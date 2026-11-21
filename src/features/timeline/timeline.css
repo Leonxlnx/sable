@@ -73,11 +73,12 @@
 /* A widget that arrives whole opens from nothing to its height. An answer that follows it within a
    moment waits out of the flow until the widget has drawn, then fades in once it has opened, at its
    final place: nothing slides down under the reader. Fresh items only (history never hides). */
-.tl-item[data-k='widget'][data-fresh]:has(.gw-box[data-phase='wait']) + .tl-item[data-t='text'] {
+.tl-item[data-k='widget'][data-fresh]:has(.gw-box[data-phase='wait']) + :is(.tl-item[data-t='text'], .fold-text) {
   display: none;
 }
 
-.tl-item[data-k='widget'][data-fresh] + .tl-item[data-t='text'][data-fresh] {
+.tl-item[data-k='widget'][data-fresh] + .tl-item[data-t='text'][data-fresh],
+.tl-item[data-k='widget'][data-fresh] + .fold-text > .collapse-inner > .tl-item[data-t='text'][data-fresh] {
   animation: fade-in var(--d-2) var(--ease) var(--d-3) backwards;
 }
 
@@ -1918,9 +1919,14 @@ button:hover > .row-caret {
 
 /* ───────────── a turn: message, work, answer ───────────── */
 
+/* The size the browser remembers for a turn it skips (below). Set while the turn runs too: its real
+   size is on record the moment it ends. Without it the turn stood at 360px for the first layout
+   after its end, the scroller cut the reader's place back by the difference, and a reader who had
+   scrolled up in a tall turn was thrown down the page. */
 .tg {
   display: flex;
   flex-direction: column;
+  contain-intrinsic-size: auto 360px;
 }
 
 /* A settled turn skips style, layout and paint as a whole while it is out of view: one boundary per
@@ -1929,30 +1935,92 @@ button:hover > .row-caret {
    turn draws in full. */
 .tg:not([data-state='running']) {
   content-visibility: auto;
-  contain-intrinsic-size: auto 360px;
 }
 
 .tg > .tl-item,
-.seg-work > .tl-item {
+.seg-work > .tl-item,
+.tl-fold > .collapse-inner > .tl-item {
   content-visibility: visible;
 }
 
-/* A report along the way keeps the answer's place, so a text that stops being the newest never moves. */
+/* ── checkpoints ──
+   A turn reads as checkpoints (TurnView): a run of work behind one line ("Worked 45s · 5 steps")
+   and the note that closed it; the live line stands under the newest. Every piece that folds (a
+   run's line with its steps, a note) sits in a wrapper of its own (`.tl-fold`, a Collapse): when
+   the turn ends they all close at once and one line is left, with what never folds after it. */
+
+/* The gather at a turn's end: many pieces close as one, over a longer way than a single fold, so
+   it starts softly and lands softly. Opened by the reader they come at a fold's usual pace. */
+.tl-fold {
+  transition-duration: 300ms, 190ms;
+  transition-timing-function: cubic-bezier(0.3, 0, 0.15, 1), cubic-bezier(0.3, 0, 0.7, 1);
+}
+
+.tl-fold[data-open] {
+  transition-duration: 220ms, 110ms;
+  transition-timing-function: var(--ease-out), var(--ease);
+}
+
+/* Reduced motion: nothing travels. The pieces are gone at once and the line fades in (TurnView). */
+@media (prefers-reduced-motion: reduce) {
+  .tl-fold,
+  .tl-fold[data-open] {
+    transition-duration: 1ms, 1ms;
+  }
+}
+
+/* A piece that is folding away never holds the reader's place: the scroller keeps the first thing
+   in view that stays (the answer, the turn's line) where it is, and what stood above slides down
+   into the room the fold leaves. A reader scrolled up in a turn as it ends keeps the answer in place. */
+.tl-fold:not([data-open]) {
+  overflow-anchor: none;
+}
+
+/* A note keeps the answer's place, so a text that turns out the answer never moves. It reads at
+   full strength like the answer: the owner reads every word the agent writes; only its thinking
+   sits back. A checkpoint's two lines stand close; the next checkpoint starts after a breath. */
 .tl-item[data-answer],
 .tl-item[data-mid] {
   padding-top: 6px;
 }
 
-/* What the agent says along the way (a report between steps) reads at full strength like the
-   answer: the owner reads every word the agent writes; only its thinking sits back. */
+.fold-run + .fold-text > .collapse-inner > .tl-item[data-t='text'] {
+  padding-top: 2px;
+}
 
-/* A settled turn's answer after the reports: a little more air, so the last word reads as the last
-   word. Only once settled: while the turn runs, the newest text may still become a report. */
-.tg:not([data-state='running']) .tl-item[data-mid] + .tl-item[data-answer] {
+/* Two things said with no work between them (the reply to a steered message and the answer, a
+   note right after a reply): each is a statement of its own, further apart than two paragraphs of one. */
+.fold-text + .fold-text > .collapse-inner > .tl-item[data-t='text'] {
+  padding-top: 12px;
+}
+
+.fold-text + .tl-item[data-t='tool'] {
+  padding-top: 4px;
+}
+
+/* The work of a turn, opened: its checkpoints stand one level in from the line that holds them
+   (and from the answer after them), each with its own line and note. */
+.tl-content {
+  --nest: 22px;
+}
+
+.tl-fold.nest .tl-item,
+.tl-fold.nest .story,
+.tl-steps.nest .story {
+  padding-left: calc(var(--gutter) + var(--nest));
+}
+
+.tl-fold.nest .tl-steps[data-settled] > .collapse-inner > .story::before,
+.tl-steps.nest[data-settled] > .collapse-inner > .story::before {
+  left: calc(var(--gutter) + var(--nest) - 15px);
+}
+
+/* The answer after the opened checkpoints: a little more air, so the last word reads as the last word. */
+.tl-fold.nest + .fold-text:not(.nest) > .collapse-inner > .tl-item[data-answer] {
   padding-top: 14px;
 }
 
-/* The work line and everything after it in a segment: the box the live line sticks inside. */
+/* A run's line and its opened steps: the box the live line sticks inside. */
 .seg-work {
   display: flex;
   flex-direction: column;
@@ -2080,6 +2148,17 @@ button:hover > .row-caret {
 /* The live line speaks in the running step's voice: brighter than the settled summary. */
 .work-live {
   color: var(--text-2);
+  transition:
+    opacity 160ms var(--ease),
+    color var(--d-1) var(--ease);
+}
+
+/* The agent is writing a note or the answer: the words are the signal, and the line under them
+   steps back at once (it is gone before the first words take its place) and returns when they end. */
+.work-head[data-quiet] > .work-live {
+  opacity: 0;
+  pointer-events: none;
+  transition: none;
 }
 
 .work-live .work-time {
@@ -2496,9 +2575,9 @@ button:hover > .row-caret {
   color: var(--text);
 }
 
+/* The shared focus ring (base.css), drawn inside the row: it spans the column and has no edge of its own. */
 .tail-bg:focus-visible {
-  outline: none;
-  box-shadow: var(--focus);
+  outline-offset: -2px;
   border-radius: var(--r-sm);
 }
 
@@ -2523,6 +2602,12 @@ button:hover > .row-caret {
   animation: fade-in 220ms var(--ease) 380ms backwards;
 }
 
+/* The live line of a later checkpoint (TurnView marks it `data-next`): it starts under the note
+   that closed the one before, with no travel. */
+.tl-work[data-next][data-live] > .work-head {
+  animation: fade-in 200ms var(--ease) backwards;
+}
+
 @keyframes tile-build {
   from {
     scale: 0;
@@ -2534,6 +2619,7 @@ button:hover > .row-caret {
     animation: fade-in var(--d-3) var(--ease);
   }
   .tail .tail-label,
+  .tl-work[data-next][data-live] > .work-head,
   .tl-work[data-enter][data-live] > .work-head :is(.work-label, .work-time) {
     animation: none;
   }

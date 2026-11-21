@@ -92,7 +92,7 @@ describe('Codex: the show_widget dynamic tool', () => {
 });
 
 describe('timeline: a widget is part of the answer, never a folded step', () => {
-  /** What is in view, in order: texts, widgets and plans (steps fold behind the work line). */
+  /** The pieces that are not steps, in order: texts, and what never folds (widgets, plans, errors). */
   const inView = (seg: { flow: { kind: string; id?: string }[] }) => seg.flow.filter((c) => c.kind === 'text' || c.kind === 'show').map((c) => c.id);
   const t = (ids: string) => {
     const parts = ids.split(/\s+/);
@@ -102,11 +102,12 @@ describe('timeline: a widget is part of the answer, never a folded step', () => 
       false,
     );
   };
-  it('shows widgets and every text in place, folds the steps', () => {
+  it('keeps a widget in its place between the texts; the steps and the note along the way fold', () => {
     const g = t('U1 w2 t3 g4 w5 t6 T7').groups[0];
     if (g.kind !== 'turn') throw new Error('expected a turn');
     const s = g.segments[0];
     expect(inView(s)).toEqual(['3', '4', '6']);
+    expect(s.notes).toEqual(['3']);
     expect(s.answer).toBe('6');
     expect(s.work).toEqual(['2', '5']);
     expect(s.steps).toBe(2);
@@ -117,7 +118,8 @@ describe('timeline: a widget is part of the answer, never a folded step', () => 
     expect(inView(g.segments[0])).toEqual(['3', '4']);
     const f = t('U1 g2 e3 F4').groups[0];
     if (f.kind !== 'turn') throw new Error('expected a turn');
-    expect(inView(f.segments[0])).toEqual(['2']);
+    // The widget, then the error where it happened: neither folds.
+    expect(inView(f.segments[0])).toEqual(['2', '3']);
     expect(f.segments[0].errors).toEqual(['3']);
   });
   it('reduces a widget tool item to "g"', () => {
