@@ -143,7 +143,10 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
           <p className="pr-route">
             Pushes {ctx.branch} to origin{ctx.remoteUrl ? ` (${ctx.remoteUrl})` : ''}, then opens a pull request into {ctx.base}.
           </p>
-          <Switch checked={draft} onChange={setDraft} label="Draft" disabled={busy} />
+          <label className="pr-draft">
+            <span>Open as a draft</span>
+            <Switch checked={draft} onChange={setDraft} label="Open as a draft" disabled={busy} />
+          </label>
           {error && (
             <p className="ch-commit-error" role="alert">
               <Icon name="warning" size={13} />
