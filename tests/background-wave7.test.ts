@@ -187,7 +187,7 @@ describe('a Claude process let go (5)', () => {
     h.rt.add<ToolItem>(agent('a1'));
     h.rt.add({ type: 'user', text: 'second', state: 'sent', id: 'u2', ts: Date.now() } as never);
     expect(h.rt.meta.background).toBe(1);
-    await h.app.call('session.rewind', { sessionId: h.rt.id, itemId: 'u2' });
+    await h.app.call('session.rewind', { sessionId: h.rt.id, itemId: 'u2', restoreFiles: false });
     expect(h.rt.get<ToolItem>('a1')?.result?.agent?.background).toBe('stopped');
     expect(h.rt.meta.background).toBe(0);
   });
