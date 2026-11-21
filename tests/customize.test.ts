@@ -47,7 +47,7 @@ function make(home: string, extra: Partial<ConstructorParameters<typeof Customiz
 describe('what a stylesheet may ask for', () => {
   it('flags every way of reaching the internet', () => {
     expect(remoteRef('.a { background: url(https://example.com/x.png) }')).toBe('https://example.com/x.png');
-    expect(remoteRef('@import "http://example.com/a.css";')).toMatch(/^http:\/\/example\.com/);
+    expect(remoteRef('@import "http://example.com/a.css";')).toMatch(/@import/);
     expect(remoteRef('.a { background: url(//example.com/x.png) }')).toBe('//example.com/x.png');
     expect(remoteRef('.a { background: image-set("https://e.com/a.png" 1x) }')).toMatch(/^https:\/\/e\.com/);
     // Escapes are decoded before looking.
@@ -58,8 +58,44 @@ describe('what a stylesheet may ask for', () => {
   it('leaves local and data: references alone, and comments out of it', () => {
     expect(remoteRef(':root { --bg: #000 } .sidebar { width: 200px }')).toBeUndefined();
     expect(remoteRef(".a { background: url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>\") }")).toBeUndefined();
-    expect(remoteRef(".a { background: url(data:image/svg+xml;utf8,<svg%20xmlns='http://www.w3.org/2000/svg'/>) }")).toBeUndefined();
+    expect(remoteRef('.a { background: url(data:image/svg+xml;utf8,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22/%3E) }')).toBeUndefined();
     expect(remoteRef('/* from https://example.com */ .a { background: url(/assets/x.svg) }')).toBeUndefined();
+    expect(remoteRef('@font-face { font-family: X; src: local("Inter"), url("/assets/inter.woff2") format("woff2"); unicode-range: U+0025-00FF }')).toBeUndefined();
+    expect(remoteRef('.a::before { content: "Note: a // b" } .b:hover { color: #fff; width: calc(100% - 2px) }')).toBeUndefined();
+    expect(remoteRef('.a { background: image-set("/assets/a.png" 1x type("image/png")) }')).toBeUndefined();
+  });
+
+  it('reads strings and comments as the browser does: a comment delimiter in a string hides nothing (review 7)', () => {
+    // The old scanner dropped everything from the first "/*" to the last "*/", strings or not.
+    expect(remoteRef('.a { content: "/*" } .b { background: url(https://e.com/x.png) } .c { content: "*/" }')).toBe('https://e.com/x.png');
+    expect(remoteRef(".a { content: '/*' } .b { background: url('https://e.com/x.png') } .c { content: '*/' }")).toBe('https://e.com/x.png');
+    // A quote inside a comment is not a string.
+    expect(remoteRef('/* it\'s */ .b { background: url(https://e.com/y.png) } /* \' */')).toBe('https://e.com/y.png');
+    // A line continuation inside a string, an escaped quote.
+    expect(remoteRef('.a { background: url("https://e\\\n.com/z.png") }')).toMatch(/^https:\/\/e\.com/);
+    expect(remoteRef('.a { background: url("x\\"y") } .b { background: url(https://e.com/w.png) }')).toBe('https://e.com/w.png');
+  });
+
+  it('finds every form of address, and refuses what it cannot tell', () => {
+    // Escaped names of the functions and at-rules.
+    expect(remoteRef('.a { background: u\\72l(https://e.com/a.png) }')).toMatch(/^https:/);
+    expect(remoteRef('@\\69mport "/custom/other.css";')).toMatch(/@import/);
+    expect(remoteRef('@import url(/assets/a.css);')).toMatch(/@import/);
+    // A scheme without slashes still parses as a host; slashes either way; tabs and newlines dropped.
+    expect(remoteRef('.a { background: url("https:e.com/a.png") }')).toBe('https:e.com/a.png');
+    expect(remoteRef('.a { background: url("\\\\\\\\e.com/a.png") }')).toBeDefined();
+    expect(remoteRef('.a { background: url("/\\\\e.com/a.png") }')).toBeDefined();
+    expect(remoteRef('.a { background: url("ht\\9 tps://e.com/a.png") }')).toBeDefined();
+    // Through a custom property and var().
+    expect(remoteRef(':root { --pic: "https:e.com/a.png" } .a { background: image-set(var(--pic) 1x) }')).toBe('https:e.com/a.png');
+    expect(remoteRef('.a { background: -webkit-image-set("//e.com/a.png" 1x) }')).toBe('//e.com/a.png');
+    expect(remoteRef('.a { mask: src("javascript:x") }')).toBe('javascript:x');
+    // What the browser itself cannot read is refused rather than guessed at.
+    expect(remoteRef('.a { content: "unfinished }')).toMatch(/unfinished string/);
+    expect(remoteRef('.a { color: red } /* never closed')).toMatch(/unfinished comment/);
+    expect(remoteRef('.a { background: url(https://e.com/a.png')).toMatch(/unfinished url/);
+    expect(remoteRef(".a { background: url(x'y) }")).toMatch(/cannot read/);
+    expect(remoteRef('.a { content: "line\nbreak" }')).toMatch(/broken across lines/);
   });
 });
 

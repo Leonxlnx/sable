@@ -8,6 +8,7 @@ import type { AppSettings, CustomBuild, CustomState, ProviderId, SessionMeta, Se
 import { CUSTOM_READY_MS } from '../../shared/protocol';
 import type { App } from '../app';
 import { VERSION } from '../version';
+import { remoteRef } from './css-scan';
 
 /**
  * Customize Sable: the person changes the app they are using, with an agent.
@@ -50,31 +51,8 @@ export const BUILD_OFF = 'Your own build of the interface is not available in th
 
 // ─────────────────────────────── the stylesheet ───────────────────────────────
 
-/** CSS escapes decoded (`\75 rl(` is `url(`), for looking at what the sheet asks for. */
-function unescapeCss(s: string): string {
-  return s.replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_m, hex: string) => {
-    const n = parseInt(hex, 16);
-    return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : '';
-  }).replace(/\\(.)/g, '$1');
-}
-
-/**
- * What in a stylesheet would reach beyond this computer: a remote address in any form (`url()`,
- * `@import`, `image-set()`, a bare string), protocol-relative ones included, escapes decoded first.
- * Addresses inside `data:` URIs fetch nothing (an SVG image cannot load anything) and do not count.
- * Undefined when there is none.
- */
-export function remoteRef(css: string): string | undefined {
-  let s = css.replace(/\/\*[\s\S]*?(\*\/|$)/g, ' ');
-  s = unescapeCss(s);
-  // data: URIs, quoted or bare inside url(), are dropped before looking.
-  s = s.replace(/(["'])\s*data:[\s\S]*?\1/gi, '""').replace(/url\(\s*data:[^)]*\)/gi, 'url()');
-  const m = /(?:\b[a-z][a-z0-9+.-]*:)?\/\/[^\s"')]+/i.exec(s);
-  if (m) return m[0].slice(0, 120);
-  // A scheme that fetches without slashes.
-  const other = /\b(?:https?|ftp|wss?|file|blob|javascript):[^\s"')]*/i.exec(s);
-  return other ? other[0].slice(0, 120) : undefined;
-}
+/** What a sheet asks for beyond this computer (`css-scan.ts`): a sheet with any of it is not applied. */
+export { remoteRef };
 
 /** Whether a request comes from the app's own page (same origin, a loopback host on this server). */
 export function ownOrigin(req: IncomingMessage): boolean {
@@ -329,7 +307,8 @@ export class Customizer {
         else {
           body = readFileSync(this.stylesFile, 'utf8');
           const remote = remoteRef(body);
-          if (remote) blocked = `It asks for ${remote}`;
+          // An address it asks for, or what keeps it from being read safely ("an unfinished comment").
+          if (remote) blocked = /^an? /.test(remote) ? `It has ${remote}` : `It asks for ${remote}`;
         }
       }
     } catch {
