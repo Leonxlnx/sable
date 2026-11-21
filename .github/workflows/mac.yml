@@ -4,7 +4,9 @@ name: macOS build
 # the result is a sound app, and starts it once to prove it runs. Run it by hand from the Actions
 # tab ("Run workflow"), or let it run when a release is published: the disk images and zips are then
 # added to that release (the in-app updater on a Mac reads the zip). Experimental: nobody has run
-# these builds on a Mac of their own yet.
+# these builds on a Mac of their own yet. With a tag, the tag's own commit is built (not the branch
+# the run was started from) and the files are uploaded only when the tag still points there and
+# package.json has the tag's version.
 #
 # The app is signed ad hoc ("-" in package.json > build > mac > identity): it runs, but macOS asks the
 # person to allow it once (README, "Install"). With an Apple Developer ID, remove that line and add
@@ -28,8 +30,42 @@ permissions:
   contents: read
 
 jobs:
+  # What is built: with a release tag (published, or given by hand), that tag's own commit, whatever
+  # branch the run was started from; without one, the commit the run was started on (artifact only).
+  # Resolved once, before anything is checked out, and checked again before the upload.
+  target:
+    name: What to build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+      sha: ${{ steps.t.outputs.sha }}
+    steps:
+      - id: t
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A release tag of this repository's form (v1.2.3), nothing that could read as an option or a path.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::$TAG is not a release tag (v1.2.3)"; exit 1
+          fi
+          gh release view "$TAG" --json tagName > /dev/null
+          SHA=$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" --jq .sha)
+          printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
   mac:
     name: ${{ matrix.arch }}
+    needs: target
     strategy:
       fail-fast: false
       matrix:
@@ -43,7 +79,20 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ needs.target.outputs.sha }}
           persist-credentials: false
+
+      # The source is the resolved commit, and for a release its version is the tag's.
+      - name: Check the source
+        env:
+          SHA: ${{ needs.target.outputs.sha }}
+          TAG: ${{ needs.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$SHA" ] || { echo "::error::checked out $(git rev-parse HEAD), not $SHA"; exit 1; }
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$TAG" ] && [ "v$VERSION" != "$TAG" ]; then echo "::error::package.json says $VERSION, the release is $TAG"; exit 1; fi
+          echo "built: $SHA ($VERSION)"
 
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
@@ -109,8 +158,8 @@ jobs:
 
   attach:
     name: Attach to the release
-    needs: mac
-    if: github.event_name == 'release' || inputs.tag != ''
+    needs: [target, mac]
+    if: needs.target.outputs.tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -122,12 +171,24 @@ jobs:
           path: files
           merge-multiple: true
 
+      # Only files built from the tag's commit, of the tag's version, replace a release's downloads:
+      # the tag must still point where it did when the build began, and every file must carry the version.
       - name: Upload the disk images and zips
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ needs.target.outputs.tag }}
+          SHA: ${{ needs.target.outputs.sha }}
         run: |
           set -euo pipefail
           ls -la files
-          gh release upload "$TAG" files/*.dmg files/*.zip --clobber
+          NOW=$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" --jq .sha)
+          [ "$NOW" = "$SHA" ] || { echo "::error::$TAG moved from $SHA to $NOW during the build"; exit 1; }
+          VERSION="${TAG#v}"
+          shopt -s nullglob
+          FILES=(files/*.dmg files/*.zip)
+          [ "${#FILES[@]}" -gt 0 ] || { echo "::error::no files to upload"; exit 1; }
+          for f in "${FILES[@]}"; do
+            case "$(basename "$f")" in *"-$VERSION-"*|*"-$VERSION."*) ;; *) echo "::error::$f is not of version $VERSION"; exit 1 ;; esac
+          done
+          gh release upload "$TAG" "${FILES[@]}" --clobber
