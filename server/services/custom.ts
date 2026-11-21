@@ -810,12 +810,24 @@ export function customOf(app: App): Customizer {
   return c;
 }
 
-/** The Customize chat: the newest kept one, if any. */
+/** The agents whose Customize chat gets the brief (`customBrief`: Claude Code's appended prompt, Codex's developer instructions). */
+const BRIEFED: readonly ProviderId[] = ['claude', 'codex'];
+export const CUSTOM_AGENT_ONLY = 'The Customize chat runs with Claude Code or Codex.';
+
+/**
+ * Whether the Customize chat may run with `provider`: one that gets its brief. The scripted Demo agent
+ * too (development and tests only, and only when named): it writes nothing.
+ */
+export function customAgent(provider: ProviderId): boolean {
+  return BRIEFED.includes(provider) || provider === 'demo';
+}
+
+/** The Customize chat: the newest kept one with an agent that gets its brief, if any. */
 function customChat(app: App): SessionMeta | undefined {
   let best: SessionMeta | undefined;
   for (const rt of app.sessions.values()) {
     const m = rt.meta;
-    if (m.custom && !m.archived && (!best || m.createdAt > best.createdAt)) best = m;
+    if (m.custom && customAgent(m.provider) && !m.archived && (!best || m.createdAt > best.createdAt)) best = m;
   }
   return best;
 }
@@ -843,7 +855,10 @@ export function registerCustom(app: App) {
     if (meta) snap = await app.call('session.snapshot', { sessionId: meta.id });
     else {
       const settings = app.store.state.settings;
-      const pick: ProviderId = provider && app.providers.has(provider) ? provider : app.providers.has(settings.defaultProvider) ? settings.defaultProvider : ([...app.providers.keys()][0] as ProviderId);
+      // Only an agent that gets the brief: the one asked for, else the default when it is one, else the first there is.
+      if (provider && (!customAgent(provider) || !app.providers.has(provider))) throw new Error(CUSTOM_AGENT_ONLY);
+      const pick = provider ?? [settings.defaultProvider, ...BRIEFED].find((p): p is ProviderId => BRIEFED.includes(p) && app.providers.has(p));
+      if (!pick) throw new Error(CUSTOM_AGENT_ONLY);
       mkdirSync(c.dir, { recursive: true });
       snap = await app.startSession({ provider: pick, cwd: c.dir, title: 'Customize Sable' }, { custom: true });
       meta = snap.session;

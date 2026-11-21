@@ -17,7 +17,7 @@ import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
 import { pageHeaders } from '../electron/csp';
 import { createStaticServer } from '../server/serve';
-import { BUILD_OFF, BUILD_SHIPS, BUILD_STATE_FILE, conflictMessage, customBrief, Customizer, ownOrigin, registerCustom, remoteRef, type CustomRunner, type RunResult } from '../server/services/custom';
+import { BUILD_OFF, BUILD_SHIPS, BUILD_STATE_FILE, CUSTOM_AGENT_ONLY, customAgent, conflictMessage, customBrief, Customizer, ownOrigin, registerCustom, remoteRef, type CustomRunner, type RunResult } from '../server/services/custom';
 
 const dirs: string[] = [];
 const tmp = () => {
@@ -620,6 +620,34 @@ describe('the brief, only in the Customize chat', () => {
     (p as unknown as { client: () => Promise<unknown> }).client = async () => ({ request: async () => ({ config: {} }) });
     expect(await p.developerInstructions(process.cwd(), { options: {}, custom: true })).toContain(brief);
     expect(await p.developerInstructions(process.cwd(), { options: {} })).not.toContain('customize_sable');
+  });
+});
+
+describe('the Customize chat, only with an agent that gets its brief (review 31)', () => {
+  /** The scripted agent under another agent's id: nothing real runs. */
+  const as = (id: 'opencode' | 'claude') => (ctx: ConstructorParameters<typeof DemoProvider>[0]) => Object.assign(new DemoProvider(ctx, { speed: 0 }), { id }) as unknown as DemoProvider;
+
+  it('OpenCode as the default: never picked, never accepted; Claude Code when it is there', async () => {
+    const home = tmp();
+    const only = new App({ home, quiet: true, providers: [as('opencode'), (ctx) => new DemoProvider(ctx, { speed: 0 })] });
+    apps.push(only);
+    await only.call('app.setSettings', { patch: { defaultProvider: 'opencode' } });
+    registerCustom(only);
+    await expect(only.call('custom.open', {})).rejects.toThrow(CUSTOM_AGENT_ONLY);
+    await expect(only.call('custom.open', { provider: 'opencode' })).rejects.toThrow(CUSTOM_AGENT_ONLY);
+    expect([...only.sessions.values()].some((rt) => rt.meta.custom)).toBe(false);
+
+    const home2 = tmp();
+    const both = new App({ home: home2, quiet: true, providers: [as('opencode'), as('claude')] });
+    apps.push(both);
+    await both.call('app.setSettings', { patch: { defaultProvider: 'opencode' } });
+    registerCustom(both);
+    const snap = await both.call('custom.open', {});
+    expect(snap.session).toMatchObject({ provider: 'claude', custom: true });
+    // Not moved to OpenCode in place either.
+    await expect(both.call('session.switchAgent', { sessionId: snap.session.id, provider: 'opencode' })).rejects.toThrow(CUSTOM_AGENT_ONLY);
+    expect(customAgent('opencode')).toBe(false);
+    expect(customAgent('codex')).toBe(true);
   });
 });
 
