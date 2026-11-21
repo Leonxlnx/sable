@@ -1674,6 +1674,8 @@ export type PhoneItem = TimelineItem & {
   kids?: number;
   /** The desktop holds more of it (output, the change's lines, the full input). */
   more?: boolean;
+  /** Pictures in a step's result (a screenshot): `phone.image` returns each. */
+  pics?: number;
 };
 
 /** A page of a conversation for the phone: the newest root items, or those before a cursor. */
@@ -1688,8 +1690,12 @@ export interface PhoneTail extends Omit<SessionSnapshot, 'items'> {
 
 /** Methods only the phone endpoint answers, besides `PHONE_METHODS`. */
 export interface PhoneMethods {
-  /** The newest page of a conversation (or the one before `before`), trimmed; from here on its live events reach this phone. */
-  'phone.tail': { params: { sessionId: string; before?: string; limit?: number }; result: PhoneTail };
+  /**
+   * The newest page of a conversation (or the one before `before`), trimmed; from here on its live
+   * events reach this phone. `to`: the page reaches back at least to that root item (a search hit, a
+   * place to open at), within a cap; asked again from its cursor when it is further back.
+   */
+  'phone.tail': { params: { sessionId: string; before?: string; limit?: number; to?: string }; result: PhoneTail };
   /** One item with more of it (a step's output and change, a long text in full) and the last steps nested under it. */
   'phone.item': { params: { sessionId: string; itemId: string }; result: { item: PhoneItem; children: PhoneItem[] } };
   /**
@@ -1715,9 +1721,35 @@ export interface PhoneMethods {
    * chat now: no other path can be read this way.
    */
   'phone.diff': { params: { sessionId: string; path: string; items?: string[] }; result: PhoneDiff };
+  /**
+   * Messages across the chats that are not archived, read-only: the person's own messages and what
+   * the agents said (no steps, outputs or files), newest chats first, a few hits per chat. The words
+   * of the query must all be in a message. Bounded per call (time and bytes read); `partial` when
+   * some chats were not read yet (asking again goes on where it stopped).
+   */
+  'phone.search': { params: { query: string }; result: PhoneSearch };
+  /** One picture of a step's result (`PhoneItem.pics`), as a data URL; nothing else can be read this way. */
+  'phone.image': { params: { sessionId: string; itemId: string; index: number }; result: { data: string } };
 }
 
-export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.mkdir', 'phone.changes', 'phone.diff'] as const satisfies readonly (keyof PhoneMethods)[];
+export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image'] as const satisfies readonly (keyof PhoneMethods)[];
+
+/** A message that matched a search on the phone (`phone.search`). */
+export interface PhoneSearchHit {
+  sessionId: string;
+  /** A root item of that chat (a message or a text of the agent's). */
+  itemId: string;
+  role: 'user' | 'agent';
+  /** The words around the match, at most a few lines. */
+  text: string;
+  ts: number;
+}
+
+export interface PhoneSearch {
+  hits: PhoneSearchHit[];
+  /** Some chats were not read in this call (time or bytes ran out): ask again for more. */
+  partial?: boolean;
+}
 
 /** A changed file in a chat's Changes view on the phone. */
 export interface PhoneChangedFile {

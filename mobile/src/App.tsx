@@ -4,7 +4,7 @@ import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type Reac
 import type { SessionMeta } from '@shared/protocol';
 import { goBack, pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
-import { haptic, inForeground, keepAlive, notify, onAppState, onBackButton, onNotificationTap, onPairLink } from '@m/lib/native';
+import { clearNotification, forgetNotificationLines, haptic, inForeground, keepAlive, notify, onAppState, onBackButton, onNotificationTap, onPairLink, setShortcuts } from '@m/lib/native';
 import { chatOf, nav, routeKey, useNav, type Route } from '@m/lib/nav';
 import { rowOf, takeOrigin, type Origin } from '@m/lib/open';
 import { pruneComments } from '@m/lib/comments';
@@ -15,6 +15,8 @@ import { fieldBeat } from '@m/ui/Field';
 import { Launch } from '@m/ui/Launch';
 import { ProviderMark, StatusMark } from '@m/ui/marks';
 import { nowOf, reduced, SNAP, SPRING } from '@m/ui/motion';
+import { Viewer } from '@m/ui/Viewer';
+import { MessageMenu } from './screens/MessageMenu';
 import { Home } from './screens/Home';
 import { Pair } from './screens/Pair';
 import { prefs, Settings } from './screens/Settings';
@@ -53,7 +55,8 @@ function watchTurns() {
       if (ended && s.status === 'idle') {
         // The ring closes on the composer of the chat on screen (or on home's field).
         fieldBeat('done', [...document.querySelectorAll('.layer')].pop()?.querySelector('.composer') ?? document.querySelector('.home-dock'));
-        if (inForeground() && chatOf(nav.stack[nav.stack.length - 1]) === s.id) haptic('select');
+        // Felt while the app is open: clearly for the chat on screen, a tick for one elsewhere.
+        if (inForeground()) haptic(chatOf(nav.stack[nav.stack.length - 1]) === s.id ? 'success' : 'select');
       }
       if (!waits && !ended) continue;
       if (waits && inForeground()) {
@@ -65,14 +68,35 @@ function watchTurns() {
         }
       }
       if (inForeground() || !prefs.notify) continue;
-      if (waits) void notify(s.title, 'Waiting for you', s.id);
-      else if (ended) void notify(s.title, s.status === 'error' ? (s.lastError ?? 'Stopped with an error') : 'Done', s.id);
+      if (waits) void notify(s.title, 'Waiting for you', s.id, 'waiting');
+      else if (ended) void notify(s.title, s.status === 'error' ? (s.lastError ?? 'Stopped with an error') : 'Done', s.id, 'done');
     }
     last = next;
     seeded = true;
     // Something at work: the connection stays when the app leaves the screen (to say when it ends or waits).
     const busy = Object.values(sessions).filter((s) => !s.archived && (s.status === 'running' || s.status === 'starting' || s.status === 'awaiting'));
     keepAlive(prefs.notify && busy.length && getState().conn !== 'unpaired' ? (busy.length === 1 ? busy[0].title : `${busy.length} chats`) : null);
+  };
+}
+
+/** The app icon's shortcuts follow the two chats with the latest activity (besides "New chat"). */
+function watchShortcuts() {
+  let prev = getState().sessions;
+  let timer = 0;
+  const sync = () => {
+    timer = 0;
+    const recent = Object.values(getState().sessions)
+      .filter((s) => !s.archived)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 2)
+      .map((s) => ({ id: s.id, title: s.title }));
+    setShortcuts(recent);
+  };
+  return () => {
+    const { sessions, fresh } = getState();
+    if (sessions === prev || !fresh) return;
+    prev = sessions;
+    if (!timer) timer = window.setTimeout(sync, 4000);
   };
 }
 
@@ -104,13 +128,30 @@ export function App() {
           })
           .catch(() => {});
       }),
-      onAppState((active) => (active ? conn.wake() : conn.sleep())),
+      onAppState((active) => {
+        if (active) {
+          forgetNotificationLines();
+          const id = chatOf(nav.stack[nav.stack.length - 1]);
+          if (id) clearNotification(id);
+          conn.wake();
+        } else conn.sleep();
+      }),
       onBackButton(goBack),
       pushBack(() => nav.pop()),
-      onPairLink((url) => setLink(url)),
-      onNotificationTap((id) => nav.chat(id)),
+      onPairLink((url) => {
+        // The app icon's shortcuts: a new chat (home's bar, focused), or one of the last chats.
+        const m = /^sable:\/\/(new|chat)(?:\/([^/?#]+))?/i.exec(url);
+        if (!m) return setLink(url);
+        if (m[1].toLowerCase() === 'new') {
+          nav.reset();
+          window.setTimeout(() => window.dispatchEvent(new Event('sable:newchat')), 350);
+        } else if (m[2]) nav.chat(decodeURIComponent(m[2]));
+      }),
+      // A notification opens its chat where it matters: the prompt waiting (its sheet opens by itself), or the newest turn.
+      onNotificationTap((id, kind) => (kind === 'home' ? nav.reset() : nav.chat(id, kind === 'done' ? 'turn' : undefined))),
     ];
     const stopWatch = subscribeStore(watchTurns());
+    const stopShortcuts = subscribeStore(watchShortcuts());
     const idle = window.setTimeout(() => void loadChat().then(() => window.setTimeout(() => void loadChanges(), 800)), 400);
     // Back where it was: Android may have closed the app in the background.
     void conn.init().then(() => {
@@ -121,9 +162,16 @@ export function App() {
     return () => {
       offs.forEach((f) => f());
       stopWatch();
+      stopShortcuts();
       clearTimeout(idle);
     };
   }, []);
+
+  // A chat on screen: its notification has been read.
+  const topChat = chatOf(stack[stack.length - 1]);
+  useEffect(() => {
+    if (topChat && inForeground()) clearNotification(topChat);
+  }, [topChat]);
 
   // Data for chats that are no longer on screen is dropped (the snapshot reloads it), once the screen
   // that showed it has left: dropped at once, the chat on its way out showed its skeleton for its last frames.
@@ -180,6 +228,8 @@ export function App() {
         )}
       </div>
       {launch === 'on' && <Launch onDone={() => setLaunch('done')} />}
+      <MessageMenu />
+      <Viewer />
       <Toast />
     </>
   );
@@ -191,7 +241,7 @@ function Screen({ route: r }: { route: Route }) {
   if (r.name === 'chat')
     return (
       <Suspense fallback={<div className="screen chat" />}>
-        <Chat id={r.id} />
+        <Chat id={r.id} at={r.at} seq={r.seq} find={r.find} />
       </Suspense>
     );
   return (

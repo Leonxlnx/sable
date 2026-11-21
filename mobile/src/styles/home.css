@@ -1,7 +1,7 @@
 /*
  * Home: the field lies under everything, its light gathered under the new-chat bar. A large title
- * (the computer's name) that hands over to the bar as you scroll, what runs or waits as cards with
- * their agent's light at their foot, then the folders as cards of ink.
+ * (the computer's name) that hands over to the bar as you scroll, what waits on you as one card, the
+ * folders as chips, then the chats: pinned, then by their latest activity, in rows of two lines.
  */
 .home {
   timeline-scope: --home;
@@ -223,77 +223,72 @@
   animation-delay: calc(var(--d) * 75ms);
 }
 
-/* ── now: what runs or waits ── */
-.now {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 0 14px 8px;
+/* ── waiting on you: one calm card at the top, its amber light along its foot ── */
+.wait-strip-wrap {
+  padding: 0 14px 6px;
+  overflow: hidden;
 }
 
-.live {
+.wait-strip {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 6px;
   width: 100%;
-  padding: 16px 16px 24px 18px;
+  padding: 14px 14px 16px 16px;
   border-radius: 22px;
   text-align: left;
   overflow: hidden;
   isolation: isolate;
-  background: rgb(19 19 22 / 0.92);
+  background: var(--card);
   box-shadow: var(--edge), var(--lift);
-  transition: background-color 120ms;
+  transition: background-color 100ms, scale 140ms var(--ease-out);
 }
 
-.live:active {
-  background: rgb(25 25 29 / 0.95);
+.wait-strip:active {
+  background-color: rgb(25 25 29 / 0.95);
+  scale: 0.985;
 }
 
-.live-glow {
-  position: absolute;
-  z-index: -1;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 30px;
-  overflow: hidden;
-  pointer-events: none;
-  opacity: 0.8;
-}
-
-.live-glow i {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: calc(100% + 384px);
-  background-repeat: repeat-x;
-  background-size: 384px 30px;
-  image-rendering: pixelated;
-  animation: glow-drift 14s linear infinite;
-  will-change: transform;
-}
-
-.live[data-tone='awaiting'] .live-glow i {
-  animation: none;
-}
-
-@keyframes glow-drift {
-  to {
-    transform: translateX(-384px);
-  }
-}
-
-.live-line {
+.wait-head {
   display: flex;
   align-items: center;
-  gap: 12px;
-  min-width: 0;
+  gap: 9px;
 }
 
-.live-title {
+.wait-count {
+  flex: 1;
+  font-size: var(--t-sm);
+  font-weight: 580;
+  color: var(--amber);
+}
+
+.wait-go {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: var(--r-pill);
+  background-color: var(--fill-2);
+  box-shadow: var(--press-up);
+  font-size: var(--t-sm);
+  font-weight: 580;
+  line-height: 32px;
+  color: var(--text);
+}
+
+.wait-strip:active .wait-go {
+  background-color: var(--fill-3);
+  box-shadow: var(--press-down);
+}
+
+.wait-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 2px;
+}
+
+.wait-ask {
   flex: 1;
   min-width: 0;
   font-size: 16px;
@@ -304,56 +299,89 @@
   text-overflow: ellipsis;
 }
 
-.live-end {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  flex-shrink: 0;
-}
-
-.live-sub {
-  padding-left: 30px;
-  font-size: 14px;
-  color: var(--text-2);
+.wait-chat {
+  padding-left: 25px;
+  font-size: var(--t-sm);
+  color: var(--text-3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.live[data-tone='awaiting'] .live-sub {
-  color: var(--amber);
+/* ── the folders: a row of chips (all chats, or one folder's) ── */
+.filters {
+  display: flex;
+  gap: 8px;
+  padding: 4px 14px 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+  scroll-padding-inline: 14px;
 }
 
-/* ── folders ── */
+.filters::-webkit-scrollbar {
+  display: none;
+}
+
+/* a bare chip: flat until held or on (on: set in, a step lighter) */
+.filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+  max-width: 200px;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--r-pill);
+  background-color: var(--fill-1);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font-size: var(--t-sm);
+  font-weight: 540;
+  color: var(--text-2);
+  white-space: nowrap;
+  transition: background-color 100ms, color 100ms, scale 120ms var(--ease-out);
+}
+
+.filter span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.filter svg {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.filter:active {
+  scale: 0.96;
+  background-color: var(--fill-2);
+}
+
+.filter[aria-pressed='true'] {
+  background-color: var(--fill-3);
+  box-shadow: var(--press-down);
+  color: var(--text);
+}
+
+.filter[aria-pressed='true'] svg {
+  color: var(--text-2);
+}
+
+/* ── the list: pinned, then recent; one card each, rows of two lines ── */
 .group {
-  padding: 16px 14px 0;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 340px;
+  padding: 14px 14px 0;
 }
 
-/* a folder's name: a quiet label over its card (the chats are what is read) */
+/* a section's name: a quiet label over its card (the chats are what is read) */
 .group-name {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   padding: 0 10px 9px;
   font-size: 13.5px;
   font-weight: 560;
   color: var(--text-3);
   letter-spacing: -0.003em;
-}
-
-.group-name > span:first-child {
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.group-count {
-  font-size: var(--t-xs);
-  font-weight: 500;
-  color: var(--text-4);
 }
 
 .rows {
@@ -367,40 +395,75 @@
 
 .rows > li {
   position: relative;
-  overflow: hidden;
   border-radius: 17px;
 }
 
 .rows > li + li::before {
   content: '';
   position: absolute;
+  z-index: 2;
   top: 0;
-  left: 45px;
+  left: 50px;
   right: 14px;
   height: 1px;
   background: rgb(255 255 255 / 0.05);
   pointer-events: none;
 }
 
+/* a row moves sideways under the finger; up and down stays the list's scroll */
+.rrow {
+  overflow: hidden;
+  touch-action: pan-y;
+}
+
 .row {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 13px;
   width: 100%;
-  min-height: 54px;
-  padding: 0 14px 0 14px;
+  min-height: 64px;
+  padding: 0 14px 0 13px;
   border-radius: 17px;
   text-align: left;
-  transition: background-color 100ms, transform 140ms var(--ease-out);
+  transition: background-color 100ms, scale 140ms var(--ease-out);
 }
 
 .row:active {
-  background: rgb(255 255 255 / 0.055);
-  transform: scale(0.985);
+  background-color: rgb(255 255 255 / 0.055);
+}
+
+.rrow:not([data-swiping]) .row:active {
+  scale: 0.985;
+}
+
+/* moving, the row is opaque over its actions */
+.rrow[data-swiping] .row {
+  background-color: var(--card-solid);
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.04);
+}
+
+.row-mark {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 12px;
+}
+
+.row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  padding: 11px 0 12px;
 }
 
 .row-title {
-  flex: 1;
   min-width: 0;
   font-size: 15.5px;
   color: #e4e3df;
@@ -415,18 +478,48 @@
   font-weight: 600;
 }
 
-.row-end {
+.row-sub {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.35;
   color: var(--text-3);
 }
 
+.row-folder,
+.row-wait {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-wait {
+  color: var(--amber);
+}
+
+.row-end {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 6px;
+  align-self: stretch;
+  flex-shrink: 0;
+  min-width: 30px;
+}
+
 .row-time {
-  min-width: 26px;
-  text-align: right;
+  min-height: 16px;
   font-size: 13px;
+  line-height: 16px;
+  color: var(--text-3);
+}
+
+.row-state {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 14px;
   color: var(--text-3);
 }
 
@@ -434,25 +527,68 @@
   color: var(--text-4);
 }
 
-/* a chat racing another: the race glyph and the word, quiet (rows and live cards) */
-.race-mark {
-  display: inline-flex;
+/* ── a swipe: pin on the left, archive on the right, under the row ── */
+.swipe-act {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
   align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-  font-size: var(--t-xs);
-  font-weight: 500;
+  gap: 10px;
+  padding: 0 16px;
+  opacity: 0;
+  pointer-events: none;
+  font-size: var(--t-sm);
+  font-weight: 560;
   color: var(--text-3);
 }
 
-.live-line .race-mark {
-  margin-left: -2px;
+.swipe-pin {
+  left: 0;
+}
+
+.swipe-archive {
+  right: 0;
+}
+
+.swipe-disc {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background-color: var(--fill-2);
+  box-shadow: var(--press-up);
+  color: var(--text-2);
+  transition: scale 160ms var(--ease-spring);
+}
+
+/* past the line it commits on release: the disc turns to the ivory key, the word brightens */
+.rrow[data-armed='pin'] .swipe-pin,
+.rrow[data-armed='archive'] .swipe-archive {
+  color: var(--text);
+}
+
+.rrow[data-armed='pin'] .swipe-pin .swipe-disc,
+.rrow[data-armed='archive'] .swipe-archive .swipe-disc {
+  background-color: var(--text);
+  box-shadow: var(--thumb-up);
+  color: var(--bg);
+  scale: 1.1;
+}
+
+/* a chat racing another: the race glyph, quiet */
+.race-mark {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--text-3);
 }
 
 .more-row {
   display: block;
   height: 44px;
-  margin: 0 auto;
+  margin: 2px auto 0;
   padding: 0 22px;
   font-size: var(--t-sm);
   font-weight: 500;
@@ -472,20 +608,140 @@
 }
 
 .home-skel {
-  display: flex;
-  flex-direction: column;
-  gap: 26px;
-  padding: 8px 14px;
+  padding: 18px 14px 8px;
 }
 
 .home-skel-card {
   display: flex;
   flex-direction: column;
-  gap: 30px;
-  padding: 22px 18px;
+  padding: 5px;
   border-radius: 22px;
   background: var(--card);
   box-shadow: var(--edge);
+}
+
+.home-skel-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+  height: 64px;
+  padding: 15px 14px 0 15px;
+}
+
+.home-skel-row .skel-dot {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.home-skel-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+}
+
+.home-skel-lines .skel-sub {
+  height: 10px;
+  opacity: 0.6;
+}
+
+/* ── search: chats by title, then messages ── */
+.results {
+  padding-bottom: 8px;
+}
+
+.results .group:first-child {
+  padding-top: 2px;
+}
+
+.results-none {
+  padding: 8px 24px 0;
+  font-size: var(--t-ui);
+  color: var(--text-3);
+}
+
+.hits > li + li::before {
+  left: 16px;
+}
+
+.hit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  padding: 13px 14px 14px 15px;
+  border-radius: 17px;
+  text-align: left;
+  transition: background-color 100ms, scale 140ms var(--ease-out);
+}
+
+.hit:active {
+  background-color: rgb(255 255 255 / 0.055);
+  scale: 0.985;
+}
+
+.hit-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.hit-chat {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--t-sm);
+  font-weight: 540;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hit-time {
+  flex-shrink: 0;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+.hit-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text-2);
+  word-break: break-word;
+}
+
+.hit-text mark {
+  background: none;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.hit-you {
+  color: var(--text-3);
+}
+
+.hits-wait {
+  display: flex;
+  flex-direction: column;
+}
+
+.hits-skel {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 16px 15px 18px;
+}
+
+.hits-skel .skel:first-child {
+  height: 10px;
+  opacity: 0.6;
 }
 
 .unreachable {
@@ -511,6 +767,15 @@
   font-size: var(--t-sm);
   font-weight: 400;
   line-height: 1.5;
+}
+
+/* an older WebView does not stretch a flex button's children: the lines take the card's width */
+.wait-head,
+.wait-line,
+.wait-chat,
+.hit-head,
+.hit-text {
+  width: 100%;
 }
 
 /* ── a chat waiting on you, scrolled out of sight ── */
@@ -796,17 +1061,10 @@
 }
 
 /* covered by a chat or settings: nothing on home keeps moving (the loops pause where they are) */
-.home[data-under] .live-glow i,
 .home[data-under] .tiles i,
 .home[data-under] .ring,
 .home[data-under] .shimmer {
   animation-play-state: paused;
-}
-
-/* an older WebView does not stretch a flex button's children: the lines take the card's width */
-.live-line,
-.live-sub {
-  width: 100%;
 }
 
 /* while the list moves the bar stops blurring and goes opaque (it would be drawn again every frame) */

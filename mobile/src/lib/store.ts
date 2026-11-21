@@ -21,6 +21,8 @@ import type {
 } from '@shared/protocol';
 import { partOfTurn, syntheticOf } from '@shared/synthetic';
 import { conn, type ConnState } from './conn';
+import { reshape, shapeString } from './turns';
+import { Intents, type Field } from './intents';
 
 /**
  * The phone's view of the desktop: sessions, folders, accounts and the open conversations, kept
@@ -43,6 +45,10 @@ export interface SessionData {
   cursor?: string;
   /** Shown from the phone's cache while the desktop is asked. */
   cached?: boolean;
+  /** One character per root (lib/turns.ts `shapeOf`), kept per changed id: the conversation is grouped again only when it changes. */
+  shape: string;
+  /** File-touching steps that settled (a chat's changes are asked again when this moves). */
+  fileSteps: number;
 }
 
 export interface State {
@@ -70,6 +76,8 @@ export interface State {
   fresh?: boolean;
   /** When the whole list last came from the desktop (statuses that changed meanwhile are not news). */
   listAt?: number;
+  /** Every chat's permission prompts and questions waiting now (home's waiting strip and its deck), oldest first. */
+  pending: { permissions: PermissionRequest[]; questions: QuestionRequest[] };
 }
 
 // A phone with a list from the last run was paired then: it starts as connecting (not on the pairing screen).
@@ -81,7 +89,8 @@ const hadHome = (() => {
   }
 })();
 
-let state: State = { conn: hadHome ? 'connecting' : 'unpaired', providers: {}, projects: [], sessions: {}, data: {}, limits: {}, caps: {}, loaded: false };
+const NONE: State['pending'] = { permissions: [], questions: [] };
+let state: State = { conn: hadHome ? 'connecting' : 'unpaired', providers: {}, projects: [], sessions: {}, data: {}, limits: {}, caps: {}, loaded: false, pending: NONE };
 const listeners = new Set<() => void>();
 
 export const getState = () => state;
@@ -138,7 +147,31 @@ export function useStore<T>(selector: (s: State) => T): T {
 const deltas = new Map<string, string>();
 let deltaFrame = 0;
 
-const EMPTY: SessionData = { items: {}, roots: [], children: {}, permissions: [], questions: [], queue: [], todos: [] };
+const EMPTY: SessionData = { items: {}, roots: [], children: {}, permissions: [], questions: [], queue: [], todos: [], shape: '', fileSteps: 0 };
+
+/** A step that may have changed files and has settled (counted for the chat's changes). */
+export const settledFileTool = (it: TimelineItem | undefined) =>
+  it?.type === 'tool' && (it.kind === 'edit' || it.kind === 'write' || it.kind === 'bash') && (it.status === 'done' || it.status === 'error' || it.status === 'cancelled');
+
+const countFileSteps = (items: Record<string, TimelineItem>) => {
+  let n = 0;
+  for (const id in items) if (settledFileTool(items[id])) n++;
+  return n;
+};
+
+/**
+ * Puts items in a chat's dictionary in place (each item is still a new object, so what shows it
+ * renders again) and returns the shape and the file count with only those ids read again: streaming
+ * a word costs the same with ten turns loaded as with a thousand.
+ */
+function putItems(d: SessionData, list: TimelineItem[]): Pick<SessionData, 'shape' | 'fileSteps'> {
+  let fileSteps = d.fileSteps;
+  for (const it of list) {
+    fileSteps += Number(settledFileTool(it)) - Number(settledFileTool(d.items[it.id]));
+    d.items[it.id] = it;
+  }
+  return { shape: reshape(d.shape, d.roots, d.items, list.map((it) => it.id)), fileSteps };
+}
 
 function patchData(id: string, fn: (d: SessionData) => Partial<SessionData>) {
   const d = state.data[id];
@@ -154,63 +187,37 @@ function patchSession(id: string, patch: Partial<SessionMeta>) {
   setState({ sessions: { ...state.sessions, [id]: { ...s, ...patch } } });
 }
 
-// ── what the phone just asked for: a chat's model, effort, speed or permission mode ──
-// The choice shows at once (the desktop answers in a few hundred ms, the Claude agent later still); an
-// answer from before it (an older update of the same field) is not applied over it meanwhile. Without
-// this the effort dial went back to the old level when the finger let go and came forward again with
-// the desktop's answer, and two quick choices arrived as old, new, old, new.
-const INTENT_MS = 6000;
-const intents = new Map<string, { patch: Partial<SessionMeta>; until: number }>();
+// ── what the phone just picked: a chat's model, effort, speed or permission mode (lib/intents.ts) ──
+const picks = new Intents();
 
-const live = (id: string) => {
-  const i = intents.get(id);
-  if (i && i.until < Date.now()) intents.delete(id);
-  return intents.get(id);
-};
-
-/** Shows `patch` on the chat at once and holds it against older answers until the desktop confirms it. */
-export function intend(id: string, patch: Partial<SessionMeta>) {
-  const cur = live(id);
-  intents.set(id, { patch: { ...(cur?.patch ?? {}), ...patch }, until: Date.now() + INTENT_MS });
-  patchSession(id, patch);
+/** Shows a pick on the chat at once and holds it against older answers until the desktop confirms it. Returns its generation. */
+export function intend<K extends Field>(id: string, field: K, value: SessionMeta[K]): number {
+  const gen = picks.pick(id, field, value, state.sessions[id]?.[field]);
+  patchSession(id, { [field]: value } as Partial<SessionMeta>);
+  return gen;
 }
 
-/** The desktop refused: the chat shows `was` again (what it had before the choice). */
-export function undoIntent(id: string, was: Partial<SessionMeta>) {
-  const cur = live(id);
-  if (cur) {
-    for (const k of Object.keys(was) as (keyof SessionMeta)[]) delete cur.patch[k];
-    if (!Object.keys(cur.patch).length) intents.delete(id);
-  }
-  patchSession(id, was);
+/** The desktop accepted a pick: its value is what the field goes back to if a later pick is refused. */
+export function acceptIntent<K extends Field>(id: string, field: K, value: SessionMeta[K]) {
+  picks.accepted(id, field, value);
+}
+
+/**
+ * The desktop refused pick `gen`: when it is still the newest pick of that field, the chat shows what
+ * the desktop last said for it (true). An older pick's failure changes nothing (false).
+ */
+export function undoIntent(id: string, field: Field, gen: number): boolean {
+  const back = picks.refused(id, field, gen);
+  if (!back) return false;
+  patchSession(id, { [field]: back.value } as Partial<SessionMeta>);
+  return true;
 }
 
 /** An update from the desktop without the fields that still wait for their answer (a confirmed field lets go). */
-function sieve(id: string, patch: Partial<SessionMeta>): Partial<SessionMeta> {
-  const cur = live(id);
-  if (!cur) return patch;
-  const out = { ...patch } as Record<string, unknown>;
-  const want = cur.patch as Record<string, unknown>;
-  for (const k of Object.keys(want)) {
-    if (!(k in out)) continue;
-    if (out[k] === want[k]) delete want[k];
-    else delete out[k];
-  }
-  if (!Object.keys(want).length) intents.delete(id);
-  return out as Partial<SessionMeta>;
-}
+const sieve = (id: string, patch: Partial<SessionMeta>): Partial<SessionMeta> => picks.sieve(id, patch as Record<string, unknown>) as Partial<SessionMeta>;
 
-/** A whole chat from the desktop (a snapshot, a list) with what the phone asked for still on top. */
-const withIntents = (s: SessionMeta): SessionMeta => {
-  const cur = live(s.id);
-  if (!cur) return s;
-  // What the desktop already shows lets go; the rest stays on top.
-  const theirs: Record<string, unknown> = {};
-  for (const k of Object.keys(cur.patch)) theirs[k] = (s as unknown as Record<string, unknown>)[k];
-  sieve(s.id, theirs as Partial<SessionMeta>);
-  const left = live(s.id);
-  return left ? { ...s, ...left.patch } : s;
-};
+/** A whole chat from the desktop (a snapshot, a list) with what the phone picked still on top. */
+const withIntents = (s: SessionMeta): SessionMeta => picks.over(s as unknown as Record<string, unknown> & { id: string }) as unknown as SessionMeta;
 
 type Tail = (SessionSnapshot | PhoneTail) & { cursor?: string };
 
@@ -239,11 +246,21 @@ export function applySnapshot(snap: Tail, cached = false) {
         todos: snap.todos,
         caps: snap.caps,
         cursor: snap.cursor,
+        shape: shapeString(roots, items),
+        fileSteps: countFileSteps(items),
         ...(cached ? { cached: true } : {}),
       },
     },
   });
-  if (!cached) saveTailSoon(snap.session.id);
+  if (!cached) {
+    saveTailSoon(snap.session.id);
+    // The chat's own prompts are the truth for it in the list across chats too.
+    const sid = snap.session.id;
+    const p = state.pending;
+    const same = (a: { id: string; sessionId: string }[], b: { id: string }[]) => a.filter((x) => x.sessionId === sid).map((x) => x.id).join() === b.map((x) => x.id).join();
+    if (!same(p.permissions, snap.permissions) || !same(p.questions, snap.questions))
+      setState({ pending: { permissions: [...p.permissions.filter((x) => x.sessionId !== sid), ...snap.permissions], questions: [...p.questions.filter((x) => x.sessionId !== sid), ...snap.questions] } });
+  }
 }
 
 /** A streamed text grows on the phone up to this length; the rest is a tap away (`phone.item`). */
@@ -266,15 +283,16 @@ function flushDeltas() {
   for (const [sid, list] of bySession) {
     const d = data[sid];
     if (!d) continue;
-    const items = { ...d.items };
+    const grown: TimelineItem[] = [];
     for (const [id, field, text] of list) {
-      const it = items[id] as unknown as Record<string, unknown> | undefined;
+      const it = d.items[id] as unknown as Record<string, unknown> | undefined;
       // A text the desktop shortened for the phone does not grow here (it would grow from the wrong place).
       if (!it || it.cut) continue;
       const next = String(it[field] ?? '') + text;
-      items[id] = (next.length > STREAM_CAP ? { ...it, [field]: next.slice(0, STREAM_CAP), cut: true } : { ...it, [field]: next }) as unknown as TimelineItem;
+      grown.push((next.length > STREAM_CAP ? { ...it, [field]: next.slice(0, STREAM_CAP), cut: true } : { ...it, [field]: next }) as unknown as TimelineItem);
     }
-    data[sid] = { ...d, items };
+    // The grown items go into the dictionary in place (no copy of the chat's history per frame).
+    if (grown.length) data[sid] = { ...d, ...putItems(d, grown) };
   }
   setState({ data });
 }
@@ -290,7 +308,13 @@ function removeTree(d: SessionData, id: string): Partial<SessionData> {
   const it = d.items[id];
   drop(id);
   if (it?.parentId && children[it.parentId]) children[it.parentId] = children[it.parentId].filter((c) => c !== id);
-  return { items, children, roots: d.roots.filter((r) => r !== id) };
+  const roots = d.roots.filter((r) => r !== id);
+  return { items, children, roots, shape: shapeString(roots, items), fileSteps: countFileSteps(items) };
+}
+
+/** Changes the list of prompts waiting across chats (a new object only when it changed). */
+function setPending(patch: Partial<State['pending']>) {
+  setState({ pending: { ...state.pending, ...patch } });
 }
 
 export function applyEvent(e: BridgeEvent) {
@@ -303,23 +327,23 @@ export function applyEvent(e: BridgeEvent) {
     case 'item.added':
       flushDeltas();
       return patchData(e.sessionId, (d) => {
-        if (d.items[e.item.id]) return { items: { ...d.items, [e.item.id]: e.item } };
-        const items = { ...d.items, [e.item.id]: e.item };
-        const next: Partial<SessionData> = { items };
+        if (d.items[e.item.id]) return putItems(d, [e.item]);
         const pid = e.item.parentId;
         if (pid) {
-          next.children = { ...d.children, [pid]: [...(d.children[pid] ?? []), e.item.id] };
           // The parent's count of nested steps (the desktop's count when the page came, then live).
           const parent = d.items[pid] as PhoneItem | undefined;
-          if (parent) items[pid] = { ...parent, kids: (parent.kids ?? 0) + 1 };
-        } else next.roots = [...d.roots, e.item.id];
-        return next;
+          const put = putItems(d, parent ? [e.item, { ...parent, kids: (parent.kids ?? 0) + 1 } as PhoneItem] : [e.item]);
+          return { ...put, children: { ...d.children, [pid]: [...(d.children[pid] ?? []), e.item.id] } };
+        }
+        const roots = [...d.roots, e.item.id];
+        const put = putItems({ ...d, roots, shape: d.shape + '.' }, [e.item]);
+        return { ...put, roots };
       });
     case 'item.patch':
       flushDeltas();
       return patchData(e.sessionId, (d) => {
         const it = d.items[e.id];
-        return it ? { items: { ...d.items, [e.id]: { ...it, ...e.patch } as TimelineItem } } : {};
+        return it ? putItems(d, [{ ...it, ...e.patch } as TimelineItem]) : {};
       });
     case 'item.removed':
       return patchData(e.sessionId, (d) => removeTree(d, e.id));
@@ -339,17 +363,22 @@ export function applyEvent(e: BridgeEvent) {
       delete sessions[e.id];
       const data = { ...state.data };
       delete data[e.id];
-      return setState({ sessions, data });
+      const p = state.pending;
+      return setState({ sessions, data, pending: { permissions: p.permissions.filter((x) => x.sessionId !== e.id), questions: p.questions.filter((x) => x.sessionId !== e.id) } });
     }
     case 'session.caps':
       return patchData(e.id, () => ({ caps: e.caps }));
     case 'permission.added':
+      setPending({ permissions: [...state.pending.permissions.filter((p) => p.id !== e.request.id), e.request] });
       return patchData(e.request.sessionId, (d) => ({ permissions: [...d.permissions.filter((p) => p.id !== e.request.id), e.request] }));
     case 'permission.removed':
+      setPending({ permissions: state.pending.permissions.filter((p) => p.id !== e.id) });
       return patchData(e.sessionId, (d) => ({ permissions: d.permissions.filter((p) => p.id !== e.id) }));
     case 'question.added':
+      setPending({ questions: [...state.pending.questions.filter((q) => q.id !== e.request.id), e.request] });
       return patchData(e.request.sessionId, (d) => ({ questions: [...d.questions.filter((q) => q.id !== e.request.id), e.request] }));
     case 'question.removed':
+      setPending({ questions: state.pending.questions.filter((q) => q.id !== e.id) });
       return patchData(e.sessionId, (d) => ({ questions: d.questions.filter((q) => q.id !== e.id) }));
     case 'todos.updated':
       return patchData(e.sessionId, () => ({ todos: e.todos }));
@@ -380,7 +409,9 @@ export async function refresh(openIds: string[]) {
   for (const s of hello.sessions) sessions[s.id] = withIntents(s);
   const providers: State['providers'] = {};
   for (const p of hello.providers) providers[p.id] = p;
-  setState({ sessions, providers, projects: hello.projects, settings: hello.settings, version: hello.version, desktop: conn.pairing?.desktop, loaded: true, fresh: true, listAt: Date.now() });
+  // What waits on you in every chat (an older desktop does not say: the open chats' own lists stand in).
+  const pending = hello.prompts ? { permissions: hello.prompts.permissions ?? [], questions: hello.prompts.questions ?? [] } : NONE;
+  setState({ sessions, providers, projects: hello.projects, settings: hello.settings, version: hello.version, desktop: conn.pairing?.desktop, loaded: true, fresh: true, listAt: Date.now(), pending });
   saveHome();
   void refreshLimits();
   await Promise.all(openIds.filter((id) => sessions[id]).map((id) => openSession(id).catch(() => {})));
@@ -402,13 +433,16 @@ export async function refreshLimits() {
 /** A desktop from before pages answers only `session.snapshot` (all of it). */
 let pages = true;
 
-/** Opens a conversation on its newest page (from the cache at once when the phone has it, then from the desktop). */
-export async function openSession(id: string) {
+/**
+ * Opens a conversation on its newest page (from the cache at once when the phone has it, then from
+ * the desktop); `to`: a root item the page reaches back to (a search hit).
+ */
+export async function openSession(id: string, to?: string) {
   showCached(id);
   let snap: Tail | undefined;
   if (pages) {
     try {
-      snap = await conn.call('phone.tail', { sessionId: id });
+      snap = await conn.call('phone.tail', { sessionId: id, ...(to ? { to } : {}) });
     } catch (err) {
       if (!/Not available from the phone/.test((err as Error).message)) throw err;
       pages = false;
@@ -440,6 +474,24 @@ export async function fetchOlder(id: string, maxPages = 12): Promise<{ before: s
   return out;
 }
 
+/**
+ * Makes sure a root item is on the phone, asking for the pages back to it (a search hit further back
+ * than the newest page). True when it is there.
+ */
+export async function reachItem(id: string, itemId: string, tries = 6): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    const d = state.data[id];
+    if (!d) return false;
+    if (d.items[itemId]) return true;
+    if (!d.cursor || !pages || d.cached) return false;
+    const before = d.cursor;
+    const page: PhoneTail = await conn.call('phone.tail', { sessionId: id, before, to: itemId });
+    if (!page.items.length) return false;
+    applyOlder(id, { before, page });
+  }
+  return !!state.data[id]?.items[itemId];
+}
+
 /** Puts an older page in front of what is shown (only when nothing moved the start meanwhile). */
 export function applyOlder(id: string, older: { before: string; page: PhoneTail }) {
   const d = state.data[id];
@@ -451,7 +503,8 @@ export function applyOlder(id: string, older: { before: string; page: PhoneTail 
     items[it.id] = it;
     add.push(it.id);
   }
-  setState({ data: { ...state.data, [id]: { ...d, items, roots: [...add, ...d.roots], cursor: older.page.cursor } } });
+  const roots = [...add, ...d.roots];
+  setState({ data: { ...state.data, [id]: { ...d, items, roots, cursor: older.page.cursor, shape: shapeString(add, items) + d.shape, fileSteps: countFileSteps(items) } } });
 }
 
 const capsAsked = new Set<string>();
@@ -485,13 +538,13 @@ export function applyChildren(sid: string, parentId: string, list: PhoneItem[]) 
       if (!items[c.id]) add.push(c.id);
       items[c.id] = c;
     }
-    return { items, children: { ...d.children, [parentId]: [...add, ...have] } };
+    return { items, children: { ...d.children, [parentId]: [...add, ...have] }, fileSteps: countFileSteps(items) };
   });
 }
 
 /** Replaces a shortened text with the whole of it. */
 export function applyFull(sid: string, item: PhoneItem) {
-  patchData(sid, (d) => (d.items[item.id] ? { items: { ...d.items, [item.id]: { ...d.items[item.id], ...item, cut: false } as PhoneItem } } : {}));
+  patchData(sid, (d) => (d.items[item.id] ? putItems(d, [{ ...d.items[item.id], ...item, cut: false } as PhoneItem]) : {}));
 }
 
 export function closeSessionData(id: string) {

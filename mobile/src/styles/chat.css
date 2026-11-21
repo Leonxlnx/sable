@@ -231,7 +231,10 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 12px 0 22px;
+  /* 12 px of room each side (the content stays where it was): a lit message (held, or a search hit)
+     glows a little past its words, inside the turn's own paint (content-visibility clips at its box) */
+  margin-inline: -12px;
+  padding: 12px 12px 22px;
   content-visibility: auto;
   contain-intrinsic-size: auto 360px;
 }
@@ -1126,17 +1129,9 @@
   overflow-wrap: anywhere;
 }
 
-/* a report along the way: one tone back, a step smaller */
-.md[data-tone='mid'] {
-  font-size: 15px;
-  line-height: 1.58;
-  color: var(--text-2);
-}
-
-.md[data-tone='mid'] code,
-.md[data-tone='mid'] .md-file {
-  color: var(--text-2);
-}
+/* What the agent says along the way (a report between steps) reads at full strength and size, like
+   the answer (as on the desktop): every word the agent writes is read; only its thinking sits back.
+   A text that stops being the newest keeps its look, so nothing reflows when the next step comes. */
 
 .md > :first-child {
   margin-top: 0;
@@ -2196,4 +2191,256 @@
 /* the race key as the header's last control: its edge lines up with the conversation's margin */
 .race-key:last-child {
   padding-right: 10px;
+}
+
+/* ── opened at a place (a search hit): the message lit for a moment ── */
+.user-row[data-flash],
+.md[data-flash] {
+  position: relative;
+  isolation: isolate;
+}
+
+.user-row[data-flash]::before,
+.md[data-flash]::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: -8px -12px;
+  border-radius: 18px;
+  background: rgb(255 255 255 / 0.07);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  pointer-events: none;
+  animation: flash 1.6s var(--ease-out) both;
+}
+
+@keyframes flash {
+  0% {
+    opacity: 0;
+  }
+  14% {
+    opacity: 1;
+  }
+  60% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* held for its menu: the message stands out the same way, still */
+.user-row[data-held],
+.md[data-held] {
+  position: relative;
+  isolation: isolate;
+}
+
+.user-row[data-held]::before,
+.md[data-held]::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: -8px -12px;
+  border-radius: 18px;
+  background: rgb(255 255 255 / 0.06);
+  pointer-events: none;
+}
+
+/* ── a message's menu (long press): Copy and Share ── */
+.msg-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+
+.msg-scrim {
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / 0.32);
+}
+
+.msg-menu {
+  position: fixed;
+  width: 212px;
+  padding: 6px;
+  border-radius: 22px;
+  isolation: isolate;
+  background: var(--float-ink);
+  box-shadow: var(--rim-ring), var(--rim-inner), var(--shadow-glass);
+}
+
+.msg-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  height: 50px;
+  padding: 0 16px 0 18px;
+  border-radius: 16px;
+  font-size: var(--t-body);
+  color: var(--text);
+  transition: background-color 100ms;
+}
+
+.msg-item svg {
+  color: var(--text-2);
+}
+
+.msg-item + .msg-item::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 18px;
+  right: 16px;
+  height: 1px;
+  background: var(--line);
+}
+
+.msg-item:active {
+  background: var(--fill-2);
+}
+
+/* ── pictures of a step (a screenshot): thumbnails under its line; a tap opens them full screen ── */
+.pics {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0 10px 34px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.pics::-webkit-scrollbar {
+  display: none;
+}
+
+.pic {
+  position: relative;
+  flex-shrink: 0;
+  width: 128px;
+  height: 84px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--ink-3);
+  box-shadow: inset 0 0 0 1px var(--line);
+  transition: scale 120ms var(--ease-out);
+}
+
+.pic:active {
+  scale: 0.96;
+}
+
+.pic img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.pic::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.07);
+  pointer-events: none;
+}
+
+.pic .skel {
+  position: absolute;
+  inset: 0;
+  height: auto;
+  border-radius: 0;
+}
+
+.pic-failed {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: var(--text-4);
+}
+
+/* ── a picture full screen: pinch to zoom, drag down to close ── */
+.viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  touch-action: none;
+}
+
+.viewer-scrim {
+  position: absolute;
+  inset: 0;
+  background: #000;
+}
+
+.viewer-img {
+  position: absolute;
+  transform-origin: 0 0;
+  will-change: transform;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+
+.viewer-bar {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(var(--sat) + 6px) 8px 0 18px;
+  pointer-events: none;
+}
+
+.viewer-bar > * {
+  pointer-events: auto;
+}
+
+.viewer-count {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--r-pill);
+  background: rgb(27 27 31 / 0.9);
+  box-shadow: var(--rim-ring), var(--shadow-glass);
+  font-size: var(--t-sm);
+  font-weight: 540;
+  line-height: 32px;
+  color: var(--text-2);
+}
+
+.viewer-close {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: rgb(27 27 31 / 0.9);
+  box-shadow: var(--rim-ring), var(--shadow-glass);
+  color: var(--text);
+}
+
+.viewer-close:active {
+  scale: 0.94;
+}
+
+.viewer-wait {
+  position: absolute;
+  inset: 38% 18%;
+}
+
+.viewer-wait .skel {
+  display: block;
+  height: 100%;
+  border-radius: 16px;
+}
+
+/* the words a search found, lit for a moment where the hit opened */
+::highlight(sable-hit) {
+  background-color: rgb(242 241 238 / 0.2);
+  color: var(--text);
 }

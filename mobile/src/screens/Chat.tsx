@@ -8,8 +8,8 @@ import { onKeyboard } from '@m/lib/keyboard';
 import { haptic, openExternal } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { homeFolder, openRace, swapTo } from '@m/lib/race';
-import { applyOlder, fetchOlder, getState, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
-import { groupTurns, shapeString, stabilize } from '@m/lib/turns';
+import { applyOlder, fetchOlder, getState, openSession, reachItem, sessionData, setState, showCached, useStore } from '@m/lib/store';
+import { groupTurns, stabilize } from '@m/lib/turns';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark } from '@m/ui/marks';
@@ -23,8 +23,11 @@ import { ItemRow, TurnView } from './Timeline';
 const PAGE = 24;
 const FIRST = 5;
 
-/** A conversation: header, turns (the newest ones mounted, older ones as you scroll up), composer. */
-export function Chat({ id }: { id: string }) {
+/**
+ * A conversation: header, turns (the newest ones mounted, older ones as you scroll up), composer.
+ * `at`: opened at a place (a search hit, or 'turn': the newest turn's start, from a notification).
+ */
+export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: number; find?: string }) {
   const s = useStore((st) => st.sessions[id]);
   const loaded = useStore((st) => !!st.data[id]);
   const listed = useStore((st) => !!st.fresh);
@@ -52,7 +55,10 @@ export function Chat({ id }: { id: string }) {
     setError(undefined);
     showCached(id);
     // A connection replaced meanwhile loads it again by itself (the skeleton stays).
-    if (getState().conn === 'open') void openSession(id).catch((err) => !/connection to the desktop was lost/i.test((err as Error).message) && setError((err as Error).message));
+    // A search hit's page reaches back to it.
+    const to = at && at !== 'turn' ? at : undefined;
+    if (getState().conn === 'open') void openSession(id, to).catch((err) => !/connection to the desktop was lost/i.test((err as Error).message) && setError((err as Error).message));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   if (!s) {
@@ -92,7 +98,7 @@ export function Chat({ id }: { id: string }) {
       {later ? (
         <div className="thread-skel" />
       ) : loaded ? (
-        <Thread id={id} />
+        <Thread id={id} at={at} seq={seq} find={find} />
       ) : (
         <div className="thread-skel">
           {error ? <p className="empty">{error}</p> : connState === 'offline' ? <p className="empty">This chat opens when {desktop ?? 'the computer'} is back.</p> : <ThreadSkeleton />}
@@ -181,13 +187,11 @@ function RaceKey({ s }: { s: SessionMeta }) {
   );
 }
 
-function Thread({ id }: { id: string }) {
+function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; find?: string }) {
   const roots = useStore((st) => sessionData(st, id).roots);
-  // One character per root (lib/turns.ts): the grouping is read again only when that string changes, never on a streamed word.
-  const shape = useStore((st) => {
-    const d = sessionData(st, id);
-    return shapeString(d.roots, d.items);
-  });
+  // One character per root (lib/turns.ts), kept by the store per changed id: the grouping is read again
+  // only when that string changes, and a streamed word never walks the loaded history.
+  const shape = useStore((st) => sessionData(st, id).shape);
   const status = useStore((st) => st.sessions[id]?.status);
   const cursor = useStore((st) => sessionData(st, id).cursor);
   const busy = status === 'running' || status === 'starting' || status === 'awaiting';
@@ -215,6 +219,10 @@ function Thread({ id }: { id: string }) {
   const anchor = useRef<{ h: number; top: number } | null>(null);
   const start = Math.max(0, turns.length - count);
   const shown = turns.slice(start);
+  const groupsRef = useRef(turns);
+  groupsRef.current = turns;
+  const countRef = useRef(count);
+  countRef.current = count;
 
   const toBottom = useCallback((smooth = false) => {
     const el = scroller.current;
@@ -337,9 +345,77 @@ function Thread({ id }: { id: string }) {
     return undefined;
   }, [turns]);
   useEffect(() => {
+    if (goal.current) return;
     atBottom.current = true;
     toBottom(true);
   }, [lastUser, toBottom]);
+
+  // Opened at a place: the turns that hold it are mounted, and it comes to the top of the screen, lit
+  // for a moment. Waits for the desktop's page (not the cached one), and for the pages back to it.
+  const goal = useRef<{ at: string; seq?: number; find?: string } | null>(at ? { at, seq, find } : null);
+  const [aim, setAim] = useState(0);
+  useEffect(() => {
+    if (!at) return;
+    goal.current = { at, seq, find };
+    setAim((n) => n + 1);
+  }, [at, seq]);
+  const fresh = useStore((st) => !!st.data[id] && !st.data[id].cached);
+  useEffect(() => {
+    const g = goal.current;
+    if (!g || !fresh) return;
+    let live = true;
+    void (async () => {
+      const target = g.at;
+      if (target !== 'turn' && !(await reachItem(id, target).catch(() => false))) {
+        if (live) goal.current = null;
+        return;
+      }
+      // Two frames: the pages just added are grouped and drawn.
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      if (!live) return;
+      const all = groupsRef.current;
+      const idx = target === 'turn' ? all.findLastIndex((x) => x.kind === 'turn') : all.findIndex((x) => (x.kind === 'turn' ? x.ids.includes(target) : x.id === target));
+      if (idx < 0) return void (goal.current = null);
+      const need = all.length - idx;
+      if (need > countRef.current) {
+        setCount(need + 2);
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        if (!live) return;
+      }
+      const sc = scroller.current;
+      const group = all[idx];
+      const turnEl = sc?.querySelector<HTMLElement>(`[data-turn="${CSS.escape(group.key)}"]`);
+      const el = (target !== 'turn' && sc?.querySelector<HTMLElement>(`[data-id="${CSS.escape(target)}"]`)) || turnEl;
+      goal.current = null;
+      if (!sc || !el) return;
+      const topOf = () => el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop;
+      // The newest turn, short enough to read whole: the newest line stays in view as always.
+      if (target === 'turn' && el.offsetHeight < sc.clientHeight - 140) {
+        atBottom.current = true;
+        return toBottom();
+      }
+      atBottom.current = false;
+      // Turns off screen are not laid out (content-visibility): there first, then measured where it is drawn.
+      sc.scrollTo({ top: Math.max(0, topOf() - 84), behavior: 'auto' });
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      if (!live) return;
+      const top = topOf();
+      // The words searched for, in a long message: they come into view (a third down) and are lit.
+      const hit = target !== 'turn' && g.find ? findWords(el, g.find) : null;
+      const r = hit?.getBoundingClientRect();
+      const y = r && r.height ? r.top - sc.getBoundingClientRect().top + sc.scrollTop - sc.clientHeight * 0.32 : top - 84;
+      sc.scrollTo({ top: Math.max(0, Math.min(y, top - 84 + Math.max(0, el.offsetHeight - 120))), behavior: 'auto' });
+      if (target !== 'turn') {
+        el.setAttribute('data-flash', '');
+        window.setTimeout(() => el.removeAttribute('data-flash'), 1600);
+        if (hit) lightWords(hit);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aim, fresh, id]);
 
   return (
     <div
@@ -385,6 +461,34 @@ function Thread({ id }: { id: string }) {
       </AnimatePresence>
     </div>
   );
+}
+
+/** The first place in a message where a searched word stands (a range over it), or null. */
+function findWords(el: HTMLElement, find: string): Range | null {
+  const words = find.toLowerCase().split(/s+/).filter(Boolean);
+  if (!words.length) return null;
+  const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+    const text = (n.nodeValue ?? '').toLowerCase();
+    for (const w of words) {
+      const i = text.indexOf(w);
+      if (i < 0) continue;
+      const r = document.createRange();
+      r.setStart(n, i);
+      r.setEnd(n, i + w.length);
+      return r;
+    }
+  }
+  return null;
+}
+
+/** The words lit for a moment (the CSS highlight API: nothing in the page changes). */
+function lightWords(r: Range) {
+  const reg = (globalThis as { CSS?: { highlights?: Map<string, unknown> } }).CSS?.highlights;
+  const H = (globalThis as { Highlight?: new (...r: Range[]) => unknown }).Highlight;
+  if (!reg || !H) return;
+  reg.set('sable-hit', new H(r));
+  window.setTimeout(() => reg.delete('sable-hit'), 2600);
 }
 
 function ThreadSkeleton() {

@@ -185,7 +185,8 @@ export class PhoneChangesReader {
     const key = path.resolve(cwd);
     const hit = this.trees.get(key);
     if (hit && Date.now() - hit.at < maxAge) return hit.status;
-    const status = gitStatus(key);
+    // Only the chat's own folder: never a sibling folder of the same repository.
+    const status = gitStatus(key, { within: true });
     this.trees.set(key, { at: Date.now(), status });
     status.catch(() => this.trees.delete(key));
     while (this.trees.size > 24) this.trees.delete(this.trees.keys().next().value as string);
@@ -222,6 +223,8 @@ export class PhoneChangesReader {
     if (items) return fromEdits(editsOf(snap.items, cwd, items));
     let st = await this.tree(cwd, STATUS_TTL_MS);
     if (!st.isRepo) return fromEdits(editsOf(snap.items, cwd));
+    // In a repository a file is named as the list names it: relative to the chat's folder, inside it.
+    if (path.isAbsolute(file) || /^[\\/]|^[a-z]:/i.test(file) || want.split('/').includes('..')) throw new Error('That file is not among the changes.');
     // Only a file the folder's status lists now (asked again once when it is not in the last answer).
     let listed = st.files.find((f) => slash(f.path) === want);
     if (!listed) {
@@ -229,8 +232,9 @@ export class PhoneChangesReader {
       listed = st.isRepo ? st.files.find((f) => slash(f.path) === want) : undefined;
     }
     if (!listed) throw new Error('That file is not among the changes.');
-    const list = await gitDiff(cwd, listed.path);
-    const d = list.find((x) => slash(x.path) === want) ?? list[0] ?? null;
+    const list = await gitDiff(cwd, listed.path, false, { within: true });
+    // That file's diff and no other (a rename's other side, a file git listed beside it).
+    const d = list.find((x) => slash(x.path) === want) ?? null;
     return phoneDiffOf(d, true);
   }
 }

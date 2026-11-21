@@ -3,7 +3,7 @@
  * when a chat is named (once, after its first turn, never over a title the person set), and the
  * one-shot query Claude Code is asked with. Fake models only: nothing here calls a real one.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -57,8 +57,33 @@ describe('the prompt', () => {
       item({ type: 'user', text: 'thanks', state: 'sent' }),
       item({ type: 'text', text: 'Any time.', streaming: false }),
     ];
-    expect(titleAsk(items)).toEqual({ message: 'Refactor the auth middleware', answer: 'Moved the expiry check into its own module.\n\nTests pass.' });
+    expect(titleAsk(items)).toMatchObject({ message: 'Refactor the auth middleware', answer: 'Moved the expiry check into its own module.\n\nTests pass.' });
     expect(titleAsk([item({ type: 'text', text: 'hello', streaming: false })])).toBeNull();
+  });
+
+  it('takes the message the settled turn consumed, never a stopped one, a command or its output', () => {
+    const stopped = item({ type: 'user', text: 'Delete the staging database', state: 'sent' });
+    const cost = item({ type: 'user', text: '/cost', state: 'sent' });
+    const output = item({ type: 'user', text: '<local-command-stdout>Total cost: $0.42</local-command-stdout>', state: 'sent' });
+    const real = item({ type: 'user', text: 'Plan a weekend in Porto', state: 'sent' });
+    const items = [
+      stopped,
+      item({ type: 'notice', variant: 'interrupted', text: 'Interrupted' }),
+      cost,
+      output,
+      item({ type: 'turn', durationMs: 1 }),
+      real,
+      item({ type: 'text', text: 'Here is a plan.', streaming: false }),
+      item({ type: 'turn', durationMs: 1 }),
+      item({ type: 'text', text: 'Not this turn.', streaming: false }),
+    ];
+    // Before: the first message in the timeline, the stopped one.
+    expect(titleAsk(items)?.message).toBe('Delete the staging database');
+    // The turn that settled took the real message: that one, and only its own answer.
+    expect(titleAsk(items, [real.id])).toEqual({ message: 'Plan a weekend in Porto', answer: 'Here is a plan.', itemId: real.id });
+    // A turn that took only a command (and wrote its output) names nothing.
+    expect(titleAsk(items, [cost.id, output.id])).toBeNull();
+    expect(titleAsk(items, [])).toBeNull();
   });
 });
 
@@ -99,6 +124,15 @@ describe('when a chat is named', () => {
     expect(wantsTitle(meta({ titleAsked: true }), one, {})).toBe(false);
   });
 
+  it('after the first settled turn that took a message of the person\'s: a command\'s turn or a stopped one names nothing', () => {
+    const cost = [item({ type: 'user', text: '/cost', state: 'sent' }), item({ type: 'turn', durationMs: 1 })];
+    expect(wantsTitle(meta(), cost, {})).toBe(false);
+    expect(wantsTitle(meta(), [...cost, ...one], {})).toBe(true);
+    const stopped = [item({ type: 'user', text: 'hi', state: 'sent' }), item({ type: 'turn', durationMs: 1, stopReason: 'interrupted' })];
+    expect(wantsTitle(meta(), stopped, {})).toBe(false);
+    expect(wantsTitle(meta(), [...stopped, ...one], {})).toBe(true);
+  });
+
   it('never over a title the person set, never with the setting off, never a race\'s chats', () => {
     expect(wantsTitle(meta({ titleSource: 'user' }), one, {})).toBe(false);
     expect(wantsTitle(meta(), one, { chatTitles: false })).toBe(false);
@@ -113,7 +147,7 @@ interface Fake {
   answer: (p: TitlePrompt) => Promise<string | null>;
 }
 
-async function bridge(opts: { answer?: Fake['answer']; settings?: Partial<typeof DEFAULT_SETTINGS> } = {}) {
+async function bridge(opts: { answer?: Fake['answer']; settings?: Partial<typeof DEFAULT_SETTINGS>; gate?: Promise<void> } = {}) {
   const home = mkdtempSync(path.join(tmpdir(), 'sable-titles-'));
   cleanups.push(() => rmSync(home, { recursive: true, force: true }));
   const fake: Fake = { asked: [], answer: opts.answer ?? (async () => 'Session module cleanup') };
@@ -126,6 +160,14 @@ async function bridge(opts: { answer?: Fake['answer']; settings?: Partial<typeof
           fake.asked.push(prompt);
           return fake.answer(prompt);
         };
+        // An agent that takes its time to start (a message sent meanwhile waits for it).
+        if (opts.gate) {
+          const open = p.open.bind(p);
+          p.open = async (rt, o) => {
+            await opts.gate;
+            return open(rt, o);
+          };
+        }
         return p;
       },
     ],
@@ -217,6 +259,68 @@ describe('a chat named in the bridge', () => {
     await until(() => other.meta.title === 'Second title', 'second title');
     expect(h.rt.meta.title).toBe('First title');
   });
+
+  it('is named from the message its settled turn took, not one stopped before the agent had it', async () => {
+    let open!: () => void;
+    const h = await bridge({ gate: new Promise<void>((r) => (open = r)) });
+    // The agent is still starting: the message shows, and is stopped before it goes out.
+    const early = h.app.call('session.send', { sessionId: h.id, text: 'hey wait' });
+    await until(() => h.rt.items.some((i) => i.type === 'user'), 'early message');
+    await h.app.call('session.interrupt', { sessionId: h.id });
+    open();
+    await early;
+    await h.send('hello friend');
+    await until(() => h.fake.asked.length === 1, 'asked');
+    expect(h.fake.asked[0].user).toContain('hello friend');
+    expect(h.fake.asked[0].user).not.toContain('hey wait');
+  });
+
+  it('is named from the message of the turn that settled after a failed first turn', async () => {
+    const h = await bridge();
+    // Its steps run without asking (the turn fails after them).
+    await h.app.call('session.setMode', { sessionId: h.id, mode: 'bypassPermissions' });
+    await h.send('fail hard');
+    expect(h.rt.items.some((i) => i.type === 'turn' && !!(i as { error?: string }).error)).toBe(true);
+    await tick(30);
+    expect(h.fake.asked).toHaveLength(0);
+    await h.send('hello friend');
+    await until(() => h.fake.asked.length === 1, 'asked');
+    expect(h.fake.asked[0].user).toContain('hello friend');
+    expect(h.fake.asked[0].user).not.toContain('fail hard');
+  });
+
+  it('a first command and its output name nothing; the first real message does', async () => {
+    const h = await bridge();
+    await h.send('/cost');
+    await tick(30);
+    expect(h.fake.asked).toHaveLength(0);
+    await h.send('hello friend');
+    await until(() => h.fake.asked.length === 1, 'asked');
+    expect(h.fake.asked[0].user).toContain('hello friend');
+    expect(h.fake.asked[0].user).not.toContain('/cost');
+    expect(h.fake.asked[0].user).not.toMatch(/Session cost/);
+  });
+
+  it('a title that waits its turn is not asked once the chat was renamed, moved to another account or agent, or titles were turned off', async () => {
+    for (const change of ['rename', 'account', 'agent', 'setting'] as const) {
+      const releases: ((t: string) => void)[] = [];
+      const h = await bridge({ answer: () => new Promise((r) => releases.push(r)) });
+      const snap = await h.app.call('session.create', { provider: 'demo', cwd: h.rt.meta.cwd, mode: 'default' });
+      const other = h.app.runtime(snap.session.id);
+      await h.send('hi');
+      await until(() => h.fake.asked.length === 1, 'first asked');
+      await h.app.call('session.send', { sessionId: other.id, text: 'hello friend' });
+      await until(() => !other.turnActive && other.meta.titleAsked === true, 'second queued');
+      if (change === 'rename') await h.app.call('session.rename', { sessionId: other.id, title: 'Mine' });
+      if (change === 'account') other.update({ accountId: 'work' });
+      if (change === 'agent') other.update({ provider: 'codex' });
+      if (change === 'setting') await h.app.call('app.setSettings', { patch: { chatTitles: false } });
+      releases[0]('First title');
+      await tick(50);
+      expect(h.fake.asked, change).toHaveLength(1);
+      expect(other.meta.title, change).toBe(change === 'rename' ? 'Mine' : 'hello friend');
+    }
+  });
 });
 
 describe('the Demo\'s pretend small model', () => {
@@ -245,7 +349,7 @@ describe("Claude Code's one-shot title query", () => {
 });
 
 describe('which model names a chat', () => {
-  it("a Claude chat: Claude Code's Haiku on the chat's own account; a Codex chat: Claude's when Claude Code is signed in, else none", async () => {
+  it("a Claude chat: Claude Code's Haiku on the chat's own account; a Codex chat: Codex's own, never Claude's", async () => {
     const { CodexProvider } = await import('../server/providers/codex');
     const home = mkdtempSync(path.join(tmpdir(), 'sable-titles-route-'));
     cleanups.push(() => rmSync(home, { recursive: true, force: true }));
@@ -266,22 +370,137 @@ describe('which model names a chat', () => {
           p.quickTitle = async () => (asked.push(`claude:${ctx.account?.id ?? 'default'}`), 'From Haiku');
           return p;
         },
-        (ctx) => quiet(new CodexProvider(ctx)) as InstanceType<typeof CodexProvider>,
+        (ctx) => {
+          const p = quiet(new CodexProvider(ctx)) as InstanceType<typeof CodexProvider>;
+          p.quickTitle = async () => (asked.push(`codex:${ctx.account?.id ?? 'default'}`), 'From Codex');
+          return p;
+        },
       ],
     });
     cleanups.push(() => app.dispose());
-    const a = app as unknown as { titleModel(rt: unknown): ((p: TitlePrompt, s: AbortSignal) => Promise<string | null>) | undefined; cache: { set(k: string, v: unknown): void; get(k: string): unknown } };
+    const a = app as unknown as { titleModel(o: { provider: string; accountId: string }): ((p: TitlePrompt, s: AbortSignal) => Promise<string | null>) | undefined; cache: { set(k: string, v: unknown): void } };
     const prompt = titlePrompt({ message: 'hi', answer: '' }, home);
     const signal = new AbortController().signal;
-    const claudeChat = { meta: { provider: 'claude' } };
-    const codexChat = { meta: { provider: 'codex' } };
 
-    expect(await a.titleModel(claudeChat)!(prompt, signal)).toBe('From Haiku');
+    expect(await a.titleModel({ provider: 'claude', accountId: 'default' })!(prompt, signal)).toBe('From Haiku');
     expect(asked).toEqual(['claude:default']);
-    // Codex has no small model of its own here: Claude's, only while Claude Code is signed in.
-    a.cache.set('info:claude', { id: 'claude', name: 'Claude Code', installed: true, auth: { loggedIn: false } });
-    expect(a.titleModel(codexChat)).toBeUndefined();
+    // A Codex chat is named by Codex, also while Claude Code is signed in: its words never go to Claude.
     a.cache.set('info:claude', { id: 'claude', name: 'Claude Code', installed: true, auth: { loggedIn: true } });
-    expect(await a.titleModel(codexChat)!(prompt, signal)).toBe('From Haiku');
+    expect(await a.titleModel({ provider: 'codex', accountId: 'default' })!(prompt, signal)).toBe('From Codex');
+    expect(asked).toEqual(['claude:default', 'codex:default']);
+  });
+
+  it('an agent without a small model of its own leaves the title as it is, whoever else is signed in', async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'sable-titles-none-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    const asked: string[] = [];
+    const app = new App({
+      home,
+      quiet: true,
+      providers: [
+        (ctx) => {
+          const p = new DemoProvider(ctx, { speed: 0 });
+          Object.assign(p, { id: 'claude', name: 'Claude Code' });
+          p.quickTitle = async () => (asked.push('claude'), 'From Haiku');
+          return p as unknown as InstanceType<typeof DemoProvider>;
+        },
+        (ctx) => {
+          const p = new DemoProvider(ctx, { speed: 0 });
+          Object.assign(p, { id: 'codex', name: 'Codex' });
+          // No small model of its own.
+          (p as { quickTitle?: unknown }).quickTitle = undefined;
+          return p as unknown as InstanceType<typeof DemoProvider>;
+        },
+      ],
+    });
+    cleanups.push(() => app.dispose());
+    (app as unknown as { cache: { set(k: string, v: unknown): void } }).cache.set('info:claude', { id: 'claude', name: 'Claude Code', installed: true, auth: { loggedIn: true } });
+    mkdirSync(path.join(home, 'proj'));
+    const snap = await app.call('session.create', { provider: 'codex', cwd: path.join(home, 'proj'), mode: 'default' });
+    const rt = app.runtime(snap.session.id);
+    await app.call('session.send', { sessionId: rt.id, text: 'hello friend' });
+    await until(() => !rt.turnActive && rt.meta.status !== 'running', 'turn end');
+    await tick(50);
+    expect(asked).toEqual([]);
+    expect(rt.meta.title).toBe('hello friend');
+  });
+});
+
+describe("Codex's one-shot title", () => {
+  async function codexTitle(opts: { models?: { id: string; name: string; picker?: boolean; efforts?: string[] }[]; events?: (notify: (m: string, p: unknown) => void, threadId: string) => void; hang?: boolean } = {}) {
+    const { CodexProvider } = await import('../server/providers/codex');
+    const p = new CodexProvider({ emit: () => {}, log: () => {}, account: { id: 'work', dir: path.join(tmpdir(), 'codex-work') } });
+    const calls: { method: string; params: Record<string, unknown> }[] = [];
+    const notify = (m: string, x: unknown) => (p as unknown as { onNotification(m: string, x: unknown): void }).onNotification(m, x);
+    const rpc = {
+      request: async (method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        if (method === 'thread/start') return { thread: { id: 'tt1' }, model: params.model };
+        if (method === 'turn/start') {
+          if (!opts.hang) setTimeout(() => (opts.events ?? defaultEvents)(notify, 'tt1'), 1);
+          return { turn: { id: 'turn-t' } };
+        }
+        return {};
+      },
+    };
+    const anyP = p as unknown as Record<string, unknown>;
+    anyP.client = async () => rpc;
+    anyP.caps = async () => ({ models: opts.models ?? [{ id: 'gpt-6', name: 'GPT-6', picker: true, isDefault: true, efforts: ['low', 'medium'] }, { id: 'gpt-6-mini', name: 'GPT-6 Mini', picker: true, efforts: ['minimal', 'low', 'medium'] }] });
+    return { p, calls };
+  }
+  const defaultEvents = (notify: (m: string, p: unknown) => void, threadId: string) => {
+    notify('turn/started', { threadId, turn: { id: 'turn-t', status: 'inProgress', items: [] } });
+    notify('item/agentMessage/delta', { threadId, turnId: 'turn-t', itemId: 'm1', delta: 'Session module ' });
+    notify('item/agentMessage/delta', { threadId, turnId: 'turn-t', itemId: 'm1', delta: 'cleanup' });
+    notify('item/completed', { threadId, turnId: 'turn-t', item: { id: 'm1', type: 'agentMessage', text: 'Session module cleanup' } });
+    notify('turn/completed', { threadId, turn: { id: 'turn-t', status: 'completed', items: [] } });
+  };
+
+  it("is asked of the account's smallest model in an ephemeral thread with no environment, read-only, never asking, nothing kept", async () => {
+    const { p, calls } = await codexTitle();
+    const prompt = titlePrompt({ message: 'Summarize the session module', answer: '' }, process.cwd());
+    expect(await p.quickTitle(prompt, new AbortController().signal)).toBe('Session module cleanup');
+    const start = calls.find((c) => c.method === 'thread/start')!.params;
+    expect(start).toMatchObject({ model: 'gpt-6-mini', ephemeral: true, environments: [], sandbox: 'read-only', approvalPolicy: 'never', baseInstructions: TITLE_SYSTEM, cwd: process.cwd() });
+    expect(start.config).toMatchObject({ web_search: 'disabled', project_doc_max_bytes: 0 });
+    expect(start).not.toHaveProperty('dynamicTools');
+    expect(start).not.toHaveProperty('developerInstructions');
+    const turn = calls.find((c) => c.method === 'turn/start')!.params;
+    expect(turn).toMatchObject({ threadId: 'tt1', effort: 'minimal', summary: 'none', input: [{ type: 'text', text: prompt.user }] });
+    expect(calls.map((c) => c.method)).toEqual(['thread/start', 'turn/start', 'thread/unsubscribe']);
+  });
+
+  it('picks the smallest model by its name or its catalog words, a current one before a legacy one', async () => {
+    const { titleModelOf } = await import('../server/providers/codex');
+    const m = (id: string, description: string, efforts = ['low', 'medium', 'high']) => ({ id, name: id, description, picker: true, efforts: efforts as never });
+    const catalog = [
+      m('gpt-6.2-sol', 'Latest frontier model for coding and everyday work.'),
+      m('gpt-6.1-terra', 'Efficient model that excels at visual understanding and computer use.'),
+      m('gpt-6-luna', 'Fast and affordable model for easier tasks.'),
+      m('gpt-5.6-luna', 'Legacy fast model for simpler tasks.'),
+    ];
+    expect(titleModelOf(catalog)).toEqual({ id: 'gpt-6-luna', effort: 'low' });
+    expect(titleModelOf([...catalog, m('gpt-6-mini', 'Small model.', ['minimal', 'low'])])).toEqual({ id: 'gpt-6-mini', effort: 'minimal' });
+    expect(titleModelOf(catalog.slice(0, 2))).toBeUndefined();
+  });
+
+  it('gives none when the account has no small model, and stops the turn when the title is given up', async () => {
+    const none = await codexTitle({ models: [{ id: 'gpt-6', name: 'GPT-6', picker: true }] });
+    expect(await none.p.quickTitle(titlePrompt({ message: 'hi', answer: '' }, process.cwd()), new AbortController().signal)).toBeNull();
+    expect(none.calls).toEqual([]);
+
+    const slow = await codexTitle({ hang: true });
+    const ctrl = new AbortController();
+    const asked = slow.p.quickTitle(titlePrompt({ message: 'hi', answer: '' }, process.cwd()), ctrl.signal);
+    await until(() => slow.calls.some((c) => c.method === 'turn/start'), 'turn started');
+    ctrl.abort();
+    expect(await asked).toBeNull();
+    await tick(5);
+    expect(slow.calls.map((c) => c.method)).toEqual(['thread/start', 'turn/start', 'turn/interrupt', 'thread/unsubscribe']);
+  });
+
+  it("a failed title turn is an error, and the title thread's events never reach a chat", async () => {
+    const { p } = await codexTitle({ events: (notify, threadId) => notify('turn/completed', { threadId, turn: { id: 'turn-t', status: 'failed', error: { message: 'usage limit' }, items: [] } }) });
+    await expect(p.quickTitle(titlePrompt({ message: 'hi', answer: '' }, process.cwd()), new AbortController().signal)).rejects.toThrow(/usage limit/);
   });
 });

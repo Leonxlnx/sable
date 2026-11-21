@@ -1094,16 +1094,21 @@ class ClaudeSession implements ProviderSession {
   private streams = new Map<string, StreamState>();
   private streamedMessages = new Set<string>();
   private pendingUsers = new Map<string, string>(); // sdk uuid → UserItem id
-  /** Messages from people (ours, or from the Claude app) whose turn has not ended yet. */
-  private outstanding = 0;
+  /**
+   * Messages from people (ours, or from the Claude app) whose turn has not ended yet, by their uuid,
+   * and whether Claude Code has read them (replayed them): a result can only answer a message it read.
+   */
+  private awaiting = new Map<string, { read: boolean }>();
   /**
    * Claude Code's own messages (a background task's notification, a teammate's message) taken since
    * the last result. They wake the model with a turn whose result names no message of anyone's, or
-   * are folded into the running turn: never counted with `outstanding`, which only people's messages close.
+   * are folded into the running turn: never in `awaiting`, which only people's messages close.
    */
   private wakes = 0;
-  /** This CLI names the messages a result answers (`user_message_uuids`); older ones do not. */
+  /** This CLI names the messages a result answers (`user_message_uuids`, or `user_message_uuid`); older ones do not. */
   private namesMessages = false;
+  /** A message of ours Claude Code replayed under another uuid (a folded steer): its uuid there → ours. */
+  private aliases = new Map<string, string>();
   /** The CLI's own state (session_state_changed), as last reported. */
   private cliState?: 'idle' | 'running' | 'requires_action';
   private interrupted = false;
@@ -1364,7 +1369,7 @@ class ClaudeSession implements ProviderSession {
       this.rt.settle(failure ? 'error' : 'cancelled');
       const text = failure ?? 'Claude Code stopped unexpectedly';
       this.rt.notice('error', 'The agent process ended', text);
-      this.outstanding = 0;
+      this.awaiting.clear();
       this.rt.endTurn(text);
     }
   }
@@ -1437,7 +1442,7 @@ class ClaudeSession implements ProviderSession {
           { type: 'text', text },
         ]
       : text;
-    this.outstanding++;
+    this.awaiting.set(uuid, { read: false });
     this.interrupted = false;
     // Local commands (/cost, /context) can take a while and never "think".
     const command = /^\/[\w:-]+/.exec(item.text.trim())?.[0];
@@ -1863,6 +1868,7 @@ class ClaudeSession implements ProviderSession {
       const itemId = m.uuid ? this.pendingUsers.get(m.uuid) : undefined;
       if (itemId) {
         this.pendingUsers.delete(m.uuid);
+        this.markRead(m.uuid);
         this.chain.push(m.uuid);
         // Replayed when the agent takes it: a steered message stays where it was sent.
         rt.taken(itemId, { providerId: m.uuid });
@@ -1885,6 +1891,9 @@ class ClaudeSession implements ProviderSession {
         const words = mine?.text.trim() ?? '';
         if (mine && (words === text.trim() || (words.length >= 12 && text.includes(words)) || (!!echo && words === echo))) {
           this.pendingUsers.delete(uuid);
+          this.markRead(uuid);
+          // A result may name it by either uuid.
+          if (m.uuid && m.uuid !== uuid) this.aliases.set(m.uuid, uuid);
           if (m.uuid) this.chain.push(m.uuid);
           rt.taken(id, { providerId: m.uuid });
           return;
@@ -1905,7 +1914,7 @@ class ClaudeSession implements ProviderSession {
       // in this conversation, and the turn it starts runs here too.
       rt.add<UserItem>({ type: 'user', text, state: 'sent', providerId: m.uuid, remote: true });
       // It gets a result of its own (or is folded into the running turn's): either way the turn waits for it.
-      this.outstanding++;
+      this.awaiting.set(m.uuid || `remote-${randomUUID()}`, { read: true });
       if (!rt.turnActive) rt.beginTurn('Thinking');
       return;
     }
@@ -1962,16 +1971,52 @@ class ClaudeSession implements ProviderSession {
     }
   }
 
+  /** Claude Code read a message of ours (it replayed it). */
+  private markRead(uuid: string) {
+    const a = this.awaiting.get(uuid);
+    if (a) a.read = true;
+  }
+
+  /** Whether a message of ours is still on its way to Claude Code (sent, not read): its own turn is still to come. */
+  private unread(): boolean {
+    for (const a of this.awaiting.values()) if (!a.read) return true;
+    return false;
+  }
+
+  /**
+   * The messages a result answers, by identity. Named (`user_message_uuids`, or `user_message_uuid`):
+   * those. Named none: in a CLI that names what its turns answer, a turn Claude Code started on its own
+   * (a wake); in an older one, one message, the oldest it has read. A message it has not read yet (a
+   * steer still on its way) is never answered by a result that does not name it.
+   */
+  private answer(m: Obj) {
+    const named = (Array.isArray(m.user_message_uuids) ? (m.user_message_uuids as unknown[]) : []).filter((u): u is string => typeof u === 'string' && !!u);
+    if (!named.length && typeof m.user_message_uuid === 'string' && m.user_message_uuid) named.push(m.user_message_uuid);
+    if (named.length) {
+      this.namesMessages = true;
+      const ids = named.map((u) => this.aliases.get(u) ?? u);
+      // The messages this result answers for (a steer folded into the turn is one of them).
+      this.takeUsers(ids);
+      for (const id of ids) this.awaiting.delete(id);
+      for (const u of named) this.aliases.delete(u);
+      return;
+    }
+    if (this.wakes > 0 && this.namesMessages) return;
+    for (const [id, a] of this.awaiting) {
+      if (!a.read) continue;
+      this.awaiting.delete(id);
+      return;
+    }
+    // A wake's result never answers a message Claude Code has not read (a steer still on its way).
+    if (this.wakes > 0) return;
+    // None read (a CLI that does not replay, a replay missed): the oldest, as each result answers one.
+    const oldest = this.awaiting.keys().next().value;
+    if (oldest !== undefined) this.awaiting.delete(oldest);
+  }
+
   private onResult(m: Obj) {
     const rt = this.rt;
-    // The messages this result answers for (a steer folded into the turn is one of them).
-    if (Array.isArray(m.user_message_uuids)) this.takeUsers(m.user_message_uuids);
-    const listed = Array.isArray(m.user_message_uuids) ? m.user_message_uuids.length : 0;
-    if (listed) this.namesMessages = true;
-    // A result that names no message ends a turn Claude Code started on its own (a wake) when this CLI
-    // names the messages its turns answer; an older one names none, and each result answers one.
-    const answered = listed || (this.wakes > 0 && this.namesMessages ? 0 : 1);
-    this.outstanding = Math.max(0, this.outstanding - answered);
+    this.answer(m);
     // Its own messages are taken when they are replayed: whatever woke the model is answered by now.
     this.wakes = 0;
     const total = Number(m.total_cost_usd ?? 0);
@@ -2011,8 +2056,8 @@ class ClaudeSession implements ProviderSession {
     }
     // Fresh plan limits after every turn (shared with any read in the last few seconds).
     if (this.q) void this.provider.readLimits(this.q);
-    if (this.outstanding > 0) {
-      // Queued messages are still coming: the next turn starts right away.
+    if (this.awaiting.size > 0) {
+      // Messages it has not answered yet are still coming (a steer it has not read): their turn starts right away.
       this.interrupted = false;
       rt.update({ activity: 'Thinking' });
       return;
@@ -2024,7 +2069,8 @@ class ClaudeSession implements ProviderSession {
     const rt = this.rt;
     if (!rt.turnActive) return;
     this.interrupted = false;
-    this.outstanding = 0;
+    this.awaiting.clear();
+    this.aliases.clear();
     this.wakes = 0;
     this.limitHit = undefined;
     this.limitNoticeId = undefined;
@@ -2139,7 +2185,7 @@ class ClaudeSession implements ProviderSession {
         // Idle with nothing of Sable's still on its way: whatever no result closed (a message from the Claude
         // app folded into the turn, a background task's notification that woke no model turn) is over.
         // A message of ours it has not read yet keeps the turn: its own turn is still to come.
-        if (m.state === 'idle' && rt.turnActive && (this.outstanding <= 0 || this.pendingUsers.size === 0)) this.finishTurn(undefined, this.interrupted);
+        if (m.state === 'idle' && rt.turnActive && !this.unread()) this.finishTurn(undefined, this.interrupted);
         // Work it started on its own, with no message to replay (a scheduled wake-up): a turn like any other,
         // which its result or the next idle ends. Only from idle: after a prompt it is the same work going on.
         else if (m.state === 'running' && prev === 'idle' && !rt.turnActive && this.q && !this.closed) {

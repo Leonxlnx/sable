@@ -60,21 +60,63 @@ describe('the effort a person picks', () => {
     expect(h.applied).toEqual(['low']);
   });
 
-  it('two quick picks land in the order they were made, not the order the agent answers', async () => {
+  it('two quick picks land in the order they were made, and the agent ends with the last one', async () => {
+    const h = await demo();
+    const waits: (() => void)[] = [];
+    let active = 0;
+    let most = 0;
+    h.handle.setEffort = (e) => {
+      most = Math.max(most, ++active);
+      return new Promise<void>((r) => waits.push(() => (active--, h.applied.push(e), r())));
+    };
+    const before = h.efforts().length;
+    const first = h.setEffort('max');
+    await until(() => waits.length === 1, 'first asked');
+    const second = h.setEffort('low');
+    await new Promise((r) => setTimeout(r, 30));
+    // One change at a time: the second waits for the agent's answer to the first.
+    expect(waits).toHaveLength(1);
+    expect(h.rt.meta.effort).toBe('low');
+    waits[0]();
+    await until(() => waits.length === 2, 'second asked');
+    waits[1]();
+    await Promise.all([first, second]);
+    expect(h.efforts().slice(before)).toEqual(['max', 'low']);
+    // What the agent got last is what the session shows, and nothing is left due.
+    expect(h.applied).toEqual(['max', 'low']);
+    expect(most).toBe(1);
+    await h.app.call('session.send', { sessionId: h.id, text: 'hi' });
+    expect(h.applied).toEqual(['max', 'low']);
+  });
+
+  it('an agent that never answers an effort change holds the next message a few seconds at most', async () => {
+    const h = await demo();
+    h.handle.setEffort = () => new Promise<void>(() => {});
+    void h.setEffort('max');
+    const at = Date.now();
+    await h.app.call('session.send', { sessionId: h.id, text: 'hi' });
+    expect(Date.now() - at).toBeLessThan(9000);
+    expect(h.rt.items.filter((i) => i.type === 'user')).toHaveLength(2);
+    // The next pick is not stuck behind it for ever.
+    h.handle.setEffort = async (e) => void h.applied.push(e);
+    await h.setEffort('low');
+    expect(h.applied).toEqual(['low']);
+  }, 20_000);
+
+  it('picks made while the agent answers coalesce to the latest', async () => {
     const h = await demo();
     const waits: (() => void)[] = [];
     h.handle.setEffort = (e) => new Promise<void>((r) => waits.push(() => (h.applied.push(e), r())));
-    const before = h.efforts().length;
     const first = h.setEffort('max');
-    const second = h.setEffort('low');
-    await until(() => waits.length === 2, 'both asked');
-    // The agent answers the second first.
-    waits[1]();
-    await second;
+    await until(() => waits.length === 1, 'first asked');
+    const rest = [h.setEffort('medium'), h.setEffort('high'), h.setEffort('low')];
     waits[0]();
-    await first;
+    await until(() => waits.length === 2, 'the latest asked');
+    waits[1]();
+    await Promise.all([first, ...rest]);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.applied).toEqual(['max', 'low']);
     expect(h.rt.meta.effort).toBe('low');
-    expect(h.efforts().slice(before)).toEqual(['max', 'low']);
   });
 
   it('one the agent refused goes to it right before the next message', async () => {

@@ -7,7 +7,7 @@ import { conn } from '@m/lib/conn';
 import { dropFlight, launchFlight } from '@m/lib/flight';
 import { onKeyboard } from '@m/lib/keyboard';
 import { fit } from '@m/lib/fit';
-import { haptic } from '@m/lib/native';
+import { haptic, isNative } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
 import { applySnapshot, setState, useStore } from '@m/lib/store';
@@ -56,6 +56,16 @@ export function HomeDock({ covered }: { covered: boolean }) {
     }
     requestAnimationFrame(size);
   };
+
+  // "New chat" from the app icon's shortcuts: the bar opens, focused, with the keyboard up.
+  useEffect(() => {
+    const go = () => {
+      area.current?.focus();
+      if (isNative) void import('@capacitor/keyboard').then((k) => k.Keyboard.show()).catch(() => {});
+    };
+    window.addEventListener('sable:newchat', go);
+    return () => window.removeEventListener('sable:newchat', go);
+  }, []);
 
   // The keyboard put away: the field lets go too.
   useEffect(() => onKeyboard((lift, prev) => lift === 0 && prev > 0 && document.activeElement === area.current && area.current?.blur()), []);

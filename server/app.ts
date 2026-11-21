@@ -49,7 +49,7 @@ import { orderAccounts } from './accounts/order';
 import { withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
-import { ChatTitles, type TitleModel, type TitlePrompt } from './core/titles';
+import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
 import { Lanes } from './core/lanes';
 import { isAllModelsWeekly } from './core/limit-policy';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
@@ -129,6 +129,33 @@ export class App {
   private earlyWaiting = new Map<string, string[]>();
   /** Such messages the user stopped before the agent was there: never sent. */
   private stoppedEarly = new Set<string>();
+  /**
+   * Per session, the messages handed to its agent since its last turn ended: what the turn that ends
+   * next took (a settled first turn is named from them, server/core/titles.ts). A message stopped
+   * before the agent had it is never here; those of a failed or stopped turn are dropped with it.
+   */
+  private handed = new Map<string, string[]>();
+
+  /** `itemId` goes to the agent now (recorded first: a fast turn can end before the send returns). */
+  private handOver(rt: SessionRuntime, itemId: string) {
+    const list = this.handed.get(rt.id) ?? [];
+    if (!list.includes(itemId)) list.push(itemId);
+    this.handed.set(rt.id, list);
+    return () => this.handed.set(rt.id, (this.handed.get(rt.id) ?? []).filter((id) => id !== itemId));
+  }
+
+  /**
+   * The messages the turn that just ended took. A steer the agent has not taken yet stays for the
+   * turn that takes it; after a failure or a stop nothing stays (untaken steers go back to the queue).
+   */
+  private consumed(rt: SessionRuntime, ok: boolean): string[] {
+    const list = this.handed.get(rt.id) ?? [];
+    const taken = list.filter((id) => rt.get<UserItem>(id)?.state === 'sent');
+    const waiting = ok ? list.filter((id) => rt.get<UserItem>(id)?.state === 'queued') : [];
+    if (waiting.length) this.handed.set(rt.id, waiting);
+    else this.handed.delete(rt.id);
+    return ok ? taken : [];
+  }
   /** Automatic continues already made per session, as `${messageId}:${accountId}` (never the same twice). */
   private autoContinued = new Map<string, Set<string>>();
   /** Per session, the cap check in flight: a send and a turn's end never move a session twice. */
@@ -205,7 +232,7 @@ export class App {
   /** Chat titles by a small model, once after a chat's first turn (server/core/titles.ts). */
   private titles = new ChatTitles({
     settings: () => this.store.state.settings,
-    model: (rt) => this.titleModel(rt),
+    model: (owner) => this.titleModel(owner),
     open: (rt) => this.sessions.get(rt.id) === rt,
     log: (...args) => this.log(...args),
   });
@@ -375,16 +402,13 @@ export class App {
 
   /**
    * The model that names a chat: its own agent's smallest, on the chat's own account (Claude Code's
-   * Haiku). An agent without one (Codex) borrows Claude Code's Haiku on Claude's default account
-   * while Claude Code is signed in; otherwise none, and the chat keeps its title.
+   * Haiku, Codex's smallest model). Never another agent's or another account's: an agent without
+   * one leaves the chat its title.
    */
-  private titleModel(rt: SessionRuntime): TitleModel | undefined {
-    const ask = (p: Provider) => (p.quickTitle ? (prompt: TitlePrompt, signal: AbortSignal) => p.quickTitle!(prompt, signal) : undefined);
+  private titleModel(owner: TitleOwner): TitleModel | undefined {
     try {
-      const own = ask(this.provider(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT));
-      if (own) return own;
-      if (rt.meta.provider === 'claude' || !this.otherAgents().includes('claude')) return undefined;
-      return ask(this.provider('claude', this.defaultAccountId('claude')));
+      const p = this.provider(owner.provider, owner.accountId);
+      return p.quickTitle ? (prompt: TitlePrompt, signal: AbortSignal) => p.quickTitle!(prompt, signal) : undefined;
     } catch {
       return undefined;
     }
@@ -694,7 +718,7 @@ export class App {
       if (what === 'meta') this.store.saveState();
       else this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue, dirty: rt.takeDirty() }));
     });
-    rt.onTurnEnd = (r, error) => this.afterTurn(r, error);
+    rt.onTurnEnd = (r, error, opts) => this.afterTurn(r, error, opts?.hold);
     rt.onTurnStart = (r) => {
       this.until.turnStarted(r);
       this.spare.turnStarted(r);
@@ -798,9 +822,11 @@ export class App {
     await this.applyDue(rt, handle);
     const item = early ?? addUser();
     const runningSince = item.steered ? rt.turnStartedAt : undefined;
+    const unhand = this.handOver(rt, item.id);
     try {
       await handle.send(this.withBrowserPage(rt, this.withHandover(rt, item)));
     } catch (err) {
+      unhand();
       // A steer the agent could not take: the turn it was meant for goes on, and the message waits in the queue.
       if (item.steered && rt.turnActive && rt.turnStartedAt === runningSince && rt.get<UserItem>(item.id)?.state === 'queued') {
         this.log('steer failed; back to the queue', (err as Error).message);
@@ -866,8 +892,9 @@ export class App {
   private async applyDue(rt: SessionRuntime, handle: ProviderSession) {
     const due = this.modelDue.get(rt.id);
     if (!due || rt.turnActive) {
-      // An effort the running agent did not take when it was chosen goes with this message.
-      if (this.effortDue.has(rt.id)) await this.applyEffort(rt, handle);
+      // An effort the running agent did not take when it was chosen goes with this message (a change
+      // still unanswered holds the message a few seconds at most; the effort stays due then).
+      if (this.effortDue.has(rt.id)) await this.effortFirst(rt, handle);
       return;
     }
     this.modelDue.delete(rt.id);
@@ -878,26 +905,54 @@ export class App {
       this.log('model change failed', (err as Error).message);
     }
     // A model change can reset the agent's effort to the model's own: the session's goes again.
-    if (rt.meta.effort) await this.applyEffort(rt, handle);
+    if (rt.meta.effort) await this.effortFirst(rt, handle);
   }
 
   /** Sessions whose running agent has not taken the effort they hold (it refused, or failed to answer). */
   private effortDue = new Set<string>();
+  /** Per session, the effort change going to its agent now: the next waits for it (one at a time, in order). */
+  private effortRuns = new Map<string, Promise<void>>();
+
+  /** The effort to the agent before a message, waiting for it a few seconds at most (an agent that never answers does not hold the message). */
+  private effortFirst(rt: SessionRuntime, handle: ProviderSession) {
+    return Promise.race([
+      this.applyEffort(rt, handle),
+      new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, EFFORT_WAIT_MS);
+        t.unref?.();
+      }),
+    ]);
+  }
 
   /**
    * The session's effort to its running agent (none running: the next start reads it from the session).
+   * One change at a time per session, each sending what the session holds when its turn comes (quick
+   * picks coalesce to the latest), so the agent ends with the last pick whatever order it answers in.
    * Never throws: a refusal leaves it due, and it goes again right before the next message.
    */
   private async applyEffort(rt: SessionRuntime, handle: ProviderSession | undefined) {
-    const effort = rt.meta.effort;
-    if (!handle || !effort) return void this.effortDue.delete(rt.id);
+    if (!handle || !rt.meta.effort) return void this.effortDue.delete(rt.id);
     this.effortDue.add(rt.id);
+    // After the change before it (one the agent never answers is waited for a few seconds, not for ever).
+    const prev = this.effortRuns.get(rt.id);
+    const ready = prev ? Promise.race([prev, new Promise<void>((r) => setTimeout(r, EFFORT_WAIT_MS).unref?.())]) : Promise.resolve();
+    const run = ready.then(async () => {
+      const effort = rt.meta.effort;
+      // Settled meanwhile (a later run sent the same pick), or the agent is another one now (it starts with the session's).
+      if (!effort || !this.effortDue.has(rt.id) || (rt.handle && rt.handle !== handle)) return;
+      try {
+        await handle.setEffort(effort);
+        // A later pick came meanwhile: it stays due, and the run queued for it sends it.
+        if (rt.meta.effort === effort) this.effortDue.delete(rt.id);
+      } catch (err) {
+        this.log('effort change failed; it goes with the next message', (err as Error).message);
+      }
+    });
+    this.effortRuns.set(rt.id, run);
     try {
-      await handle.setEffort(effort);
-      // A later pick went out meanwhile: it settles what is due.
-      if (rt.meta.effort === effort) this.effortDue.delete(rt.id);
-    } catch (err) {
-      this.log('effort change failed; it goes with the next message', (err as Error).message);
+      await run;
+    } finally {
+      if (this.effortRuns.get(rt.id) === run) this.effortRuns.delete(rt.id);
     }
   }
 
@@ -1195,9 +1250,12 @@ export class App {
       : { id: randomUUID(), ts: Date.now(), type: 'user', text: 'The usage limit has reset. Carry on with the task from where it stopped.', state: 'sent' };
     const handle = await this.ensureHandle(rt);
     await this.applyDue(rt, handle);
+    // The turn carries on with the refused message: it is the one this turn answers.
+    const unhand = refused ? this.handOver(rt, refused.id) : undefined;
     try {
       await handle.send(this.withHandover(rt, item));
     } catch (err) {
+      unhand?.();
       rt.notice('error', 'Could not send the message', (err as Error).message);
       rt.endTurn((err as Error).message);
     }
@@ -1277,9 +1335,11 @@ export class App {
     }
     if (refused) {
       const handle = await this.ensureHandle(rt);
+      const unhand = this.handOver(rt, refused.id);
       try {
         await handle.send(this.withHandover(rt, this.resumeMessage(rt, refused, carried)));
       } catch (err) {
+        unhand();
         rt.notice('error', 'Could not send the message', (err as Error).message);
         rt.endTurn((err as Error).message);
       }
@@ -1398,9 +1458,10 @@ export class App {
 
   /**
    * A turn ended. When it ended normally, the next queued message goes out (one per turn
-   * end). After an interrupt, a close or a failure the queue waits for the user.
+   * end). After an interrupt, a close or a failure the queue waits for the user, as it does when
+   * the agent could not say how the turn ended (`hold`).
    */
-  private afterTurn(rt: SessionRuntime, error?: string) {
+  private afterTurn(rt: SessionRuntime, error?: string, hold = false) {
     // A spare turn's end frees its place; waiting chats are looked at again.
     const ran = this.spare.turnEnded(rt);
     const hit = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.provider && !i.parentId);
@@ -1416,15 +1477,18 @@ export class App {
     }
     // An until loop stopped during the turn says so after it.
     this.until.turnOver(rt);
-    if (error || rt.stopRequested) {
+    // What the turn took (nothing of a failed or stopped one, nor of one whose end is not known).
+    const consumed = this.consumed(rt, !error && !rt.stopRequested && !hold);
+    if (error || rt.stopRequested || hold) {
       // Steered messages the agent never took go back to the queue, to send or edit again.
-      rt.returnUntaken({ reason: error ? 'failed' : 'stopped' });
+      const back = rt.returnUntaken({ reason: error ? 'failed' : 'stopped' });
+      if (hold && !back && rt.queue.length) rt.notice('info', 'Queued messages wait', 'The agent did not say how the last turn ended. Send them when you are ready.');
       // An until loop waits for the next turn, as the queue waits for the user.
       this.until.turnHeld(rt);
       return;
     }
-    // The chat's first turn settled: a small model names it, in the background.
-    this.titles.turnEnded(rt);
+    // The chat's first turn settled: a small model names it from the message it took, in the background.
+    this.titles.turnEnded(rt, consumed);
     // Let the adapter finish its own bookkeeping (it may start a turn of its own first, with a
     // steered message the turn ended before taking).
     setTimeout(() => {
@@ -2314,6 +2378,7 @@ export class App {
       }
       if (remove) {
         this.sessions.delete(sessionId);
+        this.handed.delete(sessionId);
         this.store.deleteSession(sessionId);
         this.emit({ type: 'session.removed', id: sessionId });
         // A deleted chat takes its folder along when nothing was ever put in it.
@@ -2508,6 +2573,9 @@ const LOGIN_TIMEOUT_MS = 10 * 60_000;
 const INFO_REFRESH_DELAY_MS = 15_000;
 /** How long after a cached capabilities answer the fresh one is fetched. */
 const CAPS_REFRESH_DELAY_MS = 2_500;
+
+/** How long a message waits for an effort change the agent has not answered yet (it goes again with the next one). */
+const EFFORT_WAIT_MS = 6_000;
 
 /** Cached capabilities are per agent, account and folder (plan models, project skills and MCP servers differ). */
 function capsCacheKey(provider: ProviderId, accountId: string, cwd?: string) {

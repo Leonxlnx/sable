@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { open, stat } from 'node:fs/promises';
+import { open, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus } from '../../shared/protocol';
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
@@ -124,13 +124,33 @@ function relToCwd(root: string, cwd: string, p: string): string {
   return toPosix(path.relative(cwd, path.join(root, p)));
 }
 
-/** Reads a file prefix; null when unreadable. `binary` when NUL bytes appear in the first 8 KB. */
-async function readText(file: string, maxBytes: number): Promise<{ text: string; binary: boolean; size: number } | null> {
+/** `p` lies inside `dir` (or is it), both absolute, compared as Windows compares them there. */
+export function inside(p: string, dir: string): boolean {
+  const rel = path.relative(dir, p);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Reads a file prefix; null when unreadable. `binary` when NUL bytes appear in the first 8 KB.
+ * `within`: only a file that really lies in that folder (its links followed, `within` itself canonical);
+ * one that leads out of it (a link, a junction on the way) is not read.
+ */
+async function readText(file: string, maxBytes: number, within?: string): Promise<{ text: string; binary: boolean; size: number } | null> {
   let fh;
   try {
+    if (within) {
+      const real = await realpath(file);
+      if (!inside(real, within)) return null;
+      file = real;
+    }
     fh = await open(file, 'r');
     const st = await fh.stat();
     if (!st.isFile()) return null;
+    // The file opened is the one checked (not swapped for a link meanwhile).
+    if (within) {
+      const now = await stat(file);
+      if (now.ino !== st.ino || now.dev !== st.dev) return null;
+    }
     const len = Math.min(st.size, maxBytes);
     const buf = Buffer.alloc(len);
     const { bytesRead } = await fh.read(buf, 0, len, 0);
@@ -212,16 +232,37 @@ export function capDiff(f: FileDiff): FileDiff {
 
 // ───────────────────────────── handlers ─────────────────────────────
 
-export async function gitStatus(cwd: string): Promise<GitStatus> {
+/** Options of `gitStatus` and `gitDiff`. */
+export interface GitScope {
+  /**
+   * Only what lies in `cwd` itself (a pathspec for it, never a sibling folder of the repository), and
+   * an untracked file read only when it really lies there (links followed). The phone's Changes view.
+   */
+  within?: boolean;
+}
+
+/** `cwd` as its canonical folder (links and junctions followed), for `GitScope.within`. */
+async function realDir(dir: string): Promise<string> {
+  try {
+    return await realpath(dir);
+  } catch {
+    return dir;
+  }
+}
+
+export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitStatus> {
   const dir = path.resolve(cwd);
   const none: GitStatus = { isRepo: false, files: [], additions: 0, deletions: 0 };
   const root = await repoRoot(dir);
   if (!root) return none;
+  // A pathspec for the folder itself: git lists nothing outside it.
+  const spec = scope.within ? ['--', '.'] : [];
+  const real = scope.within ? await realDir(dir) : undefined;
 
   const [st, unstaged, staged] = await Promise.all([
-    runGit(dir, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all'], { timeoutMs: 15_000 }),
-    runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff'], { timeoutMs: 15_000 }),
-    runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff', '--cached'], { timeoutMs: 15_000 }),
+    runGit(dir, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all', ...spec], { timeoutMs: 15_000 }),
+    runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff', ...spec], { timeoutMs: 15_000 }),
+    runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff', '--cached', ...spec], { timeoutMs: 15_000 }),
   ]);
   if (st.code !== 0) return none;
 
@@ -282,7 +323,7 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
   for (let i = 0; i < counted.length && budget > 0; i += 8) {
     const batch = counted.slice(i, i + 8);
     const share = Math.min(MAX_UNTRACKED_BYTES, Math.max(1, Math.floor(budget / batch.length)));
-    const texts = await Promise.all(batch.map((f) => readText(path.join(root, f.raw), share)));
+    const texts = await Promise.all(batch.map((f) => readText(path.join(root, f.raw), share, real)));
     texts.forEach((t, k) => {
       if (!t) return;
       budget -= Math.min(t.size, share);
@@ -304,11 +345,14 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
   return result;
 }
 
-export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean): Promise<FileDiff[]> {
+export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, scope: GitScope = {}): Promise<FileDiff[]> {
   const dir = path.resolve(cwd);
   const root = await repoRoot(dir);
   if (!root) return [];
-  const spec = file ? ['--', path.resolve(dir, file)] : [];
+  // Within the folder: a file named out of it has no diff here, and no file means the folder itself.
+  if (scope.within && file && !inside(path.resolve(dir, file), dir)) return [];
+  const spec = file ? ['--', path.resolve(dir, file)] : scope.within ? ['--', '.'] : [];
+  const real = scope.within ? await realDir(dir) : undefined;
   const base = (await hasHead(dir)) ? 'HEAD' : EMPTY_TREE;
   const args = [
     'diff',
@@ -340,7 +384,7 @@ export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean):
     let budget = UNTRACKED_BUDGET;
     for (const raw of list) {
       const rel = relToCwd(root, dir, raw);
-      const t = budget > 0 ? await readText(path.join(root, raw), Math.min(MAX_UNTRACKED_BYTES, budget)) : null;
+      const t = budget > 0 ? await readText(path.join(root, raw), Math.min(MAX_UNTRACKED_BYTES, budget), real) : null;
       if (!t) continue;
       budget -= t.text.length;
       if (t.binary) {

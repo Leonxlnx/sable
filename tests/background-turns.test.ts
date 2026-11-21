@@ -203,6 +203,53 @@ describe('Claude Code: background agents and the turns they start', () => {
     expect(h.live()).toEqual(IDLE);
   });
 
+  it("a wake's result that names nothing never takes a steer Claude Code has not read, before any result named a message", async () => {
+    const h = await claude();
+    // A process whose results have named no message yet.
+    const a = await h.send('first');
+    h.replay(a.uuid, 'first');
+    h.message(result());
+    expect(h.live()).toEqual(IDLE);
+    // Claude Code wakes on its own (a scheduled wake-up); the person steers into it.
+    h.state('idle');
+    h.state('running');
+    expect(h.rt.turnActive).toBe(true);
+    const s = await h.send('and the docs?');
+    h.text('Checked again: still green.');
+    // The wake's own result, before Claude Code read the steer.
+    h.message(result());
+    expect(h.rt.turnActive).toBe(true);
+    expect(users(h.rt).find((u) => u.text === 'and the docs?')?.state).toBe('queued');
+    // An idle crossing it changes nothing either: the steer's own turn is still to come.
+    h.state('idle');
+    expect(h.rt.turnActive).toBe(true);
+    h.state('running');
+    h.replay(s.uuid, 'and the docs?');
+    h.text('The docs are fine.');
+    h.message(result([s.uuid]));
+    expect(h.live()).toEqual(IDLE);
+    expect(users(h.rt).find((u) => u.text === 'and the docs?')?.state).toBe('sent');
+  });
+
+  it('a result that names its message only by user_message_uuid counts as naming it', async () => {
+    const h = await claude();
+    const one = (uuid: string) => ({ ...result(), user_message_uuid: uuid });
+    const a = await h.send('first');
+    h.replay(a.uuid, 'first');
+    h.message(one(a.uuid));
+    expect(h.live()).toEqual(IDLE);
+    // A background helper's note wakes the model; a steer goes in before Claude Code reads it.
+    h.helperDone(1);
+    expect(h.rt.turnActive).toBe(true);
+    const s = await h.send('still there?');
+    h.message(result());
+    expect(h.rt.turnActive).toBe(true);
+    expect(users(h.rt).find((u) => u.text === 'still there?')?.state).toBe('queued');
+    h.replay(s.uuid, 'still there?');
+    h.message(one(s.uuid));
+    expect(h.live()).toEqual(IDLE);
+  });
+
   it('Claude Code starting work on its own opens a turn, and its result closes it', async () => {
     const h = await claude();
     const a = await h.send('first');
@@ -335,6 +382,175 @@ describe('Codex: turns it starts on its own, and a turn whose end never came', (
     await tick(1700);
     expect(h.rt.turnActive).toBe(true);
     h.complete('turn1');
+    await tick();
+    expect(h.rt.turnActive).toBe(false);
+  });
+});
+
+/** A fake app-server whose answers a test chooses: `turn/start` may wait, `thread/turns/list` tells a turn's stored outcome. */
+async function codexWith(answer: { turnStart?: (n: number) => Promise<unknown> | unknown; turnsList?: () => unknown } = {}) {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-bgturns-'));
+  cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+  const cwd = path.join(home, 'proj');
+  mkdirSync(cwd, { recursive: true });
+  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  let starts = 0;
+  const rpc = {
+    request: async (method: string, params: Record<string, unknown>) => {
+      calls.push({ method, params });
+      if (method === 'thread/start') return { thread: { id: 'th1', model: 'm' }, model: 'm' };
+      if (method === 'turn/start') {
+        const n = ++starts;
+        return answer.turnStart ? answer.turnStart(n) : { turn: { id: `turn${n}` } };
+      }
+      if (method === 'thread/turns/list') return answer.turnsList?.() ?? {};
+      if (method === 'account/read') return { account: { type: 'apiKey' }, requiresOpenaiAuth: true };
+      return {};
+    },
+  };
+  let provider!: CodexProvider;
+  const app = new App({
+    home,
+    providers: [
+      (ctx) => {
+        const p = new CodexProvider(ctx);
+        const anyP = p as unknown as Record<string, unknown>;
+        anyP.client = async () => rpc;
+        anyP.version = async () => ({ installed: true, version: '1' });
+        anyP.caps = async () => ({ models: [{ id: 'm', name: 'M', isDefault: true }], modes: [], commands: [], skills: [], agents: [], mcpServers: [], tools: [], skillTrigger: '$', features: { steer: true } });
+        provider ??= p;
+        return p;
+      },
+    ],
+    quiet: true,
+  });
+  cleanups.push(() => app.dispose());
+  const snap = await app.call('session.create', { provider: 'codex', cwd, mode: 'default', model: 'm' });
+  const id = snap.session.id;
+  const rt = app.runtime(id);
+  const notify = (method: string, p: unknown) => (provider as unknown as { onNotification(m: string, p: unknown): void }).onNotification(method, p);
+  const status = (type: 'idle' | 'active') => notify('thread/status/changed', { threadId: 'th1', status: type === 'active' ? { type, activeFlags: [] } : { type } });
+  const turnStarts = () => calls.filter((c) => c.method === 'turn/start').length;
+  return { app, id, rt, calls, notify, status, turnStarts, send: (text: string, steer?: boolean) => app.call('session.send', { sessionId: id, text, steer }) };
+}
+
+const lastTurn = (rt: SessionRuntime) => rt.items.findLast((i) => i.type === 'turn') as { stopReason?: string; error?: string } | undefined;
+
+describe("Codex: a turn ended from the thread's idle keeps what is known, and late news of it changes nothing", () => {
+  it('after an error that ended the turn: it ends failed and the queue waits', async () => {
+    const h = await codexWith();
+    await h.send('first');
+    await tick();
+    // A message sent meanwhile waits in the bridge's queue for the turn's end.
+    expect((await h.send('second')).queued).toBe(true);
+    h.notify('error', { threadId: 'th1', turnId: 'turn1', willRetry: false, error: { message: 'stream disconnected' } });
+    h.status('idle');
+    await tick(1700);
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.rt.meta.status).toBe('error');
+    expect(lastTurn(h.rt)?.error).toBe('stream disconnected');
+    expect(h.turnStarts()).toBe(1);
+    expect(h.rt.queue.map((q) => q.text)).toEqual(['second']);
+  });
+
+  it('after a stop was asked: it ends interrupted, not completed', async () => {
+    const h = await codexWith();
+    await h.send('first');
+    await tick();
+    await h.app.call('session.interrupt', { sessionId: h.id });
+    h.status('idle');
+    await tick(1700);
+    expect(h.rt.turnActive).toBe(false);
+    expect(lastTurn(h.rt)?.stopReason).toBe('interrupted');
+  });
+
+  it('with no word of how it ended: the thread is asked; when it cannot say, nothing queued goes out', async () => {
+    const h = await codexWith();
+    await h.send('first');
+    await tick();
+    await h.send('second');
+    h.status('idle');
+    await tick(1700);
+    expect(h.calls.some((c) => c.method === 'thread/turns/list')).toBe(true);
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.turnStarts()).toBe(1);
+    expect(h.rt.queue.map((q) => q.text)).toEqual(['second']);
+    expect(h.rt.items.some((i) => i.type === 'notice' && i.text === 'Queued messages wait')).toBe(true);
+  });
+
+  it("the thread's stored outcome decides: failed holds the queue, completed lets it go", async () => {
+    const failed = await codexWith({ turnsList: () => ({ data: [{ id: 'turn1', status: 'failed', error: { message: 'model overloaded' }, items: [] }] }) });
+    await failed.send('first');
+    await tick();
+    await failed.send('second');
+    failed.status('idle');
+    await tick(1700);
+    expect(failed.rt.meta.status).toBe('error');
+    expect(failed.turnStarts()).toBe(1);
+
+    const done = await codexWith({ turnsList: () => ({ data: [{ id: 'turn1', status: 'completed', items: [] }] }) });
+    await done.send('first');
+    await tick();
+    await done.send('second');
+    done.status('idle');
+    await tick(1700);
+    await tick(50);
+    expect(done.turnStarts()).toBe(2);
+  });
+
+  it('a late turn/completed of the turn that ended never ends the next one while it is still starting', async () => {
+    let release!: (v: unknown) => void;
+    const h = await codexWith({
+      turnStart: (n) => (n === 1 ? { turn: { id: 'turn1' } } : new Promise((r) => (release = r))),
+      turnsList: () => ({ data: [{ id: 'turn1', status: 'completed', items: [] }] }),
+    });
+    await h.send('first');
+    await tick();
+    await h.send('second');
+    h.status('idle');
+    await tick(1700);
+    await tick(50);
+    // The queued message went out; its turn/start has not answered yet (no id).
+    expect(h.turnStarts()).toBe(2);
+    expect(h.rt.turnActive).toBe(true);
+    h.notify('turn/completed', { threadId: 'th1', turn: { id: 'turn1', status: 'completed', items: [] } });
+    await tick();
+    expect(h.rt.turnActive).toBe(true);
+    release({ turn: { id: 'turn2' } });
+    await tick();
+    h.notify('turn/completed', { threadId: 'th1', turn: { id: 'turn2', status: 'completed', items: [] } });
+    await tick();
+    expect(h.rt.turnActive).toBe(false);
+  });
+});
+
+describe('Codex: a fast turn that ends while turn/start is still out', () => {
+  it('its idle is looked at once the start returns, and the chat goes idle', async () => {
+    let release!: (v: unknown) => void;
+    const h = await codexWith({ turnStart: () => new Promise((r) => (release = r)), turnsList: () => ({ data: [{ id: 'turn1', status: 'completed', items: [] }] }) });
+    void h.send('first');
+    await tick();
+    h.notify('turn/started', { threadId: 'th1', turn: { id: 'turn1', status: 'inProgress', items: [] } });
+    h.status('active');
+    h.status('idle');
+    // Its turn/completed never comes; the start answers after all of it.
+    release({ turn: { id: 'turn1' } });
+    await tick(1700);
+    await tick(50);
+    expect({ turnActive: h.rt.turnActive, status: h.rt.meta.status, activity: h.rt.meta.activity }).toEqual(IDLE);
+  });
+
+  it('an idle from before the turn showed itself changes nothing', async () => {
+    let release!: (v: unknown) => void;
+    const h = await codexWith({ turnStart: () => new Promise((r) => (release = r)) });
+    void h.send('first');
+    await tick();
+    // The thread's idle from before this turn began, delivered while the start is out.
+    h.status('idle');
+    release({ turn: { id: 'turn1' } });
+    await tick(1700);
+    expect(h.rt.turnActive).toBe(true);
+    h.notify('turn/completed', { threadId: 'th1', turn: { id: 'turn1', status: 'completed', items: [] } });
     await tick();
     expect(h.rt.turnActive).toBe(false);
   });

@@ -1,6 +1,6 @@
 import { animate } from 'motion';
 import { AnimatePresence, motion } from 'motion/react';
-import { memo, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { createContext, lazy, memo, Suspense, useContext, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { Project, SessionMeta } from '@shared/protocol';
 import { baseName, timeAgo } from '@desk/lib/format';
@@ -17,12 +17,17 @@ import { Icon } from '@m/ui/icons';
 import { LogoMark, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles, type Tone } from '@m/ui/marks';
 import { nowOf, REVEAL, SNAP, SPRING } from '@m/ui/motion';
 import { Pull } from '@m/ui/Pull';
-import { ditherStrip } from '@m/ui/strip';
-import { veil } from '@m/ui/veil';
+import { usePending } from '@m/lib/pending';
 import { HomeDock } from './HomeDock';
 import { LimitsSheet } from './Limits';
+import { SearchResults } from './Search';
 
-const PER_FOLDER = 6;
+// The deck (the prompt sheets and the markdown they render): its own chunk, fetched once something waits.
+const loadDeck = () => import('./Deck');
+const Deck = lazy(() => loadDeck().then((m) => ({ default: m.Deck })));
+
+/** Rows shown before "Show more", and how many more each time. */
+const FIRST_ROWS = 30;
 
 export const toneOf = (s: SessionMeta): Tone =>
   s.status === 'running' || s.status === 'starting' ? 'working' : s.status === 'awaiting' ? 'awaiting' : s.status === 'error' ? 'error' : s.unread ? 'unread' : 'idle';
@@ -31,82 +36,109 @@ const isLive = (s: SessionMeta) => !s.archived && (s.status === 'running' || s.s
 
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 
-interface Group {
-  key: string;
-  name: string;
-  sessions: SessionMeta[];
+/** The folder a chat belongs to on home: its own (a lane's chat: the folder it came from), or "Chats" for chats without one. */
+export const folderKey = (s: SessionMeta) => (s.chat ? '::chats' : norm(homeFolder(s)));
+export const folderName = (s: SessionMeta, projects: Project[]) => (s.chat ? 'Chats' : (projects.find((p) => norm(p.path) === norm(homeFolder(s)))?.name ?? baseName(homeFolder(s))));
+
+const FILTER = 'sable.homeFilter';
+const readFilter = () => {
+  try {
+    return localStorage.getItem(FILTER) ?? '';
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * The chats home lists, as a string (pinned, then the rest by their latest activity), so the list
+ * renders only when its order changes: a chat at work changes its line many times a second, and
+ * only that row follows it.
+ */
+function listKey(s: State, filter: string): string {
+  const hidden = new Set(s.projects.filter((p) => p.hidden).map((p) => norm(p.path)));
+  const pinned: SessionMeta[] = [];
+  const rest: SessionMeta[] = [];
+  for (const m of Object.values(s.sessions)) {
+    if (m.archived) continue;
+    const k = folderKey(m);
+    if (hidden.has(k) || (filter && k !== filter)) continue;
+    (m.pinned ? pinned : rest).push(m);
+  }
+  const by = (a: SessionMeta, b: SessionMeta) => b.updatedAt - a.updatedAt;
+  return `${pinned.sort(by).map((m) => m.id).join(',')}|${rest.sort(by).map((m) => m.id).join(',')}`;
 }
 
-function groupSessions(sessions: SessionMeta[], projects: Project[], order: string | undefined, q: string, skip: Set<string>): Group[] {
-  const byDir = new Map<string, SessionMeta[]>();
-  const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  for (const s of sessions) {
-    if (s.archived || skip.has(s.id)) continue;
-    if (words.length) {
-      const hay = `${s.title} ${baseName(homeFolder(s))}`.toLowerCase();
-      if (!words.every((w) => hay.includes(w))) continue;
-    }
-    // Chats without a folder of their own go together; a chat in a lane belongs to the folder it came from.
-    const k = s.chat ? '::chats' : norm(homeFolder(s));
-    let list = byDir.get(k);
-    if (!list) byDir.set(k, (list = []));
-    list.push(s);
+/** The folders that have chats, the most recently active first: `key\u0001name` per folder, joined by `\u0002`. */
+function foldersKey(s: State): string {
+  const last = new Map<string, { name: string; at: number }>();
+  const hidden = new Set(s.projects.filter((p) => p.hidden).map((p) => norm(p.path)));
+  for (const m of Object.values(s.sessions)) {
+    if (m.archived) continue;
+    const k = folderKey(m);
+    if (hidden.has(k)) continue;
+    const cur = last.get(k);
+    if (!cur) last.set(k, { name: folderName(m, s.projects), at: m.updatedAt });
+    else if (m.updatedAt > cur.at) cur.at = m.updatedAt;
   }
-  const proj = new Map(projects.map((p) => [norm(p.path), p]));
-  const groups: (Group & { order: number; last: number })[] = [];
-  for (const [k, list] of byDir) {
-    const p = proj.get(k);
-    if (p?.hidden) continue;
-    list.sort((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
-    groups.push({ key: k, name: k === '::chats' ? 'Chats' : (p?.name ?? baseName(homeFolder(list[0]))), sessions: list, order: p?.order ?? Number.MAX_SAFE_INTEGER, last: list.reduce((m, s) => Math.max(m, s.updatedAt), 0) });
-  }
-  if (order === 'name') groups.sort((a, b) => a.name.localeCompare(b.name));
-  else if (order === 'recent') groups.sort((a, b) => b.last - a.last);
-  else groups.sort((a, b) => a.order - b.order || b.last - a.last);
-  return groups;
+  return [...last.entries()]
+    .sort((a, b) => b[1].at - a[1].at)
+    .map(([k, v]) => `${k}\u0001${v.name}`)
+    .join('\u0002');
+}
+
+/** Covered by a chat, home keeps what it showed (it catches up as it comes forward). */
+const Under = createContext(false);
+function useHome<T>(sel: (s: State) => T): T {
+  const under = useContext(Under);
+  const last = useRef<{ v: T } | null>(null);
+  return useStore((s) => (under && last.current ? last.current.v : (last.current = { v: sel(s) }).v));
 }
 
 export function Home({ under }: { under: boolean }) {
-  // Covered by a chat, home keeps the list it showed: a chat at work changes its line many times a
-  // second, and home (rows that glide when they reorder, measured on every change) followed each one
-  // under the conversation. It catches up as it comes forward.
-  const frozen = useRef<State['sessions'] | null>(null);
-  const sessions = useStore((s) => (under && frozen.current ? frozen.current : (frozen.current = s.sessions)));
-  const projects = useStore((s) => s.projects);
-  const folderOrder = useStore((s) => s.settings?.folderOrder);
   const defaultProvider = useStore((s) => s.settings?.defaultProvider);
   const desktop = useStore((s) => s.desktop);
   const connState = useStore((s) => s.conn);
   const loaded = useStore((s) => s.loaded);
   // Reached the desktop in this run: a lost connection is then "Reconnecting".
   const fresh = useStore((s) => !!s.fresh);
+  // What runs and waits, as two numbers (the title's line and the field's pace).
+  const counts = useStore((s) => {
+    let w = 0;
+    let a = 0;
+    for (const m of Object.values(s.sessions)) if (isLive(m)) m.status === 'awaiting' ? a++ : w++;
+    return `${w}|${a}`;
+  });
+  const [working, waitingChats] = counts.split('|').map(Number);
   const [query, setQuery] = useState('');
   const [searching, setSearching] = useState(false);
   const q = useDeferredValue(searching ? query : '');
   const [limits, setLimits] = useState(false);
-  const [more, setMore] = useState<Record<string, boolean>>({});
+  const [deck, setDeck] = useState(false);
+  const [filter, setFilterState] = useState(readFilter);
   const [peek, setPeek] = useState<{ id: string; rect: DOMRect } | null>(null);
-  const [leaving, setLeaving] = useState<Set<string>>(() => new Set());
   const root = useRef<HTMLDivElement>(null);
-
-  // What runs or waits now, the waiting ones first: the cards at the top (not repeated below).
-  const live = useMemo(
-    () =>
-      Object.values(sessions)
-        .filter(isLive)
-        .sort((a, b) => Number(b.status === 'awaiting') - Number(a.status === 'awaiting') || b.updatedAt - a.updatedAt),
-    [sessions],
-  );
-  const liveIds = useMemo(() => new Set(q ? [] : live.map((s) => s.id)), [live, q]);
-  const groups = useMemo(() => groupSessions(Object.values(sessions), projects, folderOrder, q, liveIds), [sessions, projects, folderOrder, q, liveIds]);
-  const waiting = live.filter((s) => s.status === 'awaiting');
-  const working = live.length - waiting.length;
+  const pending = usePending();
   const name = desktop ?? 'Sable';
-
-  // For start-up timing (DevTools: performance.getEntriesByName('sable:list')).
+  // Mounted from the first opening on (it closes on its own spring); fetched as soon as something waits.
+  const [deckUsed, setDeckUsed] = useState(false);
   useEffect(() => {
-    if (groups.length && !performance.getEntriesByName('sable:list').length) performance.mark('sable:list');
-  }, [groups.length]);
+    if (deck) setDeckUsed(true);
+  }, [deck]);
+  useEffect(() => {
+    if (pending.length) void loadDeck();
+  }, [pending.length > 0]);
+
+  const setFilter = (k: string) => {
+    haptic('select');
+    setFilterState(k);
+    try {
+      if (k) localStorage.setItem(FILTER, k);
+      else localStorage.removeItem(FILTER);
+    } catch {
+      /* private mode */
+    }
+    root.current?.querySelector('.home-scroll')?.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
   // Under a chat or settings, home steps back (smaller, dimmer) on the same spring as the screen over it.
   // Once a screen covers it whole, home is not drawn at all (it was drawn under every frame of the chat's scrolling).
@@ -122,6 +154,15 @@ export function Home({ under }: { under: boolean }) {
   }, [under]);
 
   useEffect(() => (searching ? pushBack(() => (closeSearch(), true)) : undefined), [searching]);
+  // "New chat" from the app icon: home as it is at rest (no search), its bar focused (HomeDock).
+  useEffect(() => {
+    const rest = () => {
+      setSearching(false);
+      setQuery('');
+    };
+    window.addEventListener('sable:newchat', rest);
+    return () => window.removeEventListener('sable:newchat', rest);
+  }, []);
 
   // While the list moves, the new-chat bar drops its blur (it would be drawn again every frame) and
   // stands on denser ink; at rest it is glass again.
@@ -150,173 +191,143 @@ export function Home({ under }: { under: boolean }) {
     (document.activeElement as HTMLElement | null)?.blur?.();
   };
 
-  // A waiting chat out of sight (scrolled past the cards): one line above the field says so.
-  const nowRef = useRef<HTMLElement>(null);
-  const [nowSeen, setNowSeen] = useState(true);
+  // The waiting strip scrolled out of sight: one line above the bar brings the deck back.
+  const stripRef = useRef<HTMLElement>(null);
+  const [stripSeen, setStripSeen] = useState(true);
+  const hasStrip = pending.length > 0 && !q;
   useEffect(() => {
-    const el = nowRef.current;
-    if (!el) return setNowSeen(true);
-    const io = new IntersectionObserver(([e]) => setNowSeen(e.isIntersecting), { threshold: 0.2 });
+    const el = stripRef.current;
+    if (!el) return setStripSeen(true);
+    const io = new IntersectionObserver(([e]) => setStripSeen(e.isIntersecting), { threshold: 0.2 });
     io.observe(el);
     return () => io.disconnect();
-  }, [live.length > 0]);
-
-  const archive = (id: string) => {
-    // A row dissolves first; a card (it runs or waits) simply goes.
-    if (live.some((s) => s.id === id)) void conn.call('session.update', { sessionId: id, patch: { archived: true } }).catch(() => {});
-    else setLeaving((cur) => new Set(cur).add(id));
-  };
-  const archived = (id: string, ok: boolean) => {
-    if (!ok) setLeaving((cur) => ((cur = new Set(cur)), cur.delete(id), cur));
-  };
+  }, [hasStrip]);
 
   return (
-    <div className="screen home" ref={root} data-under={under || undefined}>
-      <Field palette={paletteFor(defaultProvider)} amount={0.9} focusX={0.62} focusY={1.12} spread={0.95} active={live.length > 0 && !under} hidden={under} />
-      <header className="home-bar">
-        <LogoMark size={20} cells className="home-mark" />
-        <span className="home-bar-title">{name}</span>
-        <div className="home-tools">
-          <button type="button" className="icon-btn" aria-label="Search" aria-pressed={searching} onClick={() => (haptic('tap'), searching ? closeSearch() : setSearching(true))}>
-            <Icon name="search" size={21} />
-          </button>
-          <button type="button" className="icon-btn" aria-label="Limits" onClick={() => (haptic('tap'), setLimits(true))}>
-            <Icon name="gauge" size={21} />
-          </button>
-          <button type="button" className="icon-btn" aria-label="Settings" onClick={() => (haptic('tap'), nav.push({ name: 'settings' }))}>
-            <Icon name="gear" size={21} />
-          </button>
-        </div>
-      </header>
+    <Under.Provider value={under}>
+      <div className="screen home" ref={root} data-under={under || undefined}>
+        <Field palette={paletteFor(defaultProvider)} amount={0.9} focusX={0.62} focusY={1.12} spread={0.95} active={working + waitingChats > 0 && !under} hidden={under} />
+        <header className="home-bar">
+          <LogoMark size={20} cells className="home-mark" />
+          <span className="home-bar-title">{name}</span>
+          <div className="home-tools">
+            <button type="button" className="icon-btn" aria-label="Search" aria-pressed={searching} onClick={() => (haptic('tap'), searching ? closeSearch() : setSearching(true))}>
+              <Icon name="search" size={21} />
+            </button>
+            <button type="button" className="icon-btn" aria-label="Limits" onClick={() => (haptic('tap'), setLimits(true))}>
+              <Icon name="gauge" size={21} />
+            </button>
+            <button type="button" className="icon-btn" aria-label="Settings" onClick={() => (haptic('tap'), nav.push({ name: 'settings' }))}>
+              <Icon name="gear" size={21} />
+            </button>
+          </div>
+        </header>
 
-      <Pull
-        className="home-scroll"
-        onRefresh={async () => {
-          fieldBeat('pulse', { x: innerWidth / 2, y: 0 });
-          if (getState().conn !== 'open') return conn.wake();
-          await refresh([]);
-        }}
-      >
-        <AnimatePresence mode="popLayout" initial={false}>
-          {searching ? (
-            <motion.div key="search" className="home-hero home-search" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={SNAP}>
-              <label className="search">
-                <Icon name="search" size={18} />
-                <input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search" aria-label="Search chats" enterKeyHint="search" />
-                {query && (
-                  <button type="button" className="search-clear" aria-label="Clear" onClick={() => setQuery('')}>
-                    <Icon name="x" size={14} weight="bold" />
-                  </button>
-                )}
-              </label>
-              <button type="button" className="link-btn" onClick={closeSearch}>
-                Cancel
+        <Pull
+          className="home-scroll"
+          onRefresh={async () => {
+            fieldBeat('pulse', { x: innerWidth / 2, y: 0 });
+            if (getState().conn !== 'open') return conn.wake();
+            await refresh([]);
+          }}
+        >
+          <AnimatePresence mode="popLayout" initial={false}>
+            {searching ? (
+              <motion.div key="search" className="home-hero home-search" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={SNAP}>
+                <label className="search">
+                  <Icon name="search" size={18} />
+                  <input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search chats and messages" aria-label="Search chats and messages" enterKeyHint="search" />
+                  {query && (
+                    <button type="button" className="search-clear" aria-label="Clear" onClick={() => setQuery('')}>
+                      <Icon name="x" size={14} weight="bold" />
+                    </button>
+                  )}
+                </label>
+                <button type="button" className="link-btn" onClick={closeSearch}>
+                  Cancel
+                </button>
+              </motion.div>
+            ) : (
+              <motion.div key="hero" className="home-hero" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={SNAP}>
+                <h1 className="home-title">{name}</h1>
+                {/* What waits on you is the strip's to say (said once, not twice). */}
+                <HomeStatus conn={connState} fresh={fresh} working={working} waiting={pending.length ? 0 : waitingChats} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {!loaded && connState === 'offline' ? (
+            <div className="unreachable">
+              <Icon name="offline" size={24} />
+              <p>Can't reach {desktop ?? 'the computer'}</p>
+              <p className="unreachable-hint">Sable must be running there with Phone on.</p>
+              <button type="button" className="btn" onClick={() => (haptic('tap'), conn.wake())}>
+                Try again
               </button>
-            </motion.div>
+            </div>
+          ) : !loaded ? (
+            <div className="home-skel" aria-hidden>
+              <div className="home-skel-card">
+                {Array.from({ length: 7 }, (_, i) => (
+                  <span key={i} className="home-skel-row">
+                    <span className="skel skel-dot" />
+                    <span className="home-skel-lines">
+                      <span className="skel" style={{ width: `${78 - ((i * 17) % 34)}%` }} />
+                      <span className="skel skel-sub" style={{ width: `${30 + ((i * 13) % 22)}%` }} />
+                    </span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : q ? (
+            <SearchResults query={q} onMenu={(id, rect) => setPeek({ id, rect })} />
           ) : (
-            <motion.div key="hero" className="home-hero" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={SNAP}>
-              <h1 className="home-title">{name}</h1>
-              <HomeStatus conn={connState} fresh={fresh} working={working} waiting={waiting.length} />
-            </motion.div>
+            <>
+              <AnimatePresence initial={false}>
+                {hasStrip && <WaitingStrip key="strip" ref={stripRef} onOpen={() => setDeck(true)} />}
+              </AnimatePresence>
+              <Filters value={filter} onChange={setFilter} />
+              <HomeList filter={filter} onMenu={(id, rect) => setPeek({ id, rect })} onClearFilter={() => setFilter('')} />
+            </>
+          )}
+          <div className="home-pad" />
+        </Pull>
+
+        {/* Waiting on you and scrolled past the strip: one line above the bar opens the deck. */}
+        <AnimatePresence>
+          {hasStrip && fresh && !stripSeen && !searching && (
+            <motion.button
+              key="attn"
+              type="button"
+              className="attn glass-liquid"
+              initial={{ opacity: 0, y: 18, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.97 }}
+              transition={SNAP}
+              whileTap={{ scale: 0.98 }}
+              onClick={() => (haptic('tap'), setDeck(true))}
+            >
+              <StatusMark tone="awaiting" size={12} />
+              <span className="attn-text">
+                <span className="attn-title">{pending[0].title}</span>
+                <span className="attn-sub">{pending.length > 1 ? `Waiting for you · ${pending.length - 1} more` : 'Waiting for you'}</span>
+              </span>
+              <span className="attn-go">Review</span>
+            </motion.button>
           )}
         </AnimatePresence>
 
-        {!loaded && connState === 'offline' ? (
-          <div className="unreachable">
-            <Icon name="offline" size={24} />
-            <p>Can't reach {desktop ?? 'the computer'}</p>
-            <p className="unreachable-hint">Sable must be running there with Phone on.</p>
-            <button type="button" className="btn" onClick={() => (haptic('tap'), conn.wake())}>
-              Try again
-            </button>
-          </div>
-        ) : !loaded ? (
-          <div className="home-skel" aria-hidden>
-            {[5, 3].map((n, g) => (
-              <div key={g} className="home-skel-card">
-                {Array.from({ length: n }, (_, i) => (
-                  <span key={i} className="skel" style={{ width: `${78 - ((i * 17 + g * 9) % 30)}%` }} />
-                ))}
-              </div>
-            ))}
-          </div>
-        ) : (
-          <>
-            {!q && live.length > 0 && (
-              <section className="now" ref={nowRef} aria-label="Now">
-                <AnimatePresence initial={false}>
-                  {live.map((s) => (
-                    <LiveCard key={s.id} s={s} onMenu={(rect) => setPeek({ id: s.id, rect })} />
-                  ))}
-                </AnimatePresence>
-              </section>
-            )}
-            {groups.length === 0 && !live.length ? (
-              <p className="empty">{q ? 'No chats match.' : 'No chats yet.'}</p>
-            ) : (
-              groups.map((g) => {
-                const open = more[g.key] || !!q;
-                const shown = open ? g.sessions : g.sessions.slice(0, PER_FOLDER);
-                return (
-                  <motion.section key={g.key} className="group" layout="position" transition={SNAP}>
-                    <h2 className="group-name">
-                      <span>{g.name}</span>
-                      {g.sessions.length > 1 && <span className="group-count num">{g.sessions.length}</span>}
-                    </h2>
-                    <ul className="rows">
-                      <AnimatePresence initial={false}>
-                        {shown.map((s) => (
-                          <Row key={s.id} s={s} leaving={leaving.has(s.id)} onLeft={archived} onMenu={(rect) => setPeek({ id: s.id, rect })} />
-                        ))}
-                      </AnimatePresence>
-                    </ul>
-                    {g.sessions.length > shown.length && (
-                      <button type="button" className="more-row" onClick={() => (haptic('tap'), setMore((m) => ({ ...m, [g.key]: true })))}>
-                        {g.sessions.length - shown.length} more
-                      </button>
-                    )}
-                  </motion.section>
-                );
-              })
-            )}
-          </>
+        <HomeDock covered={under} />
+
+        <LimitsSheet open={limits} onClose={() => setLimits(false)} />
+        {(deckUsed || deck) && (
+          <Suspense fallback={null}>
+            <Deck open={deck} onClose={() => setDeck(false)} />
+          </Suspense>
         )}
-        <div className="home-pad" />
-      </Pull>
-
-      {/* Waiting on you and scrolled past the cards: one line above the field brings it back. */}
-      <AnimatePresence>
-        {waiting.length > 0 && fresh && !nowSeen && !searching && (
-          <motion.button
-            key="attn"
-            type="button"
-            className="attn glass-liquid"
-            initial={{ opacity: 0, y: 18, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 18, scale: 0.97 }}
-            transition={SNAP}
-            whileTap={{ scale: 0.98 }}
-            onClick={(e) => {
-              haptic('tap');
-              openFrom(waiting[0].id, e.currentTarget, 20);
-              nav.chat(waiting[0].id);
-            }}
-          >
-            <StatusMark tone="awaiting" size={12} />
-            <span className="attn-text">
-              <span className="attn-title">{waiting[0].title}</span>
-              <span className="attn-sub">{waiting.length > 1 ? `Waiting for you · ${waiting.length - 1} more` : 'Waiting for you'}</span>
-            </span>
-            <span className="attn-go">Review</span>
-          </motion.button>
-        )}
-      </AnimatePresence>
-
-      <HomeDock covered={under} />
-
-      <LimitsSheet open={limits} onClose={() => setLimits(false)} />
-      <Peek peek={peek} onClose={() => setPeek(null)} onArchive={archive} />
-    </div>
+        <Peek peek={peek} onClose={() => setPeek(null)} />
+      </div>
+    </Under.Provider>
   );
 }
 
@@ -359,7 +370,134 @@ function HomeStatus({ conn: state, fresh, working, waiting }: { conn: string; fr
   );
 }
 
-/** A long press: the chat's actions. Also used by the cards. */
+/**
+ * What waits on you across chats: one calm card at the top of home. The oldest prompt names itself
+ * and its chat; Review opens them one after another (the deck), answerable right here.
+ */
+const WaitingStrip = memo(function WaitingStrip({ onOpen, ref }: { onOpen: () => void; ref: React.Ref<HTMLElement> }) {
+  const pending = usePending();
+  const first = pending[0];
+  const s = useStore((st) => (first ? st.sessions[first.sessionId] : undefined));
+  if (!first) return null;
+  return (
+    <motion.section
+      ref={ref as React.Ref<HTMLElement>}
+      className="wait-strip-wrap"
+      aria-label="Waiting for you"
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: 'auto' }}
+      exit={{ opacity: 0, height: 0 }}
+      transition={REVEAL}
+    >
+      <button type="button" className="wait-strip" onClick={() => (haptic('tap'), onOpen())}>
+        <span className="wait-head">
+          <StatusMark tone="awaiting" size={12} />
+          <span className="wait-count">{pending.length === 1 ? 'Waiting for you' : `${pending.length} waiting for you`}</span>
+          <span className="wait-go">Review</span>
+        </span>
+        <span className="wait-line">
+          {s && <ProviderMark provider={s.provider} size={15} />}
+          <span className="wait-ask">{first.title}</span>
+        </span>
+        <span className="wait-chat">{s?.title ?? ''}</span>
+      </button>
+    </motion.section>
+  );
+});
+
+/** The folders as a row of chips: all chats, or one folder's. */
+function Filters({ value, onChange }: { value: string; onChange: (k: string) => void }) {
+  const key = useHome(foldersKey);
+  const folders = useMemo(() => (key ? key.split('\u0002').map((x) => x.split('\u0001') as [string, string]) : []), [key]);
+  const row = useRef<HTMLDivElement>(null);
+  // The chosen folder stays in view when the row is longer than the screen.
+  useEffect(() => {
+    const el = row.current?.querySelector<HTMLElement>('[aria-pressed="true"]');
+    el?.scrollIntoView({ inline: 'nearest', block: 'nearest', behavior: 'smooth' });
+  }, [value]);
+  // A folder that no longer has chats: back to all.
+  useEffect(() => {
+    if (value && key && !folders.some(([k]) => k === value)) onChange('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  if (folders.length < 2) return null;
+  return (
+    <div className="filters no-drag" ref={row} role="toolbar" aria-label="Folders">
+      <button type="button" className="filter" aria-pressed={!value} onClick={() => value && onChange('')}>
+        All
+      </button>
+      {folders.map(([k, name]) => (
+        <button key={k} type="button" className="filter" aria-pressed={value === k} onClick={() => onChange(value === k ? '' : k)}>
+          {k === '::chats' ? <Icon name="chat" size={14} /> : <Icon name="folder" size={14} />}
+          <span>{name}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Pinned chats, then the rest by their latest activity: one card each, rows of two lines. */
+function HomeList({ filter, onMenu, onClearFilter }: { filter: string; onMenu: (id: string, rect: DOMRect) => void; onClearFilter: () => void }) {
+  const key = useHome((s) => listKey(s, filter));
+  const [limit, setLimit] = useState(FIRST_ROWS);
+  useEffect(() => setLimit(FIRST_ROWS), [filter]);
+  const [pinnedKey, restKey] = key.split('|');
+  const pinned = useMemo(() => (pinnedKey ? pinnedKey.split(',') : []), [pinnedKey]);
+  const rest = useMemo(() => (restKey ? restKey.split(',') : []), [restKey]);
+  const shown = rest.slice(0, Math.max(0, limit - pinned.length));
+  // For start-up timing (DevTools: performance.getEntriesByName('sable:list')).
+  useEffect(() => {
+    if ((pinned.length || rest.length) && !performance.getEntriesByName('sable:list').length) performance.mark('sable:list');
+  }, [pinned.length, rest.length]);
+  if (!pinned.length && !rest.length)
+    return filter ? (
+      <p className="empty">
+        No chats in this folder.{' '}
+        <button type="button" className="link-btn" onClick={onClearFilter}>
+          Show all
+        </button>
+      </p>
+    ) : (
+      <p className="empty">No chats yet.</p>
+    );
+  return (
+    <>
+      <AnimatePresence initial={false}>
+        {pinned.length > 0 && (
+          <motion.section key="pinned" className="group" initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={SNAP}>
+            <h2 className="group-name">Pinned</h2>
+            <Rows ids={pinned} onMenu={onMenu} />
+          </motion.section>
+        )}
+      </AnimatePresence>
+      {rest.length > 0 && (
+        <section className="group">
+          {pinned.length > 0 && <h2 className="group-name">Recent</h2>}
+          <Rows ids={shown} onMenu={onMenu} />
+          {rest.length > shown.length && (
+            <button type="button" className="more-row" onClick={() => (haptic('tap'), setLimit((n) => n + FIRST_ROWS))}>
+              Show more
+            </button>
+          )}
+        </section>
+      )}
+    </>
+  );
+}
+
+export function Rows({ ids, onMenu, swipe = true }: { ids: string[]; onMenu: (id: string, rect: DOMRect) => void; swipe?: boolean }) {
+  return (
+    <ul className="rows">
+      <AnimatePresence initial={false}>
+        {ids.map((id) => (
+          <Row key={id} id={id} onMenu={onMenu} swipe={swipe} search={!swipe} />
+        ))}
+      </AnimatePresence>
+    </ul>
+  );
+}
+
+/** A long press: the chat's actions. */
 function useLongPress(onLong: (el: HTMLElement) => void) {
   const press = useRef<{ timer: number; fired: boolean; x: number; y: number } | null>(null);
   const cancel = () => {
@@ -367,6 +505,7 @@ function useLongPress(onLong: (el: HTMLElement) => void) {
   };
   return {
     fired: () => !!press.current?.fired,
+    cancel,
     handlers: {
       onPointerDown: (e: React.PointerEvent<HTMLElement>) => {
         cancel();
@@ -391,118 +530,224 @@ function useLongPress(onLong: (el: HTMLElement) => void) {
   };
 }
 
-/** A chat racing another (the desktop's `/race`): the race glyph and the word, quiet, beside the time. */
+/** A chat racing another (the desktop's `/race`): the race glyph, quiet, beside the time. */
 function RaceMark() {
   return (
     <span className="race-mark" role="img" aria-label="Racing another chat">
       <RaceGlyph size={13} />
-      <span aria-hidden>Race</span>
     </span>
   );
 }
 
-/** A chat at work or waiting: a card with what it does now, its agent's light at its foot. */
-const LiveCard = memo(function LiveCard({ s, onMenu }: { s: SessionMeta; onMenu: (rect: DOMRect) => void }) {
-  const tone = toneOf(s);
-  const waiting = tone === 'awaiting';
-  const lp = useLongPress((el) => onMenu(el.getBoundingClientRect()));
-  return (
-    <motion.button
-      layout="position"
-      type="button"
-      className="live"
-      data-tone={tone}
-      data-chat={s.id}
-      data-radius="22"
-      initial={{ opacity: 0, y: 12, scale: 0.97 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.16 } }}
-      transition={SNAP}
-      {...lp.handlers}
-      onClick={(e) => {
-        if (lp.fired()) return;
-        haptic('tap');
-        openFrom(s.id, e.currentTarget, 22);
-        nav.chat(s.id);
-      }}
-    >
-      <span className="live-glow" aria-hidden>
-        <i style={{ backgroundImage: `url(${ditherStrip(waiting ? 'amber' : paletteFor(s.provider))})` } as CSSProperties} />
-      </span>
-      <span className="live-line">
-        <ProviderMark provider={s.provider} size={18} />
-        <span className="live-title">{s.title}</span>
-        {openRace(s) && <RaceMark />}
-        <span className="live-end">{waiting ? <StatusMark tone="awaiting" size={13} /> : <Tiles size={14} />}</span>
-      </span>
-      <span className={waiting ? 'live-sub' : 'live-sub shimmer'}>{waiting ? 'Waiting for you' : (s.activity ?? 'Working')}</span>
-    </motion.button>
-  );
-});
+/** Where a swipe commits: a share of the row's width, at most this many pixels. */
+const SWIPE_AT = 0.36;
+const SWIPE_MAX = 132;
 
-const Row = memo(function Row({ s, leaving, onLeft, onMenu }: { s: SessionMeta; leaving: boolean; onLeft: (id: string, ok: boolean) => void; onMenu: (rect: DOMRect) => void }) {
+/**
+ * A chat: its agent's mark, the title, the folder dim under it; the time, and its state at the
+ * right (the working tiles, amber while it waits on you, a dot when unread). Swiped left it archives,
+ * swiped right it pins (or unpins); held, its actions.
+ */
+export const Row = memo(function Row({ id, onMenu, swipe = true, search }: { id: string; onMenu: (id: string, rect: DOMRect) => void; swipe?: boolean; search?: boolean }) {
+  const s = useHome((st) => st.sessions[id]);
+  const projects = useHome((st) => st.projects);
   const now = useNow();
-  const tone = toneOf(s);
   const li = useRef<HTMLLIElement>(null);
-  const lp = useLongPress((el) => onMenu(el.getBoundingClientRect()));
+  const face = useRef<HTMLButtonElement>(null);
+  const swiped = useRef(false);
+  const lp = useLongPress((el) => onMenu(id, el.getBoundingClientRect()));
+  const lpCancel = useRef(lp.cancel);
+  lpCancel.current = lp.cancel;
+  const [gone, setGone] = useState(false);
 
-  // Archived: the row dissolves into the card in dither order, the gap closes, then the desktop is told.
+  // The finger: a sideways pull moves the row over its two actions; up and down stays a scroll (touch-action: pan-y).
   useEffect(() => {
     const el = li.current;
-    if (!leaving || !el) return;
+    const f = face.current;
+    if (!el || !f || !swipe) return;
+    let pid: number | null = null;
+    let x0 = 0;
+    let y0 = 0;
+    let x = 0;
+    let mode: 'idle' | 'maybe' | 'swipe' = 'idle';
+    let armed: 'pin' | 'archive' | null = null;
+    let spring: { stop: () => void } | null = null;
+    const pin = el.querySelector<HTMLElement>('.swipe-pin');
+    const arc = el.querySelector<HTMLElement>('.swipe-archive');
+    const at = () => Math.min(el.offsetWidth * SWIPE_AT, SWIPE_MAX);
+    const set = (v: number) => {
+      x = v;
+      f.style.transform = v ? `translate3d(${v.toFixed(1)}px, 0, 0)` : '';
+      const t = at();
+      if (pin) pin.style.opacity = String(Math.min(1, Math.max(0, v) / (t * 0.6)));
+      if (arc) arc.style.opacity = String(Math.min(1, Math.max(0, -v) / (t * 0.6)));
+    };
+    const arm = (next: typeof armed) => {
+      if (next === armed) return;
+      armed = next;
+      el.dataset.armed = next ?? '';
+      if (next) haptic('select');
+    };
+    const settle = (to: number, done?: () => void) => {
+      spring?.stop();
+      spring = animate(x, to, { type: 'spring', stiffness: 520, damping: 42, restDelta: 0.5, onUpdate: set, onComplete: done });
+    };
+    const down = (e: PointerEvent) => {
+      if (pid !== null || (e.pointerType === 'mouse' && e.button !== 0)) return;
+      spring?.stop();
+      pid = e.pointerId;
+      x0 = e.clientX - x;
+      y0 = e.clientY;
+      mode = 'maybe';
+    };
+    const move = (e: PointerEvent) => {
+      if (e.pointerId !== pid || mode === 'idle') return;
+      const dx = e.clientX - x0;
+      const dy = e.clientY - y0;
+      if (mode === 'maybe') {
+        if (Math.abs(dx) < 10 || Math.abs(dx) < Math.abs(dy) * 1.3) {
+          if (Math.abs(dy) > 10) mode = 'idle';
+          return;
+        }
+        mode = 'swipe';
+        lpCancel.current();
+        el.dataset.swiping = '';
+        try {
+          f.setPointerCapture(e.pointerId);
+        } catch {
+          /* gone */
+        }
+      }
+      const t = at();
+      // Past the line it gets heavier (a rubber band), so the finger feels where it commits.
+      const v = Math.abs(dx) <= t ? dx : Math.sign(dx) * (t + (Math.abs(dx) - t) * 0.35);
+      set(v);
+      arm(v >= t ? 'pin' : v <= -t ? 'archive' : null);
+    };
+    const up = (e: PointerEvent) => {
+      if (e.pointerId !== pid) return;
+      pid = null;
+      if (mode !== 'swipe') return void (mode = 'idle');
+      mode = 'idle';
+      swiped.current = true;
+      window.setTimeout(() => (swiped.current = false), 50);
+      const go = armed;
+      arm(null);
+      if (go === 'archive') {
+        haptic('tap');
+        settle(-el.offsetWidth - 24, () => setGone(true));
+      } else {
+        settle(0, () => delete el.dataset.swiping);
+        if (go === 'pin') {
+          const cur = getState().sessions[id];
+          if (cur) void conn.call('session.update', { sessionId: id, patch: { pinned: !cur.pinned } }).catch(() => setState({ toast: { text: 'Could not pin it', level: 'error', at: Date.now() } }));
+        }
+      }
+    };
+    const cancel = (e: PointerEvent) => {
+      if (e.pointerId !== pid) return;
+      pid = null;
+      if (mode === 'swipe') settle(0, () => delete el.dataset.swiping);
+      mode = 'idle';
+      arm(null);
+    };
+    el.addEventListener('pointerdown', down);
+    el.addEventListener('pointermove', move);
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', cancel);
+    return () => {
+      spring?.stop();
+      el.removeEventListener('pointerdown', down);
+      el.removeEventListener('pointermove', move);
+      el.removeEventListener('pointerup', up);
+      el.removeEventListener('pointercancel', cancel);
+    };
+  }, [id, swipe]);
+
+  // Swiped away: the gap closes, then the desktop is told (back in place if it refuses).
+  useEffect(() => {
+    const el = li.current;
+    if (!gone || !el) return;
     let live = true;
-    const v = veil(el, 'cover', { color: 'rgb(18 18 21)', duration: 300, bands: 3, from: 'top', cell: 3, z: 3 });
-    void v.done
-      .then(() => animate(el, { height: [el.offsetHeight, 0], opacity: [1, 0] }, { ...REVEAL, restDelta: 0.5 }).finished)
-      .then(() => conn.call('session.update', { sessionId: s.id, patch: { archived: true } }))
+    void animate(el, { height: [el.offsetHeight, 0], opacity: [1, 0] }, { ...REVEAL, restDelta: 0.5 })
+      .finished.then(() => conn.call('session.update', { sessionId: id, patch: { archived: true } }))
       .then(
-        () => live && onLeft(s.id, true),
+        () => {},
         () => {
           if (!live) return;
-          v.remove();
           el.style.height = '';
           el.style.opacity = '';
-          onLeft(s.id, false);
+          if (face.current) face.current.style.transform = '';
+          delete el.dataset.swiping;
+          setGone(false);
           setState({ toast: { text: 'Could not archive it', level: 'error', at: Date.now() } });
         },
       );
     return () => {
       live = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leaving]);
+  }, [gone, id]);
 
+  if (!s) return null;
+  const tone = toneOf(s);
+  const folder = folderName(s, projects);
   return (
     <motion.li
       ref={li}
       layout="position"
+      className="rrow"
       initial={{ height: 0, opacity: 0 }}
       animate={{ height: 'auto', opacity: 1 }}
       exit={{ height: 0, opacity: 0, transition: { duration: 0.2 } }}
       transition={SNAP}
-      style={{ overflow: 'hidden' }}
     >
+      {swipe && (
+        <>
+          <span className="swipe-act swipe-pin" aria-hidden>
+            <span className="swipe-disc">
+              <Icon name={s.pinned ? 'unpin' : 'pin'} size={18} />
+            </span>
+            <span className="swipe-word">{s.pinned ? 'Unpin' : 'Pin'}</span>
+          </span>
+          <span className="swipe-act swipe-archive" aria-hidden>
+            <span className="swipe-word">Archive</span>
+            <span className="swipe-disc">
+              <Icon name="archive" size={18} />
+            </span>
+          </span>
+        </>
+      )}
       <button
+        ref={face}
         type="button"
         className="row"
         data-tone={tone}
-        data-chat={s.id}
-        data-radius="16"
+        data-chat={search ? undefined : id}
+        data-radius="17"
         {...lp.handlers}
         onClick={(e) => {
-          if (lp.fired() || leaving) return;
+          if (lp.fired() || swiped.current || gone) return;
           haptic('tap');
-          openFrom(s.id, e.currentTarget, 16);
-          nav.chat(s.id);
+          openFrom(id, e.currentTarget, 17);
+          nav.chat(id);
         }}
       >
-        <ProviderMark provider={s.provider} size={16} />
-        <span className="row-title">{s.title}</span>
+        <span className="row-mark">
+          <ProviderMark provider={s.provider} size={18} />
+        </span>
+        <span className="row-main">
+          <span className="row-title">{s.title}</span>
+          <span className="row-sub">
+            {tone === 'awaiting' ? <span className="row-wait">Waiting for you</span> : <span className="row-folder">{folder}</span>}
+          </span>
+        </span>
         <span className="row-end">
-          {tone === 'error' ? <StatusMark tone="error" /> : tone === 'unread' ? <StatusMark tone="unread" size={10} /> : null}
-          {openRace(s) && <RaceMark />}
-          {s.pinned && <Icon name="pin" size={13} className="row-pin" />}
-          <span className="row-time num">{timeAgo(s.updatedAt, now)}</span>
+          <span className="row-time num">{tone === 'working' ? '' : timeAgo(s.updatedAt, now)}</span>
+          <span className="row-state">
+            {openRace(s) && <RaceMark />}
+            {s.pinned && !swipe && <Icon name="pin" size={12} className="row-pin" />}
+            {tone === 'working' ? <Tiles size={11} /> : tone === 'awaiting' ? <StatusMark tone="awaiting" size={11} /> : tone === 'error' ? <StatusMark tone="error" size={10} /> : tone === 'unread' ? <StatusMark tone="unread" size={10} /> : null}
+          </span>
         </span>
       </button>
     </motion.li>
@@ -513,7 +758,7 @@ const Row = memo(function Row({ s, leaving, onLeft, onMenu }: { s: SessionMeta; 
  * A long press lifts the chat out of the list: the row (as it was) over a dimmed screen, its
  * actions under it. Rename turns the menu into a field in place.
  */
-function Peek({ peek, onClose, onArchive }: { peek: { id: string; rect: DOMRect } | null; onClose: () => void; onArchive: (id: string) => void }) {
+function Peek({ peek, onClose }: { peek: { id: string; rect: DOMRect } | null; onClose: () => void }) {
   const s = useStore((st) => (peek ? st.sessions[peek.id] : undefined));
   const [renaming, setRenaming] = useState(false);
   const [title, setTitle] = useState('');
@@ -534,6 +779,12 @@ function Peek({ peek, onClose, onArchive }: { peek: { id: string; rect: DOMRect 
     void conn.call('session.update', { sessionId: s.id, patch: { pinned: !s.pinned } }).catch(() => {});
     onClose();
   };
+  const archive = () => {
+    if (!s) return;
+    haptic('select');
+    onClose();
+    void conn.call('session.update', { sessionId: s.id, patch: { archived: true } }).catch(() => setState({ toast: { text: 'Could not archive it', level: 'error', at: Date.now() } }));
+  };
   return createPortal(
     <AnimatePresence>
       {show && (
@@ -547,7 +798,7 @@ function Peek({ peek, onClose, onArchive }: { peek: { id: string; rect: DOMRect 
             exit={{ scale: 1, opacity: 0, transition: { duration: 0.14 } }}
             transition={SNAP}
           >
-            <ProviderMark provider={s!.provider} size={16} />
+            <ProviderMark provider={s!.provider} size={18} />
             <span className="row-title">{s!.title}</span>
           </motion.div>
           <motion.div
@@ -584,15 +835,7 @@ function Peek({ peek, onClose, onArchive }: { peek: { id: string; rect: DOMRect 
                   <span>Rename</span>
                   <Icon name="edit" size={19} />
                 </button>
-                <button
-                  type="button"
-                  className="peek-item"
-                  onClick={() => {
-                    haptic('select');
-                    onClose();
-                    onArchive(s!.id);
-                  }}
-                >
+                <button type="button" className="peek-item" onClick={archive}>
                   <span>Archive</span>
                   <Icon name="archive" size={19} />
                 </button>

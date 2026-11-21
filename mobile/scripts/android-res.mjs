@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { shortcutResources } from './shortcuts-res.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const main = path.join(here, '..', 'android', 'app', 'src', 'main');
@@ -136,6 +137,9 @@ if (!m.includes('KeepAliveService'))
   );
 if (!m.includes('android.hardware.camera')) m = m.replace('<!-- Permissions -->', '<!-- Permissions -->\n    <uses-feature android:name="android.hardware.camera" android:required="false" />');
 writeFileSync(mf, m);
+
+// The app icon's shortcuts: "New chat", and the icons for the chats the app adds (shortcuts-res.mjs).
+shortcutResources(main, path.join(here, '..', 'src', 'ui', 'icon-data.ts'));
 
 // PNG launcher icons (legacy and adaptive foreground), drawn by headless Edge.
 const require = createRequire(path.join(here, '..', '..', 'package.json'));

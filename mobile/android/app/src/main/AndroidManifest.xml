@@ -31,6 +31,9 @@
                 <data android:scheme="sable" android:host="pair" />
             </intent-filter>
 
+            <!-- The app icon's shortcuts: "New chat" here, the last chats from the app (SystemPlugin). -->
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
+
         </activity>
 
         <provider

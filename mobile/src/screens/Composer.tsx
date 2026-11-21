@@ -9,7 +9,7 @@ import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
 import { onPutDraft } from '@m/lib/put-draft';
 import { haptic } from '@m/lib/native';
-import { ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, useStore } from '@m/lib/store';
+import { acceptIntent, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, useStore } from '@m/lib/store';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
@@ -160,15 +160,19 @@ export function Composer({ sid }: { sid: string }) {
   const speed = speedFor(model, s.speed);
   const modelLabel = modelName(model) ?? modelNameById(s.model, caps?.models) ?? 'Model';
   const away = AGENTS.filter((p) => p !== s.provider && signedIn(providers[p]));
-  // Every choice shows at once (the store holds it against older answers) and goes back if the desktop refuses it.
+  // Every choice shows at once (the store holds it against older answers). Accepted, it is the field's
+  // truth; refused, the field goes back to what the desktop last said, but only for the newest choice
+  // of that field (an older one failing late changes nothing: lib/intents.ts).
   const choose = <K extends 'model' | 'effort' | 'speed' | 'mode'>(key: K, value: SessionMeta[K], call: () => Promise<unknown>) => {
-    const was = { [key]: s[key] } as Partial<SessionMeta>;
-    intend(sid, { [key]: value } as Partial<SessionMeta>);
-    void call().catch((err) => {
-      undoIntent(sid, was);
-      haptic('deny');
-      toast((err as Error).message, 'error');
-    });
+    const gen = intend(sid, key, value);
+    void call().then(
+      () => acceptIntent(sid, key, value),
+      (err) => {
+        if (!undoIntent(sid, key, gen)) return;
+        haptic('deny');
+        toast((err as Error).message, 'error');
+      },
+    );
   };
   const setup: SetupState = {
     agent: s.provider,

@@ -19,6 +19,9 @@ import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
 import { FileGlyph, kindName } from '@m/ui/FileGlyph';
 import { PROVIDER_NAME, ProviderMark, Ring, StatusMark, Tiles } from '@m/ui/marks';
 import { REVEAL, reduced } from '@m/ui/motion';
+import { keptPic, loadPic } from '@m/lib/pics';
+import { openViewer, viewerLoaded } from '@m/ui/Viewer';
+import { holdMessage } from './MessageMenu';
 import { SynLine } from './Synthetic';
 
 const useItem = <T extends TimelineItem>(sid: string, id: string | null | undefined) => useStore((s) => (id ? (sessionData(s, sid).items[id] as T | undefined) : undefined));
@@ -80,7 +83,7 @@ export const TurnView = memo(function TurnView({ sid, turn, newest }: { sid: str
   const last = turn.segments.length - 1;
   const running = turn.state === 'running';
   return (
-    <section className="turn" data-live={running || undefined}>
+    <section className="turn" data-live={running || undefined} data-turn={turn.key}>
       {turn.segments.map((seg, i) => (
         <SegmentView key={seg.key} sid={sid} seg={seg} turn={turn} index={i} live={running && i === last} />
       ))}
@@ -113,8 +116,8 @@ function TurnFoot({ sid, turn }: { sid: string; turn: TurnGroup }) {
 }
 
 /**
- * A segment as it reads: the message, each thing the agent says in order (reports one tone back,
- * the answer and a steered message's reply at full strength), and one line for the work: live
+ * A segment as it reads: the message, each thing the agent says in order (reports, the answer and a
+ * steered message's reply, all at full strength; only thinking sits back), and one line for the work: live
  * while it runs (what it does now, the time, how many steps), the summary once it settled. A tap
  * on the line opens every run of steps in its place between the texts.
  */
@@ -450,8 +453,14 @@ const UserBubble = memo(function UserBubble({ sid, id, steered, queued }: { sid:
   const waitingSteer = steered && it.state === 'queued';
   const words = review ? review.lead : stripWrappers(it.text);
   return (
-    <div className="user-row" data-steered={steered || undefined} data-queued={queued || waitingSteer || undefined}>
-      <div ref={ref} className="user-bubble" data-long={long && !open ? true : undefined} onClick={() => long && (haptic('select'), setOpen((v) => !v))}>
+    <div className="user-row" data-id={id} data-steered={steered || undefined} data-queued={queued || waitingSteer || undefined}>
+      <div
+        ref={ref}
+        className="user-bubble"
+        data-long={long && !open ? true : undefined}
+        onClick={() => long && (haptic('select'), setOpen((v) => !v))}
+        onContextMenu={(e) => holdMessage(e, e.currentTarget.parentElement, () => (cut ? fetchItem(sid, id).then((r) => stripWrappers((r.item as UserItem).text)) : words || it.text))}
+      >
         {images.length > 0 && (
           <div className="user-images">
             {images.map((a) => (
@@ -552,6 +561,7 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
         {it.result?.diff && <DiffStat diff={it.result.diff} />}
         {(status === 'error' || status === 'denied') && <span className="step-flag">{status === 'denied' ? 'Denied' : 'Failed'}</span>}
       </button>
+      {!!(it as PhoneItem).pics && <Pics sid={sid} id={id} n={(it as PhoneItem).pics!} />}
       <AnimatePresence initial={false}>
         {open && (detail || more) && (
           <motion.div className="step-detail-wrap" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={REVEAL}>
@@ -565,6 +575,53 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
     </div>
   );
 });
+
+/** A step's pictures (a screenshot): thumbnails under its line, each asked of the desktop; a tap opens them full screen. */
+function Pics({ sid, id, n }: { sid: string; id: string; n: number }) {
+  const count = Math.min(n, 12);
+  const open = (index: number, el: HTMLElement) => {
+    haptic('tap');
+    const srcs = Array.from({ length: count }, (_, i) => keptPic(sid, id, i) ?? null);
+    openViewer({ srcs, index, from: el.getBoundingClientRect() });
+    srcs.forEach((src, i) => !src && void loadPic(sid, id, i).then((d) => viewerLoaded(i, d), () => {}));
+  };
+  return (
+    <div className="pics no-drag">
+      {Array.from({ length: count }, (_, i) => (
+        <Pic key={i} sid={sid} id={id} index={i} onOpen={open} />
+      ))}
+    </div>
+  );
+}
+
+function Pic({ sid, id, index, onOpen }: { sid: string; id: string; index: number; onOpen: (index: number, el: HTMLElement) => void }) {
+  const [src, setSrc] = useState(() => keptPic(sid, id, index));
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (src) return;
+    let live = true;
+    void loadPic(sid, id, index).then(
+      (d) => live && setSrc(d),
+      () => live && setFailed(true),
+    );
+    return () => {
+      live = false;
+    };
+  }, [sid, id, index, src]);
+  return (
+    <button type="button" className="pic" aria-label={`Picture ${index + 1}`} disabled={failed} onClick={(e) => onOpen(index, e.currentTarget)}>
+      {src ? (
+        <img src={src} alt="" decoding="async" />
+      ) : failed ? (
+        <span className="pic-failed">
+          <Icon name="image" size={18} />
+        </span>
+      ) : (
+        <span className="skel" aria-label="Loading" />
+      )}
+    </button>
+  );
+}
 
 /** Text between steps: plain, with `code` set as code (not shown with its backticks). */
 function inlineCode(text: string): ReactNode {
@@ -908,7 +965,16 @@ const Answer = memo(function Answer({ sid, id, tone = 'answer' }: { sid: string;
   const cut = (it as PhoneItem).cut && !it.streaming;
   return (
     <>
-      <div className="md" data-tone={tone} data-streaming={it.streaming || undefined} data-cut={cut || undefined} onClick={copyCode} dangerouslySetInnerHTML={{ __html: html }} />
+      <div
+        className="md"
+        data-id={id}
+        data-tone={tone}
+        data-streaming={it.streaming || undefined}
+        data-cut={cut || undefined}
+        onClick={copyCode}
+        onContextMenu={(e) => holdMessage(e, e.currentTarget, () => (cut ? fetchItem(sid, id).then((r) => (r.item as TextItem).text) : it.text))}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
       {cut && (
         <button
           type="button"

@@ -106,7 +106,7 @@ let channelMade = false;
 const idFor = (sessionId: string) => {
   let h = 7;
   for (let i = 0; i < sessionId.length; i++) h = (h * 31 + sessionId.charCodeAt(i)) | 0;
-  return (Math.abs(h) % 2_000_000_000) + 1;
+  return (Math.abs(h) % 2_000_000_000) + 2;
 };
 
 export async function notificationsAllowed(): Promise<boolean> {
@@ -128,7 +128,41 @@ export async function askNotifications(): Promise<boolean> {
   }
 }
 
-export async function notify(title: string, body: string, sessionId: string) {
+/** What a notification says happened: a turn ended (or failed), or the chat waits on you; 'home' for the summary. */
+export type NoteKind = 'done' | 'waiting' | 'home';
+
+/** Each chat's lines since the app was last on screen, newest first (one notification per chat holds them). */
+const lines = new Map<string, { title: string; lines: string[] }>();
+const GROUP = 'sable.chats';
+const SUMMARY_ID = 1;
+
+/** The chats with a notification up (kept across restarts): the summary stays while there are two or more. */
+const POSTED = 'sable.notified';
+const posted = new Set<string>(
+  (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(POSTED) ?? '[]') as unknown;
+      return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(-50) : [];
+    } catch {
+      return [];
+    }
+  })(),
+);
+const keepPosted = () => {
+  try {
+    localStorage.setItem(POSTED, JSON.stringify([...posted]));
+  } catch {
+    /* full */
+  }
+};
+
+/**
+ * One notification per chat, grouped under Sable: its newest news as the line, the earlier ones of
+ * this time away listed under it when expanded ("Waiting for you", then "Done"). A tap opens the chat
+ * where it matters: its prompt when it waits on you, the newest turn when one ended; the group's own
+ * line opens home.
+ */
+export async function notify(title: string, body: string, sessionId: string, kind: NoteKind = 'done') {
   if (!isNative) return;
   try {
     // Never ask from the background (the plugin would try to show a prompt): only post when allowed.
@@ -137,22 +171,82 @@ export async function notify(title: string, body: string, sessionId: string) {
       channelMade = true;
       await LocalNotifications.createChannel({ id: 'turns', name: 'Turns', description: 'A turn ended or waits for you', importance: 4, visibility: 1, vibration: true }).catch(() => {});
     }
-    await LocalNotifications.schedule({
+    const line = body.slice(0, 180);
+    const cur = lines.get(sessionId) ?? { title, lines: [] };
+    cur.title = title;
+    cur.lines = [line, ...cur.lines.filter((l) => l !== line)].slice(0, 5);
+    lines.set(sessionId, cur);
+    posted.delete(sessionId);
+    posted.add(sessionId);
+    keepPosted();
+    const common = { channelId: 'turns', smallIcon: 'ic_stat_sable', iconColor: '#f2f1ee', isExactNotification: false, group: GROUP };
+    const notifications: Parameters<typeof LocalNotifications.schedule>[0]['notifications'] = [
       // Shown now, not at a time: no exact alarm (asking for one would open a settings screen, impossible from the background).
-      notifications: [{ id: idFor(sessionId), title, body: body.slice(0, 180), channelId: 'turns', extra: { sessionId }, smallIcon: 'ic_stat_sable', iconColor: '#f2f1ee', isExactNotification: false }],
-    });
+      { ...common, id: idFor(sessionId), title, body: line, extra: { sessionId, kind }, ...(cur.lines.length > 1 ? { inboxList: cur.lines, summaryText: title } : {}) },
+    ];
+    // Two chats or more: one summary holds them together (its own tap opens home).
+    if (posted.size > 1) notifications.push({ ...common, id: SUMMARY_ID, title: 'Sable', body: `${posted.size} chats`, groupSummary: true, summaryText: `${posted.size} chats`, extra: { kind: 'home' } });
+    await LocalNotifications.schedule({ notifications });
   } catch {
     /* not allowed */
   }
 }
 
-export function onNotificationTap(fn: (sessionId: string) => void) {
+/**
+ * A chat opened on the phone: its notification goes. The summary goes only with the last chat's
+ * (cancelling a summary takes every notification of its group with it).
+ */
+export function clearNotification(sessionId: string) {
+  if (!isNative) return;
+  lines.delete(sessionId);
+  const had = posted.delete(sessionId);
+  if (had) keepPosted();
+  const ids = [{ id: idFor(sessionId) }, ...(had && posted.size === 0 ? [{ id: SUMMARY_ID }] : [])];
+  void LocalNotifications.cancel({ notifications: ids }).catch(() => {});
+}
+
+/** Back on screen: the lines of the time away start over (the notifications stay until opened or swiped). */
+export function forgetNotificationLines() {
+  lines.clear();
+}
+
+export function onNotificationTap(fn: (sessionId: string, kind: NoteKind) => void) {
   if (!isNative) return () => {};
   const h = LocalNotifications.addListener('localNotificationActionPerformed', (a) => {
-    const id = (a.notification.extra as { sessionId?: string } | undefined)?.sessionId;
-    if (id) fn(id);
+    const x = a.notification.extra as { sessionId?: string; kind?: NoteKind } | undefined;
+    if (x?.sessionId) fn(x.sessionId, x.kind === 'waiting' ? 'waiting' : 'done');
+    else if (x?.kind === 'home') fn('', 'home');
   });
   return () => void h.then((x) => x.remove());
+}
+
+// ── the system: share a text, the app icon's shortcuts (android/…/SystemPlugin.java) ──
+
+const System = registerPlugin<{
+  share(o: { text: string; title?: string }): Promise<void>;
+  shortcuts(o: { chats: { id: string; title: string }[] }): Promise<void>;
+}>('System');
+
+/** Android's share sheet for a text (a message); a browser's own where there is one. False when nothing could share it. */
+export async function shareText(text: string, title?: string): Promise<boolean> {
+  try {
+    if (isNative) await System.share({ text, ...(title ? { title } : {}) });
+    else if (navigator.share) await navigator.share({ text, ...(title ? { title } : {}) });
+    else return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let shortcutsKey = '';
+/** The app icon's shortcuts: "New chat" (static, in the manifest) and the last chats, newest first. */
+export function setShortcuts(chats: { id: string; title: string }[]) {
+  if (!isNative) return;
+  const key = JSON.stringify(chats);
+  if (key === shortcutsKey) return;
+  shortcutsKey = key;
+  void System.shortcuts({ chats }).catch(() => (shortcutsKey = ''));
 }
 
 // ── the connection kept in the background (android/…/KeepAliveService.java) ──
@@ -203,7 +297,10 @@ export function onBackButton(fn: () => boolean) {
   return () => void h.then((x) => x.remove());
 }
 
-/** Pairing links opened from the camera or another app (`sable://pair?...`), the launch one included. */
+/**
+ * Sable's links opened from the camera, another app or the app icon's shortcuts (`sable://pair?...`,
+ * `sable://new`, `sable://chat/<id>`), the launch one included.
+ */
 export function onPairLink(fn: (url: string) => void) {
   if (!isNative) {
     const q = new URLSearchParams(location.search).get('pair');

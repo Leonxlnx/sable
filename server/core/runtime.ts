@@ -48,8 +48,11 @@ export class SessionRuntime {
   queue: QueuedMessage[] = [];
   /** The user stopped the current turn (interrupt or close): its end sends nothing from the queue. */
   stopRequested = false;
-  /** Called after every turn end; `error` is set when the turn failed. */
-  onTurnEnd?: (rt: SessionRuntime, error?: string) => void;
+  /**
+   * Called after every turn end; `error` is set when the turn failed. `hold`: the agent could not say
+   * how the turn ended (it went idle without its end), so nothing queued goes out by itself.
+   */
+  onTurnEnd?: (rt: SessionRuntime, error?: string, opts?: { hold?: boolean }) => void;
   /** Called as a turn begins (an until loop's check in flight gives way to it). */
   onTurnStart?: (rt: SessionRuntime) => void;
 
@@ -329,11 +332,11 @@ export class SessionRuntime {
     this.onTurnStart?.(this);
   }
 
-  endTurn(error?: string) {
+  endTurn(error?: string, opts?: { hold?: boolean }) {
     this.turnActive = false;
     this.cancelPrompts();
     this.update({ status: error ? 'error' : 'idle', lastError: error, activity: undefined, updatedAt: Date.now() });
-    this.onTurnEnd?.(this, error);
+    this.onTurnEnd?.(this, error, opts);
   }
 
   /** How long, between `from` and `to`, the session waited for the user (some prompt was open). */

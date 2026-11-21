@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Capabilities } from '@shared/protocol';
 import { capsFromAnywhere } from '@/features/composer/choice';
-import { folderOf } from '@/features/timeline/FileCard';
+import { folderOf, shareReadable, sharedPath, sheetKey } from '@/features/timeline/FileCard';
 import { coverWord, sheetOf, wantsText } from '@/features/timeline/file-sheet';
 
 describe('folderOf', () => {
@@ -19,6 +19,28 @@ describe('folderOf', () => {
 
   it('has nothing to say for a bare name', () => {
     expect(folderOf('audit.pdf', '/work', '/home/me')).toBe('');
+  });
+});
+
+describe('a shared file on its card', () => {
+  it('is read for its page only once the share went through', () => {
+    expect(shareReadable({ status: 'done' })).toBe(true);
+    for (const status of ['pending', 'running', 'awaiting', 'denied', 'cancelled', 'error'] as const) expect(shareReadable({ status }), status).toBe(false);
+  });
+
+  it('lies in the chat folder when the agent named it relative to it', () => {
+    expect(sharedPath('reports/audit.pdf', 'C:\\work\\relay-api')).toBe('C:\\work\\relay-api\\reports/audit.pdf');
+    expect(sharedPath('./out.csv', '/work/relay-api/')).toBe('/work/relay-api/out.csv');
+    expect(sharedPath('C:\\Users\\me\\a.txt', 'C:\\work')).toBe('C:\\Users\\me\\a.txt');
+    expect(sharedPath('/srv/a.txt', '/work')).toBe('/srv/a.txt');
+    expect(sharedPath('a.txt', '')).toBe('a.txt');
+  });
+
+  it('keeps its page per share step: the same file shared again at the same size is read again', () => {
+    const before = sheetKey('share-1', 0, 'C:\\work\\report.md', 1200);
+    expect(sheetKey('share-2', 0, 'C:\\work\\report.md', 1200)).not.toBe(before);
+    expect(sheetKey('share-1', 0, 'C:\\work\\report.md', 1200)).toBe(before);
+    expect(sheetKey('share-1', 1, 'C:\\work\\report.md', 1200)).not.toBe(before);
   });
 });
 

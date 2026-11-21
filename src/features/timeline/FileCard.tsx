@@ -29,6 +29,22 @@ export function folderOf(file: string, cwd: string, home: string): string {
   return root.slice(root.lastIndexOf('/') + 1) || rel;
 }
 
+/** A shared file's path as the computer knows it: one the agent named relative to the chat's folder lies in that folder. */
+export function sharedPath(file: string, cwd: string): string {
+  if (!file || /^([a-z]:[\\/]|[\\/])/i.test(file) || !cwd) return file;
+  const sep = cwd.includes('\\') && !cwd.includes('/') ? '\\' : '/';
+  return `${cwd.replace(/[\\/]+$/, '')}${sep}${file.replace(/^\.[\\/]/, '')}`;
+}
+
+/** Whether a share step's files may be read for their cards: only once it went through (not while asked, nor denied, stopped or failed). */
+export const shareReadable = (item: Pick<ToolItem, 'status'>) => item.status === 'done';
+
+/**
+ * The key a card's page is kept under: this share step's file (a file handed over again is another
+ * step, so a report rewritten at the same size shows its new page), at its size.
+ */
+export const sheetKey = (itemId: string, index: number, path: string, size?: number) => `${itemId}\n${index}\n${path}\n${size ?? ''}`;
+
 /**
  * Files the agent hands over (Claude Code's SendUserFile), always in view like a widget: its caption
  * as a quiet line, then one card per file, side by side.
@@ -37,6 +53,8 @@ export const FileShare = memo(function FileShare({ item }: { item: ToolItem }) {
   const files = item.detail.files ?? [];
   const caption = item.detail.caption?.trim();
   const failed = item.status === 'error';
+  // A page of the file only once the share went through (never for one waiting, denied or stopped).
+  const readable = shareReadable(item);
   if (!files.length) {
     // The call is still arriving: one card's room, so nothing jumps when the files are named.
     return isActive(item) ? (
@@ -69,7 +87,7 @@ export const FileShare = memo(function FileShare({ item }: { item: ToolItem }) {
       {caption && <Markdown text={caption} className="fshare-caption" />}
       <div className="fshare-list" role="list" aria-label={files.length === 1 ? 'Shared file' : 'Shared files'}>
         {files.map((f, i) => (
-          <FileCard key={`${i}:${f.path}`} file={f} failed={failed} />
+          <FileCard key={`${i}:${f.path}`} file={f} failed={failed} readable={readable} sheet={sheetKey(item.id, i, f.path, f.size)} />
         ))}
       </div>
     </div>
@@ -78,7 +96,7 @@ export const FileShare = memo(function FileShare({ item }: { item: ToolItem }) {
 
 // ── the sheet: what the file's first page looks like ──
 
-/** Sheets read so far, by path and size (a file handed over again with the same size is the same page). */
+/** Sheets read so far, by share step and file (`sheetKey`). */
 const sheets = new Map<string, Sheet>();
 const SHEETS_MAX = 120;
 
@@ -86,28 +104,29 @@ const SHEETS_MAX = 120;
  * The page a card shows: for a text file its real first lines (read once, a couple of kilobytes),
  * a table for CSV, the drawing itself for an SVG; for anything else a cover with its kind.
  * The cover shows at once and the page fades in over it, so the card never changes size.
+ * `key` (`sheetKey`): a new key never shows the page read for another.
  */
-function useSheet(file: SharedFile, skip: boolean): Sheet | null {
-  const key = `${file.path}\n${file.size ?? ''}`;
+function useSheet(file: SharedFile, at: string, key: string, skip: boolean): Sheet | null {
   const want = !skip && wantsText(file.name, file.size);
-  const [sheet, setSheet] = useState<Sheet | null>(() => sheets.get(key) ?? null);
+  const [read, setRead] = useState<{ key: string; sheet: Sheet } | null>(null);
   useEffect(() => {
     if (!want || sheets.has(key)) return;
     let live = true;
     bridge
-      .call('fs.read', { path: file.path, maxBytes: want })
+      .call('fs.read', { path: at, maxBytes: want })
       .then((r) => {
         const s = sheetOf(file.name, r.binary ? '' : r.content, r.truncated);
         if (sheets.size >= SHEETS_MAX) sheets.delete(sheets.keys().next().value!);
         sheets.set(key, s);
-        if (live) setSheet(s);
+        if (live) setRead({ key, sheet: s });
       })
       .catch(() => {});
     return () => {
       live = false;
     };
   }, [key, want]); // eslint-disable-line react-hooks/exhaustive-deps
-  return want ? sheet : null;
+  if (!want) return null;
+  return sheets.get(key) ?? (read?.key === key ? read.sheet : null);
 }
 
 const Page = memo(function Page({ sheet }: { sheet: Sheet }) {
@@ -146,13 +165,15 @@ const Page = memo(function Page({ sheet }: { sheet: Sheet }) {
  * with its kind otherwise), its name, its size and where it lies. The whole card opens the file
  * with its app; Show in folder and Copy path come forward on hover or focus.
  */
-const FileCard = memo(function FileCard({ file, failed }: { file: SharedFile; failed: boolean }) {
+const FileCard = memo(function FileCard({ file, failed, readable, sheet: key }: { file: SharedFile; failed: boolean; readable: boolean; sheet: string }) {
   const { cwd, home } = useTimeline();
-  const where = folderOf(file.path, cwd, home);
+  // Where it is on the computer: a name relative to the chat's folder lies in it.
+  const at = sharedPath(file.path, cwd);
+  const where = folderOf(at, cwd, home);
   // The folder by its own name (the whole path is the card's tooltip, and Show in folder goes there).
   const folder = where.slice(where.replace(/\/+$/, '').lastIndexOf('/') + 1);
   const size = formatBytes(file.size);
-  const sheet = useSheet(file, failed);
+  const sheet = useSheet(file, at, key, failed || !readable);
   const page = sheet && sheet.kind !== 'cover' ? sheet : null;
   return (
     <div className="fcard" role="listitem" data-spot data-failed={failed || undefined}>
@@ -173,7 +194,7 @@ const FileCard = memo(function FileCard({ file, failed }: { file: SharedFile; fa
       </span>
       <span className="fcard-foot">
         {/* The one button that opens the file: it covers the card, so a click anywhere on it opens. */}
-        <button type="button" className="fcard-open" onClick={() => openFile(file.path)} aria-label={`Open ${file.name}`} title={file.path}>
+        <button type="button" className="fcard-open" onClick={() => openFile(at)} aria-label={`Open ${file.name}`} title={at}>
           <Icon name={fileIcon(file.name)} size={15} className="fcard-kind" />
           <span className="fcard-name truncate">{file.name}</span>
         </button>
@@ -184,8 +205,8 @@ const FileCard = memo(function FileCard({ file, failed }: { file: SharedFile; fa
         </span>
       </span>
       <span className="fcard-acts">
-        <IconButton icon="folder-open" label="Show in folder" size={14} tipSide="top" className="fcard-act" onClick={() => openFile(file.path, true)} />
-        <CopyButton text={file.path} label="Copy path" size={14} className="fcard-act" />
+        <IconButton icon="folder-open" label="Show in folder" size={14} tipSide="top" className="fcard-act" onClick={() => openFile(at, true)} />
+        <CopyButton text={at} label="Copy path" size={14} className="fcard-act" />
       </span>
     </div>
   );

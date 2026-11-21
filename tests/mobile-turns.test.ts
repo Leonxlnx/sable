@@ -225,3 +225,208 @@ describe("a comment on a diff from the phone's Changes view", async () => {
     expect(diffRows(gone).rows.map((r) => (r.t === 'sep' ? r.text : `${r.t}${rowNumber(r)}`))).toEqual(['Lines 1–3 unchanged', '-4', '-5', '-6']);
   });
 });
+
+// ── the review's phone findings (eleventh pass): picks, downloads, streaming cost ──
+
+type Field = 'model' | 'effort' | 'speed' | 'mode';
+interface IntentsLike {
+  heard(id: string, from: Record<string, unknown>): void;
+  pick(id: string, field: Field, value: unknown, before: unknown): number;
+  accepted(id: string, field: Field, value: unknown): void;
+  refused(id: string, field: Field, gen: number): { value: unknown } | null;
+  sieve<T extends Record<string, unknown>>(id: string, patch: T): T;
+  over<T extends Record<string, unknown> & { id: string }>(meta: T): T;
+  waiting(id: string, field: Field): unknown;
+}
+const INTENTS = '../mobile/src/lib/intents';
+const { Intents } = (await import(/* @vite-ignore */ INTENTS)) as { Intents: new (ms?: number, now?: () => number) => IntentsLike };
+
+describe("the phone's picks (model, effort, speed, mode)", () => {
+  it('a late failure of an older pick never rolls back a newer accepted one', () => {
+    const p = new Intents();
+    p.heard('c', { mode: 'default' });
+    const first = p.pick('c', 'mode', 'acceptEdits', 'default');
+    const second = p.pick('c', 'mode', 'bypassPermissions', 'acceptEdits');
+    p.accepted('c', 'mode', 'bypassPermissions');
+    // The first request times out after the second was accepted: nothing changes.
+    expect(p.refused('c', 'mode', first)).toBeNull();
+    expect(p.waiting('c', 'mode')).toBe('bypassPermissions');
+    // The newest pick refused goes back to what the desktop last said (the accepted pick), not to what was shown before it.
+    const third = p.pick('c', 'mode', 'plan', 'bypassPermissions');
+    expect(p.refused('c', 'mode', third)).toEqual({ value: 'bypassPermissions' });
+    expect(p.refused('c', 'mode', second)).toBeNull();
+  });
+
+  it('holds a pick against older updates, lets go when confirmed, and goes back to the latest word of the desktop', () => {
+    let t = 0;
+    const p = new Intents(6000, () => t);
+    const gen = p.pick('c', 'effort', 'high', 'medium');
+    // An update from before the pick: the field is held; other fields pass.
+    expect(p.sieve('c', { effort: 'low', title: 'x' })).toEqual({ title: 'x' });
+    expect(p.over({ id: 'c', effort: 'low', model: 'm' })).toMatchObject({ effort: 'high', model: 'm' });
+    // Refused: what the desktop said last (low), not what was shown when the pick was made (medium).
+    expect(p.refused('c', 'effort', gen)).toEqual({ value: 'low' });
+    // Confirmed by an update: it lets go; an expired pick does too.
+    p.pick('c', 'speed', 'fast', undefined);
+    expect(p.sieve('c', { speed: 'fast' })).toEqual({ speed: 'fast' });
+    expect(p.waiting('c', 'speed')).toBeUndefined();
+    p.pick('c', 'model', 'big', 'small');
+    t = 7000;
+    expect(p.sieve('c', { model: 'small' })).toEqual({ model: 'small' });
+  });
+});
+
+type DL = { state: string; id?: string; attempt?: number; bytes?: number };
+interface Core {
+  get(key: string): DL;
+  set(key: string, d: DL): void;
+  size(): number;
+  resume(): void;
+  start(key: string, p: { sid: string; itemId: string; index: number; name: string }): Promise<void>;
+  cancel(key: string): Promise<void>;
+}
+const CORE = '../mobile/src/lib/download-core';
+const { createDownloads, KEEP, POLL } = (await import(/* @vite-ignore */ CORE)) as {
+  createDownloads: (deps: Record<string, unknown>) => Core;
+  KEEP: number;
+  POLL: { moving: number; paused: number };
+};
+
+/** A promise and its resolve, to answer when the test says so. */
+function later<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+const tick = () => new Promise((r) => setTimeout(r, 0));
+const FILE = { sid: 's', itemId: 'i', index: 0, name: 'app.apk' };
+
+describe('downloads on the phone', () => {
+  it('a Stop while the desktop prepares the link ends that attempt: nothing starts later', async () => {
+    const link = later<{ url: string }>();
+    const download = vi.fn(async () => ({ id: 'n1' }));
+    const d = createDownloads({ plugin: { download, status: vi.fn(), cancel: vi.fn(async () => {}) }, link: () => link.promise, native: true });
+    const started = d.start('k', FILE);
+    expect(d.get('k').state).toBe('asking');
+    await d.cancel('k');
+    link.resolve({ url: 'http://desk/f/t/app.apk' });
+    await started;
+    expect(download).not.toHaveBeenCalled();
+    expect(d.get('k').state).toBe('idle');
+  });
+
+  it('a native download made after its attempt was stopped is removed again', async () => {
+    const made = later<{ id: string }>();
+    const cancel = vi.fn(async () => {});
+    const d = createDownloads({ plugin: { download: () => made.promise, status: vi.fn(), cancel }, link: async () => ({ url: 'http://desk/f' }), native: true });
+    const started = d.start('k', FILE);
+    await tick();
+    await d.cancel('k');
+    made.resolve({ id: 'late' });
+    await started;
+    expect(cancel).toHaveBeenCalledWith({ id: 'late' });
+    expect(d.get('k').state).toBe('idle');
+  });
+
+  it('an older status reply never lands over a newer attempt', async () => {
+    const replies: { promise: Promise<{ state: string; bytes?: number }>; resolve: (v: { state: string; bytes?: number }) => void }[] = [];
+    const status = vi.fn(() => {
+      const r = later<{ state: string; bytes?: number }>();
+      replies.push(r);
+      return r.promise;
+    });
+    let n = 0;
+    const d = createDownloads({ plugin: { download: async () => ({ id: `n${++n}` }), status, cancel: async () => {} }, link: async () => ({ url: 'http://desk/f' }), native: true, sleep: () => new Promise(() => {}) });
+    await d.start('k', FILE);
+    await tick();
+    expect(status).toHaveBeenCalledTimes(1);
+    // Stopped and started again while the first read is out.
+    await d.cancel('k');
+    await d.start('k', FILE);
+    expect(d.get('k')).toMatchObject({ state: 'pending', id: 'n2' });
+    replies[0].resolve({ state: 'done', bytes: 9 });
+    await tick();
+    expect(d.get('k')).toMatchObject({ state: 'pending', id: 'n2' });
+  });
+
+  it('one awaited loop: slower while paused, none in the background; storage written only when it changed; at most KEEP entries', async () => {
+    const waits: number[] = [];
+    let hidden = false;
+    const gate: { resolve: (v: void) => void }[] = [];
+    const sleep = (ms: number) => {
+      waits.push(ms);
+      const g = later<void>();
+      gate.push(g);
+      return g.promise;
+    };
+    const states = [
+      { state: 'running', bytes: 1, total: 10 },
+      { state: 'running', bytes: 5, total: 10 },
+      { state: 'paused', bytes: 5, total: 10 },
+    ];
+    const status = vi.fn(async () => states.shift() ?? { state: 'paused', bytes: 5, total: 10 });
+    const writes: string[] = [];
+    const d = createDownloads({
+      plugin: { download: async () => ({ id: 'n1' }), status, cancel: async () => {} },
+      link: async () => ({ url: 'http://desk/f' }),
+      native: true,
+      sleep,
+      hidden: () => hidden,
+      storage: { get: () => null, set: (v: string) => writes.push(v) },
+    });
+    await d.start('k', FILE);
+    for (let i = 0; i < 3; i++) {
+      await tick();
+      gate.shift()?.resolve();
+    }
+    await tick();
+    expect(waits.slice(0, 3)).toEqual([POLL.moving, POLL.moving, POLL.paused]);
+    // Bytes moving are not written: only the start (pending), running, and paused.
+    expect(writes.map((w) => JSON.parse(w).k.state)).toEqual(['pending', 'running', 'paused']);
+    // In the background the loop ends at its next turn: no more reads.
+    hidden = true;
+    const reads = status.mock.calls.length;
+    gate.shift()?.resolve();
+    await tick();
+    await tick();
+    expect(status.mock.calls.length).toBe(reads);
+    // The history is capped in memory too (an entry at work is never dropped).
+    for (let i = 0; i < KEEP + 15; i++) d.set(`done${i}`, { state: 'done', id: `x${i}` });
+    expect(d.size()).toBeLessThanOrEqual(KEEP);
+    expect(d.get('k').state).toBe('paused');
+  });
+});
+
+describe('streaming cost on the phone', async () => {
+  const { reshape, shapeString } = (await import(/* @vite-ignore */ TURNS)) as {
+    reshape: (shape: string, roots: string[], items: Record<string, TimelineItem>, ids: Iterable<string>) => string;
+    shapeString: (roots: string[], items: Record<string, TimelineItem>) => string;
+  };
+  it('the shape is read again only for the items that changed', () => {
+    const items: Record<string, TimelineItem> = {};
+    const roots: string[] = [];
+    for (let t = 0; t < 300; t++) {
+      for (const it of [
+        { id: `u${t}`, ts: 0, type: 'user', text: 'go' },
+        { id: `w${t}`, ts: 0, type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'done', detail: {} },
+        { id: `a${t}`, ts: 0, type: 'text', text: 'Done. Everything passes.', streaming: false },
+        { id: `e${t}`, ts: 0, type: 'turn', durationMs: 1 },
+      ] as TimelineItem[]) {
+        items[it.id] = it;
+        roots.push(it.id);
+      }
+    }
+    const shape = shapeString(roots, items);
+    // The newest answer streams on: its item is replaced.
+    const next: Record<string, TimelineItem> = { ...items, a299: { ...items.a299, text: 'Done. Everything passes, and more words arrive.', streaming: true } as TimelineItem };
+    const read = new Set<string>();
+    const watched = new Proxy(next, { get: (o, k) => (read.add(String(k)), o[k as string]) });
+    expect(reshape(shape, roots, watched, ['a299'])).toBe(shapeString(roots, next));
+    expect([...read]).toEqual(['a299']);
+    // A step that becomes another kind of row changes its character in place.
+    const changed: Record<string, TimelineItem> = { ...next, w5: { ...next.w5, check: { turn: 'u5', agent: 'codex' } } as unknown as TimelineItem };
+    const again = reshape(shape, roots, changed, ['w5']);
+    expect(again).toBe(shapeString(roots, { ...items, w5: changed.w5 }));
+    expect(again).not.toBe(shape);
+  });
+});

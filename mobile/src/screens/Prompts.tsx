@@ -77,7 +77,7 @@ function PathLabel({ path }: { path: string }) {
   );
 }
 
-function PermissionBody({ sid, req, more, onLater }: { sid: string; req: PermissionRequest; more: number; onLater: () => void }) {
+export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }: { sid: string; req: PermissionRequest; more: number; onLater: () => void; laterLabel?: string }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   // Deny with a note, as on the desktop: when the agent takes one, Deny turns the keys into a field
@@ -218,7 +218,7 @@ function PermissionBody({ sid, req, more, onLater }: { sid: string; req: Permiss
                   </button>
                 ))}
                 <button type="button" className="btn ask-btn btn-ghost ask-later" disabled={!!busy} onClick={() => (haptic('tap'), onLater())}>
-                  Later
+                  {laterLabel}
                 </button>
               </div>
             </motion.div>
@@ -254,7 +254,7 @@ const tabName = (q: Question, i: number) => q.header?.trim() || `Question ${i + 
  * answered), the answers as a card of rows with their own words under them, and one more row to
  * write something else. The key at the foot goes to the next question, and answers on the last.
  */
-function QuestionBody({ sid, req, onLater }: { sid: string; req: QuestionRequest; onLater: () => void }) {
+export function QuestionBody({ sid, req, onLater, laterLabel = 'Later' }: { sid: string; req: QuestionRequest; onLater: () => void; laterLabel?: string }) {
   const [picked, setPicked] = useState<Record<number, string[]>>({});
   const [other, setOther] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
@@ -372,7 +372,7 @@ function QuestionBody({ sid, req, onLater }: { sid: string; req: QuestionRequest
             Skip
           </button>
           <button type="button" className="link-btn" disabled={busy} onClick={() => (haptic('tap'), onLater())}>
-            Later
+            {laterLabel}
           </button>
         </div>
       </div>

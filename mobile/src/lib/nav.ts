@@ -6,7 +6,8 @@ import { useSyncExternalStore } from 'react';
  * underneath (its scroll is kept).
  */
 export type Route =
-  | { name: 'chat'; id: string }
+  /** `at`: where it opens: a root item (a search hit), or 'turn' for the newest turn's start (a notification). */
+  | { name: 'chat'; id: string; at?: string; seq?: number; find?: string }
   | { name: 'settings' }
   | { name: 'changes'; id: string; items?: string[]; lead?: string }
   | { name: 'diff'; id: string; path: string; items?: string[] };
@@ -40,10 +41,13 @@ const load = (): Route[] => {
 };
 
 let stack: Route[] = [];
+/** Tells two openings at the same place apart (the same hit tapped twice scrolls there again). */
+let seq = 0;
 const listeners = new Set<() => void>();
 const emit = () => {
   try {
-    localStorage.setItem(KEY, JSON.stringify(stack));
+    // Where a chat was opened at is not kept: opened again later, it opens at its newest.
+    localStorage.setItem(KEY, JSON.stringify(stack.map((r) => (r.name === 'chat' && r.at ? { name: 'chat', id: r.id } : r))));
   } catch {
     /* private mode */
   }
@@ -60,9 +64,9 @@ export const nav = {
     stack = [...stack.filter((x) => routeKey(x) !== routeKey(r) && (r.name === 'chat' || x.name !== r.name)), r];
     emit();
   },
-  /** Opens a chat on top of home (replacing any other open chat, and what was open over it). */
-  chat(id: string) {
-    stack = [...stack.filter((x) => x.name === 'settings'), { name: 'chat', id }];
+  /** Opens a chat on top of home (replacing any other open chat, and what was open over it); `at`: where (see Route). */
+  chat(id: string, at?: string, find?: string) {
+    stack = [...stack.filter((x) => x.name === 'settings'), at ? { name: 'chat', id, at, seq: ++seq, ...(find ? { find } : {}) } : { name: 'chat', id }];
     emit();
   },
   pop(): boolean {

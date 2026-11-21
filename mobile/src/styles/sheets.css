@@ -1505,3 +1505,80 @@
   font-size: var(--t-xs);
   color: var(--red);
 }
+
+/* ── the deck: what waits on you across chats, one card at a time ── */
+.deck {
+  display: flex;
+  flex-direction: column;
+}
+
+/* the chat a card is from, over it: its mark and name, where it is in the deck, and the way there */
+.deck-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  padding: 0 4px 0 10px;
+}
+
+.deck-chat {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--t-sm);
+  font-weight: 540;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.deck-count {
+  flex-shrink: 0;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.deck-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--r-pill);
+  font-size: var(--t-sm);
+  font-weight: 560;
+  color: var(--text-2);
+  transition: background-color 100ms, color 100ms;
+}
+
+.deck-open:active {
+  background-color: var(--fill-2);
+  color: var(--text);
+}
+
+.deck-card {
+  position: relative;
+}
+
+.deck-done {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 34px 0 38px;
+  font-size: var(--t-lead);
+  font-weight: 560;
+  color: var(--text-2);
+}
+
+.deck-done-mark {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background-color: var(--fill-2);
+  box-shadow: var(--press-up);
+  color: var(--text);
+}

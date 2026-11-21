@@ -1,5 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import type { PhoneChangedFile, PhoneChanges, PhoneDiff, TimelineItem } from '@shared/protocol';
+import type { PhoneChangedFile, PhoneChanges, PhoneDiff } from '@shared/protocol';
 import { conn } from './conn';
 import { useStore, type State } from './store';
 
@@ -62,25 +62,9 @@ export const reloadChanges = (s: ChangesScope) => load(lists, scopeKey(s), () =>
 export const reloadDiff = (s: ChangesScope, path: string) =>
   load(diffs, `${scopeKey(s)}|${path}`, () => conn.call('phone.diff', { sessionId: s.sid, path, ...(s.items ? { items: s.items } : {}) }), 30);
 
-const settledFileTool = (it: TimelineItem | undefined) =>
-  it?.type === 'tool' && (it.kind === 'edit' || it.kind === 'write' || it.kind === 'bash') && (it.status === 'done' || it.status === 'error' || it.status === 'cancelled');
-
-const counted = new WeakMap<object, number>();
-/** Moves when the chat's work could have changed files: its state, and how many file-touching steps have settled. */
+/** Moves when the chat's work could have changed files: its state, and how many file-touching steps have settled (the store keeps that count per changed item). */
 function workSignature(sid: string) {
-  return (s: State) => {
-    const d = s.data[sid];
-    let n = 0;
-    if (d) {
-      const hit = counted.get(d.items);
-      if (hit !== undefined) n = hit;
-      else {
-        for (const id in d.items) if (settledFileTool(d.items[id])) n++;
-        counted.set(d.items, n);
-      }
-    }
-    return `${s.sessions[sid]?.status ?? ''}|${n}`;
-  };
+  return (s: State) => `${s.sessions[sid]?.status ?? ''}|${s.data[sid]?.fileSteps ?? 0}`;
 }
 
 /**

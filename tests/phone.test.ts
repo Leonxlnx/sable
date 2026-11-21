@@ -13,6 +13,7 @@ import {
   type PhoneChanges,
   type PhoneDiff,
   type PhoneFrame,
+  type PhoneSearch,
   type PhoneStatus,
   type PhoneTail,
   type TextItem,
@@ -25,7 +26,7 @@ import { DemoProvider } from '../server/providers/demo';
 import { capabilities } from '../server/providers/demo-catalog';
 import type { Provider, ProviderContext } from '../server/providers/types';
 import { registerFs } from '../server/services/fs';
-import { LIMITS, phoneDetail, phoneEvent, phonePage, registerPhone, type PhoneService } from '../server/services/phone';
+import { LIMITS, phoneDetail, phoneEvent, phonePage, REACH, registerPhone, SEARCH, type PhoneService } from '../server/services/phone';
 import { qrMatrix } from '../server/services/qr';
 import { mergeHosts } from '../mobile/src/lib/hosts';
 
@@ -312,6 +313,24 @@ describe('conversations in pages', () => {
     expect(phonePage(items, { before: 'nope' }).items).toEqual([]);
   });
 
+  it('reaches back to an item asked for (a search hit), within its cap, and pages on from there', () => {
+    const items = long(60, 5);
+    const plain = phonePage(items);
+    expect(plain.items.some((i) => i.id === 'u20')).toBe(false);
+    const page = phonePage(items, { to: 'a20' });
+    const ids = page.items.map((i) => i.id);
+    // The turn that holds it is whole (from its message), and the page runs to the newest.
+    expect(ids[0]).toBe('u20');
+    expect(ids[ids.length - 1]).toBe('e59');
+    expect(page.cursor).toBe('u20');
+    expect(JSON.stringify(page).length).toBeLessThan(REACH.bytes * 1.7);
+    // From a cursor, as `before`; an item after the cursor or unknown changes nothing.
+    const older = phonePage(items, { before: 'u20', to: 'u3' });
+    expect(older.items[0].id).toBe('u3');
+    expect(older.items[older.items.length - 1].id).toBe('e19');
+    expect(phonePage(items, { to: 'nope' }).items.map((i) => i.id)).toEqual(plain.items.map((i) => i.id));
+  });
+
   it('cuts text between steps to a line, and returns one item in full on request', () => {
     const items: TimelineItem[] = [
       { id: 'u', ts: 0, type: 'user', text: 'go' },
@@ -398,6 +417,114 @@ describe('files the agent hands over', () => {
     expect(((await c.call('phone.fileLink', { sessionId: id, itemId: 'read1', index: 0 })) as { ok: boolean }).ok).toBe(false);
     expect(((await c.call('phone.fileLink', { sessionId: id, itemId: 'share1', index: 3 })) as { ok: boolean }).ok).toBe(false);
     expect((await fetch(`http://127.0.0.1:${port}/f/not-a-token/build.apk`)).status).toBe(404);
+    c.ws.close();
+  });
+});
+
+describe('searching chats from the phone', () => {
+  /** A chat with messages and steps whose output must never be searched. */
+  function fill(app: App, id: string, words: string[]) {
+    const rt = app.sessions.get(id)!;
+    words.forEach((w, i) => {
+      rt.add({ type: 'user', text: `question ${i}: ${w}` } as never);
+      rt.add({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'done', detail: { command: 'grep pineapple' }, output: 'pineapple pineapple', result: { text: 'pineapple', images: [`data:image/png;base64,${'A'.repeat(1_500_000)}`] } } as never);
+      rt.add({ type: 'text', text: `Answer ${i} about ${w}.`, streaming: false } as never);
+      rt.add({ type: 'turn', durationMs: 10 } as never);
+    });
+  }
+
+  it('finds messages across chats, newest first, never in steps, archived chats or what the harness wrote', async () => {
+    const { app, port } = await setup();
+    const { c } = await pairPhone(app, port);
+    const a = (await app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const b = (await app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const gone = (await app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    fill(app, a, ['the Banana split', 'apple pie', 'banana bread']);
+    fill(app, b, ['a cherry banana tart']);
+    fill(app, gone, ['banana archived']);
+    app.sessions.get(a)!.add({ type: 'user', text: '<task-notification>banana done</task-notification>' } as never);
+    await app.call('session.update', { sessionId: gone, patch: { archived: true } });
+    const r = (await c.call('phone.search', { query: 'BANANA' })) as { ok: boolean; result: PhoneSearch };
+    expect(r.ok).toBe(true);
+    const hits = r.result.hits;
+    expect(new Set(hits.map((h) => h.sessionId))).toEqual(new Set([a, b]));
+    // Within a chat, the newest message first; the person's words and the agent's.
+    const inA = hits.filter((h) => h.sessionId === a);
+    expect(inA.map((h) => h.text)).toEqual(['Answer 2 about banana bread.', 'question 2: banana bread', 'Answer 0 about the Banana split.', 'question 0: the Banana split']);
+    expect(inA[0].role).toBe('agent');
+    expect(inA[1].role).toBe('user');
+    // Every word must be there; steps and their output are not searched; short queries find nothing.
+    expect(((await c.call('phone.search', { query: 'banana bread' })) as { result: PhoneSearch }).result.hits).toHaveLength(2);
+    expect(((await c.call('phone.search', { query: 'pineapple' })) as { result: PhoneSearch }).result.hits).toEqual([]);
+    expect(((await c.call('phone.search', { query: 'b' })) as { result: PhoneSearch }).result.hits).toEqual([]);
+    // A long message gives the words around the match.
+    app.sessions.get(b)!.add({ type: 'text', text: `${'lorem ipsum '.repeat(60)}the quokka sleeps ${'dolor sit '.repeat(60)}`, streaming: false } as never);
+    const q = ((await c.call('phone.search', { query: 'quokka' })) as { result: PhoneSearch }).result.hits[0];
+    expect(q.text.length).toBeLessThanOrEqual(SEARCH.snippet + 2);
+    expect(q.text).toMatch(/^….*the quokka sleeps.*…$/);
+    // Not on the localhost bridge.
+    await expect(app.call('phone.search' as never, { query: 'banana' } as never)).rejects.toThrow();
+    c.ws.close();
+  });
+
+  it('reads chats the desktop has not opened from their files, without opening them, and keeps what it read', async () => {
+    const first = await setup();
+    const a = (await first.app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const words = Array.from({ length: 40 }, (_, i) => (i === 3 ? 'the walrus plan' : i === 38 ? 'walrus again, late' : `topic ${i}`));
+    fill(first.app, a, words);
+    await first.app.call('session.update', { sessionId: a, patch: { unread: true } });
+    await first.app.dispose();
+    apps.splice(apps.indexOf(first.app), 1);
+    expect(existsSync(path.join(first.home, 'sessions', `${a}.json`))).toBe(true);
+
+    const app = new App({ home: first.home, quiet: true, providers: [(ctx) => new DemoProvider(ctx, { speed: 0 })] });
+    apps.push(app);
+    const phone = registerPhone(app, { port: 0, host: '127.0.0.1' });
+    const port = (await app.call('phone.setEnabled', { on: true })).port;
+    const { c } = await pairPhone(app, port);
+    expect(app.sessions.get(a)!.items).toHaveLength(0);
+    const r = (await c.call('phone.search', { query: 'walrus' })) as { result: PhoneSearch };
+    expect(r.result.hits.map((h) => h.text)).toEqual(['Answer 38 about walrus again, late.', 'question 38: walrus again, late', 'Answer 3 about the walrus plan.', 'question 3: the walrus plan']);
+    // The chat was not opened (nor marked read); the second search reads nothing from disk.
+    expect(app.sessions.get(a)!.items).toHaveLength(0);
+    expect(app.sessions.get(a)!.meta.unread).toBe(true);
+    const kept = (phone as unknown as { finder: { kept: Map<string, unknown> } }).finder.kept;
+    expect(kept.has(a)).toBe(true);
+    expect(((await c.call('phone.search', { query: 'topic 12' })) as { result: PhoneSearch }).result.hits).toHaveLength(2);
+    // The hit opens there: the page reaches back to it.
+    const page = (await c.call('phone.tail', { sessionId: a, to: r.result.hits[3].itemId })) as { result: PhoneTail };
+    expect(page.result.items.some((i) => i.id === r.result.hits[3].itemId)).toBe(true);
+    c.ws.close();
+  });
+});
+
+describe('pictures of a step', () => {
+  it('counts them on the step and gives each one, only a picture of that chat', async () => {
+    const { app, port } = await setup();
+    const { c } = await pairPhone(app, port);
+    const id = (await app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const other = (await app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const png = `data:image/png;base64,${'iVBORw0KGgo'.repeat(10)}`;
+    const rt = app.sessions.get(id)!;
+    rt.add({ id: 'u1', type: 'user', text: 'take a screenshot' } as never);
+    rt.add({ id: 'shot', type: 'tool', name: 'browser_screenshot', kind: 'browser', title: 'Screenshot', status: 'done', detail: {}, result: { images: [png, 'file:///C:/secret.png', `data:image/svg+xml;base64,PHN2Zz4=`] } } as never);
+    app.sessions.get(other)!.add({ id: 'theirs', type: 'tool', name: 'browser_screenshot', kind: 'browser', title: 'Screenshot', status: 'done', detail: {}, result: { images: [png] } } as never);
+    const tail = (await c.call('phone.tail', { sessionId: id })) as { result: PhoneTail };
+    const step = tail.result.items.find((i) => i.id === 'shot')!;
+    expect(step.pics).toBe(3);
+    expect((step as ToolItem).result?.images).toBeUndefined();
+    const ok = (await c.call('phone.image', { sessionId: id, itemId: 'shot', index: 0 })) as { ok: boolean; result: { data: string } };
+    expect(ok.result.data).toBe(png);
+    for (const params of [
+      { sessionId: id, itemId: 'shot', index: 1 },
+      { sessionId: id, itemId: 'shot', index: 2 },
+      { sessionId: id, itemId: 'shot', index: 7 },
+      { sessionId: id, itemId: 'u1', index: 0 },
+      { sessionId: id, itemId: 'theirs', index: 0 },
+    ])
+      expect(((await c.call('phone.image', params)) as { ok: boolean }).ok).toBe(false);
+    // A live patch says so too.
+    expect(phoneEvent({ type: 'item.patch', sessionId: id, id: 'shot', patch: { result: { images: [png, png] } } as Partial<TimelineItem> })).toMatchObject({ patch: { pics: 2 } });
     c.ws.close();
   });
 });

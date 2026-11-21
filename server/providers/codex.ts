@@ -30,6 +30,7 @@ import type {
   UserItem,
 } from '../../shared/protocol';
 import type { SessionRuntime } from '../core/runtime';
+import type { TitlePrompt } from '../core/titles';
 import { codexForkTurn, cutAt } from '../core/fork';
 import type { Provider, ProviderContext, ProviderSession } from './types';
 import { codexPlan } from './plans';
@@ -152,6 +153,64 @@ function errMsg(err: unknown): string {
 export type CodexFunctionTool = { type: 'function'; name: string; description: string; inputSchema: unknown; deferLoading?: boolean };
 /** A dynamic tool: a function, or a namespace of functions (`DynamicToolSpec`); a deferred function must sit in a namespace. */
 export type CodexDynamicTool = CodexFunctionTool | { type: 'namespace'; name: string; description: string; tools: CodexFunctionTool[] };
+/**
+ * How small a Codex model says it is, by its name (a nano, a mini) and the words of its catalog entry
+ * ("Fast and affordable model for easier tasks"); 0 for one that says nothing of it.
+ */
+function smallness(m: ModelInfo): number {
+  const name = `${m.id} ${m.name}`;
+  const said = m.description ?? '';
+  let n = 0;
+  if (/\bnano\b/i.test(name)) n += 4;
+  else if (/\bmini\b/i.test(name)) n += 3;
+  if (/\b(affordable|cheap(est)?|lightweight|small(est)?|mini)\b/i.test(said)) n += 2;
+  if (/\b(fast(est)?|quick(est)?|easier|simpler|simple tasks)\b/i.test(said)) n += 1;
+  return n;
+}
+
+/**
+ * The model that names a chat (`CodexProvider.quickTitle`): the smallest one this account's Codex
+ * offers (by name and catalog words; a current one before a legacy one, one in the picker before a
+ * hidden one), with its lowest effort. None when no model says it is small: no title then.
+ */
+export function titleModelOf(models: readonly ModelInfo[]): { id: string; effort?: Effort } | undefined {
+  const legacy = (m: ModelInfo) => /^(legacy|previous generation)\b/i.test(m.description ?? '');
+  const rank = (m: ModelInfo) => smallness(m) * 4 + (legacy(m) ? 0 : 2) + (m.picker ? 1 : 0);
+  let best: ModelInfo | undefined;
+  for (const m of models) if (smallness(m) > 0 && (!best || rank(m) > rank(best))) best = m;
+  if (!best) return undefined;
+  const m = best;
+  const effort = (['minimal', 'low'] as Effort[]).find((e) => m.efforts?.includes(e));
+  return { id: m.id, ...(effort ? { effort } : {}) };
+}
+
+/**
+ * The thread a title is asked in: ephemeral (never written to the account's history), the title's
+ * own instructions instead of Codex's, no environment (so no shell and no file of the folder read),
+ * read-only and never asking, no web search, no AGENTS.md, the account's known MCP servers and the
+ * computer-use plugin off, no tools of Sable's.
+ */
+export function titleThreadParams(prompt: TitlePrompt, model: string, off: { mcp?: string[]; plugin?: string } = {}): Record<string, unknown> {
+  const config: Record<string, unknown> = { web_search: 'disabled', project_doc_max_bytes: 0 };
+  if (off.mcp?.length) config.mcp_servers = Object.fromEntries(off.mcp.map((n) => [n, { enabled: false }]));
+  if (off.plugin) config.plugins = { [off.plugin]: { enabled: false } };
+  return {
+    model,
+    cwd: existsSync(prompt.cwd) ? prompt.cwd : homedir(),
+    approvalPolicy: 'never',
+    sandbox: 'read-only',
+    ephemeral: true,
+    baseInstructions: prompt.system,
+    environments: [],
+    config,
+  };
+}
+
+/** The one turn of a title thread: the prompt as text, the lowest effort, no reasoning summary. */
+export function titleTurnParams(threadId: string, prompt: TitlePrompt, effort?: Effort): TurnStartParams & { summary: string } {
+  return { threadId, input: [{ type: 'text', text: prompt.user, text_elements: [] }], ...(effort ? { effort } : {}), summary: 'none' };
+}
+
 /** The namespace that holds the deferred Browser tab tools. */
 export const BROWSER_NAMESPACE = 'sable_browser';
 const BROWSER_NAMESPACE_DESCRIPTION = "Tools that work the page open in Sable's Browser tab: snapshot, click, type, press, scroll, evaluate, logs, wait, navigate.";
@@ -179,6 +238,8 @@ export class CodexProvider implements Provider {
   private idleTimer?: NodeJS.Timeout;
   /** An app-server this provider is stopping on purpose (its exit is not news). */
   private stopping?: CodexRpc;
+  /** Threads a title is being asked in (`quickTitle`), by id: their notifications go to that call, never to a chat. */
+  private titleThreads = new Map<string, (method: string, p: any) => void>();
 
   constructor(readonly ctx: ProviderContext) {
     if (ctx.account?.dir) this.env = { CODEX_HOME: ctx.account.dir };
@@ -212,7 +273,7 @@ export class CodexProvider implements Provider {
   private stopIfIdle(ms: number) {
     const rpc = this.rpc;
     if (!rpc || this.disposed) return;
-    const busy = this.sessions.size > 0 || this.remoteWanted.size > 0 || !!this.pendingLogin || !!this.mcpLoading || !!this.starting;
+    const busy = this.sessions.size > 0 || this.titleThreads.size > 0 || this.remoteWanted.size > 0 || !!this.pendingLogin || !!this.mcpLoading || !!this.starting;
     const quietFor = Date.now() - this.lastUse;
     if (busy || quietFor < ms) return this.armIdle(busy ? IDLE_STOP_MS : Math.max(1000, ms - quietFor));
     this.ctx.log('[codex] stopping idle app-server');
@@ -313,9 +374,62 @@ export class CodexProvider implements Provider {
       }
       default: {
         const tid = p?.threadId;
-        if (typeof tid === 'string') this.sessions.get(tid)?.onNotification(method, p);
+        if (typeof tid !== 'string') return;
+        const title = this.titleThreads.get(tid);
+        if (title) return title(method, p);
+        this.sessions.get(tid)?.onNotification(method, p);
       }
     }
+  }
+
+  /**
+   * A chat's title from Codex's smallest model, on this account (its own app-server and CODEX_HOME):
+   * one prompt in an ephemeral thread with no environment, no tools and the title's own instructions,
+   * the lowest effort, nothing kept. Null when this account has no small model or gives no answer.
+   */
+  async quickTitle(prompt: TitlePrompt, signal: AbortSignal): Promise<string | null> {
+    if (signal.aborted) return null;
+    const caps = await this.caps().catch(() => undefined);
+    const pick = titleModelOf(caps?.models ?? []);
+    if (!pick || signal.aborted) return null;
+    const rpc = await this.client();
+    if (signal.aborted) return null;
+    const off = { mcp: (this.mcpCache ?? []).filter((s) => !s.scope).map((s) => s.name), plugin: this.computerUsePlugin() };
+    const started = await rpc.request<ThreadStartResponse>('thread/start', titleThreadParams(prompt, pick.id, off), THREAD_TIMEOUT);
+    const threadId = started.thread.id;
+    let text = '';
+    let deltas = '';
+    let turnId: string | undefined;
+    let quit = () => {};
+    const done = new Promise<void>((resolve, reject) => {
+      quit = resolve;
+      this.titleThreads.set(threadId, (method, p) => {
+        if (method === 'item/agentMessage/delta' && typeof p?.delta === 'string') deltas += p.delta;
+        else if (method === 'item/completed' && p?.item?.type === 'agentMessage' && typeof p.item.text === 'string') text = p.item.text;
+        else if (method === 'turn/started' && p?.turn?.id) turnId ??= p.turn.id;
+        else if (method === 'error' && !p?.willRetry) reject(new Error(p?.error?.message ?? 'Codex error'));
+        else if (method === 'turn/completed') {
+          if (p?.turn?.status === 'failed') reject(new Error(p.turn.error?.message ?? 'The title turn failed'));
+          else resolve();
+        }
+      });
+    });
+    // Settled before it is awaited (an error while the turn starts): no unhandled rejection meanwhile.
+    done.catch(() => {});
+    const stop = () => quit();
+    signal.addEventListener('abort', stop, { once: true });
+    try {
+      const r = await rpc.request<{ turn: Turn }>('turn/start', titleTurnParams(threadId, prompt, pick.effort), 60_000);
+      turnId ??= r.turn?.id;
+      if (!signal.aborted) await done;
+    } finally {
+      signal.removeEventListener('abort', stop);
+      this.titleThreads.delete(threadId);
+      if (signal.aborted && turnId) void rpc.request('turn/interrupt', { threadId, turnId }, 10_000).catch(() => {});
+      void rpc.request('thread/unsubscribe', { threadId }, 10_000).catch(() => {});
+    }
+    if (signal.aborted) return null;
+    return (text || deltas).trim() || null;
   }
 
   private async onServerRequest(method: string, p: any, id: RequestId): Promise<unknown> {
@@ -824,6 +938,16 @@ class CodexSession implements ProviderSession {
   private commandTimer?: NodeJS.Timeout;
   /** The thread reported idle while a turn was open: the turn ends unless turn/completed comes first. */
   private idleTimer?: NodeJS.Timeout;
+  /** The turn's generation: a new one for every turn begun here or by Codex, so late news of an earlier one is told apart. */
+  private gen = 0;
+  /** This turn showed itself (turn/started, or the thread went active) since it began. */
+  private sawActive = false;
+  /** The thread went idle (after this turn showed itself) while turn/start was still out: considered when it returns. */
+  private idleSeen = false;
+  /** The person asked to stop this turn. */
+  private interrupting = false;
+  /** Turns that ended (newest last, a few): a turn/completed for one of them is late news, never the running turn's end. */
+  private doneTurns: string[] = [];
   private prompts = new Map<string, AbortController>();
   private reasoningSource = new Map<string, 'summary' | 'content'>();
   private compactSeen = false;
@@ -1121,20 +1245,29 @@ class CodexSession implements ProviderSession {
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }
+    const gen = this.gen;
     const started = (this.turnStarting = (async () => {
       const rpc = await this.provider.client();
       const r = await rpc.request<{ turn: Turn }>('turn/start', params, 60_000);
-      this.turnId ??= r.turn?.id;
+      // The turn may have ended already (its turn/completed came first): its id is no running turn's.
+      if (this.gen === gen && r.turn?.id && !this.doneTurns.includes(r.turn.id)) this.turnId ??= r.turn.id;
       this.policyDirty = false;
     })());
     try {
       await started;
     } finally {
       if (this.turnStarting === started) this.turnStarting = undefined;
+      // The thread went idle while the start was out, after this turn showed itself: its end is looked at now.
+      if (this.idleSeen && this.gen === gen && rt.turnActive && !this.turnStarting) this.armIdleEnd();
     }
   }
 
   private resetTurnState() {
+    this.gen++;
+    this.sawActive = false;
+    this.idleSeen = false;
+    this.interrupting = false;
+    clearTimeout(this.idleTimer);
     this.turnId = undefined;
     this.turnError = undefined;
     this.compactSeen = false;
@@ -1211,6 +1344,7 @@ class CodexSession implements ProviderSession {
   async interrupt() {
     const rt = this.rt;
     if (!rt.turnActive) return;
+    this.interrupting = true;
     if (this.turnStarting) await this.turnStarting.catch(() => {});
     if (!this.turnId || !this.loaded) {
       this.completeTurn({ status: 'interrupted' });
@@ -1233,13 +1367,22 @@ class CodexSession implements ProviderSession {
     }, 8_000);
   }
 
-  /** Closes the running turn: settles items, adds the TurnItem, ends the turn, drains the queue. */
-  private completeTurn(t: { status: Turn['status']; error?: string; durationMs?: number | null }) {
+  /**
+   * Closes the running turn: settles items, adds the TurnItem, ends the turn, drains the queue.
+   * `hold`: how it ended is not known (the thread went idle and neither its end nor the thread said
+   * more): it ends, but nothing queued goes out by itself.
+   */
+  private completeTurn(t: { status: Turn['status']; error?: string; durationMs?: number | null; hold?: boolean; id?: string }) {
     const rt = this.rt;
     clearTimeout(this.interruptTimer);
     clearTimeout(this.commandTimer);
     clearTimeout(this.idleTimer);
     if (!rt.turnActive) return;
+    const ended = t.id ?? this.turnId;
+    if (ended) {
+      this.doneTurns.push(ended);
+      if (this.doneTurns.length > 16) this.doneTurns.shift();
+    }
     this.abortPrompts();
     if (t.status === 'interrupted') {
       rt.settle('cancelled');
@@ -1260,8 +1403,50 @@ class CodexSession implements ProviderSession {
     });
     rt.update({ usage: { ...rt.meta.usage, turns: rt.meta.usage.turns + 1 } });
     this.turnId = undefined;
-    rt.endTurn(error);
-    this.drainQueue();
+    this.gen++;
+    rt.endTurn(error, t.hold ? { hold: true } : undefined);
+    if (!t.hold) this.drainQueue();
+  }
+
+  /** The thread is idle with this turn open: its own end gets a moment (it normally lands with the idle), then it is ended from what is known. */
+  private armIdleEnd() {
+    clearTimeout(this.idleTimer);
+    const gen = this.gen;
+    const turnId = this.turnId;
+    if (!turnId) return;
+    this.idleTimer = setTimeout(() => void this.idleEnd(gen, turnId).catch((err) => this.log('idle end failed', errMsg(err))), THREAD_IDLE_GRACE_MS);
+  }
+
+  /**
+   * Ends a turn whose turn/completed never came, with what is known: an error that ended it, a stop
+   * asked for, else the outcome the thread has stored for it. When even that is not known it ends
+   * without anything queued going out (`hold`).
+   */
+  private async idleEnd(gen: number, turnId: string) {
+    const rt = this.rt;
+    const current = () => rt.turnActive && this.gen === gen && this.turnId === turnId && !this.turnStarting && !this.closed;
+    if (!current()) return;
+    if (this.turnError) return this.completeTurn({ status: 'failed', error: this.turnError });
+    if (this.interrupting || rt.stopRequested) return this.completeTurn({ status: 'interrupted' });
+    let stored: Turn | undefined;
+    // Asked of the app-server that runs the thread (never one started for this).
+    if (this.loaded && this.provider.sessions.get(this.threadId) === this) {
+      try {
+        const rpc = await this.provider.client();
+        const r = await rpc.request<{ data?: Turn[] }>('thread/turns/list', { threadId: this.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' }, 10_000);
+        stored = r?.data?.find((x) => x?.id === turnId);
+      } catch (err) {
+        this.log('thread/turns/list failed; the turn ends without its outcome', errMsg(err));
+      }
+    }
+    if (!current()) return;
+    // Known by now (an error or a stop came while the thread was asked).
+    if (this.turnError) return this.completeTurn({ status: 'failed', error: this.turnError });
+    if (this.interrupting || rt.stopRequested) return this.completeTurn({ status: 'interrupted' });
+    // Still running after all: its end (or the next idle) closes it.
+    if (stored?.status === 'inProgress') return;
+    if (stored?.status) return this.completeTurn({ status: stored.status, error: stored.error?.message, durationMs: stored.durationMs });
+    this.completeTurn({ status: 'completed', hold: true });
   }
 
   // ── notifications ──
@@ -1272,28 +1457,44 @@ class CodexSession implements ProviderSession {
     switch (method) {
       case 'turn/started': {
         const turn = (p as TurnNotification).turn;
+        // Late news of a turn that ended already.
+        if (turn?.id && this.doneTurns.includes(turn.id)) return;
         if (!rt.turnActive) {
           rt.beginTurn('Thinking');
           this.resetTurnState();
         }
         if (turn?.id) this.turnId = turn.id;
+        this.sawActive = true;
+        this.idleSeen = false;
         return;
       }
       case 'turn/completed': {
         const turn = (p as TurnNotification).turn;
-        if (this.turnId && turn?.id && turn.id !== this.turnId) return; // stale turn
-        return this.completeTurn({ status: turn?.status ?? 'completed', error: turn?.error?.message, durationMs: turn?.durationMs });
+        // A turn that ended already (late, or ended from an idle): never the running turn's end, also while
+        // the next turn is still starting and has no id yet.
+        if (turn?.id && this.doneTurns.includes(turn.id)) return;
+        if (this.turnId && turn?.id && turn.id !== this.turnId) return; // another turn's
+        return this.completeTurn({ status: turn?.status ?? 'completed', error: turn?.error?.message, durationMs: turn?.durationMs, id: turn?.id });
       }
       case 'thread/status/changed': {
         // The thread's own word that nothing runs: a turn whose turn/completed never came (or was
         // dropped as another turn's) must not keep the chat busy. turn/completed normally lands with
         // it and carries the real outcome, so it gets a moment first.
         clearTimeout(this.idleTimer);
-        const turnId = this.turnId;
-        if (p?.status?.type !== 'idle' || !rt.turnActive || !turnId || this.turnStarting) return;
-        this.idleTimer = setTimeout(() => {
-          if (rt.turnActive && this.turnId === turnId && !this.turnStarting) this.completeTurn({ status: 'completed' });
-        }, THREAD_IDLE_GRACE_MS);
+        const type = p?.status?.type;
+        if (type === 'active') {
+          this.sawActive = true;
+          this.idleSeen = false;
+          return;
+        }
+        if (type !== 'idle' || !rt.turnActive) return;
+        if (this.turnStarting) {
+          // turn/start is still out. An idle after this turn showed itself is its end (a fast turn):
+          // looked at once the start returns. One before is the thread's state from before it began.
+          if (this.sawActive) this.idleSeen = true;
+          return;
+        }
+        this.armIdleEnd();
         return;
       }
       case 'item/started':

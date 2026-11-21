@@ -128,6 +128,23 @@ export const shapeString = (roots: string[], items: Record<string, TimelineItem>
   return s;
 };
 
+/**
+ * A shape string with the characters of `ids` read again, and nothing else: the store keeps each
+ * open chat's shape this way, so a streamed word never walks the loaded history (a changed item is
+ * near the end: its place is looked for from there).
+ */
+export function reshape(shape: string, roots: readonly string[], items: Record<string, TimelineItem>, ids: Iterable<string>): string {
+  for (const id of ids) {
+    const it = items[id];
+    if (!it || it.parentId) continue;
+    const i = roots.lastIndexOf(id);
+    if (i < 0) continue;
+    const c = shapeOf(it);
+    if (shape[i] !== c) shape = shape.slice(0, i) + c + shape.slice(i + 1);
+  }
+  return shape;
+}
+
 const ANSWER = new Set(['t', 'c', 'p']);
 const SHOW = new Set(['c', 'g', 'p']);
 const WORK_AFTER = new Set(['w', 'h', 'k', 'n', 'l']);
