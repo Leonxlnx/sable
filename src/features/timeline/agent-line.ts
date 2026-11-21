@@ -1,4 +1,5 @@
 import type { ProviderId, ToolItem, WorkflowRun } from '@shared/protocol';
+import { worksInBackground } from '@shared/background';
 import { clock } from '@/features/usage/format';
 import { limitTitle } from '@/features/usage/scope';
 import { formatTokens, plural } from '@/lib/format';
@@ -36,9 +37,9 @@ export const agentTask = (item: ToolItem): string => item.detail.description || 
 /** Working now: its call runs, or it works on in the background (a background agent, a workflow). */
 export const isAgentLive = (item: ToolItem | undefined): boolean => {
   if (!item) return false;
-  if (item.workflow) return item.workflow.status === 'running' && item.status !== 'error' && item.status !== 'cancelled' && item.status !== 'denied';
-  if (item.status === 'running' || item.status === 'pending' || item.status === 'awaiting') return true;
-  return item.status === 'done' && item.result?.agent?.background === 'running';
+  // The same rule as the bridge's count of background work (shared/background.ts).
+  if (!item.workflow && (item.status === 'running' || item.status === 'pending' || item.status === 'awaiting')) return true;
+  return worksInBackground(item);
 };
 
 /** "Fable weekly limit reached · resets Sat 00:00": a sub-agent the plan stopped. */

@@ -344,6 +344,8 @@ export class App {
       // Remote links and live capability state belong to the agent process that is gone.
       meta.remote = meta.options?.remoteControl ? { status: 'Reconnects when the agent starts again', tone: 'waiting' } : undefined;
       meta.capState = undefined;
+      // Background work lived in the agent process that is gone (its steps are stopped as the chat is read: `loadRestored`).
+      meta.background = undefined;
       // An until loop does not outlive Sable: the session says so when it is opened.
       if (meta.until) this.untilLost.set(meta.id, meta.until), (meta.until = undefined);
       // A chat titled from a message the agent's harness wrote (`<task-notification>`): its plain words.
@@ -849,13 +851,12 @@ export class App {
   }
 
   private loadInto(rt: SessionRuntime, file: ReturnType<Store['loadSession']>) {
-    rt.load(file.items, file.todos, file.queue ?? []);
-    rt.markSaved();
+    // No agent process carries anything from before: background sub-agents and workflows ended with it
+    // (stopped as read, so the count never shows them, also not on the way).
+    rt.loadRestored(file.items, file.todos, file.queue ?? []);
     // A file that is there but cannot be read is left exactly as it is (nothing is written to it).
     if (file.unreadable) rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Restart Sable to try again.');
     rt.settle('cancelled');
-    // No agent process carries anything from before: background sub-agents and workflows ended with it.
-    rt.stopBackground();
     // Messages still waiting for the agent when Sable closed (a steer not taken yet) would wait forever: back to the queue.
     rt.returnUntaken({ all: true, reason: 'closed' });
     const lost = this.untilLost.get(rt.id);

@@ -19,6 +19,7 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { userText } from '../../shared/synthetic';
+import { worksInBackground } from '../../shared/background';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
 
 export type Emit = (event: BridgeEvent) => void;
@@ -37,8 +38,16 @@ export type MessageOutcome = 'ok' | 'failed' | 'stopped';
 type NewItem<T extends TimelineItem> = T extends TimelineItem ? Omit<T, 'id' | 'ts'> & { id?: string; ts?: number } : never;
 
 
-/** A step whose sub-agent or workflow still works in the background (its own call returned, the work goes on). */
-export const worksInBackground = (i: TimelineItem): boolean => i.type === 'tool' && (i.result?.agent?.background === 'running' || i.workflow?.status === 'running');
+export { worksInBackground };
+
+/** The step with its sub-agent or workflow marked stopped (their process is gone), or the step itself when nothing of it runs. */
+export function stoppedBackground(i: TimelineItem): TimelineItem {
+  if (i.type !== 'tool') return i;
+  let out = i;
+  if (i.result?.agent?.background === 'running') out = { ...out, result: { ...i.result, agent: { ...i.result.agent, background: 'stopped' } } };
+  if (i.workflow?.status === 'running') out = { ...out, workflow: { ...i.workflow, status: 'stopped' } };
+  return out;
+}
 
 /**
  * One open session: metadata, the normalized timeline and any prompt waiting on the
@@ -128,6 +137,23 @@ export class SessionRuntime {
 
   private markDirty(id: string) {
     if (this.dirty !== 'all') this.dirty.add(id);
+  }
+
+  /**
+   * As `load`, for a chat read from disk after a restart: no agent process carries anything from before,
+   * so sub-agents and workflows still marked running are stopped first and the count starts at 0, with
+   * nothing announced on the way (review wave 7, #4). The steps it changed go with the next save.
+   */
+  loadRestored(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]) {
+    const changed: string[] = [];
+    const out = items.map((i) => {
+      const s = stoppedBackground(i);
+      if (s !== i) changed.push(i.id);
+      return s;
+    });
+    this.load(out, todos, queue);
+    this.markSaved();
+    for (const id of changed) this.markDirty(id);
   }
 
   load(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]) {
@@ -734,11 +760,13 @@ export class SessionRuntime {
    * Sub-agents and workflows still marked as running in the background whose agent process is gone
    * (it ended, or Sable restarted): they died with it and their end will never be reported.
    */
-  stopBackground() {
+  stopBackground(only?: (item: TimelineItem) => boolean) {
     for (const item of this.items) {
-      if (item.type !== 'tool') continue;
-      if (item.result?.agent?.background === 'running') this.patch<ToolItem>(item.id, { result: { ...item.result, agent: { ...item.result.agent, background: 'stopped' } } });
-      if (item.workflow?.status === 'running') this.patch<ToolItem>(item.id, { workflow: { ...item.workflow, status: 'stopped' } });
+      if (only && !only(item)) continue;
+      const stopped = stoppedBackground(item);
+      if (stopped === item || stopped.type !== 'tool') continue;
+      const was = item as ToolItem;
+      this.patch<ToolItem>(item.id, { ...(stopped.result !== was.result ? { result: stopped.result } : {}), ...(stopped.workflow !== was.workflow ? { workflow: stopped.workflow } : {}) });
     }
   }
 
