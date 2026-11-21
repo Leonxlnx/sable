@@ -1,7 +1,7 @@
 {
   "name": "sable",
   "private": true,
-  "version": "0.2.11",
+  "version": "0.2.12",
   "type": "module",
   "description": "Sable: a desktop agentic development environment for Claude Code and Codex.",
   "author": {
