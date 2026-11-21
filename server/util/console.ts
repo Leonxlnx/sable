@@ -28,16 +28,20 @@ export type OpenConsole = (spec: ConsoleSpec) => ConsoleWindow;
 const PLAIN = /^[\w@+=:,.\\-][\w@+=:,./\\-]*$/;
 
 /**
- * The command line `cmd.exe /d /s /c` runs: `start "<title>" /wait <bin> <args>`, the whole of it in
- * one pair of outer quotes that `/s` takes off. It must reach cmd verbatim (`windowsVerbatimArguments`):
- * Node's own quoting would turn the title into `"\"OpenCode login\""`, which `start` takes apart.
- * Refuses what cmd would read as more than text (a quote, `%`, a line break), so nothing passed in
- * can change the command.
+ * The command line `cmd.exe /d /s /c` runs: `start "<title>" /wait cmd /d /s /c "<bin> <args>"`,
+ * the whole of it in one pair of outer quotes that `/s` takes off. The window runs a `cmd /c` of its
+ * own around the program, so a batch file (npm's `claude.cmd`) runs like an .exe, a path with spaces
+ * holds, and the window closes when the program ends (`start` keeps a batch file's window open with
+ * `/k`). A bare name stays unquoted: a batch file found on PATH by a quoted name gets a wrong `%~dp0`,
+ * which npm's shims need. It must reach cmd verbatim (`windowsVerbatimArguments`): Node's own quoting
+ * would turn the title into `"\"OpenCode login\""`, which `start` takes apart. Refuses what cmd would
+ * read as more than text (a quote, `%`, `&`, a pipe or redirection, `^`, a line break), so nothing
+ * passed in can change the command.
  */
 export function consoleCommandLine(spec: Pick<ConsoleSpec, 'title' | 'bin' | 'args'>): string {
-  for (const part of [spec.title, spec.bin, ...spec.args]) if (/["%\r\n\0]/.test(part)) throw new Error('That command cannot be run in a console window');
+  for (const part of [spec.title, spec.bin, ...spec.args]) if (/["%&|<>^\r\n\0]/.test(part)) throw new Error('That command cannot be run in a console window');
   const word = (s: string) => (PLAIN.test(s) ? s : `"${s}"`);
-  return `"start "${spec.title}" /wait ${word(spec.bin)}${spec.args.map((a) => ` ${word(a)}`).join('')}"`;
+  return `"start "${spec.title}" /wait cmd /d /s /c "${word(spec.bin)}${spec.args.map((a) => ` ${word(a)}`).join('')}""`;
 }
 
 /** Opens the program in a console window of its own (Windows only). */

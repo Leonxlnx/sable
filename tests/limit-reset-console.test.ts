@@ -62,17 +62,20 @@ function fakeConsoles() {
 // ───────────────────────────── the command line ─────────────────────────────
 
 describe('the console command line', () => {
-  it('starts the program with start /wait, the title and every argument as given, in one verbatim line', () => {
+  // Checked by hand on Windows with `start /b` and stand-ins (no window, no Claude Code session): an
+  // .exe in a folder with spaces, a batch file found on PATH by name (its %~dp0 intact) and one by a
+  // path with spaces each got `/limit-reset` as one argument, the account's CLAUDE_CONFIG_DIR and the folder.
+  it('starts the program with start /wait in a cmd /c of its own, every argument as given, in one verbatim line', () => {
     expect(consoleCommandLine({ title: 'Claude Code reset', bin: 'C:\\Program Files\\Sable\\resources\\claude\\claude.exe', args: ['/limit-reset'] })).toBe(
-      '"start "Claude Code reset" /wait "C:\\Program Files\\Sable\\resources\\claude\\claude.exe" "/limit-reset""',
+      '"start "Claude Code reset" /wait cmd /d /s /c ""C:\\Program Files\\Sable\\resources\\claude\\claude.exe" "/limit-reset"""',
     );
-    expect(consoleCommandLine({ title: 'Claude Code reset (Work)', bin: 'claude', args: ['/limit-reset'] })).toBe('"start "Claude Code reset (Work)" /wait claude "/limit-reset""');
-    // OpenCode's sign-in, as before its move to the shared helper (now inside the outer quotes `/s` takes off).
-    expect(consoleCommandLine({ title: 'OpenCode login', bin: 'opencode', args: ['auth', 'login'] })).toBe('"start "OpenCode login" /wait opencode auth login"');
+    expect(consoleCommandLine({ title: 'Claude Code reset (Work)', bin: 'claude', args: ['/limit-reset'] })).toBe('"start "Claude Code reset (Work)" /wait cmd /d /s /c "claude "/limit-reset"""');
+    // OpenCode's sign-in through the same helper.
+    expect(consoleCommandLine({ title: 'OpenCode login', bin: 'opencode', args: ['auth', 'login'] })).toBe('"start "OpenCode login" /wait cmd /d /s /c "opencode auth login""');
   });
 
   it('refuses what cmd would read as more than text', () => {
-    for (const bad of ['a"b', '%PATH%', 'a\r\nb'])
+    for (const bad of ['a"b', '%PATH%', 'a\r\nb', 'a & calc', 'a | b', 'a > f', 'a ^ b'])
       expect(() => consoleCommandLine({ title: 'x', bin: 'claude', args: [bad] })).toThrow();
     expect(() => consoleCommandLine({ title: 'say "hi"', bin: 'claude', args: [] })).toThrow();
   });
@@ -135,7 +138,7 @@ describe("Claude Code's reset dialog", () => {
       expect(spec.env?.CLAUDE_CONFIG_DIR).toBe(account.dir);
       expect(spec.cwd).toBe(path.join(home, 'limit-reset'));
       expect(existsSync(spec.cwd!)).toBe(true);
-      expect(consoleCommandLine(spec)).toBe('"start "Claude Code reset (Work)" /wait claude "/limit-reset""');
+      expect(consoleCommandLine(spec)).toBe('"start "Claude Code reset (Work)" /wait cmd /d /s /c "claude "/limit-reset"""');
 
       // The packaged app's own binary, when the desktop shell names it.
       process.env.SABLE_CLAUDE_BIN = 'C:\\Sable\\claude.exe';
