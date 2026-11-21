@@ -90,10 +90,10 @@ export async function commitAll(cwd: string, message: string): Promise<GitCommit
   }
 }
 
-/** A commit message written from the folder's changes (Claude Code's Haiku). Stages nothing. Never throws. */
-export async function draftCommitMessage(cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+/** A commit message written from the folder's changes by the chat's own agent and account (its smallest model). Stages nothing. Never throws. */
+export async function draftCommitMessage(sessionId: string, cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
   try {
-    return await bridge.call('git.draft', { cwd }, 90_000);
+    return await bridge.call('git.draft', { sessionId, cwd }, 90_000);
   } catch (err) {
     return { ok: false, error: (err as Error).message || String(err) };
   }

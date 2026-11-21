@@ -454,23 +454,22 @@ export class App {
   }
 
   /**
-   * A commit message for a folder's changes, written by Claude Code's Haiku on the default account.
-   * Nothing is staged or committed: the person reads it and commits.
+   * A commit message for a chat's changes, written by its own agent's smallest model on the chat's
+   * own account, as chat titles are (`titleModel`: Claude Code's Haiku, Codex's smallest model; never
+   * another agent's or account's). Only on the person's click. Nothing is staged or committed: the
+   * person reads it and commits.
    */
-  private async draftCommit(cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+  private async draftCommit(sessionId: string, cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+    const rt = this.runtime(sessionId);
+    const owner = { provider: rt.meta.provider, accountId: rt.meta.accountId ?? DEFAULT_ACCOUNT };
+    const model = this.titleModel(owner);
+    if (!model) return { ok: false, error: `${this.agentName(owner.provider)} cannot write a commit message. Write one yourself.` };
     const input = await gitDraftInput(cwd);
     if ('error' in input) return { ok: false, error: input.error };
-    let model: Provider;
-    try {
-      model = this.provider('claude', this.defaultAccountId('claude'));
-    } catch {
-      return { ok: false, error: 'Claude Code is not set up, so no message can be written.' };
-    }
-    if (!model.quickTitle) return { ok: false, error: 'Claude Code is not set up, so no message can be written.' };
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 60_000);
     try {
-      const message = cleanCommit(await model.quickTitle(commitPrompt(input, path.resolve(cwd)), ctrl.signal));
+      const message = cleanCommit(await model(commitPrompt(input, path.resolve(cwd)), ctrl.signal));
       return message ? { ok: true, message } : { ok: false, error: 'The model gave no message. Write one yourself.' };
     } catch (err) {
       return { ok: false, error: (err as Error).message || 'The message could not be written.' };
@@ -2557,7 +2556,7 @@ export class App {
 
     // Lanes (server/core/lanes.ts).
     this.register('git.worktrees', ({ cwd }) => gitWorktrees(cwd));
-    this.register('git.draft', ({ cwd }) => this.draftCommit(String(cwd ?? '')));
+    this.register('git.draft', ({ sessionId, cwd }) => this.draftCommit(String(sessionId ?? ''), String(cwd ?? '')));
     this.register('lane.forecast', ({ sessionId }) => this.lanes.forecast(this.runtime(sessionId)));
     this.register('lane.land', ({ sessionId, message }) => this.lanes.land(this.loaded(sessionId), typeof message === 'string' ? message : undefined));
     this.register('lane.discard', ({ sessionId }) => this.lanes.discard(this.loaded(sessionId)));

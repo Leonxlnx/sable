@@ -47,5 +47,6 @@ export function cleanCommit(raw: string | null | undefined): string | null {
     .trim();
   if (!subject) return null;
   const body = lines.slice(1).join('\n').replace(/\s+$/, '');
-  return body.trim() ? `${subject}\n${body.replace(/^\n+/, '')}` : subject;
+  // A blank line between the subject and the body, as git wants it (without one the body joins the subject).
+  return body.trim() ? `${subject}\n\n${body.replace(/^\n+/, '')}` : subject;
 }
