@@ -34,7 +34,9 @@ export function Scanner({ onCode, onClose, onPaste }: { onCode: (text: string) =
         canvas.height = h;
         ctx.drawImage(v, 0, 0, w, h);
         const code = jsQR?.(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'attemptBoth' });
-        if (code?.data && /^sable:\/\/pair\?/i.test(code.data)) {
+        // Any version of the pairing link (`sable://pair/2?…` now, `sable://pair?…` from an older
+        // desktop): pairing reads it and says when it is too old.
+        if (code?.data && /^sable:\/\/pair(?:\/\d+)?\?/i.test(code.data)) {
           stopped = true;
           haptic('success');
           setFound(true);

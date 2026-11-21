@@ -233,7 +233,7 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
                 <input
                   className="pair-input"
                   autoFocus
-                  placeholder="sable://pair?…"
+                  placeholder="sable://pair/2?…"
                   value={text}
                   onChange={(e) => setText(e.target.value)}
                   autoCapitalize="off"
