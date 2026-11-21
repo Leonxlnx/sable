@@ -1524,7 +1524,8 @@
   font-size: var(--t-ui);
   color: var(--text-3);
   min-width: 0;
-  max-width: 45%;
+  /* The branch is what the row is: the folder gives way first. */
+  max-width: 35%;
 }
 
 .cm-row-name {
