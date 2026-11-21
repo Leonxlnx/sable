@@ -166,11 +166,15 @@
   font-weight: var(--w-medium);
 }
 
+/* Where the lane came from is three or four letters ("from main"): it keeps its words and the
+   lane's long name gives way (it used to shrink first and read "from ..."). A long base branch
+   still cannot take more than half the line. */
 .lane-from {
   min-width: 0;
+  max-width: 50%;
   color: var(--text-3);
   font-size: var(--t-small);
-  flex-shrink: 1000;
+  flex-shrink: 0;
 }
 
 .lane-head-end {

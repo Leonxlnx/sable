@@ -105,6 +105,17 @@
   background-color: #e4e2dd;
 }
 
+/* Not ready yet: ivory at disabled strength is a grey slab with dark words, the muddiest thing on a
+   dark card. It rests as a plain button with dim words instead, and turns ivory the moment it can
+   be pressed (the fill's own transition): the key arms. Busy keeps the ivory, it is working. */
+.btn-primary:disabled:not([data-busy]),
+.btn-primary[aria-disabled='true']:not([data-busy]) {
+  --btn-bg: var(--fill-2);
+  color: var(--text-3);
+  box-shadow: inset 0 0 0 1px var(--line);
+  opacity: 1;
+}
+
 .btn-ghost {
   --btn-bg: transparent;
   box-shadow: none;

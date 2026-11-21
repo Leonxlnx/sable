@@ -575,8 +575,9 @@ function liveSelector(sessionId: string, seg: Segment, held: { title: string }) 
   };
 }
 
-/** How long the old title takes to fade before the new one comes in (ms). */
-const SWAP_OUT_MS = 110;
+/** How long the old title takes to fade before the new one comes in (ms). Short: the line is the
+ *  turn's pulse, and a title that is gone for a quarter of a second reads as a line that went out. */
+const SWAP_OUT_MS = 80;
 
 /**
  * A title that changes by fading through: the old one fades out, the new one fades in, and the
@@ -637,8 +638,8 @@ function LiveLine({ seg, open, onToggle }: { seg: Segment; open: boolean; onTogg
     if (!el || was < 0) return;
     const w = el.offsetWidth;
     if (Math.abs(was - w) < 1) return;
-    for (let n = el.nextElementSibling; n; n = n.nextElementSibling) n.animate([{ transform: `translateX(${was - w}px)` }, { transform: 'translateX(0)' }], { duration: 220, easing: 'cubic-bezier(0.2, 0, 0, 1)', composite: 'add' });
-    if (w > was) el.animate([{ opacity: 0 }, { opacity: 0, offset: 0.4 }, { opacity: 1 }], { duration: 300, easing: 'ease-out' });
+    for (let n = el.nextElementSibling; n; n = n.nextElementSibling) n.animate([{ transform: `translateX(${was - w}px)` }, { transform: 'translateX(0)' }], { duration: 180, easing: 'cubic-bezier(0.2, 0, 0, 1)', composite: 'add' });
+    if (w > was) el.animate([{ opacity: 0 }, { opacity: 0, offset: 0.25 }, { opacity: 1 }], { duration: 240, easing: 'ease-out' });
   }, [title, waiting]);
   const body = (
     <>

@@ -142,6 +142,12 @@
   flex-direction: column;
 }
 
+/* What the conversation paints in "the surface behind it" (the sticky live line's band and its
+   fade) is the column's panel here, not the stage: it stood as a darker block over the words. */
+.race-col-body {
+  --sheet: var(--panel);
+}
+
 /* The conversation's top fade is drawn in its surface's colour. */
 .race-col-body .tl::before {
   background: linear-gradient(to bottom, var(--panel), transparent);
@@ -162,6 +168,13 @@
 
 .race-col-prompts:has(.pd-slot) {
   padding-bottom: 10px;
+}
+
+/* A column is half a chat wide and shares its height with its conversation: a card's preview (a
+   diff, a plan, a command's output) is cut shorter here, so the chat it asks about stays in view
+   above it. It scrolls as it does in a chat. */
+.race-col-prompts .pc-scroll {
+  max-height: min(calc(24 * var(--vh)), 200px);
 }
 
 /* ── the foot ── */

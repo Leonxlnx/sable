@@ -4,6 +4,7 @@ import { Icon, type IconName } from '@/icons';
 import { LimitNotice } from '@/features/accounts';
 import { AgentSwitchLine } from './AgentSwitch';
 import { CommandOutput } from './Synthetic';
+import { readErrorDetail } from './error-detail';
 
 const ICON: Record<NoticeItem['variant'], IconName> = {
   info: 'info',
@@ -16,6 +17,18 @@ const ICON: Record<NoticeItem['variant'], IconName> = {
   command: 'prompt',
   rewind: 'rewind',
 };
+
+/** An error's second line: what the service said and its status when the line is an API failure (error-detail.ts), else the line as it came. */
+function ErrorDetailLine({ detail }: { detail: string }) {
+  const d = readErrorDetail(detail);
+  if (!d.raw) return <div className="notice-error-detail">{d.text}</div>;
+  return (
+    <div className="notice-error-detail" data-read title={d.raw}>
+      {d.text}
+      {d.status && <span className="notice-error-status num">{d.status}</span>}
+    </div>
+  );
+}
 
 /** Things that happened to the conversation rather than in it: dividers, errors, command output. */
 export const Notice = memo(function Notice({ item }: { item: NoticeItem }) {
@@ -30,7 +43,7 @@ export const Notice = memo(function Notice({ item }: { item: NoticeItem }) {
         <Icon name="error" size={16} />
         <div className="notice-error-body">
           <div className="notice-error-text">{item.text}</div>
-          {item.detail && <div className="notice-error-detail">{item.detail}</div>}
+          {item.detail && <ErrorDetailLine detail={item.detail} />}
         </div>
       </div>
     );

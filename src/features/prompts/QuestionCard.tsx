@@ -288,14 +288,17 @@ export function QuestionCard({ sessionId, req, more }: { sessionId: string; req:
           Skip
         </button>
         <span className="grow" />
-        {!last && (
-          <button type="button" className="btn" disabled={!x.ready} onClick={() => x.go(step + 1)}>
+        {/* One way forward, as Enter does it: on to the next question until the last has its answer,
+            then send. Two keys of which neither could be pressed read as a card that was stuck. */}
+        {!last ? (
+          <button type="button" className="btn btn-primary" disabled={!x.ready} onClick={() => x.go(step + 1)}>
             Next
           </button>
+        ) : (
+          <button type="button" className="btn btn-primary" disabled={!complete || sent} onClick={() => x.send()}>
+            {qs.length > 1 ? 'Send answers' : 'Send answer'}
+          </button>
         )}
-        <button type="button" className="btn btn-primary" disabled={!complete || sent} onClick={() => x.send()}>
-          Send answers
-        </button>
       </div>
     </section>
   );

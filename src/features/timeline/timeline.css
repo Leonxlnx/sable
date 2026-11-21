@@ -1875,6 +1875,19 @@ button:hover > .row-caret {
   overflow-wrap: anywhere;
 }
 
+/* An API failure read for the person (error-detail.ts): the service's words in the interface's own
+   type, the status after them; the raw line is the element's title. */
+.notice-error-detail[data-read] {
+  font-family: var(--font-sans);
+  font-size: var(--t-small);
+  line-height: 1.5;
+}
+
+.notice-error-status {
+  margin-left: 8px;
+  color: var(--text-3);
+}
+
 /* Inside a turn's trail a notice is one more quiet line, not a divider. */
 .story .notice-line {
   gap: 8px;
@@ -2090,12 +2103,12 @@ button:hover > .row-caret {
 /* A new title fades through: the old one out, then the new one in (TurnView `useSwap`). */
 .work-live-title {
   flex: 0 1 auto;
-  transition: opacity 170ms var(--ease);
+  transition: opacity 150ms var(--ease);
 }
 
 .work-live-title[data-out] {
   opacity: 0;
-  transition-duration: 110ms;
+  transition-duration: 80ms;
 }
 
 /* What the turn changed: a second, quiet control on the summary line that opens Changes. It stands
