@@ -530,7 +530,7 @@
   }
 }
 
-/* The selected row: one step of light, raised a hair (a top light and a contact shadow).
+/* The selected row: one step of light with an even hairline (flat controls, ui.css).
    It slides between rows (ActivePill). */
 .srow-pill {
   position: absolute;
@@ -538,7 +538,7 @@
   z-index: -1;
   border-radius: inherit;
   background-color: var(--fill-3);
-  /* Tactile (ui.css): raised a hair above the list. */
+  /* Flat controls (ui.css): one fill step and one even hairline. */
   box-shadow: var(--press-up);
 }
 

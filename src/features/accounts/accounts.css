@@ -206,7 +206,6 @@
   width: 284px;
   border-radius: 16px;
   background:
-    var(--glass-sheen),
     var(--grain) 0 0 / var(--grain-size),
     linear-gradient(var(--glass-strong), var(--glass-strong)),
     var(--bg);

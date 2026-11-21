@@ -450,8 +450,8 @@
   font-size: var(--t-small);
   font-weight: var(--w-medium);
   color: var(--text-2);
-  /* Liquid glass like a toast (ui.css): the rim is its ::before. */
-  background: var(--glass-sheen), var(--grain) 0 0 / var(--grain-size), var(--panel-2);
+  /* Glass like a toast (ui.css): the rim is its ::before. */
+  background: var(--grain) 0 0 / var(--grain-size), var(--panel-2);
   box-shadow: var(--rim-inner), var(--shadow-glass);
   animation: rise-in var(--d-3) var(--ease-out);
 }
@@ -659,8 +659,8 @@ body:has(.stage-dock) .toasts {
   text-align: left;
   font-size: var(--t-ui);
   color: var(--text);
-  /* Liquid glass (ui.css): the rim is its ::before. */
-  background: var(--glass-sheen), var(--grain) 0 0 / var(--grain-size), var(--panel-2);
+  /* Glass (ui.css): the rim is its ::before. */
+  background: var(--grain) 0 0 / var(--grain-size), var(--panel-2);
   box-shadow: var(--rim-inner), var(--shadow-glass);
   transition: background-color var(--d-1) var(--ease);
 }
