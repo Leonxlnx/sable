@@ -190,8 +190,13 @@ export function statusTone(s: SessionMeta): StatusTone {
   if (s.status === 'running' || s.status === 'starting' || (s.status === 'idle' && s.until?.phase === 'checking')) return 'working';
   if (s.status === 'awaiting') return 'awaiting';
   if (s.status === 'error') return 'error';
+  // Its own turn ended, but sub-agents it sent to the background still work: the chat is not at rest.
+  if ((s.background ?? 0) > 0) return 'working';
   return s.unread ? 'unread' : 'idle';
 }
+
+/** "2 sub-agents working": a chat's background work in words (`SessionMeta.background`). */
+export const backgroundLabel = (n: number) => `${n} ${n === 1 ? 'sub-agent' : 'sub-agents'} working`;
 
 export function StatusMark({ session }: { session: SessionMeta }) {
   return <StatusGlyph tone={statusTone(session)} />;
@@ -202,6 +207,7 @@ export function statusLabel(s: SessionMeta): string | null {
   if (s.status === 'idle' && s.until?.phase === 'checking') return 'Running the check';
   if (s.status === 'awaiting') return 'Needs approval';
   if (s.status === 'error') return s.lastError ? `Error: ${s.lastError}` : 'Error';
+  if ((s.background ?? 0) > 0) return backgroundLabel(s.background!);
   return null;
 }
 

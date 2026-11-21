@@ -99,7 +99,7 @@ export function AccountSwitcher() {
           align="start"
           sideOffset={8}
           collisionPadding={10}
-          style={{ width: 268 }}
+          style={{ width: many ? 292 : 268 }}
           loop
         >
           {many && (

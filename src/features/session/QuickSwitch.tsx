@@ -123,7 +123,7 @@ export function QuickSwitch() {
               <ProviderMark provider={s.provider} size={14} className="qs-mark" />
               <span className="qs-title truncate">{s.title || 'New session'}</span>
               {/* Only a session that is working or waiting on you carries a mark. */}
-              {(s.status === 'running' || s.status === 'starting') && <StatusGlyph tone="working" />}
+              {(s.status === 'running' || s.status === 'starting' || (s.background ?? 0) > 0) && <StatusGlyph tone="working" />}
               {s.status === 'awaiting' && <StatusGlyph tone="awaiting" />}
               <span className="qs-where truncate">{baseName(s.cwd)}</span>
               <span className="qs-when num">{timeAgo(s.updatedAt)}</span>

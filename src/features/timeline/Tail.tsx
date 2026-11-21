@@ -1,6 +1,7 @@
 import { memo } from 'react';
 import { Tiles } from '@/art/Logo';
 import { Icon } from '@/icons';
+import { showRailTab } from '@/state/actions';
 import { useStore, type SessionData } from '@/state/store';
 import { useTimeline } from './ctx';
 import { shortDuration, useTick } from './util';
@@ -26,15 +27,30 @@ function tailInfo(data: SessionData | undefined): string {
 /**
  * The line under the transcript while the agent works: what it is doing and for how long (the
  * stop button and Esc stop it). It steps back while prose is streaming, since the words are the signal.
+ * With the chat's own turn over but sub-agents it sent to the background still at work
+ * (`SessionMeta.background`), it says so, and opens the Agents tab.
  */
 export const Tail = memo(function Tail() {
   const { sessionId } = useTimeline();
   const status = useStore((s) => s.sessions[sessionId]?.status);
   const activity = useStore((s) => s.sessions[sessionId]?.activity);
   const info = useStore((s) => tailInfo(s.data[sessionId]));
+  const background = useStore((s) => s.sessions[sessionId]?.background ?? 0);
   const working = status === 'running' || status === 'starting';
   const now = useTick(working);
-  if (!working && status !== 'awaiting') return null;
+  if (!working && status !== 'awaiting') {
+    if (!background) return null;
+    return (
+      <button type="button" className="tail tail-bg" onClick={() => showRailTab('agents')} aria-label={`${background} ${background === 1 ? 'sub-agent' : 'sub-agents'} working. Open Agents`}>
+        <span className="row-slot">
+          <Tiles size={14} />
+        </span>
+        <span className="tail-label truncate">
+          {background} {background === 1 ? 'sub-agent' : 'sub-agents'} working
+        </span>
+      </button>
+    );
+  }
 
   const [startRaw, quietRaw] = info.split('|');
   const start = Number(startRaw);

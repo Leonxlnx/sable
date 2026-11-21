@@ -11,6 +11,8 @@ import { accountName } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { Tip } from '@/ui';
 import { accountsOf, planWord } from './model';
+import { rankWords, shortUntil, useFirstRanks } from './order';
+import type { UseFirstRank } from '@shared/use-first';
 import { appliesTo } from '@/features/usage/scope';
 
 /** From this many accounts on, the switcher filters, groups and orders by room left. */
@@ -81,6 +83,8 @@ export function ManyAccounts({
 }) {
   const reports = useStore((s) => s.limitReports);
   const live = useStore((s) => s.limits);
+  const byUseFirst = useStore((s) => s.settings.accountsBy !== 'manual');
+  const caps = useStore((s) => s.settings.accountCaps);
   const now = useNow();
   const [query, setQuery] = useState('');
   const [collapsed, setCollapsed] = useState(loadCollapsed);
@@ -92,11 +96,17 @@ export function ManyAccounts({
       agents.map((id) => {
         const entries = entriesOf(id, providers[id], reports, live);
         const rows = entries.map((e) => roomRow(e, now));
-        // Usable accounts by room left; signed-out ones after them.
-        const sorted = [...sortRows(rows.filter((r) => r.state !== 'off'), 'room'), ...sortRows(rows.filter((r) => r.state === 'off'), 'agent')];
-        return { id, rows: sorted, total: sorted.length, pool: poolOf(entries, now) };
+        // The order to use them in: the week that ends soonest first (shared/use-first.ts).
+        const ranks = useFirstRanks(id, entries, caps, now);
+        const rank = new Map(ranks.map((r, i) => [r.id, { ...r, place: i }]));
+        const place = (r: (typeof rows)[number]) => rank.get(r.input.account.id)?.place ?? ranks.length;
+        // Or, in the person's own order: usable accounts by room left; signed-out ones after them.
+        const sorted = byUseFirst
+          ? [...rows].sort((a, b) => place(a) - place(b))
+          : [...sortRows(rows.filter((r) => r.state !== 'off'), 'room'), ...sortRows(rows.filter((r) => r.state === 'off'), 'agent')];
+        return { id, rows: sorted, total: sorted.length, pool: poolOf(entries, now), rank };
       }),
-    [agents, providers, reports, live, now],
+    [agents, providers, reports, live, now, byUseFirst, caps],
   );
 
   const q = query.trim();
@@ -185,7 +195,7 @@ export function ManyAccounts({
           if (g.total === 1)
             return (
               <RM.Group key={g.id} className="acs-group">
-                <ManyRow row={g.rows[0]} now={now} single inUse={inUse.provider === g.id} onPeek={() => onPeek({ provider: g.id, accountId: g.rows[0].input.account.id })} onSelect={() => onPick(g.id, g.rows[0].input.account)} />
+                <ManyRow row={g.rows[0]} now={now} single rank={g.rank.get(g.rows[0].input.account.id)} inUse={inUse.provider === g.id} onPeek={() => onPeek({ provider: g.id, accountId: g.rows[0].input.account.id })} onSelect={() => onPick(g.id, g.rows[0].input.account)} />
               </RM.Group>
             );
           return (
@@ -207,7 +217,7 @@ export function ManyAccounts({
                   <Icon name="caret-down" size={11} className="acs-fold" />
                 </span>
               </RM.Item>
-              {!folded && g.rows.map((r) => <ManyRow key={r.input.key} row={r} now={now} inUse={inUse.provider === g.id && inUse.accountId === r.input.account.id} onPeek={() => onPeek({ provider: g.id, accountId: r.input.account.id })} onSelect={() => onPick(g.id, r.input.account)} />)}
+              {!folded && g.rows.map((r) => <ManyRow key={r.input.key} row={r} now={now} rank={g.rank.get(r.input.account.id)} inUse={inUse.provider === g.id && inUse.accountId === r.input.account.id} onPeek={() => onPeek({ provider: g.id, accountId: r.input.account.id })} onSelect={() => onPick(g.id, r.input.account)} />)}
             </RM.Group>
           );
         })}
@@ -219,10 +229,11 @@ export function ManyAccounts({
 /** The plan as one word, the Demo's made-up plans included. */
 export const planOf = (a: AccountInfo) => (a.auth.loggedIn ? (planWord(a) ?? planText(a.auth)?.replace(/\s+plan$/i, '')) : undefined);
 
-function ManyRow({ row, now, inUse, single, onPeek, onSelect }: { row: RoomRow<Entry>; now: number; inUse: boolean; single?: boolean; onPeek: () => void; onSelect: () => void }) {
+function ManyRow({ row, now, rank, inUse, single, onPeek, onSelect }: { row: RoomRow<Entry>; now: number; rank?: UseFirstRank; inUse: boolean; single?: boolean; onPeek: () => void; onSelect: () => void }) {
   const { account, provider } = row.input;
   const plan = planOf(account);
   const used = row.tight ? Math.round(livePercent(row.tight, now)) : undefined;
+  const words = rankWords(rank, now);
   return (
     <RM.Item
       className="menu-item acs-row acs-row-in"
@@ -230,7 +241,7 @@ function ManyRow({ row, now, inUse, single, onPeek, onSelect }: { row: RoomRow<E
       data-in-use={inUse || undefined}
       onFocus={onPeek}
       onSelect={onSelect}
-      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${used}% used` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${account.isDefault ? ', default' : ''}`}
+      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${used}% used` : ''}${words ? `, ${words.toLowerCase()}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${account.isDefault ? ', default' : ''}`}
     >
       {single ? (
         <ProviderMark provider={provider} size={14} className="acs-mark" />
@@ -242,7 +253,23 @@ function ManyRow({ row, now, inUse, single, onPeek, onSelect }: { row: RoomRow<E
       <span className="acs-name truncate">{single ? PROVIDER_NAME[provider] : row.input.name}</span>
       <span className="acs-plan">{account.auth.loggedIn ? plan : 'Sign in'}</span>
       <UsedCell limit={account.auth.loggedIn ? row.tight : undefined} now={now} />
+      <EndsCell rank={rank} now={now} />
     </RM.Item>
+  );
+}
+
+/**
+ * When an account's week ends (what is unused then is gone): the figure the list is ordered by,
+ * soonest first. Dim for an account that does not take work now (held, used up); empty when its
+ * week is not known.
+ */
+export function EndsCell({ rank, now }: { rank: UseFirstRank | undefined; now: number }) {
+  const at = rank?.state === 'held' ? (rank.until ?? rank.expiresAt) : rank?.expiresAt;
+  const text = rank && rank.state !== 'off' && rank.state !== 'unknown' ? shortUntil(at, now) : '';
+  return (
+    <span className="acs-ends num" data-state={rank?.state} title={rankWords(rank, now) || undefined} aria-hidden>
+      {text}
+    </span>
   );
 }
 

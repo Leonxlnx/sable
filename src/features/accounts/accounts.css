@@ -654,6 +654,20 @@
   flex-shrink: 0;
 }
 
+/* When the account's week ends: the figure the list is ordered by. */
+.acs-ends {
+  flex-shrink: 0;
+  width: 26px;
+  text-align: right;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.acs-ends[data-state='held'],
+.acs-ends[data-state='spent'] {
+  color: var(--text-4);
+}
+
 /* How full an account is, as the Usage page draws a window: a thin meter and the percent used. */
 .acs-used {
   display: inline-grid;
