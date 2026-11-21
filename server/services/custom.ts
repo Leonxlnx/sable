@@ -159,7 +159,9 @@ export class Customizer {
   private missing?: string;
   private changedAt?: number;
   private watchers: FSWatcher[] = [];
-  private debounce?: NodeJS.Timeout;
+  private stylesTimer?: NodeJS.Timeout;
+  private sourceTimer?: NodeJS.Timeout;
+  private sourceWatched = false;
   private watchdog?: unknown;
   private reloadListeners = new Set<(why: 'fallback' | 'switch') => void>();
   private busy?: Promise<unknown>;
@@ -372,11 +374,7 @@ export class Customizer {
       mkdirSync(this.dir, { recursive: true });
       const w = watch(this.dir, (_ev, name) => {
         if (name && String(name).toLowerCase() !== STYLES_FILE) return;
-        clearTimeout(this.debounce);
-        // Editors and agents write in bursts (truncate, write, rename): one read after it settles.
-        this.debounce = setTimeout(() => {
-          if (this.readStyles()) this.changed();
-        }, 60);
+        this.stylesTouched();
       });
       w.on('error', () => {});
       this.watchers.push(w);
@@ -386,18 +384,37 @@ export class Customizer {
     this.watchSource();
   }
 
+  /**
+   * The stylesheet was written. Editors and agents write in bursts (truncate, write, rename): one read
+   * after it settles. A timer of its own: a source change at the same moment never cancels this read.
+   */
+  private stylesTouched() {
+    clearTimeout(this.stylesTimer);
+    this.stylesTimer = setTimeout(() => {
+      this.stylesTimer = undefined;
+      if (this.readStyles()) this.changed();
+    }, 60);
+  }
+
+  /** The workspace's source changed: the state goes out once the burst settles (its own timer). */
+  private sourceTouched() {
+    this.changedAt = this.now();
+    clearTimeout(this.sourceTimer);
+    this.sourceTimer = setTimeout(() => {
+      this.sourceTimer = undefined;
+      this.changed();
+    }, 200);
+  }
+
   /** The workspace's own source: a change an agent made means there is something to build. */
   private watchSource() {
     const src = path.join(this.workspace, 'src');
-    if (!existsSync(src) || this.watchers.length > 1) return;
+    if (!this.buildOn || this.sourceWatched || !existsSync(src)) return;
     try {
-      const w = watch(src, { recursive: true }, () => {
-        this.changedAt = this.now();
-        clearTimeout(this.debounce);
-        this.debounce = setTimeout(() => this.changed(), 200);
-      });
+      const w = watch(src, { recursive: true }, () => this.sourceTouched());
       w.on('error', () => {});
       this.watchers.push(w);
+      this.sourceWatched = true;
     } catch {
       /* not watched: the build button is always offered */
     }
@@ -707,7 +724,8 @@ export class Customizer {
   }
 
   dispose() {
-    clearTimeout(this.debounce);
+    clearTimeout(this.stylesTimer);
+    clearTimeout(this.sourceTimer);
     this.clearWatchdog();
     for (const w of this.watchers) w.close();
     this.watchers = [];

@@ -196,6 +196,23 @@ describe('the stylesheet route', () => {
     expect(widget).not.toContain('frame-ancestors');
   });
 
+  it('a source change right after a save of the sheet does not cancel its read (review 30)', async () => {
+    const home = tmp();
+    const { c, events } = make(home, { build: true });
+    const touch = c as unknown as { stylesTouched(): void; sourceTouched(): void };
+    try {
+      writeStyles(home, '.sidebar { width: 170px }');
+      touch.stylesTouched();
+      touch.sourceTouched();
+      await new Promise((r) => setTimeout(r, 400));
+      expect(c.stylesheet()).toBe('.sidebar { width: 170px }');
+      expect(events.some((e) => e.styles.exists)).toBe(true);
+      expect(c.state().build.changedAt).toBeDefined();
+    } finally {
+      c.dispose();
+    }
+  });
+
   it('a change of the file moves the rev; reading the same file again does not', () => {
     const home = tmp();
     const { c } = make(home);
