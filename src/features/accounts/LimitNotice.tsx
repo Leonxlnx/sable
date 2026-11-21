@@ -6,7 +6,7 @@ import { resetIn } from '@/lib/format';
 import { useNow } from '@/lib/useNow';
 import { continueAtReset, spendLimitReset, switchSessionAccount } from '@/state/actions';
 import { SpareClock } from '@/features/composer/SpareStrip';
-import { useResetOffers, useResets } from '@/features/usage/LimitReset';
+import { offersText, useResetOffers, useResets } from '@/features/usage/LimitReset';
 import { ResetInAgentAction, resetRunLine, useResetInAgent } from '@/features/usage/ResetInAgent';
 import { accountName, useLimitLevel } from '@/state/hooks';
 import { useStore } from '@/state/store';
@@ -110,6 +110,8 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
   const agentRun = viaAgent ? inAgent.run?.state : undefined;
   const agentLine = viaAgent ? agentError || (agentRun === 'cleared' ? undefined : resetRunLine(inAgent)) : undefined;
   const agentBusy = agentRun === 'open' || agentRun === 'reading';
+  // What the account's resets are, when the agent said ("1 full reset, until 10 Dec").
+  const offersLine = viaAgent && agentOffers ? offersText(agentOffers, now) : undefined;
   const moveButton = offer && sid && (
     <button
       type="button"
@@ -155,7 +157,7 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
         <div className="lim-text">
           {limitTitle(limit.window)} reached on {who}
         </div>
-        {(resetNote || agentLine || reset || item.detail) && <div className="lim-detail">{resetNote ?? agentLine ?? reset ?? item.detail}</div>}
+        {(resetNote || agentLine || reset || item.detail) && <div className="lim-detail">{resetNote ?? agentLine ?? (reset && offersLine ? `${reset} · ${offersLine}` : reset) ?? item.detail}</div>}
         {viaAgent && inAgent.via === 'terminal' && !agentRun && <div className="lim-detail">Run {inAgent.command} in a terminal to use a reset</div>}
       </div>
       {ask === 'done' ? (
