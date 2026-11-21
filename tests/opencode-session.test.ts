@@ -6,7 +6,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BridgeEvent, PermissionRequest, SessionMeta, UserItem } from '@shared/protocol';
 import { SessionRuntime } from '../server/core/runtime';
 import { OpenCodeProvider } from '../server/providers/opencode';
@@ -31,6 +31,7 @@ function fakeAcp() {
         calls.push({ method, params, resolve, reject });
         if (method === 'session/new') resolve({ sessionId: 'oc-1', configOptions: [] });
         if (method === 'session/set_config_option') resolve({});
+        if (method === 'session/resume') resolve({ configOptions: [] });
       });
     },
     notify(method: string, params: any) {
@@ -128,6 +129,94 @@ describe('OpenCode turns', () => {
     // OpenCode does not answer the cancel: the turn ends by itself (8 s); here it is answered at once.
     fake.prompts()[0].resolve({ stopReason: 'cancelled' });
     await new Promise((r) => setTimeout(r, 0));
+    expect(rt.turnActive).toBe(false);
+  });
+});
+
+describe('OpenCode after a Stop it does not answer, and after its process dies (review wave 8, #23)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+  };
+
+  it('a Stop that times out ends the turn, but nothing else goes until the old prompt has answered', async () => {
+    vi.useFakeTimers();
+    const { rt, provider, session, fake, user } = await chat();
+    await session.send(user('first'));
+    await session.interrupt();
+    vi.advanceTimersByTime(8_000);
+    expect(rt.turnActive).toBe(false);
+    // The next message waits: OpenCode may still be working on the stopped prompt.
+    const next = user('second');
+    await session.send(next);
+    await flush();
+    expect(fake.prompts()).toHaveLength(1);
+    expect(rt.get<UserItem>(next.id)?.state).toBe('queued');
+    // What the stopped prompt still streams is dropped, and what it asks is refused.
+    const before = rt.items.length;
+    (provider as unknown as { onNotification(m: string, p: unknown): void }).onNotification('session/update', { sessionId: 'oc-1', update: { sessionUpdate: 'agent_message_chunk', messageId: 'late', content: { text: 'late words' } } });
+    expect(rt.items.length).toBe(before);
+    expect(await (provider as unknown as { onRequest(m: string, p: unknown): Promise<unknown> }).onRequest('session/request_permission', { sessionId: 'oc-1', options: [{ optionId: 'y', kind: 'allow_once' }] })).toEqual({ outcome: { outcome: 'cancelled' } });
+    // It answers at last: the waiting message goes.
+    fake.prompts()[0].resolve({ stopReason: 'cancelled' });
+    await flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.prompts()).toHaveLength(2);
+    expect(rt.turnActive).toBe(true);
+  });
+
+  it('a stopped prompt that never answers gives the process up, and the waiting message goes on a new one', async () => {
+    vi.useFakeTimers();
+    const { rt, session, fake, user } = await chat();
+    await session.send(user('first'));
+    await session.interrupt();
+    vi.advanceTimersByTime(8_000);
+    await session.send(user('second'));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fake.calls.some((c) => c.method === 'session/resume')).toBe(true);
+    expect(fake.prompts()).toHaveLength(2);
+    expect(rt.turnActive).toBe(true);
+  });
+
+  it('after the process died the next message opens the conversation again instead of failing', async () => {
+    const { rt, provider, session, fake, user } = await chat();
+    await session.send(user('first'));
+    (provider as unknown as { onExit(a: unknown, i: unknown): void }).onExit(fake.acp, { code: 1, signal: null, stderr: '' });
+    expect(rt.turnActive).toBe(false);
+    await session.send(user('again'));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.calls.some((c) => c.method === 'session/resume' && c.params.sessionId === 'oc-1')).toBe(true);
+    expect(fake.prompts()).toHaveLength(2);
+    expect(rt.turnActive).toBe(true);
+  });
+
+  it("a queued message's sender is asked again after the setup, right before its prompt goes", async () => {
+    let release!: () => void;
+    const { rt, session, fake, user } = await chat();
+    await session.send(user('first'));
+    let allowed = true;
+    const queued = user('second');
+    await session.send(queued, {
+      check: () => {
+        if (!allowed) throw new Error('gone');
+      },
+    });
+    // The choices take a while to apply (a model switch): the phone is removed meanwhile.
+    rt.update({ model: 'other' });
+    const anyS = session as unknown as { options: unknown[] };
+    anyS.options = [{ id: 'model', category: 'model', currentValue: 'm', options: [{ value: 'other' }] }];
+    const slow = new Promise<void>((r) => (release = r));
+    const orig = fake.acp.request.bind(fake.acp);
+    fake.acp.request = (method: string, params: any) => (method === 'session/set_config_option' ? slow.then(() => ({})) : orig(method, params));
+    fake.prompts()[0].resolve({ stopReason: 'end_turn' });
+    await new Promise((r) => setTimeout(r, 0));
+    allowed = false;
+    release();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fake.prompts()).toHaveLength(1);
+    expect(rt.get(queued.id)).toBeUndefined();
     expect(rt.turnActive).toBe(false);
   });
 });

@@ -119,6 +119,16 @@ export class OpenCodeProvider implements Provider {
     return this.starting;
   }
 
+  /** The process stopped answering (a stopped prompt that never ends): it is stopped; each chat opens again with its next message. */
+  abandon() {
+    const acp = this.acp;
+    if (!acp) return;
+    this.ctx.log('[opencode] giving up the process');
+    // The next message starts a new one at once, never this one while it closes.
+    this.acp = null;
+    void acp.close().catch(() => {});
+  }
+
   private armIdle() {
     clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
@@ -381,7 +391,14 @@ interface Turn {
   stop?: NodeJS.Timeout;
   done: boolean;
   sent?: boolean;
+  /** Its `session/prompt` request, settled when OpenCode answers it. */
+  prompt?: Promise<unknown>;
 }
+
+/** How long a stopped turn's prompt has to answer its cancel before the turn ends here anyway. */
+const STOP_GRACE_MS = 8_000;
+/** How long after that a prompt that still runs may hold the session before the process is given up. */
+const STOP_GIVE_UP_MS = 60_000;
 
 /** Whether a sender's guard (`SendOptions.check`) lets its message go now. */
 function passes(check: () => void): boolean {
@@ -396,6 +413,10 @@ function passes(check: () => void): boolean {
 class OpenCodeSession implements ProviderSession {
   sessionId = '';
   private closed = false;
+  /** The process died under this handle: the next message revives it (`revive`). */
+  private dead = false;
+  /** A stopped turn's prompt that did not answer its cancel yet (`stopTimedOut`). */
+  private lingering?: Promise<void>;
   private turn?: Turn;
   private queue: Queued[] = [];
   private tools = new Map<string, ToolState>();
@@ -470,16 +491,73 @@ class OpenCodeSession implements ProviderSession {
     this.applied = { model: get('model', 'model'), effort: get('effort', 'thought_level'), mode: get('mode', 'mode') };
   }
 
+  /**
+   * The process is gone. The handle stays the chat's (the bridge keeps it), but it is dead: its turn
+   * ends here, and the next message starts a process again and resumes the conversation there
+   * (`revive`) instead of failing as a closed session forever (review wave 8, #23).
+   */
   onServerDied(message: string, detail?: string) {
-    if (this.closed) return;
-    this.closed = true;
+    if (this.closed || this.dead) return;
+    this.dead = true;
     const rt = this.rt;
     this.prompts.abort();
+    const turn = this.turn;
+    if (turn) {
+      turn.done = true;
+      clearTimeout(turn.stop);
+      this.turn = undefined;
+    }
+    this.lingering = undefined;
+    this.closeText();
     if (rt.turnActive) {
       rt.settle('error');
       rt.notice('error', message, detail);
       rt.endTurn(message);
     }
+  }
+
+  /** A dead handle opens its conversation again on a new process (`session/resume`, or a new one with a notice). */
+  private async revive() {
+    this.dead = false;
+    this.prompts = new AbortController();
+    this.tools.clear();
+    await this.attach(false);
+  }
+
+  /**
+   * OpenCode did not answer a Stop within the grace: the turn ends here, but its prompt may still run
+   * in OpenCode. Until that prompt answers, the session is out of the provider's map (whatever it still
+   * streams or asks is dropped or refused) and nothing else goes to it: a message waits in the queue.
+   * A prompt that never answers gives the process up (`STOP_GIVE_UP_MS`); the next message revives it.
+   */
+  private stopTimedOut(turn: Turn) {
+    if (turn.done || this.turn !== turn) return;
+    const sid = this.sessionId;
+    if (this.provider.sessions.get(sid) === this) this.provider.sessions.delete(sid);
+    const giveUp = setTimeout(() => {
+      if (this.lingering !== lingering) return;
+      this.log('a stopped prompt never answered: stopping the process');
+      this.lingering = undefined;
+      this.dead = true;
+      this.provider.abandon();
+      this.drainQueue();
+    }, STOP_GIVE_UP_MS);
+    giveUp.unref?.();
+    const lingering: Promise<void> = (turn.prompt ?? Promise.resolve())
+      .then(
+        () => {},
+        () => {},
+      )
+      .finally(() => {
+        clearTimeout(giveUp);
+        if (this.lingering !== lingering) return;
+        this.lingering = undefined;
+        if (this.closed || this.dead) return;
+        this.provider.sessions.set(sid, this);
+        this.drainQueue();
+      });
+    this.lingering = lingering;
+    this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' });
   }
 
   // ── settings (applied right before the next message) ──
@@ -519,25 +597,31 @@ class OpenCodeSession implements ProviderSession {
     // The sender's guard: asked now, again right before the prompt goes, and when a waiting message goes later.
     const check = opts?.check;
     check?.();
-    if (this.turn) {
-      // OpenCode takes one prompt at a time: the message waits for the turn to end.
+    // One prompt at a time: the message waits for the turn to end, or for a stopped prompt that has not answered yet.
+    if (this.turn || this.lingering) {
       this.queue.push({ item, ...(check ? { check } : {}) });
       if (item.state !== 'queued') this.rt.patch<UserItem>(item.id, { state: 'queued' });
       return;
     }
-    await this.startTurn([item], check);
+    await this.startTurn([{ item, ...(check ? { check } : {}) }], false);
   }
 
-  private async startTurn(items: UserItem[], check?: () => void) {
+  /**
+   * One prompt for `entries`. Each sender's guard is asked again after the setup (a process start, a
+   * resume, the choices), right before the prompt goes: a message sent directly throws (the bridge
+   * ends the turn it began); one from the queue whose sender may no longer act leaves the chat.
+   */
+  private async startTurn(entries: Queued[], fromQueue: boolean) {
     const rt = this.rt;
     const turn: Turn = { done: false };
     this.turn = turn;
     rt.beginTurn('Thinking');
-    for (const it of items) if (it.state === 'queued') rt.taken(it.id);
+    for (const { item } of entries) if (item.state === 'queued') rt.taken(item.id);
     this.text = this.thinking = undefined;
     const started = Date.now();
     let acp: AcpClient;
     try {
+      if (this.dead) await this.revive();
       await this.applyChoices();
       acp = await this.provider.client();
     } catch (err) {
@@ -545,22 +629,37 @@ class OpenCodeSession implements ProviderSession {
       return;
     }
     // Stopped, closed or replaced while the choices were applied: nothing goes (`interrupt` ended the turn).
-    if (turn.done || this.turn !== turn || this.closed) return;
-    try {
-      check?.();
-    } catch (err) {
-      // Its sender may no longer act: nothing went, and the bridge ends the turn it began.
-      turn.done = true;
-      this.turn = undefined;
-      throw err;
+    if (turn.done || this.turn !== turn || this.closed || this.dead) return;
+    let live = entries;
+    if (!fromQueue) {
+      try {
+        entries[0]?.check?.();
+      } catch (err) {
+        // Its sender may no longer act: nothing went, and the bridge ends the turn it began.
+        turn.done = true;
+        this.turn = undefined;
+        throw err;
+      }
+    } else {
+      live = entries.filter((x) => {
+        if (!x.check || passes(x.check)) return true;
+        rt.remove(x.item.id);
+        rt.notice('info', 'A message from a removed phone was not sent');
+        return false;
+      });
+      if (!live.length) {
+        turn.done = true;
+        this.turn = undefined;
+        rt.endTurn();
+        return;
+      }
     }
+    const items = live.map((x) => x.item);
     const blocks = items.length === 1 ? promptBlocks(items[0].text, items[0].attachments) : items.flatMap((it, i) => promptBlocks(i ? `\n\n${it.text}` : it.text, it.attachments));
     turn.sent = true;
     // One prompt runs for as long as the agent works: it is answered when the turn ends.
-    void acp
-      .request('session/prompt', { sessionId: this.sessionId, prompt: mergeText(blocks) }, 0)
-      .then((r) => this.completeTurn(turn, started, r, undefined, items))
-      .catch((err) => this.completeTurn(turn, started, undefined, errMsg(err), items));
+    turn.prompt = acp.request('session/prompt', { sessionId: this.sessionId, prompt: mergeText(blocks) }, 0);
+    void turn.prompt.then((r) => this.completeTurn(turn, started, r as Obj, undefined, items)).catch((err) => this.completeTurn(turn, started, undefined, errMsg(err), items));
   }
 
   private completeTurn(turn: Turn, started: number, result?: Obj, error?: string, items: UserItem[] = []) {
@@ -594,7 +693,7 @@ class OpenCodeSession implements ProviderSession {
   }
 
   private drainQueue() {
-    if (!this.queue.length || this.turn || this.closed) return;
+    if (!this.queue.length || this.turn || this.lingering || this.closed) return;
     // Messages the bridge took back (the turn was stopped or failed before they were taken) go out from its queue, not twice.
     // One whose sender may no longer act (a phone removed while it waited) never goes, and leaves the chat.
     const q = this.queue.splice(0).filter((x) => {
@@ -605,7 +704,7 @@ class OpenCodeSession implements ProviderSession {
       return false;
     });
     if (!q.length) return;
-    void this.startTurn(q.map((x) => x.item)).catch((err) => this.rt.notice('error', 'Could not send the queued message', errMsg(err)));
+    void this.startTurn(q, true).catch((err) => this.rt.notice('error', 'Could not send the queued message', errMsg(err)));
   }
 
   async interrupt() {
@@ -615,9 +714,10 @@ class OpenCodeSession implements ProviderSession {
     if (!turn.sent) return this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' });
     const acp = await this.provider.client().catch(() => null);
     acp?.notify('session/cancel', { sessionId: this.sessionId });
-    // The prompt answers "cancelled" by itself; if it does not, the turn ends anyway.
+    // The prompt answers "cancelled" by itself; if it does not, the turn ends anyway, and the session
+    // takes nothing new until that prompt has answered (`stopTimedOut`).
     clearTimeout(turn.stop);
-    turn.stop = setTimeout(() => this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' }), 8_000);
+    turn.stop = setTimeout(() => this.stopTimedOut(turn), STOP_GRACE_MS);
     turn.stop.unref?.();
   }
 
@@ -832,6 +932,7 @@ class OpenCodeSession implements ProviderSession {
     if (this.closed) return;
     if (this.turn) await this.interrupt().catch(() => {});
     this.closed = true;
+    this.lingering = undefined;
     this.prompts.abort();
     this.queue = [];
     if (this.provider.sessions.get(this.sessionId) === this) this.provider.sessions.delete(this.sessionId);
