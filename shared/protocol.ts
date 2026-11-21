@@ -1407,6 +1407,12 @@ export interface AppSettings {
   phoneAwake?: boolean;
   /** At a plan limit, a session carries on with the next signed-in account of its agent that has room. Absent means off. */
   continueAtLimit?: boolean;
+  /**
+   * How an agent's accounts are listed, and which one a chat moves to at a limit: `useFirst` (absent
+   * means this) by whose unused week ends soonest (`shared/use-first.ts`), so the least expires unused;
+   * `manual` in the person's own order (`accountOrder`). A move by a cap always follows the person's order.
+   */
+  accountsBy?: 'useFirst' | 'manual';
   /** Per account (`${provider}:${accountId}`): carry on with credits or extra usage at a limit, before the next account. Absent means off. */
   creditsAtLimit?: Record<string, boolean>;
   /** A notification when a window of an account at its limit resets. Absent means off. */
@@ -2509,7 +2515,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
  * while `AppSettings.conciseReplies` is on. Never replaces what the user configured.
  */
 export const CONCISE_REPLIES_PROMPT =
-  'Finish with a short reply: the outcome in one or two sentences, then only what the user must know or do next. '
+  'Write plainly and say each thing once: no filler, praise, hype or restating the question; concrete words and numbers over adjectives. '
+  + 'Finish with a short reply: the outcome in one or two sentences, then only what the user must know or do next. '
   + 'The app shows every change and step, so do not list the files you changed or recap what you did. '
   + 'No headings in short replies and no closing offers. Keep notes between steps to a sentence. '
   + 'If you built something that can be viewed in a browser, start or reuse a local dev server in the background and put its http://localhost URL on its own line.';

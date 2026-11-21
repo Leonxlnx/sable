@@ -1146,9 +1146,10 @@ export class App {
         planLimits: known.get(a.id)?.planLimits ?? (/api/i.test(a.auth.method ?? '') || /^(api key|console)$/i.test(a.auth.plan ?? '') ? false : undefined),
         cap: this.capOf(provider, a.id),
         plan: a.auth.plan,
+        weight: planWeight(provider, a.auth),
       })),
       Date.now(),
-      { model: model || undefined, plan: accounts.find((a) => a.id === current)?.auth.plan, byCap },
+      { model: model || undefined, plan: accounts.find((a) => a.id === current)?.auth.plan, byCap, useFirst: this.store.state.settings.accountsBy !== 'manual' },
     );
   }
 

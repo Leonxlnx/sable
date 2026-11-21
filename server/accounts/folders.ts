@@ -2,6 +2,7 @@ import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { AccountCap, AccountFolder, AuthState, ProviderId, RateLimit } from '../../shared/protocol';
 import { capReached, windowForModel } from '../core/limit-policy';
+import { useFirst } from '../../shared/use-first';
 
 /**
  * Finding config folders people already keep for an agent ("~/.claude-work",
@@ -107,6 +108,8 @@ export interface NextCandidate {
   cap?: AccountCap;
   /** The account's plan ("Ultra", "Max"), to prefer one of the same size. */
   plan?: string;
+  /** Plan size in units of Pro (`planWeight`), for `useFirst`. */
+  weight?: number;
 }
 
 /** A window that is used up and has not reset yet (with `model`: only the shared windows and that model's own). */
@@ -121,9 +124,12 @@ export function atCap(limits: RateLimit[] | undefined, now = Date.now(), model?:
  * winning a tie. With `opts.model`, a full window of another model does not count. With
  * `opts.byCap` (a move by a cap: "Ultra1 up to 95%, then Ultra2") the person's own order decides
  * instead of room: the next account after `current` in the list (same plan first, wrapping round).
+ * With `opts.useFirst` (and not `byCap`) the one whose unused week ends soonest among those that take
+ * work now (`shared/use-first.ts`), so the least quota expires unused; the room rule above decides
+ * only when none of them can be placed that way (no weekly reading).
  * Never one without plan limits (an API key, billed per token). Undefined when none has room.
  */
-export function pickNextAccount(current: string, accounts: NextCandidate[], now = Date.now(), opts: { model?: string; plan?: string; byCap?: boolean } = {}): string | undefined {
+export function pickNextAccount(current: string, accounts: NextCandidate[], now = Date.now(), opts: { model?: string; plan?: string; byCap?: boolean; useFirst?: boolean } = {}): string | undefined {
   const used = (a: NextCandidate) => {
     if (a.planLimits === false) return 0;
     const live = (a.limits ?? []).filter((l) => !(l.resetsAt && l.resetsAt <= now) && (opts.model === undefined || windowForModel(l, opts.model)));
@@ -137,6 +143,10 @@ export function pickNextAccount(current: string, accounts: NextCandidate[], now 
     // Never an account without plan limits (an API key): Sable does not start paying per token by itself.
     (a) => a.id !== current && a.signedIn && a.planLimits !== false && !atCap(a.limits, now, opts.model) && !capReached(a.limits, a.cap, opts.model, now),
   );
+  if (opts.useFirst && !opts.byCap) {
+    const first = useFirst(ok, now, opts.model).find((r) => r.state === 'now');
+    if (first) return first.id;
+  }
   ok.sort((a, b) => tier(a) - tier(b) || (opts.byCap ? after(a) - after(b) : used(a) - used(b) || Number(!!b.isDefault) - Number(!!a.isDefault)));
   return ok[0]?.id;
 }
