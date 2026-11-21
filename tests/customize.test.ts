@@ -15,6 +15,7 @@ import { App } from '../server/app';
 import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
+import { pageHeaders } from '../electron/csp';
 import { createStaticServer } from '../server/serve';
 import { BUILD_OFF, BUILD_SHIPS, BUILD_STATE_FILE, conflictMessage, customBrief, Customizer, ownOrigin, registerCustom, remoteRef, type CustomRunner, type RunResult } from '../server/services/custom';
 
@@ -167,6 +168,32 @@ describe('the stylesheet route', () => {
     ignored.readStyles();
     expect(ignored.stylesheet()).toBe('');
     expect(ignored.state().ignored).toBe(true);
+  });
+
+  it('the whole /custom/ namespace is reserved: the origin check for all of it, nothing else served there (review 16)', async () => {
+    const home = tmp();
+    const { c } = make(home);
+    writeStyles(home, '.a{}');
+    c.readStyles();
+    const { get } = await serve(ownDist(), c);
+    for (const p of ['/custom/', '/custom/other', '/custom/reference/CLAUDE.md', '/CUSTOM/styles.css', '/%63ustom/x']) {
+      expect((await get(p, { 'sec-fetch-site': 'cross-site' })).status, p).toBe(403);
+      expect((await get(p)).status, p).toBe(404);
+    }
+    expect((await get('/custom/styles.css')).body).toBe('.a{}');
+    // Anything else is the app.
+    expect((await get('/customize')).body).toContain('own');
+  });
+
+  it('the desktop app’s pages cannot be framed by any page; the widget page keeps its own policy (review 16)', () => {
+    const app = pageHeaders('http://127.0.0.1:47317', '/')['content-security-policy'];
+    expect(app).toContain("frame-ancestors 'none'");
+    expect(app).toContain("frame-src 'self'");
+    expect(pageHeaders('http://127.0.0.1:47317', '/some/route')['content-security-policy']).toBe(app);
+    const widget = pageHeaders('http://127.0.0.1:47317', '/widget-frame.html')['content-security-policy'];
+    expect(widget).toContain("connect-src 'none'");
+    // Framed by the app (and framing its srcdoc child, which inherits this policy): no frame-ancestors to refuse either.
+    expect(widget).not.toContain('frame-ancestors');
   });
 
   it('a change of the file moves the rev; reading the same file again does not', () => {

@@ -333,13 +333,25 @@ export class Customizer {
   /** Answers `/custom/styles.css`; false when the request is for something else. */
   serveStyles(req: IncomingMessage, res: ServerResponse): boolean {
     const url = new URL(req.url ?? '/', 'http://localhost');
-    if (url.pathname !== STYLES_PATH) return false;
+    let pathname = url.pathname;
+    try {
+      pathname = decodeURIComponent(pathname);
+    } catch {
+      /* looked at as sent */
+    }
+    // The whole `/custom/` namespace is reserved, in any case and spelling: only the stylesheet is in it.
+    const lower = pathname.toLowerCase();
+    if (lower !== '/custom' && !lower.startsWith('/custom/')) return false;
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.writeHead(405, { allow: 'GET, HEAD' }).end();
       return true;
     }
     if (!ownOrigin(req)) {
       res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }).end('Forbidden');
+      return true;
+    }
+    if (url.pathname !== STYLES_PATH) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('Not found');
       return true;
     }
     const body = Buffer.from(this.stylesheet(), 'utf8');
