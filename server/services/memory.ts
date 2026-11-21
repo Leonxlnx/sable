@@ -14,6 +14,12 @@ function locations(cwd: string, provider: ProviderId, home: string): Omit<Memory
       { path: path.join(dir, 'AGENTS.md'), scope: 'project' },
     ];
   }
+  if (provider === 'opencode') {
+    return [
+      { path: path.join(process.env.XDG_CONFIG_HOME || path.join(home, '.config'), 'opencode', 'AGENTS.md'), scope: 'user' },
+      { path: path.join(dir, 'AGENTS.md'), scope: 'project' },
+    ];
+  }
   // 'claude' and 'demo'
   return [
     { path: path.join(home, '.claude', 'CLAUDE.md'), scope: 'user' },

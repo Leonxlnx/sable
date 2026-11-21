@@ -117,6 +117,7 @@ require('./app.cjs');
 copyFileSync(path.join(root, 'server/providers/demo-content.md'), path.join(out, 'demo-content.md'));
 copyFileSync(path.join(root, 'build/icon.png'), path.join(out, 'icon.png'));
 copyFileSync(path.join(root, 'build/icon.ico'), path.join(out, 'icon.ico'));
+if (existsSync(path.join(root, 'build/icon-mac.png'))) copyFileSync(path.join(root, 'build/icon-mac.png'), path.join(out, 'icon-mac.png'));
 
 /* ── the Claude Code binary ── */
 

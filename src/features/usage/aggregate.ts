@@ -1,4 +1,4 @@
-import type { UsageReport, UsageRow, UsageSession, UsageTokens } from '@shared/protocol';
+import type { ProviderId, UsageReport, UsageRow, UsageSession, UsageTokens } from '@shared/protocol';
 
 /** What the Usage view sums from the bridge's rows: per day, per group, ranked lists. Pure, so it is easy to test. */
 
@@ -28,6 +28,8 @@ export function dayKeys(days: number, now = Date.now()): string[] {
 export interface Ranked {
   key: string;
   label: string;
+  /** The agent a model ranks under (model rows show its mark). */
+  provider?: ProviderId;
   total: number;
   tokens: UsageTokens;
   costUsd?: number;
@@ -97,12 +99,12 @@ export function summarize(report: UsageReport, days: number, grouping: Grouping,
     return { key: `${s?.provider}:${s?.accountId}`, label: s ? names.account(s.provider, s.accountId) : 'Unknown account' };
   };
 
-  const rank = (keyOf: (r: UsageRow) => { key: string; label: string } | undefined) => {
+  const rank = (keyOf: (r: UsageRow) => { key: string; label: string; provider?: ProviderId } | undefined) => {
     const map = new Map<string, Ranked>();
     for (const r of rows) {
       const g = keyOf(r);
       if (!g) continue;
-      const e = map.get(g.key) ?? { key: g.key, label: g.label, total: 0, tokens: zero() };
+      const e: Ranked = map.get(g.key) ?? { key: g.key, label: g.label, provider: g.provider, total: 0, tokens: zero() };
       e.total += rowTotal(r);
       addTokens(e.tokens, r);
       if (r.costUsd) e.costUsd = (e.costUsd ?? 0) + r.costUsd;
@@ -150,7 +152,10 @@ export function summarize(report: UsageReport, days: number, grouping: Grouping,
     today: bars[bars.length - 1]?.total ?? 0,
     costUsd: cost > 0 ? cost : undefined,
     tokens,
-    models: rank((r) => ({ key: `${report.sessions[r.session]?.provider ?? ''}\t${r.model}`, label: r.model ? names.model(r.model, report.sessions[r.session]?.provider ?? '') : 'Unknown model' })),
+    models: rank((r) => {
+      const provider = report.sessions[r.session]?.provider;
+      return { key: `${provider ?? ''}\t${r.model}`, label: r.model ? names.model(r.model, provider ?? '') : 'Unknown model', provider };
+    }),
     projects: rank((r) => {
       const p = report.sessions[r.session]?.project;
       return { key: p || '?', label: p || 'Unknown folder' };

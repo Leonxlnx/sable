@@ -11,6 +11,7 @@ import { registerPhone } from './phone';
 import { registerExport } from './export';
 import { registerProfile } from './profile';
 import { registerPrompts } from './prompts';
+import { registerPulls } from './pulls';
 import { registerScripts } from './scripts';
 import { registerSearch } from './search';
 import { registerTerm } from './term';
@@ -41,4 +42,5 @@ export function registerServices(app: App, opts: ServiceOptions = {}) {
   registerExport(app);
   registerPrompts(app);
   registerThumbs(app);
+  registerPulls(app);
 }

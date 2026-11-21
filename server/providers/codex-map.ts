@@ -307,7 +307,8 @@ export function mapHistory(t: Thread): HistoryEntry {
 
 export function samePath(a: string, b: string): boolean {
   const norm = (p: string) => path.resolve(p.replace(/^\\\\\?\\/, '')).replace(/[\\/]+$/, '');
-  return process.platform === 'win32' ? norm(a).toLowerCase() === norm(b).toLowerCase() : norm(a) === norm(b);
+  // Windows and macOS volumes ignore case by default.
+  return process.platform === 'win32' || process.platform === 'darwin' ? norm(a).toLowerCase() === norm(b).toLowerCase() : norm(a) === norm(b);
 }
 
 export function mapPlan(n: TurnPlanUpdatedNotification): Todo[] {

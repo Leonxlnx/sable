@@ -90,18 +90,23 @@ export function About() {
   );
 }
 
-/** Updates of the desktop app: where it stands, and the one thing to do next. Hidden where Sable cannot update itself. */
+/** Updates of the desktop app: where it stands, and the one thing to do next. Where Sable cannot update itself (a dev or standalone run) it says so. */
 function Updates() {
   const u = useStore((s) => s.update);
-  if (!u || u.status === 'unsupported') return null;
+  if (!u) return null;
+  // A release newer than the running one: said in words, here as well as in the sidebar.
+  const news = u.latest && (u.status === 'downloading' || u.status === 'ready');
   const value =
-    u.status === 'checking' ? (
+    u.status === 'unsupported' ? (
+      <span className="about-val">Only in the installed app</span>
+    ) : u.status === 'checking' ? (
       <span className="about-val about-upd">
         <Spinner size={13} />
         Checking
       </span>
     ) : u.status === 'downloading' ? (
       <span className="about-val about-upd">
+        {news && <span className="about-upd-new">New update available</span>}
         <span className="num">Downloading {u.latest} · {Math.round((u.progress ?? 0) * 100)}%</span>
         <span className="meter about-upd-meter" aria-hidden>
           <span className="meter-fill" style={{ '--p': u.progress ?? 0 } as React.CSSProperties} />
@@ -109,11 +114,17 @@ function Updates() {
       </span>
     ) : u.status === 'ready' ? (
       u.pending ? (
-        <span className="about-val">Restarts when the agents finish</span>
+        <span className="about-val about-upd">
+          <span className="about-upd-new">New update available</span>
+          <span>Restarts when the agents finish</span>
+        </span>
       ) : (
-        <button type="button" className="btn btn-sm btn-primary" onClick={() => void installUpdate()}>
-          Restart to update to {u.latest}
-        </button>
+        <span className="about-val about-upd">
+          <span className="about-upd-new">New update available</span>
+          <button type="button" className="btn btn-sm btn-primary" onClick={() => void installUpdate()}>
+            Restart to update to {u.latest}
+          </button>
+        </span>
       )
     ) : (
       <span className="about-val about-upd">

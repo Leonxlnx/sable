@@ -20,8 +20,11 @@
     "serve": "tsx server/standalone.ts",
     "desktop:build": "pnpm build && node scripts/build-electron.mjs",
     "desktop": "pnpm desktop:build && electron .",
+    "desktop:dev": "bun scripts/desktop-dev.mjs",
     "desktop:pack": "pnpm desktop:build && electron-builder --dir",
     "desktop:dist": "pnpm desktop:build && electron-builder",
+    "desktop:pack:mac": "pnpm desktop:build && electron-builder --mac --dir --config.directories.output=release-mac",
+    "desktop:dist:mac": "pnpm desktop:build && electron-builder --mac --config.directories.output=release-mac",
     "desktop:dist:next": "pnpm desktop:build && electron-builder --config.directories.output=release-next",
     "desktop:dist:sable": "pnpm desktop:build && electron-builder --config.directories.output=release-sable",
     "perf": "node scripts/perf-electron.mjs",
@@ -99,6 +102,50 @@
       "icon": "build/icon.ico",
       "executableName": "Sable",
       "artifactName": "Sable-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "Sable-${version}-mac-${arch}.${ext}",
+      "darkModeSupport": true,
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "identity": "-",
+      "extendInfo": {
+        "NSDesktopFolderUsageDescription": "Sable lets your coding agents read and edit projects in this folder.",
+        "NSDocumentsFolderUsageDescription": "Sable lets your coding agents read and edit projects in this folder.",
+        "NSDownloadsFolderUsageDescription": "Sable lets your coding agents read and edit projects in this folder.",
+        "NSRemovableVolumesUsageDescription": "Sable lets your coding agents read and edit projects on this volume.",
+        "NSLocalNetworkUsageDescription": "Sable talks to your phone on your local network when you pair it."
+      }
+    },
+    "dmg": {
+      "title": "Sable",
+      "icon": "build/icon.icns",
+      "iconSize": 112,
+      "window": {
+        "width": 540,
+        "height": 380
+      },
+      "contents": [
+        {
+          "x": 140,
+          "y": 190,
+          "type": "file"
+        },
+        {
+          "x": 400,
+          "y": 190,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
     },
     "nsis": {
       "oneClick": true,

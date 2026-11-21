@@ -15,9 +15,12 @@ export function accountsOf(info: ProviderInfo | undefined): AccountInfo[] {
   return [{ id: DEFAULT_ACCOUNT, provider: info.id, label: 'Main', isDefault: true, auth: info.auth }];
 }
 
-/** Agents with accounts to show, in the usual order: installed ones that sign in. */
-export function accountAgents(providers: Partial<Record<ProviderId, ProviderInfo>>): ProviderId[] {
-  return connectableAgents(providers).filter((id) => providers[id]?.installed);
+/**
+ * Agents with accounts to show, in the usual order: installed ones that sign in. OpenCode signs in
+ * to model providers, not as accounts, so it is listed only while it has plan limits to show (OpenCode Go).
+ */
+export function accountAgents(providers: Partial<Record<ProviderId, ProviderInfo>>, limited: (id: ProviderId) => boolean = () => false): ProviderId[] {
+  return connectableAgents(providers).filter((id) => providers[id]?.installed && (id !== 'opencode' || limited(id)));
 }
 
 // ── the Add account dialog, opened from anywhere ──

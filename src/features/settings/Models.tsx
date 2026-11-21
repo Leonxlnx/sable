@@ -135,6 +135,7 @@ export function Models() {
                   <span className="mset-name truncate">
                     {name}
                     {target && <span className="mset-dim">{target}</span>}
+                    {m.group && <span className="mset-dim">{m.group}</span>}
                   </span>
                   <Switch checked={on} onChange={(v) => setShown(m.id, v)} label={`Show ${target ? `${name} (${target})` : name} in the model menu`} />
                 </li>

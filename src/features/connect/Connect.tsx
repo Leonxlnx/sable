@@ -66,7 +66,7 @@ export function ConnectCard({ provider, primary = false, compact = false }: { pr
         accounts[0] && <AccountRow provider={provider} account={accounts[0]} multi={false} primary={accounts[0].id === firstOut} compact={compact} mark={mark} heading={name} />
       )}
 
-      {!compact && info?.installed && (
+      {!compact && info?.installed && provider !== 'opencode' && (
         <button type="button" className="acc-add" onClick={() => openAddAccount(provider)}>
           <Icon name="plus" size={14} />
           Add account
@@ -309,9 +309,17 @@ function AccountRow({
                 )}
               </>
             ) : phase === 'in' ? (
-              <button type="button" className="btn btn-sm btn-ghost acc-quiet" onClick={() => setConfirm('out')}>
-                Sign out
-              </button>
+              <>
+                {/* OpenCode signs in to as many model providers as the person adds. */}
+                {provider === 'opencode' && (
+                  <button type="button" className="btn btn-sm btn-ghost acc-quiet" onClick={signIn}>
+                    Sign in
+                  </button>
+                )}
+                <button type="button" className="btn btn-sm btn-ghost acc-quiet" onClick={() => setConfirm('out')}>
+                  Sign out
+                </button>
+              </>
             ) : phase === 'out' ? (
               <button type="button" className={cx('btn btn-sm', primary && 'btn-primary')} onClick={signIn}>
                 <Icon name="sign-in" size={14} />
@@ -357,9 +365,11 @@ function AccountRow({
                   Refresh
                 </MenuItem>
               )}
-              <MenuItem icon="pencil" onSelect={() => setRenaming(true)}>
-                Rename
-              </MenuItem>
+              {provider !== 'opencode' && (
+                <MenuItem icon="pencil" onSelect={() => setRenaming(true)}>
+                  Rename
+                </MenuItem>
+              )}
               {multi && !account.isDefault && (
                 <MenuItem icon="star" onSelect={() => void setDefaultAccount(provider, account.id)}>
                   Make default

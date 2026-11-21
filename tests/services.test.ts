@@ -7,6 +7,7 @@ import type { BridgeEvent } from '@shared/protocol';
 import { App } from '../server/app';
 import { registerServices } from '../server/services';
 import { rankPaths } from '../server/services/fs';
+import { gitWorktrees } from '../server/services/git';
 
 const isWin = process.platform === 'win32';
 
@@ -269,6 +270,25 @@ describe('git', () => {
     expect(res.branches.sort()).toEqual(['feature', 'main', 'older']);
     git('checkout', '-q', 'main');
     expect(await app.call('git.branches', { cwd: plain })).toEqual({ branches: [] });
+  });
+
+  it('worktrees lists the main checkout first and each linked tree, lanes included', async () => {
+    const side = path.join(base, 'side');
+    const lane = path.join(base, 'lanes', 'x');
+    git('worktree', 'add', '-q', '-b', 'side', side);
+    git('worktree', 'add', '-q', '-b', 'lane-x', lane);
+    const all = await gitWorktrees(repo);
+    expect(all[0].main).toBe(true);
+    expect(all[0].branch).toBe('main');
+    expect(all.slice(1).every((w) => !w.main)).toBe(true);
+    expect(all.map((w) => w.branch).sort()).toEqual(['lane-x', 'main', 'side']);
+    const sideTree = all.find((w) => w.branch === 'side');
+    expect(sideTree?.path).toBe(path.resolve(side));
+    expect(sideTree?.head).toMatch(/^[0-9a-f]{7}$/);
+    expect(await gitWorktrees(plain)).toEqual([]);
+    git('worktree', 'remove', '--force', lane);
+    git('worktree', 'remove', '--force', side);
+    git('branch', '-D', 'side', 'lane-x');
   });
 
   it('status handles detached HEAD', async () => {

@@ -13,6 +13,9 @@ export function bridgePlugin(): Plugin {
       try {
         const { attachBridge } = await import('./bridge');
         const bridge = attachBridge(server.httpServer as any);
+        // No desktop shell here, so the updater reports `unsupported` (Settings › About says so).
+        const { registerUpdates } = await import('./services/update');
+        registerUpdates(bridge.app);
         server.httpServer.once('close', () => bridge.dispose());
       } catch (err) {
         server.config.logger.error(`[sable] bridge failed to start: ${(err as Error).stack}`);

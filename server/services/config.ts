@@ -1,7 +1,7 @@
 import { open } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { AgentConfigFile, ConfigHook, ConfigPermissions, ProviderId } from '../../shared/protocol';
+import type { AgentConfigFile, ConfigHook, ConfigPermissions, McpServerInfo, ProviderId } from '../../shared/protocol';
 import type { App } from '../app';
 
 /**
@@ -211,6 +211,93 @@ function demoFiles(home: string, cwd?: string): AgentConfigFile[] {
   return files;
 }
 
+// ── OpenCode: opencode.json(c), shown as text with secrets masked ──
+
+/** JSON with comments and trailing commas, as OpenCode's config allows. */
+export function parseJsonc(text: string): unknown {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (c === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++;
+      out += '\n';
+    } else if (c === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end < 0 ? text.length : end + 1;
+    } else if (c === ',') {
+      // A trailing comma (before a closing bracket, comments aside) is dropped.
+      const rest = text.slice(i + 1).replace(/^(?:\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*/, '');
+      if (rest[0] !== '}' && rest[0] !== ']') out += c;
+    } else out += c;
+  }
+  return JSON.parse(out);
+}
+
+/** The value with everything under a secret-looking key hidden, and commands masked. */
+function maskJson(v: unknown, key = ''): unknown {
+  if (isSecretName(key)) return HIDDEN;
+  if (typeof v === 'string') return maskCommand(v);
+  if (Array.isArray(v)) return v.map((x) => maskJson(x));
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, maskJson(x, k)]));
+  return v;
+}
+
+/** OpenCode's config files, global first then the project's. */
+export function openCodeFiles(home: string, cwd: string | undefined, env: NodeJS.ProcessEnv = process.env): { file: string; scope: AgentConfigFile['scope'] }[] {
+  const global = path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'opencode');
+  const files: { file: string; scope: AgentConfigFile['scope'] }[] = [
+    { file: path.join(global, 'opencode.json'), scope: 'user' },
+    { file: path.join(global, 'opencode.jsonc'), scope: 'user' },
+  ];
+  if (cwd) files.push({ file: path.join(cwd, 'opencode.json'), scope: 'project' }, { file: path.join(cwd, 'opencode.jsonc'), scope: 'project' }, { file: path.join(cwd, '.opencode', 'opencode.json'), scope: 'project' });
+  return files;
+}
+
+async function readOpenCodeFile(file: string, scope: AgentConfigFile['scope']): Promise<{ file: AgentConfigFile; json?: Record<string, unknown> }> {
+  const base: AgentConfigFile = { path: file, scope, exists: false, format: 'jsonc' };
+  let read;
+  try {
+    read = await readCapped(file, MAX_TOML);
+  } catch (err) {
+    return { file: { ...base, exists: true, error: `Could not read the file: ${(err as Error).message}` } };
+  }
+  if (!read) return { file: base };
+  try {
+    const json = parseJsonc(read.text);
+    if (!json || typeof json !== 'object' || Array.isArray(json)) return { file: { ...base, exists: true, error: 'The file does not hold a settings object.' } };
+    return { file: { ...base, exists: true, raw: JSON.stringify(maskJson(json), null, 2), truncated: read.truncated }, json: json as Record<string, unknown> };
+  } catch {
+    return { file: { ...base, exists: true, error: read.truncated ? 'The file is too large to read.' : 'The file is not valid JSON.' } };
+  }
+}
+
+/** Every OpenCode config file that exists (a missing one is listed once per scope, so the page can say so). */
+export async function openCodeConfig(home: string, cwd: string | undefined, env?: NodeJS.ProcessEnv): Promise<{ files: AgentConfigFile[]; servers: McpServerInfo[] }> {
+  const read = await Promise.all(openCodeFiles(home, cwd, env).map((f) => readOpenCodeFile(f.file, f.scope)));
+  const files: AgentConfigFile[] = [];
+  for (const scope of ['user', 'project'] as const) {
+    const mine = read.filter((r) => r.file.scope === scope);
+    const found = mine.filter((r) => r.file.exists);
+    if (scope === 'project' && !cwd) continue;
+    files.push(...(found.length ? found.map((r) => r.file) : [mine[0].file]));
+  }
+  const servers: McpServerInfo[] = [];
+  for (const r of read) {
+    const mcp = r.json?.mcp;
+    if (!mcp || typeof mcp !== 'object' || Array.isArray(mcp)) continue;
+    for (const [name, def] of Object.entries(mcp as Record<string, any>)) {
+      if (servers.some((s) => s.name === name)) continue;
+      servers.push({ name, status: def?.enabled === false ? 'disabled' : 'configured', scope: r.file.scope === 'user' ? 'User' : 'Project' });
+    }
+  }
+  return { files, servers };
+}
+
 export interface ConfigOptions {
   /** User home (tests override it). When set, CLAUDE_CONFIG_DIR / CODEX_HOME are ignored. */
   home?: string;
@@ -220,6 +307,7 @@ export async function configRead(provider: ProviderId, cwd: string | undefined, 
   const home = opts.home ?? os.homedir();
   const dir = cwd ? path.resolve(cwd) : undefined;
   if (provider === 'demo') return demoFiles(home, dir);
+  if (provider === 'opencode') return (await openCodeConfig(home, dir, opts.home ? {} : process.env)).files;
   if (provider === 'codex') {
     const codexHome = (!opts.home && process.env.CODEX_HOME) || path.join(home, '.codex');
     return [await readCodexFile(path.join(codexHome, 'config.toml'))];

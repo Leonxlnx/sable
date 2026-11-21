@@ -807,6 +807,18 @@
   color: var(--text);
 }
 
+.ua-rank-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ua-rank-mark {
+  flex: none;
+  color: var(--text-2);
+}
+
 .ua-rank-label .path {
   min-width: 0;
   overflow: hidden;

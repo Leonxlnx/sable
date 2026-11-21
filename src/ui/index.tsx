@@ -559,7 +559,7 @@ export function Toasts() {
             aria-label={`${t.text}. Dismiss`}
             onClick={() => dismiss(t.id)}
           >
-            <Icon name={t.level === 'error' ? 'error' : t.level === 'success' ? 'check-circle' : 'info'} size={16} />
+            <Icon name={t.level === 'error' ? 'error' : t.level === 'warn' ? 'warning' : t.level === 'success' ? 'check-circle' : 'info'} size={16} />
             <span>{t.text}</span>
           </motion.button>
         ))}
