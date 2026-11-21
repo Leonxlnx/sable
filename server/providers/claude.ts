@@ -1241,7 +1241,9 @@ class ClaudeSession implements ProviderSession {
 
   private ensure(): Query {
     if (this.q) return this.q;
-    const meta = this.rt.meta;
+    // A process (re)started while a phone's switch is held runs under the mode the work had (`workMode`).
+    const rt = this.rt;
+    const meta = rt.workMode === rt.meta.mode ? rt.meta : { ...rt.meta, mode: rt.workMode };
     // A process started while the user was typing on the home screen, for exactly this choice.
     const warm = !meta.providerSessionId && !this.resumeAt ? this.provider.takeWarm(warmKey(meta, this.provider.concise(), this.provider.widgets(), this.provider.profileText())) : undefined;
     let q: Query;
@@ -2452,7 +2454,7 @@ class ClaudeSession implements ProviderSession {
     switch (m.subtype) {
       case 'init': {
         if (Array.isArray(m.skills)) this.skillNames = m.skills.map(String);
-        if (m.permissionMode && m.permissionMode !== rt.meta.mode) rt.update({ mode: m.permissionMode });
+        if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         if (rt.caps && this.skillNames.length) {
           const names = new Set(this.skillNames);
           const commands = rt.caps.commands.map((c) => (names.has(c.name) ? { ...c, kind: 'skill' as const } : c));
@@ -2467,7 +2469,7 @@ class ClaudeSession implements ProviderSession {
       }
       case 'status':
         if (m.status === 'compacting') rt.update({ activity: 'Compacting the conversation' });
-        if (m.permissionMode && m.permissionMode !== rt.meta.mode) rt.update({ mode: m.permissionMode });
+        if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         break;
       case 'compact_boundary': {
         const meta = m.compact_metadata ?? {};

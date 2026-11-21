@@ -501,7 +501,9 @@ class OpenCodeSession implements ProviderSession {
   }
 
   private async applyChoices() {
-    const { model, effort, mode } = this.rt.meta;
+    const { model, effort } = this.rt.meta;
+    // A queued message drained inside the provider keeps the mode the work had while a switch is held.
+    const mode = this.rt.workMode;
     // The model first: the efforts a model offers come with it.
     if (model && model !== this.applied.model) await this.setOption('model', 'model', model).catch((err) => this.rt.notice('error', 'Could not switch the model', errMsg(err)));
     if (effort && effort !== this.applied.effort) await this.setOption('effort', 'thought_level', effort).catch((err) => this.log('effort', errMsg(err)));
@@ -688,7 +690,8 @@ class OpenCodeSession implements ProviderSession {
         return;
       }
       case 'current_mode_update':
-        if (typeof u.currentModeId === 'string' && agentModeFor(rt.meta.mode) !== u.currentModeId) rt.update({ mode: u.currentModeId });
+        // While a switch is held the agent reports the mode the work has; the one chosen for the next message stays.
+        if (typeof u.currentModeId === 'string' && !rt.dangerHeld && agentModeFor(rt.meta.mode) !== u.currentModeId) rt.update({ mode: u.currentModeId });
         return;
       case 'config_option_update':
         if (Array.isArray(u.configOptions)) {
@@ -761,8 +764,11 @@ class OpenCodeSession implements ProviderSession {
     const options = ((p.options as Obj[]) ?? []).filter((o) => typeof o?.optionId === 'string');
     const pickKind = (...kinds: string[]) => options.find((o) => kinds.includes(String(o.kind)))?.optionId as string | undefined;
     const selected = (optionId: string) => ({ outcome: { outcome: 'selected', optionId } });
-    if (rt.meta.mode === ALLOW_ALL_MODE) {
-      const yes = pickKind('allow_once', 'allow_always');
+    // "Allow all" answers at once only when it is the mode this work runs under (a phone's switch
+    // during the turn is held: `SessionRuntime.workMode`), and only ever with a one-time grant: an
+    // "always" would outlive the mode inside OpenCode (review wave 8, #5).
+    if (rt.answersAtOnce(rt.workMode === ALLOW_ALL_MODE)) {
+      const yes = pickKind('allow_once');
       if (yes) return selected(yes);
     }
     const call = (p.toolCall ?? {}) as Obj;

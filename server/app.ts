@@ -1153,6 +1153,7 @@ export class App {
   private async applyModeDue(rt: SessionRuntime, handle: ProviderSession) {
     if (rt.turnActive || !(rt.dangerHeld || this.modeDue.has(rt.id))) return;
     rt.dangerHeld = false;
+    rt.heldMode = undefined;
     if (this.modeDue.delete(rt.id)) await handle.setMode(rt.meta.mode).catch((err: Error) => this.log('mode change failed', err.message));
   }
 
@@ -2819,10 +2820,13 @@ export class App {
       // next message on (review wave 7, #1): the phone could not be shown them. Claude Code's own mode
       // waits for it too (in Bypass the CLI would stop asking at once); the switch goes with the next message.
       if (answerWaiting === false && danger && (rt.turnActive || (rt.meta.background ?? 0) > 0)) {
+        // The work in progress keeps the mode it had (`workMode`), also over a second held switch.
+        if (!rt.dangerHeld) rt.heldMode = rt.meta.mode;
         rt.dangerHeld = true;
         this.modeDue.add(rt.id);
       } else {
         rt.dangerHeld = false;
+        rt.heldMode = undefined;
         this.modeDue.delete(rt.id);
         await rt.handle?.setMode(mode);
       }

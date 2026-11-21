@@ -1217,7 +1217,8 @@ class CodexSession implements ProviderSession {
   private async resumeOrStart(threadId: string | undefined, epoch?: number): Promise<{ resp: ThreadStartResponse; resumed: boolean }> {
     const rt = this.rt;
     const rpc = await this.provider.client();
-    const p = preset(rt.meta.mode);
+    // A reload mid-turn keeps the mode the work runs under (a phone's switch is held: `workMode`).
+    const p = preset(rt.workMode);
     const rev = this.policyRev;
     const config = this.threadConfig();
     const developerInstructions = await this.provider.developerInstructions(rt.meta.cwd, rt.meta);
@@ -1445,7 +1446,7 @@ class CodexSession implements ProviderSession {
     if (tier !== undefined) params.serviceTier = tier;
     const rev = this.policyRev;
     if (this.policyDirty) {
-      const p = preset(rt.meta.mode);
+      const p = preset(rt.workMode);
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }

@@ -117,7 +117,8 @@ export async function runSubAgent(
     title: call.description,
     titleSource: 'user',
     model: call.model ?? deps.defaultModel(call.agent) ?? '',
-    mode: deps.modeFor(call.agent, parent.meta.mode),
+    // The mode the parent's running work has, not a switch held for its next message (review wave 8, #5).
+    mode: deps.modeFor(call.agent, parent.workMode),
     status: 'starting',
     createdAt: now,
     updatedAt: now,
