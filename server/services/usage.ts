@@ -873,6 +873,12 @@ export function registerUsage(app: App, opts: { home?: string; sources?: () => U
     else if (e.type === 'item.added' && e.item.type === 'turn') afterTurn();
   });
 
+  // An account signed in as someone else now (or with an API key in place of a plan): its old reading is not its own.
+  app.onLimitsForgotten((provider, accountId) => {
+    book.remove(provider, accountId);
+    app.emit({ type: 'limits.report', report: book.report(provider, accountId) });
+  });
+
   app.register('usage.limits', () =>
     accounts()
       .map(({ provider, accountId }) => book.report(provider, accountId))
