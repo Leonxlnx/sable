@@ -149,7 +149,7 @@ function Row({ on, onPick, icon, tone, children }: { on: boolean; onPick: () => 
         onPick();
       }}
     >
-      {icon && <Icon name={icon} size={19} className="setup-row-icon" />}
+      {icon && <Icon name={icon} size={20} className="setup-row-icon" />}
       <span className="setup-row-name">{children}</span>
       <span className="setup-radio" aria-hidden>
         <i />

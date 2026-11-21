@@ -18,8 +18,8 @@ import { pairLink, phonePatch, registerPhone, type PhoneService } from '../serve
 import { deflateRawSync } from 'node:zlib';
 import { answerHello, fingerprintOf, loadIdentity, openFrame, readSecHello, sealFrame } from '../server/services/phone-secure';
 import { qrMatrix } from '../server/services/qr';
-import { b64u, IdentityError, pskOfKey, pskOfToken, startHandshake } from '../mobile/src/lib/secure';
-import { fingerprintIn, handshake, helloSecure, keyOf, pairSecure, wireClient, type Frame } from './phone-wire';
+import { b64u, IdentityError, MalformedError, pskOfKey, pskOfToken, startHandshake } from '../mobile/src/lib/secure';
+import { fetchSecure, fingerprintIn, handshake, helloPlain, helloSecure, keyOf, legacyPairing, pairSecure, wireClient, type Frame } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -61,7 +61,7 @@ describe('the secure channel', () => {
     // The link carries the identity's fingerprint, and the code still fits.
     const fp = fingerprintIn(offer);
     expect(fp).toBe(loadIdentity(path.join(home, 'phone-identity.pem')).fingerprint);
-    expect(offer.pairing!.link).toMatch(/^sable:\/\/pair\?h=.*&p=\d+&k=[\w-]{20,}&f=[\w-]{43}/);
+    expect(offer.pairing!.link).toMatch(/^sable:\/\/pair\/2\?h=.*&p=\d+&s=[\w-]{20,}&f=[\w-]{43}/);
     await app.call('phone.pair', { cancel: true });
     const { c, token, deviceId } = await pairSecure(app, port);
     const st = await app.call('phone.status', {});
@@ -140,8 +140,10 @@ describe('the secure channel', () => {
     await expect(hs.finish(JSON.stringify({ sec: { ...real.sec, pub: theirPub } }), fingerprintIn(offer), pskOfKey(key))).rejects.toBeInstanceOf(IdentityError);
     const spki = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({ type: 'spki', format: 'der' });
     await expect(hs.finish(JSON.stringify({ sec: { ...real.sec, key: b64u(spki) } }), fingerprintIn(offer), pskOfKey(key))).rejects.toBeInstanceOf(IdentityError);
-    // A refusal that is not signed by the pinned desktop is not believed either.
-    await expect(hs.finish(JSON.stringify({ sec: { ...real.sec, denied: 'This phone was removed on the desktop' } }), fingerprintIn(offer), pskOfKey(key))).rejects.toBeInstanceOf(IdentityError);
+    // A refusal that is not signed by the pinned desktop is not believed either: the outcome is signed (a channel's answer
+    // relabelled as a refusal does not verify), and an answer that is both a channel and a refusal is no answer.
+    await expect(hs.finish(JSON.stringify({ sec: { ...real.sec, outcome: 'denied', denied: 'This phone was removed on the desktop' } }), fingerprintIn(offer), pskOfKey(key))).rejects.toBeInstanceOf(IdentityError);
+    await expect(hs.finish(JSON.stringify({ sec: { ...real.sec, denied: 'This phone was removed on the desktop' } }), fingerprintIn(offer), pskOfKey(key))).rejects.toBeInstanceOf(MalformedError);
     c2.ws.close();
   });
 
@@ -263,7 +265,7 @@ describe('the secure channel', () => {
     const link = pairLink(['192.168.178.123', '100.101.102.103', '172.16.250.250', '10.255.255.254'], 47820, 'k'.repeat(22), fp, 'Workstation-of-someone-very-long-name');
     expect(() => qrMatrix(link)).not.toThrow();
     expect(link).toContain(`&f=${fp}`);
-    expect(link).toContain('&k=');
+    expect(link).toContain('&s=');
   });
 });
 
@@ -294,28 +296,51 @@ describe('phones paired before the secure channel', () => {
     expect((await app.call('phone.status', {})).request).toBeUndefined();
   });
 
-  it('pairing again securely replaces the old entry it names', async () => {
+  it('pairing again securely replaces the old entry only by the ticket this desktop gave it over the old pairing', async () => {
     const home = mkdtempSync(path.join(tmpdir(), 'sable-phone-secure-'));
-    const old = oldPairing(home);
+    const [a, b] = legacyPairing(home, [{ id: 'old-a' }, { id: 'old-b' }]);
     const { app, port } = await setup(home);
-    const offer = await app.call('phone.pair', {});
-    const c = wireClient(port);
-    expect(await handshake(c, 'pair', fingerprintIn(offer), pskOfKey(keyOf(offer)))).toEqual({});
-    c.send({ pair: { key: keyOf(offer), name: 'Old phone', replaces: { id: old.deviceId, token: old.token } } });
-    await c.next((f) => 'waiting' in f);
-    const asking = await app.call('phone.status', {});
-    await app.call('phone.approve', { requestId: asking.request!.id, allow: true });
-    await c.next((f) => 'welcome' in f);
-    const st = await app.call('phone.status', {});
-    expect(st.devices).toHaveLength(1);
-    expect(st.devices[0].secure).toBe(true);
-    // A `replaces` with a wrong token removes nothing.
+    /** Pairs securely naming `replaces`; returns the device ids then on the desktop. */
+    const pairNaming = async (replaces: unknown) => {
+      const offer = await app.call('phone.pair', {});
+      const c = wireClient(port);
+      expect(await handshake(c, 'pair', fingerprintIn(offer), pskOfKey(keyOf(offer)))).toEqual({});
+      c.send({ pair: { key: keyOf(offer), name: 'Old phone', replaces } });
+      await c.next((f) => 'waiting' in f);
+      const asking = await app.call('phone.status', {});
+      await app.call('phone.approve', { requestId: asking.request!.id, allow: true });
+      await c.next((f) => 'welcome' in f);
+      c.ws.close();
+      return (await app.call('phone.status', {})).devices.map((d) => d.id);
+    };
+    // Over its own plain pairing: this desktop's fingerprint and a one-time ticket.
+    const plainA = await helloPlain(port, a.token);
+    const ma = (await plainA.call('phone.migrate')) as { ok: boolean; result: { fingerprint: string; ticket: string } };
+    expect(ma.ok).toBe(true);
+    expect(ma.result.fingerprint).toBe(loadIdentity(path.join(home, 'phone-identity.pem')).fingerprint);
+    // The ticket replaces that entry, and only that one.
+    let ids = await pairNaming({ id: a.deviceId, ticket: ma.result.ticket });
+    expect(ids).not.toContain(a.deviceId);
+    expect(ids).toContain(b.deviceId);
+    // The old token (what app 2.1 named) replaces nothing: a token never travels in a pairing.
+    ids = await pairNaming({ id: b.deviceId, token: b.token });
+    expect(ids).toContain(b.deviceId);
+    // Another phone's ticket, a wrong ticket: nothing; and a ticket tried wrong once is used up.
+    const plainB = await helloPlain(port, b.token);
+    const mb = (await plainB.call('phone.migrate')) as { result: { ticket: string } };
+    ids = await pairNaming({ id: b.deviceId, ticket: 'not-the-ticket-0123456789' });
+    expect(ids).toContain(b.deviceId);
+    ids = await pairNaming({ id: b.deviceId, ticket: mb.result.ticket });
+    expect(ids).toContain(b.deviceId);
+    // A securely paired phone gets no ticket.
+    const { c } = await pairSecure(app, port);
+    expect(((await c.call('phone.migrate')) as { error?: string }).error).toBe('This phone is already paired securely.');
     c.ws.close();
   });
 });
 
 describe('downloads over the channel', () => {
-  it("names the file's SHA-256 and size with the link; the bytes served are exactly those", async () => {
+  it("sends the file in chunks over the sealed connection, named by the share's SHA-256 and size", async () => {
     const { app, port, home } = await setup();
     const { c } = await pairSecure(app, port);
     const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
@@ -323,13 +348,12 @@ describe('downloads over the channel', () => {
     const body = Buffer.from(Array.from({ length: 5000 }, (_, i) => i % 251));
     writeFileSync(path.join(home, 'app-release.apk'), body);
     app.sessions.get(id)!.add({ id: 'share1', type: 'tool', name: 'share', kind: 'share', title: 'Share app-release.apk', status: 'done', detail: { files: [{ path: 'app-release.apk', name: 'app-release.apk', size: body.length }] } } as ToolItem);
-    const link = (await c.call('phone.fileLink', { sessionId: id, itemId: 'share1', index: 0 })) as { ok: boolean; result: { path: string; size: number; sha256: string } };
-    expect(link.ok).toBe(true);
-    expect(link.result.size).toBe(body.length);
-    expect(link.result.sha256).toBe(createHash('sha256').update(body).digest('hex'));
-    const res = await fetch(`http://127.0.0.1:${port}${link.result.path}`);
-    const got = Buffer.from(await res.arrayBuffer());
-    expect(createHash('sha256').update(got).digest('hex')).toBe(link.result.sha256);
+    const got = await fetchSecure(c, { sessionId: id, itemId: 'share1', index: 0 }, 1024);
+    expect(got.ok).toBe(true);
+    if (!got.ok) return;
+    expect(got.start.size).toBe(body.length);
+    expect(got.start.sha256).toBe(createHash('sha256').update(body).digest('hex'));
+    expect(createHash('sha256').update(got.bytes).digest('hex')).toBe(got.start.sha256);
     c.ws.close();
   });
 });

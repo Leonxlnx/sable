@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { PhoneSearchHit } from '@shared/protocol';
 import { timeAgo } from '@desk/lib/format';
 import { conn } from '@m/lib/conn';
@@ -6,6 +6,7 @@ import { matchRanges } from '@m/lib/find';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
+import { nothingFound, searchMessages, skippedLine, type Found } from '@m/lib/search';
 import { useStore, type State } from '@m/lib/store';
 import { useNow } from '@m/lib/useNow';
 import { ProviderMark, Ring } from '@m/ui/marks';
@@ -29,18 +30,10 @@ function titleKey(s: State, q: string): string {
     .join(',');
 }
 
-interface Found {
-  q: string;
-  hits: PhoneSearchHit[];
-  busy: boolean;
-  /** The desktop cannot search messages (an older build), or it failed. */
-  off?: boolean;
-}
-
 /**
  * Search on home: chats by their title and folder at once (the phone has the list), then the
- * messages in them, asked of the desktop (`phone.search`: what you wrote and what the agents said).
- * A message opens its chat at that message.
+ * messages in them, asked of the desktop (`phone.search`: what you wrote and what the agents said),
+ * on until it says the search is whole (lib/search.ts). A message opens its chat at that message.
  */
 export function SearchResults({ query, onMenu }: { query: string; onMenu: (id: string, rect: DOMRect) => void }) {
   const key = useStore((s) => titleKey(s, query));
@@ -48,29 +41,32 @@ export function SearchResults({ query, onMenu }: { query: string; onMenu: (id: s
   const online = useStore((s) => s.conn === 'open');
   const [found, setFound] = useState<Found>();
   const q = query.trim();
+  // The search being asked: an older one stops once a newer one starts, the query changes or the connection goes.
+  const gen = useRef(0);
+  const ask = useCallback((query: string, from?: Found) => {
+    const my = ++gen.current;
+    void searchMessages((p) => conn.call('phone.search', p, 15_000), query, () => gen.current === my, setFound, from);
+  }, []);
 
   useEffect(() => {
+    gen.current++;
     if (q.length < 2 || !online) return setFound(undefined);
-    let live = true;
     setFound((f) => ({ q, hits: f?.q === q ? f.hits : (f?.hits ?? []), busy: true }));
-    // Asked once typing pauses; a partial answer (chats not read yet) is asked again a few times.
-    const t = window.setTimeout(async () => {
-      try {
-        for (let round = 0; round < 4 && live; round++) {
-          const r = await conn.call('phone.search', { query: q }, 15_000);
-          if (!live) return;
-          setFound({ q, hits: r.hits, busy: !!r.partial && round < 3 });
-          if (!r.partial) break;
-        }
-      } catch {
-        if (live) setFound({ q, hits: [], busy: false, off: true });
-      }
-    }, 280);
+    // Asked once typing pauses; a partial answer (chats not read yet) is asked on until the desktop says it is whole.
+    const t = window.setTimeout(() => ask(q), 280);
     return () => {
-      live = false;
+      gen.current++;
       clearTimeout(t);
     };
-  }, [q, online]);
+  }, [q, online, ask]);
+
+  // The desktop has more to read and the phone stopped asking by itself: a tap goes on from there.
+  const further = () => {
+    if (!found?.more || found.busy) return;
+    haptic('tap');
+    setFound({ ...found, busy: true, more: undefined });
+    ask(found.q, found);
+  };
 
   const w = useMemo(() => words(q), [q]);
   const hits = found?.hits ?? [];
@@ -95,9 +91,7 @@ export function SearchResults({ query, onMenu }: { query: string; onMenu: (id: s
                 <Hit key={`${h.sessionId}:${h.itemId}`} h={h} words={w} />
               ))}
             </ul>
-          ) : !busy ? (
-            <p className="results-none">{ids.length ? 'No messages match.' : 'Nothing matches.'}</p>
-          ) : (
+          ) : busy ? (
             <div className="rows hits-wait" aria-hidden>
               {[64, 48, 56].map((n, i) => (
                 <span key={i} className="hits-skel">
@@ -106,7 +100,15 @@ export function SearchResults({ query, onMenu }: { query: string; onMenu: (id: s
                 </span>
               ))}
             </div>
+          ) : found && nothingFound(found) ? (
+            <p className="results-none">{ids.length ? 'No messages match.' : 'Nothing matches.'}</p>
+          ) : null}
+          {found?.more && !busy && (
+            <button type="button" className="more-row" onClick={further}>
+              Search further
+            </button>
           )}
+          {!busy && !!found?.skipped && <p className="results-none">{skippedLine(found.skipped)}</p>}
         </section>
       )}
       {q.length > 0 && q.length < 2 && !ids.length && <p className="results-none">Nothing matches.</p>}

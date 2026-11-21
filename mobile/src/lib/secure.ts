@@ -6,16 +6,19 @@ import { PHONE_SECURE_VERSION } from '@shared/protocol';
  *
  * 1. `startHandshake` makes an ephemeral P-256 ECDH key and the first frame (`PhoneSecHello`).
  * 2. `finish` reads the desktop's answer: its identity key must hash to the fingerprint the QR code
- *    gave (`f`), and its signature over the transcript must hold. Only then does a refusal count, or
- *    are the keys made: HKDF-SHA256 over the ECDH secret and the pairing secret (`psk`: the QR
+ *    gave (`f`), and its signature over the transcript must hold; the transcript names which answer
+ *    it is (`outcome`: a channel, or a refusal, which always has words). Only then does a refusal
+ *    count (the only kind that stops the phone for good), or are the keys made: HKDF-SHA256 over the ECDH secret and the pairing secret (`psk`: the QR
  *    code's one-time key, or the SHA-256 of this phone's token), salted with the transcript's hash.
  * 3. `Channel` seals and opens every frame after it (AES-256-GCM, a flag byte as AAD, the nonce the
  *    frame's sequence number in its direction): a frame that was replayed, dropped, reordered or
  *    altered does not open, and the connection ends.
  */
 
-const LABEL = 'sable-phone/1';
-const KEYS_INFO = 'sable-phone/1 keys';
+const LABEL = 'sable-phone/2';
+const KEYS_INFO = 'sable-phone/2 keys';
+/** The longest refusal a desktop sends. */
+const REFUSAL_MAX = 2000;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -63,9 +66,9 @@ const u32 = (n: number) => {
   return b;
 };
 
-/** What the desktop signs: every field length-prefixed, in the desktop's order. */
-export function transcript(kind: 'pair' | 'hello', id: string, pub: Uint8Array, z: boolean, deskPub: Uint8Array, spki: Uint8Array, denied: string): Uint8Array<ArrayBuffer> {
-  const parts = [enc.encode(LABEL), enc.encode(kind), enc.encode(id), pub, Uint8Array.of(z ? 1 : 0), deskPub, spki, enc.encode(denied)];
+/** What the desktop signs: every field length-prefixed, in the desktop's order (version 2: the outcome before the refusal's words). */
+export function transcript(kind: 'pair' | 'hello', id: string, pub: Uint8Array, z: boolean, deskPub: Uint8Array, spki: Uint8Array, outcome: 'ok' | 'denied', denied: string): Uint8Array<ArrayBuffer> {
+  const parts = [enc.encode(LABEL), enc.encode(kind), enc.encode(id), pub, Uint8Array.of(z ? 1 : 0), deskPub, spki, enc.encode(outcome), enc.encode(denied)];
   return concat(...parts.flatMap((p) => [u32(p.length), p]));
 }
 
@@ -146,10 +149,22 @@ export class Channel {
   }
 }
 
+/** An answer that is not the shape Sable's answers have (an older desktop, something else at that address): never a refusal. */
+export class MalformedError extends Error {
+  readonly malformed = true;
+  constructor() {
+    super('The desktop did not answer as Sable does');
+  }
+}
+
 export interface Handshake {
   /** The first frame to send (JSON text). */
   first: string;
-  /** Reads the desktop's answer: a channel, or its signed refusal. Throws `IdentityError` for a desktop that is not the pinned one. */
+  /**
+   * Reads the desktop's answer: a channel, or its signed refusal (`denied`, verified: signed by the
+   * pinned desktop, with words). Throws `IdentityError` for a desktop that is not the pinned one and
+   * `MalformedError` for an answer of another shape (an empty refusal, a refusal and a channel both).
+   */
   finish(reply: string, fingerprint: string, psk: Uint8Array): Promise<{ channel: Channel } | { denied: string }>;
 }
 
@@ -168,9 +183,10 @@ export async function startHandshake(kind: 'pair' | 'hello', id = ''): Promise<H
       } catch {
         r = undefined;
       }
-      if (!r || r.v !== PHONE_SECURE_VERSION || typeof r.pub !== 'string' || typeof r.key !== 'string' || typeof r.sig !== 'string' || (r.denied !== undefined && typeof r.denied !== 'string')) {
-        throw new Error('The desktop did not answer as Sable does');
-      }
+      if (!r || r.v !== PHONE_SECURE_VERSION || typeof r.pub !== 'string' || typeof r.key !== 'string' || typeof r.sig !== 'string') throw new MalformedError();
+      // Exactly one of the two answers: a channel (no words), or a refusal with words.
+      const outcome = r.outcome === 'ok' || r.outcome === 'denied' ? r.outcome : undefined;
+      if (!outcome || (outcome === 'ok' ? r.denied !== undefined : typeof r.denied !== 'string' || !r.denied.trim() || r.denied.length > REFUSAL_MAX)) throw new MalformedError();
       const spki = unb64u(r.key);
       const deskPub = unb64u(r.pub);
       const sig = unb64u(r.sig);
@@ -182,15 +198,15 @@ export async function startHandshake(kind: 'pair' | 'hello', id = ''): Promise<H
       } catch {
         throw new IdentityError();
       }
-      const denied = r.denied as string | undefined;
-      const script = transcript(kind, id, pub, z, deskPub, spki, denied ?? '');
+      const denied = outcome === 'denied' ? (r.denied as string) : '';
+      const script = transcript(kind, id, pub, z, deskPub, spki, outcome, denied);
       if (sig.length !== 64 || !(await subtle().verify({ name: 'ECDSA', hash: 'SHA-256' }, verifyKey, sig, script))) throw new IdentityError();
-      if (denied !== undefined) return { denied };
+      if (outcome === 'denied') return { denied };
       let peer: CryptoKey;
       try {
         peer = await subtle().importKey('raw', deskPub, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
       } catch {
-        throw new Error('The desktop did not answer as Sable does');
+        throw new MalformedError();
       }
       const shared = new Uint8Array(await subtle().deriveBits({ name: 'ECDH', public: peer }, pair.privateKey, 256));
       const base = await subtle().importKey('raw', concat(shared, psk), 'HKDF', false, ['deriveBits']);

@@ -87,9 +87,9 @@ export function Settings() {
         {p && !conn.pairedSecurely && (
           <div className="group-card set-secure">
             <button type="button" className="set-row" onClick={() => (haptic('tap'), setState({ repairing: true }))}>
-              <Icon name="shield" size={19} />
+              <Icon name="shield" size={20} />
               <span className="set-label">Pair again for a secure connection</span>
-              <Icon name="next" size={15} className="set-chev" />
+              <Icon name="next" size={16} className="set-chev" />
             </button>
           </div>
         )}
@@ -99,14 +99,14 @@ export function Settings() {
             <h3 className="set-title">This phone</h3>
             <div className="group-card">
               <button type="button" className="set-row switch-row" role="switch" aria-checked={notify && !!allowed} onClick={() => void toggleNotify()}>
-                <Icon name="bell" size={19} />
+                <Icon name="bell" size={20} />
                 <span className="set-label">Notifications</span>
                 <span className="switch" data-on={(notify && !!allowed) || undefined}>
                   <i />
                 </span>
               </button>
               <button type="button" className="set-row switch-row" role="switch" aria-checked={haptics} onClick={toggleHaptics}>
-                <Icon name="vibrate" size={19} />
+                <Icon name="vibrate" size={20} />
                 <span className="set-label">Haptics</span>
                 <span className="switch" data-on={haptics || undefined}>
                   <i />
@@ -119,15 +119,15 @@ export function Settings() {
         <h3 className="set-title">Chats</h3>
         <div className="group-card">
           <button type="button" className="set-row" onClick={() => (haptic('tap'), setLimits(true))}>
-            <Icon name="gauge" size={19} />
+            <Icon name="gauge" size={20} />
             <span className="set-label">Limits</span>
-            <Icon name="next" size={15} className="set-chev" />
+            <Icon name="next" size={16} className="set-chev" />
           </button>
           <button type="button" className="set-row" onClick={() => (haptic('tap'), setArchive(true))}>
-            <Icon name="archive" size={19} />
+            <Icon name="archive" size={20} />
             <span className="set-label">Archived</span>
             {archivedCount > 0 && <span className="set-val num">{archivedCount}</span>}
-            <Icon name="next" size={15} className="set-chev" />
+            <Icon name="next" size={16} className="set-chev" />
           </button>
         </div>
 
@@ -140,7 +140,7 @@ export function Settings() {
           </div>
           {mine && (
             <div className="set-row">
-              <Icon name="phone" size={19} />
+              <Icon name="phone" size={20} />
               <span className="set-label">This app</span>
               <span className="set-val num">{mine}</span>
             </div>
@@ -149,7 +149,7 @@ export function Settings() {
 
         <div className="group-card set-danger">
           <button type="button" className="set-row" onClick={() => (haptic('tap'), setConfirm(true))}>
-            <Icon name="unlink" size={19} />
+            <Icon name="unlink" size={20} />
             <span className="set-label">Forget this computer</span>
           </button>
         </div>
@@ -165,8 +165,8 @@ export function Settings() {
             onClick={() => {
               haptic('warning');
               setConfirm(false);
-              nav.reset();
-              void conn.forget();
+              // The token gone from the phone first; when it cannot be, it says so and nothing is forgotten.
+              void conn.forget().then(() => nav.reset()).catch((err: Error) => setState({ toast: { text: err.message, level: 'error', at: Date.now() } }));
             }}
           >
             Forget
@@ -227,7 +227,7 @@ function Computer({ name, state, palette }: { name: string; state: string; palet
             ) : (
               <>
                 <span className="computer-addr">{error ?? 'Removed on the desktop'}</span>
-                <button type="button" className="computer-act" onClick={() => (haptic('tap'), nav.reset(), void conn.forget())}>
+                <button type="button" className="computer-act" onClick={() => (haptic('tap'), void conn.forget().then(() => nav.reset()).catch((err: Error) => setState({ toast: { text: err.message, level: 'error', at: Date.now() } })))}>
                   Pair again
                 </button>
               </>

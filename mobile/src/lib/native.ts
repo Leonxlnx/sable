@@ -5,7 +5,9 @@ import { Haptics, ImpactStyle, NotificationType } from '@capacitor/haptics';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Preferences } from '@capacitor/preferences';
 import type { Pairing } from './conn';
+import { removeChecked } from './credential';
 import { NoteBook } from './note-book';
+import { NotePoster, SUMMARY_ID } from './note-post';
 
 /** Thin wrappers over the Capacitor plugins, quiet when a plugin is missing (the web preview). */
 
@@ -22,13 +24,18 @@ export async function loadPairing(): Promise<Pairing | null> {
   }
 }
 
-export async function savePairing(p: Pairing | null) {
-  try {
-    if (p) await Preferences.set({ key: 'pairing', value: JSON.stringify(p) });
-    else await Preferences.remove({ key: 'pairing' });
-  } catch {
-    /* web preview without storage */
-  }
+/** Keeps the pairing (throws when it could not be written: the caller decides what to say). */
+export async function savePairing(p: Pairing) {
+  await Preferences.set({ key: 'pairing', value: JSON.stringify(p) });
+}
+
+/**
+ * Removes the pairing's token from the phone's storage, and checks that it is gone: a removal that
+ * failed (or a value still there) throws a sentence to show, so Forget never looks done while a
+ * restart would connect with the old token again.
+ */
+export async function removePairing() {
+  await removeChecked(Preferences, 'pairing');
 }
 
 export async function loadPref<T>(key: string, fallback: T): Promise<T> {
@@ -132,10 +139,7 @@ export async function askNotifications(): Promise<boolean> {
 /** What a notification says happened: a turn ended (or failed), or the chat waits on you; 'home' for the summary. */
 export type NoteKind = 'done' | 'waiting' | 'home';
 
-/** Each chat's lines since the app was last on screen, newest first (one notification per chat holds them). */
-const lines = new Map<string, { title: string; lines: string[] }>();
 const GROUP = 'sable.chats';
-const SUMMARY_ID = 1;
 
 /** The chats with a notification up (kept across restarts, reconciled with Android's): the summary stays while there are two or more. */
 const POSTED = 'sable.notified';
@@ -147,76 +151,72 @@ const posted = new NoteBook(
   (id) => idFor(id),
 );
 
+/** Posts one at a time, each reconciled with what Android shows; Forget lets go of any still on its way (lib/note-post.ts). */
+const poster = new NotePoster(
+  {
+    // Never ask from the background (the plugin would try to show a prompt): only post when allowed.
+    allowed: async () => (await LocalNotifications.checkPermissions()).display === 'granted',
+    prepare: async () => {
+      if (channelMade) return;
+      channelMade = true;
+      await LocalNotifications.createChannel({ id: 'turns', name: 'Turns', description: 'A turn ended or waits for you', importance: 4, visibility: 1, vibration: true }).catch(() => {});
+    },
+    delivered: () =>
+      LocalNotifications.getDeliveredNotifications().then(
+        (r) => r.notifications.map((n) => n.id),
+        () => null,
+      ),
+    cancel: async (ids) => void (await LocalNotifications.cancel({ notifications: ids.map((id) => ({ id })) })),
+    post: async (n, chats) => {
+      const common = { channelId: 'turns', smallIcon: 'ic_stat_sable', iconColor: '#f2f1ee', isExactNotification: false, group: GROUP };
+      const notifications: Parameters<typeof LocalNotifications.schedule>[0]['notifications'] = [
+        // Shown now, not at a time: no exact alarm (asking for one would open a settings screen, impossible from the background).
+        { ...common, id: n.id, title: n.title, body: n.body, extra: { sessionId: n.sessionId, kind: n.kind }, ...(n.lines.length > 1 ? { inboxList: n.lines, summaryText: n.title } : {}) },
+      ];
+      // Two chats or more: one summary holds them together (its own tap opens home).
+      if (chats > 1) notifications.push({ ...common, id: SUMMARY_ID, title: 'Sable', body: `${chats} chats`, groupSummary: true, summaryText: `${chats} chats`, extra: { kind: 'home' } });
+      await LocalNotifications.schedule({ notifications });
+    },
+    clearAll: async () => {
+      if (!isNative) return;
+      await LocalNotifications.removeAllDeliveredNotifications().catch(() => {});
+      const p = await LocalNotifications.getPending();
+      if (p.notifications.length) await LocalNotifications.cancel({ notifications: p.notifications.map((n) => ({ id: n.id })) });
+    },
+  },
+  posted,
+  idFor,
+);
+
 /**
  * One notification per chat, grouped under Sable: its newest news as the line, the earlier ones of
  * this time away listed under it when expanded ("Waiting for you", then "Done"). A tap opens the chat
  * where it matters: its prompt when it waits on you, the newest turn when one ended; the group's own
- * line opens home.
+ * line opens home. Two chats finishing together are posted one after the other (the second with the
+ * summary of two).
  */
 export async function notify(title: string, body: string, sessionId: string, kind: NoteKind = 'done') {
   if (!isNative) return;
-  try {
-    // Never ask from the background (the plugin would try to show a prompt): only post when allowed.
-    if ((await LocalNotifications.checkPermissions()).display !== 'granted') return;
-    if (!channelMade) {
-      channelMade = true;
-      await LocalNotifications.createChannel({ id: 'turns', name: 'Turns', description: 'A turn ended or waits for you', importance: 4, visibility: 1, vibration: true }).catch(() => {});
-    }
-    const line = body.slice(0, 180);
-    const cur = lines.get(sessionId) ?? { title, lines: [] };
-    cur.title = title;
-    cur.lines = [line, ...cur.lines.filter((l) => l !== line)].slice(0, 5);
-    lines.set(sessionId, cur);
-    // What is still up: a notification swiped away no longer counts in the summary.
-    const delivered = await LocalNotifications.getDeliveredNotifications().then(
-      (r) => r.notifications.map((n) => n.id),
-      () => null,
-    );
-    if (delivered) posted.reconcile(delivered);
-    const count = posted.countWith(sessionId);
-    // A summary left from chats that were swiped away goes first (with it its group: this chat's own is posted again below).
-    if (count < 2 && delivered?.includes(SUMMARY_ID)) await LocalNotifications.cancel({ notifications: [{ id: SUMMARY_ID }] }).catch(() => {});
-    const common = { channelId: 'turns', smallIcon: 'ic_stat_sable', iconColor: '#f2f1ee', isExactNotification: false, group: GROUP };
-    const notifications: Parameters<typeof LocalNotifications.schedule>[0]['notifications'] = [
-      // Shown now, not at a time: no exact alarm (asking for one would open a settings screen, impossible from the background).
-      { ...common, id: idFor(sessionId), title, body: line, extra: { sessionId, kind }, ...(cur.lines.length > 1 ? { inboxList: cur.lines, summaryText: title } : {}) },
-    ];
-    // Two chats or more: one summary holds them together (its own tap opens home).
-    if (count > 1) notifications.push({ ...common, id: SUMMARY_ID, title: 'Sable', body: `${count} chats`, groupSummary: true, summaryText: `${count} chats`, extra: { kind: 'home' } });
-    await LocalNotifications.schedule({ notifications });
-    // Written down once it is up (a schedule that failed leaves nothing behind).
-    posted.add(sessionId);
-  } catch {
-    /* not allowed */
-  }
+  await poster.notify(title, body, sessionId, kind);
 }
 
-/** Every chat's notification goes, with what was kept of them (the desktop was forgotten). */
+/** Every chat's notification goes, with what was kept of them, and any still on its way (the desktop was forgotten). */
 export function clearChatNotifications() {
-  lines.clear();
-  posted.clear();
-  if (!isNative) return;
-  void LocalNotifications.removeAllDeliveredNotifications().catch(() => {});
-  void LocalNotifications.getPending()
-    .then((p) => (p.notifications.length ? LocalNotifications.cancel({ notifications: p.notifications.map((n) => ({ id: n.id })) }) : undefined))
-    .catch(() => {});
+  void poster.clear();
 }
 
 /**
- * A chat opened on the phone: its notification goes. The summary goes only with the last chat's
- * (cancelling a summary takes every notification of its group with it).
+ * A chat opened on the phone: its notification goes (after one still going up). The summary goes
+ * only with the last chat's (cancelling a summary takes every notification of its group with it).
  */
 export function clearNotification(sessionId: string) {
   if (!isNative) return;
-  lines.delete(sessionId);
-  const had = posted.remove(sessionId);
-  const ids = [{ id: idFor(sessionId) }, ...(had && posted.size === 0 ? [{ id: SUMMARY_ID }] : [])];
-  void LocalNotifications.cancel({ notifications: ids }).catch(() => {});
+  void poster.clearOne(sessionId);
 }
 
 /** Back on screen: the lines of the time away start over (the notifications stay until opened or swiped). */
 export function forgetNotificationLines() {
-  lines.clear();
+  void poster.forgetLines();
 }
 
 export function onNotificationTap(fn: (sessionId: string, kind: NoteKind) => void) {

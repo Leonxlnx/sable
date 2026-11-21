@@ -6,6 +6,7 @@ import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format'
 import { leadTitle } from '@desk/features/timeline/lead-in';
 import { useNow } from '@m/lib/useNow';
 import { cancelDownload, downloadKey, installable, openDownload, startDownload, useDownload } from '@m/lib/downloads';
+import { canonicalName, isPackageName } from '@shared/file-name';
 import { conn } from '@m/lib/conn';
 import { diffLines, renderMarkdown } from '@m/lib/md';
 import { haptic, openExternal } from '@m/lib/native';
@@ -473,7 +474,7 @@ const UserBubble = memo(function UserBubble({ sid, id, steered, queued }: { sid:
           <div className="user-files">
             {files.map((a) => (
               <span key={a.id} className="file-chip">
-                <Icon name="file" size={13} /> {a.name}
+                <Icon name="file" size={14} /> {a.name}
               </span>
             ))}
           </div>
@@ -557,7 +558,7 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
   return (
     <div className="step" data-status={status} data-open={open || undefined}>
       <button type="button" className="step-line" onClick={toggle} disabled={quiet || !(detail || more)}>
-        <span className="step-icon">{status === 'running' || status === 'pending' ? <Ring size={13} /> : <Icon name={TOOL_ICON[it.kind] ?? 'tool'} size={15} />}</span>
+        <span className="step-icon">{status === 'running' || status === 'pending' ? <Ring size={13} /> : <Icon name={TOOL_ICON[it.kind] ?? 'tool'} size={16} />}</span>
         <span className="step-title">{it.title}</span>
         {it.result?.diff && <DiffStat diff={it.result.diff} />}
         {(status === 'error' || status === 'denied') && <span className="step-flag">{status === 'denied' ? 'Denied' : 'Failed'}</span>}
@@ -644,7 +645,7 @@ function ThinkingStep({ sid, it, quiet }: { sid: string; it: ThinkingItem; quiet
   return (
     <div className="step" data-open={open || undefined}>
       <button type="button" className="step-line" onClick={toggle} disabled={quiet || !it.text}>
-        <span className="step-icon">{it.streaming ? <Ring size={13} /> : <Icon name="brain" size={15} />}</span>
+        <span className="step-icon">{it.streaming ? <Ring size={13} /> : <Icon name="brain" size={16} />}</span>
         <span className="step-title">{it.streaming ? 'Thinking' : secs ? `Thought for ${secs}s` : 'Thought'}</span>
       </button>
       <AnimatePresence initial={false}>
@@ -921,7 +922,7 @@ function UntilEnd({ it }: { it: NoticeItem }) {
     <div className="until-end">
       {it.until?.check && <CheckRow check={it.until.check} />}
       <div className="until-line" data-end={end}>
-        <Icon name={end === 'passed' ? 'check' : 'hand'} size={13} weight={end === 'passed' ? 'bold' : 'regular'} />
+        <Icon name={end === 'passed' ? 'check' : 'hand'} size={14} weight={end === 'passed' ? 'bold' : 'regular'} />
         <span>{it.text}</span>
       </div>
     </div>
@@ -1056,8 +1057,10 @@ function ShareCards({ sid, it }: { sid: string; it: ToolItem }) {
   );
 }
 
-function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; itemId: string; index: number; name: string; size?: number; shared: boolean }) {
+function ShareRow({ sid, itemId, index, name: listed, size, shared }: { sid: string; itemId: string; index: number; name: string; size?: number; shared: boolean }) {
   const key = downloadKey(sid, itemId, index);
+  // One canonical name for everything here (what shows, what it is saved as, whether it is an app), as the desktop and FilesPlugin read it.
+  const name = useMemo(() => canonicalName(listed), [listed]);
   // A picture of it (a photo, a PDF's first page, a video's frame) once the share went through.
   const thumb = useThumb(sid, itemId, index, shared ? name : '', size);
   const d = useDownload(key);
@@ -1068,7 +1071,7 @@ function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; ite
   const busy = d.state === 'asking' || d.state === 'pending' || d.state === 'running' || d.state === 'paused' || d.state === 'verifying';
   const total = d.total ?? size;
   const p = total && d.bytes !== undefined ? Math.min(1, d.bytes / total) : 0;
-  const apk = /\.(apk|aab|xapk)$/i.test(name);
+  const apk = isPackageName(name);
   // An app is installed only from bytes checked against a digest that came sealed; one fetched before that is fetched again.
   const install = apk && installable(d);
   const again = apk && d.state === 'done' && !install;
@@ -1082,7 +1085,7 @@ function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; ite
   };
   const open = () => {
     haptic('tap');
-    void openDownload(key, name).catch(fail);
+    void openDownload(key).catch(fail);
   };
   const meta =
     d.state === 'failed'
@@ -1136,7 +1139,7 @@ function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; ite
         </button>
       ) : (
         <button type="button" className="share-key" aria-label={`${d.state === 'failed' ? 'Try again' : 'Download'} ${name}`} onClick={get}>
-          <Icon name={d.state === 'failed' ? 'retry' : 'download'} size={19} />
+          <Icon name={d.state === 'failed' ? 'retry' : 'download'} size={20} />
         </button>
       )}
     </div>

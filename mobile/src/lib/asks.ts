@@ -7,7 +7,9 @@ import type { FileDiff, PermissionOption, PermissionRequest, PhoneMethods, Phone
  * - A permission the desktop marked `incomplete` (some of what it would allow was shortened for the
  *   phone) offers no allowing key: only its refusals and Later; the desktop answers the rest.
  * - The change an edit asks to make shows whole, every line the phone got (the desktop sends at most
- *   600 and marks a longer one incomplete).
+ *   600 and marks a longer one incomplete), each file by its whole path and a renamed one by both.
+ * - What a request reaches is in view (`scopeOf`): a command's working folder, a file's whole path,
+ *   both ends of a rename, never only a name two files could share.
  * - Questions are answered by the ids the desktop gave each question and option (`phone.answer`),
  *   never by their words, which may be shortened for the phone; an `incomplete` questionnaire is
  *   answered on the desktop. A desktop from before ids gets the words, as before.
@@ -23,11 +25,14 @@ export function permissionKeys(req: Phone): { grants: PermissionOption[]; denial
   return { grants: desktopOnly ? [] : ordered.filter((o) => o.tone !== 'deny'), denials: ordered.filter((o) => o.tone === 'deny'), desktopOnly };
 }
 
-/** Every line of a change as the sheet shows it: a file's name over its hunks when there are several, each hunk's header. */
+/** A changed file as a label: its whole path, and a renamed one from where to where. */
+export const fileLabel = (f: Pick<FileDiff, 'path' | 'oldPath'>) => (f.oldPath && f.oldPath !== f.path ? `${f.oldPath} → ${f.path}` : f.path);
+
+/** Every line of a change as the sheet shows it: a file's whole path over its hunks when there are several (a rename by both), each hunk's header. */
 export function patchLines(diff: FileDiff[]): string[] {
   const lines: string[] = [];
   for (const f of diff) {
-    if (diff.length > 1) lines.push(`@@ ${f.path.split(/[\\/]/).pop()}`);
+    if (diff.length > 1 || (f.oldPath && f.oldPath !== f.path)) lines.push(`@@ ${fileLabel(f)}`);
     for (const h of f.hunks) {
       lines.push(`@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines}`);
       lines.push(...h.lines);
@@ -82,4 +87,16 @@ export function answerCall(sid: string, req: AnyQuestions, picked: Record<string
     answers[q.question] = list;
   }
   return { method: 'question.respond', params: { sessionId: sid, requestId: req.id, answers } };
+}
+
+/**
+ * Where a permission request reaches, as the sheet shows it: the folder a command runs in, the whole
+ * path of a file it reads or writes, every file of a change by its whole path (a rename by both ends).
+ * Nothing here is shortened to a name two files could share.
+ */
+export function scopeOf(req: Pick<PermissionRequest, 'detail' | 'diff'>): { cwd?: string; path?: string; files: string[] } {
+  const d = req.detail ?? {};
+  const files = (req.diff ?? []).map(fileLabel);
+  const path = typeof d.path === 'string' && d.path && !(req.diff ?? []).some((f) => f.path === d.path) ? d.path : undefined;
+  return { ...(typeof d.cwd === 'string' && d.cwd ? { cwd: d.cwd } : {}), ...(path ? { path } : {}), files };
 }

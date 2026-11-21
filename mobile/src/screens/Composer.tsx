@@ -8,6 +8,7 @@ import { claimFlight, dropFlight, inFlight, launchFlight } from '@m/lib/flight';
 import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
 import { onPutDraft, putDraft } from '@m/lib/put-draft';
+import { onForget } from '@m/lib/forget';
 import { haptic } from '@m/lib/native';
 import { acceptIntent, closeGap, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, unsureIntent, useStore } from '@m/lib/store';
 import { isUncertain } from '@m/lib/errors';
@@ -48,6 +49,18 @@ const saveDrafts = () => {
  */
 const unsure = new Map<string, { text: string; at: number }>();
 const LOST = /connection to the desktop was lost|did not answer in time/i;
+
+// Forgetting the computer forgets the words written for it, with the write still due.
+onForget(() => {
+  clearTimeout(saveTimer);
+  drafts.clear();
+  unsure.clear();
+  try {
+    localStorage.removeItem(DRAFTS);
+  } catch {
+    /* private mode */
+  }
+});
 
 /** The agents a chat can switch to, in the desktop's order. */
 const AGENTS: ProviderId[] = ['claude', 'codex'];
@@ -355,7 +368,7 @@ export function Composer({ sid }: { sid: string }) {
           {caps?.features.images !== false && (
             <>
               <button type="button" className="tool-key" aria-label="Add a photo" onPointerDown={(e) => e.preventDefault()} onClick={() => (haptic('tap'), fileInput.current?.click())}>
-                <Icon name="plus" size={19} />
+                <Icon name="plus" size={20} />
               </button>
               <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => void pick(e.target.files).then(() => (e.target.value = ''))} />
             </>
@@ -370,7 +383,7 @@ export function Composer({ sid }: { sid: string }) {
               onPointerDown={(e) => e.preventDefault()}
               onClick={() => (haptic('tap'), setSheet(true))}
             >
-              {mode && <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={15} className="setup-chip-mode" />}
+              {mode && <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={16} className="setup-chip-mode" />}
               <span className="setup-chip-model">{modelLabel}</span>
               {effort && efforts.length > 1 && <span className="setup-chip-dim">{effortName(effort)}</span>}
               <Icon name="updown" size={12} weight="bold" className="setup-chip-caret" />
@@ -408,6 +421,8 @@ export function Composer({ sid }: { sid: string }) {
 
 /** Messages sent while the agent works: they go out when the turn ends, or now with the arrow (steered in). */
 function QueueTray({ sid, queue }: { sid: string; queue: QueuedMessage[] }) {
+  // A long queue comes as its first page: the rest is counted, and stays on the desktop in order.
+  const total = useStore((st) => sessionData(st, sid).queueTotal ?? 0);
   return (
     <div className="queue">
       <AnimatePresence initial={false}>
@@ -415,6 +430,7 @@ function QueueTray({ sid, queue }: { sid: string; queue: QueuedMessage[] }) {
           <QueueRow key={q.id} sid={sid} q={q} />
         ))}
       </AnimatePresence>
+      {total > queue.length && <p className="queue-more num">{total - queue.length} more queued on the desktop</p>}
     </div>
   );
 }
@@ -476,7 +492,7 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
                 void conn.call('queue.sendNow', { sessionId: sid, id: q.id }).catch(() => {});
               }}
             >
-              <Icon name="steer" size={17} />
+              <Icon name="steer" size={18} />
             </button>
             <button
               type="button"
@@ -487,7 +503,7 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
                 void conn.call('queue.remove', { sessionId: sid, id: q.id }).catch(() => {});
               }}
             >
-              <Icon name="x" size={15} />
+              <Icon name="x" size={16} />
             </button>
           </motion.div>
   );

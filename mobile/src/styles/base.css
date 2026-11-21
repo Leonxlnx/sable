@@ -43,26 +43,36 @@
   --mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace, monospace;
   --t-xs: 12.5px;
   --t-sm: 13.5px;
+  --t-md: 14.5px;
   --t-ui: 15px;
   --t-body: 16px;
   --t-lead: 17px;
   --t-h3: 19px;
   --t-h2: 21px;
+  --t-h1: 28px;
   --t-display: 34px;
+  /* three weights and one for display: body, a label or a row's name, a heading or a key, the large titles */
+  --w-medium: 510;
+  --w-strong: 590;
+  --w-display: 650;
 
   --r-sm: 12px;
   --r-md: 16px;
   --r-lg: 20px;
   --r-xl: 24px;
+  /* the prompt bars, and a sheet's top corners */
+  --r-pane: 26px;
+  --r-sheet: 30px;
   --r-pill: 999px;
 
   /* the material */
-  --card: rgb(16 16 19 / 0.88);
-  --card-solid: rgb(18 18 21);
+  --card: rgb(19 19 22 / 0.9);
+  --card-solid: rgb(20 20 23);
   --glass: rgb(19 19 22 / 0.72);
   --glass-up: rgb(25 25 29 / 0.86);
   --blur: blur(24px) saturate(160%);
-  --edge: inset 0 0 0 1px rgb(255 255 255 / 0.07);
+  /* a card is its fill, a step over the ground; its edge is a hairline that only finishes it, lit a little along the top */
+  --edge: inset 0 0 0 1px rgb(255 255 255 / 0.045), inset 0 1px 0 0 rgb(255 255 255 / 0.03);
   --edge-2: inset 0 0 0 1px rgb(255 255 255 / 0.1);
   --lift: 0 18px 40px -22px rgb(0 0 0 / 0.9);
   --lift-2: 0 24px 54px -20px rgb(0 0 0 / 0.92), 0 6px 16px -10px rgb(0 0 0 / 0.6);
@@ -321,7 +331,7 @@ p {
   background: var(--fill-3);
   box-shadow: inset 0 0 0 1px var(--line);
   font-size: var(--t-ui);
-  font-weight: 560;
+  font-weight: var(--w-strong);
   color: var(--text);
   white-space: nowrap;
   transition: background-color 100ms, transform 100ms, opacity 100ms;
@@ -345,9 +355,9 @@ p {
 
 .btn-lg {
   height: 56px;
-  border-radius: 18px;
-  font-size: 16.5px;
-  font-weight: 600;
+  border-radius: var(--r-lg);
+  font-size: var(--t-lead);
+  font-weight: var(--w-strong);
   letter-spacing: -0.005em;
 }
 
@@ -425,7 +435,7 @@ p {
   padding: 0 12px;
   color: var(--text-2);
   font-size: var(--t-ui);
-  font-weight: 500;
+  font-weight: var(--w-medium);
   white-space: nowrap;
   transition: color 100ms, opacity 100ms;
 }
@@ -490,7 +500,6 @@ p {
   box-shadow: inset 0 0 0 1px var(--line-2);
   font-size: var(--t-body);
   outline: none;
-  transition: box-shadow 120ms;
 }
 
 .field-input:focus {
@@ -707,13 +716,13 @@ p {
   align-items: center;
   gap: 10px;
   padding: 12px 18px;
-  border-radius: 22px;
+  border-radius: var(--r-xl);
   /* liquid glass, opaque (a toast never blurs) */
   isolation: isolate;
   background: rgb(31 31 35);
   box-shadow: var(--rim-ring), var(--rim-inner), var(--shadow-glass);
-  font-size: 14px;
-  font-weight: 500;
+  font-size: var(--t-md);
+  font-weight: var(--w-medium);
   line-height: 1.4;
 }
 
@@ -765,7 +774,7 @@ p {
   gap: 13px;
   height: 64px;
   padding: 0 10px 0 18px;
-  border-radius: 22px;
+  border-radius: var(--r-xl);
   text-align: left;
 }
 
@@ -779,7 +788,7 @@ p {
 
 .attn-title {
   font-size: var(--t-ui);
-  font-weight: 560;
+  font-weight: var(--w-strong);
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
@@ -800,10 +809,10 @@ p {
   place-items: center;
   height: 38px;
   padding: 0 16px;
-  border-radius: 19px;
+  border-radius: var(--r-pill);
   background: var(--fill-3);
   font-size: var(--t-sm);
-  font-weight: 600;
+  font-weight: var(--w-strong);
   color: var(--text);
   flex-shrink: 0;
 }
@@ -823,4 +832,82 @@ p {
   position: absolute;
   inset: 0;
   transform-origin: 50% 42%;
+}
+
+/* ── touch ──
+   A control drawn smaller than 44 px is still 44 px to the finger: an unpainted area around it
+   (--hit: how far it reaches past the control, top and bottom, then the sides). */
+.filter,
+.tool-key,
+.send,
+.setup-chip,
+.where-chip,
+.search-clear,
+.dock-agent,
+.deck-open,
+.q-step,
+.check-offer,
+.md-copy,
+.share-open,
+.switch-back,
+.work-changes,
+.arch-go,
+.computer-act,
+.rc-copy,
+.wait-go {
+  position: relative;
+}
+
+.filter::after,
+.tool-key::after,
+.send::after,
+.setup-chip::after,
+.where-chip::after,
+.search-clear::after,
+.dock-agent::after,
+.deck-open::after,
+.q-step::after,
+.check-offer::after,
+.md-copy::after,
+.share-open::after,
+.switch-back::after,
+.arch-go::after,
+.computer-act::after,
+.rc-copy::after {
+  content: '';
+  position: absolute;
+  inset: var(--hit, -4px 0);
+}
+
+.tool-key,
+.send,
+.search-clear {
+  --hit: -2px;
+}
+
+.setup-chip,
+.where-chip {
+  --hit: -2px 0;
+}
+
+.dock-agent {
+  --hit: 0 -4px;
+}
+
+.deck-open,
+.q-step {
+  --hit: -5px 0;
+}
+
+.md-copy {
+  --hit: -4px -2px;
+}
+
+.switch-back,
+.computer-act {
+  --hit: -6px 0;
+}
+
+.rc-copy {
+  --hit: -3px 0;
 }

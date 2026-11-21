@@ -13,12 +13,21 @@ import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark } from '@m/ui/marks';
 import { SPRING } from '@m/ui/motion';
 import { Choice, Sheet } from '@m/ui/Sheet';
+import { onForget } from '@m/lib/forget';
 
 /**
  * What a new chat starts with: the agent, the folder (or none: the desktop makes one for it), the
  * model. The last choice is kept; the field on home shows it as three chips.
  */
 const KEY = 'sable.newchat';
+// Its folders and models are the forgotten computer's.
+onForget(() => {
+  try {
+    localStorage.removeItem(KEY);
+  } catch {
+    /* private mode */
+  }
+});
 type Saved = { agent?: ProviderId; folder?: string; none?: boolean; model?: string; effort?: Effort; mode?: string; speed?: string };
 const load = (): Saved => {
   try {
@@ -242,7 +251,7 @@ export function FolderSheet({ open, onClose, c }: { open: boolean; onClose: () =
                   <Icon name="plus" size={18} />
                 </span>
                 <span className="choice-label">Other folder</span>
-                <Icon name="next" size={15} className="choice-caret" />
+                <Icon name="next" size={16} className="choice-caret" />
               </button>
             </div>
           </motion.div>
@@ -321,7 +330,7 @@ function FolderBrowser({ start, onPick, onCancel }: { start: string | null; onPi
                 <Icon name="folder" size={18} />
               </span>
               <span className="choice-label">{e.name}</span>
-              <Icon name="next" size={15} className="choice-caret" />
+              <Icon name="next" size={16} className="choice-caret" />
             </button>
           ))}
           {here && !here.entries.length && !here.path && <p className="empty">No folders here.</p>}

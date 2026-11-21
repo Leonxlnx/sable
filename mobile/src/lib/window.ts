@@ -78,3 +78,56 @@ export function spacers(keys: readonly string[], r: Range, heights: ReadonlyMap<
   };
   return { top: total(0, r.lo), bottom: total(r.hi, keys.length) };
 }
+
+/**
+ * The groups' measured heights with `spacers`' sums kept over them: a running sum of the heights
+ * before each group, made again only when the groups (a new `keys` list) or a measurement change.
+ * A scroll frame then reads two numbers instead of adding up every group outside the window.
+ */
+export class SpacerSums {
+  private heights = new Map<string, number>();
+  private measured = 0;
+  private keys: readonly string[] | null = null;
+  /** `pre[i]`: the height of the groups before group `i` (`pre[keys.length]`: all of them). */
+  private pre = new Float64Array(1);
+  private stale = true;
+  /** How many times the sums were made (tests). */
+  builds = 0;
+
+  /** A group's height as drawn; the sums are made again only when it differs from the one kept. */
+  set(key: string, height: number) {
+    const old = this.heights.get(key);
+    if (old === height) return;
+    this.measured += height - (old ?? 0);
+    this.heights.set(key, height);
+    this.stale = true;
+  }
+
+  /** Every height forgotten (the chat was replaced). */
+  clear() {
+    if (!this.heights.size) return;
+    this.heights.clear();
+    this.measured = 0;
+    this.stale = true;
+  }
+
+  /** As `spacers(keys, r, heights)`, from the kept sums. */
+  of(keys: readonly string[], r: Range): { top: number; bottom: number } {
+    if (this.stale || keys !== this.keys) this.build(keys);
+    const n = keys.length;
+    const lo = Math.max(0, Math.min(r.lo, n));
+    const hi = Math.max(lo, Math.min(r.hi, n));
+    return { top: Math.round(this.pre[lo]), bottom: Math.round(this.pre[n] - this.pre[hi]) };
+  }
+
+  private build(keys: readonly string[]) {
+    const guess = this.heights.size ? this.measured / this.heights.size : GUESS;
+    const pre = this.pre.length > keys.length ? this.pre : new Float64Array(keys.length + 257);
+    pre[0] = 0;
+    for (let i = 0; i < keys.length; i++) pre[i + 1] = pre[i] + (this.heights.get(keys[i]) ?? guess);
+    this.pre = pre;
+    this.keys = keys;
+    this.stale = false;
+    this.builds++;
+  }
+}

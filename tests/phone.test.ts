@@ -28,7 +28,7 @@ import { qrMatrix } from '../server/services/qr';
 import { registerThumbs } from '../server/services/thumbs';
 import { mergeHosts } from '../mobile/src/lib/hosts';
 import { pskOfKey } from '../mobile/src/lib/secure';
-import { fingerprintIn, handshake, helloSecure, keyOf, pairSecure, wireClient } from './phone-wire';
+import { fetchSecure, fingerprintIn, handshake, helloSecure, keyOf, pairSecure, wireClient } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -79,7 +79,7 @@ describe('phone endpoint', () => {
   it('pairs only after "Allow", keeps the token hashed, and the key works once', async () => {
     const { app, port, home } = await setup();
     const offer = await app.call('phone.pair', {});
-    expect(offer.pairing?.link).toMatch(/^sable:\/\/pair\?h=.*&p=\d+&k=[\w-]{20,}/);
+    expect(offer.pairing?.link).toMatch(/^sable:\/\/pair\/2\?h=.*&p=\d+&s=[\w-]{20,}/);
     const { c, token } = await pairPhone(app, port);
     expect(token.length).toBeGreaterThanOrEqual(40);
     const saved = readFileSync(path.join(home, 'phone.json'), 'utf8');
@@ -343,7 +343,7 @@ describe('conversations in pages', () => {
 });
 
 describe('files the agent hands over', () => {
-  it('gives a short-lived link for a shared file of the chat, serves only that file, and refuses others', async () => {
+  it('sends a shared file of the chat over the secure channel, only that file, and refuses others', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
     // The chat's own folder: a file outside it goes to a phone only when the person allowed the share (tests/share-handed.test.ts).
@@ -354,16 +354,18 @@ describe('files the agent hands over', () => {
     const rt = app.sessions.get(id)!;
     rt.add({ id: 'share1', type: 'tool', name: 'SendUserFile', kind: 'share', title: 'build.apk', status: 'done', detail: { files: [{ path: file, name: 'build.apk', size: 9 }] } } as never);
     rt.add({ id: 'read1', type: 'tool', name: 'Read', kind: 'read', title: 'Read', status: 'done', detail: { path: file } } as never);
-    const link = (await c.call('phone.fileLink', { sessionId: id, itemId: 'share1', index: 0 })) as { ok: boolean; result: { path: string; name: string; size: number } };
-    expect(link.ok).toBe(true);
-    expect(link.result).toMatchObject({ name: 'build.apk', size: 9 });
-    const res = await fetch(`http://127.0.0.1:${port}${link.result.path}`);
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toBe('application/vnd.android.package-archive');
-    expect(await res.text()).toBe('apk bytes');
+    const got = await fetchSecure(c, { sessionId: id, itemId: 'share1', index: 0 });
+    expect(got.ok).toBe(true);
+    if (got.ok) {
+      expect(got.start).toMatchObject({ name: 'build.apk', size: 9 });
+      expect(got.bytes.toString()).toBe('apk bytes');
+    }
+    // A securely paired phone never gets a plain HTTP link.
+    expect(((await c.call('phone.fileLink', { sessionId: id, itemId: 'share1', index: 0 })) as { error?: string }).error).toBe('Update Sable on this phone to download files.');
     // Not a share step, an index out of range, or a made-up token: nothing.
-    expect(((await c.call('phone.fileLink', { sessionId: id, itemId: 'read1', index: 0 })) as { ok: boolean }).ok).toBe(false);
-    expect(((await c.call('phone.fileLink', { sessionId: id, itemId: 'share1', index: 3 })) as { ok: boolean }).ok).toBe(false);
+    expect((await fetchSecure(c, { sessionId: id, itemId: 'read1', index: 0 })).ok).toBe(false);
+    expect((await fetchSecure(c, { sessionId: id, itemId: 'share1', index: 3 })).ok).toBe(false);
+    expect(((await c.call('phone.fileChunk', { transfer: 'not-a-transfer', offset: 0 })) as { ok: boolean }).ok).toBe(false);
     expect((await fetch(`http://127.0.0.1:${port}/f/not-a-token/build.apk`)).status).toBe(404);
     c.ws.close();
   });

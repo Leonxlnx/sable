@@ -24,7 +24,7 @@ import { conn, type ConnState } from './conn';
 import { reshape, shapeString } from './turns';
 import { Intents, type Field } from './intents';
 import { clearChatNotifications, clearShortcuts } from './native';
-import { coalesce, staleFetch } from './stale';
+import { reconciler, staleFetch } from './stale';
 
 /**
  * The phone's view of the desktop: sessions, folders, accounts and the open conversations, kept
@@ -41,16 +41,22 @@ export interface SessionData {
   permissions: PermissionRequest[];
   questions: QuestionRequest[];
   queue: QueuedMessage[];
+  /** Queued messages in all, when more wait than the first page here (`phone.queue` reads on). */
+  queueTotal?: number;
   todos: Todo[];
   caps?: Capabilities;
   /** Pass to `phone.tail` for the page before the oldest one here; absent once the start is in. */
   cursor?: string;
   /**
    * The pages here stop before the newest (opened around a message far back): the first root after
-   * them, for `fetchNewer`. New messages meanwhile wait in `late` until the gap closes.
+   * them, for `fetchNewer`. New messages meanwhile wait in `late` until the gap closes, at most
+   * `LATE_MAX` of them: past that they are let go (the desktop has them all after `next`, and reading
+   * on brings them), and `lateDrops` counts the times, so a page that reaches the newest while some
+   * were let go does not close the gap without them.
    */
   next?: string;
   late?: string[];
+  lateDrops?: number;
   /** Counts the times the whole chat was replaced from the desktop (a page around a message, the newest page again): what was mounted starts over. */
   epoch?: number;
   /** Shown from the phone's cache while the desktop is asked. */
@@ -273,6 +279,7 @@ export function applySnapshot(snap: Tail, cached = false) {
         permissions: snap.permissions,
         questions: snap.questions,
         queue: snap.queue,
+        ...((snap as { queueTotal?: number }).queueTotal ? { queueTotal: (snap as { queueTotal?: number }).queueTotal } : {}),
         todos: snap.todos,
         caps: snap.caps,
         cursor: snap.cursor,
@@ -344,6 +351,36 @@ function removeTree(d: SessionData, id: string): Partial<SessionData> {
   return { items, children, roots, shape: shapeString(roots, items), fileSteps: countFileSteps(items) };
 }
 
+/** Roots held while the pages here stop before the newest, at most (past it they are let go; reading on brings them). */
+export const LATE_MAX = 120;
+
+/**
+ * A root that arrived while the pages here stop before the newest: held in `late` (appended in place,
+ * no copy per root) until the gap closes. Past `LATE_MAX` the ones held are let go with their steps,
+ * and this one too: the desktop has every root after `next`, and `lateDrops` tells a page on its way
+ * that it may lack some.
+ */
+function holdLate(d: SessionData, it: TimelineItem): Partial<SessionData> {
+  const late = d.late ?? [];
+  if (late.length < LATE_MAX) {
+    d.items[it.id] = it;
+    late.push(it.id);
+    return { late, ...(settledFileTool(it) ? { fileSteps: d.fileSteps + 1 } : {}) };
+  }
+  let children = d.children;
+  const drop = (x: string) => {
+    const kids = children[x];
+    if (kids) {
+      for (const c of kids) drop(c);
+      if (children === d.children) children = { ...children };
+      delete children[x];
+    }
+    delete d.items[x];
+  };
+  for (const x of late) drop(x);
+  return { late: [], lateDrops: (d.lateDrops ?? 0) + 1, children, fileSteps: countFileSteps(d.items) };
+}
+
 /** Changes the list of prompts waiting across chats (a new object only when it changed). */
 function setPending(patch: Partial<State['pending']>) {
   setState({ pending: { ...state.pending, ...patch } });
@@ -364,13 +401,12 @@ export function applyEvent(e: BridgeEvent) {
         if (pid) {
           // The parent's count of nested steps (the desktop's count when the page came, then live).
           const parent = d.items[pid] as PhoneItem | undefined;
+          // Under a root that is not here while the pages stop before the newest (let go past the bound, or not reached): it comes with its root.
+          if (!parent && d.next) return {};
           const put = putItems(d, parent ? [e.item, { ...parent, kids: (parent.kids ?? 0) + 1 } as PhoneItem] : [e.item]);
           return { ...put, children: { ...d.children, [pid]: [...(d.children[pid] ?? []), e.item.id] } };
         }
-        if (d.next) {
-          d.items[e.item.id] = e.item;
-          return { late: [...(d.late ?? []), e.item.id] };
-        }
+        if (d.next) return holdLate(d, e.item);
         const roots = [...d.roots, e.item.id];
         const put = putItems({ ...d, roots, shape: d.shape + '.' }, [e.item]);
         return { ...put, roots };
@@ -419,7 +455,7 @@ export function applyEvent(e: BridgeEvent) {
     case 'todos.updated':
       return patchData(e.sessionId, () => ({ todos: e.todos }));
     case 'queue.updated':
-      return patchData(e.sessionId, () => ({ queue: e.queue }));
+      return patchData(e.sessionId, () => ({ queue: e.queue, queueTotal: (e as { total?: number }).total }));
     case 'provider.updated':
       return setState({ providers: { ...state.providers, [e.provider.id]: e.provider } });
     case 'projects.updated':
@@ -442,11 +478,18 @@ export function applyEvent(e: BridgeEvent) {
 
 /** `phone.stale`: the open chat's newest page, or the list; a burst fetches each once at a time. */
 const HELLO_KEY = '\u0000hello';
-const staleRun = coalesce(async (key) => {
-  if (state.conn !== 'open') return;
-  if (key === HELLO_KEY) return refresh(Object.keys(state.data));
-  return openSession(key);
-});
+// A refresh that fails is said once and tried again in a moment (lib/stale.ts `reconciler`): what shows may be out of date meanwhile.
+const staleRun = reconciler(
+  async (key) => {
+    if (state.conn !== 'open') return;
+    if (key === HELLO_KEY) return refresh(Object.keys(state.data));
+    return openSession(key);
+  },
+  {
+    report: (key) =>
+      setState({ toast: { text: key === HELLO_KEY ? 'The chats could not be brought up to date. Sable tries again.' : 'This chat could not be brought up to date. Sable tries again.', level: 'error', at: Date.now() } }),
+  },
+);
 function onStale(e: { sessionId?: string }) {
   const f = staleFetch(e, (id) => !!state.data[id]);
   staleRun(f.kind === 'tail' ? f.sessionId : HELLO_KEY);
@@ -551,6 +594,7 @@ export async function fetchNewer(id: string): Promise<boolean> {
   const d = state.data[id];
   if (!d?.next || d.cached) return false;
   const after = d.next;
+  const drops = d.lateDrops ?? 0;
   const page: PhoneTail = await conn.call('phone.tail', { sessionId: id, after });
   const now = state.data[id];
   if (!now || now.next !== after) return false;
@@ -561,12 +605,15 @@ export async function fetchNewer(id: string): Promise<boolean> {
     if (!have.has(it.id)) add.push(it.id);
     items[it.id] = it;
   }
-  // Reached the newest: what arrived meanwhile follows, once each.
-  const closing = !page.next;
+  // Reached the newest: what arrived meanwhile follows, once each. Unless roots were let go while
+  // this page was on its way (some may have come after it was made): then on from its last root.
+  const last = page.items.at(-1)?.id;
+  const closing = !page.next && !((now.lateDrops ?? 0) !== drops && last);
   const seen = new Set([...now.roots, ...add]);
   const late = closing ? (now.late ?? []).filter((x) => !seen.has(x) && items[x]) : [];
   const roots = [...now.roots, ...add, ...late];
-  setState({ data: { ...state.data, [id]: { ...now, items, roots, next: page.next, late: closing ? undefined : now.late, shape: shapeString(roots, items), fileSteps: countFileSteps(items) } } });
+  const gap = closing ? { next: undefined, late: undefined, lateDrops: undefined } : { next: page.next ?? last, late: (now.late ?? []).filter((x) => !seen.has(x)) };
+  setState({ data: { ...state.data, [id]: { ...now, items, roots, ...gap, shape: shapeString(roots, items), fileSteps: countFileSteps(items) } } });
   return true;
 }
 

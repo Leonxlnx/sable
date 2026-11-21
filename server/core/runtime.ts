@@ -19,7 +19,7 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { userText } from '../../shared/synthetic';
-import { approvedShare, handFiles, type ApprovedShare } from './handed';
+import { approvedShare, handOver, type ApprovedShare } from './handed';
 
 export type Emit = (event: BridgeEvent) => void;
 
@@ -138,20 +138,70 @@ export class SessionRuntime {
     return q;
   }
 
-  /** New text, and new attachments when given (empty clears them). Left empty, the message goes. */
+  /**
+   * New text, and new attachments when given (empty clears them). Left empty, the message goes. A
+   * change is a new object with a new revision; a message a phone is taking back is not changed
+   * (`reserveQueued`).
+   */
   updateQueued(id: string, text: string, attachments?: QueuedMessage['attachments']) {
     const at = this.queue.findIndex((x) => x.id === id);
-    if (at < 0) return false;
+    if (at < 0 || this.reserved.has(id)) return false;
     const q = this.queue[at];
     const files = attachments === undefined ? q.attachments : attachments.length ? attachments : undefined;
     if (!text.trim() && !files?.length) {
       this.queue.splice(at, 1);
     } else {
-      q.text = text;
-      q.attachments = files;
+      this.queue[at] = { ...q, text, attachments: files };
     }
+    this.queueRev.set(id, (this.queueRev.get(id) ?? 0) + 1);
     this.queueChanged();
     return true;
+  }
+
+  // A queued message a phone takes back to edit (phone.ts): it stays in its place while the phone's
+  // reply goes, neither edited nor sent, then the take commits (it leaves the queue) or rolls back
+  // (it is exactly where and as it was, its scheduling untouched). A queue that would have sent it
+  // meanwhile goes on once it is released (`onQueueReleased`).
+
+  /** Messages reserved by a take, with their revision then. */
+  private reserved = new Map<string, number>();
+  /** Each queued message's revision (one more with every change). */
+  private queueRev = new Map<string, number>();
+  /** A reservation ended (committed or rolled back): what waited for it may go now. */
+  onQueueReleased?: (rt: SessionRuntime) => void;
+
+  /** Reserves a queued message for a take: a copy of it as it is and its revision, or undefined (not there, or already reserved). */
+  reserveQueued(id: string): { message: QueuedMessage; rev: number } | undefined {
+    const q = this.queue.find((x) => x.id === id);
+    if (!q || this.reserved.has(id)) return undefined;
+    const rev = this.queueRev.get(id) ?? 0;
+    this.reserved.set(id, rev);
+    return { message: { ...q, ...(q.attachments ? { attachments: q.attachments.map((a) => ({ ...a })) } : {}) }, rev };
+  }
+
+  isReserved(id: string | undefined): boolean {
+    return !!id && this.reserved.has(id);
+  }
+
+  /** The take went through: the message leaves the queue, if it is still that revision. */
+  commitReserved(id: string, rev: number): QueuedMessage | undefined {
+    const had = this.reserved.get(id);
+    if (had === undefined) return undefined;
+    this.reserved.delete(id);
+    const at = this.queue.findIndex((x) => x.id === id);
+    const out = at >= 0 && had === rev && (this.queueRev.get(id) ?? 0) === rev ? this.queue.splice(at, 1)[0] : undefined;
+    if (out) {
+      this.queueRev.delete(id);
+      this.queueChanged();
+    }
+    this.onQueueReleased?.(this);
+    return out;
+  }
+
+  /** The take did not go through: the message stays as and where it is. */
+  rollbackReserved(id: string) {
+    if (!this.reserved.delete(id)) return;
+    this.onQueueReleased?.(this);
   }
 
   /** `ids` first in that order; messages not named keep their relative order after them. */
@@ -199,11 +249,12 @@ export class SessionRuntime {
     return untaken.length;
   }
 
-  /** Takes a message out of the queue (the first one without an id). */
+  /** Takes a message out of the queue (the first one without an id); never one a phone is taking back. */
   takeQueued(id?: string): QueuedMessage | undefined {
     const at = id ? this.queue.findIndex((x) => x.id === id) : this.queue.length ? 0 : -1;
-    if (at < 0) return undefined;
+    if (at < 0 || this.reserved.has(this.queue[at].id)) return undefined;
     const [q] = this.queue.splice(at, 1);
+    this.queueRev.delete(q.id);
     this.queueChanged();
     return q;
   }
@@ -255,36 +306,68 @@ export class SessionRuntime {
   /** Share steps the person allowed themselves (a permission they answered with an allow), by item id: the files as they were shown. */
   private allowedShares = new Map<string, ApprovedShare>();
 
-  /** What share step `item` hands over, captured as it goes through (core/handed.ts): outside the folder, only what the person was shown. */
+  /** Share steps whose digests are still being read (core/handed.ts `handOver`), by item id: settled once they are recorded. */
+  private handings = new Map<string, Promise<void>>();
+
+  /**
+   * What share step `item` hands over, captured as it goes through (core/handed.ts): outside the
+   * folder, only what the person was shown. The records go on the step at once; each file's digest
+   * is read after, through the handle opened here, and lands as a patch of its own (saved with the
+   * session), unless the step was rewound, removed or recorded anew meanwhile.
+   */
   private hand(item: ToolItem) {
     const approved = this.allowedShares.get(item.id);
     this.allowedShares.delete(item.id);
-    return handFiles(this.meta.cwd, item.detail?.files, approved);
+    const { handed, digests } = handOver(this.meta.cwd, item.detail?.files, approved);
+    if (digests) {
+      const id = item.id;
+      const done = digests
+        .then((next) => {
+          const now = this.index.get(id);
+          if (now?.type === 'tool' && now.handed === handed) this.patch<ToolItem>(id, { handed: next });
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (this.handings.get(id) === done) this.handings.delete(id);
+        });
+      this.handings.set(id, done);
+    }
+    return handed;
+  }
+
+  /**
+   * Settles once the digests of share step `itemId` are recorded on it (`handed[i].sha256` or
+   * `unhashed`); undefined when none are being read (recorded already, or never captured here).
+   */
+  handing(itemId: string): Promise<void> | undefined {
+    return this.handings.get(itemId);
   }
 
   /**
    * What each message of the person's came to, as its agent reported it (Claude Code: one result per
    * message, so one turn can answer one message failed and the next ok). Only one answered `ok` may
-   * name a chat; a message with no word of its own goes by its turn's end. Kept until the turn's end
-   * has been looked at (`forgetOutcome`).
+   * name a chat; a message with no word of its own goes by its turn's end. `pending`: handed to an
+   * agent that reports per message (`expectOutcome`), with no word yet. Every one is kept, however
+   * many a turn answers, until the bridge has looked at the turn's end (`forgetOutcomes`).
    */
-  private outcomes = new Map<string, MessageOutcome>();
+  private outcomes = new Map<string, MessageOutcome | 'pending'>();
   /**
    * The result that answered each such message: its TurnItem's id, or null when none of its own did
    * (it came to its turn's end), so which texts were its answer is not known (core/titles.ts).
    */
   private answers = new Map<string, string | null>();
 
+  /** Message `itemId` goes to an agent that says what each message came to: until it does, it came to nothing (never ok by default). */
+  expectOutcome(itemId: string) {
+    this.outcomes.set(itemId, 'pending');
+  }
+
   /** `resultId`: the TurnItem of the result that answered them (absent: none of their own). */
   answered(itemIds: readonly string[], outcome: MessageOutcome, resultId?: string) {
     for (const id of itemIds) {
-      this.outcomes.delete(id);
       this.outcomes.set(id, outcome);
-      this.answers.delete(id);
       this.answers.set(id, resultId ?? null);
     }
-    while (this.outcomes.size > 200) this.outcomes.delete(this.outcomes.keys().next().value!);
-    while (this.answers.size > 200) this.answers.delete(this.answers.keys().next().value!);
   }
 
   /** The TurnItem of the result that answered message `itemId`; null: answered by none of its own; undefined: its agent says nothing per message. */
@@ -292,12 +375,25 @@ export class SessionRuntime {
     return this.answers.get(itemId);
   }
 
-  outcomeOf(itemId: string): MessageOutcome | undefined {
+  outcomeOf(itemId: string): MessageOutcome | 'pending' | undefined {
     return this.outcomes.get(itemId);
   }
 
-  forgetOutcome(itemId: string) {
-    this.outcomes.delete(itemId);
+  /**
+   * Whether message `itemId` went ok as far as its agent said: one handed to an agent that reports per
+   * message needs that agent's own word (a missing one is no success); one of an agent that says
+   * nothing per message goes by its turn's end.
+   */
+  answeredOk(itemId: string): boolean {
+    const o = this.outcomes.get(itemId);
+    return o === undefined || o === 'ok';
+  }
+
+  /** The bridge has looked at a turn's end: every record goes but those of `keep` (messages still to be taken, or still to be named from). */
+  forgetOutcomes(keep: readonly string[] = []) {
+    const kept = new Set(keep);
+    for (const id of [...this.outcomes.keys()]) if (!kept.has(id)) this.outcomes.delete(id);
+    for (const id of [...this.answers.keys()]) if (!kept.has(id)) this.answers.delete(id);
   }
 
   /** Marks a message the agent has taken: a steered one stays where it was sent, a queued one moves down to here. */

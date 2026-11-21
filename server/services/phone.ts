@@ -12,6 +12,7 @@ import {
   PHONE_OWN_METHODS,
   PHONE_PATH,
   PHONE_PORT,
+  PAIR_LINK_PREFIX,
   type Attachment,
   type BridgeEvent,
   type DiffHunk,
@@ -40,11 +41,13 @@ import {
   type ToolResult,
   type WorkflowRun,
 } from '../../shared/protocol';
+import { canonicalName, isPackageName } from '../../shared/file-name';
 import { partOfTurn, syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
 import { cap, isSnapshot, lines } from '../core/trim';
 import { VERSION } from '../version';
 import { PhoneChangesReader, stepIds } from './phone-changes';
+import { digestOfHandle, PhoneFiles } from './phone-files';
 import { FRAME_MAX, grantFor, openGrant, phoneAttachments, readHello, type FileGrant } from './phone-guard';
 import { qrMatrix, qrSvgPath } from './qr';
 import { searchOf, type ChatSearch } from './search';
@@ -617,17 +620,27 @@ export function phoneWindow(items: TimelineItem[], opts: { around?: string; afte
 
 /** A queued message's words as a phone shows them (one line; `queue.take` gives the whole message). */
 const QUEUE_TEXT = LIMITS.answer;
+/** Queued messages per page (`phone.tail` holds the first, `phone.queue` reads on), and permissions or questions a page holds. */
+export const QUEUE_PAGE = 20;
+export const PROMPTS_PAGE = 20;
 const trimQueue = (q: QueuedMessage[]) =>
   q.map((m) => ({ ...m, ...(m.attachments ? { attachments: trimAttachments(m.attachments) } : {}), ...(m.text.length > QUEUE_TEXT ? { text: m.text.slice(0, QUEUE_TEXT), cut: true } : {}) })) as QueuedMessage[];
 
 /** A snapshot as a phone gets it: the newest page instead of every item (or a page `around` / `after` an item). */
 export function phoneTail(snap: SessionSnapshot, opts: { before?: string; limit?: number; to?: string; around?: string; after?: string } = {}): PhoneTail {
   const page: { items: PhoneItem[]; cursor?: string; next?: string; total: number } = opts.around || opts.after ? phoneWindow(snap.items, opts) : phonePage(snap.items, opts);
+  // Every collection bounded, so the page always fits the phone's frame (a long queue reads on with `phone.queue`).
+  const queue = snap.queue ?? [];
+  const permissions = snap.permissions ?? [];
+  const questions = snap.questions ?? [];
   return {
     ...snap,
-    queue: trimQueue(snap.queue ?? []),
-    permissions: (snap.permissions ?? []).map(phonePermission),
-    questions: (snap.questions ?? []).map(phoneQuestion),
+    queue: trimQueue(queue.slice(0, QUEUE_PAGE)),
+    ...(queue.length > QUEUE_PAGE ? { queueTotal: queue.length } : {}),
+    permissions: permissions.slice(0, PROMPTS_PAGE).map(phonePermission),
+    ...(permissions.length > PROMPTS_PAGE ? { permissionsTotal: permissions.length } : {}),
+    questions: questions.slice(0, PROMPTS_PAGE).map(phoneQuestion),
+    ...(questions.length > PROMPTS_PAGE ? { questionsTotal: questions.length } : {}),
     todos: (snap.todos ?? []).slice(0, 100).map((t) => ({ ...t, content: cap(t.content, LIMITS.field) })),
     items: page.items,
     total: page.total,
@@ -687,7 +700,7 @@ export function phoneEvent(event: BridgeEvent): BridgeEvent | PhoneReset | null 
     case 'question.added':
       return { ...event, request: phoneQuestion(event.request) };
     case 'queue.updated':
-      return { ...event, queue: trimQueue(event.queue) };
+      return { ...event, queue: trimQueue(event.queue.slice(0, QUEUE_PAGE)), ...(event.queue.length > QUEUE_PAGE ? { total: event.queue.length } : {}) };
     default:
       return event;
   }
@@ -721,11 +734,13 @@ const sameHash = (a: string, b: string) => a.length === b.length && timingSafeEq
 const IDENTITY_ERROR = 'Sable could not read its phone key. Phones cannot pair until it can.';
 
 /**
- * The pairing link: `sable://pair?h=<addresses>&p=<port>&k=<one-time key>&f=<the desktop's key
- * fingerprint>&n=<its name>`, short enough for the QR code (the name, then addresses, give way).
+ * The pairing link (version 2, `PAIR_LINK_PREFIX`): `sable://pair/2?h=<addresses>&p=<port>&s=<one-time
+ * secret>&f=<the desktop's key fingerprint>&n=<its name>`, short enough for the QR code (the name,
+ * then addresses give way). An app older than the secure channel reads only `sable://pair?…&k=`: it
+ * cannot take this link, so it never sends the secret in the clear.
  */
 export function pairLink(hosts: string[], port: number, key: string, fingerprint: string, name: string): string {
-  const make = (h: string[], n: string) => `sable://pair?h=${h.join(',')}&p=${port}&k=${key}&f=${fingerprint}${n ? `&n=${encodeURIComponent(n)}` : ''}`;
+  const make = (h: string[], n: string) => `${PAIR_LINK_PREFIX}h=${h.join(',')}&p=${port}&s=${key}&f=${fingerprint}${n ? `&n=${encodeURIComponent(n)}` : ''}`;
   const fits = (s: string) => {
     try {
       qrMatrix(s);
@@ -848,8 +863,18 @@ export class PhoneService {
   private port: number;
   private host: string;
   private pairing?: { key: string; expiresAt: number; link: string; qr: string; size: number };
-  /** A phone that presented the pairing key and waits for "Allow"; `replaces`: the pairing it had before. */
-  private request?: { id: string; name: string; address: string; at: number; link: Link; socket: WebSocket; timer: NodeJS.Timeout; replaces?: { id: string; token: string } };
+  /** A phone that presented the pairing key and waits for "Allow"; `replaces`: its older plain pairing with this desktop, by its migration ticket. */
+  private request?: { id: string; name: string; address: string; at: number; link: Link; socket: WebSocket; timer: NodeJS.Timeout; replaces?: { id: string; ticket: string } };
+  /**
+   * Migration tickets (`phone.migrate`): per phone paired before the secure channel, the hash of a
+   * one-time ticket it got over its own connection, and until when it holds. A secure pairing that
+   * names it replaces that phone's old entry; nothing else does.
+   */
+  private tickets = new Map<string, { hash: string; expires: number }>();
+  /** Per authenticated connection: stops its dispatch at once (a removed phone's requests are never acted on). */
+  private detach = new Map<Link, () => void>();
+  /** Files going to securely paired phones over their sealed connections (phone-files.ts). */
+  private sending = new PhoneFiles();
   private fails = new Map<string, { count: number; first: number; blockedUntil?: number }>();
   private globalFails: number[] = [];
   /** Authenticated connections per device id. */
@@ -1023,7 +1048,11 @@ export class PhoneService {
       for (const c of wss.clients) c.terminate();
       wss.close();
     }
+    for (const off of [...this.detach.values()]) off();
+    this.detach.clear();
     this.live.clear();
+    this.sending.drop();
+    this.tickets.clear();
     if (server) {
       server.closeAllConnections();
       await new Promise<void>((r) => server.close(() => r()));
@@ -1062,8 +1091,8 @@ export class PhoneService {
       const token = randomBytes(32).toString('base64url');
       // Pairing happens only over the secure channel now: this phone connects only that way.
       const device: StoredPhone = { id: randomUUID(), name: r.name, tokenHash: sha256(token), pairedAt: Date.now(), lastSeen: Date.now(), secure: true };
-      // The pairing this phone had before goes (it named it, with its token): one entry per phone.
-      const old = r.replaces ? this.data.devices.find((d) => d.id === r.replaces!.id && sameHash(d.tokenHash, sha256(r.replaces!.token))) : undefined;
+      // The plain pairing this phone had with this desktop goes, by the ticket this desktop gave it over that pairing: one entry per phone.
+      const old = r.replaces ? this.ticketFor(r.replaces.id, r.replaces.ticket) : undefined;
       if (old) this.dropDevice(old.id, false);
       this.data.devices.push(device);
       this.save(true);
@@ -1087,13 +1116,33 @@ export class PhoneService {
 
   private dropDevice(deviceId: string, tell: boolean) {
     this.data.devices = this.data.devices.filter((d) => d.id !== deviceId);
-    // Its download links go with it.
+    // Nothing it sends from now on is acted on, before its sockets get to close (they close behind what is still going out).
+    for (const link of this.live.get(deviceId) ?? []) this.detach.get(link)?.();
+    // Its download links, files under way and migration ticket go with it.
     this.dropLinks(deviceId);
+    this.sending.drop(deviceId);
+    this.tickets.delete(deviceId);
     for (const link of this.live.get(deviceId) ?? []) {
       if (tell) this.sendFrame(link, { denied: 'This phone was removed on the desktop' });
       link.close(4001, 'revoked');
     }
     this.live.delete(deviceId);
+  }
+
+  /** A one-time ticket for a phone paired plain (`phone.migrate`), 10 minutes. */
+  private ticketOf(deviceId: string): string {
+    const ticket = randomBytes(24).toString('base64url');
+    this.tickets.set(deviceId, { hash: sha256(ticket), expires: Date.now() + PAIR_TTL_MS });
+    return ticket;
+  }
+
+  /** The plain pairing a ticket names, if it is that phone's live ticket (it is used up either way). */
+  private ticketFor(deviceId: string, ticket: string): StoredPhone | undefined {
+    const t = this.tickets.get(deviceId);
+    if (!t) return undefined;
+    this.tickets.delete(deviceId);
+    if (t.expires < Date.now() || !sameHash(t.hash, sha256(ticket))) return undefined;
+    return this.data.devices.find((d) => d.id === deviceId && !d.secure);
   }
 
   private endRequest(reason: string) {
@@ -1135,51 +1184,50 @@ export class PhoneService {
    */
   private files = new Map<string, FileGrant>();
 
+  /**
+   * The grant for a share's file with the digest the share recorded when it completed (core/handed.ts):
+   * while that is still being read, it is waited for; a share without one (from a stored transcript,
+   * from before Sable kept one, or one too big or changed while it was read) is not downloaded.
+   */
+  private async sharedFile(deviceId: string, sessionId: string, itemId: string, index: number): Promise<FileGrant & { sha256: string }> {
+    let snap = await this.app.call('session.snapshot', { sessionId });
+    let grant = grantFor(snap, itemId, index, deviceId);
+    if (!grant.sha256 && !grant.unhashed) {
+      const pending = this.app.sessions.get(sessionId)?.handing(itemId);
+      if (pending) {
+        await Promise.race([pending, new Promise((r) => setTimeout(r, 60_000).unref?.())]);
+        snap = await this.app.call('session.snapshot', { sessionId });
+        grant = grantFor(snap, itemId, index, deviceId);
+      }
+    }
+    if (grant.unhashed === 'big') throw new Error('That file is too big to send to the phone.');
+    if (grant.unhashed === 'changed') throw new Error('That file changed while it was shared. Ask the agent to share it again.');
+    if (!grant.sha256) throw new Error('Ask the agent to share that file again.');
+    return grant as FileGrant & { sha256: string };
+  }
+
+  /** A phone paired before the secure channel: a plain HTTP link (never for an APK, which nothing could check on the way). */
   private async fileLink(deviceId: string, sessionId: string, itemId: string, index: number): Promise<{ path: string; name: string; size?: number; sha256?: string }> {
-    const snap = await this.app.call('session.snapshot', { sessionId });
-    const grant = grantFor(snap, itemId, index, deviceId);
-    // What the phone checks the bytes against (they come over plain HTTP; this over the channel).
-    const sha256 = await this.digestOf(grant);
-    // A share that recorded what it handed over by content: the file must still be those bytes.
-    const share = snap.items.find((i) => i.id === itemId) as ToolItem | undefined;
-    const handed = (share?.handed?.[index] as { sha256?: unknown } | undefined)?.sha256;
-    if (typeof handed === 'string' && handed.toLowerCase() !== sha256) throw new Error('That file changed after it was shared.');
+    const grant = await this.sharedFile(deviceId, sessionId, itemId, index);
+    const name = canonicalName(grant.name);
+    if (isPackageName(name)) throw new Error('Pair again for a secure connection to get this file.');
+    // The file must still be the bytes the share recorded before a link to it is made.
+    const opened = await openGrant(grant);
+    if ('code' in opened) throw new Error(opened.code === 409 ? 'That file changed after it was shared.' : 'That file is no longer on the computer.');
+    let sha256: string | null;
+    try {
+      sha256 = await digestOfHandle(opened.fh, grant.size);
+    } finally {
+      await opened.fh.close().catch(() => {});
+    }
+    if (sha256 !== grant.sha256) throw new Error('That file changed after it was shared.');
+    grant.name = name;
     const now = Date.now();
     for (const [t, f] of this.files) if (f.expires < now) this.files.delete(t);
     while (this.files.size >= 50) this.files.delete(this.files.keys().next().value as string);
     const token = randomBytes(24).toString('base64url');
     this.files.set(token, grant);
     return { path: `/f/${token}/${encodeURIComponent(grant.name)}`, name: grant.name, size: grant.size, sha256 };
-  }
-
-  /** SHA-256 (hex) of a grant's file, read through a handle checked against the grant; kept per file identity. */
-  private digests = new Map<string, Promise<string>>();
-  private digestOf(g: FileGrant): Promise<string> {
-    const key = [g.path, g.size, g.mtimeMs, g.fileId ?? g.ino, g.dev ?? ''].join('\u0000');
-    const have = this.digests.get(key);
-    if (have) return have;
-    const p = (async () => {
-      const opened = await openGrant(g);
-      if ('code' in opened) throw new Error(opened.code === 409 ? 'That file changed after it was shared.' : 'That file is no longer on the computer.');
-      try {
-        const h = createHash('sha256');
-        let read = 0;
-        if (g.size > 0) {
-          for await (const chunk of opened.fh.createReadStream({ start: 0, end: g.size - 1, autoClose: false })) {
-            h.update(chunk as Buffer);
-            read += (chunk as Buffer).length;
-          }
-        }
-        if (read !== g.size) throw new Error('That file changed after it was shared.');
-        return h.digest('hex');
-      } finally {
-        await opened.fh.close().catch(() => {});
-      }
-    })();
-    this.digests.set(key, p);
-    p.catch(() => this.digests.delete(key));
-    while (this.digests.size > 64) this.digests.delete(this.digests.keys().next().value as string);
-    return p;
   }
 
   /** Downloads under way, per phone: each one's abort (it ends the transfer and closes the file). */
@@ -1196,9 +1244,9 @@ export class PhoneService {
     return this.transfers.get(deviceId)?.size ?? 0;
   }
 
-  /** This link still serves: its phone paired, phone access on, the link not dropped. */
+  /** This link still serves: its phone paired (plain: a secure phone downloads over its connection), phone access on, the link not dropped. */
   private linkLive(token: string, entry: FileGrant): boolean {
-    return this.files.get(token) === entry && this.data.enabled && this.data.devices.some((d) => d.id === entry.deviceId);
+    return this.files.get(token) === entry && this.data.enabled && this.data.devices.some((d) => d.id === entry.deviceId && !d.secure);
   }
 
   /** `phone.image`: one picture of a step's result in this chat (a data URL of an image, capped), nothing else. */
@@ -1259,9 +1307,8 @@ export class PhoneService {
     if (!set) this.transfers.set(entry.deviceId, (set = new Set()));
     set.add(ac);
     try {
-      const type = /\.apk$/i.test(entry.name) ? 'application/vnd.android.package-archive' : 'application/octet-stream';
       res.writeHead(200, {
-        'content-type': type,
+        'content-type': 'application/octet-stream',
         'content-length': String(entry.size),
         'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(entry.name)}`,
         'cache-control': 'no-store',
@@ -1347,21 +1394,26 @@ export class PhoneService {
    * ends as it does for a take on the desktop). A reply that fails leaves the message, its place and
    * its scheduling exactly as they were.
    */
-  private async takeQueued(link: Link, id: number, params: Record<string, unknown>) {
+  private async takeQueued(link: Link, id: number, params: Record<string, unknown>, allowed: () => boolean) {
     const sessionId = String(params.sessionId ?? '');
     const qid = String(params.id ?? '');
     const tooBig = 'That message is too big to take back to the phone. Edit it on the desktop.';
     // Loads the chat when the desktop has not yet (as the bridge's own take would).
     await this.app.call('session.snapshot', { sessionId });
     const rt = this.app.sessions.get(sessionId);
-    const held = rt?.queue.find((q) => q.id === qid);
-    if (!rt || !held) return this.sendFrame(link, { id, ok: true, result: {} });
-    const json = this.deliverable(link, { id, ok: true, result: phoneResult('queue.take', { message: held }) });
-    if (!json) return this.sendFrame(link, { id, ok: false, error: tooBig });
+    if (!rt || !allowed()) return this.sendFrame(link, { id, ok: true, result: {} });
+    // Reserved: neither edited nor sent while the reply goes (core/runtime.ts `reserveQueued`).
+    const held = rt.reserveQueued(qid);
+    if (!held) return this.sendFrame(link, { id, ok: true, result: {} });
+    const json = this.deliverable(link, { id, ok: true, result: phoneResult('queue.take', { message: held.message }) });
+    if (!json) {
+      rt.rollbackReserved(qid);
+      return this.sendFrame(link, { id, ok: false, error: tooBig });
+    }
     link.send(json, (err) => {
-      if (err) return;
-      // Taken only if it is still the message the phone got (an edit on the desktop meanwhile keeps it there).
-      if (rt.queue.find((q) => q.id === qid) === held) void this.app.call('queue.take', { sessionId, id: qid }).catch(() => {});
+      // Gone out to a phone still allowed: the message leaves the queue (if it is still that revision); otherwise it stays as it was.
+      if (err || !allowed()) return rt.rollbackReserved(qid);
+      this.app.takeReserved(rt, qid, held.rev);
     });
   }
 
@@ -1492,6 +1544,13 @@ export class PhoneService {
       return;
     }
     if (!sec) {
+      // An app too old for the secure channel sent the code in the clear: someone on the way may have read it, so it no longer pairs.
+      const p = this.pairing;
+      if (p && sameSecret(msg.pair.key, p.key)) {
+        this.pairing = undefined;
+        this.app.log('phone: a pairing code came in the clear; it no longer pairs');
+        this.changed();
+      } else this.failed(ip);
       this.sendFrame(link, { denied: 'Update Sable on this phone to pair with this computer.' });
       return link.close(4003, 'update');
     }
@@ -1563,7 +1622,17 @@ export class PhoneService {
       link.ping();
     }, 25_000);
 
-    link.onMessage(async (text) => {
+    // Still allowed to act: this connection not detached (its phone removed, phone access off) and its
+    // phone still paired with this token. Asked before every request and again before anything a
+    // request does after a wait.
+    let attached = true;
+    const allowed = () => attached && this.data.enabled && this.data.devices.some((d) => d.id === device.id && d.tokenHash === device.tokenHash);
+    const act = () => {
+      if (!allowed()) throw new Error('This phone was removed on the desktop');
+    };
+
+    const offMessage = link.onMessage(async (text) => {
+      if (!allowed()) return;
       let req: RpcRequest;
       try {
         req = JSON.parse(text);
@@ -1580,8 +1649,31 @@ export class PhoneService {
         const own = req.method as string;
         let result: unknown;
         if (own === 'phone.fileLink') {
+          // Plain HTTP downloads only for a phone paired before the secure channel; a secure one gets its files over this connection.
+          if (link.secure) throw new Error('Update Sable on this phone to download files.');
           result = await this.fileLink(device.id, String(raw.sessionId ?? ''), String(raw.itemId ?? ''), Number(raw.index ?? 0));
+          act();
+        } else if (own === 'phone.fileStart' || own === 'phone.fileChunk' || own === 'phone.fileEnd') {
+          if (!link.secure) throw new Error('Pair again for a secure connection to get this file.');
+          if (own === 'phone.fileStart') {
+            const grant = await this.sharedFile(device.id, String(raw.sessionId ?? ''), String(raw.itemId ?? ''), Number(raw.index ?? 0));
+            act();
+            result = await this.sending.start(device.id, grant, grant.sha256, allowed);
+          } else if (own === 'phone.fileChunk') result = await this.sending.chunk(device.id, raw.transfer, raw.offset, raw.length);
+          else result = this.sending.end(device.id, raw.transfer);
+          act();
+        } else if (own === 'phone.migrate') {
+          // Only over a pairing from before the secure channel: what lets its secure pairing replace it here, and nowhere else.
+          if (link.secure || device.secure) throw new Error('This phone is already paired securely.');
+          result = { fingerprint: this.identity().fingerprint, ticket: this.ticketOf(device.id) };
+        } else if (own === 'phone.queue') {
+          const sessionId = String(raw.sessionId ?? '');
+          await this.app.call('session.snapshot', { sessionId });
+          const q = this.app.sessions.get(sessionId)?.queue ?? [];
+          const from = typeof raw.from === 'number' && Number.isInteger(raw.from) && raw.from >= 0 ? raw.from : 0;
+          result = { queue: trimQueue(q.slice(from, from + QUEUE_PAGE)), from, total: q.length };
         } else if (own === 'phone.mkdir') {
+          act();
           result = this.makeFolder(String(raw.parent ?? ''), String(raw.name ?? ''));
         } else if (own === 'phone.changes') {
           result = await this.changes.changes(String(raw.sessionId ?? ''), stepIds(raw.items));
@@ -1589,7 +1681,7 @@ export class PhoneService {
           result = await this.changes.diff(String(raw.sessionId ?? ''), typeof raw.path === 'string' ? raw.path : '', stepIds(raw.items));
         } else if (own === 'phone.search') {
           // Each phone its own search: one phone's query never goes on with, or stops, another's.
-          result = await this.finder.search(typeof raw.query === 'string' ? raw.query : '', { scope: `phone:${device.id}` });
+          result = await this.finder.search(typeof raw.query === 'string' ? raw.query : '', { scope: `phone:${device.id}`, cursor: typeof raw.cursor === 'string' ? raw.cursor : undefined });
         } else if (own === 'phone.image') {
           result = await this.image(String(raw.sessionId ?? ''), String(raw.itemId ?? ''), Number(raw.index ?? 0));
         } else if (own === 'phone.thumb') {
@@ -1610,9 +1702,24 @@ export class PhoneService {
           const requestId = String(raw.requestId ?? '');
           const asked = this.app.sessions.get(sessionId)?.prompts().questions.find((q) => q.id === requestId);
           if (!asked) throw new Error('Those questions were already answered.');
-          result = await this.app.call('question.respond', { sessionId, requestId, answers: phonePicks(asked, raw.picks) });
+          const answers = phonePicks(asked, raw.picks);
+          act();
+          result = await this.app.call('question.respond', { sessionId, requestId, answers });
         } else if (own === 'queue.take') {
-          return void (await this.takeQueued(link, req.id, raw));
+          return void (await this.takeQueued(link, req.id, raw, allowed));
+        } else if (own === 'session.setMode') {
+          // A mode that never asks answers only what the phone could allow itself; what only the desktop may answer keeps waiting there.
+          const sessionId = String(raw.sessionId ?? '');
+          act();
+          result = await this.app.call('session.setMode', { sessionId, mode: String(raw.mode ?? ''), answerWaiting: false });
+          const rt = this.app.sessions.get(sessionId);
+          if (rt && allowed() && rt.caps?.modes.find((m) => m.id === rt.meta.mode)?.tone === 'danger') {
+            for (const p of rt.prompts().permissions) {
+              if (p.toolName === 'ExitPlanMode' || phonePermission(p).incomplete) continue;
+              const ok = p.options.find((o) => o.tone === 'allow');
+              if (ok) rt.answerPermission(p.id, { optionId: ok.id });
+            }
+          }
         } else {
           const params = narrow(req.method, raw, (sessionId, id) => this.app.sessions.get(sessionId)?.queue.find((q) => q.id === id)?.attachments);
           // An answer from the phone allows only what the phone was shown, and answers questions it got whole.
@@ -1622,6 +1729,7 @@ export class PhoneService {
             const asked = prompts?.questions.find((q) => q.id === params.requestId);
             if (asked) params.answers = phoneWordAnswers(asked, params.answers);
           }
+          act();
           result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never));
           // Folder browsing for a new chat: folders only, never file names.
           if (req.method === 'fs.list' && result && typeof result === 'object') {
@@ -1639,12 +1747,22 @@ export class PhoneService {
         this.sendFrame(link, { id: req.id, ok: false, error: (err as Error).message ?? String(err) });
       }
     });
+    // Detached at once when the phone is removed or phone access goes off: no request of it is acted on from then.
+    const detach = () => {
+      attached = false;
+      offMessage();
+      unsubscribe();
+      this.detach.delete(link);
+    };
+    this.detach.set(link, detach);
     const done = () => {
       clearInterval(ping);
-      unsubscribe();
+      detach();
       const s = this.live.get(device.id);
       s?.delete(link);
       if (s && !s.size) this.live.delete(device.id);
+      // Its files under way end with its last connection (the phone starts them again when it is back).
+      if (!this.live.get(device.id)?.size) this.sending.drop(device.id);
       const d = this.data.devices.find((x) => x.id === device.id);
       if (d) {
         d.lastSeen = Date.now();

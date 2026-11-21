@@ -962,10 +962,13 @@ interface Queued {
 /** How long an idle thread waits for its turn's own turn/completed before the turn is ended without it. */
 const THREAD_IDLE_GRACE_MS = 1_500;
 /**
- * While the thread stays idle and its store still says the turn runs (a stale answer), it is asked
- * again after each of these waits; after the last the turn ends with nothing queued going out.
+ * While the thread stays idle and its store still says the turn runs (a stale answer), or cannot say,
+ * it is asked again after each of these waits; after the last the turn stays open, unsure, the queue
+ * held, until its own end comes or the person stops it.
  */
 const IDLE_RECHECK_MS = [2_000, 4_000, 8_000, 16_000];
+/** How many of the thread's latest turns an idle probe reads to find the turn's own record. */
+const IDLE_LOOKUP_TURNS = 5;
 /** How long a start stopped before its turn's id was known watches for that turn (to interrupt it). */
 const STRAY_MS = 60_000;
 
@@ -997,7 +1000,7 @@ class CodexSession implements ProviderSession {
   private idleRecheckMs: readonly number[] = IDLE_RECHECK_MS;
   /** The thread last said idle while this turn is open (an idle end is armed or out). */
   private threadIdle = false;
-  /** The store kept saying this turn runs while the thread stayed idle: how it ended is not known; it stays open until its end or a stop. */
+  /** How this turn ended is not known (the store kept saying it runs, or could not say, while the thread stayed idle; a command's turn never showed itself): it stays open until its end or a stop. */
   private uncertain = false;
   private uncertainTold = false;
   /** The generation whose start request went out last (turn/start, review/start, thread/compact/start). */
@@ -1005,12 +1008,17 @@ class CodexSession implements ProviderSession {
   /**
    * A start stopped after it went out, before its turn's id was known (a command's answer names none):
    * when that turn shows itself (turn/started) it is interrupted, never taken for a turn here. When it
-   * came. `strayMaybe`: a turn that showed itself while a start of ours was out (told apart by its answer).
+   * came. `strayMaybe`: a turn that showed itself (or ended) while a start of ours was out with no id
+   * yet: the stopped start's, or that start's own, told apart by its answer (`tookStart`). Its end, if
+   * it came meanwhile (`strayMaybeEnd`), waits for that answer: it settles nothing before.
    */
   private strayStart?: number;
   private strayMaybe?: string;
-  /** How long a command waits for its turn to show itself before it is ended (tests make it short). */
+  private strayMaybeEnd?: { status: Turn['status']; error?: string; durationMs?: number | null };
+  /** How long a command waits for its turn to show itself before it is left unsure (tests make it short). */
   private commandMs = 15_000;
+  /** How long a stopped turn waits for its own end after turn/interrupt answered, before it is ended (tests make it short). */
+  private interruptMs = 8_000;
   /** Bumped whenever the loaded thread is let go (the app-server died, its options changed, the session closed): a reload begun before commits nothing. */
   private loadEpoch = 0;
   /** The reload in flight: every start waits for this one, never two at once. */
@@ -1380,39 +1388,61 @@ class CodexSession implements ProviderSession {
   /** A start's answer for generation `gen`: the turn id it names (if any) is that generation's own. */
   private tookStart(gen: number, id: string | undefined) {
     const maybe = this.strayMaybe;
-    this.strayMaybe = undefined;
+    const maybeEnd = this.strayMaybeEnd;
+    // The answer names this start's own turn; one that showed itself meanwhile (while a stopped start's
+    // turn was not told apart) is either it, or the stopped start's (interrupted then). An answer that
+    // names none (a compaction) owns none of it: Codex runs a thread's turns one at a time, so what
+    // showed itself first is the stopped start's, and this start's own turn shows itself after.
+    if (maybe !== id) this.dropMaybe();
+    this.strayMaybe = this.strayMaybeEnd = undefined;
     if (this.gen !== gen) {
       // Its generation ended here while the start was out: the turn is over to us, and its late news (an end, an error) belongs to nobody running.
       if (id) this.endedTurn(id);
-      if (maybe && maybe !== id) this.stopStray(maybe);
       return;
     }
     // The turn may have ended already (its turn/completed came first): its id is no running turn's.
-    if (id && this.doneTurns.includes(id)) return;
-    // The answer names this start's own turn; one that showed itself meanwhile is either it, or the
-    // stopped start's (interrupted then). An answer without an id (a compaction) owns what showed itself.
-    const own = id ?? maybe;
-    if (maybe && own !== maybe) this.stopStray(maybe);
-    if (!own) return;
-    this.turnId = own;
-    if (own === maybe) {
+    if (!id || this.doneTurns.includes(id)) return;
+    this.turnId = id;
+    if (id === maybe) {
       this.sawActive = true;
       this.idleSeen = false;
       this.statusSeen++;
+      // Its own end came before its answer: that is how it ended.
+      if (maybeEnd) this.completeTurn({ ...maybeEnd, id });
     }
+  }
+
+  /** Whether a start stopped before its turn's id was known still watches for that turn (`strayStart`). */
+  private strayPending(): boolean {
+    if (this.strayStart === undefined) return false;
+    if (Date.now() - this.strayStart <= STRAY_MS) return true;
+    this.strayStart = undefined;
+    return false;
+  }
+
+  /** The turn held as `strayMaybe` is the stopped start's: interrupted (or, already ended, remembered as ended), never taken for one here. */
+  private dropMaybe() {
+    const maybe = this.strayMaybe;
+    const ended = this.strayMaybeEnd;
+    this.strayMaybe = this.strayMaybeEnd = undefined;
+    if (!maybe) return;
+    if (!ended) return this.stopStray(maybe);
+    this.strayStart = undefined;
+    this.endedTurn(maybe);
   }
 
   /** Whether turn `id`, showing itself now, is the one a stopped start began (`strayStart`): then it is interrupted, never taken for a turn here. */
   private strayOf(id: string): boolean {
-    const at = this.strayStart;
-    if (at === undefined) return false;
-    if (Date.now() - at > STRAY_MS) {
-      this.strayStart = undefined;
-      return false;
-    }
+    if (!this.strayPending()) return false;
     if (this.rt.turnActive && this.turnId === id) return false;
     // A start of ours is out: its answer tells which turn is its own (`tookStart`).
     if (this.turnStarting && !this.turnId) {
+      // A second one while the first is held: the first showed itself first, so it is the stopped
+      // start's (turns run one at a time), and this one is the running start's own.
+      if (this.strayMaybe && this.strayMaybe !== id) {
+        this.dropMaybe();
+        return false;
+      }
       this.strayMaybe = id;
       return true;
     }
@@ -1449,7 +1479,7 @@ class CodexSession implements ProviderSession {
     this.threadIdle = false;
     this.uncertain = false;
     this.uncertainTold = false;
-    this.strayMaybe = undefined;
+    this.strayMaybe = this.strayMaybeEnd = undefined;
     clearTimeout(this.idleTimer);
     this.turnId = undefined;
     this.turnErrors.clear();
@@ -1517,19 +1547,29 @@ class CodexSession implements ProviderSession {
       name === 'compact'
         ? await this.dispatchStart(gen, 'thread/compact/start', { threadId: this.threadId })
         : await this.dispatchStart(gen, 'review/start', { threadId: this.threadId, target, delivery: 'inline' });
-    // Safety net: if the server never reports a turn for this command, don't stay "running" (this command's turn only).
+    // The server named no turn for this command and none showed itself in a while: how it went is not
+    // known, so nothing is recorded (this command's turn only). It stays open and says so, the queue
+    // held, until its turn shows itself and ends, or the person stops it.
     if (!sent || this.gen !== gen || !rt.turnActive || this.turnId) return;
     clearTimeout(this.commandTimer);
     this.commandTimer = setTimeout(() => {
-      if (this.gen === gen && rt.turnActive && !this.turnId) this.completeTurn({ status: 'completed' });
+      if (this.gen === gen && rt.turnActive && !this.turnId) this.unsure();
     }, this.commandMs);
   }
 
   async interrupt() {
     const rt = this.rt;
     if (!rt.turnActive) return;
+    // The turn this stop is for, and its thread, before any await: its own end may come while its start
+    // is out, and the person may begin (and stop) a newer turn before the start answers. That one is
+    // never this stop's.
+    const gen = this.gen;
+    const threadId = this.threadId;
+    const ours = () => rt.turnActive && this.gen === gen;
     this.interrupting = true;
     if (this.turnStarting) await this.turnStarting.catch(() => {});
+    if (!ours()) return;
+    // Its turn id, if any, is its own start's answer (`tookStart` takes one only for its generation).
     if (!this.turnId || !this.loaded) {
       // Its start went out and named no turn (a command's answer carries none): that turn is stopped when it shows itself.
       if (this.loaded && this.dispatched === this.gen) this.strayStart = Date.now();
@@ -1539,18 +1579,18 @@ class CodexSession implements ProviderSession {
     const turnId = this.turnId;
     try {
       const rpc = await this.provider.client();
-      await rpc.request('turn/interrupt', { threadId: this.threadId, turnId }, 15_000);
+      await rpc.request('turn/interrupt', { threadId, turnId }, 15_000);
     } catch (err) {
       this.log('turn/interrupt failed', errMsg(err));
     }
+    // turn/completed (status "interrupted") often lands before the request returns; then a safety net
+    // armed now would end the person's next turn, and the one that turn's own stop armed is its own.
+    if (!ours() || this.turnId !== turnId) return;
     clearTimeout(this.interruptTimer);
-    // turn/completed (status "interrupted") often lands before the request returns; then
-    // a safety net armed now would end the user's next turn.
-    if (!rt.turnActive || this.turnId !== turnId) return;
     // turn/completed normally follows; don't hang if it doesn't.
     this.interruptTimer = setTimeout(() => {
-      if (rt.turnActive && this.turnId === turnId) this.completeTurn({ status: 'interrupted' });
-    }, 8_000);
+      if (ours() && this.turnId === turnId) this.completeTurn({ status: 'interrupted' });
+    }, this.interruptMs);
   }
 
   /**
@@ -1621,12 +1661,12 @@ class CodexSession implements ProviderSession {
 
   /**
    * Ends a turn whose turn/completed never came, with what is known: an error that ended it, a stop
-   * asked for, else the outcome the thread has stored for it. When even that is not known it ends
-   * without anything queued going out (`hold`). `seen`: the thread's news when the idle was armed;
-   * anything newer (the thread active again, another idle, news of the turn's own work) makes this
-   * probe moot, whatever it answers. A stored "still running" while the thread stays idle is asked
-   * again a few times (IDLE_RECHECK_MS); after that how the turn ended is not known (`unsure`): it
-   * stays open, the queue held, until its own end comes or the person stops it.
+   * asked for, else the outcome the thread has stored for exactly this turn. `seen`: the thread's news
+   * when the idle was armed; anything newer (the thread active again, another idle, news of the turn's
+   * own work) makes this probe moot, whatever it answers. A stored "still running", a lookup that
+   * failed, or one that names no such turn, while the thread stays idle, is asked again a few times
+   * (IDLE_RECHECK_MS); after that how the turn ended is not known (`unsure`): nothing is recorded, and
+   * it stays open with its prompts, the queue held, until its own end comes or the person stops it.
    */
   private async idleEnd(gen: number, turnId: string, seen: number, attempt: number) {
     const rt = this.rt;
@@ -1640,10 +1680,11 @@ class CodexSession implements ProviderSession {
     if (this.loaded && this.provider.sessions.get(this.threadId) === this) {
       try {
         const rpc = await this.provider.client();
-        const r = await rpc.request<{ data?: Turn[] }>('thread/turns/list', { threadId: this.threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' }, 10_000);
+        // The latest few, so the turn's own record is found also when the thread went on to another.
+        const r = await rpc.request<{ data?: Turn[] }>('thread/turns/list', { threadId: this.threadId, limit: IDLE_LOOKUP_TURNS, sortDirection: 'desc', itemsView: 'notLoaded' }, 10_000);
         stored = r?.data?.find((x) => x?.id === turnId);
       } catch (err) {
-        this.log('thread/turns/list failed; the turn ends without its outcome', errMsg(err));
+        this.log('thread/turns/list failed; the turn is asked about again', errMsg(err));
       }
     }
     if (!current()) return;
@@ -1651,24 +1692,23 @@ class CodexSession implements ProviderSession {
     const late = this.errorOf(turnId);
     if (late) return this.completeTurn({ status: 'failed', error: late });
     if (this.interrupting || rt.stopRequested) return this.completeTurn({ status: 'interrupted' });
-    if (stored?.status === 'inProgress') {
-      // Still running by the store while the thread says idle: its end (or newer news) normally
-      // comes; else it is asked again, a few times, and then ends held.
-      const wait = this.idleRecheckMs[attempt];
-      if (wait !== undefined) return this.armIdleEnd(wait, attempt + 1);
-      return this.unsure(turnId);
-    }
-    if (stored?.status) return this.completeTurn({ status: stored.status, error: stored.error?.message, durationMs: stored.durationMs });
-    this.completeTurn({ status: 'completed', hold: true });
+    // Its own stored end: that is how it ended.
+    if (stored?.status && stored.status !== 'inProgress') return this.completeTurn({ status: stored.status, error: stored.error?.message, durationMs: stored.durationMs });
+    // Still running by the store, or not known, while the thread says idle: its end (or newer news)
+    // normally comes; else it is asked again, a few times, and then left unsure.
+    const wait = this.idleRecheckMs[attempt];
+    if (wait !== undefined) return this.armIdleEnd(wait, attempt + 1);
+    return this.unsure(turnId);
   }
 
   /**
-   * Idle by the thread, running by its store, every time it was asked: how turn `turnId` ended is not
-   * known. Nothing is guessed: the turn stays open (its prompts, its id, the queue held behind it) and
-   * says so, until its own end comes (honoured as any end), newer news of it, or the person stops it.
+   * How the running turn ended is not known: idle by the thread while its store says it runs (or
+   * cannot say) every time it was asked, or a command whose turn never showed itself. Nothing is
+   * guessed: the turn stays open (its prompts, its id, the queue held behind it) and says so, until
+   * its own end comes (honoured as any end), newer news of it, or the person stops it.
    */
-  private unsure(turnId: string) {
-    this.log('the thread stays idle while its store says turn', turnId, 'runs; it stays open until it ends or is stopped');
+  private unsure(turnId?: string) {
+    this.log(`${turnId ? `the thread stays idle while turn ${turnId} has no stored end` : 'the command named no turn and none showed itself'}; it stays open until it ends or is stopped`);
     this.uncertain = true;
     this.rt.update({ activity: 'Waiting for Codex' });
     if (this.uncertainTold) return;
@@ -1724,7 +1764,22 @@ class CodexSession implements ProviderSession {
         // the next turn is still starting and has no id yet.
         if (turn?.id && this.doneTurns.includes(turn.id)) return;
         if (this.turnId && turn?.id && turn.id !== this.turnId) return; // another turn's
-        return this.completeTurn({ status: turn?.status ?? 'completed', error: turn?.error?.message, durationMs: turn?.durationMs, id: turn?.id });
+        const end = { status: turn?.status ?? 'completed', error: turn?.error?.message, durationMs: turn?.durationMs };
+        // No id of ours yet while a stopped start's turn is not told apart: the end of the turn held, or
+        // of one not seen before, settles nothing by a guess. With a start of ours out it is that turn's
+        // or the start's own, and waits for the start's answer to say which (`tookStart`); with none out
+        // it is the stopped start's (it began first; the running turn's own has not shown itself).
+        if (turn?.id && !this.turnId && (turn.id === this.strayMaybe || (!this.strayMaybe && this.strayPending()))) {
+          if (this.turnStarting) {
+            this.strayMaybe = turn.id;
+            this.strayMaybeEnd = end;
+          } else {
+            this.strayStart = undefined;
+            this.endedTurn(turn.id);
+          }
+          return;
+        }
+        return this.completeTurn({ ...end, id: turn?.id });
       }
       case 'thread/status/changed': {
         // The thread's own word that nothing runs: a turn whose turn/completed never came (or was

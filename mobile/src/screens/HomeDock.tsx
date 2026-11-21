@@ -9,6 +9,7 @@ import { onKeyboard } from '@m/lib/keyboard';
 import { fit } from '@m/lib/fit';
 import { haptic, isNative } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
+import { onForget } from '@m/lib/forget';
 import { openFrom } from '@m/lib/open';
 import { applySnapshot, setState, useStore } from '@m/lib/store';
 import { Icon } from '@m/ui/icons';
@@ -19,6 +20,14 @@ import { AgentSheet, createChat, FolderSheet, useNewChat } from './NewChat';
 import { MODE_ICON, SetupSheet, type SetupState } from './Setup';
 
 const DRAFT = 'sable.newdraft';
+// Forgetting the computer forgets the words written for a new chat on it.
+onForget(() => {
+  try {
+    localStorage.removeItem(DRAFT);
+  } catch {
+    /* private mode */
+  }
+});
 
 /**
  * New chat, as on the desktop's home: the prompt bar itself. At rest one line of frosted glass over
@@ -201,7 +210,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
             <motion.div className="dock-bar-wrap" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={SNAP}>
               <div className="dock-bar no-drag">
                 <button type="button" className="where-chip" aria-expanded={sheet === 'folder'} onPointerDown={(e) => e.preventDefault()} onClick={(e) => (e.stopPropagation(), haptic('tap'), setSheet('folder'))}>
-                  <Icon name={c.folder === null ? 'chat' : 'folder'} size={15} />
+                  <Icon name={c.folder === null ? 'chat' : 'folder'} size={16} />
                   <span>{folderLabel}</span>
                 </button>
                 {(modelLabel || mode) && (
@@ -213,7 +222,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
                     onPointerDown={(e) => e.preventDefault()}
                     onClick={(e) => (e.stopPropagation(), haptic('tap'), setSheet('setup'))}
                   >
-                    {mode && <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={15} className="setup-chip-mode" />}
+                    {mode && <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={16} className="setup-chip-mode" />}
                     {modelLabel && <span className="setup-chip-model">{modelLabel}</span>}
                     {c.effort && c.efforts.length > 1 && <span className="setup-chip-dim">{effortName(c.effort)}</span>}
                     <Icon name="updown" size={12} weight="bold" className="setup-chip-caret" />

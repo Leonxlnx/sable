@@ -239,7 +239,7 @@ export function App() {
         {state === 'denied' && (
           <div className="banner glass" role="alert">
             <span>{error ?? 'This phone is no longer allowed'}</span>
-            <button type="button" className="btn btn-sm" onClick={() => void conn.forget()}>
+            <button type="button" className="btn btn-sm" onClick={() => void conn.forget().catch((err: Error) => setState({ toast: { text: err.message, level: 'error', at: Date.now() } }))}>
               Pair again
             </button>
           </div>

@@ -134,7 +134,7 @@ function TaskLine({ task, ts, more }: { task: TaskNote; ts: number; more?: () =>
               {facts && <div className="syn-facts num">{facts}</div>}
               {task.outputFile && (
                 <button type="button" className="syn-file" onClick={() => copy(task.outputFile!)} aria-label={`Copy the output file's path, ${task.outputFile}`}>
-                  <Icon name="file" size={13} />
+                  <Icon name="file" size={14} />
                   {/* Left-to-right marks hold the slashes in place inside the box that cuts from the start. */}
                   <span className="syn-file-path">{`‎${task.outputFile}‎`}</span>
                 </button>
@@ -153,7 +153,7 @@ function StaticLine({ icon, name, args, ts }: { icon: IconName; name: string; ar
     <div className="step syn-line" data-outcome="done">
       <div className="step-line">
         <span className="step-icon">
-          <Icon name={icon} size={15} />
+          <Icon name={icon} size={16} />
         </span>
         <span className="syn-title syn-cmd">
           <span className="syn-cmd-name">{name}</span>
@@ -194,7 +194,7 @@ function OpenLine({ icon, title, body, ts, more }: { icon: IconName; title: stri
     <div className="step syn-line" data-outcome="done" data-open={open || undefined}>
       <button type="button" className="step-line" disabled={!text} aria-expanded={text ? open : undefined} onClick={() => text && (haptic('select'), setOpen((v) => !v))}>
         <span className="step-icon">
-          <Icon name={icon} size={15} />
+          <Icon name={icon} size={16} />
         </span>
         <span className="syn-title">{title}</span>
         {icon === 'chat' && first && <span className="syn-sub">{first}</span>}

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { deflateRaw } from 'node:zlib';
 import type { RawData, WebSocket } from 'ws';
-import { PHONE_SECURE_VERSION, type PhoneSecReply } from '../../shared/protocol';
+import { PHONE_SECURE_VERSIONS, type PhoneSecReply } from '../../shared/protocol';
 
 /**
  * The phone's secure channel, the desktop's side (the phone's is mobile/src/lib/secure.ts, WebCrypto).
@@ -16,7 +16,8 @@ import { PHONE_SECURE_VERSION, type PhoneSecReply } from '../../shared/protocol'
  *   own ephemeral key, its identity key and an ECDSA signature over the transcript (both keys, what
  *   the phone came for, its identity key). The phone checks the identity against the fingerprint it
  *   was given by the QR code and the signature against the identity, so nobody else can answer as
- *   this desktop. A refusal is signed the same way.
+ *   this desktop. A refusal is signed the same way; from version 2 on, which of the two the answer
+ *   is (`outcome`) is part of what is signed, and a refusal always has words.
  * - Keys: HKDF-SHA256 over the ECDH secret and the pairing secret (the QR code's one-time key, or the
  *   SHA-256 of the device's token, which is what the desktop keeps), salted with the transcript's
  *   hash: one AES-256-GCM key each way. Someone who does not hold the pairing secret cannot open or
@@ -27,8 +28,11 @@ import { PHONE_SECURE_VERSION, type PhoneSecReply } from '../../shared/protocol'
  * - Inside the channel the phone speaks the protocol it always did (`hello`, `pair`, RPC).
  */
 
+/** The transcript's label and the keys' HKDF info, per version. */
 export const SEC_LABEL = 'sable-phone/1';
-const KEYS_INFO = 'sable-phone/1 keys';
+const LABELS: Record<number, { label: string; info: string }> = { 1: { label: SEC_LABEL, info: 'sable-phone/1 keys' }, 2: { label: 'sable-phone/2', info: 'sable-phone/2 keys' } };
+/** A refusal says something (an empty one could be read as no refusal at all). */
+const REFUSED = 'The desktop refused this connection';
 /** Frames from the desktop at least this long are compressed before they are sealed (as permessage-deflate did). */
 const DEFLATE_FROM = 1024;
 const TAG = 16;
@@ -90,6 +94,8 @@ export function loadIdentity(file: string, log: (...args: unknown[]) => void = (
 
 /** A phone's first frame on a secure connection, checked. */
 export interface SecHello {
+  /** The channel's version the phone speaks (1: app 2.1; 2: a signed outcome). */
+  v: 1 | 2;
   kind: 'pair' | 'hello';
   /** The device id it says it is (`hello`); empty for `pair`. */
   id: string;
@@ -110,14 +116,14 @@ export function readSecHello(text: string): SecHello | null {
   const s = m && typeof m === 'object' && !Array.isArray(m) ? (m as { sec?: unknown }).sec : undefined;
   if (!s || typeof s !== 'object' || Array.isArray(s)) return null;
   const o = s as Record<string, unknown>;
-  if (o.v !== PHONE_SECURE_VERSION || (o.kind !== 'pair' && o.kind !== 'hello')) return null;
+  if (!(PHONE_SECURE_VERSIONS as readonly unknown[]).includes(o.v) || (o.kind !== 'pair' && o.kind !== 'hello')) return null;
   if (o.id !== undefined && (typeof o.id !== 'string' || o.id.length > 100)) return null;
   const id = typeof o.id === 'string' ? o.id : '';
   if (o.kind === 'hello' && !id) return null;
   if (typeof o.pub !== 'string' || o.pub.length > 100 || !/^[\w-]+$/.test(o.pub)) return null;
   const pub = Buffer.from(o.pub, 'base64url');
   if (pub.length !== 65 || pub[0] !== 4) return null;
-  return { kind: o.kind, id, pub, z: o.z === true };
+  return { v: o.v as 1 | 2, kind: o.kind, id, pub, z: o.z === true };
 }
 
 const u32 = (n: number) => {
@@ -126,9 +132,15 @@ const u32 = (n: number) => {
   return b;
 };
 
-/** What the desktop signs and both sides derive their keys from: every field length-prefixed, in this order. */
-export function transcript(h: Pick<SecHello, 'kind' | 'id' | 'pub' | 'z'>, deskPub: Uint8Array, spki: Uint8Array, denied: string): Buffer {
-  const parts = [Buffer.from(SEC_LABEL), Buffer.from(h.kind), Buffer.from(h.id, 'utf8'), Buffer.from(h.pub), Buffer.of(h.z ? 1 : 0), Buffer.from(deskPub), Buffer.from(spki), Buffer.from(denied, 'utf8')];
+/**
+ * What the desktop signs and both sides derive their keys from: every field length-prefixed, in this
+ * order. Version 2 adds the outcome (`ok` or `denied`) before the refusal's words, so an answer that
+ * opens a channel can never be read as a refusal, or the other way round.
+ */
+export function transcript(h: Pick<SecHello, 'kind' | 'id' | 'pub' | 'z'> & { v?: 1 | 2 }, deskPub: Uint8Array, spki: Uint8Array, denied: string, outcome: 'ok' | 'denied' = denied ? 'denied' : 'ok'): Buffer {
+  const v = h.v ?? 1;
+  const head = [Buffer.from(LABELS[v].label), Buffer.from(h.kind), Buffer.from(h.id, 'utf8'), Buffer.from(h.pub), Buffer.of(h.z ? 1 : 0), Buffer.from(deskPub), Buffer.from(spki)];
+  const parts = v >= 2 ? [...head, Buffer.from(outcome), Buffer.from(denied, 'utf8')] : [...head, Buffer.from(denied, 'utf8')];
   return Buffer.concat(parts.flatMap((p) => [u32(p.length), p]));
 }
 
@@ -141,8 +153,8 @@ export interface ChannelKeys {
 }
 
 /** HKDF-SHA256 over the ECDH secret and the pairing secret, salted with the transcript's hash: phone-to-desktop key, then desktop-to-phone. */
-export function deriveKeys(shared: Uint8Array, psk: Uint8Array, script: Uint8Array): ChannelKeys {
-  const okm = Buffer.from(hkdfSync('sha256', Buffer.concat([shared, psk]), sha256(script), KEYS_INFO, 64));
+export function deriveKeys(shared: Uint8Array, psk: Uint8Array, script: Uint8Array, v: 1 | 2 = 1): ChannelKeys {
+  const okm = Buffer.from(hkdfSync('sha256', Buffer.concat([shared, psk]), sha256(script), LABELS[v].info, 64));
   return { rx: okm.subarray(0, 32), tx: okm.subarray(32, 64) };
 }
 
@@ -153,18 +165,22 @@ export function deriveKeys(shared: Uint8Array, psk: Uint8Array, script: Uint8Arr
 export function answerHello(identity: Identity, h: SecHello, psk: Uint8Array | null, denied?: string): { reply: string; keys?: ChannelKeys } {
   const ecdh = createECDH('prime256v1');
   const deskPub = ecdh.generateKeys();
+  // A refusal always has words; no pairing secret is a refusal too.
+  const refusal = denied !== undefined || !psk ? denied || REFUSED : undefined;
   let shared: Buffer | undefined;
-  if (denied === undefined && psk) {
+  if (refusal === undefined) {
     try {
       shared = ecdh.computeSecret(h.pub);
     } catch {
       return { reply: '' };
     }
   }
-  const script = transcript(h, deskPub, identity.spki, denied ?? '');
+  const v = h.v ?? 1;
+  const outcome = refusal === undefined ? 'ok' : 'denied';
+  const script = transcript(h, deskPub, identity.spki, refusal ?? '', outcome);
   const sig = sign('sha256', script, { key: identity.key, dsaEncoding: 'ieee-p1363' });
-  const reply: PhoneSecReply = { sec: { v: PHONE_SECURE_VERSION, pub: b64u(deskPub), key: b64u(identity.spki), sig: b64u(sig), ...(denied !== undefined ? { denied } : {}) } };
-  return { reply: JSON.stringify(reply), ...(shared && psk ? { keys: deriveKeys(shared, psk, script) } : {}) };
+  const reply: PhoneSecReply = { sec: { v, pub: b64u(deskPub), key: b64u(identity.spki), sig: b64u(sig), ...(v >= 2 ? { outcome } : {}), ...(refusal !== undefined ? { denied: refusal } : {}) } };
+  return { reply: JSON.stringify(reply), ...(shared && psk ? { keys: deriveKeys(shared, psk, script, v) } : {}) };
 }
 
 /** The 96-bit nonce of frame `seq` in one direction: four zero bytes, then the number. */

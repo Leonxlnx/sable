@@ -9,7 +9,7 @@ import { haptic, openExternal } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { homeFolder, openRace, swapTo } from '@m/lib/race';
 import { applyOlder, closeGap, fetchNewer, fetchOlder, getState, openAt, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
-import { around, growDown, growUp, MOUNT_MAX, rangeOf, spacers, trimTop, type Win } from '@m/lib/window';
+import { around, growDown, growUp, MOUNT_MAX, rangeOf, SpacerSums, trimTop, type Win } from '@m/lib/window';
 import { matchRanges, searchWords } from '@m/lib/find';
 import { groupTurns, stabilize } from '@m/lib/turns';
 import { Field, paletteFor } from '@m/ui/Field';
@@ -231,8 +231,9 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   const range = rangeOf(keys, win, count);
   const start = range.lo;
   const shown = turns.slice(range.lo, range.hi);
-  const heights = useRef(new Map<string, number>());
-  const space = win ? spacers(keys, range, heights.current) : { top: 0, bottom: 0 };
+  // The groups' heights with the spacers' sums kept over them (summed again only when the groups or a height change, never per scroll frame).
+  const [heights] = useState(() => new SpacerSums());
+  const space = win ? heights.of(keys, range) : { top: 0, bottom: 0 };
   const groupsRef = useRef(turns);
   groupsRef.current = turns;
   const countRef = useRef(count);
@@ -250,7 +251,7 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   const record = () => {
     const c = content.current;
     if (!c) return;
-    for (const el of c.querySelectorAll<HTMLElement>(':scope > [data-turn]')) if (el.dataset.turn) heights.current.set(el.dataset.turn, el.offsetHeight);
+    for (const el of c.querySelectorAll<HTMLElement>(':scope > [data-turn]')) if (el.dataset.turn) heights.set(el.dataset.turn, el.offsetHeight);
   };
 
   const toBottom = useCallback((smooth = false) => {
@@ -326,7 +327,7 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     const r = rangeRef.current;
     const w = winRef.current;
     const ks = keysRef.current;
-    const sp = w ? spacers(ks, r, heights.current) : { top: 0, bottom: 0 };
+    const sp = w ? heights.of(ks, r) : { top: 0, bottom: 0 };
     const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
     const byHand = touch.current.down || performance.now() - touch.current.at < 1200;
     // At the newest only where the newest is: the window reaches it and nothing waits after it.
@@ -439,7 +440,7 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   useEffect(() => {
     if (lastEpoch.current === epoch) return;
     lastEpoch.current = epoch;
-    heights.current.clear();
+    heights.clear();
     if (goal.current) return;
     setWin(null);
     setCount(PAGE);
@@ -703,7 +704,7 @@ function RemoteSheet({ id, open, onClose }: { id: string; open: boolean; onClose
                   <span className="rc-rest">{link.rest}</span>
                 </span>
                 <span className="rc-copy" data-done={copied || undefined}>
-                  {copied ? <Icon name="check" size={16} weight="bold" /> : <Icon name="copy" size={17} />}
+                  {copied ? <Icon name="check" size={16} weight="bold" /> : <Icon name="copy" size={18} />}
                   <span>{copied ? 'Copied' : 'Copy'}</span>
                 </span>
               </button>

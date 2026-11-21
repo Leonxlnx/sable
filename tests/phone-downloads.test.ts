@@ -3,7 +3,8 @@
  * pairing asked again once the file is open, ended when the phone is removed, when phone access is
  * turned off and when the phone goes away, the file closed on every path. `open` is wrapped only to
  * see the handles the endpoint opens. The grant is put in place directly (what makes one is
- * phone-guard.ts `grantFor`, tested on its own).
+ * phone-guard.ts `grantFor`, tested on its own). Plain HTTP links are only for a phone paired before the
+ * secure channel (a secure one gets its files over its own connection: tests/phone-wave4.test.ts).
  */
 import type { PathLike } from 'node:fs';
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -12,7 +13,7 @@ import { get, type IncomingMessage, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { pairSecure } from './phone-wire';
+import { helloPlain, legacyPairing } from './phone-wire';
 
 const opened: { file: string; fh: FileHandle }[] = [];
 
@@ -45,6 +46,7 @@ const SIZE = 32 * 1024 * 1024;
 async function setup() {
   const home = mkdtempSync(path.join(tmpdir(), 'sable-phone-dl-'));
   homes.push(home);
+  const [old] = legacyPairing(home);
   const app = new App({ home, quiet: true, providers: [(ctx) => new DemoProvider(ctx, { speed: 0 })] });
   apps.push(app);
   const phone = registerPhone(app, { port: 0, host: '127.0.0.1' });
@@ -52,13 +54,13 @@ async function setup() {
   const file = path.join(home, 'chat', 'big.bin');
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileSync(file, Buffer.alloc(SIZE, 7));
-  return { app, phone, port: status.port, file };
+  return { app, phone, port: status.port, file, old };
 }
 
-/** Pairs a phone over the secure channel (tests/phone-wire.ts), "Allow" clicked. */
-async function pairPhone(app: AppT, port: number) {
-  const { c, deviceId } = await pairSecure(app, port, 'Phone');
-  return { ws: c.ws, deviceId };
+/** The phone paired before the secure channel (`setup` wrote it), connected plain as it was. */
+async function pairPhone(_app: AppT, port: number, old: { deviceId: string; token: string }) {
+  const c = await helloPlain(port, old.token);
+  return { ws: c.ws, deviceId: old.deviceId };
 }
 
 async function until(ok: () => boolean, ms = 5000) {
@@ -101,8 +103,8 @@ const handlesOf = (file: string) => opened.filter((o) => path.resolve(o.file) ==
 
 describe('a download from the phone', () => {
   it('goes through whole while its phone stays paired', async () => {
-    const { app, phone, port, file } = await setup();
-    const { ws, deviceId } = await pairPhone(app, port);
+    const { app, phone, port, file, old } = await setup();
+    const { ws, deviceId } = await pairPhone(app, port, old);
     const res = await fetchPaused(port, link(phone, deviceId, file));
     expect(res.statusCode).toBe(200);
     expect(await drain(res)).toEqual({ bytes: SIZE, complete: true });
@@ -112,8 +114,8 @@ describe('a download from the phone', () => {
   }, 30_000);
 
   it('ends when the phone is removed while it runs, and the file closes', async () => {
-    const { app, phone, port, file } = await setup();
-    const { deviceId } = await pairPhone(app, port);
+    const { app, phone, port, file, old } = await setup();
+    const { deviceId } = await pairPhone(app, port, old);
     const res = await fetchPaused(port, link(phone, deviceId, file));
     expect(res.statusCode).toBe(200);
     await app.call('phone.revoke', { deviceId });
@@ -125,8 +127,8 @@ describe('a download from the phone', () => {
   }, 30_000);
 
   it('ends when phone access is turned off while it runs', async () => {
-    const { app, phone, port, file } = await setup();
-    const { deviceId } = await pairPhone(app, port);
+    const { app, phone, port, file, old } = await setup();
+    const { deviceId } = await pairPhone(app, port, old);
     const res = await fetchPaused(port, link(phone, deviceId, file));
     expect(res.statusCode).toBe(200);
     await app.call('phone.setEnabled', { on: false });
@@ -136,8 +138,8 @@ describe('a download from the phone', () => {
   }, 30_000);
 
   it('closes the file when the phone goes away halfway', async () => {
-    const { app, phone, port, file } = await setup();
-    const { ws, deviceId } = await pairPhone(app, port);
+    const { app, phone, port, file, old } = await setup();
+    const { ws, deviceId } = await pairPhone(app, port, old);
     const res = await fetchPaused(port, link(phone, deviceId, file));
     expect(res.statusCode).toBe(200);
     res.destroy();
@@ -147,8 +149,8 @@ describe('a download from the phone', () => {
   }, 30_000);
 
   it('is refused when the phone is removed while the file opens', async () => {
-    const { app, phone, port, file } = await setup();
-    const { deviceId } = await pairPhone(app, port);
+    const { app, phone, port, file, old } = await setup();
+    const { deviceId } = await pairPhone(app, port, old);
     const server = (phone as unknown as { server: Server }).server;
     // Removed right after the request was read, before the file is open.
     server.prependListener('request', () => queueMicrotask(() => phone.revoke(deviceId)));

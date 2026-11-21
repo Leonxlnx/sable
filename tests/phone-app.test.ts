@@ -263,7 +263,7 @@ describe('search highlighting (29)', () => {
   });
 });
 
-describe('a download checked against what the desktop named', () => {
+describe('a download over DownloadManager (a pairing from before the secure channel), checked against what the desktop named', () => {
   type Plug = FilesPlugin & { removed: string[]; verifyWith: (o: { sha256: string }) => { ok: boolean } };
   const plugin = (status: Status, verify: (o: { sha256: string }) => { ok: boolean }): Plug => {
     const removed: string[] = [];
@@ -274,6 +274,10 @@ describe('a download checked against what the desktop named', () => {
       status: async () => status,
       cancel: async ({ id }) => void removed.push(id),
       verify: async (o) => verify(o),
+      stageBegin: async () => ({ id: 's', have: 0 }),
+      stageWrite: async () => ({ have: 0 }),
+      stageFinish: async () => ({ ok: false }),
+      stageDrop: async () => {},
     };
   };
   const make = (p: Plug, link: { sha256?: string; secure?: boolean }) => {
@@ -301,14 +305,14 @@ describe('a download checked against what the desktop named', () => {
     expect(installable(dl.get('k'))).toBe(false);
   });
 
-  it('a file that is what was named over the secure channel can be installed; over a plain pairing it cannot', async () => {
+  it('a file that is what was named opens, but never goes to the installer: only a verified private copy from the secure channel does', async () => {
     const ok = plugin({ state: 'done', bytes: 4, total: 4 }, (o) => ({ ok: o.sha256 === 'b'.repeat(64) }));
     const sealed = make(ok, { sha256: 'B'.repeat(64), secure: true });
     await sealed.dl.start('k', FILE);
     await tick();
     await tick();
-    expect(sealed.dl.get('k')).toMatchObject({ state: 'done', verified: true, secure: true, sha256: 'b'.repeat(64) });
-    expect(installable(sealed.dl.get('k'))).toBe(true);
+    expect(sealed.dl.get('k')).toMatchObject({ state: 'done', verified: true, sha256: 'b'.repeat(64) });
+    expect(installable(sealed.dl.get('k'))).toBe(false);
     const plain = make(ok, { sha256: 'b'.repeat(64), secure: false });
     await plain.dl.start('k', FILE);
     await tick();

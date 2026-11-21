@@ -187,7 +187,7 @@ function CommentSummary({ c, onRemove }: { c: ReviewComment; onRemove: () => voi
         <div className="rvs-text">{c.text}</div>
       </div>
       <button type="button" className="icon-btn sm rvs-x" aria-label="Remove comment" onClick={onRemove}>
-        <Icon name="x" size={15} />
+        <Icon name="x" size={16} />
       </button>
     </div>
   );

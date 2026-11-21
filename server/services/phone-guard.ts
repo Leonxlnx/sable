@@ -38,9 +38,10 @@ export function readHello(text: string): PhoneHello | null {
   const pair = obj(m.pair);
   if (pair) {
     const key = str(pair.key);
-    // The pairing it had before (to be removed once this one is allowed): both fields, or nothing.
+    // The older pairing it had with this desktop (removed once this one is allowed): its device and
+    // the migration ticket this desktop gave it (`phone.migrate`), both, or nothing. Never a token.
     const was = obj(pair.replaces);
-    const replaces = was && str(was.id) && str(was.token) ? { id: str(was.id)!, token: str(was.token)! } : undefined;
+    const replaces = was && str(was.id) && str(was.ticket) ? { id: str(was.id)!, ticket: str(was.ticket)! } : undefined;
     return key ? { pair: { key, name: typeof pair.name === 'string' ? pair.name.slice(0, HELLO_FIELD) : '', ...(replaces ? { replaces } : {}) } } : null;
   }
   return null;
@@ -110,6 +111,9 @@ export interface FileGrant {
   /** The exact file id in decimal (`ino` as a number rounds Windows' 64-bit ids; absent: not checked). */
   fileId?: string;
   expires: number;
+  /** SHA-256 (hex) of the bytes as the share completed (core/handed.ts); absent while it is read, or never (`unhashed`). */
+  sha256?: string;
+  unhashed?: 'big' | 'changed' | 'unreadable';
 }
 
 /** How long a link works. */
@@ -164,7 +168,15 @@ export function grantFor(snap: Pick<SessionSnapshot, 'session' | 'items'>, itemI
   const was = { size: handed.size, mtimeMs: handed.mtimeMs, ino: Number(handed.ino), dev: handed.dev, fileId: String(handed.ino) };
   // The same file at the same place: what a link leads to now, a replacement or a rewrite is not what was shared.
   if (!samePath(real, handed.path) || !sameFile(st, was, exact)) throw new Error('That file changed after it was shared.');
-  return { deviceId, path: handed.path, name: file.name || path.basename(real), ...was, expires: now + GRANT_MS };
+  return {
+    deviceId,
+    path: handed.path,
+    name: file.name || path.basename(real),
+    ...was,
+    expires: now + GRANT_MS,
+    ...(typeof handed.sha256 === 'string' && /^[0-9a-f]{64}$/i.test(handed.sha256) ? { sha256: handed.sha256.toLowerCase() } : {}),
+    ...(handed.unhashed ? { unhashed: handed.unhashed } : {}),
+  };
 }
 
 /** Opens a grant's file for serving, or says why not: the handle is checked against the grant, so a file changed or replaced since is refused. */

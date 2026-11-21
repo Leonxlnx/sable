@@ -2,6 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { addComment, clearReview, editComment, pruneReviews, removeComment, reviewMessage, type ReviewComment, type Reviews } from '@desk/features/review/model';
 import { packReviews, unpackReviews } from '@desk/features/review/persist';
 import { conn } from './conn';
+import { onForget } from './forget';
 
 /**
  * A chat's review written on the phone: comments on lines of its diffs, kept per chat until sent
@@ -76,9 +77,16 @@ export async function sendReview(sid: string): Promise<{ queued: boolean }> {
 }
 
 // Forgetting the computer forgets what was written for it.
-conn.onState(() => {
-  if (conn.state === 'unpaired') {
-    leads.clear();
-    set({});
+const forgetAll = () => {
+  leads.clear();
+  set({});
+  try {
+    localStorage.removeItem(KEY);
+  } catch {
+    /* private mode */
   }
+};
+onForget(forgetAll);
+conn.onState(() => {
+  if (conn.state === 'unpaired') forgetAll();
 });

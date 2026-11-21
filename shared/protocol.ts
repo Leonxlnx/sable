@@ -846,6 +846,14 @@ export interface HandedFile {
   inside: boolean;
   /** Outside it, and the person allowed this share themselves (a permission they answered). */
   granted?: boolean;
+  /**
+   * SHA-256 (hex) of the bytes as the share completed, read through the handle the share opened
+   * (core/handed.ts). Absent while it is still being read, and for good when it could not be
+   * (`unhashed`). A phone gets only bytes that match it.
+   */
+  sha256?: string;
+  /** Why there is no `sha256` and never will be: too big to read for the phone, changed while it was read, or unreadable. */
+  unhashed?: 'big' | 'changed' | 'unreadable';
 }
 
 export interface ToolResult {
@@ -1503,7 +1511,8 @@ export type BridgeEvent =
   | { type: 'question.removed'; sessionId: string; id: string }
   | { type: 'todos.updated'; sessionId: string; todos: Todo[] }
   | { type: 'suggestion'; sessionId: string; text: string }
-  | { type: 'queue.updated'; sessionId: string; queue: QueuedMessage[] }
+  /** `total`: set only for a phone, which gets the first page of a long queue (`phone.queue` reads on). */
+  | { type: 'queue.updated'; sessionId: string; queue: QueuedMessage[]; total?: number }
   | { type: 'limits.updated'; provider: ProviderId; accountId?: string; limits: RateLimit[]; meta?: LimitsMeta }
   /** An account's limits with their history and pace (after every read, and for cached ones at start-up). */
   | { type: 'limits.report'; report: LimitsReport }
@@ -1648,13 +1657,28 @@ export interface PhoneStatus {
 
 /**
  * Frames a phone sends before it is authenticated (as JSON text). Afterwards it sends `RpcRequest`s.
- * On a secure connection these go inside the channel, after `PhoneSecHello` / `PhoneSecReply`;
- * `replaces`: the pairing this phone had before (its device and token), removed once the new one is allowed.
+ * On a secure connection these go inside the channel, after `PhoneSecHello` / `PhoneSecReply`.
+ * `replaces`: the older plain pairing this phone had with this same desktop, named by its device id
+ * and the migration ticket that desktop gave it over that pairing (`phone.migrate`); removed once the
+ * new one is allowed. The old token itself never goes to a desktop in a pairing.
  */
-export type PhoneHello = { hello: { token: string; name?: string } } | { pair: { key: string; name: string; replaces?: { id: string; token: string } } };
+export type PhoneHello = { hello: { token: string; name?: string } } | { pair: { key: string; name: string; replaces?: { id: string; ticket: string } } };
 
-/** The secure channel's version (server/services/phone-secure.ts, mobile/src/lib/secure.ts). */
-export const PHONE_SECURE_VERSION = 1;
+/**
+ * The secure channel's version (server/services/phone-secure.ts, mobile/src/lib/secure.ts). 2 signs
+ * which answer it is (`outcome`: a channel or a refusal); the desktop still answers phones that
+ * speak 1 (app 2.1), the phone speaks 2 only.
+ */
+export const PHONE_SECURE_VERSION = 2;
+/** The versions the desktop answers. */
+export const PHONE_SECURE_VERSIONS = [1, 2] as const;
+
+/**
+ * The pairing link (the QR code), version 2: `sable://pair/2?h=<addresses>&p=<port>&s=<one-time
+ * secret>&f=<the desktop's key fingerprint>&n=<its name>`. An older app reads only `sable://pair?…`
+ * with `k=`, so it cannot take this one (and never sends its secret in the clear).
+ */
+export const PAIR_LINK_PREFIX = 'sable://pair/2?';
 
 /**
  * The phone's first frame on a secure connection (JSON text): what it comes for (`pair` with the
@@ -1668,12 +1692,13 @@ export interface PhoneSecHello {
 /**
  * The desktop's answer: its ephemeral key (`pub`), its long-lived identity key (`key`, SPKI DER,
  * base64url; the pairing link carries its SHA-256 as `f`), and its ECDSA P-256 signature over the
- * transcript (`sig`, IEEE P1363). `denied`: a signed refusal instead of a channel. From here on
- * every frame both ways is binary: a flag byte (1: deflate-raw inside), then AES-256-GCM of the
- * JSON text with an implicit sequence number, under keys bound to the pairing secret.
+ * transcript (`sig`, IEEE P1363). `outcome` (version 2, signed): `ok`, a channel; `denied`, a
+ * signed refusal (`denied`, never empty) instead. From here on every frame both ways is binary: a
+ * flag byte (1: deflate-raw inside), then AES-256-GCM of the JSON text with an implicit sequence
+ * number, under keys bound to the pairing secret.
  */
 export interface PhoneSecReply {
-  sec: { v: number; pub: string; key: string; sig: string; denied?: string };
+  sec: { v: number; pub: string; key: string; sig: string; outcome?: 'ok' | 'denied'; denied?: string };
 }
 
 /** Frames the phone endpoint sends besides `ServerFrame`s. */
@@ -1747,6 +1772,24 @@ export interface PhoneTail extends Omit<SessionSnapshot, 'items'> {
   next?: string;
   /** The item a page `around` it was asked for (absent: an older desktop gave the newest page instead). */
   at?: string;
+  /** Queued messages in all (`queue` holds the first page of them; `phone.queue` reads on). Absent: `queue` is all of it. */
+  queueTotal?: number;
+  /** Permissions and questions waiting in all, when more wait than came here (the desktop has them all). */
+  permissionsTotal?: number;
+  questionsTotal?: number;
+}
+
+/** A file the agent handed over, opened for the phone over the secure channel (`phone.fileStart`). */
+export interface PhoneFileStart {
+  /** Names this transfer in `phone.fileChunk` / `phone.fileEnd`. */
+  transfer: string;
+  /** The file's name, canonical (server/services/phone-files.ts `canonicalName`): what the phone shows, saves and decides by. */
+  name: string;
+  size: number;
+  /** SHA-256 (hex) of the bytes as the share completed: the phone takes only bytes that match it. */
+  sha256: string;
+  /** The biggest chunk the desktop sends. */
+  chunk: number;
 }
 
 /** Methods only the phone endpoint answers, besides `PHONE_METHODS`. */
@@ -1763,12 +1806,29 @@ export interface PhoneMethods {
   'phone.item': { params: { sessionId: string; itemId: string }; result: { item: PhoneItem; children: PhoneItem[] } };
   /**
    * A download link for a file the agent handed over in this conversation (a `share` step's
-   * `detail.files[index]`): a path on the phone endpoint (`/f/<token>/<name>`) that serves that one
-   * file for 15 minutes. Nothing else on the computer can be fetched this way. `sha256` (hex) and
-   * `size` are the file's as it is served: the phone checks what arrived against both before it opens
-   * or installs it (they come over the authenticated channel, the bytes over plain HTTP).
+   * `detail.files[index]`), for a phone paired before the secure channel only (a secure one uses
+   * `phone.fileStart`): a path on the phone endpoint (`/f/<token>/<name>`) that serves that one
+   * file for 15 minutes over plain HTTP. Never an APK (it could not be checked on the way).
    */
   'phone.fileLink': { params: { sessionId: string; itemId: string; index: number }; result: { path: string; name: string; size?: number; sha256?: string } };
+  /**
+   * Opens a file the agent handed over for this phone, over the secure channel only: the share's own
+   * record of it (its bytes' SHA-256 as the share completed), checked again on the file now. The
+   * bytes then come in chunks (`phone.fileChunk`, the phone asks for each: bounded, in order, from
+   * any offset after a reconnect), until `phone.fileEnd` or a while unused.
+   */
+  'phone.fileStart': { params: { sessionId: string; itemId: string; index: number }; result: PhoneFileStart };
+  /** Up to `length` bytes (at most `PhoneFileStart.chunk`) at `offset`, base64. */
+  'phone.fileChunk': { params: { transfer: string; offset: number; length?: number }; result: { data: string } };
+  'phone.fileEnd': { params: { transfer: string }; result: { ok: boolean } };
+  /**
+   * For a phone paired before the secure channel, over that pairing: this desktop's identity
+   * fingerprint and a one-time ticket (10 minutes) that lets a secure pairing with this same desktop
+   * replace the old one (`PhoneHello` `pair.replaces`). The old token never goes anywhere else.
+   */
+  'phone.migrate': { params: Record<string, never>; result: { fingerprint: string; ticket: string } };
+  /** Queued messages from `from` on (a page; `phone.tail` holds the first). */
+  'phone.queue': { params: { sessionId: string; from: number }; result: { queue: QueuedMessage[]; from: number; total: number } };
   /**
    * A new, empty folder inside an existing one (a new chat's folder, from the folder browser): one
    * plain name, no path separators, nothing hidden; never overwrites. Returns its path.
@@ -1792,7 +1852,7 @@ export interface PhoneMethods {
    * of the query must all be in a message. Bounded per call (time and bytes read); `partial` when
    * some chats were not read yet (asking again goes on where it stopped).
    */
-  'phone.search': { params: { query: string }; result: PhoneSearch };
+  'phone.search': { params: { query: string; cursor?: string }; result: PhoneSearch };
   /** One picture of a step's result (`PhoneItem.pics`), as a data URL; nothing else can be read this way. */
   'phone.image': { params: { sessionId: string; itemId: string; index: number }; result: { data: string } };
   /**
@@ -1808,7 +1868,7 @@ export interface PhoneMethods {
   'phone.answer': { params: { sessionId: string; requestId: string; picks: Record<string, { options?: string[]; other?: string }> }; result: { ok: boolean } };
 }
 
-export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image', 'phone.thumb', 'phone.answer'] as const satisfies readonly (keyof PhoneMethods)[];
+export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.fileStart', 'phone.fileChunk', 'phone.fileEnd', 'phone.migrate', 'phone.queue', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image', 'phone.thumb', 'phone.answer'] as const satisfies readonly (keyof PhoneMethods)[];
 
 /** A message that matched a search across chats (`search.messages` on the desktop, `phone.search` on the phone). */
 export interface MessageHit {
@@ -2085,7 +2145,8 @@ export interface RpcMethods {
   'session.interrupt': { params: { sessionId: string }; result: { ok: boolean } };
   'session.setModel': { params: { sessionId: string; model: string }; result: { ok: boolean } };
   'session.setEffort': { params: { sessionId: string; effort: Effort }; result: { ok: boolean } };
-  'session.setMode': { params: { sessionId: string; mode: string }; result: { ok: boolean } };
+  /** `answerWaiting: false`: a mode that never asks does not answer what already waits (the phone answers what it may itself). */
+  'session.setMode': { params: { sessionId: string; mode: string; answerWaiting?: boolean }; result: { ok: boolean } };
   'session.setFast': { params: { sessionId: string; fast: boolean }; result: { ok: boolean } };
   /** The session's speed (`standard` or a `SpeedInfo` id of its model); an unsupported one falls back to standard. */
   'session.setSpeed': { params: { sessionId: string; speed: string }; result: { ok: boolean; speed: string } };

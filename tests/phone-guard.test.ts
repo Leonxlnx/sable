@@ -16,7 +16,7 @@ import { DemoProvider } from '../server/providers/demo';
 import { registerFs } from '../server/services/fs';
 import { phoneEvent, phonePermission, phoneResult, registerPhone } from '../server/services/phone';
 import { FRAME_MAX, phoneAttachments, readHello } from '../server/services/phone-guard';
-import { helloSecure, pairSecure, wireClient } from './phone-wire';
+import { fetchSecure, helloPlain, helloSecure, legacyPairing, pairSecure, wireClient } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -26,16 +26,18 @@ afterEach(async () => {
   for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
-async function setup() {
+/** `legacy`: phones paired before the secure channel, in phone.json before the App starts. */
+async function setup(legacy = 0) {
   const home = mkdtempSync(path.join(tmpdir(), 'sable-phone-guard-'));
   homes.push(home);
+  const old = legacy ? legacyPairing(home, Array.from({ length: legacy }, () => ({}))) : [];
   const app = new App({ home, quiet: true, providers: [(ctx) => new DemoProvider(ctx, { speed: 0 })] });
   apps.push(app);
   registerFs(app);
   registerPhone(app, { port: 0, host: '127.0.0.1' });
   const status = await app.call('phone.setEnabled', { on: true });
   expect(status.listening).toBe(true);
-  return { app, home, port: status.port };
+  return { app, home, port: status.port, old };
 }
 
 type Frame = Record<string, unknown>;
@@ -66,32 +68,33 @@ describe('download links from the phone', () => {
     const file = { path: 'reports/audit.txt', name: 'audit.txt', size: 9 };
     for (const status of ['running', 'awaiting', 'denied', 'cancelled', 'error']) rt.add(share(`s-${status}`, status, [file]));
     rt.add(share('s-done', 'done', [file]));
-    const link = (itemId: string) => c.call('phone.fileLink', { sessionId: rt.id, itemId, index: 0 }) as Promise<{ ok: boolean; error?: string; result: { path: string } }>;
+    // Over the secure channel (phone.fileStart and its chunks), by the same rules as a link.
+    const get = (itemId: string) => fetchSecure(c, { sessionId: rt.id, itemId, index: 0 });
     for (const status of ['running', 'awaiting', 'denied', 'cancelled', 'error']) {
-      const r = await link(`s-${status}`);
+      const r = await get(`s-${status}`);
       expect(r.ok, status).toBe(false);
-      expect(r.error, status).toBe('That file was not shared.');
+      expect(!r.ok && r.error, status).toBe('That file was not shared.');
     }
-    const ok = await link('s-done');
-    expect(ok.ok).toBe(true);
-    const res = await fetch(`http://127.0.0.1:${port}${ok.result.path}`);
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe('the audit');
+    const ok = await get('s-done');
+    expect(ok.ok && ok.bytes.toString()).toBe('the audit');
     // A file that changed since the share named its size is not handed out.
     writeFileSync(path.join(cwd, 'reports', 'audit.txt'), 'the audit, rewritten');
-    expect((await link('s-done')).error).toBe('That file changed after it was shared.');
+    const changed = await get('s-done');
+    expect(!changed.ok && changed.error).toBe('That file changed after it was shared.');
     c.ws.close();
   });
 
   it('stop working when the phone is removed or phone access is turned off', async () => {
-    const { app, port, home } = await setup();
-    const { c, deviceId } = await pairPhone(app, port);
+    // Plain HTTP links: phones paired before the secure channel.
+    const { app, port, home, old } = await setup(2);
+    const c = await helloPlain(port, old[0].token);
+    const deviceId = old[0].deviceId;
     const cwd = path.join(home, 'chat');
     const rt = await chatIn(app, c, cwd);
-    writeFileSync(path.join(cwd, 'build.apk'), 'apk bytes');
-    rt.add(share('s1', 'done', [{ path: path.join(cwd, 'build.apk'), name: 'build.apk', size: 9 }]));
+    writeFileSync(path.join(cwd, 'build.zip'), 'zip bytes');
+    rt.add(share('s1', 'done', [{ path: path.join(cwd, 'build.zip'), name: 'build.zip', size: 9 }]));
     const link = (await c.call('phone.fileLink', { sessionId: rt.id, itemId: 's1', index: 0 })) as { result: { path: string } };
-    const other = await pairPhone(app, port, 'Other phone');
+    const other = { c: await helloPlain(port, old[1].token) };
     const kept = (await other.c.call('phone.fileLink', { sessionId: rt.id, itemId: 's1', index: 0 })) as { result: { path: string } };
     await app.call('phone.revoke', { deviceId });
     await c.closed;
@@ -110,8 +113,9 @@ describe('download links from the phone', () => {
   });
 
   it('serve the file as it was when the link was made, and refuse it once it changed or was replaced', async () => {
-    const { app, port, home } = await setup();
-    const { c } = await pairPhone(app, port);
+    // Plain HTTP links: a phone paired before the secure channel.
+    const { app, port, home, old } = await setup(1);
+    const c = await helloPlain(port, old[0].token);
     const cwd = path.join(home, 'chat');
     const rt = await chatIn(app, c, cwd);
     const file = path.join(cwd, 'notes.txt');

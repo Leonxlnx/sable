@@ -1124,6 +1124,13 @@ class ClaudeSession implements ProviderSession {
   /** Turns settled here so far: a stop's safety net (`interruptTimer`) acts only on the turn it was for. */
   private turnSeq = 0;
   private interruptTimer?: NodeJS.Timeout;
+  /**
+   * Results still owed by turns a stop's safety net settled without one (oldest first): the messages
+   * each turn had read, by sdk uuid (and any other uuid a result may name one by); empty for a turn
+   * Claude Code began by itself. It answers its turns in order, so a result that names only such
+   * messages, or (naming none) the next one owed, is that settled turn's, come late (`late`).
+   */
+  private owed: Set<string>[] = [];
   /** A new agent process has not said hello yet (system/init): the live line says "Starting", not "Thinking". */
   private booting = false;
   private idleTimer?: NodeJS.Timeout;
@@ -1214,6 +1221,8 @@ class ClaudeSession implements ProviderSession {
     this.applied = { ...meta.options };
     this.lastTotalCost = 0;
     this.liveCaps = false;
+    // A new process owes no result of the last one's turns.
+    this.owed = [];
     void this.pump(q);
     void q
       .initializationResult()
@@ -1374,6 +1383,7 @@ class ClaudeSession implements ProviderSession {
     this.liveTasks.clear();
     this.wakes = 0;
     this.cliState = undefined;
+    this.owed = [];
     // What the process had not read went with it.
     this.withdrawn.clear();
     this.retire(this.sentItems.keys(), 'failed');
@@ -1462,6 +1472,8 @@ class ClaudeSession implements ProviderSession {
       : text;
     this.awaiting.set(uuid, { read: false });
     this.sentItems.set(uuid, item.id);
+    // Its result says what it came to (`retire`): until then it went ok for nobody (the bridge names a chat only from one that did).
+    this.rt.expectOutcome(item.id);
     this.interrupted = false;
     // Local commands (/cost, /context) can take a while and never "think".
     const command = /^\/[\w:-]+/.exec(item.text.trim())?.[0];
@@ -1496,8 +1508,37 @@ class ClaudeSession implements ProviderSession {
     // The CLI answers with a result message; if it does not, close the turn ourselves.
     clearTimeout(this.interruptTimer);
     this.interruptTimer = setTimeout(() => {
-      if (this.interrupted && ours()) this.finishTurn(undefined, true);
+      if (!this.interrupted || !ours()) return;
+      // Settled without its result: should that come after all, it is this turn's, never a newer one's.
+      this.owe();
+      this.finishTurn(undefined, true);
     }, 2_500);
+  }
+
+  /** The running turn is settled without its result: the result it still owes is told apart when it comes (`late`). */
+  private owe() {
+    const uuids = new Set<string>();
+    for (const [u, a] of this.awaiting) if (a.read) uuids.add(u);
+    for (const [alias, u] of this.aliases) if (uuids.has(u)) uuids.add(alias);
+    // Nothing read and nothing that woke it: Claude Code began no turn for it, and owes no result.
+    if (!uuids.size && !this.wakes) return;
+    this.owed.push(uuids);
+    if (this.owed.length > 8) this.owed.shift();
+  }
+
+  /**
+   * Whether result `m` is one a turn settled by the safety net owed (`owed`): naming messages, when it
+   * names only that turn's; naming none, the oldest owed that named none (any, in a CLI that names
+   * none). Claude Code answers its turns in order: what was owed before the result that came is not
+   * coming any more.
+   */
+  private late(m: Obj): boolean {
+    if (!this.owed.length) return false;
+    const named = resultUuids(m);
+    if (named.length) this.namesMessages = true;
+    const at = named.length ? this.owed.findIndex((s) => named.every((u) => s.has(u))) : this.owed.findIndex((s) => !this.namesMessages || !s.size);
+    this.owed.splice(0, at < 0 ? this.owed.length : at + 1);
+    return at >= 0;
   }
 
   async setModel(model: string) {
@@ -1919,6 +1960,7 @@ class ClaudeSession implements ProviderSession {
           rt.add<UserItem>({ id, type: 'user', text: back.text || replayText(m.message?.content) || '', attachments: back.attachments, state: 'sent', providerId: m.uuid });
         }
         this.sentItems.set(m.uuid, id);
+        this.rt.expectOutcome(id);
         // Begun by Claude Code, not the person: the stop's hold on the queue stays through it.
         if (!rt.turnActive) rt.beginTurn('Thinking', { keepHold: true });
         return;
@@ -2041,8 +2083,7 @@ class ClaudeSession implements ProviderSession {
    * steer still on its way) is never answered by a result that does not name it.
    */
   private answer(m: Obj): string[] {
-    const named = (Array.isArray(m.user_message_uuids) ? (m.user_message_uuids as unknown[]) : []).filter((u): u is string => typeof u === 'string' && !!u);
-    if (!named.length && typeof m.user_message_uuid === 'string' && m.user_message_uuid) named.push(m.user_message_uuid);
+    const named = resultUuids(m);
     if (named.length) {
       this.namesMessages = true;
       const ids = named.map((u) => this.aliases.get(u) ?? u);
@@ -2103,9 +2144,12 @@ class ClaudeSession implements ProviderSession {
 
   private onResult(m: Obj) {
     const rt = this.rt;
-    const answered = this.answer(m);
+    // The result of a turn the stop's safety net already settled, come late: what it cost counts, and
+    // nothing else of it. It answers nothing of the running turn, and never reads that turn's stop.
+    const late = this.late(m);
+    const answered = late ? [] : this.answer(m);
     // Its own messages are taken when they are replayed: whatever woke the model is answered by now.
-    this.wakes = 0;
+    if (!late) this.wakes = 0;
     const total = Number(m.total_cost_usd ?? 0);
     const usage: SessionUsage = { ...rt.meta.usage };
     // total_cost_usd counts from the start of this CLI process (reset in ensure()).
@@ -2119,6 +2163,10 @@ class ClaudeSession implements ProviderSession {
     const window = Object.values((m.modelUsage as Record<string, Obj>) ?? {}).reduce((max, u) => Math.max(max, Number(u.contextWindow ?? 0)), 0);
     if (window) usage.contextWindow = window;
     rt.update({ usage });
+    if (late) {
+      if (this.q) void this.provider.readLimits(this.q);
+      return;
+    }
 
     this.compacted = false;
     const failed = m.subtype !== 'success' || m.is_error;
@@ -2294,9 +2342,10 @@ class ClaudeSession implements ProviderSession {
         if (m.state === 'idle' && rt.turnActive && (this.interrupted || !this.unread())) this.finishTurn(undefined, this.interrupted);
         // Work it started on its own, with no message to replay (a scheduled wake-up): a turn like any other,
         // which its result or the next idle ends. Only from idle: after a prompt it is the same work going on.
+        // Not the person's: a stop's hold on the queue stays through it, as through any turn the agent begins.
         else if (m.state === 'running' && prev === 'idle' && !rt.turnActive && this.q && !this.closed) {
           this.wakes++;
-          rt.beginTurn('Thinking');
+          rt.beginTurn('Thinking', { keepHold: true });
         }
         break;
       }
@@ -2447,6 +2496,13 @@ function resultLabel(subtype?: string): string {
     default:
       return 'The turn ended with an error.';
   }
+}
+
+/** The messages a result names as the ones it answers (`user_message_uuids`, or `user_message_uuid`); none in an older CLI. */
+function resultUuids(m: Obj): string[] {
+  const named = (Array.isArray(m.user_message_uuids) ? (m.user_message_uuids as unknown[]) : []).filter((u): u is string => typeof u === 'string' && !!u);
+  if (!named.length && typeof m.user_message_uuid === 'string' && m.user_message_uuid) named.push(m.user_message_uuid);
+  return named;
 }
 
 function fmtTokens(n?: number) {

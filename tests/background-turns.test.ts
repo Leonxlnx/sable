@@ -350,7 +350,7 @@ describe('Codex: turns it starts on its own, and a turn whose end never came', (
     expect({ turnActive: h.rt.turnActive, status: h.rt.meta.status, activity: h.rt.meta.activity }).toEqual(IDLE);
   });
 
-  it('the thread goes idle and the turn end never comes: the chat goes idle all the same', async () => {
+  it('the thread goes idle and the turn end never comes: nothing is recorded by a guess, and its end, when it comes, is honoured', async () => {
     const h = await codex();
     await h.send('first');
     await tick();
@@ -358,6 +358,10 @@ describe('Codex: turns it starts on its own, and a turn whose end never came', (
     h.status('idle');
     // A short grace for turn/completed, which normally lands with it and carries the real outcome.
     await tick(1700);
+    // The thread's store cannot say how it ended (review wave 4, #13): it stays open, asked again later.
+    expect(h.rt.turnActive).toBe(true);
+    h.complete('turn1');
+    await tick();
     expect({ turnActive: h.rt.turnActive, status: h.rt.meta.status, activity: h.rt.meta.activity }).toEqual(IDLE);
   });
 
@@ -472,10 +476,10 @@ describe("Codex: a turn ended from the thread's idle keeps what is known, and la
     h.status('idle');
     await tick(1700);
     expect(h.calls.some((c) => c.method === 'thread/turns/list')).toBe(true);
-    expect(h.rt.turnActive).toBe(false);
+    // Not ended by a guess (review wave 4, #13): the turn stays open, the queue held behind it.
+    expect(h.rt.turnActive).toBe(true);
     expect(h.turnStarts()).toBe(1);
     expect(h.rt.queue.map((q) => q.text)).toEqual(['second']);
-    expect(h.rt.items.some((i) => i.type === 'notice' && i.text === 'Queued messages wait')).toBe(true);
   });
 
   it("the thread's stored outcome decides: failed holds the queue, completed lets it go", async () => {

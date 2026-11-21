@@ -80,7 +80,7 @@ export function Scanner({ onCode, onClose, onPaste }: { onCode: (text: string) =
             </span>
             <p className="scanner-card-title">{error}</p>
             <button type="button" className="btn btn-primary btn-lg btn-block" onClick={() => (haptic('tap'), onPaste())}>
-              <Icon name="clipboard" size={19} /> Paste link
+              <Icon name="clipboard" size={20} /> Paste link
             </button>
             <button type="button" className="btn btn-lg btn-block btn-ghost" onClick={onClose}>
               Close
@@ -99,7 +99,7 @@ export function Scanner({ onCode, onClose, onPaste }: { onCode: (text: string) =
         <div className="scanner-foot">
           <p className="scanner-hint">The code is in Settings › Phone on your computer</p>
           <button type="button" className="btn btn-lg scanner-paste" onClick={() => (haptic('tap'), onPaste())}>
-            <Icon name="clipboard" size={19} /> Paste link
+            <Icon name="clipboard" size={20} /> Paste link
           </button>
         </div>
       )}

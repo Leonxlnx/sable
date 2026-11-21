@@ -32,10 +32,12 @@ import { grantFor } from './phone-guard';
  *      (`THUMB.hostGap`), so a share of many files never adds up to one long hold;
  *   4. a bigger picture file of a common type, up to `THUMB.fileMax`, as it is (a dev or standalone
  *      bridge has no shell). Otherwise none (`null`).
- * - Made of the very file that was checked: it is opened once and the handle must be that file (its
+ * - Made of the very file that was checked: each time it is opened the handle must be that file (its
  *   volume and exact id, size and time); a picture is read from the handle (never more than its
  *   size), and a renderer that takes a path (the PDF renderer, the shell) gets a private copy made
  *   from the handle (`THUMB.copyMax`), so what replaces the file at its path meanwhile is never drawn.
+ *   Copies are made only within their room (`THUMB.copies` at once, `THUMB.copyBytes` together),
+ *   taken before the file is opened and given back once the copy is removed, on every path.
  * - Kept by the checked file (path, volume and id, size, time) and width (`THUMB.entries`,
  *   `THUMB.bytes`): another file at the same path with the same size and time is pictured anew. One
  *   picture per file is made at a time; one PDF is drawn at a time and the shell makes one at a time,
@@ -76,6 +78,12 @@ export const THUMB = {
   png: 4 * 1024 * 1024,
   /** The biggest file copied for a renderer that takes a path (a PDF's page, the shell's thumbnail); a bigger one gets none. */
   copyMax: 256 * 1024 * 1024,
+  /**
+   * Private copies that may exist at once, and their bytes together: a copy takes its room before its
+   * file is opened and keeps it until it is removed (after its renderer), first come first served.
+   */
+  copies: 2,
+  copyBytes: 512 * 1024 * 1024,
 };
 
 const KINDS: [RegExp, ThumbKind][] = [
@@ -316,6 +324,48 @@ export interface ThumbOptions {
   inline?: { small: number; large: number };
   /** The biggest file copied for the PDF renderer or the shell (`THUMB.copyMax`). */
   copyMax?: number;
+  /** Private copies at once, and their bytes together (`THUMB.copies`, `THUMB.copyBytes`). */
+  copies?: number;
+  copyBytes?: number;
+}
+
+/** Room for private copies: at most `slots` at once and `bytes` together, given in the order asked. */
+class CopyRoom {
+  private held = 0;
+  private used = 0;
+  private waiting: { bytes: number; go: (release: () => void) => void }[] = [];
+
+  constructor(
+    private readonly slots: number,
+    private readonly bytes: number,
+  ) {}
+
+  /** Waits for room for a copy of `bytes`; the release it gives back is safe to call more than once. */
+  take(bytes: number): Promise<() => void> {
+    return new Promise((go) => {
+      this.waiting.push({ bytes, go });
+      this.pump();
+    });
+  }
+
+  private pump() {
+    while (this.waiting.length) {
+      const next = this.waiting[0];
+      // With nothing held the next always goes (a copy is never bigger than the room).
+      if (this.held > 0 && (this.held >= this.slots || this.used + next.bytes > this.bytes)) return;
+      this.waiting.shift();
+      this.held++;
+      this.used += next.bytes;
+      let given = false;
+      next.go(() => {
+        if (given) return;
+        given = true;
+        this.held--;
+        this.used -= next.bytes;
+        this.pump();
+      });
+    }
+  }
 }
 
 const dataUrl = (mime: string, data: Buffer) => `data:${mime};base64,${data.toString('base64')}`;
@@ -333,13 +383,17 @@ export class Thumbs {
   private readonly fileMax: number;
   private readonly inline: { small: number; large: number };
   private readonly copyMax: number;
+  private readonly room: CopyRoom;
 
   constructor(opts: ThumbOptions = {}) {
     this.host = opts.host;
     this.pdf = opts.pdf === undefined ? windowsPdfPage : opts.pdf;
     this.fileMax = opts.fileMax ?? THUMB.fileMax;
     this.inline = opts.inline ?? THUMB.inline;
-    this.copyMax = opts.copyMax ?? THUMB.copyMax;
+    const bytes = Math.max(1, opts.copyBytes ?? THUMB.copyBytes);
+    // A copy always fits the room.
+    this.copyMax = Math.min(opts.copyMax ?? THUMB.copyMax, bytes);
+    this.room = new CopyRoom(Math.max(1, Math.floor(opts.copies ?? THUMB.copies)), bytes);
   }
 
   /** A picture of the file that was checked at `px` wide (a data URL), or null when there is none. */
@@ -371,60 +425,73 @@ export class Thumbs {
   }
 
   /**
-   * The picture, made of the checked file only: opened once and that very file, read from its handle;
-   * a renderer that takes a path gets a private copy made from the handle. The handle is closed
-   * before anything waits for a renderer (an open file cannot be replaced on Windows: a build moving
-   * a new one over it would fail). Undefined when the file could not be read as it was checked.
+   * The picture, made of the checked file only: opened once per step and that very file, read from
+   * its handle; a renderer that takes a path gets a private copy made from the handle, within the
+   * copies' room (`THUMB.copies`, `THUMB.copyBytes`), taken before the file is opened and given back
+   * once the copy is removed, so a chat of many videos never copies them all ahead of the renderer.
+   * The handle is closed before anything waits for a renderer (an open file cannot be replaced on
+   * Windows: a build moving a new one over it would fail) and is never held while waiting for room.
+   * Undefined when the file could not be read as it was checked.
    */
   private async make(file: ThumbFile, kind: ThumbKind, px: number): Promise<string | null | undefined> {
     this.made++;
     const size = file.size;
     const viaPath = (kind === 'pdf' && !!this.pdf) || !!this.host;
-    let copy: { dir: string; file: string } | null = null;
-    let own: string | null = null;
-    let read = false;
-    const fh = await openChecked(file);
-    if (!fh) return undefined;
-    try {
-      // 1. A small picture as it is: nothing is decoded here.
-      if (kind === 'image' && size <= (px >= 256 ? this.inline.large : this.inline.small)) {
-        own = await this.itself(fh, size);
-        read = true;
-        if (own) return own;
-      }
-      if (viaPath) copy = await copyOut(fh, file, this.copyMax);
-      // No copy to read the picture from later: read it now (step 4).
-      else if (kind === 'image' && !read) own = await this.itself(fh, size);
-    } catch {
-      if (copy) await rm(copy.dir, { recursive: true, force: true }).catch(() => {});
-      return undefined;
-    } finally {
-      await fh.close().catch(() => {});
-    }
-    try {
-      // 2. A PDF's page, drawn in a process of its own.
-      if (kind === 'pdf' && this.pdf && copy) {
-        const t = await this.viaPdf(this.pdf, copy.file, px);
-        if (t?.data.length) return dataUrl(t.mime, t.data);
-      }
-      // 3. The shell's own thumbnail (it holds the main process: one at a time, with a breather).
-      if (this.host && copy) {
-        const t = await this.viaHost(this.host, copy.file, px);
-        if (t?.data.length && (t.mime === 'image/png' || t.mime === 'image/jpeg')) return dataUrl(t.mime, t.data);
-      }
-      // 4. A bigger picture as it is, when nothing made a smaller one.
-      if (kind !== 'image') return null;
-      if (!copy || read) return own;
-      const ch = await openFile(copy.file, 'r');
+    const small = kind === 'image' && size <= (px >= 256 ? this.inline.large : this.inline.small);
+    const copies = viaPath && size > 0 && size <= this.copyMax;
+    if (small || !copies) {
+      // 1. A small picture as it is (nothing is decoded here); with no copy to come, the picture file itself (step 4).
+      let own: string | null = null;
+      const fh = await openChecked(file);
+      if (!fh) return undefined;
       try {
-        return await this.itself(ch, size);
+        if (kind === 'image' && (small || !viaPath)) own = await this.itself(fh, size);
+      } catch {
+        return undefined;
       } finally {
-        await ch.close().catch(() => {});
+        await fh.close().catch(() => {});
       }
-    } catch {
-      return undefined;
+      if (own || !copies) return kind === 'image' ? own : null;
+    }
+    const release = await this.room.take(size);
+    try {
+      let copy: { dir: string; file: string } | null = null;
+      const fh = await openChecked(file);
+      if (!fh) return undefined;
+      try {
+        copy = await copyOut(fh, file, this.copyMax);
+      } catch {
+        return undefined;
+      } finally {
+        await fh.close().catch(() => {});
+      }
+      if (!copy) return null;
+      try {
+        // 2. A PDF's page, drawn in a process of its own.
+        if (kind === 'pdf' && this.pdf) {
+          const t = await this.viaPdf(this.pdf, copy.file, px);
+          if (t?.data.length) return dataUrl(t.mime, t.data);
+        }
+        // 3. The shell's own thumbnail (it holds the main process: one at a time, with a breather).
+        if (this.host) {
+          const t = await this.viaHost(this.host, copy.file, px);
+          if (t?.data.length && (t.mime === 'image/png' || t.mime === 'image/jpeg')) return dataUrl(t.mime, t.data);
+        }
+        // 4. A bigger picture as it is, when nothing made a smaller one (a small one was read already).
+        if (kind !== 'image' || small) return null;
+        const ch = await openFile(copy.file, 'r');
+        try {
+          return await this.itself(ch, size);
+        } finally {
+          await ch.close().catch(() => {});
+        }
+      } catch {
+        return undefined;
+      } finally {
+        await rm(copy.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }).catch(() => {});
+      }
     } finally {
-      if (copy) await rm(copy.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }).catch(() => {});
+      release();
     }
   }
 

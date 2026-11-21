@@ -151,14 +151,16 @@ export class App {
    */
   private consumed(rt: SessionRuntime, ok: boolean): string[] {
     const list = this.handed.get(rt.id) ?? [];
-    // A message its agent answered on its own (Claude Code: a result per message) counts only when that
-    // answer was ok: one that failed while a steer kept the turn going never names the chat.
-    const answeredOk = (id: string) => (rt.outcomeOf(id) ?? 'ok') === 'ok';
-    const taken = list.filter((id) => rt.get<UserItem>(id)?.state === 'sent' && answeredOk(id));
+    // A message its agent answers on its own (Claude Code: a result per message) counts only on that
+    // agent's word that it went ok: one that failed while a steer kept the turn going, or one with no
+    // word at all, never names the chat.
+    const taken = list.filter((id) => rt.get<UserItem>(id)?.state === 'sent' && rt.answeredOk(id));
     const waiting = ok ? list.filter((id) => rt.get<UserItem>(id)?.state === 'queued') : [];
     if (waiting.length) this.handed.set(rt.id, waiting);
     else this.handed.delete(rt.id);
-    for (const id of list) if (!waiting.includes(id)) rt.forgetOutcome(id);
+    // Looked at now: only a steer still to be taken keeps its record, and what this turn took keeps its
+    // own while the chat is named from it (right after); the next turn's end lets those go.
+    rt.forgetOutcomes(ok ? [...waiting, ...taken] : []);
     return ok ? taken : [];
   }
   /** Automatic continues already made per session, as `${messageId}:${accountId}` (never the same twice). */
@@ -726,6 +728,14 @@ export class App {
       else this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue, dirty: rt.takeDirty() }));
     });
     rt.onTurnEnd = (r, error, opts) => this.afterTurn(r, error, opts?.hold);
+    // A queued message a phone was taking back is released: the queue goes on if it waited for it.
+    rt.onQueueReleased = (r) => {
+      if (!this.drainWaiting.delete(r.id)) return;
+      setTimeout(() => {
+        if (r.turnActive || r.stopRequested || this.sessions.get(r.id) !== r) return;
+        this.sendNextQueued(r);
+      }, 0);
+    };
     rt.onTurnStart = (r) => {
       this.until.turnStarted(r);
       this.spare.turnStarted(r);
@@ -1525,14 +1535,31 @@ export class App {
       if (rt.turnActive || rt.stopRequested || this.sessions.get(rt.id) !== rt) return;
       // A steered message no turn took and no adapter carried on is never left waiting: it goes out first.
       rt.returnUntaken();
-      // Messages held for Spare stay where they are: the chat starts them by itself.
-      const held = this.spare.held(rt);
-      const nextId = rt.queue.find((q) => !held.has(q.id))?.id;
-      const next = nextId ? rt.takeQueued(nextId) : undefined;
-      if (next) void this.deliver(rt, next.text, next.attachments).catch((err) => this.log('queued send failed', (err as Error).message));
-      // Nothing waits: an until loop runs its check (the user's messages always go first).
-      else this.until.turnEnded(rt);
+      this.sendNextQueued(rt);
     }, 0);
+  }
+
+  /** Sessions whose next queued message is being taken back by a phone: the queue goes on when that take settles. */
+  private drainWaiting = new Set<string>();
+
+  /** After a turn: the next queued message goes out, or (nothing waits) an until loop runs its check. */
+  private sendNextQueued(rt: SessionRuntime) {
+    // Messages held for Spare stay where they are: the chat starts them by itself.
+    const held = this.spare.held(rt);
+    const nextId = rt.queue.find((q) => !held.has(q.id))?.id;
+    // A phone is taking it back right now: it neither goes nor is skipped; the queue goes on once that settles.
+    if (rt.isReserved(nextId)) return void this.drainWaiting.add(rt.id);
+    const next = nextId ? rt.takeQueued(nextId) : undefined;
+    if (next) void this.deliver(rt, next.text, next.attachments).catch((err) => this.log('queued send failed', (err as Error).message));
+    // Nothing waits: an until loop runs its check (the user's messages always go first).
+    else this.until.turnEnded(rt);
+  }
+
+  /** A phone's take of a queued message went through (phone.ts): it leaves the queue if it is still the one reserved. */
+  takeReserved(rt: SessionRuntime, id: string, rev: number) {
+    const message = rt.commitReserved(id, rev);
+    if (message) this.spare.queueChanged(rt);
+    return message;
   }
 
   private async ensureHandle(rt: SessionRuntime) {
@@ -2300,12 +2327,13 @@ export class App {
       await this.applyEffort(rt, rt.handle);
       return { ok: true };
     });
-    this.register('session.setMode', async ({ sessionId, mode }) => {
+    this.register('session.setMode', async ({ sessionId, mode, answerWaiting }) => {
       const rt = this.runtime(sessionId);
       await rt.handle?.setMode(mode);
       rt.update({ mode });
       // The mode that never asks (Bypass, Full access) answers what already waits too; questions stay.
-      if (rt.caps?.modes.find((m) => m.id === mode)?.tone === 'danger') {
+      // A phone answers only what it may itself (`answerWaiting: false`, phone.ts).
+      if (answerWaiting !== false && rt.caps?.modes.find((m) => m.id === mode)?.tone === 'danger') {
         for (const p of rt.prompts().permissions) {
           if (p.toolName === 'ExitPlanMode') continue;
           const allow = p.options.find((o) => o.tone === 'allow');

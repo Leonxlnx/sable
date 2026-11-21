@@ -1,24 +1,36 @@
+import type { PhoneFileStart } from '@shared/protocol';
+
 /**
  * The downloads' logic, free of Capacitor and the connection (lib/downloads.ts wires it), so it can
- * be tested: one attempt per start, each with its own identity, checked after every await (a Stop
- * while the desktop prepares the link ends the attempt for good, and a native download that starts
- * after its attempt was stopped is removed again); one polling loop that awaits each read (never two
- * at once, an older reply never lands over a newer entry), reads four times a second while bytes
- * move, every few seconds while a transfer is paused, and not at all while the app is in the
- * background; storage written only when what is kept changed; at most `KEEP` entries, in memory as
- * on disk.
+ * be tested.
  *
- * What arrived is checked before it counts as there: the desktop names the file's SHA-256 and size
- * with its link (over the connection, the bytes come over plain HTTP), and a finished download is read
- * whole on the phone and compared (`verifying`); a file that differs is removed and the row says so.
- * Open checks it again (FilesPlugin.java), and an APK is offered to the installer only when its link
- * came over the secure channel and its bytes matched.
+ * Over the secure channel (a phone paired securely, the only way an APK comes): the desktop opens the
+ * file the share recorded (`phone.fileStart`: its canonical name, size and the SHA-256 the share
+ * recorded when it completed) and the phone asks for it chunk by chunk over the sealed connection
+ * (`phone.fileChunk`, at most `WINDOW` asked ahead: the phone sets the pace), each written in order to
+ * a file in the app's private storage (`stageWrite`). A connection that goes away pauses it; once
+ * back, it goes on from the bytes it has (a new transfer, the same digest, or it starts over). When
+ * every byte is there, FilesPlugin.java reads the private file whole and compares it with the digest
+ * (`stageFinish`): only a file that matches is kept (and, unless it is an app, copied to
+ * Downloads/Sable); one that does not is removed and the row says so. Nothing is public, and nothing
+ * says "downloaded", before that. Open and Install hand on that verified private copy (a FileProvider
+ * URI), and the installer is reached only for such a record (decided natively, by the final MIME type).
+ *
+ * Over a pairing from before the secure channel: Android's DownloadManager over plain HTTP as before
+ * (never an APK: the desktop refuses those links and the row offers no download), one polling loop
+ * that awaits each read, reads four times a second while bytes move, every few seconds while a
+ * transfer is paused, and not at all while the app is in the background.
+ *
+ * Every start has its own attempt, checked after every await (a Stop while the desktop prepares the
+ * file ends it for good). Storage is written only when what is kept changed; at most `KEEP` entries.
  */
 
 export type DownloadState = 'idle' | 'asking' | 'pending' | 'running' | 'paused' | 'verifying' | 'done' | 'failed';
 export interface Download {
   state: DownloadState;
-  /** DownloadManager's id once it started. */
+  /** How it comes: over the sealed connection (`channel`), or DownloadManager over plain HTTP (`system`, a legacy pairing). */
+  via?: 'channel' | 'system';
+  /** DownloadManager's id once it started (`system`). */
   id?: string;
   bytes?: number;
   total?: number;
@@ -26,36 +38,68 @@ export interface Download {
   url?: string;
   /** Which start this entry belongs to (a stopped or newer attempt makes an older one's replies moot). */
   attempt?: number;
-  /** What the desktop said the file is (hex SHA-256, bytes); absent from an older desktop. */
+  /** What the desktop said the file is (hex SHA-256, bytes). */
   sha256?: string;
   size?: number;
-  /** The bytes on the phone are those (checked when it finished). */
+  /** The bytes on the phone are those (checked whole on the phone when they were all there). */
   verified?: boolean;
-  /** Its link came over the secure channel (the desktop proven, the digest sealed). */
+  /** Its digest came over the secure channel. */
   secure?: boolean;
+  /** `channel`: the private file being written (FilesPlugin \`stage*\`), and once checked, the verified record that Open hands on. */
+  stage?: string;
+  file?: string;
+  /** `channel`: the file's canonical name as the desktop named it (shared/file-name.ts). */
+  name?: string;
+  /** `channel`: the share's file it is (to go on with after a pause, also after a restart). */
+  from?: { sid: string; itemId: string; index: number };
 }
 
 export type Status = { state: 'pending' | 'running' | 'paused' | 'done' | 'failed' | 'gone'; bytes?: number; total?: number; reason?: number };
 
 export interface FilesPlugin {
+  // DownloadManager (a legacy pairing).
   download(o: { url: string; name: string; mime?: string; from?: string }): Promise<{ id: string }>;
   status(o: { id: string }): Promise<Status>;
   cancel(o: { id: string }): Promise<void>;
   /** Reads the finished file whole: its SHA-256 and size, and whether they are what was named. */
   verify(o: { id: string; sha256: string; size?: number }): Promise<{ ok: boolean; sha256?: string; size?: number }>;
+  // The secure channel's private files.
+  /** A private file for `key`'s bytes (the one already there when it is the same file: `have` bytes of it). */
+  stageBegin(o: { key: string; name: string; size: number; sha256: string }): Promise<{ id: string; have: number }>;
+  /** Appends a chunk (base64) at `offset`, which must be where the file ends. */
+  stageWrite(o: { id: string; offset: number; data: string }): Promise<{ have: number }>;
+  /** Reads the private file whole and compares it with its digest: kept (a verified record, `file`) or removed. */
+  stageFinish(o: { id: string }): Promise<{ ok: boolean; file?: string }>;
+  /** Drops a private file not finished (stopped). */
+  stageDrop(o: { id: string }): Promise<void>;
 }
 
-/** An APK goes to the installer only when its link came over the secure channel and what arrived is what the desktop named. */
-export const installable = (d: Download) => d.state === 'done' && !!d.secure && !!d.verified;
+/** What the secure channel gives (conn.ts over `phone.fileStart` / `phone.fileChunk` / `phone.fileEnd`). */
+export interface Channel {
+  /** Paired securely: downloads come this way (and only this way). */
+  secure(): boolean;
+  start(p: { sid: string; itemId: string; index: number }): Promise<PhoneFileStart>;
+  chunk(p: { transfer: string; offset: number; length: number }): Promise<{ data: string }>;
+  end(transfer: string): Promise<unknown>;
+}
+
+/** An app goes to the installer only from a verified private copy that came over the secure channel. */
+export const installable = (d: Download) => d.state === 'done' && d.via === 'channel' && !!d.verified && !!d.file;
 
 /** Why a finished download was thrown away. */
 export const SWAPPED = 'Changed on the way, so it was removed.';
+/** Chunks asked for ahead of the one being written. */
+export const WINDOW = 2;
 
 export interface Deps {
   plugin: FilesPlugin;
-  /** The one-time link for a file of a share step (the desktop's `phone.fileLink`), as a URL, with what the file is and whether it came sealed. */
+  /** A legacy pairing: the one-time link for a file of a share step (the desktop's `phone.fileLink`), as a URL. */
   link(p: { sid: string; itemId: string; index: number }): Promise<{ url: string; size?: number; sha256?: string; secure?: boolean }>;
-  /** On the phone (the system downloads); otherwise the web preview acts it out. */
+  /** The secure channel (absent: downloads only as a legacy pairing does). */
+  channel?: Channel;
+  /** A lost connection (the call may not have reached the desktop): such a failure pauses, it does not fail. */
+  lost?: (err: unknown) => boolean;
+  /** On the phone (the system's downloads for a legacy pairing); otherwise the web preview acts those out. */
   native: boolean;
   storage?: { get(): string | null; set(v: string): void };
   /** The app is in the background (the loop stops; `resume` starts it again). */
@@ -72,9 +116,11 @@ export const POLL = { moving: 250, paused: 3000 };
 const IDLE: Download = { state: 'idle' };
 const active = (s: DownloadState) => s === 'pending' || s === 'running' || s === 'paused' || s === 'verifying';
 const settled = (s: DownloadState) => s === 'idle' || s === 'done' || s === 'failed';
+/** Polled from DownloadManager: a legacy download under way. */
+const polled = (d: Download) => d.via !== 'channel' && !!d.id && active(d.state);
 
-const same = (a: Download, b: Download) =>
-  a.state === b.state && a.id === b.id && a.bytes === b.bytes && a.total === b.total && a.error === b.error && a.url === b.url && a.attempt === b.attempt && a.sha256 === b.sha256 && a.size === b.size && a.verified === b.verified && a.secure === b.secure;
+const KEYS = ['state', 'via', 'id', 'bytes', 'total', 'error', 'url', 'attempt', 'sha256', 'size', 'verified', 'secure', 'stage', 'file', 'name'] as const;
+const same = (a: Download, b: Download) => KEYS.every((k) => a[k] === b[k]) && a.from === b.from;
 
 export function reasonText(r?: number) {
   // DownloadManager's ERROR_* codes that a person can do something about.
@@ -90,16 +136,27 @@ export function fromStatus(d: Download, s: Status): Download {
   return { ...d, state: s.state, bytes: s.bytes, total: s.total && s.total > 0 ? s.total : d.total };
 }
 
-/** What an entry keeps across restarts: where it stands, the system's id, and what the file must be. */
+/** What an entry keeps across restarts: where it stands, how it comes, and what the file must be. */
 const keepOf = (d: Download): Download => ({
-  state: d.state,
-  id: d.id,
-  total: d.total,
+  // A channel download cut off by the app closing goes on when it is back (paused until connected).
+  state: d.via === 'channel' && active(d.state) ? 'paused' : d.state,
+  ...(d.via ? { via: d.via } : {}),
+  ...(d.id ? { id: d.id } : {}),
+  ...(d.total !== undefined ? { total: d.total } : {}),
+  ...(d.bytes !== undefined && d.via === 'channel' ? { bytes: d.bytes } : {}),
   ...(d.sha256 ? { sha256: d.sha256 } : {}),
   ...(d.size !== undefined ? { size: d.size } : {}),
   ...(d.verified ? { verified: true } : {}),
   ...(d.secure ? { secure: true } : {}),
+  ...(d.stage ? { stage: d.stage } : {}),
+  ...(d.file ? { file: d.file } : {}),
+  ...(d.name ? { name: d.name } : {}),
+  ...(d.from ? { from: d.from } : {}),
 });
+const keepable = (d: Download) => (d.via === 'channel' ? d.state === 'done' || active(d.state) : !!d.id && (d.state === 'done' || active(d.state)));
+
+/** A refusal the desktop gave (it reached the desktop): such a download fails; a lost connection only pauses it. */
+const refusedBy = (deps: Deps, err: unknown) => !(deps.lost?.(err) ?? false);
 
 export function createDownloads(deps: Deps) {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -110,24 +167,24 @@ export function createDownloads(deps: Deps) {
   let all: Record<string, Download> = (() => {
     try {
       const raw = JSON.parse(deps.storage?.get() ?? '{}') as Record<string, Download>;
-      // Kept: finished ones (Open) and ones still in the system's hands (read again).
+      // Kept: finished ones (Open) and ones still under way (read again, or gone on with).
       const out: Record<string, Download> = {};
-      for (const [k, d] of Object.entries(raw)) if (d && d.id && (d.state === 'done' || active(d.state))) out[k] = keepOf(d);
+      for (const [k, d] of Object.entries(raw)) if (d && keepable(d)) out[k] = keepOf(d);
       return out;
     } catch {
       return {};
     }
   })();
 
-  /** What is kept across restarts: finished and running downloads (no byte counts). */
+  /** What is kept across restarts: finished downloads and ones under way. */
   const kept = () => {
     const keep: Record<string, Download> = {};
-    for (const [k, d] of Object.entries(all)) if (d.id && (d.state === 'done' || active(d.state))) keep[k] = keepOf(d);
+    for (const [k, d] of Object.entries(all)) if (keepable(d)) keep[k] = keepOf(d);
     return JSON.stringify(keep);
   };
   savedJson = kept();
 
-  /** Written only when what is kept changed (bytes moving never write). */
+  /** Written only when what is kept changed (bytes moving over DownloadManager never write). */
   function save() {
     const json = kept();
     if (json === savedJson) return;
@@ -159,14 +216,14 @@ export function createDownloads(deps: Deps) {
   }
 
   let polling = false;
-  /** One loop at a time; each read awaited; a reply that comes back after its entry changed is dropped. */
+  /** One loop at a time (DownloadManager's downloads); each read awaited; a reply that comes back after its entry changed is dropped. */
   async function poll() {
     if (polling) return;
     polling = true;
     try {
       for (;;) {
         if (deps.hidden?.()) return;
-        const live = Object.entries(all).filter(([, d]) => d.id && active(d.state));
+        const live = Object.entries(all).filter(([, d]) => polled(d));
         if (!live.length) return;
         for (const [k, d] of live) {
           if (d.state === 'verifying') {
@@ -188,7 +245,7 @@ export function createDownloads(deps: Deps) {
             await check(k, v);
           } else set(k, next.state === 'done' ? { ...next, verified: false } : next);
         }
-        const moving = Object.values(all).some((d) => d.id && (d.state === 'running' || d.state === 'pending' || d.state === 'verifying'));
+        const moving = Object.values(all).some((d) => polled(d) && (d.state === 'running' || d.state === 'pending' || d.state === 'verifying'));
         await sleep(moving ? POLL.moving : POLL.paused);
       }
     } finally {
@@ -196,7 +253,7 @@ export function createDownloads(deps: Deps) {
     }
   }
 
-  /** A finished file read whole: kept when it is what the desktop named, removed (and said so) when not. */
+  /** A finished DownloadManager file read whole: kept when it is what the desktop named, removed (and said so) when not. */
   async function check(key: string, d: Download) {
     let r: { ok: boolean };
     try {
@@ -212,19 +269,87 @@ export function createDownloads(deps: Deps) {
     set(key, { state: 'failed', error: SWAPPED, attempt: d.attempt, total: d.total });
   }
 
-  /** The web preview: a download acted out (progress over a moment, then done), its attempt checked at every step. */
+  /** The web preview: a legacy download acted out (progress over a moment, then done), its attempt checked at every step. */
   function act(key: string, url: string, total: number, attempt: number, what: Pick<Download, 'sha256' | 'size' | 'secure'>) {
     const ms = deps.actMs?.() ?? 2200;
     const t0 = Date.now();
-    set(key, { state: 'running', bytes: 0, total, url, id: 'web', attempt, ...what });
+    set(key, { state: 'running', via: 'system', bytes: 0, total, url, id: 'web', attempt, ...what });
     const tick = () => {
       if (all[key]?.attempt !== attempt || all[key]?.state !== 'running') return;
       const k = Math.min(1, (Date.now() - t0) / ms);
-      if (k >= 1) return set(key, { state: 'done', bytes: total, total, url, id: 'web', attempt, ...what, verified: !!what.sha256 });
-      set(key, { state: 'running', bytes: Math.round(total * k * k * (3 - 2 * k)), total, url, id: 'web', attempt, ...what });
+      if (k >= 1) return set(key, { state: 'done', via: 'system', bytes: total, total, url, id: 'web', attempt, ...what, verified: !!what.sha256 });
+      set(key, { state: 'running', via: 'system', bytes: Math.round(total * k * k * (3 - 2 * k)), total, url, id: 'web', attempt, ...what });
       setTimeout(tick, 120);
     };
     setTimeout(tick, 200);
+  }
+
+  /**
+   * A download over the secure channel, from the bytes already in its private file. Each await checks
+   * that this attempt is still the entry's; a lost connection pauses it (it goes on when the phone is
+   * connected again), a refusal or a file that does not match fails it.
+   */
+  async function viaChannel(key: string, p: { sid: string; itemId: string; index: number }, attempt: number, size?: number) {
+    const ch = deps.channel!;
+    const mine = () => all[key]?.attempt === attempt;
+    const from = { sid: p.sid, itemId: p.itemId, index: p.index };
+    const was = all[key];
+    set(key, { ...(was && was.via === 'channel' && was.state === 'paused' ? was : {}), state: 'asking', via: 'channel', secure: true, total: was?.total ?? size, attempt, from });
+    let transfer: string | undefined;
+    let stage: string | undefined;
+    try {
+      const s = await ch.start(p);
+      transfer = s.transfer;
+      if (!mine()) return void ch.end(s.transfer).catch(() => {});
+      // A paused download of other bytes (the share recorded another file since) starts over.
+      const st = await deps.plugin.stageBegin({ key, name: s.name, size: s.size, sha256: s.sha256 });
+      stage = st.id;
+      if (!mine()) return void ch.end(s.transfer).catch(() => {});
+      const base: Download = { state: 'running', via: 'channel', secure: true, bytes: st.have, total: s.size, sha256: s.sha256, size: s.size, stage: st.id, name: s.name, attempt, from };
+      set(key, base);
+      // Asked ahead (at most WINDOW), written strictly in order.
+      let asked = st.have;
+      let written = st.have;
+      const ahead: { at: number; len: number; reply: Promise<{ data: string }> }[] = [];
+      const ask = () => {
+        while (ahead.length < WINDOW && asked < s.size) {
+          const len = Math.min(s.chunk, s.size - asked);
+          const reply = ch.chunk({ transfer: s.transfer, offset: asked, length: len });
+          reply.catch(() => {});
+          ahead.push({ at: asked, len, reply });
+          asked += len;
+        }
+      };
+      ask();
+      while (written < s.size) {
+        const next = ahead.shift()!;
+        const r = await next.reply;
+        if (!mine()) return void ch.end(s.transfer).catch(() => {});
+        const w = await deps.plugin.stageWrite({ id: st.id, offset: next.at, data: r.data });
+        if (!mine()) return void ch.end(s.transfer).catch(() => {});
+        if (w.have !== next.at + next.len) throw new Error('The download stopped. Try again.');
+        written = w.have;
+        set(key, { ...base, bytes: written });
+        ask();
+      }
+      void ch.end(s.transfer).catch(() => {});
+      transfer = undefined;
+      set(key, { ...base, bytes: written, state: 'verifying' });
+      // Read whole on the phone (natively) and compared with the digest the share recorded: only then is it there.
+      const v = await deps.plugin.stageFinish({ id: st.id });
+      if (!mine()) return;
+      if (!v.ok || !v.file) return set(key, { state: 'failed', via: 'channel', error: SWAPPED, attempt, total: s.size });
+      set(key, { ...base, bytes: written, state: 'done', verified: true, file: v.file });
+    } catch (err) {
+      if (transfer) void ch.end(transfer).catch(() => {});
+      if (!mine()) return;
+      const cur = all[key];
+      // The connection went away: it waits, its bytes kept, and goes on once connected.
+      if (!refusedBy(deps, err)) return set(key, { ...cur, state: 'paused', attempt });
+      if (stage) void deps.plugin.stageDrop({ id: stage }).catch(() => {});
+      set(key, { state: 'failed', via: 'channel', total: cur?.total ?? size, error: (err as Error).message, attempt });
+      throw err;
+    }
   }
 
   return {
@@ -236,39 +361,62 @@ export function createDownloads(deps: Deps) {
     set,
     /** Entries in memory (tests). */
     size: () => Object.keys(all).length,
-    hasActive: () => Object.values(all).some((d) => d.id && active(d.state)),
+    hasActive: () => Object.values(all).some((d) => polled(d)),
     /** Back on screen (or started again): the loop reads what is still at work. */
     resume: () => void poll(),
+    /** Connected again (over the secure channel): channel downloads that paused go on from their bytes. */
+    reconnected() {
+      if (!deps.channel?.secure()) return;
+      for (const [k, d] of Object.entries(all)) if (d.via === 'channel' && d.state === 'paused' && d.from) void viaChannel(k, d.from, ++attempts, d.total).catch(() => {});
+    },
+    /** Every entry goes (the desktop was forgotten); a download under way stops where it is. */
+    forgetAll() {
+      attempts++;
+      const was = all;
+      all = {};
+      for (const d of Object.values(was)) {
+        if (d.via === 'channel' && d.stage && d.state !== 'done') void deps.plugin.stageDrop({ id: d.stage }).catch(() => {});
+        if (d.via !== 'channel' && d.id && active(d.state) && deps.native) void deps.plugin.cancel({ id: d.id }).catch(() => {});
+      }
+      subs.forEach((f) => f());
+      save();
+    },
 
-    /** Starts a download of one file of a share step. */
+    /** Starts a download of one file of a share step (over the secure channel when that is the connection). */
     async start(key: string, p: { sid: string; itemId: string; index: number; name: string; size?: number; mime?: string; from?: string }) {
       const cur = all[key];
       if (cur && (cur.state === 'asking' || cur.state === 'pending' || cur.state === 'running' || cur.state === 'verifying')) return;
       const attempt = ++attempts;
+      if (deps.channel?.secure()) return viaChannel(key, p, attempt, p.size);
       const mine = () => all[key]?.attempt === attempt;
-      set(key, { state: 'asking', total: p.size, attempt });
+      set(key, { state: 'asking', via: 'system', total: p.size, attempt });
       try {
         const r = await deps.link(p);
         if (!mine()) return;
         const total = r.size ?? p.size;
-        const what = { ...(r.sha256 ? { sha256: r.sha256.toLowerCase() } : {}), ...(r.size !== undefined ? { size: r.size } : {}), ...(r.secure ? { secure: true } : {}) };
+        // A plain pairing's digest proves nothing (it came the same way as the bytes): kept to catch damage, never to install.
+        const what = { ...(r.sha256 ? { sha256: r.sha256.toLowerCase() } : {}), ...(r.size !== undefined ? { size: r.size } : {}) };
         if (!deps.native) return void act(key, r.url, total ?? 1_000_000, attempt, what);
         const { id } = await deps.plugin.download({ url: r.url, name: p.name, mime: p.mime, from: p.from });
         // Stopped while the system was asked: the download it made goes again.
         if (!mine()) return void (await deps.plugin.cancel({ id }).catch(() => {}));
-        set(key, { state: 'pending', id, bytes: 0, total, url: r.url, attempt, ...what });
+        set(key, { state: 'pending', via: 'system', id, bytes: 0, total, url: r.url, attempt, ...what });
         void poll();
       } catch (err) {
         if (!mine()) return;
-        set(key, { state: 'failed', total: p.size, error: (err as Error).message, attempt });
+        set(key, { state: 'failed', via: 'system', total: p.size, error: (err as Error).message, attempt });
         throw err;
       }
     },
 
-    /** Stops a download, also one whose link is still being prepared (that attempt ends now). */
+    /** Stops a download, also one whose link or file is still being prepared (that attempt ends now). */
     async cancel(key: string) {
       const d = all[key];
       set(key, { state: 'idle' });
+      if (d?.via === 'channel') {
+        if (d.stage && d.state !== 'done') await deps.plugin.stageDrop({ id: d.stage }).catch(() => {});
+        return;
+      }
       if (d?.id && deps.native) await deps.plugin.cancel({ id: d.id }).catch(() => {});
     },
   };

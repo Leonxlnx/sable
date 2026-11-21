@@ -150,17 +150,17 @@ function Meta({ items, data, leadText, status }: { items: boolean; data?: PhoneC
   return (
     <div className="chg-meta">
       <span className="chg-where">
-        <Icon name={icon} size={15} />
+        <Icon name={icon} size={16} />
         <span className="chg-where-text">{label}</span>
         {!!data?.ahead && (
           <span className="chg-ab num" aria-label={`${plural(data.ahead, 'commit')} ahead`}>
-            <Icon name="up" size={11} weight="bold" />
+            <Icon name="up" size={12} weight="bold" />
             {data.ahead}
           </span>
         )}
         {!!data?.behind && (
           <span className="chg-ab num" aria-label={`${plural(data.behind, 'commit')} behind`}>
-            <Icon name="down" size={11} weight="bold" />
+            <Icon name="down" size={12} weight="bold" />
             {data.behind}
           </span>
         )}
@@ -198,13 +198,13 @@ const FileRow = memo(function FileRow({ f, notes, onOpen }: { f: PhoneChangedFil
         {!!f.edits && f.edits > 1 && <span className="chg-edits num">{f.edits} edits</span>}
         {notes > 0 && (
           <span className="chg-notes num">
-            <Icon name="comment" size={13} />
+            <Icon name="comment" size={14} />
             {notes}
           </span>
         )}
         <Stat add={f.additions} del={f.deletions} />
       </span>
-      <Icon name="next" size={15} className="chg-chev" />
+      <Icon name="next" size={16} className="chg-chev" />
     </button>
   );
 });
@@ -264,7 +264,7 @@ function ReviewBar({ sid, onOpen }: { sid: string; onOpen: () => void }) {
   return (
     <div className="composer-bar rp-bar">
       <button type="button" className="setup-chip rp-count" aria-haspopup="dialog" onPointerDown={(e) => e.preventDefault()} onClick={() => (haptic('tap'), onOpen())}>
-        <Icon name="comment" size={15} className="setup-chip-mode" />
+        <Icon name="comment" size={16} className="setup-chip-mode" />
         <span className="setup-chip-model num">{commentCount(n)}</span>
         <Icon name="updown" size={12} weight="bold" className="setup-chip-caret" />
       </button>
@@ -649,7 +649,7 @@ export function DiffScreen({ id, path, items }: { id: string; path: string; item
               setWrap((w) => (writeFlag(WRAP_KEY, !w), !w));
             }}
           >
-            <Icon name="wrap" size={19} />
+            <Icon name="wrap" size={20} />
           </button>
         ) : (
           <span className="icon-btn-spacer" />
@@ -677,11 +677,11 @@ export function DiffScreen({ id, path, items }: { id: string; path: string; item
                       />
                       <div className="composer-bar">
                         <button type="button" className="tool-key" aria-label="Cancel" onPointerDown={(e) => e.preventDefault()} onClick={() => (haptic('tap'), cancel())}>
-                          <Icon name="x" size={17} />
+                          <Icon name="x" size={18} />
                         </button>
                         {editing && (
                           <button type="button" className="tool-key" aria-label="Delete comment" onPointerDown={(e) => e.preventDefault()} onClick={remove}>
-                            <Icon name="trash" size={17} />
+                            <Icon name="trash" size={18} />
                           </button>
                         )}
                         <span className="bar-gap" />

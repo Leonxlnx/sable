@@ -18,6 +18,7 @@ import { LogoMark, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles, type Tone }
 import { nowOf, REVEAL, SNAP, SPRING } from '@m/ui/motion';
 import { Pull } from '@m/ui/Pull';
 import { usePending } from '@m/lib/pending';
+import { onForget } from '@m/lib/forget';
 import { HomeDock } from './HomeDock';
 import { LimitsSheet } from './Limits';
 import { SearchResults } from './Search';
@@ -41,6 +42,13 @@ export const folderKey = (s: SessionMeta) => (s.chat ? '::chats' : norm(homeFold
 export const folderName = (s: SessionMeta, projects: Project[]) => (s.chat ? 'Chats' : (projects.find((p) => norm(p.path) === norm(homeFolder(s)))?.name ?? baseName(homeFolder(s))));
 
 const FILTER = 'sable.homeFilter';
+onForget(() => {
+  try {
+    localStorage.removeItem(FILTER);
+  } catch {
+    /* private mode */
+  }
+});
 const readFilter = () => {
   try {
     return localStorage.getItem(FILTER) ?? '';
@@ -212,13 +220,13 @@ export function Home({ under }: { under: boolean }) {
           <span className="home-bar-title">{name}</span>
           <div className="home-tools">
             <button type="button" className="icon-btn" aria-label="Search" aria-pressed={searching} onClick={() => (haptic('tap'), searching ? closeSearch() : setSearching(true))}>
-              <Icon name="search" size={21} />
+              <Icon name="search" size={22} />
             </button>
             <button type="button" className="icon-btn" aria-label="Limits" onClick={() => (haptic('tap'), setLimits(true))}>
-              <Icon name="gauge" size={21} />
+              <Icon name="gauge" size={22} />
             </button>
             <button type="button" className="icon-btn" aria-label="Settings" onClick={() => (haptic('tap'), nav.push({ name: 'settings' }))}>
-              <Icon name="gear" size={21} />
+              <Icon name="gear" size={22} />
             </button>
           </div>
         </header>
@@ -258,7 +266,7 @@ export function Home({ under }: { under: boolean }) {
 
           {!loaded && connState === 'offline' ? (
             <div className="unreachable">
-              <Icon name="offline" size={24} />
+              <Icon name="offline" size={22} />
               <p>Can't reach {desktop ?? 'the computer'}</p>
               <p className="unreachable-hint">Sable must be running there with Phone on.</p>
               <button type="button" className="btn" onClick={() => (haptic('tap'), conn.wake())}>
@@ -829,15 +837,15 @@ function Peek({ peek, onClose }: { peek: { id: string; rect: DOMRect } | null; o
               <>
                 <button type="button" className="peek-item" onClick={pin}>
                   <span>{s!.pinned ? 'Unpin' : 'Pin to top'}</span>
-                  <Icon name={s!.pinned ? 'unpin' : 'pin'} size={19} />
+                  <Icon name={s!.pinned ? 'unpin' : 'pin'} size={20} />
                 </button>
                 <button type="button" className="peek-item" onClick={() => (haptic('tap'), setRenaming(true))}>
                   <span>Rename</span>
-                  <Icon name="edit" size={19} />
+                  <Icon name="edit" size={20} />
                 </button>
                 <button type="button" className="peek-item" onClick={archive}>
                   <span>Archive</span>
-                  <Icon name="archive" size={19} />
+                  <Icon name="archive" size={20} />
                 </button>
               </>
             )}

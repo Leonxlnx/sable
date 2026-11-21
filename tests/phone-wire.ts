@@ -3,6 +3,9 @@
  * own module (mobile/src/lib/secure.ts, WebCrypto), or plain frames as a phone paired before it did.
  * Frames come in order, opened; `call` seals an RPC and waits for its answer.
  */
+import { createHash } from 'node:crypto';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { expect } from 'vitest';
 import WebSocket from 'ws';
 import { PHONE_PATH, type PhoneStatus } from '@shared/protocol';
@@ -119,7 +122,7 @@ export async function handshake(c: WireClient, kind: 'pair' | 'hello', fingerpri
   return {};
 }
 
-export const keyOf = (s: PhoneStatus) => /[?&]k=([^&]+)/.exec(s.pairing!.link)![1];
+export const keyOf = (s: PhoneStatus) => /[?&]s=([^&]+)/.exec(s.pairing!.link)![1];
 export const fingerprintIn = (s: PhoneStatus) => /[?&]f=([^&]+)/.exec(s.pairing!.link)![1];
 
 /** Pairs a phone over the secure channel, "Allow" clicked on the desktop. */
@@ -144,4 +147,47 @@ export async function helloSecure(port: number, p: { deviceId: string; token: st
   const r = await handshake(c, 'hello', p.fingerprint, await pskOfToken(p.token), p.deviceId);
   if (!r.denied) c.send({ hello: { token: p.token } });
   return { c, ...r };
+}
+
+/**
+ * A phone paired before the secure channel, as phone.json held it (written before the App starts,
+ * phone access on): its device and its token, which it sends plain.
+ */
+export function legacyPairing(home: string, devices: { id?: string; token?: string; name?: string }[] = [{}]) {
+  const out = devices.map((d, i) => ({ deviceId: d.id ?? `old-phone-${i}`, token: d.token ?? `old-phone-token-${i}-0123456789abcdef0123456789`, name: d.name ?? `Old phone ${i}` }));
+  const stored = out.map((d) => ({ id: d.deviceId, name: d.name, tokenHash: createHash('sha256').update(d.token).digest('hex'), pairedAt: 1 }));
+  mkdirSync(home, { recursive: true });
+  writeFileSync(path.join(home, 'phone.json'), JSON.stringify({ enabled: true, devices: stored }));
+  return out;
+}
+
+/** A phone paired before the secure channel connecting as it did: its token in the first plain frame. */
+export async function helloPlain(port: number, token: string) {
+  const c = wireClient(port);
+  await c.open;
+  c.send({ hello: { token } });
+  await c.next((f) => 'welcome' in f);
+  return c;
+}
+
+/**
+ * A shared file over the secure channel, as the phone fetches it: `phone.fileStart`, then each chunk
+ * in order (`chunk` bytes at a time, at most the desktop's), then `phone.fileEnd`. The bytes, or the
+ * desktop's refusal.
+ */
+export async function fetchSecure(c: WireClient, params: { sessionId: string; itemId: string; index: number }, chunk?: number): Promise<{ ok: true; start: { transfer: string; name: string; size: number; sha256: string; chunk: number }; bytes: Buffer } | { ok: false; error: string }> {
+  const s = (await c.call('phone.fileStart', params, 10_000)) as { ok: boolean; result?: { transfer: string; name: string; size: number; sha256: string; chunk: number }; error?: string };
+  if (!s.ok || !s.result) return { ok: false, error: s.error ?? 'refused' };
+  const parts: Buffer[] = [];
+  let at = 0;
+  while (at < s.result.size) {
+    const r = (await c.call('phone.fileChunk', { transfer: s.result.transfer, offset: at, ...(chunk ? { length: chunk } : {}) }, 10_000)) as { ok: boolean; result?: { data: string }; error?: string };
+    if (!r.ok || !r.result) return { ok: false, error: r.error ?? 'refused' };
+    const b = Buffer.from(r.result.data, 'base64');
+    if (!b.length) break;
+    parts.push(b);
+    at += b.length;
+  }
+  await c.call('phone.fileEnd', { transfer: s.result.transfer });
+  return { ok: true, start: s.result, bytes: Buffer.concat(parts) };
 }

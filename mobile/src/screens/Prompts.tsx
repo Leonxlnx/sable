@@ -5,7 +5,7 @@ import { fit } from '@m/lib/fit';
 import { pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
 import { diffLines, renderMarkdown } from '@m/lib/md';
-import { answerCall, optionKey, patchLines, permissionKeys, questionKey, questionsDesktopOnly } from '@m/lib/asks';
+import { answerCall, fileLabel, optionKey, patchLines, permissionKeys, questionKey, questionsDesktopOnly, scopeOf } from '@m/lib/asks';
 import { haptic } from '@m/lib/native';
 import { sessionData, setState, useStore } from '@m/lib/store';
 import { AutoHeight } from '@m/ui/AutoHeight';
@@ -110,7 +110,9 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
   // request the phone got shortened grants nothing here: the desktop has all of it (lib/asks.ts).
   const { grants, denials, desktopOnly } = permissionKeys(req);
   const command = d.command && d.command.trim() !== req.title.trim() ? d.command : undefined;
-  const path = !command && d.path && !req.title.includes(d.path.split(/[\\/]/).pop() ?? '\u0000') ? d.path : undefined;
+  // Where it reaches, whole: the command's folder, the file's path, every changed file (a rename by both ends).
+  const scope = scopeOf(req);
+  const path = scope.path;
   // What a write would put in a file, when no change shows it.
   const content = !req.diff?.length && typeof d.content === 'string' && d.content ? d.content : undefined;
   // Files a share would hand over, each by its whole path (one outside the chat's folder is allowed only by name here).
@@ -134,7 +136,13 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
           {command}
         </pre>
       )}
-      {path && (
+      {scope.cwd && (
+        <div className="ask-well">
+          <Icon name="folder" size={16} />
+          <PathLabel path={scope.cwd} />
+        </div>
+      )}
+      {path && !content && (
         <div className="ask-well">
           <Icon name="file" size={16} />
           <PathLabel path={path} />
@@ -156,14 +164,24 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
           ))}
         </div>
       )}
+      {req.diff && (req.diff.length > 1 || req.diff.some((f) => f.oldPath && f.oldPath !== f.path)) && (
+        <div className="ask-files">
+          {req.diff.map((f, i) => (
+            <div key={`${f.path}:${i}`} className="ask-well">
+              <Icon name="file" size={16} />
+              {f.oldPath && f.oldPath !== f.path ? <span className="ask-path">{fileLabel(f)}</span> : <PathLabel path={f.path} />}
+            </div>
+          ))}
+        </div>
+      )}
       {req.diff && req.diff.length > 0 && (
         <div className="ask-diff-card">
           <button type="button" className="ask-diff num" aria-expanded={showDiff} onClick={() => (haptic('select'), setShowDiff((v) => !v))}>
             <Icon name="file" size={16} />
-            <span className="ask-diff-name">{req.diff.length === 1 ? req.diff[0].path.split(/[\\/]/).pop() : `${req.diff.length} files`}</span>
+            <span className="ask-diff-name">{req.diff.length === 1 ? <PathLabel path={req.diff[0].path} /> : `${req.diff.length} files`}</span>
             <span className="add">+{add}</span>
             <span className="del">−{del}</span>
-            <Icon name="caretDown" size={13} weight="bold" className="ask-diff-caret" />
+            <Icon name="caretDown" size={14} weight="bold" className="ask-diff-caret" />
           </button>
           <AnimatePresence initial={false}>
             {showDiff && (
@@ -178,9 +196,9 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
         <div className="ask-diff-card">
           <button type="button" className="ask-diff num" aria-expanded={showDiff} onClick={() => (haptic('select'), setShowDiff((v) => !v))}>
             <Icon name="file" size={16} />
-            <span className="ask-diff-name">{d.path ? d.path.split(/[\\/]/).pop() : 'New file'}</span>
+            <span className="ask-diff-name">{d.path ? <PathLabel path={d.path} /> : 'New file'}</span>
             <span className="ask-diff-lines">{content.split('\n').length} lines</span>
-            <Icon name="caretDown" size={13} weight="bold" className="ask-diff-caret" />
+            <Icon name="caretDown" size={14} weight="bold" className="ask-diff-caret" />
           </button>
           <AnimatePresence initial={false}>
             {showDiff && (

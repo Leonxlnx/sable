@@ -124,15 +124,15 @@ export function MessageMenu() {
               >
                 <button type="button" role="menuitem" className="msg-item" disabled={busy} onClick={() => void run('copy')}>
                   <span>Copy</span>
-                  <Icon name="copy" size={19} />
+                  <Icon name="copy" size={20} />
                 </button>
                 <button type="button" role="menuitem" className="msg-item" disabled={busy} onClick={() => void run('select')}>
                   <span>Select text</span>
-                  <Icon name="select" size={19} />
+                  <Icon name="select" size={20} />
                 </button>
                 <button type="button" role="menuitem" className="msg-item" disabled={busy} onClick={() => void run('share')}>
                   <span>Share</span>
-                  <Icon name="share" size={19} />
+                  <Icon name="share" size={20} />
                 </button>
               </motion.div>
             </div>
