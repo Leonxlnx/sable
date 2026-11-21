@@ -1,6 +1,7 @@
 import { memo, useMemo, useRef, type CSSProperties, type ReactNode } from 'react';
 import type { ToolItem, WorkflowRun } from '@shared/protocol';
 import { userItemText } from '@shared/synthetic';
+import { worksInBackground } from '@shared/background';
 import { ProviderMark, Ring } from '@/art/Logo';
 import { Collapse } from '@/components/Collapse';
 import { agentProvider, agentTask, isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
@@ -199,7 +200,7 @@ function Since({ ts }: { ts: number }) {
 function AgentLive({ item, progress: p, awaiting }: { item: ToolItem; progress: Progress; awaiting: boolean }) {
   // A run of quick steps reads as a calm sequence of titles, not a flicker.
   const now = useHeld(p.now, 700);
-  const bg = item.status === 'done' && item.result?.agent?.background === 'running';
+  const bg = item.status === 'done' && worksInBackground(item);
   const doing = awaiting ? 'Needs your approval' : now || (bg && !p.steps ? 'Working in the background' : 'Starting');
   return (
     <>

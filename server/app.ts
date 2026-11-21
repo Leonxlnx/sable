@@ -9,6 +9,7 @@ import {
   type AgentHandover,
   type UpdateState,
   type AccountInfo,
+  type AuthState,
   type AppState,
   type BridgeEvent,
   type Capabilities,
@@ -49,13 +50,14 @@ import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
 import { cutAt } from './core/fork';
 import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
-import { withBrowserLine } from './providers/browser-tool';
+import { allowsEverything, withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
 import { customOf } from './services/custom';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
 import { Lanes, worktreesRoot } from './core/lanes';
 import { isAllModelsWeekly } from './core/limit-policy';
+import { mergeWindows } from './services/limits';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
@@ -121,6 +123,10 @@ export class App {
   /** Last known sign-in per extra account (the default account asks its provider every time, as before). */
   private infoCache = new Map<string, Promise<ProviderInfo>>();
   private limitsCache = new Map<string, RateLimit[]>();
+  /** Accounts whose last limits event named only some windows (`LimitsMeta.partial`): their cache lays over what the usage service knows. */
+  private limitsPartial = new Set<string>();
+  /** Called when an account's old limits are no longer its own (its sign-in changed): the usage service forgets them. */
+  private limitsForgetters: ((provider: ProviderId, accountId: string) => void)[] = [];
   /** What each account's agent last said beside its windows (credits, extra usage), merged. */
   private limitsMeta = new Map<string, LimitsMeta>();
   /** Per agent: the limit handover moved sessions off the preferred account; new sessions use `to` until `until`. */
@@ -345,6 +351,8 @@ export class App {
       // Remote links and live capability state belong to the agent process that is gone.
       meta.remote = meta.options?.remoteControl ? { status: 'Reconnects when the agent starts again', tone: 'waiting' } : undefined;
       meta.capState = undefined;
+      // Background work lived in the agent process that is gone (its steps are stopped as the chat is read: `loadRestored`).
+      meta.background = undefined;
       // An until loop does not outlive Sable: the session says so when it is opened.
       if (meta.until) this.untilLost.set(meta.id, meta.until), (meta.until = undefined);
       // A chat titled from a message the agent's harness wrote (`<task-notification>`): its plain words.
@@ -494,6 +502,8 @@ export class App {
       case 'limits.updated': {
         const key = accountKey(e.provider, accountId);
         this.limitsCache.set(key, e.limits);
+        if (e.meta?.partial) this.limitsPartial.add(key);
+        else this.limitsPartial.delete(key);
         if (e.meta) this.limitsMeta.set(key, { ...this.limitsMeta.get(key), ...e.meta });
         this.limitsSeq.set(key, (this.limitsSeq.get(key) ?? 0) + 1);
         this.scheduleResetAlert();
@@ -620,7 +630,39 @@ export class App {
         };
       }),
     );
+    this.noteSignIns(provider, accounts);
     return { ...base, accounts };
+  }
+
+  /**
+   * The sign-in each account's limits were read under. One that changed (another person, a
+   * subscription replaced by an API key) makes the old reading another account's: it is forgotten
+   * (review wave 7, #3).
+   */
+  private noteSignIns(provider: ProviderId, accounts: AccountInfo[]) {
+    for (const a of accounts) {
+      if (!a.auth.loggedIn) continue;
+      const now = signInOf(a.auth);
+      const key = `signin:${accountKey(provider, a.id)}`;
+      const was = this.cache.get<SignIn>(key);
+      if (was && was.apiKey === now.apiKey && (was.email ?? '') === (now.email ?? was.email ?? '')) continue;
+      // The same sign-in told with its address now: kept, nothing forgotten.
+      this.cache.set(key, { ...now, email: now.email ?? was?.email });
+      if (was && (was.apiKey !== now.apiKey || (!!was.email && !!now.email && was.email !== now.email))) this.forgetLimits(provider, a.id);
+    }
+  }
+
+  private forgetLimits(provider: ProviderId, accountId: string) {
+    const key = accountKey(provider, accountId);
+    this.limitsCache.delete(key);
+    this.limitsPartial.delete(key);
+    this.limitsMeta.delete(key);
+    for (const fn of this.limitsForgetters) fn(provider, accountId);
+  }
+
+  /** The usage service forgets an account's limits when they are no longer its own (`noteSignIns`). */
+  onLimitsForgotten(fn: (provider: ProviderId, accountId: string) => void) {
+    this.limitsForgetters.push(fn);
   }
 
   private async emitProvider(provider: ProviderId, force?: string) {
@@ -850,13 +892,12 @@ export class App {
   }
 
   private loadInto(rt: SessionRuntime, file: ReturnType<Store['loadSession']>) {
-    rt.load(file.items, file.todos, file.queue ?? []);
-    rt.markSaved();
+    // No agent process carries anything from before: background sub-agents and workflows ended with it
+    // (stopped as read, so the count never shows them, also not on the way).
+    rt.loadRestored(file.items, file.todos, file.queue ?? []);
     // A file that is there but cannot be read is left exactly as it is (nothing is written to it).
     if (file.unreadable) rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Restart Sable to try again.');
     rt.settle('cancelled');
-    // No agent process carries anything from before: background sub-agents and workflows ended with it.
-    rt.stopBackground();
     // Messages still waiting for the agent when Sable closed (a steer not taken yet) would wait forever: back to the queue.
     rt.returnUntaken({ all: true, reason: 'closed' });
     const lost = this.untilLost.get(rt.id);
@@ -1001,6 +1042,8 @@ export class App {
 
   /** Sessions whose model changed while their agent was there: it takes the model right before the next message (`speed`: the speed fell back too). */
   private modelDue = new Map<string, { speed: boolean }>();
+  /** Sessions whose agent has not taken the mode a phone chose while work ran (`session.setMode`): it goes with the next message. */
+  private modeDue = new Set<string>();
 
   /**
    * Sets the session's model. Nothing goes to the agent now: a running agent takes it right
@@ -1019,8 +1062,16 @@ export class App {
     if (rt.handle || this.opening.has(rt.id)) this.modelDue.set(rt.id, { speed: speed || !!this.modelDue.get(rt.id)?.speed });
   }
 
+  /** A mode a phone chose during earlier work goes to the agent and answers at once from this message on (never inside a running turn). */
+  private async applyModeDue(rt: SessionRuntime, handle: ProviderSession) {
+    if (rt.turnActive || !(rt.dangerHeld || this.modeDue.has(rt.id))) return;
+    rt.dangerHeld = false;
+    if (this.modeDue.delete(rt.id)) await handle.setMode(rt.meta.mode).catch((err: Error) => this.log('mode change failed', err.message));
+  }
+
   /** A model chosen since the agent started goes to it now (never into a running turn: a steer leaves it for the next message). */
   private async applyDue(rt: SessionRuntime, handle: ProviderSession) {
+    await this.applyModeDue(rt, handle);
     const due = this.modelDue.get(rt.id);
     if (!due || rt.turnActive) {
       // An effort the running agent did not take when it was chosen goes with this message (a change
@@ -1149,9 +1200,14 @@ export class App {
       const reports = await this.call('usage.limits', {}).catch(() => []);
       for (const r of reports) if (r.provider === provider) out.set(r.accountId, { limits: r.limits, planLimits: r.planLimits });
     }
+    // This run's last read: whole, it is the account's; partial (some windows only), it lays over the
+    // merged report by window, never a shorter list in its place (review wave 7, #9).
     for (const a of this.accountList(provider)) {
-      const l = this.limitsCache.get(accountKey(provider, a.id));
-      if (l?.length) out.set(a.id, { ...out.get(a.id), limits: l });
+      const key = accountKey(provider, a.id);
+      const l = this.limitsCache.get(key);
+      if (!l?.length) continue;
+      const known = out.get(a.id)?.limits;
+      out.set(a.id, { ...out.get(a.id), limits: this.limitsPartial.has(key) && known?.length ? mergeWindows(known, l) : l });
     }
     return out;
   }
@@ -1159,12 +1215,32 @@ export class App {
   /**
    * The signed-in account of `provider` to go on with, other than `current`: under its own cap, one
    * on the same plan first, then the most room (with `model`, other models' full windows do not
-   * count); with `byCap`, the next one in the person's order and never an API key. Undefined when
-   * none has room.
+   * count); with `byCap`, the next one in the person's order and never an API key; with the person's
+   * own order chosen (`accountsBy: 'manual'`), the first in it. Undefined when none has room.
+   * `rt`: the chat that moves: its effective model decides which windows count (the alias "default"
+   * is the model it names, as the Spare planner reads it), and an account whose known models leave out
+   * the chat's own is not taken. `except`: accounts that already refused this message.
    */
-  async nextAccount(provider: ProviderId, current: string, model?: string, byCap = false): Promise<string | undefined> {
-    const [info, known] = await Promise.all([this.providerInfo(provider), this.knownLimits(provider)]);
+  async nextAccount(provider: ProviderId, current: string, opts: { model?: string; cwd?: string; rt?: SessionRuntime; byCap?: boolean; except?: Iterable<string> } = {}): Promise<string | undefined> {
+    // The sign-ins first: one that changed forgets its old limits before they are read.
+    const info = await this.providerInfo(provider);
+    const known = await this.knownLimits(provider);
     const accounts = info.accounts ?? [];
+    const cwd = opts.rt?.meta.cwd ?? opts.cwd;
+    const capsOf = (accountId: string) => this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, accountId));
+    const chosen = opts.rt ? opts.rt.meta.model : opts.model;
+    const ownCaps = (opts.rt?.caps ?? capsOf(current))?.models;
+    const model = effectiveModel(chosen || undefined, ownCaps, this.store.state.settings.defaultModels[provider]);
+    // The chat's own model as its account lists it: another account whose known list leaves it out cannot take the chat (review wave 7, #12).
+    const named = chosen && chosen !== 'default' && ownCaps?.some((m) => m.id === chosen) ? chosen : undefined;
+    const offers = (accountId: string) => {
+      if (!named) return true;
+      const models = capsOf(accountId)?.models;
+      return !models?.length || models.some((m) => m.id === named);
+    };
+    const except = new Set(opts.except ?? []);
+    for (const a of accounts) if (a.id !== current && !offers(a.id)) except.add(a.id);
+    const manual = this.store.state.settings.accountsBy === 'manual';
     return pickNextAccount(
       current,
       accounts.map((a) => ({
@@ -1172,14 +1248,14 @@ export class App {
         signedIn: a.auth.loggedIn,
         isDefault: a.isDefault,
         limits: known.get(a.id)?.limits ?? a.limits,
-        // An API key bills per token: known as such from its sign-in even before its limits were read.
-        planLimits: known.get(a.id)?.planLimits ?? (/api/i.test(a.auth.method ?? '') || /^(api key|console)$/i.test(a.auth.plan ?? '') ? false : undefined),
+        // An API key bills per token: known as such from its sign-in now, whatever an older limits report said (review wave 7, #3).
+        planLimits: isApiKeyAuth(a.auth) ? false : known.get(a.id)?.planLimits,
         cap: this.capOf(provider, a.id),
         plan: a.auth.plan,
         weight: planWeight(provider, a.auth),
       })),
       Date.now(),
-      { model: model || undefined, plan: accounts.find((a) => a.id === current)?.auth.plan, byCap, useFirst: this.store.state.settings.accountsBy !== 'manual' },
+      { model, plan: accounts.find((a) => a.id === current)?.auth.plan, byCap: opts.byCap, useFirst: !manual, manual, except },
     );
   }
 
@@ -1205,7 +1281,7 @@ export class App {
     const known = await this.knownLimits(provider);
     const reached = capReached(known.get(accountId)?.limits, cap, model || undefined);
     if (!reached) return undefined;
-    const next = await this.nextAccount(provider, accountId, model, true).catch(() => undefined);
+    const next = await this.nextAccount(provider, accountId, { model, byCap: true }).catch(() => undefined);
     if (!next) return undefined;
     return { to: next, line: `Started with ${this.accountLabel(provider, next)}: ${capReason(this.accountLabel(provider, accountId), reached)}` };
   }
@@ -1235,7 +1311,7 @@ export class App {
     const reached = capReached(known.get(from)?.limits, this.capOf(provider, from), model);
     if (!reached) return;
     // The next account in the person's order, never an API key (a cap does not start paying per token).
-    const next = await this.nextAccount(provider, from, model, true).catch(() => undefined);
+    const next = await this.nextAccount(provider, from, { rt, byCap: true }).catch(() => undefined);
     // Never mid-turn: a turn that started meanwhile runs on, and its end checks again.
     if (rt.turnActive || (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from || this.sessions.get(rt.id) !== rt) return;
     const name = this.accountLabel(provider, from);
@@ -1263,7 +1339,12 @@ export class App {
     const own = (known.get(accountId)?.limits ?? []).filter((l) => l.percent >= 100);
     // Every window that is used up has to reset before the account can work again.
     const full = own.sort((a, b) => (b.resetsAt ?? 0) - (a.resetsAt ?? 0))[0];
-    const next = await this.nextAccount(provider, accountId, rt.meta.model).catch(() => undefined);
+    // The accounts that already refused this message are not tried again (review wave 7, #10).
+    const refused = this.refusedMessage(rt);
+    const done = this.autoContinued.get(rt.id) ?? new Set<string>();
+    const mark = `${refused?.id ?? ''}:`;
+    const tried = [...done].flatMap((k) => (k.startsWith(mark) ? [k.slice(mark.length)] : []));
+    const next = await this.nextAccount(provider, accountId, { rt, except: tried }).catch(() => undefined);
     const limit = { ...notice.limit, provider, accountId, resetsAt: notice.limit?.resetsAt ?? full?.resetsAt, window: notice.limit?.window ?? full?.label, ...(next ? { next } : {}) };
     rt.patch<NoticeItem>(notice.id, { limit });
     if (spare) return;
@@ -1273,11 +1354,11 @@ export class App {
     // No other account takes over: the chat waits for this account's reset and then carries on by itself.
     if (!moves && !rt.turnActive && settings.continueAtReset) this.spare.atReset(rt);
     if (!moves || rt.turnActive) return;
-    const refused = this.refusedMessage(rt);
-    const done = this.autoContinued.get(rt.id) ?? new Set<string>();
-    const key = `${refused?.id ?? ''}:${next}`;
+    const key = `${mark}${next}`;
     if (done.has(key)) return;
     done.add(key);
+    // This account refused it: a later limit of the same message does not come back here.
+    done.add(`${mark}${accountId}`);
     this.autoContinued.set(rt.id, done);
     this.movedByLimit(rt, accountId, next, full?.resetsAt ?? limit.resetsAt);
     await this.switchAccount(rt, next, { retry: true });
@@ -1304,7 +1385,8 @@ export class App {
     const meta = this.limitsMeta.get(accountKey(provider, accountId));
     if (!runningOnCredits(meta)) return;
     const settings = this.store.state.settings;
-    const next = settings.continueAtLimit ? await this.nextAccount(provider, accountId).catch(() => undefined) : undefined;
+    // The chat's model goes along: only its own windows and the shared ones count (review wave 7, #13).
+    const next = settings.continueAtLimit ? await this.nextAccount(provider, accountId, { rt }).catch(() => undefined) : undefined;
     const decision = decideAtLimit({ creditsAllowed: !!settings.creditsAtLimit?.[creditsKey(provider, accountId)], creditsAvailable: true, continueAtLimit: !!settings.continueAtLimit, next });
     if (decision === 'credits' || rt.turnActive) return;
     const until = meta?.extra?.resetsAt ?? meta?.credits?.resetsAt;
@@ -1498,6 +1580,7 @@ export class App {
       const handle = await this.ensureHandle(rt);
       // Asked again once the new account's agent is there, and by the agent's own dispatch.
       still(ctx);
+      await this.applyModeDue(rt, handle);
       const unhand = this.handOver(rt, refused.id);
       try {
         await handle.send(this.withHandover(rt, this.resumeMessage(rt, refused, carried)), { check: () => still(ctx) });
@@ -2487,7 +2570,18 @@ export class App {
     });
     this.register('session.setMode', async ({ sessionId, mode, answerWaiting }) => {
       const rt = this.runtime(sessionId);
-      await rt.handle?.setMode(mode);
+      const danger = rt.caps?.modes.find((m) => m.id === mode)?.tone === 'danger' || allowsEverything(mode);
+      // A mode that never asks, chosen from a phone while work runs, answers that work's asks only from the
+      // next message on (review wave 7, #1): the phone could not be shown them. Claude Code's own mode
+      // waits for it too (in Bypass the CLI would stop asking at once); the switch goes with the next message.
+      if (answerWaiting === false && danger && (rt.turnActive || (rt.meta.background ?? 0) > 0)) {
+        rt.dangerHeld = true;
+        this.modeDue.add(rt.id);
+      } else {
+        rt.dangerHeld = false;
+        this.modeDue.delete(rt.id);
+        await rt.handle?.setMode(mode);
+      }
       rt.update({ mode });
       // The mode that never asks (Bypass, Full access) answers what already waits too; questions stay.
       // A phone answers only what it may itself (`answerWaiting: false`, phone.ts).
@@ -2836,4 +2930,20 @@ function capsCacheKey(provider: ProviderId, accountId: string, cwd?: string) {
 
 function fallbackInfo(p: Provider) {
   return { id: p.id, name: p.name, installed: false, auth: { loggedIn: false }, problem: 'Could not query the CLI' };
+}
+
+/** A sign-in that bills per token (an API key, the Console): never a plan with a week to use up. */
+export function isApiKeyAuth(auth: AuthState): boolean {
+  return /api/i.test(auth.method ?? '') || /^(api key|console)$/i.test(auth.plan ?? '');
+}
+
+/** Who an account is signed in as, for telling a changed sign-in (another person, a key in place of a plan). */
+interface SignIn {
+  apiKey: boolean;
+  email?: string;
+}
+
+function signInOf(auth: AuthState): SignIn {
+  const email = auth.email?.trim().toLowerCase();
+  return { apiKey: isApiKeyAuth(auth), ...(email ? { email } : {}) };
 }

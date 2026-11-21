@@ -1,4 +1,5 @@
 import type { AgentLeg, NoticeItem, ProviderId, SessionMeta, TimelineItem } from '../../shared/protocol';
+import { worksInBackground } from '../../shared/background';
 
 /**
  * Switching a chat's agent in place (`session.switchAgent`): pure helpers for the agents a chat has
@@ -88,5 +89,5 @@ export function workedIn(range: TimelineItem[], before: ProviderId): ProviderId[
 
 /** Sub-agents or workflows still running in the background (they live in the agent's process). */
 export function backgroundRunning(items: TimelineItem[]): boolean {
-  return items.some((i) => i.type === 'tool' && (i.result?.agent?.background === 'running' || i.workflow?.status === 'running'));
+  return items.some(worksInBackground);
 }

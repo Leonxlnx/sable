@@ -682,7 +682,11 @@ const workflow: Scenario = async ({ s }) => {
   const push = (status: 'running' | 'done' = 'running') => {
     const tokens = rows.reduce((n, r) => n + (r.tokens ?? 0), 0);
     const steps = rows.reduce((n, r) => n + (r.steps ?? 0), 0);
-    s.patchTool(id, { workflow: { name: 'auth-hardening', phases, phase, agents: rows.map((r) => ({ ...r })), status, tokens, steps, ...(status === 'done' ? { durationMs: Date.now() - t0 } : {}) } });
+    s.patchTool(id, {
+      workflow: { name: 'auth-hardening', phases, phase, agents: rows.map((r) => ({ ...r })), status, tokens, steps, ...(status === 'done' ? { durationMs: Date.now() - t0 } : {}) },
+      // Its launch result follows the run's end, as Claude Code's task notification sets both.
+      ...(status === 'done' ? { result: { text: 'Workflow launched in the background.', agent: { background: 'done' as const } } } : {}),
+    });
   };
   const work = async (r: Row, acts: string[], end: { tokens: number; error?: string }) => {
     r.state = 'running';
@@ -891,6 +895,7 @@ const fleet: Scenario = async ({ s }) => {
   const push = (status: 'running' | 'done' = 'running') =>
     s.patchTool(wf, {
       workflow: { name: 'audit-fixes', phases, phase, agents: rows.map((r) => ({ ...r })), status, tokens: rows.reduce((n, r) => n + (r.tokens ?? 0), 0), steps: rows.reduce((n, r) => n + (r.steps ?? 0), 0), ...(status === 'done' ? { durationMs: Date.now() - t0 } : {}) },
+      ...(status === 'done' ? { result: { text: 'Workflow launched in the background.', agent: { background: 'done' as const } } } : {}),
     });
   const work = async (r: Row, acts: string[], tokens: number) => {
     r.state = 'running';

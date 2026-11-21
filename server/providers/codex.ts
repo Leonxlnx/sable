@@ -99,6 +99,7 @@ import type {
   GetAccountResponse,
   ItemDeltaNotification,
   ItemNotification,
+  ThreadItem,
   ListMcpServerStatusResponse,
   LoginAccountResponse,
   ModelListResponse,
@@ -251,6 +252,8 @@ export class CodexProvider implements Provider {
 
   /** threadId → session */
   readonly sessions = new Map<string, CodexSession>();
+  /** Codex's own sub-agents by their thread, to the chat whose spawn step shows them (news of their threads goes there). */
+  readonly receivers = new Map<string, CodexSession>();
   private rpc: CodexRpc | null = null;
   private starting: Promise<CodexRpc> | null = null;
   private disposed = false;
@@ -407,7 +410,9 @@ export class CodexProvider implements Provider {
         if (typeof tid !== 'string') return;
         const title = this.titleThreads.get(tid);
         if (title) return title(method, p);
-        this.sessions.get(tid)?.onNotification(method, p);
+        const session = this.sessions.get(tid);
+        if (session) return session.onNotification(method, p);
+        this.receivers.get(tid)?.onReceiverNews(tid, method, p);
       }
     }
   }
@@ -1004,6 +1009,27 @@ const IDLE_LOOKUP_TURNS = 5;
 const STRAY_MS = 60_000;
 
 
+type AgentBackground = NonNullable<NonNullable<NonNullable<ToolItem['result']>['agent']>['background']>;
+
+/** A Codex sub-agent's state (CollabAgentStatus) as background work: undefined when it says nothing known. */
+export function receiverStatus(status: string | undefined): AgentBackground | undefined {
+  switch (status) {
+    case 'pendingInit':
+    case 'running':
+      return 'running';
+    case 'completed':
+      return 'done';
+    case 'errored':
+      return 'failed';
+    case 'interrupted':
+    case 'shutdown':
+    case 'notFound':
+      return 'stopped';
+    default:
+      return undefined;
+  }
+}
+
 class CodexSession implements ProviderSession {
   threadId = '';
   /** The thread is loaded in the current app-server process. */
@@ -1012,7 +1038,19 @@ class CodexSession implements ProviderSession {
   private turnId?: string;
   private turnStarting?: Promise<unknown>;
   private queue: Queued[] = [];
+  /** The mode changed since a start last carried the policy: the next turn/start sends it. */
   private policyDirty = false;
+  /**
+   * Counts mode changes: a start's answer clears `policyDirty` only when no change came after it was
+   * sent (a switch while a Full access start is out must still reach the next turn; review wave 7, #2).
+   */
+  private policyRev = 0;
+  /**
+   * Codex's own sub-agents (a spawn's receiver threads) by thread id, to the spawn step that shows
+   * each: one still running when its spawn returned counts as background work until a later call, or
+   * its own thread, says it ended (review wave 7, #7).
+   */
+  private receivers = new Map<string, string>();
   private interruptTimer?: NodeJS.Timeout;
   private commandTimer?: NodeJS.Timeout;
   /** The thread reported idle while a turn was open: the turn ends unless turn/completed comes first. */
@@ -1180,6 +1218,7 @@ class CodexSession implements ProviderSession {
     const rt = this.rt;
     const rpc = await this.provider.client();
     const p = preset(rt.meta.mode);
+    const rev = this.policyRev;
     const config = this.threadConfig();
     const developerInstructions = await this.provider.developerInstructions(rt.meta.cwd, rt.meta);
     const params = {
@@ -1216,13 +1255,14 @@ class CodexSession implements ProviderSession {
     if (this.threadId && this.threadId !== resp.thread.id && this.provider.sessions.get(this.threadId) === this) this.provider.sessions.delete(this.threadId);
     this.threadId = resp.thread.id;
     this.loaded = true;
-    this.policyDirty = false;
+    if (rev === this.policyRev) this.policyDirty = false;
     this.provider.sessions.set(this.threadId, this);
     return { resp, resumed };
   }
 
   onServerDied(msg: string, detail?: string) {
     this.loaded = false;
+    this.dropReceivers();
     this.loadEpoch++;
     this.turnStarting = undefined;
     this.abortPrompts();
@@ -1256,6 +1296,7 @@ class CodexSession implements ProviderSession {
     clearTimeout(this.commandTimer);
     clearTimeout(this.idleTimer);
     this.queue = [];
+    this.dropReceivers();
     if (this.provider.sessions.get(this.threadId) === this) this.provider.sessions.delete(this.threadId);
     if (this.loaded) {
       const rpc = await this.provider.client().catch(() => null);
@@ -1275,6 +1316,7 @@ class CodexSession implements ProviderSession {
     // Applied as a turn/start override, like the model.
   }
   async setMode(_mode: string) {
+    this.policyRev++;
     this.policyDirty = true;
   }
 
@@ -1401,12 +1443,13 @@ class CodexSession implements ProviderSession {
     // The speed as a service tier (it persists for later turns); null asks for standard. Unchosen leaves Codex's own.
     const tier = serviceTierFor(rt.caps?.models.find((x) => x.id === rt.meta.model), rt.meta.speed);
     if (tier !== undefined) params.serviceTier = tier;
+    const rev = this.policyRev;
     if (this.policyDirty) {
       const p = preset(rt.meta.mode);
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }
-    if (await this.dispatchStart(gen, 'turn/start', params, check)) this.policyDirty = false;
+    if ((await this.dispatchStart(gen, 'turn/start', params, check)) && rev === this.policyRev) this.policyDirty = false;
   }
 
   /**
@@ -2199,6 +2242,54 @@ class CodexSession implements ProviderSession {
     }
   }
 
+  /** A finished call of Codex's own sub-agent tools: what it says of each receiver goes to the spawn step that shows it. */
+  private noteReceivers(item: Extract<ThreadItem, { type: 'collabAgentToolCall' }>, id: string) {
+    if (item.tool === 'spawnAgent' && item.status === 'completed') {
+      for (const tid of item.receiverThreadIds ?? []) {
+        this.receivers.set(tid, id);
+        this.provider.receivers.set(tid, this);
+      }
+    }
+    for (const [tid, state] of Object.entries(item.agentsStates ?? {})) if (state) this.receiverState(tid, receiverStatus(state.status));
+  }
+
+  /** News of a sub-agent's own thread: its turn ended, its thread closed or failed. */
+  onReceiverNews(tid: string, method: string, p: any) {
+    if (method === 'turn/completed') this.receiverState(tid, p?.turn?.status === 'failed' ? 'failed' : p?.turn?.status === 'interrupted' ? 'stopped' : 'done');
+    else if (method === 'thread/closed') this.receiverState(tid, 'stopped');
+    else if (method === 'thread/status/changed' && p?.status?.type === 'systemError') this.receiverState(tid, 'failed');
+  }
+
+  private receiverState(tid: string, state: AgentBackground | undefined) {
+    const spawn = this.receivers.get(tid);
+    if (!spawn || !state) return;
+    if (state === 'running') this.receiverLive.add(tid);
+    else {
+      this.receiverLive.delete(tid);
+      this.receivers.delete(tid);
+      if (this.provider.receivers.get(tid) === this) this.provider.receivers.delete(tid);
+    }
+    // A spawn with several receivers works while any of them does.
+    const live = [...this.receivers].some(([t, s]) => s === spawn && this.receiverLive.has(t));
+    const shown: AgentBackground = live ? 'running' : state;
+    const item = this.rt.get<ToolItem>(spawn);
+    if (item?.type !== 'tool' || item.status !== 'done') return;
+    const was = item.result?.agent?.background;
+    // An end is news only of one that was working (a spawn whose agent was done at once never was).
+    if (was === shown || (shown !== 'running' && was !== 'running')) return;
+    this.rt.patch<ToolItem>(spawn, { result: { ...item.result, agent: { ...item.result?.agent, background: shown } } });
+  }
+  private receiverLive = new Set<string>();
+
+  /** The sub-agents' app-server is gone, or this chat lets go of them: their steps work no more here. */
+  private dropReceivers() {
+    const spawns = new Set(this.receivers.values());
+    for (const tid of this.receivers.keys()) if (this.provider.receivers.get(tid) === this) this.provider.receivers.delete(tid);
+    this.receivers.clear();
+    this.receiverLive.clear();
+    if (spawns.size) this.rt.stopBackground((i) => spawns.has(i.id));
+  }
+
   private onItem(n: ItemNotification, completed: boolean) {
     const rt = this.rt;
     const item = n.item;
@@ -2243,6 +2334,7 @@ class CodexSession implements ProviderSession {
       if (d.type === 'tool' && patch.output === undefined) delete patch.output;
       rt.patch(id, patch as Partial<TimelineItem>);
     }
+    if (item.type === 'collabAgentToolCall') this.noteReceivers(item, id);
     if (rt.turnActive && d.type === 'tool') rt.update({ activity: 'Thinking' });
   }
 
@@ -2269,7 +2361,8 @@ class CodexSession implements ProviderSession {
    * Code's are in Bypass (the switch itself answered the ones already waiting, app.ts).
    */
   private fullAccess(): boolean {
-    return preset(this.rt.meta.mode).approval === 'never';
+    // Chosen from a phone during this work: its asks still wait (`SessionRuntime.dangerHeld`).
+    return this.rt.answersAtOnce(preset(this.rt.meta.mode).approval === 'never');
   }
 
   /** What Full access answers to each kind of ask: allowed once (a later switch back asks again). */

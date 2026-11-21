@@ -1,9 +1,12 @@
 import { useMemo } from 'react';
 import { DEFAULT_ACCOUNT, type ProviderId, type RateLimit } from '@shared/protocol';
+import { windowForModel } from '@shared/limit-windows';
 import { modelNameById } from '@/lib/models';
 import type { LimitLevel } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { clock } from './format';
+
+export { windowModel } from '@shared/limit-windows';
 
 /**
  * Which windows limit which model. A plan has windows for every model (the 5-hour one, the week of
@@ -13,27 +16,9 @@ import { clock } from './format';
  * the chat.
  */
 
-/** The model a window limits, by name ("fable", "opus"), or undefined when it limits every model. */
-export function windowModel(l: RateLimit): string | undefined {
-  if (l.id.startsWith('model_')) return l.id.slice('model_'.length);
-  const family = /^(?:five_hour|seven_day)_(opus|sonnet|haiku|fable)$/.exec(l.id);
-  if (family) return family[1];
-  // Codex names a model's own limit in front of the window ("GPT-5.3-Codex-Spark · 5-hour").
-  if (l.id.includes(':') && !l.id.startsWith('codex:')) {
-    const name = l.label.split(' · ')[0]?.trim();
-    return name || l.id.slice(0, l.id.indexOf(':'));
-  }
-  return undefined;
-}
-
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '');
-
-/** Whether a window holds back a model (by its id or its name); a window of every model always does. */
+/** Whether a window holds back a model (by its id or its name); a window of every model always does. The bridge's rule (shared/limit-windows.ts). */
 export function appliesTo(l: RateLimit, model: { id?: string; name?: string }): boolean {
-  const wm = windowModel(l);
-  if (!wm) return true;
-  const want = norm(wm);
-  return !!want && [model.id, model.name].some((x) => !!x && norm(x).includes(want));
+  return windowForModel(l, model);
 }
 
 export interface ModelLimits {

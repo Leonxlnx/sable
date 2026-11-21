@@ -333,7 +333,7 @@ function findItem(rt: SessionRuntime, op: BrowserOp): ToolItem | undefined {
 
 /** Asks before touching a page that is not on this machine; true when allowed. */
 async function permit(rt: SessionRuntime, op: BrowserOp, url: string, item: ToolItem | undefined, signal?: AbortSignal, input: Record<string, unknown> = {}): Promise<boolean | string> {
-  if (isLocalUrl(url) || allowsEverything(rt.meta.mode)) return true;
+  if (isLocalUrl(url) || rt.answersAtOnce(allowsEverything(rt.meta.mode))) return true;
   const host = shortUrl(url);
   const hosts = allowedHosts.get(rt) ?? new Set<string>();
   // Looking and acting are allowed apart: "read example.com for this session" never lets the agent click there.

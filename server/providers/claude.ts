@@ -1164,6 +1164,12 @@ class ClaudeSession implements ProviderSession {
   private idleTimer?: NodeJS.Timeout;
   /** Background tasks (agents, shells, monitors) running in this process, by task id. */
   private liveTasks = new Set<string>();
+  /**
+   * The step each task of this process belongs to (task id to item id), from the task events that named
+   * it: a task's end that names no step still finds it, and the live task list settles a step whose task
+   * is gone (review wave 7, #8).
+   */
+  private taskItems = new Map<string, string>();
   private costBase = 0;
   private lastTotalCost = 0;
   private retryNotice?: string;
@@ -1411,6 +1417,7 @@ class ClaudeSession implements ProviderSession {
     this.input = undefined;
     this.streams.clear();
     this.liveTasks.clear();
+    this.taskItems.clear();
     this.wakes = 0;
     this.cliState = undefined;
     this.owed = [];
@@ -1435,6 +1442,30 @@ class ClaudeSession implements ProviderSession {
       this.rt.notice('error', 'The agent process ended', text);
       this.awaiting.clear();
       this.rt.endTurn(text);
+    }
+  }
+
+  /** The step a task event belongs to: the one it names, or the one its task was seen with. */
+  private taskItem(m: Obj): ToolItem | undefined {
+    const id = m.tool_use_id ?? (m.task_id ? this.taskItems.get(String(m.task_id)) : undefined);
+    return id ? this.rt.get<ToolItem>(String(id)) : undefined;
+  }
+
+  /**
+   * The live task list is Claude Code's own word on what runs in the background: a step whose task is
+   * not on it, or any background step at all when nothing runs, has ended without its end reaching
+   * here (it is stopped). A step whose own call still runs is not background work yet.
+   */
+  private reconcileTasks() {
+    const called = (i: TimelineItem) => i.type === 'tool' && i.status !== 'running' && i.status !== 'pending' && i.status !== 'awaiting';
+    const gone = new Set<string>();
+    for (const [task, id] of this.taskItems) if (!this.liveTasks.has(task)) gone.add(id);
+    if (!this.liveTasks.size) this.rt.stopBackground(called);
+    else if (gone.size) this.rt.stopBackground((i) => gone.has(i.id) && called(i));
+    // A task off the list is forgotten once its step's call has returned (a running call's own end still comes).
+    for (const [task, id] of [...this.taskItems]) {
+      const item = this.rt.get(id);
+      if (!this.liveTasks.has(task) && (!item || called(item))) this.taskItems.delete(task);
     }
   }
 
@@ -1463,7 +1494,14 @@ class ClaudeSession implements ProviderSession {
     clearTimeout(this.idleTimer);
     dropRemote(this.remoteHolder);
     const q = this.q;
-    if (q) this.clearLiveState();
+    if (q) {
+      this.clearLiveState();
+      // Background sub-agents and workflows live in the process: they end with it (its pump, which
+      // settles them when the process ends by itself, skips a process let go here; review wave 7, #5).
+      this.liveTasks.clear();
+      this.taskItems.clear();
+      this.rt.stopBackground();
+    }
     this.q = undefined;
     this.cliState = undefined;
     this.input?.end();
@@ -1807,7 +1845,8 @@ class ClaudeSession implements ProviderSession {
     // Bypass runs everything without asking. Claude Code's own safety checks still send some calls
     // here in that mode (compound commands, deletes with a glob, protected paths): they run too. Only
     // real questions (AskUserQuestion, above) wait for the person.
-    if (bypassesAsking(rt.meta.mode)) {
+    // Bypass chosen from a phone while this work ran: its asks still wait (`SessionRuntime.dangerHeld`).
+    if (rt.answersAtOnce(bypassesAsking(rt.meta.mode))) {
       if (item && name === 'ExitPlanMode' && input.plan) rt.patch<ToolItem>(item.id, { input, detail: describeTool(name, input).detail });
       return { behavior: 'allow', updatedInput: input };
     }
@@ -2447,7 +2486,8 @@ class ClaudeSession implements ProviderSession {
         break;
       }
       case 'task_progress': {
-        const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
+        if (m.task_id && m.tool_use_id) this.taskItems.set(String(m.task_id), String(m.tool_use_id));
+        const item = this.taskItem(m);
         if (item?.workflow) {
           rt.patch<ToolItem>(item.id, { workflow: workflowProgress(item.workflow, m) });
           break;
@@ -2462,11 +2502,13 @@ class ClaudeSession implements ProviderSession {
       case 'background_tasks_changed':
         // Every live background task (replace, not merge): the process is kept open while any runs.
         this.liveTasks = new Set(((m.tasks as Obj[] | undefined) ?? []).map((t) => String(t.task_id)));
+        this.reconcileTasks();
         // The last one ended: messages held for this process's owed result can go to a new one.
         if (!this.liveTasks.size) this.release();
         break;
       case 'task_started': {
         if (m.task_id) this.liveTasks.add(String(m.task_id));
+        if (m.task_id && m.tool_use_id) this.taskItems.set(String(m.task_id), String(m.tool_use_id));
         const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
         if (item?.workflow && m.workflow_name && !item.workflow.name) rt.patch<ToolItem>(item.id, { workflow: { ...item.workflow, name: String(m.workflow_name) } });
         break;
@@ -2475,7 +2517,8 @@ class ClaudeSession implements ProviderSession {
         if (m.task_id) this.liveTasks.delete(String(m.task_id));
         if (!this.liveTasks.size) this.release();
         // How a sub-agent ended, with its own figures. For one started in the background this is the only word of it.
-        const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
+        const item = this.taskItem(m);
+        if (m.task_id) this.taskItems.delete(String(m.task_id));
         if (item?.workflow) {
           const run = workflowProgress(item.workflow, m);
           run.status = m.status === 'completed' ? 'done' : m.status === 'failed' ? 'failed' : 'stopped';

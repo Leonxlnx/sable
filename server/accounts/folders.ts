@@ -1,8 +1,8 @@
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { AccountCap, AccountFolder, AuthState, ProviderId, RateLimit } from '../../shared/protocol';
-import { capReached, windowForModel } from '../core/limit-policy';
-import { useFirst } from '../../shared/use-first';
+import { capPercent, capReached, isSessionWindow, windowForModel } from '../core/limit-policy';
+import { USE_FIRST_SESSION_CEILING, useFirst } from '../../shared/use-first';
 
 /**
  * Finding config folders people already keep for an agent ("~/.claude-work",
@@ -117,6 +117,22 @@ export function atCap(limits: RateLimit[] | undefined, now = Date.now(), model?:
   return (limits ?? []).some((l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now) && (model === undefined || windowForModel(l, model)));
 }
 
+/** Options of `pickNextAccount`. */
+export interface NextOptions {
+  /** The chat's model (its effective one: `effectiveModel`): other models' windows do not count. */
+  model?: string;
+  /** The current account's plan, to prefer one of the same size. */
+  plan?: string;
+  /** A move by a cap: the person's order after `current`, same plan first. */
+  byCap?: boolean;
+  /** Earliest expiry first (`shared/use-first.ts`). */
+  useFirst?: boolean;
+  /** `accountsBy: 'manual'`: the person's saved order decides, from the top (review wave 7, #15). */
+  manual?: boolean;
+  /** Accounts never taken (those that already refused this message). */
+  except?: Iterable<string>;
+}
+
 /**
  * The account to continue with when `current` is at a limit or past its cap: another signed-in
  * account that is neither at a limit nor past its own cap, one on the same plan as `opts.plan`
@@ -124,12 +140,14 @@ export function atCap(limits: RateLimit[] | undefined, now = Date.now(), model?:
  * winning a tie. With `opts.model`, a full window of another model does not count. With
  * `opts.byCap` (a move by a cap: "Ultra1 up to 95%, then Ultra2") the person's own order decides
  * instead of room: the next account after `current` in the list (same plan first, wrapping round).
- * With `opts.useFirst` (and not `byCap`) the one whose unused week ends soonest among those that take
- * work now (`shared/use-first.ts`), so the least quota expires unused; the room rule above decides
- * only when none of them can be placed that way (no weekly reading).
- * Never one without plan limits (an API key, billed per token). Undefined when none has room.
+ * With `opts.manual` the first in the person's order. With `opts.useFirst` (and neither of those)
+ * the one whose unused week ends soonest among those that take work now (`shared/use-first.ts`), so
+ * the least quota expires unused; when none takes work now, only one whose week was never read (and
+ * whose 5-hour window has room) may be taken by the room rule, never one it holds or counts spent.
+ * Never one without plan limits (an API key, billed per token), nor one in `opts.except`. Undefined
+ * when none has room.
  */
-export function pickNextAccount(current: string, accounts: NextCandidate[], now = Date.now(), opts: { model?: string; plan?: string; byCap?: boolean; useFirst?: boolean } = {}): string | undefined {
+export function pickNextAccount(current: string, accounts: NextCandidate[], now = Date.now(), opts: NextOptions = {}): string | undefined {
   const used = (a: NextCandidate) => {
     if (a.planLimits === false) return 0;
     const live = (a.limits ?? []).filter((l) => !(l.resetsAt && l.resetsAt <= now) && (opts.model === undefined || windowForModel(l, opts.model)));
@@ -139,13 +157,23 @@ export function pickNextAccount(current: string, accounts: NextCandidate[], now 
   const at = accounts.findIndex((a) => a.id === current);
   // Places after the current account in the list, wrapping round (the current one itself is never taken).
   const after = (a: NextCandidate) => (accounts.indexOf(a) - at + accounts.length) % accounts.length;
-  const ok = accounts.filter(
+  const except = new Set(opts.except ?? []);
+  let ok = accounts.filter(
     // Never an account without plan limits (an API key): Sable does not start paying per token by itself.
-    (a) => a.id !== current && a.signedIn && a.planLimits !== false && !atCap(a.limits, now, opts.model) && !capReached(a.limits, a.cap, opts.model, now),
+    (a) => a.id !== current && !except.has(a.id) && a.signedIn && a.planLimits !== false && !atCap(a.limits, now, opts.model) && !capReached(a.limits, a.cap, opts.model, now),
   );
+  if (opts.manual && !opts.byCap) return ok[0]?.id;
   if (opts.useFirst && !opts.byCap) {
-    const first = useFirst(ok, now, opts.model).find((r) => r.state === 'now');
+    const ranks = useFirst(ok, now, opts.model);
+    const first = ranks.find((r) => r.state === 'now');
     if (first) return first.id;
+    // None takes work now: only an account whose week is unread can still be the one, when its 5-hour window has room.
+    const unread = new Set(ranks.filter((r) => r.state === 'unknown').map((r) => r.id));
+    ok = ok.filter((a) => {
+      if (!unread.has(a.id)) return false;
+      const five = (a.limits ?? []).find((l) => isSessionWindow(l) && !(l.resetsAt && l.resetsAt <= now));
+      return !five || five.percent < Math.min(USE_FIRST_SESSION_CEILING, capPercent(a.cap?.session));
+    });
   }
   ok.sort((a, b) => tier(a) - tier(b) || (opts.byCap ? after(a) - after(b) : used(a) - used(b) || Number(!!b.isDefault) - Number(!!a.isDefault)));
   return ok[0]?.id;
