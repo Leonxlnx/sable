@@ -20,6 +20,13 @@ import { answerHello, fingerprintOf, loadIdentity, openFrame, readSecHello, seal
 import { qrMatrix } from '../server/services/qr';
 import { b64u, IdentityError, MalformedError, pskOfKey, pskOfToken, startHandshake } from '../mobile/src/lib/secure';
 import { fetchSecure, fingerprintIn, handshake, helloPlain, helloSecure, keyOf, legacyPairing, pairSecure, wireClient, type Frame } from './phone-wire';
+import { CONTAIN } from '../server/core/contain';
+
+// These tests are about the secure channel, not containment. Where no handle names its file (Windows), the
+// default ('none') counts every file as external, so a share reaches a phone only when the person
+// allowed it (review wave 5, #7: tests/contain.test.ts, tests/files-wave5.test.ts). Here the walks
+// ('walk') stand in for Linux's proof, so a plain file in the chat folder counts as inside as it does there.
+if (CONTAIN.how === 'none') CONTAIN.how = 'walk';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -300,13 +307,17 @@ describe('phones paired before the secure channel', () => {
     const home = mkdtempSync(path.join(tmpdir(), 'sable-phone-secure-'));
     const [a, b] = legacyPairing(home, [{ id: 'old-a' }, { id: 'old-b' }]);
     const { app, port } = await setup(home);
-    /** Pairs securely naming `replaces`; returns the device ids then on the desktop. */
+    /** Pairs securely naming `replaces`; returns the device ids then on the desktop (a replacement refused at once: none are added). */
     const pairNaming = async (replaces: unknown) => {
       const offer = await app.call('phone.pair', {});
       const c = wireClient(port);
       expect(await handshake(c, 'pair', fingerprintIn(offer), pskOfKey(keyOf(offer)))).toEqual({});
       c.send({ pair: { key: keyOf(offer), name: 'Old phone', replaces } });
-      await c.next((f) => 'waiting' in f);
+      const first = await c.next((f) => 'waiting' in f || 'denied' in f);
+      if ('denied' in first) {
+        c.ws.close();
+        return (await app.call('phone.status', {})).devices.map((d) => d.id);
+      }
       const asking = await app.call('phone.status', {});
       await app.call('phone.approve', { requestId: asking.request!.id, allow: true });
       await c.next((f) => 'welcome' in f);
@@ -325,13 +336,18 @@ describe('phones paired before the secure channel', () => {
     // The old token (what app 2.1 named) replaces nothing: a token never travels in a pairing.
     ids = await pairNaming({ id: b.deviceId, token: b.token });
     expect(ids).toContain(b.deviceId);
-    // Another phone's ticket, a wrong ticket: nothing; and a ticket tried wrong once is used up.
+    // Another phone's ticket, a wrong ticket: refused, nothing changes; a wrong try uses up nothing (wave 5, 6), so the real one still replaces it.
     const plainB = await helloPlain(port, b.token);
     const mb = (await plainB.call('phone.migrate')) as { result: { ticket: string } };
+    const before = ids.length;
     ids = await pairNaming({ id: b.deviceId, ticket: 'not-the-ticket-0123456789' });
     expect(ids).toContain(b.deviceId);
-    ids = await pairNaming({ id: b.deviceId, ticket: mb.result.ticket });
+    expect(ids).toHaveLength(before);
+    ids = await pairNaming({ id: a.deviceId, ticket: mb.result.ticket });
     expect(ids).toContain(b.deviceId);
+    expect(ids).toHaveLength(before);
+    ids = await pairNaming({ id: b.deviceId, ticket: mb.result.ticket });
+    expect(ids).not.toContain(b.deviceId);
     // A securely paired phone gets no ticket.
     const { c } = await pairSecure(app, port);
     expect(((await c.call('phone.migrate')) as { error?: string }).error).toBe('This phone is already paired securely.');

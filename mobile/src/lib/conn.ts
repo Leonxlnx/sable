@@ -2,10 +2,11 @@ import { PAIR_LINK_PREFIX, PHONE_PATH, type BridgeEvent, type PhoneFrame, type P
 
 /** Everything the phone may ask: the allowlisted bridge methods and the phone endpoint's own. */
 type Methods = RpcMethods & PhoneMethods;
-import { loadPairing, removePairing, savePairing } from './native';
+import { eraseNative, loadMark, loadPairing, removePairing, saveMark, savePairing, type EraseMark } from './native';
 import { mergeHosts, sameHosts } from './hosts';
 import { transportError } from './errors';
-import { runForget } from './forget';
+import { eraseAll, pageStorage } from './erase';
+import { FORGET_FAILED } from './credential';
 import { IdentityError, pskOfKey, pskOfToken, startHandshake, type Channel } from './secure';
 
 /** What the phone keeps after pairing: where the desktop is and the token it gave this phone. */
@@ -62,10 +63,43 @@ export function parsePairLink(text: string): PairOffer | null {
 /** A link from a desktop older than this app's pairing (`sable://pair?…`): it cannot pair securely. */
 export const isOldPairLink = (text: string) => /sable:\/\/pair\?/i.test(text);
 
+/**
+ * What the camera takes as a pairing code (Scanner.tsx): a link this app pairs from, or an older
+ * desktop's (pairing then says it is too old). Anything else keeps the camera looking.
+ */
+export const isPairCode = (text: string) => !!parsePairLink(text) || isOldPairLink(text);
+
 /** A link again from an offer (Try again). */
 export const offerLink = (o: PairOffer) => `${PAIR_LINK_PREFIX}h=${o.hosts.join(',')}&p=${o.port}&s=${o.key}&f=${o.fp}${o.name ? `&n=${encodeURIComponent(o.name)}` : ''}`;
 
-type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: number };
+/** A call waiting for its answer, on the one wire it went out on (an answer on another is not its answer). */
+type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: number; wire: Wire };
+
+/** Calls over one authenticated secure wire to the desktop this phone is paired with (`conn.sealed`). */
+export interface Sealed {
+  /** The desktop's identity that wire proved. */
+  readonly fp: string;
+  call<M extends keyof Methods>(method: M, params: Methods[M]['params'], timeoutMs?: number): Promise<Methods[M]['result']>;
+}
+
+/** The storage could not be read: pairing waits (a link would otherwise replace a pairing unseen). */
+export const READ_FAILED = 'Sable could not read what this phone keeps. Close Sable and open it again.';
+/** A pairing that could not be kept on the phone: nothing of it counts. */
+export const KEEP_FAILED = 'This phone could not keep the pairing. Try again.';
+/** A plain pairing that was to be replaced but is still on the desktop. */
+export const OLD_STAYS = 'The earlier pairing is still listed on the computer. Remove it there in Settings › Phone.';
+/** An erasure that did not finish: it goes on at the next start. */
+export const ERASE_LEFT = 'Some of what this phone kept could not be removed yet. Sable tries again when it opens.';
+
+/**
+ * The person has not confirmed that `offer` replaces the pairing this phone has (Pair.tsx shows
+ * "Replace…?" and pairs again with the confirmation's token).
+ */
+export class ConfirmError extends Error {
+  constructor(readonly was: Pairing) {
+    super('Confirm first');
+  }
+}
 
 const url = (host: string, port: number) => `ws://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}${PHONE_PATH}`;
 
@@ -94,6 +128,8 @@ export function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
  */
 interface Wire {
   readonly secure: boolean;
+  /** The desktop identity its handshake proved (a secure wire only). */
+  readonly fp?: string;
   readonly socket: WebSocket;
   readonly ready: boolean;
   send(text: string): void;
@@ -135,6 +171,7 @@ class SealedWire implements Wire {
   constructor(
     private ws: WebSocket,
     private ch: Channel,
+    readonly fp: string,
   ) {
     ws.binaryType = 'arraybuffer';
     ws.onmessage = (ev) => {
@@ -204,7 +241,7 @@ function secureWire(ws: WebSocket, kind: 'pair' | 'hello', id: string, fp: strin
               over = true;
               clearTimeout(silent);
               ws.onclose = null;
-              resolve(new SealedWire(ws, r.channel));
+              resolve(new SealedWire(ws, r.channel, fp));
             },
             (err: Error) => fail(err),
           );
@@ -266,19 +303,27 @@ function reach(hosts: string[], port: number, auth: (ws: WebSocket) => Promise<W
           }
           sockets.add(ws);
           let opened = false;
-          ws.onerror = () => !opened && lose(ws, new Error('The desktop did not answer'));
-          ws.onclose = () => !opened && lose(ws, new Error('The desktop did not answer'));
+          // Each address counts once, however many ways its socket ends (a failed socket says both error and close).
+          let settled = false;
+          const fail = (err: unknown) => {
+            if (settled) return;
+            settled = true;
+            lose(ws, err);
+          };
+          ws.onerror = () => !opened && fail(new Error('The desktop did not answer'));
+          ws.onclose = () => !opened && fail(new Error('The desktop did not answer'));
           ws.onopen = () => {
             opened = true;
             ws.onerror = null;
             if (done) return ws.close();
             auth(ws).then(
               (wire) => {
-                if (done) return wire.close();
+                if (done || settled) return wire.close();
+                settled = true;
                 finish(undefined, ws);
                 resolve({ wire, host });
               },
-              (err) => lose(ws, err),
+              fail,
             );
           };
         }, i === 0 ? 0 : 450 + i * 150),
@@ -301,14 +346,38 @@ class Conn {
     return `http://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${p.port}${path}`;
   }
 
-  /** This connection is the secure channel (the desktop proven, every frame sealed). */
+  /** This connection is the secure channel to the desktop this phone is paired with (proven, every frame sealed). */
   get secure(): boolean {
-    return !!this.wire?.secure && this.state === 'open';
+    return !!this.sealed();
   }
 
   /** Paired over the secure channel (false: an older pairing, to pair again). */
   get pairedSecurely(): boolean {
     return !!this.pairing?.fp;
+  }
+
+  /**
+   * The wire in use, when it is a secure one whose handshake proved the very desktop this phone is
+   * paired with: calls through it go over that wire only. A newer wire, a new pairing, or none at all
+   * fails them as lost (never sends them elsewhere), so a file's start, its chunks and its digest all
+   * come from that one authenticated desktop. Null otherwise.
+   */
+  sealed(): Sealed | null {
+    const w = this.wire;
+    const p = this.pairing;
+    if (!w || !p?.fp || !w.secure || w.fp !== p.fp || !w.ready || this.state !== 'open') return null;
+    const gen = this.gen;
+    const fp = p.fp;
+    return {
+      fp,
+      call: (method, params, timeoutMs) =>
+        this.wire === w && this.gen === gen && this.pairing?.fp === fp ? this.callOn(w, method, params, timeoutMs) : Promise.reject(transportError('The connection to the desktop was lost', 'lost')),
+    };
+  }
+
+  /** A live wire carries the pairing in use. */
+  private live(): boolean {
+    return !!this.wire?.ready;
   }
 
   private wire?: Wire;
@@ -317,16 +386,104 @@ class Conn {
   private listeners = new Set<(e: BridgeEvent) => void>();
   private stateListeners = new Set<() => void>();
   private openListeners = new Set<() => void>();
+  private noticeListeners = new Set<(text: string) => void>();
   private retry = 0;
   private retryTimer?: number;
   private connecting = false;
 
+  /**
+   * The credential generation: every attempt, wire and call belongs to one. It moves on when a pairing
+   * is kept or forgotten, so nothing begun with the old credential (a reconnect that answers late, a
+   * call still waiting) can take over or be answered afterwards.
+   */
+  private gen = 0;
+  /** While a new pairing is under way the old credential stays still (no reconnect with it until the pairing ends). */
+  private holdOld = false;
+  /** The erasure under way, as kept on the phone's storage (native.ts `EraseMark`). */
+  private mark: EraseMark | null = null;
+  /** What this phone keeps was read (`ok`), could not be (`failed`: nothing pairs), or not yet. */
+  lookup: 'pending' | 'ok' | 'failed' = 'pending';
+  private lookedUp!: () => void;
+  /** Settles once the saved pairing was looked up: pairing waits for it. */
+  readonly ready = new Promise<void>((r) => (this.lookedUp = r));
+  /** Pairing writes, one at a time in the order made (a late write of an older pairing never lands over a newer one). */
+  private writes: Promise<unknown> = Promise.resolve();
+
   async init() {
     // A network that comes back (Wi-Fi again after mobile data) reconnects at once.
     window.addEventListener('online', () => this.wake());
-    this.pairing = await loadPairing();
+    let got: [EraseMark | null, Pairing | null] | undefined;
+    // A read that fails is not "nothing saved": tried again a moment later, then pairing waits.
+    for (let i = 0; i < 3 && !got; i++) {
+      try {
+        got = await Promise.all([loadMark(), loadPairing()]);
+      } catch {
+        await new Promise((r) => window.setTimeout(r, 150 * (i + 1)));
+      }
+    }
+    if (!got) {
+      this.lookup = 'failed';
+      this.lookedUp();
+      this.setState('unpaired', READ_FAILED);
+      return;
+    }
+    [this.mark, this.pairing] = got;
+    this.lookup = 'ok';
+    // An erasure that Android cut off (Forget, or a replacement by another computer) goes on before anything else.
+    if (this.mark) {
+      const kept = !!this.mark.to && this.pairing?.deviceId === this.mark.to;
+      let gone = true;
+      if (this.mark.forget && !kept) {
+        // The old token goes first; when it cannot, it is not used (the mark stays, tried again next time).
+        gone = await removePairing().then(
+          () => true,
+          () => false,
+        );
+        this.pairing = null;
+      }
+      if (this.mark.forget || kept) await this.eraseData(gone);
+      // A replacement that never got as far as keeping its pairing: nothing to erase.
+      else await this.setMark(null).catch(() => {});
+    }
+    this.lookedUp();
     if (this.pairing) void this.connect();
     else this.setState('unpaired');
+  }
+
+  /** Something the person should know that is not a state (an erasure left for later). */
+  onNotice(l: (text: string) => void) {
+    this.noticeListeners.add(l);
+    return () => void this.noticeListeners.delete(l);
+  }
+
+  private notice(text: string) {
+    for (const l of this.noticeListeners) l(text);
+  }
+
+  private async setMark(m: EraseMark | null) {
+    await saveMark(m);
+    this.mark = m && (m.forget || m.to) ? m : null;
+  }
+
+  /**
+   * Erases what was kept for the desktop (lib/erase.ts) and, when nothing is left, the mark. When
+   * something is left, the mark stays (the next start goes on with it) and the person is told.
+   */
+  private async eraseData(done = true): Promise<boolean> {
+    const failed = await eraseAll({ storage: pageStorage(), native: eraseNative });
+    if (failed.length || !done) {
+      this.notice(ERASE_LEFT);
+      return false;
+    }
+    await this.setMark(null).catch(() => {});
+    return true;
+  }
+
+  /** The pairing written in order; it lands only while it is still the pairing this phone uses (or is about to). */
+  private write(p: Pairing, still: () => boolean): Promise<void> {
+    const next = this.writes.then(() => (still() ? savePairing(p) : undefined));
+    this.writes = next.catch(() => {});
+    return next;
   }
 
   private setState(s: ConnState, error?: string) {
@@ -364,10 +521,11 @@ class Conn {
    * the socket instead. Only a verified refusal stops it for good (`denied`).
    */
   wake() {
-    if (!this.pairing || this.state === 'denied') return;
+    if (!this.pairing || this.state === 'denied' || this.holdOld) return;
     const away = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
     this.hiddenAt = 0;
-    if (this.state === 'open' && away < 15_000) {
+    // Said to be open with no live wire under it (one closed for a pairing given up): it reconnects.
+    if (this.state === 'open' && this.live() && away < 15_000) {
       const w = this.wire;
       void this.call('usage.limits', {}, 3000).catch(() => {
         if (this.wire === w) w?.close();
@@ -400,11 +558,14 @@ class Conn {
 
   async connect() {
     const p = this.pairing;
-    if (!p || this.connecting) return;
+    // While a new pairing is under way, the old credential does not reconnect (pair() goes on with it if that pairing ends).
+    if (!p || this.connecting || this.holdOld) return;
     this.connecting = true;
     const attempt = ++this.attemptId;
+    const gen = this.gen;
     this.attemptAt = performance.now();
-    const current = () => attempt === this.attemptId;
+    // This attempt, of this credential: a newer attempt, a pairing kept or Forget make it moot.
+    const current = () => attempt === this.attemptId && gen === this.gen && this.pairing === p;
     clearTimeout(this.retryTimer);
     // Retries on their own keep "offline" on screen (it would flicker with every attempt); the first
     // attempt, and one asked for (`wake`: Try again, back to the front, a network change), say "connecting".
@@ -437,15 +598,17 @@ class Conn {
             if ('welcome' in f) {
               clearTimeout(silent);
               if (!current()) return reject(cancelled());
+              // The welcome of another device is not this pairing's.
+              if (typeof f.welcome?.deviceId === 'string' && f.welcome.deviceId !== p.deviceId) return reject(new Error('The desktop did not answer as Sable does'));
+              if (!this.adopt(w, gen)) return reject(cancelled());
               // The desktop's addresses now join the saved ones (Tailscale installed after pairing: reachable there next time).
               const hosts = mergeHosts(p.hosts, f.welcome.hosts, host);
               if (p.lastHost !== host || p.desktop !== f.welcome.desktop || !sameHosts(hosts, p.hosts)) {
                 p.lastHost = host;
                 p.desktop = f.welcome.desktop;
                 p.hosts = hosts;
-                void savePairing(p).catch(() => {});
+                void this.write({ ...p }, () => this.pairing === p && this.gen === gen).catch(() => {});
               }
-              this.adopt(w);
               resolve();
             } else if ('denied' in f && typeof f.denied === 'string' && f.denied.trim()) {
               clearTimeout(silent);
@@ -506,26 +669,42 @@ class Conn {
     this.retryTimer = window.setTimeout(() => void this.connect(), delay);
   }
 
-  /** Calls still waiting fail now (their socket is gone); `transport` marks that the desktop may have done them. */
-  private failPending(text: string) {
+  /** Calls still waiting on `wire` fail now (their socket is gone); `transport` marks that the desktop may have done them. */
+  private failPending(text: string, wire: Wire) {
     for (const [id, p] of this.pending) {
+      if (p.wire !== wire) continue;
       clearTimeout(p.timer);
       p.reject(transportError(text, 'lost'));
       this.pending.delete(id);
     }
   }
 
-  /** An authenticated connection becomes the one in use. */
-  private adopt(wire: Wire) {
-    // One connection feeds the store, never two: a second one would apply every streamed piece twice.
-    const old = this.wire;
-    if (old && old !== wire) {
-      old.onText = null;
-      old.onClose = null;
-      old.close();
-      // Calls sent on the old connection get no answer: they fail now, not after their timeout.
-      this.failPending('The connection to the desktop was lost');
+  /** The wire in use goes, quietly (a pairing replacing it, Forget): its calls fail as lost. */
+  private dropWire() {
+    const w = this.wire;
+    this.wire = undefined;
+    if (!w) return;
+    w.onText = null;
+    w.onClose = null;
+    w.close();
+    this.failPending('The connection to the desktop was lost', w);
+  }
+
+  /**
+   * An authenticated connection becomes the one in use, if it belongs to the credential generation
+   * in use (`gen`); false (and closed) when it does not: a reconnect with an older credential that
+   * answered after a new pairing was kept never takes over.
+   */
+  private adopt(wire: Wire, gen: number): boolean {
+    if (gen !== this.gen || (wire.secure && wire.fp !== this.pairing?.fp)) {
+      wire.onText = null;
+      wire.onClose = null;
+      wire.close();
+      return false;
     }
+    // One connection feeds the store, never two: a second one would apply every streamed piece twice.
+    // Calls sent on the old connection get no answer: they fail now, not after their timeout.
+    if (this.wire !== wire) this.dropWire();
     this.wire = wire;
     this.retry = 0;
     wire.onText = (text) => {
@@ -546,7 +725,8 @@ class Conn {
       }
       if (!('id' in f)) return;
       const pending = this.pending.get(f.id);
-      if (!pending) return;
+      // Only an answer on the wire the call went out on is its answer.
+      if (!pending || pending.wire !== wire) return;
       this.pending.delete(f.id);
       clearTimeout(pending.timer);
       if (f.ok) pending.resolve(f.result);
@@ -555,7 +735,7 @@ class Conn {
     wire.onClose = (code) => {
       if (this.wire !== wire) return;
       this.wire = undefined;
-      this.failPending('The connection to the desktop was lost');
+      this.failPending('The connection to the desktop was lost', wire);
       // On a secure connection only a sealed refusal says the phone was removed (it came before the close); a bare code is just a close.
       if (code === 4001 && !wire.secure) {
         this.setState('denied', 'This phone was removed on the desktop');
@@ -568,11 +748,16 @@ class Conn {
     };
     this.setState('open');
     for (const l of this.openListeners) l();
+    return true;
   }
 
   call<M extends keyof Methods>(method: M, params: Methods[M]['params'], timeoutMs = 30_000): Promise<Methods[M]['result']> {
-    const wire = this.wire;
-    if (!wire || !wire.ready) return Promise.reject(transportError('Not connected to the desktop', 'unsent'));
+    return this.callOn(this.wire, method, params, timeoutMs);
+  }
+
+  /** A call on `wire`, only while it is the wire in use. */
+  private callOn<M extends keyof Methods>(wire: Wire | undefined, method: M, params: Methods[M]['params'], timeoutMs = 30_000): Promise<Methods[M]['result']> {
+    if (!wire || !wire.ready || wire !== this.wire) return Promise.reject(transportError('Not connected to the desktop', 'unsent'));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
@@ -580,7 +765,7 @@ class Conn {
         // The desktop may have done it: whoever asked looks again (lib/errors.ts).
         reject(transportError('The desktop did not answer in time', 'timeout'));
       }, timeoutMs);
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer, wire });
       wire.send(JSON.stringify({ id, method, params }));
     });
   }
@@ -613,26 +798,52 @@ class Conn {
   }
 
   /**
+   * The person's confirmation that `offer` replaces the pairing this phone has now: a token bound to
+   * that pairing (its pin, or its device for one from before the secure channel) and to this offer
+   * (its key and its one-time secret). `pair` takes only the token of the pairing it would replace at
+   * that moment, so a pairing that became known after the question was asked (a cold start's link
+   * read before the saved pairing) asks again. Undefined when nothing would be replaced.
+   */
+  confirmFor(offer: PairOffer): string | undefined {
+    const p = this.replaces(offer);
+    return p ? `${p.fp ?? 'plain'}|${p.deviceId}|${offer.fp}|${offer.key}` : undefined;
+  }
+
+  /**
    * Pairs with a desktop over the secure channel (the link's fingerprint pinned; the one-time secret
    * goes only inside): presents the secret, waits while the desktop asks "Allow?", keeps the token it
    * gives. `onWaiting` runs once the desktop has the request. A pairing from before the secure channel
    * with this same desktop is replaced by the migration ticket that desktop gives over that pairing
    * (`phone.migrate`, only when its fingerprint is the link's); its token never goes to the new peer.
-   * Until the new pairing is allowed the old one stays (a pairing given up connects with it again).
-   * `signal` (`beginPair`) aborts it at any step.
+   * Until the new pairing is allowed and kept the old one stays (a pairing given up connects with it
+   * again). Nothing pairs before the saved pairing was read, and one that would be replaced needs the
+   * person's `confirmed` token for it (`confirmFor`; otherwise a `ConfirmError`). `signal`
+   * (`beginPair`) aborts it at any step until the pairing is being kept.
    */
-  async pair(offer: PairOffer, name: string, onWaiting: () => void, signal?: AbortSignal): Promise<void> {
+  async pair(offer: PairOffer, name: string, onWaiting: () => void, signal?: AbortSignal, confirmed?: string): Promise<void> {
     if (!/^[\w-]{43}$/.test(offer.fp ?? '')) throw new Error('That is not a Sable pairing link');
+    await abortable(this.ready, signal);
+    if (this.lookup !== 'ok') throw new Error(READ_FAILED);
     const before = this.pairing;
+    if (before && this.replaces(offer) && confirmed !== this.confirmFor(offer)) throw new ConfirmError(before);
     try {
       const replaces = before && !before.fp ? await this.migrationTicket(before, offer.fp, signal) : undefined;
       if (signal?.aborted) throw cancelled();
+      if (this.pairing !== before) throw new Error('The pairing on this phone changed meanwhile. Try again.');
+      // From here the old credential stays still: no reconnect with it while the desktop is asked.
+      this.holdOld = true;
       this.forgetSocket();
-      await this.pairWith(offer, name, onWaiting, replaces, signal);
+      await this.pairWith(offer, name, onWaiting, before, replaces, signal);
     } catch (err) {
-      // Given up or refused: the pairing this phone had goes on as it was.
-      if (this.pairing && this.pairing === before && this.state !== 'open') void this.connect();
+      this.holdOld = false;
+      // Given up, refused or not kept: the pairing this phone had goes on as it was, with a live wire again.
+      if (this.pairing && this.pairing === before && !this.live()) {
+        this.retry = 0;
+        void this.connect();
+      }
       throw err;
+    } finally {
+      this.holdOld = false;
     }
   }
 
@@ -665,7 +876,7 @@ class Conn {
     }
   }
 
-  private async pairWith(offer: PairOffer, name: string, onWaiting: () => void, replaces: { id: string; ticket: string } | undefined, signal?: AbortSignal) {
+  private async pairWith(offer: PairOffer, name: string, onWaiting: () => void, before: Pairing | null, replaces: { id: string; ticket: string } | undefined, signal?: AbortSignal) {
     const reached = await reach(
       offer.hosts,
       offer.port,
@@ -677,8 +888,15 @@ class Conn {
       { signal },
     );
     const { wire, host } = reached;
+    const odd = () => new Error('The desktop did not answer as Sable does');
     await new Promise<void>((resolve, reject) => {
       let over = false;
+      // The welcome came: the pairing is being kept, and nothing (Cancel, a close) undoes that half way.
+      let keeping = false;
+      /** The new pairing as the desktop gave it (`paired`), apart from the one this phone has until it is kept. */
+      let candidate: Pairing | undefined;
+      /** The desktop removed the plain pairing this one replaces (`paired.replaced`). */
+      let replaced = false;
       const end = (err?: Error) => {
         if (over) return;
         over = true;
@@ -691,12 +909,12 @@ class Conn {
           reject(err);
         } else resolve();
       };
-      const onAbort = () => end(cancelled());
+      const onAbort = () => !keeping && end(cancelled());
       if (signal?.aborted) return onAbort();
       signal?.addEventListener('abort', onAbort, { once: true });
       const timer = window.setTimeout(() => end(new Error('Nobody answered on the desktop')), 150_000);
       wire.onText = (text) => {
-        if (over) return;
+        if (over || keeping) return;
         let f: PhoneFrame;
         try {
           f = JSON.parse(text);
@@ -705,48 +923,110 @@ class Conn {
         }
         if ('waiting' in f) onWaiting();
         else if ('paired' in f) {
-          this.pairing = { hosts: offer.hosts, port: offer.port, token: f.paired.token, deviceId: f.paired.deviceId, desktop: f.paired.desktop, lastHost: host, fp: offer.fp };
-          void savePairing(this.pairing).catch(() => {});
+          const t = f.paired as { token?: unknown; deviceId?: unknown; desktop?: unknown; replaced?: unknown } | undefined;
+          // One pairing per exchange, whole.
+          if (candidate || typeof t?.token !== 'string' || !t.token || typeof t.deviceId !== 'string' || !t.deviceId) return end(odd());
+          candidate = { hosts: offer.hosts, port: offer.port, token: t.token, deviceId: t.deviceId, desktop: typeof t.desktop === 'string' ? t.desktop : (offer.name ?? ''), lastHost: host, fp: offer.fp };
+          replaced = typeof t.replaced === 'string' && !!t.replaced;
         } else if ('welcome' in f) {
-          if (this.pairing) {
-            this.pairing.hosts = mergeHosts(this.pairing.hosts, f.welcome.hosts, host);
-            void savePairing(this.pairing).catch(() => {});
-          }
-          this.adopt(wire);
-          end();
+          // Only the welcome of the device just paired completes it: a welcome first, or another device's, is not a pairing.
+          if (!candidate || f.welcome?.deviceId !== candidate.deviceId) return end(odd());
+          keeping = true;
+          clearTimeout(timer);
+          // The desktop's addresses join the new pairing's own (never the old pairing's).
+          const kept: Pairing = { ...candidate, hosts: mergeHosts(offer.hosts, f.welcome.hosts, host), desktop: f.welcome.desktop || candidate.desktop };
+          this.keep(kept, before, replaces, wire).then(
+            () => {
+              // The old plain pairing was to go with this one and the desktop did not say it went: it stays listed there.
+              if (replaces && !replaced) this.notice(OLD_STAYS);
+              end();
+            },
+            (err: Error) => end(err),
+          );
         } else if ('denied' in f) {
           end(new Error(typeof f.denied === 'string' && f.denied.trim() ? f.denied : 'The desktop did not allow this phone'));
         }
       };
-      wire.onClose = (code) => end(new Error(code === 4005 ? 'This pairing code is not valid. Show a new one on the desktop.' : 'The desktop closed the connection'));
+      wire.onClose = (code) => !keeping && end(new Error(code === 4005 ? 'This pairing code is not valid. Show a new one on the desktop.' : 'The desktop closed the connection'));
       wire.send(JSON.stringify({ pair: { key: offer.key, name, ...(replaces ? { replaces } : {}) } }));
     });
+  }
+
+  /**
+   * Keeps a new pairing in one step. It must still replace exactly the pairing that was confirmed
+   * (`before`). Every attempt and call of the old credential ends first (its generation moves on).
+   * The new pairing is written to the phone's storage and read only once that worked (a write that
+   * fails fails the pairing; the old one goes on). When it replaces another computer (or one not
+   * proven to be the same), what was kept for the old one is erased, restart-safe (the mark names
+   * the new pairing, so a start after Android closed the app in the middle erases only once the new
+   * pairing is the one kept). Then the new wire is the connection.
+   */
+  private async keep(c: Pairing, before: Pairing | null, replaces: { id: string; ticket: string } | undefined, wire: Wire) {
+    if (this.pairing !== before) throw new Error('The pairing on this phone changed meanwhile. Try again.');
+    this.gen++;
+    this.cancelAttempt();
+    clearTimeout(this.retryTimer);
+    this.dropWire();
+    const other = !!before && (before.fp ? before.fp !== c.fp : !replaces);
+    const was = this.mark;
+    // An erasure left from before goes on with this one.
+    const erase = other || !!was;
+    try {
+      if (erase) await this.setMark({ ...(was?.forget ? { forget: true } : {}), to: c.deviceId });
+      await this.write(c, () => true);
+    } catch {
+      if (erase) await this.setMark(was).catch(() => {});
+      throw new Error(KEEP_FAILED);
+    }
+    this.pairing = c;
+    // Still no other connection while the old one's data is erased: the wire that paired comes next.
+    if (erase) await this.eraseData();
+    this.holdOld = false;
+    const gen = this.gen;
+    if (!this.pairing || this.pairing !== c) return;
+    // The wire that paired goes on as the connection (or, gone meanwhile, a new one with the new token).
+    if (!wire.ready || !this.adopt(wire, gen)) {
+      wire.close();
+      this.retry = 0;
+      void this.connect();
+    }
   }
 
   private forgetSocket() {
     clearTimeout(this.retryTimer);
     this.cancelAttempt();
-    const w = this.wire;
-    this.wire = undefined;
-    if (w) {
-      w.onClose = null;
-      w.close();
-    }
+    this.dropWire();
   }
 
   /**
-   * Forgets the desktop on this phone (the desktop keeps the entry until removed there). The token
-   * goes first: when it cannot be removed from the phone's storage, this throws and nothing else
-   * changes (a restart would connect with it again). Then everything kept for that desktop goes
-   * together (lib/forget.ts: drafts, review comments, downloads, notifications, the cache).
+   * Forgets the desktop on this phone (the desktop keeps the entry until removed there), restart-safe:
+   * a mark goes on the phone's storage first, then the token is removed and read back (when it cannot
+   * be, this throws and nothing else changes). Every attempt, wire and call of it ends, and everything
+   * kept for that desktop is erased (lib/erase.ts: whatever the screens loaded, the page's storage
+   * swept, Android's private files and copies removed); only when nothing is left does the mark go. A
+   * Forget that Android cut off goes on at the next start.
    */
   async forget() {
-    await removePairing();
+    await this.ready;
+    const was = this.mark;
+    try {
+      await this.setMark({ forget: true });
+    } catch {
+      throw new Error(FORGET_FAILED);
+    }
+    try {
+      await removePairing();
+    } catch (err) {
+      await this.setMark(was).catch(() => {});
+      throw err;
+    }
+    this.gen++;
     this.cancelPair();
     this.forgetSocket();
+    this.holdOld = false;
     this.pairing = null;
-    runForget();
     this.setState('unpaired');
+    await this.eraseData();
   }
 }
 

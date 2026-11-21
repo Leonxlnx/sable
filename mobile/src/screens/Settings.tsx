@@ -158,7 +158,7 @@ export function Settings() {
       <Sheet open={confirm} onClose={() => setConfirm(false)} label="Forget this computer">
         <div className="confirm">
           <h2 className="confirm-title">Forget {name}?</h2>
-          <p className="confirm-sub">To use it from this phone again, scan its code in Settings › Phone.</p>
+          <p className="confirm-sub">Its chats, drafts and the files downloaded from it go from this phone. To use it again, scan its code in Settings › Phone.</p>
           <button
             type="button"
             className="btn btn-primary btn-lg btn-block"

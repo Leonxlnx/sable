@@ -1,7 +1,9 @@
 package io.github.leonxlnx.sable.mobile;
 
+import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import androidx.core.content.pm.ShortcutInfoCompat;
 import androidx.core.content.pm.ShortcutManagerCompat;
@@ -18,7 +20,9 @@ import org.json.JSONObject;
 /**
  * What the app asks of Android itself: the share sheet for a message's text, and the app icon's
  * shortcuts for the last chats (a long press on the icon; "New chat" is static, res/xml/shortcuts.xml).
- * A shortcut opens `sable://chat/<id>` in this activity; the page routes it (App.tsx).
+ * A shortcut opens `sable://chat/<id>` in this activity; the page routes it (App.tsx). And `keep`:
+ * a preference written to the phone's storage before it answers (the pairing, an erasure's mark,
+ * words taken back from the queue).
  */
 @CapacitorPlugin(name = "System")
 public class SystemPlugin extends Plugin {
@@ -44,6 +48,26 @@ public class SystemPlugin extends Plugin {
         } catch (ActivityNotFoundException e) {
             call.reject("Nothing here can share it.");
         }
+    }
+
+    /**
+     * Writes (or, without `value`, removes) a key of Capacitor's preferences (the same store
+     * `Preferences.get` reads) with Android's commit: it resolves only once the value is on the phone's
+     * storage, where Capacitor's own `set` and `remove` apply it in the background.
+     */
+    @PluginMethod
+    public void keep(PluginCall call) {
+        String key = call.getString("key");
+        if (key == null || key.isEmpty()) {
+            call.reject("Nothing to keep.");
+            return;
+        }
+        String value = call.getString("value");
+        SharedPreferences.Editor e = getContext().getSharedPreferences("CapacitorStorage", Activity.MODE_PRIVATE).edit();
+        if (value == null) e.remove(key);
+        else e.putString(key, value);
+        if (e.commit()) call.resolve();
+        else call.reject("This phone could not keep it.");
     }
 
     private static String cut(String s, int n) {

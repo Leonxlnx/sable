@@ -16,6 +16,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BridgeEvent, SessionMeta, ToolItem } from '@shared/protocol';
+import { CONTAIN } from '../server/core/contain';
+
+// These tests are about a share's digests, not containment. Where no handle names its file (Windows), the
+// default ('none') counts every file as external, so a share reaches a phone only when the person
+// allowed it (review wave 5, #7: tests/contain.test.ts, tests/files-wave5.test.ts). Here the walks
+// ('walk') stand in for Linux's proof, so a plain file in the chat folder counts as inside as it does there.
+if (CONTAIN.how === 'none') CONTAIN.how = 'walk';
 
 const seen = { opened: new Map<number, string>(), closed: new Set<number>(), reads: [] as string[] };
 const hook: { read?: (file: string) => Error | void } = {};

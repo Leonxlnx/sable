@@ -3,6 +3,7 @@ import { addComment, clearReview, editComment, pruneReviews, removeComment, revi
 import { packReviews, unpackReviews } from '@desk/features/review/persist';
 import { conn } from './conn';
 import { onForget } from './forget';
+import { epoch, still } from './epoch';
 
 /**
  * A chat's review written on the phone: comments on lines of its diffs, kept per chat until sent
@@ -69,7 +70,10 @@ export async function sendReview(sid: string): Promise<{ queued: boolean }> {
   const list = commentsOf(sid);
   if (!list.length) return { queued: false };
   const lead = leadOf(sid).trim();
+  const e = epoch();
   const r = await conn.call('session.send', { sessionId: sid, text: reviewMessage(list, lead) });
+  // Forgotten while it went: nothing of that computer is written again.
+  if (!still(e)) return { queued: !!r.queued };
   if (!r.ok) throw new Error(r.error ?? 'The review was not sent');
   leads.delete(sid);
   set(clearReview(reviews, sid, new Set(list.map((c) => c.id))));

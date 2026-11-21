@@ -10,6 +10,13 @@ import type { PathLike } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { CONTAIN } from '../server/core/contain';
+
+// These tests are about the untracked-file reader's races (review wave 3, #6) as the walks meet them.
+// Where no handle names its file (Windows), the default ('none') counts every file as external, so
+// nothing is read there at all (review wave 5, #7: tests/contain.test.ts, tests/files-wave5.test.ts).
+// Here the walks ('walk') stand in for Linux's proof, so a plain file in the chat folder is read.
+if (CONTAIN.how === 'none') CONTAIN.how = 'walk';
 
 const hook: { beforeOpen?: (file: string) => void; beforePath?: (fn: string, file: string) => void } = {};
 

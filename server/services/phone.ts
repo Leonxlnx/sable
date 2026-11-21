@@ -1,10 +1,9 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import type { Duplex } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { answerHello, loadIdentity, PlainLink, readSecHello, SealedLink, type Identity, type Link, type SecHello } from './phone-secure';
 import {
@@ -13,6 +12,7 @@ import {
   PHONE_PATH,
   PHONE_PORT,
   PAIR_LINK_PREFIX,
+  type AppState,
   type Attachment,
   type BridgeEvent,
   type DiffHunk,
@@ -25,6 +25,7 @@ import {
   type PhoneQuestion,
   type PhoneQuestionRequest,
   type PhoneReset,
+  type PhoneRetryReply,
   type PhoneStale,
   type PhoneStatus,
   type PhoneTail,
@@ -34,6 +35,7 @@ import {
   type RpcName,
   type RpcRequest,
   type ServerFrame,
+  type SessionMeta,
   type SessionSnapshot,
   type TimelineItem,
   type ToolDetail,
@@ -44,10 +46,11 @@ import {
 import { canonicalName, isPackageName } from '../../shared/file-name';
 import { partOfTurn, syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
+import { fileLine, scopeLines } from '../core/permission-scope';
 import { cap, isSnapshot, lines } from '../core/trim';
 import { VERSION } from '../version';
 import { PhoneChangesReader, stepIds } from './phone-changes';
-import { digestOfHandle, PhoneFiles } from './phone-files';
+import { blockDigests, FILE_CHUNK, PhoneFiles, RetryLater } from './phone-files';
 import { FRAME_MAX, grantFor, openGrant, phoneAttachments, readHello, type FileGrant } from './phone-guard';
 import { qrMatrix, qrSvgPath } from './qr';
 import { searchOf, type ChatSearch } from './search';
@@ -112,6 +115,11 @@ export interface PhoneOptions {
 }
 
 const PAIR_TTL_MS = 10 * 60_000;
+/** Live migration tickets one phone may hold at once (`phone.migrate` asked again keeps the earlier ones). */
+const TICKETS_PER_PHONE = 4;
+/** A queued message a phone takes back with a receipt stays reserved this long for its word (`phone.takeDone`); a receipt is remembered this long after. */
+const TAKE_HOLD_MS = 45_000;
+const TAKE_KEEP_MS = 15 * 60_000;
 const REQUEST_TTL_MS = 2 * 60_000;
 const HELLO_TIMEOUT_MS = 8_000;
 const MAX_FAILS = 5;
@@ -393,7 +401,22 @@ export function phonePermission(p: PermissionRequest): PhonePermission {
     ...(change ? { diff: change.diff } : {}),
     options: p.options.slice(0, 12).map((o) => ({ ...o, label: c(o.label, ASK_TEXT.label), ...(o.hint ? { hint: c(o.hint, ASK_TEXT.hint) } : {}) })),
   };
+  if (!scopeShown(p.scope, out)) cut = true;
   return cut ? { ...out, incomplete: true } : out;
+}
+
+/**
+ * Whether the phone shows all of where an approval reaches (`PermissionScope`): each grant root,
+ * network destination and sandbox path as a whole line of its description or reason, each changed
+ * file in the change the phone gets (a moved one with both ends) or as its own line. A scope not
+ * known yet (an approval that came before its change) is never shown whole.
+ */
+function scopeShown(scope: PermissionRequest['scope'], shown: PhonePermission): boolean {
+  if (!scope) return true;
+  if (scope.unknown) return false;
+  const said = new Set([...(shown.description?.split('\n') ?? []), ...(shown.reason?.split('\n') ?? [])]);
+  if (scopeLines(scope).some((l) => !said.has(l))) return false;
+  return (scope.files ?? []).every((f) => said.has(fileLine(f)) || !!shown.diff?.some((d) => d.path === f.path && (f.from ? d.oldPath === f.from : !d.oldPath || d.oldPath === d.path)));
 }
 
 /**
@@ -626,21 +649,88 @@ export const PROMPTS_PAGE = 20;
 const trimQueue = (q: QueuedMessage[]) =>
   q.map((m) => ({ ...m, ...(m.attachments ? { attachments: trimAttachments(m.attachments) } : {}), ...(m.text.length > QUEUE_TEXT ? { text: m.text.slice(0, QUEUE_TEXT), cut: true } : {}) })) as QueuedMessage[];
 
+/**
+ * Byte budgets, counted in UTF-8 as the frames go out: `app.hello` for a phone (its chats' list, and
+ * what waits across chats), a page of what waits (`phone.prompts`, and in `phone.tail`), a page of the
+ * chats' list (`phone.sessions`). What does not fit comes by cursor; together they stay well under a
+ * result frame (`FRAME_MAX.result`).
+ */
+export const PHONE_BYTES = { helloSessions: 6_000_000, helloPrompts: 4_000_000, prompts: 3_000_000, sessions: 6_000_000 };
+
+const utf8 = (v: unknown) => Buffer.byteLength(JSON.stringify(v), 'utf8');
+
+/** A place in a list for a cursor: its index and the id there (a list that changed meanwhile goes on from that id). */
+const placeOf = (i: number, id: string) => `${i}:${id}`;
+function placeIn(list: { id: string }[], cursor: unknown): number {
+  if (typeof cursor !== 'string') return 0;
+  const m = /^(\d{1,9}):(.*)$/s.exec(cursor);
+  if (!m) return 0;
+  const i = Number(m[1]);
+  if (list[i]?.id === m[2]) return i;
+  const at = list.findIndex((x) => x.id === m[2]);
+  return at >= 0 ? at : Math.min(i, list.length);
+}
+
+/** Chats' list entries from `from` on, within `budget` bytes (one at least); `cursor` where the next page starts. */
+export function sessionsPage(sessions: SessionMeta[], from: number, budget: number): { sessions: SessionMeta[]; cursor?: string; total: number } {
+  const out: SessionMeta[] = [];
+  let bytes = 0;
+  let i = from;
+  for (; i < sessions.length; i++) {
+    // With its comma in the list.
+    const n = utf8(sessions[i]) + 1;
+    if (out.length && bytes + n > budget) break;
+    out.push(sessions[i]);
+    bytes += n;
+  }
+  return { sessions: out, ...(i < sessions.length ? { cursor: placeOf(i, sessions[i].id) } : {}), total: sessions.length };
+}
+
+/**
+ * What waits, as a phone gets it, from a cursor on (permissions, then questions), within `budget`
+ * bytes and `count` of each kind; `cursor` where the next page starts, and the totals.
+ */
+export function promptsPage(p: { permissions: PermissionRequest[]; questions: QuestionRequest[] }, cursor: unknown, budget: number, count = Infinity): { permissions: PhonePermission[]; questions: PhoneQuestionRequest[]; cursor?: string; permissionsTotal: number; questionsTotal: number } {
+  const all: ({ kind: 'p'; r: PermissionRequest } | { kind: 'q'; r: QuestionRequest })[] = [...p.permissions.map((r) => ({ kind: 'p' as const, r })), ...p.questions.map((r) => ({ kind: 'q' as const, r }))];
+  const permissions: PhonePermission[] = [];
+  const questions: PhoneQuestionRequest[] = [];
+  const start = placeIn(all.map((x) => x.r), cursor);
+  const taken = new Set<number>();
+  let bytes = 0;
+  for (let i = start; i < all.length; i++) {
+    const x = all[i];
+    // A kind whose page is full lets the other kind still come (the rest of it by cursor).
+    if ((x.kind === 'p' ? permissions : questions).length >= count) continue;
+    const made = x.kind === 'p' ? phonePermission(x.r) : phoneQuestion(x.r);
+    const n = utf8(made) + 1;
+    if (taken.size && bytes + n > budget) break;
+    if (x.kind === 'p') permissions.push(made as PhonePermission);
+    else questions.push(made as PhoneQuestionRequest);
+    taken.add(i);
+    bytes += n;
+  }
+  // The next page starts at the first one left out (it may hold again some this one had: they are keyed by id).
+  let next = -1;
+  for (let i = start; i < all.length && next < 0; i++) if (!taken.has(i)) next = i;
+  return { permissions, questions, ...(next >= 0 ? { cursor: placeOf(next, all[next].r.id) } : {}), permissionsTotal: p.permissions.length, questionsTotal: p.questions.length };
+}
+
 /** A snapshot as a phone gets it: the newest page instead of every item (or a page `around` / `after` an item). */
 export function phoneTail(snap: SessionSnapshot, opts: { before?: string; limit?: number; to?: string; around?: string; after?: string } = {}): PhoneTail {
   const page: { items: PhoneItem[]; cursor?: string; next?: string; total: number } = opts.around || opts.after ? phoneWindow(snap.items, opts) : phonePage(snap.items, opts);
-  // Every collection bounded, so the page always fits the phone's frame (a long queue reads on with `phone.queue`).
+  // Every collection bounded, so the page always fits the phone's frame (a long queue reads on with
+  // `phone.queue`, what waits with `phone.prompts`: bounded by count and by bytes).
   const queue = snap.queue ?? [];
-  const permissions = snap.permissions ?? [];
-  const questions = snap.questions ?? [];
+  const waiting = promptsPage({ permissions: snap.permissions ?? [], questions: snap.questions ?? [] }, undefined, PHONE_BYTES.prompts, PROMPTS_PAGE);
   return {
     ...snap,
     queue: trimQueue(queue.slice(0, QUEUE_PAGE)),
     ...(queue.length > QUEUE_PAGE ? { queueTotal: queue.length } : {}),
-    permissions: permissions.slice(0, PROMPTS_PAGE).map(phonePermission),
-    ...(permissions.length > PROMPTS_PAGE ? { permissionsTotal: permissions.length } : {}),
-    questions: questions.slice(0, PROMPTS_PAGE).map(phoneQuestion),
-    ...(questions.length > PROMPTS_PAGE ? { questionsTotal: questions.length } : {}),
+    permissions: waiting.permissions,
+    ...(waiting.permissions.length < waiting.permissionsTotal ? { permissionsTotal: waiting.permissionsTotal } : {}),
+    questions: waiting.questions,
+    ...(waiting.questions.length < waiting.questionsTotal ? { questionsTotal: waiting.questionsTotal } : {}),
+    ...(waiting.cursor ? { promptsCursor: waiting.cursor } : {}),
     todos: (snap.todos ?? []).slice(0, 100).map((t) => ({ ...t, content: cap(t.content, LIMITS.field) })),
     items: page.items,
     total: page.total,
@@ -658,8 +748,22 @@ export function phoneTail(snap: SessionSnapshot, opts: { before?: string; limit?
 export function phoneResult(method: string, result: unknown): unknown {
   if (!result || typeof result !== 'object') return result;
   if (method === 'app.hello') {
-    const r = result as { prompts?: { permissions: PermissionRequest[]; questions: QuestionRequest[] } };
-    return r.prompts ? { ...r, prompts: { permissions: r.prompts.permissions.map(phonePermission), questions: r.prompts.questions.map(phoneQuestion) } } : r;
+    // Within a byte budget for the chats' list and one for what waits; the rest by cursor
+    // (`sessionsCursor` with `phone.sessions`, `promptsCursor` with `phone.prompts`), with the totals.
+    const r = result as AppState;
+    const list = sessionsPage(r.sessions ?? [], 0, PHONE_BYTES.helloSessions);
+    const waiting = r.prompts ? promptsPage(r.prompts, undefined, PHONE_BYTES.helloPrompts) : undefined;
+    return {
+      ...r,
+      sessions: list.sessions,
+      ...(list.cursor ? { sessionsCursor: list.cursor, sessionsTotal: list.total } : {}),
+      ...(waiting
+        ? {
+            prompts: { permissions: waiting.permissions, questions: waiting.questions },
+            ...(waiting.cursor ? { promptsCursor: waiting.cursor, permissionsTotal: waiting.permissionsTotal, questionsTotal: waiting.questionsTotal } : {}),
+          }
+        : {}),
+    };
   }
   if (method === 'queue.take') {
     // Its words whole (the phone edits them); its pictures without their data.
@@ -722,6 +826,25 @@ export function staleOf(event: BridgeEvent | PhoneReset): PhoneStale | null {
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
+/** Until a response can take more (it drained), or rejects when it closed, failed or `signal` aborted. */
+function roomIn(res: ServerResponse, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (res.destroyed || signal.aborted) return reject(new Error('closed'));
+    const off = () => {
+      res.off('drain', ok);
+      res.off('close', gone);
+      res.off('error', gone);
+      signal.removeEventListener('abort', gone);
+    };
+    const ok = () => (off(), resolve());
+    const gone = () => (off(), reject(new Error('closed')));
+    res.on('drain', ok);
+    res.on('close', gone);
+    res.on('error', gone);
+    signal.addEventListener('abort', gone);
+  });
+}
+
 function sameSecret(a: string, b: string): boolean {
   const x = Buffer.from(sha256(a), 'hex');
   const y = Buffer.from(sha256(b), 'hex');
@@ -732,6 +855,8 @@ function sameSecret(a: string, b: string): boolean {
 const sameHash = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 
 const IDENTITY_ERROR = 'Sable could not read its phone key. Phones cannot pair until it can.';
+/** A pairing that names the plain one it replaces by a ticket that is not (or no longer) that phone's. */
+const TICKET_REFUSED = 'This pairing could not replace the earlier one on this computer. Pair again from the phone.';
 
 /**
  * The pairing link (version 2, `PAIR_LINK_PREFIX`): `sable://pair/2?h=<addresses>&p=<port>&s=<one-time
@@ -833,9 +958,13 @@ function narrow(method: string, params: Record<string, unknown>, queued?: (sessi
   const p = { ...params };
   // Pictures as data, never a path on the computer: a message from the phone carries nothing of the desktop's.
   if (method === 'session.send' || method === 'queue.update') {
+    // Words first: nothing is queued, edited or sent for a message without them.
+    if (typeof p.text !== 'string') throw new Error('A message needs its words.');
     const known = method === 'queue.update' ? queued?.(String(p.sessionId ?? ''), String(p.id ?? '')) : undefined;
     const list = phoneAttachments(p.attachments, known);
     if (list) p.attachments = list;
+    // An edit that removes every picture says so with an empty list (omitted keeps them).
+    else if (method === 'queue.update' && Array.isArray(p.attachments)) p.attachments = [];
     else delete p.attachments;
   }
   if (method === 'session.setOptions') {
@@ -864,13 +993,13 @@ export class PhoneService {
   private host: string;
   private pairing?: { key: string; expiresAt: number; link: string; qr: string; size: number };
   /** A phone that presented the pairing key and waits for "Allow"; `replaces`: its older plain pairing with this desktop, by its migration ticket. */
-  private request?: { id: string; name: string; address: string; at: number; link: Link; socket: WebSocket; timer: NodeJS.Timeout; replaces?: { id: string; ticket: string } };
+  private request?: { id: string; name: string; address: string; at: number; link: Link; socket: WebSocket; timer: NodeJS.Timeout; replaces?: { id: string; ticket: string }; replacesName?: string };
   /**
    * Migration tickets (`phone.migrate`): per phone paired before the secure channel, the hash of a
    * one-time ticket it got over its own connection, and until when it holds. A secure pairing that
    * names it replaces that phone's old entry; nothing else does.
    */
-  private tickets = new Map<string, { hash: string; expires: number }>();
+  private tickets = new Map<string, { hash: string; expires: number }[]>();
   /** Per authenticated connection: stops its dispatch at once (a removed phone's requests are never acted on). */
   private detach = new Map<Link, () => void>();
   /** Files going to securely paired phones over their sealed connections (phone-files.ts). */
@@ -973,7 +1102,7 @@ export class PhoneService {
       name: os.hostname(),
       devices,
       ...(this.pairing ? { pairing: { link: this.pairing.link, expiresAt: this.pairing.expiresAt, qr: this.pairing.qr, size: this.pairing.size } } : {}),
-      ...(this.request ? { request: { id: this.request.id, name: this.request.name, address: this.request.address, at: this.request.at } } : {}),
+      ...(this.request ? { request: { id: this.request.id, name: this.request.name, address: this.request.address, at: this.request.at, ...(this.request.replacesName !== undefined ? { replaces: this.request.replacesName } : {}) } } : {}),
       ...(this.error ? { error: this.error } : {}),
       ...(this.saveError ? { saveError: this.saveError } : {}),
     };
@@ -1053,6 +1182,7 @@ export class PhoneService {
     this.live.clear();
     this.sending.drop();
     this.tickets.clear();
+    this.releaseTakes();
     if (server) {
       server.closeAllConnections();
       await new Promise<void>((r) => server.close(() => r()));
@@ -1088,15 +1218,28 @@ export class PhoneService {
       this.sendFrame(r.link, { denied: 'The desktop did not allow this phone' });
       r.link.close(4003, 'denied');
     } else if (r.link.open) {
+      // A replacement goes only with a live ticket for that plain pairing (it may have expired, or that
+      // pairing been removed, while the desktop asked): never a separate pairing in its place.
+      const old = r.replaces ? this.ticketFor(r.replaces.id, r.replaces.ticket) : undefined;
+      if (r.replaces && !old) {
+        this.sendFrame(r.link, { denied: TICKET_REFUSED });
+        r.link.close(4002, 'bad ticket');
+        this.changed();
+        return this.status();
+      }
       const token = randomBytes(32).toString('base64url');
       // Pairing happens only over the secure channel now: this phone connects only that way.
       const device: StoredPhone = { id: randomUUID(), name: r.name, tokenHash: sha256(token), pairedAt: Date.now(), lastSeen: Date.now(), secure: true };
-      // The plain pairing this phone had with this desktop goes, by the ticket this desktop gave it over that pairing: one entry per phone.
-      const old = r.replaces ? this.ticketFor(r.replaces.id, r.replaces.ticket) : undefined;
+      // The new entry and the removal of the plain one it replaces are written together, and in effect only once written.
+      if (!this.commitDevices([...this.data.devices.filter((d) => d.id !== old?.id), device])) {
+        this.sendFrame(r.link, { denied: 'This computer could not save the pairing. Try again.' });
+        r.link.close(4003, 'not saved');
+        this.changed();
+        return this.status();
+      }
+      // The plain pairing this phone had with this desktop is gone: its connections close, its tickets end.
       if (old) this.dropDevice(old.id, false);
-      this.data.devices.push(device);
-      this.save(true);
-      this.sendFrame(r.link, { paired: { token, deviceId: device.id, desktop: os.hostname() } });
+      this.sendFrame(r.link, { paired: { token, deviceId: device.id, desktop: os.hostname(), ...(old ? { replaced: old.id } : {}) } });
       this.authenticated(r.link, device);
     }
     this.changed();
@@ -1122,6 +1265,8 @@ export class PhoneService {
     this.dropLinks(deviceId);
     this.sending.drop(deviceId);
     this.tickets.delete(deviceId);
+    // A message it was taking back stays in the queue as it was.
+    this.releaseTakes(deviceId);
     for (const link of this.live.get(deviceId) ?? []) {
       if (tell) this.sendFrame(link, { denied: 'This phone was removed on the desktop' });
       link.close(4001, 'revoked');
@@ -1129,20 +1274,57 @@ export class PhoneService {
     this.live.delete(deviceId);
   }
 
-  /** A one-time ticket for a phone paired plain (`phone.migrate`), 10 minutes. */
+  /**
+   * A one-time ticket for a phone paired plain (`phone.migrate`), 10 minutes. Asking again (a retry)
+   * does not void the ones it already has (a few at most); the pairing that uses one ends them all.
+   */
   private ticketOf(deviceId: string): string {
     const ticket = randomBytes(24).toString('base64url');
-    this.tickets.set(deviceId, { hash: sha256(ticket), expires: Date.now() + PAIR_TTL_MS });
+    const now = Date.now();
+    const live = (this.tickets.get(deviceId) ?? []).filter((t) => t.expires >= now).slice(-(TICKETS_PER_PHONE - 1));
+    this.tickets.set(deviceId, [...live, { hash: sha256(ticket), expires: now + PAIR_TTL_MS }]);
     return ticket;
   }
 
-  /** The plain pairing a ticket names, if it is that phone's live ticket (it is used up either way). */
+  /**
+   * The plain pairing a ticket names, if it is one of that phone's live tickets. Only checked: an
+   * attempt that does not match uses nothing up; the pairing that commits ends them (`approve`).
+   */
   private ticketFor(deviceId: string, ticket: string): StoredPhone | undefined {
-    const t = this.tickets.get(deviceId);
-    if (!t) return undefined;
-    this.tickets.delete(deviceId);
-    if (t.expires < Date.now() || !sameHash(t.hash, sha256(ticket))) return undefined;
+    const now = Date.now();
+    const hash = sha256(ticket);
+    if (!(this.tickets.get(deviceId) ?? []).some((t) => t.expires >= now && sameHash(t.hash, hash))) return undefined;
     return this.data.devices.find((d) => d.id === deviceId && !d.secure);
+  }
+
+  /**
+   * Writes the paired phones as `devices` and only then makes them the ones in effect: written whole
+   * to a temporary file, flushed to the disk and moved over the old one, so a pairing and the removal
+   * it replaces are on disk together or not at all. False when it could not be written (nothing changed).
+   */
+  private commitDevices(devices: StoredPhone[]): boolean {
+    const next: PhoneFile = { ...this.data, devices };
+    try {
+      mkdirSync(path.dirname(this.file), { recursive: true });
+      const tmp = `${this.file}.tmp`;
+      const fd = openSync(tmp, 'w');
+      try {
+        writeSync(fd, JSON.stringify(next, null, 2));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, this.file);
+    } catch (err) {
+      this.app.log('phone: could not save a pairing', (err as Error).message);
+      return false;
+    }
+    this.data.devices = devices;
+    if (this.saveError) {
+      this.saveError = undefined;
+      clearTimeout(this.saveTimer);
+    }
+    return true;
   }
 
   private endRequest(reason: string) {
@@ -1182,7 +1364,7 @@ export class PhoneService {
    * finished share, for the phone it was made for, as it was then (phone-guard.ts), until it expires,
    * that phone is removed or phone access is turned off.
    */
-  private files = new Map<string, FileGrant>();
+  private files = new Map<string, FileGrant & { blocks: Buffer }>();
 
   /**
    * The grant for a share's file with the digest the share recorded when it completed (core/handed.ts):
@@ -1214,19 +1396,21 @@ export class PhoneService {
     // The file must still be the bytes the share recorded before a link to it is made.
     const opened = await openGrant(grant);
     if ('code' in opened) throw new Error(opened.code === 409 ? 'That file changed after it was shared.' : 'That file is no longer on the computer.');
-    let sha256: string | null;
+    // Each block's digest too: the link serves a block only while it is still those bytes (`serveFile`).
+    let read: { sha256: string; blocks: Buffer } | null;
     try {
-      sha256 = await digestOfHandle(opened.fh, grant.size);
+      read = await blockDigests(opened.fh, grant.size);
     } finally {
       await opened.fh.close().catch(() => {});
     }
-    if (sha256 !== grant.sha256) throw new Error('That file changed after it was shared.');
+    const sha256 = read?.sha256;
+    if (!read || sha256 !== grant.sha256) throw new Error('That file changed after it was shared.');
     grant.name = name;
     const now = Date.now();
     for (const [t, f] of this.files) if (f.expires < now) this.files.delete(t);
     while (this.files.size >= 50) this.files.delete(this.files.keys().next().value as string);
     const token = randomBytes(24).toString('base64url');
-    this.files.set(token, grant);
+    this.files.set(token, { ...grant, blocks: read.blocks });
     return { path: `/f/${token}/${encodeURIComponent(grant.name)}`, name: grant.name, size: grant.size, sha256 };
   }
 
@@ -1315,7 +1499,22 @@ export class PhoneService {
         'x-content-type-options': 'nosniff',
       });
       if (!entry.size) return void res.end();
-      await pipeline(opened.fh.createReadStream({ start: 0, end: entry.size - 1, autoClose: true }), res, { signal: ac.signal });
+      // Block by block, each checked against its digest from when the link was made before it goes:
+      // a file rewritten in place since sends nothing new (the download ends short).
+      const buf = Buffer.allocUnsafe(Math.min(FILE_CHUNK, entry.size));
+      for (let at = 0; at < entry.size; at += FILE_CHUNK) {
+        if (ac.signal.aborted || !this.linkLive(token, entry)) throw new Error('ended');
+        const want = Math.min(FILE_CHUNK, entry.size - at);
+        for (let got = 0; got < want; ) {
+          const { bytesRead } = await opened.fh.read(buf, got, want - got, at + got);
+          if (!bytesRead) throw new Error('short');
+          got += bytesRead;
+        }
+        const block = at / FILE_CHUNK;
+        if (!createHash('sha256').update(buf.subarray(0, want)).digest().equals(entry.blocks.subarray(block * 32, block * 32 + 32))) throw new Error('changed');
+        if (!res.write(Buffer.from(buf.subarray(0, want)))) await roomIn(res, ac.signal);
+      }
+      res.end();
     } catch {
       res.destroy();
     } finally {
@@ -1394,7 +1593,7 @@ export class PhoneService {
    * ends as it does for a take on the desktop). A reply that fails leaves the message, its place and
    * its scheduling exactly as they were.
    */
-  private async takeQueued(link: Link, id: number, params: Record<string, unknown>, allowed: () => boolean) {
+  private async takeQueued(link: Link, id: number, params: Record<string, unknown>, allowed: () => boolean, deviceId: string) {
     const sessionId = String(params.sessionId ?? '');
     const qid = String(params.id ?? '');
     const tooBig = 'That message is too big to take back to the phone. Edit it on the desktop.';
@@ -1405,16 +1604,82 @@ export class PhoneService {
     // Reserved: neither edited nor sent while the reply goes (core/runtime.ts `reserveQueued`).
     const held = rt.reserveQueued(qid);
     if (!held) return this.sendFrame(link, { id, ok: true, result: {} });
-    const json = this.deliverable(link, { id, ok: true, result: phoneResult('queue.take', { message: held.message }) });
+    // A phone that confirms (`ack`) gets a receipt: the message stays reserved until it says it kept
+    // the words (`phone.takeDone`), never on the reply's way out alone.
+    const take = params.ack === true ? randomBytes(18).toString('base64url') : undefined;
+    const json = this.deliverable(link, { id, ok: true, result: { ...(phoneResult('queue.take', { message: held.message }) as object), ...(take ? { take } : {}) } });
     if (!json) {
       rt.rollbackReserved(qid);
       return this.sendFrame(link, { id, ok: false, error: tooBig });
     }
+    if (take) this.holdTake(take, { deviceId, sessionId, id: qid, rev: held.rev });
     link.send(json, (err) => {
-      // Gone out to a phone still allowed: the message leaves the queue (if it is still that revision); otherwise it stays as it was.
+      if (take) {
+        // Not gone out (or the phone removed meanwhile): back as it was, the receipt void.
+        if (err || !allowed()) this.releaseTake(take, true);
+        return;
+      }
+      // A phone from before receipts: gone out to a phone still allowed, the message leaves the queue (if it is still that revision); otherwise it stays as it was.
       if (err || !allowed()) return rt.rollbackReserved(qid);
       this.app.takeReserved(rt, qid, held.rev);
     });
+  }
+
+  /**
+   * Takes a phone holds a receipt for (`queue.take` with `ack`), by receipt: `held` while the message
+   * waits reserved for the phone's word, `taken` once it left the queue for it, `released` when it
+   * went back as it was (the phone did not answer within `TAKE_HOLD_MS`, or said it could not keep
+   * the words). Kept a while after, so a confirmation that comes again, or late, answers the same.
+   */
+  private takes = new Map<string, { deviceId: string; sessionId: string; id: string; rev: number; state: 'held' | 'taken' | 'released'; at: number; timer?: NodeJS.Timeout }>();
+  /** How long a take waits for the phone's word (tests shorten it). */
+  takeHoldMs = TAKE_HOLD_MS;
+
+  private holdTake(take: string, t: { deviceId: string; sessionId: string; id: string; rev: number }) {
+    const now = Date.now();
+    for (const [k, v] of this.takes) if (v.state !== 'held' && now - v.at > TAKE_KEEP_MS) this.takes.delete(k);
+    const timer = setTimeout(() => this.releaseTake(take), this.takeHoldMs);
+    timer.unref?.();
+    this.takes.set(take, { ...t, state: 'held', at: now, timer });
+  }
+
+  /** A held take goes back as it was (`forget`: and its receipt is void, as for a reply that never went out). */
+  private releaseTake(take: string, forget = false) {
+    const t = this.takes.get(take);
+    if (!t) return;
+    clearTimeout(t.timer);
+    if (t.state === 'held') this.app.sessions.get(t.sessionId)?.rollbackReserved(t.id);
+    if (forget) this.takes.delete(take);
+    else Object.assign(t, { state: 'released', at: Date.now(), timer: undefined });
+  }
+
+  /**
+   * `phone.takeDone`: the phone kept the words of a take (`kept`, by default) or could not. Idempotent:
+   * the same receipt answers the same. Kept: a held message leaves the queue now; one that went back
+   * meanwhile leaves it if it is still there as it was; `taken` says whether it is out of the queue.
+   */
+  private takeDone(deviceId: string, raw: Record<string, unknown>): { taken: boolean } {
+    const take = typeof raw.take === 'string' ? raw.take : '';
+    const t = this.takes.get(take);
+    if (!t || t.deviceId !== deviceId) return { taken: false };
+    if (t.state === 'taken') return { taken: true };
+    if (raw.kept === false) {
+      this.releaseTake(take);
+      return { taken: false };
+    }
+    const rt = this.app.sessions.get(t.sessionId);
+    if (!rt) return { taken: false };
+    clearTimeout(t.timer);
+    // Went back meanwhile: taken now only while it is still that message, unchanged and not reserved by another take.
+    if (t.state === 'released' && !rt.reserveQueued(t.id)) return { taken: false };
+    const out = this.app.takeReserved(rt, t.id, t.rev);
+    Object.assign(t, { state: out ? 'taken' : 'released', at: Date.now(), timer: undefined });
+    return { taken: !!out };
+  }
+
+  /** Every held take of one phone (or all of them) goes back as it was. */
+  private releaseTakes(deviceId?: string) {
+    for (const [k, t] of this.takes) if (!deviceId || t.deviceId === deviceId) this.releaseTake(k, true);
   }
 
   /** In place of an item event too big for a phone: the newest page of its conversation. */
@@ -1565,11 +1830,19 @@ export class PhoneService {
       this.sendFrame(link, { denied: 'Another phone is pairing. Try again in a moment.' });
       return link.close(4003, 'busy');
     }
+    // A replacement needs a live ticket of the pairing it names, before anyone is asked; a wrong one
+    // uses nothing up (neither the code nor that phone's ticket) and counts as a failure.
+    const replaces = msg.pair.replaces;
+    const old = replaces ? this.ticketFor(replaces.id, replaces.ticket) : undefined;
+    if (replaces && !old) {
+      this.failed(ip);
+      this.sendFrame(link, { denied: TICKET_REFUSED });
+      return link.close(4002, 'bad ticket');
+    }
     this.pairing = undefined;
     clearTimeout(helloTimer);
     gate.admitted = true;
     const id = randomUUID();
-    const replaces = msg.pair.replaces;
     this.request = {
       id,
       name: cleanName(msg.pair.name),
@@ -1577,7 +1850,7 @@ export class PhoneService {
       at: Date.now(),
       link,
       socket: sec.socket,
-      ...(replaces ? { replaces } : {}),
+      ...(replaces && old ? { replaces, replacesName: old.name } : {}),
       timer: setTimeout(() => {
         if (this.request?.id === id) {
           this.endRequest('Nobody answered on the desktop');
@@ -1655,12 +1928,19 @@ export class PhoneService {
           act();
         } else if (own === 'phone.fileStart' || own === 'phone.fileChunk' || own === 'phone.fileEnd') {
           if (!link.secure) throw new Error('Pair again for a secure connection to get this file.');
-          if (own === 'phone.fileStart') {
-            const grant = await this.sharedFile(device.id, String(raw.sessionId ?? ''), String(raw.itemId ?? ''), Number(raw.index ?? 0));
-            act();
-            result = await this.sending.start(device.id, grant, grant.sha256, allowed);
-          } else if (own === 'phone.fileChunk') result = await this.sending.chunk(device.id, raw.transfer, raw.offset, raw.length);
-          else result = this.sending.end(device.id, raw.transfer);
+          try {
+            if (own === 'phone.fileStart') {
+              const grant = await this.sharedFile(device.id, String(raw.sessionId ?? ''), String(raw.itemId ?? ''), Number(raw.index ?? 0));
+              act();
+              result = await this.sending.start(device.id, grant, grant.sha256, allowed);
+            } else if (own === 'phone.fileChunk') result = await this.sending.chunk(device.id, raw.transfer, raw.offset, raw.length);
+            else result = this.sending.end(device.id, raw.transfer);
+          } catch (err) {
+            // Refused for now (starts in line, parts still on their way): the phone asks the same again after a moment.
+            if (!(err instanceof RetryLater)) throw err;
+            const reply: PhoneRetryReply = { id: req.id, ok: false, error: err.message, retry: true, retryAfterMs: err.retryAfterMs };
+            return void this.sendFrame(link, reply);
+          }
           act();
         } else if (own === 'phone.migrate') {
           // Only over a pairing from before the secure channel: what lets its secure pairing replace it here, and nowhere else.
@@ -1672,6 +1952,17 @@ export class PhoneService {
           const q = this.app.sessions.get(sessionId)?.queue ?? [];
           const from = typeof raw.from === 'number' && Number.isInteger(raw.from) && raw.from >= 0 ? raw.from : 0;
           result = { queue: trimQueue(q.slice(from, from + QUEUE_PAGE)), from, total: q.length };
+        } else if (own === 'phone.sessions') {
+          // The chats' list on from where `app.hello` (or the page before) stopped.
+          const state = await this.app.call('app.hello', {});
+          result = sessionsPage(state.sessions, placeIn(state.sessions, raw.cursor), PHONE_BYTES.sessions);
+        } else if (own === 'phone.prompts') {
+          // What waits on from a cursor: in one chat (`sessionId`, after `phone.tail`) or across chats (after `app.hello`).
+          const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : undefined;
+          let all: { permissions: PermissionRequest[]; questions: QuestionRequest[] };
+          if (sessionId) all = this.app.sessions.get(sessionId)?.prompts() ?? { permissions: [], questions: [] };
+          else all = (await this.app.call('app.hello', {})).prompts ?? { permissions: [], questions: [] };
+          result = promptsPage(all, raw.cursor, PHONE_BYTES.prompts);
         } else if (own === 'phone.mkdir') {
           act();
           result = this.makeFolder(String(raw.parent ?? ''), String(raw.name ?? ''));
@@ -1704,14 +1995,17 @@ export class PhoneService {
           if (!asked) throw new Error('Those questions were already answered.');
           const answers = phonePicks(asked, raw.picks);
           act();
-          result = await this.app.call('question.respond', { sessionId, requestId, answers });
+          result = await this.app.call('question.respond', { sessionId, requestId, answers }, { allowed });
         } else if (own === 'queue.take') {
-          return void (await this.takeQueued(link, req.id, raw, allowed));
+          return void (await this.takeQueued(link, req.id, raw, allowed, device.id));
+        } else if (own === 'phone.takeDone') {
+          act();
+          result = this.takeDone(device.id, raw);
         } else if (own === 'session.setMode') {
           // A mode that never asks answers only what the phone could allow itself; what only the desktop may answer keeps waiting there.
           const sessionId = String(raw.sessionId ?? '');
           act();
-          result = await this.app.call('session.setMode', { sessionId, mode: String(raw.mode ?? ''), answerWaiting: false });
+          result = await this.app.call('session.setMode', { sessionId, mode: String(raw.mode ?? ''), answerWaiting: false }, { allowed });
           const rt = this.app.sessions.get(sessionId);
           if (rt && allowed() && rt.caps?.modes.find((m) => m.id === rt.meta.mode)?.tone === 'danger') {
             for (const p of rt.prompts().permissions) {
@@ -1730,7 +2024,8 @@ export class PhoneService {
             if (asked) params.answers = phoneWordAnswers(asked, params.answers);
           }
           act();
-          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never));
+          // The guard goes along: a handler that waits (a send for the agent to start, a model change to apply) asks it again before it acts.
+          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed }));
           // Folder browsing for a new chat: folders only, never file names.
           if (req.method === 'fs.list' && result && typeof result === 'object') {
             const r = result as { entries?: { dir: boolean }[] };

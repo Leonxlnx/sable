@@ -17,6 +17,13 @@ import { registerFs } from '../server/services/fs';
 import { phoneEvent, phonePermission, phoneResult, registerPhone } from '../server/services/phone';
 import { FRAME_MAX, phoneAttachments, readHello } from '../server/services/phone-guard';
 import { fetchSecure, helloPlain, helloSecure, legacyPairing, pairSecure, wireClient } from './phone-wire';
+import { CONTAIN } from '../server/core/contain';
+
+// These tests are about the phone's download links and changes, not containment. Where no handle names its file (Windows), the
+// default ('none') counts every file as external, so a share reaches a phone only when the person
+// allowed it (review wave 5, #7: tests/contain.test.ts, tests/files-wave5.test.ts). Here the walks
+// ('walk') stand in for Linux's proof, so a plain file in the chat folder counts as inside as it does there.
+if (CONTAIN.how === 'none') CONTAIN.how = 'walk';
 
 const homes: string[] = [];
 const apps: App[] = [];

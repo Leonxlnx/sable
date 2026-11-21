@@ -137,19 +137,37 @@ export function inside(p: string, dir: string): boolean {
  * `within`: only a file that really lies in that folder (its links followed, `within` itself canonical);
  * one that leads out of it (a link, a junction on the way) is not read, nor a file with another name
  * elsewhere (a hard link: it is that file). That it lies there is established against the opened
- * handle (core/contain.ts `openContained`: its own path where the system names it, else the walks
- * around the open), and not read where it cannot be.
+ * handle (core/contain.ts `openContained`: its own path where the system names it, Linux), and not
+ * read where it cannot be (Windows and macOS: nothing is read with `within` there).
  */
-export async function readText(file: string, maxBytes: number, within?: string): Promise<{ text: string; binary: boolean; size: number } | null> {
+export async function readText(file: string, maxBytes: number, within?: string): Promise<FileText | null> {
+  const got = await readIn(file, maxBytes, within);
+  return got === 'outside' ? null : got;
+}
+
+export interface FileText {
+  text: string;
+  binary: boolean;
+  size: number;
+}
+
+/** `readText`, saying `outside` when the file is not established to lie in `within` (null: it could not be read). */
+async function readIn(file: string, maxBytes: number, within?: string): Promise<FileText | 'outside' | null> {
   let fh: FileHandle | undefined;
   try {
     let st: BigIntStats;
     if (within) {
-      const real = await realpath(file);
-      if (!inside(real, within)) return null;
+      let real: string;
+      try {
+        real = await realpath(file);
+      } catch {
+        return null;
+      }
+      if (!inside(real, within)) return 'outside';
       const got = await openContained(real, within);
       fh = got.fh;
-      if (!got.inside) return null;
+      if (!got.st.isFile()) return null;
+      if (!got.inside) return 'outside';
       st = got.st;
     } else {
       fh = await open(file, 'r');
@@ -241,7 +259,9 @@ export function capDiff(f: FileDiff): FileDiff {
 export interface GitScope {
   /**
    * Only what lies in `cwd` itself (a pathspec for it, never a sibling folder of the repository), and
-   * an untracked file read only when it really lies there (links followed). The phone's Changes view.
+   * a file's working-tree text (untracked, or a tracked file's side of its diff: `checkedDiff`) read
+   * only through a handle established to lie there (links followed, no other name elsewhere), else
+   * withheld (`GitFileDiff.withheld`). The phone's Changes view.
    */
   within?: boolean;
 }
@@ -350,7 +370,50 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
   return result;
 }
 
-export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, scope: GitScope = {}): Promise<FileDiff[]> {
+/** A file's diff, or (`GitScope.within`) its place in the list with its text withheld, and why. */
+export type GitFileDiff = FileDiff & { withheld?: 'outside' | 'big' | 'unreadable' };
+
+/** The biggest side of a tracked file whose diff is made for the phone (`GitScope.within`): read whole, both sides. */
+const MAX_SIDE_BYTES = 2_000_000;
+
+const SUBPROJECT = /^[-+ ]Subproject commit [0-9a-f]+(-dirty)?$/;
+
+/**
+ * A tracked file's diff for `GitScope.within`: the old side from git's own objects (`base`, as
+ * `git diff <base>` has it), the working tree's side read through a handle established to lie in
+ * `within` (`readIn`, core/contain.ts), and the diff made from the two; git's own patch read the
+ * working tree by its path (a hard link to a file elsewhere, a junction on the way) and is never
+ * used for that side. Withheld (no text, no counts) where the file is not established to lie there,
+ * cannot be read, or a side is over `MAX_SIDE_BYTES`. A deletion and a submodule's commit line keep
+ * git's own patch: neither reads the working tree.
+ */
+async function checkedDiff(root: string, base: string, f: FileDiff, within: string): Promise<GitFileDiff> {
+  if (f.status === 'deleted') return f;
+  if (f.hunks.length && f.hunks.every((h) => h.lines.every((l) => SUBPROJECT.test(l) || l.startsWith('\\')))) return f;
+  const none = (withheld: NonNullable<GitFileDiff['withheld']>): GitFileDiff => ({ path: f.path, ...(f.oldPath ? { oldPath: f.oldPath } : {}), status: f.status, additions: 0, deletions: 0, hunks: [], withheld });
+  const now = await readIn(path.join(root, f.path), MAX_SIDE_BYTES + 1, within);
+  if (now === 'outside') return none('outside');
+  if (!now) return none('unreadable');
+  if (now.size > MAX_SIDE_BYTES) return none('big');
+  const old = f.status === 'added' || base === EMPTY_TREE ? null : await blobOf(root, base, f.oldPath ?? f.path);
+  if (old === 'big') return none('big');
+  if (old === undefined) return none('unreadable');
+  const binary = now.binary || !!old?.binary;
+  if (binary) return { path: f.path, ...(f.oldPath ? { oldPath: f.oldPath } : {}), status: f.status, additions: 0, deletions: 0, hunks: [], binary: true };
+  const made = makeFileDiff(f.path, old ? old.text : null, now.text);
+  return { path: f.path, ...(f.oldPath ? { oldPath: f.oldPath } : {}), status: f.status, additions: made.additions, deletions: made.deletions, hunks: made.hunks };
+}
+
+/** A file as `rev` has it (repository-relative path), from git's objects: undefined when git cannot say, `big` over `MAX_SIDE_BYTES`. */
+async function blobOf(root: string, rev: string, file: string): Promise<{ text: string; binary: boolean } | 'big' | undefined> {
+  const r = await runGit(root, ['cat-file', 'blob', `${rev}:${file}`], { timeoutMs: 10_000, maxBytes: MAX_SIDE_BYTES + 1 });
+  if (r.code !== 0 && !r.truncated) return undefined;
+  if (r.truncated || Buffer.byteLength(r.stdout) > MAX_SIDE_BYTES) return 'big';
+  const binary = r.stdout.slice(0, 8192).includes('\0');
+  return { text: binary ? '' : r.stdout, binary };
+}
+
+export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, scope: GitScope = {}): Promise<GitFileDiff[]> {
   const dir = path.resolve(cwd);
   const root = await repoRoot(dir);
   if (!root) return [];
@@ -375,10 +438,12 @@ export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, 
       ? Promise.resolve(null)
       : runGit(dir, ['ls-files', '--others', '--exclude-standard', '-z', '--full-name', ...spec], { timeoutMs: 10_000 }),
   ]);
-  const out: FileDiff[] = [];
+  const out: GitFileDiff[] = [];
   if (d.code === 0 || d.stdout) {
-    for (const f of parseUnifiedDiff(d.stdout)) {
-      const fixed: FileDiff = { ...f, path: relToCwd(root, dir, f.path) };
+    for (const parsed of parseUnifiedDiff(d.stdout)) {
+      // Within the folder (the phone), the working tree's side is never git's reading of the path.
+      const f = real && !stagedOnly ? await checkedDiff(root, base, parsed, real) : parsed;
+      const fixed: GitFileDiff = { ...f, path: relToCwd(root, dir, f.path) };
       if (f.oldPath) fixed.oldPath = relToCwd(root, dir, f.oldPath);
       if (fixed.binary) fixed.hunks = [];
       out.push(capDiff(fixed));
@@ -389,7 +454,11 @@ export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, 
     let budget = UNTRACKED_BUDGET;
     for (const raw of list) {
       const rel = relToCwd(root, dir, raw);
-      const t = budget > 0 ? await readText(path.join(root, raw), Math.min(MAX_UNTRACKED_BYTES, budget), real) : null;
+      const t = budget > 0 ? await readIn(path.join(root, raw), Math.min(MAX_UNTRACKED_BYTES, budget), real) : null;
+      if (t === 'outside') {
+        out.push({ path: rel, status: 'added', additions: 0, deletions: 0, hunks: [], withheld: 'outside' });
+        continue;
+      }
       if (!t) continue;
       budget -= t.text.length;
       if (t.binary) {

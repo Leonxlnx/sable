@@ -12,6 +12,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
 import { pictureOf, pictureType, registerThumbs, setThumbHost, THUMB, thumbKind, thumbSize, Thumbs, windowsPdfPage, type ThumbHost, type ThumbOptions } from '../server/services/thumbs';
+import { CONTAIN } from '../server/core/contain';
+
+// These tests are about pictures of shared files, not containment. Where no handle names its file (Windows), the
+// default ('none') counts every file as external, so a share reaches a phone only when the person
+// allowed it (review wave 5, #7: tests/contain.test.ts, tests/files-wave5.test.ts). Here the walks
+// ('walk') stand in for Linux's proof, so a plain file in the chat folder counts as inside as it does there.
+if (CONTAIN.how === 'none') CONTAIN.how = 'walk';
 
 const homes: string[] = [];
 const apps: App[] = [];

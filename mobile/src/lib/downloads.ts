@@ -1,9 +1,9 @@
 import { useSyncExternalStore } from 'react';
 import { registerPlugin } from '@capacitor/core';
 import { canonicalName, isPackageName } from '@shared/file-name';
-import { conn } from './conn';
-import { createDownloads, type Download, type FilesPlugin } from './download-core';
-import { isTransport } from './errors';
+import { conn, type Sealed } from './conn';
+import { createDownloads, PLAIN_OFF, type Download, type FilesPlugin } from './download-core';
+import { isTransport, transportError } from './errors';
 import { onForget } from './forget';
 import { isNative, openExternal } from './native';
 import { memorySink } from './sink';
@@ -12,8 +12,10 @@ import { memorySink } from './sink';
  * Files the agent handed over, downloaded inside the app. Paired securely, over the sealed
  * connection into the app's private storage, checked whole on the phone against the digest the
  * share recorded, and only then kept (android/…/FilesPlugin.java `stage*`; an app other than an
- * APK is also copied to Downloads/Sable). Over a pairing from before the secure channel, Android's
- * DownloadManager over plain HTTP, never for an APK. A card asks the desktop, shows the progress and
+ * APK is also copied to Downloads/Sable). Every call of one transfer (its start with the digest, its
+ * chunks, its end) goes over the one wire that proved the paired desktop (conn.ts `sealed`): a wire
+ * that changes under it pauses the download, never answers it from elsewhere. Over a pairing from
+ * before the secure channel nothing is transferred (the row says to pair again). A card asks the desktop, shows the progress and
  * offers Open (Install for an APK) when it is there. What was downloaded is remembered per file
  * across restarts (`sable.downloads`) and forgotten with the desktop. In the web preview the secure
  * channel's bytes are kept in memory and checked with WebCrypto, so every state can be looked at;
@@ -25,7 +27,6 @@ export { installable } from './download-core';
 
 type Native = FilesPlugin & {
   open(o: { id?: string; file?: string; sha256?: string; size?: number }): Promise<void>;
-  forgetAll(): Promise<void>;
 };
 const Files = registerPlugin<Native>('Files');
 /** The web preview: the secure channel's files in memory (lib/sink.ts), opened as a blob. */
@@ -33,20 +34,29 @@ const web = isNative ? undefined : memorySink();
 
 const KEY = 'sable.downloads';
 
+/** Each transfer's wire: its chunks and its end go over the wire its start went over, or nowhere. */
+const wires = new Map<string, Sealed>();
+const lost = () => Promise.reject(transportError('The connection to the desktop was lost', 'lost'));
+
 const core = createDownloads({
   plugin: web ? { ...Files, ...web } : Files,
-  async link(p) {
-    const r = await conn.call('phone.fileLink', { sessionId: p.sid, itemId: p.itemId, index: p.index });
-    const url = conn.httpUrl(r.path);
-    if (!url) throw new Error('The computer is not connected.');
-    return { url, size: r.size, sha256: r.sha256 };
-  },
   channel: {
     // Paired securely: every download comes this way (offline, it waits for the connection, never a plain link).
     secure: () => conn.pairedSecurely,
-    start: (p) => conn.call('phone.fileStart', { sessionId: p.sid, itemId: p.itemId, index: p.index }, 120_000),
-    chunk: (p) => conn.call('phone.fileChunk', p, 60_000),
-    end: (transfer) => conn.call('phone.fileEnd', { transfer }, 10_000),
+    async start(p) {
+      // Only over a wire whose handshake proved the very desktop this phone is paired with.
+      const w = conn.sealed();
+      if (!w) throw transportError('Not connected to the desktop', 'unsent');
+      const r = await w.call('phone.fileStart', { sessionId: p.sid, itemId: p.itemId, index: p.index }, 120_000);
+      wires.set(r.transfer, w);
+      return r;
+    },
+    chunk: (p) => wires.get(p.transfer)?.call('phone.fileChunk', p, 60_000) ?? lost(),
+    end(transfer) {
+      const w = wires.get(transfer);
+      wires.delete(transfer);
+      return w ? w.call('phone.fileEnd', { transfer }, 10_000) : Promise.resolve();
+    },
   },
   lost: (err) => isTransport(err),
   native: isNative,
@@ -64,15 +74,16 @@ if (typeof document !== 'undefined') document.addEventListener('visibilitychange
 if (isNative && core.hasActive()) setTimeout(core.resume, 600);
 // Connected again: what paused with the connection goes on from its bytes.
 conn.onOpen(() => core.reconnected());
-// Forgetting the computer forgets its downloads too: the records, the private files, what is under way.
+// Forgetting the computer forgets its downloads too: what is under way and the records here (lib/erase.ts
+// removes the private files and copies natively and sweeps the storage, whether or not this module loaded).
 onForget(() => {
   core.forgetAll();
+  wires.clear();
   try {
     localStorage.removeItem(KEY);
   } catch {
     /* private mode */
   }
-  if (isNative) void Files.forgetAll().catch(() => {});
   web?.forgetAll();
 });
 
@@ -108,8 +119,8 @@ export const mimeOf = (name: string) => (isPackageName(canonicalName(name)) ? un
 /** Starts a download of one file of a share step. */
 export function startDownload(key: string, p: { sid: string; itemId: string; index: number; name: string; size?: number; from?: string }) {
   const name = canonicalName(p.name);
-  // Over a plain pairing an app is never fetched (it could not be checked on the way).
-  if (!conn.pairedSecurely && isPackageName(name)) return Promise.reject(new Error('Pair again for a secure connection to install it'));
+  // Over a plain pairing nothing is fetched (neither the bytes nor their digest could be trusted on the way).
+  if (!conn.pairedSecurely) return Promise.reject(new Error(PLAIN_OFF));
   return core.start(key, { ...p, name, mime: mimeOf(name) });
 }
 

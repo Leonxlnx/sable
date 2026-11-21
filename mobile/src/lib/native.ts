@@ -13,10 +13,25 @@ import { NotePoster, SUMMARY_ID } from './note-post';
 
 export const isNative = Capacitor.isNativePlatform();
 
+/**
+ * Writes (or with `null` removes) a key of the app's preferences and resolves only once it is on the
+ * phone's storage (SystemPlugin `keep`: Android's commit, not the background apply that Capacitor's
+ * Preferences uses); throws when it could not be written. In the web preview, Preferences itself.
+ */
+export async function durable(key: string, value: string | null) {
+  if (isNative) return void (await System.keep(value === null ? { key } : { key, value }));
+  if (value === null) await Preferences.remove({ key });
+  else await Preferences.set({ key, value });
+}
+
+/**
+ * The pairing kept on this phone: null when there is none (or what is there is not one). A read that
+ * fails throws: it is never taken as "none" (a link would then pair without asking to replace it).
+ */
 export async function loadPairing(): Promise<Pairing | null> {
+  const { value } = await Preferences.get({ key: 'pairing' });
+  if (!value) return null;
   try {
-    const { value } = await Preferences.get({ key: 'pairing' });
-    if (!value) return null;
     const p = JSON.parse(value) as Pairing;
     return p && typeof p.token === 'string' && Array.isArray(p.hosts) ? p : null;
   } catch {
@@ -24,9 +39,9 @@ export async function loadPairing(): Promise<Pairing | null> {
   }
 }
 
-/** Keeps the pairing (throws when it could not be written: the caller decides what to say). */
+/** Keeps the pairing, on the phone's storage before it resolves (throws when it could not be written: the caller decides what to say). */
 export async function savePairing(p: Pairing) {
-  await Preferences.set({ key: 'pairing', value: JSON.stringify(p) });
+  await durable('pairing', JSON.stringify(p));
 }
 
 /**
@@ -35,7 +50,37 @@ export async function savePairing(p: Pairing) {
  * restart would connect with the old token again.
  */
 export async function removePairing() {
-  await removeChecked(Preferences, 'pairing');
+  await removeChecked({ remove: ({ key }) => durable(key, null), get: (o) => Preferences.get(o) }, 'pairing');
+}
+
+/**
+ * An erasure under way (conn.ts), kept on the phone's storage so a start after Android closed the app
+ * in the middle of it goes on with it: `forget` (the pairing this phone had is to go, with everything
+ * kept for it), `to` (a pairing that replaces it with another computer was being kept: once that one
+ * is the pairing here, what was kept for the old one goes).
+ */
+export interface EraseMark {
+  forget?: boolean;
+  to?: string;
+}
+
+const MARK = 'erasing';
+
+/** The erasure under way, if any (a read that fails throws; a mark that cannot be read is taken as Forget). */
+export async function loadMark(): Promise<EraseMark | null> {
+  const { value } = await Preferences.get({ key: MARK });
+  if (!value) return null;
+  try {
+    const m = JSON.parse(value) as EraseMark;
+    return m && typeof m === 'object' ? { ...(m.forget ? { forget: true } : {}), ...(typeof m.to === 'string' ? { to: m.to } : {}) } : { forget: true };
+  } catch {
+    return { forget: true };
+  }
+}
+
+/** Keeps the mark (null: done), on the phone's storage before it resolves. */
+export async function saveMark(m: EraseMark | null) {
+  await durable(MARK, m && (m.forget || m.to) ? JSON.stringify(m) : null);
 }
 
 export async function loadPref<T>(key: string, fallback: T): Promise<T> {
@@ -234,6 +279,7 @@ export function onNotificationTap(fn: (sessionId: string, kind: NoteKind) => voi
 const System = registerPlugin<{
   share(o: { text: string; title?: string }): Promise<void>;
   shortcuts(o: { chats: { id: string; title: string }[] }): Promise<void>;
+  keep(o: { key: string; value?: string }): Promise<void>;
 }>('System');
 
 /** Android's share sheet for a text (a message); a browser's own where there is one. False when nothing could share it. */
@@ -277,6 +323,38 @@ export function keepAlive(text: string | null) {
   if (!isNative || text === armed) return;
   armed = text;
   void KeepAlive.arm(text ? { text } : {}).catch(() => {});
+}
+
+// ── erasing what was kept for a desktop (lib/erase.ts) ──
+
+const FilesNative = registerPlugin<{ forgetAll(): Promise<void> }>('Files');
+/** Preferences kept for the desktop (the pairing itself and the erasure's mark are conn.ts's). */
+const PAIRING_PREFS = ['sable.taken'];
+
+/**
+ * Android's side of an erasure, each step awaited: every private file (downloads under way, verified
+ * copies and their records), the copies Sable put in Downloads/Sable and the system downloads it made
+ * (FilesPlugin `forgetAll`, which fails when anything is left), the chats' notifications, the app
+ * icon's chat shortcuts and the line that kept the connection. The steps that failed, by name.
+ */
+export async function eraseNative(): Promise<string[]> {
+  const failed: string[] = [];
+  const step = async (name: string, fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+    } catch {
+      failed.push(name);
+    }
+  };
+  // The preferences that belong to the pairing (words taken back from the queue: lib/drafts.ts).
+  for (const key of PAIRING_PREFS) await step(key, () => durable(key, null));
+  if (!isNative) return failed;
+  await step('files', () => FilesNative.forgetAll());
+  await step('notifications', () => poster.clear());
+  shortcutsKey = '';
+  await step('shortcuts', () => System.shortcuts({ chats: [] }));
+  keepAlive(null);
+  return failed;
 }
 
 // ── app lifecycle ──

@@ -1022,7 +1022,30 @@ export interface PermissionRequest {
   options: PermissionOption[];
   /** When true the UI offers a free-text field with the deny option. */
   allowFeedback?: boolean;
+  /** What allowing it reaches beyond `detail`, as data (server/core/permission-scope.ts); `description` and `reason` carry it in words too. */
+  scope?: PermissionScope;
   createdAt: number;
+}
+
+/**
+ * Where an approval reaches, field by field: a request shows all of it before it can be allowed from
+ * a phone (`PhonePermission.incomplete` otherwise). `unknown`: part of it is not known here yet (an
+ * approval that came before its change), so only the desktop answers it.
+ */
+export interface PermissionScope {
+  /** Folders under which it allows writes for the rest of the session. */
+  roots?: string[];
+  /** Network destinations it opens; `*` for any. */
+  hosts?: string[];
+  /** Paths it lets the agent read, or write, beyond its sandbox. */
+  read?: string[];
+  write?: string[];
+  /** Every file it changes, a moved or renamed one by both ends (`from`). */
+  files?: { path: string; from?: string }[];
+  /** Folders an "always" answer adds to what the agent may reach, and rules it saves (`Tool(content)`). */
+  dirs?: string[];
+  rules?: string[];
+  unknown?: true;
 }
 
 export interface QuestionRequest {
@@ -1648,8 +1671,11 @@ export interface PhoneStatus {
   devices: PhoneDevice[];
   /** The open pairing offer (a one-time key, valid for minutes): the link the QR code encodes, and the code as SVG path data on a `size` grid. */
   pairing?: { link: string; expiresAt: number; qr: string; size: number };
-  /** A phone that presented the pairing key and waits for "Allow". */
-  request?: { id: string; name: string; address: string; at: number };
+  /**
+   * A phone that presented the pairing key and waits for "Allow". `replaces`: the name of the plain
+   * pairing it replaces (by its migration ticket); absent, a pairing of its own (any older entry stays).
+   */
+  request?: { id: string; name: string; address: string; at: number; replaces?: string };
   error?: string;
   /** A change to the paired phones (a removal, phone access off) is in effect but could not be written to disk yet; it is tried again. */
   saveError?: string;
@@ -1706,7 +1732,11 @@ export type PhoneFrame =
   /** `hosts`: the desktop's addresses now (a phone adds new ones, e.g. Tailscale's, to its pairing). */
   | { welcome: { deviceId: string; desktop: string; version: string; hosts?: string[] } }
   | { waiting: true }
-  | { paired: { token: string; deviceId: string; desktop: string } }
+  /**
+   * `replaced`: the plain pairing this one replaced (named by its ticket) is gone, written together
+   * with this one. Absent: a separate pairing; an older entry, if any, stays until it is removed.
+   */
+  | { paired: { token: string; deviceId: string; desktop: string; replaced?: string } }
   | { denied: string };
 
 /**
@@ -1777,6 +1807,30 @@ export interface PhoneTail extends Omit<SessionSnapshot, 'items'> {
   /** Permissions and questions waiting in all, when more wait than came here (the desktop has them all). */
   permissionsTotal?: number;
   questionsTotal?: number;
+  /** More of what waits in this chat than this page holds (by count or by bytes): `phone.prompts` with this chat and this cursor reads on. */
+  promptsCursor?: string;
+}
+
+/**
+ * `app.hello` as a phone gets it: the chats' list and what waits across chats each within a byte
+ * budget. Where one was cut, its cursor and totals: `phone.sessions` / `phone.prompts` read on. A
+ * page may repeat entries of the one before: take them by id.
+ */
+export interface PhoneHelloState extends AppState {
+  sessionsCursor?: string;
+  sessionsTotal?: number;
+  promptsCursor?: string;
+  permissionsTotal?: number;
+  questionsTotal?: number;
+}
+
+/** A page of what waits, as a phone gets it (`phone.prompts`); `cursor` absent at the end. */
+export interface PhonePromptsPage {
+  permissions: PhonePermission[];
+  questions: PhoneQuestionRequest[];
+  cursor?: string;
+  permissionsTotal: number;
+  questionsTotal: number;
 }
 
 /** A file the agent handed over, opened for the phone over the secure channel (`phone.fileStart`). */
@@ -1790,6 +1844,18 @@ export interface PhoneFileStart {
   sha256: string;
   /** The biggest chunk the desktop sends. */
   chunk: number;
+}
+
+/**
+ * A file request refused for now, not failed (`phone.fileStart` beyond the starts that may wait,
+ * `phone.fileChunk` beyond the reads in flight): the phone asks the same again after `retryAfterMs`.
+ */
+export interface PhoneRetryReply {
+  id: number;
+  ok: false;
+  error: string;
+  retry: true;
+  retryAfterMs: number;
 }
 
 /** Methods only the phone endpoint answers, besides `PHONE_METHODS`. */
@@ -1866,9 +1932,25 @@ export interface PhoneMethods {
    * answer; refused for `incomplete` questions. Skipping stays `question.respond` with `answers: null`.
    */
   'phone.answer': { params: { sessionId: string; requestId: string; picks: Record<string, { options?: string[]; other?: string }> }; result: { ok: boolean } };
+  /**
+   * A queued message taken back with a receipt (`queue.take` with `ack: true`), once the phone has kept
+   * its words (`kept`, by default; `false`: it could not, the message stays queued as it was).
+   * Idempotent: asked again, the same receipt answers the same. `taken`: the message is out of the
+   * queue for this take (false: it stayed, was changed or already went out on the desktop; the phone
+   * keeps what it holds and says so). Without an answer within 45 s the message goes back as it was;
+   * a confirmation after that still takes it while it is unchanged in the queue.
+   */
+  'phone.takeDone': { params: { take: string; kept?: boolean }; result: { taken: boolean } };
+  /** The chats' list on from a cursor (`PhoneHelloState.sessionsCursor`, or the page before), within a byte budget. */
+  'phone.sessions': { params: { cursor: string }; result: { sessions: SessionMeta[]; cursor?: string; total: number } };
+  /**
+   * What waits on from a cursor, within a byte budget: across chats (`PhoneHelloState.promptsCursor`)
+   * or in one chat (`sessionId`, `PhoneTail.promptsCursor`).
+   */
+  'phone.prompts': { params: { cursor: string; sessionId?: string }; result: PhonePromptsPage };
 }
 
-export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.fileStart', 'phone.fileChunk', 'phone.fileEnd', 'phone.migrate', 'phone.queue', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image', 'phone.thumb', 'phone.answer'] as const satisfies readonly (keyof PhoneMethods)[];
+export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.fileStart', 'phone.fileChunk', 'phone.fileEnd', 'phone.migrate', 'phone.queue', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image', 'phone.thumb', 'phone.answer', 'phone.takeDone', 'phone.sessions', 'phone.prompts'] as const satisfies readonly (keyof PhoneMethods)[];
 
 /** A message that matched a search across chats (`search.messages` on the desktop, `phone.search` on the phone). */
 export interface MessageHit {
@@ -2219,7 +2301,11 @@ export interface RpcMethods {
    * Removes a queued message and returns it, atomically (for "edit": put it back in the composer).
    * `message` is absent when it already went out or was removed.
    */
-  'queue.take': { params: { sessionId: string; id: string }; result: { message?: QueuedMessage } };
+  /**
+   * From a phone with `ack: true`: the message stays reserved in the queue and the answer carries a
+   * receipt (`take`); it leaves the queue only on `phone.takeDone` with that receipt.
+   */
+  'queue.take': { params: { sessionId: string; id: string; ack?: boolean }; result: { message?: QueuedMessage; take?: string } };
   /** Reorders the queue: `ids` first in that order, any message not named keeps its place after them. */
   'queue.reorder': { params: { sessionId: string; ids: string[] }; result: { ok: boolean } };
   /** Takes a queued message out of the queue and gives it to the agent now (steered into the running turn, if any). */

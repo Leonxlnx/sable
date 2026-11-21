@@ -156,8 +156,17 @@ describe('#11: a wake Claude Code starts by itself after a stop', () => {
 });
 
 describe('#15: a result of a turn the safety net settled', () => {
+  /** A CLI that names what each result answers, as its first turn's result showed (wave 5 #13: one that has not shown it gets a new process for the next turn). */
+  const naming = async (h: Awaited<ReturnType<typeof claudeApp>>) => {
+    const z = await h.send('hello');
+    h.replay(z, 'hello');
+    h.result([z]);
+    expect(h.rt.turnActive).toBe(false);
+  };
+
   it('named for its own message, it never ends the next turn, stopped too', async () => {
     const h = await claudeApp();
+    await naming(h);
     const a = await h.send('first');
     h.replay(a, 'first');
     await h.stop();
@@ -176,6 +185,7 @@ describe('#15: a result of a turn the safety net settled', () => {
 
   it('it adds no line of its own to the next turn, nor fails a message of it', async () => {
     const h = await claudeApp();
+    await naming(h);
     const a = await h.send('first');
     h.replay(a, 'first');
     await h.stop();
@@ -192,7 +202,7 @@ describe('#15: a result of a turn the safety net settled', () => {
     expect(h.turns().slice(before).map((t) => t.error)).toEqual([undefined]);
   }, 10_000);
 
-  it('in a CLI that names no messages, the one late result owed is the settled turn\'s', async () => {
+  it('in a CLI that names no messages, the next turn goes to a new process: its first result is its own', async () => {
     const h = await claudeApp();
     const a = await h.send('first');
     h.replay(a, 'first');
@@ -201,9 +211,8 @@ describe('#15: a result of a turn the safety net settled', () => {
     const b = await h.send('second');
     h.replay(b, 'second');
     await h.stop();
-    // Results that name nothing: the first one is the settled turn's.
-    h.result([], true);
-    expect(h.rt.turnActive).toBe(true);
+    // A result that names nothing could be either turn's; the old process (and what it owed) was let
+    // go, so it is the second's (wave 5 #13; turns-wave5 shows the old process's late result dropped).
     h.result([], true);
     expect(h.rt.turnActive).toBe(false);
   }, 10_000);

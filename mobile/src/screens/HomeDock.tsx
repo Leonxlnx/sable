@@ -10,6 +10,7 @@ import { fit } from '@m/lib/fit';
 import { haptic, isNative } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { onForget } from '@m/lib/forget';
+import { epoch, still } from '@m/lib/epoch';
 import { openFrom } from '@m/lib/open';
 import { applySnapshot, setState, useStore } from '@m/lib/store';
 import { Icon } from '@m/ui/icons';
@@ -109,6 +110,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
     if (el && dock.current) launchFlight(t, el, dock.current);
     else haptic('tap');
     update('');
+    const e = epoch();
     try {
       const snap = await createChat(c, t);
       applySnapshot(snap);
@@ -120,6 +122,8 @@ export function HomeDock({ covered }: { covered: boolean }) {
       await conn.call('session.send', { sessionId: snap.session.id, text: t });
     } catch (err) {
       dropFlight();
+      // Forgotten (or replaced by another computer) while the chat was being made: its words are not put back.
+      if (!still(e)) return;
       haptic('deny');
       if (!area.current?.value) update(t);
       setState({ toast: { text: (err as Error).message, level: 'error', at: Date.now() } });

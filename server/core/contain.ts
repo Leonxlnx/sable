@@ -5,16 +5,22 @@ import path from 'node:path';
 /**
  * Whether a file opened for reading lies in a folder (a chat's), established against the open
  * handle, else not: where it cannot be established the answer is "not inside" (fail closed). Used by
- * a share's capture (core/handed.ts, sync) and the untracked-file reader of a chat's changes
- * (services/git.ts `readText`, async). The caller resolves the file's real place first (links
+ * a share's capture (core/handed.ts, sync) and the working-tree reader of a chat's changes for the
+ * phone (services/git.ts `readText`, `checkedDiff`, async). The caller resolves the file's real place first (links
  * followed) and passes the folder canonical; a file whose place is not in the folder is opened and
  * is simply not inside.
  *
  * - Linux: the handle names its own file (/proc/self/fd): that path must lie in the folder and still
  *   be this very file (volume and id), with no other name (one link).
- * - Elsewhere (Windows, macOS) a handle cannot say where its file is (Node has no
- *   GetFinalPathNameByHandle and cannot open relative to a folder's handle, and holding a folder
- *   exclusively fails while anything watches it). So the open is put between two walks down the path:
+ * - Elsewhere (Windows, macOS: `CONTAIN.how` 'walk') a handle cannot say where its file is: Node has
+ *   no GetFinalPathNameByHandle, `realpath` resolves a path anew (its own handle, not this one), and
+ *   every lookup by name can be raced. What the walks below can say is the check there; it is not a
+ *   proof (review wave 5, #7: a folder above the chat's folder flipped for a junction between their
+ *   lookups makes a file outside agree with both, tests/contain.test.ts). 'none' (nothing is inside:
+ *   every file counts as external) was tried and kept as an option: on Windows it withholds every
+ *   phone diff and every Bypass share, which breaks the phone for the people it is for.
+ * - `CONTAIN.how` 'walk': the
+ *   open is put between two walks down the path:
  *   every folder from the volume's root to the file looked up with lstat (nothing followed), each a
  *   real folder (no link, no junction), the last a plain file with one link; between the two walks
  *   every folder is the same (volume and id), from the chat's folder itself down also with the same
@@ -43,8 +49,11 @@ import path from 'node:path';
 export const CONTAIN = {
   /** A folder on the way must have been left alone this long before a walk can tell its next change (its times move by clock ticks). */
   settleMs: 25,
-  /** How it is established here: the handle's own path (Linux) or the walks around the open. Tests may set it. */
-  how: (process.platform === 'linux' ? 'proc' : 'walk') as 'proc' | 'walk',
+  /**
+   * How it is established here: the handle's own path (Linux), the two walks around the open
+   * (Windows, macOS: not a proof, see above), or not at all (`none`: nothing is inside).
+   */
+  how: (process.platform === 'linux' ? 'proc' : 'walk') as 'proc' | 'walk' | 'none',
 };
 
 /** `p` is `root` or lies under it (both real paths; case-insensitive on Windows). */
@@ -174,8 +183,9 @@ function* tryWalk(chain: Chain): Check<{ seen: Seen[]; wait: number } | null | '
 
 function* check<H>(file: string, root: string | undefined): Check<Contained<H>> {
   const chain = root ? chainOf(root, file) : null;
-  if (!root || !chain) return { ...(yield* opened<H>(file)), inside: false };
-  let how = CONTAIN.how;
+  const how = CONTAIN.how;
+  // No proof of where an opened file lies here: it is not inside.
+  if (!root || !chain || how === 'none') return { ...(yield* opened<H>(file)), inside: false };
   for (let attempt = 0; attempt < 2; attempt++) {
     const last = attempt === 1;
     if (how === 'proc') {
@@ -196,11 +206,8 @@ function* check<H>(file: string, root: string | undefined): Check<Contained<H>> 
         yield { k: 'close', h: got.handle };
         continue;
       }
-      // No /proc here: the walks instead, this try again.
-      yield { k: 'close', h: got.handle };
-      how = 'walk';
-      attempt--;
-      continue;
+      // No /proc here: nothing names the handle's file, so it is not established.
+      return { ...got, inside: false };
     }
     let before = yield* tryWalk(chain);
     if (before && before !== 'gone' && before.wait) {

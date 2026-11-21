@@ -56,7 +56,33 @@ import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRu
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
 
-type Handler<M extends RpcName> = (params: RpcMethods[M]['params']) => Promise<RpcMethods[M]['result']> | RpcMethods[M]['result'];
+/**
+ * Who asks, beside the params: `allowed` (the phone endpoint's guard, services/phone.ts) says whether
+ * the caller may still act; a handler that waits asks it again right before what it does after the wait.
+ */
+export interface CallContext {
+  allowed?: () => boolean;
+}
+
+/** The caller of a call may no longer act (a phone removed while its request waited). */
+export class CallerGone extends Error {
+  constructor() {
+    super('This phone was removed on the desktop');
+  }
+}
+
+/** Throws `CallerGone` when the caller may no longer act. */
+const still = (ctx?: CallContext) => {
+  if (ctx?.allowed && !ctx.allowed()) throw new CallerGone();
+};
+
+/** A message's words and pictures as a send or a queue edit takes them: words a string, pictures a list or nothing. */
+function validMessage(text: unknown, attachments: unknown) {
+  if (typeof text !== 'string') throw new Error('A message needs its words.');
+  if (attachments !== undefined && attachments !== null && !Array.isArray(attachments)) throw new Error('Those attachments cannot go with a message.');
+}
+
+type Handler<M extends RpcName> = (params: RpcMethods[M]['params'], ctx: CallContext) => Promise<RpcMethods[M]['result']> | RpcMethods[M]['result'];
 
 export interface AppOptions {
   home?: string;
@@ -350,10 +376,10 @@ export class App {
     this.handlers.set(method, handler as unknown as Handler<RpcName>);
   }
 
-  async call<M extends RpcName>(method: M, params: RpcMethods[M]['params']): Promise<RpcMethods[M]['result']> {
+  async call<M extends RpcName>(method: M, params: RpcMethods[M]['params'], ctx: CallContext = {}): Promise<RpcMethods[M]['result']> {
     const h = this.handlers.get(method);
     if (!h) throw new Error(`Unknown method: ${method}`);
-    return (await h(params as never)) as RpcMethods[M]['result'];
+    return (await h(params as never, ctx)) as RpcMethods[M]['result'];
   }
 
   /** The provider instance for an account (the default account when `accountId` is absent). */
@@ -788,11 +814,14 @@ export class App {
    * Puts a message in the timeline and hands it to the agent. Mid-turn it is steered: the agent
    * takes it at its next step and it stays where it was sent.
    */
-  private async deliver(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: Pick<UserItem, 'until'>) {
+  private async deliver(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: Pick<UserItem, 'until'>, ctx?: CallContext) {
     // Past its account's cap, the session moves to the next account before the message goes out.
     // The first message names the session's lane, or moves it into one when its folder got busy.
+    // A caller that may no longer act (a phone removed meanwhile) is asked again after every wait.
     if (!extra?.until && !rt.items.some((i) => i.type === 'user')) await this.lanes.beforeFirstSend(rt, text);
+    still(ctx);
     if (!rt.turnActive && !this.opening.has(rt.id)) await this.checkCap(rt);
+    still(ctx);
     const addUser = () => {
       if (rt.meta.titleSource === 'auto' && !rt.items.some((i) => i.type === 'user')) {
         rt.update({ title: extra?.until?.check ? autoTitle(`Until ${extra.until.check.command} passes`) : autoTitle(text) });
@@ -835,8 +864,20 @@ export class App {
     }
     // Stopped while the agent was starting: the message stays where it was sent, and is not sent later.
     if (early && this.stoppedEarly.delete(early.id)) return;
+    // Its phone was removed while it waited: it never goes out (one shown early leaves the chat, said in a line).
+    const gone = () => {
+      if (!ctx?.allowed || ctx.allowed()) return;
+      if (early) {
+        rt.remove(early.id);
+        if (!rt.turnActive && rt.meta.status === 'starting') rt.update({ status: 'idle' });
+        rt.notice('info', 'A message from a removed phone was not sent');
+      }
+      throw new CallerGone();
+    };
+    gone();
     // A model chosen since the agent started takes effect now, with this message (never inside a running turn).
     await this.applyDue(rt, handle);
+    gone();
     const item = early ?? addUser();
     const runningSince = item.steered ? rt.turnStartedAt : undefined;
     const unhand = this.handOver(rt, item.id);
@@ -849,6 +890,13 @@ export class App {
         this.log('steer failed; back to the queue', (err as Error).message);
         rt.remove(item.id);
         rt.requeue([{ id: item.id, text: item.text, attachments: item.attachments, createdAt: item.ts }]);
+        return;
+      }
+      // The turn this message began has ended since (its end stands after it): a failure of its send
+      // that comes now is that turn's, and never ends the one running now (begun by a newer message).
+      const at = item.steered ? -1 : rt.items.findIndex((i) => i.id === item.id);
+      if (at >= 0 && rt.items.slice(at + 1).some((i) => i.type === 'turn' && !i.parentId)) {
+        this.log('a send failed after its turn ended; nothing else ends', (err as Error).message);
         return;
       }
       rt.notice('error', 'Could not send the message', (err as Error).message);
@@ -1773,13 +1821,15 @@ export class App {
    * starts, whatever the folder's state (a race); when the lane cannot be made the session is removed
    * and this rejects.
    */
-  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string } } = {}): Promise<SessionSnapshot> {
+  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string } } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
     const settings = this.store.state.settings;
     let accountId = p.accountId ?? this.defaultAccountId(p.provider);
     this.provider(p.provider, accountId);
     // An account past its cap: the session starts on the next one under its own (a resumed
     // conversation stays where it lives).
     const capStart = p.resume ? undefined : await this.underCapStart(p.provider, accountId, p.model ?? settings.defaultModels[p.provider]).catch(() => undefined);
+    // Its caller (a phone) removed while that was read: no chat, no folder.
+    still(ctx);
     if (capStart) accountId = capStart.to;
     const provider = this.provider(p.provider, accountId);
     // A chat without a folder gets a fresh folder of its own under the chats folder.
@@ -2211,7 +2261,7 @@ export class App {
     });
 
     // ── sessions ──
-    this.register('session.create', (p) => this.createSession(p));
+    this.register('session.create', (p, ctx) => this.createSession(p, {}, ctx));
 
     this.register('session.snapshot', async ({ sessionId }) => {
       const rt = this.runtime(sessionId);
@@ -2231,7 +2281,9 @@ export class App {
       return { item: { ...item } };
     });
 
-    this.register('session.send', async ({ sessionId, text, attachments, steer }) => {
+    this.register('session.send', async ({ sessionId, text, attachments, steer }, ctx) => {
+      // A message is words (maybe empty, with pictures) before anything holds it: the queue, the timeline, the agent.
+      validMessage(text, attachments);
       const rt = this.runtime(sessionId);
       this.hydrate(rt);
       // `/model <name>` changes the model; it never goes to the agent (whose own /model restarts it).
@@ -2243,14 +2295,16 @@ export class App {
         rt.enqueue(text, attachments);
         return { ok: true, queued: true };
       }
-      await this.deliver(rt, text, attachments);
+      await this.deliver(rt, text, attachments, undefined, ctx);
       return { ok: true };
     });
 
     this.register('queue.update', ({ sessionId, id, text, attachments }) => {
+      // Omitted attachments keep the message's; an empty list removes them.
+      validMessage(text, attachments);
       const rt = this.runtime(sessionId);
       this.hydrate(rt);
-      const ok = rt.updateQueued(id, text, attachments);
+      const ok = rt.updateQueued(id, text, attachments ?? undefined);
       this.spare.queueChanged(rt);
       return { ok };
     });
@@ -2274,14 +2328,23 @@ export class App {
       this.spare.queueChanged(rt);
       return { ok };
     });
-    this.register('queue.sendNow', async ({ sessionId, id }) => {
+    this.register('queue.sendNow', async ({ sessionId, id }, ctx) => {
       const rt = this.runtime(sessionId);
       this.hydrate(rt);
       const q = rt.takeQueued(id);
       this.spare.queueChanged(rt);
       if (!q) return { ok: false };
       // Mid-turn this is steered into the running turn.
-      await this.deliver(rt, q.text, q.attachments);
+      try {
+        await this.deliver(rt, q.text, q.attachments, undefined, ctx);
+      } catch (err) {
+        // Its phone was removed while it waited: the message goes back where it was, unsent.
+        if (err instanceof CallerGone) {
+          rt.requeue([q]);
+          this.spare.queueChanged(rt);
+        }
+        throw err;
+      }
       return { ok: true };
     });
 

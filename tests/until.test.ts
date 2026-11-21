@@ -502,7 +502,8 @@ describe('until green in the app (Demo agent, real check)', () => {
 
   it('a message sent while the check runs goes first; the check runs again after its turn', async () => {
     const { app: a, home } = await app();
-    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    // The check's process lets go of its folder a moment after it ends (Windows, a busy machine).
+    cleanups.push(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
     const cwd = path.join(home, 'proj');
     mkdirSync(cwd, { recursive: true });
     const snap = await a.call('session.create', { provider: 'demo', cwd, mode: 'bypassPermissions' });

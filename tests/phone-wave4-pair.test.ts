@@ -25,6 +25,9 @@ import { FORGET_FAILED, removeChecked } from '../mobile/src/lib/credential';
 const stored = new Map<string, string>();
 const storage = { failRemove: false };
 vi.mock('../mobile/src/lib/native', () => ({
+  loadMark: async () => null,
+  saveMark: async () => {},
+  eraseNative: async () => [],
   loadPairing: async () => {
     const v = stored.get('pairing');
     return v ? JSON.parse(v) : null;
@@ -163,7 +166,7 @@ describe('an old plain pairing paired again (1, 2)', () => {
     const offer = { hosts: ['127.0.0.1'], port: await b.ready, key, fp: other.fingerprint, name: os.hostname() };
     expect(m.conn.replaces(offer)).toBeTruthy();
     const signal = m.conn.beginPair();
-    const pairing = m.conn.pair(offer, 'Phone', () => {}, signal);
+    const pairing = m.conn.pair(offer, 'Phone', () => {}, signal, m.conn.confirmFor(offer));
     pairing.catch(() => {});
     await until(() => b.got.length > 0);
     const frame = JSON.parse(b.got[0]) as { pair: { key: string; replaces?: unknown } };
@@ -180,7 +183,7 @@ describe('an old plain pairing paired again (1, 2)', () => {
     const m = await legacyPhone(a.port, legacy);
     const offer = await offerOf(a.app, a.port);
     const signal = m.conn.beginPair();
-    const pairing = m.conn.pair(offer, 'Phone', () => {}, signal);
+    const pairing = m.conn.pair(offer, 'Phone', () => {}, signal, m.conn.confirmFor(offer));
     await until(() => !!(a.phone as unknown as { request?: unknown }).request, 6000);
     const req = (a.phone as unknown as { request: { id: string; replaces?: { id: string; ticket: string } } }).request;
     expect(req.replaces?.id).toBe(legacy.id);
@@ -232,6 +235,7 @@ describe('who may stop the phone (18)', () => {
     const { c: _c, ...paired } = await (async () => {
       const m = await phoneApp();
       conns.push(m.conn);
+      await m.conn.init();
       const offer = await offerOf(a.app, a.port);
       const signal = m.conn.beginPair();
       const p = m.conn.pair(offer, 'Phone', () => {}, signal);
@@ -262,6 +266,7 @@ describe('a pairing given up (19)', () => {
     const port = await fake.ready;
     const m = await phoneApp();
     conns.push(m.conn);
+    await m.conn.init();
     // The first address does not answer at all; the desktop is the second (tried a moment later).
     const offer = { hosts: ['10.255.255.1', '127.0.0.1'], port, key: 'k'.repeat(22), fp: id.fingerprint, name: 'Desk' };
     const signal = m.conn.beginPair();
@@ -280,6 +285,7 @@ describe('a pairing given up (19)', () => {
     const port = await fake.ready;
     const m = await phoneApp();
     conns.push(m.conn);
+    await m.conn.init();
     m.TIMING.handshake = 300;
     const p = m.conn.pair({ hosts: ['127.0.0.1'], port, key: 'k'.repeat(22), fp: id.fingerprint, name: 'Desk' }, 'Phone', () => {}, m.conn.beginPair());
     await until(() => fake.seen.connections === 1);
@@ -295,8 +301,8 @@ describe('forgetting the computer (20)', () => {
     const a = await desktop({ legacy });
     const m = await legacyPhone(a.port, legacy);
     const forgotten: string[] = [];
-    m.onForget(() => forgotten.push('drafts'));
-    m.onForget(() => forgotten.push('downloads'));
+    m.onForget(() => void forgotten.push('drafts'));
+    m.onForget(() => void forgotten.push('downloads'));
     storage.failRemove = true;
     await expect(m.conn.forget()).rejects.toThrow(FORGET_FAILED);
     expect(m.conn.pairing).not.toBeNull();

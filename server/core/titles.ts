@@ -216,12 +216,20 @@ export class ChatTitles {
 
   constructor(private deps: TitleDeps) {}
 
-  /** A turn ended without error and was not stopped; `consumed`: the messages it took. The chat's first is named. */
+  /**
+   * A turn ended without error and was not stopped; `consumed`: the messages it took. The chat's first
+   * is named, from a message that went ok by its agent's own word (runtime `answeredOk`): one with no
+   * word yet, or one that failed or was stopped, never names it.
+   */
   turnEnded(rt: SessionRuntime, consumed: readonly string[]) {
     if (!wantsTitle(rt.meta, rt.items, this.deps.settings())) return;
     const turn = rt.items.findLast((i) => i.type === 'turn' && !i.parentId);
     if (!turn || !settledTurn(turn)) return;
-    const ask = titleAsk(rt.items, consumed, (id) => rt.answeredBy(id));
+    const ask = titleAsk(
+      rt.items,
+      consumed.filter((id) => rt.answeredOk(id)),
+      (id) => rt.answeredBy(id),
+    );
     const owner = ownerOf(rt.meta);
     if (!ask || !this.deps.model(owner)) return;
     // Asked once, whatever comes of it: a failed call is not tried again.

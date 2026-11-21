@@ -15,7 +15,7 @@ import type { PathLike } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionMeta, ToolItem } from '@shared/protocol';
 
 const hook: { look?: (fn: string, file: string) => void } = {};
@@ -52,8 +52,17 @@ const { readText } = await import('../server/services/git');
 const { SessionRuntime } = await import('../server/core/runtime');
 const { CONTAIN, openContained, openContainedSync } = await import('../server/core/contain');
 
+/** What this platform establishes by default: Linux by the handle's own path, elsewhere the two walks ('walk': not a proof, see core/contain.ts). */
+const DEFAULT = CONTAIN.how;
+// The walks' own tests (the races of waves 3 and 4) run with the walks where no handle names its
+// file; the default there is tested on its own ('by default').
+beforeEach(() => {
+  CONTAIN.how = DEFAULT === 'none' ? 'walk' : DEFAULT;
+});
+
 const homes: string[] = [];
 afterEach(() => {
+  CONTAIN.how = DEFAULT;
   hook.look = undefined;
   looks.length = 0;
   for (const h of homes.splice(0)) fs.rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -245,6 +254,83 @@ describe('siblings of the chat folder coming and going', () => {
       Atomics.store(stop, 0, 1);
       await worker.terminate();
     }
+  });
+});
+
+describe('by default (review wave 5, #7)', () => {
+  beforeEach(() => {
+    CONTAIN.how = DEFAULT;
+  });
+
+  it("is the handle's own path on Linux, and the walks elsewhere", () => {
+    expect(DEFAULT).toBe(process.platform === 'linux' ? 'proc' : 'walk');
+  });
+
+  it("a plain file in the folder is inside by default; with 'none' it is external, and a share of it reaches a phone only when the person allowed it", async () => {
+    for (const how of [DEFAULT, 'none'] as const) {
+      CONTAIN.how = how;
+      const { root, file } = folders();
+      const proven = how !== 'none';
+      const a = openContainedSync(file, root);
+      fs.closeSync(a.fd);
+      expect(a.inside).toBe(proven);
+      const b = await openContained(file, root);
+      await b.fh.close();
+      expect(b.inside).toBe(proven);
+      expect((await readText(file, 1000, root))?.text).toBe(proven ? 'inside the chat' : undefined);
+      const { share, allowed } = session(root);
+      expect(share('s1', ['dir/a.txt'])[0]).toMatchObject({ inside: proven });
+      expect(share('s1b', ['dir/a.txt'])[0]?.granted).toBeUndefined();
+      expect(await allowed('s2', ['dir/a.txt'])).toMatchObject([proven ? { inside: true } : { inside: false, granted: true }]);
+    }
+  });
+});
+
+describe('a folder above the chat folder flipped between lookups (review wave 5, #7)', () => {
+  // The walks check the folders above the chat's folder for links and ids only: this race is their
+  // known gap (core/contain.ts, "What remains"). It holds by the handle's own path and with 'none'.
+  beforeEach(() => {
+    CONTAIN.how = DEFAULT === 'walk' ? 'none' : DEFAULT;
+  });
+
+  /** `home/proj/chat` is the chat's folder; `home/evil/chat` has the same names and a secret. */
+  function above() {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(tmpdir(), 'sable-contain-up-')));
+    homes.push(home);
+    const proj = path.join(home, 'proj');
+    const root = path.join(proj, 'chat');
+    fs.mkdirSync(path.join(root, 'dir'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'dir', 'a.txt'), 'inside the chat');
+    const evil = path.join(home, 'evil');
+    fs.mkdirSync(path.join(evil, 'chat', 'dir'), { recursive: true });
+    fs.writeFileSync(path.join(evil, 'chat', 'dir', 'a.txt'), 'outside secret');
+    // `proj` looks plain to its own lookup and leads to `evil` for everything under it; resolving the whole path sees it plain.
+    const f = flipper(proj, evil);
+    const arm = () =>
+      (hook.look = (fn, p) => {
+        if (fn === 'realpath' || norm(p) === norm(proj) || !under(p, proj)) f.set(false);
+        else f.set(true);
+      });
+    return { root, file: path.join(root, 'dir', 'a.txt'), f, arm };
+  }
+
+  it('the outside file is never taken for one in the chat folder, by the untracked-diff reader or a share', async () => {
+    const { root, file, f, arm } = above();
+    arm();
+    const got = await readText(file, 1000, root);
+    hook.look = undefined;
+    f.set(false);
+    expect(got?.text).not.toBe('outside secret');
+    expect(got).toBeNull();
+    arm();
+    const sync = openContainedSync(file, root);
+    hook.look = undefined;
+    f.set(false);
+    const read = Buffer.alloc(64);
+    const n = fs.readSync(sync.fd, read, 0, 64, 0);
+    fs.closeSync(sync.fd);
+    expect(sync.inside && read.toString('utf8', 0, n) === 'outside secret').toBe(false);
+    expect(sync.inside).toBe(false);
   });
 });
 

@@ -32,6 +32,7 @@ import type {
   ModelInfo,
   NoticeItem,
   PermissionOption,
+  PermissionScope,
   ProviderInfo,
   RateLimit,
   ResetOffer,
@@ -64,6 +65,7 @@ import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
 import { claimStep } from '../core/sub-agent';
+import { compactScope, withScope } from '../core/permission-scope';
 
 type Obj = Record<string, any>;
 
@@ -1126,11 +1128,12 @@ class ClaudeSession implements ProviderSession {
   private interruptTimer?: NodeJS.Timeout;
   /**
    * Results still owed by turns a stop's safety net settled without one (oldest first): the messages
-   * each turn had read, by sdk uuid (and any other uuid a result may name one by); empty for a turn
-   * Claude Code began by itself. It answers its turns in order, so a result that names only such
-   * messages, or (naming none) the next one owed, is that settled turn's, come late (`late`).
+   * each turn had read, each still owing its own result, as every uuid a result may name it by → its
+   * sdk uuid; empty for a turn Claude Code began by itself. It answers its turns in order, so a result
+   * that names only such messages, or (naming none) the next one owed, is that settled turn's, come
+   * late (`late`), and pays for those messages only.
    */
-  private owed: Set<string>[] = [];
+  private owed: Map<string, string>[] = [];
   /** A new agent process has not said hello yet (system/init): the live line says "Starting", not "Thinking". */
   private booting = false;
   private idleTimer?: NodeJS.Timeout;
@@ -1367,6 +1370,8 @@ class ClaudeSession implements ProviderSession {
     let failure: string | undefined;
     try {
       for await (const m of q) {
+        // A process let go (closed, restarted, set aside after a stop): what it still writes is no turn's here.
+        if (this.q !== q) break;
         try {
           this.onMessage(m);
         } catch (err) {
@@ -1446,6 +1451,20 @@ class ClaudeSession implements ProviderSession {
     this.provider.sessions.delete(this);
   }
 
+  /**
+   * Lets the idle process go with the results it still owes (`owed`): nothing it writes after this
+   * reaches a turn here (`pump`), and the next message starts a new one. What it had not read went
+   * back to the queue at the stop.
+   */
+  private setAside() {
+    this.log('claude: a stopped turn never sent its result; the next message goes to a new agent process');
+    this.shutdown();
+    this.owed = [];
+    this.streams.clear();
+    this.wakes = 0;
+    this.withdrawn.clear();
+  }
+
   // ── commands from the UI ──
 
   async send(item: UserItem) {
@@ -1453,6 +1472,10 @@ class ClaudeSession implements ProviderSession {
     if (!existsSync(this.rt.meta.cwd)) throw new Error(`The folder ${this.rt.meta.cwd} does not exist.`);
     this.closed = false;
     this.lastActive = Date.now();
+    // A stopped turn still owes its result on a stream that has not shown it names what a result
+    // answers: a result naming nothing could then be either turn's. The next turn goes to a new process
+    // (the conversation resumes there), whose results are all its own.
+    if (this.q && !this.rt.turnActive && this.owed.length && !this.namesMessages && !this.liveTasks.size) this.setAside();
     this.ensure();
     clearTimeout(this.idleTimer);
     const uuid = randomUUID();
@@ -1517,28 +1540,37 @@ class ClaudeSession implements ProviderSession {
 
   /** The running turn is settled without its result: the result it still owes is told apart when it comes (`late`). */
   private owe() {
-    const uuids = new Set<string>();
-    for (const [u, a] of this.awaiting) if (a.read) uuids.add(u);
-    for (const [alias, u] of this.aliases) if (uuids.has(u)) uuids.add(alias);
+    const names = new Map<string, string>();
+    for (const [u, a] of this.awaiting) if (a.read) names.set(u, u);
+    for (const [alias, u] of this.aliases) if (names.get(u) === u) names.set(alias, u);
     // Nothing read and nothing that woke it: Claude Code began no turn for it, and owes no result.
-    if (!uuids.size && !this.wakes) return;
-    this.owed.push(uuids);
+    if (!names.size && !this.wakes) return;
+    this.owed.push(names);
     if (this.owed.length > 8) this.owed.shift();
   }
 
   /**
    * Whether result `m` is one a turn settled by the safety net owed (`owed`): naming messages, when it
    * names only that turn's; naming none, the oldest owed that named none (any, in a CLI that names
-   * none). Claude Code answers its turns in order: what was owed before the result that came is not
-   * coming any more.
+   * none). It pays for the messages it answers only (named, or in a CLI that names none, the oldest):
+   * a turn that had read more still owes their results. Claude Code answers its turns in order: what
+   * was owed before the result that came is not coming any more.
    */
   private late(m: Obj): boolean {
     if (!this.owed.length) return false;
     const named = resultUuids(m);
     if (named.length) this.namesMessages = true;
     const at = named.length ? this.owed.findIndex((s) => named.every((u) => s.has(u))) : this.owed.findIndex((s) => !this.namesMessages || !s.size);
-    this.owed.splice(0, at < 0 ? this.owed.length : at + 1);
-    return at >= 0;
+    if (at < 0) {
+      this.owed = [];
+      return false;
+    }
+    this.owed.splice(0, at);
+    const debt = this.owed[0];
+    const paid = new Set(named.length ? named.map((u) => debt.get(u)) : [debt.values().next().value]);
+    for (const [name, u] of [...debt]) if (paid.has(u)) debt.delete(name);
+    if (!debt.size) this.owed.shift();
+    return true;
   }
 
   async setModel(model: string) {
@@ -1678,6 +1710,7 @@ class ClaudeSession implements ProviderSession {
 
     const suggestions = (o.suggestions as PermissionUpdate[] | undefined) ?? [];
     let options: PermissionOption[];
+    let scope: PermissionScope | undefined;
     if (name === 'ExitPlanMode') {
       options = [
         { id: 'plan-auto', label: 'Approve and accept edits', tone: 'always' },
@@ -1687,7 +1720,18 @@ class ClaudeSession implements ProviderSession {
     } else {
       options = [{ id: 'allow', label: 'Allow once', tone: 'allow' }];
       const always = !o.suppressAlwaysAllowRule && suggestions.length ? describeSuggestion(suggestions[0], view.detail.path) : undefined;
-      if (always) options.push({ id: 'always', label: always.label, hint: always.hint, tone: 'always' });
+      if (always) {
+        options.push({ id: 'always', label: always.label, hint: always.hint, tone: 'always' });
+        // "Always" saves every suggestion, its label names the first (shortened): the folders and rules
+        // it saves whole, in the request's words and as data; a kind of change Sable does not name
+        // (or a mode switch the label does not say) leaves it to the desktop.
+        const unnamed = suggestions.some((s, i) => !(s.type === 'addDirectories' || s.type === 'addRules' || (s.type === 'setMode' && i === 0)));
+        scope = compactScope({
+          dirs: suggestions.flatMap((s) => (s.type === 'addDirectories' ? s.directories : [])),
+          rules: suggestions.flatMap((s) => (s.type === 'addRules' ? s.rules.map((r) => (r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName)) : [])),
+          ...(unnamed ? { unknown: true as const } : {}),
+        });
+      }
       options.push({ id: 'deny', label: 'Deny', hint: 'Tell Claude what to do instead', tone: 'deny' });
     }
 
@@ -1705,7 +1749,8 @@ class ClaudeSession implements ProviderSession {
         description: description && description !== title.trim() ? description : undefined,
         detail: view.detail,
         diff,
-        reason: o.blockedPath ? `Outside the allowed folders: ${o.blockedPath}` : undefined,
+        reason: scope ? withScope(o.blockedPath ? `Outside the allowed folders: ${o.blockedPath}` : undefined, scope) : o.blockedPath ? `Outside the allowed folders: ${o.blockedPath}` : undefined,
+        ...(scope ? { scope } : {}),
         options,
         allowFeedback: true,
       },
@@ -2219,8 +2264,11 @@ class ClaudeSession implements ProviderSession {
     this.turnSeq++;
     clearTimeout(this.interruptTimer);
     if (interrupted) this.withdrawUnread();
-    // Messages no result named on its own (an older CLI, a steer folded in) come to what the turn did.
-    this.retire(this.sentItems.keys(), interrupted ? 'stopped' : error ? 'failed' : 'ok');
+    // Messages no result named on its own (an older CLI, a steer folded in, one the turn went idle
+    // without answering) come to the turn's stop or failure. Otherwise what they came to is not known:
+    // nothing is recorded, and a message with no word of its own is never taken as having gone ok.
+    if (interrupted || error) this.retire(this.sentItems.keys(), interrupted ? 'stopped' : 'failed');
+    else this.sentItems.clear();
     this.interrupted = false;
     this.awaiting.clear();
     this.aliases.clear();

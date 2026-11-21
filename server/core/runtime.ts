@@ -132,6 +132,8 @@ export class SessionRuntime {
   }
 
   enqueue(text: string, attachments?: QueuedMessage['attachments']): QueuedMessage {
+    // Nothing without words goes in (a page of the queue reads each one's).
+    if (typeof text !== 'string') throw new Error('A message needs its words.');
     const q: QueuedMessage = { id: randomUUID(), text, attachments: attachments?.length ? attachments : undefined, createdAt: Date.now() };
     this.queue.push(q);
     this.queueChanged();

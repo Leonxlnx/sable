@@ -125,6 +125,8 @@ export function App() {
   // The launch plays once per start, over home (from the cache, or right after pairing).
   const [launch, setLaunch] = useState<'pending' | 'on' | 'done'>(() => (hasCachedHome() ? 'on' : 'pending'));
   const wasPairing = useRef(false);
+  // The saved pairing has been read: only then does a link that opened the app start pairing (it may replace that pairing, and asks first).
+  const [lookedUp, setLookedUp] = useState(false);
 
   useEffect(() => {
     const offs = [
@@ -158,6 +160,8 @@ export function App() {
       }),
       // A notification opens its chat where it matters: the prompt waiting (its sheet opens by itself), or the newest turn.
       onNotificationTap((id, kind) => (kind === 'home' ? nav.reset() : nav.chat(id, kind === 'done' ? 'turn' : undefined))),
+      // An erasure that could not finish (it goes on at the next start).
+      conn.onNotice((text) => setState({ toast: { text, level: 'error', at: Date.now() } })),
     ];
     const stopWatch = subscribeStore(watchTurns());
     const stopShortcuts = subscribeStore(watchShortcuts());
@@ -167,6 +171,7 @@ export function App() {
       // The list of chats as it was last time, at once; the desktop's answer replaces it.
       if (conn.pairing) loadCachedHome(), nav.restore();
       setReady(true);
+      setLookedUp(true);
     });
     return () => {
       offs.forEach((f) => f());
@@ -204,20 +209,31 @@ export function App() {
     } else if (ready && launch === 'pending') setLaunch('done');
   }, [pairing, ready, launch]);
 
-  if (!ready && !link) return <div className="app" />;
+  if (!ready) return <div className="app" />;
   const top = stack[stack.length - 1];
 
   if (pairing) {
     return (
       <>
         <Pair
-          link={link}
+          link={lookedUp ? link : null}
           onLinkUsed={() => {
             setLink(null);
             setState({ repairing: false });
           }}
-          denied={state === 'denied' ? error : undefined}
-          onCancel={repairing && !unpaired ? () => setState({ repairing: false }) : undefined}
+          // A link given up (Cancel, or not replacing the computer this phone has): it is used, the screen goes back to where it was.
+          onLinkDone={() => setLink(null)}
+          again={repairing && !unpaired}
+          denied={state === 'denied' || conn.lookup === 'failed' ? error : undefined}
+          // Paired already (pairing again, or a link that came in): Not now and Back go back to the chats.
+          onCancel={
+            !unpaired && (repairing || !!link)
+              ? () => {
+                  setLink(null);
+                  setState({ repairing: false });
+                }
+              : undefined
+          }
         />
         <Toast />
       </>

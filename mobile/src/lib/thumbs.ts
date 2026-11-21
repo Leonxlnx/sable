@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { kindOfFile } from '@m/ui/FileGlyph';
 import { conn } from './conn';
 import { isTransport } from './errors';
+import { epoch, still } from './epoch';
+import { onForget } from './forget';
 
 /**
  * Small pictures of the files an agent handed over, for their rows (`phone.thumb`: the desktop's
@@ -19,6 +21,11 @@ const KEEP = 48;
 /** By chat, step and file: the picture, or null when the desktop has none. */
 const kept = new Map<string, Thumb | null>();
 const asking = new Map<string, Promise<Thumb | null>>();
+// The desktop forgotten (or replaced): its pictures go, and one still decoding is not kept.
+onForget(() => {
+  kept.clear();
+  asking.clear();
+});
 
 /** Which files a picture is asked for: pictures (not drawings), PDFs and videos. */
 export function thumbKind(name: string): ThumbKind | null {
@@ -33,6 +40,7 @@ function load(sid: string, itemId: string, index: number, kind: ThumbKind): Prom
   const key = keyOf(sid, itemId, index);
   let p = asking.get(key);
   if (!p) {
+    const e = epoch();
     p = conn
       .call('phone.thumb', { sessionId: sid, itemId, index }, 30_000)
       .then(
@@ -51,12 +59,14 @@ function load(sid: string, itemId: string, index: number, kind: ThumbKind): Prom
         },
       )
       .then((t) => {
+        // Decoded after the computer was forgotten: shown nowhere, kept nowhere.
+        if (!still(e)) return null;
         kept.delete(key);
         kept.set(key, t);
         while (kept.size > KEEP) kept.delete(kept.keys().next().value as string);
         return t;
       })
-      .finally(() => asking.delete(key));
+      .finally(() => asking.get(key) === p && asking.delete(key));
     asking.set(key, p);
   }
   return p;

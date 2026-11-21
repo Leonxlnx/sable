@@ -6,6 +6,7 @@ import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format'
 import { leadTitle } from '@desk/features/timeline/lead-in';
 import { useNow } from '@m/lib/useNow';
 import { cancelDownload, downloadKey, installable, openDownload, startDownload, useDownload } from '@m/lib/downloads';
+import { PLAIN_OFF } from '@m/lib/download-core';
 import { canonicalName, isPackageName } from '@shared/file-name';
 import { conn } from '@m/lib/conn';
 import { diffLines, renderMarkdown } from '@m/lib/md';
@@ -1059,11 +1060,12 @@ function ShareCards({ sid, it }: { sid: string; it: ToolItem }) {
 
 function ShareRow({ sid, itemId, index, name: listed, size, shared }: { sid: string; itemId: string; index: number; name: string; size?: number; shared: boolean }) {
   const key = downloadKey(sid, itemId, index);
+  const d = useDownload(key);
   // One canonical name for everything here (what shows, what it is saved as, whether it is an app), as the desktop and FilesPlugin read it.
-  const name = useMemo(() => canonicalName(listed), [listed]);
+  // Once a download has its record, the name the desktop gave it for that transfer (whole, its extension kept) decides, never the row's.
+  const name = useMemo(() => (d.via === 'channel' && d.name ? d.name : canonicalName(listed)), [listed, d.via, d.name]);
   // A picture of it (a photo, a PDF's first page, a video's frame) once the share went through.
   const thumb = useThumb(sid, itemId, index, shared ? name : '', size);
-  const d = useDownload(key);
   const desktop = useStore((st) => st.desktop);
   // Re-read when the connection changes (a pairing made again on the way).
   useStore((st) => st.conn);
@@ -1090,8 +1092,8 @@ function ShareRow({ sid, itemId, index, name: listed, size, shared }: { sid: str
   const meta =
     d.state === 'failed'
       ? (d.error ?? 'The download stopped.')
-      : apk && !paired && d.state === 'idle'
-        ? 'Pair again for a secure connection to install it'
+      : !paired && d.state !== 'done'
+        ? PLAIN_OFF
         : d.state === 'verifying'
           ? 'Checking'
           : busy && (d.state === 'asking' || !d.bytes)
@@ -1103,10 +1105,10 @@ function ShareRow({ sid, itemId, index, name: listed, size, shared }: { sid: str
                   ? 'Download it again to install it'
                   : 'Pair again for a secure connection to install it'
                 : d.state === 'done'
-                  ? `${fileSize(total)} · Downloaded`
+                  ? `${fileSize(total)} · ${d.published === false ? 'Saved in Sable only' : 'Downloaded'}`
                   : [fileSize(size), kindName(name)].filter(Boolean).join(' · ');
-  // An app over an older, plain pairing: nothing to fetch it with that could be trusted.
-  const blocked = apk && !paired;
+  // An older, plain pairing: nothing to fetch a file with that could be trusted (pair again).
+  const blocked = !paired;
   return (
     <div className="share-row" data-state={d.state}>
       <span className="share-glyph" data-pic={thumb?.kind}>

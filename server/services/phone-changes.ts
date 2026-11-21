@@ -1,14 +1,16 @@
 import path from 'node:path';
 import type { DiffHunk, FileDiff, GitStatus, PhoneChangedFile, PhoneChanges, PhoneDiff, SessionSnapshot, TimelineItem } from '../../shared/protocol';
 import { cap } from '../core/trim';
-import { gitDiff, gitStatus } from './git';
+import { gitDiff, gitStatus, type GitFileDiff } from './git';
 
 /**
  * What a chat changed, for the phone's Changes view (`phone.changes`, `phone.diff`, answered in
  * phone.ts). Read-only, and only ever about the chat's own folder (its lane's worktree when it has
  * one): the phone names a chat, never a folder.
  * - In a git repository: the working tree, as the desktop's Changes tab shows it. A diff is read only
- *   for a file the status lists for that folder now, so no other path on the computer can be read.
+ *   for a file the status lists for that folder now, so no other path on the computer can be read;
+ *   its working-tree side only through a handle established to lie in the folder (git.ts
+ *   `checkedDiff`), else it is withheld with a sentence that says why.
  * - Outside one: the chat's own edits (its edit and write steps' diffs, merged per file, as the
  *   desktop's Changes tab does there). No file is read at all.
  * - A turn (`items`): the edits of the steps the phone names, sub-agents' steps included.
@@ -235,6 +237,15 @@ export class PhoneChangesReader {
     const list = await gitDiff(cwd, listed.path, false, { within: true });
     // That file's diff and no other (a rename's other side, a file git listed beside it).
     const d = list.find((x) => slash(x.path) === want) ?? null;
+    // Its working-tree text could not be read as lying in the chat's folder (git.ts `checkedDiff`): none of it goes.
+    if (d?.withheld) throw new Error(WITHHELD[d.withheld]);
     return phoneDiffOf(d, true);
   }
 }
+
+/** Why a file's diff stays on the computer (`GitFileDiff.withheld`). */
+const WITHHELD: Record<NonNullable<GitFileDiff['withheld']>, string> = {
+  outside: "This file's changes show only on the computer: it could not be confirmed to lie in the chat's folder.",
+  big: 'This file is too big to show its changes on the phone.',
+  unreadable: 'This file could not be read just now.',
+};

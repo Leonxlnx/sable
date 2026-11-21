@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { realpathSync, statSync, type Stats } from 'node:fs';
 import { mkdtemp, open as openFile, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -18,7 +19,10 @@ import { grantFor } from './phone-guard';
  *     lists, in the chat's folder, or outside it only at the very place the person allowed for that
  *     share; never through a link from the folder that leads out;
  *   - the phone's row (`phone.thumb`, `thumbFile`): exactly a phone download link's rule
- *     (phone-guard.ts `grantFor`): the very file the step handed over, unchanged, else no picture.
+ *     (phone-guard.ts `grantFor`): the very file the step handed over, unchanged, else no picture;
+ *     and made only of bytes that are the SHA-256 the share recorded (what is read, and what is
+ *     copied for a renderer, is hashed and compared), kept by that digest. A share without one
+ *     (too big, changed while it was read, from before Sable kept one) has no picture on the phone.
  * - Where it comes from, cheapest for the bridge first:
  *   1. a small picture of a common type (PNG, JPEG, GIF, WebP, by its bytes) is given as it is
  *      (`THUMB.inline`: the window decodes it, off the bridge);
@@ -113,17 +117,24 @@ export interface ThumbFile {
   /** The volume it is on and its exact id (decimal): the picture is made of that very file (absent: not checked). */
   dev?: number;
   fileId?: string;
+  /** The phone's rule: the SHA-256 the share recorded of its bytes. A picture is made only of bytes that are it, and kept by it. */
+  sha256?: string;
+  /** The phone's rule: why the share has no digest (absent, with no `sha256`: it may still be being read). */
+  unhashed?: 'big' | 'changed' | 'unreadable';
 }
 
 /**
  * The phone's rule: file `index` of share step `itemId` exactly as a phone's download link has it
  * (phone-guard.ts `grantFor`, one place for those rules): the very file the step handed over,
- * unchanged. Throws a plain sentence otherwise.
+ * unchanged, with the digest the share recorded of its bytes. Throws a plain sentence otherwise.
  */
 export function thumbFile(snap: Pick<SessionSnapshot, 'session' | 'items'>, itemId: string, index: number): ThumbFile {
   const grant = grantFor(snap, itemId, index, '');
-  return { path: grant.path, size: grant.size, mtimeMs: grant.mtimeMs, dev: grant.dev, fileId: grant.fileId };
+  return { path: grant.path, size: grant.size, mtimeMs: grant.mtimeMs, dev: grant.dev, fileId: grant.fileId, ...(grant.sha256 ? { sha256: grant.sha256 } : {}), ...(grant.unhashed ? { unhashed: grant.unhashed } : {}) };
 }
+
+/** The bytes are the ones the share recorded (always, when there is no record to hold them to: the desktop's rule). */
+const recorded = (file: ThumbFile, data: Buffer) => !file.sha256 || createHash('sha256').update(data).digest('hex') === file.sha256;
 
 const samePath = (a: string, b: string) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
 
@@ -196,7 +207,11 @@ async function readCapped(fh: FileHandle, size: number): Promise<Buffer | null> 
   return got === size ? buf.subarray(0, size) : null;
 }
 
-/** A private copy of the checked file for a renderer that takes a path, made from its handle; null over `max`. Throws when the file changed while it was copied. */
+/**
+ * A private copy of the checked file for a renderer that takes a path, made from its handle; null
+ * over `max`. Throws when the file changed while it was copied, or (the phone's rule) when what was
+ * copied is not the bytes the share recorded: the renderer is never given other bytes.
+ */
 async function copyOut(fh: FileHandle, file: ThumbFile, max: number): Promise<{ dir: string; file: string } | null> {
   if (!(file.size > 0 && file.size <= max)) return null;
   const dir = await mkdtemp(path.join(tmpdir(), 'sable-thumb-'));
@@ -205,6 +220,7 @@ async function copyOut(fh: FileHandle, file: ThumbFile, max: number): Promise<{ 
   try {
     const out = await openFile(to, 'wx');
     try {
+      const hash = file.sha256 ? createHash('sha256') : null;
       const buf = Buffer.allocUnsafe(Math.min(1024 * 1024, file.size + 1));
       let off = 0;
       for (;;) {
@@ -212,12 +228,14 @@ async function copyOut(fh: FileHandle, file: ThumbFile, max: number): Promise<{ 
         if (want <= 0) break;
         const { bytesRead } = await fh.read(buf, 0, want, off);
         if (!bytesRead) break;
+        hash?.update(buf.subarray(0, bytesRead));
         for (let w = 0; w < bytesRead; ) w += (await out.write(buf, w, bytesRead - w)).bytesWritten;
         off += bytesRead;
       }
       // All of it and no more, and written to by nobody meanwhile (a write moves its time).
       const st = await fh.stat();
       if (off !== file.size || st.size !== file.size || st.mtimeMs !== file.mtimeMs) throw new Error('The file changed while it was read.');
+      if (hash && hash.digest('hex') !== file.sha256) throw new Error('The file is not what was shared.');
     } finally {
       await out.close();
     }
@@ -400,8 +418,9 @@ export class Thumbs {
   async thumb(file: ThumbFile, px: number): Promise<string | null> {
     const kind = thumbKind(file.path);
     if (!kind) return null;
-    // By the very file: another one at the same path with the same size and time is another picture.
-    const stamp = `${file.path}\n${file.dev ?? ''}:${file.fileId ?? ''}\n${file.size}\n${file.mtimeMs}\n`;
+    // By the very file: another one at the same path with the same size and time is another picture;
+    // and by the bytes a share recorded (the phone's rule), so a picture made for other bytes is never given.
+    const stamp = `${file.path}\n${file.dev ?? ''}:${file.fileId ?? ''}\n${file.size}\n${file.mtimeMs}\n${file.sha256 ?? ''}\n`;
     const key = stamp + px;
     const hit = this.take(key);
     if (hit !== undefined) return hit;
@@ -445,7 +464,7 @@ export class Thumbs {
       const fh = await openChecked(file);
       if (!fh) return undefined;
       try {
-        if (kind === 'image' && (small || !viaPath)) own = await this.itself(fh, size);
+        if (kind === 'image' && (small || !viaPath)) own = await this.itself(fh, file);
       } catch {
         return undefined;
       } finally {
@@ -481,7 +500,7 @@ export class Thumbs {
         if (kind !== 'image' || small) return null;
         const ch = await openFile(copy.file, 'r');
         try {
-          return await this.itself(ch, size);
+          return await this.itself(ch, file);
         } finally {
           await ch.close().catch(() => {});
         }
@@ -495,10 +514,16 @@ export class Thumbs {
     }
   }
 
-  /** The picture file itself (from its handle, its size and no more), when it is one of the common types (by its bytes) and within `fileMax`. */
-  private async itself(fh: FileHandle, size: number): Promise<string | null> {
+  /**
+   * The picture file itself (from its handle, its size and no more), when it is one of the common
+   * types (by its bytes) and within `fileMax`. Throws when they are not the bytes the share recorded
+   * (the phone's rule): no picture this time, and nothing kept.
+   */
+  private async itself(fh: FileHandle, file: ThumbFile): Promise<string | null> {
+    const size = file.size;
     if (!(size > 0 && size <= this.fileMax)) return null;
     const data = await readCapped(fh, size);
+    if (data && !recorded(file, data)) throw new Error('The file is not what was shared.');
     const type = data ? pictureType(data) : null;
     return data && type ? dataUrl(type, data) : null;
   }
@@ -580,9 +605,26 @@ export async function pictureOf(app: App, p: { sessionId?: unknown; itemId?: unk
   }
   const snap = { session: app.runtime(sessionId).meta, items: [item] };
   const index = Number(p.index);
-  const file = rule === 'phone' ? thumbFile(snap, itemId, index) : currentFile(snap, itemId, index);
+  if (rule === 'desktop') return { data: await thumbs.thumb(currentFile(snap, itemId, index), thumbSize(p.size)) };
+  let file = thumbFile(snap, itemId, index);
+  // The share's digest still being read (a bigger file, after the share completed): waited for, as a download waits.
+  const pending = !file.sha256 && !file.unhashed ? app.sessions.get(sessionId)?.handing(itemId) : undefined;
+  if (pending) {
+    await Promise.race([pending, new Promise((r) => setTimeout(r, PHONE_DIGEST_WAIT_MS).unref?.())]);
+    try {
+      ({ item } = await app.call('session.item', { sessionId, itemId }));
+    } catch {
+      throw new Error('That file is not in this chat.');
+    }
+    file = thumbFile({ session: snap.session, items: [item] }, itemId, index);
+  }
+  // No record of its bytes (too big, changed while it was read, from before Sable kept one): no picture of them.
+  if (!file.sha256) return { data: null };
   return { data: await thumbs.thumb(file, thumbSize(p.size)) };
 }
+
+/** How long a phone's picture waits for a share's digest still being read (the phone asks with 30 s to answer). */
+const PHONE_DIGEST_WAIT_MS = 20_000;
 
 /** The desktop shell's thumbnails for the app's pictures (`serve.ts`); none in a dev or standalone bridge. */
 export function setThumbHost(app: App, host?: ThumbHost) {

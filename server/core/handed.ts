@@ -37,6 +37,8 @@ export interface Handing {
  * - In the chat's folder (`inside`) only when that is established against the opened handle
  *   (core/contain.ts): a file reached through a folder flipped for a junction around the open, or one
  *   with another name elsewhere (a hard link), is not; where it cannot be established, not either.
+ *   Only Linux names a handle's file, so on Windows and macOS no file is inside: every file there is
+ *   external and reaches a phone only as `granted` (the person allowed that share themselves).
  * - `approved`: what the person allowed themselves, captured when the permission was shown to them
  *   (`approvedShare`), which is what lets a file outside the chat's folder go to a phone (`granted`):
  *   only a file that is exactly one they were shown, at its place in the list, at the same real place

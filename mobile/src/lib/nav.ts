@@ -46,8 +46,10 @@ let seq = 0;
 const listeners = new Set<() => void>();
 const emit = () => {
   try {
-    // Where a chat was opened at is not kept: opened again later, it opens at its newest.
-    localStorage.setItem(KEY, JSON.stringify(stack.map((r) => (r.name === 'chat' && r.at ? { name: 'chat', id: r.id } : r))));
+    // Where a chat was opened at is not kept: opened again later, it opens at its newest. Home alone keeps
+    // nothing (after Forget, nothing of the desktop is written back).
+    if (!stack.length) localStorage.removeItem(KEY);
+    else localStorage.setItem(KEY, JSON.stringify(stack.map((r) => (r.name === 'chat' && r.at ? { name: 'chat', id: r.id } : r))));
   } catch {
     /* private mode */
   }

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { realpathSync, statSync, type Stats } from 'node:fs';
+import { lstatSync, realpathSync, statSync, type Stats } from 'node:fs';
 import { open as openFile, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { Attachment, PhoneHello, SessionSnapshot } from '../../shared/protocol';
@@ -152,7 +152,18 @@ export function grantFor(snap: Pick<SessionSnapshot, 'session' | 'items'>, itemI
   if (!handed.inside && !handed.granted) {
     const rel = path.relative(cwd, listed);
     const named = rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
-    throw new Error(named ? 'That file is a link to another place.' : 'That file is outside the chat\'s folder.');
+    if (!named) throw new Error('That file is outside the chat\'s folder.');
+    // Named inside it but not proven there: a link (or a hard link), or a system that cannot say where
+    // an open file lies (Windows, core/contain.ts): only a share the person allowed goes to a phone.
+    let link = false;
+    try {
+      const st = lstatSync(listed);
+      link = st.isSymbolicLink() || st.nlink > 1;
+    } catch {
+      /* gone: said below as a link would be */
+      link = true;
+    }
+    throw new Error(link ? 'That file is a link to another place.' : 'Sable could not confirm that file is in the chat\'s folder. Only a share you allowed on the desktop goes to the phone.');
   }
   let real: string;
   let st: Stats;

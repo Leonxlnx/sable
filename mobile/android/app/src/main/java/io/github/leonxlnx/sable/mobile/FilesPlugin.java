@@ -3,12 +3,14 @@ package io.github.leonxlnx.sable.mobile;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
+import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
@@ -29,9 +31,14 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.text.Normalizer;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
@@ -41,13 +48,20 @@ import org.json.JSONObject;
  * written here into the app's private storage (`stageBegin`, `stageWrite`), never anywhere another
  * app can reach. When they are all there, `stageFinish` reads the private file whole and compares it
  * with the SHA-256 the desktop recorded when the share completed: a file that differs is removed;
- * one that matches becomes a verified record (`files/verified/<id>.json` beside its file) and, unless
- * it is an app, is then copied to Downloads/Sable. Nothing is public and nothing says "downloaded"
- * before that check. Open hands on the verified private copy through this app's FileProvider.
+ * one that matches becomes a verified record (`files/verified/<id>.json` beside its file, named by
+ * its id: `<id>.file`, so no name can be too long for the file system) and, unless it is an app, is
+ * then copied to Downloads/Sable under its name cut to Android's byte budget, the extension kept.
+ * Nothing is public and nothing says "downloaded" before that check. The record says where its copy
+ * stands at every step ("pending" with the entry's uri before the bytes go, then true or false), so
+ * a start after Android stopped the app in the middle finds the verified file done (`stageBegin`)
+ * and finishes, or redoes, a copy cut off; it never downloads or publishes the file twice. Open hands
+ * on the verified private copy through this app's FileProvider (its name given as the display name).
+ * `discard` and `prune` remove private files no record of the page names; `forgetAll` removes every
+ * private file and every copy and system download Sable made, and fails when anything is left.
  *
- * Over a pairing from before the secure channel, Android's DownloadManager fetches a plain HTTP link
- * into Downloads/Sable as before (`download`, `status`, `verify`); such a file never goes to the
- * installer.
+ * Over a pairing from before the secure channel nothing is downloaded any more (`download` refuses);
+ * what an older build downloaded with DownloadManager still opens (`status`, `verify`, `open` by id)
+ * and never goes to the installer.
  *
  * What goes to the installer is decided here, at the moment the intent is made (`dispatch`): by the
  * final MIME type, computed here from the file's canonical name (the page's word is never taken), and
@@ -90,6 +104,36 @@ public class FilesPlugin extends Plugin {
         char first = name.charAt(0);
         char last = name.charAt(name.length() - 1);
         return !(Character.isWhitespace(first) || Character.isSpaceChar(first) || first == '.' || Character.isWhitespace(last) || Character.isSpaceChar(last) || last == '.');
+    }
+
+    /** Bytes of a name in UTF-8 (Android's file names are at most 255 of them). */
+    private static int utf8(String s) {
+        return s.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    /**
+     * A canonical name cut to fit a file name: at most 240 bytes of UTF-8 (room for the " (1)" that
+     * MediaStore adds to a name already there), the extension kept, cut between characters.
+     */
+    static String displayName(String name) {
+        final int budget = 240;
+        if (utf8(name) <= budget) return name;
+        int dot = name.lastIndexOf('.');
+        String ext = dot > 0 && name.length() - dot <= 16 ? name.substring(dot) : "";
+        String base = ext.isEmpty() ? name : name.substring(0, dot);
+        int room = budget - utf8(ext);
+        StringBuilder b = new StringBuilder();
+        int used = 0;
+        for (int i = 0; i < base.length(); ) {
+            int c = base.codePointAt(i);
+            int n = utf8(new String(Character.toChars(c)));
+            if (used + n > room) break;
+            b.appendCodePoint(c);
+            used += n;
+            i += Character.charCount(c);
+        }
+        String out = b.toString().replaceAll("[\s.]+$", "");
+        return (out.isEmpty() ? "file" : out) + ext;
     }
 
     /** The final MIME type of a canonical name: the one thing that decides whether the installer is reached. */
@@ -166,11 +210,13 @@ public class FilesPlugin extends Plugin {
         if (!tmp.renameTo(f)) throw new IOException("rename");
     }
 
-    private static void deleteTree(File f) {
+    /** Deletes a file or a folder with everything in it; true when nothing of it is left. */
+    private static boolean deleteTree(File f) {
         File[] kids = f.listFiles();
         if (kids != null) for (File k : kids) deleteTree(k);
         //noinspection ResultOfMethodCallIgnored
         f.delete();
+        return !f.exists();
     }
 
     // ── the secure channel's private files ──
@@ -193,6 +239,22 @@ public class FilesPlugin extends Plugin {
         return id != null && id.matches("[0-9a-f]{32}");
     }
 
+    /** A verified record's private file: by its id (`<id>.file`), or where an older build put it (`<id>/<name>`). */
+    private File verifiedFile(String id, String name) {
+        File byId = new File(verified(), id + ".file");
+        if (byId.exists()) return byId;
+        File old = new File(new File(verified(), id), name);
+        return old.exists() ? old : byId;
+    }
+
+    /** A verified record's private file and record go (not its copy in Downloads); true when nothing of it is left. */
+    private boolean dropVerified(String id) {
+        boolean ok = deleteTree(new File(verified(), id + ".file"));
+        ok &= deleteTree(new File(verified(), id));
+        ok &= deleteTree(new File(verified(), id + ".json"));
+        return ok;
+    }
+
     @PluginMethod
     public void stageBegin(PluginCall call) {
         String key = call.getString("key");
@@ -208,6 +270,25 @@ public class FilesPlugin extends Plugin {
                 String want = sha.toLowerCase(Locale.ROOT);
                 // The same file of the same share goes on from what is there; anything else starts over.
                 String id = sha256Hex(key + "\u0000" + want + "\u0000" + size + "\u0000" + name).substring(0, 32);
+                // Verified before (Android stopped the app after the check, before the page wrote it down): done, never fetched again; a copy cut off is finished.
+                File rec = new File(verified(), id + ".json");
+                if (rec.exists()) {
+                    JSONObject r = new JSONObject(readText(rec));
+                    File f = verifiedFile(id, name);
+                    if (name.equals(r.optString("name")) && want.equalsIgnoreCase(r.optString("sha256")) && r.optLong("size", -1) == size && f.exists() && f.length() == size) {
+                        JSObject o = new JSObject();
+                        o.put("id", id);
+                        o.put("have", size);
+                        o.put("file", id);
+                        if (!APK.equals(mimeFor(name))) {
+                            Object pub = r.opt("published");
+                            o.put("published", Boolean.TRUE.equals(pub) || (!Boolean.FALSE.equals(pub) && publish(rec, r, f, name, mimeFor(name))));
+                        }
+                        call.resolve(o);
+                        return;
+                    }
+                    dropVerified(id);
+                }
                 File meta = new File(incoming(), id + ".json");
                 File part = new File(incoming(), id + ".part");
                 long have = 0;
@@ -292,11 +373,9 @@ public class FilesPlugin extends Plugin {
                     call.resolve(o);
                     return;
                 }
-                File dir = new File(verified(), id);
-                deleteTree(dir);
-                //noinspection ResultOfMethodCallIgnored
-                dir.mkdirs();
-                File file = new File(dir, name);
+                dropVerified(id);
+                // By its id: no name, however long in bytes, can make this move fail.
+                File file = new File(verified(), id + ".file");
                 if (!part.renameTo(file)) throw new IOException("move");
                 JSONObject r = new JSONObject();
                 r.put("name", name);
@@ -304,13 +383,17 @@ public class FilesPlugin extends Plugin {
                 r.put("size", size);
                 r.put("mime", mimeFor(name));
                 r.put("at", System.currentTimeMillis());
-                // Verified: only now a copy where the person finds files (never an app: that is installed from here).
-                if (!APK.equals(mimeFor(name))) r.put("published", publish(file, name, mimeFor(name)));
-                writeText(new File(verified(), id + ".json"), r.toString());
+                boolean app = APK.equals(mimeFor(name));
+                // The record first (verified, its copy still to make), then the copy: a stop in between is finished at the next start.
+                if (!app) r.put("published", "pending");
+                File rec = new File(verified(), id + ".json");
+                writeText(rec, r.toString());
                 //noinspection ResultOfMethodCallIgnored
                 meta.delete();
                 o.put("ok", true);
                 o.put("file", id);
+                // Verified: only now a copy where the person finds files (never an app: that is installed from here).
+                if (!app) o.put("published", publish(rec, r, file, name, mimeFor(name)));
                 call.resolve(o);
             } catch (Exception e) {
                 //noinspection ResultOfMethodCallIgnored
@@ -322,43 +405,78 @@ public class FilesPlugin extends Plugin {
         });
     }
 
-    /** A copy of a verified file in Downloads/Sable (Android 10 on; before, the app's own Downloads folder). */
-    private boolean publish(File file, String name, String mime) {
+    /**
+     * A copy of a verified file in Downloads/Sable (Android 10 on; before, the app's own Downloads
+     * folder), under its name cut to the byte budget. The record says where it stands at each step:
+     * the entry's uri with "pending" before the bytes go (a copy half made by a start Android cut off
+     * is removed and made again), true once it is there, false when it could not be made (said on the
+     * row). True when the copy is there.
+     */
+    private boolean publish(File rec, JSONObject r, File file, String name, String mime) {
+        String display = displayName(name);
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 ContentResolver cr = getContext().getContentResolver();
+                String half = r.optString("uri", "");
+                if (!half.isEmpty()) {
+                    try {
+                        cr.delete(Uri.parse(half), null, null);
+                    } catch (Exception ignored) {
+                        // gone already
+                    }
+                    r.remove("uri");
+                }
                 ContentValues v = new ContentValues();
-                v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                v.put(MediaStore.MediaColumns.DISPLAY_NAME, display);
                 v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
                 v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Sable");
                 v.put(MediaStore.MediaColumns.IS_PENDING, 1);
                 Uri uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-                if (uri == null) return false;
+                if (uri == null) return published(rec, r, false);
+                r.put("uri", uri.toString());
+                r.put("published", "pending");
+                writeText(rec, r.toString());
                 try (InputStream in = new FileInputStream(file); OutputStream out = cr.openOutputStream(uri)) {
                     if (out == null) throw new IOException("no stream");
                     byte[] buf = new byte[1 << 16];
                     for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
                 } catch (IOException e) {
                     cr.delete(uri, null, null);
-                    return false;
+                    r.remove("uri");
+                    return published(rec, r, false);
                 }
                 ContentValues done = new ContentValues();
                 done.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                cr.update(uri, done, null, null);
-                return true;
+                if (cr.update(uri, done, null, null) < 1) {
+                    cr.delete(uri, null, null);
+                    r.remove("uri");
+                    return published(rec, r, false);
+                }
+                return published(rec, r, true);
             }
             File dir = getContext().getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-            if (dir == null) return false;
+            if (dir == null) return published(rec, r, false);
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
-            try (InputStream in = new FileInputStream(file); OutputStream out = new FileOutputStream(new File(dir, name))) {
+            try (InputStream in = new FileInputStream(file); OutputStream out = new FileOutputStream(new File(dir, display))) {
                 byte[] buf = new byte[1 << 16];
                 for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
             }
-            return true;
+            return published(rec, r, true);
         } catch (Exception e) {
-            return false;
+            return published(rec, r, false);
         }
+    }
+
+    /** Writes where a record's copy stands; returns it. */
+    private static boolean published(File rec, JSONObject r, boolean ok) {
+        try {
+            r.put("published", ok);
+            writeText(rec, r.toString());
+        } catch (Exception ignored) {
+            // the next start reads "pending" and makes it again
+        }
+        return ok;
     }
 
     @PluginMethod
@@ -377,52 +495,134 @@ public class FilesPlugin extends Plugin {
         });
     }
 
-    /** Every private file and record goes (the desktop was forgotten); copies in Downloads are the person's. */
+    /**
+     * Everything Sable kept for the desktop goes (it was forgotten, or replaced by another computer):
+     * every private file and record, every copy it put in Downloads/Sable (found in MediaStore by its
+     * place and this app as owner, half-made ones included, whatever the page recorded) and every
+     * system download an older build made. Read again after: anything left fails it, so the page
+     * keeps its mark and tries again at the next start.
+     */
     @PluginMethod
     public void forgetAll(PluginCall call) {
         io.execute(() -> {
-            deleteTree(incoming());
-            deleteTree(verified());
+            boolean ok = deleteTree(incoming());
+            ok &= deleteTree(verified());
+            ok &= unpublishAll();
+            ok &= removeSystemDownloads();
+            if (ok) call.resolve();
+            else call.reject("Some files could not be removed.");
+        });
+    }
+
+    /** The copies Sable made in Downloads/Sable, by MediaStore (Android 10 on) or in its own Downloads folder before; true when none is left. */
+    private boolean unpublishAll() {
+        if (Build.VERSION.SDK_INT < 29) {
+            File dir = getContext().getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+            return dir == null || deleteTree(dir);
+        }
+        ContentResolver cr = getContext().getContentResolver();
+        Uri col = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+        try {
+            for (long id : ownCopies(cr, col)) cr.delete(ContentUris.withAppendedId(col, id), null, null);
+            return ownCopies(cr, col).isEmpty();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** The entries in Downloads/Sable this app owns (pending and trashed ones too). */
+    private List<Long> ownCopies(ContentResolver cr, Uri col) {
+        List<Long> ids = new ArrayList<>();
+        String sel = MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ? AND " + MediaStore.MediaColumns.OWNER_PACKAGE_NAME + " = ?";
+        String[] args = { Environment.DIRECTORY_DOWNLOADS + "/Sable/%", getContext().getPackageName() };
+        String[] cols = { MediaStore.MediaColumns._ID };
+        Cursor c;
+        if (Build.VERSION.SDK_INT >= 30) {
+            Bundle q = new Bundle();
+            q.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, sel);
+            q.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args);
+            q.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE);
+            q.putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE);
+            c = cr.query(col, cols, q, null);
+        } else {
+            //noinspection deprecation
+            c = cr.query(MediaStore.setIncludePending(col), cols, sel, args, null);
+        }
+        if (c == null) return ids;
+        try {
+            while (c.moveToNext()) ids.add(c.getLong(0));
+        } finally {
+            c.close();
+        }
+        return ids;
+    }
+
+    /** Every download this app asked DownloadManager for (an older build's plain ones), with their files; true when none is left. */
+    private boolean removeSystemDownloads() {
+        try {
+            long[] ids = systemDownloads();
+            if (ids.length > 0) manager().remove(ids);
+            return systemDownloads().length == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private long[] systemDownloads() {
+        List<Long> ids = new ArrayList<>();
+        try (Cursor c = manager().query(new DownloadManager.Query())) {
+            if (c != null) while (c.moveToNext()) ids.add(c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)));
+        }
+        long[] out = new long[ids.size()];
+        for (int i = 0; i < out.length; i++) out[i] = ids.get(i);
+        return out;
+    }
+
+    /** A verified private copy and its record go: the page let go of its entry (its copy in Downloads stays). */
+    @PluginMethod
+    public void discard(PluginCall call) {
+        String id = call.getString("file");
+        if (!idOk(id)) {
+            call.resolve();
+            return;
+        }
+        io.execute(() -> {
+            if (dropVerified(id)) call.resolve();
+            else call.reject("That file could not be removed.");
+        });
+    }
+
+    /** Every private file and record whose id the page does not name goes (at start: entries let go, records Android cut off). */
+    @PluginMethod
+    public void prune(PluginCall call) {
+        JSONArray list = call.getData().optJSONArray("keep");
+        Set<String> keep = new HashSet<>();
+        if (list != null) for (int i = 0; i < list.length(); i++) keep.add(list.optString(i));
+        io.execute(() -> {
+            for (File dir : new File[] { incoming(), verified() }) {
+                File[] kids = dir.listFiles();
+                if (kids == null) continue;
+                for (File k : kids) {
+                    String n = k.getName();
+                    int dot = n.indexOf('.');
+                    String id = dot > 0 ? n.substring(0, dot) : n;
+                    if (!keep.contains(id)) deleteTree(k);
+                }
+            }
             call.resolve();
         });
     }
 
     // ── DownloadManager (a pairing from before the secure channel) ──
 
+    /**
+     * Nothing is fetched over plain HTTP any more: DownloadManager would publish it, and post its
+     * notification, before anything could check bytes whose digest came the same plain way. A
+     * pairing from before the secure channel pairs again to download.
+     */
     @PluginMethod
     public void download(PluginCall call) {
-        String url = call.getString("url");
-        String name = call.getString("name");
-        if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) {
-            call.reject("That file has no link.");
-            return;
-        }
-        if (!canonical(name)) {
-            call.reject("That file cannot be saved on this phone.");
-            return;
-        }
-        // Nothing fetched over plain HTTP ever goes to the installer, so nothing of that kind is fetched that way.
-        if (APK.equals(mimeFor(name))) {
-            call.reject("Pair again for a secure connection to install it");
-            return;
-        }
-        try {
-            DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
-            r.setTitle(name);
-            String from = call.getString("from");
-            if (from != null) r.setDescription(from);
-            r.setMimeType(mimeFor(name));
-            r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            // Downloads/Sable from Android 10 on (no permission needed there); before, the app's own folder.
-            if (Build.VERSION.SDK_INT >= 29) r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "Sable/" + name);
-            else r.setDestinationInExternalFilesDir(getContext(), Environment.DIRECTORY_DOWNLOADS, name);
-            long id = manager().enqueue(r);
-            JSObject o = new JSObject();
-            o.put("id", String.valueOf(id));
-            call.resolve(o);
-        } catch (Exception e) {
-            call.reject(e.getMessage() != null ? e.getMessage() : "The download could not start.");
-        }
+        call.reject("Pair again to download it");
     }
 
     @PluginMethod
@@ -561,17 +761,16 @@ public class FilesPlugin extends Plugin {
                 JSONObject r = new JSONObject(readText(rec));
                 String name = r.getString("name");
                 if (!canonical(name)) throw new IOException("name");
-                File f = new File(new File(verified(), id), name);
+                File f = verifiedFile(id, name);
                 if (!f.exists()) throw new IOException("gone");
                 String mime = mimeFor(name);
                 if (APK.equals(mime) && !same(digest(f), r.getString("sha256"), r.getLong("size"))) {
-                    deleteTree(new File(verified(), id));
-                    //noinspection ResultOfMethodCallIgnored
-                    rec.delete();
+                    dropVerified(id);
                     call.reject("It changed on this phone, so it was removed.");
                     return;
                 }
-                Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f);
+                // The file is named by its id here: the app that opens it is told its own name.
+                Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f, displayName(name));
                 dispatch(call, uri, mime, true);
             } catch (Exception e) {
                 call.reject("The file is no longer on this phone.");

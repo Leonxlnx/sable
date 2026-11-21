@@ -7,7 +7,8 @@
  * secure channel (a secure one gets its files over its own connection: tests/phone-wave4.test.ts).
  */
 import type { PathLike } from 'node:fs';
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { get, type IncomingMessage, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -30,6 +31,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 const { App } = await import('../server/app');
 const { DemoProvider } = await import('../server/providers/demo');
 const { registerPhone } = await import('../server/services/phone');
+const { FILE_CHUNK } = await import('../server/services/phone-files');
 type AppT = InstanceType<typeof App>;
 type Phone = ReturnType<typeof registerPhone>;
 
@@ -74,7 +76,11 @@ async function until(ok: () => boolean, ms = 5000) {
 /** A link for `file` made for `deviceId`, as `phone.fileLink` would make it. */
 function link(phone: Phone, deviceId: string, file: string, token = 'tok-' + Math.random().toString(36).slice(2)) {
   const st = statSync(file);
-  (phone as unknown as { files: Map<string, unknown> }).files.set(token, { deviceId, path: file, name: 'big.bin', size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, expires: Date.now() + 60_000 });
+  // With each block's digest as `phone.fileLink` records it (a link serves only blocks that still match: wave 5, 5).
+  const data = readFileSync(file);
+  const blocks = Buffer.alloc(Math.ceil(data.length / FILE_CHUNK) * 32);
+  for (let at = 0; at < data.length; at += FILE_CHUNK) createHash('sha256').update(data.subarray(at, at + FILE_CHUNK)).digest().copy(blocks, (at / FILE_CHUNK) * 32);
+  (phone as unknown as { files: Map<string, unknown> }).files.set(token, { deviceId, path: file, name: 'big.bin', size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, expires: Date.now() + 60_000, blocks });
   return `/f/${token}/big.bin`;
 }
 

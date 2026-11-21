@@ -1,7 +1,7 @@
 import { AnimatePresence, motion } from 'motion/react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { pushBack } from '@m/lib/back';
-import { abortable, conn, isOldPairLink, offerLink, parsePairLink, type PairOffer } from '@m/lib/conn';
+import { abortable, conn, ConfirmError, isOldPairLink, offerLink, parsePairLink, type PairOffer } from '@m/lib/conn';
 import { askNotifications, deviceName, haptic } from '@m/lib/native';
 import { Field } from '@m/ui/Field';
 import { launchFrom } from '@m/ui/Launch';
@@ -12,8 +12,11 @@ import { Scanner } from './Scanner';
 
 type Step =
   | { kind: 'idle' }
-  /** The code would replace the desktop this phone has: asked first. `was`: that desktop's name. */
-  | { kind: 'confirm'; offer: PairOffer; was: string }
+  /**
+   * The code would replace the desktop this phone has: asked first. `was`: that desktop's name;
+   * `token`: the confirmation of replacing exactly that pairing with exactly this code (conn.ts `confirmFor`).
+   */
+  | { kind: 'confirm'; offer: PairOffer; was: string; token?: string }
   | { kind: 'connecting'; offer: PairOffer }
   | { kind: 'waiting'; offer: PairOffer; phone: string }
   | { kind: 'error'; text: string; quiet?: boolean; offer?: PairOffer };
@@ -34,7 +37,23 @@ const WHERE = (
  * first, however it came (a link from another app included). A pairing is one generation from its
  * first wait: Cancel or Back ends it at any step, with every socket it opened.
  */
-export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | null; onLinkUsed: () => void; denied?: string; onCancel?: () => void }) {
+export function Pair({
+  link,
+  onLinkUsed,
+  onLinkDone,
+  again,
+  denied,
+  onCancel,
+}: {
+  link?: string | null;
+  onLinkUsed: () => void;
+  /** A link given up (Cancel, or not replacing): it is used up, so the screen it kept open can go. */
+  onLinkDone?: () => void;
+  /** Paired before the secure channel: pairing again from Settings. */
+  again?: boolean;
+  denied?: string;
+  onCancel?: () => void;
+}) {
   const [step, setStep] = useState<Step>(denied ? { kind: 'error', text: denied, quiet: true } : { kind: 'idle' });
   const [scan, setScan] = useState(false);
   const [paste, setPaste] = useState(false);
@@ -56,6 +75,12 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
     haptic('tap');
     conn.cancelPair();
     setStep({ kind: 'idle' });
+    onLinkDone?.();
+  };
+
+  const confirm = (offer: PairOffer, was: { desktop?: string }) => {
+    haptic('warning');
+    setStep({ kind: 'confirm', offer, was: was.desktop || 'your computer', token: conn.confirmFor(offer) });
   };
 
   const start = (raw: string) => {
@@ -71,15 +96,11 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
     setPaste(false);
     setText('');
     const was = conn.replaces(offer);
-    if (was) {
-      haptic('warning');
-      setStep({ kind: 'confirm', offer, was: was.desktop || 'your computer' });
-      return;
-    }
+    if (was) return confirm(offer, was);
     void go(offer);
   };
 
-  const go = async (offer: PairOffer) => {
+  const go = async (offer: PairOffer, token?: string) => {
     if (inFlight.current) return;
     inFlight.current = true;
     cancelled.current = false;
@@ -88,7 +109,8 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
     const signal = conn.beginPair();
     try {
       const phone = await abortable(deviceName(), signal);
-      await conn.pair(offer, phone, () => !signal.aborted && setStep({ kind: 'waiting', offer, phone }), signal);
+      // The connection asks for the confirmation itself (a pairing read after this screen asked counts too).
+      await conn.pair(offer, phone, () => !signal.aborted && setStep({ kind: 'waiting', offer, phone }), signal, token);
       haptic('success');
       // Home opens out of this mark (the launch glides it into the bar).
       const r = mark.current?.querySelector('svg')?.getBoundingClientRect();
@@ -97,6 +119,10 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
       // The one moment to ask: right after pairing, so a turn that ends while the phone is away can say so.
       void askNotifications();
     } catch (err) {
+      if (err instanceof ConfirmError) {
+        if (!signal.aborted) confirm(offer, err.was);
+        return;
+      }
       if (!cancelled.current && !signal.aborted) {
         haptic('deny');
         const msg = (err as Error).message;
@@ -124,7 +150,9 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
   // A link that opened the app: paired once; the screen stays until pairing ends (App shows it while `link` is set).
   const started = useRef<string | null>(null);
   useEffect(() => {
-    if (link && started.current !== link) {
+    // Given up and cleared: the same link opened again starts again.
+    if (!link) started.current = null;
+    else if (started.current !== link) {
       started.current = link;
       void start(link);
     }
@@ -135,7 +163,7 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
   let status: ReactNode;
   let tone: string | undefined;
   if (step.kind === 'idle')
-    status = onCancel ? (
+    status = again ? (
       <>
         <p className="pair-line pair-strong">Pair again for a secure connection</p>
         <p className="pair-sub">On your computer, open {WHERE} and scan the code.</p>
@@ -252,7 +280,7 @@ export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | n
         <AnimatePresence mode="popLayout" initial={false}>
           {step.kind === 'confirm' ? (
             <motion.div key="confirm" className="pair-buttons" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} transition={SNAP}>
-              <button type="button" className="btn btn-primary btn-lg" onClick={() => (haptic('tap'), void go(step.offer))}>
+              <button type="button" className="btn btn-primary btn-lg" onClick={() => (haptic('tap'), void go(step.offer, step.token))}>
                 {step.was === name(step.offer) ? 'Pair again' : 'Replace'}
               </button>
               <button type="button" className="btn btn-lg pair-alt" onClick={cancel}>

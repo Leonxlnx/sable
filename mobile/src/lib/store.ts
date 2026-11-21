@@ -25,6 +25,7 @@ import { reshape, shapeString } from './turns';
 import { Intents, type Field } from './intents';
 import { clearChatNotifications, clearShortcuts } from './native';
 import { reconciler, staleFetch } from './stale';
+import { onForget } from './forget';
 
 /**
  * The phone's view of the desktop: sessions, folders, accounts and the open conversations, kept
@@ -57,6 +58,12 @@ export interface SessionData {
   next?: string;
   late?: string[];
   lateDrops?: number;
+  /**
+   * Steps held under the roots in `late` (a sub-agent working there), at most `LATE_KIDS_MAX`: past
+   * that a step is only counted on its parent (`kids`) and not kept; opening the parent asks the
+   * desktop for its steps (`phone.item`), as for any step whose children are not all here.
+   */
+  lateKids?: number;
   /** Counts the times the whole chat was replaced from the desktop (a page around a message, the newest page again): what was mounted starts over. */
   epoch?: number;
   /** Shown from the phone's cache while the desktop is asked. */
@@ -378,7 +385,33 @@ function holdLate(d: SessionData, it: TimelineItem): Partial<SessionData> {
     delete d.items[x];
   };
   for (const x of late) drop(x);
-  return { late: [], lateDrops: (d.lateDrops ?? 0) + 1, children, fileSteps: countFileSteps(d.items) };
+  return { late: [], lateDrops: (d.lateDrops ?? 0) + 1, lateKids: 0, children, fileSteps: countFileSteps(d.items) };
+}
+
+/** Steps held under the late roots, at most (past it they are counted on their parent, and fetched when it is opened). */
+export const LATE_KIDS_MAX = 600;
+
+/** The root an item hangs under (itself for a root). */
+function rootOf(d: SessionData, id: string): string | undefined {
+  let it = d.items[id];
+  for (let i = 0; it?.parentId && i < 64; i++) it = d.items[it.parentId];
+  return it?.id;
+}
+
+/**
+ * A step under a root held in `late`: kept in place (no copy of its parent's list per step) while
+ * fewer than `LATE_KIDS_MAX` are held, else only counted on its parent. Undefined when its parent is
+ * not held there (an ordinary step).
+ */
+function holdLateKid(d: SessionData, it: TimelineItem, parent: PhoneItem): Partial<SessionData> | undefined {
+  const root = rootOf(d, parent.id);
+  if (!root || !d.late?.includes(root)) return undefined;
+  d.items[parent.id] = { ...parent, kids: (parent.kids ?? 0) + 1 } as PhoneItem;
+  const held = d.lateKids ?? 0;
+  if (held >= LATE_KIDS_MAX) return {};
+  d.items[it.id] = it;
+  (d.children[parent.id] ??= []).push(it.id);
+  return { lateKids: held + 1 };
 }
 
 /** Changes the list of prompts waiting across chats (a new object only when it changed). */
@@ -403,6 +436,9 @@ export function applyEvent(e: BridgeEvent) {
           const parent = d.items[pid] as PhoneItem | undefined;
           // Under a root that is not here while the pages stop before the newest (let go past the bound, or not reached): it comes with its root.
           if (!parent && d.next) return {};
+          // Under a root held in `late`: bounded, in place.
+          const held = parent && d.next ? holdLateKid(d, e.item, parent) : undefined;
+          if (held) return held;
           const put = putItems(d, parent ? [e.item, { ...parent, kids: (parent.kids ?? 0) + 1 } as PhoneItem] : [e.item]);
           return { ...put, children: { ...d.children, [pid]: [...(d.children[pid] ?? []), e.item.id] } };
         }
@@ -612,7 +648,7 @@ export async function fetchNewer(id: string): Promise<boolean> {
   const seen = new Set([...now.roots, ...add]);
   const late = closing ? (now.late ?? []).filter((x) => !seen.has(x) && items[x]) : [];
   const roots = [...now.roots, ...add, ...late];
-  const gap = closing ? { next: undefined, late: undefined, lateDrops: undefined } : { next: page.next ?? last, late: (now.late ?? []).filter((x) => !seen.has(x)) };
+  const gap = closing ? { next: undefined, late: undefined, lateDrops: undefined, lateKids: undefined } : { next: page.next ?? last, late: (now.late ?? []).filter((x) => !seen.has(x)) };
   setState({ data: { ...state.data, [id]: { ...now, items, roots, ...gap, shape: shapeString(roots, items), fileSteps: countFileSteps(items) } } });
   return true;
 }
@@ -706,6 +742,8 @@ export function closeSessionData(id: string) {
 export const sessionData = (s: State, id: string): SessionData => s.data[id] ?? EMPTY;
 
 conn.on(applyEventSoon);
+// Forgotten, or replaced by another computer: what is in memory of the old one goes too (lib/erase.ts sweeps the storage).
+onForget(() => forgetDesktop());
 conn.onState(() => {
   if (conn.state === 'unpaired') return forgetDesktop();
   setState({ conn: conn.state, connError: conn.error, desktop: conn.pairing?.desktop ?? state.desktop });

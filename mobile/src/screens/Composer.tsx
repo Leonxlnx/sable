@@ -9,6 +9,9 @@ import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
 import { onPutDraft, putDraft } from '@m/lib/put-draft';
 import { onForget } from '@m/lib/forget';
+import { drafts, pendingTakes, saveDrafts, settleTaken, stageTaken } from '@m/lib/drafts';
+import { epoch, still } from '@m/lib/epoch';
+import { confirmTake, STILL_QUEUED, takeBack, type TakeDeps } from '@m/lib/take';
 import { haptic } from '@m/lib/native';
 import { acceptIntent, closeGap, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, unsureIntent, useStore } from '@m/lib/store';
 import { isUncertain } from '@m/lib/errors';
@@ -17,50 +20,30 @@ import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
 import { MODE_ICON, SetupSheet, type SetupState } from './Setup';
 
-/** Unsent words per chat, kept across restarts (Android may close the app in the background). */
-const DRAFTS = 'sable.drafts';
-const drafts = new Map<string, string>(
-  (() => {
-    try {
-      return Object.entries(JSON.parse(localStorage.getItem(DRAFTS) ?? '{}') as Record<string, string>);
-    } catch {
-      return [];
-    }
-  })(),
-);
-let saveTimer = 0;
-const saveDrafts = () => {
-  clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    try {
-      const o: Record<string, string> = {};
-      for (const [k, v] of drafts) if (v.trim()) o[k] = v;
-      localStorage.setItem(DRAFTS, JSON.stringify(o));
-    } catch {
-      /* private mode */
-    }
-  }, 400);
-};
-
 /**
  * A message whose send was cut off by a lost connection may or may not have reached the desktop.
  * It goes back into the field; when the conversation reloads and shows it arrived, the field clears
- * again (so it is never lost and never sent twice).
+ * again (so it is never lost and never sent twice). Unsent words per chat: lib/drafts.ts.
  */
 const unsure = new Map<string, { text: string; at: number }>();
 const LOST = /connection to the desktop was lost|did not answer in time/i;
 
-// Forgetting the computer forgets the words written for it, with the write still due.
+// Forgetting the computer forgets the sends it cut off (the drafts forget themselves: lib/drafts.ts).
 onForget(() => {
-  clearTimeout(saveTimer);
-  drafts.clear();
   unsure.clear();
-  try {
-    localStorage.removeItem(DRAFTS);
-  } catch {
-    /* private mode */
-  }
 });
+
+/** Words taken back from the queue: kept on the phone before the desktop lets the message go (lib/take.ts). */
+const takes: TakeDeps = {
+  take: (sid, id) => conn.call('queue.take', { sessionId: sid, id, ack: true }),
+  done: (take, kept) => conn.call('phone.takeDone', { take, kept }),
+  stage: stageTaken,
+  settle: settleTaken,
+};
+// Receipts a cut connection left unanswered: confirmed once connected again (the desktop answers each the same however often).
+const confirmPending = () => void pendingTakes().then((list) => list.forEach((t) => void confirmTake(takes, t)));
+conn.onOpen(confirmPending);
+if (conn.state === 'open') confirmPending();
 
 /** The agents a chat can switch to, in the desktop's order. */
 const AGENTS: ProviderId[] = ['claude', 'codex'];
@@ -264,6 +247,7 @@ export function Composer({ sid }: { sid: string }) {
       return;
     }
     haptic('select');
+    const e = epoch();
     try {
       const r = await conn.call('session.send', { sessionId: sid, text: t });
       if (!r.ok) {
@@ -277,6 +261,8 @@ export function Composer({ sid }: { sid: string }) {
       const name2 = (r.model && modelNameById(r.model, list)) ?? r.model ?? '';
       toast(r.switched ? `Switched to ${PROVIDER_NAME[r.switched]}${name2 ? `, ${name2}` : ''}` : `Model set to ${name2}`, 'success');
     } catch (err) {
+      // Forgotten meanwhile: the words belonged to that computer; nothing goes back.
+      if (!still(e)) return;
       haptic('deny');
       update(t);
       toast((err as Error).message, 'error');
@@ -298,11 +284,14 @@ export function Composer({ sid }: { sid: string }) {
     setFiles([]);
     // Opened far back (a search hit): the chat goes to its newest, where the message lands.
     void closeGap(sid).catch(() => {});
+    const e = epoch();
     try {
       await conn.call('session.send', { sessionId: sid, text: t, attachments });
     } catch (err) {
       const msg = (err as Error).message;
       dropFlight();
+      // Forgotten (or replaced by another computer) while it went: its words are not put back.
+      if (!still(e)) return;
       haptic('deny');
       update(t);
       setFiles(attachments ?? []);
@@ -453,13 +442,17 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
     if (taking) return;
     haptic('tap');
     setTaking(true);
-    void conn
-      .call('queue.take', { sessionId: sid, id: q.id })
+    const e = epoch();
+    // The words are kept on the phone before the desktop lets the message go (lib/take.ts).
+    void takeBack(takes, sid, q.id)
       .then(
         (r) => {
-          if (r.message?.text) putDraft(sid, r.message.text, { append: true });
+          if (!r.text || !still(e)) return;
+          putDraft(sid, r.text, { append: true });
+          if (r.stillQueued) toast(STILL_QUEUED);
         },
         (err) => {
+          if (!still(e)) return;
           haptic('deny');
           toast((err as Error).message, 'error');
         },
