@@ -3,6 +3,9 @@ import { DEFAULT_ACCOUNT, type AccountInfo, type Capabilities, type LimitsReport
 import { homeAccountId, homeChoice, prewarmHome } from './actions';
 import { accountKey, capsKey, ensureProviderCaps, useStore } from './store';
 
+/** No prewarm before this many ms after the page started loading. */
+const PREWARM_AFTER_LOAD_MS = 1800;
+
 /**
  * Prewarms the agent process while focus is inside `selector` (the home composer) and a folder
  * is chosen; again whenever the choice changes, and every two minutes while focus stays (the
@@ -22,7 +25,9 @@ export function usePrewarm(selector: string) {
     const schedule = () => {
       window.clearTimeout(timer);
       // A short pause: focus moving through the composer, or start-up still busy, starts nothing.
-      timer = window.setTimeout(() => inside() && prewarmHome(), 700);
+      // Not in the window's first seconds either (the composer has the focus from the start): the
+      // agent process is a heavy start of its own, kept out of the launch and the first frames.
+      timer = window.setTimeout(() => inside() && prewarmHome(), Math.max(700, PREWARM_AFTER_LOAD_MS - performance.now()));
     };
     const onFocus = (e: FocusEvent) => {
       if ((e.target as Element | null)?.closest?.(selector)) schedule();

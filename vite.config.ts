@@ -29,8 +29,36 @@ function phosphorWeights(): PluginOption {
   };
 }
 
+/**
+ * The page's first script (src/boot.ts: the bridge socket and the launch light) is an entry of its
+ * own and loads before the app's. Bundled into the app's entry (what Vite does with a second script
+ * in index.html) it would run only after the app's shared chunks had loaded and run.
+ */
+function bootEntry(): PluginOption {
+  let build = false;
+  return {
+    name: 'sable:boot-entry',
+    config(_config, env) {
+      build = env.command === 'build';
+      return build ? { build: { rollupOptions: { input: { index: r('./index.html'), boot: r('./src/boot.ts') } } } } : undefined;
+    },
+    transformIndexHtml: {
+      order: 'post',
+      handler(_html, ctx) {
+        if (!build) return [{ tag: 'script', attrs: { type: 'module', src: '/src/boot.ts' }, injectTo: 'head-prepend' }];
+        const chunk = Object.values(ctx.bundle ?? {}).find((c) => c.type === 'chunk' && c.isEntry && c.name === 'boot');
+        if (!chunk || chunk.type !== 'chunk') return;
+        return [
+          { tag: 'script', attrs: { type: 'module', crossorigin: true, src: `/${chunk.fileName}` }, injectTo: 'head-prepend' },
+          ...chunk.imports.map((f) => ({ tag: 'link', attrs: { rel: 'modulepreload', crossorigin: true, href: `/${f}` }, injectTo: 'head-prepend' as const })),
+        ];
+      },
+    },
+  };
+}
+
 export default defineConfig(async ({ command }) => {
-  const plugins: PluginOption[] = [phosphorWeights(), react()];
+  const plugins: PluginOption[] = [phosphorWeights(), bootEntry(), react()];
   if (command === 'serve') {
     // The bridge (Claude Code / Codex / demo providers) rides on the dev server.
     const { bridgePlugin } = await import('./server/vite-plugin');

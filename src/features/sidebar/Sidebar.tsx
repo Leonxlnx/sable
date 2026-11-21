@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useState, type ComponentType, ty
 import { AnimatePresence, MotionConfig, motion, useReducedMotion } from 'motion/react';
 import { ContextMenu as RC, DropdownMenu as RM } from 'radix-ui';
 import type { SessionMeta } from '@shared/protocol';
+import { afterLaunch } from '@/art/LaunchLayer';
 import { LogoMark, PROVIDER_NAME, ProviderMark, StatusGlyph, Wordmark } from '@/art/Logo';
 import { Icon } from '@/icons';
 import { QuickSwitch } from '@/features/session/QuickSwitch';
@@ -305,14 +306,60 @@ function selectActiveKey(s: { ui: { activeSessionId: string | null }; sessions: 
   return a && !a.pinned ? (a.chat ? 'chats' : pathKey(a.lane?.folder ?? a.cwd)) : null;
 }
 
+/**
+ * The window's first rendering of the sidebar: the rows of about a screenful mount with it, the
+ * rest once the launch has gone, list by list in tasks of their own. A few hundred rows rendered and
+ * laid out in one go held the page for a good part of a tenth of a second right as the app first
+ * came up, and kept the launch from opening onto it. Later lists (a folder opened, a row added)
+ * render whole, as ever.
+ */
+const FIRST_ROWS = { left: -1, until: 0 };
+/** The longest the rows past the first screenful wait for the launch to go. */
+const FIRST_ROWS_WAIT = 2500;
+function rowsNow(count: number): number {
+  const now = performance.now();
+  if (!FIRST_ROWS.until) {
+    FIRST_ROWS.until = now + 1000;
+    // A screenful of rows (about 28 px each) and a few more.
+    FIRST_ROWS.left = Math.ceil(window.innerHeight / 28) + 6;
+  }
+  if (now > FIRST_ROWS.until) return count;
+  const n = Math.min(count, Math.max(0, FIRST_ROWS.left));
+  FIRST_ROWS.left -= n;
+  return n;
+}
+
 /** Rows by id (a space-joined string, so the list re-renders only when membership or order changes). */
 const SessionList = memo(function SessionList({ ids, mix }: { ids: string; mix: Mix }) {
-  // Rows that arrive after the first paint animate in; the first paint does not.
+  // Rows that arrive after the first paint animate in; the first paint does not (nor the rows it left for a moment later).
   const [drawnAt] = useState(() => performance.now());
+  const all = ids ? ids.split(' ') : [];
+  const [shown, setShown] = useState(() => rowsNow(all.length));
+  // The rows left for a moment later belong to the first paint: they never animate in.
+  const [held] = useState(() => (shown < all.length ? new Set(all.slice(shown)) : null));
+  const later = shown < all.length;
+  useEffect(() => {
+    if (!later) return;
+    let t = 0;
+    const all = () => {
+      window.clearTimeout(t);
+      // A task of its own for each list, so no one task holds the window for long.
+      t = window.setTimeout(() => setShown(Infinity), 0);
+    };
+    const off = afterLaunch(all);
+    const cap = window.setTimeout(all, FIRST_ROWS_WAIT);
+    return () => {
+      off();
+      window.clearTimeout(t);
+      window.clearTimeout(cap);
+    };
+  }, [later]);
   const enter = performance.now() - drawnAt > 400;
   return (
     <Flip order={ids} className="srows" role="list">
-      {ids ? ids.split(' ').map((id) => <SessionRow key={id} id={id} enter={enter} mix={mix} />) : null}
+      {(later ? all.slice(0, shown) : all).map((id) => (
+        <SessionRow key={id} id={id} enter={enter && !held?.has(id)} mix={mix} />
+      ))}
     </Flip>
   );
 });

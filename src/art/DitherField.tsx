@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { bootLight, type BootLaunch } from '@/lib/boot';
 import { useStore } from '@/state/store';
 import { FIELD_EVENT, type FieldEventDetail } from './events';
 import { FieldEngine, fieldLayout, QUALITY_CELL, RAMP, type DitherTexture, type FieldBeat, type Look, type Metrics } from './field';
@@ -39,15 +40,20 @@ let nextId = 0;
 const replies = new Map<number, (r: FieldReply) => void>();
 const onBroken = new Set<() => void>();
 
-function acquireWorker(): Worker | null {
+/** `adopt`: the worker the boot script started for the launch light (src/boot.ts), when the launch takes it over. */
+function acquireWorker(adopt?: Worker): Worker | null {
   if (workerBroken || typeof Worker !== 'function' || typeof OffscreenCanvas === 'undefined') return null;
   if (!worker) {
+    // The boot script's light already runs in a field worker: that one becomes the shared worker,
+    // and its replies wait for the launch layer until it takes the light over.
+    const early = adopt ? undefined : bootLight();
     try {
-      worker = new Worker(new URL('./field.worker.ts', import.meta.url), { type: 'module' });
+      worker = adopt ?? early?.worker ?? new Worker(new URL('./field.worker.ts', import.meta.url), { type: 'module' });
     } catch {
       workerBroken = true;
       return null;
     }
+    if (early) replies.set(early.id, (r) => void early.replies.push(r));
     worker.onmessage = (e: MessageEvent<FieldReply>) => replies.get(e.data.id)?.(e.data);
     worker.onerror = () => {
       // Every field falls back to drawing on the main thread.
@@ -79,10 +85,12 @@ function releaseWorker() {
  * The shared worker for another drawer (the launch piece, LaunchLayer.tsx): its own id and its own
  * replies. Null when workers or OffscreenCanvas are missing; `onLost` runs if the worker dies.
  */
-export function fieldWorkerPort(onReply: (data: unknown) => void, onLost: () => void) {
-  const w = acquireWorker();
+export function fieldWorkerPort(onReply: (data: unknown) => void, onLost: () => void, early?: Pick<BootLaunch, 'worker' | 'id'>) {
+  // The boot light (src/boot.ts): its own worker and id, unless another worker is the shared one by now.
+  if (early && worker && worker !== early.worker) return null;
+  const w = acquireWorker(early?.worker);
   if (!w) return null;
-  const id = ++nextId;
+  const id = early ? early.id : ++nextId;
   replies.set(id, onReply as (r: FieldReply) => void);
   onBroken.add(onLost);
   return {
@@ -93,6 +101,18 @@ export function fieldWorkerPort(onReply: (data: unknown) => void, onLost: () => 
       if (replies.delete(id)) releaseWorker();
     },
   };
+}
+
+/** A boot light the launch layer does not take over: it stops, and so does its worker unless it is the shared one. */
+export function dropBootLight(early: BootLaunch) {
+  try {
+    early.worker.postMessage({ type: 'launch', id: early.id, op: 'dispose' });
+  } catch {
+    /* gone */
+  }
+  early.canvas.remove();
+  if (early.worker === worker) replies.delete(early.id);
+  else early.worker.terminate();
 }
 
 // ── main-thread load, shared by every animating field ──

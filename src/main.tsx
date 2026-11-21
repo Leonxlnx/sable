@@ -3,10 +3,13 @@ import { createRoot } from 'react-dom/client';
 import './styles/base.css';
 import './styles/ui.css';
 import { App } from './app/App';
+import { bootMark } from './lib/boot';
 import { bridge } from './lib/bridge';
 import * as actions from './state/actions';
 import { startBridge, useStore } from './state/store';
 import { startSpot } from './ui/spot';
+
+bootMark('main');
 
 // The desktop shell's preload exposes this; app.css uses the attribute for the title bar.
 const desktop = (window as { sableDesktop?: { platform: string; debug?: boolean } }).sableDesktop;

@@ -40,6 +40,11 @@ export const LAUNCH = {
   finish: 150,
   /** One ring per this while held. */
   breath: 1900,
+  /**
+   * The app was ready before the mark stood whole: the build runs this many times faster until it
+   * does, so the piece gives way as soon as it can (the same build, only quicker).
+   */
+  hurry: 2.5,
 } as const;
 
 /** When the mark stands whole. */
@@ -90,6 +95,33 @@ export function launchGeometry(width: number, height: number, cell: number): Lau
     // A little above the middle, where the eye lands.
     my: Math.round((height / cell) * 0.46) - LAUNCH_MARK_CELLS / 2,
   };
+}
+
+/** Cells of about 6 px (larger on a large window), in whole device pixels, and where the mark sits. */
+export function launchMeasure(width: number, height: number, dpr: number): { cell: number; geometry: LaunchGeometry } {
+  const base = Math.min(8, Math.max(5, Math.round(Math.min(width, height) / 130)));
+  const cell = Math.max(1, Math.round(base * dpr)) / dpr;
+  return { cell, geometry: launchGeometry(width, height, cell) };
+}
+
+/** #rrggbb to the Uint32 an ImageData view reads (little-endian: 0xAABBGGRR). */
+function abgr(hex: string, fallback: number) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return fallback;
+  const v = parseInt(m[1], 16);
+  return (0xff000000 | ((v & 0xff) << 16) | (v & 0xff00) | (v >> 16)) >>> 0;
+}
+
+function mix(a: number, b: number, k: number) {
+  const ch = (s: number) => Math.round(((a >> s) & 0xff) * (1 - k) + ((b >> s) & 0xff) * k) << s;
+  return (0xff000000 | ch(16) | ch(8) | ch(0)) >>> 0;
+}
+
+/** The piece's colours from the page's tokens (`--bg`, `--text`). */
+export function launchColours(css: CSSStyleDeclaration): LaunchColours {
+  const ink = abgr(css.getPropertyValue('--bg'), 0xff080707);
+  const ivory = abgr(css.getPropertyValue('--text'), 0xffeef1f2);
+  return { ink, ivory, dim: mix(ink, ivory, 0.4) };
 }
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -313,6 +345,8 @@ export type LaunchMessage =
   | { type: 'launch'; id: number; op: 'init'; canvas: OffscreenCanvas; geometry: LaunchGeometry; colours: LaunchColours; frozen: boolean }
   | { type: 'launch'; id: number; op: 'size'; geometry: LaunchGeometry }
   | { type: 'launch'; id: number; op: 'release' | 'finish' | 'dispose' }
+  /** The app is ready: the mark, not whole yet, builds faster until it is (`LAUNCH.hurry`). */
+  | { type: 'launch'; id: number; op: 'hurry' }
   /** Development only (frame sheets): the clock stands at `t` and a frame is drawn for it. */
   | { type: 'launch'; id: number; op: 'clock'; t: number };
 
@@ -332,6 +366,8 @@ interface Host {
   px: Uint32Array;
   t0: number;
   frozen: number | null;
+  /** From real time `r0` (ms since t0) the clock ran `LAUNCH.hurry` times faster until the mark stood. */
+  hurried: { r0: number } | null;
   formed: boolean;
   frames: number;
   worst: number;
@@ -348,7 +384,7 @@ export function launchMessage(m: { type: string }, post: (r: LaunchReply) => voi
     const ctx = msg.canvas.getContext('2d');
     if (!ctx) return true;
     const piece = new LaunchPiece(msg.colours);
-    const h: Host = { piece, canvas: msg.canvas, ctx, image: new ImageData(1, 1), px: new Uint32Array(1), t0: -1, frozen: msg.frozen ? 0 : null, formed: false, frames: 0, worst: 0, stopped: false };
+    const h: Host = { piece, canvas: msg.canvas, ctx, image: new ImageData(1, 1), px: new Uint32Array(1), t0: -1, frozen: msg.frozen ? 0 : null, hurried: null, formed: false, frames: 0, worst: 0, stopped: false };
     hosts.set(msg.id, h);
     fit(h, msg.geometry);
     frame(msg.id, h, post);
@@ -356,7 +392,7 @@ export function launchMessage(m: { type: string }, post: (r: LaunchReply) => voi
   }
   const h = hosts.get(msg.id);
   if (!h) return true;
-  const now = () => (h.frozen != null ? h.frozen : h.t0 < 0 ? 0 : performance.now() - h.t0);
+  const now = () => (h.frozen != null ? h.frozen : h.t0 < 0 ? 0 : clock(h, performance.now() - h.t0));
   switch (msg.op) {
     case 'size':
       fit(h, msg.geometry);
@@ -366,6 +402,9 @@ export function launchMessage(m: { type: string }, post: (r: LaunchReply) => voi
       break;
     case 'finish':
       h.piece.finish(now());
+      break;
+    case 'hurry':
+      if (!h.formed && !h.hurried && h.frozen == null && h.t0 >= 0) h.hurried = { r0: performance.now() - h.t0 };
       break;
     case 'clock':
       h.frozen = msg.t;
@@ -378,6 +417,21 @@ export function launchMessage(m: { type: string }, post: (r: LaunchReply) => voi
   }
   return true;
 }
+
+/**
+ * The piece's clock for `real` ms since its first frame: real time, except after a hurry at `hurriedAt`
+ * (real ms), from where it runs `LAUNCH.hurry` times faster until the mark stands whole, then at the
+ * real pace again. Continuous, never going back.
+ */
+export function launchClock(real: number, hurriedAt: number | null): number {
+  if (hurriedAt === null || real <= hurriedAt || hurriedAt >= LAUNCH_FORMED) return real;
+  const fast = hurriedAt + (real - hurriedAt) * LAUNCH.hurry;
+  if (fast <= LAUNCH_FORMED) return fast;
+  const whole = hurriedAt + (LAUNCH_FORMED - hurriedAt) / LAUNCH.hurry;
+  return LAUNCH_FORMED + (real - whole);
+}
+
+const clock = (h: Host, real: number) => launchClock(real, h.hurried ? h.hurried.r0 : null);
 
 function fit(h: Host, g: LaunchGeometry) {
   h.canvas.width = g.cols;
@@ -395,7 +449,7 @@ function frame(id: number, h: Host, post: (r: LaunchReply) => void) {
   const start = performance.now();
   const first = h.t0 < 0;
   if (first) h.t0 = start;
-  const t = h.frozen != null ? h.frozen : start - h.t0;
+  const t = h.frozen != null ? h.frozen : clock(h, start - h.t0);
   h.piece.draw(t, h.px);
   h.ctx.putImageData(h.image, 0, 0);
   const cost = performance.now() - start;

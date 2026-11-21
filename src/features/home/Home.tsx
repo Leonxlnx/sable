@@ -8,6 +8,7 @@ import { launchArrival, resolveGlyphs } from '@/art/LaunchLayer';
 import { buildMark, LogoMark, markEcho } from '@/art/Logo';
 import { Composer } from '@/features/composer/Composer';
 import { ConnectBanner } from '@/features/connect/Connect';
+import { bootMark } from '@/lib/boot';
 import { EASE_OUT, play, reducedMotion } from '@/lib/motion';
 import { usePrewarm } from '@/state/hooks';
 import { useStore } from '@/state/store';
@@ -37,6 +38,7 @@ function useArrival(mark: RefObject<HTMLDivElement | null>, title: RefObject<HTM
   // Once per mount (a development double run would start it twice).
   const ran = useRef(false);
   useLayoutEffect(() => {
+    bootMark('home');
     if (ran.current || reducedMotion()) return;
     ran.current = true;
     const m = mark.current;

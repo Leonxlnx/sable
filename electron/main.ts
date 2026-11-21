@@ -1,14 +1,24 @@
 import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, powerMonitor, powerSaveBlocker, screen, session, shell, webContents, type MenuItemConstructorOptions, type Rectangle, type WebContents } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import nodeModule from 'node:module';
 import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
+import { bootMark } from '../server/util/boot';
 import { pickFolder, type ShowFolderDialog } from './folder';
 import { windowsThumbs } from './thumbs';
 
+// Start-up marks (server/util/boot.ts): the process, the entry (main.cjs) and the bundle (its banner)
+// starting to run, and here, once the bundle's modules have run.
+const early = globalThis as { __sableT00?: number; __sableT0?: number };
+bootMark('main:process', performance.timeOrigin);
+if (typeof early.__sableT00 === 'number') bootMark('main:loader', early.__sableT00);
+if (typeof early.__sableT0 === 'number') bootMark('main:eval', early.__sableT0);
+bootMark('main:body');
+
 /**
  * Sable desktop shell. Runs the production server (UI + bridge) in this process on a localhost
- * port and shows it in one hardened window. Bundled to dist-electron/main.cjs by
- * scripts/build-electron.mjs; started with `electron .` from the project root, or packaged by
+ * port and shows it in one hardened window. Bundled to dist-electron/app.cjs (loaded by main.cjs,
+ * which turns on Node's compile cache first) by scripts/build-electron.mjs; started with `electron .` from the project root, or packaged by
  * electron-builder (`pnpm desktop:dist`, configured in package.json → build).
  *
  * Development flags (verification only):
@@ -572,6 +582,20 @@ function harden() {
     });
   });
 
+  const allowed = new Set(['notifications', 'clipboard-read', 'clipboard-sanitized-write']);
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback, details) => {
+    callback(allowed.has(permission) && isAppUrl(details.requestingUrl));
+  });
+  // Electron passes the origin here as a URL with a trailing slash ("http://127.0.0.1:47317/"): compare origins.
+  session.defaultSession.setPermissionCheckHandler((_wc, permission, requestingOrigin) => allowed.has(permission) && isAppUrl(requestingOrigin));
+  windowCalls();
+}
+
+/**
+ * The Content-Security-Policy of every page the app's server sends (passed to startServer, which adds
+ * it to each response: set by the server itself, no response waits on this process for its headers).
+ */
+function pageHeaders(pathname: string): Record<string, string> {
   // The page only loads its own code; agent output may show images (data, blob, https) and nothing else.
   const csp = [
     "default-src 'self'",
@@ -607,25 +631,7 @@ function harden() {
     "base-uri 'none'",
     "manifest-src 'none'",
   ].join('; ');
-  const isWidgetPage = (url: string): boolean => {
-    try {
-      return new URL(url).pathname === '/widget-frame.html';
-    } catch {
-      return false;
-    }
-  };
-  session.defaultSession.webRequest.onHeadersReceived({ urls: [`${appOrigin}/*`] }, (details, callback) => {
-    callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [isWidgetPage(details.url) ? widgetCsp : csp] } });
-  });
-
-  const allowed = new Set(['notifications', 'clipboard-read', 'clipboard-sanitized-write']);
-  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback, details) => {
-    callback(allowed.has(permission) && isAppUrl(details.requestingUrl));
-  });
-  // Electron passes the origin here as a URL with a trailing slash ("http://127.0.0.1:47317/"): compare origins.
-  session.defaultSession.setPermissionCheckHandler((_wc, permission, requestingOrigin) => allowed.has(permission) && isAppUrl(requestingOrigin));
-  hardenBrowser();
-  windowCalls();
+  return { 'content-security-policy': pathname === '/widget-frame.html' ? widgetCsp : csp };
 }
 
 /* ── menu and shortcuts ── */
@@ -735,7 +741,11 @@ function createWindow(url: string) {
     },
   });
 
+  bootMark('main:browserwindow');
   w.once('ready-to-show', () => {
+    bootMark('main:ready-to-show');
+    // The compile cache main.cjs turned on (it holds the compiled bundle): written out once, now.
+    setTimeout(() => flushCompileCache(), 3000);
     if (screenshotFile) {
       // Shown (so it paints) but off-screen and out of the taskbar; the bounds are set again in case
       // the system moved the window back onto a display when it was created.
@@ -770,6 +780,15 @@ function createWindow(url: string) {
 /* ── verification capture ── */
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Writes out what Node's compile cache holds (main.cjs turned it on; a no-op without it). */
+function flushCompileCache() {
+  try {
+    (nodeModule as { flushCompileCache?: () => void }).flushCompileCache?.();
+  } catch {
+    /* the cache is a hint */
+  }
+}
 
 async function capture(w: BrowserWindow, file: string) {
   const wc = w.webContents;
@@ -841,10 +860,15 @@ function keepAwake(s: RunningServer) {
     }
   };
   s.watchBusy((busy) => ((work = busy), apply()));
-  s.watchPhone((on) => ((phone = on), apply()));
+  // The phone's part a few seconds in: reading its state lists the network adapters, which is not
+  // worth doing while the window loads (a phone waits for the computer to stay up, not for this).
+  setTimeout(() => {
+    if (!quitting) s.watchPhone((on) => ((phone = on), apply()));
+  }, PHONE_AWAKE_DELAY_MS);
   powerMonitor.on('on-ac', apply);
   powerMonitor.on('on-battery', apply);
 }
+const PHONE_AWAKE_DELAY_MS = 4000;
 
 app.on('before-quit', (e) => {
   if (quitting || !server) return;
@@ -867,28 +891,23 @@ if (!app.requestSingleInstanceLock()) {
     win.focus();
   });
 
-  app.whenReady().then(async () => {
-    installMenu();
-    try {
-      server = await startServer({
-        root: path.join(app.getAppPath(), 'dist'),
-        port: PREFERRED_PORT,
-        fallbackToFreePort: true,
-        // An installed build updates itself; a build run from a folder (or a test run) does not.
-        updates: app.isPackaged && !screenshotFile ? { quit: () => app.quit() } : undefined,
-        // Windows' own thumbnails for the files an agent hands over.
-        thumbs: windowsThumbs,
-      });
-    } catch (err) {
-      dialog.showErrorBox('Sable could not start', String((err as Error)?.message ?? err));
-      app.quit();
-      return;
-    }
-    appOrigin = new URL(server.url).origin;
-    keepAwake(server);
+  /*
+   * Start-up. The server (its port, then the bridge: the store, the sessions, the services) starts
+   * at once, while Electron itself is still getting ready; the window opens as soon as Electron is
+   * ready and the port is known. When the port comes after Electron, the window opens before the
+   * bridge is built (in the same task, so no request reaches the server before the bridge is
+   * there), and the window's renderer starts while the bridge is built.
+   */
+  let electronReady = false;
+  const openWindow = (url: string) => {
+    if (win) return;
+    appOrigin = new URL(url).origin;
     harden();
-    win = createWindow(server.url);
-
+    bootMark('main:harden');
+    win = createWindow(url);
+    bootMark('main:window');
+    // The panel browser's own session: needed once a page opens in the Browser tab, not for the first frame.
+    hardenBrowser();
     if (screenshotFile) {
       capture(win, screenshotFile)
         .catch((err) => {
@@ -897,5 +916,37 @@ if (!app.requestSingleInstanceLock()) {
         })
         .finally(() => app.quit());
     }
+  };
+  const starting = startServer({
+    root: path.join(app.getAppPath(), 'dist'),
+    port: PREFERRED_PORT,
+    fallbackToFreePort: true,
+    // An installed build updates itself; a build run from a folder (or a test run) does not.
+    updates: app.isPackaged && !screenshotFile ? { quit: () => app.quit() } : undefined,
+    // Windows' own thumbnails for the files an agent hands over.
+    thumbs: windowsThumbs,
+    headers: pageHeaders,
+    onListening: (url) => {
+      if (electronReady) openWindow(url);
+    },
+  });
+  // Handled below, once Electron is ready (a failure before that must not count as unhandled).
+  starting.catch(() => {});
+
+  app.whenReady().then(async () => {
+    electronReady = true;
+    bootMark('main:ready');
+    installMenu();
+    try {
+      server = await starting;
+    } catch (err) {
+      dialog.showErrorBox('Sable could not start', String((err as Error)?.message ?? err));
+      app.quit();
+      return;
+    }
+    bootMark('main:server');
+    openWindow(server.url);
+    keepAwake(server);
+    bootMark('main:awake');
   });
 }

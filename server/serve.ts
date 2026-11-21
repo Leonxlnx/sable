@@ -6,6 +6,7 @@ import { attachBridge } from './bridge';
 import { watchAwake, watchPhoneAwake } from './core/awake';
 import { setThumbHost, type ThumbHost } from './services/thumbs';
 import { registerUpdates, type UpdateHost } from './services/update';
+import { bootMark } from './util/boot';
 
 /**
  * The production server: serves the built UI and hosts the bridge on one port, on 127.0.0.1 only
@@ -23,6 +24,17 @@ export interface ServerOptions {
   updates?: UpdateHost;
   /** The desktop shell: Windows' own thumbnails for the file cards (`services/thumbs.ts`). */
   thumbs?: ThumbHost;
+  /**
+   * Called once the port is known, right before the bridge is built in the same task: the desktop
+   * shell opens its window here, so the window's renderer starts while the bridge is built (no
+   * request can reach the server before the bridge is attached).
+   */
+  onListening?: (url: string) => void;
+  /**
+   * Headers added to every response (the desktop shell's Content-Security-Policy, by path). Set here,
+   * by the server that sends the page, rather than by the shell rewriting each response's headers.
+   */
+  headers?: (pathname: string) => Record<string, string>;
 }
 
 export interface RunningServer {
@@ -61,8 +73,11 @@ const types: Record<string, string> = {
 
 const isFile = (p: string) => existsSync(p) && statSync(p).isFile();
 
-function createStaticServer(root: string): Server {
+function createStaticServer(root: string, extra?: (pathname: string) => Record<string, string>): Server {
+  // Build assets carry their content hash in their names: their size is looked up once.
+  const sizes = new Map<string, number>();
   return createServer((req, res) => {
+    bootMark('server:first-request');
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.writeHead(405, { allow: 'GET, HEAD' }).end();
       return;
@@ -80,7 +95,9 @@ function createStaticServer(root: string): Server {
       res.writeHead(403).end();
       return;
     }
-    if (!isFile(file)) {
+    const hashed = file.startsWith(path.join(root, 'assets') + path.sep);
+    const known = hashed ? sizes.get(file) : undefined;
+    if (known === undefined && !isFile(file)) {
       // A missing build asset is a 404 (serving index.html would fail as a script with a MIME error);
       // any other path is a client route and gets the app.
       if (pathname.startsWith('/assets/') || path.extname(pathname)) {
@@ -89,14 +106,16 @@ function createStaticServer(root: string): Server {
       }
       file = path.join(root, 'index.html');
     }
-    if (!isFile(file)) {
+    if (known === undefined && !isFile(file)) {
       res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }).end('Sable is not built yet. Run "pnpm build" first.');
       return;
     }
-    const hashed = file.startsWith(path.join(root, 'assets') + path.sep);
+    const size = known ?? statSync(file).size;
+    if (hashed) sizes.set(file, size);
     res.writeHead(200, {
+      ...extra?.(pathname),
       'content-type': types[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
-      'content-length': statSync(file).size,
+      'content-length': size,
       'cache-control': hashed ? 'public, max-age=31536000, immutable' : 'no-cache',
       'x-content-type-options': 'nosniff',
     });
@@ -124,7 +143,7 @@ function listen(server: Server, port: number): Promise<number> {
 
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const root = path.resolve(opts.root);
-  const server = createStaticServer(root);
+  const server = createStaticServer(root, opts.headers);
 
   // The bridge handles its own path; nothing else upgrades here (no Vite HMR in production),
   // so close other upgrade requests instead of leaving the sockets half open.
@@ -139,9 +158,12 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     if (!opts.fallbackToFreePort || (err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
     port = await listen(server, 0);
   }
+  bootMark('server:listen');
+  opts.onListening?.(`http://127.0.0.1:${port}`);
   const bridge = attachBridge(server);
   registerUpdates(bridge.app, opts.updates);
   setThumbHost(bridge.app, opts.thumbs);
+  bootMark('server:bridge');
 
   let closing: Promise<void> | undefined;
   const close = () =>

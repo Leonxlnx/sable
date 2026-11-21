@@ -24,6 +24,7 @@ import type {
 } from '@shared/protocol';
 import { DEFAULT_ACCOUNT, DEFAULT_SETTINGS } from '@shared/protocol';
 import { bridge, type ConnStatus } from '@/lib/bridge';
+import { bootMark } from '@/lib/boot';
 import type { Reviews } from '@/features/review/model';
 
 export { changedSince } from './revision';
@@ -623,7 +624,9 @@ export function onTerm(l: (e: Extract<BridgeEvent, { type: 'term.data' | 'term.e
 }
 
 async function hello() {
+  bootMark('hello-sent');
   const app = await bridge.call('app.hello', {});
+  bootMark('hello');
   useStore.setState((s) => {
     const sessions = Object.fromEntries(app.sessions.map((m) => [m.id, m]));
     const active = s.ui.activeSessionId && sessions[s.ui.activeSessionId] ? s.ui.activeSessionId : null;
@@ -682,6 +685,7 @@ export function startBridge() {
   });
   bridge.onStatus((conn) => {
     useStore.setState({ conn });
+    if (conn === 'open') bootMark('ws-open');
     if (conn === 'open') void hello().catch((err) => useStore.getState().toast(String(err.message ?? err), 'error'));
   });
   bridge.start();

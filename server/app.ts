@@ -54,6 +54,7 @@ import { Lanes } from './core/lanes';
 import { isAllModelsWeekly } from './core/limit-policy';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
 import { VERSION } from './version';
+import { bootMark } from './util/boot';
 
 type Handler<M extends RpcName> = (params: RpcMethods[M]['params']) => Promise<RpcMethods[M]['result']> | RpcMethods[M]['result'];
 
@@ -294,6 +295,7 @@ export class App {
     this.loginTimeoutMs = opts.loginTimeoutMs ?? LOGIN_TIMEOUT_MS;
     this.store = new Store(opts.home);
     this.cache = new DiskCache(this.store.dir);
+    bootMark('app:store');
     for (const make of opts.providers) {
       const p = make(this.contextFor(DEFAULT_ACCOUNT));
       this.providers.set(p.id, p);
@@ -317,6 +319,7 @@ export class App {
       if (plain !== meta.title) meta.title = plain || 'New session';
       this.sessions.set(meta.id, this.makeRuntime(meta, true));
     }
+    bootMark('app:sessions');
     this.seedFolderOrder();
     this.registerCore();
     // Chats that waited when Sable closed go on waiting (a reset that passed meanwhile is due now).
@@ -1840,7 +1843,12 @@ export class App {
   }
 
   private registerCore() {
-    this.register('app.hello', () => this.state());
+    this.register('app.hello', async () => {
+      bootMark('hello:asked');
+      const state = await this.state();
+      bootMark('hello:answered');
+      return state;
+    });
 
     this.register('app.setSettings', ({ patch: raw }) => {
       // Backdrop images change only through backdrop.*; the config is always checked.

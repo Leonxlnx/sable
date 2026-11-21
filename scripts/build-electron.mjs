@@ -1,12 +1,14 @@
 // Bundles the desktop shell: electron/main.ts (with the server, ws and the Agent SDK's JavaScript)
-// -> dist-electron/main.cjs, electron/preload.ts -> dist-electron/preload.cjs. Run after `vite build`
-// (see `pnpm desktop:build`). The bundle needs nothing from node_modules at runtime.
+// -> dist-electron/app.cjs, loaded by dist-electron/main.cjs (written below: it turns on Node's compile
+// cache first), the Agent SDK with zod -> dist-electron/sdk.cjs (read on first use, see LAZY below),
+// electron/preload.ts -> dist-electron/preload.cjs. Run after `vite build` (see `pnpm desktop:build`).
+// The bundles need nothing from node_modules at runtime.
 //
 // The SDK starts a native Claude Code binary from its platform package; that binary is staged in
 // dist-resources/claude/ (a hard link, so no copy of its ~370 MB) and shipped by electron-builder as
 // an extra resource. electron/main.ts points SABLE_CLAUDE_BIN at it.
 import { build } from 'esbuild';
-import { copyFileSync, existsSync, linkSync, mkdirSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,15 +28,55 @@ const common = {
   absWorkingDir: root,
 };
 
+/*
+ * The Agent SDK and zod (Claude Code's tools are defined with it) are most of the shell's code: about
+ * 2.3 MB of 3.7. They go into a bundle of their own, sdk.cjs, read the first time Claude Code is used
+ * (a session, a sign-in, its models), not while the app starts. The main bundle gets a stand-in for
+ * each: its exports are the real ones, read from sdk.cjs on first access (one zod for both).
+ */
+const LAZY = { '@anthropic-ai/claude-agent-sdk': 'sdk', zod: 'zod' };
+const lazyKeys = Object.fromEntries(await Promise.all(Object.keys(LAZY).map(async (name) => [name, Object.keys(await import(name))])));
+const lazyPackages = {
+  name: 'sable:lazy-sdk',
+  setup(b) {
+    b.onResolve({ filter: /^(@anthropic-ai\/claude-agent-sdk|zod)$/ }, (a) => ({ path: a.path, namespace: 'sable-lazy' }));
+    b.onResolve({ filter: /^\.\/sdk\.cjs$/ }, () => ({ path: './sdk.cjs', external: true }));
+    b.onLoad({ filter: /.*/, namespace: 'sable-lazy' }, (a) => ({
+      loader: 'js',
+      resolveDir: out,
+      contents: `// Stand-in for ${a.path}: sdk.cjs is read the first time one of its exports is.
+let real;
+const load = () => {
+  if (real) return real;
+  // A start-up mark (server/util/boot.ts): when the SDK was first needed.
+  if (process.env.SABLE_BOOT_TRACE === '1') console.log('[boot] sdk:load ' + (performance.timeOrigin + performance.now()).toFixed(1));
+  return (real = require('./sdk.cjs'));
+};
+for (const k of ${JSON.stringify(lazyKeys[a.path])}) Object.defineProperty(module.exports, k, { enumerable: true, get: () => load().${LAZY[a.path]}[k] });
+`,
+    }));
+  },
+};
+
 await Promise.all([
   build({
     ...common,
     entryPoints: ['electron/main.ts'],
-    outfile: path.join(out, 'main.cjs'),
+    outfile: path.join(out, 'app.cjs'),
+    plugins: [lazyPackages],
     // ws tries its optional native add-ons in a try/catch and falls back to JavaScript without them.
     external: ['electron', 'bufferutil', 'utf-8-validate'],
     // Server modules (and the SDK) locate files next to themselves through import.meta.url; in the
     // bundle that is the bundle's own location, so the files they read are copied next to it below.
+    define: { 'import.meta.url': '__bundleUrl' },
+    // __sableT0: when the bundle starts to run (a start-up mark, server/util/boot.ts).
+    banner: { js: "globalThis.__sableT0 = performance.timeOrigin + performance.now();\nconst __bundleUrl = require('node:url').pathToFileURL(__filename).href;" },
+    legalComments: 'none',
+  }),
+  build({
+    ...common,
+    stdin: { contents: "export * as sdk from '@anthropic-ai/claude-agent-sdk';\nexport * as zod from 'zod';\n", resolveDir: root, sourcefile: 'sdk-entry.js' },
+    outfile: path.join(out, 'sdk.cjs'),
     define: { 'import.meta.url': '__bundleUrl' },
     banner: { js: "const __bundleUrl = require('node:url').pathToFileURL(__filename).href;" },
     legalComments: 'none',
@@ -46,6 +88,31 @@ await Promise.all([
     external: ['electron'],
   }),
 ]);
+
+/*
+ * The entry (package.json main): Node's compile cache for the bundle, then the bundle. Compiling the
+ * 3.6 MB bundle is a good part of the shell's start; with the cache a start after the first reads it
+ * compiled (the cache checks the source, so an update simply compiles again). The folder is the
+ * window's profile folder, chosen as in electron/main.ts (SABLE_USER_DATA, SABLE_HOME, else Sable's
+ * own under the user's app data); main.ts writes the cache out once the window is up.
+ */
+writeFileSync(
+  path.join(out, 'main.cjs'),
+  `'use strict';
+// Generated by scripts/build-electron.mjs: Node's compile cache, then the bundle (app.cjs).
+globalThis.__sableT00 = performance.timeOrigin + performance.now();
+try {
+  const path = require('node:path');
+  const { app } = require('electron');
+  const env = process.env;
+  const profile = env.SABLE_USER_DATA ? path.resolve(env.SABLE_USER_DATA) : env.SABLE_HOME ? path.join(env.SABLE_HOME, 'desktop') : path.join(app.getPath('appData'), 'Sable');
+  require('node:module').enableCompileCache?.(path.join(profile, 'compile-cache'));
+} catch {
+  /* runs without the cache */
+}
+require('./app.cjs');
+`,
+);
 
 copyFileSync(path.join(root, 'server/providers/demo-content.md'), path.join(out, 'demo-content.md'));
 copyFileSync(path.join(root, 'build/icon.png'), path.join(out, 'icon.png'));
@@ -76,4 +143,4 @@ if (!same(source, staged)) {
   }
 }
 
-console.log('Built dist-electron/main.cjs and dist-electron/preload.cjs; staged dist-resources/claude/' + exe);
+console.log('Built dist-electron/main.cjs (app.cjs) and dist-electron/preload.cjs; staged dist-resources/claude/' + exe);

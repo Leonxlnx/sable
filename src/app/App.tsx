@@ -180,6 +180,28 @@ const VIEW: Variants = {
         : { opacity: 0, transition: { duration: 0.16 } },
 };
 
+/**
+ * The window's first frame is the launch over an empty frame; the sidebar and the stage's view
+ * mount right after it. On a large profile their first render and layout hold the page for a moment,
+ * and the launch's light (drawn in a worker) is on screen meanwhile instead of after it. Without the
+ * launch (automated development pages) everything mounts at once, as before.
+ */
+function useBuilt(): boolean {
+  const [built, setBuilt] = useState(() => !launchPlays());
+  useEffect(() => {
+    if (built) return;
+    const go = () => setBuilt(true);
+    // After the frame that shows the launch; the timer in case no frame comes (a window not drawn).
+    const raf = requestAnimationFrame(() => window.setTimeout(go, 0));
+    const t = window.setTimeout(go, 150);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(t);
+    };
+  }, [built]);
+  return built;
+}
+
 /** Which kind of change the stage is making (read while rendering the change, see ViewMode). */
 function useViewMode(key: string | null, body: RefObject<HTMLElement | null>): ViewMode {
   const last = useRef(key);
@@ -219,13 +241,15 @@ export function App() {
   // mounts the moment the bridge is ready, under it: nothing waits for the piece.
   const [launching, setLaunching] = useState(launchPlays);
   const endLaunch = useCallback(() => setLaunching(false), []);
+  const launched = useRef(launching);
+  const built = useBuilt();
   const booting = !ready;
   // First run: the welcome takes over the window; the app behind it waits, inert.
   const onboarding = useOnboarding(!booting);
   const stageBody = useRef<HTMLDivElement>(null);
   // The race view (features/race): both chats of a race side by side, while no session is open.
   const raceId = useOpenRace(sessionId);
-  const viewKey = booting || onboarding ? null : (sessionId ?? (raceId ? `race:${raceId}` : 'home'));
+  const viewKey = booting || onboarding || !built ? null : (sessionId ?? (raceId ? `race:${raceId}` : 'home'));
   const viewMode = useViewMode(viewKey, stageBody);
   // The panel waits while the first message's composer glides to the dock: the session mounts
   // first, the panel opens once the card has landed (only read while the panel is meant to be open).
@@ -265,15 +289,17 @@ export function App() {
 
   // Warm the on-demand chunks once the app is idle, so the first open is instant. The session view
   // first and soon (a send from home needs it), the rest when the window has nothing else to do.
+  // Not while the launch plays: its release is the moment the window must not be busy.
   useEffect(() => {
-    if (!ready) return;
-    const t = window.setTimeout(() => void loadSessionView().catch(() => {}), 600);
+    if (!ready || launching) return;
+    // Right after the launch has gone (it ends on home at rest), else a moment after the bridge answered.
+    const t = window.setTimeout(() => void loadSessionView().catch(() => {}), launched.current ? 150 : 600);
     const warm = () => void Promise.all([loadPalette(), loadRail(), loadSettings(), loadHistory(), loadPicker(), loadTriage(), loadRace()]).catch(() => {});
     const ric = (window as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
     if (ric) ric(warm, { timeout: 4000 });
     else window.setTimeout(warm, 1500);
     return () => window.clearTimeout(t);
-  }, [ready]);
+  }, [ready, launching]);
 
   useHotkey('mod+k', useCallback((e) => (e.preventDefault(), setUi({ paletteOpen: !useStore.getState().ui.paletteOpen })), [setUi]));
   useHotkey('mod+b', useCallback((e) => (e.preventDefault(), toggleSidebar(sidebarOpen)), [sidebarOpen]));
@@ -303,13 +329,14 @@ export function App() {
       <TipProvider>
         <div className="app" data-provider={provider} data-sidebar={sidebarOpen}>
           <aside className="app-side" aria-hidden={!sidebarOpen || onboarding} inert={onboarding}>
-            <Sidebar />
+            {built && <Sidebar />}
           </aside>
 
           <main className="stage" inert={onboarding}>
             <Topbar panelShown={railShown} />
             <div className="stage-body" ref={stageBody}>
-              {launching && <Launch ready={ready} onDone={endLaunch} />}
+              {/* Released once there is something under it: the bridge's answer and the view it opens onto. */}
+              {launching && <Launch ready={ready && built} onDone={endLaunch} />}
               {/* The session's band of light, one field for every session (like the dock): a switch
                   changes its colour and pace, it is never built again. Under the conversation. */}
               <AnimatePresence initial={false} custom={viewMode}>

@@ -5,6 +5,7 @@ import { App, type AppOptions } from './app';
 import { eventForWindow, resultForWindow } from './core/trim';
 import { registerServices } from './services/index';
 import { defaultProviders } from './providers/index';
+import { bootMark } from './util/boot';
 
 /**
  * Only same-machine pages may talk to the bridge: it can read files and run commands.
@@ -22,9 +23,13 @@ function originAllowed(req: IncomingMessage): boolean {
   }
 }
 
+const trace = process.env.SABLE_BOOT_TRACE === '1';
+
 export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
   const app = new App({ providers: defaultProviders(), ...opts });
+  bootMark('bridge:app');
   registerServices(app);
+  bootMark('bridge:services');
 
   const wss = new WebSocketServer({ noServer: true });
 
@@ -41,6 +46,7 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
   http.on('upgrade', onUpgrade);
 
   wss.on('connection', (ws: WebSocket) => {
+    bootMark('bridge:connected');
     const send = (frame: ServerFrame) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(frame));
     };
@@ -54,8 +60,12 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
         return;
       }
       try {
+        const t = trace ? performance.now() : 0;
         const result = await app.call(req.method, req.params as never);
-        send({ id: req.id, ok: true, result: resultForWindow(result) });
+        const frame = JSON.stringify({ id: req.id, ok: true, result: resultForWindow(result) });
+        // Measuring runs (SABLE_BOOT_TRACE=1): each call, when it came, how long it took, how big its answer was.
+        if (trace) console.log(`[rpc] ${req.method} ${(performance.timeOrigin + t).toFixed(1)} ${(performance.now() - t).toFixed(1)}ms ${frame.length}B`);
+        if (ws.readyState === ws.OPEN) ws.send(frame);
       } catch (err) {
         send({ id: req.id, ok: false, error: (err as Error).message ?? String(err) });
       }

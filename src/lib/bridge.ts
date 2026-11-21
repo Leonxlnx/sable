@@ -1,4 +1,5 @@
 import { BRIDGE_PATH, type BridgeEvent, type RpcMethods, type RpcName, type ServerFrame } from '@shared/protocol';
+import { takeBootSocket } from './boot';
 
 export type ConnStatus = 'connecting' | 'open' | 'closed';
 
@@ -24,18 +25,21 @@ class Bridge {
 
   private open() {
     this.setStatus('connecting');
+    // The first time, the socket the page's first script opened (src/boot.ts), `app.hello` asked on it.
+    const early = takeBootSocket();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}${BRIDGE_PATH}`);
+    const ws = early?.ws ?? new WebSocket(`${proto}://${location.host}${BRIDGE_PATH}`);
     this.ws = ws;
-    ws.onopen = () => {
+    this.bootHello = early ? { id: early.helloId, asked: early.asked } : undefined;
+    const opened = () => {
       this.retry = 0;
       this.setStatus('open');
       for (const frame of this.outbox.splice(0)) ws.send(frame);
     };
-    ws.onmessage = (ev) => {
+    const received = (data: string) => {
       let frame: ServerFrame;
       try {
-        frame = JSON.parse(ev.data as string);
+        frame = JSON.parse(data);
       } catch {
         return;
       }
@@ -50,8 +54,9 @@ class Bridge {
       if (frame.ok) p.resolve(frame.result);
       else p.reject(new Error(frame.error));
     };
-    ws.onclose = () => {
+    const closed = () => {
       if (this.ws !== ws) return;
+      this.bootHello = undefined;
       this.setStatus('closed');
       for (const [id, p] of this.pending) {
         clearTimeout(p.timer);
@@ -61,8 +66,20 @@ class Bridge {
       const delay = Math.min(4000, 300 * 2 ** this.retry++);
       setTimeout(() => this.open(), delay);
     };
+    ws.onopen = opened;
+    ws.onmessage = (ev) => received(ev.data as string);
+    ws.onclose = closed;
     ws.onerror = () => ws.close();
+    if (!early) return;
+    // Taken over: the state it is in now, then what it received meanwhile, in order (the status
+    // first, so `app.hello` is asked for, and answered by its frame, as on a socket of its own).
+    if (ws.readyState === WebSocket.OPEN) opened();
+    else if (ws.readyState === WebSocket.CLOSED) return closed();
+    for (const data of early.frames.splice(0)) received(data);
   }
+
+  /** `app.hello` on the boot socket: asked with this id (already sent unless `asked` is false). */
+  private bootHello?: { id: number; asked: boolean };
 
   private setStatus(s: ConnStatus) {
     if (this.status === s) return;
@@ -71,7 +88,10 @@ class Bridge {
   }
 
   call<M extends RpcName>(method: M, params: RpcMethods[M]['params'], timeoutMs = 60_000): Promise<RpcMethods[M]['result']> {
-    const id = this.nextId++;
+    // The first `app.hello` is the one the boot script asked (its answer may be here already).
+    const early = method === 'app.hello' ? this.bootHello : undefined;
+    if (early) this.bootHello = undefined;
+    const id = early ? early.id : this.nextId++;
     const frame = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
@@ -79,6 +99,7 @@ class Bridge {
         reject(new Error(`${method} timed out`));
       }, timeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      if (early?.asked) return;
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(frame);
       else this.outbox.push(frame);
     });

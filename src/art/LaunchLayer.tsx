@@ -1,8 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { fieldWorkerPort } from './DitherField';
+import { dropBootLight, fieldWorkerPort } from './DitherField';
 import { FIELD_EVENT, type FieldEventDetail } from './events';
-import { LAUNCH, LAUNCH_MARK_CELLS, launchGeometry, type LaunchGeometry, type LaunchMessage, type LaunchReply } from './launch-light';
+import { LAUNCH, LAUNCH_MARK_CELLS, launchColours, launchMeasure, type LaunchGeometry, type LaunchMessage, type LaunchReply } from './launch-light';
 import { MARK_PATH, markCell } from './Logo';
+import { bootMark, takeBootLaunch, type BootLaunch } from '@/lib/boot';
 
 /**
  * The launch: one piece from the window's first frame to the home screen at rest.
@@ -15,6 +16,9 @@ import { MARK_PATH, markCell } from './Logo';
  *   typed lands in it and the piece yields at once (everything opens in 150 ms); a click skips it.
  * - While the bridge starts, the piece holds (the mark, a halo, a ring now and then) and releases
  *   whenever the bridge answers, early or late. A sentence shows only after four seconds.
+ * - The light starts with the page (src/boot.ts), before the app's code has loaded; the layer takes
+ *   its canvas and worker over when it mounts. An app that is ready before the mark stands whole
+ *   quickens the build (`LAUNCH.hurry`), so the piece never holds a ready app back.
  * - Reduced motion, or no worker: the mark on ink, then a short fade into the app.
  * - When it ends nothing is left: no canvas, no listeners, no timers.
  *
@@ -129,27 +133,35 @@ function animate(r: Run, el: Element | null | undefined, frames: Keyframe[], opt
   return a;
 }
 
-/** #rrggbb to the Uint32 an ImageData view reads (little-endian: 0xAABBGGRR). */
-function abgr(hex: string, fallback: number) {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
-  if (!m) return fallback;
-  const v = parseInt(m[1], 16);
-  return (0xff000000 | ((v & 0xff) << 16) | (v & 0xff00) | (v >> 16)) >>> 0;
-}
-
-function mix(a: number, b: number, k: number) {
-  const ch = (s: number) => Math.round(((a >> s) & 0xff) * (1 - k) + ((b >> s) & 0xff) * k) << s;
-  return (0xff000000 | ch(16) | ch(8) | ch(0)) >>> 0;
-}
-
 /** Cells of about 6 px (larger on a large window), in whole device pixels. */
-function measure() {
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-  const dpr = window.devicePixelRatio || 1;
-  const base = Math.min(8, Math.max(5, Math.round(Math.min(w, h) / 130)));
-  const cell = Math.max(1, Math.round(base * dpr)) / dpr;
-  return { cell, geometry: launchGeometry(w, h, cell) };
+const measure = () => launchMeasure(window.innerWidth, window.innerHeight, window.devicePixelRatio || 1);
+
+/**
+ * Takes over the light the page's first script started (src/boot.ts): its canvas moves into the
+ * layer and its worker becomes the shared field worker, so the piece goes on from where it is (its
+ * clock started with the page). False when it cannot be used; it is then stopped and removed.
+ */
+function adopt(r: Run, root: HTMLDivElement, early: BootLaunch): boolean {
+  const port = early.failed ? null : fieldWorkerPort((d) => onReply(r, d as LaunchReply), () => goPlain(r), early);
+  if (!port) {
+    dropBootLight(early);
+    return false;
+  }
+  r.port = port;
+  r.canvas = early.canvas;
+  r.plain = false;
+  r.cell = early.cell;
+  r.geometry = early.geometry;
+  // Placed by the layer from here (the boot script held it over the window by itself).
+  early.canvas.removeAttribute('style');
+  root.prepend(early.canvas);
+  // The window may have changed size since the light started: it follows, as on a resize.
+  const now = measure();
+  if (now.cell !== r.cell || now.geometry.cols !== r.geometry.cols || now.geometry.rows !== r.geometry.rows) {
+    Object.assign(r, now);
+    port.post({ type: 'launch', id: port.id, op: 'size', geometry: r.geometry } satisfies LaunchMessage);
+  }
+  return true;
 }
 
 function place(r: Run) {
@@ -193,8 +205,19 @@ function start(root: HTMLDivElement, mark: HTMLDivElement, onDone: () => void, o
     off: [],
   };
   run = r;
+  bootMark('launch-start');
 
-  if (!reducedMotion()) {
+  // The light may be running already, started by the page's first script before the app loaded.
+  const early = takeBootLaunch();
+  let adopted = false;
+  if (early) {
+    if (!r.frozen && !reducedMotion()) adopted = adopt(r, root, early);
+    else dropBootLight(early);
+  }
+  if (adopted) {
+    // A worker that never answers (it failed to load) must not leave the window in ink.
+    cue(r, 1600, () => !r.ignited && goPlain(r));
+  } else if (!reducedMotion()) {
     const canvas = document.createElement('canvas');
     canvas.className = 'launch-light';
     canvas.setAttribute('aria-hidden', 'true');
@@ -204,11 +227,8 @@ function start(root: HTMLDivElement, mark: HTMLDivElement, onDone: () => void, o
       r.canvas = canvas;
       r.plain = false;
       root.prepend(canvas);
-      const css = getComputedStyle(document.documentElement);
-      const ink = abgr(css.getPropertyValue('--bg'), 0xff080707);
-      const ivory = abgr(css.getPropertyValue('--text'), 0xffeef1f2);
       const off = canvas.transferControlToOffscreen();
-      const init: LaunchMessage = { type: 'launch', id: port.id, op: 'init', canvas: off, geometry: r.geometry, colours: { ink, ivory, dim: mix(ink, ivory, 0.4) }, frozen: r.frozen };
+      const init: LaunchMessage = { type: 'launch', id: port.id, op: 'init', canvas: off, geometry: r.geometry, colours: launchColours(getComputedStyle(document.documentElement)), frozen: r.frozen };
       port.post(init, [off]);
       // A worker that never answers (it failed to load) must not leave the window in ink.
       cue(r, 1600, () => !r.ignited && goPlain(r));
@@ -281,6 +301,8 @@ function start(root: HTMLDivElement, mark: HTMLDivElement, onDone: () => void, o
       }
     };
   }
+  // What the adopted light said before the layer was there (it has lit, perhaps formed already).
+  if (adopted && early) for (const m of early.replies.splice(0)) onReply(r, m as LaunchReply);
 }
 
 function onReply(r: Run, m: LaunchReply) {
@@ -290,8 +312,10 @@ function onReply(r: Run, m: LaunchReply) {
 
 function answer(r: Run, m: LaunchReply) {
   if (m.launch === 'ignite') {
+    bootMark('launch-ignite');
     r.ignited = true;
   } else if (m.launch === 'formed') {
+    bootMark('launch-formed');
     // The element takes over from the canvas's copy of the mark: the same pixels, so nothing shows.
     r.mark.style.opacity = '1';
     r.root.dataset.lit = '';
@@ -310,6 +334,7 @@ function answer(r: Run, m: LaunchReply) {
 
 /** The plain form: the mark fades in on ink. */
 function showPlain(r: Run) {
+  bootMark('launch-plain');
   r.plain = true;
   r.root.removeAttribute('data-lit');
   r.mark.style.opacity = '1';
@@ -380,6 +405,7 @@ function release(r: Run) {
   const port = r.port;
   if (!port) return;
   r.released = true;
+  bootMark('launch-release');
   r.root.dataset.phase = 'release';
   port.post({ type: 'launch', id: port.id, op: 'release' } satisfies LaunchMessage);
 
@@ -468,6 +494,7 @@ function yieldNow(r: Run) {
     return;
   }
   r.yielded = true;
+  bootMark('launch-yield');
   r.released = true;
   r.root.dataset.phase = 'open';
   // The canvas carries the ink from its first frame: the layer's own ground goes, so the opening shows.
@@ -494,6 +521,7 @@ function yieldNow(r: Run) {
 function end(r: Run, silent = false) {
   if (r.ended) return;
   r.ended = true;
+  bootMark('launch-end');
   for (const c of r.cues) window.clearTimeout(c.timer);
   r.cues.length = 0;
   for (const off of r.off) off();
@@ -508,7 +536,33 @@ function end(r: Run, silent = false) {
   if (hook && !r.frozen) hook.step = undefined;
   if (run === r) run = null;
   // The layer leaves in the same commit the home mark returns in.
-  if (!silent) r.onDone();
+  if (!silent) {
+    r.onDone();
+    settle();
+  }
+}
+
+let settled = false;
+const afterListeners = new Set<() => void>();
+
+function settle() {
+  settled = true;
+  for (const fn of [...afterListeners]) fn();
+  afterListeners.clear();
+}
+
+/**
+ * Runs `fn` once the launch has gone (at once when none plays, or it is over): for start-up work
+ * that can wait until the window is at rest (rows of the sidebar beyond the first screenful).
+ * Returns a cancel.
+ */
+export function afterLaunch(fn: () => void): () => void {
+  if (settled || !launchPlays()) {
+    fn();
+    return () => {};
+  }
+  afterListeners.add(fn);
+  return () => void afterListeners.delete(fn);
 }
 
 /**
@@ -571,6 +625,9 @@ export function Launch({ ready, onDone }: { ready: boolean; onDone: () => void }
     r.ready = true;
     // From here the window is the app's: no longer a drag region, and a click skips the piece.
     r.root.dataset.ready = '';
+    // The app is there before the mark stands whole: the build quickens, so the piece gives way as
+    // soon as it can (launch-light.ts, LAUNCH.hurry).
+    if (r.port && !r.painted && !r.frozen) r.port.post({ type: 'launch', id: r.port.id, op: 'hurry' } satisfies LaunchMessage);
     tryRelease(r);
     // The app is there: if the light cannot finish forming (a hidden window draws no frames), the ink goes anyway.
     if (!r.ended && !r.released) cue(r, 2600, () => !r.released && end(r));
