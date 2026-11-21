@@ -398,8 +398,10 @@ export const LATE_KIDS_MAX = 600;
 /** The root an item hangs under (itself for a root). */
 function rootOf(d: SessionData, id: string): string | undefined {
   let it = d.items[id];
-  for (let i = 0; it?.parentId && i < 64; i++) it = d.items[it.parentId];
-  return it?.id;
+  const seen = new Set<string>();
+  // To the top however deep (a cycle, which the desktop never sends, ends it).
+  while (it?.parentId && !seen.has(it.id)) (seen.add(it.id), (it = d.items[it.parentId]));
+  return it && !it.parentId ? it.id : undefined;
 }
 
 /**
@@ -444,6 +446,9 @@ export function applyEvent(e: BridgeEvent) {
           // Under a root held in `late`: bounded, in place.
           const held = parent && d.next ? holdLateKid(d, e.item, parent) : undefined;
           if (held) return held;
+          // Under a root in view while the pages stop before the newest: the same bound per parent
+          // (a sub-agent working there for hours); past it only counted, fetched when it is opened.
+          if (parent && d.next && (d.children[pid]?.length ?? 0) >= LATE_KIDS_MAX) return putItems(d, [{ ...parent, kids: (parent.kids ?? 0) + 1 } as PhoneItem]);
           const put = putItems(d, parent ? [e.item, { ...parent, kids: (parent.kids ?? 0) + 1 } as PhoneItem] : [e.item]);
           return { ...put, children: { ...d.children, [pid]: [...(d.children[pid] ?? []), e.item.id] } };
         }

@@ -166,3 +166,29 @@ describe('Forget while a load is on its way', () => {
     expect(store.getState().data.secret).toBeUndefined();
   });
 });
+
+describe('steps under a root in view while the pages stop before the newest (#16)', () => {
+  it('are bounded per parent too, and counted on it past the bound', async () => {
+    const store = (await load()) as Store & { openAt: (id: string, itemId: string) => Promise<'here' | 'gone'>; LATE_KIDS_MAX: number; getState: () => { data: Record<string, { items: Record<string, { kids?: number }>; children: Record<string, string[]>; next?: string }> } };
+    const roots: Record<string, unknown>[] = Array.from({ length: 200 }, (_, n) => ({ id: `r${n}`, ts: n, type: 'user', text: `m${n}` }));
+    // A sub-agent still working, within the window opened around r20.
+    roots[22] = { id: 'agent', ts: 22, type: 'tool', name: 'Task', kind: 'agent', title: 'Agent', status: 'running', detail: {} };
+    store.setState({ sessions: { deep: meta('deep') } });
+    fake.conn.call = async (method, p) => {
+      if (method !== 'phone.tail') throw new Error(`unexpected ${method}`);
+      const at = roots.findIndex((r) => r.id === p.around);
+      const s = Math.max(0, at - 10);
+      const e = Math.min(roots.length, s + 40);
+      return { session: meta('deep'), items: roots.slice(s, e), total: roots.length, cursor: roots[s].id, ...(e < roots.length ? { next: roots[e].id } : {}), at: p.around, permissions: [], questions: [], queue: [], todos: [] };
+    };
+    expect(await store.openAt('deep', 'r20')).toBe('here');
+    expect(store.getState().data.deep.next).toBeDefined();
+    const steps = store.LATE_KIDS_MAX + 250;
+    for (let k = 0; k < steps; k++) store.applyEvent({ type: 'item.added', sessionId: 'deep', item: { id: `s${k}`, ts: k, type: 'tool', parentId: 'agent', name: 'Bash', kind: 'bash', title: 'ls', status: 'done', detail: {} } });
+    await tick();
+    const d = store.getState().data.deep;
+    expect(d.children.agent.length).toBe(store.LATE_KIDS_MAX);
+    expect(d.items.agent.kids).toBe(steps);
+    expect(Object.keys(d.items).length).toBeLessThan(40 + store.LATE_KIDS_MAX + 10);
+  });
+});
