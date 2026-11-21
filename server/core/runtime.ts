@@ -36,6 +36,10 @@ export type MessageOutcome = 'ok' | 'failed' | 'stopped';
 
 type NewItem<T extends TimelineItem> = T extends TimelineItem ? Omit<T, 'id' | 'ts'> & { id?: string; ts?: number } : never;
 
+
+/** A step whose sub-agent or workflow still works in the background (its own call returned, the work goes on). */
+export const worksInBackground = (i: TimelineItem): boolean => i.type === 'tool' && (i.result?.agent?.background === 'running' || i.workflow?.status === 'running');
+
 /**
  * One open session: metadata, the normalized timeline and any prompt waiting on the
  * user. Provider adapters write to it; every mutation is broadcast to the UI.
@@ -122,6 +126,24 @@ export class SessionRuntime {
     this.todos = todos;
     if (queue) this.queue = queue;
     this.index = new Map(items.map((i) => [i.id, i]));
+    this.working.clear();
+    for (const i of items) if (worksInBackground(i)) this.working.add(i.id);
+    // As read: whoever loads gets the whole chat next (a snapshot), so nothing is announced here.
+    this.meta.background = this.working.size;
+  }
+
+  // ── background work ──
+
+  /** Steps whose sub-agent or workflow still works in the background (`SessionMeta.background` is their count). */
+  private working = new Set<string>();
+
+  /** A step was added or changed: the chat's count of background work follows it. */
+  private trackBackground(item: TimelineItem) {
+    const now = worksInBackground(item);
+    if (now === this.working.has(item.id)) return;
+    if (now) this.working.add(item.id);
+    else this.working.delete(item.id);
+    this.update({ background: this.working.size });
   }
 
   // ── queue ──
@@ -270,6 +292,7 @@ export class SessionRuntime {
     // Emit a copy: the live object keeps mutating as deltas arrive.
     this.emit({ type: 'item.added', sessionId: this.id, item: { ...full } });
     this.onDirty(this, 'items');
+    this.trackBackground(full);
     return full;
   }
 
@@ -303,6 +326,7 @@ export class SessionRuntime {
     this.markDirty(id);
     this.emit({ type: 'item.patch', sessionId: this.id, id, patch: patch as Partial<TimelineItem> });
     this.onDirty(this, 'items');
+    this.trackBackground(item);
   }
 
   /** Share steps the person allowed themselves (a permission they answered with an allow), by item id: the files as they were shown. */
@@ -443,12 +467,21 @@ export class SessionRuntime {
     // One event for the root: clients drop its descendants themselves.
     this.emit({ type: 'item.removed', sessionId: this.id, id });
     this.onDirty(this, 'items');
+    let had = false;
+    for (const g of gone) had = this.working.delete(g) || had;
+    if (had) this.update({ background: this.working.size });
   }
 
   reset(items: TimelineItem[]) {
+    const before = this.meta.background ?? 0;
     this.load(items, this.todos);
     this.emit({ type: 'timeline.reset', sessionId: this.id, items: items.map((i) => ({ ...i })) });
     this.onDirty(this, 'items');
+    // `load` set the count silently: a reset happens under clients that are listening.
+    if (before !== this.working.size) {
+      this.meta.background = before;
+      this.update({ background: this.working.size });
+    }
   }
 
   notice(variant: NoticeItem['variant'], text: string, detail?: string, parentId?: string) {

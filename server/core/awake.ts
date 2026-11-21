@@ -25,9 +25,13 @@ export function working(s: { meta: SessionMeta; turnActive: boolean }): boolean 
  * for `graceMs` (an /until loop's gap between check and next turn, or a queued message starting,
  * does not release and take the block again). Returns a stop function.
  */
+const atWork = working;
+
 export function watchAwake(src: AwakeSource, onChange: (busy: boolean) => void, graceMs = 60_000): () => void {
   let busy = false;
   let release: ReturnType<typeof setTimeout> | undefined;
+  // Sub-agents still working after their chat's own turn ended keep the computer awake too.
+  const working = (s: { meta: SessionMeta; turnActive: boolean }) => atWork(s) || (s.meta.background ?? 0) > 0;
   const check = () => {
     const now = [...src.sessions].some(working);
     if (now) {
@@ -48,7 +52,7 @@ export function watchAwake(src: AwakeSource, onChange: (busy: boolean) => void, 
     }
   };
   const off = src.subscribe((e) => {
-    if (e.type === 'session.updated' && ('status' in e.patch || 'until' in e.patch)) check();
+    if (e.type === 'session.updated' && ('status' in e.patch || 'until' in e.patch || 'background' in e.patch)) check();
     else if (e.type === 'session.removed' || e.type === 'session.added') check();
   });
   check();

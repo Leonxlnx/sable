@@ -236,7 +236,8 @@ export class Updater {
 export function registerUpdates(app: App, host?: UpdateHost) {
   const updater = new Updater((state) => app.emit({ type: 'update.state', state }), {
     host: process.platform === 'win32' ? host : undefined,
-    busy: () => [...app.sessions.values()].some((rt) => rt.turnActive || rt.meta.status === 'running' || rt.meta.status === 'starting'),
+    // Sub-agents still working in the background count: an update would end them.
+    busy: () => [...app.sessions.values()].some((rt) => rt.turnActive || rt.meta.status === 'running' || rt.meta.status === 'starting' || (rt.meta.background ?? 0) > 0),
   });
   app.updates = updater;
   app.subscribe((e) => {

@@ -411,6 +411,12 @@ export interface SessionMeta {
   lastError?: string;
   /** One line describing what the agent is doing right now. */
   activity?: string;
+  /**
+   * Sub-agents and workflows of this chat still working in the background, counted by the bridge
+   * from its steps (`SessionRuntime`). Above 0 the chat is not at rest even when its own turn has
+   * ended (`status` idle): lists and the conversation say that it still works.
+   */
+  background?: number;
   /** The account the session runs under; absent means `default`. */
   accountId?: string;
   /** Capabilities switched on for this session (browser, computer use, remote control). */
@@ -2515,8 +2521,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
  * while `AppSettings.conciseReplies` is on. Never replaces what the user configured.
  */
 export const CONCISE_REPLIES_PROMPT =
-  'Write plainly and say each thing once: no filler, praise, hype or restating the question; concrete words and numbers over adjectives. '
-  + 'Finish with a short reply: the outcome in one or two sentences, then only what the user must know or do next. '
+  'Finish with a short reply: the outcome in one or two sentences, then only what the user must know or do next. '
+  + 'Plain words, each thing once: no filler or praise. '
   + 'The app shows every change and step, so do not list the files you changed or recap what you did. '
-  + 'No headings in short replies and no closing offers. Keep notes between steps to a sentence. '
-  + 'If you built something that can be viewed in a browser, start or reuse a local dev server in the background and put its http://localhost URL on its own line.';
+  + 'No headings in short replies, no closing offers. Notes between steps: one sentence. '
+  + 'If you built something viewable in a browser, start or reuse a local dev server in the background and put its http://localhost URL on its own line.';

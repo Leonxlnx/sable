@@ -315,6 +315,8 @@ describe('short answers', () => {
     expect(CONCISE_REPLIES_PROMPT).toMatch(/^Finish with a short reply: the outcome in one or two sentences/);
     expect(CONCISE_REPLIES_PROMPT).toMatch(/do not list the files you changed or recap/);
     expect(CONCISE_REPLIES_PROMPT).toMatch(/no closing offers/);
+    // One sentence against slop, not a style guide.
+    expect(CONCISE_REPLIES_PROMPT).toMatch(/Plain words, each thing once: no filler or praise\./);
   });
 
   it('is on by default', () => {
