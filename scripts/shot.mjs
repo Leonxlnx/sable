@@ -24,8 +24,8 @@ import path from 'node:path';
 /** The dev server prefers 5173 and moves to 5174 when that is taken: use whichever answers. */
 async function findServer() {
   if (process.env.SABLE_URL) return process.env.SABLE_URL;
-  // `localhost` first; the test server (scripts/dev-test.mjs) listens on 127.0.0.1 only.
-  for (const host of ['localhost', '127.0.0.1']) {
+  // 127.0.0.1 first: the test server (scripts/dev-test.mjs) listens there only, and a browser may take `localhost` for ::1.
+  for (const host of ['127.0.0.1', 'localhost']) {
     for (const port of [5173, 5174, 4173]) {
       try {
         const res = await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(1500) });
@@ -66,8 +66,11 @@ const errors = [];
 /** A recording under way (`--film`): the frames Chromium painted, with their times. */
 let film = null;
 async function startFilm(val) {
+  if (film) throw new Error('a film is already recording: --cut it first');
   const [file, sel] = val.split('@');
   const box = sel ? await page.locator(sel).first().boundingBox() : null;
+  // A selector that names nothing visible must not turn into a film of the whole window.
+  if (sel && !box) throw new Error(`film: nothing visible matches ${sel}`);
   const cdp = await context.newCDPSession(page);
   const frames = [];
   cdp.on('Page.screencastFrame', (f) => {
@@ -78,9 +81,12 @@ async function startFilm(val) {
   film = { file, box, cdp, frames };
 }
 async function cutFilm(count) {
+  if (!film) throw new Error('--cut without --film');
   const { file, box, cdp, frames } = film;
   film = null;
   await cdp.send('Page.stopScreencast').catch(() => {});
+  // The session and its frame listener go with the recording (several films in one run kept every frame).
+  await cdp.detach().catch(() => {});
   if (!frames.length) return console.log('film: no frames were painted');
   const n = Math.max(1, Math.min(count || 12, frames.length));
   const picked = n === frames.length ? frames : Array.from({ length: n }, (_, i) => frames[Math.round((i * (frames.length - 1)) / (n - 1 || 1))]);

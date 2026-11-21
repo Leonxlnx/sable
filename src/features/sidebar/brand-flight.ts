@@ -7,6 +7,8 @@
  */
 
 let live: { ghost: HTMLElement; hidden: HTMLElement[]; anim: Animation } | null = null;
+/** The frame a glide waits for (it measures where the mark will rest once the view has rendered). */
+let pending = 0;
 
 const zoom = () => parseFloat(document.documentElement.style.zoom) || 1;
 
@@ -29,9 +31,11 @@ const barMark = () => document.querySelector<HTMLElement>('.topbar-home .logo-ma
  */
 export function flyBrand(opening: boolean, ms: number, easing: string) {
   land();
+  // A toggle before the last one's frame came: that frame must not start a second glide.
+  cancelAnimationFrame(pending);
   const from = (opening ? barMark() : brandMark())?.getBoundingClientRect();
   if (!from || from.width < 1) return;
-  requestAnimationFrame(() => {
+  pending = requestAnimationFrame(() => {
     const side = document.querySelector<HTMLElement>('.app-side');
     const stage = document.querySelector<HTMLElement>('.stage');
     const target = opening ? brandMark() : barMark();

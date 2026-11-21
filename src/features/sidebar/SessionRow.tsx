@@ -38,7 +38,7 @@ const useRenaming = (id: string) => useSyncExternalStore(subscribeRename, () => 
 export const SidebarRowContext = createContext<RowCtx>({ setRenaming, askDelete: () => {} });
 
 /** The fields a row shows. Anything else changing on a session (usage, model, options) must not re-render it. */
-const SHOWN = ['id', 'title', 'status', 'unread', 'pinned', 'archived', 'updatedAt', 'activity', 'lastError', 'provider', 'accountId', 'spare'] as const;
+const SHOWN = ['id', 'title', 'status', 'unread', 'pinned', 'archived', 'updatedAt', 'activity', 'lastError', 'provider', 'accountId', 'spare', 'background'] as const;
 const sameShown = (a: SessionMeta, b: SessionMeta) => SHOWN.every((k) => a[k] === b[k]) && a.until?.phase === b.until?.phase;
 
 // ── what each row shows, from one store subscription for the whole list ──
