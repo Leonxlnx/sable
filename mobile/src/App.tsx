@@ -53,8 +53,8 @@ function watchTurns() {
       const ended = (was === 'running' || was === 'awaiting') && (s.status === 'idle' || s.status === 'error');
       const waits = s.status === 'awaiting' && was !== 'awaiting';
       if (ended && s.status === 'idle') {
-        // The ring closes on the composer of the chat on screen (or on home's field).
-        fieldBeat('done', [...document.querySelectorAll('.layer')].pop()?.querySelector('.composer') ?? document.querySelector('.home-dock'));
+        // The ring closes on the composer of the chat on screen, or on home on that chat's row at the top (else on the new-chat bar).
+        fieldBeat('done', [...document.querySelectorAll('.layer')].pop()?.querySelector('.composer') ?? document.querySelector(`.home [data-live="${s.id}"]`) ?? document.querySelector('.home-dock'));
         // Felt while the app is open: clearly for the chat on screen, a tick for one elsewhere.
         if (inForeground()) haptic(chatOf(nav.stack[nav.stack.length - 1]) === s.id ? 'success' : 'select');
       }

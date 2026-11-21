@@ -9,8 +9,16 @@
   will-change: transform, opacity;
 }
 
+/* at full opacity: the canvas dimmed by an opacity cost frames in every scroll (the emulator, sixteenth pass:
+   15 frames over 25 ms per two flings against 6); its strength is set where it is drawn (Home.tsx) */
 .home > .field {
-  opacity: 0.85;
+  opacity: 1;
+}
+
+/* home's cards are opaque over the stage: a translucent card over the field cost frames in every scroll
+   (measured on the emulator, sixteenth pass: 16 frames over 25 ms per two flings against 7) */
+.home {
+  --card: var(--card-solid);
 }
 
 /* ── the bar: the mark, the title once the large one has gone, the tools ── */
@@ -110,7 +118,10 @@
 }
 
 .home-hero {
-  padding: 4px 22px 22px;
+  /* room under the title: the horizon's light is seen here, before the cards */
+  /* the title and the line under it keep their room whether the line is there or not (the horizon is placed by this block) */
+  min-height: 120px;
+  padding: 10px 22px 34px;
   transform-origin: 0 100%;
   animation: hero-out linear both;
   animation-timeline: --home;
@@ -132,6 +143,7 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 6px 16px;
+  min-height: 24px;
   margin-top: 8px;
   font-size: var(--t-md);
   font-weight: var(--w-medium);
@@ -153,6 +165,7 @@
 }
 
 .home-search {
+  min-height: 0;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -333,7 +346,8 @@
   height: 36px;
   padding: 0 14px;
   border-radius: var(--r-pill);
-  background-color: var(--fill-1);
+  /* ink of its own: it lies on the stage, where the field's light may be behind it */
+  background-color: rgb(21 21 24 / 0.9);
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.04);
   font-size: var(--t-sm);
   font-weight: var(--w-medium);
@@ -354,11 +368,11 @@
 
 .filter:active {
   scale: 0.96;
-  background-color: var(--fill-2);
+  background-color: rgb(30 30 34);
 }
 
 .filter[aria-pressed='true'] {
-  background-color: var(--fill-3);
+  background-color: rgb(38 38 42);
   box-shadow: var(--press-down);
   color: var(--text);
 }
@@ -1077,4 +1091,221 @@
 /* the new-chat bar open (its chips over the words): the waiting line stays above it */
 .home:has(.home-dock[data-open]) .attn {
   bottom: calc(var(--sab) + 12px + 106px + 10px);
+}
+
+/* ── the stage (sixteenth pass): the field is seen and breathes; what works now is at the top ── */
+
+/* the account's limits at a glance, under the title: two windows, a small meter each */
+.glance {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 18px;
+  height: 30px;
+  margin: 0 -4px;
+  padding: 0 13px 0 12px;
+  border-radius: var(--r-pill);
+  /* ink of its own, as the folder chips: the horizon's light may be behind it */
+  background-color: rgb(21 21 24 / 0.9);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.04);
+  font-size: var(--t-sm);
+  font-weight: var(--w-medium);
+  transition: background-color 100ms, scale 120ms var(--ease-out);
+}
+
+/* its touch area (44 px tall) */
+.glance::before {
+  content: '';
+  position: absolute;
+  inset: -7px 0;
+}
+
+.glance:active {
+  scale: 0.97;
+  background-color: rgb(30 30 34);
+}
+
+.glance-win {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.glance-meter {
+  position: relative;
+  width: 26px;
+  height: 4px;
+  border-radius: 2px;
+  background-color: rgb(255 255 255 / 0.13);
+  overflow: hidden;
+}
+
+.glance-meter i {
+  position: absolute;
+  inset: 0;
+  background-color: var(--text-2);
+  transform: translateX(calc((var(--p) - 1) * 100%));
+  transition: transform 600ms var(--ease-out);
+}
+
+.glance-label {
+  color: var(--text-3);
+}
+
+.glance-pct {
+  color: var(--text-2);
+}
+
+.glance-win[data-level='amber'] .glance-meter i {
+  background-color: var(--amber);
+}
+
+.glance-win[data-level='amber'] .glance-pct {
+  color: var(--amber);
+}
+
+.glance-win[data-level='red'] .glance-meter i {
+  background-color: var(--red);
+}
+
+.glance-win[data-level='red'] .glance-pct {
+  color: var(--red);
+}
+
+/* what works now: a card of its own above the list, each chat with what it does this moment and its time */
+.group.live {
+  padding-top: 0;
+  padding-bottom: 8px;
+  overflow: hidden;
+}
+
+.live-row {
+  min-height: 68px;
+}
+
+.live-row .row-title {
+  color: var(--text);
+  font-weight: var(--w-medium);
+}
+
+.live-line {
+  position: relative;
+  align-items: center;
+  gap: 9px;
+  height: 19px;
+  color: var(--text-2);
+}
+
+.live-state {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+}
+
+.live-text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-check {
+  color: var(--text);
+}
+
+.live-row[data-done] .live-text {
+  color: var(--text);
+}
+
+.live-row[data-done='error'] .live-text {
+  color: var(--red);
+}
+
+.live-end {
+  justify-content: flex-start;
+  padding-top: 13px;
+}
+
+.live-time {
+  font-size: var(--t-sm);
+  line-height: 16px;
+  color: var(--text-2);
+}
+
+/* no chats yet: the stage is the screen, one sentence on it */
+.home-empty {
+  margin-top: 26vh;
+  font-size: var(--t-lead);
+  color: var(--text-2);
+}
+
+/* home comes in: what is under the title rises into place, one piece after the other (once, at the start) */
+.home[data-enter] .pull-body > :not(.home-hero) {
+  animation: home-in 460ms var(--ease-out) backwards;
+}
+
+.home[data-enter] .pull-body > :nth-child(3) {
+  animation-delay: 50ms;
+}
+
+.home[data-enter] .pull-body > :nth-child(4) {
+  animation-delay: 100ms;
+}
+
+.home[data-enter] .pull-body > :nth-child(n + 5) {
+  animation-delay: 150ms;
+}
+
+@keyframes home-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home[data-enter] .pull-body > * {
+    animation: none;
+  }
+}
+
+/* a live row's line: new words rise in */
+.live-text {
+  animation: live-in 220ms var(--ease-out) backwards;
+}
+
+@keyframes live-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+}
+
+/* scrolled, the horizon steps back: ink over the top of the stage, under the list, faded in by the scroll (opacity only) */
+.home-shade {
+  position: absolute;
+  z-index: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 46%;
+  background: linear-gradient(var(--bg) 0, var(--bg) 62%, rgb(7 7 8 / 0));
+  opacity: 0;
+  pointer-events: none;
+  animation: shade-in linear both;
+  animation-timeline: --home;
+  animation-range: 20px 150px;
+}
+
+@keyframes shade-in {
+  to {
+    opacity: 0.78;
+  }
+}
+
+/* the computer cannot be reached: the stage's light is low until it is back */
+.home[data-offline] > .field {
+  opacity: 0.38;
 }

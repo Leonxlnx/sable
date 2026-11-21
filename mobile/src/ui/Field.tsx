@@ -7,6 +7,11 @@ import type { ProviderId } from '@shared/protocol';
  * frame at rest, a slow drift (8 fps) only while a turn runs on screen, one-shot beats (a wave from
  * the send key, a ring that closes when a turn is done, a pulse), nothing at all while the app is
  * hidden or under reduced motion. Waiting on you, it stills in amber.
+ *
+ * Home is its stage (`stage`): a second gather hangs from the top edge behind the title (the
+ * horizon; amber while something waits on you), a sparse floor of cells lies under the whole page,
+ * and the light breathes: it drifts for a while after home comes forward or is touched (`fieldWake`),
+ * quicker while a turn runs, then rests on a still frame with no timer and no frame.
  */
 
 type RGB = [number, number, number];
@@ -47,6 +52,28 @@ export function fieldBeat(kind: BeatKind, at?: { x: number; y: number } | Elemen
 
 const LIFE: Record<BeatKind, number> = { send: 1.15, done: 1.3, pulse: 1.0, open: 0.9 };
 
+/** How long the stage drifts after it was woken, then it rests. */
+const AWAKE_MS = 20_000;
+const wakes = new Set<() => void>();
+/** Input on home, or home coming forward: the stage drifts again for a while. */
+export function fieldWake() {
+  for (const w of wakes) w();
+}
+
+/**
+ * The horizon: a band of light across the top of the stage, behind the title. `y` is its line (0..1 of
+ * the height), `up` and `down` how far it reaches above and below it, `x` where it is strongest and
+ * `spread` how far it reaches sideways from there.
+ */
+export interface Horizon {
+  x: number;
+  y: number;
+  up: number;
+  down: number;
+  spread: number;
+  amount: number;
+}
+
 export function Field({
   palette,
   amount = 1,
@@ -56,6 +83,9 @@ export function Field({
   active = false,
   hidden = false,
   waiting = false,
+  stage,
+  floor = 0,
+  alert = false,
   className,
 }: {
   palette: Palette;
@@ -68,11 +98,18 @@ export function Field({
   hidden?: boolean;
   /** Waiting on you: amber, still. */
   waiting?: boolean;
+  /** Home's stage: a second gather at the top edge, and the light breathes while awake. */
+  stage?: Horizon;
+  /** A sparse floor of cells under the whole page (0: none). */
+  floor?: number;
+  /** Something waits on you: the horizon is amber. */
+  alert?: boolean;
   className?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const live = useRef({ palette, amount, active, focusX, focusY, spread, hidden, waiting });
-  live.current = { palette, amount, active, focusX, focusY, spread, hidden, waiting };
+  const live = useRef({ palette, amount, active, focusX, focusY, spread, hidden, waiting, stage, floor, alert });
+  live.current = { palette, amount, active, focusX, focusY, spread, hidden, waiting, stage, floor, alert };
+  const stageKey = stage ? `${stage.x}|${stage.y}|${stage.up}|${stage.down}|${stage.spread}|${stage.amount}` : '';
   const api = useRef<{ kick: () => void; reshape: () => void } | null>(null);
 
   useEffect(() => {
@@ -81,11 +118,24 @@ export function Field({
     const ctx = canvas.getContext('2d', { alpha: true });
     if (!ctx) return;
     const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const CELL = 3;
+    // The stage is seen whole, so its cells are finer; it draws only the rows its light reaches (`lit`).
+    const CELL = live.current.stage ? 2 : 3;
+    // Rows that can show light, as [from, to) ranges: the rest of the canvas is never touched.
+    let lit: [number, number][] = [];
+    // The whole image goes to the canvas once after the shape changed (rows that went dark are cleared).
+    let whole = true;
+    let frame = 0;
+    let touching = false;
     let cols = 0;
     let rows = 0;
     let base = new Float32Array(0);
+    // The horizon's share of each cell (stage only).
+    let high = new Float32Array(0);
     let img: ImageData | null = null;
+    // The drift's own clock: it runs only while frames are drawn, quicker while a turn runs.
+    let phase = 0;
+    let lastDraw = 0;
+    let awakeUntil = 0;
     let beat: (Beat & { nx: number; ny: number }) | null = null;
     let timer = 0;
     let raf = 0;
@@ -104,6 +154,37 @@ export function Field({
           base[y * cols + x] = Math.max(0, 1 - d) ** 1.6;
         }
       }
+      const st = live.current.stage;
+      whole = true;
+      if (!st) {
+        lit = [[0, rows]];
+        return;
+      }
+      img?.data.fill(0);
+      // The far tail of the lower light would be a few lonely cells over half the page: cut.
+      for (let i = 0; i < base.length; i++) base[i] = Math.max(0, base[i] - 0.04);
+      // The horizon: a band that falls off quickly above its line (the status bar and the tools stay
+      // clear) and slowly below it, strongest on its own side.
+      for (let y = 0; y < rows; y++) {
+        const ny = y / rows;
+        const v = (ny - st.y) / (ny < st.y ? st.up : st.down);
+        const band = Math.exp(-v * v);
+        for (let x = 0; x < cols; x++) {
+          const side = Math.max(0, 1 - Math.abs(x / cols - st.x) / st.spread);
+          high[y * cols + x] = band < 0.03 ? 0 : (band - 0.03) * side ** 1.3 * st.amount;
+        }
+      }
+      // The rows a cell of which can light up at the light's strongest (a swell, a breath).
+      const amt = live.current.amount;
+      lit = [];
+      for (let y = 0; y < rows; y++) {
+        let on = false;
+        for (let x = 0, i = y * cols; x < cols && !on; x++, i++) on = base[i] * amt + high[i] > 0.005;
+        if (!on) continue;
+        const last = lit[lit.length - 1];
+        if (last && y - last[1] < 6) last[1] = y + 1;
+        else lit.push([y, y + 1]);
+      }
     };
 
     const resize = () => {
@@ -115,17 +196,25 @@ export function Field({
       canvas.height = rows;
       img = ctx.createImageData(cols, rows);
       base = new Float32Array(cols * rows);
+      high = new Float32Array(live.current.stage ? cols * rows : 0);
       shape();
     };
 
     const draw = () => {
       // Hidden: skipped; showing again kicks a fresh frame (the effect on `hidden` below).
       if (!img || live.current.hidden) return;
-      const { amount: amt, waiting } = live.current;
+      const { amount: amt, waiting, stage, floor, alert, active } = live.current;
       const stops = PALETTES[waiting ? 'amber' : live.current.palette];
+      const topStops = alert ? PALETTES.amber : stops;
       const now = performance.now();
+      // The stage's drift has its own clock (it does not jump after a rest); a turn at work quickens it.
+      if (stage && !reduced) phase += Math.min(0.25, (now - (lastDraw || now)) / 1000) * (active ? 2.1 : 1);
+      lastDraw = now;
       // Waiting stills the drift where it is.
-      const t = reduced || waiting ? 0 : (now - t0) / 1000;
+      const t = reduced || waiting ? 0 : stage ? phase : (now - t0) / 1000;
+      // The stage breathes: the whole light swells and eases, slowly.
+      const breath = stage && !reduced ? 1 + 0.07 * Math.sin(phase * 0.8) : 1;
+      const hasHigh = !!stage && high.length === cols * rows;
       const data = img.data;
       const ca = Math.cos(0.61);
       const sa = Math.sin(0.61);
@@ -161,19 +250,27 @@ export function Field({
           }
         }
       }
-      for (let y = 0; y < rows; y++) {
+      for (const [y0, y1] of lit)
+      for (let y = y0; y < y1; y++) {
         const ny = y / rows;
         for (let x = 0; x < cols; x++) {
           const i = y * cols + x;
           let b = base[i];
-          if (b <= 0.002 && !wave) {
+          const h = hasHigh ? high[i] : 0;
+          const bay = BAYER[(y & 3) * 4 + (x & 3)];
+          // Too dark to light this cell whatever the streaks do: nothing to work out (most of the page).
+          // (On the stage a wave only moves the light that is there, so this holds during a beat too.)
+          if ((!wave || stage) && (b * amt + h + floor) * (wave ? 7.5 : 4.4) + bay < 1) {
             data[i * 4 + 3] = 0;
             continue;
           }
           const nx = x / cols;
           const u = nx * ca + ny * sa;
-          const streak = 0.62 + 0.38 * Math.sin(u * 22 + t * 0.35) * Math.sin(u * 7.3 - t * 0.12 + ny * 2.1);
-          b *= streak * amt * swell;
+          // (the stage's streaks are softer: it is looked at, not only glimpsed under a list)
+          const streak = stage ? 0.74 + 0.26 * Math.sin(u * 15 + t * 0.35) * Math.sin(u * 5.1 - t * 0.12 + ny * 2.1) : 0.62 + 0.38 * Math.sin(u * 22 + t * 0.35) * Math.sin(u * 7.3 - t * 0.12 + ny * 2.1);
+          // The horizon leads here: its palette (amber while something waits on you).
+          const top = h > b * amt;
+          b = (b * amt + h) * streak * swell * breath + floor * (0.35 + streak);
           if (wave) {
             const dx = nx - bx;
             const dy = (ny - by) * aspect;
@@ -182,37 +279,54 @@ export function Field({
             // A trough just inside the crest: the pattern seems to bend as it passes.
             const trough = kind === 'send' ? Math.exp(-(((d - waveR + 0.09) / 0.05) ** 2)) * 0.45 : 0;
             // Low on the screen it is strong; it thins as it rises (never over what you read).
-            const low = kind === 'pulse' ? 1 - ny * 0.6 : Math.max(0, (ny - 0.4) / 0.6);
-            b += (crest - trough) * wave * (0.25 + base[i]) * low * low;
+            // On the stage a beat is seen wherever it happens (the page is cards over the field), a little softer.
+            const low = stage ? 0.78 : kind === 'pulse' ? 1 - ny * 0.6 : Math.max(0, (ny - 0.4) / 0.6);
+            b += (crest - trough) * wave * (stage ? (base[i] * amt + h) * 1.7 : 0.25 + base[i]) * low * low;
           }
-          const level = b * 3 + BAYER[(y & 3) * 4 + (x & 3)] - 0.5;
+          const level = b * 3 + bay - 0.5;
           const k = Math.min(3, Math.floor(level + 0.5));
           if (k <= 0) {
             data[i * 4 + 3] = 0;
             continue;
           }
-          const c = stops[k - 1];
+          const c = (top ? topStops : stops)[k - 1];
           data[i * 4] = c[0];
           data[i * 4 + 1] = c[1];
           data[i * 4 + 2] = c[2];
           data[i * 4 + 3] = 255;
         }
       }
-      ctx.putImageData(img, 0, 0);
+      if (whole || !stage) ctx.putImageData(img, 0, 0);
+      else for (const [y0, y1] of lit) ctx.putImageData(img, 0, 0, 0, y0, cols, y1 - y0);
+      whole = false;
     };
 
     const loop = () => {
       raf = 0;
       if (document.hidden) return;
-      draw();
+      const onStage = !!live.current.stage;
+      const host = canvas.parentElement;
+      // The stage holds its frame while the page under it scrolls, a finger is down or the keyboard is
+      // up (those have the frames), and draws a beat on every other frame.
+      const held = onStage && (beat ? ++frame % 2 === 1 : touching || !!host?.hasAttribute('data-moving') || !!host?.querySelector('.home-dock[data-focus]'));
+      if (!held || whole) draw();
       if (beat) {
         raf = requestAnimationFrame(loop);
         return;
       }
-      if (live.current.active && !live.current.waiting && !reduced) timer = window.setTimeout(() => (raf = requestAnimationFrame(loop)), 125);
+      const awake = onStage && performance.now() < awakeUntil;
+      if ((live.current.active || awake) && !live.current.waiting && !live.current.hidden && !reduced)
+        timer = window.setTimeout(
+          () => {
+            timer = 0;
+            raf = requestAnimationFrame(loop);
+          },
+          onStage ? 160 : 125,
+        );
     };
     const kick = () => {
       clearTimeout(timer);
+      timer = 0;
       if (!raf) raf = requestAnimationFrame(loop);
     };
     api.current = {
@@ -240,11 +354,30 @@ export function Field({
       kick();
     };
     beats.add(onBeat);
+    const onWake = () => {
+      if (!live.current.stage || live.current.hidden || reduced) return;
+      const resting = !timer && !raf;
+      awakeUntil = performance.now() + AWAKE_MS;
+      if (resting) kick();
+    };
+    wakes.add(onWake);
+    // A finger on the stage's screen: the drift waits until it lifts.
+    const host = live.current.stage ? canvas.parentElement : null;
+    const onDown = () => (touching = true);
+    const onUp = () => (touching = false);
+    host?.addEventListener('pointerdown', onDown, { passive: true });
+    host?.addEventListener('pointerup', onUp, { passive: true });
+    host?.addEventListener('pointercancel', onUp, { passive: true });
+    if (live.current.stage) awakeUntil = performance.now() + AWAKE_MS;
     const onVis = () => !document.hidden && kick();
     document.addEventListener('visibilitychange', onVis);
     return () => {
       ro.disconnect();
       beats.delete(onBeat);
+      wakes.delete(onWake);
+      host?.removeEventListener('pointerdown', onDown);
+      host?.removeEventListener('pointerup', onUp);
+      host?.removeEventListener('pointercancel', onUp);
       document.removeEventListener('visibilitychange', onVis);
       clearTimeout(timer);
       cancelAnimationFrame(raf);
@@ -254,10 +387,10 @@ export function Field({
 
   useEffect(() => {
     api.current?.kick();
-  }, [palette, amount, active, hidden, waiting]);
+  }, [palette, amount, active, hidden, waiting, floor, alert]);
   useEffect(() => {
     api.current?.reshape();
-  }, [focusX, focusY, spread]);
+  }, [focusX, focusY, spread, stageKey]);
 
   return <canvas ref={ref} className={`field ${className ?? ''}`} aria-hidden />;
 }

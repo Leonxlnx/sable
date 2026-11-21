@@ -22,7 +22,7 @@ function clock(ts: number, now: number): string {
 }
 
 /** The 5-hour window first, then the plan's week, then a model's own windows; as given otherwise. */
-const scoped = (l: RateLimit) => /^model_|^(five_hour|seven_day)_/.test(l.id) || (l.id.includes(':') && !l.id.startsWith('codex:'));
+export const scoped = (l: RateLimit) => /^model_|^(five_hour|seven_day)_/.test(l.id) || (l.id.includes(':') && !l.id.startsWith('codex:'));
 const ordered = (list: RateLimit[]) =>
   list
     .map((l, i) => ({ l, i, r: ((l.windowMins ?? 0) >= 1440 ? 2 : 0) + (scoped(l) ? 1 : 0) }))
@@ -30,7 +30,7 @@ const ordered = (list: RateLimit[]) =>
     .map((x) => x.l);
 
 /** Amber near a cap, red at it: the only colours a limit uses. */
-const levelOf = (l: RateLimit, now: number) => (l.resetsAt && l.resetsAt <= now ? undefined : l.percent >= 100 ? 'red' : l.percent >= 80 ? 'amber' : undefined);
+export const levelOf = (l: RateLimit, now: number) => (l.resetsAt && l.resetsAt <= now ? undefined : l.percent >= 100 ? 'red' : l.percent >= 80 ? 'amber' : undefined);
 
 /** Where the window would stand now at an even pace (0..1), when its length and reset are known. */
 function elapsed(l: RateLimit, now: number): number | undefined {
