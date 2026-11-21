@@ -162,10 +162,9 @@
   height: 28px;
   translate: 50% -50%;
   border-radius: 50%;
-  /* The tactile ivory key (tokens.css --key-*), as the send key and the slider's thumb: a lit upper
-     half and top lip, a short drop; held, it sinks in the same frame as its give. */
+  /* The ivory key (tokens.css --key-*), as the send key: a flat ivory face and a short soft drop;
+     held, the drop shortens in the same frame as its give. */
   background-color: var(--accent);
-  background-image: var(--key-face);
   color: var(--text-inverse);
   box-shadow: var(--key-up);
   pointer-events: auto;
@@ -179,7 +178,6 @@
 
 .cmp-handle:active {
   scale: var(--press);
-  background-image: var(--key-face-down);
   box-shadow: var(--key-down);
 }
 

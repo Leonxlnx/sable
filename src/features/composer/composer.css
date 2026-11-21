@@ -1,12 +1,11 @@
-/* The composer: the main pane of liquid glass (styles/ui.css "material: liquid glass"), the same
-   on home and in a session. A translucent ink pane with a backdrop blur that is thinner toward its
-   edges, so the field's light gathers there as in thick glass; the specular rim (::before: bright
-   along the top edge and left of centre, falling off around the corners), the inner edge and the
-   sheen under the top edge; a contact line and two shadows for depth. Focus draws no ring: the
-   pane lifts (one layer under the content, faded in: the fill a step lighter, a brighter top edge
-   and a deeper shadow), and the backdrop's light under it brightens. Monochrome: the only colour
-   is the field's, through the glass. Everything here is static paint; only that one layer's
-   opacity ever moves. */
+/* The composer: the main pane of glass (styles/ui.css "material: glass"), the same on home and in
+   a session. One even frosted fill with a backdrop blur, thin enough for the field's colour to
+   come through; one even hairline rim all the way round (::before); a contact line and two
+   shadows for depth. No glint, no sheen, no thinner edges. Focus draws no ring and never lightens
+   the pane: one layer under the content fades in (a little more ink, so the words sit calmer, the
+   hairline a step clearer all the way round, a deeper shadow). Monochrome: the only colour is the
+   field's, through the glass. Everything here is static paint; only that layer's opacity and the
+   pointer's ring (ui/spot.ts) ever move. */
 
 .composer {
   position: relative;
@@ -15,33 +14,20 @@
 
 .cmp-card {
   --cmp-fill: var(--glass-pane);
-  /* What long text fades into at the field's lower edge: about the pane's tone at its centre. */
-  --cmp-fade: rgb(15 15 18 / 0.8);
-  /* The pane's body: two crossed plates over the thin fill, so the centre is densest, the edges
-     thinner and the corners thinnest. */
-  --cmp-body: rgb(14 14 17 / 0.28);
   position: relative;
   z-index: 1;
   container: cmp / inline-size;
   padding: 10px 11px 10px;
   border-radius: 20px;
   background-color: var(--cmp-fill);
-  background-image:
-    var(--glass-sheen),
-    var(--grain),
-    linear-gradient(90deg, transparent, var(--cmp-body) 26px, var(--cmp-body) calc(100% - 26px), transparent),
-    linear-gradient(180deg, transparent, var(--cmp-body) 20px, var(--cmp-body) calc(100% - 20px), transparent);
-  background-size:
-    auto,
-    var(--grain-size),
-    auto,
-    auto;
+  background-image: var(--grain);
+  background-size: var(--grain-size);
   -webkit-backdrop-filter: var(--blur-pane);
   backdrop-filter: var(--blur-pane);
   box-shadow: var(--rim-inner), var(--shadow-glass);
 }
 
-/* The specular rim (the same ring as .pop's). */
+/* The rim (the same even ring as .pop's). */
 .cmp-card::before {
   content: '';
   position: absolute;
@@ -49,10 +35,7 @@
   z-index: 1;
   padding: 1px;
   border-radius: inherit;
-  background:
-    var(--rim-spec) top / 100% 1px no-repeat,
-    var(--rim-bounce) bottom / 100% 1px no-repeat,
-    var(--rim-light);
+  background: var(--rim-light);
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
@@ -63,14 +46,20 @@
   pointer-events: none;
 }
 
+/* The pointer on the bar: the whole rim steps up a little, evenly (the ring's own fill, faded in
+   with the ring), and a touch more near the pointer. The bar is wide and low, so the pointer is
+   always close to its top and bottom edges: a light that only followed it would brighten those two
+   and leave the sides dark. */
 .cmp-card > .spot-ring {
-  --spot: var(--spot-glass);
-  --spot-r: var(--spot-glass-r);
+  --spot: rgb(255 255 255 / 0.05);
+  --spot-r: 280px;
+  background-color: rgb(255 255 255 / 0.035);
 }
 
-/* The lift on focus, all of it on one layer under the content that only fades in: the fill a step
-   lighter, a brighter top edge and a deeper shadow. The pane itself is never repainted for it (no
-   animated fill, no animated shadow). */
+/* Focus, all of it on one layer under the content that only fades in: a little more ink in the
+   fill (the pane settles, it never goes lighter), the hairline a step clearer on all four sides
+   (an even ring on the rim's own pixels) and a deeper shadow. The pane itself is never repainted
+   for it (no animated fill, no animated shadow). */
 .cmp-card::after {
   content: '';
   position: absolute;
@@ -79,8 +68,7 @@
   border-radius: inherit;
   background-color: var(--glass-pane-lift);
   box-shadow:
-    inset 0 0 0 1px rgb(255 255 255 / 0.035),
-    inset 0 1.5px 2px -1px rgb(255 255 255 / 0.06),
+    inset 0 0 0 1px rgb(255 255 255 / 0.03),
     var(--shadow-glass-lift);
   opacity: 0;
   pointer-events: none;
@@ -96,33 +84,15 @@
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   --cmp-fill: var(--glass-solid);
-  --cmp-fade: var(--glass-solid);
-  --cmp-body: transparent;
-}
-
-/* The field's light under the composer brightens while it holds focus: the band's own opacity,
-   eased by the field's slow fade (art.css). Nothing draws a new frame for it. */
-:root:has(textarea.cmp-input:focus) :is(.session-light .dither, .home > .dither)[data-ready='true'] {
-  opacity: min(1, calc(var(--dither-opacity, 1) * 1.3));
 }
 
 /* ── text ── */
 
+/* Long text scrolls inside the field and is cut at the field's own edges, top and bottom alike.
+   Nothing is laid over the lower edge: a fade in "the card's colour" cannot match a translucent
+   pane (it showed as a pale band across the glass), and a mask on a scroller is not allowed. */
 .cmp-field {
   position: relative;
-}
-
-/* Long text scrolls inside the field: its lower edge fades into the card (an overlay in the card's
-   colour, clear of the scrollbar), so no line is cut hard against the toolbar. */
-.cmp-field[data-scrolls]::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 12px;
-  bottom: 0;
-  height: 14px;
-  background: linear-gradient(to bottom, transparent, var(--cmp-fade));
-  pointer-events: none;
 }
 
 .cmp-input {
@@ -317,11 +287,11 @@
   inset: 0;
   z-index: -1;
   border-radius: 18px 18px 6px 18px;
-  background-color: rgb(20 20 23 / 0.84);
-  background-image: var(--grain);
-  background-size: var(--grain-size);
+  background-color: rgb(26 26 30 / 0.72);
   box-shadow:
-    inset 0 0 0 1px rgb(255 255 255 / 0.08),
+    inset 0 0 0 1px rgb(255 255 255 / 0.09),
+    var(--rim-inner),
+    0 0 0 1px rgb(0 0 0 / 0.3),
     var(--shadow-composer);
   pointer-events: none;
 }
@@ -442,7 +412,9 @@
     scale var(--d-2) var(--spring);
 }
 
-/* Tactile (ui.css): raised a hair at rest, set in while pressed or open. */
+/* A flat disc (ui.css "material: flat controls"): one fill step and an even hairline. Hover is the
+   next fill step, held one more with the give in scale, open holds the hover step with the
+   hairline a step clearer. */
 .cmp-attach {
   margin-right: 2px;
   color: var(--text-2);
@@ -456,7 +428,7 @@
 }
 
 .cmp-attach:active {
-  background-color: var(--fill-3);
+  background-color: var(--fill-4);
   box-shadow: var(--press-down);
   scale: var(--press-icon);
   transition-duration: var(--d-1), var(--d-1), 70ms;
@@ -464,7 +436,7 @@
 
 .cmp-attach[aria-expanded='true'] {
   color: var(--text);
-  background-color: var(--fill-2);
+  background-color: var(--fill-3);
   box-shadow: var(--press-down);
 }
 
@@ -522,7 +494,7 @@
   transition-duration: var(--d-1), var(--d-1), 70ms;
 }
 
-/* Tactile: a bare chip is flat until it is held or its menu is open, then it sits pressed in. */
+/* A bare chip has no edge until it is held or its menu is open: then its fill gets the even hairline. */
 .tb-chip:not(.th-chip):is(:active, [aria-expanded='true']) {
   box-shadow: var(--press-down);
 }
@@ -555,9 +527,12 @@
   background-color: var(--fill-3);
 }
 
-.cm-mode:active,
 .cm-mode[aria-expanded='true'] {
-  background-color: var(--fill-2);
+  background-color: var(--fill-3);
+}
+
+.cm-mode:active {
+  background-color: var(--fill-4);
 }
 
 .cm-mode svg,
@@ -1120,11 +1095,10 @@
   grid-area: 1 / 1;
 }
 
-/* Send: a tactile ivory key with a dark glyph (styles/tokens.css --key-*): a soft light on its
-   upper half, a lit top lip, a shaded lower lip and a short drop, so it reads as a domed disc
-   standing on the glass. Pressed, it sinks: the light leaves the face, the lip turns to an inner
-   shade and the drop shortens, in the same frame as the give in scale. With nothing to send it
-   is a dim glyph on one fill step, the same raised disc as the attach button at the other end. */
+/* Send: the one ivory key, with a dark glyph. A flat ivory face and a short soft drop that sets it
+   on the glass (styles/tokens.css --key-up): no gradient, no lips. Hover goes to white; held, it
+   dims a touch and the drop shortens in the same frame as the give in scale. With nothing to send
+   it is a dim glyph on one fill step, the same flat disc as the attach button at the other end. */
 .cmp-send,
 .cmp-stop {
   display: grid;
@@ -1136,7 +1110,6 @@
   border-radius: 50%;
   color: var(--text-inverse);
   background-color: var(--text);
-  background-image: var(--key-face);
   box-shadow: var(--key-up);
   transition:
     background-color var(--d-1) var(--ease),
@@ -1151,7 +1124,6 @@
 .cmp-send:active,
 .cmp-stop:active {
   background-color: #e6e4df;
-  background-image: var(--key-face-down);
   box-shadow: var(--key-down);
 }
 
@@ -1162,13 +1134,12 @@
 .cmp-send[data-on]:not([data-ready]) {
   color: var(--text-3);
   background-color: var(--fill-2);
-  background-image: none;
   box-shadow: var(--press-up);
   pointer-events: none;
 }
 
 /* The two keys swap in one frame. The stop key never moves, pulses or changes on hover; held, it
-   sinks like the send key (no scale). */
+   dims like the send key (no scale). */
 .cmp-send:not([data-on]),
 .cmp-stop:not([data-on]) {
   visibility: hidden;

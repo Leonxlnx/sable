@@ -311,9 +311,27 @@ html[data-gallery] body {
   color: var(--text-2);
 }
 
+/* A small glass layer, as "Jump to latest": the even rim must hold on a 30px pill. */
+.gal-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px 0 10px;
+  border-radius: var(--r-pill);
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+  color: var(--text-2);
+}
+
+/* The message card, at the left of its column here. */
+.gal-user {
+  justify-content: flex-start;
+}
+
 /* .glass-rim brings the rim only: the layer sets its own fill and depth. */
 .gal-rim {
-  background: var(--glass-sheen), var(--grain) 0 0 / var(--grain-size), var(--panel);
+  background: var(--grain) 0 0 / var(--grain-size), var(--panel);
   box-shadow: var(--rim-inner), var(--shadow-glass);
 }
 
@@ -323,8 +341,19 @@ html[data-gallery] body {
   animation: none;
 }
 
+/* A filled control, stepping as the composer's mode chip does: hover one fill step up, held one
+   more, on at the hover step. */
 .gal-tactile {
   border-radius: var(--r-pill);
   color: var(--text);
   background-color: var(--fill-2);
+}
+
+.gal-tactile:hover,
+.gal-tactile[aria-pressed='true'] {
+  background-color: var(--fill-3);
+}
+
+.gal-tactile:active {
+  background-color: var(--fill-4);
 }

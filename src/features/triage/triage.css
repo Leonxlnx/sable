@@ -1,6 +1,6 @@
 /* The triage deck: every waiting prompt across sessions, as a stack of glass cards over the app.
-   The front card is the composer's material (frosted ink, grain, the specular rim and inner edge of
-   liquid glass, one soft shadow, radius 20); the two behind are the same glass one step deeper
+   The front card is the composer's material (frosted ink, grain, the even rim of glass, one soft
+   shadow, radius 20); the two behind are the same glass one step deeper
    each: lower, narrower, darker, their rim quieter. The app stays in view under a calm dim, so the backdrop's light
    still reads around the stack. Monochrome; the agent's mark is the one colour. */
 
@@ -96,9 +96,9 @@
   transform-origin: 50% 100%;
   border-radius: 20px;
   background-color: var(--tri-fill);
-  background-image: var(--glass-sheen), var(--grain);
-  background-size: auto, var(--grain-size);
-  /* The same at every depth (a shadow never animates): the pane's inner edge (--rim-inner), a close
+  background-image: var(--grain);
+  background-size: var(--grain-size);
+  /* The same at every depth (a shadow never animates): the pane's inner glow (--rim-inner), a close
      contact shadow that draws the card's edge over the one behind, and a dark outline against the app. */
   box-shadow:
     var(--rim-inner),
@@ -108,7 +108,7 @@
   transition: background-color 220ms var(--ease-out);
 }
 
-/* The specular rim (.glass-rim's ::before, ui.css): it steps back with the card, by opacity only. */
+/* The even rim (.glass-rim's ::before, ui.css): it steps back with the card, by opacity only. */
 .tri-card::before {
   opacity: var(--tri-edge);
   transition: opacity 220ms var(--ease-out);
@@ -560,10 +560,10 @@ button.tri-opt:active {
   gap: 10px;
   padding: 0 18px 0 13px;
   border-radius: 22px;
-  /* Liquid glass, as the front card: the rim is .glass-rim's ::before. */
+  /* Glass, as the front card: the rim is .glass-rim's ::before. */
   background-color: rgb(16 16 19 / 0.86);
-  background-image: var(--glass-sheen), var(--grain);
-  background-size: auto, var(--grain-size);
+  background-image: var(--grain);
+  background-size: var(--grain-size);
   -webkit-backdrop-filter: var(--blur-pane);
   backdrop-filter: var(--blur-pane);
   box-shadow: var(--rim-inner), var(--shadow-glass);

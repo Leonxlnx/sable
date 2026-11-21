@@ -579,12 +579,12 @@ export function liquidBounds(plan: LiquidPlan, room = 90): { left: number; top: 
  * in the air a drop of dark glass (`GLASS`), and one soft shadow under it.
  */
 export const INK = {
-  fill: [20, 20, 23] as [number, number, number],
-  a: 0.84,
+  fill: [26, 26, 30] as [number, number, number],
+  a: 0.72,
   /** The drop's ink is a step lighter than the card's: it reads on the dark stage, and settles. */
-  lift: [26, 26, 30] as [number, number, number],
+  lift: [32, 32, 37] as [number, number, number],
   /** The hairline: the card's, and its top while lit. */
-  rim: 0.08,
+  rim: 0.09,
   lit: 0.34,
 };
 

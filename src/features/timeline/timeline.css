@@ -936,13 +936,15 @@ button:hover > .row-caret {
 
 /* ───────────── user message ───────────── */
 
-/* The person's words sit on the right in the composer's own material: frosted dark ink with its
-   grain, the same faint inner hairline and one soft shadow, so a message reads as what left the
-   composer. No backdrop blur (a long conversation holds hundreds of these): the ink is a touch
-   lighter and a little denser than the bar's instead, so it reads as glass on the stage and the
-   field's light passes through it as a tint. The words are set like the answer's
-   (markdown.css `.md`). Time and actions appear above its right end on hover. Its numbers are
-   shared with the bubble that flies here from the composer (user-card.ts). */
+/* The person's words sit on the right on a small pane of the composer's glass: one clean
+   translucent fill (no grain), the same even hairline all the way round, the faint glow inside
+   it, a contact line and one soft shadow, so a message reads as what left the composer. No
+   backdrop blur (a long conversation holds hundreds of these): the ink is a step lighter and a
+   little denser than the bar's instead, so it reads as glass on the stage and the field's light
+   passes through it as a tint. The words are set like the answer's (markdown.css `.md`). Time and
+   actions appear above its right end on hover. Its numbers are shared with the bubble that flies
+   here from the composer (user-card.ts; the fill and the hairline also live in composer.css
+   `.send-surface` and liquid-shape.ts `INK`: change them together). */
 .user {
   position: relative;
   display: flex;
@@ -971,11 +973,11 @@ button:hover > .row-caret {
   inset: 0;
   z-index: -1;
   border-radius: 18px 18px 6px 18px;
-  background-color: rgb(20 20 23 / 0.84);
-  background-image: var(--grain);
-  background-size: var(--grain-size);
+  background-color: rgb(26 26 30 / 0.72);
   box-shadow:
-    inset 0 0 0 1px rgb(255 255 255 / 0.08),
+    inset 0 0 0 1px rgb(255 255 255 / 0.09),
+    var(--rim-inner),
+    0 0 0 1px rgb(0 0 0 / 0.3),
     var(--shadow-composer);
   pointer-events: none;
 }
@@ -2479,6 +2481,27 @@ button:hover > .row-caret {
   animation: fade-in 220ms var(--ease) 260ms backwards;
 }
 
+/* The chat's own turn is over; sub-agents still work in the background. A quiet button to the Agents tab. */
+.tail-bg {
+  width: 100%;
+  border: 0;
+  background: none;
+  text-align: left;
+  color: var(--text-2);
+  cursor: default;
+  transition: color 100ms var(--ease);
+}
+
+.tail-bg:hover {
+  color: var(--text);
+}
+
+.tail-bg:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: var(--r-sm);
+}
+
 /* A turn just sent (TurnView marks it fresh): its live line arrives under the message as the sent
    words land there (composer/flight.ts, about half a second), the same way: rise, the tiles build
    in their diagonal order, then the words. Only while live: the summary line that replaces it has
@@ -2568,7 +2591,7 @@ button:hover > .row-caret {
   font-size: var(--t-small);
   font-weight: var(--w-medium);
   color: var(--text-2);
-  /* Frosted liquid glass (.glass in ui.css: fill, blur, rim, inner edge, depth), as the composer
+  /* Frosted glass (.glass in ui.css: fill, blur, the even rim, depth), as the composer
      under it; it floats over the conversation and never scrolls with it. */
   transition: color var(--d-1) var(--ease);
 }

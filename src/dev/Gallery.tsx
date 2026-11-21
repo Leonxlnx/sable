@@ -25,6 +25,7 @@ import '@/app/app.css';
 import '@/features/composer/composer.css';
 import '@/features/sidebar/sidebar.css';
 import '@/features/rail/rail.css';
+import '@/features/timeline/timeline.css';
 import './gallery.css';
 
 /**
@@ -543,7 +544,7 @@ export default function Gallery() {
           </div>
         </Section>
 
-        <Section title="Material: liquid glass and tactile" id="material">
+        <Section title="Material: glass and flat controls" id="material">
           <div className="gal-stage">
             <div className="gal-glass-col" style={{ flex: 1.6 }}>
               <div className="gal-caption">Composer, rest</div>
@@ -552,6 +553,14 @@ export default function Gallery() {
                 Composer, focused
               </div>
               <GlassComposer focus />
+              <div className="gal-caption" style={{ marginTop: 18 }}>
+                Message
+              </div>
+              <div className="user gal-user">
+                <div className="user-card">
+                  <div className="user-text">Refactor the session module so it is easier to test</div>
+                </div>
+              </div>
             </div>
             <div className="gal-glass-col">
               <div className="gal-caption">Menu (.pop)</div>
@@ -562,6 +571,13 @@ export default function Gallery() {
               <div className="glass gal-pane" data-spot="">
                 Find in conversation
               </div>
+              <div className="gal-caption" style={{ marginTop: 18 }}>
+                Small (.glass)
+              </div>
+              <button className="glass gal-jump" data-spot="">
+                <Icon name="arrow-down" size={13} />
+                Jump to latest
+              </button>
               <div className="gal-caption" style={{ marginTop: 18 }}>
                 Opaque (.glass-liquid)
               </div>
@@ -592,24 +608,33 @@ export default function Gallery() {
           </div>
           <Head />
           <States
-            label="Tactile (.tactile)"
+            label="Filled control (.tactile)"
             only={['rest', 'hover', 'press', 'focus']}
             render={() => (
               <button className="chip tactile gal-tactile">
                 <Icon name="hand" size={14} />
-                Raised
+                Ask first
               </button>
             )}
           />
           <div className="gal-row">
-            <div className="gal-label">Tactile, on</div>
+            <div className="gal-label">Filled control, on</div>
             <div className="gal-cell">
               <button className="chip tactile gal-tactile" aria-pressed="true">
                 <Icon name="hand" size={14} />
-                Set in
+                Ask first
               </button>
             </div>
           </div>
+          <States
+            label="Ivory key"
+            only={['rest', 'hover', 'press', 'focus']}
+            render={() => (
+              <button className="cmp-send" data-on="" data-ready="" aria-label="Send">
+                <Icon name="arrow-up" size={14} />
+              </button>
+            )}
+          />
           <div className="gal-row">
             <div className="gal-label">Selected pill</div>
             <div className="gal-cell gal-wide">

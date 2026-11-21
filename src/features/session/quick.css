@@ -1,5 +1,5 @@
 /* The quick switcher (Ctrl+Tab held): a small list of recent sessions over the middle of the window,
-   on frosted liquid glass (.glass: rim, inner edge, depth). The session it will open carries the
+   on frosted glass (.glass: fill, even rim, depth). The session it will open carries the
    selected-row pill, as in the palette. */
 
 .qs {

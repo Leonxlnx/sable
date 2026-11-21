@@ -6,10 +6,10 @@
  * red = error, green/red numbers in diffs). In-flow surfaces are flat; depth comes from layering
  * (each layer one small step lighter) and from light that reacts: hairlines that are almost
  * invisible at rest brighten near the pointer ([data-spot], ui/spot.ts). What floats (the
- * composer, menus, popovers, dialogs, toasts) is liquid glass: a specular rim, an inner edge, a
- * layered shadow, a faint static grain. A few small controls are slightly tactile (raised a hair,
- * set in when pressed). One light, from the top and slightly left. Small accents use a monochrome
- * dither. Never gaudy: no gloss, no bevels on plain controls, no colour.
+ * composer, menus, popovers, dialogs, toasts) is glass: a frosted ink fill, one even hairline rim
+ * all the way round, a layered shadow, a faint static grain. Controls are flat: a fill step and an
+ * even hairline, never a bevel. Small accents use a monochrome dither. Never gaudy: no gloss, no
+ * glint, no colour.
  */
 
 :root {
@@ -118,59 +118,62 @@
   --shadow-pop: 0 12px 32px -12px rgb(0 0 0 / 0.75), 0 0 0 1px rgb(0 0 0 / 0.35);
   --shadow-composer: 0 18px 44px -18px rgb(0 0 0 / 0.75);
 
-  /* Floating layers: frosted ink and a faint static grain (their rim and depth: "liquid glass" below). */
+  /* Floating layers: frosted ink and a faint static grain (their rim and depth: "glass" below). */
   --glass: rgb(20 20 23 / 0.88);
   --glass-strong: rgb(22 22 25 / 0.95);
   /* Glass without its blur (shed under load) must hide what is behind it completely. */
   --glass-solid: rgb(22 22 25);
   --glass-menu: rgb(23 23 27 / 0.78);
-  /* The old uniform hairline of floating layers; the rim replaces it. Left only for two composer
-     surfaces (composer.css: the drop label, a queued message in the hand) until their pass. */
+  /* A plain inset hairline for a floating layer that is not glass (a drag label, a row in the hand). */
   --glass-edge: inset 0 0 0 1px rgb(255 255 255 / 0.075);
   --blur: blur(22px) saturate(150%);
   --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0.08 0 0 0 -0.035'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   --grain-size: 160px 160px;
 
-  /* ── liquid glass and tactile controls: chosen places only (see "material" in ui.css) ──
-     One light, from the top and slightly left. Glass (the composer, menus, popovers, dialogs,
-     toasts) wears a specular rim: a 1px ring that is brightest where the light meets the top
-     edge, falls off around the corners and down the sides, and picks up a little bounce at the
-     far bottom corner. All of it is static paint; nothing here animates. Monochrome: the only
-     colour is what shows through from the field. */
-  --rim-light: linear-gradient(180deg, rgb(255 255 255 / 0.085) 0, rgb(255 255 255 / 0.065) 10px, rgb(255 255 255 / 0.05) 40px, rgb(255 255 255 / 0.035) calc(100% - 24px), rgb(255 255 255 / 0.045) 100%);
-  /* The glint along the top edge: strongest left of centre, gone before the corners. */
-  --rim-spec: linear-gradient(90deg, transparent 6%, rgb(255 255 255 / 0.075) 28%, rgb(255 255 255 / 0.02) 62%, transparent 92%);
-  /* The bounce along the bottom edge, at the corner farthest from the light. */
-  --rim-bounce: linear-gradient(270deg, transparent 4%, rgb(255 255 255 / 0.05) 22%, transparent 60%);
-  /* The edge's own thickness: a faint glow just inside the rim, strongest under the top edge. */
-  --rim-inner: inset 0 0 0 1.5px rgb(0 0 0 / 0.16), inset 0 14px 18px -14px rgb(255 255 255 / 0.07), inset 0 0 16px 0 rgb(255 255 255 / 0.016);
-  /* Light gathered under the top edge, as in thick glass: a short sheen over the fill. */
-  --glass-sheen: linear-gradient(180deg, rgb(255 255 255 / 0.028), rgb(255 255 255 / 0.01) 30px, transparent 64px);
-  /* The glass pane over the field: thinner toward its edges, so the field's light gathers there. */
-  --glass-pane: rgb(15 15 18 / 0.52);
-  --glass-pane-lift: rgb(255 255 255 / 0.03);
+  /* ── glass: what floats (see "material: glass" in ui.css) ──
+     The composer, menus, popovers, dialogs and toasts. Calm, even, precise: a frosted fill, one
+     1px rim that reads the same on all four sides and round every corner, and depth from the
+     shadow alone. No glint, no bright corner, no sheen under the top edge. All static paint;
+     nothing here animates. Monochrome: the only colour is what shows through from the field. */
+  /* The rim's fill: one even hairline. The top is a breath lighter than the bottom (the light is
+     above), far too little to read as a gradient. */
+  --rim-light: linear-gradient(180deg, rgb(255 255 255 / 0.1), rgb(255 255 255 / 0.088));
+  /* The pane's thickness: a faint glow just inside the rim, the same all the way round. */
+  --rim-inner: inset 0 0 12px 0 rgb(255 255 255 / 0.02);
+  /* Retired (the band of light under the top edge). Surfaces that still name it get nothing. */
+  --glass-sheen: none;
+  /* The composer's pane over the field: one even frosted fill, thin enough for the field's colour. */
+  --glass-pane: rgb(15 15 18 / 0.6);
+  /* What focus lays under the composer's content: a little more ink, so the words sit calmer.
+     Never lighter. */
+  --glass-pane-lift: rgb(9 9 11 / 0.14);
   --blur-pane: blur(22px) saturate(150%);
-  /* Depth: a dark contact line that sharpens the rim, a tight near shadow, a wide soft one. */
+  /* Depth: a dark contact line that sharpens the rim evenly, a tight near shadow, a wide soft one. */
   --shadow-glass: 0 0 0 1px rgb(0 0 0 / 0.42), 0 2px 5px -1px rgb(0 0 0 / 0.38), 0 14px 34px -12px rgb(0 0 0 / 0.72), 0 34px 70px -34px rgb(0 0 0 / 0.6);
   /* What focus adds under the composer (its own layer, faded in; never an animated shadow). */
   --shadow-glass-lift: 0 22px 48px -16px rgb(0 0 0 / 0.78), 0 44px 90px -40px rgb(0 0 0 / 0.6);
+  /* The reactive hairline on glass: the same rim, a little brighter near the pointer and fading
+     out wide, so it never reads as a second line. */
+  --spot-glass: rgb(255 255 255 / 0.12);
+  --spot-glass-r: 240px;
+  /* A tooltip is too small and too frequent for a rim layer: the same even hairline, contact line
+     and a short drop in one box-shadow. */
+  --shadow-tip: inset 0 0 0 1px rgb(255 255 255 / 0.075), 0 0 0 1px rgb(0 0 0 / 0.42), 0 5px 14px -5px rgb(0 0 0 / 0.7);
 
-  /* Tactile: raised a hair at rest (a top light, a contact shadow), set in when pressed or on. */
-  --press-up: inset 0 1.5px 2px -1px rgb(255 255 255 / 0.06), inset 0 0 0 1px rgb(255 255 255 / 0.03), 0 1px 1.5px 0 rgb(0 0 0 / 0.32);
-  --press-down: inset 0 1px 2px 0 rgb(0 0 0 / 0.42), inset 0 0 0 1px rgb(0 0 0 / 0.16), 0 1px 0 0 rgb(255 255 255 / 0.04);
-  /* A track or well a raised part travels in. */
-  --press-well: inset 0 1px 2px 0 rgb(0 0 0 / 0.45), inset 0 0 0 1px rgb(0 0 0 / 0.2), 0 1px 0 0 rgb(255 255 255 / 0.045);
-  /* The ivory key (send, stop, a switch's thumb): a lit top lip, a shaded lower lip, a short drop. */
-  --key-face: linear-gradient(180deg, rgb(255 255 255 / 0.26), rgb(255 255 255 / 0) 50%, rgb(0 0 0 / 0.07));
-  --key-up: inset 0 1.5px 2px -1px rgb(255 255 255 / 0.4), inset 0 -1px 0 0 rgb(0 0 0 / 0.14), 0 1px 2px 0 rgb(0 0 0 / 0.5), 0 4px 10px -3px rgb(0 0 0 / 0.5);
-  --key-face-down: linear-gradient(180deg, rgb(0 0 0 / 0.1), rgb(0 0 0 / 0) 55%);
-  --key-down: inset 0 1px 2px 0 rgb(0 0 0 / 0.32), inset 0 0 0 1px rgb(0 0 0 / 0.06), 0 1px 1px 0 rgb(0 0 0 / 0.4);
-  /* The reactive hairline on glass: the rim's specular answer to the pointer, a little stronger and wider. */
-  --spot-glass: rgb(255 255 255 / 0.5);
-  --spot-glass-r: 190px;
-  /* A tooltip is too small and too frequent for the rim: the same light in one box-shadow (a lit
-     top edge over a faint ring, a dark contact line, a short drop). */
-  --shadow-tip: inset 0 1.5px 2px -1px rgb(255 255 255 / 0.05), inset 0 0 0 1px rgb(255 255 255 / 0.055), 0 0 0 1px rgb(0 0 0 / 0.42), 0 5px 14px -5px rgb(0 0 0 / 0.7);
+  /* ── controls with a fill of their own: flat and precise (see "material: flat controls" in ui.css) ──
+     The toolbar's disc and mode chip, a segmented control's pill, a selected row's pill. A fill
+     step and one even hairline; held, open or on is the next fill step and the small give in
+     scale, and the hairline steps up with it. No top light, no inner shade, no contact shadow. */
+  --press-up: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  --press-down: inset 0 0 0 1px rgb(255 255 255 / 0.1);
+  /* A track a part travels in (a switch, a segmented control): a darker fill with the same hairline. */
+  --press-well: inset 0 0 0 1px rgb(255 255 255 / 0.05);
+  /* The ivory key (send, stop, the compare handle): a flat ivory face and a short soft drop that
+     sets it on the glass. Held, the drop shortens with the give in scale. */
+  --key-up: 0 1px 2px 0 rgb(0 0 0 / 0.36), 0 4px 10px -4px rgb(0 0 0 / 0.5);
+  --key-down: 0 1px 1px 0 rgb(0 0 0 / 0.4);
+  /* A small ivory part that slides (a switch's thumb, the slider's thumb): a short drop, nothing else. */
+  --thumb-up: 0 1px 2px 0 rgb(0 0 0 / 0.35);
 
   /* ── dither: the house texture for small accents (white pixels; set strength with opacity) ──
      --dither-fade runs dense to empty, left to right (24 x 4 cells); -50 and -25 are flat tones.
