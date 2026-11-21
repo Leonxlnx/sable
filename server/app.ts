@@ -1596,15 +1596,20 @@ export class App {
     }
   }
 
-  /** Whether `accountId` can run a turn now: signed in as far as known, not at a plan limit, not running on credits. */
-  private async canRunTurn(provider: ProviderId, accountId: string): Promise<boolean> {
+  /**
+   * Whether the chat's account can run a turn now: still there, not at a plan limit that counts for
+   * the chat's model (another model's full weekly does not), not running on credits.
+   */
+  private async canRunTurn(rt: SessionRuntime, accountId: string): Promise<boolean> {
+    const provider = rt.meta.provider;
     try {
       this.provider(provider, accountId);
     } catch {
       return false;
     }
     const known = await this.knownLimits(provider).catch(() => new Map<string, { limits?: RateLimit[] }>());
-    if (atCap(known.get(accountId)?.limits, Date.now())) return false;
+    const model = effectiveModel(rt.meta.model || undefined, rt.caps?.models, this.store.state.settings.defaultModels[provider]);
+    if (atCap(known.get(accountId)?.limits, Date.now(), model)) return false;
     return !runningOnCredits(this.limitsMeta.get(accountKey(provider, accountId)));
   }
 
@@ -1682,7 +1687,7 @@ export class App {
     let outcome: MoveOutcome = { kind: 'plain' };
     if (rt.meta.providerSessionId && target.adoptConversation && bigContext(tokens, rt.meta.usage.contextWindow)) {
       const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId, rt.meta.cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId));
-      const can = opts.compact !== false && !opts.retry && caps?.features.compact !== false && (await this.canRunTurn(provider, fromId));
+      const can = opts.compact !== false && !opts.retry && caps?.features.compact !== false && (await this.canRunTurn(rt, fromId));
       still(ctx);
       if (can && !rt.turnActive) {
         opts.onCompacting?.();
