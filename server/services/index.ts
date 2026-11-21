@@ -2,6 +2,7 @@ import type { App } from '../app';
 import { registerBackdrop } from './backdrop';
 import { registerCapture } from './capture';
 import { registerConfig } from './config';
+import { registerCustom } from './custom';
 import { registerDevice } from './device';
 import { registerFiles } from './files';
 import { registerFs } from './fs';
@@ -41,4 +42,5 @@ export function registerServices(app: App, opts: ServiceOptions = {}) {
   registerExport(app);
   registerPrompts(app);
   registerThumbs(app);
+  registerCustom(app);
 }

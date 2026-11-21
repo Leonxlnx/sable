@@ -711,6 +711,17 @@ export class CodexProvider implements Provider {
     }
   }
 
+  /** The Customize chat's brief: only for that chat (`SessionMeta.custom`). */
+  customText(meta?: Pick<SessionMeta, 'custom'>): string {
+    if (!meta?.custom) return '';
+    try {
+      return this.ctx.customBrief?.() ?? '';
+    } catch (err) {
+      this.ctx.log('[codex] the Customize brief could not be made:', errMsg(err));
+      return '';
+    }
+  }
+
   /** remember_about_user: one fact into the profile. */
   rememberAboutUser(args: unknown): { ok: boolean; text: string } {
     const profile = this.ctx.profile?.();
@@ -725,9 +736,9 @@ export class CodexProvider implements Provider {
    * generative UI hint when those settings are on. Undefined means "send nothing" (Codex then uses
    * the config as it is).
    */
-  async developerInstructions(cwd: string, meta?: Pick<SessionMeta, 'options'>): Promise<string | undefined> {
+  async developerInstructions(cwd: string, meta?: Pick<SessionMeta, 'options' | 'custom'>): Promise<string | undefined> {
     const settings = this.ctx.settings?.();
-    const ours = [settings?.conciseReplies === false ? '' : CONCISE_REPLIES_PROMPT, widgetsEnabled(settings) ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText()].filter(Boolean).join('\n\n');
+    const ours = [settings?.conciseReplies === false ? '' : CONCISE_REPLIES_PROMPT, widgetsEnabled(settings) ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText(), this.customText(meta)].filter(Boolean).join('\n\n');
     if (!ours) return undefined;
     let own: string | undefined;
     try {

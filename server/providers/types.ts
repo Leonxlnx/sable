@@ -40,6 +40,8 @@ export interface ProviderContext {
   otherAgents?: () => ProviderId[];
   /** The user's profile: its prompt text and the remember_about_user tool (see services/profile.ts). Absent in bare tests. */
   profile?: () => ProfileAccess;
+  /** The Customize chat's brief (`services/custom.ts`), appended to the prompt of a session with `SessionMeta.custom` only. */
+  customBrief?: () => string;
   /** Runs a sub-agent of another agent for `rt`, nested under the tool step `itemId` (see `agent-tool.ts`). */
   runAgent?: (rt: SessionRuntime, call: AgentCall, itemId: string | undefined, signal?: AbortSignal) => Promise<{ ok: boolean; text: string }>;
 }

@@ -7,6 +7,7 @@ import { useStore } from '@/state/store';
 import { Spinner } from '@/ui';
 import { tildePath } from '@/lib/format';
 import { Card, CodeChip, Row } from './parts';
+import { customized, useCustom } from '@/features/customize/custom-store';
 
 const PLATFORM: Record<string, string> = { win32: 'Windows', darwin: 'macOS', linux: 'Linux' };
 
@@ -18,6 +19,7 @@ export function About() {
   const providers = useStore((s) => s.providers);
   const conn = useStore((s) => s.conn);
   const setUi = useStore((s) => s.setUi);
+  const custom = customized(useCustom());
   // Whatever agents the bridge reports, Claude Code and Codex first.
   const agents: ProviderId[] = [...connectableAgents(providers), ...(Object.keys(providers) as ProviderId[]).filter((id) => !connectableAgents(providers).includes(id))];
 
@@ -30,7 +32,10 @@ export function About() {
         <div className="about-veil" />
         <LogoMark size={48} />
         <Wordmark className="about-word" />
-        <span className="about-ver num">Version {version || 'unknown'}</span>
+        <span className="about-ver num">
+          Version {version || 'unknown'}
+          {custom && ' · Customized'}
+        </span>
         <p className="about-line">Claude Code and Codex in one place: every session, step and change in one timeline.</p>
       </div>
 

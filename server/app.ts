@@ -49,6 +49,7 @@ import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
 import { withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
+import { customOf } from './services/custom';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
 import { Lanes } from './core/lanes';
@@ -408,6 +409,7 @@ export class App {
       settings: () => this.store.state.settings,
       otherAgents: () => this.otherAgents(),
       profile: () => profileOf(this),
+      customBrief: () => customOf(this).brief(),
       runAgent: (rt, call, itemId, signal) => {
         if (this.sessions.get(rt.id) !== rt) return Promise.resolve({ ok: false, text: 'No session is attached yet.' });
         return runSubAgent(
@@ -1870,7 +1872,12 @@ export class App {
    * starts, whatever the folder's state (a race); when the lane cannot be made the session is removed
    * and this rejects.
    */
-  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string } } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
+  /** A new session with what `session.create` cannot ask for (the Customize chat, `services/custom.ts`). */
+  startSession(p: RpcMethods['session.create']['params'], extra: { custom?: boolean } = {}): Promise<SessionSnapshot> {
+    return this.createSession(p, extra);
+  }
+
+  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string }; custom?: boolean } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
     const settings = this.store.state.settings;
     let accountId = p.accountId ?? this.defaultAccountId(p.provider);
     this.provider(p.provider, accountId);
@@ -1899,6 +1906,8 @@ export class App {
       ...(p.ultracode ? { ultracode: true } : {}),
       ...this.startSpeed(p.provider, accountId, cwd, p.model ?? settings.defaultModels[p.provider], p.speed ?? settings.defaultSpeeds?.[p.provider]),
       ...(p.chat ? { chat: true } : {}),
+      // The Customize chat lives in Sable's own folder, never one of the sidebar's folders.
+      ...(extra.custom ? { custom: true, chat: true } : {}),
       status: 'starting',
       createdAt: now,
       updatedAt: now,

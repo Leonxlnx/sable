@@ -57,6 +57,10 @@ const captureWait = Number(flag('wait') ?? (evalSnippet ? 3000 : 1200));
  * when covered, so frame timings are real even on a machine someone is using.
  */
 const perfRun = process.env.SABLE_PERF === '1';
+/** `--original`: nothing of the person's Customize Sable (their styles, their build) for this run. Shift held at start does the same. */
+const original = process.argv.includes('--original');
+/** How long after the window opens a held Shift still means "Sable's own look for this run". */
+const SHIFT_WINDOW_MS = 4000;
 
 // Everything Sable keeps lives under SABLE_HOME when it is set (verification runs use a temp folder).
 app.setName('Sable');
@@ -870,6 +874,28 @@ function keepAwake(s: RunningServer) {
 }
 const PHONE_AWAKE_DELAY_MS = 4000;
 
+/**
+ * Customize Sable (server/services/custom.ts): the window reloads when what it is served changes (the
+ * person's build set aside because it did not start, or switched on or off). Shift held while the
+ * window opens leaves the person's styles and build out for this run, as `--original` does.
+ */
+function customize(s: RunningServer) {
+  s.watchCustom(() => {
+    if (win && !win.isDestroyed()) win.webContents.reload();
+  });
+  const w = win;
+  if (!w || original || screenshotFile) return;
+  const until = Date.now() + SHIFT_WINDOW_MS;
+  const onKey = (_e: Electron.Event, input: Electron.Input) => {
+    if (Date.now() > until) return void w.webContents.off('before-input-event', onKey);
+    if (input.type !== 'keyDown' || input.key !== 'Shift') return;
+    w.webContents.off('before-input-event', onKey);
+    if (s.ignoreCustom()) w.webContents.reload();
+  };
+  w.webContents.on('before-input-event', onKey);
+  setTimeout(() => w.isDestroyed() || w.webContents.off('before-input-event', onKey), SHIFT_WINDOW_MS + 100);
+}
+
 app.on('before-quit', (e) => {
   if (quitting || !server) return;
   e.preventDefault();
@@ -919,6 +945,9 @@ if (!app.requestSingleInstanceLock()) {
   };
   const starting = startServer({
     root: path.join(app.getAppPath(), 'dist'),
+    original,
+    // The Customize chat's reference (CLAUDE.md and the app's CSS), staged by scripts/build-electron.mjs.
+    reference: app.isPackaged ? path.join(process.resourcesPath, 'reference') : path.join(app.getAppPath(), 'dist-resources', 'reference'),
     port: PREFERRED_PORT,
     fallbackToFreePort: true,
     // An installed build updates itself; a build run from a folder (or a test run) does not.
@@ -947,6 +976,7 @@ if (!app.requestSingleInstanceLock()) {
     bootMark('main:server');
     openWindow(server.url);
     keepAwake(server);
+    customize(server);
     bootMark('main:awake');
   });
 }

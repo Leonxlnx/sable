@@ -12,6 +12,7 @@ import { untilCommand } from './until';
 import { spareCommand } from './spare';
 import { raceCommand } from '@/features/race/race';
 import { getPrompts, subscribePrompts } from '@/features/saved/prompts-store';
+import { openCustomize } from '@/features/customize/custom-store';
 
 /** Slash commands Sable handles itself, before anything reaches the agent. */
 
@@ -124,6 +125,12 @@ const BUILT_IN: AppCommand[] = [
     description: 'Give the task to two agents at once, each in a lane of its own',
     argumentHint: '<task>',
     run: ({ sessionId }, arg) => void raceCommand(sessionId, arg),
+  },
+  {
+    name: 'customize',
+    description: 'Change how Sable looks with an agent',
+    argumentHint: '<what you want>',
+    run: (_c, arg) => void openCustomize(arg),
   },
   { name: 'stop', description: 'Stop the current turn', session: true, run: ({ sessionId }) => sessionId && void interrupt(sessionId) },
   { name: 'copy', description: 'Copy the last answer', session: true, run: ({ sessionId }) => sessionId && copyLastAnswer(sessionId) },

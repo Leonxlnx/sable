@@ -8,7 +8,7 @@
 // dist-resources/claude/ (a hard link, so no copy of its ~370 MB) and shipped by electron-builder as
 // an extra resource. electron/main.ts points SABLE_CLAUDE_BIN at it.
 import { build } from 'esbuild';
-import { copyFileSync, existsSync, linkSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -118,6 +118,27 @@ copyFileSync(path.join(root, 'server/providers/demo-content.md'), path.join(out,
 copyFileSync(path.join(root, 'build/icon.png'), path.join(out, 'icon.png'));
 copyFileSync(path.join(root, 'build/icon.ico'), path.join(out, 'icon.ico'));
 
+/*
+ * The Customize chat's reference (server/services/custom.ts): CLAUDE.md and every stylesheet of the
+ * interface by its path under src/, staged in dist-resources/reference/ and shipped as an extra
+ * resource (a real folder, so an agent can read it; the bridge copies it into <data>/custom/reference).
+ */
+const reference = path.join(root, 'dist-resources/reference');
+rmSync(reference, { recursive: true, force: true });
+mkdirSync(path.join(reference, 'styles'), { recursive: true });
+copyFileSync(path.join(root, 'CLAUDE.md'), path.join(reference, 'CLAUDE.md'));
+const stageCss = (rel) => {
+  for (const e of readdirSync(path.join(root, 'src', rel), { withFileTypes: true })) {
+    const r = rel ? `${rel}/${e.name}` : e.name;
+    if (e.isDirectory()) stageCss(r);
+    else if (e.name.endsWith('.css')) {
+      mkdirSync(path.dirname(path.join(reference, 'styles', r)), { recursive: true });
+      copyFileSync(path.join(root, 'src', r), path.join(reference, 'styles', r));
+    }
+  }
+};
+stageCss('');
+
 /* ── the Claude Code binary ── */
 
 const exe = process.platform === 'win32' ? 'claude.exe' : 'claude';
@@ -143,4 +164,4 @@ if (!same(source, staged)) {
   }
 }
 
-console.log('Built dist-electron/main.cjs (app.cjs) and dist-electron/preload.cjs; staged dist-resources/claude/' + exe);
+console.log('Built dist-electron/main.cjs (app.cjs) and dist-electron/preload.cjs; staged dist-resources/claude/' + exe + ' and dist-resources/reference/');

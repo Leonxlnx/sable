@@ -107,5 +107,26 @@ function startLight() {
   boot.launch = launch;
 }
 
+/**
+ * The person's own stylesheet (Customize Sable, `server/services/custom.ts`): linked at the end of the
+ * body, so it comes after every stylesheet of the app in the cascade, the ones loaded later with a
+ * lazy part of the app included (those go into the head). Empty when there is none or it is off;
+ * `features/customize/live.ts` swaps it in place when the file changes.
+ */
+function linkStyles() {
+  try {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = CUSTOM_STYLES;
+    link.dataset.sableCustom = '';
+    document.body.append(link);
+  } catch {
+    /* the app's own look */
+  }
+}
+
+const CUSTOM_STYLES = '/custom/styles.css';
+
 openSocket();
+linkStyles();
 startLight();

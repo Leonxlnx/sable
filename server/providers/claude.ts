@@ -389,8 +389,19 @@ export class ClaudeProvider implements Provider {
    * generative UI on, one line that reminds the model the widget tool exists (a tool description
    * alone is rarely enough for a model to reach for an optional tool unprompted).
    */
-  appendix(meta?: Pick<SessionMeta, 'options'>): string {
-    return [this.concise() ? CONCISE_REPLIES_PROMPT : '', this.widgets() ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText()].filter(Boolean).join('\n\n');
+  appendix(meta?: Pick<SessionMeta, 'options' | 'custom'>): string {
+    return [this.concise() ? CONCISE_REPLIES_PROMPT : '', this.widgets() ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText(), this.customText(meta)].filter(Boolean).join('\n\n');
+  }
+
+  /** The Customize chat's brief: only for that chat (`SessionMeta.custom`). */
+  customText(meta?: Pick<SessionMeta, 'custom'>): string {
+    if (!meta?.custom) return '';
+    try {
+      return this.ctx.customBrief?.() ?? '';
+    } catch (err) {
+      this.ctx.log('claude: the Customize brief could not be made:', (err as Error).message);
+      return '';
+    }
   }
 
   /** Whether new agent processes get the user's profile and remember_about_user (Settings › Profile). */
@@ -408,7 +419,7 @@ export class ClaudeProvider implements Provider {
     }
   }
 
-  agentOptions(meta: Pick<SessionMeta, 'cwd' | 'model' | 'effort' | 'mode' | 'options' | 'providerSessionId' | 'ultracode'>, owner: WarmOwner, resumeAt?: string): Options {
+  agentOptions(meta: Pick<SessionMeta, 'cwd' | 'model' | 'effort' | 'mode' | 'options' | 'providerSessionId' | 'ultracode' | 'custom'>, owner: WarmOwner, resumeAt?: string): Options {
     const extraArgs: Record<string, string | null> = { 'replay-user-messages': null };
     // Claude in Chrome is a start-up flag; without it the CLI follows the machine's /chrome setting.
     if (meta.options?.browser) extraArgs.chrome = null;
@@ -1065,9 +1076,10 @@ export function titleOptions(prompt: TitlePrompt, env: NodeJS.ProcessEnv, abortC
   };
 }
 
-function warmKey(c: { cwd: string; model?: string; mode?: string; effort?: Effort; options?: SessionOptions; ultracode?: boolean }, concise: boolean, widgets = true, profile = '') {
+function warmKey(c: { cwd: string; model?: string; mode?: string; effort?: Effort; options?: SessionOptions; ultracode?: boolean; custom?: boolean }, concise: boolean, widgets = true, profile = '') {
   const o = c.options ?? {};
-  return JSON.stringify([path.resolve(c.cwd).toLowerCase(), c.model && c.model !== 'default' ? c.model : '', c.mode || 'default', sdkEffort(c.effort) ?? '', o.browser ?? null, !!c.ultracode, concise, widgets, o.browserTab !== false, deviceEnabled(c), profile]);
+  // A process warmed for an ordinary chat never serves the Customize chat (its prompt carries the brief).
+  return JSON.stringify([path.resolve(c.cwd).toLowerCase(), c.model && c.model !== 'default' ? c.model : '', c.mode || 'default', sdkEffort(c.effort) ?? '', o.browser ?? null, !!c.ultracode, concise, widgets, o.browserTab !== false, deviceEnabled(c), profile, !!c.custom]);
 }
 
 /** Control requests the SDK does not wrap (remote_control, mcp_call): the CLI answers them on stdio. */

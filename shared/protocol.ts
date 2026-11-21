@@ -440,6 +440,8 @@ export interface SessionMeta {
   agents?: AgentLeg[];
   /** The next message goes out with a handover of the conversation (after a switch of agent); null once sent. */
   agentHandover?: AgentHandover | null;
+  /** The Customize chat (`custom.open`): its agent gets the brief about changing Sable itself (`server/services/custom.ts`). */
+  custom?: boolean;
 }
 
 /**
@@ -1444,6 +1446,8 @@ export interface AppSettings {
    * session moves between turns to the next signed-in account of its agent that is under its own cap.
    */
   accountCaps?: Record<string, AccountCap>;
+  /** The person's own stylesheet (`<data>/custom/styles.css`) is applied over the app. Absent means on (when the file exists). */
+  customStyles?: boolean;
 }
 
 /** One permission rule set from an agent's settings file (read-only view). */
@@ -1582,6 +1586,8 @@ export type BridgeEvent =
   | { type: 'profile.updated'; profile: UserProfile }
   /** The saved prompts changed (all of them, in order). */
   | { type: 'prompts.updated'; prompts: SavedPrompt[] }
+  /** Customize Sable changed: the person's styles (a new `styles.rev`: the page reloads the sheet), the build's state or work. */
+  | { type: 'custom.updated'; state: CustomState }
   /** A turn's before / after pictures of a local page were taken or changed state (server/services/capture.ts). */
   | { type: 'capture.updated'; sessionId: string; capture: TurnCapture };
 
@@ -2469,6 +2475,82 @@ export interface RpcMethods {
   'prompts.remove': { params: { id: string }; result: { ok: boolean } };
   /** The prompts in this order (ids; any not named keep their place after them). */
   'prompts.reorder': { params: { ids: string[] }; result: SavedPrompt[] };
+  /** Customize Sable (`server/services/custom.ts`): the person's own styles and build, as they stand. Changes are pushed as `custom.updated`. */
+  'custom.state': { params: Record<string, never>; result: CustomState };
+  /**
+   * The Customize chat (one, kept, in `<data>/custom`), made with the person's default agent when there
+   * is none; `text`, when given, is sent to it. Answers its snapshot (open it like any chat).
+   */
+  'custom.open': { params: { text?: string; provider?: ProviderId }; result: SessionSnapshot };
+  /** "Use Sable's own look": the person's styles and build both off, at once. */
+  'custom.original': { params: Record<string, never>; result: CustomState };
+  /** The page served from a custom build started (it calls this within `CUSTOM_READY_MS` or the build is set aside). */
+  'custom.ready': { params: Record<string, never>; result: { ok: boolean } };
+  /**
+   * Your build, each a click of the person's (a phone or an agent never gets these): `setup` clones the
+   * public repository at the running version and installs; `build` builds the workspace and, with `use`,
+   * switches to it; `use` switches a finished build on or off; `bring` brings the changes to the running
+   * version (rebase, install, build, switch). Progress arrives as `custom.updated`.
+   */
+  'custom.setup': { params: Record<string, never>; result: CustomState };
+  'custom.build': { params: { use?: boolean }; result: CustomState };
+  'custom.use': { params: { on: boolean }; result: CustomState };
+  'custom.bring': { params: Record<string, never>; result: CustomState & { conflict?: string[] } };
+}
+
+/** How long a custom interface has to call `custom.ready` after its page was served. */
+export const CUSTOM_READY_MS = 15_000;
+
+/** The person's own stylesheet (`<data>/custom/styles.css`), as the bridge serves it at `/custom/styles.css`. */
+export interface CustomStyles {
+  exists: boolean;
+  /** `AppSettings.customStyles` (absent means on). */
+  on: boolean;
+  /** Changes with every change of the file that is served (the page reloads the sheet with it). */
+  rev: number;
+  size: number;
+  /** When the file last changed (ms). */
+  changedAt?: number;
+  /** The file asks for something from the internet (a remote `url()` or `@import`): it is not applied, and this says what. */
+  blocked?: string;
+}
+
+/** The person's own build of the interface (`<data>/custom/src`). */
+export interface CustomBuild {
+  /** This bridge can serve a custom interface (the desktop app; not the dev server). */
+  supported: boolean;
+  /** The workspace (a clone of the public repository on a branch `mine`) exists. */
+  workspace: boolean;
+  /** The person switched it on. */
+  active: boolean;
+  /** It is what windows get now (on, built for this version, not set aside, not ignored for this run). */
+  serving: boolean;
+  /** The version its last build was made for, and when. */
+  builtFor?: string;
+  builtAt?: number;
+  /** The last start of it failed and Sable's own interface took over. */
+  failed?: { at: number; reason: string };
+  /** Work under way. */
+  step?: 'checking' | 'cloning' | 'installing' | 'building' | 'rebasing';
+  /** The last step that went wrong, in one line. */
+  error?: string;
+  /** What the machine lacks to set up a build, with the command that installs it. */
+  missing?: string;
+  /** When the workspace's source last changed (an agent edited it): newer than `builtAt` means there is something to build. */
+  changedAt?: number;
+}
+
+export interface CustomState {
+  /** `<data>/custom`: the Customize chat's folder. */
+  dir: string;
+  /** The running version. */
+  version: string;
+  /** Started with `--original` (or Shift held): nothing of the person's is applied this run. */
+  ignored: boolean;
+  /** The Customize chat, when there is one. */
+  sessionId?: string;
+  styles: CustomStyles;
+  build: CustomBuild;
 }
 
 /** A prompt saved under a name: put into the composer from the palette or the `/` menu, never sent by itself. */
