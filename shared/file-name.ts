@@ -6,7 +6,7 @@
  * the page and the one at Android's intent can never read a name differently ("x.apk " with a space,
  * "x.APK.", a name with a control character).
  *
- * The rules: Unicode NFC; control and format characters (bidi overrides, zero-width) gone; path and
+ * The rules: Unicode NFC (before and after the rest); control and format characters (bidi overrides, zero-width) gone; path and
  * reserved characters (`\ / : * ? " < > |`) become `_`; whitespace runs become one space; no
  * leading or trailing spaces or dots; at most 120 characters, the extension kept; empty becomes
  * `file`.
@@ -25,7 +25,9 @@ export function canonicalName(raw: string): string {
     const ext = dot > 0 && s.length - dot <= 16 ? [...s.slice(dot)] : [];
     s = chars.slice(0, 120 - ext.length).join('').replace(/[\s.]+$/u, '') + ext.join('');
   }
-  return s;
+  // Once more: a format character removed between a letter and its accent, or a cut, can leave a
+  // decomposed pair the first pass could not compose (FilesPlugin.java refuses a name not in NFC).
+  return s.normalize('NFC');
 }
 
 /** True for a name that is already canonical (what FilesPlugin.java checks before it decides anything by it). */

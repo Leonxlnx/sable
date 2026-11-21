@@ -27,6 +27,7 @@ import { Intents, type Field } from './intents';
 import { clearChatNotifications, clearShortcuts } from './native';
 import { reconciler, staleFetch } from './stale';
 import { onForget } from './forget';
+import { epoch, still } from './epoch';
 
 /**
  * The phone's view of the desktop: sessions, folders, accounts and the open conversations, kept
@@ -241,9 +242,11 @@ export function unsureIntent(id: string, field: Field, gen: number): boolean {
 
 /** A chat's own fields (model, effort, speed, mode, the rest of its entry) as the desktop has them now. */
 async function refreshMeta(id: string) {
+  const e0 = epoch();
   const hello = await conn.call('app.hello', {});
   const s = hello.sessions.find((x) => x.id === id);
-  if (s) setState({ sessions: { ...state.sessions, [id]: withIntents(s) } });
+  // Forgotten meanwhile: nothing of that desktop comes back.
+  if (s && still(e0) && state.sessions[id]) setState({ sessions: { ...state.sessions, [id]: withIntents(s) } });
 }
 
 /**
@@ -421,6 +424,7 @@ function setPending(patch: Partial<State['pending']>) {
 }
 
 export function applyEvent(e: BridgeEvent) {
+  if (journals.size && JOURNALED.has(e.type)) for (const j of journals) j.length < JOURNAL_MAX ? j.push(e) : (j.over = true);
   switch (e.type) {
     case 'item.delta': {
       deltas.set(`${e.sessionId}\u0000${e.id}\u0000${e.field}`, (deltas.get(`${e.sessionId}\u0000${e.id}\u0000${e.field}`) ?? '') + e.delta);
@@ -550,9 +554,10 @@ function byId<T extends { id: string }>(list: T[], more: T[]): T[] {
 
 /**
  * What waits on from a cursor (`phone.prompts`), across chats or in one: every page within
- * `MORE_PAGES`, merged by id. An older desktop without the method, or a failure, ends it with what came.
+ * `MORE_PAGES`, merged by id. An older desktop without the method, or a failure, ends it with what
+ * came (`complete` false).
  */
-async function promptsOn(cursor: string | undefined, sessionId?: string): Promise<State['pending']> {
+async function promptsOn(cursor: string | undefined, sessionId?: string): Promise<State['pending'] & { complete: boolean }> {
   let permissions: PermissionRequest[] = [];
   let questions: QuestionRequest[] = [];
   for (let i = 0; cursor && i < MORE_PAGES; i++) {
@@ -565,37 +570,98 @@ async function promptsOn(cursor: string | undefined, sessionId?: string): Promis
       break;
     }
   }
-  return { permissions, questions };
+  return { permissions, questions, complete: !cursor };
 }
 
-/** Loads everything the phone shows after each (re)connect, and the open conversations again. */
-export async function refresh(openIds: string[]) {
-  const hello = (await conn.call('app.hello', {})) as PhoneHelloState;
-  // A long list came in pages (`sessionsCursor`): the rest is read on before the list is shown.
-  let cursor = hello.sessionsCursor;
-  for (let i = 0; cursor && i < MORE_PAGES; i++) {
-    try {
-      const page = await conn.call('phone.sessions', { cursor });
-      hello.sessions = byId(hello.sessions, page.sessions);
-      cursor = page.cursor;
-    } catch {
-      break;
+/**
+ * The list's and the prompts' events that come while a load reads pages on (`refresh`, a chat's
+ * prompts): applied again over what the load read, since they are newer than its pages (each of
+ * these events is idempotent). One per load in flight; over `JOURNAL_MAX` the list counts as not
+ * read to its end.
+ */
+type Journal = BridgeEvent[] & { over?: boolean };
+const journals = new Set<Journal>();
+const JOURNALED = new Set<BridgeEvent['type']>(['session.added', 'session.updated', 'session.removed', 'permission.added', 'permission.removed', 'question.added', 'question.removed']);
+const JOURNAL_MAX = 5000;
+function journal() {
+  const j: Journal = [];
+  journals.add(j);
+  return {
+    /** Applies what came meanwhile; false when more came than it kept. */
+    replay(): boolean {
+      journals.delete(j);
+      for (const e of j) applyEvent(e);
+      return !j.over;
+    },
+    drop: () => void journals.delete(j),
+  };
+}
+
+/** The prompts of a chat beyond its page (`PhoneTail.promptsCursor`), added to it once read; what was answered meanwhile stays answered. */
+async function morePrompts(id: string, snap: { promptsCursor?: string }, e0: number) {
+  if (!snap.promptsCursor) return;
+  const j = journal();
+  try {
+    const more = await promptsOn(snap.promptsCursor, id);
+    const d = state.data[id];
+    if (!still(e0) || !d) return;
+    const p = state.pending;
+    setState({
+      data: { ...state.data, [id]: { ...d, permissions: byId(d.permissions, more.permissions), questions: byId(d.questions, more.questions) } },
+      pending: { permissions: byId(p.permissions, more.permissions), questions: byId(p.questions, more.questions) },
+    });
+    j.replay();
+  } finally {
+    j.drop();
+  }
+}
+
+/**
+ * Loads everything the phone shows after each (re)connect, and the open conversations again.
+ * `complete` false when a list could not be read to its end (a page failed, or more pages than
+ * `MORE_PAGES`): the chats known before that it did not reach stay, and nothing is pruned by it.
+ * Forgotten meanwhile, nothing of it is applied.
+ */
+export async function refresh(openIds: string[]): Promise<{ complete: boolean }> {
+  const e0 = epoch();
+  const j = journal();
+  try {
+    const hello = (await conn.call('app.hello', {})) as PhoneHelloState;
+    // A long list came in pages (`sessionsCursor`): the rest is read on before the list is shown.
+    let cursor = hello.sessionsCursor;
+    for (let i = 0; cursor && i < MORE_PAGES && still(e0); i++) {
+      try {
+        const page = await conn.call('phone.sessions', { cursor });
+        hello.sessions = byId(hello.sessions, page.sessions);
+        cursor = page.cursor;
+      } catch {
+        break;
+      }
     }
+    let complete = !cursor;
+    const sessions: Record<string, SessionMeta> = {};
+    for (const s of hello.sessions) sessions[s.id] = withIntents(s);
+    const providers: State['providers'] = {};
+    for (const p of hello.providers) providers[p.id] = p;
+    // What waits on you in every chat (an older desktop does not say: the open chats' own lists stand in).
+    let pending = hello.prompts ? { permissions: hello.prompts.permissions ?? [], questions: hello.prompts.questions ?? [] } : NONE;
+    if (hello.promptsCursor && still(e0)) {
+      const more = await promptsOn(hello.promptsCursor);
+      pending = { permissions: byId(pending.permissions, more.permissions), questions: byId(pending.questions, more.questions) };
+      // Not read to the end: what was known stays besides (one answered elsewhere goes when the desktop says so).
+      if (!more.complete) pending = { permissions: byId(state.pending.permissions, pending.permissions), questions: byId(state.pending.questions, pending.questions) };
+    }
+    if (!still(e0)) return { complete: false };
+    if (!complete) for (const [id, s] of Object.entries(state.sessions)) sessions[id] ??= s;
+    setState({ sessions, providers, projects: hello.projects, settings: hello.settings, version: hello.version, desktop: conn.pairing?.desktop, loaded: true, fresh: true, listAt: Date.now(), pending });
+    if (!j.replay()) complete = false;
+    saveHome();
+    void refreshLimits();
+    await Promise.all(openIds.filter((id) => state.sessions[id]).map((id) => openSession(id).catch(() => {})));
+    return { complete };
+  } finally {
+    j.drop();
   }
-  const sessions: Record<string, SessionMeta> = {};
-  for (const s of hello.sessions) sessions[s.id] = withIntents(s);
-  const providers: State['providers'] = {};
-  for (const p of hello.providers) providers[p.id] = p;
-  // What waits on you in every chat (an older desktop does not say: the open chats' own lists stand in).
-  let pending = hello.prompts ? { permissions: hello.prompts.permissions ?? [], questions: hello.prompts.questions ?? [] } : NONE;
-  if (hello.promptsCursor) {
-    const more = await promptsOn(hello.promptsCursor);
-    pending = { permissions: byId(pending.permissions, more.permissions), questions: byId(pending.questions, more.questions) };
-  }
-  setState({ sessions, providers, projects: hello.projects, settings: hello.settings, version: hello.version, desktop: conn.pairing?.desktop, loaded: true, fresh: true, listAt: Date.now(), pending });
-  saveHome();
-  void refreshLimits();
-  await Promise.all(openIds.filter((id) => sessions[id]).map((id) => openSession(id).catch(() => {})));
 }
 
 /** Every account's limits as the desktop last read them (it reads them itself; this only asks what it knows). */
@@ -619,6 +685,7 @@ let pages = true;
  * the desktop); `to`: a root item the page reaches back to (a search hit).
  */
 export async function openSession(id: string, to?: string) {
+  const e0 = epoch();
   showCached(id);
   let snap: Tail | undefined;
   if (pages) {
@@ -630,13 +697,11 @@ export async function openSession(id: string, to?: string) {
     }
   }
   snap ??= await conn.call('session.snapshot', { sessionId: id });
-  // More waits in this chat than its page holds: the rest is read on, and the chat's lists get all of it.
-  const cursor = (snap as Partial<PhoneTail>).promptsCursor;
-  if (cursor) {
-    const more = await promptsOn(cursor, id);
-    snap = { ...snap, permissions: byId(snap.permissions, more.permissions), questions: byId(snap.questions, more.questions) };
-  }
+  // Forgotten meanwhile: nothing of that desktop comes back.
+  if (!still(e0)) return;
   applySnapshot(snap);
+  // More waits in this chat than its page holds: the rest is read on and added.
+  void morePrompts(id, snap as Partial<PhoneTail>, e0);
 }
 
 /** A message that opens a turn (not a steer, not a command's output or a reminder Claude Code wrote). */
@@ -670,6 +735,7 @@ export async function fetchOlder(id: string, maxPages = 12): Promise<{ before: s
 export async function openAt(id: string, itemId: string): Promise<'here' | 'gone'> {
   if (state.data[id]?.items[itemId] && !state.data[id].cached) return 'here';
   if (!pages) return (await reachItem(id, itemId)) ? 'here' : 'gone';
+  const e0 = epoch();
   let snap: PhoneTail;
   try {
     snap = await conn.call('phone.tail', { sessionId: id, around: itemId });
@@ -677,7 +743,9 @@ export async function openAt(id: string, itemId: string): Promise<'here' | 'gone
     if (/no longer in this chat/i.test((err as Error).message)) return 'gone';
     throw err;
   }
+  if (!still(e0)) return 'gone';
   applySnapshot(snap);
+  void morePrompts(id, snap, e0);
   if (snap.at === itemId) return state.data[id]?.items[itemId] ? 'here' : 'gone';
   // An older desktop gave the newest page: the pages back to it, as before.
   return (await reachItem(id, itemId)) ? 'here' : 'gone';

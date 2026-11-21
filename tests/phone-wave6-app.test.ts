@@ -1,0 +1,168 @@
+/**
+ * The phone's store reading long lists on (review wave 6, #7, #13, #14): the chats' list and what
+ * waits come in pages; events that arrive meanwhile stay applied (an answered prompt is not put
+ * back by a later page); a list not read to its end keeps the chats known before and says so (no
+ * pruning by it); Forget while a load is on its way applies nothing of it.
+ */
+import { describe, expect, it, vi } from 'vitest';
+import type { PermissionRequest, SessionMeta } from '@shared/protocol';
+import { bumpEpoch } from '../mobile/src/lib/epoch';
+
+const fake = vi.hoisted(() => ({
+  conn: {
+    state: 'open',
+    pairing: undefined as unknown,
+    on: () => {},
+    onState: () => {},
+    call: (async () => {
+      throw new Error('no desktop');
+    }) as (method: string, params: Record<string, unknown>) => Promise<unknown>,
+  },
+}));
+vi.mock('../mobile/src/lib/conn', () => ({ conn: fake.conn }));
+vi.mock('../mobile/src/lib/native', () => ({
+  clearChatNotifications: () => {},
+  clearShortcuts: () => {},
+  loadPref: async (_k: string, f: unknown) => f,
+  durable: async () => {},
+}));
+vi.mock('@desk/features/timeline/lead-in', async () => await import('../src/features/timeline/lead-in'));
+
+const mem = new Map<string, string>();
+vi.stubGlobal('localStorage', {
+  get length() {
+    return mem.size;
+  },
+  key: (i: number) => [...mem.keys()][i] ?? null,
+  getItem: (k: string) => mem.get(k) ?? null,
+  setItem: (k: string, v: string) => void mem.set(k, String(v)),
+  removeItem: (k: string) => void mem.delete(k),
+});
+vi.stubGlobal('window', globalThis);
+vi.stubGlobal('requestAnimationFrame', (f: () => void) => setTimeout(f, 0));
+vi.stubGlobal('cancelAnimationFrame', (h: ReturnType<typeof setTimeout>) => clearTimeout(h));
+
+type Store = {
+  refresh: (open: string[]) => Promise<{ complete: boolean }>;
+  openSession: (id: string) => Promise<void>;
+  applyEvent: (e: unknown) => void;
+  getState: () => { sessions: Record<string, SessionMeta>; pending: { permissions: PermissionRequest[] }; data: Record<string, { permissions: PermissionRequest[] }> };
+  setState: (p: Record<string, unknown>) => void;
+};
+// By a name in a variable: the root type-check does not follow it into the phone's own aliases.
+const STORE = '../mobile/src/lib/store';
+const load = async () => (await import(/* @vite-ignore */ STORE)) as Store;
+
+const meta = (id: string) => ({ id, title: id, provider: 'demo', cwd: '/x', status: 'idle', createdAt: 1, updatedAt: 1 }) as unknown as SessionMeta;
+const perm = (id: string, sessionId = 'a') => ({ id, sessionId, tool: 'Bash', title: 'Run', input: {} }) as unknown as PermissionRequest;
+const hello = (over: Record<string, unknown> = {}) => ({ sessions: [meta('a')], providers: [], projects: [], settings: {}, version: 'x', ...over });
+const tick = () => new Promise((r) => setTimeout(r, 0));
+/** A call that answers when `open()` is called. */
+function gate<T>(value: T) {
+  let open!: () => void;
+  const p = new Promise<T>((r) => (open = () => r(value)));
+  return { p, open };
+}
+
+describe("the chats' list in pages", () => {
+  it('is read to its end and merged by id', async () => {
+    const store = await load();
+    fake.conn.call = async (method, p) => {
+      if (method === 'app.hello') return hello({ sessions: [meta('a'), meta('b')], sessionsCursor: '2:c' });
+      if (method === 'phone.sessions') return p.cursor === '2:c' ? { sessions: [meta('b'), meta('c')], cursor: '4:e', total: 5 } : { sessions: [meta('e')], total: 5 };
+      throw new Error(`unexpected ${method}`);
+    };
+    expect(await store.refresh([])).toEqual({ complete: true });
+    expect(Object.keys(store.getState().sessions).sort()).toEqual(['a', 'b', 'c', 'e']);
+  });
+
+  it('not read to its end: the chats known before stay, and it says so', async () => {
+    const store = await load();
+    store.setState({ sessions: { old: meta('old'), a: meta('a') } });
+    fake.conn.call = async (method) => {
+      if (method === 'app.hello') return hello({ sessionsCursor: '1:b' });
+      if (method === 'phone.sessions') throw new Error('The connection to the desktop was lost');
+      throw new Error(`unexpected ${method}`);
+    };
+    expect(await store.refresh([])).toEqual({ complete: false });
+    expect(Object.keys(store.getState().sessions).sort()).toEqual(['a', 'old']);
+  });
+
+  it('a chat added while the next page is on its way stays', async () => {
+    const store = await load();
+    const page = gate({ sessions: [meta('b')], total: 2 });
+    fake.conn.call = async (method) => {
+      if (method === 'app.hello') return hello({ sessionsCursor: '1:b' });
+      if (method === 'phone.sessions') return page.p;
+      throw new Error(`unexpected ${method}`);
+    };
+    const done = store.refresh([]);
+    await tick();
+    store.applyEvent({ type: 'session.added', session: meta('new') });
+    page.open();
+    expect(await done).toEqual({ complete: true });
+    expect(Object.keys(store.getState().sessions).sort()).toEqual(['a', 'b', 'new']);
+  });
+});
+
+describe('what waits, in pages', () => {
+  it('one answered while the next page is on its way is not put back', async () => {
+    const store = await load();
+    const page = gate({ permissions: [perm('p2'), perm('p3')], questions: [], permissionsTotal: 3, questionsTotal: 0 });
+    fake.conn.call = async (method) => {
+      if (method === 'app.hello') return hello({ prompts: { permissions: [perm('p1')], questions: [] }, promptsCursor: '1:p2' });
+      if (method === 'phone.prompts') return page.p;
+      throw new Error(`unexpected ${method}`);
+    };
+    const done = store.refresh([]);
+    await tick();
+    await tick();
+    store.applyEvent({ type: 'permission.removed', sessionId: 'a', id: 'p2' });
+    page.open();
+    await done;
+    expect(store.getState().pending.permissions.map((p) => p.id)).toEqual(['p1', 'p3']);
+  });
+
+  it("a chat's own: its page shows at once, the rest is added, an answered one stays answered", async () => {
+    const store = await load();
+    store.setState({ sessions: { a: meta('a') } });
+    const page = gate({ permissions: [perm('p2'), perm('p3')], questions: [], permissionsTotal: 3, questionsTotal: 0 });
+    fake.conn.call = async (method) => {
+      if (method === 'phone.tail') return { session: meta('a'), items: [], total: 0, permissions: [perm('p1')], questions: [], queue: [], todos: [], promptsCursor: '1:p2' };
+      if (method === 'phone.prompts') return page.p;
+      throw new Error(`unexpected ${method}`);
+    };
+    await store.openSession('a');
+    // Shown before the rest came.
+    expect(store.getState().data.a.permissions.map((p) => p.id)).toEqual(['p1']);
+    store.applyEvent({ type: 'permission.removed', sessionId: 'a', id: 'p3' });
+    page.open();
+    await tick();
+    await tick();
+    expect(store.getState().data.a.permissions.map((p) => p.id)).toEqual(['p1', 'p2']);
+    expect(store.getState().pending.permissions.map((p) => p.id)).toContain('p2');
+    expect(store.getState().pending.permissions.map((p) => p.id)).not.toContain('p3');
+  });
+});
+
+describe('Forget while a load is on its way', () => {
+  it('applies nothing of it', async () => {
+    const store = await load();
+    store.setState({ sessions: {}, data: {}, pending: { permissions: [], questions: [] } });
+    const first = gate(hello({ sessions: [meta('secret')] }));
+    fake.conn.call = async (method) => {
+      if (method === 'app.hello') return first.p;
+      if (method === 'phone.tail') return { session: meta('secret'), items: [], total: 0, permissions: [], questions: [], queue: [], todos: [] };
+      throw new Error(`unexpected ${method}`);
+    };
+    const done = store.refresh([]);
+    const opened = store.openSession('secret');
+    // Forget moves the pairing's generation on before what was kept is erased.
+    bumpEpoch();
+    first.open();
+    expect(await done).toEqual({ complete: false });
+    await opened;
+    expect(store.getState().sessions.secret).toBeUndefined();
+    expect(store.getState().data.secret).toBeUndefined();
+  });
+});

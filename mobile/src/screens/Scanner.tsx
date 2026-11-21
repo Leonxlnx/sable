@@ -22,6 +22,7 @@ export function Scanner({ onCode, onClose, onPaste }: { onCode: (text: string) =
   useEffect(() => {
     let stream: MediaStream | undefined;
     let timer = 0;
+    let deliver = 0;
     let stopped = false;
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -41,8 +42,8 @@ export function Scanner({ onCode, onClose, onPaste }: { onCode: (text: string) =
           stopped = true;
           haptic('success');
           setFound(true);
-          // The window closes on the code, then pairing takes over.
-          window.setTimeout(() => onCode(code.data), 220);
+          // The window closes on the code, then pairing takes over (unless the camera was closed meanwhile).
+          deliver = window.setTimeout(() => onCode(code.data), 220);
           return;
         }
       }
@@ -68,6 +69,7 @@ export function Scanner({ onCode, onClose, onPaste }: { onCode: (text: string) =
     return () => {
       stopped = true;
       clearTimeout(timer);
+      clearTimeout(deliver);
       stream?.getTracks().forEach((t) => t.stop());
     };
   }, [onCode]);

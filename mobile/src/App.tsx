@@ -133,7 +133,9 @@ export function App() {
       conn.onOpen(() => {
         const open = nav.stack.filter((r) => r.name === 'chat').map((r) => (r as { id: string }).id);
         void refresh(open)
-          .then(() => {
+          .then(({ complete }) => {
+            // Only a list read to its end says a chat is gone.
+            if (!complete) return;
             nav.prune((id) => !!getState().sessions[id]);
             pruneComments((id) => !!getState().sessions[id]);
           })

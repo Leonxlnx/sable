@@ -88,6 +88,8 @@ export function Pair({
     const offer = parsePairLink(raw);
     if (!offer) {
       haptic('warning');
+      // The camera closes first, so what it read is shown, never hidden under it.
+      setScan(false);
       // An older desktop's code cannot pin its key: this app pairs only securely.
       setStep({ kind: 'error', text: isOldPairLink(raw) ? 'This code is from an older Sable. Update Sable on the computer.' : 'That is not a Sable pairing link' });
       return;
