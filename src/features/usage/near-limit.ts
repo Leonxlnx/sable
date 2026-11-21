@@ -8,6 +8,11 @@ import { windowPhrase } from './LimitReset';
  * In-app warnings as an account nears its plan limits: one toast when a window reaches 80%, a
  * stronger one when it is used up. Once per crossing: nothing repeats while the window stays
  * there, and a window that cools below 70% (or resets) can warn again. Claude Code and Codex alike.
+ *
+ * With several accounts of one agent, Sable spends them down on purpose (`shared/use-first.ts`: the
+ * one whose unused week ends soonest first, then the next at a limit), so one account nearing its
+ * limit is not news while another signed-in account of that agent still has room. An account warns
+ * only when none does.
  */
 
 const STAY_BELOW = 70;
@@ -37,11 +42,17 @@ function check() {
   for (const provider of Object.keys(s.providers) as ProviderId[]) {
     const info = s.providers[provider];
     const accounts: (AccountInfo | undefined)[] = info?.accounts?.length ? info.accounts : [undefined];
+    // The same read `useLimitLevel` uses: an empty answer does not erase what the bridge remembers.
+    const limitsOf = (account: AccountInfo | undefined) => {
+      const key = accountKey(provider, account?.id ?? DEFAULT_ACCOUNT);
+      const known = s.limitReports[key]?.limits;
+      return known?.length ? known : s.limits[key];
+    };
+    // Accounts that still have room: signed in, their limits read, none of them near.
+    const roomy = accounts.filter((a) => (a ? a.auth.loggedIn : !!info?.auth.loggedIn) && liveWindows(limitsOf(a), now).length > 0 && !limitLevel(limitsOf(a), now));
     for (const account of accounts) {
       const key = accountKey(provider, account?.id ?? DEFAULT_ACCOUNT);
-      // The same read `useLimitLevel` uses: an empty answer does not erase what the bridge remembers.
-      const known = s.limitReports[key]?.limits;
-      const limits = known?.length ? known : s.limits[key];
+      const limits = limitsOf(account);
       const windows = liveWindows(limits, now);
       const before = announced.get(key);
       const level = limitLevel(limits, now);
@@ -52,6 +63,8 @@ function check() {
       }
       // Already said this, or something worse: nothing new to tell.
       if (before && rank(before) >= rank(level)) continue;
+      // Another account of this agent takes over: said only once none has room (nothing is marked as told).
+      if (roomy.some((a) => a !== account)) continue;
       announced.set(key, level);
       const top = windows[0];
       if (top) announce(provider, info, account, top, level);

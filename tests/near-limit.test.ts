@@ -106,3 +106,29 @@ describe('limit warnings', () => {
     expect(texts()).toEqual([{ text: 'Claude Code (Work) is at 88% of the 5-hour limit', level: 'warn' }]);
   });
 });
+
+describe('limit warnings with several accounts (use first)', () => {
+  const two = (main: RateLimit[], work: RateLimit[]) =>
+    S.useStore.setState({
+      providers: {
+        claude: {
+          id: 'claude',
+          name: 'Claude Code',
+          installed: true,
+          auth: { loggedIn: true },
+          accounts: [
+            { id: 'default', provider: 'claude', label: 'Main', isDefault: true, auth: { loggedIn: true } },
+            { id: 'work', provider: 'claude', label: 'Work', isDefault: false, auth: { loggedIn: true } },
+          ],
+        },
+      } as never,
+      limits: { claude: main, 'claude:work': work },
+    });
+
+  it('stays quiet while another account of the agent has room, and warns once none has', () => {
+    two([win(30)], [win(88)]);
+    expect(texts()).toEqual([]);
+    two([win(85)], [win(100)]);
+    expect(texts().map((t) => t.text)).toEqual(['Claude Code (Main) is at 85% of the 5-hour limit', 'Claude Code (Work) has used up the 5-hour limit']);
+  });
+});
