@@ -6,7 +6,8 @@ import { resetIn } from '@/lib/format';
 import { useNow } from '@/lib/useNow';
 import { continueAtReset, spendLimitReset, switchSessionAccount } from '@/state/actions';
 import { SpareClock } from '@/features/composer/SpareStrip';
-import { useResets } from '@/features/usage/LimitReset';
+import { useResetOffers, useResets } from '@/features/usage/LimitReset';
+import { ResetInAgentAction, resetRunLine, useResetInAgent } from '@/features/usage/ResetInAgent';
 import { accountName, useLimitLevel } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { Spinner } from '@/ui';
@@ -98,6 +99,35 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
     }
   };
 
+  // A reset in the agent's own dialog (Claude Code): the person confirms in its window; Sable reads the
+  // limits again when it closes. Primary when the agent reported offers; a quiet action otherwise,
+  // since the account may have one Sable cannot see. Not offered once the account reads clear.
+  const accountId = limit.accountId ?? DEFAULT_ACCOUNT;
+  const inAgent = useResetInAgent(provider, accountId);
+  const agentOffers = useResetOffers(provider ?? 'demo', accountId);
+  const [agentError, setAgentError] = useState<string>();
+  const viaAgent = !!inAgent && !!provider && !limit.continuedWith && !resets && (inAgent.atLimit || !inAgent.known || !!inAgent.run);
+  const agentRun = viaAgent ? inAgent.run?.state : undefined;
+  const agentLine = viaAgent ? agentError || (agentRun === 'cleared' ? undefined : resetRunLine(inAgent)) : undefined;
+  const agentBusy = agentRun === 'open' || agentRun === 'reading';
+  const moveButton = offer && sid && (
+    <button
+      type="button"
+      className="btn btn-sm lim-go"
+      disabled={moving || busy}
+      onClick={() => {
+        setMoving(true);
+        void switchSessionAccount(sid, offer.id, true).finally(() => setMoving(false));
+      }}
+    >
+      {moving ? <Spinner size={12} /> : <Icon name="arrow-right" size={14} />}
+      Continue with {accountName(offer)}
+    </button>
+  );
+  const agentAction = viaAgent && inAgent.via === 'console' && (
+    <ResetInAgentAction provider={provider} accountId={accountId} state={inAgent} buttonClass={agentOffers && !agentBusy ? 'btn-primary' : 'lim-reset'} onError={setAgentError} disabled={busy} />
+  );
+
   if (canReset && ask !== 'idle' && ask !== 'done')
     return (
       <div className="lim" role="status">
@@ -119,13 +149,14 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
     );
 
   return (
-    <div className="lim" role="status" data-done={limit.continuedWith || ask === 'done' ? '' : undefined}>
+    <div className="lim" role="status" data-done={limit.continuedWith || ask === 'done' || agentRun === 'cleared' ? '' : undefined}>
       <Icon name="hourglass" size={16} className="lim-icon" />
       <div className="lim-body">
         <div className="lim-text">
           {limitTitle(limit.window)} reached on {who}
         </div>
-        {(resetNote || reset || item.detail) && <div className="lim-detail">{resetNote ?? reset ?? item.detail}</div>}
+        {(resetNote || agentLine || reset || item.detail) && <div className="lim-detail">{resetNote ?? agentLine ?? reset ?? item.detail}</div>}
+        {viaAgent && inAgent.via === 'terminal' && !agentRun && <div className="lim-detail">Run {inAgent.command} in a terminal to use a reset</div>}
       </div>
       {ask === 'done' ? (
         <span className="lim-went">
@@ -152,6 +183,18 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
             </button>
           )}
           {waitButton}
+        </span>
+      ) : agentRun === 'cleared' ? (
+        <span className="lim-went">
+          <Icon name="check" size={13} />
+          Limits cleared
+        </span>
+      ) : agentAction ? (
+        <span className="lim-ask">
+          {agentOffers && agentAction}
+          {!agentBusy && moveButton}
+          {!agentBusy && waitButton}
+          {!agentOffers && agentAction}
         </span>
       ) : limit.continuedWith ? (
         <span className="lim-went">

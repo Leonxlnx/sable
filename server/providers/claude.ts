@@ -237,6 +237,15 @@ export class ClaudeProvider implements Provider {
     return claudeEnv(this.configDir);
   }
 
+  /**
+   * Claude Code's own reset dialog: the binary the SDK runs (else `claude` on PATH) with the hidden
+   * `/limit-reset` command as its initial prompt, which an interactive session runs as if typed, and
+   * this account's config folder. Sable never runs it itself: only a console window the person sees.
+   */
+  limitResetCommand() {
+    return { bin: claudeBinary() ?? 'claude', args: ['/limit-reset'], env: this.env(), line: 'claude "/limit-reset"' };
+  }
+
   /** Runs an SDK history read against this account's config folder. */
   withHistory<T>(fn: () => Promise<T>): Promise<T> {
     return withConfigDir(this.configDir, fn);

@@ -110,6 +110,13 @@ export interface Provider {
    * the limits again. Present only for agents that report resets. `key` makes a retry idempotent.
    */
   useReset?(key: string): Promise<ResetOutcome>;
+  /**
+   * How to open this account's own agent straight into its limit reset dialog, for a console window
+   * of its own (`core/reset-console.ts`): the program, its arguments, and the environment the agent
+   * runs with for this account; `line`, the same for a person to type in a terminal. Present only for
+   * agents whose resets Sable cannot spend itself.
+   */
+  limitResetCommand?(): { bin: string; args: string[]; env: NodeJS.ProcessEnv; line: string };
   history(cwd?: string, limit?: number): Promise<HistoryEntry[]>;
   /**
    * Binds a runtime to the provider. When `rt.meta.providerSessionId` is set the

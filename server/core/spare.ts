@@ -532,6 +532,27 @@ export class SpareWaits {
     if (this.hasWaits()) this.poke(1500);
   }
 
+  /**
+   * An account's full windows cleared before their time (a reset used in the agent's own dialog,
+   * confirmed by a fresh read): chats waiting for its reset are due now. The planner then starts
+   * them exactly as at a reset by time, checking the account's limits once more first.
+   */
+  resetCleared(provider: ProviderId, accountId: string) {
+    const now = this.now();
+    let due = false;
+    for (const rt of this.waiting()) {
+      const wait = rt.meta.spare;
+      if (wait?.reason !== 'reset' || rt.meta.provider !== provider || (wait.accountId ?? DEFAULT_ACCOUNT) !== accountId) continue;
+      if (wait.at !== undefined && wait.at > now) rt.update({ spare: { ...wait, at: now } });
+      due = true;
+    }
+    if (due) {
+      // The read that confirmed it is the fresh reading a start needs.
+      this.readAt.set(`${provider}:${accountId}`, now);
+      this.poke();
+    }
+  }
+
   /** Plans again after `delay` (coalesced: the earliest asked wins). */
   poke(delay = 0) {
     if (this.disposed) return;

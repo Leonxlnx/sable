@@ -657,6 +657,10 @@ export const refreshLimits = (provider: ProviderId, accountId?: string) => bridg
 /** Plan limits read now, even when no agent process runs (it may start a short one; no tokens). For a refresh the user asked for. */
 export const readLimitsNow = (provider: ProviderId, accountId?: string) => bridge.call('provider.limits', { provider, accountId, force: true }).catch(() => []);
 /** Spends one reset credit of the account. Call only from the user's confirmed click; reuse `key` on a retry. */
+/** Opens the account's own agent in its reset dialog (a console window); the person confirms there. Progress comes as `limit.resetRun`. */
+export const resetInAgent = (provider: ProviderId, accountId: string | undefined) => bridge.call('limit.resetInAgent', { provider, accountId });
+/** Closes that window; the limits are read again all the same. */
+export const cancelResetInAgent = (provider: ProviderId, accountId: string | undefined) => bridge.call('limit.resetCancel', { provider, accountId });
 export const spendLimitReset =(provider: ProviderId, accountId: string | undefined, key: string) => bridge.call('provider.useReset', { provider, accountId, key }, 60_000);
 /** Local token usage for the last 30 days, at once; `refresh` scans the transcripts for changes (the result comes as `usage.updated`). */
 export const fetchUsage = (refresh = false) => bridge.call('usage.report', { refresh }, 120_000);

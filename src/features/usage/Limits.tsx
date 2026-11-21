@@ -10,7 +10,8 @@ import { clock, duration, exactTime, isApiKey, NUMBER_LOCALE, orderWindows, STAL
 import { LimitsOverview, LimitsTotals } from './Overview';
 import { planShort } from './plans';
 import { livePercent } from './room';
-import { LimitReset, resetTarget } from './LimitReset';
+import { fullTarget, LimitReset, resetTarget } from './LimitReset';
+import { useResetInAgent } from './ResetInAgent';
 import { useLimitsTicker } from './ticker';
 import './usage.css';
 
@@ -58,7 +59,9 @@ export const WindowLine = memo(function WindowLine({ limit, pace, now }: { limit
  */
 export function WindowList({ provider, accountId, report, limits, now, compact, head, children }: { provider: ProviderId; accountId: string; report: LimitsReport | undefined; limits: RateLimit[]; now: number; compact?: boolean; head?: ReactNode; children?: ReactNode }) {
   const ordered = useMemo(() => orderWindows(limits), [limits]);
-  const resetOn = report?.resets?.available ? resetTarget(limits, report.resets.windows) : undefined;
+  // A reset in the agent's own dialog, where it has one, goes under the window that is full.
+  const inAgent = useResetInAgent(provider, accountId);
+  const resetOn = report?.resets?.available ? resetTarget(limits, report.resets.windows) : inAgent?.atLimit || inAgent?.run ? fullTarget(limits, now) : undefined;
   return (
     <div className="ulw-list" data-compact={compact || undefined}>
       {head}

@@ -1345,6 +1345,13 @@
   margin-left: auto;
 }
 
+.ul-resets-done {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+}
+
 .ul-resets[data-compact] {
   margin-top: -6px;
   font-size: var(--t-micro);
