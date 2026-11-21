@@ -6,6 +6,7 @@ import path from 'node:path';
 import type { Duplex } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
+import { answerHello, loadIdentity, PlainLink, readSecHello, SealedLink, type Identity, type Link, type SecHello } from './phone-secure';
 import {
   PHONE_METHODS,
   PHONE_OWN_METHODS,
@@ -45,7 +46,7 @@ import { cap, isSnapshot, lines } from '../core/trim';
 import { VERSION } from '../version';
 import { PhoneChangesReader, stepIds } from './phone-changes';
 import { FRAME_MAX, grantFor, openGrant, phoneAttachments, readHello, type FileGrant } from './phone-guard';
-import { qrSvgPath } from './qr';
+import { qrMatrix, qrSvgPath } from './qr';
 import { searchOf, type ChatSearch } from './search';
 import { pictureOf } from './thumbs';
 
@@ -61,6 +62,11 @@ export { SEARCH } from './search';
  * - Pairing: a one-time key (QR code / link, valid 10 minutes, used up by the first phone that
  *   presents it), then "Allow <phone>?" on the desktop. An allowed phone gets a 256-bit token,
  *   stored here only as a SHA-256 hash; Settings › Phone revokes it.
+ * - The secure channel (phone-secure.ts): the link carries the desktop's identity key fingerprint;
+ *   the phone checks the desktop's signed handshake against it, and every frame after it is sealed
+ *   (AES-GCM, keys bound to the pairing key or the token, sequence-numbered). Pairing happens only
+ *   that way; a phone paired before it keeps its plain connection until it pairs again, and a phone
+ *   paired securely never connects plain.
  * - Every socket authenticates first (`hello` with the token) within a few seconds; wrong keys and
  *   tokens are counted per address and block it for a while; there is a cap on sockets.
  * - Authenticated sockets may call only `PHONE_METHODS`, with their parameters narrowed; they get
@@ -82,6 +88,8 @@ interface StoredPhone {
   tokenHash: string;
   pairedAt: number;
   lastSeen?: number;
+  /** Paired over the secure channel: it may connect only that way (phone-secure.ts). */
+  secure?: true;
 }
 
 interface PhoneFile {
@@ -96,6 +104,8 @@ export interface PhoneOptions {
   host?: string;
   /** Where the paired phones are kept (defaults to `<SABLE_HOME>/phone.json`). */
   file?: string;
+  /** The desktop's identity key for the secure channel (defaults to `phone-identity.pem` beside `file`). */
+  identity?: string;
 }
 
 const PAIR_TTL_MS = 10 * 60_000;
@@ -107,6 +117,8 @@ const BLOCK_MS = 15 * 60_000;
 const GLOBAL_FAILS_PER_MIN = 30;
 const MAX_SOCKETS = 12;
 const MAX_HELLO_BYTES = 4096;
+/** How soon a failed write of the paired phones is tried again. */
+const SAVE_RETRY_MS = 3000;
 /** A phone that falls this far behind (bytes queued) is dropped; it reconnects and reloads. */
 const MAX_BUFFERED = 24 * 1024 * 1024;
 
@@ -288,12 +300,14 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
   }
 }
 
-/** A patch to an item, trimmed like the item (no output, input or images; long text cut). */
+/** A patch to an item, trimmed like the item (no output, input, images or the record of what a share handed over; long text cut). */
 export function phonePatch(patch: Partial<TimelineItem>): Partial<PhoneItem> | null {
   const p = { ...patch } as Record<string, unknown>;
   delete p.input;
   delete p.inputText;
   delete p.output;
+  // What a share handed over (real paths, file ids, grants) stays on the desktop, as in a page.
+  delete p.handed;
   if (p.detail) p.detail = trimDetail(p.detail as ToolDetail, LIMITS.field);
   if (p.result) p.result = trimResult(p.result as ToolResult);
   if (p.workflow) p.workflow = trimWorkflow(p.workflow as WorkflowRun);
@@ -391,7 +405,7 @@ export function phoneAllowed(req: PermissionRequest | undefined, optionId: unkno
   if (o.tone !== 'deny' && phonePermission(req).incomplete) throw new Error('This request is longer than the phone shows. Answer it on the desktop.');
 }
 
-/** Questions and options a phone gets, and how long their words may be. */
+/** Questions and options a phone gets, and how long their words may be (also `incomplete` when two questions read the same). */
 const ASK_Q = { questions: 12, options: 24, question: FULL.field, header: 200, label: 300, description: LIMITS.field, other: 4000 };
 
 /**
@@ -400,7 +414,10 @@ const ASK_Q = { questions: 12, options: 24, question: FULL.field, header: 200, l
  * question). `incomplete` when questions or options were left out: only the desktop answers those.
  */
 export function phoneQuestion(q: QuestionRequest): PhoneQuestionRequest {
-  const incomplete = q.questions.length > ASK_Q.questions || q.questions.some((x) => x.options.length > ASK_Q.options);
+  // Two questions in the same words would come back as one answer (the agent's answers are keyed by
+  // a question's words): only the desktop answers those.
+  const twice = new Set(q.questions.map((x) => x.question)).size !== q.questions.length;
+  const incomplete = twice || q.questions.length > ASK_Q.questions || q.questions.some((x) => x.options.length > ASK_Q.options);
   const out: PhoneQuestionRequest = {
     ...q,
     questions: q.questions.slice(0, ASK_Q.questions).map((x, i): PhoneQuestion => {
@@ -538,19 +555,85 @@ export function phonePage(items: TimelineItem[], opts: { before?: string; limit?
   return { items: out, ...(start > 0 ? { cursor: roots[start].id } : {}), total };
 }
 
-const trimQueue = (q: QueuedMessage[]) => q.map((m) => (m.attachments ? { ...m, attachments: trimAttachments(m.attachments) } : m)) as QueuedMessage[];
+/**
+ * A bounded page of root items `around` one (a search hit far back: some before it, some after,
+ * whole turns), or the page that starts `after` at one, toward the newest. `cursor` is the page
+ * before (as `phonePage`'s), `next` the first root after it when it stops before the newest. Throws
+ * when the item is not a root of this conversation (rewound, or another chat's).
+ */
+export function phoneWindow(items: TimelineItem[], opts: { around?: string; after?: string; limit?: number; budget?: number }): { items: PhoneItem[]; cursor?: string; next?: string; total: number } {
+  const roots: TimelineItem[] = [];
+  const kids = new Map<string, number>();
+  for (const it of items) {
+    if (it.parentId) kids.set(it.parentId, (kids.get(it.parentId) ?? 0) + 1);
+    else roots.push(it);
+  }
+  const total = roots.length;
+  const id = opts.around ?? opts.after;
+  const at = id ? roots.findIndex((r) => r.id === id) : -1;
+  if (at < 0) throw new Error('That message is no longer in this chat.');
+  const limit = Math.max(1, Math.min(PAGE_MAX, opts.limit ?? (opts.around ? PAGE_ITEMS * 1.5 : PAGE_ITEMS)));
+  const budget = opts.budget ?? PAGE_BYTES;
+  const roleAt = (i: number): 'answer' | 'step' => {
+    if (roots[i].type !== 'text') return 'answer';
+    for (let j = i + 1; j < total; j++) {
+      const t = roots[j];
+      if (turnStart(t) || t.type === 'turn') return 'answer';
+      if (t.type === 'tool' || t.type === 'thinking') return 'step';
+    }
+    return 'answer';
+  };
+  const made = new Map<number, PhoneItem>();
+  let bytes = 0;
+  const take = (i: number) => {
+    const p = phoneItem(roots[i], { role: roleAt(i), kids: kids.get(roots[i].id) });
+    made.set(i, p);
+    bytes += JSON.stringify(p).length;
+  };
+  let s = at;
+  let e = at + 1;
+  take(at);
+  if (opts.around) {
+    // One back, one forward, while it fits (the item about a third down the page, as it shows).
+    for (let n = 0; e - s < limit && bytes < budget && (s > 0 || e < total); n++) {
+      if ((n % 3 !== 2 && s > 0) || e >= total) take(--s);
+      else take(e++);
+    }
+    // Back to the message that opened its first turn when that is near (a turn is not split).
+    if (s > 0 && !turnStart(roots[s])) {
+      let k = s - 1;
+      while (k > 0 && s - k < TURN_REACH && !turnStart(roots[k])) k--;
+      if (turnStart(roots[k])) while (s > k && bytes < budget * 1.6) take(--s);
+    }
+  } else {
+    while (e < total && e - s < limit && (bytes < budget || e - s < 4)) take(e++);
+  }
+  // On to the end of its last turn, within reach (the next page goes on from `next` otherwise).
+  while (e < total && !turnStart(roots[e]) && roots[e - 1].type !== 'turn' && bytes < budget * 1.6) take(e++);
+  const out: PhoneItem[] = [];
+  for (let i = s; i < e; i++) out.push(made.get(i)!);
+  return { items: out, ...(s > 0 ? { cursor: roots[s].id } : {}), ...(e < total ? { next: roots[e].id } : {}), total };
+}
 
-/** A snapshot as a phone gets it: the newest page instead of every item. */
-export function phoneTail(snap: SessionSnapshot, opts: { before?: string; limit?: number; to?: string } = {}): PhoneTail {
-  const page = phonePage(snap.items, opts);
+/** A queued message's words as a phone shows them (one line; `queue.take` gives the whole message). */
+const QUEUE_TEXT = LIMITS.answer;
+const trimQueue = (q: QueuedMessage[]) =>
+  q.map((m) => ({ ...m, ...(m.attachments ? { attachments: trimAttachments(m.attachments) } : {}), ...(m.text.length > QUEUE_TEXT ? { text: m.text.slice(0, QUEUE_TEXT), cut: true } : {}) })) as QueuedMessage[];
+
+/** A snapshot as a phone gets it: the newest page instead of every item (or a page `around` / `after` an item). */
+export function phoneTail(snap: SessionSnapshot, opts: { before?: string; limit?: number; to?: string; around?: string; after?: string } = {}): PhoneTail {
+  const page: { items: PhoneItem[]; cursor?: string; next?: string; total: number } = opts.around || opts.after ? phoneWindow(snap.items, opts) : phonePage(snap.items, opts);
   return {
     ...snap,
     queue: trimQueue(snap.queue ?? []),
     permissions: (snap.permissions ?? []).map(phonePermission),
     questions: (snap.questions ?? []).map(phoneQuestion),
+    todos: (snap.todos ?? []).slice(0, 100).map((t) => ({ ...t, content: cap(t.content, LIMITS.field) })),
     items: page.items,
     total: page.total,
     ...(page.cursor ? { cursor: page.cursor } : {}),
+    ...(page.next ? { next: page.next } : {}),
+    ...(opts.around ? { at: opts.around } : {}),
   };
 }
 
@@ -566,8 +649,9 @@ export function phoneResult(method: string, result: unknown): unknown {
     return r.prompts ? { ...r, prompts: { permissions: r.prompts.permissions.map(phonePermission), questions: r.prompts.questions.map(phoneQuestion) } } : r;
   }
   if (method === 'queue.take') {
+    // Its words whole (the phone edits them); its pictures without their data.
     const r = result as { message?: QueuedMessage };
-    return r.message ? { ...r, message: trimQueue([r.message])[0] } : r;
+    return r.message ? { ...r, message: { ...r.message, ...(r.message.attachments ? { attachments: trimAttachments(r.message.attachments) } : {}) } } : r;
   }
   return result;
 }
@@ -629,6 +713,32 @@ function sameSecret(a: string, b: string): boolean {
   const x = Buffer.from(sha256(a), 'hex');
   const y = Buffer.from(sha256(b), 'hex');
   return timingSafeEqual(x, y);
+}
+
+/** Two token hashes (hex) compared in constant time. */
+const sameHash = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
+
+const IDENTITY_ERROR = 'Sable could not read its phone key. Phones cannot pair until it can.';
+
+/**
+ * The pairing link: `sable://pair?h=<addresses>&p=<port>&k=<one-time key>&f=<the desktop's key
+ * fingerprint>&n=<its name>`, short enough for the QR code (the name, then addresses, give way).
+ */
+export function pairLink(hosts: string[], port: number, key: string, fingerprint: string, name: string): string {
+  const make = (h: string[], n: string) => `sable://pair?h=${h.join(',')}&p=${port}&k=${key}&f=${fingerprint}${n ? `&n=${encodeURIComponent(n)}` : ''}`;
+  const fits = (s: string) => {
+    try {
+      qrMatrix(s);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (let n = Math.max(1, hosts.length); n >= 1; n--) {
+    const h = hosts.slice(0, n);
+    for (const nm of [name.slice(0, 30), name.slice(0, 12), '']) if (fits(make(h, nm))) return make(h, nm);
+  }
+  return make(hosts.slice(0, 1), '');
 }
 
 /** A phone's name as shown on the desktop: printable, short. */
@@ -738,17 +848,23 @@ export class PhoneService {
   private port: number;
   private host: string;
   private pairing?: { key: string; expiresAt: number; link: string; qr: string; size: number };
-  private request?: { id: string; name: string; address: string; at: number; ws: WebSocket; timer: NodeJS.Timeout };
+  /** A phone that presented the pairing key and waits for "Allow"; `replaces`: the pairing it had before. */
+  private request?: { id: string; name: string; address: string; at: number; link: Link; socket: WebSocket; timer: NodeJS.Timeout; replaces?: { id: string; token: string } };
   private fails = new Map<string, { count: number; first: number; blockedUntil?: number }>();
   private globalFails: number[] = [];
-  /** Authenticated sockets per device id. */
-  private live = new Map<string, Set<WebSocket>>();
+  /** Authenticated connections per device id. */
+  private live = new Map<string, Set<Link>>();
   private saveTimer?: NodeJS.Timeout;
+  /** The paired phones could not be written (the change holds in memory; tried again). */
+  private saveError?: string;
   private starting?: Promise<void>;
   /** A chat's changes and diffs, read-only (`phone.changes`, `phone.diff`). */
   private changes: PhoneChangesReader;
   /** Messages across chats (`phone.search`). */
   private finder: ChatSearch;
+  /** The desktop's identity for the secure channel (phone-secure.ts), read or made when first needed. */
+  private identityFile: string;
+  private ident?: Identity;
 
   constructor(
     private app: App,
@@ -757,6 +873,7 @@ export class PhoneService {
     this.changes = new PhoneChangesReader((sessionId) => this.app.call('session.snapshot', { sessionId }));
     this.finder = searchOf(app);
     this.file = opts.file ?? path.join(app.store.dir, 'phone.json');
+    this.identityFile = opts.identity ?? path.join(path.dirname(this.file), 'phone-identity.pem');
     this.port = opts.port ?? PHONE_PORT;
     this.host = opts.host ?? process.env.SABLE_PHONE_HOST ?? '0.0.0.0';
     this.data = this.read();
@@ -766,36 +883,62 @@ export class PhoneService {
     return this.data.enabled;
   }
 
+  /** The identity key, read (or made) once; throws when its file is there but cannot be read. */
+  identity(): Identity {
+    return (this.ident ??= loadIdentity(this.identityFile, (...a) => this.app.log(...a)));
+  }
+
   private read(): PhoneFile {
     try {
       const raw = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<PhoneFile>;
-      const devices = Array.isArray(raw.devices) ? raw.devices.filter((d) => d && typeof d.id === 'string' && typeof d.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(d.tokenHash)) : [];
+      const devices = Array.isArray(raw.devices)
+        ? raw.devices
+            .filter((d) => d && typeof d.id === 'string' && typeof d.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(d.tokenHash))
+            .map((d) => ({ id: d.id, name: String(d.name ?? 'Phone'), tokenHash: d.tokenHash, pairedAt: Number(d.pairedAt) || 0, ...(typeof d.lastSeen === 'number' ? { lastSeen: d.lastSeen } : {}), ...(d.secure === true ? { secure: true as const } : {}) }))
+        : [];
       return { enabled: !!raw.enabled, devices };
     } catch {
       return { enabled: false, devices: [] };
     }
   }
 
-  private save(now = false) {
+  /**
+   * Writes the paired phones (at once, or in a moment for a last-seen time). A write that fails (a
+   * locked file on Windows) leaves the change in effect in memory, says so in Settings › Phone
+   * (`saveError`) and is tried again until it goes through. Returns whether it was written now.
+   */
+  private save(now = false): boolean {
     clearTimeout(this.saveTimer);
-    const write = () => {
+    const write = (): boolean => {
       try {
         mkdirSync(path.dirname(this.file), { recursive: true });
         const tmp = `${this.file}.tmp`;
         writeFileSync(tmp, JSON.stringify(this.data, null, 2));
         renameSync(tmp, this.file);
+        if (this.saveError) {
+          this.saveError = undefined;
+          this.changed();
+        }
+        return true;
       } catch (err) {
         this.app.log('phone: could not save', (err as Error).message);
+        const was = this.saveError;
+        this.saveError = 'Could not save the paired phones. Sable tries again; until then, a restart would undo this change.';
+        if (!was) this.changed();
+        this.saveTimer = setTimeout(() => this.save(true), SAVE_RETRY_MS);
+        this.saveTimer.unref?.();
+        return false;
       }
     };
-    if (now) write();
-    else this.saveTimer = setTimeout(write, 2000);
+    if (now) return write();
+    this.saveTimer = setTimeout(write, 2000);
+    return true;
   }
 
   status(): PhoneStatus {
     if (this.pairing && this.pairing.expiresAt < Date.now()) this.pairing = undefined;
     const devices: PhoneDevice[] = this.data.devices
-      .map((d) => ({ id: d.id, name: d.name, pairedAt: d.pairedAt, lastSeen: d.lastSeen, ...(this.live.get(d.id)?.size ? { online: true } : {}) }))
+      .map((d) => ({ id: d.id, name: d.name, pairedAt: d.pairedAt, lastSeen: d.lastSeen, ...(this.live.get(d.id)?.size ? { online: true } : {}), ...(d.secure ? { secure: true } : {}) }))
       .sort((a, b) => (b.lastSeen ?? b.pairedAt) - (a.lastSeen ?? a.pairedAt));
     return {
       enabled: this.data.enabled,
@@ -807,6 +950,7 @@ export class PhoneService {
       ...(this.pairing ? { pairing: { link: this.pairing.link, expiresAt: this.pairing.expiresAt, qr: this.pairing.qr, size: this.pairing.size } } : {}),
       ...(this.request ? { request: { id: this.request.id, name: this.request.name, address: this.request.address, at: this.request.at } } : {}),
       ...(this.error ? { error: this.error } : {}),
+      ...(this.saveError ? { saveError: this.saveError } : {}),
     };
   }
 
@@ -889,11 +1033,18 @@ export class PhoneService {
   pair(cancel?: boolean) {
     if (cancel) this.pairing = undefined;
     else {
-      const key = randomBytes(16).toString('base64url');
-      const hosts = lanAddresses();
-      const link = `sable://pair?h=${hosts.join(',')}&p=${this.port}&k=${key}&n=${encodeURIComponent(os.hostname().slice(0, 30))}`;
-      const { path: qr, size } = qrSvgPath(link);
-      this.pairing = { key, expiresAt: Date.now() + PAIR_TTL_MS, link, qr, size };
+      try {
+        const key = randomBytes(16).toString('base64url');
+        // The link carries the desktop's identity (its key's fingerprint): the phone trusts no other.
+        const link = pairLink(lanAddresses(), this.port, key, this.identity().fingerprint, os.hostname());
+        const { path: qr, size } = qrSvgPath(link);
+        this.pairing = { key, expiresAt: Date.now() + PAIR_TTL_MS, link, qr, size };
+        if (this.error === IDENTITY_ERROR) this.error = undefined;
+      } catch (err) {
+        this.pairing = undefined;
+        this.app.log('phone: no pairing code', (err as Error).message);
+        this.error = IDENTITY_ERROR;
+      }
     }
     this.changed();
     return this.status();
@@ -905,32 +1056,44 @@ export class PhoneService {
     clearTimeout(r.timer);
     this.request = undefined;
     if (!allow) {
-      this.sendFrame(r.ws, { denied: 'The desktop did not allow this phone' });
-      r.ws.close(4003, 'denied');
-    } else if (r.ws.readyState === r.ws.OPEN) {
+      this.sendFrame(r.link, { denied: 'The desktop did not allow this phone' });
+      r.link.close(4003, 'denied');
+    } else if (r.link.open) {
       const token = randomBytes(32).toString('base64url');
-      const device: StoredPhone = { id: randomUUID(), name: r.name, tokenHash: sha256(token), pairedAt: Date.now(), lastSeen: Date.now() };
+      // Pairing happens only over the secure channel now: this phone connects only that way.
+      const device: StoredPhone = { id: randomUUID(), name: r.name, tokenHash: sha256(token), pairedAt: Date.now(), lastSeen: Date.now(), secure: true };
+      // The pairing this phone had before goes (it named it, with its token): one entry per phone.
+      const old = r.replaces ? this.data.devices.find((d) => d.id === r.replaces!.id && sameHash(d.tokenHash, sha256(r.replaces!.token))) : undefined;
+      if (old) this.dropDevice(old.id, false);
       this.data.devices.push(device);
       this.save(true);
-      this.sendFrame(r.ws, { paired: { token, deviceId: device.id, desktop: os.hostname() } });
-      this.authenticated(r.ws, device);
+      this.sendFrame(r.link, { paired: { token, deviceId: device.id, desktop: os.hostname() } });
+      this.authenticated(r.link, device);
     }
     this.changed();
     return this.status();
   }
 
+  /**
+   * Removes a phone: at once in memory (its token no longer works, its connections close, its links
+   * and downloads end), then on disk; a write that fails says so (`saveError`) and is tried again.
+   */
   revoke(deviceId: string) {
-    this.data.devices = this.data.devices.filter((d) => d.id !== deviceId);
+    this.dropDevice(deviceId, true);
     this.save(true);
-    // Its download links go with it.
-    this.dropLinks(deviceId);
-    for (const ws of this.live.get(deviceId) ?? []) {
-      this.sendFrame(ws, { denied: 'This phone was removed on the desktop' });
-      ws.close(4001, 'revoked');
-    }
-    this.live.delete(deviceId);
     this.changed();
     return this.status();
+  }
+
+  private dropDevice(deviceId: string, tell: boolean) {
+    this.data.devices = this.data.devices.filter((d) => d.id !== deviceId);
+    // Its download links go with it.
+    this.dropLinks(deviceId);
+    for (const link of this.live.get(deviceId) ?? []) {
+      if (tell) this.sendFrame(link, { denied: 'This phone was removed on the desktop' });
+      link.close(4001, 'revoked');
+    }
+    this.live.delete(deviceId);
   }
 
   private endRequest(reason: string) {
@@ -938,8 +1101,8 @@ export class PhoneService {
     if (!r) return;
     clearTimeout(r.timer);
     this.request = undefined;
-    this.sendFrame(r.ws, { denied: reason });
-    r.ws.close(4003, 'denied');
+    this.sendFrame(r.link, { denied: reason });
+    r.link.close(4003, 'denied');
   }
 
   // ── rate limits ──
@@ -972,15 +1135,51 @@ export class PhoneService {
    */
   private files = new Map<string, FileGrant>();
 
-  private async fileLink(deviceId: string, sessionId: string, itemId: string, index: number): Promise<{ path: string; name: string; size?: number }> {
+  private async fileLink(deviceId: string, sessionId: string, itemId: string, index: number): Promise<{ path: string; name: string; size?: number; sha256?: string }> {
     const snap = await this.app.call('session.snapshot', { sessionId });
     const grant = grantFor(snap, itemId, index, deviceId);
+    // What the phone checks the bytes against (they come over plain HTTP; this over the channel).
+    const sha256 = await this.digestOf(grant);
+    // A share that recorded what it handed over by content: the file must still be those bytes.
+    const share = snap.items.find((i) => i.id === itemId) as ToolItem | undefined;
+    const handed = (share?.handed?.[index] as { sha256?: unknown } | undefined)?.sha256;
+    if (typeof handed === 'string' && handed.toLowerCase() !== sha256) throw new Error('That file changed after it was shared.');
     const now = Date.now();
     for (const [t, f] of this.files) if (f.expires < now) this.files.delete(t);
     while (this.files.size >= 50) this.files.delete(this.files.keys().next().value as string);
     const token = randomBytes(24).toString('base64url');
     this.files.set(token, grant);
-    return { path: `/f/${token}/${encodeURIComponent(grant.name)}`, name: grant.name, size: grant.size };
+    return { path: `/f/${token}/${encodeURIComponent(grant.name)}`, name: grant.name, size: grant.size, sha256 };
+  }
+
+  /** SHA-256 (hex) of a grant's file, read through a handle checked against the grant; kept per file identity. */
+  private digests = new Map<string, Promise<string>>();
+  private digestOf(g: FileGrant): Promise<string> {
+    const key = [g.path, g.size, g.mtimeMs, g.fileId ?? g.ino, g.dev ?? ''].join('\u0000');
+    const have = this.digests.get(key);
+    if (have) return have;
+    const p = (async () => {
+      const opened = await openGrant(g);
+      if ('code' in opened) throw new Error(opened.code === 409 ? 'That file changed after it was shared.' : 'That file is no longer on the computer.');
+      try {
+        const h = createHash('sha256');
+        let read = 0;
+        if (g.size > 0) {
+          for await (const chunk of opened.fh.createReadStream({ start: 0, end: g.size - 1, autoClose: false })) {
+            h.update(chunk as Buffer);
+            read += (chunk as Buffer).length;
+          }
+        }
+        if (read !== g.size) throw new Error('That file changed after it was shared.');
+        return h.digest('hex');
+      } finally {
+        await opened.fh.close().catch(() => {});
+      }
+    })();
+    this.digests.set(key, p);
+    p.catch(() => this.digests.delete(key));
+    while (this.digests.size > 64) this.digests.delete(this.digests.keys().next().value as string);
+    return p;
   }
 
   /** Downloads under way, per phone: each one's abort (it ends the transfer and closes the file). */
@@ -1111,10 +1310,10 @@ export class PhoneService {
    * too big for it goes as an error; an event too big goes as its conversation's newest page (an item
    * event) or else as `phone.stale`, which makes the phone fetch the current state.
    */
-  private sendFrame(ws: WebSocket, frame: PhoneFrame | ServerFrame, sent?: (err?: Error) => void) {
-    if (ws.readyState !== ws.OPEN) return void sent?.(new Error('closed'));
-    if (ws.bufferedAmount > MAX_BUFFERED) {
-      ws.terminate();
+  private sendFrame(link: Link, frame: PhoneFrame | ServerFrame, sent?: (err?: Error) => void) {
+    if (!link.open) return void sent?.(new Error('closed'));
+    if (link.buffered > MAX_BUFFERED) {
+      link.terminate();
       return void sent?.(new Error('behind'));
     }
     let json = JSON.stringify(frame);
@@ -1131,41 +1330,38 @@ export class PhoneService {
     } else if (typeof f.id === 'number' && overBytes(json, FRAME_MAX.result)) {
       json = JSON.stringify({ id: f.id, ok: false, error: 'That is too big to send to the phone.' });
     }
-    ws.send(json, sent);
+    link.send(json, sent);
   }
 
   /** The reply as it would go to this phone, or why it cannot go now (closed, behind, over its budget). */
-  private deliverable(ws: WebSocket, frame: ServerFrame): string | null {
-    if (ws.readyState !== ws.OPEN || ws.bufferedAmount > MAX_BUFFERED) return null;
+  private deliverable(link: Link, frame: ServerFrame): string | null {
+    if (!link.open || link.buffered > MAX_BUFFERED) return null;
     const json = JSON.stringify(frame);
     return overBytes(json, FRAME_MAX.result) ? null : json;
   }
 
   /**
-   * `queue.take` from the phone: the message leaves the queue only once its reply can go to this
-   * phone (the socket open and keeping up, the reply within its budget); one that cannot is left
-   * where it is, and one whose send fails after all goes back to the front of the queue.
+   * `queue.take` from the phone. The message is reserved, not removed, while its reply goes: the
+   * reply goes first (refused when it cannot go: closed, behind, over its budget), and only once it
+   * went out is the message taken from the queue, by the bridge's own `queue.take` (so a Spare wait
+   * ends as it does for a take on the desktop). A reply that fails leaves the message, its place and
+   * its scheduling exactly as they were.
    */
-  private async takeQueued(ws: WebSocket, id: number, params: Record<string, unknown>) {
+  private async takeQueued(link: Link, id: number, params: Record<string, unknown>) {
     const sessionId = String(params.sessionId ?? '');
     const qid = String(params.id ?? '');
+    const tooBig = 'That message is too big to take back to the phone. Edit it on the desktop.';
+    // Loads the chat when the desktop has not yet (as the bridge's own take would).
+    await this.app.call('session.snapshot', { sessionId });
     const rt = this.app.sessions.get(sessionId);
     const held = rt?.queue.find((q) => q.id === qid);
-    if (held && !this.deliverable(ws, { id, ok: true, result: phoneResult('queue.take', { message: held }) })) {
-      return this.sendFrame(ws, { id, ok: false, error: 'That message is too big to take back to the phone. Edit it on the desktop.' });
-    }
-    const result = (await this.app.call('queue.take', { sessionId, id: qid })) as { message?: QueuedMessage };
-    const frame: ServerFrame = { id, ok: true, result: phoneResult('queue.take', result) };
-    const json = this.deliverable(ws, frame);
-    const back = () => {
-      if (result.message) this.app.sessions.get(sessionId)?.requeue([result.message]);
-    };
-    if (!json) {
-      back();
-      return this.sendFrame(ws, { id, ok: false, error: 'That message is too big to take back to the phone. Edit it on the desktop.' });
-    }
-    ws.send(json, (err) => {
-      if (err) back();
+    if (!rt || !held) return this.sendFrame(link, { id, ok: true, result: {} });
+    const json = this.deliverable(link, { id, ok: true, result: phoneResult('queue.take', { message: held }) });
+    if (!json) return this.sendFrame(link, { id, ok: false, error: tooBig });
+    link.send(json, (err) => {
+      if (err) return;
+      // Taken only if it is still the message the phone got (an edit on the desktop meanwhile keeps it there).
+      if (rt.queue.find((q) => q.id === qid) === held) void this.app.call('queue.take', { sessionId, id: qid }).catch(() => {});
     });
   }
 
@@ -1178,82 +1374,34 @@ export class PhoneService {
 
   private onSocket(ws: WebSocket, req: IncomingMessage) {
     const ip = req.socket.remoteAddress ?? '?';
-    let state: 'hello' | 'waiting' | 'open' = 'hello';
+    // Until the phone is in (or waits for "Allow"), a few seconds; then the socket closes.
+    const gate = { admitted: false };
     const helloTimer = setTimeout(() => {
-      if (state === 'hello') ws.close(4000, 'timeout');
+      if (!gate.admitted) ws.close(4000, 'timeout');
     }, HELLO_TIMEOUT_MS);
-
-    const hello = (raw: RawData) => {
-      if (state !== 'hello') return;
+    const first = (raw: RawData, binary: boolean) => {
+      if (binary) return ws.close(4000, 'bad hello');
       const text = raw.toString();
       if (text.length > MAX_HELLO_BYTES) return ws.close(1009, 'too big');
-      // Its shape first (an object with a token or a key): anything else closes this socket and nothing more.
+      // Its shape first: the secure channel's hello, or (a phone paired before it) a token or a key; anything else closes this socket and nothing more.
+      const sec = readSecHello(text);
+      if (sec) return this.secureStart(ws, ip, sec, gate, helloTimer);
       const msg: PhoneHello | null = readHello(text);
       if (!msg) return ws.close(4000, 'bad hello');
-      if ('hello' in msg) {
-        const hash = sha256(msg.hello.token);
-        const device = this.data.devices.find((d) => timingSafeEqual(Buffer.from(d.tokenHash, 'hex'), Buffer.from(hash, 'hex')));
-        if (!device) {
-          this.failed(ip);
-          this.sendFrame(ws, { denied: 'This phone is not paired with this computer' });
-          return ws.close(4001, 'unknown token');
-        }
-        this.fails.delete(ip);
-        clearTimeout(helloTimer);
-        ws.off('message', onHello);
-        state = 'open';
-        this.authenticated(ws, device);
-        return;
-      }
-      if ('pair' in msg && msg.pair && typeof msg.pair.key === 'string') {
-        const p = this.pairing;
-        if (!p || p.expiresAt < Date.now() || !sameSecret(msg.pair.key, p.key)) {
-          this.failed(ip);
-          this.sendFrame(ws, { denied: p ? 'This pairing code is not valid. Show a new one on the desktop.' : 'Pairing is not open. Show the code in Settings › Phone.' });
-          return ws.close(4002, 'bad key');
-        }
-        // One phone per key; a second request replaces nothing while one waits.
-        if (this.request) {
-          this.sendFrame(ws, { denied: 'Another phone is pairing. Try again in a moment.' });
-          return ws.close(4003, 'busy');
-        }
-        this.pairing = undefined;
-        clearTimeout(helloTimer);
-        state = 'waiting';
-        const id = randomUUID();
-        this.request = {
-          id,
-          name: cleanName(msg.pair.name),
-          address: ip.replace(/^::ffff:/, ''),
-          at: Date.now(),
-          ws,
-          timer: setTimeout(() => {
-            if (this.request?.id === id) {
-              this.endRequest('Nobody answered on the desktop');
-              this.changed();
-            }
-          }, REQUEST_TTL_MS),
-        };
-        this.sendFrame(ws, { waiting: true });
-        ws.off('message', onHello);
-        this.changed();
-        return;
-      }
-      ws.close(4000, 'bad hello');
+      this.admit(new PlainLink(ws), ip, msg, null, gate, helloTimer);
     };
     // Nothing thrown while a first frame is read leaves this listener: only this socket closes.
-    const onHello = (raw: RawData) => {
+    ws.once('message', (raw, binary) => {
       try {
-        hello(raw);
+        first(raw, binary);
       } catch (err) {
         this.app.log('phone: a first frame failed', (err as Error).message);
         ws.close(4000, 'bad hello');
       }
-    };
-    ws.on('message', onHello);
+    });
     ws.on('close', () => {
       clearTimeout(helloTimer);
-      if (this.request?.ws === ws) {
+      if (this.request?.socket === ws) {
         clearTimeout(this.request.timer);
         this.request = undefined;
         this.changed();
@@ -1262,15 +1410,135 @@ export class PhoneService {
     ws.on('error', () => ws.terminate());
   }
 
-  /** From here on the socket is a narrowed bridge connection for `device`. */
-  private authenticated(ws: WebSocket, device: StoredPhone) {
+  /**
+   * The secure channel's handshake (phone-secure.ts): the pairing secret it is bound to is the open
+   * pairing code's key (`pair`) or the named device's token hash (`hello`). An unknown device, or no
+   * pairing open, gets a signed refusal. Then the first sealed frame is the phone's own hello or pair,
+   * which must agree with what the handshake was for; one that does not open counts as a failure.
+   */
+  private secureStart(ws: WebSocket, ip: string, sec: SecHello, gate: { admitted: boolean }, helloTimer: NodeJS.Timeout) {
+    let identity: Identity;
+    try {
+      identity = this.identity();
+    } catch (err) {
+      this.app.log('phone:', (err as Error).message);
+      return ws.close(1011, 'no identity');
+    }
+    const refuse = (text: string, code: number) => {
+      ws.send(answerHello(identity, sec, null, text).reply);
+      ws.close(code, 'denied');
+    };
+    let psk: Buffer;
+    let pairKey: string | undefined;
+    if (sec.kind === 'hello') {
+      const device = this.data.devices.find((d) => d.id === sec.id);
+      if (!device) {
+        this.failed(ip);
+        return refuse('This phone is not paired with this computer', 4001);
+      }
+      psk = Buffer.from(device.tokenHash, 'hex');
+    } else {
+      const p = this.pairing;
+      if (!p || p.expiresAt < Date.now()) {
+        this.failed(ip);
+        return refuse(p ? 'This pairing code is not valid. Show a new one on the desktop.' : 'Pairing is not open. Show the code in Settings › Phone.', 4002);
+      }
+      psk = Buffer.from(p.key, 'utf8');
+      pairKey = p.key;
+    }
+    const answer = answerHello(identity, sec, psk);
+    if (!answer.keys) return ws.close(4000, 'bad hello');
+    ws.send(answer.reply);
+    const link = new SealedLink(ws, answer.keys, {
+      z: sec.z,
+      onBroken: (why) => {
+        this.failed(ip);
+        this.app.log(`phone: closed a secure connection from ${ip}: ${why}`);
+      },
+    });
+    const off = link.onMessage((text) => {
+      off();
+      try {
+        const msg = text.length <= MAX_HELLO_BYTES ? readHello(text) : null;
+        if (!msg) return link.close(4000, 'bad hello');
+        this.admit(link, ip, msg, { kind: sec.kind, deviceId: sec.id, pairKey, socket: ws }, gate, helloTimer);
+      } catch (err) {
+        this.app.log('phone: a first frame failed', (err as Error).message);
+        link.close(4000, 'bad hello');
+      }
+    });
+  }
+
+  /**
+   * A phone's hello or pair, over a plain link (paired before the secure channel) or inside one.
+   * Plain: a token of a phone paired then still works; a phone paired securely never connects plain,
+   * and pairing anew plain is refused (the app is too old). Sealed: it must be what the handshake was
+   * for (the same device, the same pairing key).
+   */
+  private admit(link: Link, ip: string, msg: PhoneHello, sec: { kind: 'pair' | 'hello'; deviceId: string; pairKey?: string; socket: WebSocket } | null, gate: { admitted: boolean }, helloTimer: NodeJS.Timeout) {
+    if ('hello' in msg) {
+      const hash = sha256(msg.hello.token);
+      const device = this.data.devices.find((d) => sameHash(d.tokenHash, hash));
+      const ok = !!device && (sec ? sec.kind === 'hello' && device.id === sec.deviceId : !device.secure);
+      if (!ok) {
+        this.failed(ip);
+        this.sendFrame(link, { denied: 'This phone is not paired with this computer' });
+        return link.close(4001, 'unknown token');
+      }
+      this.fails.delete(ip);
+      clearTimeout(helloTimer);
+      gate.admitted = true;
+      this.authenticated(link, device!);
+      return;
+    }
+    if (!sec) {
+      this.sendFrame(link, { denied: 'Update Sable on this phone to pair with this computer.' });
+      return link.close(4003, 'update');
+    }
+    const p = this.pairing;
+    if (sec.kind !== 'pair' || !p || p.key !== sec.pairKey || p.expiresAt < Date.now() || !sameSecret(msg.pair.key, p.key)) {
+      this.failed(ip);
+      this.sendFrame(link, { denied: p ? 'This pairing code is not valid. Show a new one on the desktop.' : 'Pairing is not open. Show the code in Settings › Phone.' });
+      return link.close(4002, 'bad key');
+    }
+    // One phone per key; a second request replaces nothing while one waits.
+    if (this.request) {
+      this.sendFrame(link, { denied: 'Another phone is pairing. Try again in a moment.' });
+      return link.close(4003, 'busy');
+    }
+    this.pairing = undefined;
+    clearTimeout(helloTimer);
+    gate.admitted = true;
+    const id = randomUUID();
+    const replaces = msg.pair.replaces;
+    this.request = {
+      id,
+      name: cleanName(msg.pair.name),
+      address: ip.replace(/^::ffff:/, ''),
+      at: Date.now(),
+      link,
+      socket: sec.socket,
+      ...(replaces ? { replaces } : {}),
+      timer: setTimeout(() => {
+        if (this.request?.id === id) {
+          this.endRequest('Nobody answered on the desktop');
+          this.changed();
+        }
+      }, REQUEST_TTL_MS),
+    };
+    this.sendFrame(link, { waiting: true });
+    this.changed();
+  }
+
+  /** From here on the link is a narrowed bridge connection for `device`. */
+  private authenticated(link: Link, device: StoredPhone) {
     device.lastSeen = Date.now();
     this.save();
     let set = this.live.get(device.id);
     if (!set) this.live.set(device.id, (set = new Set()));
-    set.add(ws);
+    set.add(link);
     // Its addresses now: a phone keeps new ones (Tailscale, a new network) and reaches it there later.
-    this.sendFrame(ws, { welcome: { deviceId: device.id, desktop: os.hostname(), version: VERSION, hosts: lanAddresses() } });
+    this.sendFrame(link, { welcome: { deviceId: device.id, desktop: os.hostname(), version: VERSION, hosts: lanAddresses() } });
     this.changed();
 
     // The conversations this socket has open (opened last at the end): their items' events reach it.
@@ -1285,26 +1553,26 @@ export class PhoneService {
       if (!PHONE_EVENTS.has(event.type)) return;
       if (ITEM_EVENTS.has(event.type) && !watching.includes((event as { sessionId: string }).sessionId)) return;
       const e = phoneEvent(event);
-      if (e) this.sendFrame(ws, { event: e as BridgeEvent });
+      if (e) this.sendFrame(link, { event: e as BridgeEvent });
     });
     let alive = true;
-    ws.on('pong', () => (alive = true));
+    link.onPong(() => (alive = true));
     const ping = setInterval(() => {
-      if (!alive) return ws.terminate();
+      if (!alive) return link.terminate();
       alive = false;
-      ws.ping();
+      link.ping();
     }, 25_000);
 
-    ws.on('message', async (raw) => {
+    link.onMessage(async (text) => {
       let req: RpcRequest;
       try {
-        req = JSON.parse(raw.toString());
+        req = JSON.parse(text);
       } catch {
         return;
       }
       if (typeof req?.id !== 'number' || typeof req.method !== 'string') return;
       if (!ALLOWED.has(req.method) && !OWN.has(req.method)) {
-        this.sendFrame(ws, { id: req.id, ok: false, error: `Not available from the phone: ${req.method}` });
+        this.sendFrame(link, { id: req.id, ok: false, error: `Not available from the phone: ${req.method}` });
         return;
       }
       try {
@@ -1332,10 +1600,9 @@ export class PhoneService {
           const snap = await this.app.call('session.snapshot', { sessionId });
           if (own === 'phone.tail') {
             watch(sessionId);
-            const before = typeof raw.before === 'string' ? raw.before : undefined;
+            const str = (k: string) => (typeof raw[k] === 'string' ? (raw[k] as string) : undefined);
             const limit = typeof raw.limit === 'number' ? raw.limit : undefined;
-            const to = typeof raw.to === 'string' ? raw.to : undefined;
-            result = phoneTail(snap, { before, limit, to });
+            result = phoneTail(snap, { before: str('before'), limit, to: str('to'), around: str('around'), after: str('after') });
           } else result = phoneDetail(snap.items, String(raw.itemId ?? ''));
         } else if (own === 'phone.answer') {
           // By the ids the phone got, into the agent's own keys (the original question and option words).
@@ -1345,7 +1612,7 @@ export class PhoneService {
           if (!asked) throw new Error('Those questions were already answered.');
           result = await this.app.call('question.respond', { sessionId, requestId, answers: phonePicks(asked, raw.picks) });
         } else if (own === 'queue.take') {
-          return void (await this.takeQueued(ws, req.id, raw));
+          return void (await this.takeQueued(link, req.id, raw));
         } else {
           const params = narrow(req.method, raw, (sessionId, id) => this.app.sessions.get(sessionId)?.queue.find((q) => q.id === id)?.attachments);
           // An answer from the phone allows only what the phone was shown, and answers questions it got whole.
@@ -1367,16 +1634,16 @@ export class PhoneService {
             result = phoneTail(result);
           }
         }
-        this.sendFrame(ws, { id: req.id, ok: true, result });
+        this.sendFrame(link, { id: req.id, ok: true, result });
       } catch (err) {
-        this.sendFrame(ws, { id: req.id, ok: false, error: (err as Error).message ?? String(err) });
+        this.sendFrame(link, { id: req.id, ok: false, error: (err as Error).message ?? String(err) });
       }
     });
     const done = () => {
       clearInterval(ping);
       unsubscribe();
       const s = this.live.get(device.id);
-      s?.delete(ws);
+      s?.delete(link);
       if (s && !s.size) this.live.delete(device.id);
       const d = this.data.devices.find((x) => x.id === device.id);
       if (d) {
@@ -1385,7 +1652,7 @@ export class PhoneService {
       }
       this.changed();
     };
-    ws.once('close', done);
+    link.onClose(done);
   }
 
   async dispose() {

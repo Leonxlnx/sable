@@ -3,6 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } fr
 import { createPortal } from 'react-dom';
 import { pushBack } from '@m/lib/back';
 import { haptic } from '@m/lib/native';
+import { closeViewer, subscribeViewer, viewerState, type ViewerOpen } from '@m/lib/viewer-state';
 import { Icon } from './icons';
 import { reduced } from './motion';
 
@@ -12,42 +13,13 @@ import { reduced } from './motion';
  * (or Back). Several pictures: swipe sideways. Transform only; the pictures come as data URLs.
  */
 
-interface Open {
-  /** The pictures, by index (null: still loading). */
-  srcs: (string | null)[];
-  index: number;
-  /** The thumbnail it came from (it grows out of it and goes back into it). */
-  from?: DOMRect;
-}
-
-let open: Open | null = null;
-const subs = new Set<() => void>();
-const emit = () => subs.forEach((l) => l());
-
-export function openViewer(v: Open) {
-  open = v;
-  emit();
-}
-
-/** A picture that arrived after the viewer opened. */
-export function viewerLoaded(index: number, src: string) {
-  if (!open || open.srcs[index] === src) return;
-  const srcs = [...open.srcs];
-  srcs[index] = src;
-  open = { ...open, srcs };
-  emit();
-}
-
-const close = () => {
-  open = null;
-  emit();
-};
+// What is open, by opening and step (a late picture lands only where it was asked for): lib/viewer-state.ts.
+export { openViewer, viewerLoaded } from '@m/lib/viewer-state';
+type Open = ViewerOpen;
+const close = closeViewer;
 
 export function Viewer() {
-  const v = useSyncExternalStore(
-    (l) => (subs.add(l), () => void subs.delete(l)),
-    () => open,
-  );
+  const v = useSyncExternalStore(subscribeViewer, viewerState);
   if (!v) return null;
   return createPortal(<Stage v={v} />, document.body);
 }

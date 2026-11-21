@@ -21,20 +21,51 @@ const makeHighlight = (ranges: Range[]) => new (window as unknown as { Highlight
 
 const builtRow = (id: string) => [...document.querySelectorAll<HTMLElement>(`[data-item-id="${CSS.escape(id)}"]`)].find((el) => el.closest('.tl-scroll'));
 
+/** One character folded for matching (its lowercase, a final sigma as any sigma). */
+const foldChar = (ch: string) => ch.toLowerCase().replace(/ς/g, 'σ');
+const foldText = (s: string) => {
+  let out = '';
+  for (const ch of s) out += foldChar(ch);
+  return out;
+};
+
+/**
+ * Every place the words stand in `text`, as [start, end) offsets into `text` itself. Lowercasing can
+ * change a string's length (`İ` becomes two code units), so each character is folded on its own and
+ * every folded unit remembers the original character it came from: an offset never lands past the
+ * text or inside the wrong character. (The phone does the same: mobile/src/lib/find.ts.)
+ */
+export function matchRanges(text: string, words: readonly string[]): [number, number][] {
+  const ws = words.map(foldText).filter(Boolean);
+  if (!ws.length || !text) return [];
+  let s = '';
+  const from: number[] = [];
+  const to: number[] = [];
+  let at = 0;
+  for (const ch of text) {
+    const f = foldChar(ch);
+    for (let k = 0; k < f.length; k++) {
+      from.push(at);
+      to.push(at + ch.length);
+    }
+    s += f;
+    at += ch.length;
+  }
+  const out: [number, number][] = [];
+  for (const w of ws) for (let i = s.indexOf(w); i >= 0; i = s.indexOf(w, i + w.length)) out.push([from[i], to[i + w.length - 1]]);
+  return out.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+}
+
 /** Every occurrence of the words in an element's text, as ranges (a match inside one text node). */
 function rangesIn(el: HTMLElement, words: string[]): Range[] {
   const out: Range[] = [];
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-    const text = (n.nodeValue ?? '').toLowerCase();
-    for (const w of words) {
-      if (!w) continue;
-      for (let i = text.indexOf(w); i >= 0; i = text.indexOf(w, i + w.length)) {
-        const r = document.createRange();
-        r.setStart(n, i);
-        r.setEnd(n, i + w.length);
-        out.push(r);
-      }
+    for (const [a, b] of matchRanges(n.nodeValue ?? '', words)) {
+      const r = document.createRange();
+      r.setStart(n, a);
+      r.setEnd(n, b);
+      out.push(r);
     }
   }
   return out.sort((a, b) => a.compareBoundaryPoints(Range.START_TO_START, b));

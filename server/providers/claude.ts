@@ -1113,12 +1113,17 @@ class ClaudeSession implements ProviderSession {
   private sentItems = new Map<string, string>();
   /**
    * Steers Claude Code had not read when the person stopped: they went back to the queue (sdk uuid →
-   * UserItem id). One it reads after all is taken out of the queue again, so it never goes twice.
+   * the UserItem's id and the words and pictures as they went to Claude Code). One it reads after all
+   * is shown as it went, and its copy in the queue is taken out (never sent twice) unless the person
+   * changed it there since.
    */
-  private withdrawn = new Map<string, string>();
+  private withdrawn = new Map<string, { itemId: string; text: string; attachments?: UserItem['attachments'] }>();
   /** The CLI's own state (session_state_changed), as last reported. */
   private cliState?: 'idle' | 'running' | 'requires_action';
   private interrupted = false;
+  /** Turns settled here so far: a stop's safety net (`interruptTimer`) acts only on the turn it was for. */
+  private turnSeq = 0;
+  private interruptTimer?: NodeJS.Timeout;
   /** A new agent process has not said hello yet (system/init): the live line says "Starting", not "Thinking". */
   private booting = false;
   private idleTimer?: NodeJS.Timeout;
@@ -1376,6 +1381,8 @@ class ClaudeSession implements ProviderSession {
     // Background sub-agents and workflows lived in this process: they ended with it.
     this.rt.stopBackground();
     if (this.rt.turnActive && !this.closed) {
+      this.turnSeq++;
+      clearTimeout(this.interruptTimer);
       this.rt.settle(failure ? 'error' : 'cancelled');
       const text = failure ?? 'Claude Code stopped unexpectedly';
       this.rt.notice('error', 'The agent process ended', text);
@@ -1424,6 +1431,7 @@ class ClaudeSession implements ProviderSession {
 
   async close() {
     this.closed = true;
+    clearTimeout(this.interruptTimer);
     this.shutdown();
     this.provider.sessions.delete(this);
   }
@@ -1458,6 +1466,8 @@ class ClaudeSession implements ProviderSession {
     // Local commands (/cost, /context) can take a while and never "think".
     const command = /^\/[\w:-]+/.exec(item.text.trim())?.[0];
     if (!this.rt.turnActive) this.rt.beginTurn(command ? `Running ${command}` : this.booting ? 'Starting' : 'Thinking');
+    // Steered into a turn the agent began by itself after a stop: the person lifts the stop's hold.
+    else this.rt.personSent();
     this.input!.push({
       type: 'user',
       uuid,
@@ -1472,15 +1482,21 @@ class ClaudeSession implements ProviderSession {
 
   async interrupt() {
     if (!this.q || !this.rt.turnActive) return;
+    // The turn this stop is for: its safety net never ends another (one begun after it settled).
+    const turn = this.turnSeq;
+    const since = this.rt.turnStartedAt;
+    const ours = () => this.turnSeq === turn && this.rt.turnStartedAt === since && this.rt.turnActive;
     this.interrupted = true;
     try {
       await withTimeout(Promise.resolve(this.q.interrupt()), 4_000, 'interrupt');
     } catch {
       /* fall through to the safety net */
     }
+    if (!ours()) return;
     // The CLI answers with a result message; if it does not, close the turn ourselves.
-    setTimeout(() => {
-      if (this.interrupted && this.rt.turnActive) this.finishTurn(undefined, true);
+    clearTimeout(this.interruptTimer);
+    this.interruptTimer = setTimeout(() => {
+      if (this.interrupted && ours()) this.finishTurn(undefined, true);
     }, 2_500);
   }
 
@@ -1887,17 +1903,24 @@ class ClaudeSession implements ProviderSession {
       }
       const back = m.uuid ? this.withdrawn.get(m.uuid) : undefined;
       if (back && !m.parent_tool_use_id) {
-        // A steer withdrawn at a stop that Claude Code read after all: it is this turn's, out of the queue again (never sent twice).
+        // A steer withdrawn at a stop that Claude Code read after all: it is this turn's, shown as it
+        // went to Claude Code. Its copy in the queue goes (never sent twice), unless the person changed
+        // it there since: those are newer words of theirs, and they stay queued.
         this.withdrawn.delete(m.uuid);
         this.chain.push(m.uuid);
         this.awaiting.set(m.uuid, { read: true });
-        this.sentItems.set(m.uuid, back);
-        const left = rt.get<UserItem>(back);
-        const queued = left ? undefined : rt.takeQueued(back);
-        if (left?.type === 'user') rt.taken(back, { providerId: m.uuid });
-        else if (queued) rt.add<UserItem>({ id: back, type: 'user', text: queued.text, attachments: queued.attachments, state: 'sent', providerId: m.uuid });
-        else rt.add<UserItem>({ type: 'user', text: replayText(m.message?.content) || '', state: 'sent', providerId: m.uuid });
-        if (!rt.turnActive) rt.beginTurn('Thinking');
+        let id = back.itemId;
+        if (rt.get<UserItem>(id)?.type === 'user') rt.taken(id, { providerId: m.uuid });
+        else {
+          const copy = rt.queue.find((q) => q.id === id);
+          const same = (a?: UserItem['attachments'], b?: UserItem['attachments']) => (a ?? []).map((x) => x.id).join('\n') === (b ?? []).map((x) => x.id).join('\n');
+          if (copy && copy.text === back.text && same(copy.attachments, back.attachments)) rt.takeQueued(id);
+          else if (copy) id = randomUUID();
+          rt.add<UserItem>({ id, type: 'user', text: back.text || replayText(m.message?.content) || '', attachments: back.attachments, state: 'sent', providerId: m.uuid });
+        }
+        this.sentItems.set(m.uuid, id);
+        // Begun by Claude Code, not the person: the stop's hold on the queue stays through it.
+        if (!rt.turnActive) rt.beginTurn('Thinking', { keepHold: true });
         return;
       }
       if (m.parent_tool_use_id) return;
@@ -1933,7 +1956,8 @@ class ClaudeSession implements ProviderSession {
         // Output, summaries and wrappers belong to the turn they came in; a notification or a command opens one.
         if (syn?.role === 'output' || syn?.role === 'summary' || syn?.role === 'hidden') return;
         this.wakes++;
-        if (!rt.turnActive) rt.beginTurn('Thinking');
+        // Not the person's: a stop's hold on the queue stays through the turn it wakes.
+        if (!rt.turnActive) rt.beginTurn('Thinking', { keepHold: true });
         return;
       }
       // A message sent from elsewhere (Remote Control in the Claude app or on claude.ai): it belongs
@@ -1942,6 +1966,7 @@ class ClaudeSession implements ProviderSession {
       // It gets a result of its own (or is folded into the running turn's): either way the turn waits for it.
       this.awaiting.set(m.uuid || `remote-${randomUUID()}`, { read: true });
       if (!rt.turnActive) rt.beginTurn('Thinking');
+      else rt.personSent();
       return;
     }
     if (m.uuid && !m.parent_tool_use_id) this.chain.push(m.uuid);
@@ -2042,21 +2067,26 @@ class ClaudeSession implements ProviderSession {
     return [oldest];
   }
 
-  /** Messages of ours a result (or the turn's end) answered, and what they came to: the bridge names a chat only from one answered ok. */
-  private retire(uuids: Iterable<string>, outcome: MessageOutcome) {
+  /**
+   * Messages of ours a result (or the turn's end) answered, and what they came to: the bridge names a
+   * chat only from one answered ok. `resultId`: the TurnItem of the result that answered them (its
+   * texts are their answer); none for messages that came to the turn's end.
+   */
+  private retire(uuids: Iterable<string>, outcome: MessageOutcome, resultId?: string) {
     const ids: string[] = [];
     for (const u of [...uuids]) {
       const id = this.sentItems.get(u);
       if (id) ids.push(id);
       this.sentItems.delete(u);
     }
-    if (ids.length) this.rt.answered(ids, outcome);
+    if (ids.length) this.rt.answered(ids, outcome, resultId);
   }
 
   /**
    * At a stop: messages Claude Code has not read are no part of the stopped turn. Their bookkeeping
    * goes, and the bridge puts them back in the queue (runtime `returnUntaken`); one Claude Code reads
-   * after all is taken back out of the queue then (onUser), so it never goes twice.
+   * after all is taken back out of the queue then (onUser), so it never goes twice. What each was when
+   * it went is kept with it: the queue's copy may be edited meanwhile.
    */
   private withdrawUnread() {
     for (const [uuid, a] of [...this.awaiting]) {
@@ -2065,7 +2095,8 @@ class ClaudeSession implements ProviderSession {
       const itemId = this.sentItems.get(uuid) ?? this.pendingUsers.get(uuid);
       this.pendingUsers.delete(uuid);
       this.sentItems.delete(uuid);
-      if (itemId) this.withdrawn.set(uuid, itemId);
+      const row = itemId ? this.rt.get<UserItem>(itemId) : undefined;
+      if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined });
     }
     while (this.withdrawn.size > 50) this.withdrawn.delete(this.withdrawn.keys().next().value!);
   }
@@ -2099,10 +2130,13 @@ class ClaudeSession implements ProviderSession {
         (typeof m.result === 'string' && m.result ? m.result : undefined) ??
         resultLabel(m.subtype);
     }
-    // What the messages this result answers came to, whatever the turn does next.
-    this.retire(answered, wasInterrupted ? 'stopped' : failed ? 'failed' : 'ok');
-    if (!wasInterrupted) {
+    // What the messages this result answers came to, whatever the turn does next, and the result's
+    // line in the timeline that closes their answer.
+    const resultId = wasInterrupted ? undefined : randomUUID();
+    this.retire(answered, wasInterrupted ? 'stopped' : failed ? 'failed' : 'ok', resultId);
+    if (resultId) {
       rt.add<TurnItem>({
+        id: resultId,
         type: 'turn',
         durationMs: Number(m.duration_ms ?? Date.now() - rt.turnStartedAt),
         costUsd: turnCost || undefined,
@@ -2133,6 +2167,9 @@ class ClaudeSession implements ProviderSession {
   private finishTurn(error: string | undefined, interrupted: boolean) {
     const rt = this.rt;
     if (!rt.turnActive) return;
+    // This turn is settled: its stop's safety net goes with it.
+    this.turnSeq++;
+    clearTimeout(this.interruptTimer);
     if (interrupted) this.withdrawUnread();
     // Messages no result named on its own (an older CLI, a steer folded in) come to what the turn did.
     this.retire(this.sentItems.keys(), interrupted ? 'stopped' : error ? 'failed' : 'ok');

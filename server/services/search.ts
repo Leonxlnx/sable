@@ -622,10 +622,11 @@ export class ChatSearch {
     if (rt?.items.length) return this.fromList(run, 'mem', id, rt.items, undefined, budget);
     const base = path.join(this.app.store.dir, 'sessions', `${id}.json`);
     const tail = base.replace(/\.json$/, '.tail.json');
-    const st = (f: string) => statFile(f).then((s) => `${s.size}:${s.mtimeMs}`, () => '-');
+    // Not there ('-') is a state of its own; a file that cannot even be looked at ('?') is never answered from what was kept.
+    const st = (f: string) => statFile(f).then((s) => `${s.size}:${s.mtimeMs}`, (err: NodeJS.ErrnoException) => (err?.code === 'ENOENT' ? '-' : '?'));
     const key = `${await st(base)}|${await st(tail)}`;
     const have = this.kept.get(id);
-    if (have?.key === key) {
+    if (have?.key === key && !key.includes('?')) {
       this.kept.delete(id);
       this.kept.set(id, have);
       return this.fromList(run, 'kept', id, have.said, key, budget);
@@ -638,6 +639,11 @@ export class ChatSearch {
     if (budget.signal?.aborted) return true;
     if (budget.fresh) return false;
     return Date.now() > budget.until || (bytes && budget.bytes <= 0);
+  }
+
+  /** How much the next read may take: a piece, and never more than what is left of the call (the first piece of a call is whole). */
+  private want(budget: Budget, piece: number) {
+    return budget.fresh ? piece : Math.max(1, Math.min(piece, Math.floor(budget.bytes)));
   }
 
   /** Matches a chat's messages from memory or from what was kept, newest first, a slice at a time. */
@@ -713,17 +719,27 @@ export class ChatSearch {
     return hits;
   }
 
-  /** The tail, as `session-file.ts` reads it (whole, any size: read in pieces here when big). False when the budget ran out. */
+  /**
+   * The tail, as `session-file.ts` reads it (whole, any size: read in pieces here when big or when
+   * more than what is left of the call). False when the budget ran out. A tail that is not there is
+   * none; one that is there but cannot be read or parsed is a part of the chat not searched (`bad`:
+   * said in `skipped`, and nothing of the chat is kept), never taken for none.
+   */
   private async readTail(c: FileCursor, file: string, budget: Budget, onTail: (s: Said | null) => void): Promise<boolean> {
     const t = c.tail;
+    const failed = (err: unknown) => {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') c.bad = true;
+    };
     let size: number;
     try {
       size = (await statFile(file)).size;
-    } catch {
+    } catch (err) {
+      failed(err);
       t.done = true;
       return true;
     }
-    if (size <= SEARCH.tailWhole && !t.scan) {
+    // Read whole only when it fits what is left of this call (the first piece of a call always goes).
+    if (size <= SEARCH.tailWhole && !t.scan && (budget.fresh || size <= budget.bytes)) {
       if (this.out(budget, true)) return false;
       try {
         const v = JSON.parse(await readFileAsync(file, 'utf8')) as { baseGen?: number; from?: number; items?: TimelineItem[] };
@@ -732,12 +748,13 @@ export class ChatSearch {
           t.gen = v.baseGen;
           t.from = v.from;
           for (const it of v.items) onTail(it && typeof it === 'object' ? sayOf(it) : null);
-        }
-      } catch {
-        /* the reader ignores a tail it cannot parse */
+        } else c.bad = true;
+      } catch (err) {
+        failed(err);
       }
       budget.bytes -= size;
       budget.read += size;
+      budget.fresh = false;
       t.done = true;
       return true;
     }
@@ -748,7 +765,7 @@ export class ChatSearch {
       const buf = Buffer.allocUnsafe(SEARCH.chunk);
       while (t.off < size) {
         if (this.out(budget, true)) return false;
-        const { bytesRead: n } = await fh.read(buf, 0, buf.length, t.off);
+        const { bytesRead: n } = await fh.read(buf, 0, this.want(budget, buf.length), t.off);
         if (n <= 0) break;
         t.off += n;
         budget.bytes -= n;
@@ -766,10 +783,13 @@ export class ChatSearch {
         }
       };
       t.ok = t.scan.closed && !t.scan.broken && t.scan.hasItems;
+      // There but not whole (cut off, damaged): its messages were not all searched.
+      if (!t.ok) c.bad = true;
       t.gen = num(t.scan.root.baseGen);
       t.from = num(t.scan.root.from);
-    } catch {
-      /* gone or locked: the reader would not have it either */
+    } catch (err) {
+      // Gone since it was looked at: none. Locked or unreadable: said, never taken for none.
+      failed(err);
     } finally {
       await fh?.close().catch(() => {});
     }
@@ -794,7 +814,7 @@ export class ChatSearch {
       const buf = Buffer.allocUnsafe(SEARCH.chunk);
       while (b.off < size) {
         if (this.out(budget, true)) return 'paused';
-        const { bytesRead: n } = await fh.read(buf, 0, buf.length, b.off);
+        const { bytesRead: n } = await fh.read(buf, 0, this.want(budget, buf.length), b.off);
         if (n <= 0) break;
         b.off += n;
         budget.bytes -= n;

@@ -8,19 +8,27 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.os.ParcelFileDescriptor;
 import android.webkit.MimeTypeMap;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.security.MessageDigest;
 import java.util.Locale;
 
 /**
  * Files the agent handed over, downloaded inside the app: Android's DownloadManager fetches the
  * desktop's one-file link (`phone.fileLink`) into Downloads/Sable, the page reads its progress, and
  * Open hands the finished file to the app that opens its kind (an APK to the installer). The system
- * shows its own notification when a download is done.
+ * shows its own notification when a download is done. The bytes come over plain HTTP, so what arrived
+ * is read whole and compared with the SHA-256 and size the desktop named over the connection: when
+ * the download finishes (verify) and again right before Open hands it on; a file that differs is
+ * removed and never opened.
  */
 @CapacitorPlugin(name = "Files")
 public class FilesPlugin extends Plugin {
@@ -101,8 +109,84 @@ public class FilesPlugin extends Plugin {
         }
     }
 
+    /** The SHA-256 (hex) and size of a finished download, read whole. */
+    private String[] digest(long id) throws IOException {
+        try (ParcelFileDescriptor pfd = manager().openDownloadedFile(id); InputStream in = new FileInputStream(pfd.getFileDescriptor())) {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[1 << 16];
+            long size = 0;
+            for (int n; (n = in.read(buf)) > 0; ) {
+                md.update(buf, 0, n);
+                size += n;
+            }
+            StringBuilder hex = new StringBuilder();
+            for (byte b : md.digest()) hex.append(String.format(Locale.ROOT, "%02x", b));
+            return new String[] { hex.toString(), String.valueOf(size) };
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException(e);
+        }
+    }
+
+    /** A number the page sent, as a long (a small one arrives as an Integer, which getLong does not take). */
+    private static Long longOf(PluginCall call, String name) {
+        Object v = call.getData().opt(name);
+        return v instanceof Number ? ((Number) v).longValue() : null;
+    }
+
+    /** True when the file is what was named (sha256 in hex, and size when given). */
+    private static boolean same(String[] got, String sha256, Long size) {
+        return sha256 != null && sha256.equalsIgnoreCase(got[0]) && (size == null || size == Long.parseLong(got[1]));
+    }
+
+    @PluginMethod
+    public void verify(PluginCall call) {
+        long id = idOf(call);
+        String want = call.getString("sha256");
+        Long size = longOf(call, "size");
+        // Off the plugins' thread: a big file takes a moment to read.
+        new Thread(() -> {
+            try {
+                String[] got = digest(id);
+                JSObject o = new JSObject();
+                o.put("ok", same(got, want, size));
+                o.put("sha256", got[0]);
+                o.put("size", Long.parseLong(got[1]));
+                call.resolve(o);
+            } catch (Exception e) {
+                call.reject("The file is no longer on this phone.");
+            }
+        }).start();
+    }
+
     @PluginMethod
     public void open(PluginCall call) {
+        String want = call.getString("sha256");
+        if (want == null || want.isEmpty()) {
+            openNow(call);
+            return;
+        }
+        long id = idOf(call);
+        Long size = longOf(call, "size");
+        new Thread(() -> {
+            try {
+                if (!same(digest(id), want, size)) {
+                    try {
+                        manager().remove(id);
+                    } catch (Exception ignored) {
+                        // already gone
+                    }
+                    call.reject("It changed on this phone, so it was removed.");
+                    return;
+                }
+            } catch (Exception e) {
+                call.reject("The file is no longer on this phone.");
+                return;
+            }
+            openNow(call);
+        }).start();
+    }
+
+    private void openNow(PluginCall call) {
         long id = idOf(call);
         Uri uri;
         try {

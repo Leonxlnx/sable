@@ -195,6 +195,11 @@
   margin-top: 30px;
 }
 
+/* an older pairing: one row under the computer to make it secure */
+.set-secure {
+  margin-top: 12px;
+}
+
 .set-row {
   position: relative;
   display: flex;
@@ -551,6 +556,15 @@ button.set-row:active {
 
 .pair-cancel {
   color: var(--text-2);
+}
+
+/* pairing again from an older pairing: leaving keeps that one */
+.pair-later {
+  align-self: center;
+  min-height: 40px;
+  padding: 0 16px;
+  /* over the brightest part of the field: full ivory, still only words */
+  color: var(--text);
 }
 
 /* holds the place of the first key while Cancel stands where the second was: nothing moves */

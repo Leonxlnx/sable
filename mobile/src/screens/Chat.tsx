@@ -8,7 +8,9 @@ import { onKeyboard } from '@m/lib/keyboard';
 import { haptic, openExternal } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { homeFolder, openRace, swapTo } from '@m/lib/race';
-import { applyOlder, fetchOlder, getState, openSession, reachItem, sessionData, setState, showCached, useStore } from '@m/lib/store';
+import { applyOlder, closeGap, fetchNewer, fetchOlder, getState, openAt, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
+import { around, growDown, growUp, MOUNT_MAX, rangeOf, spacers, trimTop, type Win } from '@m/lib/window';
+import { matchRanges, searchWords } from '@m/lib/find';
 import { groupTurns, stabilize } from '@m/lib/turns';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
@@ -55,9 +57,10 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
     setError(undefined);
     showCached(id);
     // A connection replaced meanwhile loads it again by itself (the skeleton stays).
-    // A search hit's page reaches back to it.
+    // A search hit opens on a bounded page around it (the thread mounts a window there and says so when it is gone).
     const to = at && at !== 'turn' ? at : undefined;
-    if (getState().conn === 'open') void openSession(id, to).catch((err) => !/connection to the desktop was lost/i.test((err as Error).message) && setError((err as Error).message));
+    const lost = (err: unknown) => !/connection to the desktop was lost/i.test((err as Error).message) && setError((err as Error).message);
+    if (getState().conn === 'open') void (to ? openAt(id, to).then((r) => (r === 'gone' && !getState().data[id] ? openSession(id) : undefined)) : openSession(id)).catch(lost);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
@@ -194,6 +197,9 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   const shape = useStore((st) => sessionData(st, id).shape);
   const status = useStore((st) => st.sessions[id]?.status);
   const cursor = useStore((st) => sessionData(st, id).cursor);
+  // Opened around a message far back: the pages stop before the newest, the rest comes as you read on.
+  const gapped = useStore((st) => !!sessionData(st, id).next);
+  const epoch = useStore((st) => sessionData(st, id).epoch ?? 0);
   const busy = status === 'running' || status === 'starting' || status === 'awaiting';
   // Turns and segments that did not change keep their object, so their views do not render again.
   const kept = useRef(new Map<string, unknown>());
@@ -204,10 +210,15 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     return stabilize(groupTurns(roots, shape, busy, checkOf), kept.current);
   }, [roots, shape, busy, id]);
   const turns = layout.groups;
+  const keys = useMemo(() => turns.map((g) => g.key), [turns]);
   const [older, setOlder] = useState(false);
   const olderBusy = useRef(false);
+  const newerBusy = useRef(false);
   // The newest few turns first (the chat opens at once), the rest of the page right after it has opened.
   const [count, setCount] = useState(FIRST);
+  // Or a window of them (lib/window.ts): opened at a message far back, or scrolled past what may be
+  // mounted at once; above and below it stand spacers of the height the groups had.
+  const [win, setWin] = useState<Win | null>(null);
   useEffect(() => {
     const t = window.setTimeout(() => setCount((c) => Math.max(c, PAGE)), 520);
     return () => clearTimeout(t);
@@ -217,12 +228,30 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   const atBottom = useRef(true);
   const [showJump, setShowJump] = useState(false);
   const anchor = useRef<{ h: number; top: number } | null>(null);
-  const start = Math.max(0, turns.length - count);
-  const shown = turns.slice(start);
+  const range = rangeOf(keys, win, count);
+  const start = range.lo;
+  const shown = turns.slice(range.lo, range.hi);
+  const heights = useRef(new Map<string, number>());
+  const space = win ? spacers(keys, range, heights.current) : { top: 0, bottom: 0 };
   const groupsRef = useRef(turns);
   groupsRef.current = turns;
   const countRef = useRef(count);
   countRef.current = count;
+  const rangeRef = useRef(range);
+  rangeRef.current = range;
+  const winRef = useRef(win);
+  winRef.current = win;
+  const keysRef = useRef(keys);
+  keysRef.current = keys;
+  const gappedRef = useRef(gapped);
+  gappedRef.current = gapped;
+
+  /** The mounted groups' heights, read before the window moves: one that leaves becomes a spacer that tall (nothing on screen moves). */
+  const record = () => {
+    const c = content.current;
+    if (!c) return;
+    for (const el of c.querySelectorAll<HTMLElement>(':scope > [data-turn]')) if (el.dataset.turn) heights.current.set(el.dataset.turn, el.offsetHeight);
+  };
 
   const toBottom = useCallback((smooth = false) => {
     const el = scroller.current;
@@ -243,9 +272,12 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
         return;
       }
       if (atBottom.current) toBottom();
-      // A short page that does not fill the screen: the one before it comes at once.
+      // A short page that does not fill the screen: the one before it (or after it, opened far back) comes at once.
       const sc = scroller.current;
-      if (sc && sc.scrollHeight < sc.clientHeight + 400) olderRef.current();
+      if (sc && sc.scrollHeight < sc.clientHeight + 400) {
+        olderRef.current();
+        if (gappedRef.current) newerRef.current();
+      }
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -291,16 +323,39 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     frame.current = 0;
     const el = scroller.current;
     if (!el) return;
+    const r = rangeRef.current;
+    const w = winRef.current;
+    const ks = keysRef.current;
+    const sp = w ? spacers(ks, r, heights.current) : { top: 0, bottom: 0 };
     const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
     const byHand = touch.current.down || performance.now() - touch.current.at < 1200;
-    if (gap < 48) atBottom.current = true;
+    // At the newest only where the newest is: the window reaches it and nothing waits after it.
+    const newest = r.hi >= ks.length && !gappedRef.current;
+    if (gap < 48 && newest) atBottom.current = true;
     else if (byHand) atBottom.current = false;
-    setShowJump(gap > 600);
-    if (el.scrollTop < 600 && !anchor.current) {
-      if (start > 0) {
+    setShowJump(gap > 600 || !newest);
+    if (el.scrollTop - sp.top < 600 && !anchor.current) {
+      if (r.lo > 0) {
         anchor.current = { h: el.scrollHeight, top: el.scrollTop };
-        setCount((c) => c + PAGE);
+        if (!w && countRef.current + PAGE <= MOUNT_MAX) setCount((c) => c + PAGE);
+        else {
+          record();
+          setWin(growUp(ks, r));
+        }
       } else olderRef.current();
+    } else if (gap - sp.bottom < 600) {
+      if (w && r.hi < ks.length) {
+        record();
+        setWin(growDown(ks, r));
+      } else {
+        // At the end of what is here: the next page comes (opened far back), and the oldest turns give way past the cap.
+        if (gappedRef.current) newerRef.current();
+        const t = w ? trimTop(ks, r) : null;
+        if (t) {
+          record();
+          setWin(t);
+        }
+      }
     }
   };
 
@@ -319,7 +374,7 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
           applyOlder(id, r);
           added += r.page.items.length;
         }
-        setCount((c) => c + added);
+        if (!winRef.current) setCount((c) => Math.min(MOUNT_MAX, c + added));
         // Steps that went into a folded line add no height: then nothing moves and the next scroll may ask again.
         requestAnimationFrame(() => requestAnimationFrame(() => anchor.current === a && (anchor.current = null)));
       })
@@ -332,7 +387,24 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   const olderRef = useRef(loadOlder);
   olderRef.current = loadOlder;
 
-  // Sending scrolls to the newest.
+  // Read on toward the newest from a message far back: the page after the last one here (below: nothing on screen moves).
+  const loadNewer = () => {
+    if (newerBusy.current || !gappedRef.current) return;
+    // What is mounted stays where it is while pages land after it (without a window it would follow the newest of them).
+    if (!winRef.current) {
+      const r = rangeRef.current;
+      const ks = keysRef.current;
+      if (ks.length) setWin({ lo: ks[r.lo], hi: r.hi >= ks.length ? null : ks[r.hi] });
+    }
+    newerBusy.current = true;
+    void fetchNewer(id)
+      .catch(() => {})
+      .finally(() => (newerBusy.current = false));
+  };
+  const newerRef = useRef(loadNewer);
+  newerRef.current = loadNewer;
+
+  // Sending scrolls to the newest (not while a window far back is being read: sending closes it first).
   const newestTurn = useMemo(() => {
     for (let i = turns.length - 1; i >= 0; i--) if (turns[i].kind === 'turn') return turns[i];
     return undefined;
@@ -345,13 +417,15 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     return undefined;
   }, [turns]);
   useEffect(() => {
-    if (goal.current) return;
+    if (goal.current || gappedRef.current || (winRef.current && winRef.current.hi !== null)) return;
     atBottom.current = true;
     toBottom(true);
   }, [lastUser, toBottom]);
 
   // Opened at a place: the turns that hold it are mounted, and it comes to the top of the screen, lit
-  // for a moment. Waits for the desktop's page (not the cached one), and for the pages back to it.
+  // for a moment. Waits for the desktop's page (not the cached one); a message far back comes as a
+  // page around it (never every page between) and a window of turns around it is mounted. One the chat
+  // no longer has, or that cannot be reached, is said so.
   const goal = useRef<{ at: string; seq?: number; find?: string } | null>(at ? { at, seq, find } : null);
   const [aim, setAim] = useState(0);
   useEffect(() => {
@@ -360,26 +434,49 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     setAim((n) => n + 1);
   }, [at, seq]);
   const fresh = useStore((st) => !!st.data[id] && !st.data[id].cached);
+  // The whole chat replaced (the newest page again, or a page around a message): what is mounted starts over.
+  const lastEpoch = useRef(epoch);
+  useEffect(() => {
+    if (lastEpoch.current === epoch) return;
+    lastEpoch.current = epoch;
+    heights.current.clear();
+    if (goal.current) return;
+    setWin(null);
+    setCount(PAGE);
+  }, [epoch]);
   useEffect(() => {
     const g = goal.current;
     if (!g || !fresh) return;
     let live = true;
+    const frames = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const missed = () => setState({ toast: { text: 'That message is no longer in this chat.', level: 'info', at: Date.now() } });
     void (async () => {
       const target = g.at;
-      if (target !== 'turn' && !(await reachItem(id, target).catch(() => false))) {
-        if (live) goal.current = null;
-        return;
+      if (target !== 'turn' && (await openAt(id, target).catch(() => 'gone' as const)) === 'gone') {
+        if (!live) return;
+        goal.current = null;
+        return missed();
       }
       // Two frames: the pages just added are grouped and drawn.
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await frames();
       if (!live) return;
       const all = groupsRef.current;
       const idx = target === 'turn' ? all.findLastIndex((x) => x.kind === 'turn') : all.findIndex((x) => (x.kind === 'turn' ? x.ids.includes(target) : x.id === target));
-      if (idx < 0) return void (goal.current = null);
-      const need = all.length - idx;
-      if (need > countRef.current) {
-        setCount(need + 2);
-        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      if (idx < 0) {
+        goal.current = null;
+        if (target !== 'turn') missed();
+        return;
+      }
+      const r = rangeRef.current;
+      if (target !== 'turn') {
+        // Only the turns around it: a few before, more after (read on toward the newest); pages that land later never move them.
+        setWin(around(keysRef.current, idx));
+        await frames();
+        if (!live) return;
+      } else if (idx < r.lo || idx >= r.hi) {
+        if (!winRef.current && all.length - idx <= MOUNT_MAX) setCount(all.length - idx + 2);
+        else setWin(around(keysRef.current, idx));
+        await frames();
         if (!live) return;
       }
       const sc = scroller.current;
@@ -397,13 +494,13 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
       atBottom.current = false;
       // Turns off screen are not laid out (content-visibility): there first, then measured where it is drawn.
       sc.scrollTo({ top: Math.max(0, topOf() - 84), behavior: 'auto' });
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await frames();
       if (!live) return;
       const top = topOf();
       // The words searched for, in a long message: they come into view (a third down) and are lit.
       const hit = target !== 'turn' && g.find ? findWords(el, g.find) : null;
-      const r = hit?.getBoundingClientRect();
-      const y = r && r.height ? r.top - sc.getBoundingClientRect().top + sc.scrollTop - sc.clientHeight * 0.32 : top - 84;
+      const rect = hit?.getBoundingClientRect();
+      const y = rect && rect.height ? rect.top - sc.getBoundingClientRect().top + sc.scrollTop - sc.clientHeight * 0.32 : top - 84;
       sc.scrollTo({ top: Math.max(0, Math.min(y, top - 84 + Math.max(0, el.offsetHeight - 120))), behavior: 'auto' });
       if (target !== 'turn') {
         el.setAttribute('data-flash', '');
@@ -432,11 +529,28 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
             {older ? <Ring size={13} /> : <span className="thread-more-line" />}
           </div>
         )}
+        {space.top > 0 && <div className="thread-space" style={{ height: space.top }} aria-hidden />}
         {turns.length === 0 && <p className="empty thread-empty">Send a message to start.</p>}
-        {shown.map((g) => (g.kind === 'turn' ? <TurnView key={g.key} sid={id} turn={g} newest={g === newestTurn} /> : <ItemRow key={g.key} sid={id} id={g.id} />))}
-        {layout.queued.map((q) => (
-          <ItemRow key={q} sid={id} id={q} queued />
-        ))}
+        {shown.map((g) =>
+          g.kind === 'turn' ? (
+            <TurnView key={g.key} sid={id} turn={g} newest={g === newestTurn} />
+          ) : (
+            <div key={g.key} data-turn={g.key}>
+              <ItemRow sid={id} id={g.id} />
+            </div>
+          ),
+        )}
+        {space.bottom > 0 && <div className="thread-space" style={{ height: space.bottom }} aria-hidden />}
+        {gapped && (
+          <div className="thread-more" aria-hidden>
+            <span className="thread-more-line" />
+          </div>
+        )}
+        {!gapped &&
+          range.hi >= keys.length &&
+          layout.queued.map((q) => (
+            <ItemRow key={q} sid={id} id={q} queued />
+          ))}
       </div>
       <AnimatePresence>
         {showJump && (
@@ -452,6 +566,12 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
             onClick={() => {
               haptic('tap');
               atBottom.current = true;
+              // From a window far back: the newest again (the pages after it fetched as one newest page).
+              if (gappedRef.current) void closeGap(id).catch(() => {});
+              else if (winRef.current) {
+                setWin(null);
+                setCount(PAGE);
+              }
               toBottom(true);
             }}
           >
@@ -463,21 +583,18 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   );
 }
 
-/** The first place in a message where a searched word stands (a range over it), or null. */
+/** The first place in a message where a searched word stands (a range over it, in the text's own offsets: lib/find.ts), or null. */
 function findWords(el: HTMLElement, find: string): Range | null {
-  const words = find.toLowerCase().split(/s+/).filter(Boolean);
+  const words = searchWords(find);
   if (!words.length) return null;
   const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
   for (let n = walk.nextNode(); n; n = walk.nextNode()) {
-    const text = (n.nodeValue ?? '').toLowerCase();
-    for (const w of words) {
-      const i = text.indexOf(w);
-      if (i < 0) continue;
-      const r = document.createRange();
-      r.setStart(n, i);
-      r.setEnd(n, i + w.length);
-      return r;
-    }
+    const [hit] = matchRanges(n.nodeValue ?? '', words);
+    if (!hit) continue;
+    const r = document.createRange();
+    r.setStart(n, hit[0]);
+    r.setEnd(n, hit[1]);
+    return r;
   }
   return null;
 }

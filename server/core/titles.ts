@@ -67,8 +67,15 @@ export function titleMessage(it: TimelineItem | undefined): it is UserItem {
  * of what it handed to the agent): the first of them that is the person's own words. A message that
  * was stopped before the agent had it, or one of a turn that failed or was stopped, is never among
  * them. Without `consumed`, the first message of the person's in the timeline.
+ *
+ * `answeredBy`: for an agent that answers each message with a result of its own (Claude Code), the
+ * TurnItem of the result that answered a message (runtime `answeredBy`). Its answer is then only what
+ * that result said: the texts after the result before it (and after the message), up to it. A steer's
+ * row stands where it was sent, before the rest of the answer to the message it steered: that text is
+ * the other result's. Answered by none of its own (null), or by one no longer in the chat: which text
+ * answered it is not known, and no answer goes with it.
  */
-export function titleAsk(items: readonly TimelineItem[], consumed?: readonly string[]): { message: string; answer: string; itemId: string } | null {
+export function titleAsk(items: readonly TimelineItem[], consumed?: readonly string[], answeredBy?: (itemId: string) => string | null | undefined): { message: string; answer: string; itemId: string } | null {
   let at = -1;
   if (consumed) {
     const ids = new Set(consumed);
@@ -78,13 +85,32 @@ export function titleAsk(items: readonly TimelineItem[], consumed?: readonly str
   const msg = items[at] as UserItem;
   const message = userText(msg.text).trim();
   const answer: string[] = [];
+  const add = (it: TimelineItem) => {
+    if (it.type === 'text' && (it as TextItem).text.trim()) answer.push((it as TextItem).text.trim());
+    return answer.join('\n\n').length > ANSWER_CHARS;
+  };
+  const by = answeredBy?.(msg.id);
+  if (by !== undefined) {
+    const end = by === null ? -1 : items.findIndex((i) => i.id === by);
+    if (end > at) {
+      // From the result before it (a message it steered past), else from the message itself.
+      let from = at;
+      for (let k = end - 1; k > at; k--) {
+        if (items[k].type === 'turn' && !items[k].parentId) {
+          from = k;
+          break;
+        }
+      }
+      for (const it of items.slice(from + 1, end)) if (!it.parentId && add(it)) break;
+    }
+    return { message, answer: answer.join('\n\n'), itemId: msg.id };
+  }
   for (const it of items.slice(at + 1)) {
     if (it.parentId) continue;
     // The answer is this turn's: it ends at the turn's end or the next message of the person's.
     if (it.type === 'turn') break;
     if (it.type === 'user' && !parseSynthetic((it as UserItem).text)) break;
-    if (it.type === 'text' && (it as TextItem).text.trim()) answer.push((it as TextItem).text.trim());
-    if (answer.join('\n\n').length > ANSWER_CHARS) break;
+    if (add(it)) break;
   }
   return { message, answer: answer.join('\n\n'), itemId: msg.id };
 }
@@ -195,7 +221,7 @@ export class ChatTitles {
     if (!wantsTitle(rt.meta, rt.items, this.deps.settings())) return;
     const turn = rt.items.findLast((i) => i.type === 'turn' && !i.parentId);
     if (!turn || !settledTurn(turn)) return;
-    const ask = titleAsk(rt.items, consumed);
+    const ask = titleAsk(rt.items, consumed, (id) => rt.answeredBy(id));
     const owner = ownerOf(rt.meta);
     if (!ask || !this.deps.model(owner)) return;
     // Asked once, whatever comes of it: a failed call is not tried again.

@@ -227,6 +227,12 @@
   margin-top: 30vh;
 }
 
+/* the height of turns not mounted (above or below a window of them) */
+.thread-space {
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
 .turn {
   display: flex;
   flex-direction: column;
@@ -1794,6 +1800,30 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* the words are the key that takes the message back into the field to edit */
+button.queued-text {
+  align-self: stretch;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--t-sm);
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  transition: color 100ms var(--ease-out);
+}
+button.queued-text:active {
+  color: var(--text);
+}
+button.queued-text:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+button.queued-text[data-busy] {
+  color: var(--text-3);
 }
 
 

@@ -19,7 +19,7 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { userText } from '../../shared/synthetic';
-import { handFiles } from './handed';
+import { approvedShare, handFiles, type ApprovedShare } from './handed';
 
 export type Emit = (event: BridgeEvent) => void;
 
@@ -50,8 +50,21 @@ export class SessionRuntime {
   turnStartedAt = 0;
   /** Messages sent while a turn was running; the app sends them as turns end. */
   queue: QueuedMessage[] = [];
-  /** The user stopped the current turn (interrupt or close): its end sends nothing from the queue. */
-  stopRequested = false;
+  /**
+   * The user stopped the current turn (interrupt or close): its end sends nothing from the queue, and
+   * that hold stays until a turn begins for the person (a turn the agent begins by itself carries it:
+   * `beginTurn` with `keepHold`).
+   */
+  get stopRequested() {
+    return this.stopped;
+  }
+  set stopRequested(v: boolean) {
+    this.stopped = v;
+    this.carried = false;
+  }
+  private stopped = false;
+  /** The running turn carries a stop's hold it did not make (the agent began it by itself): the person's next message lifts it (`personSent`). */
+  private carried = false;
   /**
    * Called after every turn end; `error` is set when the turn failed. `hold`: the agent could not say
    * how the turn ended (it went idle without its end), so nothing queued goes out by itself.
@@ -61,7 +74,8 @@ export class SessionRuntime {
   onTurnStart?: (rt: SessionRuntime) => void;
 
   private index = new Map<string, TimelineItem>();
-  private permissions = new Map<string, { request: PermissionRequest; resolve: (a: PermissionAnswer | null) => void }>();
+  /** `share`: for a share's permission, the files as it showed them (core/handed.ts `approvedShare`). */
+  private permissions = new Map<string, { request: PermissionRequest; resolve: (a: PermissionAnswer | null) => void; share?: ApprovedShare }>();
   private questions = new Map<string, { request: QuestionRequest; resolve: (a: Record<string, string[]> | null) => void }>();
   /** Spans in which a prompt waited for the user ([start, end] ms), and the start of the open one. */
   private waits: [number, number][] = [];
@@ -238,13 +252,14 @@ export class SessionRuntime {
     this.onDirty(this, 'items');
   }
 
-  /** Share steps the person allowed themselves (a permission they answered with an allow), by item id. */
-  private allowedShares = new Set<string>();
+  /** Share steps the person allowed themselves (a permission they answered with an allow), by item id: the files as they were shown. */
+  private allowedShares = new Map<string, ApprovedShare>();
 
-  /** What share step `item` hands over, captured as it goes through (core/handed.ts). */
+  /** What share step `item` hands over, captured as it goes through (core/handed.ts): outside the folder, only what the person was shown. */
   private hand(item: ToolItem) {
-    const granted = this.allowedShares.delete(item.id);
-    return handFiles(this.meta.cwd, item.detail?.files, granted);
+    const approved = this.allowedShares.get(item.id);
+    this.allowedShares.delete(item.id);
+    return handFiles(this.meta.cwd, item.detail?.files, approved);
   }
 
   /**
@@ -254,13 +269,27 @@ export class SessionRuntime {
    * has been looked at (`forgetOutcome`).
    */
   private outcomes = new Map<string, MessageOutcome>();
+  /**
+   * The result that answered each such message: its TurnItem's id, or null when none of its own did
+   * (it came to its turn's end), so which texts were its answer is not known (core/titles.ts).
+   */
+  private answers = new Map<string, string | null>();
 
-  answered(itemIds: readonly string[], outcome: MessageOutcome) {
+  /** `resultId`: the TurnItem of the result that answered them (absent: none of their own). */
+  answered(itemIds: readonly string[], outcome: MessageOutcome, resultId?: string) {
     for (const id of itemIds) {
       this.outcomes.delete(id);
       this.outcomes.set(id, outcome);
+      this.answers.delete(id);
+      this.answers.set(id, resultId ?? null);
     }
     while (this.outcomes.size > 200) this.outcomes.delete(this.outcomes.keys().next().value!);
+    while (this.answers.size > 200) this.answers.delete(this.answers.keys().next().value!);
+  }
+
+  /** The TurnItem of the result that answered message `itemId`; null: answered by none of its own; undefined: its agent says nothing per message. */
+  answeredBy(itemId: string): string | null | undefined {
+    return this.answers.get(itemId);
   }
 
   outcomeOf(itemId: string): MessageOutcome | undefined {
@@ -365,17 +394,32 @@ export class SessionRuntime {
 
   // ── turn state ──
 
-  beginTurn(activity?: string) {
+  /**
+   * `keepHold`: the agent begins this turn by itself (it read a message withdrawn at a stop after all,
+   * a background task woke it): a stop's hold on the queue stays through it, so its end sends nothing
+   * queued either, until the person sends something.
+   */
+  beginTurn(activity?: string, opts: { keepHold?: boolean } = {}) {
+    const hold = !!opts.keepHold && this.stopped && !this.turnActive;
     this.turnActive = true;
     this.turnStartedAt = Date.now();
-    this.stopRequested = false;
+    this.stopped = hold;
+    this.carried = hold;
     this.setSuggestion(undefined);
     this.update({ status: 'running', lastError: undefined, activity, updatedAt: Date.now() });
     this.onTurnStart?.(this);
   }
 
+  /** The person sent a message into the running turn: a hold it carries from an earlier stop is theirs to lift. */
+  personSent() {
+    if (!this.carried) return;
+    this.carried = false;
+    this.stopped = false;
+  }
+
   endTurn(error?: string, opts?: { hold?: boolean }) {
     this.turnActive = false;
+    this.carried = false;
     this.cancelPrompts();
     this.update({ status: error ? 'error' : 'idle', lastError: error, activity: undefined, updatedAt: Date.now() });
     this.onTurnEnd?.(this, error, opts);
@@ -414,6 +458,8 @@ export class SessionRuntime {
     signal?: AbortSignal,
   ): Promise<PermissionAnswer | null> {
     const request: PermissionRequest = { ...req, id: randomUUID(), sessionId: this.id, createdAt: Date.now() };
+    // A share: the files it lists, as they are now that the person is shown them (an allow grants only those).
+    const share = req.kind === 'share' && req.itemId ? approvedShare(this.meta.cwd, req.detail?.files) : undefined;
     return new Promise((resolve) => {
       const done = (a: PermissionAnswer | null) => {
         if (!this.permissions.delete(request.id)) return;
@@ -421,7 +467,7 @@ export class SessionRuntime {
         this.refreshStatus();
         resolve(a);
       };
-      this.permissions.set(request.id, { request, resolve: done });
+      this.permissions.set(request.id, { request, resolve: done, share });
       signal?.addEventListener('abort', () => done(null), { once: true });
       this.emit({ type: 'permission.added', request });
       this.refreshStatus();
@@ -430,13 +476,14 @@ export class SessionRuntime {
 
   /**
    * `person`: the person answered it themselves (the desktop or a phone), not a mode that answers for
-   * them. A share they allowed may hand a file outside the chat's folder to a phone.
+   * them. A share they allowed may hand a file outside the chat's folder to a phone: exactly a file
+   * they were shown, unchanged when the share goes through.
    */
   answerPermission(requestId: string, answer: PermissionAnswer, opts: { person?: boolean } = {}) {
     const p = this.permissions.get(requestId);
     if (!p) return false;
     const tone = p.request.options.find((o) => o.id === answer.optionId)?.tone;
-    if (opts.person && p.request.kind === 'share' && p.request.itemId && tone && tone !== 'deny') this.allowedShares.add(p.request.itemId);
+    if (opts.person && p.request.kind === 'share' && p.request.itemId && p.share && tone && tone !== 'deny') this.allowedShares.set(p.request.itemId, p.share);
     p.resolve(answer);
     return true;
   }

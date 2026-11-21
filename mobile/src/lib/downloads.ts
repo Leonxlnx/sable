@@ -14,18 +14,21 @@ import { isNative, openExternal } from './native';
  */
 
 export type { Download, DownloadState } from './download-core';
+export { installable } from './download-core';
 
-const Files = registerPlugin<FilesPlugin & { open(o: { id: string; mime?: string }): Promise<void> }>('Files');
+const Files = registerPlugin<FilesPlugin & { open(o: { id: string; mime?: string; sha256?: string; size?: number }): Promise<void> }>('Files');
 
 const KEY = 'sable.downloads';
 
 const core = createDownloads({
   plugin: Files,
   async link(p) {
+    // Whether the link (and the digest with it) came sealed, read as it is asked.
+    const secure = conn.secure;
     const r = await conn.call('phone.fileLink', { sessionId: p.sid, itemId: p.itemId, index: p.index });
     const url = conn.httpUrl(r.path);
     if (!url) throw new Error('The computer is not connected.');
-    return { url, size: r.size };
+    return { url, size: r.size, sha256: r.sha256, secure };
   },
   native: isNative,
   storage: {
@@ -84,10 +87,13 @@ export async function openDownload(key: string, name: string) {
   if (d.state === 'idle') return;
   if (!isNative) return void (d.url && openExternal(d.url));
   try {
-    await Files.open({ id: d.id!, mime: mimeOf(name) });
+    // Read whole again and compared before anything opens it (it sat in Downloads meanwhile).
+    await Files.open({ id: d.id!, mime: mimeOf(name), ...(d.sha256 ? { sha256: d.sha256 } : {}), ...(d.size !== undefined ? { size: d.size } : {}) });
   } catch (err) {
-    // Gone from the phone (deleted in Files): it can be downloaded again.
-    if (/no longer on this phone/i.test((err as Error).message)) core.set(key, { state: 'idle' });
+    const text = (err as Error).message;
+    // Gone from the phone (deleted in Files): it can be downloaded again. Changed since: removed there, said so.
+    if (/no longer on this phone/i.test(text)) core.set(key, { state: 'idle' });
+    else if (/so it was removed/i.test(text)) core.set(key, { state: 'failed', error: text });
     throw err;
   }
 }

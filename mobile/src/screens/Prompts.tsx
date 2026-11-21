@@ -5,6 +5,7 @@ import { fit } from '@m/lib/fit';
 import { pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
 import { diffLines, renderMarkdown } from '@m/lib/md';
+import { answerCall, optionKey, patchLines, permissionKeys, questionKey, questionsDesktopOnly } from '@m/lib/asks';
 import { haptic } from '@m/lib/native';
 import { sessionData, setState, useStore } from '@m/lib/store';
 import { AutoHeight } from '@m/ui/AutoHeight';
@@ -105,12 +106,15 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
   const d = req.detail;
   const add = req.diff?.reduce((n, f) => n + f.additions, 0) ?? 0;
   const del = req.diff?.reduce((n, f) => n + f.deletions, 0) ?? 0;
-  const ordered = [...req.options].sort((a, b) => rank(a) - rank(b));
-  // Granting keys stacked (the first one ivory); refusing and "Later" side by side under them.
-  const grants = ordered.filter((o) => o.tone !== 'deny');
-  const denials = ordered.filter((o) => o.tone === 'deny');
+  // Granting keys stacked (the first one ivory); refusing and "Later" side by side under them. A
+  // request the phone got shortened grants nothing here: the desktop has all of it (lib/asks.ts).
+  const { grants, denials, desktopOnly } = permissionKeys(req);
   const command = d.command && d.command.trim() !== req.title.trim() ? d.command : undefined;
   const path = !command && d.path && !req.title.includes(d.path.split(/[\\/]/).pop() ?? '\u0000') ? d.path : undefined;
+  // What a write would put in a file, when no change shows it.
+  const content = !req.diff?.length && typeof d.content === 'string' && d.content ? d.content : undefined;
+  // Files a share would hand over, each by its whole path (one outside the chat's folder is allowed only by name here).
+  const files = d.files?.length ? d.files : undefined;
   return (
     <div className="ask">
       <div className="ask-head">
@@ -142,6 +146,16 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
           <span className="ask-url">{d.url}</span>
         </div>
       )}
+      {files && (
+        <div className="ask-files">
+          {files.map((f, i) => (
+            <div key={`${f.path}:${i}`} className="ask-well">
+              <Icon name="file" size={16} />
+              <PathLabel path={f.path} />
+            </div>
+          ))}
+        </div>
+      )}
       {req.diff && req.diff.length > 0 && (
         <div className="ask-diff-card">
           <button type="button" className="ask-diff num" aria-expanded={showDiff} onClick={() => (haptic('select'), setShowDiff((v) => !v))}>
@@ -154,7 +168,24 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
           <AnimatePresence initial={false}>
             {showDiff && (
               <motion.div className="ask-patch-wrap" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={REVEAL}>
-                <pre className="ask-patch no-drag" dangerouslySetInnerHTML={{ __html: patchHtml(req.diff) }} />
+                <pre className="ask-patch no-drag" dangerouslySetInnerHTML={{ __html: diffLines(patchLines(req.diff).join('\n')) }} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      )}
+      {content && (
+        <div className="ask-diff-card">
+          <button type="button" className="ask-diff num" aria-expanded={showDiff} onClick={() => (haptic('select'), setShowDiff((v) => !v))}>
+            <Icon name="file" size={16} />
+            <span className="ask-diff-name">{d.path ? d.path.split(/[\\/]/).pop() : 'New file'}</span>
+            <span className="ask-diff-lines">{content.split('\n').length} lines</span>
+            <Icon name="caretDown" size={13} weight="bold" className="ask-diff-caret" />
+          </button>
+          <AnimatePresence initial={false}>
+            {showDiff && (
+              <motion.div className="ask-patch-wrap" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={REVEAL}>
+                <pre className="ask-patch no-drag">{content}</pre>
               </motion.div>
             )}
           </AnimatePresence>
@@ -162,6 +193,7 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
       )}
       {d.plan && <div className="md ask-plan no-drag" dangerouslySetInnerHTML={{ __html: renderMarkdown(d.plan) }} />}
       {req.reason && <p className="ask-reason">{req.reason}</p>}
+      {desktopOnly && <p className="ask-desk">Answer this one on the desktop. The phone shows only part of it.</p>}
 
       <AutoHeight className="ask-actions-wrap">
         <AnimatePresence mode="popLayout" initial={false}>
@@ -229,22 +261,6 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
   );
 }
 
-/** The change an edit asks to make: its hunks, coloured, at most 160 lines. */
-function patchHtml(diff: NonNullable<PermissionRequest['diff']>): string {
-  const lines: string[] = [];
-  for (const f of diff) {
-    if (diff.length > 1) lines.push(`@@ ${f.path.split(/[\\/]/).pop()}`);
-    for (const h of f.hunks) {
-      lines.push(`@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines}`);
-      lines.push(...h.lines);
-      if (lines.length > 160) break;
-    }
-    if (lines.length > 160) break;
-  }
-  return diffLines(lines.slice(0, 160).join('\n'));
-}
-
-const rank = (o: PermissionOption) => (o.tone === 'allow' ? 0 : o.tone === 'always' ? 1 : 2);
 
 /** A short name for a question in the steps above it: its own header, else its first words. */
 const tabName = (q: Question, i: number) => q.header?.trim() || `Question ${i + 1}`;
@@ -255,16 +271,21 @@ const tabName = (q: Question, i: number) => q.header?.trim() || `Question ${i + 
  * write something else. The key at the foot goes to the next question, and answers on the last.
  */
 export function QuestionBody({ sid, req, onLater, laterLabel = 'Later' }: { sid: string; req: QuestionRequest; onLater: () => void; laterLabel?: string }) {
-  const [picked, setPicked] = useState<Record<number, string[]>>({});
-  const [other, setOther] = useState<Record<number, string>>({});
+  // Picks are kept by the question's and option's ids (their words may be shortened for the phone).
+  const [picked, setPicked] = useState<Record<string, string[]>>({});
+  const [other, setOther] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [at, setAt] = useState(0);
   const [dir, setDir] = useState(1);
   const n = req.questions.length;
-  const done = (i: number) => (picked[i]?.length ?? 0) > 0 || !!(other[i] ?? '').trim();
+  const desktopOnly = questionsDesktopOnly(req);
+  const qk = (i: number) => questionKey(req, i);
+  const done = (i: number) => (picked[qk(i)]?.length ?? 0) > 0 || !!(other[qk(i)] ?? '').trim();
   const ready = useMemo(() => req.questions.every((_, i) => done(i)), [req, picked, other]); // eslint-disable-line react-hooks/exhaustive-deps
   const q = req.questions[at];
+  const key = qk(at);
   const last = at === n - 1;
+  const cut = !!(q as { cut?: boolean }).cut;
 
   const go = (i: number) => {
     if (i === at || i < 0 || i >= n) return;
@@ -274,19 +295,17 @@ export function QuestionBody({ sid, req, onLater, laterLabel = 'Later' }: { sid:
   };
 
   const submit = async (skip?: boolean) => {
+    const call = answerCall(sid, req, picked, other, skip);
+    if (!call) return;
     setBusy(true);
     haptic(skip ? 'tap' : 'success');
-    const answers: Record<string, string[]> = {};
-    req.questions.forEach((qq, i) => {
-      const list = [...(picked[i] ?? [])];
-      const o = (other[i] ?? '').trim();
-      if (o) list.push(o);
-      answers[qq.question] = list;
-    });
     try {
-      await conn.call('question.respond', { sessionId: sid, requestId: req.id, answers: skip ? null : answers });
+      // By ids (`phone.answer`) where the desktop gave them; refused (shortened, answered elsewhere): it says why, the sheet stays.
+      if (call.method === 'phone.answer') await conn.call('phone.answer', call.params);
+      else await conn.call('question.respond', call.params);
     } catch (err) {
       setBusy(false);
+      haptic('deny');
       fail(err);
     }
   };
@@ -322,21 +341,24 @@ export function QuestionBody({ sid, req, onLater, laterLabel = 'Later' }: { sid:
             transition={SNAP}
           >
             <h2 className="ask-title q-title">{q.question}</h2>
+            {cut && <p className="q-cut">Shortened for the phone. The desktop has it whole.</p>}
             <div className="choices q-choices" role={q.multiSelect ? 'group' : 'radiogroup'} aria-label={q.question}>
-              {q.options.map((o) => {
-                const on = picked[at]?.includes(o.label) ?? false;
+              {q.options.map((o, j) => {
+                const ok = optionKey(req, at, j);
+                const on = picked[key]?.includes(ok) ?? false;
                 return (
                   <button
-                    key={o.label}
+                    key={ok}
                     type="button"
                     className="choice choice-mark"
                     data-selected={on || undefined}
                     role={q.multiSelect ? 'checkbox' : 'radio'}
                     aria-checked={on}
+                    disabled={desktopOnly}
                     onClick={() => {
                       haptic('select');
-                      setPicked((p) => ({ ...p, [at]: q.multiSelect ? (on ? (p[at] ?? []).filter((x) => x !== o.label) : [...(p[at] ?? []), o.label]) : on ? [] : [o.label] }));
-                      if (!q.multiSelect) setOther((x) => ({ ...x, [at]: '' }));
+                      setPicked((p) => ({ ...p, [key]: q.multiSelect ? (on ? (p[key] ?? []).filter((x) => x !== ok) : [...(p[key] ?? []), ok]) : on ? [] : [ok] }));
+                      if (!q.multiSelect) setOther((x) => ({ ...x, [key]: '' }));
                     }}
                   >
                     <span className="pick" data-kind={q.multiSelect ? 'check' : 'radio'} aria-hidden>
@@ -351,22 +373,28 @@ export function QuestionBody({ sid, req, onLater, laterLabel = 'Later' }: { sid:
                   </button>
                 );
               })}
-              <OtherRow
-                value={other[at] ?? ''}
-                on={!!(other[at] ?? '').trim()}
-                onChange={(v) => {
-                  setOther((x) => ({ ...x, [at]: v }));
-                  if (!q.multiSelect && v) setPicked((p) => ({ ...p, [at]: [] }));
-                }}
-              />
+              {!desktopOnly && (
+                <OtherRow
+                  value={other[key] ?? ''}
+                  on={!!(other[key] ?? '').trim()}
+                  onChange={(v) => {
+                    setOther((x) => ({ ...x, [key]: v }));
+                    if (!q.multiSelect && v) setPicked((p) => ({ ...p, [key]: [] }));
+                  }}
+                />
+              )}
             </div>
           </motion.div>
         </AnimatePresence>
       </AutoHeight>
       <div className="ask-actions q-actions">
-        <button type="button" className="btn btn-primary btn-block ask-btn" disabled={busy || (last ? !ready : !done(at))} onClick={next}>
-          {busy ? <span className="dots" /> : last ? 'Answer' : 'Next'}
-        </button>
+        {desktopOnly ? (
+          <p className="ask-desk q-desk">Answer these on the desktop. The phone does not have all of them.</p>
+        ) : (
+          <button type="button" className="btn btn-primary btn-block ask-btn" disabled={busy || (last ? !ready : !done(at))} onClick={next}>
+            {busy ? <span className="dots" /> : last ? 'Answer' : 'Next'}
+          </button>
+        )}
         <div className="q-links">
           <button type="button" className="link-btn" disabled={busy} onClick={() => void submit(true)}>
             Skip

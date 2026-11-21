@@ -5,6 +5,7 @@ import { Haptics, ImpactStyle, NotificationType } from '@capacitor/haptics';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Preferences } from '@capacitor/preferences';
 import type { Pairing } from './conn';
+import { NoteBook } from './note-book';
 
 /** Thin wrappers over the Capacitor plugins, quiet when a plugin is missing (the web preview). */
 
@@ -136,25 +137,15 @@ const lines = new Map<string, { title: string; lines: string[] }>();
 const GROUP = 'sable.chats';
 const SUMMARY_ID = 1;
 
-/** The chats with a notification up (kept across restarts): the summary stays while there are two or more. */
+/** The chats with a notification up (kept across restarts, reconciled with Android's): the summary stays while there are two or more. */
 const POSTED = 'sable.notified';
-const posted = new Set<string>(
-  (() => {
-    try {
-      const v = JSON.parse(localStorage.getItem(POSTED) ?? '[]') as unknown;
-      return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(-50) : [];
-    } catch {
-      return [];
-    }
-  })(),
+const posted = new NoteBook(
+  {
+    get: () => (typeof localStorage === 'undefined' ? null : localStorage.getItem(POSTED)),
+    set: (v) => localStorage.setItem(POSTED, v),
+  },
+  (id) => idFor(id),
 );
-const keepPosted = () => {
-  try {
-    localStorage.setItem(POSTED, JSON.stringify([...posted]));
-  } catch {
-    /* full */
-  }
-};
 
 /**
  * One notification per chat, grouped under Sable: its newest news as the line, the earlier ones of
@@ -176,20 +167,39 @@ export async function notify(title: string, body: string, sessionId: string, kin
     cur.title = title;
     cur.lines = [line, ...cur.lines.filter((l) => l !== line)].slice(0, 5);
     lines.set(sessionId, cur);
-    posted.delete(sessionId);
-    posted.add(sessionId);
-    keepPosted();
+    // What is still up: a notification swiped away no longer counts in the summary.
+    const delivered = await LocalNotifications.getDeliveredNotifications().then(
+      (r) => r.notifications.map((n) => n.id),
+      () => null,
+    );
+    if (delivered) posted.reconcile(delivered);
+    const count = posted.countWith(sessionId);
+    // A summary left from chats that were swiped away goes first (with it its group: this chat's own is posted again below).
+    if (count < 2 && delivered?.includes(SUMMARY_ID)) await LocalNotifications.cancel({ notifications: [{ id: SUMMARY_ID }] }).catch(() => {});
     const common = { channelId: 'turns', smallIcon: 'ic_stat_sable', iconColor: '#f2f1ee', isExactNotification: false, group: GROUP };
     const notifications: Parameters<typeof LocalNotifications.schedule>[0]['notifications'] = [
       // Shown now, not at a time: no exact alarm (asking for one would open a settings screen, impossible from the background).
       { ...common, id: idFor(sessionId), title, body: line, extra: { sessionId, kind }, ...(cur.lines.length > 1 ? { inboxList: cur.lines, summaryText: title } : {}) },
     ];
     // Two chats or more: one summary holds them together (its own tap opens home).
-    if (posted.size > 1) notifications.push({ ...common, id: SUMMARY_ID, title: 'Sable', body: `${posted.size} chats`, groupSummary: true, summaryText: `${posted.size} chats`, extra: { kind: 'home' } });
+    if (count > 1) notifications.push({ ...common, id: SUMMARY_ID, title: 'Sable', body: `${count} chats`, groupSummary: true, summaryText: `${count} chats`, extra: { kind: 'home' } });
     await LocalNotifications.schedule({ notifications });
+    // Written down once it is up (a schedule that failed leaves nothing behind).
+    posted.add(sessionId);
   } catch {
     /* not allowed */
   }
+}
+
+/** Every chat's notification goes, with what was kept of them (the desktop was forgotten). */
+export function clearChatNotifications() {
+  lines.clear();
+  posted.clear();
+  if (!isNative) return;
+  void LocalNotifications.removeAllDeliveredNotifications().catch(() => {});
+  void LocalNotifications.getPending()
+    .then((p) => (p.notifications.length ? LocalNotifications.cancel({ notifications: p.notifications.map((n) => ({ id: n.id })) }) : undefined))
+    .catch(() => {});
 }
 
 /**
@@ -199,8 +209,7 @@ export async function notify(title: string, body: string, sessionId: string, kin
 export function clearNotification(sessionId: string) {
   if (!isNative) return;
   lines.delete(sessionId);
-  const had = posted.delete(sessionId);
-  if (had) keepPosted();
+  const had = posted.remove(sessionId);
   const ids = [{ id: idFor(sessionId) }, ...(had && posted.size === 0 ? [{ id: SUMMARY_ID }] : [])];
   void LocalNotifications.cancel({ notifications: ids }).catch(() => {});
 }
@@ -247,6 +256,12 @@ export function setShortcuts(chats: { id: string; title: string }[]) {
   if (key === shortcutsKey) return;
   shortcutsKey = key;
   void System.shortcuts({ chats }).catch(() => (shortcutsKey = ''));
+}
+
+/** The chats' shortcuts go ("New chat" stays): the desktop was forgotten. */
+export function clearShortcuts() {
+  shortcutsKey = '';
+  setShortcuts([]);
 }
 
 // ── the connection kept in the background (android/…/KeepAliveService.java) ──

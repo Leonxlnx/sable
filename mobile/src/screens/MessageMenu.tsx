@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { pushBack } from '@m/lib/back';
 import { renderMarkdown } from '@m/lib/md';
+import { holder, type Hold } from '@m/lib/held';
 import { haptic, shareText } from '@m/lib/native';
 import { setState } from '@m/lib/store';
 import { Icon } from '@m/ui/icons';
@@ -26,9 +27,11 @@ interface Held {
   at: number;
 }
 
-let held: Held | null = null;
-const subs = new Set<() => void>();
-const emit = () => subs.forEach((l) => l());
+// One hold at a time; each its own (lib/held.ts): what the menu does after a wait checks it still holds that one.
+const holds = holder<Held>((prev, next) => {
+  prev?.value.el.removeAttribute('data-held');
+  next?.value.el.setAttribute('data-held', '');
+});
 
 const done = (text: string, level: 'success' | 'error' = 'success') => setState({ toast: { text, level, at: Date.now() } });
 
@@ -39,17 +42,11 @@ export function holdMessage(e: React.MouseEvent, el: HTMLElement | null, text: (
   // A long press already selected words: the system's own menu is in charge.
   if (String(window.getSelection() ?? '').trim()) window.getSelection()?.removeAllRanges();
   haptic('select');
-  held?.el.removeAttribute('data-held');
-  el.setAttribute('data-held', '');
-  held = { el, x: e.clientX, y: e.clientY, text, md: as === 'md', at: Date.now() };
-  emit();
+  holds.hold({ el, x: e.clientX, y: e.clientY, text, md: as === 'md', at: Date.now() });
 }
 
-const let_go = () => {
-  held?.el.removeAttribute('data-held');
-  held = null;
-  emit();
-};
+/** Lets go of one hold (or whatever is held): a newer one stays. */
+const let_go = (h?: Hold<Held>) => void holds.release(h);
 
 /** The message in a sheet, its words selectable with the system's handles (and nothing else in the way). */
 function SelectSheet({ open, text, md, onClose }: { open: boolean; text: string; md: boolean; onClose: () => void }) {
@@ -66,25 +63,26 @@ function SelectSheet({ open, text, md, onClose }: { open: boolean; text: string;
 }
 
 export function MessageMenu() {
-  const h = useSyncExternalStore(
-    (l) => (subs.add(l), () => void subs.delete(l)),
-    () => held,
-  );
+  const hold = useSyncExternalStore(holds.subscribe, holds.current);
+  const h = hold?.value ?? null;
   const [busy, setBusy] = useState(false);
   const [select, setSelect] = useState<{ text: string; md: boolean; open: boolean } | null>(null);
-  useEffect(() => (h ? pushBack(() => (let_go(), true)) : undefined), [h]);
-  useEffect(() => setBusy(false), [h]);
+  useEffect(() => (hold ? pushBack(() => (let_go(hold), true)) : undefined), [hold]);
+  useEffect(() => setBusy(false), [hold]);
   const run = async (what: 'copy' | 'share' | 'select') => {
-    if (!h || busy) return;
+    if (!hold || !h || busy) return;
     setBusy(true);
     let text = '';
     try {
       text = await h.text();
     } catch {
+      if (!holds.holds(hold)) return;
       haptic('deny');
       done('Could not read the message', 'error');
-      return let_go();
+      return let_go(hold);
     }
+    // Let go of (Back) or replaced by another message while it was fetched: nothing opens, nothing else closes.
+    if (!holds.holds(hold)) return;
     if (what === 'copy') {
       try {
         await navigator.clipboard.writeText(text);
@@ -101,7 +99,7 @@ export function MessageMenu() {
       haptic('tap');
       if (!(await shareText(text))) done('Nothing here can share it', 'error');
     }
-    let_go();
+    let_go(hold);
   };
   const W = 212;
   const H = 162;
@@ -114,7 +112,7 @@ export function MessageMenu() {
         <AnimatePresence>
           {h && (
             <div className="msg-layer" key={h.at}>
-              <motion.div className="msg-scrim" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.16 }} onClick={let_go} onContextMenu={(e) => (e.preventDefault(), let_go())} />
+              <motion.div className="msg-scrim" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.16 }} onClick={() => let_go(hold!)} onContextMenu={(e) => (e.preventDefault(), let_go(hold!))} />
               <motion.div
                 className="msg-menu"
                 role="menu"

@@ -83,6 +83,17 @@ export function Settings() {
 
         <Computer name={name} state={state} palette={paletteFor(defaultProvider)} />
 
+        {/* Paired before the secure channel: it still works, plain; pairing again makes it secure (and installs possible). */}
+        {p && !conn.pairedSecurely && (
+          <div className="group-card set-secure">
+            <button type="button" className="set-row" onClick={() => (haptic('tap'), setState({ repairing: true }))}>
+              <Icon name="shield" size={19} />
+              <span className="set-label">Pair again for a secure connection</span>
+              <Icon name="next" size={15} className="set-chev" />
+            </button>
+          </div>
+        )}
+
         {isNative && (
           <>
             <h3 className="set-title">This phone</h3>

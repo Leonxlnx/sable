@@ -1,7 +1,7 @@
 import { AnimatePresence, motion } from 'motion/react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { pushBack } from '@m/lib/back';
-import { conn, parsePairLink, type PairOffer } from '@m/lib/conn';
+import { conn, offerLink, parsePairLink, type PairOffer } from '@m/lib/conn';
 import { askNotifications, deviceName, haptic } from '@m/lib/native';
 import { Field } from '@m/ui/Field';
 import { launchFrom } from '@m/ui/Launch';
@@ -29,7 +29,7 @@ const WHERE = (
  * computer, waiting for Allow there and under which name, or what went wrong with a way to try
  * again); it keeps its height in every state, and the keys under it keep theirs.
  */
-export function Pair({ link, onLinkUsed, denied }: { link?: string | null; onLinkUsed: () => void; denied?: string }) {
+export function Pair({ link, onLinkUsed, denied, onCancel }: { link?: string | null; onLinkUsed: () => void; denied?: string; onCancel?: () => void }) {
   const [step, setStep] = useState<Step>(denied ? { kind: 'error', text: denied, quiet: true } : { kind: 'idle' });
   const [scan, setScan] = useState(false);
   const [paste, setPaste] = useState(false);
@@ -39,7 +39,8 @@ export function Pair({ link, onLinkUsed, denied }: { link?: string | null; onLin
   const cancelled = useRef(false);
   const mark = useRef<HTMLDivElement>(null);
 
-  // Back closes the link field first.
+  // Back closes the link field first; pairing again from an older pairing, Back leaves it (that pairing goes on).
+  useEffect(() => (onCancel && !busy && !paste ? pushBack(() => (onCancel(), true)) : undefined), [onCancel, busy, paste]);
   useEffect(() => (paste ? pushBack(() => (setPaste(false), true)) : undefined), [paste]);
   useEffect(() => (busy ? pushBack(() => (cancel(), true)) : undefined), [busy]);
 
@@ -112,7 +113,15 @@ export function Pair({ link, onLinkUsed, denied }: { link?: string | null; onLin
   const name = (o: PairOffer) => o.name ?? 'your computer';
   let status: ReactNode;
   let tone: string | undefined;
-  if (step.kind === 'idle') status = <p className="pair-line">On your computer, open {WHERE} and scan the code.</p>;
+  if (step.kind === 'idle')
+    status = onCancel ? (
+      <>
+        <p className="pair-line pair-strong">Pair again for a secure connection</p>
+        <p className="pair-sub">On your computer, open {WHERE} and scan the code.</p>
+      </>
+    ) : (
+      <p className="pair-line">On your computer, open {WHERE} and scan the code.</p>
+    );
   else if (step.kind === 'connecting')
     status = (
       <>
@@ -141,7 +150,7 @@ export function Pair({ link, onLinkUsed, denied }: { link?: string | null; onLin
           {!step.quiet && <i className="pair-dot" />} {step.text}
         </p>
         {again ? (
-          <button type="button" className="pair-retry" onClick={() => (haptic('tap'), void start(`sable://pair?h=${again.hosts.join(',')}&p=${again.port}&k=${again.key}${again.name ? `&n=${encodeURIComponent(again.name)}` : ''}`))}>
+          <button type="button" className="pair-retry" onClick={() => (haptic('tap'), void start(offerLink(again)))}>
             <Icon name="retry" size={15} /> Try again
           </button>
         ) : (
@@ -225,6 +234,11 @@ export function Pair({ link, onLinkUsed, denied }: { link?: string | null; onLin
             </motion.div>
           )}
         </AnimatePresence>
+        {onCancel && !busy && (
+          <button type="button" className="link-btn pair-later" onClick={() => (haptic('tap'), onCancel())}>
+            Not now
+          </button>
+        )}
       </div>
 
       <AnimatePresence>

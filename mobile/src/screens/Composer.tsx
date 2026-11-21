@@ -7,9 +7,10 @@ import { conn } from '@m/lib/conn';
 import { claimFlight, dropFlight, inFlight, launchFlight } from '@m/lib/flight';
 import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
-import { onPutDraft } from '@m/lib/put-draft';
+import { onPutDraft, putDraft } from '@m/lib/put-draft';
 import { haptic } from '@m/lib/native';
-import { acceptIntent, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, useStore } from '@m/lib/store';
+import { acceptIntent, closeGap, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, unsureIntent, useStore } from '@m/lib/store';
+import { isUncertain } from '@m/lib/errors';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
@@ -125,10 +126,12 @@ export function Composer({ sid }: { sid: string }) {
   // The keyboard put away (back, the keyboard's own key): the field lets go too, so it does not stay lifted.
   useEffect(() => onKeyboard((lift, prev) => lift === 0 && prev > 0 && document.activeElement === area.current && area.current?.blur()), []);
 
-  // Words put here from the chat (a check's findings): into the field, ready to edit and send.
+  // Words put here from the chat (a check's findings, a queued message taken back): into the field, ready to edit and send.
   useEffect(
     () =>
-      onPutDraft(sid, (t) => {
+      onPutDraft(sid, (words, append) => {
+        const had = area.current?.value ?? '';
+        const t = append && had.trim() ? `${had.trimEnd()}\n${words}` : words;
         setText(t);
         drafts.set(sid, t);
         saveDrafts();
@@ -162,12 +165,17 @@ export function Composer({ sid }: { sid: string }) {
   const away = AGENTS.filter((p) => p !== s.provider && signedIn(providers[p]));
   // Every choice shows at once (the store holds it against older answers). Accepted, it is the field's
   // truth; refused, the field goes back to what the desktop last said, but only for the newest choice
-  // of that field (an older one failing late changes nothing: lib/intents.ts).
+  // of that field (an older one failing late changes nothing: lib/intents.ts), however late the
+  // refusal comes. No answer at all (a timeout, the connection gone): the desktop is asked what it is.
   const choose = <K extends 'model' | 'effort' | 'speed' | 'mode'>(key: K, value: SessionMeta[K], call: () => Promise<unknown>) => {
     const gen = intend(sid, key, value);
     void call().then(
-      () => acceptIntent(sid, key, value),
+      () => acceptIntent(sid, key, value, gen),
       (err) => {
+        if (isUncertain(err)) {
+          if (unsureIntent(sid, key, gen)) toast('The desktop did not answer. It shows what the chat uses now.', 'error');
+          return;
+        }
         if (!undoIntent(sid, key, gen)) return;
         haptic('deny');
         toast((err as Error).message, 'error');
@@ -275,6 +283,8 @@ export function Composer({ sid }: { sid: string }) {
     const attachments = files.length ? files : undefined;
     update('', true);
     setFiles([]);
+    // Opened far back (a search hit): the chat goes to its newest, where the message lands.
+    void closeGap(sid).catch(() => {});
     try {
       await conn.call('session.send', { sessionId: sid, text: t, attachments });
     } catch (err) {
@@ -409,14 +419,37 @@ function QueueTray({ sid, queue }: { sid: string; queue: QueuedMessage[] }) {
   );
 }
 
-/** One waiting message; a row its words are flying into lands as liquid instead of rising in. */
+/**
+ * One waiting message; a row its words are flying into lands as liquid instead of rising in. A tap on
+ * its words takes it back into the field to edit (`queue.take`; one with pictures stays: the phone does
+ * not hold their data). A take the desktop refuses (too long to send back) says so and leaves it queued.
+ */
 function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
   const ref = useRef<HTMLDivElement>(null);
   const [liquid] = useState(() => inFlight(q.text));
+  const [taking, setTaking] = useState(false);
   useLayoutEffect(() => {
     if (liquid && ref.current) claimFlight(q.text, ref.current, 'row');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  const editable = !q.attachments?.length && !!q.text;
+  const take = () => {
+    if (taking) return;
+    haptic('tap');
+    setTaking(true);
+    void conn
+      .call('queue.take', { sessionId: sid, id: q.id })
+      .then(
+        (r) => {
+          if (r.message?.text) putDraft(sid, r.message.text, { append: true });
+        },
+        (err) => {
+          haptic('deny');
+          toast((err as Error).message, 'error');
+        },
+      )
+      .finally(() => setTaking(false));
+  };
   return (
           <motion.div
             ref={ref}
@@ -427,7 +460,13 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
             exit={{ opacity: 0, y: -18, scale: 0.97, transition: { duration: 0.18 } }}
             transition={SNAP}
           >
-            <span className="queued-text">{q.text || 'Photo'}</span>
+            {editable ? (
+              <button type="button" className="queued-text" aria-label={`Edit: ${q.text.slice(0, 80)}`} data-busy={taking || undefined} onClick={take}>
+                {q.text}
+              </button>
+            ) : (
+              <span className="queued-text">{q.text || 'Photo'}</span>
+            )}
             <button
               type="button"
               className="icon-btn sm"

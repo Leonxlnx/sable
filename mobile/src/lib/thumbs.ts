@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { kindOfFile } from '@m/ui/FileGlyph';
 import { conn } from './conn';
+import { isTransport } from './errors';
 
 /**
  * Small pictures of the files an agent handed over, for their rows (`phone.thumb`: the desktop's
@@ -43,8 +44,9 @@ function load(sid: string, itemId: string, index: number, kind: ThumbKind): Prom
           return { src: r.data, kind };
         },
         (err: Error) => {
-          // Not connected or no answer: asked again next time; the desktop's own no (an older desktop, a changed file): none.
-          if (/not connected|in time/i.test(err.message)) throw err;
+          // The connection failed the call (never sent, lost on the way, no answer in time): asked again once
+          // connected, never kept as "none". The desktop's own no (an older desktop, a changed file): none.
+          if (isTransport(err)) throw err;
           return null;
         },
       )

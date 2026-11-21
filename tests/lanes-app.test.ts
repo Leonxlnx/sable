@@ -177,5 +177,5 @@ describe('lanes with two Demo sessions in one folder', { timeout: 180_000 }, () 
     expect(existsSync(full.path)).toBe(true);
     expect(git(repo, 'branch', '--list', 'sable/*')).toContain(full.branch);
     expect(full.path.startsWith(lanes)).toBe(true);
-  });
+  }, 30_000);
 });

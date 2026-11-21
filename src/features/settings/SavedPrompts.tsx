@@ -7,7 +7,7 @@ import { plural } from '@/lib/format';
 import { removePrompt, reorderPrompts, savePrompt, updatePrompt, usePromptsLoaded, useSavedPrompts } from '@/features/saved/prompts-store';
 import { IconButton } from '@/ui';
 import { Empty, Skeleton } from './parts';
-import { promptEdits, type PromptField, type PromptFields } from './prompt-edits';
+import { promptEdits, RowWrites, type PromptField, type PromptFields } from './prompt-edits';
 import './saved-prompts.css';
 
 /**
@@ -172,15 +172,38 @@ function PromptRow({ prompt: p, index, count, open, reduced, onOpen, onClose, on
   const textRef = useRef<HTMLTextAreaElement>(null);
   useGrow(textRef, open ? text : '');
 
-  // Closed, the fields follow the prompt (a change from elsewhere). Open, a field not edited here
-  // follows it too, and one edited here that changed elsewhere as well is shown as a conflict.
+  const openNow = useRef(open);
+  openNow.current = open;
+  const latest = useRef(p);
+  latest.current = p;
+  const reopen = useRef(onOpen);
+  reopen.current = onOpen;
+  /** Closed with nothing in flight: the fields follow the prompt. */
+  const follow = () => {
+    const q = latest.current;
+    setName(q.name);
+    setText(q.text);
+    seen.current = { name: q.name, text: q.text };
+    setConflict([]);
+  };
+  /** This row's writes: once the bridge took one its fields are what this row has seen; Done waits for them (prompt-edits.ts). */
+  const writes = useRef<RowWrites | null>(null);
+  writes.current ??= new RowWrites(
+    (patch, was) =>
+      updatePrompt(p.id, patch, was).then((ok) => {
+        if (ok) Object.assign(seen.current, patch);
+        return ok;
+      }),
+    { isOpen: () => openNow.current, refusedClosed: () => reopen.current(), idle: follow },
+  );
+
+  // Closed, the fields follow the prompt (a change from elsewhere), once no write of theirs is out
+  // (one refused opens the row again on its words). Open, a field not edited here follows it too,
+  // and one edited here that changed elsewhere as well is shown as a conflict.
   useEffect(() => {
     const s = seen.current;
     if (!open) {
-      setName(p.name);
-      setText(p.text);
-      seen.current = { name: p.name, text: p.text };
-      setConflict([]);
+      if (!writes.current?.busy) follow();
       return;
     }
     const cur = { ...now.current };
@@ -203,8 +226,7 @@ function PromptRow({ prompt: p, index, count, open, reduced, onOpen, onClose, on
 
   /** Sends fields as given; once the bridge took them they are what this row has seen. */
   const send = (patch: Partial<PromptFields>, was: Partial<PromptFields>) => {
-    if (!Object.keys(patch).length) return;
-    void updatePrompt(p.id, patch, was).then((ok) => ok && Object.assign(seen.current, patch));
+    void writes.current!.send(patch, was);
   };
   /**
    * Keeps what was typed: only the fields edited since the edit began (an emptied name keeps the old
@@ -216,8 +238,9 @@ function PromptRow({ prompt: p, index, count, open, reduced, onOpen, onClose, on
     setConflict(r.conflicts);
     return !r.conflicts.length;
   };
+  /** Done: closed once what was typed is stored; refused (changed in another window meanwhile), the row stays open on the words and the conflict shows. */
   const close = () => {
-    if (save()) onClose();
+    if (save()) void writes.current!.closeWhenStored(onClose);
   };
   /** This window's words win the conflicting fields (over what the other window saved). */
   const keepMine = () => {

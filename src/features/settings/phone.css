@@ -131,3 +131,28 @@
 .phone-dev svg {
   color: var(--text-2);
 }
+
+/* a phone paired before the secure channel */
+.phone-dev-plain {
+  color: var(--text-2);
+}
+
+/* a change to the paired phones that could not be written yet (it holds; Sable tries again) */
+.phone-save-error {
+  padding: 12px 16px;
+  border-radius: var(--r-lg);
+  font-size: var(--t-small);
+  line-height: 1.45;
+  color: var(--text-2);
+}
+
+.phone-save-error::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 8px;
+  border-radius: 50%;
+  background: var(--red);
+  vertical-align: 1px;
+}

@@ -337,16 +337,29 @@ describe('file.thumb: what is kept', () => {
   it("drops a file's pictures of before when it is pictured as it is now (another size or time)", async () => {
     const { host, asked } = fakeHost();
     const thumbs = new Thumbs({ host, pdf: null, inline: { small: 0, large: 0 } });
-    const at = { path: path.join(tmpdir(), 'clip.mp4'), size: 10, mtimeMs: 1 };
+    // Real files: a picture is made only of the file as it was checked (its size and time).
+    const dir = mkdtempSync(path.join(tmpdir(), 'sable-thumbs-drop-'));
+    homes.push(dir);
+    const at = { path: path.join(dir, 'clip.mp4'), size: 10, mtimeMs: 1000 };
+    const other = { ...at, path: path.join(dir, 'other.mp4') };
+    for (const f of [at, other]) {
+      writeFileSync(f.path, Buffer.alloc(f.size));
+      utimesSync(f.path, 1, 1);
+    }
     await thumbs.thumb(at, 320);
     await thumbs.thumb(at, 160);
-    await thumbs.thumb({ ...at, path: path.join(tmpdir(), 'other.mp4') }, 320);
+    await thumbs.thumb(other, 320);
     expect(thumbs.size.entries).toBe(3);
-    await thumbs.thumb({ ...at, mtimeMs: 2 }, 320);
+    utimesSync(at.path, 2, 2);
+    await thumbs.thumb({ ...at, mtimeMs: 2000 }, 320);
     // Its two pictures of before went; the other file's stays.
     expect(thumbs.size.entries).toBe(2);
-    await thumbs.thumb({ ...at, mtimeMs: 2 }, 320);
+    await thumbs.thumb({ ...at, mtimeMs: 2000 }, 320);
     expect(asked).toHaveLength(4);
+    // Asked by what it no longer is (its time of before): nothing is read, nothing is kept.
+    expect(await thumbs.thumb(at, 96)).toBeNull();
+    expect(asked).toHaveLength(4);
+    expect(thumbs.size.entries).toBe(2);
   });
 
   it('keeps a file without a picture as none, and stays within its count', async () => {

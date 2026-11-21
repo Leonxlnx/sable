@@ -23,6 +23,8 @@ import { partOfTurn, syntheticOf } from '@shared/synthetic';
 import { conn, type ConnState } from './conn';
 import { reshape, shapeString } from './turns';
 import { Intents, type Field } from './intents';
+import { clearChatNotifications, clearShortcuts } from './native';
+import { coalesce, staleFetch } from './stale';
 
 /**
  * The phone's view of the desktop: sessions, folders, accounts and the open conversations, kept
@@ -43,6 +45,14 @@ export interface SessionData {
   caps?: Capabilities;
   /** Pass to `phone.tail` for the page before the oldest one here; absent once the start is in. */
   cursor?: string;
+  /**
+   * The pages here stop before the newest (opened around a message far back): the first root after
+   * them, for `fetchNewer`. New messages meanwhile wait in `late` until the gap closes.
+   */
+  next?: string;
+  late?: string[];
+  /** Counts the times the whole chat was replaced from the desktop (a page around a message, the newest page again): what was mounted starts over. */
+  epoch?: number;
   /** Shown from the phone's cache while the desktop is asked. */
   cached?: boolean;
   /** One character per root (lib/turns.ts `shapeOf`), kept per changed id: the conversation is grouped again only when it changes. */
@@ -78,6 +88,8 @@ export interface State {
   listAt?: number;
   /** Every chat's permission prompts and questions waiting now (home's waiting strip and its deck), oldest first. */
   pending: { permissions: PermissionRequest[]; questions: QuestionRequest[] };
+  /** Pairing again (from an older, plain pairing) while that one still works: the pairing screen is up over home. */
+  repairing?: boolean;
 }
 
 // A phone with a list from the last run was paired then: it starts as connecting (not on the pairing screen).
@@ -197,9 +209,27 @@ export function intend<K extends Field>(id: string, field: K, value: SessionMeta
   return gen;
 }
 
-/** The desktop accepted a pick: its value is what the field goes back to if a later pick is refused. */
-export function acceptIntent<K extends Field>(id: string, field: K, value: SessionMeta[K]) {
-  picks.accepted(id, field, value);
+/** The desktop accepted pick `gen`: its value is what the field goes back to if a later pick is refused. */
+export function acceptIntent<K extends Field>(id: string, field: K, value: SessionMeta[K], gen?: number) {
+  picks.accepted(id, field, value, gen);
+}
+
+/**
+ * Pick `gen` got no answer (timed out, the connection went): the desktop may have taken it or not.
+ * When it is still the newest pick of that field, the hold lets go and the chat's fields are asked of
+ * the desktop again (true); with no connection, the next one's list says.
+ */
+export function unsureIntent(id: string, field: Field, gen: number): boolean {
+  if (!picks.unsure(id, field, gen)) return false;
+  if (state.conn === 'open') void refreshMeta(id).catch(() => {});
+  return true;
+}
+
+/** A chat's own fields (model, effort, speed, mode, the rest of its entry) as the desktop has them now. */
+async function refreshMeta(id: string) {
+  const hello = await conn.call('app.hello', {});
+  const s = hello.sessions.find((x) => x.id === id);
+  if (s) setState({ sessions: { ...state.sessions, [id]: withIntents(s) } });
 }
 
 /**
@@ -219,7 +249,7 @@ const sieve = (id: string, patch: Partial<SessionMeta>): Partial<SessionMeta> =>
 /** A whole chat from the desktop (a snapshot, a list) with what the phone picked still on top. */
 const withIntents = (s: SessionMeta): SessionMeta => picks.over(s as unknown as Record<string, unknown> & { id: string }) as unknown as SessionMeta;
 
-type Tail = (SessionSnapshot | PhoneTail) & { cursor?: string };
+type Tail = (SessionSnapshot | PhoneTail) & { cursor?: string; next?: string };
 
 export function applySnapshot(snap: Tail, cached = false) {
   // Streamed pieces still waiting for the next frame are already in the snapshot: adding them again would repeat words.
@@ -246,6 +276,8 @@ export function applySnapshot(snap: Tail, cached = false) {
         todos: snap.todos,
         caps: snap.caps,
         cursor: snap.cursor,
+        ...(snap.next ? { next: snap.next, late: [] } : {}),
+        epoch: (state.data[snap.session.id]?.epoch ?? 0) + 1,
         shape: shapeString(roots, items),
         fileSteps: countFileSteps(items),
         ...(cached ? { cached: true } : {}),
@@ -335,6 +367,10 @@ export function applyEvent(e: BridgeEvent) {
           const put = putItems(d, parent ? [e.item, { ...parent, kids: (parent.kids ?? 0) + 1 } as PhoneItem] : [e.item]);
           return { ...put, children: { ...d.children, [pid]: [...(d.children[pid] ?? []), e.item.id] } };
         }
+        if (d.next) {
+          d.items[e.item.id] = e.item;
+          return { late: [...(d.late ?? []), e.item.id] };
+        }
         const roots = [...d.roots, e.item.id];
         const put = putItems({ ...d, roots, shape: d.shape + '.' }, [e.item]);
         return { ...put, roots };
@@ -398,8 +434,22 @@ export function applyEvent(e: BridgeEvent) {
     case 'toast':
       return setState({ toast: { text: e.text, level: e.level, at: Date.now() } });
     default:
+      // An event too big for the phone came as `phone.stale`: what it stood for is fetched again.
+      if ((e as { type: string }).type === 'phone.stale') onStale(e as unknown as { sessionId?: string });
       return;
   }
+}
+
+/** `phone.stale`: the open chat's newest page, or the list; a burst fetches each once at a time. */
+const HELLO_KEY = '\u0000hello';
+const staleRun = coalesce(async (key) => {
+  if (state.conn !== 'open') return;
+  if (key === HELLO_KEY) return refresh(Object.keys(state.data));
+  return openSession(key);
+});
+function onStale(e: { sessionId?: string }) {
+  const f = staleFetch(e, (id) => !!state.data[id]);
+  staleRun(f.kind === 'tail' ? f.sessionId : HELLO_KEY);
 }
 
 /** Loads everything the phone shows after each (re)connect, and the open conversations again. */
@@ -475,8 +525,59 @@ export async function fetchOlder(id: string, maxPages = 12): Promise<{ before: s
 }
 
 /**
+ * Opens a chat at a root item (a search hit): when it is not here, a bounded page around it replaces
+ * what is shown (`phone.tail` `around`; the pages to the newest come as the person scrolls,
+ * `fetchNewer`). 'here' once it is on the phone, 'gone' when the chat no longer has it or it could
+ * not be reached (the caller says so). A desktop without `around` gets the old way: the pages back to it.
+ */
+export async function openAt(id: string, itemId: string): Promise<'here' | 'gone'> {
+  if (state.data[id]?.items[itemId] && !state.data[id].cached) return 'here';
+  if (!pages) return (await reachItem(id, itemId)) ? 'here' : 'gone';
+  let snap: PhoneTail;
+  try {
+    snap = await conn.call('phone.tail', { sessionId: id, around: itemId });
+  } catch (err) {
+    if (/no longer in this chat/i.test((err as Error).message)) return 'gone';
+    throw err;
+  }
+  applySnapshot(snap);
+  if (snap.at === itemId) return state.data[id]?.items[itemId] ? 'here' : 'gone';
+  // An older desktop gave the newest page: the pages back to it, as before.
+  return (await reachItem(id, itemId)) ? 'here' : 'gone';
+}
+
+/** The page after the newest one here, when the pages stop before the newest (opened around a message). Closes the gap when it reaches it. */
+export async function fetchNewer(id: string): Promise<boolean> {
+  const d = state.data[id];
+  if (!d?.next || d.cached) return false;
+  const after = d.next;
+  const page: PhoneTail = await conn.call('phone.tail', { sessionId: id, after });
+  const now = state.data[id];
+  if (!now || now.next !== after) return false;
+  const items = { ...now.items };
+  const have = new Set(now.roots);
+  const add: string[] = [];
+  for (const it of page.items) {
+    if (!have.has(it.id)) add.push(it.id);
+    items[it.id] = it;
+  }
+  // Reached the newest: what arrived meanwhile follows, once each.
+  const closing = !page.next;
+  const seen = new Set([...now.roots, ...add]);
+  const late = closing ? (now.late ?? []).filter((x) => !seen.has(x) && items[x]) : [];
+  const roots = [...now.roots, ...add, ...late];
+  setState({ data: { ...state.data, [id]: { ...now, items, roots, next: page.next, late: closing ? undefined : now.late, shape: shapeString(roots, items), fileSteps: countFileSteps(items) } } });
+  return true;
+}
+
+/** Back to the newest when the pages here stop before it (a message was sent, or "Jump to the newest"). */
+export async function closeGap(id: string) {
+  if (state.data[id]?.next) await openSession(id);
+}
+
+/**
  * Makes sure a root item is on the phone, asking for the pages back to it (a search hit further back
- * than the newest page). True when it is there.
+ * than the newest page, from a desktop without `around`). True when it is there.
  */
 export async function reachItem(id: string, itemId: string, tries = 6): Promise<boolean> {
   for (let i = 0; i < tries; i++) {
@@ -559,9 +660,29 @@ export const sessionData = (s: State, id: string): SessionData => s.data[id] ?? 
 
 conn.on(applyEventSoon);
 conn.onState(() => {
-  if (conn.state === 'unpaired') clearCache();
+  if (conn.state === 'unpaired') return forgetDesktop();
   setState({ conn: conn.state, connError: conn.error, desktop: conn.pairing?.desktop ?? state.desktop });
 });
+
+/**
+ * The desktop was forgotten on this phone: nothing of it stays. Its cache and the writes still due
+ * to it, what is in memory (chats, conversations, what waits, limits), the picks, and in Android the
+ * app icon's chat shortcuts and the chats' notifications with their bookkeeping.
+ */
+export function forgetDesktop() {
+  clearTimeout(homeTimer);
+  homeTimer = 0;
+  for (const t of tailTimers.values()) clearTimeout(t);
+  tailTimers.clear();
+  deltas.clear();
+  savedSessions = undefined;
+  clearCache();
+  picks.clear();
+  capsAsked.clear();
+  clearShortcuts();
+  clearChatNotifications();
+  setState({ conn: conn.state, connError: conn.error, desktop: undefined, version: undefined, providers: {}, projects: [], sessions: {}, settings: undefined, data: {}, limits: {}, limitsAt: undefined, caps: {}, toast: undefined, attention: undefined, loaded: false, fresh: false, listAt: undefined, pending: NONE, repairing: false });
+}
 
 // ── the phone's cache: the list of chats and the newest page of the last chats opened ──
 // Shown at once at the next start (Android closes apps in the background), then refreshed.
@@ -601,7 +722,7 @@ export function loadCachedHome() {
 function saveTail(id: string) {
   const d = state.data[id];
   const s = state.sessions[id];
-  if (!d || !s || d.cached) return;
+  if (!d || !s || d.cached || d.next) return;
   try {
     const roots = d.roots.slice(-TAIL_ROOTS);
     const items = roots.map((r) => d.items[r]).filter(Boolean);

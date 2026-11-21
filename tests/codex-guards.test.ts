@@ -191,14 +191,15 @@ describe('#13: an idle probe gives way to newer news, and a stale answer is aske
     expect(h.count('turn/start')).toBe(2);
   });
 
-  it('an answer that stays "inProgress" is asked a few times, then the turn ends with the queue held', async () => {
+  it('an answer that stays "inProgress" is asked a few times, then the turn stays open, unsure, with the queue held (wave 3, #11)', async () => {
     const h = await codexFake({ turnsList: () => ({ data: [{ id: 'turn1', status: 'inProgress', items: [] }] }) });
     await h.send('first');
     await tick();
     h.session().idleRecheckMs = [20, 20];
     await h.send('second');
     h.status('idle');
-    await until(() => !h.rt.turnActive, 'the turn ended', 3000);
+    await until(() => h.rt.meta.activity === 'Waiting for Codex', 'the turn left unsure', 3000);
+    expect(h.rt.turnActive).toBe(true);
     expect(h.count('thread/turns/list')).toBe(3);
     expect(h.count('turn/start')).toBe(1);
     expect(h.rt.queue.map((q) => q.text)).toEqual(['second']);

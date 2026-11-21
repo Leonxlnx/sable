@@ -12,8 +12,7 @@ import { get, type IncomingMessage, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import WebSocket from 'ws';
-import { PHONE_PATH, type PhoneStatus } from '@shared/protocol';
+import { pairSecure } from './phone-wire';
 
 const opened: { file: string; fh: FileHandle }[] = [];
 
@@ -56,19 +55,10 @@ async function setup() {
   return { app, phone, port: status.port, file };
 }
 
+/** Pairs a phone over the secure channel (tests/phone-wire.ts), "Allow" clicked. */
 async function pairPhone(app: AppT, port: number) {
-  const offer = (await app.call('phone.pair', {})) as PhoneStatus;
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${PHONE_PATH}`, { headers: { origin: 'http://localhost' } });
-  const frames: Record<string, unknown>[] = [];
-  ws.on('message', (m) => frames.push(JSON.parse(String(m))));
-  await new Promise((r) => ws.on('open', r));
-  ws.send(JSON.stringify({ pair: { key: /k=([^&]+)/.exec(offer.pairing!.link)![1], name: 'Phone' } }));
-  await until(() => frames.some((f) => 'waiting' in f));
-  const asking = await app.call('phone.status', {});
-  await app.call('phone.approve', { requestId: asking.request!.id, allow: true });
-  await until(() => frames.some((f) => 'paired' in f));
-  const deviceId = (frames.find((f) => 'paired' in f) as { paired: { deviceId: string } }).paired.deviceId;
-  return { ws, deviceId };
+  const { c, deviceId } = await pairSecure(app, port, 'Phone');
+  return { ws: c.ws, deviceId };
 }
 
 async function until(ok: () => boolean, ms = 5000) {

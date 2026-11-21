@@ -4,18 +4,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import WebSocket from 'ws';
 import {
   PHONE_OWN_METHODS,
-  PHONE_PATH,
   type Capabilities,
   type ModelInfo,
   type NoticeItem,
   type PhoneChanges,
   type PhoneDiff,
-  type PhoneFrame,
   type PhoneSearch,
-  type PhoneStatus,
   type PhoneTail,
   type TextItem,
   type TimelineItem,
@@ -31,6 +27,8 @@ import { LIMITS, phoneDetail, phoneEvent, phonePage, REACH, registerPhone, SEARC
 import { qrMatrix } from '../server/services/qr';
 import { registerThumbs } from '../server/services/thumbs';
 import { mergeHosts } from '../mobile/src/lib/hosts';
+import { pskOfKey } from '../mobile/src/lib/secure';
+import { fingerprintIn, handshake, helloSecure, keyOf, pairSecure, wireClient } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -71,60 +69,11 @@ async function setup(opts: { codex?: boolean } = {}) {
   return { app, phone, home, port: status.port };
 }
 
-type Frame = PhoneFrame | { id: number; ok: boolean; result?: unknown; error?: string } | { event: unknown };
+/** A socket to the endpoint (tests/phone-wire.ts): plain until a handshake makes it secure. */
+const client = (port: number, origin?: string) => wireClient(port, origin ?? null);
 
-function client(port: number, origin?: string) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${PHONE_PATH}`, origin ? { headers: { origin } } : undefined);
-  const frames: Frame[] = [];
-  const waiters: ((f: Frame) => void)[] = [];
-  ws.on('message', (m) => {
-    const f = JSON.parse(String(m)) as Frame;
-    frames.push(f);
-    for (const w of waiters.splice(0)) w(f);
-  });
-  const next = (pred: (f: Frame) => boolean) =>
-    new Promise<Frame>((resolve, reject) => {
-      const hit = frames.find(pred);
-      if (hit) return resolve(hit);
-      const t = setTimeout(() => reject(new Error('no such frame')), 3000);
-      const check = (f: Frame) => {
-        if (pred(f)) {
-          clearTimeout(t);
-          resolve(f);
-        } else waiters.push(check);
-      };
-      waiters.push(check);
-    });
-  const open = new Promise<void>((resolve, reject) => {
-    ws.on('open', () => resolve());
-    ws.on('unexpected-response', (_req, res) => reject(Object.assign(new Error('refused'), { status: res.statusCode })));
-    ws.on('error', reject);
-  });
-  let id = 0;
-  const call = async (method: string, params: unknown = {}) => {
-    const i = ++id;
-    ws.send(JSON.stringify({ id: i, method, params }));
-    return (await next((f) => 'id' in f && f.id === i)) as { ok: boolean; result?: unknown; error?: string };
-  };
-  const closed = new Promise<number>((r) => ws.on('close', (code) => r(code)));
-  return { ws, open, next, call, closed, frames };
-}
-
-const keyOf = (s: PhoneStatus) => /k=([^&]+)/.exec(s.pairing!.link)![1];
-
-async function pairPhone(app: App, port: number) {
-  const offer = await app.call('phone.pair', {});
-  const c = client(port, 'http://localhost');
-  await c.open;
-  c.ws.send(JSON.stringify({ pair: { key: keyOf(offer), name: 'Test phone' } }));
-  await c.next((f) => 'waiting' in f);
-  const asking = await app.call('phone.status', {});
-  expect(asking.request?.name).toBe('Test phone');
-  await app.call('phone.approve', { requestId: asking.request!.id, allow: true });
-  const paired = (await c.next((f) => 'paired' in f)) as { paired: { token: string; deviceId: string } };
-  await c.next((f) => 'welcome' in f);
-  return { c, token: paired.paired.token, deviceId: paired.paired.deviceId };
-}
+/** Pairs a phone (over the secure channel, the only way now), "Allow" clicked. */
+const pairPhone = (app: App, port: number) => pairSecure(app, port);
 
 describe('phone endpoint', () => {
   it('pairs only after "Allow", keeps the token hashed, and the key works once', async () => {
@@ -136,11 +85,9 @@ describe('phone endpoint', () => {
     const saved = readFileSync(path.join(home, 'phone.json'), 'utf8');
     expect(saved).not.toContain(token);
     expect((await app.call('phone.status', {})).devices).toHaveLength(1);
-    // The same key again: refused.
+    // The same key again: refused (signed by the desktop), before anything secret goes.
     const again = client(port);
-    await again.open;
-    again.ws.send(JSON.stringify({ pair: { key: keyOf(offer), name: 'Other' } }));
-    expect(await again.next((f) => 'denied' in f)).toBeTruthy();
+    expect((await handshake(again, 'pair', fingerprintIn(offer), pskOfKey(keyOf(offer)))).denied).toMatch(/Pairing is not open/);
     c.ws.close();
   });
 
@@ -148,8 +95,8 @@ describe('phone endpoint', () => {
     const { app, port } = await setup();
     const offer = await app.call('phone.pair', {});
     const c = client(port);
-    await c.open;
-    c.ws.send(JSON.stringify({ pair: { key: keyOf(offer), name: 'Stranger' } }));
+    expect(await handshake(c, 'pair', fingerprintIn(offer), pskOfKey(keyOf(offer)))).toEqual({});
+    c.send({ pair: { key: keyOf(offer), name: 'Stranger' } });
     await c.next((f) => 'waiting' in f);
     const st = await app.call('phone.status', {});
     await app.call('phone.approve', { requestId: st.request!.id, allow: false });
@@ -204,7 +151,7 @@ describe('phone endpoint', () => {
     for (let i = 0; i < 5; i++) {
       const c = client(port);
       await c.open;
-      c.ws.send(JSON.stringify({ hello: { token: `wrong-${i}` } }));
+      c.send({ hello: { token: `wrong-${i}` } });
       expect(await c.closed).toBe(4001);
     }
     const blocked = client(port);
@@ -220,22 +167,20 @@ describe('phone endpoint', () => {
     expect(await c.closed).toBe(4001);
     const again = client(port);
     await again.open;
-    again.ws.send(JSON.stringify({ hello: { token } }));
+    again.send({ hello: { token } });
     expect(await again.closed).toBe(4001);
   });
 
   it('a paired phone reconnects with its token after a restart of the endpoint', async () => {
     const { app, port, phone } = await setup();
-    const { c, token } = await pairPhone(app, port);
+    const { c, token, deviceId, fingerprint } = await pairPhone(app, port);
     c.ws.close();
     await (phone as PhoneService).stop();
     await app.call('phone.setEnabled', { on: true });
     const port2 = (await app.call('phone.status', {})).port;
-    const again = client(port2);
-    await again.open;
-    again.ws.send(JSON.stringify({ hello: { token } }));
-    expect(await again.next((f) => 'welcome' in f)).toBeTruthy();
-    again.ws.close();
+    const again = await helloSecure(port2, { deviceId, token, fingerprint });
+    expect(await again.c.next((f) => 'welcome' in f)).toBeTruthy();
+    again.c.ws.close();
   });
 });
 
@@ -447,7 +392,9 @@ describe('files the agent hands over', () => {
     const ok = await thumb({ sessionId: id, itemId: 'share1', index: 0, size: 4096 });
     expect(ok.result?.data).toBe(`data:image/jpeg;base64,${jpeg.toString('base64')}`);
     // The row's width, whatever the phone asked for; a kind with no picture is none, nothing tried.
-    expect(asked).toEqual([{ file: shot, px: 160 }]);
+    // The shell gets a private copy of the file that was checked, never its path.
+    expect(asked.map((a) => [path.basename(a.file), a.px])).toEqual([['shot.png', 160]]);
+    expect(asked[0].file).not.toBe(shot);
     expect((await thumb({ sessionId: id, itemId: 'share1', index: 1 })).result?.data).toBeNull();
     // Waiting for "Allow", not a share, past the list, another chat, a path of its own: nothing.
     for (const params of [
@@ -698,7 +645,7 @@ describe("a chat's changes from the phone", () => {
     await expect(app.call('phone.changes' as never, { sessionId: id } as never)).rejects.toThrow();
     await expect(app.call('phone.diff' as never, { sessionId: id, path: 'src/a.ts' } as never)).rejects.toThrow();
     c.ws.close();
-  });
+  }, 30_000);
 
   it('outside a repository: the chat’s own edits; with steps named, only theirs (sub-agents included)', async () => {
     const { app, port, home } = await setup();

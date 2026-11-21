@@ -1,18 +1,19 @@
 import { useEffect, useState } from 'react';
-import type { MessageHit } from '@shared/protocol';
+import type { MessageHit, MessageSearch } from '@shared/protocol';
 import { bridge } from '@/lib/bridge';
 
 /**
  * Messages across chats for the palette, asked of the bridge (`search.messages`: what the person
  * wrote and what the agents said, newest chats first, a few per chat). Asked once typing pauses; an
  * answer that is partial (chats not read yet) is asked again with its cursor, each time going on
- * where the last one stopped, until it is whole. A new query drops what the old one was still
- * waiting for (the bridge stops this window's search too, never another window's).
+ * where the last one stopped, until the bridge says it is whole (`searchAll`): "Searching…" shows
+ * until then, so a match further on never looks absent. Each call is bounded by the bridge. A new
+ * query drops what the old one was still waiting for (the bridge stops this window's search too,
+ * never another window's).
  */
 
 export const MIN_QUERY = 2;
 const DEBOUNCE_MS = 170;
-const ROUNDS = 16;
 export const PER_CHAT = 3;
 export const MAX_HITS = 24;
 /** This window, to the bridge: its searches stop only its own. */
@@ -30,6 +31,24 @@ export interface MessageResults {
 
 const NONE: MessageResults = { q: '', hits: [], busy: false };
 
+type SearchCall = (params: { query: string; perChat: number; limit: number; scope: string; cursor?: string }) => Promise<MessageSearch>;
+
+/**
+ * Asks for `q` until the search is whole: a partial answer is asked again with its cursor, however
+ * many answers that takes, and what came so far is shown meanwhile as still coming (`busy`). Stops
+ * as soon as `live()` says the answer is no longer wanted (a new query, the palette closed).
+ */
+export async function searchAll(call: SearchCall, q: string, live: () => boolean, show: (r: MessageResults) => void): Promise<void> {
+  let cursor: string | undefined;
+  while (live()) {
+    const r = await call({ query: q, perChat: PER_CHAT, limit: MAX_HITS, scope: SCOPE, ...(cursor ? { cursor } : {}) });
+    if (!live()) return;
+    show({ q, hits: r.hits, busy: !!r.partial, ...(r.skipped ? { skipped: r.skipped } : {}) });
+    if (!r.partial) return;
+    cursor = r.cursor;
+  }
+}
+
 export function useMessageSearch(query: string, enabled: boolean): MessageResults {
   const [found, setFound] = useState<MessageResults>(NONE);
   const q = query.trim();
@@ -44,14 +63,7 @@ export function useMessageSearch(query: string, enabled: boolean): MessageResult
     setFound((f) => ({ q: f.q, hits: f.hits, busy: true }));
     const t = window.setTimeout(async () => {
       try {
-        let cursor: string | undefined;
-        for (let round = 0; round < ROUNDS && live; round++) {
-          const r = await bridge.call('search.messages', { query: q, perChat: PER_CHAT, limit: MAX_HITS, scope: SCOPE, ...(cursor ? { cursor } : {}) }, 20_000);
-          if (!live) return;
-          setFound({ q, hits: r.hits, busy: !!r.partial && round < ROUNDS - 1, ...(r.skipped ? { skipped: r.skipped } : {}) });
-          if (!r.partial) return;
-          cursor = r.cursor;
-        }
+        await searchAll((params) => bridge.call('search.messages', params, 20_000), q, () => live, setFound);
       } catch {
         // An older bridge, or the search failed: no messages section.
         if (live) setFound({ q, hits: [], busy: false });

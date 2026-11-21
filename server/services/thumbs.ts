@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { realpathSync, statSync, type Stats } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, open as openFile, rm, type FileHandle } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { App } from '../app';
 import type { SessionSnapshot } from '../../shared/protocol';
@@ -26,13 +27,19 @@ import { grantFor } from './phone-guard';
  *   3. the desktop shell's host (`ThumbHost`, electron/thumbs.ts: Windows' own thumbnail of a
  *      picture, a video, a document, anything Explorer shows one for). Electron makes it on the main
  *      process, where the bridge runs, and holds it meanwhile (about 70 to 150 ms a file, 300 to 400
- *      for the first one; Windows keeps them, so asked again they are quick): one at a time, with a
- *      breather between (`THUMB.hostGap`), so a share of many files never adds up to one long hold;
+ *      for the first one; it is given a private copy, so Windows' own cache of thumbnails does not
+ *      help, and the picture is kept here instead): one at a time, with a breather between
+ *      (`THUMB.hostGap`), so a share of many files never adds up to one long hold;
  *   4. a bigger picture file of a common type, up to `THUMB.fileMax`, as it is (a dev or standalone
  *      bridge has no shell). Otherwise none (`null`).
- * - Kept by file, size, time and width (`THUMB.entries`, `THUMB.bytes`). One picture per file is
- *   made at a time; one PDF is drawn at a time and the shell makes one at a time, each in its own
- *   lane, so a small picture never waits behind a PDF or a video.
+ * - Made of the very file that was checked: it is opened once and the handle must be that file (its
+ *   volume and exact id, size and time); a picture is read from the handle (never more than its
+ *   size), and a renderer that takes a path (the PDF renderer, the shell) gets a private copy made
+ *   from the handle (`THUMB.copyMax`), so what replaces the file at its path meanwhile is never drawn.
+ * - Kept by the checked file (path, volume and id, size, time) and width (`THUMB.entries`,
+ *   `THUMB.bytes`): another file at the same path with the same size and time is pictured anew. One
+ *   picture per file is made at a time; one PDF is drawn at a time and the shell makes one at a time,
+ *   each in its own lane, so a small picture never waits behind a PDF or a video.
  */
 
 export type ThumbKind = 'image' | 'pdf' | 'video' | 'doc';
@@ -63,6 +70,12 @@ export const THUMB = {
   bytes: 32 * 1024 * 1024,
   /** A PDF's page has this long to be drawn. */
   pdfMs: 15_000,
+  /** A page is drawn at most this many times as tall as it is wide (only its top shows), within `pixels`, and its PNG within `png` bytes. */
+  pageTall: 2,
+  pixels: 2_000_000,
+  png: 4 * 1024 * 1024,
+  /** The biggest file copied for a renderer that takes a path (a PDF's page, the shell's thumbnail); a bigger one gets none. */
+  copyMax: 256 * 1024 * 1024,
 };
 
 const KINDS: [RegExp, ThumbKind][] = [
@@ -84,11 +97,14 @@ export function thumbSize(px?: unknown): number {
   return THUMB.sizes.find((s) => s >= n) ?? THUMB.sizes[THUMB.sizes.length - 1];
 }
 
-/** A shared file as a thumbnail may read it. */
+/** A shared file as a thumbnail may read it: the file that was checked. */
 export interface ThumbFile {
   path: string;
   size: number;
   mtimeMs: number;
+  /** The volume it is on and its exact id (decimal): the picture is made of that very file (absent: not checked). */
+  dev?: number;
+  fileId?: string;
 }
 
 /**
@@ -98,7 +114,7 @@ export interface ThumbFile {
  */
 export function thumbFile(snap: Pick<SessionSnapshot, 'session' | 'items'>, itemId: string, index: number): ThumbFile {
   const grant = grantFor(snap, itemId, index, '');
-  return { path: grant.path, size: grant.size, mtimeMs: grant.mtimeMs };
+  return { path: grant.path, size: grant.size, mtimeMs: grant.mtimeMs, dev: grant.dev, fileId: grant.fileId };
 }
 
 const samePath = (a: string, b: string) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
@@ -121,9 +137,11 @@ export function currentFile(snap: Pick<SessionSnapshot, 'session' | 'items'>, it
   const listed = path.resolve(cwd, file.path);
   let real: string;
   let st: Stats;
+  let exact: bigint;
   try {
     real = realpathSync(listed);
     st = statSync(real);
+    exact = statSync(real, { bigint: true }).ino;
   } catch {
     throw new Error('That file is no longer on the computer.');
   }
@@ -138,7 +156,73 @@ export function currentFile(snap: Pick<SessionSnapshot, 'session' | 'items'>, it
     const handed = Array.isArray(share.handed) ? share.handed[index] : undefined;
     if (!handed?.granted || !samePath(real, handed.path)) throw new Error(within(path.resolve(cwd), listed) ? 'That file is a link to another place.' : "That file is outside the chat's folder.");
   }
-  return { path: real, size: st.size, mtimeMs: st.mtimeMs };
+  return { path: real, size: st.size, mtimeMs: st.mtimeMs, dev: st.dev, fileId: exact.toString() };
+}
+
+// ── the checked file, read from its handle ──
+
+/** The checked file opened: the handle must be that very file (volume and exact id when known, size, time), else null. */
+async function openChecked(file: ThumbFile): Promise<FileHandle | null> {
+  let fh: FileHandle | undefined;
+  try {
+    fh = await openFile(file.path, 'r');
+    const st = await fh.stat();
+    const exact = file.fileId !== undefined ? (await fh.stat({ bigint: true })).ino.toString() : undefined;
+    if (st.isFile() && st.size === file.size && st.mtimeMs === file.mtimeMs && exact === file.fileId && (file.dev === undefined || st.dev === file.dev)) return fh;
+  } catch {
+    /* gone or locked: no picture this time */
+  }
+  await fh?.close().catch(() => {});
+  return null;
+}
+
+/** The handle's file, `size` bytes and never more (one byte over is read to see it grew): null when it is not that size now. */
+async function readCapped(fh: FileHandle, size: number): Promise<Buffer | null> {
+  const buf = Buffer.alloc(size + 1);
+  let got = 0;
+  while (got < buf.length) {
+    const { bytesRead } = await fh.read(buf, got, buf.length - got, got);
+    if (!bytesRead) break;
+    got += bytesRead;
+  }
+  return got === size ? buf.subarray(0, size) : null;
+}
+
+/** A private copy of the checked file for a renderer that takes a path, made from its handle; null over `max`. Throws when the file changed while it was copied. */
+async function copyOut(fh: FileHandle, file: ThumbFile, max: number): Promise<{ dir: string; file: string } | null> {
+  if (!(file.size > 0 && file.size <= max)) return null;
+  const dir = await mkdtemp(path.join(tmpdir(), 'sable-thumb-'));
+  // Its own name (a renderer may go by the extension), in a folder of its own.
+  const to = path.join(dir, path.basename(file.path) || 'file');
+  try {
+    const out = await openFile(to, 'wx');
+    try {
+      const buf = Buffer.allocUnsafe(Math.min(1024 * 1024, file.size + 1));
+      let off = 0;
+      for (;;) {
+        const want = Math.min(buf.length, file.size + 1 - off);
+        if (want <= 0) break;
+        const { bytesRead } = await fh.read(buf, 0, want, off);
+        if (!bytesRead) break;
+        for (let w = 0; w < bytesRead; ) w += (await out.write(buf, w, bytesRead - w)).bytesWritten;
+        off += bytesRead;
+      }
+      // All of it and no more, and written to by nobody meanwhile (a write moves its time).
+      const st = await fh.stat();
+      if (off !== file.size || st.size !== file.size || st.mtimeMs !== file.mtimeMs) throw new Error('The file changed while it was read.');
+    } finally {
+      await out.close();
+    }
+    return { dir, file: to };
+  } catch (err) {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
+}
+
+/** A PNG's width and height from its header, or null when it has none. */
+export function pngSize(b: Buffer): { w: number; h: number } | null {
+  return pictureType(b) === 'image/png' && b.length >= 24 && b.toString('latin1', 12, 16) === 'IHDR' ? { w: b.readUInt32BE(16), h: b.readUInt32BE(20) } : null;
 }
 
 /** The type of picture these bytes are (by their first bytes, never by the name), or null. */
@@ -155,6 +239,9 @@ export function pictureType(b: Buffer): 'image/png' | 'image/jpeg' | 'image/gif'
 /**
  * Draws page 1 of the PDF in `SABLE_THUMB_SRC` at `SABLE_THUMB_PX` wide (in the process's own scale)
  * and writes it to stdout as base64 PNG. The path comes in the environment, never in the script.
+ * A page taller than `SABLE_THUMB_TALL` times its width is drawn only down to there (its top, at the
+ * same scale: only the top shows), so the bitmap stays within a bounded height; a PNG over
+ * `SABLE_THUMB_BYTES` is refused before it is copied out.
  */
 const PDF_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -169,11 +256,24 @@ $null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Str
 $file = Wait-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync($env:SABLE_THUMB_SRC)) ([Windows.Storage.StorageFile])
 $doc = Wait-Op ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
 $page = $doc.GetPage(0)
+$w = [double]$page.Size.Width
+$h = [double]$page.Size.Height
+if (-not ($w -gt 0 -and $h -gt 0)) { throw 'no page' }
+$px = [double]$env:SABLE_THUMB_PX
+$maxH = $px * [double]$env:SABLE_THUMB_TALL
+$scale = $px / $w
+$outH = $h * $scale
 $opts = New-Object Windows.Data.Pdf.PdfPageRenderOptions
-$opts.DestinationWidth = [uint32]$env:SABLE_THUMB_PX
+if ($outH -gt $maxH) {
+  $opts.SourceRect = New-Object Windows.Foundation.Rect(0, 0, $w, ($maxH / $scale))
+  $outH = $maxH
+}
+$opts.DestinationWidth = [uint32]$px
+$opts.DestinationHeight = [uint32][Math]::Max(1, [Math]::Round($outH))
 $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
 $task = $asAct.Invoke($null, @($page.RenderToStreamAsync($stream, $opts)))
 if (-not $task.Wait(10000)) { throw 'timeout' }
+if ($stream.Size -gt [uint64]$env:SABLE_THUMB_BYTES) { throw 'too big' }
 $read = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($stream.GetInputStreamAt(0))
 $ms = New-Object System.IO.MemoryStream
 $read.CopyTo($ms)
@@ -188,11 +288,18 @@ export function windowsPdfPage(file: string, px: number): Promise<ThumbImage | n
     execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
-      { env: { ...process.env, SABLE_THUMB_SRC: file, SABLE_THUMB_PX: String(px) }, timeout: THUMB.pdfMs, maxBuffer: 12 * 1024 * 1024, windowsHide: true },
+      {
+        env: { ...process.env, SABLE_THUMB_SRC: file, SABLE_THUMB_PX: String(px), SABLE_THUMB_TALL: String(THUMB.pageTall), SABLE_THUMB_BYTES: String(THUMB.png) },
+        timeout: THUMB.pdfMs,
+        maxBuffer: Math.ceil((THUMB.png * 4) / 3) + 1024,
+        windowsHide: true,
+      },
       (err, stdout) => {
         if (err) return resolve(null);
         const data = Buffer.from(String(stdout).trim(), 'base64');
-        resolve(pictureType(data) === 'image/png' ? { mime: 'image/png', data } : null);
+        // Within its bounds, also as Windows scaled it (the process's own scale).
+        const at = pngSize(data);
+        resolve(at && at.w * at.h <= THUMB.pixels && data.length <= THUMB.png ? { mime: 'image/png', data } : null);
       },
     );
   });
@@ -207,6 +314,8 @@ export interface ThumbOptions {
   fileMax?: number;
   /** Pictures given as they are before the shell is asked (`THUMB.inline`). */
   inline?: { small: number; large: number };
+  /** The biggest file copied for the PDF renderer or the shell (`THUMB.copyMax`). */
+  copyMax?: number;
 }
 
 const dataUrl = (mime: string, data: Buffer) => `data:${mime};base64,${data.toString('base64')}`;
@@ -223,19 +332,22 @@ export class Thumbs {
   private readonly pdf: ((file: string, px: number) => Promise<ThumbImage | null>) | null;
   private readonly fileMax: number;
   private readonly inline: { small: number; large: number };
+  private readonly copyMax: number;
 
   constructor(opts: ThumbOptions = {}) {
     this.host = opts.host;
     this.pdf = opts.pdf === undefined ? windowsPdfPage : opts.pdf;
     this.fileMax = opts.fileMax ?? THUMB.fileMax;
     this.inline = opts.inline ?? THUMB.inline;
+    this.copyMax = opts.copyMax ?? THUMB.copyMax;
   }
 
-  /** A picture of the file at `px` wide (a data URL), or null when there is none. */
+  /** A picture of the file that was checked at `px` wide (a data URL), or null when there is none. */
   async thumb(file: ThumbFile, px: number): Promise<string | null> {
     const kind = thumbKind(file.path);
     if (!kind) return null;
-    const stamp = `${file.path}\n${file.size}\n${file.mtimeMs}\n`;
+    // By the very file: another one at the same path with the same size and time is another picture.
+    const stamp = `${file.path}\n${file.dev ?? ''}:${file.fileId ?? ''}\n${file.size}\n${file.mtimeMs}\n`;
     const key = stamp + px;
     const hit = this.take(key);
     if (hit !== undefined) return hit;
@@ -244,7 +356,9 @@ export class Thumbs {
     const run = before.then(async () => {
       const again = this.take(key);
       if (again !== undefined) return again;
-      const data = await this.make(file.path, kind, px, file.size);
+      const data = await this.make(file, kind, px);
+      // Not read as it was checked (gone, locked, changed): none this time, and nothing is kept.
+      if (data === undefined) return null;
       this.keep(key, stamp, file.path, data);
       return data;
     });
@@ -256,33 +370,69 @@ export class Thumbs {
     return run;
   }
 
-  private async make(file: string, kind: ThumbKind, px: number, size: number): Promise<string | null> {
+  /**
+   * The picture, made of the checked file only: opened once and that very file, read from its handle;
+   * a renderer that takes a path gets a private copy made from the handle. The handle is closed
+   * before anything waits for a renderer (an open file cannot be replaced on Windows: a build moving
+   * a new one over it would fail). Undefined when the file could not be read as it was checked.
+   */
+  private async make(file: ThumbFile, kind: ThumbKind, px: number): Promise<string | null | undefined> {
     this.made++;
-    // 1. A small picture as it is: nothing is decoded here.
-    if (kind === 'image' && size <= (px >= 256 ? this.inline.large : this.inline.small)) {
-      const own = await this.itself(file, size);
-      if (own) return own;
+    const size = file.size;
+    const viaPath = (kind === 'pdf' && !!this.pdf) || !!this.host;
+    let copy: { dir: string; file: string } | null = null;
+    let own: string | null = null;
+    let read = false;
+    const fh = await openChecked(file);
+    if (!fh) return undefined;
+    try {
+      // 1. A small picture as it is: nothing is decoded here.
+      if (kind === 'image' && size <= (px >= 256 ? this.inline.large : this.inline.small)) {
+        own = await this.itself(fh, size);
+        read = true;
+        if (own) return own;
+      }
+      if (viaPath) copy = await copyOut(fh, file, this.copyMax);
+      // No copy to read the picture from later: read it now (step 4).
+      else if (kind === 'image' && !read) own = await this.itself(fh, size);
+    } catch {
+      if (copy) await rm(copy.dir, { recursive: true, force: true }).catch(() => {});
+      return undefined;
+    } finally {
+      await fh.close().catch(() => {});
     }
-    // 2. A PDF's page, drawn in a process of its own.
-    if (kind === 'pdf' && this.pdf) {
-      const t = await this.viaPdf(this.pdf, file, px);
-      if (t?.data.length) return dataUrl(t.mime, t.data);
+    try {
+      // 2. A PDF's page, drawn in a process of its own.
+      if (kind === 'pdf' && this.pdf && copy) {
+        const t = await this.viaPdf(this.pdf, copy.file, px);
+        if (t?.data.length) return dataUrl(t.mime, t.data);
+      }
+      // 3. The shell's own thumbnail (it holds the main process: one at a time, with a breather).
+      if (this.host && copy) {
+        const t = await this.viaHost(this.host, copy.file, px);
+        if (t?.data.length && (t.mime === 'image/png' || t.mime === 'image/jpeg')) return dataUrl(t.mime, t.data);
+      }
+      // 4. A bigger picture as it is, when nothing made a smaller one.
+      if (kind !== 'image') return null;
+      if (!copy || read) return own;
+      const ch = await openFile(copy.file, 'r');
+      try {
+        return await this.itself(ch, size);
+      } finally {
+        await ch.close().catch(() => {});
+      }
+    } catch {
+      return undefined;
+    } finally {
+      if (copy) await rm(copy.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }).catch(() => {});
     }
-    // 3. The shell's own thumbnail (it holds the main process: one at a time, with a breather).
-    if (this.host) {
-      const t = await this.viaHost(this.host, file, px);
-      if (t?.data.length && (t.mime === 'image/png' || t.mime === 'image/jpeg')) return dataUrl(t.mime, t.data);
-    }
-    // 4. A bigger picture as it is, when nothing made a smaller one.
-    return kind === 'image' ? this.itself(file, size) : null;
   }
 
-  /** The picture file itself, when it is one of the common types (by its bytes) and within `fileMax`. */
-  private async itself(file: string, size: number): Promise<string | null> {
+  /** The picture file itself (from its handle, its size and no more), when it is one of the common types (by its bytes) and within `fileMax`. */
+  private async itself(fh: FileHandle, size: number): Promise<string | null> {
     if (!(size > 0 && size <= this.fileMax)) return null;
-    const data = await readFile(file).catch(() => null);
-    // Read as it is now: a file that changed size since it was looked at is not given.
-    const type = data && data.length === size ? pictureType(data) : null;
+    const data = await readCapped(fh, size);
+    const type = data ? pictureType(data) : null;
     return data && type ? dataUrl(type, data) : null;
   }
 

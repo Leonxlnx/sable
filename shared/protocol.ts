@@ -1619,6 +1619,11 @@ export interface PhoneDevice {
   lastSeen?: number;
   /** Connected now. */
   online?: boolean;
+  /**
+   * Paired over the secure channel (`PhoneSecHello`): it connects only that way. Absent: a phone
+   * paired before it, still on plain frames until it pairs again.
+   */
+  secure?: boolean;
 }
 
 export interface PhoneStatus {
@@ -1637,10 +1642,39 @@ export interface PhoneStatus {
   /** A phone that presented the pairing key and waits for "Allow". */
   request?: { id: string; name: string; address: string; at: number };
   error?: string;
+  /** A change to the paired phones (a removal, phone access off) is in effect but could not be written to disk yet; it is tried again. */
+  saveError?: string;
 }
 
-/** Frames a phone sends before it is authenticated (as JSON text). Afterwards it sends `RpcRequest`s. */
-export type PhoneHello = { hello: { token: string; name?: string } } | { pair: { key: string; name: string } };
+/**
+ * Frames a phone sends before it is authenticated (as JSON text). Afterwards it sends `RpcRequest`s.
+ * On a secure connection these go inside the channel, after `PhoneSecHello` / `PhoneSecReply`;
+ * `replaces`: the pairing this phone had before (its device and token), removed once the new one is allowed.
+ */
+export type PhoneHello = { hello: { token: string; name?: string } } | { pair: { key: string; name: string; replaces?: { id: string; token: string } } };
+
+/** The secure channel's version (server/services/phone-secure.ts, mobile/src/lib/secure.ts). */
+export const PHONE_SECURE_VERSION = 1;
+
+/**
+ * The phone's first frame on a secure connection (JSON text): what it comes for (`pair` with the
+ * QR code's one-time key, `hello` as device `id` with its token), its ephemeral P-256 ECDH key (`pub`,
+ * raw, base64url) and whether it can inflate compressed frames (`z`). Nothing secret.
+ */
+export interface PhoneSecHello {
+  sec: { v: number; kind: 'pair' | 'hello'; id?: string; pub: string; z?: boolean };
+}
+
+/**
+ * The desktop's answer: its ephemeral key (`pub`), its long-lived identity key (`key`, SPKI DER,
+ * base64url; the pairing link carries its SHA-256 as `f`), and its ECDSA P-256 signature over the
+ * transcript (`sig`, IEEE P1363). `denied`: a signed refusal instead of a channel. From here on
+ * every frame both ways is binary: a flag byte (1: deflate-raw inside), then AES-256-GCM of the
+ * JSON text with an implicit sequence number, under keys bound to the pairing secret.
+ */
+export interface PhoneSecReply {
+  sec: { v: number; pub: string; key: string; sig: string; denied?: string };
+}
 
 /** Frames the phone endpoint sends besides `ServerFrame`s. */
 export type PhoneFrame =
@@ -1709,6 +1743,10 @@ export interface PhoneTail extends Omit<SessionSnapshot, 'items'> {
   cursor?: string;
   /** Root items in the whole conversation. */
   total: number;
+  /** The page stops before the newest (`around`, `after`): the first root after it; pass as `after` for the next page. */
+  next?: string;
+  /** The item a page `around` it was asked for (absent: an older desktop gave the newest page instead). */
+  at?: string;
 }
 
 /** Methods only the phone endpoint answers, besides `PHONE_METHODS`. */
@@ -1716,17 +1754,21 @@ export interface PhoneMethods {
   /**
    * The newest page of a conversation (or the one before `before`), trimmed; from here on its live
    * events reach this phone. `to`: the page reaches back at least to that root item (a search hit, a
-   * place to open at), within a cap; asked again from its cursor when it is further back.
+   * place to open at), within a cap; asked again from its cursor when it is further back. `around`:
+   * a bounded page around that root item instead (whole turns, `at` names it, `next` when it stops
+   * before the newest); `after`: the page that starts at that root, toward the newest.
    */
-  'phone.tail': { params: { sessionId: string; before?: string; limit?: number; to?: string }; result: PhoneTail };
+  'phone.tail': { params: { sessionId: string; before?: string; limit?: number; to?: string; around?: string; after?: string }; result: PhoneTail };
   /** One item with more of it (a step's output and change, a long text in full) and the last steps nested under it. */
   'phone.item': { params: { sessionId: string; itemId: string }; result: { item: PhoneItem; children: PhoneItem[] } };
   /**
    * A download link for a file the agent handed over in this conversation (a `share` step's
    * `detail.files[index]`): a path on the phone endpoint (`/f/<token>/<name>`) that serves that one
-   * file for 15 minutes. Nothing else on the computer can be fetched this way.
+   * file for 15 minutes. Nothing else on the computer can be fetched this way. `sha256` (hex) and
+   * `size` are the file's as it is served: the phone checks what arrived against both before it opens
+   * or installs it (they come over the authenticated channel, the bytes over plain HTTP).
    */
-  'phone.fileLink': { params: { sessionId: string; itemId: string; index: number }; result: { path: string; name: string; size?: number } };
+  'phone.fileLink': { params: { sessionId: string; itemId: string; index: number }; result: { path: string; name: string; size?: number; sha256?: string } };
   /**
    * A new, empty folder inside an existing one (a new chat's folder, from the folder browser): one
    * plain name, no path separators, nothing hidden; never overwrites. Returns its path.

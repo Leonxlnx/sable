@@ -131,6 +131,12 @@ export function Phone() {
         </Card>
       )}
 
+      {status.saveError && (
+        <div className="phone-save-error card" role="alert">
+          {status.saveError}
+        </div>
+      )}
+
       {status.devices.length > 0 && (
         <Card title="Phones">
           {status.devices.map((d) => (
@@ -142,7 +148,13 @@ export function Phone() {
                   {d.name}
                 </span>
               }
-              help={d.online ? 'Connected' : d.lastSeen ? `Last seen ${ago(d.lastSeen, now)}` : `Paired ${ago(d.pairedAt, now)}`}
+              help={
+                <>
+                  {d.online ? 'Connected' : d.lastSeen ? `Last seen ${ago(d.lastSeen, now)}` : `Paired ${ago(d.pairedAt, now)}`}
+                  {/* Paired before the secure channel: it works, plain, until it pairs again. */}
+                  {!d.secure && <span className="phone-dev-plain"> · Pair again for a secure connection</span>}
+                </>
+              }
             >
               <button type="button" className="btn btn-sm" onClick={() => void run(() => bridge.call('phone.revoke', { deviceId: d.id }))}>
                 Remove

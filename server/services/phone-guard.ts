@@ -38,7 +38,10 @@ export function readHello(text: string): PhoneHello | null {
   const pair = obj(m.pair);
   if (pair) {
     const key = str(pair.key);
-    return key ? { pair: { key, name: typeof pair.name === 'string' ? pair.name.slice(0, HELLO_FIELD) : '' } } : null;
+    // The pairing it had before (to be removed once this one is allowed): both fields, or nothing.
+    const was = obj(pair.replaces);
+    const replaces = was && str(was.id) && str(was.token) ? { id: str(was.id)!, token: str(was.token)! } : undefined;
+    return key ? { pair: { key, name: typeof pair.name === 'string' ? pair.name.slice(0, HELLO_FIELD) : '', ...(replaces ? { replaces } : {}) } } : null;
   }
   return null;
 }

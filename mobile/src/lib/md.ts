@@ -27,8 +27,6 @@ function fileChip(text: string): string | null {
   return `<span class="md-file" role="button" tabindex="0" data-path="${esc(t)}" aria-label="${esc(name)}, copy path">${FILE_ICON}<span class="md-file-name">${esc(name)}</span>${line ? `<span class="md-file-line">${esc(line)}</span>` : ''}</span>`;
 }
 
-const unescape = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
-
 const md = new Marked({
   gfm: true,
   breaks: false,
@@ -46,8 +44,9 @@ const md = new Marked({
       return h ? `<a href="${esc(h)}" target="_blank" rel="noopener noreferrer">${esc(text || 'Image')}</a>` : esc(text || '');
     },
     codespan({ text }: Tokens.Codespan) {
-      // marked hands the span escaped: read it back as plain text for the file test.
-      return fileChip(unescape(text)) ?? `<code>${text}</code>`;
+      // Marked 16 hands the span's raw text (`<b>x</b>` stays a tag): the file test reads it as it is,
+      // and what shows is escaped, so an answer can never put markup in the app.
+      return fileChip(text) ?? `<code>${esc(text)}</code>`;
     },
     code({ text, lang }: Tokens.Code) {
       const l = (lang ?? '').trim().split(/\s+/)[0].toLowerCase();

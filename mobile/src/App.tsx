@@ -85,6 +85,8 @@ function watchShortcuts() {
   let timer = 0;
   const sync = () => {
     timer = 0;
+    // Forgotten meanwhile: no chat of that desktop goes back on the icon.
+    if (getState().conn === 'unpaired') return setShortcuts([]);
     const recent = Object.values(getState().sessions)
       .filter((s) => !s.archived)
       .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -93,7 +95,14 @@ function watchShortcuts() {
     setShortcuts(recent);
   };
   return () => {
-    const { sessions, fresh } = getState();
+    const { sessions, fresh, conn: state } = getState();
+    // Forgotten: a sync still due goes (forgetDesktop clears the shortcuts themselves).
+    if (state === 'unpaired') {
+      clearTimeout(timer);
+      timer = 0;
+      prev = sessions;
+      return;
+    }
     if (sessions === prev || !fresh) return;
     prev = sessions;
     if (!timer) timer = window.setTimeout(sync, 4000);
@@ -183,8 +192,9 @@ export function App() {
     return () => clearTimeout(t);
   }, [stack]);
 
+  const repairing = useStore((s) => !!s.repairing);
   const unpaired = state === 'unpaired' || (state === 'denied' && !getState().loaded);
-  const pairing = unpaired || !!link;
+  const pairing = unpaired || !!link || repairing;
   // Leaving the pairing screen for home: the launch plays from the pairing mark.
   useEffect(() => {
     if (pairing) wasPairing.current = true;
@@ -200,7 +210,15 @@ export function App() {
   if (pairing) {
     return (
       <>
-        <Pair link={link} onLinkUsed={() => setLink(null)} denied={state === 'denied' ? error : undefined} />
+        <Pair
+          link={link}
+          onLinkUsed={() => {
+            setLink(null);
+            setState({ repairing: false });
+          }}
+          denied={state === 'denied' ? error : undefined}
+          onCancel={repairing && !unpaired ? () => setState({ repairing: false }) : undefined}
+        />
         <Toast />
       </>
     );

@@ -5,13 +5,13 @@
  * caught after the open, so what lies outside is never read. `open` is wrapped to make the swap at
  * exactly that moment.
  */
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { PathLike } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const hook: { beforeOpen?: (file: string) => void } = {};
+const hook: { beforeOpen?: (file: string) => void; beforePath?: (fn: string, file: string) => void } = {};
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const m = await importOriginal<typeof import('node:fs/promises')>();
@@ -19,7 +19,17 @@ vi.mock('node:fs/promises', async (importOriginal) => {
     hook.beforeOpen?.(String(file));
     return (m.open as (...a: unknown[]) => Promise<unknown>)(file, ...rest);
   }) as typeof m.open;
-  return { ...m, open, default: { ...m, open } };
+  /** Every call that looks a path up again, hooked (the race of review wave 3, #6). */
+  const looked = <F extends (...a: never[]) => unknown>(name: string, f: F) =>
+    ((file: PathLike, ...rest: unknown[]) => {
+      hook.beforePath?.(name, String(file));
+      return (f as unknown as (...a: unknown[]) => unknown)(file, ...rest);
+    }) as unknown as F;
+  const realpath = looked('realpath', m.realpath);
+  const stat = looked('stat', m.stat);
+  const lstat = looked('lstat', m.lstat);
+  const mine = { open, realpath, stat, lstat };
+  return { ...m, ...mine, default: { ...m, ...mine } };
 });
 
 const { readText } = await import('../server/services/git');
@@ -27,6 +37,7 @@ const { readText } = await import('../server/services/git');
 const homes: string[] = [];
 afterEach(() => {
   hook.beforeOpen = undefined;
+  hook.beforePath = undefined;
   for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
@@ -62,5 +73,54 @@ describe('the untracked-diff reader', () => {
     expect(swapped).toBe(true);
     expect(got?.text).not.toBe('outside secret');
     expect(got).toBeNull();
+  });
+
+  it('never reads outside when the folder flips back for the check after the open and to the junction again for the next look (#6)', async () => {
+    const { root, outside } = folders();
+    const dir = path.join(root, 'dir');
+    const real = path.join(root, 'dir-real');
+    renameSync(dir, real);
+    // The folder on the way is a junction to the outside at the open, then the real folder, then the junction again, and so on at every look after it.
+    let junction = false;
+    const flip = (to: boolean) => {
+      if (to === junction) return;
+      if (to) {
+        renameSync(dir, real);
+        symlinkSync(outside, dir, 'junction');
+      } else {
+        unlinkSync(dir);
+        renameSync(real, dir);
+      }
+      junction = to;
+    };
+    renameSync(real, dir);
+    let opened = false;
+    let looks = 0;
+    hook.beforeOpen = (file) => {
+      if (!file.endsWith('a.txt')) return;
+      flip(true);
+      opened = true;
+    };
+    hook.beforePath = () => {
+      if (!opened) return;
+      flip(looks++ % 2 === 1);
+    };
+    const got = await readText(path.join(root, 'dir', 'a.txt'), 1000, root);
+    expect(opened).toBe(true);
+    expect(looks).toBeGreaterThan(0);
+    expect(got?.text).not.toBe('outside secret');
+    expect(got).toBeNull();
+  });
+
+  it('never reads a file elsewhere through a hard link in the chat folder', async () => {
+    const { root, outside } = folders();
+    linkSync(path.join(outside, 'a.txt'), path.join(root, 'notes.txt'));
+    expect(await readText(path.join(root, 'notes.txt'), 1000, root)).toBeNull();
+  });
+
+  it('reads a file reached through a link that stays in the folder (its own place is plain)', async () => {
+    const { root } = folders();
+    symlinkSync(path.join(root, 'dir'), path.join(root, 'alias'), 'junction');
+    expect((await readText(path.join(root, 'alias', 'a.txt'), 1000, root))?.text).toBe('inside the chat');
   });
 });

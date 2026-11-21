@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
+import type { BigIntStats } from 'node:fs';
+import { lstat, open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus } from '../../shared/protocol';
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
@@ -141,11 +142,38 @@ async function handlePath(fh: FileHandle): Promise<string | null> {
 }
 
 /**
+ * Windows (and wherever a handle cannot name its own file): the file the handle has open must be the
+ * one at `file` (its real place in the folder), looked up without following anything: every folder
+ * from `root` down a real folder (no link, no junction), the last a plain file with the handle's exact
+ * id on its volume; anything else is not read. Node has no way to ask a Windows handle where its file
+ * is (GetFinalPathNameByHandle), nor to open relative to a folder's handle, and an exclusive hold on a
+ * folder fails while anything watches it. What this cannot rule out is a folder on the way swapped
+ * for a junction and back between two of these looks, which takes a local process racing the read on
+ * purpose (one that could as well copy the file into the folder).
+ */
+async function plainPath(file: string, root: string, st: BigIntStats): Promise<boolean> {
+  const rel = path.relative(root, file);
+  if (rel === '' || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
+  const top = await lstat(root, { bigint: true });
+  if (top.isSymbolicLink() || !top.isDirectory()) return false;
+  const parts = rel.split(path.sep);
+  let at = root;
+  for (let i = 0; i < parts.length; i++) {
+    at = path.join(at, parts[i]);
+    const s = await lstat(at, { bigint: true });
+    if (s.isSymbolicLink()) return false;
+    if (i < parts.length - 1 ? !s.isDirectory() : !(s.isFile() && s.ino === st.ino && s.dev === st.dev)) return false;
+  }
+  return true;
+}
+
+/**
  * Reads a file prefix; null when unreadable. `binary` when NUL bytes appear in the first 8 KB.
  * `within`: only a file that really lies in that folder (its links followed, `within` itself canonical);
- * one that leads out of it (a link, a junction on the way) is not read. Checked again on the handle
- * once it is open: the file it refers to must lie in the folder, so a folder on the way that became a
- * junction between the first check and the open is caught.
+ * one that leads out of it (a link, a junction on the way) is not read, nor a file with another name
+ * elsewhere (a hard link: it is that file). Checked again on the handle once it is open, by exact
+ * file ids: its own path where the system names it (Linux), else its plain place in the folder
+ * (`plainPath`), so a folder on the way that became a junction around the open is caught.
  */
 export async function readText(file: string, maxBytes: number, within?: string): Promise<{ text: string; binary: boolean; size: number } | null> {
   let fh: FileHandle | undefined;
@@ -156,22 +184,24 @@ export async function readText(file: string, maxBytes: number, within?: string):
       file = real;
     }
     fh = await open(file, 'r');
-    const st = await fh.stat();
+    const st = await fh.stat({ bigint: true });
     if (!st.isFile()) return null;
     if (within) {
-      // Where the handle's file is: its own path (Linux), else the path opened resolved again now,
-      // which must still lie in the folder and name this very file (same volume and file id).
-      const final = (await handlePath(fh)) ?? (await realpath(file));
-      if (!inside(final, within)) return null;
-      const now = await stat(final);
-      if (now.ino !== st.ino || now.dev !== st.dev) return null;
+      if (st.nlink !== 1n) return null;
+      const final = await handlePath(fh);
+      if (final !== null) {
+        // The handle's own path: in the folder, and still this very file.
+        if (!inside(final, within)) return null;
+        const now = await stat(final, { bigint: true });
+        if (now.ino !== st.ino || now.dev !== st.dev) return null;
+      } else if (!(await plainPath(file, within, st))) return null;
     }
-    const len = Math.min(st.size, maxBytes);
+    const len = Math.min(Number(st.size), maxBytes);
     const buf = Buffer.alloc(len);
     const { bytesRead } = await fh.read(buf, 0, len, 0);
     const data = buf.subarray(0, bytesRead);
     const binary = data.subarray(0, 8192).includes(0);
-    return { text: binary ? '' : data.toString('utf8'), binary, size: st.size };
+    return { text: binary ? '' : data.toString('utf8'), binary, size: Number(st.size) };
   } catch {
     return null;
   } finally {

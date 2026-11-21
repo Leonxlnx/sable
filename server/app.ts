@@ -2185,9 +2185,11 @@ export class App {
       if (rt.meta.unread) rt.update({ unread: false });
       return rt.snapshot();
     });
-    // A window gets finished steps cut (core/trim.ts): one whole, when it opens.
-    this.register('session.item', ({ sessionId, itemId }) => {
+    // A window gets finished steps cut (core/trim.ts): one whole, when it opens. A chat not read yet
+    // (a picture of a file asked after a restart) is read off the main thread, one read for all, as a snapshot is.
+    this.register('session.item', async ({ sessionId, itemId }) => {
       const rt = this.runtime(sessionId);
+      await this.hydrateAsync(rt).catch(() => {});
       this.hydrate(rt);
       const item = rt.get(itemId);
       if (!item) throw new Error('That part of the conversation is no longer there');

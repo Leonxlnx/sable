@@ -5,7 +5,7 @@ import { stripWrappers, syntheticOf } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
 import { leadTitle } from '@desk/features/timeline/lead-in';
 import { useNow } from '@m/lib/useNow';
-import { cancelDownload, downloadKey, openDownload, startDownload, useDownload } from '@m/lib/downloads';
+import { cancelDownload, downloadKey, installable, openDownload, startDownload, useDownload } from '@m/lib/downloads';
 import { conn } from '@m/lib/conn';
 import { diffLines, renderMarkdown } from '@m/lib/md';
 import { haptic, openExternal } from '@m/lib/native';
@@ -583,8 +583,10 @@ function Pics({ sid, id, n }: { sid: string; id: string; n: number }) {
   const open = (index: number, el: HTMLElement) => {
     haptic('tap');
     const srcs = Array.from({ length: count }, (_, i) => keptPic(sid, id, i) ?? null);
-    openViewer({ srcs, index, from: el.getBoundingClientRect() });
-    srcs.forEach((src, i) => !src && void loadPic(sid, id, i).then((d) => viewerLoaded(i, d), () => {}));
+    // Each late picture names this opening and this step: it never lands in another step's viewer.
+    const key = `${sid}\u0000${id}`;
+    const gen = openViewer({ srcs, index, from: el.getBoundingClientRect(), key });
+    srcs.forEach((src, i) => !src && void loadPic(sid, id, i).then((d) => viewerLoaded(gen, key, i, d), () => {}));
   };
   return (
     <div className="pics no-drag">
@@ -1060,10 +1062,16 @@ function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; ite
   const thumb = useThumb(sid, itemId, index, shared ? name : '', size);
   const d = useDownload(key);
   const desktop = useStore((st) => st.desktop);
-  const busy = d.state === 'asking' || d.state === 'pending' || d.state === 'running' || d.state === 'paused';
+  // Re-read when the connection changes (a pairing made again on the way).
+  useStore((st) => st.conn);
+  const paired = conn.pairedSecurely;
+  const busy = d.state === 'asking' || d.state === 'pending' || d.state === 'running' || d.state === 'paused' || d.state === 'verifying';
   const total = d.total ?? size;
   const p = total && d.bytes !== undefined ? Math.min(1, d.bytes / total) : 0;
   const apk = /\.(apk|aab|xapk)$/i.test(name);
+  // An app is installed only from bytes checked against a digest that came sealed; one fetched before that is fetched again.
+  const install = apk && installable(d);
+  const again = apk && d.state === 'done' && !install;
   const fail = (err: unknown) => {
     haptic('deny');
     setState({ toast: { text: (err as Error).message, level: 'error', at: Date.now() } });
@@ -1079,13 +1087,23 @@ function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; ite
   const meta =
     d.state === 'failed'
       ? (d.error ?? 'The download stopped.')
-      : busy && (d.state === 'asking' || !d.bytes)
-        ? 'Starting'
-        : busy && total
-          ? `${fileSize(d.bytes ?? 0)} of ${fileSize(total)}`
-          : d.state === 'done'
-            ? `${fileSize(total)} · Downloaded`
-            : [fileSize(size), kindName(name)].filter(Boolean).join(' · ');
+      : apk && !paired && d.state === 'idle'
+        ? 'Pair again for a secure connection to install it'
+        : d.state === 'verifying'
+          ? 'Checking'
+          : busy && (d.state === 'asking' || !d.bytes)
+            ? 'Starting'
+            : busy && total
+              ? `${fileSize(d.bytes ?? 0)} of ${fileSize(total)}`
+              : again
+                ? paired
+                  ? 'Download it again to install it'
+                  : 'Pair again for a secure connection to install it'
+                : d.state === 'done'
+                  ? `${fileSize(total)} · Downloaded`
+                  : [fileSize(size), kindName(name)].filter(Boolean).join(' · ');
+  // An app over an older, plain pairing: nothing to fetch it with that could be trusted.
+  const blocked = apk && !paired;
   return (
     <div className="share-row" data-state={d.state}>
       <span className="share-glyph" data-pic={thumb?.kind}>
@@ -1104,13 +1122,13 @@ function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; ite
           {meta}
         </span>
       </span>
-      {d.state === 'done' ? (
+      {d.state === 'done' && !again ? (
         <button type="button" className="share-open" onClick={open} aria-label={`${apk ? 'Install' : 'Open'} ${name}`}>
           {apk ? 'Install' : 'Open'}
         </button>
-      ) : busy ? (
+      ) : blocked ? null : busy ? (
         <button type="button" className="share-key" data-busy aria-label={`Stop downloading ${name}`} onClick={() => (haptic('tap'), void cancelDownload(key))}>
-          <svg className="share-ring" viewBox="0 0 40 40" aria-hidden data-wait={d.state === 'asking' || d.state === 'pending' || undefined}>
+          <svg className="share-ring" viewBox="0 0 40 40" aria-hidden data-wait={d.state === 'asking' || d.state === 'pending' || d.state === 'verifying' || undefined}>
             <circle cx="20" cy="20" r="17" className="share-ring-track" />
             <circle cx="20" cy="20" r="17" className="share-ring-fill" pathLength={100} strokeDasharray={`${Math.max(2, p * 100)} 100`} />
           </svg>

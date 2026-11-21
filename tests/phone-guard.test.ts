@@ -10,13 +10,13 @@ import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, wr
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import WebSocket from 'ws';
-import { PHONE_PATH, type PermissionRequest, type PhoneChanges, type PhoneDiff, type PhoneStatus, type PhoneTail, type QueuedMessage, type UserItem } from '@shared/protocol';
+import type { PermissionRequest, PhoneChanges, PhoneDiff, PhoneTail, QueuedMessage, UserItem } from '@shared/protocol';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
 import { registerFs } from '../server/services/fs';
 import { phoneEvent, phonePermission, phoneResult, registerPhone } from '../server/services/phone';
 import { FRAME_MAX, phoneAttachments, readHello } from '../server/services/phone-guard';
+import { helloSecure, pairSecure, wireClient } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -40,56 +40,11 @@ async function setup() {
 
 type Frame = Record<string, unknown>;
 
-function client(port: number) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${PHONE_PATH}`, { headers: { origin: 'http://localhost' } });
-  const frames: Frame[] = [];
-  const waiters: ((f: Frame) => void)[] = [];
-  ws.on('message', (m) => {
-    const f = JSON.parse(String(m)) as Frame;
-    frames.push(f);
-    for (const w of waiters.splice(0)) w(f);
-  });
-  const next = (pred: (f: Frame) => boolean, ms = 3000) =>
-    new Promise<Frame>((resolve, reject) => {
-      const hit = frames.find(pred);
-      if (hit) return resolve(hit);
-      const t = setTimeout(() => reject(new Error('no such frame')), ms);
-      const check = (f: Frame) => {
-        if (pred(f)) {
-          clearTimeout(t);
-          resolve(f);
-        } else waiters.push(check);
-      };
-      waiters.push(check);
-    });
-  const open = new Promise<void>((resolve, reject) => {
-    ws.on('open', () => resolve());
-    ws.on('error', reject);
-  });
-  let id = 0;
-  const call = async (method: string, params: unknown = {}) => {
-    const i = ++id;
-    ws.send(JSON.stringify({ id: i, method, params }));
-    return (await next((f) => f.id === i)) as { ok: boolean; result?: unknown; error?: string };
-  };
-  const closed = new Promise<number>((r) => ws.on('close', (code) => r(code)));
-  return { ws, open, next, call, closed, frames };
-}
+/** A socket to the endpoint (tests/phone-wire.ts): plain until a handshake makes it secure. */
+const client = (port: number) => wireClient(port);
 
-const keyOf = (s: PhoneStatus) => /k=([^&]+)/.exec(s.pairing!.link)![1];
-
-async function pairPhone(app: App, port: number, name = 'Test phone') {
-  const offer = await app.call('phone.pair', {});
-  const c = client(port);
-  await c.open;
-  c.ws.send(JSON.stringify({ pair: { key: keyOf(offer), name } }));
-  await c.next((f) => 'waiting' in f);
-  const asking = await app.call('phone.status', {});
-  await app.call('phone.approve', { requestId: asking.request!.id, allow: true });
-  const paired = (await c.next((f) => 'paired' in f)) as { paired: { token: string; deviceId: string } };
-  await c.next((f) => 'welcome' in f);
-  return { c, token: paired.paired.token, deviceId: paired.paired.deviceId };
-}
+/** Pairs a phone over the secure channel (the only way now), "Allow" clicked. */
+const pairPhone = (app: App, port: number, name = 'Test phone') => pairSecure(app, port, name);
 
 /** A chat in its own folder, opened from the phone. */
 async function chatIn(app: App, c: ReturnType<typeof client>, cwd: string) {
@@ -190,7 +145,7 @@ describe('the first frame of a socket', () => {
 
   it('malformed, closes only that socket; the endpoint and other phones go on', async () => {
     const { app, port } = await setup();
-    const { c, token } = await pairPhone(app, port);
+    const { c, token, deviceId, fingerprint } = await pairPhone(app, port);
     for (const bad of ['42', 'null', '[1]', '"x"', '{"hello":null}', '{"hello":"x"}', '{"pair":3}']) {
       const s = client(port);
       await s.open;
@@ -199,9 +154,7 @@ describe('the first frame of a socket', () => {
     }
     // Still there: the paired phone works, and a new socket with the token is welcomed.
     expect((await c.call('app.hello')).ok).toBe(true);
-    const again = client(port);
-    await again.open;
-    again.ws.send(JSON.stringify({ hello: { token } }));
+    const again = (await helloSecure(port, { deviceId, token, fingerprint })).c;
     expect(await again.next((f) => 'welcome' in f)).toBeTruthy();
     expect((await app.call('phone.status', {})).listening).toBe(true);
     again.ws.close();

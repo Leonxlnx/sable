@@ -11,13 +11,13 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import WebSocket from 'ws';
-import { PHONE_PATH, type PermissionRequest, type PhoneStatus, type PhoneTail, type Question } from '@shared/protocol';
+import type { PermissionRequest, PhoneTail, Question } from '@shared/protocol';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
 import { registerFs } from '../server/services/fs';
 import { phonePermission, phoneQuestion, registerPhone } from '../server/services/phone';
 import { FRAME_MAX } from '../server/services/phone-guard';
+import { helloSecure, pairSecure, wireClient } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -40,61 +40,25 @@ async function setup() {
 
 type Frame = Record<string, unknown>;
 
-function client(port: number) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${PHONE_PATH}`, { headers: { origin: 'http://localhost' } });
-  const frames: Frame[] = [];
-  const waiters: ((f: Frame) => void)[] = [];
-  ws.on('message', (m) => {
-    const f = JSON.parse(String(m)) as Frame;
-    frames.push(f);
-    for (const w of waiters.splice(0)) w(f);
-  });
-  const next = (pred: (f: Frame) => boolean, ms = 3000) =>
-    new Promise<Frame>((resolve, reject) => {
-      const hit = frames.find(pred);
-      if (hit) return resolve(hit);
-      const t = setTimeout(() => reject(new Error('no such frame')), ms);
-      const check = (f: Frame) => {
-        if (pred(f)) {
-          clearTimeout(t);
-          resolve(f);
-        } else waiters.push(check);
-      };
-      waiters.push(check);
-    });
-  const open = new Promise<void>((resolve, reject) => {
-    ws.on('open', () => resolve());
-    ws.on('error', reject);
-  });
-  let id = 0;
-  const call = async (method: string, params: unknown = {}, ms?: number) => {
-    const i = ++id;
-    ws.send(JSON.stringify({ id: i, method, params }));
-    return (await next((f) => f.id === i, ms)) as { ok: boolean; result?: unknown; error?: string };
-  };
-  return { ws, open, next, call, frames };
-}
+/** A socket to the endpoint (tests/phone-wire.ts). */
+const client = (port: number) => wireClient(port);
 
-const keyOf = (s: PhoneStatus) => /k=([^&]+)/.exec(s.pairing!.link)![1];
-
-async function pairPhone(app: App, port: number, name = 'Test phone') {
-  const offer = await app.call('phone.pair', {});
-  const c = client(port);
-  await c.open;
-  c.ws.send(JSON.stringify({ pair: { key: keyOf(offer), name } }));
-  await c.next((f) => 'waiting' in f);
-  const asking = await app.call('phone.status', {});
-  await app.call('phone.approve', { requestId: asking.request!.id, allow: true });
-  const paired = (await c.next((f) => 'paired' in f)) as { paired: { token: string; deviceId: string } };
-  await c.next((f) => 'welcome' in f);
-  return { c, token: paired.paired.token, deviceId: paired.paired.deviceId };
-}
+/** Pairs a phone over the secure channel (the only way now), "Allow" clicked. */
+const pairPhone = (app: App, port: number, name = 'Test phone') => pairSecure(app, port, name);
 
 async function chatIn(app: App, c: ReturnType<typeof client>, cwd: string) {
   mkdirSync(cwd, { recursive: true });
   const created = (await c.call('session.create', { provider: 'demo', cwd })) as { result: PhoneTail };
   return app.sessions.get(created.result.session.id)!;
 }
+
+const until = async (ok: () => boolean, ms = 3000) => {
+  const end = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > end) throw new Error('timed out');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+};
 
 const eventOf = (f: Frame) => f.event as { type?: string; [k: string]: unknown } | undefined;
 
@@ -155,7 +119,7 @@ describe('an approval the phone gets shortened', () => {
 describe('an upgrade with a malformed target', () => {
   it('closes only that socket; the endpoint and a paired phone go on', async () => {
     const { app, port } = await setup();
-    const { c, token } = await pairPhone(app, port);
+    const { c, token, deviceId, fingerprint } = await pairPhone(app, port);
     for (const target of ['//[', '//[::1', 'http://[x', '//a:b:c']) {
       const answer = await new Promise<string>((resolve) => {
         const s = connect(port, '127.0.0.1', () => {
@@ -173,9 +137,7 @@ describe('an upgrade with a malformed target', () => {
       expect(answer, target).toMatch(/^HTTP\/1\.1 4\d\d/);
     }
     expect((await c.call('app.hello')).ok).toBe(true);
-    const again = client(port);
-    await again.open;
-    again.ws.send(JSON.stringify({ hello: { token } }));
+    const again = (await helloSecure(port, { deviceId, token, fingerprint })).c;
     expect(await again.next((f) => 'welcome' in f)).toBeTruthy();
     expect((await app.call('phone.status', {})).listening).toBe(true);
     again.ws.close();
@@ -321,10 +283,14 @@ describe('the frame budget', () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
     const rt = await chatIn(app, c, path.join(home, 'chat'));
-    rt.enqueue('x'.repeat(FRAME_MAX.event + 100));
+    app.emit({ type: 'todos.updated', sessionId: rt.id, todos: [{ content: 'x'.repeat(FRAME_MAX.event + 100), status: 'pending' }] });
     const stale = await c.next((f) => eventOf(f)?.type === 'phone.stale');
-    expect(eventOf(stale)).toEqual({ type: 'phone.stale', sessionId: rt.id, of: 'queue.updated' });
-    expect(c.frames.some((f) => eventOf(f)?.type === 'queue.updated')).toBe(false);
+    expect(eventOf(stale)).toEqual({ type: 'phone.stale', sessionId: rt.id, of: 'todos.updated' });
+    expect(c.frames.some((f) => eventOf(f)?.type === 'todos.updated')).toBe(false);
+    // A queued message that long reaches the phone's list cut, and its tail stays within budget.
+    rt.enqueue('y'.repeat(FRAME_MAX.event + 100));
+    const q = await c.next((f) => eventOf(f)?.type === 'queue.updated');
+    expect(((eventOf(q)!.queue as { text: string }[])[0]).text.length).toBeLessThan(10_000);
     c.ws.close();
   });
 
@@ -342,6 +308,7 @@ describe('the frame budget', () => {
     const ok = (await c.call('queue.take', { sessionId: rt.id, id: small.id })) as { ok: boolean; result: { message: { text: string } } };
     expect(ok.ok).toBe(true);
     expect(ok.result.message.text).toBe('small one');
+    await until(() => rt.queue.length === 1);
     expect(rt.queue.map((m) => m.id)).toEqual([q.id]);
     c.ws.close();
   }, 30_000);

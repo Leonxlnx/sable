@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { PhoneSearchHit } from '@shared/protocol';
 import { timeAgo } from '@desk/lib/format';
 import { conn } from '@m/lib/conn';
+import { matchRanges } from '@m/lib/find';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
@@ -113,11 +114,20 @@ export function SearchResults({ query, onMenu }: { query: string; onMenu: (id: s
   );
 }
 
-/** The words of the query in a snippet, a step brighter. */
+/** The words of the query in a snippet, a step brighter (found in the snippet's own offsets: lib/find.ts). */
 function marked(text: string, w: string[]): ReactNode {
   if (!w.length) return text;
-  const re = new RegExp(`(${w.map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi');
-  return text.split(re).map((part, i) => (i % 2 ? <mark key={i}>{part}</mark> : part));
+  const out: ReactNode[] = [];
+  let at = 0;
+  for (const [a, b] of matchRanges(text, w)) {
+    if (b <= at) continue;
+    const s = Math.max(a, at);
+    if (s > at) out.push(text.slice(at, s));
+    out.push(<mark key={s}>{text.slice(s, b)}</mark>);
+    at = b;
+  }
+  if (at < text.length) out.push(text.slice(at));
+  return out;
 }
 
 /** One message that matched: its chat and when, then the words around the match. A tap opens the chat there. */
