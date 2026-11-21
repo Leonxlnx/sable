@@ -667,7 +667,8 @@ export async function gitDraftInput(cwd: string): Promise<CommitDraftInput | { e
   if (head.code !== 0) return { files, patch: '', subjects: [] };
   const [diff, log] = await Promise.all([
     runGit(dir, ['diff', 'HEAD', '--no-color', '--no-ext-diff', '-M'], { timeoutMs: 20_000, maxBytes: 4_000_000 }),
-    runGit(dir, ['log', '-8', '--format=%s'], { timeoutMs: 5000 }),
+    // Eight subjects are a few hundred bytes; a repository with an endless one is cut here (commit-draft.ts budgets the rest).
+    runGit(dir, ['log', '-8', '--format=%s'], { timeoutMs: 5000, maxBytes: 64_000 }),
   ]);
   return {
     files,

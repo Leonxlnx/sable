@@ -515,8 +515,13 @@ export class ClaudeProvider implements Provider {
         const any = m as Obj;
         if (m.type === 'assistant' && !any.parent_tool_use_id) {
           for (const b of (any.message?.content as Obj[] | undefined) ?? []) if (b.type === 'text' && b.text) text += String(b.text);
+          // Longer than any title or commit message: stop there (review wave 8, #24).
+          if (text.length > QUICK_MAX_CHARS) {
+            text = text.slice(0, QUICK_MAX_CHARS);
+            break;
+          }
         } else if (m.type === 'result') {
-          if (any.subtype === 'success' && typeof any.result === 'string' && any.result.trim()) text = any.result;
+          if (any.subtype === 'success' && typeof any.result === 'string' && any.result.trim()) text = any.result.slice(0, QUICK_MAX_CHARS);
           else if (any.subtype !== 'success') this.ctx.log('claude: no title:', any.subtype, (any.errors as string[] | undefined)?.join('; ') ?? '');
           break;
         }
@@ -882,6 +887,8 @@ export class ClaudeProvider implements Provider {
 }
 
 const WARM_TTL_MS = 3 * 60_000;
+/** The most of a quick answer (a title, a commit message) kept. */
+const QUICK_MAX_CHARS = 16_000;
 /** How long after the usage endpoint refused before Sable asks it again unasked. */
 const LIMITS_REFUSED_BACKOFF_MS = 10 * 60_000;
 /** Plan windows as `rate_limit_event` names them, with the rows the usage answer gives them. */

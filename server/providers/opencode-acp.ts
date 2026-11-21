@@ -1,8 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import readline from 'node:readline';
+import { boundedLines } from '../util/lines';
 import { cliCommand } from '../util/proc';
 import { killTree } from './codex-rpc';
+
+/** The largest ACP frame kept (a replayed conversation's update with a long tool output fits well within it). */
+export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 
 /**
  * Client for `opencode acp`: the Agent Client Protocol (JSON-RPC 2.0, newline-delimited, over
@@ -61,8 +64,8 @@ export class AcpClient {
     private child: ChildProcess,
     private log: (...a: unknown[]) => void,
   ) {
-    const rl = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
-    rl.on('line', (line) => this.onLine(line));
+    // Each frame bounded before it is kept (review wave 8, #24): one endless line must not fill memory.
+    boundedLines(child.stdout!, MAX_FRAME_BYTES, (line) => this.onLine(line), (bytes) => this.log(`[opencode] dropped a frame of ${bytes} bytes or more (over ${MAX_FRAME_BYTES})`));
     child.stderr!.setEncoding('utf8');
     child.stderr!.on('data', (d: string) => {
       this.stderrTail = (this.stderrTail + d).slice(-4000);
