@@ -18,8 +18,8 @@ export function About() {
   const providers = useStore((s) => s.providers);
   const conn = useStore((s) => s.conn);
   const setUi = useStore((s) => s.setUi);
-  // Whatever agents the bridge reports, Claude Code and Codex first.
-  const agents: ProviderId[] = [...connectableAgents(providers), ...(Object.keys(providers) as ProviderId[]).filter((id) => !connectableAgents(providers).includes(id))];
+  // Whatever agents the bridge reports, Claude Code and Codex first; any other (OpenCode) only where it is installed.
+  const agents: ProviderId[] = [...connectableAgents(providers), ...(Object.keys(providers) as ProviderId[]).filter((id) => !connectableAgents(providers).includes(id) && providers[id]?.installed)];
 
   return (
     <div className="set-stack">
