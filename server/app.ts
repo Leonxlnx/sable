@@ -1330,7 +1330,7 @@ export class App {
     if (!progressed) return refused;
     const text =
       carried === 'reset'
-        ? 'Usage has been restored. Continue the task from where it stopped. Do not repeat steps that are already done.'
+        ? 'The last turn was cut off by a usage limit, which has reset now. Carry on with the task from where it stopped. Do not repeat steps that are already done.'
         : carried === 'conversation'
           ? 'The last turn was cut off by a usage limit; the conversation now continues under another account. Carry on with the task from where it stopped. Do not repeat steps that are already done.'
           : `${refused.text}\n\n(Part of this was already done before a usage limit cut the turn off: the summary above shows how far it got. Carry on from there.)`;
@@ -1404,7 +1404,7 @@ export class App {
     rt.patch<NoticeItem>(open.id, { limit: { ...open.limit, continuedWith: accountId, ...(carried === 'reset' ? { atReset: true } : {}) } });
     const item: UserItem = refused
       ? this.resumeMessage(rt, refused, carried)
-      : { id: randomUUID(), ts: Date.now(), type: 'user', text: 'Usage has been restored. Continue the task from where it stopped.', state: 'sent' };
+      : { id: randomUUID(), ts: Date.now(), type: 'user', text: 'The usage limit has reset. Carry on with the task from where it stopped.', state: 'sent' };
     const handle = await this.ensureHandle(rt);
     await this.applyDue(rt, handle);
     // The turn carries on with the refused message: it is the one this turn answers.

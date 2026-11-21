@@ -47,12 +47,12 @@ export function Accounts() {
         <Switch checked={carryOn} onChange={(v) => void setSettings({ continueAtLimit: v })} label="Continue with the next account at a limit" />
       </label>
       <label className="acct-auto" data-spot>
-        <span className="acct-auto-label">Use the account whose week ends soonest first</span>
-        <Switch checked={useFirst} onChange={(v) => void setSettings({ accountsBy: v ? 'useFirst' : 'manual' })} label="Use the account whose week ends soonest first" />
-      </label>
-      <label className="acct-auto" data-spot>
         <span className="acct-auto-label">Continue when the usage resets</span>
         <Switch checked={resumeAtReset} onChange={(v) => void setSettings({ continueAtReset: v })} label="Continue when the usage resets" />
+      </label>
+      <label className="acct-auto" data-spot>
+        <span className="acct-auto-label">Use the account whose week ends soonest first</span>
+        <Switch checked={useFirst} onChange={(v) => void setSettings({ accountsBy: v ? 'useFirst' : 'manual' })} label="Use the account whose week ends soonest first" />
       </label>
       <label className="acct-auto" data-spot>
         <span className="acct-auto-label">Return to the preferred account when its limit resets</span>
