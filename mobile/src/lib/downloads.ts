@@ -3,7 +3,7 @@ import { registerPlugin } from '@capacitor/core';
 import { canonicalName, isPackageName } from '@shared/file-name';
 import { conn, type Sealed } from './conn';
 import { createDownloads, PLAIN_OFF, type Download, type FilesPlugin } from './download-core';
-import { isTransport, transportError } from './errors';
+import { isTransport, transportError, whileBusy } from './errors';
 import { onForget } from './forget';
 import { isNative, openExternal } from './native';
 import { memorySink } from './sink';
@@ -47,11 +47,12 @@ const core = createDownloads({
       // Only over a wire whose handshake proved the very desktop this phone is paired with.
       const w = conn.sealed();
       if (!w) throw transportError('Not connected to the desktop', 'unsent');
-      const r = await w.call('phone.fileStart', { sessionId: p.sid, itemId: p.itemId, index: p.index }, 120_000);
+      // A desktop busy with other transfers says when to ask again (`retry`): the start waits its turn.
+      const r = await whileBusy(() => w.call('phone.fileStart', { sessionId: p.sid, itemId: p.itemId, index: p.index }, 120_000));
       wires.set(r.transfer, w);
       return r;
     },
-    chunk: (p) => wires.get(p.transfer)?.call('phone.fileChunk', p, 60_000) ?? lost(),
+    chunk: (p) => whileBusy(() => wires.get(p.transfer)?.call('phone.fileChunk', p, 60_000) ?? lost()),
     end(transfer) {
       const w = wires.get(transfer);
       wires.delete(transfer);

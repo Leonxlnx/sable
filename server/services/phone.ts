@@ -201,8 +201,10 @@ function trimDetail(d: ToolDetail | undefined, n: number, full = false): ToolDet
   if (!d) return out;
   for (const k of DETAIL_TEXT) if (typeof d[k] === 'string') out[k] = cap(d[k] as string, n);
   if (d.range) out.range = d.range;
-  // A `share` step: the files' names and sizes for its cards (the phone downloads one through `phone.fileLink`).
-  if (d.files) out.files = d.files.slice(0, 12).map((f) => ({ path: cap(f.path, 400), name: cap(f.name, 200), ...(typeof f.size === 'number' ? { size: f.size } : {}) }));
+  // A `share` step: the files' names and sizes for its cards (the phone downloads one through
+  // `phone.fileStart`). The name canonical, as the download names it, so a card never shows one name
+  // ("setup.apk " with a space, a bidi override) and saves another.
+  if (d.files) out.files = d.files.slice(0, 12).map((f) => ({ path: cap(f.path, 400), name: canonicalName(f.name), ...(typeof f.size === 'number' ? { size: f.size } : {}) }));
   if (d.background) out.background = true;
   if (full) {
     for (const k of ['oldText', 'newText', 'content', 'prompt', 'plan'] as const) if (typeof d[k] === 'string') out[k] = cap(d[k] as string, n);

@@ -1,10 +1,10 @@
-import { PAIR_LINK_PREFIX, PHONE_PATH, type BridgeEvent, type PhoneFrame, type PhoneMethods, type RpcMethods, type RpcResponse } from '@shared/protocol';
+import { PAIR_LINK_PREFIX, PHONE_PATH, type BridgeEvent, type PhoneFrame, type PhoneMethods, type PhoneRetryReply, type RpcMethods, type RpcResponse } from '@shared/protocol';
 
 /** Everything the phone may ask: the allowlisted bridge methods and the phone endpoint's own. */
 type Methods = RpcMethods & PhoneMethods;
 import { eraseNative, loadMark, loadPairing, removePairing, saveMark, savePairing, type EraseMark } from './native';
 import { mergeHosts, sameHosts } from './hosts';
-import { transportError } from './errors';
+import { busyError, transportError } from './errors';
 import { eraseAll, pageStorage } from './erase';
 import { FORGET_FAILED } from './credential';
 import { IdentityError, pskOfKey, pskOfToken, startHandshake, type Channel } from './secure';
@@ -730,6 +730,8 @@ class Conn {
       this.pending.delete(f.id);
       clearTimeout(pending.timer);
       if (f.ok) pending.resolve(f.result);
+      // Busy, not refused (`PhoneRetryReply`): whoever asked may ask the same again after the wait.
+      else if ((f as Partial<PhoneRetryReply>).retry === true && Number.isFinite((f as Partial<PhoneRetryReply>).retryAfterMs)) pending.reject(busyError(String(f.error), (f as PhoneRetryReply).retryAfterMs));
       else pending.reject(new Error(f.error));
     };
     wire.onClose = (code) => {

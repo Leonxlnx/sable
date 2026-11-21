@@ -6,6 +6,7 @@ import type {
   Capabilities,
   LimitsReport,
   PermissionRequest,
+  PhoneHelloState,
   PhoneItem,
   PhoneReset,
   PhoneTail,
@@ -531,15 +532,66 @@ function onStale(e: { sessionId?: string }) {
   staleRun(f.kind === 'tail' ? f.sessionId : HELLO_KEY);
 }
 
+/** Pages read on at most, per list (each is within the desktop's byte budget, megabytes). */
+const MORE_PAGES = 12;
+
+/** Adds `more` to `list` by id: a page may repeat entries of the one before; the newer copy stands. */
+function byId<T extends { id: string }>(list: T[], more: T[]): T[] {
+  if (!more.length) return list;
+  const at = new Map(list.map((x, i) => [x.id, i]));
+  const out = list.slice();
+  for (const x of more) {
+    const i = at.get(x.id);
+    if (i === undefined) (at.set(x.id, out.length), out.push(x));
+    else out[i] = x;
+  }
+  return out;
+}
+
+/**
+ * What waits on from a cursor (`phone.prompts`), across chats or in one: every page within
+ * `MORE_PAGES`, merged by id. An older desktop without the method, or a failure, ends it with what came.
+ */
+async function promptsOn(cursor: string | undefined, sessionId?: string): Promise<State['pending']> {
+  let permissions: PermissionRequest[] = [];
+  let questions: QuestionRequest[] = [];
+  for (let i = 0; cursor && i < MORE_PAGES; i++) {
+    try {
+      const page = await conn.call('phone.prompts', { cursor, ...(sessionId ? { sessionId } : {}) });
+      permissions = byId(permissions, page.permissions);
+      questions = byId(questions, page.questions as unknown as QuestionRequest[]);
+      cursor = page.cursor;
+    } catch {
+      break;
+    }
+  }
+  return { permissions, questions };
+}
+
 /** Loads everything the phone shows after each (re)connect, and the open conversations again. */
 export async function refresh(openIds: string[]) {
-  const hello = await conn.call('app.hello', {});
+  const hello = (await conn.call('app.hello', {})) as PhoneHelloState;
+  // A long list came in pages (`sessionsCursor`): the rest is read on before the list is shown.
+  let cursor = hello.sessionsCursor;
+  for (let i = 0; cursor && i < MORE_PAGES; i++) {
+    try {
+      const page = await conn.call('phone.sessions', { cursor });
+      hello.sessions = byId(hello.sessions, page.sessions);
+      cursor = page.cursor;
+    } catch {
+      break;
+    }
+  }
   const sessions: Record<string, SessionMeta> = {};
   for (const s of hello.sessions) sessions[s.id] = withIntents(s);
   const providers: State['providers'] = {};
   for (const p of hello.providers) providers[p.id] = p;
   // What waits on you in every chat (an older desktop does not say: the open chats' own lists stand in).
-  const pending = hello.prompts ? { permissions: hello.prompts.permissions ?? [], questions: hello.prompts.questions ?? [] } : NONE;
+  let pending = hello.prompts ? { permissions: hello.prompts.permissions ?? [], questions: hello.prompts.questions ?? [] } : NONE;
+  if (hello.promptsCursor) {
+    const more = await promptsOn(hello.promptsCursor);
+    pending = { permissions: byId(pending.permissions, more.permissions), questions: byId(pending.questions, more.questions) };
+  }
   setState({ sessions, providers, projects: hello.projects, settings: hello.settings, version: hello.version, desktop: conn.pairing?.desktop, loaded: true, fresh: true, listAt: Date.now(), pending });
   saveHome();
   void refreshLimits();
@@ -578,6 +630,12 @@ export async function openSession(id: string, to?: string) {
     }
   }
   snap ??= await conn.call('session.snapshot', { sessionId: id });
+  // More waits in this chat than its page holds: the rest is read on, and the chat's lists get all of it.
+  const cursor = (snap as Partial<PhoneTail>).promptsCursor;
+  if (cursor) {
+    const more = await promptsOn(cursor, id);
+    snap = { ...snap, permissions: byId(snap.permissions, more.permissions), questions: byId(snap.questions, more.questions) };
+  }
   applySnapshot(snap);
 }
 
