@@ -42,7 +42,8 @@ import { capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, ne
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
 import { speedFor, startSpeedFor } from '../shared/speed';
 import type { Provider, ProviderContext, ProviderSession } from './providers/types';
-import { findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
+import { atCap, findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
+import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, moveNote, type MoveOutcome } from './core/move-context';
 import { handoverText } from './accounts/handover';
 import { backgroundRunning, itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
 import { runSubAgent } from './core/sub-agent';
@@ -107,6 +108,8 @@ export interface AppOptions {
   openConsole?: OpenConsole;
   /** How long after a first read that showed no change a reset's limits are read once more (tests shorten it). */
   resetSettleMs?: number;
+  /** How long a compaction before a move to another account may take (tests shorten it). */
+  compactTimeoutMs?: number;
 }
 
 export { VERSION };
@@ -163,6 +166,12 @@ export class App {
   private hidden: SessionMeta[] = [];
   private userHome: string;
   private loginTimeoutMs: number;
+  private compactTimeoutMs: number;
+  /** Chats compacting on the account they leave, before a move: their compaction turn ends here, not in `afterTurn`. */
+  private compacting = new Map<string, (error?: string) => void>();
+  /** Chats moving to another account right now: a message sent meanwhile waits in the queue (`queuedWhileMoving`). */
+  private moving = new Set<string>();
+  private queuedWhileMoving = new Set<string>();
   /** Sign-ins given up after `loginTimeoutMs`; the rejection that follows is not an error. */
   private loginTimedOut = new Set<string>();
   /**
@@ -370,6 +379,7 @@ export class App {
     this.delays = opts.refreshDelays ?? {};
     this.userHome = opts.userHome ?? homedir();
     this.loginTimeoutMs = opts.loginTimeoutMs ?? LOGIN_TIMEOUT_MS;
+    this.compactTimeoutMs = opts.compactTimeoutMs ?? COMPACT_TIMEOUT_MS;
     this.store = new Store(opts.home);
     this.cache = new DiskCache(this.store.dir);
     bootMark('app:store');
@@ -912,6 +922,8 @@ export class App {
       }, 0);
     };
     rt.onTurnStart = (r) => {
+      // A compaction before a move is no round of an until loop, nor a turn Spare started.
+      if (this.compacting.has(r.id)) return;
       this.until.turnStarted(r);
       this.spare.turnStarted(r);
     };
@@ -966,6 +978,12 @@ export class App {
     // Past its account's cap, the session moves to the next account before the message goes out.
     // The first message names the session's lane, or moves it into one when its folder got busy.
     // A caller that may no longer act (a phone removed meanwhile) is asked again after every wait.
+    // Moving to another account (compacting first): the message waits in the queue and goes there.
+    if (this.moving.has(rt.id)) {
+      rt.enqueue(text, attachments);
+      this.queuedWhileMoving.add(rt.id);
+      return;
+    }
     if (!extra?.until && !rt.items.some((i) => i.type === 'user')) await this.lanes.beforeFirstSend(rt, text);
     still(ctx);
     if (!rt.turnActive && !this.opening.has(rt.id)) await this.checkCap(rt);
@@ -1070,13 +1088,26 @@ export class App {
    * summary goes first (once); after a switch of agent, the handover of what that agent has not seen.
    */
   private withHandover(rt: SessionRuntime, item: UserItem): UserItem {
+    // A slash command takes nothing before or after it (the agent would read it as its words): what
+    // is pending waits for the next message.
+    if (isSlashCommand(item.text)) return item;
     const pending = rt.meta.agentHandover;
     if (pending) rt.update({ agentHandover: null });
     // A summary of the whole conversation covers what a switch would hand over.
     const summary = this.handovers.get(rt.id) ?? (pending ? this.agentHandoverText(rt, pending, item.id) : '');
     this.handovers.delete(rt.id);
-    if (!summary) return item;
-    return { ...item, text: `${summary}\n\n---\n\n${item.text}` };
+    // After a move to another account: a short note after the person's words, once.
+    const moved = rt.meta.moveNote;
+    if (moved) rt.update({ moveNote: null });
+    const note = moved ? this.moveNoteText(rt, moved.line, item.id) : '';
+    if (!summary && !note) return item;
+    return { ...item, text: `${summary ? `${summary}\n\n---\n\n` : ''}${item.text}${note ? `\n\n${note}` : ''}` };
+  }
+
+  /** The note after a move: what the person waits on and the open todos, as the chat stood at its switch line. */
+  private moveNoteText(rt: SessionRuntime, line: string, skip: string): string {
+    const at = rt.items.findIndex((i) => i.id === line);
+    return moveNote(at >= 0 ? rt.items.slice(0, at) : rt.items, rt.todos, { skip });
   }
 
   /** What an agent the chat switched to has not seen: the whole chat, or what happened since it was left (`since`). */
@@ -1084,7 +1115,9 @@ export class App {
     const range = withoutChecks(itemsSince(rt.items, pending.since)).filter((i) => i.id !== skip);
     const worked = workedIn(range, pending.from).filter((p) => p !== rt.meta.provider);
     const from = (worked.length ? worked : [pending.from]).map((p) => this.agentName(p)).join(' and ');
-    return handoverText(range, { from, since: !!pending.since, maxChars: SWITCH_HANDOVER_CHARS });
+    // Bounded whatever the chat holds: the newest exchanges within the budget, the person's last
+    // message always, the open todos and the files changed in the range.
+    return handoverText(range, { from, since: !!pending.since, maxChars: SWITCH_HANDOVER_CHARS, todos: rt.todos, files: changedFiles(range, rt.meta.cwd) });
   }
 
   /** An agent's name, also for one this build does not have. */
@@ -1446,7 +1479,8 @@ export class App {
     const until = meta?.extra?.resetsAt ?? meta?.credits?.resetsAt;
     if (decision === 'next' && next) {
       this.movedByLimit(rt, accountId, next, until);
-      await this.switchAccount(rt, next);
+      // Past its limit: a compaction there would be paid for with credits.
+      await this.switchAccount(rt, next, { compact: false });
       return;
     }
     const key = `${rt.id}:${accountId}:${until ?? ''}`;
@@ -1582,16 +1616,141 @@ export class App {
    * Moves an idle session to another account of its agent. The conversation is carried into that
    * account's folder so the same conversation resumes there; when that is not possible, a new one
    * starts and the next message carries a summary of this one.
+   *
+   * A big chat (`bigContext`) whose account can still run a turn compacts there first, where its
+   * cache is warm, and the compacted conversation is carried (`compact: false`: never, as at a limit,
+   * where that account cannot). `onCompacting`: called as the compaction starts. The switch line
+   * says what the move did to the context; the first message after it carries a short note.
    */
-  async switchAccount(rt: SessionRuntime, accountId: string, opts: { retry?: boolean; line?: string } = {}, ctx?: CallContext): Promise<RpcMethods['session.switchAccount']['result']> {
+  async switchAccount(
+    rt: SessionRuntime,
+    accountId: string,
+    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void } = {},
+    ctx?: CallContext,
+  ): Promise<RpcMethods['session.switchAccount']['result']> {
     this.hydrate(rt);
     if (rt.turnActive) throw new Error('The agent is still working. Stop it first.');
+    if (this.moving.has(rt.id)) throw new Error('This chat is moving to another account already.');
+    const target = this.provider(rt.meta.provider, accountId);
+    if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) return { ok: true, carried: 'none' };
+    this.moving.add(rt.id);
+    let compacted = false;
+    try {
+      return await this.moveAccount(rt, accountId, target, opts, ctx, () => (compacted = true));
+    } finally {
+      this.moving.delete(rt.id);
+      // What was sent meanwhile (or waited behind the compaction) goes out on the new account.
+      const waited = this.queuedWhileMoving.delete(rt.id);
+      if ((waited || compacted) && rt.queue.length) {
+        setTimeout(() => {
+          if (rt.turnActive || rt.stopRequested || this.moving.has(rt.id) || this.sessions.get(rt.id) !== rt) return;
+          this.sendNextQueued(rt);
+        }, 0);
+      }
+    }
+  }
+
+  /**
+   * Whether the chat's account can run a turn now: still there, not at a plan limit that counts for
+   * the chat's model (another model's full weekly does not), not running on credits.
+   */
+  private async canRunTurn(rt: SessionRuntime, accountId: string): Promise<boolean> {
+    const provider = rt.meta.provider;
+    try {
+      this.provider(provider, accountId);
+    } catch {
+      return false;
+    }
+    const known = await this.knownLimits(provider).catch(() => new Map<string, { limits?: RateLimit[] }>());
+    const model = effectiveModel(rt.meta.model || undefined, rt.caps?.models, this.store.state.settings.defaultModels[provider]);
+    if (atCap(known.get(accountId)?.limits, Date.now(), model)) return false;
+    return !runningOnCredits(this.limitsMeta.get(accountKey(provider, accountId)));
+  }
+
+  /**
+   * Compacts the chat on the account it is on (the agent's own compaction: Claude Code's `/compact`,
+   * Codex's thread compaction, the Demo's), as a turn of its own that opens with a hidden line, so
+   * the chat shows it working. Never longer than `compactTimeoutMs`: then it is stopped. Says how it
+   * went; the context ring is right after it (the agent's own count, or unknown until the next turn).
+   */
+  private async compactBeforeMove(rt: SessionRuntime, label: string): Promise<MoveOutcome> {
+    const before = rt.meta.usage.contextTokens ?? 0;
+    const opener = rt.add<UserItem>({ type: 'user', text: COMPACT_OPENER, state: 'sent' });
+    const status = rt.notice('info', `Compacting before the move to ${label}`);
+    let ended!: (error: string | undefined) => void;
+    const done = new Promise<{ error?: string }>((resolve) => (ended = (error) => resolve({ error })));
+    this.compacting.set(rt.id, (error) => ended(error));
+    let timer: NodeJS.Timeout | undefined;
+    let ok = false;
+    let handle: ProviderSession | undefined;
+    try {
+      handle = await this.ensureHandle(rt);
+      await handle.send({ ...opener, text: '/compact' });
+      const timeout = new Promise<'timeout'>((resolve) => (timer = setTimeout(() => resolve('timeout'), this.compactTimeoutMs)));
+      const r = await Promise.race([done, timeout]);
+      if (r === 'timeout') {
+        this.log('compaction before a move timed out');
+        await handle.interrupt().catch(() => {});
+      } else ok = !r.error && !rt.stopRequested;
+    } catch (err) {
+      this.log('compaction before a move failed', (err as Error).message);
+    } finally {
+      clearTimeout(timer);
+      if (rt.turnActive) {
+        rt.settle('cancelled');
+        rt.endTurn();
+      }
+      this.compacting.delete(rt.id);
+      rt.remove(status.id);
+    }
+    const from = rt.items.findIndex((i) => i.id === opener.id);
+    const after = from >= 0 ? rt.items.slice(from + 1) : [];
+    // Nothing came of it (the send failed at once): the opener goes too.
+    if (!after.some((i) => !i.parentId && i.type !== 'turn')) rt.remove(opener.id);
+    if (!ok || !after.some((i) => i.type === 'notice' && i.variant === 'compact')) return { kind: 'notCompacted', tokens: before };
+    // The ring: the agent's own count after the compaction, asked for when its events did not say.
+    let now = rt.meta.usage.contextTokens;
+    if (!(now !== undefined && now < before) && handle?.context) {
+      const c = await Promise.race([handle.context().catch(() => null), new Promise<null>((r) => setTimeout(() => r(null), 5000))]);
+      if (c?.totalTokens !== undefined && c.totalTokens < before) now = c.totalTokens;
+    }
+    if (now !== undefined && now < before) {
+      if (now !== rt.meta.usage.contextTokens) rt.update({ usage: { ...rt.meta.usage, contextTokens: now } });
+      return { kind: 'compacted', before, after: now };
+    }
+    // Compacted, but no count came: unknown until the next turn rather than the old one.
+    rt.update({ usage: { ...rt.meta.usage, contextTokens: undefined } });
+    return { kind: 'compacted', before };
+  }
+
+  private async moveAccount(
+    rt: SessionRuntime,
+    accountId: string,
+    target: Provider,
+    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void },
+    ctx: CallContext | undefined,
+    onCompacted: () => void,
+  ): Promise<RpcMethods['session.switchAccount']['result']> {
     const provider = rt.meta.provider;
     const fromId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-    const target = this.provider(provider, accountId);
     const label = this.findAccount(provider, accountId)?.label ?? 'another account';
-    if (fromId === accountId) return { ok: true, carried: 'none' };
     const refused = opts.retry ? this.refusedMessage(rt) : undefined;
+
+    // A big chat compacts first where it is, when that account can still run a turn (never to carry on a refused one).
+    const tokens = rt.meta.usage.contextTokens;
+    let outcome: MoveOutcome = { kind: 'plain' };
+    if (rt.meta.providerSessionId && target.adoptConversation && bigContext(tokens, rt.meta.usage.contextWindow)) {
+      const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId, rt.meta.cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId));
+      const can = opts.compact !== false && !opts.retry && caps?.features.compact !== false && (await this.canRunTurn(rt, fromId));
+      still(ctx);
+      if (can && !rt.turnActive) {
+        opts.onCompacting?.();
+        onCompacted();
+        outcome = await this.compactBeforeMove(rt, label);
+        still(ctx);
+        if (rt.turnActive) throw new Error('The agent is still working. Stop it first.');
+      } else outcome = { kind: 'asIs', tokens: tokens! };
+    }
 
     rt.cancelPrompts();
     await rt.handle?.close().catch(() => {});
@@ -1620,16 +1779,31 @@ export class App {
         }
       }
     }
-    rt.update({ accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, status: 'idle', lastError: undefined });
+    // A new conversation starts from the summary: the old count says nothing about it (the ring is
+    // empty until its first turn says). A carried one keeps its count, compacted or not.
+    const usage = carried === 'summary' ? { usage: { ...rt.meta.usage, contextTokens: undefined } } : {};
+    if (carried === 'summary' || carried === 'none') outcome = { kind: 'plain' };
+    rt.update({ accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, status: 'idle', lastError: undefined, ...usage });
     this.persistSessions();
 
-    // A move by a cap says why in its own line; a move at a limit closes the limit's notice.
+    // A move by a cap says why in its own line; a move at a limit closes the limit's notice. The
+    // line says what the move did to the context: compacted (before and after), or read again in full.
+    const clause = contextClause(outcome, !!refused);
+    const summaryLine = 'With a summary of the conversation so far';
     const open = opts.line ? undefined : rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId);
     if (open) rt.patch<NoticeItem>(open.id, { limit: { ...open.limit, continuedWith: accountId } });
-    if (opts.line) rt.notice('info', opts.line, carried === 'summary' ? 'With a summary of the conversation so far' : undefined);
+    let line: NoticeItem | undefined;
+    if (opts.line) line = rt.notice('info', `${opts.line}${clause.suffix ?? ''}`, carried === 'summary' ? summaryLine : clause.detail);
     else if (!open || carried === 'summary') {
-      rt.notice('info', carried === 'summary' ? `New conversation with ${label}` : `Continued with ${label}`, carried === 'summary' ? 'With a summary of the conversation so far' : undefined);
+      line = rt.notice('info', carried === 'summary' ? `New conversation with ${label}` : `Continued with ${label}${clause.suffix ?? ''}`, carried === 'summary' ? summaryLine : clause.detail);
+    } else if (clause.suffix || clause.detail) {
+      // The limit's notice says where it went; one quiet line says what that did to the context.
+      line = rt.notice('info', clause.suffix ? `Context${clause.suffix.replace(/^ · context/, '')}` : 'Carried as it is', clause.detail);
     }
+    // The first message after the move tells the agent (moveNote): anchored at the line, so what the
+    // person waits on is read from before it, also after a restart.
+    const anchor = line?.id ?? open?.id ?? rt.items.findLast((i) => !i.parentId)?.id;
+    if (anchor) rt.update({ moveNote: { line: anchor } });
     if (refused) {
       const handle = await this.ensureHandle(rt);
       // Asked again once the new account's agent is there, and by the agent's own dispatch.
@@ -1737,6 +1911,8 @@ export class App {
       usage: { ...rt.meta.usage, contextTokens: keeps ? target!.context?.tokens : undefined, contextWindow: keeps ? target!.context?.window : undefined },
       agents: withLeg(legs, leaving),
       agentHandover: { from, ...(knows ? { since: knows } : {}) },
+      // The handover covers a move of account before it: no second note.
+      moveNote: undefined,
     };
     // Fields that end are dropped, not left undefined (patches travel as JSON; the meta goes whole below).
     for (const k of Object.keys(next) as (keyof SessionMeta)[]) if (next[k] === undefined) delete next[k];
@@ -1769,6 +1945,9 @@ export class App {
    * the agent could not say how the turn ended (`hold`).
    */
   private afterTurn(rt: SessionRuntime, error?: string, hold = false) {
+    // The compaction before a move ended: the move goes on (nothing is sent, nothing else follows).
+    const compacted = this.compacting.get(rt.id);
+    if (compacted) return compacted(error);
     // A spare turn's end frees its place; waiting chats are looked at again.
     const ran = this.spare.turnEnded(rt);
     const hit = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.provider && !i.parentId);
@@ -1811,6 +1990,8 @@ export class App {
 
   /** After a turn: the next queued message goes out, or (nothing waits) an until loop runs its check. */
   private sendNextQueued(rt: SessionRuntime) {
+    // Moving to another account: the queue goes on there once the move is done.
+    if (this.moving.has(rt.id)) return void this.queuedWhileMoving.add(rt.id);
     // Messages held for Spare stay where they are: the chat starts them by itself.
     const held = this.spare.held(rt);
     const nextId = rt.queue.find((q) => !held.has(q.id))?.id;
@@ -2829,10 +3010,22 @@ export class App {
     this.register('session.switchAccount', async ({ sessionId, accountId, retry }, ctx) => {
       const rt = this.runtime(sessionId);
       const from = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-      const result = await this.switchAccount(rt, accountId, { retry }, ctx);
-      // Moved by hand: a wait for the old account's reset is over.
-      if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from) this.spare.movedByHand(rt);
-      return result;
+      // A big chat compacts first, which can take minutes: the answer comes as it starts, and the
+      // chat shows the compaction and then the switch line (a failure later is said there too).
+      let started!: () => void;
+      const compacting = new Promise<'compacting'>((resolve) => (started = () => resolve('compacting')));
+      const run = this.switchAccount(rt, accountId, { retry, onCompacting: () => started() }, ctx).then((result) => {
+        // Moved by hand: a wait for the old account's reset is over.
+        if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from) this.spare.movedByHand(rt);
+        return result;
+      });
+      const first = await Promise.race([run, compacting]);
+      if (first !== 'compacting') return first;
+      run.catch((err) => {
+        if (err instanceof CallerGone || this.sessions.get(rt.id) !== rt) return;
+        rt.notice('error', 'Could not move the chat to another account', (err as Error).message);
+      });
+      return { ok: true, carried: 'conversation', compacting: true };
     });
     this.register('session.context', async ({ sessionId }) => (await this.runtime(sessionId).handle?.context?.()) ?? null);
     this.register('session.setOptions', async ({ sessionId, options }, ctx) => {

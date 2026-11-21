@@ -1,6 +1,6 @@
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
-import type { TimelineItem } from '../../shared/protocol';
+import type { TimelineItem, Todo } from '../../shared/protocol';
 import { parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
 
 /**
@@ -98,9 +98,11 @@ const clip = (s: string, n: number) => {
  * message to the new account's agent (the timeline shows only what the user typed). The newest
  * exchanges are kept when it gets long. `skip` leaves out an item (the message about to be sent again).
  */
-export function handoverText(items: TimelineItem[], opts: { skip?: string; maxChars?: number; from?: string; since?: boolean } = {}): string {
+export function handoverText(items: TimelineItem[], opts: { skip?: string; maxChars?: number; from?: string; since?: boolean; todos?: readonly Todo[]; files?: readonly string[] } = {}): string {
   const max = opts.maxChars ?? 6000;
   const lines: string[] = [];
+  /** The person's last message among `lines`: always kept, the task as they last put it. */
+  let task = -1;
   let tools: string[] = [];
   const flushTools = () => {
     if (tools.length) lines.push(`Agent steps: ${clip(tools.slice(-8).join('; '), 400)}`);
@@ -115,7 +117,10 @@ export function handoverText(items: TimelineItem[], opts: { skip?: string; maxCh
       const line = syn ? syntheticLine(syn) : '';
       if (syn && !line) continue;
       flushTools();
-      if (!syn) lines.push(`User: ${clip(stripWrappers(it.text), 700)}`);
+      if (!syn) {
+        task = lines.length;
+        lines.push(`User: ${clip(stripWrappers(it.text), 700)}`);
+      }
       else if (syn.role === 'command') lines.push(`User ran: ${clip(line, 300)}`);
       else if (syn.role === 'output') lines.push(`Output: ${clip(line, 300)}`);
       else lines.push(`Event: ${clip(line, 300)}`);
@@ -136,13 +141,35 @@ export function handoverText(items: TimelineItem[], opts: { skip?: string; maxCh
       ? `This continues a conversation the user had with ${opts.from} in this folder. Here is what happened so far, oldest first:`
       : 'This continues a conversation that started under another account. Here is what happened so far, oldest first:';
   const tail = 'Carry on from there. The next message is the one to answer now.';
+  // What stands after the exchanges, each part bounded: the open todos and the files changed.
+  const extra: string[] = [];
+  const open = (opts.todos ?? []).filter((t) => t.status !== 'completed');
+  if (open.length) {
+    const shown = open.slice(0, 8).map((t) => `- ${clip(t.content, 90)}${t.status === 'in_progress' ? ' (in progress)' : ''}`);
+    extra.push(['Open todos:', ...shown, ...(open.length > 8 ? [`- and ${open.length - 8} more`] : [])].join('\n'));
+  }
+  const files = opts.files ?? [];
+  if (files.length) {
+    const shown = files.slice(0, 15).map((f) => clip(f, 80));
+    extra.push(`Files changed: ${shown.join(', ')}${files.length > 15 ? `, and ${files.length - 15} more` : ''}`);
+  }
   const kept: string[] = [];
-  let size = head.length + tail.length;
+  let size = head.length + tail.length + extra.reduce((n, e) => n + e.length + 2, 0);
+  // The task as the person last put it is kept whatever came after it.
+  const pinned = task >= 0 ? lines[task] : undefined;
+  if (pinned) size += pinned.length + 2;
+  let first = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
+    if (i === task) {
+      first = i;
+      continue;
+    }
     if (size + lines[i].length + 2 > max) break;
-    kept.unshift(lines[i]);
+    first = i;
     size += lines[i].length + 2;
   }
-  if (kept.length < lines.length) kept.unshift('(earlier messages left out)');
-  return [head, '', ...kept, '', tail].join('\n');
+  for (let i = first; i < lines.length; i++) kept.push(lines[i]);
+  if (pinned && task < first) kept.unshift(pinned);
+  if (first > 0) kept.unshift('(earlier messages left out)');
+  return [head, '', ...kept, ...(extra.length ? ['', ...extra] : []), '', tail].join('\n');
 }
