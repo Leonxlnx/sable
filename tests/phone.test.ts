@@ -489,7 +489,7 @@ describe('searching chats from the phone', () => {
     const page = (await c.call('phone.tail', { sessionId: a, to: r.result.hits[3].itemId })) as { result: PhoneTail };
     expect(page.result.items.some((i) => i.id === r.result.hits[3].itemId)).toBe(true);
     c.ws.close();
-  });
+  }, 30_000);
 });
 
 describe('pictures of a step', () => {

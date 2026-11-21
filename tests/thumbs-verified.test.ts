@@ -110,7 +110,17 @@ async function setup(opts: Parameters<typeof registerThumbs>[1]) {
     const next = `${f}.next`;
     writeFileSync(next, body);
     utimesSync(next, T, T);
-    renameSync(next, f);
+    // Windows refuses the move while a reader still holds the file for a moment (under a full parallel
+    // run the copy for the renderer can take a while): try again briefly, as a build tool would.
+    for (let i = 0; ; i++) {
+      try {
+        renameSync(next, f);
+        break;
+      } catch (err) {
+        if (i >= 60 || (err as NodeJS.ErrnoException).code !== 'EPERM') throw err;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      }
+    }
     expect(statSync(f).size).toBe(was.size);
     expect(statSync(f).mtimeMs).toBe(was.mtimeMs);
   };

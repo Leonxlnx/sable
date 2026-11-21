@@ -162,6 +162,8 @@ describe('lanes with two Demo sessions in one folder', { timeout: 180_000 }, () 
     await turn(a, 'until green');
     const b = await app.call('session.create', { provider: 'demo', cwd: repo, mode: 'bypassPermissions' });
     await turn(b, 'hi');
+    // The lane is named from the first message in the background, without holding that message up.
+    await until(() => meta(b.session.id).lane?.branch === 'sable/hi', 'the lane to take its name');
     const empty = meta(b.session.id).lane!;
     expect(empty.branch).toBe('sable/hi');
     const c = await app.call('session.create', { provider: 'demo', cwd: repo, mode: 'bypassPermissions' });
