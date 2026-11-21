@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { registerPlugin } from '@capacitor/core';
 import { canonicalName, isPackageName } from '@shared/file-name';
 import { conn, type Sealed } from './conn';
-import { createDownloads, PLAIN_OFF, type Download, type FilesPlugin } from './download-core';
+import { createDownloads, PLAIN_OFF, START_BUDGET, type Download, type FilesPlugin } from './download-core';
 import { isTransport, transportError, whileBusy } from './errors';
 import { onForget } from './forget';
 import { isNative, openExternal } from './native';
@@ -34,6 +34,11 @@ const web = isNative ? undefined : memorySink();
 
 const KEY = 'sable.downloads';
 
+/** One start call at most (the desktop hashes the file first); a chunk call; a chunk's whole time, waits on a busy desktop included. */
+const START_RPC_MS = 120_000;
+const CHUNK_RPC_MS = 60_000;
+const CHUNK_BUDGET = 90_000;
+
 /** Each transfer's wire: its chunks and its end go over the wire its start went over, or nowhere. */
 const wires = new Map<string, Sealed>();
 const lost = () => Promise.reject(transportError('The connection to the desktop was lost', 'lost'));
@@ -43,16 +48,21 @@ const core = createDownloads({
   channel: {
     // Paired securely: every download comes this way (offline, it waits for the connection, never a plain link).
     secure: () => conn.pairedSecurely,
-    async start(p) {
+    async start(p, ctx) {
       // Only over a wire whose handshake proved the very desktop this phone is paired with.
       const w = conn.sealed();
       if (!w) throw transportError('Not connected to the desktop', 'unsent');
-      // A desktop busy with other transfers says when to ask again (`retry`): the start waits its turn.
-      const r = await whileBusy(() => w.call('phone.fileStart', { sessionId: p.sid, itemId: p.itemId, index: p.index }, 120_000));
+      // A desktop busy with other transfers says when to ask again (`retry`): the start waits its turn,
+      // within the start's one deadline (download-core.ts), each call no longer than the time left; a Stop ends it.
+      const r = await whileBusy((left) => w.call('phone.fileStart', { sessionId: p.sid, itemId: p.itemId, index: p.index }, Math.min(START_RPC_MS, left)), {
+        deadline: ctx?.deadline,
+        budgetMs: START_BUDGET,
+        signal: ctx?.signal,
+      });
       wires.set(r.transfer, w);
       return r;
     },
-    chunk: (p) => whileBusy(() => wires.get(p.transfer)?.call('phone.fileChunk', p, 60_000) ?? lost()),
+    chunk: (p, ctx) => whileBusy((left) => wires.get(p.transfer)?.call('phone.fileChunk', p, Math.min(CHUNK_RPC_MS, left)) ?? lost(), { deadline: ctx?.deadline, budgetMs: CHUNK_BUDGET, signal: ctx?.signal }),
     end(transfer) {
       const w = wires.get(transfer);
       wires.delete(transfer);
@@ -73,8 +83,10 @@ const core = createDownloads({
 if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && core.resume());
 // Downloads still running when the app was closed: read again.
 if (isNative && core.hasActive()) setTimeout(core.resume, 600);
-// Connected again: what paused with the connection goes on from its bytes.
+// Connected again: what paused with the connection goes on from its bytes. This module loads with
+// the first screen that shows a file, often onto a connection already open: that is "connected" too.
 conn.onOpen(() => core.reconnected());
+if (conn.state === 'open') core.reconnected();
 // Forgetting the computer forgets its downloads too: what is under way and the records here (lib/erase.ts
 // removes the private files and copies natively and sweeps the storage, whether or not this module loaded).
 onForget(() => {

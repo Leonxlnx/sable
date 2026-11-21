@@ -54,17 +54,19 @@ export interface EraseDeps {
 
 /**
  * Erases it all: the generation moves on, the loaded modules let go of what they hold (and of writes
- * they still had due), the page's storage is swept, Android removes its files, copies, notifications
- * and shortcuts, and the storage is swept again (a hook or a late write may have put something back).
- * What failed, by name (empty when nothing of the desktop is left).
+ * they still had due, drained before their keys go), the page's storage is swept, Android removes its
+ * files, copies, notifications and shortcuts, and the storage is swept again (a hook or a late write
+ * may have put something back). What failed, by name (empty when nothing of the desktop is left): a
+ * module that could not let go (`forget`) counts, as does every native step, so the erasure's mark
+ * stays and it goes on later.
  */
 export async function eraseAll(deps: EraseDeps): Promise<string[]> {
   bumpEpoch();
-  await runForget();
+  const hooks = await runForget().catch(() => 1);
   if (deps.storage) sweep(deps.storage);
   const failed = await deps.native().catch(() => ['native']);
   const left = deps.storage ? sweep(deps.storage) : [];
-  return [...failed, ...(left.length ? ['storage'] : [])];
+  return [...(hooks ? ['forget'] : []), ...failed, ...(left.length ? ['storage'] : [])];
 }
 
 /** The page's localStorage, where there is one. */

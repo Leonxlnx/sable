@@ -53,8 +53,10 @@ import org.json.JSONObject;
  * then copied to Downloads/Sable under its name cut to Android's byte budget, the extension kept.
  * Nothing is public and nothing says "downloaded" before that check. The record says where its copy
  * stands at every step ("pending" with the entry's uri before the bytes go, then true or false), so
- * a start after Android stopped the app in the middle finds the verified file done (`stageBegin`)
- * and finishes, or redoes, a copy cut off; it never downloads or publishes the file twice. Open hands
+ * a start after Android stopped the app in the middle finds the verified file done (`stageBegin`,
+ * once it read the private file whole again and it still matches) and finishes, or redoes, a copy
+ * cut off (a pending row whose uri was never written down goes first); it never downloads or
+ * publishes the file twice. Open hands
  * on the verified private copy through this app's FileProvider (its name given as the display name).
  * `discard` and `prune` remove private files no record of the page names; `forgetAll` removes every
  * private file and every copy and system download Sable made, and fails when anything is left.
@@ -271,11 +273,12 @@ public class FilesPlugin extends Plugin {
                 // The same file of the same share goes on from what is there; anything else starts over.
                 String id = sha256Hex(key + "\u0000" + want + "\u0000" + size + "\u0000" + name).substring(0, 32);
                 // Verified before (Android stopped the app after the check, before the page wrote it down): done, never fetched again; a copy cut off is finished.
+                // Read whole again first: a private file damaged since its check (the same length or not) is never published or handed on; it starts over.
                 File rec = new File(verified(), id + ".json");
                 if (rec.exists()) {
                     JSONObject r = new JSONObject(readText(rec));
                     File f = verifiedFile(id, name);
-                    if (name.equals(r.optString("name")) && want.equalsIgnoreCase(r.optString("sha256")) && r.optLong("size", -1) == size && f.exists() && f.length() == size) {
+                    if (name.equals(r.optString("name")) && want.equalsIgnoreCase(r.optString("sha256")) && r.optLong("size", -1) == size && f.exists() && f.length() == size && same(digest(f), want, size)) {
                         JSObject o = new JSObject();
                         o.put("id", id);
                         o.put("have", size);
@@ -426,6 +429,14 @@ public class FilesPlugin extends Plugin {
                     }
                     r.remove("uri");
                 }
+                // A row inserted by a start Android stopped before its uri was written down is still pending, and ours:
+                // copies are made one at a time on this thread, so any pending row of ours in Downloads/Sable now is such an orphan.
+                try {
+                    Uri col = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+                    for (long orphan : ownCopies(cr, col, true)) cr.delete(ContentUris.withAppendedId(col, orphan), null, null);
+                } catch (Exception ignored) {
+                    // left for forgetAll, which removes every row of ours, pending ones included
+                }
                 ContentValues v = new ContentValues();
                 v.put(MediaStore.MediaColumns.DISPLAY_NAME, display);
                 v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
@@ -523,17 +534,20 @@ public class FilesPlugin extends Plugin {
         ContentResolver cr = getContext().getContentResolver();
         Uri col = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
         try {
-            for (long id : ownCopies(cr, col)) cr.delete(ContentUris.withAppendedId(col, id), null, null);
-            return ownCopies(cr, col).isEmpty();
+            for (long id : ownCopies(cr, col, false)) cr.delete(ContentUris.withAppendedId(col, id), null, null);
+            return ownCopies(cr, col, false).isEmpty();
         } catch (Exception e) {
             return false;
         }
     }
 
-    /** The entries in Downloads/Sable this app owns (pending and trashed ones too). */
-    private List<Long> ownCopies(ContentResolver cr, Uri col) {
+    /**
+     * The entries in Downloads/Sable this app owns (pending and trashed ones too; `pendingOnly`: only
+     * the pending ones). A query MediaStore does not answer (a null cursor) throws: it is never "none".
+     */
+    private List<Long> ownCopies(ContentResolver cr, Uri col, boolean pendingOnly) throws IOException {
         List<Long> ids = new ArrayList<>();
-        String sel = MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ? AND " + MediaStore.MediaColumns.OWNER_PACKAGE_NAME + " = ?";
+        String sel = MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ? AND " + MediaStore.MediaColumns.OWNER_PACKAGE_NAME + " = ?" + (pendingOnly ? " AND " + MediaStore.MediaColumns.IS_PENDING + " = 1" : "");
         String[] args = { Environment.DIRECTORY_DOWNLOADS + "/Sable/%", getContext().getPackageName() };
         String[] cols = { MediaStore.MediaColumns._ID };
         Cursor c;
@@ -548,7 +562,7 @@ public class FilesPlugin extends Plugin {
             //noinspection deprecation
             c = cr.query(MediaStore.setIncludePending(col), cols, sel, args, null);
         }
-        if (c == null) return ids;
+        if (c == null) throw new IOException("MediaStore did not answer");
         try {
             while (c.moveToNext()) ids.add(c.getLong(0));
         } finally {
@@ -568,10 +582,12 @@ public class FilesPlugin extends Plugin {
         }
     }
 
-    private long[] systemDownloads() {
+    /** Every download this app asked DownloadManager for; a query it does not answer (a null cursor) throws, never "none". */
+    private long[] systemDownloads() throws IOException {
         List<Long> ids = new ArrayList<>();
         try (Cursor c = manager().query(new DownloadManager.Query())) {
-            if (c != null) while (c.moveToNext()) ids.add(c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)));
+            if (c == null) throw new IOException("DownloadManager did not answer");
+            while (c.moveToNext()) ids.add(c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)));
         }
         long[] out = new long[ids.size()];
         for (int i = 0; i < out.length; i++) out[i] = ids.get(i);

@@ -1,7 +1,7 @@
 import { AnimatePresence, motion } from 'motion/react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { pushBack } from '@m/lib/back';
-import { abortable, conn, ConfirmError, isOldPairLink, offerLink, parsePairLink, type PairOffer } from '@m/lib/conn';
+import { abortable, conn, ConfirmError, isOldPairLink, offerLink, parsePairLink, SeparateError, type PairOffer } from '@m/lib/conn';
 import { askNotifications, deviceName, haptic } from '@m/lib/native';
 import { Field } from '@m/ui/Field';
 import { launchFrom } from '@m/ui/Launch';
@@ -17,6 +17,11 @@ type Step =
    * `token`: the confirmation of replacing exactly that pairing with exactly this code (conn.ts `confirmFor`).
    */
   | { kind: 'confirm'; offer: PairOffer; was: string; token?: string }
+  /**
+   * The earlier pairing (from before the secure channel) gave no ticket to end it: pairing goes on
+   * only when the person chooses so (`separate`, conn.ts `separateFor`); that entry then stays there.
+   */
+  | { kind: 'separate'; offer: PairOffer; was: string; token?: string; separate?: string }
   | { kind: 'connecting'; offer: PairOffer }
   | { kind: 'waiting'; offer: PairOffer; phone: string }
   | { kind: 'error'; text: string; quiet?: boolean; offer?: PairOffer };
@@ -59,7 +64,7 @@ export function Pair({
   const [paste, setPaste] = useState(false);
   const [text, setText] = useState('');
   const busy = step.kind === 'connecting' || step.kind === 'waiting';
-  const confirming = step.kind === 'confirm';
+  const confirming = step.kind === 'confirm' || step.kind === 'separate';
   const inFlight = useRef(false);
   const cancelled = useRef(false);
   const mark = useRef<HTMLDivElement>(null);
@@ -102,7 +107,7 @@ export function Pair({
     void go(offer);
   };
 
-  const go = async (offer: PairOffer, token?: string) => {
+  const go = async (offer: PairOffer, token?: string, separate?: string) => {
     if (inFlight.current) return;
     inFlight.current = true;
     cancelled.current = false;
@@ -112,7 +117,7 @@ export function Pair({
     try {
       const phone = await abortable(deviceName(), signal);
       // The connection asks for the confirmation itself (a pairing read after this screen asked counts too).
-      await conn.pair(offer, phone, () => !signal.aborted && setStep({ kind: 'waiting', offer, phone }), signal, token);
+      await conn.pair(offer, phone, () => !signal.aborted && setStep({ kind: 'waiting', offer, phone }), signal, token, separate);
       haptic('success');
       // Home opens out of this mark (the launch glides it into the bar).
       const r = mark.current?.querySelector('svg')?.getBoundingClientRect();
@@ -123,6 +128,13 @@ export function Pair({
     } catch (err) {
       if (err instanceof ConfirmError) {
         if (!signal.aborted) confirm(offer, err.was);
+        return;
+      }
+      if (err instanceof SeparateError) {
+        if (!signal.aborted) {
+          haptic('warning');
+          setStep({ kind: 'separate', offer, was: err.was.desktop || 'your computer', token, separate: conn.separateFor(offer) });
+        }
         return;
       }
       if (!cancelled.current && !signal.aborted) {
@@ -186,6 +198,15 @@ export function Pair({
           <p className="pair-sub">This phone then connects to {name(step.offer)} instead.</p>
         </>
       );
+  else if (step.kind === 'separate')
+    status = (
+      <>
+        <p className="pair-line pair-strong">The earlier pairing cannot be ended from here</p>
+        <p className="pair-sub">
+          Pair anyway, then remove it on {step.was} in {WHERE}.
+        </p>
+      </>
+    );
   else if (step.kind === 'connecting')
     status = (
       <>
@@ -280,7 +301,16 @@ export function Pair({
           )}
         </AnimatePresence>
         <AnimatePresence mode="popLayout" initial={false}>
-          {step.kind === 'confirm' ? (
+          {step.kind === 'separate' ? (
+            <motion.div key="separate" className="pair-buttons" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} transition={SNAP}>
+              <button type="button" className="btn btn-primary btn-lg" onClick={() => (haptic('tap'), void go(step.offer, step.token, step.separate))}>
+                Pair anyway
+              </button>
+              <button type="button" className="btn btn-lg pair-alt" onClick={cancel}>
+                Cancel
+              </button>
+            </motion.div>
+          ) : step.kind === 'confirm' ? (
             <motion.div key="confirm" className="pair-buttons" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} transition={SNAP}>
               <button type="button" className="btn btn-primary btn-lg" onClick={() => (haptic('tap'), void go(step.offer, step.token))}>
                 {step.was === name(step.offer) ? 'Pair again' : 'Replace'}

@@ -25,18 +25,27 @@ export async function durable(key: string, value: string | null) {
 }
 
 /**
- * The pairing kept on this phone: null when there is none (or what is there is not one). A read that
- * fails throws: it is never taken as "none" (a link would then pair without asking to replace it).
+ * The pairing kept on this phone: null when there is none. A read that fails throws, and so does a
+ * pairing that is there but cannot be read as one (`damaged: true`): neither is ever taken as "none"
+ * (a link would then pair without asking to replace it, and nothing of the old one would be erased).
  */
 export async function loadPairing(): Promise<Pairing | null> {
   const { value } = await Preferences.get({ key: 'pairing' });
   if (!value) return null;
+  const damaged = () => Object.assign(new Error('The pairing kept on this phone cannot be read'), { damaged: true as const });
+  let p: Pairing;
   try {
-    const p = JSON.parse(value) as Pairing;
-    return p && typeof p.token === 'string' && Array.isArray(p.hosts) ? p : null;
+    p = JSON.parse(value) as Pairing;
   } catch {
-    return null;
+    throw damaged();
   }
+  if (!p || typeof p !== 'object' || typeof p.token !== 'string' || !p.token || !Array.isArray(p.hosts)) throw damaged();
+  return p;
+}
+
+/** A preference's text (null when there is none); a read that fails throws (never taken as "none"). */
+export async function readPref(key: string): Promise<string | null> {
+  return (await Preferences.get({ key })).value;
 }
 
 /** Keeps the pairing, on the phone's storage before it resolves (throws when it could not be written: the caller decides what to say). */
@@ -222,9 +231,10 @@ const poster = new NotePoster(
       if (chats > 1) notifications.push({ ...common, id: SUMMARY_ID, title: 'Sable', body: `${chats} chats`, groupSummary: true, summaryText: `${chats} chats`, extra: { kind: 'home' } });
       await LocalNotifications.schedule({ notifications });
     },
+    // Each step awaited and none swallowed: an erasure that leaves a chat's line in the shade says so (lib/erase.ts).
     clearAll: async () => {
       if (!isNative) return;
-      await LocalNotifications.removeAllDeliveredNotifications().catch(() => {});
+      await LocalNotifications.removeAllDeliveredNotifications();
       const p = await LocalNotifications.getPending();
       if (p.notifications.length) await LocalNotifications.cancel({ notifications: p.notifications.map((n) => ({ id: n.id })) });
     },
@@ -245,9 +255,9 @@ export async function notify(title: string, body: string, sessionId: string, kin
   await poster.notify(title, body, sessionId, kind);
 }
 
-/** Every chat's notification goes, with what was kept of them, and any still on its way (the desktop was forgotten). */
+/** Every chat's notification goes, with what was kept of them, and any still on its way (the desktop was forgotten; the erasure itself checks it: `eraseNative`). */
 export function clearChatNotifications() {
-  void poster.clear();
+  void poster.clear().catch(() => {});
 }
 
 /**

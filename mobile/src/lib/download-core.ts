@@ -1,4 +1,5 @@
 import type { PhoneFileStart } from '@shared/protocol';
+import { isBusy, monotonic, nap, stoppedError, untilStopped } from './errors';
 
 /**
  * The downloads' logic, free of Capacitor and the connection (lib/downloads.ts wires it), so it can
@@ -32,7 +33,17 @@ import type { PhoneFileStart } from '@shared/protocol';
  * start every private file no entry names is removed (`prune`).
  *
  * Every start has its own attempt, checked after every await (a Stop while the desktop prepares the
- * file ends it for good). Storage is written only when what is kept changed; at most `KEEP` entries.
+ * file ends it for good), and its own signal: a Stop ends a wait on a busy desktop at once, nothing
+ * more is asked for it, and the starts behind it go on without waiting for its turn to end. A start
+ * has one deadline (`START_BUDGET` from its turn) for every layer that waits on a busy desktop (this
+ * queue's "another download is starting" and lib/errors.ts `whileBusy`), and each call is limited
+ * to the time left. A start the desktop still refuses for now when that time is up (no room for one
+ * more of this phone's transfers) pauses, its bytes kept, and goes on when one of them ends.
+ *
+ * Storage is written only when what is kept changed, and counts as written only once the write
+ * worked (a failed one is tried again with the next change); at most `KEEP` entries. A history that
+ * could not be read is not an empty one: nothing is pruned and nothing written over it until it
+ * reads (then it is merged under what came meanwhile, and the private files are reconciled).
  */
 
 export type DownloadState = 'idle' | 'asking' | 'pending' | 'running' | 'paused' | 'verifying' | 'done' | 'failed';
@@ -93,12 +104,18 @@ export interface FilesPlugin {
   prune?(o: { keep: string[] }): Promise<void>;
 }
 
+/** How long one call may wait (`deadline`, on lib/errors.ts `monotonic` time) and what stops it (`signal`: the download was stopped). */
+export interface CallCtx {
+  signal?: AbortSignal;
+  deadline?: number;
+}
+
 /** What the secure channel gives (conn.ts over `phone.fileStart` / `phone.fileChunk` / `phone.fileEnd`). */
 export interface Channel {
   /** Paired securely: downloads come this way (and only this way). */
   secure(): boolean;
-  start(p: { sid: string; itemId: string; index: number }): Promise<PhoneFileStart>;
-  chunk(p: { transfer: string; offset: number; length: number }): Promise<{ data: string }>;
+  start(p: { sid: string; itemId: string; index: number }, ctx?: CallCtx): Promise<PhoneFileStart>;
+  chunk(p: { transfer: string; offset: number; length: number }, ctx?: CallCtx): Promise<{ data: string }>;
   end(transfer: string): Promise<unknown>;
 }
 
@@ -113,6 +130,8 @@ export const PLAIN_OFF = 'Pair again to download it';
 const BUSY = /another download is starting/i;
 /** How a start told "another download is starting" waits before it asks again. */
 export const BUSY_WAIT = [300, 600, 1200, 2000, 3000, 4000, 5000, 6000];
+/** One start's whole time from its turn: every wait on a busy desktop and the desktop's hashing of the file. */
+export const START_BUDGET = 150_000;
 /** Chunks asked for ahead of the one being written. */
 export const WINDOW = 2;
 
@@ -134,6 +153,8 @@ export interface Deps {
   /** The app is in the background (the loop stops; `resume` starts it again). */
   hidden?: () => boolean;
   sleep?: (ms: number) => Promise<void>;
+  /** Monotonic time for deadlines (tests). */
+  now?: () => number;
   /** The web preview's acted download takes this long. */
   actMs?: () => number;
 }
@@ -188,23 +209,46 @@ const keepable = (d: Download) => (d.via === 'channel' ? d.state === 'done' || a
 /** A refusal the desktop gave (it reached the desktop): such a download fails; a lost connection only pauses it. */
 const refusedBy = (deps: Deps, err: unknown) => !(deps.lost?.(err) ?? false);
 
+/**
+ * The history as kept: `ok` with its entries (`sound`: it was a history, read whole), or not `ok`
+ * when the storage itself could not be read (it may hold everything).
+ */
+function readKept(storage: Deps['storage']): { ok: true; entries: Record<string, Download>; sound: boolean } | { ok: false } {
+  let text: string | null;
+  try {
+    text = storage ? storage.get() : null;
+  } catch {
+    return { ok: false };
+  }
+  // Kept: finished ones (Open) and ones still under way (read again, or gone on with).
+  const out: Record<string, Download> = {};
+  try {
+    const raw = JSON.parse(text ?? '{}') as Record<string, Download>;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: true, entries: out, sound: false };
+    for (const [k, d] of Object.entries(raw)) if (d && typeof d === 'object' && keepable(d)) out[k] = keepOf(d);
+    return { ok: true, entries: out, sound: true };
+  } catch {
+    // Not a history (damaged): what it named cannot be told, so nothing is pruned by it.
+    return { ok: true, entries: out, sound: false };
+  }
+}
+
 export function createDownloads(deps: Deps) {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = deps.now ?? monotonic;
   let attempts = 0;
+  /** What the storage holds as far as this knows (moved on only by a write that worked). */
   let savedJson = '';
   const subs = new Set<() => void>();
+  /** Each attempt's stop (a Stop, Forget, or a newer attempt of the same entry aborts it). */
+  const stops = new Map<string, AbortController>();
+  /** Paused because the desktop had no room for one more of this phone's transfers: each goes on when one of them ends. */
+  const turnWait = new Set<string>();
 
-  let all: Record<string, Download> = (() => {
-    try {
-      const raw = JSON.parse(deps.storage?.get() ?? '{}') as Record<string, Download>;
-      // Kept: finished ones (Open) and ones still under way (read again, or gone on with).
-      const out: Record<string, Download> = {};
-      for (const [k, d] of Object.entries(raw)) if (d && keepable(d)) out[k] = keepOf(d);
-      return out;
-    } catch {
-      return {};
-    }
-  })();
+  const first = readKept(deps.storage);
+  /** The history could not be read: nothing is written over it (nor pruned by it) until it can be. */
+  let unread = !first.ok;
+  let all: Record<string, Download> = first.ok ? first.entries : {};
 
   /** What is kept across restarts: finished downloads and ones under way. */
   const kept = () => {
@@ -212,7 +256,7 @@ export function createDownloads(deps: Deps) {
     for (const [k, d] of Object.entries(all)) if (keepable(d)) keep[k] = keepOf(d);
     return JSON.stringify(keep);
   };
-  savedJson = kept();
+  if (first.ok) savedJson = kept();
 
   if (!deps.link) {
     // No plain transfers any more: a system download an older build left running stops here (before it publishes unchecked bytes).
@@ -222,8 +266,9 @@ export function createDownloads(deps: Deps) {
       all = { ...all, [k]: { state: 'failed', via: 'system', error: PLAIN_OFF, attempt: d.attempt, total: d.total } };
     }
   }
-  // Private files no entry names (an entry let go, a record Android cut off before the page wrote it) go.
-  if (deps.native && deps.plugin.prune) {
+  /** Private files no entry names (an entry let go, a record Android cut off before the page wrote it) go: only by a history read whole. */
+  function prune() {
+    if (!deps.native || !deps.plugin.prune) return;
     const keep = new Set<string>();
     for (const d of Object.values(all)) {
       if (d.stage) keep.add(d.stage);
@@ -231,16 +276,28 @@ export function createDownloads(deps: Deps) {
     }
     void deps.plugin.prune({ keep: [...keep] }).catch(() => {});
   }
+  if (first.ok && first.sound) prune();
 
-  /** Written only when what is kept changed (bytes moving over DownloadManager never write). */
+  /** The history read after all (it could not be at start): what came since stays over it, then the private files are reconciled. */
+  function readLate(): boolean {
+    const r = readKept(deps.storage);
+    if (!r.ok) return false;
+    unread = false;
+    all = { ...r.entries, ...all };
+    if (r.sound) prune();
+    return true;
+  }
+
+  /** Written only when what is kept changed (bytes moving over DownloadManager never write); it counts as written once the write worked. */
   function save() {
+    if (unread && !readLate()) return;
     const json = kept();
     if (json === savedJson) return;
-    savedJson = json;
     try {
       deps.storage?.set(json);
+      savedJson = json;
     } catch {
-      /* full */
+      /* full: tried again with the next change */
     }
   }
 
@@ -335,22 +392,28 @@ export function createDownloads(deps: Deps) {
     setTimeout(tick, 200);
   }
 
-  /** Starts over the channel, one at a time (the queue), each told "another download is starting" waiting it out. */
+  /**
+   * Starts over the channel, one at a time (the queue), each told "another download is starting"
+   * waiting it out, all within one deadline from its turn. A start stopped meanwhile asks nothing
+   * more, and the queue goes on at once (a stopped start never holds the ones behind it).
+   */
   let starting: Promise<unknown> = Promise.resolve();
-  function startOne(p: { sid: string; itemId: string; index: number }, mine: () => boolean): Promise<PhoneFileStart> {
+  function startOne(p: { sid: string; itemId: string; index: number }, mine: () => boolean, signal: AbortSignal): Promise<PhoneFileStart> {
     const run = starting.then(async () => {
+      const deadline = now() + START_BUDGET;
       for (let i = 0; ; i++) {
         // Stopped while it waited its turn: it does not ask at all.
-        if (!mine()) throw Object.assign(new Error('Stopped'), { stopped: true });
+        if (!mine() || signal.aborted) throw stoppedError();
         try {
-          return await deps.channel!.start(p);
+          return await deps.channel!.start(p, { signal, deadline });
         } catch (err) {
-          if (!BUSY.test((err as Error)?.message ?? '') || i >= BUSY_WAIT.length) throw err;
-          await sleep(BUSY_WAIT[i]);
+          if (signal.aborted) throw stoppedError();
+          if (!BUSY.test((err as Error)?.message ?? '') || i >= BUSY_WAIT.length || now() + BUSY_WAIT[i] > deadline) throw err;
+          await nap(BUSY_WAIT[i], signal, sleep);
         }
       }
     });
-    starting = run.catch(() => {});
+    starting = untilStopped(run, signal).catch(() => {});
     return run;
   }
 
@@ -362,14 +425,22 @@ export function createDownloads(deps: Deps) {
   async function viaChannel(key: string, p: { sid: string; itemId: string; index: number }, attempt: number, size?: number) {
     const ch = deps.channel!;
     const mine = () => all[key]?.attempt === attempt;
+    stops.get(key)?.abort();
+    const stop = new AbortController();
+    stops.set(key, stop);
+    const signal = stop.signal;
     const from = { sid: p.sid, itemId: p.itemId, index: p.index };
     const was = all[key];
     set(key, { ...(was && was.via === 'channel' && was.state === 'paused' ? was : {}), state: 'asking', via: 'channel', secure: true, total: was?.total ?? size, attempt, from });
     let transfer: string | undefined;
     let stage: string | undefined;
+    /** A transfer was opened on the desktop for it: its end frees room there for one waiting its turn. */
+    let opened = false;
+    turnWait.delete(key);
     try {
-      const s = await startOne(p, mine);
+      const s = await startOne(p, mine, signal);
       transfer = s.transfer;
+      opened = true;
       if (!mine()) return void ch.end(s.transfer).catch(() => {});
       // A paused download of other bytes (the share recorded another file since) starts over.
       const st = await deps.plugin.stageBegin({ key, name: s.name, size: s.size, sha256: s.sha256 });
@@ -390,7 +461,7 @@ export function createDownloads(deps: Deps) {
       const ask = () => {
         while (ahead.length < WINDOW && asked < s.size) {
           const len = Math.min(s.chunk, s.size - asked);
-          const reply = ch.chunk({ transfer: s.transfer, offset: asked, length: len });
+          const reply = ch.chunk({ transfer: s.transfer, offset: asked, length: len }, { signal });
           reply.catch(() => {});
           ahead.push({ at: asked, len, reply });
           asked += len;
@@ -422,10 +493,35 @@ export function createDownloads(deps: Deps) {
       const cur = all[key];
       // The connection went away: it waits, its bytes kept, and goes on once connected.
       if (!refusedBy(deps, err)) return set(key, { ...cur, state: 'paused', attempt });
+      // Still no room on the desktop when its time ran out (every transfer of this phone in use): it
+      // waits, its bytes kept, and goes on when one of them ends (or once connected again).
+      if (isBusy(err)) {
+        turnWait.add(key);
+        return set(key, { ...cur, state: 'paused', attempt });
+      }
       if (stage) void deps.plugin.stageDrop({ id: stage }).catch(() => {});
       set(key, { state: 'failed', via: 'channel', total: cur?.total ?? size, error: (err as Error).message, attempt });
       throw err;
+    } finally {
+      if (stops.get(key) === stop) stops.delete(key);
+      if (opened) nextInTurn();
     }
+  }
+
+  /** A transfer of this phone ended: the first download waiting for room goes on now. */
+  function nextInTurn() {
+    if (!deps.channel?.secure()) return;
+    for (const k of turnWait) {
+      turnWait.delete(k);
+      const d = all[k];
+      if (d?.via === 'channel' && d.state === 'paused' && d.from) return void viaChannel(k, d.from, ++attempts, d.total).catch(() => {});
+    }
+  }
+
+  /** The attempt of `key` under way stops: nothing more is asked for it, and a wait on a busy desktop ends now. */
+  function stopAttempt(key: string) {
+    stops.get(key)?.abort();
+    stops.delete(key);
   }
 
   return {
@@ -448,6 +544,9 @@ export function createDownloads(deps: Deps) {
     /** Every entry goes (the desktop was forgotten); a download under way stops where it is. */
     forgetAll() {
       attempts++;
+      for (const s of stops.values()) s.abort();
+      stops.clear();
+      turnWait.clear();
       const was = all;
       all = {};
       for (const d of Object.values(was)) {
@@ -495,6 +594,8 @@ export function createDownloads(deps: Deps) {
     async cancel(key: string) {
       const d = all[key];
       set(key, { state: 'idle' });
+      stopAttempt(key);
+      turnWait.delete(key);
       if (d?.via === 'channel') {
         if (d.stage && d.state !== 'done') await deps.plugin.stageDrop({ id: d.stage }).catch(() => {});
         return;

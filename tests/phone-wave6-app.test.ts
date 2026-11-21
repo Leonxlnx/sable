@@ -169,7 +169,8 @@ describe('Forget while a load is on its way', () => {
 
 describe('steps under a root in view while the pages stop before the newest (#16)', () => {
   it('are bounded per parent too, and counted on it past the bound', async () => {
-    const store = (await load()) as Store & { openAt: (id: string, itemId: string) => Promise<'here' | 'gone'>; LATE_KIDS_MAX: number; getState: () => { data: Record<string, { items: Record<string, { kids?: number }>; children: Record<string, string[]>; next?: string }> } };
+    type Deep = { items: Record<string, { kids?: number }>; children: Record<string, string[]>; next?: string };
+    const store = (await load()) as unknown as Omit<Store, 'getState'> & { openAt: (id: string, itemId: string) => Promise<'here' | 'gone'>; LATE_KIDS_MAX: number; getState: () => { data: Record<string, Deep> } };
     const roots: Record<string, unknown>[] = Array.from({ length: 200 }, (_, n) => ({ id: `r${n}`, ts: n, type: 'user', text: `m${n}` }));
     // A sub-agent still working, within the window opened around r20.
     roots[22] = { id: 'agent', ts: 22, type: 'tool', name: 'Task', kind: 'agent', title: 'Agent', status: 'running', detail: {} };

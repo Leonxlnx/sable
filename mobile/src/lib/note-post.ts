@@ -113,14 +113,15 @@ export class NotePoster {
 
   /**
    * The desktop was forgotten: at once, every post waiting or under way is let go, what was kept goes,
-   * and every notification is taken away; what is asked after this waits until that is done.
+   * and every notification is taken away; what is asked after this waits until that is done. Rejects
+   * when Android could not take them away (an erasure then says something is left: lib/erase.ts).
    */
   clear(): Promise<void> {
     this.gen++;
     this.lines.clear();
     this.book.clear();
-    const cleared = this.api.clearAll().catch(() => {});
-    this.chain = Promise.all([this.chain, cleared]);
+    const cleared = this.api.clearAll();
+    this.chain = Promise.all([this.chain, cleared.catch(() => {})]);
     return cleared;
   }
 }

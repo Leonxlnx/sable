@@ -7,9 +7,9 @@ import { conn } from '@m/lib/conn';
 import { claimFlight, dropFlight, inFlight, launchFlight } from '@m/lib/flight';
 import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
-import { onPutDraft, putDraft } from '@m/lib/put-draft';
+import { onPutDraft } from '@m/lib/put-draft';
 import { onForget } from '@m/lib/forget';
-import { drafts, pendingTakes, saveDrafts, settleTaken, stageTaken } from '@m/lib/drafts';
+import { getDraft, onDraft, pendingTakes, setDraft, settleTaken, stageTaken } from '@m/lib/drafts';
 import { epoch, still } from '@m/lib/epoch';
 import { confirmTake, STILL_QUEUED, takeBack, type TakeDeps } from '@m/lib/take';
 import { haptic } from '@m/lib/native';
@@ -74,7 +74,7 @@ export function Composer({ sid }: { sid: string }) {
   const providers = useStore((st) => st.providers);
   const allCaps = useStore((st) => st.caps);
   const sendWithEnter = useStore((st) => st.settings?.sendWithEnter !== false);
-  const [text, setText] = useState(() => drafts.get(sid) ?? '');
+  const [text, setText] = useState(() => getDraft(sid));
   const online = useStore((st) => st.conn === 'open');
   // The newest message of yours, to settle a send the connection cut off.
   const lastUser = useStore((st) => {
@@ -99,8 +99,7 @@ export function Composer({ sid }: { sid: string }) {
       unsure.delete(sid);
       if (area.current && area.current.value.trim() === u.text) {
         setText('');
-        drafts.set(sid, '');
-        saveDrafts();
+        setDraft(sid, '');
         area.current.style.height = '';
         fit(area.current, 168);
       }
@@ -129,13 +128,27 @@ export function Composer({ sid }: { sid: string }) {
         const had = area.current?.value ?? '';
         const t = append && had.trim() ? `${had.trimEnd()}\n${words}` : words;
         setText(t);
-        drafts.set(sid, t);
-        saveDrafts();
+        setDraft(sid, t);
         const el = area.current;
         if (!el) return;
         el.value = t;
         fit(el, 168);
         el.focus();
+      }),
+    [sid],
+  );
+
+  // The draft changed from elsewhere (words taken back from the queue, recovered at a start): the field
+  // shows it at once, so what is typed next goes on from it and never writes an older text over it.
+  useEffect(
+    () =>
+      onDraft(sid, (t, why) => {
+        setText(t);
+        const el = area.current;
+        if (!el) return;
+        el.value = t;
+        fit(el, 168);
+        if (why === 'taken') el.focus();
       }),
     [sid],
   );
@@ -209,8 +222,7 @@ export function Composer({ sid }: { sid: string }) {
 
   const update = (v: string, hold = false) => {
     setText(v);
-    drafts.set(sid, v);
-    saveDrafts();
+    setDraft(sid, v);
     const el = area.current;
     if (!el) return;
     if (hold) {
@@ -443,12 +455,12 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
     haptic('tap');
     setTaking(true);
     const e = epoch();
-    // The words are kept on the phone before the desktop lets the message go (lib/take.ts).
+    // The words go into the chat's draft (and its field) as they are kept on the phone, before the
+    // desktop lets the message go (lib/take.ts, lib/drafts.ts): nothing more to put here once it answers.
     void takeBack(takes, sid, q.id)
       .then(
         (r) => {
           if (!r.text || !still(e)) return;
-          putDraft(sid, r.text, { append: true });
           if (r.stillQueued) toast(STILL_QUEUED);
         },
         (err) => {

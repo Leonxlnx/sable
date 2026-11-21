@@ -2,10 +2,12 @@ import { isTransport } from './errors';
 
 /**
  * Taking a queued message back into the composer (`queue.take`) without ever losing it: the desktop
- * keeps the message reserved and hands a receipt (`ack: true` → `take`); the phone first keeps the
- * words on its own storage (the chat's draft, and a committed copy that survives Android closing the
- * app: lib/drafts.ts), and only then says so (`phone.takeDone`), which is when the message leaves
- * the queue. Words the phone could not keep are said back (`kept: false`) and the message stays
+ * keeps the message reserved and hands a receipt (`ack: true` → `take`); the phone first puts the
+ * words into the chat's one draft (its field shows them at once) and commits that draft revision to
+ * its own storage (a copy that survives Android closing the app and follows the draft until it is
+ * sent or emptied: lib/drafts.ts), and only then says so (`phone.takeDone`), which is when the
+ * message leaves the queue. Its answer changes nothing on the phone (the words are already where
+ * they stay), so a chat left meanwhile loses nothing. Words the phone could not keep are said back (`kept: false`) and the message stays
  * queued. A confirmation that does not get through is sent again (the receipt is idempotent), now a
  * few times and later once the phone is connected again; a desktop from before receipts takes the
  * message as its reply goes out, as it did. Pure over what it is given (tests).
@@ -15,8 +17,8 @@ export interface TakeDeps {
   take(sid: string, id: string): Promise<{ message?: { text?: string }; take?: string }>;
   /** `phone.takeDone`. */
   done(take: string, kept: boolean): Promise<{ taken: boolean }>;
-  /** Keeps the words (the draft, committed); throws when it could not. */
-  stage(sid: string, text: string, take?: string): Promise<void>;
+  /** Keeps the words: in the chat's draft at once, and that draft revision committed (resolves with it); throws when it could not. */
+  stage(sid: string, text: string, take?: string): Promise<number | void>;
   /** The receipt was answered: its copy kept for it can go. */
   settle(take: string): void;
   sleep?: (ms: number) => Promise<void>;

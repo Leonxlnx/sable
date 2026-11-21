@@ -88,8 +88,10 @@ export const READ_FAILED = 'Sable could not read what this phone keeps. Close Sa
 export const KEEP_FAILED = 'This phone could not keep the pairing. Try again.';
 /** A plain pairing that was to be replaced but is still on the desktop. */
 export const OLD_STAYS = 'The earlier pairing is still listed on the computer. Remove it there in Settings › Phone.';
-/** An erasure that did not finish: it goes on at the next start. */
+/** An erasure that did not finish: it goes on by itself (and at the next start); the pairing in use waits for it. */
 export const ERASE_LEFT = 'Some of what this phone kept could not be removed yet. Sable tries again when it opens.';
+/** What this phone kept as its pairing is there but cannot be read: nothing pairs until it is replaced (and erased). */
+export const UNREADABLE = 'What this phone kept for its computer cannot be read. Scan a code to replace it.';
 
 /**
  * The person has not confirmed that `offer` replaces the pairing this phone has (Pair.tsx shows
@@ -100,6 +102,29 @@ export class ConfirmError extends Error {
     super('Confirm first');
   }
 }
+
+/**
+ * A pairing from before the secure channel that the new one cannot end: its desktop gave no
+ * migration ticket (`unreached`: it did not answer over the old pairing, or is too old to; `other`:
+ * it is another computer than the code's). Pairing goes on only when the person chooses so
+ * (`separateFor`): the old entry then stays on that computer, to remove there.
+ */
+export class SeparateError extends Error {
+  constructor(
+    readonly was: Pairing,
+    readonly why: 'unreached' | 'other',
+  ) {
+    super('The earlier pairing cannot be ended from here');
+  }
+}
+
+/** How a pairing ended the one it replaced: `removed` (the desktop said it removed exactly that device), `stays` (still listed there). */
+export interface PairResult {
+  old?: 'removed' | 'stays';
+}
+
+/** What `pair` shows in place of the pairing it would replace while the kept one cannot be read. */
+const UNREAD_PAIRING: Pairing = { hosts: [], port: 0, token: '', deviceId: '', desktop: '' };
 
 const url = (host: string, port: number) => `ws://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}${PHONE_PATH}`;
 
@@ -401,8 +426,18 @@ class Conn {
   private holdOld = false;
   /** The erasure under way, as kept on the phone's storage (native.ts `EraseMark`). */
   private mark: EraseMark | null = null;
-  /** What this phone keeps was read (`ok`), could not be (`failed`: nothing pairs), or not yet. */
-  lookup: 'pending' | 'ok' | 'failed' = 'pending';
+  /**
+   * What this phone keeps was read (`ok`), could not be (`failed`: nothing pairs), was there but is
+   * not a pairing (`damaged`: a code replaces it once the person confirms, erasing first), or not yet.
+   */
+  lookup: 'pending' | 'ok' | 'failed' | 'damaged' = 'pending';
+  /** The erasure under way (one at a time; a reconnect waits for it). */
+  private erasing?: Promise<boolean>;
+
+  /** Something of a computer this phone no longer uses is still to be erased: the pairing in use does not connect until it is. */
+  get cleaning(): boolean {
+    return !!this.mark;
+  }
   private lookedUp!: () => void;
   /** Settles once the saved pairing was looked up: pairing waits for it. */
   readonly ready = new Promise<void>((r) => (this.lookedUp = r));
@@ -413,11 +448,22 @@ class Conn {
     // A network that comes back (Wi-Fi again after mobile data) reconnects at once.
     window.addEventListener('online', () => this.wake());
     let got: [EraseMark | null, Pairing | null] | undefined;
+    let damaged = false;
     // A read that fails is not "nothing saved": tried again a moment later, then pairing waits.
     for (let i = 0; i < 3 && !got; i++) {
       try {
-        got = await Promise.all([loadMark(), loadPairing()]);
+        const [mark, pairing] = await Promise.all([
+          loadMark(),
+          // There but not a pairing: not "none" either (it is replaced only once the person confirms).
+          loadPairing().catch((err: unknown) => {
+            if (!(err as { damaged?: boolean } | undefined)?.damaged) throw err;
+            damaged = true;
+            return null;
+          }),
+        ]);
+        got = [mark, pairing];
       } catch {
+        damaged = false;
         await new Promise((r) => window.setTimeout(r, 150 * (i + 1)));
       }
     }
@@ -440,13 +486,20 @@ class Conn {
           () => false,
         );
         this.pairing = null;
+        if (gone) damaged = false;
       }
-      if (this.mark.forget || kept) await this.eraseData(gone);
-      // A replacement that never got as far as keeping its pairing: nothing to erase.
-      else await this.setMark(null).catch(() => {});
+      if (this.mark.forget || kept) {
+        if (!(await this.eraseData(gone))) this.notice(ERASE_LEFT);
+      } else if (!damaged) {
+        // A replacement that never got as far as keeping its pairing: nothing to erase (and nothing waits for it).
+        await this.setMark(null).catch(() => {});
+        this.mark = null;
+      }
     }
+    if (damaged) this.lookup = 'damaged';
     this.lookedUp();
-    if (this.pairing) void this.connect();
+    if (damaged) this.setState('unpaired', UNREADABLE);
+    else if (this.pairing) void this.connect();
     else this.setState('unpaired');
   }
 
@@ -466,17 +519,24 @@ class Conn {
   }
 
   /**
-   * Erases what was kept for the desktop (lib/erase.ts) and, when nothing is left, the mark. When
-   * something is left, the mark stays (the next start goes on with it) and the person is told.
+   * Erases what was kept for the desktop (lib/erase.ts) and, when nothing is left, the mark: true
+   * only once both are done. When something is left (or the mark could not go), the mark stays: the
+   * pairing in use does not connect until a later try worked (`connect`), and the next start goes
+   * on with it too. One erasure at a time (a second ask waits for the one under way).
    */
-  private async eraseData(done = true): Promise<boolean> {
-    const failed = await eraseAll({ storage: pageStorage(), native: eraseNative });
-    if (failed.length || !done) {
-      this.notice(ERASE_LEFT);
-      return false;
-    }
-    await this.setMark(null).catch(() => {});
-    return true;
+  private eraseData(done = true): Promise<boolean> {
+    if (this.erasing) return this.erasing.then((ok) => ok && done);
+    const run = (async () => {
+      const failed = await eraseAll({ storage: pageStorage(), native: eraseNative });
+      if (failed.length || !done) return false;
+      return this.setMark(null).then(
+        () => true,
+        () => false,
+      );
+    })();
+    this.erasing = run;
+    void run.finally(() => this.erasing === run && (this.erasing = undefined));
+    return run;
   }
 
   /** The pairing written in order; it lands only while it is still the pairing this phone uses (or is about to). */
@@ -560,6 +620,23 @@ class Conn {
     const p = this.pairing;
     // While a new pairing is under way, the old credential does not reconnect (pair() goes on with it if that pairing ends).
     if (!p || this.connecting || this.holdOld) return;
+    // What was kept for a computer this phone no longer uses goes first: until it is gone (and its
+    // mark), this pairing does not connect, so nothing of it lands among what that erasure removes.
+    if (this.mark) {
+      this.connecting = true;
+      let clean = false;
+      try {
+        clean = await this.eraseData();
+      } finally {
+        this.connecting = false;
+      }
+      if (this.pairing !== p || this.holdOld) return;
+      if (!clean) {
+        if (this.state !== 'offline' || this.error !== ERASE_LEFT) this.setState('offline', ERASE_LEFT);
+        this.scheduleRetry();
+        return;
+      }
+    }
     this.connecting = true;
     const attempt = ++this.attemptId;
     const gen = this.gen;
@@ -795,6 +872,8 @@ class Conn {
    * pairing before the secure channel): the phone asks first (Pair.tsx).
    */
   replaces(offer: PairOffer): Pairing | null {
+    // Kept but unreadable: whatever it was, a code replaces it only once the person says so.
+    if (this.lookup === 'damaged') return UNREAD_PAIRING;
     const p = this.pairing;
     return p && p.fp !== offer.fp ? p : null;
   }
@@ -807,8 +886,19 @@ class Conn {
    * read before the saved pairing) asks again. Undefined when nothing would be replaced.
    */
   confirmFor(offer: PairOffer): string | undefined {
+    if (this.lookup === 'damaged') return `unreadable|${offer.fp}|${offer.key}`;
     const p = this.replaces(offer);
     return p ? `${p.fp ?? 'plain'}|${p.deviceId}|${offer.fp}|${offer.key}` : undefined;
+  }
+
+  /**
+   * The person's choice to pair with `offer` although the pairing from before the secure channel it
+   * replaces cannot be ended from here (`SeparateError`): bound to that pairing and to this offer, as
+   * `confirmFor` is. Undefined when nothing such would be replaced.
+   */
+  separateFor(offer: PairOffer): string | undefined {
+    const p = this.lookup === 'ok' ? this.pairing : null;
+    return p && !p.fp ? `separate|${p.deviceId}|${offer.fp}|${offer.key}` : undefined;
   }
 
   /**
@@ -819,23 +909,39 @@ class Conn {
    * (`phone.migrate`, only when its fingerprint is the link's); its token never goes to the new peer.
    * Until the new pairing is allowed and kept the old one stays (a pairing given up connects with it
    * again). Nothing pairs before the saved pairing was read, and one that would be replaced needs the
-   * person's `confirmed` token for it (`confirmFor`; otherwise a `ConfirmError`). `signal`
-   * (`beginPair`) aborts it at any step until the pairing is being kept.
+   * person's `confirmed` token for it (`confirmFor`; otherwise a `ConfirmError`). A pairing from
+   * before the secure channel that this one cannot end (no ticket: its desktop did not answer, or is
+   * another computer) stops it with a `SeparateError` until the person chooses to pair anyway
+   * (`separate`, the token of `separateFor`). Kept but unreadable data is replaced only with the
+   * person's confirmation, and erased before anything else is paired. `signal` (`beginPair`) aborts it
+   * at any step until the pairing is being kept. Resolves with whether the old pairing went (`old`).
    */
-  async pair(offer: PairOffer, name: string, onWaiting: () => void, signal?: AbortSignal, confirmed?: string): Promise<void> {
+  async pair(offer: PairOffer, name: string, onWaiting: () => void, signal?: AbortSignal, confirmed?: string, separate?: string): Promise<PairResult> {
     if (!/^[\w-]{43}$/.test(offer.fp ?? '')) throw new Error('That is not a Sable pairing link');
     await abortable(this.ready, signal);
+    if (this.lookup === 'damaged') {
+      if (confirmed !== this.confirmFor(offer)) throw new ConfirmError(UNREAD_PAIRING);
+      // Whatever it was goes first, with everything kept for it; only a clean phone pairs.
+      if (!(await this.retire(false))) throw new Error(ERASE_LEFT);
+      if (signal?.aborted) throw cancelled();
+    }
     if (this.lookup !== 'ok') throw new Error(READ_FAILED);
     const before = this.pairing;
     if (before && this.replaces(offer) && confirmed !== this.confirmFor(offer)) throw new ConfirmError(before);
     try {
-      const replaces = before && !before.fp ? await this.migrationTicket(before, offer.fp, signal) : undefined;
+      let replaces: { id: string; ticket: string } | undefined;
+      if (before && !before.fp && !(separate && separate === this.separateFor(offer))) {
+        const got = await this.migrationTicket(before, offer.fp, signal);
+        // No ticket: the old pairing would stay valid on its computer. That is the person's choice to make, before anything is sent.
+        if (got === 'unreached' || got === 'other') throw new SeparateError(before, got);
+        replaces = got;
+      }
       if (signal?.aborted) throw cancelled();
       if (this.pairing !== before) throw new Error('The pairing on this phone changed meanwhile. Try again.');
       // From here the old credential stays still: no reconnect with it while the desktop is asked.
       this.holdOld = true;
       this.forgetSocket();
-      await this.pairWith(offer, name, onWaiting, before, replaces, signal);
+      return await this.pairWith(offer, name, onWaiting, before, replaces, signal);
     } catch (err) {
       this.holdOld = false;
       // Given up, refused or not kept: the pairing this phone had goes on as it was, with a live wire again.
@@ -850,11 +956,11 @@ class Conn {
   }
 
   /**
-   * Over the old plain pairing: the desktop's fingerprint and a one-time ticket. Undefined when that
-   * desktop is not the link's (another computer: its old entry stays there, to remove on it), when it
-   * cannot be reached or is too old to say.
+   * Over the old plain pairing: the desktop's fingerprint and a one-time ticket. `other` when that
+   * desktop is not the link's (another computer: its old entry stays there, to remove on it);
+   * `unreached` when it cannot be reached, does not answer in time or is too old to say.
    */
-  private async migrationTicket(before: Pairing, fp: string, signal?: AbortSignal): Promise<{ id: string; ticket: string } | undefined> {
+  private async migrationTicket(before: Pairing, fp: string, signal?: AbortSignal): Promise<{ id: string; ticket: string } | 'unreached' | 'other'> {
     try {
       if (this.state !== 'open' || this.wire?.secure !== false) {
         this.wake();
@@ -869,16 +975,17 @@ class Conn {
           signal,
         );
       }
-      if (this.pairing !== before || this.wire?.secure !== false) return undefined;
+      if (this.pairing !== before || this.wire?.secure !== false) return 'unreached';
       const r = await abortable(this.call('phone.migrate', {}, 8000), signal);
-      return r && r.fingerprint === fp && typeof r.ticket === 'string' ? { id: before.deviceId, ticket: r.ticket } : undefined;
+      if (r && typeof r.fingerprint === 'string' && r.fingerprint && r.fingerprint !== fp) return 'other';
+      return r && r.fingerprint === fp && typeof r.ticket === 'string' && r.ticket ? { id: before.deviceId, ticket: r.ticket } : 'unreached';
     } catch (err) {
       if ((err as { cancelled?: boolean }).cancelled) throw err;
-      return undefined;
+      return 'unreached';
     }
   }
 
-  private async pairWith(offer: PairOffer, name: string, onWaiting: () => void, before: Pairing | null, replaces: { id: string; ticket: string } | undefined, signal?: AbortSignal) {
+  private async pairWith(offer: PairOffer, name: string, onWaiting: () => void, before: Pairing | null, replaces: { id: string; ticket: string } | undefined, signal?: AbortSignal): Promise<PairResult> {
     const reached = await reach(
       offer.hosts,
       offer.port,
@@ -891,15 +998,15 @@ class Conn {
     );
     const { wire, host } = reached;
     const odd = () => new Error('The desktop did not answer as Sable does');
-    await new Promise<void>((resolve, reject) => {
+    return new Promise<PairResult>((resolve, reject) => {
       let over = false;
       // The welcome came: the pairing is being kept, and nothing (Cancel, a close) undoes that half way.
       let keeping = false;
       /** The new pairing as the desktop gave it (`paired`), apart from the one this phone has until it is kept. */
       let candidate: Pairing | undefined;
-      /** The desktop removed the plain pairing this one replaces (`paired.replaced`). */
-      let replaced = false;
-      const end = (err?: Error) => {
+      /** The device the desktop says it removed with this pairing (`paired.replaced`): it counts only when it is exactly the one replaced. */
+      let replaced: string | undefined;
+      const end = (err?: Error, result: PairResult = {}) => {
         if (over) return;
         over = true;
         clearTimeout(timer);
@@ -909,7 +1016,7 @@ class Conn {
           wire.onClose = null;
           wire.close();
           reject(err);
-        } else resolve();
+        } else resolve(result);
       };
       const onAbort = () => !keeping && end(cancelled());
       if (signal?.aborted) return onAbort();
@@ -929,7 +1036,7 @@ class Conn {
           // One pairing per exchange, whole.
           if (candidate || typeof t?.token !== 'string' || !t.token || typeof t.deviceId !== 'string' || !t.deviceId) return end(odd());
           candidate = { hosts: offer.hosts, port: offer.port, token: t.token, deviceId: t.deviceId, desktop: typeof t.desktop === 'string' ? t.desktop : (offer.name ?? ''), lastHost: host, fp: offer.fp };
-          replaced = typeof t.replaced === 'string' && !!t.replaced;
+          replaced = typeof t.replaced === 'string' && t.replaced ? t.replaced : undefined;
         } else if ('welcome' in f) {
           // Only the welcome of the device just paired completes it: a welcome first, or another device's, is not a pairing.
           if (!candidate || f.welcome?.deviceId !== candidate.deviceId) return end(odd());
@@ -939,9 +1046,12 @@ class Conn {
           const kept: Pairing = { ...candidate, hosts: mergeHosts(offer.hosts, f.welcome.hosts, host), desktop: f.welcome.desktop || candidate.desktop };
           this.keep(kept, before, replaces, wire).then(
             () => {
-              // The old plain pairing was to go with this one and the desktop did not say it went: it stays listed there.
-              if (replaces && !replaced) this.notice(OLD_STAYS);
-              end();
+              // A plain pairing replaced: gone only when the desktop said it removed exactly that device;
+              // otherwise (no ticket, the person chose to pair anyway, or another device named) it stays listed there.
+              if (!before || before.fp) return end();
+              const gone = !!replaces && replaced === replaces.id;
+              if (!gone) this.notice(OLD_STAYS);
+              end(undefined, { old: gone ? 'removed' : 'stays' });
             },
             (err: Error) => end(err),
           );
@@ -982,10 +1092,22 @@ class Conn {
     }
     this.pairing = c;
     // Still no other connection while the old one's data is erased: the wire that paired comes next.
-    if (erase) await this.eraseData();
+    const clean = erase ? await this.eraseData() : true;
     this.holdOld = false;
     const gen = this.gen;
     if (!this.pairing || this.pairing !== c) return;
+    if (!clean) {
+      // Kept, but not used until what was kept for the old computer is gone (it would be erased with it):
+      // tried again by itself (`connect`), and at the next start.
+      wire.onText = null;
+      wire.onClose = null;
+      wire.close();
+      this.notice(ERASE_LEFT);
+      this.setState('offline', ERASE_LEFT);
+      this.retry = 0;
+      this.scheduleRetry();
+      return;
+    }
     // The wire that paired goes on as the connection (or, gone meanwhile, a new one with the new token).
     if (!wire.ready || !this.adopt(wire, gen)) {
       wire.close();
@@ -1008,7 +1130,12 @@ class Conn {
    * swept, Android's private files and copies removed); only when nothing is left does the mark go. A
    * Forget that Android cut off goes on at the next start.
    */
-  async forget() {
+  async forget(): Promise<void> {
+    await this.retire(true);
+  }
+
+  /** Forget's steps; `cancelPairing`: a pairing in progress ends too (not when that pairing is what asked: unreadable data replaced). True when nothing is left. */
+  private async retire(cancelPairing: boolean): Promise<boolean> {
     await this.ready;
     const was = this.mark;
     try {
@@ -1023,12 +1150,16 @@ class Conn {
       throw err;
     }
     this.gen++;
-    this.cancelPair();
+    if (cancelPairing) this.cancelPair();
     this.forgetSocket();
     this.holdOld = false;
     this.pairing = null;
+    // What could not be read as a pairing is gone with it.
+    if (this.lookup === 'damaged') this.lookup = 'ok';
     this.setState('unpaired');
-    await this.eraseData();
+    const clean = await this.eraseData();
+    if (!clean) this.notice(ERASE_LEFT);
+    return clean;
   }
 }
 

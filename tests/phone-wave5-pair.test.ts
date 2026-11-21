@@ -212,7 +212,8 @@ describe('one credential generation per wire and call (1)', () => {
     await until(() => m.conn.state === 'open');
     const a = await desktop();
     const offer = await offerOf(a);
-    const p = m.conn.pair(offer, 'Phone', () => {}, m.conn.beginPair(), m.conn.confirmFor(offer));
+    // That old desktop gives no ticket: paired as a separate pairing, as the person chose (review wave 6, #6).
+    const p = m.conn.pair(offer, 'Phone', () => {}, m.conn.beginPair(), m.conn.confirmFor(offer), m.conn.separateFor(offer));
     await until(() => !!requestOf(a), 6000);
     const before = old.state.connections;
     // Back to the front, the network back, a retry due: none of them reaches the old desktop now.

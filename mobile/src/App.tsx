@@ -171,7 +171,8 @@ export function App() {
     // Back where it was: Android may have closed the app in the background.
     void conn.init().then(() => {
       // The list of chats as it was last time, at once; the desktop's answer replaces it.
-      if (conn.pairing) loadCachedHome(), nav.restore();
+      // While an erasure is unfinished the cache may still be the earlier computer's.
+      if (conn.pairing && !conn.cleaning) loadCachedHome(), nav.restore();
       setReady(true);
       setLookedUp(true);
     });
@@ -226,7 +227,7 @@ export function App() {
           // A link given up (Cancel, or not replacing the computer this phone has): it is used, the screen goes back to where it was.
           onLinkDone={() => setLink(null)}
           again={repairing && !unpaired}
-          denied={state === 'denied' || conn.lookup === 'failed' ? error : undefined}
+          denied={state === 'denied' || conn.lookup === 'failed' || conn.lookup === 'damaged' ? error : undefined}
           // Paired already (pairing again, or a link that came in): Not now and Back go back to the chats.
           onCancel={
             !unpaired && (repairing || !!link)

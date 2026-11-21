@@ -165,8 +165,12 @@ describe('an old plain pairing paired again (1, 2)', () => {
     const b = fakeDesktop({ identity: other, psk: key });
     const offer = { hosts: ['127.0.0.1'], port: await b.ready, key, fp: other.fingerprint, name: os.hostname() };
     expect(m.conn.replaces(offer)).toBeTruthy();
+    // No ticket for that desktop (review wave 6, #6): the person chooses first, and nothing went to it.
+    const first = await m.conn.pair(offer, 'Phone', () => {}, m.conn.beginPair(), m.conn.confirmFor(offer)).catch((e) => e);
+    expect(first).toBeInstanceOf(m.SeparateError);
+    expect(b.got).toHaveLength(0);
     const signal = m.conn.beginPair();
-    const pairing = m.conn.pair(offer, 'Phone', () => {}, signal, m.conn.confirmFor(offer));
+    const pairing = m.conn.pair(offer, 'Phone', () => {}, signal, m.conn.confirmFor(offer), m.conn.separateFor(offer));
     pairing.catch(() => {});
     await until(() => b.got.length > 0);
     const frame = JSON.parse(b.got[0]) as { pair: { key: string; replaces?: unknown } };

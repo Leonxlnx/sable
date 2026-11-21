@@ -47,6 +47,7 @@ vi.mock('../mobile/src/lib/native', () => ({
   clearChatNotifications: () => {},
   clearShortcuts: () => {},
   loadPref: async (k: string, f: unknown) => (fake.prefs.has(k) ? JSON.parse(fake.prefs.get(k)!) : f),
+  readPref: async (k: string) => fake.prefs.get(k) ?? null,
   durable: async (k: string, v: string | null) => void (v === null ? fake.prefs.delete(k) : fake.prefs.set(k, v)),
 }));
 vi.mock('@desk/features/timeline/lead-in', async () => await import('../src/features/timeline/lead-in'));
@@ -115,15 +116,18 @@ describe('a queued message taken back (20)', () => {
 
   it('the staged words go into the draft and a committed copy; after Forget nothing is staged', async () => {
     const drafts = await import('../mobile/src/lib/drafts');
-    drafts.drafts.set('s', 'had');
+    drafts.setDraft('s', 'had');
     await drafts.stageTaken('s', 'taken', 'R9');
-    expect(JSON.parse(mem.get('sable.drafts')!)).toEqual({ s: 'had\ntaken' });
-    expect(JSON.parse(fake.prefs.get(drafts.TAKEN)!)).toMatchObject([{ sid: 's', text: 'taken', take: 'R9' }]);
+    expect(JSON.parse(mem.get('sable.drafts')!)).toMatchObject({ s: { t: 'had\ntaken' } });
+    expect(JSON.parse(fake.prefs.get(drafts.TAKEN)!)).toMatchObject({ kept: { s: { t: 'had\ntaken' } }, takes: [{ id: 'R9', sid: 's' }] });
     expect(await drafts.pendingTakes()).toEqual(['R9']);
+    // Answered: the receipt goes; the committed copy stays with the draft (review wave 6, #9) until it is sent.
     drafts.settleTaken('R9');
+    await until(() => JSON.parse(fake.prefs.get(drafts.TAKEN)!).takes.length === 0);
+    drafts.setDraft('s', '');
     await until(() => !fake.prefs.has(drafts.TAKEN));
     await eraseAll({ storage: ls, native: async () => [] });
-    expect(drafts.drafts.size).toBe(0);
+    expect(drafts.getDraft('s')).toBe('');
   });
 });
 
