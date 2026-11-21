@@ -91,7 +91,7 @@ const RULES = `
 :where(code,kbd,samp,pre){font-family:var(--font-mono);font-size:12px;font-variant-ligatures:none}
 :where(:not(pre)>code,kbd){padding:.12em .38em;border-radius:5px;background:var(--fill-2);box-shadow:inset 0 0 0 1px var(--line)}
 :where(pre){margin:0 0 .75em;padding:10px 12px;border-radius:var(--r-md);border:1px solid var(--line);background:rgb(0 0 0/.3);overflow:auto;line-height:18px;color:var(--text-2)}
-:where(img,video,canvas){max-width:100%}:where(img,video){height:auto}
+:where(img,video,canvas){max-width:100%}:where(img,video){height:auto}:where(img){max-height:440px;object-fit:contain}
 :where(svg:not([fill])){fill:var(--text-2)}:where(svg){overflow:visible;max-width:100%}
 :where(table){width:100%;border-collapse:collapse;font-size:13px;margin:0 0 .75em}
 :where(th){text-align:left;font-weight:500;color:var(--text-2);font-size:12px;padding:7px 10px;border-bottom:1px solid var(--line-2);white-space:nowrap}

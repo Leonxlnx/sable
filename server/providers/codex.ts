@@ -70,6 +70,7 @@ import {
   toEffort,
   transcript,
   unwrapCommand,
+  innerCommand,
   warningNotice,
 } from './codex-map';
 
@@ -240,6 +241,9 @@ export function titleTurnParams(threadId: string, prompt: TitlePrompt, effort?: 
 /** The namespace that holds the deferred Browser tab tools. */
 export const BROWSER_NAMESPACE = 'sable_browser';
 const BROWSER_NAMESPACE_DESCRIPTION = "Tools that work the page open in Sable's Browser tab: snapshot, click, type, press, scroll, evaluate, logs, wait, navigate.";
+
+/** Codex's asks for approval (not its questions, which always wait for the person). */
+const ASKS = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'execCommandApproval', 'applyPatchApproval']);
 
 export class CodexProvider implements Provider {
   readonly id = 'codex' as const;
@@ -2246,11 +2250,41 @@ class CodexSession implements ProviderSession {
 
   // ── server requests (approvals & questions) ──
 
+  /**
+   * The chat is in Full access now. Codex fixes a turn's approval policy when the turn starts, so a turn
+   * begun in another mode keeps asking after the switch: those asks are answered at once, as Claude
+   * Code's are in Bypass (the switch itself answered the ones already waiting, app.ts).
+   */
+  private fullAccess(): boolean {
+    return preset(this.rt.meta.mode).approval === 'never';
+  }
+
+  /** What Full access answers to each kind of ask: allowed once (a later switch back asks again). */
+  private allowAtOnce(method: string, p: any): unknown {
+    switch (method) {
+      case 'item/commandExecution/requestApproval':
+      case 'item/fileChange/requestApproval': {
+        const id = p?.turnId && p?.itemId ? `${p.turnId}:${p.itemId}` : '';
+        if (id) this.afterDecision(id, true);
+        return { decision: 'accept' };
+      }
+      case 'item/permissions/requestApproval': {
+        const granted: PermissionsRequestApprovalResponse['permissions'] = {};
+        if (p?.permissions?.network) granted.network = p.permissions.network;
+        if (p?.permissions?.fileSystem) granted.fileSystem = p.permissions.fileSystem;
+        return { permissions: granted, scope: 'turn' };
+      }
+      default:
+        return { decision: 'approved' };
+    }
+  }
+
   async onRequest(method: string, p: any, reqId: RequestId): Promise<unknown> {
     const ac = new AbortController();
     const key = String(reqId);
     this.prompts.set(key, ac);
     try {
+      if (ASKS.has(method) && this.fullAccess()) return this.allowAtOnce(method, p);
       switch (method) {
         case 'item/commandExecution/requestApproval':
           return await this.approveCommand(p as CommandExecutionRequestApprovalParams, ac.signal);
@@ -2347,7 +2381,8 @@ class CodexSession implements ProviderSession {
       { id: 'accept', label: 'Allow once', tone: 'allow' },
       { id: 'acceptForSession', label: 'Allow for this session', tone: 'always' },
     ];
-    if (amend) options.push({ id: 'amend', label: `Always allow “${amend.join(' ')}”`, hint: 'Saves a rule; matching commands run without asking', tone: 'always' });
+    // Named by the command itself, not the shell that wraps it (the rule saved is Codex's own, whole).
+    if (amend) options.push({ id: 'amend', label: `Always allow “${innerCommand(amend) || amend.join(' ')}”`, hint: 'Saves a rule; matching commands run without asking', tone: 'always' });
     options.push({ id: 'decline', label: 'Decline', hint: 'Codex continues without running it', tone: 'deny' }, { id: 'cancel', label: 'Decline and stop', hint: 'Ends the turn', tone: 'deny' });
     // The destination a network approval opens is part of what it allows, beside any words of Codex's own.
     const scope = compactScope({ hosts: p.networkApprovalContext?.host ? [p.networkApprovalContext.host] : [] });

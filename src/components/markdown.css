@@ -213,7 +213,11 @@ a.md-file:focus-visible,
 .md-img {
   display: inline-block;
   max-width: 100%;
+  /* Every picture in an answer at one calm size: never taller than this, its shape kept. */
+  max-height: var(--pic-max-h, 420px);
+  width: auto;
   height: auto;
+  object-fit: contain;
   border-radius: var(--r-md);
   outline: 1px solid var(--line);
   outline-offset: -1px;

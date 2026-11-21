@@ -2084,6 +2084,11 @@ button:hover > .row-caret {
   color: var(--text-3);
 }
 
+/* A command past its own time limit: the one word that asks the reader to look (and stop it). */
+.work-live .work-stall {
+  color: var(--amber);
+}
+
 .work-ind {
   display: inline-grid;
   place-items: center;

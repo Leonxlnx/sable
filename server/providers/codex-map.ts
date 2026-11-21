@@ -385,6 +385,20 @@ export function buildInput(text: string, attachments: Attachment[] | undefined, 
 
 const base = (p: string) => path.basename(p.replace(/[\\/]+$/, '')) || p;
 
+/**
+ * The command inside a shell's argument list (`["C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-Command", "gh …"]`,
+ * `["bash", "-lc", "…"]`, `["cmd.exe", "/c", "…"]`), as a person reads it; the list joined when it is
+ * not a shell's.
+ */
+export function innerCommand(argv: string[]): string {
+  const shell = /(?:^|[\\/])(?:pwsh|powershell|cmd|bash|zsh|sh)(?:\.exe)?$/i.test(argv[0] ?? '');
+  if (shell) {
+    const at = argv.findIndex((a, i) => i > 0 && /^(?:-Command|-c|-lc|\/c)$/i.test(a));
+    if (at > 0 && at < argv.length - 1) return argv.slice(at + 1).join(' ');
+  }
+  return unwrapCommand(argv.join(' '));
+}
+
 /** Strips the shell wrapper Codex reports (`powershell.exe -Command "..."`, `bash -lc '...'`). */
 export function unwrapCommand(cmd: string): string {
   let c = cmd.trim();

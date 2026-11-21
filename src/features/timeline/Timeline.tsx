@@ -8,6 +8,7 @@ import { useStore } from '@/state/store';
 import { EMPTY, TimelineCtx, type TimelineCtxValue } from './ctx';
 import { navFeed } from './nav-bus';
 import { Navigator } from './Navigator';
+import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
 import { DOCK_GLIDE_MS } from '@/features/session/dock-glide';
@@ -362,6 +363,8 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     // leaves hover alone while a scroll runs.
     const onWheel = (e: WheelEvent) => {
       mark();
+      // Widget frames let the wheel through while it scrolls (genui/frames.ts).
+      readerScrolls();
       restoreTo.current = null;
       if (e.deltaY < 0 && room.current > 1) stuck.current = false;
     };
@@ -415,6 +418,9 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     room.current = dist;
     scrolled.current = performance.now();
     const byReader = dragging.current || performance.now() - intent.current < 600;
+    // A scroll the reader made (also one a wheel over a widget handed on to the conversation), not
+    // the view following the end: widget frames let the pointer through until it rests.
+    if (byReader || !stuck.current) readerScrolls();
     if (top < lastTop.current - 1 && dist > 1) {
       if (byReader) stuck.current = false;
       else if (stuck.current) {

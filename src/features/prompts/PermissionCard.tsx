@@ -27,6 +27,9 @@ function Field({ label, value, mono, path }: { label: string; value?: string; mo
  * A scroller whose lower edge fades into the well while more is below (as the composer field does),
  * so no line is cut hard at the bottom; the fade goes once the end is in view.
  */
+/** Past this many characters an option's own words take the whole button (its hint goes to the tooltip). */
+const HINT_ROOM = 64;
+
 export function FadeScroll({ className, children }: { className: string; children: ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
   const [more, setMore] = useState(false);
@@ -286,10 +289,12 @@ export function PermissionCard({ sessionId, req, more }: { sessionId: string; re
               disabled={sent}
               className={o.tone === 'allow' ? 'btn btn-primary' : o.tone === 'always' ? 'btn' : 'btn btn-ghost'}
               data-tone={o.tone}
+              title={o.hint ? `${o.label}. ${o.hint}` : o.label}
               onClick={() => choose(o)}
             >
               <span>{o.label}</span>
-              {o.hint && <span className="pc-hint">{o.hint}</span>}
+              {/* A long option (a whole command) keeps its own words; its hint is in the tooltip. */}
+              {o.hint && o.label.length <= HINT_ROOM && <span className="pc-hint">{o.hint}</span>}
             </button>
           ))}
         </div>

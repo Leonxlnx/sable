@@ -17,6 +17,7 @@ import { TurnFoot } from './Turn';
 import { LINE, shapeIndex, turnsIndex, type FlowChunk, type Group, type Segment, type TurnGroup, type TurnLayout } from './turns';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
+import { stallAt } from './stall';
 import { shortDuration, thinkingHeadline, useHeld, useTick } from './util';
 
 /** Groups built when a transcript opens, and how many more each step up builds. */
@@ -507,6 +508,7 @@ const TITLE_HOLD_MS = 900;
 /** How long a finished step still names what the agent is doing, when nothing newer has started (ms). */
 const RECENT_MS = 2000;
 
+
 /**
  * The lead-in that names what the agent does now, or '' when there is none: the newest one written
  * since the agent last said something in view, while the steps it announced run. A step started
@@ -541,6 +543,8 @@ function liveSelector(sessionId: string, seg: Segment, held: { title: string }) 
     if (!d || !meta) return '0|Working';
     let waiting = meta.status === 'awaiting' || d.permissions.length > 0 || d.questions.length > 0;
     let title = '';
+    // The earliest moment a running command is past its own limit (it is not answering after that).
+    let stall = 0;
     let agents = 0;
     // The newest step, when it finished a moment ago: quick steps in a row read as one calm sequence
     // of their titles instead of flickering back to "Working" between them.
@@ -553,6 +557,8 @@ function liveSelector(sessionId: string, seg: Segment, held: { title: string }) 
       if (it.type === 'tool' && (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting')) {
         if (it.status === 'awaiting') waiting = true;
         if (it.kind === 'agent') agents++;
+        const at = stallAt(it);
+        if (at && (!stall || at < stall)) stall = at;
         if (!title) title = it.title;
       } else if (it.type === 'thinking' && it.streaming && !title) title = thinkingHeadline((it as ThinkingItem).text) || 'Thinking';
       else if (n === 0 && it.type === 'text' && it.streaming) writing = true;
@@ -571,7 +577,7 @@ function liveSelector(sessionId: string, seg: Segment, held: { title: string }) 
     }
     if (!title) title = recent || (meta.status === 'starting' ? 'Starting' : meta.activity || 'Working');
     held.title = title;
-    return `${waiting ? 1 : 0}|${title}`;
+    return `${waiting ? 1 : 0}|${stall}|${title}`;
   };
 }
 
@@ -615,9 +621,13 @@ function LiveLine({ seg, open, onToggle }: { seg: Segment; open: boolean; onTogg
   const lead = useItem(seg.lead ?? seg.work[0] ?? '');
   const now = useTick();
   const cut = info.indexOf('|');
+  const cut2 = info.indexOf('|', cut + 1);
   const waiting = info.slice(0, cut) === '1';
+  const stall = Number(info.slice(cut + 1, cut2)) || 0;
+  // A command past its own time limit: the line says so, so a hung step never just counts on.
+  const stalled = !waiting && stall > 0 && now >= stall;
   // Quick steps in a row: each title holds a moment instead of flickering past (waiting shows at once).
-  const held = useHeld(info.slice(cut + 1), TITLE_HOLD_MS);
+  const held = useHeld(info.slice(cut2 + 1), TITLE_HOLD_MS);
   const [title, out] = useSwap(held);
   const elapsed = lead ? now - lead.ts : 0;
   // The working tiles keep their own animation: the line's ticks and title changes leave them alone.
@@ -661,6 +671,7 @@ function LiveLine({ seg, open, onToggle }: { seg: Segment; open: boolean; onTogg
       )}
       {elapsed >= 1000 && <span className="work-time num">{shortDuration(elapsed)}</span>}
       {seg.steps > 0 && <span className="work-time num">{plural(seg.steps, 'step')}</span>}
+      {stalled && <span className="work-time work-stall">Not answering</span>}
       {onToggle && <Icon name="caret-right" size={10} className="row-caret" />}
     </>
   );

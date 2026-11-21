@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from '@/icons';
 import { Flood, HeightGuard } from './guard';
 import { handlePrompt, linkFrame, postToFrame, type FrameLink } from './host';
+import { trackFrame } from './frames';
 import { cachedHeight, rememberHeight, useNear } from './near';
 import { hasVisibleMarkup, prepareCode } from './partial';
 import { baseCss, fontCss } from './theme';
@@ -122,6 +123,13 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
   useEffect(() => push(), [code, final, push]);
 
   const mounted = near && !stopped;
+
+  // While the conversation scrolls, the frame lets the wheel through (frames.ts).
+  useEffect(() => {
+    const el = frame.current;
+    if (!mounted || !el) return;
+    return trackFrame(el);
+  }, [mounted, left, final, code === '']); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const outer = frame.current;

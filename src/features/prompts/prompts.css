@@ -244,11 +244,23 @@
 
 .pc-foot .btn {
   gap: 8px;
+  /* A long option (an "Always allow" with a whole command) stays inside the card: its words cut. */
+  max-width: 100%;
+  min-width: 0;
+}
+
+.pc-foot .btn > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pc-hint {
   font-weight: var(--w-regular);
   color: var(--text-3);
+  /* The hint gives way before the option's own words. */
+  flex-shrink: 4;
 }
 
 .btn-primary .pc-hint {
