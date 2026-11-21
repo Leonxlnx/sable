@@ -69,8 +69,10 @@ describe('Claude limits read through a live process', () => {
     const events: BridgeEvent[] = [];
     const p = new ClaudeProvider(ctx(events));
     const read = (rl: object) => (p as unknown as { readLimitsNow: (q: unknown) => Promise<RateLimit[]> }).readLimitsNow(answer(rl));
-    await read({ five_hour: win(10), seven_day: win(50), model_scoped: [{ display_name: 'Fable', ...win(60) }] });
-    const rows = await read({ five_hour: win(11), seven_day: win(51) });
+    // On the real clock: the windows reset a few days from now (a fixed date would roll over one day).
+    const ahead = new Date(Date.now() + 3 * 86_400_000).toISOString();
+    await read({ five_hour: win(10, ahead), seven_day: win(50, ahead), model_scoped: [{ display_name: 'Fable', ...win(60, ahead) }] });
+    const rows = await read({ five_hour: win(11, ahead), seven_day: win(51, ahead) });
     expect(rows.map((l) => [l.id, l.percent])).toEqual([
       ['five_hour', 11],
       ['seven_day', 51],
@@ -83,7 +85,8 @@ describe('Claude limits read through a live process', () => {
 
 describe('Claude rate-limit events', () => {
   const ctx = (events: BridgeEvent[]) => ({ emit: (e: BridgeEvent) => events.push(e), log: () => {}, settings: () => DEFAULT_SETTINGS });
-  const reset = Math.floor(WEEK / 1000);
+  // On the real clock: a reset a few days from now (a fixed date would roll over one day).
+  const reset = Math.floor((Date.now() + 3 * 86_400_000) / 1000);
   const event = (oi: number) => ({ status: 'allowed', rateLimitType: 'seven_day', utilization: 0.5, resetsAt: reset, unifiedWindows: { seven_day: { utilization: 0.5, resetsAt: reset }, seven_day_overage_included: { utilization: oi, resetsAt: reset } } });
 
   it('reads the overage-included window as the Fable window', () => {

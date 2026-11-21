@@ -189,6 +189,42 @@ const FULL = { text: 200_000, thinking: 40_000, field: 4000, outLines: 200, outC
 /** Pictures of one step a phone can ask for, and the biggest one it gets (a data URL's length). */
 const MAX_PICS = 12;
 export const IMAGE_MAX = 12 * 1024 * 1024;
+/** A widget's own pictures (`<img src="data:image/png;base64,...">`): what a phone shows of it. */
+const WIDGET_PIC = /data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}/g;
+/** Shorter sources are spacers and dots (a 1 px GIF), not pictures. */
+const WIDGET_PIC_MIN = 256;
+const widgetPicsOf = new WeakMap<object, string[]>();
+
+/**
+ * The pictures in a widget's code, in order, each source once, at most `MAX_PICS`: a phone shows
+ * them after any pictures of the step's result (`phone.image` by the same index). Remembered per
+ * input (an item's input is replaced, never changed, so a page reads a long code once).
+ */
+export function widgetPics(input: unknown): string[] {
+  if (!input || typeof input !== 'object') return [];
+  const code = (input as { code?: unknown }).code;
+  if (typeof code !== 'string' || !code.includes('data:image/')) return [];
+  const known = widgetPicsOf.get(input);
+  if (known) return known;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of code.matchAll(WIDGET_PIC)) {
+    const src = m[0];
+    if (src.length < WIDGET_PIC_MIN || seen.has(src)) continue;
+    seen.add(src);
+    out.push(src);
+    if (out.length >= MAX_PICS) break;
+  }
+  widgetPicsOf.set(input, out);
+  return out;
+}
+
+/** How many pictures a phone may ask for: a result's (a screenshot), then a widget's own. */
+function picCount(it: Partial<ToolItem>, kind: string | undefined = it.kind): number {
+  const n = (it.result?.images?.length ?? 0) + (kind === 'widget' ? widgetPics(it.input).length : 0);
+  return Math.min(n, MAX_PICS);
+}
+
 /** How wide a file row's picture is made for the phone (a 40 px tile at up to 4x). */
 const PHONE_THUMB_PX = 160;
 /** `phone.tail` with `to`: how far back a page may reach for the item asked for (roots, bytes). */
@@ -298,8 +334,8 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
         ...(it.check ? { check: it.check } : {}),
         ...(opts.kids ? { kids: opts.kids } : {}),
         ...(!full && hasMore(it) ? { more: true } : {}),
-        // Pictures (a screenshot) stay on the desktop: their count, and `phone.image` for each.
-        ...(it.result?.images?.length ? { pics: Math.min(it.result.images.length, MAX_PICS) } : {}),
+        // Pictures (a screenshot, a widget's own) stay on the desktop: their count, and `phone.image` for each.
+        ...(picCount(it) ? { pics: picCount(it) } : {}),
       };
       if (it.check && it.result?.text && out.result) (out.result as ToolResult).text = cap(it.result.text, full ? FULL.text : LIMITS.answer);
       // A widget shows by its title only.
@@ -313,8 +349,11 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
   }
 }
 
-/** A patch to an item, trimmed like the item (no output, input, images or the record of what a share handed over; long text cut). */
-export function phonePatch(patch: Partial<TimelineItem>): Partial<PhoneItem> | null {
+/**
+ * A patch to an item, trimmed like the item (no output, input, images or the record of what a share
+ * handed over; long text cut). `kind`: the item's own (a widget's input brings its pictures).
+ */
+export function phonePatch(patch: Partial<TimelineItem>, kind?: string): Partial<PhoneItem> | null {
   const p = { ...patch } as Record<string, unknown>;
   delete p.input;
   delete p.inputText;
@@ -332,8 +371,9 @@ export function phonePatch(patch: Partial<TimelineItem>): Partial<PhoneItem> | n
   if (typeof p.detail === 'string') p.detail = cap(p.detail, LIMITS.notice);
   if (typeof p.error === 'string') p.error = cap(p.error, LIMITS.notice);
   if ((patch as Partial<ToolItem>).output || (patch as Partial<ToolItem>).result?.text) p.more = true;
-  const pics = (patch as Partial<ToolItem>).result?.images?.length;
-  if (pics) p.pics = Math.min(pics, MAX_PICS);
+  // A widget's code arrives with its input (streamed, then patched in whole): its pictures counted then.
+  const pics = picCount(patch as Partial<ToolItem>, (patch as Partial<ToolItem>).kind ?? kind);
+  if (pics) p.pics = pics;
   return Object.keys(p).length ? (p as Partial<PhoneItem>) : null;
 }
 
@@ -827,7 +867,7 @@ export function phoneDetail(items: TimelineItem[], itemId: string): { item: Phon
 }
 
 /** An event as a phone gets it, or null when it does not need it. */
-export function phoneEvent(event: BridgeEvent): BridgeEvent | PhoneReset | null {
+export function phoneEvent(event: BridgeEvent, kindOf?: (sessionId: string, id: string) => string | undefined): BridgeEvent | PhoneReset | null {
   switch (event.type) {
     case 'item.added':
       return { ...event, item: phoneItem(event.item, { role: event.item.type === 'text' && event.item.parentId ? 'step' : 'answer' }) };
@@ -835,7 +875,7 @@ export function phoneEvent(event: BridgeEvent): BridgeEvent | PhoneReset | null 
       // Live tool output and streamed tool input stay on the desktop (`phone.item` has it).
       return event.field === 'text' ? event : null;
     case 'item.patch': {
-      const patch = phonePatch(event.patch);
+      const patch = phonePatch(event.patch, (event.patch as Partial<ToolItem>).input ? kindOf?.(event.sessionId, event.id) : undefined);
       return patch ? { ...event, patch } : null;
     }
     case 'timeline.reset': {
@@ -1476,11 +1516,26 @@ export class PhoneService {
     return this.files.get(token) === entry && this.data.enabled && this.data.devices.some((d) => d.id === entry.deviceId && !d.secure);
   }
 
+  /** An item's kind (a tool's), for a patch that brings a widget's input. */
+  private kindOf = (sessionId: string, id: string): string | undefined => {
+    const it = this.app.sessions.get(sessionId)?.get(id);
+    return it?.type === 'tool' ? it.kind : undefined;
+  };
+
   /** `phone.image`: one picture of a step's result in this chat (a data URL of an image, capped), nothing else. */
   private async image(sessionId: string, itemId: string, index: number): Promise<{ data: string }> {
     const snap = await this.app.call('session.snapshot', { sessionId });
     const item = snap.items.find((i) => i.id === itemId);
-    const src = item?.type === 'tool' && Number.isInteger(index) && index >= 0 && index < MAX_PICS ? item.result?.images?.[index] : undefined;
+    // A result's pictures first, then a widget's own, as `pics` counts them.
+    const shots = item?.type === 'tool' ? (item.result?.images ?? []) : [];
+    const src =
+      item?.type === 'tool' && Number.isInteger(index) && index >= 0 && index < MAX_PICS
+        ? index < shots.length
+          ? shots[index]
+          : item.kind === 'widget'
+            ? widgetPics(item.input)[index - shots.length]
+            : undefined
+        : undefined;
     if (typeof src !== 'string' || !/^data:image\/(png|jpeg|gif|webp);base64,/.test(src)) throw new Error('That picture is not in this chat.');
     if (src.length > IMAGE_MAX) throw new Error('That picture is too big to show on the phone.');
     return { data: src };
@@ -1927,7 +1982,7 @@ export class PhoneService {
     const unsubscribe = this.app.subscribe((event) => {
       if (!PHONE_EVENTS.has(event.type)) return;
       if (ITEM_EVENTS.has(event.type) && !watching.includes((event as { sessionId: string }).sessionId)) return;
-      const e = phoneEvent(event);
+      const e = phoneEvent(event, this.kindOf);
       if (e) this.sendFrame(link, { event: e as BridgeEvent });
     });
     let alive = true;

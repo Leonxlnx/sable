@@ -9,7 +9,7 @@ import { cancelDownload, downloadKey, installable, openDownload, startDownload, 
 import { PLAIN_OFF } from '@m/lib/download-core';
 import { canonicalName, isPackageName } from '@shared/file-name';
 import { conn } from '@m/lib/conn';
-import { diffLines, renderMarkdown } from '@m/lib/md';
+import { diffLines, renderMarkdown, settledCut } from '@m/lib/md';
 import { haptic, openExternal } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { putDraft } from '@m/lib/put-draft';
@@ -393,7 +393,8 @@ function LiveLine({ sid, seg, open, onToggle }: { sid: string; seg: Segment; ope
     <div className="work" data-live data-waiting={waiting || undefined} data-open={open || undefined} role="status" aria-live="off">
       <button type="button" className="work-line" aria-expanded={onToggle ? open : undefined} onClick={onToggle} disabled={!onToggle}>
         <span className="work-ind">{waiting ? <StatusMark tone="awaiting" size={11} /> : tiles}</span>
-        <span key={waiting ? '\u0000' : title} className={waiting ? 'work-title' : 'work-title shimmer'}>
+        {/* No shimmer: it paints on every frame of the turn; the tiles beside it say it works. */}
+        <span key={waiting ? '\u0000' : title} className="work-title">
           {waiting ? 'Waiting for you' : title}
         </span>
         {elapsed >= 1000 && <span className="work-meta num">{shortDuration(elapsed)}</span>}
@@ -714,6 +715,18 @@ const Block = memo(function Block({ sid, id }: { sid: string; id: string }) {
   const kids = Math.max(known, (it as PhoneItem).kids ?? 0);
   if (it.kind === 'widget') {
     const title = (it.input as { title?: string } | undefined)?.title ?? it.title;
+    const pics = (it as PhoneItem).pics ?? 0;
+    // A widget that holds pictures: its title and the pictures (the rest of it stays on the desktop).
+    if (pics > 0)
+      return (
+        <div className="wpics">
+          <div className="wpics-head">
+            <Icon name="image" size={15} />
+            <span className="wpics-title">{title}</span>
+          </div>
+          <Pics sid={sid} id={id} n={pics} />
+        </div>
+      );
     return (
       <div className="block block-quiet">
         <span className="block-icon">
@@ -962,15 +975,56 @@ function LimitCard({ sid, it, next, went }: { sid: string; it: NoticeItem; next?
   );
 }
 
+/**
+ * A streaming answer, block by block: blocks that are complete (`settledCut`) are parsed once and
+ * stay in the page; only the newest one is parsed and put in again as words arrive. (Parsing and
+ * rebuilding the whole answer on every frame cost more the longer it grew.) Once it has ended the
+ * answer is rendered whole, as any other.
+ */
+function useStreamed(box: React.RefObject<HTMLDivElement | null>, text: string, on: boolean) {
+  const done = useRef<{ el: HTMLElement | null; prefix: string; nodes: number }>({ el: null, prefix: '', nodes: 0 });
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el || !on) return;
+    const st = done.current;
+    // A new element (the answer streams again), or replaced rather than grown (a fuller copy came): start again.
+    if (st.el !== el || !text.startsWith(st.prefix)) {
+      st.el = el;
+      el.textContent = '';
+      st.prefix = '';
+      st.nodes = 0;
+    }
+    const put = (md: string) => {
+      const t = document.createElement('template');
+      t.innerHTML = renderMarkdown(md, true);
+      el.append(t.content);
+    };
+    const from = st.prefix.length;
+    const cut = settledCut(text, from);
+    while (el.childNodes.length > st.nodes) el.lastChild!.remove();
+    if (cut > from) {
+      put(text.slice(from, cut));
+      st.prefix = text.slice(0, cut);
+      st.nodes = el.childNodes.length;
+    }
+    put(text.slice(cut));
+  }, [box, text, on]);
+}
+
 const Answer = memo(function Answer({ sid, id, tone = 'answer' }: { sid: string; id: string; tone?: 'answer' | 'mid' }) {
   const it = useItem<TextItem>(sid, id);
-  const html = useMemo(() => (it ? renderMarkdown(it.text, it.streaming) : ''), [it]);
+  const streaming = !!it?.streaming;
+  const html = useMemo(() => (it && !it.streaming ? renderMarkdown(it.text) : ''), [it]);
+  const box = useRef<HTMLDivElement>(null);
+  useStreamed(box, it?.text ?? '', streaming);
   const [busy, setBusy] = useState(false);
   if (!it || !it.text.trim()) return null;
   const cut = (it as PhoneItem).cut && !it.streaming;
   return (
     <>
       <div
+        key={streaming ? 'streaming' : 'whole'}
+        ref={box}
         className="md"
         data-id={id}
         data-tone={tone}
@@ -978,7 +1032,7 @@ const Answer = memo(function Answer({ sid, id, tone = 'answer' }: { sid: string;
         data-cut={cut || undefined}
         onClick={copyCode}
         onContextMenu={(e) => holdMessage(e, e.currentTarget, () => (cut ? fetchItem(sid, id).then((r) => (r.item as TextItem).text) : it.text), 'md')}
-        dangerouslySetInnerHTML={{ __html: html }}
+        {...(streaming ? {} : { dangerouslySetInnerHTML: { __html: html } })}
       />
       {cut && (
         <button
@@ -1190,7 +1244,7 @@ const CheckBlock = memo(function CheckBlock({ sid, id }: { sid: string; id: stri
       <div className="check-head">
         <button type="button" className="check-line" aria-expanded={steps ? open : undefined} disabled={!steps} onClick={toggle}>
           <span className="check-mark">{live ? <Tiles size={12} /> : <ProviderMark provider={it.check.agent} size={15} />}</span>
-          <span className={live ? 'check-title shimmer' : 'check-title'}>{title}</span>
+          <span className="check-title">{title}</span>
           {took >= 1000 && <span className="work-meta num">{shortDuration(took)}</span>}
           {steps > 0 && <Icon name="caretDown" size={12} weight="bold" className="work-caret" />}
         </button>

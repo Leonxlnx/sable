@@ -64,6 +64,9 @@
   --r-pane: 26px;
   --r-sheet: 30px;
   --r-pill: 999px;
+  /* every picture in a conversation (a screenshot, a widget's, a photo sent): one calm tile */
+  --pic-w: 176px;
+  --pic-h: 112px;
 
   /* the material */
   --card: rgb(19 19 22 / 0.9);

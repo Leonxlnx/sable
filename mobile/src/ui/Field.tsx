@@ -157,7 +157,20 @@ export function Field({
       const st = live.current.stage;
       whole = true;
       if (!st) {
-        lit = [[0, rows]];
+        // A chat's light gathers at its foot: its drift draws only the rows any light reaches (a beat,
+        // which can reach every row, draws them all; the image is cleared once it has passed).
+        lit = [];
+        if (live.current.floor > 0) lit.push([0, rows]);
+        else
+          for (let y = 0; y < rows; y++) {
+            let on = false;
+            for (let x = 0, i = y * cols; x < cols && !on; x++, i++) on = base[i] > 0;
+            if (!on) continue;
+            const last = lit[lit.length - 1];
+            if (last && y - last[1] < 6) last[1] = y + 1;
+            else lit.push([y, y + 1]);
+          }
+        img?.data.fill(0);
         return;
       }
       img?.data.fill(0);
@@ -228,7 +241,14 @@ export function Field({
       if (beat) {
         const life = LIFE[beat.kind];
         const age = (now - beat.at) / 1000;
-        if (age > life) beat = null;
+        if (age > life) {
+          beat = null;
+          // A chat's beat lit rows its drift does not draw: cleared, then the whole image goes once.
+          if (!stage) {
+            data.fill(0);
+            whole = true;
+          }
+        }
         else {
           kind = beat.kind;
           bx = beat.nx;
@@ -250,7 +270,9 @@ export function Field({
           }
         }
       }
-      for (const [y0, y1] of lit)
+      // A chat's beat may reach any row; otherwise only the rows the light reaches.
+      const all = !!wave && !stage;
+      for (const [y0, y1] of all ? [[0, rows] as [number, number]] : lit)
       for (let y = y0; y < y1; y++) {
         const ny = y / rows;
         for (let x = 0; x < cols; x++) {
@@ -296,7 +318,7 @@ export function Field({
           data[i * 4 + 3] = 255;
         }
       }
-      if (whole || !stage) ctx.putImageData(img, 0, 0);
+      if (whole || all) ctx.putImageData(img, 0, 0);
       else for (const [y0, y1] of lit) ctx.putImageData(img, 0, 0, 0, y0, cols, y1 - y0);
       whole = false;
     };
@@ -339,7 +361,13 @@ export function Field({
 
     resize();
     draw();
+    // Its first report is the size just drawn (a second shaping and drawing in the chat's opening task): only a new size draws again.
     const ro = new ResizeObserver(() => {
+      const r = canvas.getBoundingClientRect();
+      if (Math.ceil(r.width / CELL) === cols && Math.ceil(r.height / CELL) === rows) {
+        box = { left: r.left, top: r.top, width: Math.max(1, r.width), height: Math.max(1, r.height) };
+        return;
+      }
       resize();
       draw();
     });

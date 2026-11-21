@@ -300,9 +300,10 @@
 }
 
 .user-images img {
+  width: var(--pic-w);
   max-width: 100%;
-  max-height: 220px;
-  border-radius: var(--r-md);
+  height: var(--pic-h);
+  border-radius: var(--r-sm);
   object-fit: cover;
 }
 
@@ -401,7 +402,8 @@
   color: var(--text-3);
 }
 
-/* ── the work behind a segment: one line (live: a capsule that stays under the header; settled: a quiet summary) ── */
+/* ── the work behind a segment: one quiet line (live: what it does now, held under the header; settled: the summary). No
+   pill or capsule around it, as on the desktop: thinking and work read as dim words in the flow ── */
 .seg-work {
   display: flex;
   flex-direction: column;
@@ -423,16 +425,15 @@
   height: 44px;
   margin: 0 -10px;
   padding: 0 12px 0 10px;
-  border-radius: var(--r-pill);
+  border-radius: var(--r-sm);
   font-size: var(--t-sm);
   color: var(--text-3);
   text-align: left;
-  transition: background-color 100ms, transform 100ms;
+  transition: opacity 100ms;
 }
 
 .work-line:not(:disabled):active {
-  background-color: var(--fill-2);
-  transform: scale(0.98);
+  opacity: 0.6;
 }
 
 .work-title {
@@ -482,33 +483,29 @@
   display: block;
 }
 
-/* held under the header, nothing reads through it or in the gap above it: the capsule is opaque, and
-   the ground closes the strip between the header and its middle (the words come out from under it) */
+/* held under the header, nothing reads through it or in the gap above it: the ground closes the strip
+   from the header to the line's foot (a flat fill, no fade: nothing here repaints while the chat scrolls) */
 .work[data-live]::before {
   content: '';
   position: absolute;
   z-index: -1;
-  inset: -14px -20px 50%;
+  inset: -14px -20px 0;
   background: var(--bg);
   pointer-events: none;
 }
 
-/* live: one full-width capsule, so a new title of another length never moves its edge or its figures */
+/* live: the same words as settled, a tone brighter; the line spans the column so a new title of another
+   length never moves its figures */
 .work[data-live] .work-line {
   display: flex;
-  gap: 9px;
-  width: calc(100% + 12px);
+  /* a button sizes to its words: the line keeps the column's width so a long title ends in an ellipsis */
+  width: calc(100% + 20px);
   max-width: none;
-  margin: 0 -6px;
-  padding: 0 15px 0 13px;
-  background: rgb(22 22 25);
-  box-shadow: var(--edge), 0 14px 30px -16px rgb(0 0 0 / 0.95);
 }
 
 .work[data-live] .work-title {
-  flex: 1;
-  font-weight: var(--w-strong);
-  color: var(--text);
+  flex: 0 1 auto;
+  color: var(--text-2);
 }
 
 .work-title.shimmer {
@@ -528,24 +525,14 @@
   flex-shrink: 0;
 }
 
-/* the live capsule settles into the quiet summary: its ink thins away, the words step back */
-.work[data-landed] .work-line {
-  animation: work-land 560ms var(--ease-out) both;
-}
-
+/* the live line settles into the quiet summary: the words step back */
 .work[data-landed] .work-title {
   animation: work-title-land 560ms var(--ease-out) both;
 }
 
-@keyframes work-land {
-  from {
-    background-color: rgb(22 22 25);
-  }
-}
-
 @keyframes work-title-land {
   from {
-    color: var(--text);
+    color: var(--text-2);
   }
 }
 
@@ -677,6 +664,13 @@
   line-height: 1.55;
   color: var(--text-3);
   white-space: pre-wrap;
+}
+
+/* a thought opens under its line on a hairline, as on the desktop: dim words, no card */
+.step-think {
+  margin: 2px 10px 10px 17px;
+  padding: 1px 0 1px 19px;
+  border-left: 1px solid var(--line-2);
 }
 
 .step-text code,
@@ -2240,10 +2234,6 @@ button.queued-text[data-busy] {
   transform: scale(0.97);
 }
 
-.work[data-live] .work-title + .work-meta::before {
-  content: none;
-}
-
 /* ── where the chat switched agents: the agent's mark, the words, one quiet action, between two rules ── */
 .switch-line {
   display: flex;
@@ -2462,8 +2452,8 @@ button.queued-text[data-busy] {
 .pic {
   position: relative;
   flex-shrink: 0;
-  width: 128px;
-  height: 84px;
+  width: var(--pic-w);
+  height: var(--pic-h);
   border-radius: var(--r-sm);
   overflow: hidden;
   background: var(--ink-3);
@@ -2504,6 +2494,37 @@ button.queued-text[data-busy] {
   width: 100%;
   height: 100%;
   color: var(--text-4);
+}
+
+/* a widget that holds pictures: its title, quiet, and its pictures under it (the rest stays on the desktop) */
+.wpics {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wpics-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 24px;
+  font-size: var(--t-sm);
+  color: var(--text-3);
+}
+
+.wpics-title {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-2);
+}
+
+.wpics .pics {
+  margin: 0 -20px;
+  padding: 0 20px 2px;
+  scroll-padding: 0 20px;
 }
 
 /* ── a picture full screen: pinch to zoom, drag down to close ── */

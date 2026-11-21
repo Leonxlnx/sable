@@ -76,6 +76,39 @@ export function diffLines(text: string): string {
 
 const cache = new Map<string, string>();
 
+/** A line that continues the block before a blank line: a list item, or indented (a list's next paragraph, indented code). */
+const GOES_ON = /^(\s|[-*+](\s|$)|\d{1,9}[.)](\s|$))/;
+
+/**
+ * Where the settled blocks of a streaming text end: the start of the last complete line, at or past
+ * `from` (itself such a place, or 0), that begins a block of its own (after a blank line, outside a
+ * fenced code block, not a list item or an indented line, which would belong to the block before).
+ * What is before it reads the same parsed alone, so it is parsed once; only what follows is parsed
+ * again as words arrive. Returns `from` when there is no such place yet.
+ */
+export function settledCut(text: string, from = 0): number {
+  let cut = from;
+  let fence = '';
+  let blank = false;
+  for (let i = from; ; ) {
+    const nl = text.indexOf('\n', i);
+    if (nl < 0) return cut;
+    const line = text.slice(i, nl);
+    if (fence) {
+      const t = line.trim();
+      if (t[0] === fence[0] && t.length >= fence.length && /^(`+|~+)$/.test(t)) fence = '';
+      blank = false;
+    } else {
+      const empty = !line.trim();
+      if (!empty && blank && i > from && !GOES_ON.test(line)) cut = i;
+      const f = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+      if (f) fence = f[1];
+      blank = empty;
+    }
+    i = nl + 1;
+  }
+}
+
 export function renderMarkdown(text: string, streaming = false): string {
   if (!streaming) {
     const hit = cache.get(text);

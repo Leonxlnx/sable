@@ -23,7 +23,7 @@ import { DemoProvider } from '../server/providers/demo';
 import { capabilities } from '../server/providers/demo-catalog';
 import type { Provider, ProviderContext } from '../server/providers/types';
 import { registerFs } from '../server/services/fs';
-import { LIMITS, phoneDetail, phoneEvent, phonePage, REACH, registerPhone, SEARCH, type PhoneService } from '../server/services/phone';
+import { IMAGE_MAX, LIMITS, phoneDetail, phoneEvent, phonePage, REACH, registerPhone, SEARCH, type PhoneService } from '../server/services/phone';
 import { qrMatrix } from '../server/services/qr';
 import { registerThumbs } from '../server/services/thumbs';
 import { mergeHosts } from '../mobile/src/lib/hosts';
@@ -530,6 +530,70 @@ describe('pictures of a step', () => {
     expect(phoneEvent({ type: 'item.patch', sessionId: id, id: 'shot', patch: { result: { images: [png, png] } } as Partial<TimelineItem> })).toMatchObject({ patch: { pics: 2 } });
     c.ws.close();
   });
+
+  it("counts a widget's own pictures, each source once, and gives each one by index", async () => {
+    const { app, port } = await setup();
+    const { c } = await pairPhone(app, port);
+    const id = (await app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const a = `data:image/png;base64,${'iVBORw0KGgoAAAANSUhEUg'.repeat(20)}`;
+    const b = `data:image/jpeg;base64,${'/9j/4AAQSkZJRgABAQ'.repeat(20)}==`;
+    const w = `data:image/webp;base64,${'UklGRiQAAABXRUJQVlA4'.repeat(20)}`;
+    const spacer = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const svg = `data:image/svg+xml;base64,${'PHN2ZyB4bWxucz0i'.repeat(30)}`;
+    const code = `<div><img src="${a}" alt="one"><img src='${b}'><img src="${a}"><img src="${spacer}"><img src="${svg}"><div style="background:url(${w})"></div></div>`;
+    const rt = app.sessions.get(id)!;
+    rt.add({ id: 'u1', type: 'user', text: 'show me the pictures' } as never);
+    rt.add({ id: 'pics', type: 'tool', name: 'mcp__sable__show_widget', kind: 'widget', title: 'Three pictures', status: 'done', detail: {}, input: { title: 'Three pictures', code } } as never);
+    rt.add({ id: 'plain', type: 'tool', name: 'mcp__sable__show_widget', kind: 'widget', title: 'A chart', status: 'done', detail: {}, input: { title: 'A chart', code: '<svg><rect/></svg>' } } as never);
+    // Another kind of step whose input happens to hold a picture: not a widget, nothing to show.
+    rt.add({ id: 'other', type: 'tool', name: 'mcp__x__render', kind: 'mcp', title: 'Render', status: 'done', detail: {}, input: { code } } as never);
+    const tail = (await c.call('phone.tail', { sessionId: id })) as { result: PhoneTail };
+    const by = (k: string) => tail.result.items.find((i) => i.id === k)!;
+    expect(by('pics').pics).toBe(3);
+    expect((by('pics') as ToolItem).input).toEqual({ title: 'Three pictures' });
+    expect(by('plain').pics).toBeUndefined();
+    expect(by('other').pics).toBeUndefined();
+    expect(JSON.stringify(tail.result)).not.toContain('base64');
+    const got: string[] = [];
+    for (let i = 0; i < 3; i++) got.push(((await c.call('phone.image', { sessionId: id, itemId: 'pics', index: i })) as { result: { data: string } }).result.data);
+    expect(got).toEqual([a, b, w]);
+    for (const params of [
+      { sessionId: id, itemId: 'pics', index: 3 },
+      { sessionId: id, itemId: 'pics', index: -1 },
+      { sessionId: id, itemId: 'plain', index: 0 },
+      { sessionId: id, itemId: 'other', index: 0 },
+    ])
+      expect(((await c.call('phone.image', params)) as { ok: boolean }).ok, JSON.stringify(params)).toBe(false);
+    // `phone.item` counts them too.
+    expect(((await c.call('phone.item', { sessionId: id, itemId: 'pics' })) as { result: { item: { pics?: number } } }).result.item.pics).toBe(3);
+    c.ws.close();
+  });
+
+  it("a widget's pictures that arrive with its code later reach an open chat as a count, and a big one is refused", async () => {
+    const { app, port } = await setup();
+    const { c } = await pairPhone(app, port);
+    const id = (await app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const rt = app.sessions.get(id)!;
+    rt.add({ id: 'u1', type: 'user', text: 'draw it' } as never);
+    rt.add({ id: 'wid', type: 'tool', name: 'mcp__sable__show_widget', kind: 'widget', title: 'Widget', status: 'pending', detail: {}, inputText: '' } as never);
+    const tail = (await c.call('phone.tail', { sessionId: id })) as { result: PhoneTail };
+    expect(tail.result.items.find((i) => i.id === 'wid')!.pics).toBeUndefined();
+    const small = `data:image/png;base64,${'iVBORw0KGgoAAAANSUhEUg'.repeat(20)}`;
+    const huge = `data:image/png;base64,${'A'.repeat(IMAGE_MAX)}`;
+    const patched = c.next((f) => (f.event as { type?: string; id?: string } | undefined)?.type === 'item.patch' && (f.event as { id: string }).id === 'wid');
+    rt.patch('wid', { input: { title: 'Two pictures', code: `<img src="${small}"><img src="${huge}">` }, title: 'Two pictures', status: 'running' } as never);
+    const ev = (await patched).event as { patch: Record<string, unknown> };
+    expect(ev.patch.pics).toBe(2);
+    expect(ev.patch.input).toBeUndefined();
+    expect(JSON.stringify(ev)).not.toContain('base64');
+    expect(((await c.call('phone.image', { sessionId: id, itemId: 'wid', index: 0 })) as { result: { data: string } }).result.data).toBe(small);
+    const big = (await c.call('phone.image', { sessionId: id, itemId: 'wid', index: 1 })) as { ok: boolean; error?: string };
+    expect(big.ok).toBe(false);
+    expect(big.error).toMatch(/too big/);
+    // Without the item's kind a patch's input counts nothing (a widget is known by its kind).
+    expect(phoneEvent({ type: 'item.patch', sessionId: id, id: 'x', patch: { input: { code: `<img src="${small}">` } } as Partial<TimelineItem> })).toBeNull();
+    c.ws.close();
+  }, 30_000);
 });
 
 describe('a turn checked by the other agent', () => {
