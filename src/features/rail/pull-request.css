@@ -48,3 +48,12 @@
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+
+.pr-draft {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: var(--t-ui);
+  color: var(--text-2);
+}

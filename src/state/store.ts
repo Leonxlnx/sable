@@ -207,16 +207,6 @@ function touched(d: SessionData, ids: readonly string[], patch?: Partial<Session
 
 let toastId = 1;
 
-/** The release whose "New update available" toast this window already showed. */
-let announcedUpdate: string | undefined;
-
-/** Once per release and window: a downloaded update says so, whether the start check found it or a later one did. */
-function announceUpdate(u: UpdateState | undefined) {
-  if (!u || u.status !== 'ready' || !u.latest || announcedUpdate === u.latest) return;
-  announcedUpdate = u.latest;
-  useStore.getState().toast('New update available');
-}
-
 export const useStore = create<Store>((set, get) => ({
   conn: 'connecting',
   ready: false,
@@ -621,7 +611,6 @@ export function applyEvent(e: BridgeEvent) {
       return;
     case 'update.state':
       useStore.setState({ update: e.state });
-      announceUpdate(e.state);
       return;
     default:
       return;
@@ -675,7 +664,6 @@ async function hello() {
       ui: { ...s.ui, activeSessionId: active, homeProvider, homeAccount, homeCwd: s.ui.homeCwd ?? app.projects[0]?.path ?? null },
     };
   });
-  announceUpdate(app.update);
   const active = useStore.getState().ui.activeSessionId;
   if (active) void loadSession(active);
   // Limits remembered from earlier runs, so nothing waits for an agent to answer.

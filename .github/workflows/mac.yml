@@ -3,11 +3,16 @@ name: macOS build
 # Builds Sable for macOS on GitHub's own Macs (a Mac app can only be built on a Mac), checks that
 # the result is a sound app, and starts it once to prove it runs. Run it by hand from the Actions
 # tab ("Run workflow"), or let it run when a release is published: the disk images and zips are then
-# added to that release (the in-app updater on a Mac reads the zip).
+# added to that release (the in-app updater on a Mac reads the zip). Experimental: nobody has run
+# these builds on a Mac of their own yet.
 #
 # The app is signed ad hoc ("-" in package.json > build > mac > identity): it runs, but macOS asks the
 # person to allow it once (README, "Install"). With an Apple Developer ID, remove that line and add
 # the CSC_LINK, CSC_KEY_PASSWORD and APPLE_* secrets; electron-builder then signs and notarizes.
+#
+# Least privilege: the build runs with a read-only token and no cache (nothing a build step could
+# leave behind reaches a release); only the last job, which runs no code of the repository, may write
+# to the release. Actions are pinned to full commit hashes (the tag in the comment).
 
 on:
   workflow_dispatch:
@@ -20,7 +25,7 @@ on:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   mac:
@@ -36,16 +41,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          cache: pnpm
 
       # The Claude Code binary for this chip comes with the Agent SDK as an optional dependency of the
       # same chip (build-electron.mjs stages it), which is why each chip builds on its own runner.
@@ -86,7 +92,7 @@ jobs:
           "$APP/Contents/MacOS/Sable" --screenshot="$PWD/shots/first-screen-${{ matrix.arch }}.png" --wait=2500 2>&1 | tee shots/start-${{ matrix.arch }}.log
           ls -la shots
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Sable-mac-${{ matrix.arch }}
           if-no-files-found: error
@@ -94,16 +100,34 @@ jobs:
             release-mac/*.dmg
             release-mac/*.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: Sable-mac-${{ matrix.arch }}-first-screen
           if-no-files-found: ignore
           path: shots/
 
-      - name: Attach to the release
-        if: github.event_name == 'release' || inputs.tag != ''
+  attach:
+    name: Attach to the release
+    needs: mac
+    if: github.event_name == 'release' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: Sable-mac-*
+          path: files
+          merge-multiple: true
+
+      - name: Upload the disk images and zips
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
-        run: gh release upload "$TAG" release-mac/*.dmg release-mac/*.zip --clobber
+        run: |
+          set -euo pipefail
+          ls -la files
+          gh release upload "$TAG" files/*.dmg files/*.zip --clobber

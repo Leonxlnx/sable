@@ -18,6 +18,14 @@
   outline-offset: 2px;
 }
 
+/* A thumbnail (a sent picture, a step's screenshot) keeps its own frame (timeline.css .user-thumb). */
+.image-open.user-thumb {
+  display: block;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background-color: var(--well-strong);
+}
+
 /* The larger view: a glass sheet that holds the picture, with no padding of its own. */
 .dialog.image-view {
   width: auto;

@@ -139,10 +139,14 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
             Description
             <textarea className="field pr-body scroll" rows={6} value={body} onChange={(e) => setBody(e.target.value)} disabled={busy} />
           </label>
+          {/* What the click does, before it is done: the branch, where it is pushed, and the base. */}
           <p className="pr-route">
-            {ctx.branch} into {ctx.base}
+            Pushes {ctx.branch} to origin{ctx.remoteUrl ? ` (${ctx.remoteUrl})` : ''}, then opens a pull request into {ctx.base}.
           </p>
-          <Switch checked={draft} onChange={setDraft} label="Draft" disabled={busy} />
+          <label className="pr-draft">
+            <span>Open as a draft</span>
+            <Switch checked={draft} onChange={setDraft} label="Open as a draft" disabled={busy} />
+          </label>
           {error && (
             <p className="ch-commit-error" role="alert">
               <Icon name="warning" size={13} />

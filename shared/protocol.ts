@@ -1522,6 +1522,8 @@ export interface GitPullContext {
   base?: string;
   /** Whether a remote named origin exists. */
   remote: boolean;
+  /** Where origin points, without any user name or token in it. */
+  remoteUrl?: string;
   /** Subjects of the commits the base does not have, oldest first. */
   commits: string[];
   title: string;
@@ -2454,7 +2456,8 @@ export interface RpcMethods {
   /** Stages everything (`git add -A`) and commits it with `message`. */
   'git.commit': { params: { cwd: string; message: string }; result: GitCommitResult };
   /** A commit message written by a small model from the folder's changes. Stages and commits nothing. */
-  'git.draft': { params: { cwd: string }; result: { ok: boolean; message?: string; error?: string } };
+  /** On the person's click: one small request to the chat's own agent and account (as chat titles). */
+  'git.draft': { params: { sessionId: string; cwd: string }; result: { ok: boolean; message?: string; error?: string } };
   /** The branch, its base and a draft title and description for a pull request. Pushes nothing. */
   'pulls.context': { params: { cwd: string }; result: GitPullContext };
   /** Pushes the branch to origin, then opens a pull request for it with gh. */

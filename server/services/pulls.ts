@@ -22,6 +22,28 @@ export interface GhResult {
 /** Runs gh the way runGit runs git: no shell, a timeout, never rejects. */
 export type GhRunner = (cwd: string, args: string[], input?: string, timeoutMs?: number) => Promise<GhResult>;
 
+/** The most of gh's output kept per call. */
+const GH_MAX_BYTES = 1_000_000;
+
+/** A branch name git would take (no leading dash, nothing git refuses in a ref), so it can never read as an option. */
+export const branchLike = (name: string) => /^[^-\s~^:?*[\\][^\s~^:?*[\\]*$/.test(name) && !name.includes('..') && !name.endsWith('/') && !name.endsWith('.lock');
+
+/** A remote's address as it can be shown: any user name or token in it is left out. */
+export function shownRemote(url: string): string {
+  const u = url.trim();
+  try {
+    const parsed = new URL(u);
+    if (parsed.username || parsed.password) {
+      parsed.username = '';
+      parsed.password = '';
+    }
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    // scp-like (git@github.com:acme/app.git) or a path: shown as it is.
+    return u;
+  }
+}
+
 export function runGh(cwd: string, args: string[], input = '', timeoutMs = 60_000): Promise<GhResult> {
   return new Promise((resolve) => {
     const out: Buffer[] = [];
@@ -55,8 +77,15 @@ export function runGh(cwd: string, args: string[], input = '', timeoutMs = 60_00
       }
       finish(null);
     }, timeoutMs);
-    child.stdout!.on('data', (d: Buffer) => out.push(d));
-    child.stderr!.on('data', (d: Buffer) => err.push(d));
+    // Kept to a bound: what gh says is a link or a few lines, never more than this.
+    let kept = 0;
+    const keep = (list: Buffer[]) => (d: Buffer) => {
+      if (kept >= GH_MAX_BYTES) return;
+      list.push(d);
+      kept += d.length;
+    };
+    child.stdout!.on('data', keep(out));
+    child.stderr!.on('data', keep(err));
     child.on('error', (e: NodeJS.ErrnoException) => finish(null, e.code === 'ENOENT'));
     child.on('close', (code) => finish(code));
     child.stdin!.on('error', () => {});
@@ -132,7 +161,9 @@ export async function pullContext(cwd: string, gh: GhRunner = runGh): Promise<Gi
     runGit(dir, ['remote', 'get-url', 'origin'], { timeoutMs: 5000 }),
   ]);
   const branch = cur.code === 0 ? cur.stdout.trim() || undefined : undefined;
-  const base = await defaultBranch(dir, gh);
+  const found = await defaultBranch(dir, gh);
+  // A name that is not a branch (it would reach git and gh as an argument) falls back to main.
+  const base = branchLike(found) ? found : 'main';
   let commits: Commit[] = [];
   if (branch) {
     // Against the base as GitHub has it when origin knows it, else the local base.
@@ -141,7 +172,7 @@ export async function pullContext(cwd: string, gh: GhRunner = runGh): Promise<Gi
     if (log.code === 0) commits = parseLog(log.stdout);
   }
   const { title, body } = draftFrom(branch, commits);
-  return { isRepo: true, branch, base, remote: remote.code === 0, commits: commits.map((c) => c.subject), title, body };
+  return { isRepo: true, branch, base, remote: remote.code === 0, ...(remote.code === 0 && remote.stdout.trim() ? { remoteUrl: shownRemote(remote.stdout) } : {}), commits: commits.map((c) => c.subject), title, body };
 }
 
 /** Pushes the branch to origin and opens a pull request for it into `base`. */
@@ -156,9 +187,11 @@ export async function createPull(
   if (!title) return { ok: false, error: 'Write a title first.' };
   const base = o.base.trim();
   if (!base) return { ok: false, error: 'Choose the branch to merge into.' };
+  if (!branchLike(base)) return { ok: false, error: `${base} is not a branch name.` };
   const cur = await runGit(dir, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { timeoutMs: 5000 });
   const branch = cur.code === 0 ? cur.stdout.trim() : '';
   if (!branch) return { ok: false, error: 'This folder is on a detached HEAD. Check out a branch first.' };
+  if (!branchLike(branch)) return { ok: false, error: `${branch} is not a branch name gh can open a pull request for.` };
   if (branch === base) return { ok: false, error: `This is ${base}. Make a branch for the pull request first.` };
   const remote = await runGit(dir, ['remote', 'get-url', 'origin'], { timeoutMs: 5000 });
   if (remote.code !== 0) return { ok: false, error: 'This repository has no remote named origin.' };

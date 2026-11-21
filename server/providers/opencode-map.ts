@@ -1,4 +1,5 @@
-import type { Attachment, AuthState, CommandInfo, Effort, LimitsMeta, ModeInfo, ModelInfo, RateLimit, Todo, ToolKind, ToolResult, ToolStatus } from '../../shared/protocol';
+import type { Attachment, AuthState, CommandInfo, Effort, LimitsMeta, ModeInfo, ModelInfo, PermissionScope, RateLimit, Todo, ToolKind, ToolResult, ToolStatus } from '../../shared/protocol';
+import { compactScope, fileLine, scopeLines } from '../core/permission-scope';
 import { makeFileDiff } from '../../shared/diff';
 import { describeTool, previewDiff, type ToolView } from './claude-tools';
 
@@ -275,3 +276,52 @@ export function todosOf(entries: unknown): Todo[] {
 
 /** A path as the tool's own `locations` give it. */
 export const locationPath = (update: Obj): string | undefined => (typeof update.locations?.[0]?.path === 'string' ? update.locations[0].path : undefined);
+
+// ───────────────────────────── permission scope ─────────────────────────────
+
+/**
+ * Where an OpenCode permission request reaches, for the phone's boundary (`core/permission-scope.ts`):
+ * the files a change touches, the paths a read opens, the host a fetch goes to, each as a line of
+ * the request's `reason` (unless the change's diff shows it). A command shows itself. Anything else
+ * (an MCP tool, a kind Sable has no words for) cannot be described: `unknown`, so only the desktop
+ * answers it. OpenCode's "always" remembers a pattern of its own that Sable cannot name: `savesUnknown`.
+ */
+export function permissionScope(kind: string | undefined, call: Obj, input: Obj, diffPaths: string[] = [], always = false): { scope?: PermissionScope; lines: string[] } {
+  const paths = [
+    ...((Array.isArray(call.locations) ? call.locations : []) as Obj[]).map((l) => l?.path),
+    pick(input, 'path', 'filePath', 'file_path'),
+  ].filter((p, i, all): p is string => typeof p === 'string' && p.length > 0 && all.indexOf(p) === i);
+  const s: PermissionScope = {};
+  const lines: string[] = [];
+  switch (kind) {
+    case 'execute':
+      break;
+    case 'edit':
+    case 'delete':
+    case 'move':
+      if (paths.length) s.files = paths.map((p) => ({ path: p }));
+      else s.unknown = true;
+      for (const p of paths) if (!diffPaths.includes(p)) lines.push(fileLine({ path: p }));
+      break;
+    case 'read':
+    case 'search':
+      if (paths.length) s.read = paths;
+      break;
+    case 'fetch': {
+      let host: string | undefined;
+      try {
+        host = typeof input.url === 'string' ? new URL(input.url).host : undefined;
+      } catch {
+        host = undefined;
+      }
+      if (host) s.hosts = [host];
+      else s.unknown = true;
+      break;
+    }
+    default:
+      s.unknown = true;
+  }
+  if (always) s.savesUnknown = true;
+  const scope = compactScope(s);
+  return { scope, lines: [...lines, ...scopeLines(scope)] };
+}

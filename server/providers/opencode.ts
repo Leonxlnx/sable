@@ -42,13 +42,14 @@ import {
   locationPath,
   modelsOf,
   mapGoLimits,
+  permissionScope,
   parseAuthList,
   promptBlocks,
   resultOf,
   statusOf,
   todosOf,
 } from './opencode-map';
-import type { Provider, ProviderContext, ProviderSession } from './types';
+import type { Provider, ProviderContext, ProviderSession, SendOptions } from './types';
 import { VERSION } from '../version';
 
 /** How long a read of the plan limits is reused when nothing forces a new one. */
@@ -191,7 +192,9 @@ export class OpenCodeProvider implements Provider {
     await this.cancelLogin();
     if (process.platform !== 'win32') throw new Error(`Run \`opencode auth ${command}\` in a terminal.`);
     if (command === 'login') this.ctx.emit({ type: 'auth.progress', provider: 'opencode', state: 'url', message: 'Finish signing in in the OpenCode window that opened.' });
-    const child = spawn('cmd.exe', ['/c', 'start', `"OpenCode ${command}"`, '/wait', 'opencode', 'auth', command], { windowsHide: false, stdio: 'ignore' });
+    // One verbatim command line: Node's own quoting would turn the window title into `"\"OpenCode login\""`,
+    // which `start` takes apart. `command` is one of two fixed words.
+    const child = spawn('cmd.exe', ['/d', '/s', '/c', `start "OpenCode ${command}" /wait opencode auth ${command}`], { windowsHide: false, stdio: 'ignore', windowsVerbatimArguments: true });
     const l = { child, cancelled: false };
     this.login_ = l;
     await new Promise<void>((resolve, reject) => {
@@ -374,12 +377,31 @@ interface ToolState {
 
 interface Queued {
   item: UserItem;
+  /** Its sender's guard (`SendOptions.check`), asked again when it goes. */
+  check?: () => void;
+}
+
+/** A turn: `sent` once its prompt went to OpenCode, `done` once it ended. */
+interface Turn {
+  stop?: NodeJS.Timeout;
+  done: boolean;
+  sent?: boolean;
+}
+
+/** Whether a sender's guard (`SendOptions.check`) lets its message go now. */
+function passes(check: () => void): boolean {
+  try {
+    check();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 class OpenCodeSession implements ProviderSession {
   sessionId = '';
   private closed = false;
-  private turn?: { stop?: NodeJS.Timeout; done: boolean };
+  private turn?: Turn;
   private queue: Queued[] = [];
   private tools = new Map<string, ToolState>();
   private text?: { id: string; messageId?: string };
@@ -494,41 +516,57 @@ class OpenCodeSession implements ProviderSession {
 
   // ── sending ──
 
-  async send(item: UserItem) {
+  async send(item: UserItem, opts?: SendOptions) {
     if (this.closed) throw new Error('Session is closed');
     if (!existsSync(this.rt.meta.cwd)) throw new Error(`The folder ${this.rt.meta.cwd} does not exist.`);
+    // The sender's guard: asked now, again right before the prompt goes, and when a waiting message goes later.
+    const check = opts?.check;
+    check?.();
     if (this.turn) {
       // OpenCode takes one prompt at a time: the message waits for the turn to end.
-      this.queue.push({ item });
+      this.queue.push({ item, ...(check ? { check } : {}) });
       if (item.state !== 'queued') this.rt.patch<UserItem>(item.id, { state: 'queued' });
       return;
     }
-    await this.startTurn([item]);
+    await this.startTurn([item], check);
   }
 
-  private async startTurn(items: UserItem[]) {
+  private async startTurn(items: UserItem[], check?: () => void) {
     const rt = this.rt;
-    const turn: { stop?: NodeJS.Timeout; done: boolean } = { done: false };
+    const turn: Turn = { done: false };
     this.turn = turn;
     rt.beginTurn('Thinking');
     for (const it of items) if (it.state === 'queued') rt.taken(it.id);
     this.text = this.thinking = undefined;
     const started = Date.now();
+    let acp: AcpClient;
     try {
       await this.applyChoices();
-      const blocks = items.length === 1 ? promptBlocks(items[0].text, items[0].attachments) : items.flatMap((it, i) => promptBlocks(i ? `\n\n${it.text}` : it.text, it.attachments));
-      const acp = await this.provider.client();
-      // One prompt runs for as long as the agent works: it is answered when the turn ends.
-      void acp
-        .request('session/prompt', { sessionId: this.sessionId, prompt: mergeText(blocks) }, 0)
-        .then((r) => this.completeTurn(turn, started, r, undefined, items))
-        .catch((err) => this.completeTurn(turn, started, undefined, errMsg(err), items));
+      acp = await this.provider.client();
     } catch (err) {
       this.completeTurn(turn, started, undefined, errMsg(err));
+      return;
     }
+    // Stopped, closed or replaced while the choices were applied: nothing goes (`interrupt` ended the turn).
+    if (turn.done || this.turn !== turn || this.closed) return;
+    try {
+      check?.();
+    } catch (err) {
+      // Its sender may no longer act: nothing went, and the bridge ends the turn it began.
+      turn.done = true;
+      this.turn = undefined;
+      throw err;
+    }
+    const blocks = items.length === 1 ? promptBlocks(items[0].text, items[0].attachments) : items.flatMap((it, i) => promptBlocks(i ? `\n\n${it.text}` : it.text, it.attachments));
+    turn.sent = true;
+    // One prompt runs for as long as the agent works: it is answered when the turn ends.
+    void acp
+      .request('session/prompt', { sessionId: this.sessionId, prompt: mergeText(blocks) }, 0)
+      .then((r) => this.completeTurn(turn, started, r, undefined, items))
+      .catch((err) => this.completeTurn(turn, started, undefined, errMsg(err), items));
   }
 
-  private completeTurn(turn: { stop?: NodeJS.Timeout; done: boolean }, started: number, result?: Obj, error?: string, items: UserItem[] = []) {
+  private completeTurn(turn: Turn, started: number, result?: Obj, error?: string, items: UserItem[] = []) {
     const rt = this.rt;
     if (turn.done || this.turn !== turn) return;
     turn.done = true;
@@ -561,7 +599,14 @@ class OpenCodeSession implements ProviderSession {
   private drainQueue() {
     if (!this.queue.length || this.turn || this.closed) return;
     // Messages the bridge took back (the turn was stopped or failed before they were taken) go out from its queue, not twice.
-    const q = this.queue.splice(0).filter((x) => this.rt.get<UserItem>(x.item.id)?.state === 'queued');
+    // One whose sender may no longer act (a phone removed while it waited) never goes, and leaves the chat.
+    const q = this.queue.splice(0).filter((x) => {
+      if (this.rt.get<UserItem>(x.item.id)?.state !== 'queued') return false;
+      if (!x.check || passes(x.check)) return true;
+      this.rt.remove(x.item.id);
+      this.rt.notice('info', 'A message from a removed phone was not sent');
+      return false;
+    });
     if (!q.length) return;
     void this.startTurn(q.map((x) => x.item)).catch((err) => this.rt.notice('error', 'Could not send the queued message', errMsg(err)));
   }
@@ -569,6 +614,8 @@ class OpenCodeSession implements ProviderSession {
   async interrupt() {
     const turn = this.turn;
     if (!turn) return;
+    // Its prompt has not gone yet (the choices are still being applied): the turn ends here, and nothing goes.
+    if (!turn.sent) return this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' });
     const acp = await this.provider.client().catch(() => null);
     acp?.notify('session/cancel', { sessionId: this.sessionId });
     // The prompt answers "cancelled" by itself; if it does not, the turn ends anyway.
@@ -729,6 +776,8 @@ class OpenCodeSession implements ProviderSession {
     const input = inputOf(call, tool?.input);
     const view = describeCall(tool?.name ?? String(call.name ?? call.title ?? 'tool'), kind, input, typeof call.title === 'string' ? call.title : undefined);
     const result = resultOf(view.claudeName, view.kind, input, call, false);
+    // Where it reaches, in lines the phone shows whole (or it is the desktop's to answer).
+    const reach = permissionScope(kind, call, input, (result.diff ?? []).map((d) => d.path), options.some((o) => o.kind === 'allow_always'));
     if (tool) rt.patch<ToolItem>(tool.id, { status: 'awaiting' });
     const label: Record<string, { label: string; tone: 'allow' | 'always' | 'deny' }> = {
       allow_once: { label: 'Allow once', tone: 'allow' },
@@ -744,6 +793,8 @@ class OpenCodeSession implements ProviderSession {
         title: view.title,
         detail: view.detail,
         diff: result.diff,
+        ...(reach.lines.length ? { reason: reach.lines.join('\n') } : {}),
+        ...(reach.scope ? { scope: reach.scope } : {}),
         options: options.map((o) => ({ id: String(o.optionId), ...(label[String(o.kind)] ?? { label: String(o.name ?? 'Allow'), tone: /reject|deny/i.test(String(o.kind)) ? 'deny' : 'allow' }) })),
       },
       this.prompts.signal,
