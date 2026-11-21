@@ -977,7 +977,9 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => app.quit
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_e, argv) => {
+    // Started again with `--original`: the running app leaves the person's changes out from now on.
+    if (argv.includes('--original') && server && server.ignoreCustom() && win && !win.isDestroyed()) win.webContents.reload();
     if (!win || win.isDestroyed()) {
       // A Mac keeps the app running without a window: opening it again brings one back.
       if (server && !quitting) win = createWindow(server.url);

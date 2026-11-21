@@ -488,7 +488,8 @@ export class Customizer {
   /** A page was served from `root`: a custom one has `CUSTOM_READY_MS` to call `custom.ready`. */
   served(root: string) {
     if (path.resolve(root) !== path.resolve(this.workspace, 'dist')) return;
-    this.clearWatchdog();
+    // One absolute deadline: a page that reloads again and again does not move it on.
+    if (this.watchdog !== undefined) return;
     const set = this.opts.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms).unref());
     this.watchdog = set(() => this.fallback('It did not start within 15 seconds'), CUSTOM_READY_MS);
   }

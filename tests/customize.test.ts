@@ -81,17 +81,19 @@ async function serve(own: string, c: Customizer) {
   servers.push(server);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
   const port = (server.address() as AddressInfo).port;
-  const get = (p: string, headers: Record<string, string> = {}) =>
-    new Promise<{ status: number; body: string; type?: string; cache?: string }>((resolve, reject) => {
-      const r = request({ host: '127.0.0.1', port, path: p, headers }, (res) => {
+  const ask = (method: string, p: string, headers: Record<string, string> = {}) =>
+    new Promise<{ status: number; body: string; type?: string; cache?: string; length?: string; csp?: string }>((resolve, reject) => {
+      const r = request({ host: '127.0.0.1', port, path: p, headers, method }, (res) => {
         let body = '';
         res.on('data', (d) => (body += d));
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, body, type: res.headers['content-type'], cache: res.headers['cache-control'] }));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body, type: res.headers['content-type'], cache: res.headers['cache-control'], length: res.headers['content-length'], csp: res.headers['content-security-policy'] as string | undefined }));
       });
       r.on('error', reject);
       r.end();
     });
-  return { get };
+  const get = (p: string, headers: Record<string, string> = {}) => ask('GET', p, headers);
+  const head = (p: string) => ask('HEAD', p);
+  return { get, head };
 }
 
 const ownDist = () => {
@@ -215,6 +217,31 @@ describe('your build: served instead of the app’s own', () => {
   });
 });
 
+describe('the static server', () => {
+  it('an asset removed or rebuilt after it was served: a 404 or its new size, never a crash', async () => {
+    const home = tmp();
+    const own = ownDist();
+    mkdirSync(path.join(own, 'assets'), { recursive: true });
+    const asset = path.join(own, 'assets', 'index-abc.js');
+    writeFileSync(asset, 'console.log(1)');
+    const { get } = await serve(own, make(home).c);
+    let r = await get('/assets/index-abc.js');
+    expect([r.status, r.body, r.length]).toEqual([200, 'console.log(1)', '14']);
+    writeFileSync(asset, 'console.log("rebuilt")');
+    r = await get('/assets/index-abc.js');
+    expect([r.status, r.body, r.length]).toEqual([200, 'console.log("rebuilt")', '22']);
+    rmSync(asset);
+    r = await get('/assets/index-abc.js');
+    expect(r.status).toBe(404);
+    // An empty file is an empty answer.
+    writeFileSync(asset, '');
+    r = await get('/assets/index-abc.js');
+    expect([r.status, r.body, r.length]).toEqual([200, '', '0']);
+    // Still serving.
+    expect((await get('/')).body).toContain('own');
+  });
+});
+
 describe('your build: not in this version', () => {
   it('nothing offers it: not supported, never served, every step answers that it is not available', async () => {
     const home = tmp();
@@ -287,6 +314,21 @@ describe('the start watchdog', () => {
     // The person tries again: switching on clears it.
     c.use(true);
     expect(c.state().build.failed).toBeUndefined();
+  });
+
+  it('one absolute deadline: reloads do not move it on, and HEAD starts none', async () => {
+    const home = tmp();
+    const own = ownDist();
+    let arms = 0;
+    const { c } = built(home, { setTimer: () => (++arms, 1), clearTimer: () => {} });
+    c.use(true);
+    const { get, head } = await serve(own, c);
+    await head('/');
+    expect(arms).toBe(0);
+    await get('/');
+    await get('/');
+    await get('/some/route');
+    expect(arms).toBe(1);
   });
 
   it('the app’s own page starts no watchdog', async () => {
