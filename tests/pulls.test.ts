@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createPull, draftFrom, parseLog, pullContext, type GhResult, type GhRunner } from '../server/services/pulls';
+import { branchLike, createPull, shownRemote, draftFrom, parseLog, pullContext, type GhResult, type GhRunner } from '../server/services/pulls';
 
 let base = '';
 let repo = '';
@@ -112,5 +112,24 @@ describe('pull requests', () => {
       { subject: 'One', body: 'body one' },
       { subject: 'Two', body: '' },
     ]);
+  });
+});
+
+describe('what a pull request shows and accepts', () => {
+  it('shows the remote without a token in it', () => {
+    expect(shownRemote('https://someone:ghp_secret@github.com/acme/app.git\n')).toBe('https://github.com/acme/app.git');
+    expect(shownRemote('git@github.com:acme/app.git')).toBe('git@github.com:acme/app.git');
+  });
+
+  it('takes only branch names, never one that reads as an option', async () => {
+    expect(branchLike('main')).toBe(true);
+    expect(branchLike('feature/login-rate-limit')).toBe(true);
+    expect(branchLike('--output=x')).toBe(false);
+    expect(branchLike('a..b')).toBe(false);
+    expect(branchLike('a b')).toBe(false);
+    const gh = fakeGh({ code: 0, stdout: 'https://github.com/acme/app/pull/8\n' });
+    const res = await createPull(repo, { title: 'T', body: '', base: '--repo=evil/app', draft: false }, gh.run);
+    expect(res.ok).toBe(false);
+    expect(gh.calls).toHaveLength(0);
   });
 });

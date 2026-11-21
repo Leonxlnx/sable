@@ -1518,6 +1518,8 @@ export interface GitPullContext {
   base?: string;
   /** Whether a remote named origin exists. */
   remote: boolean;
+  /** Where origin points, without any user name or token in it. */
+  remoteUrl?: string;
   /** Subjects of the commits the base does not have, oldest first. */
   commits: string[];
   title: string;
