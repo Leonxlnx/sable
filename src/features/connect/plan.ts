@@ -11,6 +11,9 @@ export function planLabel(auth: AuthState | undefined): string | undefined {
   if (method === 'apikey' || method === 'console' || method === 'api') return 'API key';
   // An agent that runs on this computer has no subscription to name.
   if (method === 'local') return undefined;
+  // OpenCode names the integration it is signed in to, or says it runs on free models.
+  if (method === 'free') return 'Free models';
+  if (method === 'account' && auth.plan) return auth.plan;
   const plan = formatPlan(auth.plan);
   if (plan) return plan;
   if (method === 'claude.ai' || method === 'claudeai' || method === 'oauth') return 'Claude subscription';
@@ -72,7 +75,7 @@ export const needsAccount = (info: ProviderInfo | undefined) => !!info && !(info
 /** Every agent the bridge reports that has an account to connect: Claude Code and Codex first, then any others. */
 export function connectableAgents(providers: Partial<Record<ProviderId, ProviderInfo>>): ProviderId[] {
   const known: ProviderId[] = ['claude', 'codex'];
-  const others = (Object.keys(providers) as ProviderId[]).filter((id) => !known.includes(id) && needsAccount(providers[id]));
+  const others = (Object.keys(providers) as ProviderId[]).filter((id) => !known.includes(id) && providers[id]?.installed && needsAccount(providers[id]));
   return [...known, ...others];
 }
 
@@ -80,4 +83,5 @@ export function connectableAgents(providers: Partial<Record<ProviderId, Provider
 export const INSTALL: Partial<Record<ProviderId, string>> = {
   claude: 'npm install -g @anthropic-ai/claude-code',
   codex: 'npm install -g @openai/codex',
+  opencode: 'npm install -g opencode-ai',
 };

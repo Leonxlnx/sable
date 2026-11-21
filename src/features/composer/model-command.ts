@@ -4,7 +4,7 @@ import { homeAccountId, modelByName } from '@/state/actions';
 import { capsKey, useStore } from '@/state/store';
 import type { Choice } from './choice';
 
-const AGENTS: ProviderId[] = ['claude', 'codex'];
+const AGENTS: ProviderId[] = ['claude', 'codex', 'opencode'];
 
 /**
  * `/model <name>`: the model of that name, picked as in the model menu (the chip changes, nothing is

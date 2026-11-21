@@ -14,6 +14,9 @@ export function bridgePlugin(): Plugin {
         const { attachBridge } = await import('./bridge');
         const { customOf } = await import('./services/custom');
         const bridge = attachBridge(server.httpServer as any);
+        // No desktop shell here, so the updater reports `unsupported` (Settings › About says so).
+        const { registerUpdates } = await import('./services/update');
+        registerUpdates(bridge.app);
         server.httpServer.once('close', () => bridge.dispose());
         // The person's stylesheet (Customize Sable), served as the desktop app serves it.
         const custom = customOf(bridge.app);

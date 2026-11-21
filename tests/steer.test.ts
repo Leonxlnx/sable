@@ -7,7 +7,8 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CONCISE_REPLIES_PROMPT, DEFAULT_SETTINGS, type AppSettings, type Attachment, type BridgeEvent, type TextItem, type TurnItem, type UserItem } from '@shared/protocol';
+import { CONCISE_REPLIES_PROMPT, DEFAULT_SETTINGS, STEER_FIRST, STEER_FIRST_BLOCK, type AppSettings, type Attachment, type BridgeEvent, type TextItem, type TurnItem, type UserItem } from '@shared/protocol';
+import { stripWrappers } from '@shared/synthetic';
 import { WIDGET_FENCE_HINT } from '../server/providers/widget-tool';
 import { App } from '../server/app';
 import { ClaudeProvider } from '../server/providers/claude';
@@ -360,9 +361,9 @@ describe('the Demo agent is development-only', () => {
     const prev = process.env.SABLE_DEMO;
     try {
       delete process.env.SABLE_DEMO;
-      expect(defaultProviders()).toHaveLength(2);
-      process.env.SABLE_DEMO = '1';
       expect(defaultProviders()).toHaveLength(3);
+      process.env.SABLE_DEMO = '1';
+      expect(defaultProviders()).toHaveLength(4);
     } finally {
       if (prev === undefined) delete process.env.SABLE_DEMO;
       else process.env.SABLE_DEMO = prev;
@@ -414,5 +415,29 @@ describe('item times', () => {
     const later = items.find((i) => i.id === 't2:b')!;
     expect(later.ts).toBe(1_700_000_000_000);
     expect(items.every((i) => i.ts < Date.now() - 1000)).toBe(true);
+  });
+});
+
+// ──────────────────────── a steered message is answered first ────────────────────────
+
+describe('a steered message asks for an answer first', () => {
+  it('the note is short, and never reads as the person\'s words when a transcript is read back', () => {
+    // It goes with every steered message: a sentence or two, not a page.
+    expect(STEER_FIRST.length).toBeLessThan(260);
+    expect(STEER_FIRST).toMatch(/Answer it first/);
+    expect(STEER_FIRST_BLOCK).toBe(`<system-reminder>\n${STEER_FIRST}\n</system-reminder>`);
+    // Claude Code's transcript: the reminder is stripped wherever the person's words are shown.
+    expect(stripWrappers(`what about the PR?\n${STEER_FIRST_BLOCK}`)).toBe('what about the PR?');
+    // Codex's stored turns: the note is an input item of its own and is dropped.
+    const items = transcript([
+      {
+        id: 't1',
+        status: 'completed',
+        startedAt: 1_700_000_000,
+        completedAt: 1_700_000_010,
+        items: [{ type: 'userMessage', id: 'u', content: [{ type: 'text', text: 'what about the PR?' }, { type: 'text', text: STEER_FIRST_BLOCK }] }],
+      },
+    ] as never);
+    expect(items.filter((i) => i.type === 'user').map((i) => (i as UserItem).text)).toEqual(['what about the PR?']);
   });
 });

@@ -5,10 +5,11 @@
  * property of the chat (`SessionMeta.lane`): the chat stays in its folder in the sidebar, its
  * `cwd` is inside the lane, and it returns to the folder when the lane lands or is discarded.
  *
- * Where lanes live: `<Sable home>/lanes/<repo name>-<hash>/<id>`. Not beside the repository
+ * Where lanes live: `<worktrees folder>/<repo name>-<hash>/<id>`, the folder the person chose
+ * (`AppSettings.worktreesFolder`), by default `<Sable home>/lanes`. Not beside the repository
  * (`../.repo-lanes/`): that would put folders of Sable's into the user's own tree (often a synced,
  * shared or read-only parent, and every file watcher and search there would see them), and one
- * place under Sable's home is easy to find, clean and keep short (Windows path lengths).
+ * place is easy to find, clean and keep short (Windows path lengths).
  *
  * Nothing runs at rest: the busy check runs when a session starts or sends its first message,
  * the dry merge when the lane is looked at, and every git call has a timeout.
@@ -22,9 +23,20 @@ import { repoRoot, runGit } from '../services/git';
 import { createLane, forecastLane, landLane, laneDiff, laneSlug, removeLane, renameLane } from '../services/git-lanes';
 import type { SessionRuntime } from './runtime';
 
+/**
+ * Where lanes' worktrees go: the folder the person chose (`AppSettings.worktreesFolder`, `~` for
+ * their home folder), else `<Sable home>/lanes`. Paths are resolved, so both `/` and `\` work.
+ */
+export function worktreesRoot(chosen: string | undefined, userHome: string, sableHome: string): string {
+  const picked = chosen?.trim();
+  return picked ? path.resolve(picked.replace(/^~(?=$|[\\/])/, userHome)) : path.join(sableHome, 'lanes');
+}
+
 export interface LaneHost {
   /** Sable's home folder (`~/.sable`). */
   home(): string;
+  /** Where new lanes go (`worktreesRoot`); absent means `<home>/lanes`. */
+  root?(): string;
   sessions(): Iterable<SessionRuntime>;
   /** Automatic lanes (`AppSettings.autoLanes`, absent means off). */
   auto(): boolean;
@@ -109,13 +121,18 @@ export class Lanes {
 
   constructor(private host: LaneHost) {}
 
+  /** The folder new lanes are made in. */
   get dir() {
-    return path.join(this.host.home(), 'lanes');
+    return this.host.root?.() ?? path.join(this.host.home(), 'lanes');
   }
 
-  /** Only a lane under Sable's lanes folder is ever removed. */
+  /**
+   * Only a lane in a folder Sable made is ever removed: the chosen worktrees folder, or the default
+   * one (a lane made before the folder was changed still goes).
+   */
   ours(lane: SessionLane | null | undefined): lane is SessionLane {
-    return !!lane && inside(lane.path, this.dir) && !same(lane.path, this.dir);
+    if (!lane) return false;
+    return [this.dir, path.join(this.host.home(), 'lanes')].some((root) => inside(lane.path, root) && !same(lane.path, root));
   }
 
   /** A new lane's folder: `<lanes>/<repo name>-<hash>/<id>`, short for Windows paths. */

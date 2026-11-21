@@ -16,9 +16,10 @@ const STATUS: Record<McpServerInfo['status'], { word: string; tone: string }> = 
   failed: { word: 'Failed', tone: 'red' },
   pending: { word: 'Starting', tone: 'grey' },
   disabled: { word: 'Disabled', tone: 'grey' },
+  configured: { word: 'Configured', tone: 'grey' },
 };
 
-const ORDER: McpServerInfo['status'][] = ['failed', 'needs-auth', 'connected', 'pending', 'disabled'];
+const ORDER: McpServerInfo['status'][] = ['failed', 'needs-auth', 'connected', 'pending', 'configured', 'disabled'];
 
 export function Mcp() {
   const { provider, cwd, sessionId } = useContextTarget();
@@ -54,7 +55,7 @@ export function Mcp() {
       <div className="set-toolbar">
         {caps && servers.length > 0 && (
           <span className="set-context num">
-            {connected} of {plural(servers.length, 'server')} connected
+            {provider === 'opencode' ? `${plural(servers.length, 'server')} configured` : `${connected} of ${plural(servers.length, 'server')} connected`}
           </span>
         )}
         <span className="grow" />
@@ -87,6 +88,10 @@ export function Mcp() {
         ) : provider === 'claude' ? (
           <>
             <CodeChip text="claude mcp add" /> or a project's <CodeChip text=".mcp.json" />
+          </>
+        ) : provider === 'opencode' ? (
+          <>
+            <CodeChip text="~/.config/opencode/opencode.json" /> or a project's <CodeChip text="opencode.json" />, under <CodeChip text="mcp" copy={false} />. OpenCode does not say which of them started.
           </>
         ) : (
           'the demo agent ships a fixed set.'

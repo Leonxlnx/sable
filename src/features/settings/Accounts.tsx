@@ -15,6 +15,7 @@ export function Accounts() {
   const providers = useStore((s) => s.providers);
   const ready = useStore((s) => s.ready);
   const carryOn = useStore((s) => !!s.settings.continueAtLimit);
+  const resumeAtReset = useStore((s) => !!s.settings.continueAtReset);
   const notifyReset = useStore((s) => !!s.settings.notifyLimitReset);
   const backHome = useStore((s) => !!s.settings.returnToPreferred);
   const useFirst = useStore((s) => s.settings.accountsBy !== 'manual');
@@ -48,6 +49,10 @@ export function Accounts() {
       <label className="acct-auto" data-spot>
         <span className="acct-auto-label">Use the account whose week ends soonest first</span>
         <Switch checked={useFirst} onChange={(v) => void setSettings({ accountsBy: v ? 'useFirst' : 'manual' })} label="Use the account whose week ends soonest first" />
+      </label>
+      <label className="acct-auto" data-spot>
+        <span className="acct-auto-label">Continue when the usage resets</span>
+        <Switch checked={resumeAtReset} onChange={(v) => void setSettings({ continueAtReset: v })} label="Continue when the usage resets" />
       </label>
       <label className="acct-auto" data-spot>
         <span className="acct-auto-label">Return to the preferred account when its limit resets</span>

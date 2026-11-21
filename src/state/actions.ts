@@ -641,8 +641,13 @@ export const logout = (provider: ProviderId, accountId?: string) => bridge.call(
 
 // ── updates of the desktop app ──
 const setUpdate = (state: import('@shared/protocol').UpdateState | undefined) => state && useStore.setState({ update: state });
-/** Asks GitHub for a newer release now; one found downloads in the background. */
-export const checkForUpdate = () => bridge.call('update.check', {}).then(setUpdate).catch(fail);
+/** Asks GitHub for a newer release now; one found downloads in the background. Says the outcome when there is nothing to restart into. */
+export const checkForUpdate = () =>
+  bridge.call('update.check', {}).then((state) => {
+    setUpdate(state);
+    if (state.status === 'idle') useStore.getState().toast('Sable is up to date', 'success');
+    else if (state.status === 'error') useStore.getState().toast(state.error || 'The check failed', 'error');
+  }).catch(fail);
 /** Installs the downloaded release and restarts Sable (while agents work: once they are done). */
 export const installUpdate = () => bridge.call('update.install', {}).then(setUpdate).catch(fail);
 /** A restart waiting for the agents to finish: not after all. */
@@ -705,6 +710,9 @@ export function setAccountCap(provider: ProviderId, accountId: string, patch: Ac
 
 /** Where chats without a folder get their folders; empty goes back to the default place. */
 export const setChatsFolder = (path: string) => setSettings({ chatsFolder: path.trim() });
+
+/** Where lanes' worktrees go; empty goes back to `<Sable home>/lanes`. */
+export const setWorktreesFolder = (path: string) => setSettings({ worktreesFolder: path.trim() });
 
 /** Removes an extra account and its folder. Resolves false when the bridge refused (a session is still working). */
 export async function removeAccount(provider: ProviderId, accountId: string): Promise<boolean> {

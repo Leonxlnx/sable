@@ -102,7 +102,7 @@ export function ActivitySection() {
           <Chart summary={summary} grouping={grouping} />
         </div>
         <div className="ua-lists">
-          <RankList title="Models" items={summary.models} total={summary.total} />
+          <RankList title="Models" items={summary.models} total={summary.total} marks />
           <RankList title="Projects" items={summary.projects} total={summary.total} project />
           <SessionList items={summary.sessions} />
         </div>
@@ -402,7 +402,7 @@ function Tip({ bar, summary, grouping, today, left, tone }: { bar: DayBar; summa
 
 const LIST_ROWS = 5;
 
-function RankList({ title, items, total, project }: { title: string; items: Ranked[]; total: number; project?: boolean }) {
+function RankList({ title, items, total, project, marks }: { title: string; items: Ranked[]; total: number; project?: boolean; marks?: boolean }) {
   const [all, setAll] = useState(false);
   const home = useStore((s) => s.home);
   if (!items.length) return null;
@@ -414,7 +414,16 @@ function RankList({ title, items, total, project }: { title: string; items: Rank
       <div className="ua-list-card card" data-spot>
         {shown.map((it) => (
           <div key={it.key} className="ua-rank" title={it.label}>
-            <span className="ua-rank-label">{project ? <PathLabel path={tildePath(it.label, home)} /> : <span className="truncate">{it.label}</span>}</span>
+            <span className="ua-rank-label">
+              {project ? (
+                <PathLabel path={tildePath(it.label, home)} />
+              ) : (
+                <span className="ua-rank-name">
+                  {marks && it.provider && <ProviderMark provider={it.provider} size={13} className="ua-rank-mark" />}
+                  <span className="truncate">{it.label}</span>
+                </span>
+              )}
+            </span>
             <span className="ua-rank-track" aria-hidden>
               <span className="ua-rank-fill" style={{ transform: `scaleX(${it.total / max})` }} />
             </span>

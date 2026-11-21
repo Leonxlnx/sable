@@ -16,6 +16,7 @@ import { goHome, openSettings, renameSession, toggleTriage } from '@/state/actio
 import { useActiveProvider, useHotkey } from '@/state/hooks';
 import { SessionAccount } from '@/features/accounts';
 import { WaitingCount } from '@/features/triage/WaitingCount';
+import { watchLimitWarnings } from '@/features/usage/near-limit';
 import { LaneMark } from '@/features/session/LaneMark';
 import { RaceMark, RaceTitle } from '@/features/race/RaceMark';
 import { raceKey } from '@/features/race/race';
@@ -272,6 +273,9 @@ export function App() {
   useEffect(() => {
     document.title = title ? `${title} · Sable` : 'Sable';
   }, [title]);
+
+  // A toast as an account nears or reaches its plan limit (Claude Code and Codex alike).
+  useEffect(() => watchLimitWarnings(), []);
 
   // Interface size scales everything (type, spacing, icons) the way browser zoom does.
   // Floating layers are positioned in unzoomed pixels and undo it (see `--ui-zoom` in ui.css).

@@ -112,7 +112,7 @@ export function Empty({ children }: { children: ReactNode }) {
 /** Installed providers in display order. */
 export function useInstalled(): ProviderId[] {
   const providers = useStore((s) => s.providers);
-  return (['claude', 'codex', 'demo'] as ProviderId[]).filter((id) => providers[id]?.installed);
+  return (['claude', 'codex', 'opencode', 'demo'] as ProviderId[]).filter((id) => providers[id]?.installed);
 }
 
 export function ProviderPicker({ value, onChange, id }: { value: ProviderId; onChange: (p: ProviderId) => void; id: string }) {

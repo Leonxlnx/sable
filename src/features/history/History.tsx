@@ -36,7 +36,7 @@ export function openImport() {
   useStore.getState().setUi({ historyOpen: true });
 }
 
-const ORDER: ProviderId[] = ['claude', 'codex', 'demo'];
+const ORDER: ProviderId[] = ['claude', 'codex', 'opencode', 'demo'];
 const pathKey = (p?: string) => (p ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 
 /** Listings are cached for the app's lifetime so switching back is instant; a refresh runs behind. */

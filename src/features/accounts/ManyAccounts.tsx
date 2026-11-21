@@ -4,7 +4,7 @@ import type { AccountInfo, LimitsReport, ProviderId, ProviderInfo, RateLimit } f
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { isApiKey, planText, windowLevel } from '@/features/usage/format';
 import { poolLeftPercent, poolTotals, poolWeeksText, type PoolInput, type PoolTotal } from '@/features/usage/plans';
-import { livePercent, roomRow, sortRows, tightest, type RoomInput, type RoomRow } from '@/features/usage/room';
+import { livePercent, roomRow, tightest, type RoomInput, type RoomRow } from '@/features/usage/room';
 import { Icon } from '@/icons';
 import { useNow } from '@/lib/useNow';
 import { accountName } from '@/state/hooks';
@@ -66,7 +66,8 @@ export function matchesAccount(query: string, hay: (string | undefined)[]): bool
 
 /**
  * The switcher's list for many accounts: a filter on top (typing anywhere in the list goes to it),
- * one group per agent that folds, and within a group the account with the most room first.
+ * one group per agent that folds, and within a group the accounts in the order to use them
+ * (or the person's own order: `useAccountOrder` has the same rule for the short list).
  */
 export function ManyAccounts({
   agents,
@@ -100,10 +101,8 @@ export function ManyAccounts({
         const ranks = useFirstRanks(id, entries, caps, now);
         const rank = new Map(ranks.map((r, i) => [r.id, { ...r, place: i }]));
         const place = (r: (typeof rows)[number]) => rank.get(r.input.account.id)?.place ?? ranks.length;
-        // Or, in the person's own order: usable accounts by room left; signed-out ones after them.
-        const sorted = byUseFirst
-          ? [...rows].sort((a, b) => place(a) - place(b))
-          : [...sortRows(rows.filter((r) => r.state !== 'off'), 'room'), ...sortRows(rows.filter((r) => r.state === 'off'), 'agent')];
+        // Or the person's own order, as saved (the same order a move at a limit follows then).
+        const sorted = byUseFirst ? [...rows].sort((a, b) => place(a) - place(b)) : rows;
         return { id, rows: sorted, total: sorted.length, pool: poolOf(entries, now), rank };
       }),
     [agents, providers, reports, live, now, byUseFirst, caps],

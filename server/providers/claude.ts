@@ -57,7 +57,7 @@ import { baseName, describeTool, flattenContent, mapResult, mergeWorkflow, norma
 import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoice } from './types';
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
-import { CONCISE_REPLIES_PROMPT } from '../../shared/protocol';
+import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import { parseSynthetic, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled } from './browser-tool';
@@ -244,11 +244,14 @@ export class ClaudeProvider implements Provider {
 
   async info(force = false): Promise<ProviderInfo> {
     if (!force && this.infoCache && Date.now() - this.infoCache.at < 30_000) return this.infoCache.info;
+    // The same binary the SDK runs (SABLE_CLAUDE_BIN, set by the desktop shell), so the check does
+    // not depend on what PATH the app was started with.
+    const bin = claudeBinary() ?? 'claude';
     const [ver, status, text] = await Promise.all([
-      runCli('claude', ['--version'], { timeoutMs: 12_000, env: this.env() }),
-      runCli('claude', ['auth', 'status', '--json'], { timeoutMs: 12_000, env: this.env() }),
+      runCli(bin, ['--version'], { timeoutMs: 12_000, env: this.env() }),
+      runCli(bin, ['auth', 'status', '--json'], { timeoutMs: 12_000, env: this.env() }),
       // The CLI's own name for the plan ("Login method: Claude Max account"); JSON has only a raw id.
-      runCli('claude', ['auth', 'status', '--text'], { timeoutMs: 12_000, env: this.env() }),
+      runCli(bin, ['auth', 'status', '--text'], { timeoutMs: 12_000, env: this.env() }),
     ]);
     const info: ProviderInfo = { id: 'claude', name: this.name, installed: !ver.missing && ver.code === 0, auth: { loggedIn: false } };
     if (info.installed) info.version = ver.stdout.trim().split(/\s+/)[0];
@@ -1069,7 +1072,7 @@ export function titleOptions(prompt: TitlePrompt, env: NodeJS.ProcessEnv, abortC
     effort: 'low',
     maxTurns: 1,
     persistSession: false,
-    env: { ...env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: TITLE_MAX_TOKENS, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+    env: { ...env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: prompt.maxTokens ?? TITLE_MAX_TOKENS, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
     pathToClaudeCodeExecutable: claudeBinary(),
     abortController,
     stderr: () => {},
@@ -1521,15 +1524,21 @@ class ClaudeSession implements ProviderSession {
     const files = (item.attachments ?? []).filter((a) => a.kind !== 'image' && a.path);
     let text = item.text;
     if (files.length) text += '\n\n' + files.map((f) => `@${f.path}`).join(' ');
-    const content: unknown = images.length
-      ? [
-          ...images.map((a) => {
-            const m = a.dataUrl!.match(/^data:([^;]+);base64,(.*)$/);
-            return { type: 'image', source: { type: 'base64', media_type: m?.[1] ?? 'image/png', data: m?.[2] ?? '' } };
-          }),
-          { type: 'text', text },
-        ]
-      : text;
+    // Steered into a running turn: the person waits for a reply, so the agent is told to answer first
+    // (a block of its own after their words; the conversation shows only what they wrote). Not for a
+    // slash command, which is not a question.
+    const steerFirst = !!item.steered && this.rt.turnActive && !/^\/[\w:-]+/.test(item.text.trim());
+    const content: unknown =
+      images.length || steerFirst
+        ? [
+            ...images.map((a) => {
+              const m = a.dataUrl!.match(/^data:([^;]+);base64,(.*)$/);
+              return { type: 'image', source: { type: 'base64', media_type: m?.[1] ?? 'image/png', data: m?.[2] ?? '' } };
+            }),
+            { type: 'text', text },
+            ...(steerFirst ? [{ type: 'text', text: STEER_FIRST_BLOCK }] : []),
+          ]
+        : text;
     this.awaiting.set(uuid, { read: false });
     this.sentItems.set(uuid, item.id);
     // Its result says what it came to (`retire`): until then it went ok for nobody (the bridge names a chat only from one that did).

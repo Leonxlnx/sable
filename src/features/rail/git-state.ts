@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { create } from 'zustand';
-import type { FileDiff, GitCommitResult, GitStatus, TimelineItem } from '@shared/protocol';
+import type { FileDiff, GitCommitResult, GitPullContext, GitPullRequestResult, GitStatus, TimelineItem } from '@shared/protocol';
 import { bridge } from '@/lib/bridge';
 import { changedSince, useStore } from '@/state/store';
 
@@ -87,6 +87,33 @@ export async function commitAll(cwd: string, message: string): Promise<GitCommit
     return { ok: false, error: (err as Error).message || String(err) };
   } finally {
     void refreshGit(cwd);
+  }
+}
+
+/** A commit message written from the folder's changes (Claude Code's Haiku). Stages nothing. Never throws. */
+export async function draftCommitMessage(cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+  try {
+    return await bridge.call('git.draft', { cwd }, 90_000);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || String(err) };
+  }
+}
+
+/** The branch, its base and a draft title and description for a pull request. Never throws. */
+export async function pullContext(cwd: string): Promise<GitPullContext | { error: string }> {
+  try {
+    return await bridge.call('pulls.context', { cwd }, 30_000);
+  } catch (err) {
+    return { error: (err as Error).message || String(err) };
+  }
+}
+
+/** Pushes the branch and opens its pull request. Never throws. */
+export async function createPull(cwd: string, opts: { title: string; body: string; base: string; draft: boolean }): Promise<GitPullRequestResult> {
+  try {
+    return await bridge.call('pulls.create', { cwd, ...opts }, 180_000);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || String(err) };
   }
 }
 

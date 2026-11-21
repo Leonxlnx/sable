@@ -128,6 +128,15 @@ export function ProviderMark({ provider, size = 16, className, style }: { provid
       </svg>
     );
   }
+  if (provider === 'opencode') {
+    // A square frame holding a block: the shape of OpenCode's own mark, drawn here as plain geometry.
+    return (
+      <svg {...common} viewBox="0 0 24 24" data-provider="opencode">
+        <path fillRule="evenodd" clipRule="evenodd" d="M4 2h16v20H4V2zm4 4v12h8V6H8z" fill="currentColor" />
+        <rect x="8" y="12" width="8" height="6" fill="currentColor" opacity="0.5" />
+      </svg>
+    );
+  }
   return (
     <svg {...common} viewBox="0 0 24 24" data-provider="demo">
       <g fill="currentColor">
@@ -143,6 +152,7 @@ export function ProviderMark({ provider, size = 16, className, style }: { provid
 export const PROVIDER_NAME: Record<ProviderId, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
+  opencode: 'OpenCode',
   demo: 'Demo',
 };
 

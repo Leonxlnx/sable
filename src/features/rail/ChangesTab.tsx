@@ -7,9 +7,10 @@ import { plural, relPath } from '@/lib/format';
 import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { IconButton, Spinner, Tip } from '@/ui';
-import { STATUS_TONE, commitAll, gitKey, isSmall, loadAllDiffs, loadDiff, refreshGit, useRepo, type DiffEntry } from './git-state';
+import { STATUS_TONE, commitAll, draftCommitMessage, gitKey, isSmall, loadAllDiffs, loadDiff, refreshGit, useRepo, type DiffEntry } from './git-state';
 import { LeaveList } from './leave';
 import { LaneSection } from './LaneSection';
+import { PullRequestAction } from './PullRequest';
 import { useSessionLane } from '@/features/session/lane';
 import { useJumpOpen } from '@/features/review/jump';
 import { splitPath, useArrivals, useToolIds } from './util';
@@ -163,7 +164,10 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
       </div>
       <div className="rail-scroll scroll">
         {status.files.length === 0 ? (
-          <p className="rail-empty">The working tree is clean.</p>
+          <>
+            <p className="rail-empty">The working tree is clean.</p>
+            <PullRequestAction cwd={cwd} />
+          </>
         ) : (
           <LeaveList className="ch-list" order={status.files.map((f) => f.path).join('|')}>
             {(shown < status.files.length ? status.files.slice(0, shown) : status.files).map((f) => (
@@ -205,6 +209,21 @@ function CommitBox({ cwd }: { cwd: string }) {
     if (text) commitDrafts.set(key, text);
     else commitDrafts.delete(key);
     if (error) setError(null);
+  };
+
+  const [drafting, setDrafting] = useState(false);
+  const draft = async () => {
+    if (drafting || busy) return;
+    setDrafting(true);
+    setError(null);
+    const res = await draftCommitMessage(cwd);
+    setDrafting(false);
+    if (res.ok && res.message) {
+      update(res.message);
+      area.current?.focus();
+    } else {
+      setError(res.error ?? 'The message could not be written.');
+    }
   };
 
   const commit = async () => {
@@ -252,6 +271,11 @@ function CommitBox({ cwd }: { cwd: string }) {
             }
           }}
         />
+        <Tip label="Write the message from the changes" side="top">
+          <button type="button" className="btn btn-sm ch-commit-draft" aria-label="Write the message from the changes" disabled={busy || drafting} onClick={() => void draft()}>
+            {drafting ? <Spinner size={12} /> : <Icon name="sparkle" size={14} />}
+          </button>
+        </Tip>
         <Tip label="Stage every change and commit" keys="mod+enter" side="top">
           <button type="submit" className="btn btn-sm ch-commit-btn" disabled={!ready}>
             {busy ? <Spinner size={12} /> : <Icon name="commit" size={14} />}

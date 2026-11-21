@@ -1,4 +1,5 @@
 import { bridge } from '@/lib/bridge';
+import type { GitWorktree } from '../../shared/protocol';
 
 /**
  * Read-only workspace lookups used by the composer (file mentions, branch chip).
@@ -11,3 +12,6 @@ export const searchFiles = (cwd: string, query: string, limit = 40): Promise<Fil
 
 /** The checked-out branch (the refs only, not a full status); undefined outside a repo or when detached. */
 export const currentBranch = (cwd: string): Promise<string | undefined> => bridge.call('git.branches', { cwd }).then((b) => b.current);
+
+/** The repository's working trees, main checkout first; [] outside a repo. */
+export const worktrees = (cwd: string): Promise<GitWorktree[]> => bridge.call('git.worktrees', { cwd });

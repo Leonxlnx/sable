@@ -1,9 +1,10 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, powerMonitor, powerSaveBlocker, screen, session, shell, webContents, type MenuItemConstructorOptions, type Rectangle, type WebContents } from 'electron';
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, screen, session, shell, webContents, type MenuItemConstructorOptions, type Rectangle, type WebContents } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import nodeModule from 'node:module';
 import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
 import { bootMark } from '../server/util/boot';
+import { fixPathFromLoginShell } from '../server/util/login-env';
 import { pickFolder, type ShowFolderDialog } from './folder';
 import { windowsThumbs } from './thumbs';
 
@@ -77,6 +78,15 @@ app.enableSandbox();
 // The same id as electron-builder's appId, so the taskbar groups the window with the pinned
 // shortcut and notifications carry the app's name and icon.
 if (isWin) app.setAppUserModelId('io.github.leonxlnx.sable');
+if (isMac) {
+  // The standard About panel (Sable menu > About Sable): name, version and the copyright line.
+  app.setAboutPanelOptions({ applicationName: 'Sable', applicationVersion: app.getVersion(), copyright: 'Copyright © 2026 Leonxlnx', website: 'https://github.com/Leonxlnx/sable' });
+  // `electron .` shows Electron's own Dock icon; the packaged app carries Sable's (icon.icns).
+  if (!app.isPackaged) {
+    const icon = nativeImage.createFromPath(path.join(__dirname, 'icon-mac.png'));
+    if (!icon.isEmpty()) app.dock?.setIcon(icon);
+  }
+}
 
 // The Agent SDK starts the Claude Code binary that ships with the app (an extra resource when
 // packaged, the staged copy in dist-resources/ when run from the project); see build-electron.mjs.
@@ -223,7 +233,7 @@ function windowCalls() {
 
 /** Keeps the page's window controls in step with the window: restore icon while maximised, dimmed while unfocused. */
 function reportWindowState(w: BrowserWindow) {
-  if (isMac) return;
+  // On a Mac the page only needs to know about full screen (the traffic lights go away).
   const push = () => {
     if (!w.isDestroyed()) w.webContents.send('sable:window-state', windowState(w));
   };
@@ -640,6 +650,27 @@ function pageHeaders(pathname: string): Record<string, string> {
 
 /* ── menu and shortcuts ── */
 
+/**
+ * A shortcut the page itself answers (Settings, New session, Open a folder), shown in the menu with
+ * its keys. The menu item does not register the accelerator, so the page keeps getting the key as
+ * before; clicking the item sends the same key to the page.
+ */
+function pageKey(label: string, accelerator: string, keyCode: string, modifiers: ('shift' | 'alt')[] = []): MenuItemConstructorOptions {
+  return {
+    label,
+    accelerator,
+    registerAccelerator: false,
+    click: () => {
+      const wc = win?.webContents;
+      if (!wc || wc.isDestroyed()) return;
+      win?.show();
+      const mods = ['meta' as const, ...modifiers];
+      wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers: mods });
+      wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers: mods });
+    },
+  };
+}
+
 function installMenu() {
   if (!isMac) {
     // No menu bar on Windows and Linux: Chromium handles the edit shortcuts itself, and the
@@ -647,10 +678,28 @@ function installMenu() {
     Menu.setApplicationMenu(null);
     return;
   }
+  // The usual Mac set. Edit has to be here: on a Mac the copy, paste and undo keys only work through it.
+  // Cmd+W closes the window (the app stays in the Dock), Cmd+Q quits and stops the agents.
   const template: MenuItemConstructorOptions[] = [
     {
       label: app.name,
-      submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'services' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' }],
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        pageKey('Settings…', 'Cmd+,', ','),
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' },
+      ],
+    },
+    {
+      label: 'File',
+      submenu: [pageKey('New session', 'Shift+Cmd+O', 'o', ['shift']), pageKey('Open a folder…', 'Cmd+O', 'o'), { type: 'separator' }, { role: 'close' }],
     },
     {
       label: 'Edit',
@@ -660,7 +709,14 @@ function installMenu() {
       label: 'View',
       submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }],
     },
-    { label: 'Window', submenu: [{ role: 'minimize' }, { role: 'zoom' }, { role: 'close' }, { type: 'separator' }, { role: 'front' }] },
+    { label: 'Window', role: 'windowMenu' },
+    {
+      role: 'help',
+      submenu: [
+        { label: 'Sable on GitHub', click: () => void shell.openExternal('https://github.com/Leonxlnx/sable') },
+        { label: 'Releases', click: () => void shell.openExternal('https://github.com/Leonxlnx/sable/releases') },
+      ],
+    },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -904,14 +960,29 @@ app.on('before-quit', (e) => {
   // Dispose the bridge (agent child processes exit) before the process goes; never hang on it.
   void Promise.race([server.close(), sleep(3000)]).finally(() => app.exit(typeof process.exitCode === 'number' ? process.exitCode : 0));
 });
-app.on('window-all-closed', () => app.quit());
+// On a Mac closing the window leaves the app running in the Dock (agents keep working, the phone stays
+// connected); clicking the Dock icon opens a window again, Cmd+Q quits.
+app.on('window-all-closed', () => {
+  if (!isMac || screenshotFile || perfRun) app.quit();
+});
+app.on('activate', () => {
+  if (!server || quitting) return;
+  if (win && !win.isDestroyed()) {
+    if (win.isMinimized()) win.restore();
+    win.show();
+  } else win = createWindow(server.url);
+});
 for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => app.quit());
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (!win) return;
+    if (!win || win.isDestroyed()) {
+      // A Mac keeps the app running without a window: opening it again brings one back.
+      if (server && !quitting) win = createWindow(server.url);
+      return;
+    }
     if (win.isMinimized()) win.restore();
     win.show();
     win.focus();
@@ -943,22 +1014,27 @@ if (!app.requestSingleInstanceLock()) {
         .finally(() => app.quit());
     }
   };
-  const starting = startServer({
-    root: path.join(app.getAppPath(), 'dist'),
-    original,
-    // The Customize chat's reference (CLAUDE.md and the app's CSS), staged by scripts/build-electron.mjs.
-    reference: app.isPackaged ? path.join(process.resourcesPath, 'reference') : path.join(app.getAppPath(), 'dist-resources', 'reference'),
-    port: PREFERRED_PORT,
-    fallbackToFreePort: true,
-    // An installed build updates itself; a build run from a folder (or a test run) does not.
-    updates: app.isPackaged && !screenshotFile ? { quit: () => app.quit() } : undefined,
-    // Windows' own thumbnails for the files an agent hands over.
-    thumbs: windowsThumbs,
-    headers: pageHeaders,
-    onListening: (url) => {
-      if (electronReady) openWindow(url);
-    },
-  });
+  const serve = () =>
+    startServer({
+      root: path.join(app.getAppPath(), 'dist'),
+      original,
+      // The Customize chat's reference (CLAUDE.md and the app's CSS), staged by scripts/build-electron.mjs.
+      reference: app.isPackaged ? path.join(process.resourcesPath, 'reference') : path.join(app.getAppPath(), 'dist-resources', 'reference'),
+      port: PREFERRED_PORT,
+      fallbackToFreePort: true,
+      // An installed build updates itself; a build run from a folder (or a test run) does not.
+      updates: app.isPackaged && !screenshotFile ? { quit: () => app.quit() } : undefined,
+      // Windows' own thumbnails for the files an agent hands over.
+      thumbs: windowsThumbs,
+      headers: pageHeaders,
+      onListening: (url) => {
+        if (electronReady) openWindow(url);
+      },
+    });
+  // Started from Finder or the Dock, a Mac app has launchd's bare PATH: the person's login shell is
+  // asked for theirs (so `codex`, `git` and `node` are found as in a terminal) before the bridge
+  // starts any of them. Windows starts at once, as before.
+  const starting = isWin ? serve() : fixPathFromLoginShell().catch(() => undefined).then(serve);
   // Handled below, once Electron is ready (a failure before that must not count as unhandled).
   starting.catch(() => {});
 

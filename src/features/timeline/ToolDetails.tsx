@@ -5,6 +5,7 @@ import { Ring } from '@/art/Logo';
 import { CodeBlock } from '@/components/CodeBlock';
 import { CopyButton } from '@/components/CopyButton';
 import { DiffView } from '@/components/DiffView';
+import { ImageView } from '@/components/ImageView';
 import { Markdown } from '@/components/Markdown';
 import { Icon } from '@/icons';
 import { parseAnsi } from '@/lib/ansi';
@@ -216,9 +217,9 @@ function Images({ images }: { images?: string[] }) {
   return (
     <div className="detail-images">
       {images.map((src, i) => (
-        <a key={i} href={src} target="_blank" rel="noopener noreferrer" className="user-thumb">
+        <ImageView key={i} src={src} alt="Result image" className="user-thumb">
           <img src={src} alt="" loading="lazy" />
-        </a>
+        </ImageView>
       ))}
     </div>
   );

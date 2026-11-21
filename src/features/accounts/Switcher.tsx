@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
-import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId, type RateLimit } from '@shared/protocol';
+import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId, type ProviderInfo, type RateLimit } from '@shared/protocol';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { LimitsGlance } from '@/features/usage';
 import { clock, isScopedWindow, orderWindows, windowLevel } from '@/features/usage/format';
@@ -10,10 +10,12 @@ import { livePercent, tightest } from '@/features/usage/room';
 import { useNow } from '@/lib/useNow';
 import { Tip } from '@/ui';
 import { Icon } from '@/icons';
-import { openSettings, setDefaultAccount } from '@/state/actions';
+import { openSettings, refreshLimits, setDefaultAccount } from '@/state/actions';
 import { accountName, useFocusAccount } from '@/state/hooks';
-import { useStore } from '@/state/store';
-import { AccountUsed, ManyAccounts, MANY_ACCOUNTS, planOf, usePool } from './ManyAccounts';
+import { accountKey, useStore } from '@/state/store';
+import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, planOf, usePool } from './ManyAccounts';
+import { useAccountOrder } from './order';
+import type { UseFirstRank } from '@shared/use-first';
 import { poolLeftPercent } from '@/features/usage/plans';
 import { accountAgents, accountsOf, openAddAccount, planWord } from './model';
 
@@ -34,6 +36,13 @@ export function AccountSwitcher() {
   const reduce = useReducedMotion();
   const contentRef = useRef<HTMLDivElement>(null);
 
+  // OpenCode is listed once its plan limits are known: one read when it is installed and not read yet.
+  const openCodeReady = !!providers.opencode?.installed;
+  const openCodeRead = useStore((s) => s.limitReports[accountKey('opencode', DEFAULT_ACCOUNT)]?.readAt !== undefined);
+  useEffect(() => {
+    if (openCodeReady && !openCodeRead) void refreshLimits('opencode');
+  }, [openCodeReady, openCodeRead]);
+
   // As the menu opens, the account in use takes the focus (pointer or keys alike), so its limits
   // show beside the menu at once. After Radix's own focus on open, at the start of a frame (a focus
   // move forces a style pass, and the menu's styles were just invalidated).
@@ -53,7 +62,8 @@ export function AccountSwitcher() {
     return () => cancelAnimationFrame(r);
   }, [open]);
 
-  const agents = accountAgents(providers);
+  const reports = useStore((s) => s.limitReports);
+  const agents = accountAgents(providers, (id) => reports[accountKey(id, DEFAULT_ACCOUNT)]?.planLimits === true);
   const signedIn = agents.filter((id) => accountsOf(providers[id]).some((a) => a.auth.loggedIn));
   const focus: ProviderId = signedIn.includes(active) || agents.includes(active) ? active : (signedIn[0] ?? agents[0] ?? active);
   const list = accountsOf(providers[focus]);
@@ -119,21 +129,17 @@ export function AccountSwitcher() {
           {!many && agents.map((id, i) => (
             <RM.Group key={id} className="acs-group">
               {i > 0 && <RM.Separator className="menu-sep" />}
-              {accountsOf(providers[id]).map((a, _, all) => (
-                <Row
-                  key={a.id}
-                  provider={id}
-                  account={a}
-                  single={all.length === 1}
-                  inUse={id === focus && a.id === current?.id}
-                  onPeek={() => setPeek({ provider: id, accountId: a.id })}
-                  onSelect={() => {
-                    if (!a.auth.loggedIn) return openSettings('accounts');
-                    void setDefaultAccount(id, a.id);
-                    useStore.getState().setUi({ homeProvider: id });
-                  }}
-                />
-              ))}
+              <Rows
+                provider={id}
+                info={providers[id]}
+                inUse={id === focus ? current?.id : undefined}
+                onPeek={(accountId) => setPeek({ provider: id, accountId })}
+                onSelect={(a) => {
+                  if (!a.auth.loggedIn) return openSettings('accounts');
+                  void setDefaultAccount(id, a.id);
+                  useStore.getState().setUi({ homeProvider: id });
+                }}
+              />
             </RM.Group>
           ))}
           <RM.Separator className="menu-sep" />
@@ -170,7 +176,21 @@ export function AccountSwitcher() {
   );
 }
 
-function Row({ provider, account, single, inUse, onPeek, onSelect }: { provider: ProviderId; account: AccountInfo; single: boolean; inUse: boolean; onPeek: () => void; onSelect: () => void }) {
+/** One agent's accounts in the short list, in the order every list uses (`useAccountOrder`). */
+function Rows({ provider, info, inUse, onPeek, onSelect }: { provider: ProviderId; info: ProviderInfo | undefined; inUse: string | undefined; onPeek: (accountId: string) => void; onSelect: (a: AccountInfo) => void }) {
+  const accounts = useMemo(() => accountsOf(info), [info]);
+  const { list, rank } = useAccountOrder(provider, accounts);
+  const now = useNow();
+  return (
+    <>
+      {list.map((a) => (
+        <Row key={a.id} provider={provider} account={a} single={list.length === 1} inUse={a.id === inUse} rank={list.length > 1 ? rank.get(a.id) : undefined} now={now} onPeek={() => onPeek(a.id)} onSelect={() => onSelect(a)} />
+      ))}
+    </>
+  );
+}
+
+function Row({ provider, account, single, inUse, rank, now, onPeek, onSelect }: { provider: ProviderId; account: AccountInfo; single: boolean; inUse: boolean; rank?: UseFirstRank; now: number; onPeek: () => void; onSelect: () => void }) {
   const plan = planOf(account);
   // An agent's only account goes by the agent's name, and there is no choice to check.
   const label = single ? PROVIDER_NAME[provider] : accountName(account);
@@ -187,6 +207,7 @@ function Row({ provider, account, single, inUse, onPeek, onSelect }: { provider:
       <span className="acs-name truncate">{label}</span>
       <span className="acs-plan">{account.auth.loggedIn ? plan : 'Sign in'}</span>
       {account.auth.loggedIn ? <AccountUsed provider={provider} accountId={account.id} /> : <span className="acs-used" aria-hidden />}
+      {rank && <EndsCell rank={rank} now={now} />}
       <span className="acs-end">{account.isDefault && !single && <Icon name="check" size={14} className="acs-check" />}</span>
     </RM.Item>
   );

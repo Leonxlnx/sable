@@ -44,6 +44,8 @@ export const UltraEdge = memo(function UltraEdge({ on, card }: { on: boolean; ca
   if (!phase) return null;
   return (
     <span className="uc" data-phase={phase} aria-hidden>
+      <span className="uc-ring" />
+      <span className="uc-bloom" />
       {phase === 'charge' && <span className="uc-flash" />}
     </span>
   );

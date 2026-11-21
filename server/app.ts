@@ -32,6 +32,8 @@ import { normalizeBackdrop } from '../shared/backdrop';
 import { readableTitle } from '../shared/synthetic';
 import { Races, type Contender } from './core/race';
 import { laneSlug } from './services/git-lanes';
+import { gitDraftInput, gitWorktrees } from './services/git';
+import { cleanCommit, commitPrompt } from './core/commit-draft';
 import { SessionRuntime, autoTitle, pendingPrompts } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
@@ -52,7 +54,7 @@ import { profileOf } from './services/profile';
 import { customOf } from './services/custom';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
-import { Lanes } from './core/lanes';
+import { Lanes, worktreesRoot } from './core/lanes';
 import { isAllModelsWeekly } from './core/limit-policy';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
 import { VERSION } from './version';
@@ -244,6 +246,7 @@ export class App {
   /** Lanes: a worktree of its own for a session whose folder another session is working in (server/core/lanes.ts). */
   private lanes = new Lanes({
     home: () => this.store.dir,
+    root: () => this.worktreesRoot(),
     sessions: () => this.sessions.values(),
     // Off unless turned on: a lane starts from the last commit, without the folder's uncommitted work.
     auto: () => this.store.state.settings.autoLanes === true,
@@ -449,6 +452,32 @@ export class App {
       return p.quickTitle ? (prompt: TitlePrompt, signal: AbortSignal, holds?: () => boolean) => p.quickTitle!(prompt, signal, holds) : undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * A commit message for a folder's changes, written by Claude Code's Haiku on the default account.
+   * Nothing is staged or committed: the person reads it and commits.
+   */
+  private async draftCommit(cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+    const input = await gitDraftInput(cwd);
+    if ('error' in input) return { ok: false, error: input.error };
+    let model: Provider;
+    try {
+      model = this.provider('claude', this.defaultAccountId('claude'));
+    } catch {
+      return { ok: false, error: 'Claude Code is not set up, so no message can be written.' };
+    }
+    if (!model.quickTitle) return { ok: false, error: 'Claude Code is not set up, so no message can be written.' };
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60_000);
+    try {
+      const message = cleanCommit(await model.quickTitle(commitPrompt(input, path.resolve(cwd)), ctrl.signal));
+      return message ? { ok: true, message } : { ok: false, error: 'The model gave no message. Write one yourself.' };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message || 'The message could not be written.' };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -1241,7 +1270,10 @@ export class App {
     if (spare) return;
     // A refused turn was not carried by credits, so only the next account or the notice remain.
     const settings = this.store.state.settings;
-    if (decideAtLimit({ creditsAllowed: false, creditsAvailable: false, continueAtLimit: !!settings.continueAtLimit, next }) !== 'next' || !next || rt.turnActive) return;
+    const moves = decideAtLimit({ creditsAllowed: false, creditsAvailable: false, continueAtLimit: !!settings.continueAtLimit, next }) === 'next' && !!next;
+    // No other account takes over: the chat waits for this account's reset and then carries on by itself.
+    if (!moves && !rt.turnActive && settings.continueAtReset) this.spare.atReset(rt);
+    if (!moves || rt.turnActive) return;
     const refused = this.refusedMessage(rt);
     const done = this.autoContinued.get(rt.id) ?? new Set<string>();
     const key = `${refused?.id ?? ''}:${next}`;
@@ -1300,7 +1332,7 @@ export class App {
     if (!progressed) return refused;
     const text =
       carried === 'reset'
-        ? 'The last turn was cut off by a usage limit, which has reset now. Carry on with the task from where it stopped. Do not repeat steps that are already done.'
+        ? 'Usage has been restored. Continue the task from where it stopped. Do not repeat steps that are already done.'
         : carried === 'conversation'
           ? 'The last turn was cut off by a usage limit; the conversation now continues under another account. Carry on with the task from where it stopped. Do not repeat steps that are already done.'
           : `${refused.text}\n\n(Part of this was already done before a usage limit cut the turn off: the summary above shows how far it got. Carry on from there.)`;
@@ -1374,7 +1406,7 @@ export class App {
     rt.patch<NoticeItem>(open.id, { limit: { ...open.limit, continuedWith: accountId, ...(carried === 'reset' ? { atReset: true } : {}) } });
     const item: UserItem = refused
       ? this.resumeMessage(rt, refused, carried)
-      : { id: randomUUID(), ts: Date.now(), type: 'user', text: 'The usage limit has reset. Carry on with the task from where it stopped.', state: 'sent' };
+      : { id: randomUUID(), ts: Date.now(), type: 'user', text: 'Usage has been restored. Continue the task from where it stopped.', state: 'sent' };
     const handle = await this.ensureHandle(rt);
     await this.applyDue(rt, handle);
     // The turn carries on with the refused message: it is the one this turn answers.
@@ -1727,6 +1759,11 @@ export class App {
     return p.group ? this.store.state.groups?.find((g) => g.id === p.group) : undefined;
   }
 
+  /** Where lanes' worktrees go: the chosen folder, else `<Sable home>/lanes` (`worktreesRoot`). */
+  worktreesRoot(): string {
+    return worktreesRoot(this.store.state.settings.worktreesFolder, this.userHome, this.store.dir);
+  }
+
   /** Where chats without a folder get their folders: the chosen place, else D:\Sable chats or ~/Sable chats. */
   chatsRoot(): string {
     const chosen = this.store.state.settings.chatsFolder?.trim();
@@ -1812,6 +1849,7 @@ export class App {
       groups: this.store.state.groups ?? [],
       chatsOrder: this.store.state.chatsOrder,
       chatsDefault: defaultChatsRoot(this.userHome),
+      worktreesDefault: worktreesRoot(undefined, this.userHome, this.store.dir),
       // Read last, after the awaits: every later change reaches the window as an event.
       prompts: pendingPrompts(this.sessions.values()),
       ...(this.updates ? { update: this.updates.state } : {}),
@@ -2527,6 +2565,8 @@ export class App {
     });
 
     // Lanes (server/core/lanes.ts).
+    this.register('git.worktrees', ({ cwd }) => gitWorktrees(cwd));
+    this.register('git.draft', ({ cwd }) => this.draftCommit(String(cwd ?? '')));
     this.register('lane.forecast', ({ sessionId }) => this.lanes.forecast(this.runtime(sessionId)));
     this.register('lane.land', ({ sessionId, message }) => this.lanes.land(this.loaded(sessionId), typeof message === 'string' ? message : undefined));
     this.register('lane.discard', ({ sessionId }) => this.lanes.discard(this.loaded(sessionId)));
@@ -2777,7 +2817,7 @@ const sameDir = (a: string, b: string) => path.resolve(a).replace(/[\\/]+$/, '')
 const SWITCH_HANDOVER_CHARS = 4500;
 
 /** Agents' names when this build has no such provider (a chat that once ran with it). */
-const AGENT_NAMES: Partial<Record<ProviderId, string>> = { claude: 'Claude Code', codex: 'Codex', demo: 'Demo' };
+const AGENT_NAMES: Partial<Record<ProviderId, string>> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', demo: 'Demo' };
 
 /** How long a sign-in may wait for the browser. */
 const LOGIN_TIMEOUT_MS = 10 * 60_000;

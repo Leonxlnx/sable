@@ -566,6 +566,14 @@ textarea.field.ch-commit-field {
   padding: 0 11px;
 }
 
+.ch-commit-draft {
+  --h: 34px;
+  width: 34px;
+  padding: 0;
+  justify-content: center;
+  flex: none;
+}
+
 .ch-commit-error {
   display: flex;
   align-items: flex-start;

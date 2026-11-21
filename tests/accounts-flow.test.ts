@@ -299,6 +299,11 @@ describe('Claude sign-in through its CLI (fake CLI)', () => {
     const before = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${before}`;
     process.env.SABLE_LOGIN = 'cli';
+    // The fake CLI is found on PATH: a path to a real Claude Code in the environment (the desktop
+    // shell sets SABLE_CLAUDE_BIN for its children, also for a test run started from inside Sable)
+    // would be asked instead.
+    const realBin = process.env.SABLE_CLAUDE_BIN;
+    delete process.env.SABLE_CLAUDE_BIN;
     try {
       const home = temp('sable-home-');
       const app = new App({ home, providers: [(ctx) => new ClaudeProvider(ctx)], quiet: true, userHome: temp() });
@@ -331,6 +336,7 @@ describe('Claude sign-in through its CLI (fake CLI)', () => {
       process.env.PATH = before;
       delete process.env.FAKE_LOGIN;
       delete process.env.SABLE_LOGIN;
+      if (realBin !== undefined) process.env.SABLE_CLAUDE_BIN = realBin;
     }
   });
 });
