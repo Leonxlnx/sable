@@ -270,6 +270,38 @@ describe('switching the agent in place', () => {
     expect(handover).not.toContain('question 0 ');
   });
 
+  it('a huge chat hands over a bounded brief with the task as last put, the open todos and the files changed', { timeout: 20_000 }, async () => {
+    const { app, log } = setup();
+    const cwd = folder();
+    const a = await app.call('session.create', { provider: 'demo', cwd });
+    const id = a.session.id;
+    const rt = app.sessions.get(id)!;
+    for (let n = 0; n < 2000; n++) {
+      rt.add<UserItem>({ type: 'user', text: `question ${n} ${'x'.repeat(300)}`, state: 'sent' });
+      rt.add({ type: 'text', text: `answer ${n} ${'y'.repeat(2000)}` } as never);
+    }
+    rt.add<UserItem>({ type: 'user', text: 'Port the importer to streams', state: 'sent' });
+    for (let n = 0; n < 30; n++) {
+      rt.add({ type: 'text', text: `progress ${n} ${'p'.repeat(1000)}`, streaming: false } as never);
+      rt.add({ type: 'tool', name: 'Edit', kind: 'edit', title: `Edit f${n}.ts`, status: 'done', detail: { path: path.join(cwd, 'src', `f${n}.ts`) } } as never);
+    }
+    rt.setTodos([
+      { content: 'Stream the parser', status: 'completed' },
+      { content: 'Keep the CLI flags', status: 'in_progress' },
+    ]);
+    await app.call('session.switchAgent', { sessionId: id, provider: 'codex' });
+    // What it gets is what matters here (the Demo's reply to it may pick any scenario).
+    await app.call('session.send', { sessionId: id, text: 'hello codex' });
+    await until(() => log.sent.some((s) => s.provider === 'codex'), 'the send to codex');
+    const text = log.sent.find((s) => s.provider === 'codex')!.text;
+    const handover = text.slice(0, text.lastIndexOf('\n\n---\n\n'));
+    expect(handover.length).toBeLessThanOrEqual(4600);
+    expect(handover).toContain('User: Port the importer to streams');
+    expect(handover).toContain('Open todos:\n- Keep the CLI flags (in progress)');
+    expect(handover).toMatch(/Files changed: src\/f0\.ts, .*, and 15 more/);
+    expect(text.endsWith('hello codex')).toBe(true);
+  });
+
   it('names who worked since an agent was left', () => {
     const items = [
       { id: 'n1', ts: 0, type: 'notice', variant: 'info', text: '', agentSwitch: { from: 'claude', to: 'codex' } },
