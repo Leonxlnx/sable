@@ -443,6 +443,11 @@ export interface SessionMeta {
   agents?: AgentLeg[];
   /** The next message goes out with a handover of the conversation (after a switch of agent); null once sent. */
   agentHandover?: AgentHandover | null;
+  /**
+   * The chat moved to another account at `line` (its switch line): the next message the person sends
+   * carries a short note for the agent (`server/core/move-context.ts` `moveNote`); null once sent.
+   */
+  moveNote?: { line: string } | null;
   /** The Customize chat (`custom.open`): its agent gets the brief about changing Sable itself (`server/services/custom.ts`). */
   custom?: boolean;
 }
@@ -2219,10 +2224,12 @@ export interface RpcMethods {
    * Moves an idle session to another account of its agent. The same conversation continues when the
    * agent's transcript can be carried over (`carried: 'conversation'`); otherwise a new one starts with a
    * short handover of this one (`'summary'`). `retry` sends the message a limit refused again.
+   * A big chat whose account can still run a turn compacts there first: then the answer comes as
+   * the compaction starts (`compacting`), and the move follows when it ends, said in the chat.
    */
   'session.switchAccount': {
     params: { sessionId: string; accountId: string; retry?: boolean };
-    result: { ok: boolean; carried: 'conversation' | 'summary' | 'none'; message?: string };
+    result: { ok: boolean; carried: 'conversation' | 'summary' | 'none'; message?: string; compacting?: boolean };
   };
 
   /** Models, modes, commands… for a provider before any session exists. */
