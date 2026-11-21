@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -134,6 +134,8 @@ interface BuildFile {
   index?: string;
   /** The tag the branch `mine` stands on. */
   base?: string;
+  /** Setup finished: the workspace installed (a failed install leaves it unset, and setup installs again). */
+  installed?: boolean;
   failed?: { at: number; reason: string };
 }
 
@@ -576,22 +578,49 @@ export class Customizer {
   setup(): Promise<CustomState> {
     if (!this.buildOn) return Promise.reject(new Error(BUILD_OFF));
     return this.exclusive(async () => {
-      if (this.hasWorkspace()) return this.state();
+      // Set up only once it installed: a workspace whose install failed installs again.
+      if (this.hasWorkspace() && this.file.installed) return this.state();
       this.setStep('checking');
       this.missing = await this.tools();
       if (this.missing) this.fail(this.missing);
-      this.setStep('cloning');
-      const tag = `v${this.version}`;
-      mkdirSync(this.dir, { recursive: true });
-      if (existsSync(this.workspace)) rmSync(this.workspace, { recursive: true, force: true });
-      const r = await this.run('git', ['clone', '--filter=blob:none', '--branch', tag, REPO_URL, this.workspace], { cwd: this.dir, timeoutMs: 900_000 });
-      if (r.code !== 0) {
-        rmSync(this.workspace, { recursive: true, force: true });
-        this.fail(`Cloning failed: ${lastLine(r)}`);
+      if (!this.hasWorkspace()) {
+        // Never a folder Sable did not make: files of the person's there stay, and setup stops.
+        if (existsSync(this.workspace)) {
+          let kept = true;
+          try {
+            kept = !statSync(this.workspace).isDirectory() || readdirSync(this.workspace).length > 0;
+            if (!kept) rmdirSync(this.workspace);
+          } catch {
+            kept = true;
+          }
+          if (kept) this.fail(`${this.workspace} already has files in it. Sable leaves them alone: move them out to set up your build.`);
+        }
+        this.setStep('cloning');
+        const tag = `v${this.version}`;
+        mkdirSync(this.dir, { recursive: true });
+        // Cloned beside it, in a folder of Sable's own, and moved into place only once it is whole.
+        const fresh = `${this.workspace}.new-${randomBytes(4).toString('hex')}`;
+        const drop = () => rmSync(fresh, { recursive: true, force: true });
+        const r = await this.run('git', ['clone', '--filter=blob:none', '--branch', tag, REPO_URL, fresh], { cwd: this.dir, timeoutMs: 900_000 });
+        if (r.code !== 0) {
+          drop();
+          this.fail(`Cloning failed: ${lastLine(r)}`);
+        }
+        const branch = await this.run('git', ['checkout', '-b', 'mine'], { cwd: fresh });
+        if (branch.code !== 0) {
+          drop();
+          this.fail(`Making the branch failed: ${lastLine(branch)}`);
+        }
+        try {
+          renameSync(fresh, this.workspace);
+        } catch (err) {
+          drop();
+          this.fail(`Setting up failed: ${(err as Error).message}`);
+        }
+        this.saveBuild({ base: tag, installed: undefined });
       }
-      await this.git(['checkout', '-b', 'mine'], 'Making the branch failed');
-      this.saveBuild({ base: tag });
       await this.install();
+      this.saveBuild({ installed: true });
       this.watchSource();
       return this.state();
     });

@@ -322,7 +322,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     const home = tmp();
     const ws = path.join(home, 'custom', 'src');
     const { run, calls } = fakeRunner((cmd, args) => {
-      if (cmd === 'git' && args[0] === 'clone') mkdirSync(path.join(ws, '.git'), { recursive: true });
+      if (cmd === 'git' && args[0] === 'clone') mkdirSync(path.join(args.at(-1)!, '.git'), { recursive: true });
       if (cmd === 'pnpm' && args.includes('build')) {
         mkdirSync(path.join(ws, 'dist'), { recursive: true });
         writeFileSync(path.join(ws, 'dist', 'index.html'), 'built');
@@ -332,8 +332,10 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     const reloads: string[] = [];
     c.onReload((w) => reloads.push(w));
     await c.setup();
-    expect(calls.filter((x) => !x.endsWith('--version'))).toEqual([
-      `git clone --filter=blob:none --branch v0.3.0 https://github.com/Leonxlnx/sable.git ${ws}`,
+    // Cloned into a folder of Sable's own beside the workspace, moved into place once whole.
+    expect(calls.find((x) => x.startsWith('git clone'))).toMatch(/^git clone --filter=blob:none --branch v0\.3\.0 https:\/\/github\.com\/Leonxlnx\/sable\.git .*src\.new-[0-9a-f]{8}$/);
+    expect(existsSync(path.join(ws, '.git'))).toBe(true);
+    expect(calls.filter((x) => !x.endsWith('--version') && !x.startsWith('git clone'))).toEqual([
       'git checkout -b mine',
       'pnpm install --frozen-lockfile',
     ]);
@@ -344,6 +346,51 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     expect(c.state().build).toMatchObject({ active: true, serving: true, builtFor: '0.3.0' });
     expect(reloads).toEqual(['switch']);
     expect(JSON.parse(readFileSync(path.join(home, BUILD_STATE_FILE), 'utf8')).index).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('setup never deletes a folder Sable did not make; a failed install is installed again, not skipped', async () => {
+    const home = tmp();
+    const ws = path.join(home, 'custom', 'src');
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(path.join(ws, 'App.tsx'), 'the person’s own interface');
+    let installs = 0;
+    const { run, calls } = fakeRunner((cmd, args) => {
+      if (cmd === 'git' && args[0] === 'clone') mkdirSync(path.join(args.at(-1)!, '.git'), { recursive: true });
+      if (cmd === 'pnpm' && args[0] === 'install') return ++installs === 1 ? { code: 1, stderr: 'ERR_PNPM_FETCH_404' } : undefined;
+    });
+    const { c } = make(home, { serving: true, build: true, runner: run });
+    await expect(c.setup()).rejects.toThrow(/already has files in it/);
+    expect(readFileSync(path.join(ws, 'App.tsx'), 'utf8')).toBe('the person’s own interface');
+    expect(calls.some((x) => x.startsWith('git clone'))).toBe(false);
+    // Moved out: setup clones, and its install fails.
+    rmSync(ws, { recursive: true });
+    await expect(c.setup()).rejects.toThrow(/Installing failed: ERR_PNPM_FETCH_404/);
+    expect(c.state().build.workspace).toBe(true);
+    // Again: no second clone, the install runs again and only then is it set up.
+    await c.setup();
+    expect(calls.filter((x) => x.startsWith('git clone'))).toHaveLength(1);
+    expect(installs).toBe(2);
+    expect(JSON.parse(readFileSync(path.join(home, BUILD_STATE_FILE), 'utf8')).installed).toBe(true);
+    await c.setup();
+    expect(installs).toBe(2);
+  });
+
+  it('a clone that fails removes only its own folder', async () => {
+    const home = tmp();
+    let into = '';
+    const { run } = fakeRunner((cmd, args) => {
+      if (cmd === 'git' && args[0] === 'clone') {
+        into = args.at(-1)!;
+        mkdirSync(into, { recursive: true });
+        return { code: 128, stderr: 'fatal: unable to access' };
+      }
+    });
+    mkdirSync(path.join(home, 'custom'), { recursive: true });
+    writeFileSync(path.join(home, 'custom', 'styles.css'), '.a{}');
+    const { c } = make(home, { serving: true, build: true, runner: run });
+    await expect(c.setup()).rejects.toThrow(/Cloning failed: fatal/);
+    expect(existsSync(into)).toBe(false);
+    expect(readFileSync(path.join(home, 'custom', 'styles.css'), 'utf8')).toBe('.a{}');
   });
 
   it('a failed build says why and switches nothing', async () => {
