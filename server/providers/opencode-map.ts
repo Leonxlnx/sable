@@ -293,12 +293,30 @@ export function permissionScope(kind: string | undefined, call: Obj, input: Obj,
   ].filter((p, i, all): p is string => typeof p === 'string' && p.length > 0 && all.indexOf(p) === i);
   const s: PermissionScope = {};
   const lines: string[] = [];
+  // A request that does not say what it does is the desktop's to answer (review wave 8, #12): a
+  // command must be there to be shown, a read must name what it opens, a move both of its ends.
   switch (kind) {
-    case 'execute':
+    case 'execute': {
+      const command = pick(input, 'command', 'cmd');
+      if (typeof command !== 'string' || !command.trim()) s.unknown = true;
       break;
+    }
+    case 'move': {
+      const locs = ((Array.isArray(call.locations) ? call.locations : []) as Obj[]).map((l) => l?.path).filter((p): p is string => typeof p === 'string' && p.length > 0);
+      const from = pick(input, 'source', 'from', 'oldPath', 'filePath', 'file_path', 'path') ?? locs[0];
+      const to = pick(input, 'destination', 'to', 'newPath', 'target') ?? (locs.length >= 2 ? locs[locs.length - 1] : undefined);
+      if (typeof from !== 'string' || typeof to !== 'string' || !from || !to || from === to) {
+        s.unknown = true;
+        break;
+      }
+      const f = { path: to, from };
+      s.files = [f];
+      // Both ends as a line, whatever a diff shows.
+      lines.push(fileLine(f));
+      break;
+    }
     case 'edit':
     case 'delete':
-    case 'move':
       if (paths.length) s.files = paths.map((p) => ({ path: p }));
       else s.unknown = true;
       for (const p of paths) if (!diffPaths.includes(p)) lines.push(fileLine({ path: p }));
@@ -306,6 +324,7 @@ export function permissionScope(kind: string | undefined, call: Obj, input: Obj,
     case 'read':
     case 'search':
       if (paths.length) s.read = paths;
+      else s.unknown = true;
       break;
     case 'fetch': {
       let host: string | undefined;

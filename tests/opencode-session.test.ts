@@ -149,6 +149,25 @@ describe('OpenCode permission scope', () => {
     expect(permissionScope('read', { locations: [{ path: '/etc/hosts' }] }, {}).lines).toEqual(['Read: /etc/hosts']);
   });
 
+  it('a request that does not say what it does is the desktop\'s (review wave 8, #12)', () => {
+    // A command with no command, a read with no paths, a move with only its source.
+    const noCommand = permissionScope('execute', {}, {});
+    expect(noCommand.scope?.unknown).toBe(true);
+    expect(phonePermission(ask({ kind: 'bash', scope: noCommand.scope })).incomplete).toBe(true);
+    const blankCommand = permissionScope('execute', {}, { command: '   ' });
+    expect(blankCommand.scope?.unknown).toBe(true);
+    const noPaths = permissionScope('read', {}, {});
+    expect(phonePermission(ask({ kind: 'read', scope: noPaths.scope })).incomplete).toBe(true);
+    const halfMove = permissionScope('move', { locations: [{ path: '/w/a.ts' }] }, {});
+    expect(halfMove.scope?.unknown).toBe(true);
+    expect(phonePermission(ask({ scope: halfMove.scope })).incomplete).toBe(true);
+    // Both ends named: shown as one line, and the phone may answer.
+    const move = permissionScope('move', { locations: [{ path: '/w/a.ts' }, { path: '/w/b.ts' }] }, {});
+    expect(move.scope?.files).toEqual([{ path: '/w/b.ts', from: '/w/a.ts' }]);
+    expect(move.lines).toEqual(['/w/a.ts → /w/b.ts']);
+    expect(phonePermission(ask({ scope: move.scope, reason: move.lines.join('\n') })).incomplete).toBeUndefined();
+  });
+
   it('what Sable cannot describe is the desktop\'s, and "always" never goes to the phone', () => {
     const mcp = permissionScope('other', {}, {});
     expect(mcp.scope?.unknown).toBe(true);
