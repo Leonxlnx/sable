@@ -17,6 +17,7 @@ import type {
   QuestionRequest,
   LimitsReport,
   RateLimit,
+  ResetRun,
   SessionMeta,
   SessionSnapshot,
   TimelineItem,
@@ -155,6 +156,8 @@ export interface Store {
   limitReports: Partial<Record<string, LimitsReport>>;
   /** Sign-in flows per account, keyed by `accountKey(provider, accountId)`. */
   auth: Partial<Record<string, AuthFlow>>;
+  /** A limit reset used in the agent's own dialog (`limit.resetInAgent`), per account, keyed like `auth`. */
+  resetRuns: Partial<Record<string, ResetRun>>;
   toasts: Toast[];
   drafts: Record<string, Draft>;
   /** Review comments on diffs not sent yet, per session (features/review; actions `*ReviewComment`, `sendReview`). */
@@ -228,6 +231,7 @@ export const useStore = create<Store>((set, get) => ({
   limits: {},
   limitReports: {},
   auth: {},
+  resetRuns: {},
   toasts: [],
   drafts: {},
   reviews: {},
@@ -609,6 +613,16 @@ export function applyEvent(e: BridgeEvent) {
     case 'limit.reset':
       announceReset(e);
       return;
+    case 'limit.resetRun': {
+      const key = accountKey(e.provider, e.accountId);
+      useStore.setState((s) => {
+        const resetRuns = { ...s.resetRuns };
+        if (e.run) resetRuns[key] = e.run;
+        else delete resetRuns[key];
+        return { resetRuns };
+      });
+      return;
+    }
     case 'update.state':
       useStore.setState({ update: e.state });
       return;

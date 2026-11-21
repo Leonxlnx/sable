@@ -42,6 +42,12 @@ export interface ProviderInfo {
    * config.toml), each once. Shown as a quiet line in Settings › Agents, never in a conversation.
    */
   warnings?: { text: string; detail?: string }[];
+  /**
+   * Where a limit reset of this agent's own is used when Sable cannot spend it: `console`, Sable
+   * opens the agent in a console window straight into its reset dialog (`limit.resetInAgent`);
+   * `terminal`, the person runs `command` in a terminal. Absent: neither.
+   */
+  limitReset?: { via: 'console' | 'terminal'; command: string };
 }
 
 /** The id of the account every provider always has: the CLI's own config (~/.claude, ~/.codex). */
@@ -1200,6 +1206,19 @@ export interface ResetOffer {
   paused?: boolean;
 }
 
+/**
+ * A reset used in the agent's own dialog (`limit.resetInAgent`), one per account at a time: `open`
+ * while its console window is open, `reading` while the limits are read again after it closed,
+ * then what that showed: `cleared` (the windows, by label, that were full and are not now),
+ * `unchanged` (nothing that was full has room), or `failed` (the window could not be opened).
+ */
+export interface ResetRun {
+  state: 'open' | 'reading' | 'cleared' | 'unchanged' | 'failed';
+  startedAt: number;
+  cleared?: string[];
+  message?: string;
+}
+
 /** What spending a reset credit did (Codex's `account/rateLimitResetCredit/consume` outcomes). */
 export type ResetOutcome = 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed';
 
@@ -1618,6 +1637,8 @@ export type BridgeEvent =
   /** A full window of an account reset (with `notifyLimitReset` on). */
   | { type: 'update.state'; state: UpdateState }
   | { type: 'limit.reset'; provider: ProviderId; accountId?: string; window: string; at: number }
+  /** A reset used in the agent's own dialog moved on (`ResetRun`); `run` null: nothing is under way or to show. */
+  | { type: 'limit.resetRun'; provider: ProviderId; accountId?: string; run: ResetRun | null }
   /** Local usage changed (a scan finished). */
   | { type: 'usage.updated'; report: UsageReport }
   /** Fresh capabilities for the home composer (after a cached answer was served first). */
@@ -2235,6 +2256,15 @@ export interface RpcMethods {
    * limits again. `key` identifies one attempt: the same key on a retry never spends a second one.
    */
   'provider.useReset': { params: { provider: ProviderId; accountId?: string; key: string }; result: { outcome: ResetOutcome } };
+  /**
+   * Opens the account's own agent in a console window, straight into its reset dialog, where the
+   * person reads what a reset clears and confirms (Sable types nothing there and spends nothing).
+   * When the window closes the limits are read again and chats waiting on a window that cleared go
+   * on. Progress comes as `limit.resetRun`. One at a time per account; refused while nothing is at a limit.
+   */
+  'limit.resetInAgent': { params: { provider: ProviderId; accountId?: string }; result: { ok: boolean; error?: string } };
+  /** Closes that console window (the limits are still read again, in case the reset went through). */
+  'limit.resetCancel': { params: { provider: ProviderId; accountId?: string }; result: { ok: boolean } };
   /**
    * Starts the agent process for the session about to be created from the home composer (no
    * prompt is sent). `session.create` with the same choice adopts it. At most one is kept.

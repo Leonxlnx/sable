@@ -6,6 +6,7 @@ import { accountName, useLimitsReport } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { cx, Tip } from '@/ui';
 import { DATE_LOCALE, exactTime } from './format';
+import { ResetInAgentLine, useResetInAgent } from './ResetInAgent';
 
 /** "2 resets", "1 reset". */
 export const resetsText = (n: number) => `${n} ${n === 1 ? 'reset' : 'resets'}`;
@@ -14,6 +15,12 @@ export const resetsText = (n: number) => `${n} ${n === 1 ? 'reset' : 'resets'}`;
 export function resetTarget(limits: RateLimit[] | undefined, windows: string[] | undefined): RateLimit | undefined {
   const own = (limits ?? []).filter((l) => !windows?.length || windows.includes(l.id));
   return own.find((l) => (l.windowMins ?? 0) >= 10_080) ?? own[own.length - 1];
+}
+
+/** The window a reset in the agent's own dialog is offered on: the weekly one when it is full, else the first full one (or the last known, while one runs). */
+export function fullTarget(limits: RateLimit[] | undefined, now = Date.now()): RateLimit | undefined {
+  const full = (limits ?? []).filter((l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now));
+  return full.find((l) => (l.windowMins ?? 0) >= 10_080) ?? full[0] ?? resetTarget(limits, undefined);
 }
 
 /** How a window is named inside a sentence: "the weekly limit", "the 5-hour limit". */
@@ -88,6 +95,7 @@ const newKey = () => (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math
  */
 export function LimitReset({ provider, accountId = DEFAULT_ACCOUNT, limit, compact, className }: { provider: ProviderId; accountId?: string; limit: RateLimit; compact?: boolean; className?: string }) {
   const offered = useResetOffers(provider, accountId);
+  const inAgent = useResetInAgent(provider, accountId);
   const now = useNow();
   const account = useStore((s) => s.providers[provider]?.accounts?.find((a) => a.id === accountId));
   const [step, setStep] = useState<'idle' | 'ask' | 'busy'>('idle');
@@ -99,7 +107,11 @@ export function LimitReset({ provider, accountId = DEFAULT_ACCOUNT, limit, compa
     if (step === 'ask') confirmRef.current?.focus();
   }, [step]);
 
-  if (!offered && step === 'idle' && !note) return null;
+  // At a limit (or while one runs), a reset in the agent's own dialog: primary when the agent
+  // reported offers (what they are leads the line), a quiet action otherwise.
+  const viaAgent = inAgent && (inAgent.atLimit || inAgent.run) && (!offered || offered.spendable === false);
+  if (!offered && !viaAgent && step === 'idle' && !note) return null;
+  if (viaAgent && !offered) return <ResetInAgentLine provider={provider} accountId={accountId} state={inAgent} compact={compact} className={className} />;
   // Granted, but only the agent's own app can use them: what they are, and where to use one.
   if (offered && offered.spendable === false) {
     const where = USE_AT[provider];
@@ -109,6 +121,7 @@ export function LimitReset({ provider, accountId = DEFAULT_ACCOUNT, limit, compa
         {offersText(offered, now)}
       </span>
     );
+    if (viaAgent) return <ResetInAgentLine provider={provider} accountId={accountId} state={inAgent} lead={end ? <Tip label={`Ends ${exactTime(end)}`} side="bottom">{text}</Tip> : text} primary compact={compact} className={className} />;
     return (
       <div className={cx('ul-resets', className)} data-compact={compact || undefined} role="group" aria-label="Resets">
         {end ? (

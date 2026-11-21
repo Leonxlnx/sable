@@ -59,6 +59,8 @@ import { Lanes, worktreesRoot } from './core/lanes';
 import { isAllModelsWeekly } from './core/limit-policy';
 import { mergeWindows } from './services/limits';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
+import { ResetConsoles } from './core/reset-console';
+import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
 
@@ -101,9 +103,19 @@ export interface AppOptions {
   userHome?: string;
   /** How long a sign-in may wait for the browser before it is given up (tests shorten it). */
   loginTimeoutMs?: number;
+  /** Opens a console window (`limit.resetInAgent`); tests pass one that opens nothing. Default: a real window, Windows only. */
+  openConsole?: OpenConsole;
+  /** How long after a first read that showed no change a reset's limits are read once more (tests shorten it). */
+  resetSettleMs?: number;
 }
 
 export { VERSION };
+
+/** How a reset in the agent's own dialog is offered: a console window Sable opens, or a command for a terminal. */
+const limitResetVia = (consoles: boolean, p: Provider): NonNullable<ProviderInfo['limitReset']> | undefined => {
+  const line = p.limitResetCommand?.().line;
+  return line ? { via: consoles ? 'console' : 'terminal', command: line } : undefined;
+};
 
 /** The label of each provider's built-in account until the user renames it. */
 export const DEFAULT_ACCOUNT_LABEL = 'Main';
@@ -327,7 +339,33 @@ export class App {
     log: (...args) => this.log(...args),
   });
 
+  /** Limit resets used in the agent's own dialog, in a console window (server/core/reset-console.ts). */
+  private resets: ResetConsoles;
+  /** False where Sable cannot open a console window: the person runs the reset command in a terminal. */
+  private consoles: boolean;
+
   constructor(opts: AppOptions) {
+    this.consoles = !!opts.openConsole || process.platform === 'win32';
+    this.resets = new ResetConsoles({
+      open: opts.openConsole ?? realConsole,
+      command: (provider, accountId) => this.provider(provider, accountId).limitResetCommand?.(),
+      cwd: () => {
+        // A neutral folder of Sable's own, never a project.
+        const dir = path.join(this.store.dir, 'limit-reset');
+        mkdirSync(dir, { recursive: true });
+        return dir;
+      },
+      title: (provider, accountId) => {
+        const name = this.accountList(provider).length > 1 ? this.accountLabel(provider, accountId).replace(/["%^&|<>\r\n]/g, '').trim() : '';
+        return `${this.provider(provider, accountId).name} reset${name ? ` (${name})` : ''}`;
+      },
+      known: (provider, accountId) => this.limitsCache.get(accountKey(provider, accountId)),
+      read: (provider, accountId) => this.call('provider.limits', { provider, accountId, force: true }),
+      cleared: (provider, accountId) => this.limitsCleared(provider, accountId),
+      emit: (provider, accountId, run) => this.emit({ type: 'limit.resetRun', provider, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, run }),
+      log: (...args) => this.log(...args),
+      ...(opts.resetSettleMs !== undefined ? { settleMs: opts.resetSettleMs } : {}),
+    });
     this.quiet = !!opts.quiet;
     this.delays = opts.refreshDelays ?? {};
     this.userHome = opts.userHome ?? homedir();
@@ -587,6 +625,21 @@ export class App {
     this.resetTimer.unref?.();
   }
 
+  /**
+   * An account's full windows cleared before their time (a reset used in the agent's own dialog, as
+   * a fresh read showed): what waits for its reset goes on as at a reset by time: chats waiting to
+   * continue there, and new chats return to it when it is the preferred one.
+   */
+  private limitsCleared(provider: ProviderId, accountId: string) {
+    this.spare.resetCleared(provider, accountId);
+    const fb = this.fallbacks.get(provider);
+    if (fb && fb.from === accountId && fb.until && fb.until > Date.now()) {
+      fb.until = Date.now();
+      void this.emitProvider(provider).catch(() => {});
+    }
+    this.scheduleResetAlert();
+  }
+
   private onResetDue() {
     const now = Date.now();
     const due = dueResets(this.capped(), this.resetCheckedAt, now);
@@ -631,7 +684,8 @@ export class App {
       }),
     );
     this.noteSignIns(provider, accounts);
-    return { ...base, accounts };
+    const limitReset = limitResetVia(this.consoles, this.provider(provider));
+    return { ...base, accounts, ...(limitReset ? { limitReset } : {}) };
   }
 
   /**
@@ -2295,6 +2349,15 @@ export class App {
       return { outcome: await p.useReset(key) };
     });
 
+    // A reset in the agent's own dialog: only the person's click opens it; the person confirms there.
+    this.register('limit.resetInAgent', async ({ provider, accountId = DEFAULT_ACCOUNT }) => {
+      const p = this.provider(provider, accountId);
+      if (!p.limitResetCommand) return { ok: false, error: 'This agent has no reset dialog' };
+      if (!this.consoles) return { ok: false, error: `Run ${p.limitResetCommand().line} in a terminal` };
+      return this.resets.start(provider, accountId);
+    });
+    this.register('limit.resetCancel', ({ provider, accountId = DEFAULT_ACCOUNT }) => ({ ok: this.resets.cancel(provider, accountId) }));
+
     // ── projects ──
     this.register('project.add', ({ path: dir }) => {
       if (!isDir(path.resolve(dir))) throw new Error(`Not a folder: ${path.resolve(dir)}`);
@@ -2855,6 +2918,7 @@ export class App {
     this.updates?.dispose();
     this.until.dispose();
     this.spare.dispose();
+    this.resets.dispose();
     this.titles.dispose();
     await this.checks.dispose();
     for (const fn of this.disposers.splice(0)) await Promise.resolve(fn()).catch(() => {});

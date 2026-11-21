@@ -7,7 +7,6 @@
  * with no sign-in). Its plan limits are OpenCode Go's windows, read from the CLI (`limits()`). It
  * takes no message mid-turn: a message sent while it works waits in the queue.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -29,7 +28,7 @@ import type {
 import type { SessionRuntime } from '../core/runtime';
 import { runCli } from '../util/proc';
 import { openCodeConfig } from '../services/config';
-import { killTree } from './codex-rpc';
+import { openConsole, type ConsoleWindow } from '../util/console';
 import { AcpClient, AcpError, type AcpExit } from './opencode-acp';
 import {
   ALLOW_ALL_MODE,
@@ -86,7 +85,7 @@ export class OpenCodeProvider implements Provider {
   private capsLoading?: Promise<CapsInfo>;
   /** Commands announced by a session the provider itself opened to read the capabilities. */
   private probeCommands = new Map<string, Capabilities['commands']>();
-  private login_?: { child: ChildProcess; cancelled: boolean };
+  private login_?: { window: ConsoleWindow; cancelled: boolean };
 
   constructor(readonly ctx: ProviderContext) {}
 
@@ -192,15 +191,11 @@ export class OpenCodeProvider implements Provider {
     await this.cancelLogin();
     if (process.platform !== 'win32') throw new Error(`Run \`opencode auth ${command}\` in a terminal.`);
     if (command === 'login') this.ctx.emit({ type: 'auth.progress', provider: 'opencode', state: 'url', message: 'Finish signing in in the OpenCode window that opened.' });
-    // One verbatim command line: Node's own quoting would turn the window title into `"\"OpenCode login\""`,
-    // which `start` takes apart. `command` is one of two fixed words.
-    const child = spawn('cmd.exe', ['/d', '/s', '/c', `start "OpenCode ${command}" /wait opencode auth ${command}`], { windowsHide: false, stdio: 'ignore', windowsVerbatimArguments: true });
-    const l = { child, cancelled: false };
+    // One verbatim command line (util/console.ts). `command` is one of two fixed words.
+    const window = openConsole({ title: `OpenCode ${command}`, bin: 'opencode', args: ['auth', command] });
+    const l = { window, cancelled: false };
     this.login_ = l;
-    await new Promise<void>((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', () => resolve());
-    }).finally(() => {
+    await window.closed.finally(() => {
       if (this.login_ === l) this.login_ = undefined;
       this.capsCache = undefined;
     });
@@ -214,7 +209,7 @@ export class OpenCodeProvider implements Provider {
     const l = this.login_;
     if (!l) return;
     l.cancelled = true;
-    killTree(l.child);
+    l.window.close();
   }
 
   async logout(): Promise<void> {
