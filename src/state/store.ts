@@ -66,7 +66,7 @@ export interface SessionData {
 }
 
 export type RailTab = 'changes' | 'files' | 'browser' | 'device' | 'terminal' | 'tasks' | 'context' | 'agents';
-export type SettingsSection = 'general' | 'appearance' | 'accounts' | 'usage' | 'models' | 'permissions' | 'phone' | 'mcp' | 'hooks' | 'skills' | 'agents' | 'memory' | 'profile' | 'shortcuts' | 'about';
+export type SettingsSection = 'general' | 'appearance' | 'accounts' | 'usage' | 'models' | 'permissions' | 'phone' | 'mcp' | 'hooks' | 'skills' | 'agents' | 'memory' | 'profile' | 'prompts' | 'shortcuts' | 'about';
 
 export interface AuthFlow {
   state: 'started' | 'url' | 'done' | 'error' | 'cancelled' | 'timeout';

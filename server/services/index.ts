@@ -8,8 +8,11 @@ import { registerFs } from './fs';
 import { registerGit } from './git';
 import { registerMemory } from './memory';
 import { registerPhone } from './phone';
+import { registerExport } from './export';
 import { registerProfile } from './profile';
+import { registerPrompts } from './prompts';
 import { registerScripts } from './scripts';
+import { registerSearch } from './search';
 import { registerTerm } from './term';
 import { registerUsage } from './usage';
 
@@ -33,4 +36,7 @@ export function registerServices(app: App, opts: ServiceOptions = {}) {
   registerPhone(app);
   registerProfile(app);
   registerCapture(app);
+  registerSearch(app);
+  registerExport(app);
+  registerPrompts(app);
 }

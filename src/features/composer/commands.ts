@@ -1,4 +1,4 @@
-import type { Capabilities, CommandKind } from '@shared/protocol';
+import type { Capabilities, CommandKind, SavedPrompt } from '@shared/protocol';
 import type { IconName } from '@/icons';
 import { baseName, dirName } from '@/lib/format';
 import { fuzzy } from '@/lib/fuzzy';
@@ -6,10 +6,12 @@ import { skillLabeller } from '@/lib/skills';
 import type { FileHit } from '@/lib/workspace';
 import { fileIcon } from './file-icon';
 import { goHome, interrupt, openSettings, renameSession } from '@/state/actions';
+import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { untilCommand } from './until';
 import { spareCommand } from './spare';
 import { raceCommand } from '@/features/race/race';
+import { getPrompts, subscribePrompts } from '@/features/saved/prompts-store';
 
 /** Slash commands Sable handles itself, before anything reaches the agent. */
 
@@ -30,6 +32,8 @@ export interface AppCommand {
   argumentHint?: string;
   /** Only offered inside a session. */
   session?: boolean;
+  /** A saved prompt (Settings › Prompts): listed under Prompts by its name; choosing it puts its text into the composer. */
+  prompt?: SavedPrompt;
   run: (ctx: CommandCtx, arg: string) => void;
 }
 
@@ -52,7 +56,7 @@ function copyLastAnswer(sessionId: string) {
   s.toast('There is no answer to copy yet');
 }
 
-export const APP_COMMANDS: AppCommand[] = [
+const BUILT_IN: AppCommand[] = [
   {
     name: 'new',
     description: 'Start a new session',
@@ -126,6 +130,29 @@ export const APP_COMMANDS: AppCommand[] = [
   { name: 'help', description: 'Show keyboard shortcuts', run: () => ui()({ shortcutsOpen: true }) },
 ];
 
+/** The command name a saved prompt goes by inside the menu (never typed, never sent: the prompt's text replaces it). */
+const promptName = (p: SavedPrompt) => `prompt:${p.id}`;
+
+/**
+ * A saved prompt as a command: the menu removes the "/…" it was chosen from (whatever followed it
+ * stays) before this runs, then the prompt's text goes in its place. Nothing is sent.
+ */
+const promptCommand = (p: SavedPrompt): AppCommand => ({
+  name: promptName(p),
+  description: '',
+  prompt: p,
+  run: ({ sessionId }) => {
+    const rest = (useStore.getState().drafts[sessionId ?? 'home']?.text ?? '').replace(/^\s+/, '');
+    focusComposer(rest ? `${p.text}${/\s$/.test(p.text) ? '' : '\n\n'}${rest}` : p.text);
+  },
+});
+
+/** Sable's own commands, then the saved prompts (kept in step with them: the composer looks commands up here). */
+export const APP_COMMANDS: AppCommand[] = [...BUILT_IN];
+const syncPrompts = () => APP_COMMANDS.splice(BUILT_IN.length, Infinity, ...getPrompts().map(promptCommand));
+syncPrompts();
+subscribePrompts(syncPrompts);
+
 export const appCommandsFor = (sessionId: string | null) => APP_COMMANDS.filter((c) => !c.session || sessionId);
 
 export type RowKind = CommandKind | 'file' | 'dir' | 'skill' | 'agent';
@@ -164,10 +191,12 @@ function rank<T>(list: T[], query: string, text: (t: T) => string, full?: (t: T)
   return out.sort((a, b) => b.score - a.score);
 }
 
-/** Rows for "/": Sable's own commands, then the agent's commands and skills. */
+/** Rows for "/": the person's saved prompts, Sable's own commands, then the agent's commands and skills. */
 export function commandRows(query: string, caps: Capabilities | undefined, sessionId: string | null): SuggestRow[] {
-  const app = appCommandsFor(sessionId);
-  const taken = new Set(APP_COMMANDS.map((c) => c.name));
+  const all = appCommandsFor(sessionId);
+  const app = all.filter((c) => !c.prompt);
+  const prompts = all.filter((c) => c.prompt);
+  const taken = new Set(BUILT_IN.map((c) => c.name));
   const provider = (caps?.commands ?? []).filter((c) => c.kind !== 'app' && !taken.has(c.name));
   const cmds = provider.filter((c) => c.kind !== 'skill');
   const skillNames = new Set<string>();
@@ -181,6 +210,9 @@ export function commandRows(query: string, caps: Capabilities | undefined, sessi
 
   const rows: SuggestRow[] = [];
   const shift = (ix: number[]) => ix.map((i) => i + 1);
+  // Saved prompts by their names (the person's own words, so no "/" before them); first, they are few and chosen.
+  for (const { t, indices } of rank(prompts, query.replace(/[-_]+/g, ' '), (c) => c.prompt!.name))
+    rows.push({ id: `app:${t.name}`, group: 'Prompts', kind: 'app', name: t.name, label: t.prompt!.name, indices });
   for (const { t, indices } of rank(app, query, (c) => c.name))
     rows.push({ id: `app:${t.name}`, group: 'Sable', kind: 'app', name: t.name, label: `/${t.name}`, indices: shift(indices), hint: t.argumentHint });
   // Built-in commands (Sable's and the agent's) need no description: people know them. Only what the
@@ -240,7 +272,7 @@ function withShortNames(names: string[]): Set<string> {
 
 /** What the field may show as a token: commands and skills by their full and their short names. */
 export function knownTokens(caps: Capabilities | undefined, sessionId: string | null) {
-  const commands = [...appCommandsFor(sessionId).map((c) => c.name), ...(caps?.commands ?? []).map((c) => c.name)];
+  const commands = [...appCommandsFor(sessionId).filter((c) => !c.prompt).map((c) => c.name), ...(caps?.commands ?? []).map((c) => c.name)];
   const skills = (caps?.skills ?? []).map((s) => s.name);
   return { commands: withShortNames([...commands, ...skills]), skills: withShortNames(skills), dollar: caps?.skillTrigger === '$' && skills.length > 0 };
 }

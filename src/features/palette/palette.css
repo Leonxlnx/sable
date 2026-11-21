@@ -256,3 +256,78 @@
   text-decoration-thickness: 1.5px;
   text-underline-offset: 3px;
 }
+
+/* ── messages across chats ── */
+
+/* A message found in a chat: the words around the match (the match lit), the chat and when at the end. */
+.palette-row[data-group='Messages'] .palette-title {
+  flex: 1 1 auto;
+}
+
+.palette-you {
+  color: var(--text-3);
+}
+
+.palette-row[data-active] .palette-you {
+  color: var(--text-2);
+}
+
+.palette-hit-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.palette-hit-chat {
+  max-width: 190px;
+  font-size: var(--t-small);
+  color: var(--text-4);
+}
+
+.palette-row[data-active] .palette-hit-chat {
+  color: var(--text-3);
+}
+
+/* More may come: a quiet line under what has been found so far. */
+.palette-searching {
+  padding-bottom: 4px;
+}
+
+.palette-searching-text {
+  display: block;
+  height: 30px;
+  padding: 0 10px 0 36px;
+  font-size: var(--t-small);
+  line-height: 30px;
+  color: var(--text-3);
+}
+
+/* The words searched for, marked for a moment in the message a jump landed on (jump.ts). */
+::highlight(sable-jump) {
+  background-color: rgb(242 241 238 / 0.22);
+  color: inherit;
+}
+
+/* ── save prompt: naming the composer's text ── */
+
+.palette-save-btn {
+  --h: var(--ctl-h-sm);
+  padding: 0 11px;
+  border-radius: var(--r-ctl-sm);
+  font-size: var(--t-small);
+}
+
+.palette-save {
+  max-height: min(220px, calc(60 * var(--vh)));
+  margin: 8px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background-color: var(--well);
+  font-size: var(--t-ui);
+  line-height: 20px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

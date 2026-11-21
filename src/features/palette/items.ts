@@ -1,4 +1,6 @@
-import type { Capabilities, ProviderId, SessionMeta } from '@shared/protocol';
+import type { Capabilities, MessageHit, ProviderId, SavedPrompt, SessionMeta } from '@shared/protocol';
+import { copyChatMarkdown, exportChat } from '@/features/export/export';
+import { insertPrompt } from '@/features/saved/prompts-store';
 import { PROVIDER_NAME } from '@/art/Logo';
 import type { IconName } from '@/icons';
 import { baseName, tildePath } from '@/lib/format';
@@ -13,7 +15,10 @@ import { createLane } from '@/features/session/lane';
 import { openRace, raceFolder } from '@/features/race/race';
 import { useStore, type RailTab } from '@/state/store';
 
-export type PaletteGroup = 'Recent' | 'Sessions' | 'Projects' | 'Actions' | 'Commands' | 'Skills';
+export type PaletteGroup = 'Recent' | 'Sessions' | 'Projects' | 'Prompts' | 'Actions' | 'Commands' | 'Skills' | 'Messages';
+
+/** What an item turns the palette into instead of running (it stays open): naming the composer's text to save it. */
+export type PaletteMode = 'save-prompt';
 
 export interface PaletteItem {
   id: string;
@@ -26,8 +31,15 @@ export interface PaletteItem {
   tone?: string;
   keys?: string;
   session?: SessionMeta;
+  /** A message found across chats (the Messages group): its chat, and who said it. */
+  hit?: MessageHit;
+  /** Choosing it keeps the palette open in this mode. */
+  mode?: PaletteMode;
   run: () => void;
 }
+
+/** A prompt's text as one dim line beside its name. */
+const firstLine = (t: string) => (t.split('\n').find((l) => l.trim()) ?? '').trim();
 
 /** Extra words for the panel's tabs in the palette. */
 const RAIL_WORDS: Partial<Record<RailTab, string>> = {
@@ -49,6 +61,10 @@ export function buildItems(opts: {
   caps?: Capabilities;
   /** A session's account name, only when its agent has several accounts. */
   accountName?: (s: SessionMeta) => string | undefined;
+  /** Saved prompts, in the person's order. */
+  prompts?: SavedPrompt[];
+  /** The visible composer holds text that can be saved as a prompt. */
+  canSavePrompt?: boolean;
 }): PaletteItem[] {
   const { setUi } = useStore.getState();
   const ui = () => useStore.getState().ui;
@@ -77,12 +93,26 @@ export function buildItems(opts: {
     });
   }
 
+  // Saved prompts: choosing one puts its text into the composer (never sends it).
+  for (const p of opts.prompts ?? []) {
+    items.push({
+      id: `prompt:${p.id}`,
+      group: 'Prompts',
+      title: p.name,
+      sub: firstLine(p.text),
+      keywords: `prompt saved ${p.text.slice(0, 240)}`,
+      icon: 'text',
+      run: () => insertPrompt(p.text),
+    });
+  }
+
   const act = (id: string, title: string, icon: IconName, run: () => void, extra: Partial<PaletteItem> = {}) =>
     items.push({ id: `action:${id}`, group: 'Actions', title, icon, run, ...extra });
 
   act('new', 'New session', 'compose', () => goHome(), { keys: 'mod+shift+o', keywords: 'start create chat' });
   act('open-folder', 'Open a folder', 'folder-plus', () => setUi({ projectPicker: true }), { keys: 'mod+o', keywords: 'project add browse' });
   act('history', 'History', 'history', () => setUi({ historyOpen: true }), { keywords: 'resume past conversations' });
+  if (opts.canSavePrompt) act('save-prompt', 'Save prompt', 'plus', () => {}, { mode: 'save-prompt', keywords: 'save prompt snippet template reuse composer text name' });
   act('import', 'Import conversations', 'download', () => openImport(), { keywords: 'continue claude code codex cli desktop app history resume' });
   act('settings', 'Settings', 'settings', () => openSettings(), { keys: 'mod+,', keywords: 'preferences' });
   for (const s of SETTINGS_SECTIONS) {
@@ -96,6 +126,8 @@ export function buildItems(opts: {
 
   if (opts.active) {
     const id = opts.active.id;
+    act('export', 'Export chat', 'export', () => void exportChat(id), { keywords: 'export save markdown file download conversation chat md' });
+    act('copy-markdown', 'Copy as Markdown', 'copy', () => void copyChatMarkdown(id), { keywords: 'copy markdown clipboard export conversation chat md' });
     act('toggle-panel', ui().railOpen ? 'Hide panel' : 'Show panel', 'sidebar', () => setUi({ railOpen: !ui().railOpen }), { keys: 'mod+j', keywords: 'toggle panel rail' });
     for (const t of RAIL_TABS) {
       const title = t.id === 'browser' ? 'Open browser' : t.label;

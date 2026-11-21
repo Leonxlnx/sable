@@ -51,6 +51,7 @@ export const SECTIONS: SectionMeta[] = [
   { id: 'agents', label: 'Agents', icon: 'agents', keywords: 'sub-agents subagents specialists delegate' },
   { id: 'memory', label: 'Memory', icon: 'memory', keywords: 'memory claude.md agents.md instructions files' },
   { id: 'profile', label: 'Profile', icon: 'profile', keywords: 'profile about me profile.md preferences language taste learned remember facts personal' },
+  { id: 'prompts', label: 'Prompts', icon: 'text', keywords: 'prompts saved snippets templates reuse rename edit delete order slash composer' },
   { id: 'shortcuts', label: 'Shortcuts', icon: 'keyboard', gap: true, keywords: 'keyboard shortcuts keys hotkeys bindings' },
   { id: 'about', label: 'About', icon: 'info', keywords: 'about version platform data folder bridge welcome onboarding' },
 ];

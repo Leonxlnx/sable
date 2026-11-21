@@ -1504,6 +1504,8 @@ export type BridgeEvent =
   | { type: 'phone.updated'; status: PhoneStatus }
   /** The user's profile changed (an agent added a fact, or it was edited). */
   | { type: 'profile.updated'; profile: UserProfile }
+  /** The saved prompts changed (all of them, in order). */
+  | { type: 'prompts.updated'; prompts: SavedPrompt[] }
   /** A turn's before / after pictures of a local page were taken or changed state (server/services/capture.ts). */
   | { type: 'capture.updated'; sessionId: string; capture: TurnCapture };
 
@@ -1734,8 +1736,8 @@ export interface PhoneMethods {
 
 export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image'] as const satisfies readonly (keyof PhoneMethods)[];
 
-/** A message that matched a search on the phone (`phone.search`). */
-export interface PhoneSearchHit {
+/** A message that matched a search across chats (`search.messages` on the desktop, `phone.search` on the phone). */
+export interface MessageHit {
   sessionId: string;
   /** A root item of that chat (a message or a text of the agent's). */
   itemId: string;
@@ -1745,11 +1747,15 @@ export interface PhoneSearchHit {
   ts: number;
 }
 
-export interface PhoneSearch {
-  hits: PhoneSearchHit[];
+export interface MessageSearch {
+  hits: MessageHit[];
   /** Some chats were not read in this call (time or bytes ran out): ask again for more. */
   partial?: boolean;
 }
+
+/** The phone's names for the same search (`phone.search`). */
+export type PhoneSearchHit = MessageHit;
+export type PhoneSearch = MessageSearch;
 
 /** A changed file in a chat's Changes view on the phone. */
 export interface PhoneChangedFile {
@@ -2143,6 +2149,40 @@ export interface RpcMethods {
   'usage.limits': { params: Record<string, never>; result: LimitsReport[] };
   /** Local token usage for the last 30 days. Answers at once with what is known; `refresh` scans for changes (pushed as `usage.updated`). */
   'usage.report': { params: { refresh?: boolean }; result: UsageReport };
+
+  /**
+   * Messages across the chats that are not archived (the palette): as `phone.search` reads them,
+   * through the same searcher, with at most `limit` hits and `perChat` per chat. Bounded per call;
+   * `partial` when some chats were not read yet (asking again goes on where it stopped). A newer
+   * call stops one still running, which answers partial.
+   */
+  'search.messages': { params: { query: string; limit?: number; perChat?: number }; result: MessageSearch };
+
+  /** The conversation as Markdown (`server/core/chat-markdown.ts`) and a file name for it. */
+  'session.markdown': { params: { sessionId: string }; result: { markdown: string; fileName: string } };
+  /**
+   * Writes the conversation as Markdown where the person chooses, in the desktop app's save dialog.
+   * `unsupported`: no dialog here (a bridge in a browser): the window downloads `session.markdown` instead.
+   */
+  'session.export': { params: { sessionId: string }; result: { ok: boolean; path?: string; canceled?: boolean; unsupported?: boolean } };
+
+  /** Saved prompts, in the person's order (`<home>/prompts.json`). Changes are pushed as `prompts.updated`. */
+  'prompts.list': { params: Record<string, never>; result: SavedPrompt[] };
+  /** Saves a new prompt (first in the list). An empty name is made from the text. */
+  'prompts.save': { params: { name: string; text: string }; result: SavedPrompt };
+  'prompts.update': { params: { id: string; name?: string; text?: string }; result: SavedPrompt };
+  'prompts.remove': { params: { id: string }; result: { ok: boolean } };
+  /** The prompts in this order (ids; any not named keep their place after them). */
+  'prompts.reorder': { params: { ids: string[] }; result: SavedPrompt[] };
+}
+
+/** A prompt saved under a name: put into the composer from the palette or the `/` menu, never sent by itself. */
+export interface SavedPrompt {
+  id: string;
+  name: string;
+  text: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export type RpcName = keyof RpcMethods;

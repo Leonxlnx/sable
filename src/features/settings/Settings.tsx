@@ -14,6 +14,7 @@ import { Models } from './Models';
 import { Permissions } from './Permissions';
 import { Phone } from './Phone';
 import { Profile } from './Profile';
+import { SavedPrompts } from './SavedPrompts';
 import { matchSections, SECTIONS } from './sections';
 import { Shortcuts } from './Shortcuts';
 import { Skills } from './Skills';
@@ -35,6 +36,7 @@ const VIEWS: Record<SettingsSection, ComponentType> = {
   agents: Agents,
   memory: Memory,
   profile: Profile,
+  prompts: SavedPrompts,
   shortcuts: Shortcuts,
   about: About,
 };

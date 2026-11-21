@@ -19,6 +19,7 @@ import { WaitingCount } from '@/features/triage/WaitingCount';
 import { LaneMark } from '@/features/session/LaneMark';
 import { RaceMark, RaceTitle } from '@/features/race/RaceMark';
 import { raceKey } from '@/features/race/race';
+import { ChatMenu } from '@/features/export/ChatMenu';
 import { shallow } from 'zustand/shallow';
 import { useLaggedStore } from '@/lib/lagged';
 import { railTabAt } from '@/features/rail/tabs';
@@ -701,6 +702,7 @@ function Topbar({ panelShown }: { panelShown: boolean }) {
         <WaitingCount />
         {session && <ContextMeter sessionId={session.id} />}
         {session && <CapabilitiesButton sessionId={session.id} />}
+        {session && <ChatMenu sessionId={session.id} />}
         {/* The sidebar's top row has the search; the bar shows it only while the sidebar is away. */}
         {!sidebarOpen && <IconButton icon="search" label="Search and commands" keys="mod+k" onClick={() => setUi({ paletteOpen: true })} />}
         {/* While the panel shows, its own header carries this toggle at this same spot (beside the
