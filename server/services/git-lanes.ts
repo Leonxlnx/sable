@@ -155,10 +155,20 @@ export async function createLane(o: CreateLaneOptions): Promise<{ lane: SessionL
 /** Renames a lane's branch (its first message names it). Returns the new name, or null. */
 export async function renameLane(lane: SessionLane, slug: string): Promise<string | null> {
   if (!slug) return null;
-  const next = await freeBranch(lane.root, slug);
-  if (next === lane.branch) return null;
-  const r = await runGit(lane.root, ['branch', '-m', lane.branch, next], { timeoutMs: T_FAST });
-  return ok(r) ? next : null;
+  // A busy machine can keep git waiting past the fast timeout (or a scanner holds a ref file for a
+  // moment): the rename is tried again a few times before the made-up name stays.
+  let tried: string | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // A try that timed out may still have gone through: then the branch already has the new name.
+    if (tried && !(await branchExists(lane.root, lane.branch)) && (await branchExists(lane.root, tried))) return tried;
+    const next = await freeBranch(lane.root, slug);
+    tried = next;
+    if (next === lane.branch) return null;
+    const r = await runGit(lane.root, ['branch', '-m', lane.branch, next], { timeoutMs: attempt ? T_TREE : T_FAST });
+    if (ok(r)) return next;
+    await new Promise((res) => setTimeout(res, 400 * (attempt + 1)));
+  }
+  return null;
 }
 
 /** Uncommitted paths of a checkout (repository-relative, untracked included). */
