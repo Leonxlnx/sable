@@ -45,15 +45,16 @@ export function parseLoginPath(stdout: string): string | undefined {
 }
 
 /**
- * `first` stays in front; entries of `rest` follow unless already there. Empty entries and
- * duplicates go, the order of what remains is kept.
+ * `first` stays in front; entries of `rest` follow unless already there. Empty and relative
+ * entries ("." or "node_modules/.bin" in a profile) and duplicates go, the order of what remains
+ * is kept: a relative entry would make every tool Sable starts in a project folder look there first.
  */
 export function mergePath(first: string, ...rest: (string | undefined)[]): string {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const list of [first, ...rest]) {
     for (const entry of (list ?? '').split(DELIM)) {
-      if (!entry || seen.has(entry)) continue;
+      if (!entry || !entry.startsWith('/') || seen.has(entry)) continue;
       seen.add(entry);
       out.push(entry);
     }

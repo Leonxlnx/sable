@@ -147,18 +147,28 @@ const PS_WRAPPER =
   '. ([ScriptBlock]::Create($__sable));' +
   'if ($LASTEXITCODE) { exit $LASTEXITCODE } elseif ($Error.Count) { exit 1 }';
 
-function shellFor(command: string): { cmd: string; args: string[]; env?: Record<string, string> } {
+/**
+ * Windows PowerShell by its full path: the command runs in the project folder, and a bare
+ * `powershell.exe` would be looked up there first, before PATH.
+ */
+export function windowsPowerShell(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.SystemRoot ?? env.windir ?? 'C:\\Windows';
+  const sys = /^[a-zA-Z]:[\\/]/.test(root) ? root : 'C:\\Windows';
+  return path.win32.join(sys, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+export function shellFor(command: string): { cmd: string; args: string[]; env?: Record<string, string> } {
   if (process.platform === 'win32') {
     // npm, pnpm and yarn resolve to .ps1 shims in PowerShell, which Windows' default policy
     // (Restricted) refuses to load: this process may run them (a machine's group policy still wins).
     return {
-      cmd: 'powershell.exe',
+      cmd: windowsPowerShell(),
       args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', PS_WRAPPER],
       env: { SABLE_COMMAND: command },
     };
   }
   const sh = process.env.SHELL;
-  if (sh) return { cmd: sh, args: ['-lc', command] };
+  if (sh && sh.startsWith('/')) return { cmd: sh, args: ['-lc', command] };
   return { cmd: '/bin/sh', args: ['-c', command] };
 }
 

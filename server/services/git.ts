@@ -6,6 +6,7 @@ import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus, Git
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
 import { folderNow, openContained, within as under, type FolderRoot } from '../core/contain';
 import type { App } from '../app';
+import { findProgram } from '../util/which';
 
 // ───────────────────────────── git runner ─────────────────────────────
 
@@ -52,9 +53,17 @@ export function runGit(
       });
     };
     let child: ReturnType<typeof spawn>;
+    const dir = path.resolve(cwd);
+    // git from PATH, never from the folder (server/util/which.ts), and started outside it: `-C`
+    // moves it into the repository, so nothing there is looked up as a program or a library.
+    const git = findProgram('git', { outside: [dir] });
+    if (!git) {
+      resolve({ code: null, stdout: '', stderr: '', missing: true, timedOut: false, truncated: false });
+      return;
+    }
     try {
-      child = spawn('git', ['-c', 'core.quotePath=false', '-c', 'color.ui=false', ...args], {
-        cwd,
+      child = spawn(git, ['-C', dir, '-c', 'core.quotePath=false', '-c', 'color.ui=false', ...args], {
+        cwd: path.dirname(git),
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_PAGER: 'cat', LC_ALL: 'C', ...opts.env },
