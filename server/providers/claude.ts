@@ -1789,7 +1789,8 @@ class ClaudeSession implements ProviderSession {
     // Bypass runs everything without asking. Claude Code's own safety checks still send some calls
     // here in that mode (compound commands, deletes with a glob, protected paths): they run too. Only
     // real questions (AskUserQuestion, above) wait for the person.
-    if (bypassesAsking(rt.meta.mode)) {
+    // Bypass chosen from a phone while this work ran: its asks still wait (`SessionRuntime.dangerHeld`).
+    if (rt.answersAtOnce(bypassesAsking(rt.meta.mode))) {
       if (item && name === 'ExitPlanMode' && input.plan) rt.patch<ToolItem>(item.id, { input, detail: describeTool(name, input).detail });
       return { behavior: 'allow', updatedInput: input };
     }

@@ -52,6 +52,16 @@ export class SessionRuntime {
   handle?: ProviderSession;
   turnActive = false;
   turnStartedAt = 0;
+  /**
+   * A mode that never asks was chosen from a phone while work ran (a turn, background agents): what
+   * that work asks still waits as before (the phone could not be shown it), and the mode answers at
+   * once only from the person's next message on (`App.applyDue` lifts it; review wave 7, #1).
+   */
+  dangerHeld = false;
+  /** The mode answers asks at once now (`danger`: the mode is one that never asks). */
+  answersAtOnce(danger: boolean): boolean {
+    return danger && !this.dangerHeld;
+  }
   /** Messages sent while a turn was running; the app sends them as turns end. */
   queue: QueuedMessage[] = [];
   /**

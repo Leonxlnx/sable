@@ -49,7 +49,7 @@ import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
 import { cutAt } from './core/fork';
 import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
-import { withBrowserLine } from './providers/browser-tool';
+import { allowsEverything, withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
@@ -1000,6 +1000,8 @@ export class App {
 
   /** Sessions whose model changed while their agent was there: it takes the model right before the next message (`speed`: the speed fell back too). */
   private modelDue = new Map<string, { speed: boolean }>();
+  /** Sessions whose agent has not taken the mode a phone chose while work ran (`session.setMode`): it goes with the next message. */
+  private modeDue = new Set<string>();
 
   /**
    * Sets the session's model. Nothing goes to the agent now: a running agent takes it right
@@ -1018,8 +1020,16 @@ export class App {
     if (rt.handle || this.opening.has(rt.id)) this.modelDue.set(rt.id, { speed: speed || !!this.modelDue.get(rt.id)?.speed });
   }
 
+  /** A mode a phone chose during earlier work goes to the agent and answers at once from this message on (never inside a running turn). */
+  private async applyModeDue(rt: SessionRuntime, handle: ProviderSession) {
+    if (rt.turnActive || !(rt.dangerHeld || this.modeDue.has(rt.id))) return;
+    rt.dangerHeld = false;
+    if (this.modeDue.delete(rt.id)) await handle.setMode(rt.meta.mode).catch((err: Error) => this.log('mode change failed', err.message));
+  }
+
   /** A model chosen since the agent started goes to it now (never into a running turn: a steer leaves it for the next message). */
   private async applyDue(rt: SessionRuntime, handle: ProviderSession) {
+    await this.applyModeDue(rt, handle);
     const due = this.modelDue.get(rt.id);
     if (!due || rt.turnActive) {
       // An effort the running agent did not take when it was chosen goes with this message (a change
@@ -1497,6 +1507,7 @@ export class App {
       const handle = await this.ensureHandle(rt);
       // Asked again once the new account's agent is there, and by the agent's own dispatch.
       still(ctx);
+      await this.applyModeDue(rt, handle);
       const unhand = this.handOver(rt, refused.id);
       try {
         await handle.send(this.withHandover(rt, this.resumeMessage(rt, refused, carried)), { check: () => still(ctx) });
@@ -2479,7 +2490,18 @@ export class App {
     });
     this.register('session.setMode', async ({ sessionId, mode, answerWaiting }) => {
       const rt = this.runtime(sessionId);
-      await rt.handle?.setMode(mode);
+      const danger = rt.caps?.modes.find((m) => m.id === mode)?.tone === 'danger' || allowsEverything(mode);
+      // A mode that never asks, chosen from a phone while work runs, answers that work's asks only from the
+      // next message on (review wave 7, #1): the phone could not be shown them. Claude Code's own mode
+      // waits for it too (in Bypass the CLI would stop asking at once); the switch goes with the next message.
+      if (answerWaiting === false && danger && (rt.turnActive || (rt.meta.background ?? 0) > 0)) {
+        rt.dangerHeld = true;
+        this.modeDue.add(rt.id);
+      } else {
+        rt.dangerHeld = false;
+        this.modeDue.delete(rt.id);
+        await rt.handle?.setMode(mode);
+      }
       rt.update({ mode });
       // The mode that never asks (Bypass, Full access) answers what already waits too; questions stay.
       // A phone answers only what it may itself (`answerWaiting: false`, phone.ts).

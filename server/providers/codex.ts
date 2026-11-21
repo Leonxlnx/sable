@@ -1001,7 +1001,13 @@ class CodexSession implements ProviderSession {
   private turnId?: string;
   private turnStarting?: Promise<unknown>;
   private queue: Queued[] = [];
+  /** The mode changed since a start last carried the policy: the next turn/start sends it. */
   private policyDirty = false;
+  /**
+   * Counts mode changes: a start's answer clears `policyDirty` only when no change came after it was
+   * sent (a switch while a Full access start is out must still reach the next turn; review wave 7, #2).
+   */
+  private policyRev = 0;
   private interruptTimer?: NodeJS.Timeout;
   private commandTimer?: NodeJS.Timeout;
   /** The thread reported idle while a turn was open: the turn ends unless turn/completed comes first. */
@@ -1169,6 +1175,7 @@ class CodexSession implements ProviderSession {
     const rt = this.rt;
     const rpc = await this.provider.client();
     const p = preset(rt.meta.mode);
+    const rev = this.policyRev;
     const config = this.threadConfig();
     const developerInstructions = await this.provider.developerInstructions(rt.meta.cwd, rt.meta);
     const params = {
@@ -1205,7 +1212,7 @@ class CodexSession implements ProviderSession {
     if (this.threadId && this.threadId !== resp.thread.id && this.provider.sessions.get(this.threadId) === this) this.provider.sessions.delete(this.threadId);
     this.threadId = resp.thread.id;
     this.loaded = true;
-    this.policyDirty = false;
+    if (rev === this.policyRev) this.policyDirty = false;
     this.provider.sessions.set(this.threadId, this);
     return { resp, resumed };
   }
@@ -1264,6 +1271,7 @@ class CodexSession implements ProviderSession {
     // Applied as a turn/start override, like the model.
   }
   async setMode(_mode: string) {
+    this.policyRev++;
     this.policyDirty = true;
   }
 
@@ -1390,12 +1398,13 @@ class CodexSession implements ProviderSession {
     // The speed as a service tier (it persists for later turns); null asks for standard. Unchosen leaves Codex's own.
     const tier = serviceTierFor(rt.caps?.models.find((x) => x.id === rt.meta.model), rt.meta.speed);
     if (tier !== undefined) params.serviceTier = tier;
+    const rev = this.policyRev;
     if (this.policyDirty) {
       const p = preset(rt.meta.mode);
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }
-    if (await this.dispatchStart(gen, 'turn/start', params, check)) this.policyDirty = false;
+    if ((await this.dispatchStart(gen, 'turn/start', params, check)) && rev === this.policyRev) this.policyDirty = false;
   }
 
   /**
@@ -2256,7 +2265,8 @@ class CodexSession implements ProviderSession {
    * Code's are in Bypass (the switch itself answered the ones already waiting, app.ts).
    */
   private fullAccess(): boolean {
-    return preset(this.rt.meta.mode).approval === 'never';
+    // Chosen from a phone during this work: its asks still wait (`SessionRuntime.dangerHeld`).
+    return this.rt.answersAtOnce(preset(this.rt.meta.mode).approval === 'never');
   }
 
   /** What Full access answers to each kind of ask: allowed once (a later switch back asks again). */
