@@ -195,6 +195,32 @@
   line-height: 1.5;
 }
 
+/* The first chat arrives: the empty state fades where it stood (out of the flow, so the list takes
+   its place at once) and the first rows come in once it has gone (no words cross), never cut in one frame. */
+.side-empty[data-leaving] {
+  position: absolute;
+  inset: 0 4px auto 2px;
+  z-index: 1;
+  pointer-events: none;
+  animation: side-empty-out 110ms linear forwards;
+}
+
+.side-empty[data-leaving] ~ .side-rows {
+  animation: side-rows-in 200ms var(--ease-out) 120ms backwards;
+}
+
+@keyframes side-empty-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes side-rows-in {
+  from {
+    opacity: 0;
+  }
+}
+
 .side-skel {
   display: flex;
   flex-direction: column;

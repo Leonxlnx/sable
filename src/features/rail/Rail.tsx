@@ -66,6 +66,14 @@ function RailInner({ sessionId, open }: { sessionId: string; open: boolean }) {
       lastPanel.leftAt = performance.now();
     };
   }, [sessionId]);
+  // Closing by the key while the pointer rests on a tab: its tooltip stood over the dissolving panel
+  // until the panel had gone (the pointer never leaves a control that is taken away). It is told
+  // the pointer left, as the control's own trigger would be.
+  const root = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (open) return;
+    for (const el of root.current?.querySelectorAll('[aria-describedby]') ?? []) el.dispatchEvent(new PointerEvent('pointerleave', { pointerType: 'mouse' }));
+  }, [open]);
   const cwd = useStore((s) => s.sessions[sessionId]?.cwd ?? '');
   const setUi = useStore((s) => s.setUi);
   const [visited, setVisited] = useState<ReadonlySet<RailTab>>(() => new Set([tab]));
@@ -91,7 +99,7 @@ function RailInner({ sessionId, open }: { sessionId: string; open: boolean }) {
   if (nav.at !== at) setNav({ at, dir: at < nav.at ? 'back' : 'fwd' });
 
   return (
-    <div className="rail" data-spot="">
+    <div className="rail" data-spot="" ref={root}>
       <ResizeHandle />
       <header className="rail-head">
         <RailTabs sessionId={sessionId} cwd={cwd} tab={tab} onPick={(t) => setUi({ railTab: t })} />

@@ -6,6 +6,7 @@ import { bridge } from '@/lib/bridge';
 import { baseName, relPath } from '@/lib/format';
 import { useStore } from '@/state/store';
 import { Kbd, Segmented, Spinner } from '@/ui';
+import { oneOfEach } from './files';
 import { CodeChip, Empty, Skeleton, useContextTarget, Scope } from './parts';
 
 /** Unsaved edits by file path. Module level, so they survive switching sections or closing Settings. */
@@ -69,8 +70,9 @@ function MemoryEditor({ provider, cwd }: { provider: ProviderId; cwd: string }) 
     let live = true;
     bridge
       .call('memory.list', { cwd, provider })
-      .then((list) => {
+      .then((all) => {
         if (!live) return;
+        const list = oneOfEach(all);
         setFiles(list);
         // Start on the project file when it exists, else the first one that does.
         setSelected((cur) => cur ?? (list.find((f) => f.scope === 'project' && f.exists) ?? list.find((f) => f.exists) ?? list[0])?.path ?? null);

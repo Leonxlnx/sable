@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import type { AgentConfigFile, ConfigHook, ProviderId } from '@shared/protocol';
 import { Icon, type IconName } from '@/icons';
 import { FileHead, useAgentConfig } from './AgentConfig';
+import { fileKey } from './files';
 import { useInitialProvider } from './Models';
 import { Card, CodeChip, Empty, ProviderPicker, Skeleton, useContextTarget, Scope } from './parts';
 
@@ -53,7 +54,7 @@ function HookFiles({ provider, cwd }: { provider: ProviderId; cwd: string | null
   return (
     <div className="card set-card">
       {files.map((f) => (
-        <HookFile key={f.path} file={f} cwd={cwd} />
+        <HookFile key={fileKey(f)} file={f} cwd={cwd} />
       ))}
     </div>
   );

@@ -270,6 +270,10 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const canSend = shell ? text.slice(1).trim().length > 0 : trimmed.length > 0 || attachments.length > 0;
   const showStop = variant === 'session' && busy && !canSend;
   const ghost = !text && suggestion && !attachments.length ? suggestion : null;
+  // The suggestion this composer was made with (a chat switched to makes a new one): it stands
+  // there from the first frame. Fading it in left the field blank for five frames on every switch,
+  // between the last chat's suggestion going and this one's arriving.
+  const [bornWith] = useState(() => suggestion);
   const popSide = variant === 'home' ? 'bottom' : 'top';
   const steerable = !!caps?.features.steer;
   const ultraOffered = !!caps?.features.ultracode;
@@ -932,7 +936,7 @@ ${cur}` : draft.text, attachments: draft.attachments });
           />
           <textarea ref={mirror} className="cmp-input cmp-mirror" rows={1} tabIndex={-1} readOnly aria-hidden />
           {ghost && (
-            <div className="cmp-ghost" aria-hidden>
+            <div className="cmp-ghost" data-still={ghost === bornWith || undefined} aria-hidden>
               <span className="cmp-ghost-text">{ghost}</span>
             </div>
           )}

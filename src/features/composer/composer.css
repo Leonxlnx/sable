@@ -194,6 +194,11 @@
   animation: fade-in var(--d-3) var(--ease);
 }
 
+/* The suggestion a composer starts with (a chat switched to) is there at once (Composer `bornWith`). */
+.cmp-ghost[data-still] {
+  animation: none;
+}
+
 .cmp-card[data-shell] .cmp-ghost {
   font-family: var(--font-mono);
   font-size: 13.5px;
@@ -231,6 +236,11 @@
   inset: 0 0 auto;
   color: var(--text-3);
   white-space: nowrap;
+}
+
+/* In a focused field the rolled copy has the tone the real placeholder has there, so the two swap unseen. */
+.cmp-card:focus-within .cmp-roll > .cmp-roll-ph {
+  color: rgb(122 121 117 / 0.72);
 }
 
 /* ── a sent message as liquid (flight.ts, liquid.ts, liquid-shape.ts, liquid-gl.ts) ──
@@ -381,8 +391,11 @@
   background-color: currentColor;
 }
 
+/* Hidden by opacity, not by colour: the placeholder's colour has a transition (focus), so coming
+   back from transparent it was blank for a frame and then faded in when the rolled copy handed
+   over to it (seen after every queued message). */
 .cmp-card[data-rolling] .cmp-input::placeholder {
-  color: transparent;
+  opacity: 0;
 }
 
 /* The suggestion waits too: nothing shows beside the words while they are still leaving. */

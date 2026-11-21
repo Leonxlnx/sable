@@ -5,6 +5,7 @@ import { setSettings } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { Kbd } from '@/ui';
 import { RuleFile, TomlFile, useAgentConfig } from './AgentConfig';
+import { fileKey } from './files';
 import { useInitialProvider } from './Models';
 import { Card, CodeChip, Empty, ModeList, ProviderPicker, Skeleton, useContextTarget, useProviderCaps, Scope } from './parts';
 
@@ -55,7 +56,7 @@ function Rules({ provider, cwd }: { provider: ProviderId; cwd: string | null }) 
         {!files ? (
           error ? <Empty>Could not read the settings files: {error}</Empty> : <Skeleton rows={3} />
         ) : (
-          files.map((f) => (f.format === 'toml' ? <TomlFile key={f.path} file={f} /> : <RuleFile key={f.path} file={f} cwd={cwd} />))
+          files.map((f) => (f.format === 'toml' ? <TomlFile key={fileKey(f)} file={f} /> : <RuleFile key={fileKey(f)} file={f} cwd={cwd} />))
         )}
       </Card>
       <p className="set-foot-note">

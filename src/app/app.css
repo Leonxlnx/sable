@@ -96,6 +96,23 @@
   padding-left: var(--gap);
 }
 
+/* The panel sliding in over the conversation's edge, in a window where the column cannot keep its
+   width (App.tsx `slideRail`): its column has no width yet, so the stage beside it is not laid out
+   again while it moves; the panel is drawn out of it, over the stage, on the app's ground (its gap
+   to the stage must not show the conversation through). The column takes its width when the slide ends. */
+.app-rail[data-step] {
+  position: relative;
+  z-index: 10;
+  overflow: visible;
+}
+
+.app-rail[data-step] > .app-rail-inner {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background-color: var(--sheet);
+}
+
 /* ── topbar ── */
 
 .topbar {

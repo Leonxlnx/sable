@@ -232,10 +232,11 @@ export function ConversationFind({ sessionId }: { sessionId: string }) {
           className="cfind glass"
           role="search"
           aria-label="Find in conversation"
-          initial={{ opacity: 0, y: -6 }}
-          animate={{ opacity: 1, y: 0 }}
+          // The entrance is a CSS animation (find.css): it runs on the compositor from the first
+          // frame the bar is painted in. A spring stepped from here showed one faint frame, then
+          // nothing for 76 ms while the bar's first search and focus held the main thread.
+          initial={false}
           exit={{ opacity: 0, y: -4, transition: { duration: 0.09 } }}
-          transition={{ type: 'spring', stiffness: 520, damping: 38 }}
         >
           <label className="cfind-field">
             <Icon name="search" size={14} />

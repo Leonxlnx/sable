@@ -166,6 +166,13 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
   }, [ready]);
 
   const empty = ready && !groups.pinned.length && !groups.top.length;
+  // The empty state went in one frame when the first chat arrived, a frame before its row: it fades out instead.
+  const [wasEmpty, setWasEmpty] = useState(empty);
+  const [leaving, setLeaving] = useState(false);
+  if (wasEmpty !== empty) {
+    setWasEmpty(empty);
+    setLeaving(wasEmpty && !empty && !reducedMotion());
+  }
   // Any change of membership, not only of order: an entry that grows or shrinks moves the ones below it.
   const order = `pinned:${idsOf(groups.pinned)}` + groups.top.map(entryOrder).join('');
 
@@ -174,15 +181,11 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
       {!ready ? (
         <SkeletonRows />
       ) : empty ? (
-        <div className="side-empty">
-          <p>Open a folder to start your first session.</p>
-          <button type="button" className="btn btn-sm" onClick={() => setUi({ projectPicker: true })}>
-            <Icon name="folder-plus" size={14} />
-            Open a folder
-          </button>
-        </div>
+        <SideEmpty />
       ) : (
         <MotionConfig reducedMotion="user">
+          {/* The first chat ever: the empty state fades where it stood while the first row comes in after it. */}
+          {leaving && <SideEmpty onGone={() => setLeaving(false)} />}
           <div className="side-shield" aria-hidden />
           <Flip order={order} className="side-rows" beforeMeasure={releaseFolderDrag}>
             {groups.pinned.length > 0 && (
@@ -215,6 +218,20 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
 const folderOrder = (g: ProjectGroup) => `${g.key}:${idsOf(g.sessions)}:${g.archived.length}`;
 const entryOrder = (e: TopEntry) =>
   e.kind === 'folder' ? `\n${folderOrder(e.folder)}` : e.kind === 'group' ? `\n${e.key}{${e.folders.map(folderOrder).join(',')}}` : `\nchats:${idsOf(e.chats.sessions)}:${e.chats.archived.length}`;
+
+/** The list's empty state. With `onGone` it is on its way out: laid over the list, fading, then removed. */
+function SideEmpty({ onGone }: { onGone?: () => void }) {
+  const setUi = useStore((s) => s.setUi);
+  return (
+    <div className="side-empty" data-leaving={onGone ? '' : undefined} inert={!!onGone} aria-hidden={onGone ? true : undefined} onAnimationEnd={onGone}>
+      <p>Open a folder to start your first session.</p>
+      <button type="button" className="btn btn-sm" onClick={() => setUi({ projectPicker: true })}>
+        <Icon name="folder-plus" size={14} />
+        Open a folder
+      </button>
+    </div>
+  );
+}
 
 function SkeletonRows() {
   return (

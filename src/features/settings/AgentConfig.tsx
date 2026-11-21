@@ -5,6 +5,7 @@ import { Icon, type IconName } from '@/icons';
 import { bridge } from '@/lib/bridge';
 import { relPath } from '@/lib/format';
 import { useStore } from '@/state/store';
+import { oneOfEach } from './files';
 import { CodeChip } from './parts';
 
 /**
@@ -25,7 +26,8 @@ export function useAgentConfig(provider: ProviderId, cwd: string | null): { file
     let live = true;
     bridge
       .call('config.read', { provider, cwd: cwd ?? undefined })
-      .then((files) => {
+      .then((all) => {
+        const files = oneOfEach(all);
         cache.set(key, files);
         if (live) setState({ key, files });
       })

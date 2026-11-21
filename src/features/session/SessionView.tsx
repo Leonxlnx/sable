@@ -8,6 +8,7 @@ import { EASE_OUT, play } from '@/lib/motion';
 import { useStore } from '@/state/store';
 import { DOCK_GLIDE_MS } from './dock-glide';
 import { ConversationFind } from './FindBar';
+import { useStaged } from './staged';
 import './session.css';
 
 /**
@@ -18,11 +19,13 @@ import './session.css';
 export function SessionView({ sessionId }: { sessionId: string }) {
   // Only what the view needs: usage ticks while streaming must not re-render the whole view.
   const status = useStore((s) => s.sessions[sessionId]?.status);
+  // Under a first message in the air only the conversation mounts; the find bar follows the landing.
+  const extras = useStaged('landed');
   if (!status) return null;
   return (
     <div className="session" data-status={status}>
       <Timeline sessionId={sessionId} />
-      <ConversationFind sessionId={sessionId} />
+      {extras && <ConversationFind sessionId={sessionId} />}
     </div>
   );
 }
@@ -64,6 +67,10 @@ export function SessionLight({ sessionId }: { sessionId: string }) {
 export function SessionDock({ sessionId }: { sessionId: string }) {
   const dock = useRef<HTMLDivElement>(null);
   const exists = useStore((s) => !!s.sessions[sessionId]);
+  // The first message from home: the card flying to the dock stands in for the composer, which
+  // mounts a frame after the conversation (its own task), the prompt cards after the landing.
+  const composer = useStaged('soon');
+  const cards = useStaged('landed');
 
   // The timeline pads its end by the dock's height so nothing hides behind the glass. Set on the
   // stage body, which holds both the conversation and the dock.
@@ -93,8 +100,8 @@ export function SessionDock({ sessionId }: { sessionId: string }) {
   return (
     <div className="dock" ref={dock}>
       <div className="dock-inner">
-        <PromptDock key={`p:${sessionId}`} sessionId={sessionId} />
-        <Composer key={sessionId} sessionId={sessionId} variant="session" autoFocus />
+        {cards && <PromptDock key={`p:${sessionId}`} sessionId={sessionId} />}
+        {composer && <Composer key={sessionId} sessionId={sessionId} variant="session" autoFocus />}
       </div>
     </div>
   );
