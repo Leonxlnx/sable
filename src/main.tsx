@@ -9,8 +9,15 @@ import { startBridge, useStore } from './state/store';
 import { startSpot } from './ui/spot';
 
 // The desktop shell's preload exposes this; app.css uses the attribute for the title bar.
-const desktop = (window as { sableDesktop?: { platform: string; debug?: boolean } }).sableDesktop;
+const desktop = (window as { sableDesktop?: { platform: string; debug?: boolean; window?: { getState(): Promise<{ fullScreen: boolean }>; onState(cb: (s: { fullScreen: boolean }) => void): () => void } } }).sableDesktop;
 if (desktop) document.documentElement.dataset.desktop = desktop.platform;
+// macOS hides its traffic lights in full screen: app.css drops the room kept for them (data-fs).
+if (desktop?.platform === 'darwin' && desktop.window) {
+  const root = document.documentElement;
+  const show = (s: { fullScreen: boolean }) => (s.fullScreen ? (root.dataset.fs = '') : delete root.dataset.fs);
+  desktop.window.getState().then(show, () => {});
+  desktop.window.onState(show);
+}
 
 startBridge();
 startSpot();

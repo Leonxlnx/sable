@@ -5,7 +5,7 @@ import { baseName, tildePath } from '@/lib/format';
 import { skillLabeller } from '@/lib/skills';
 import { SECTIONS as SETTINGS_SECTIONS } from '@/features/settings/sections';
 import { openImport } from '@/features/history/History';
-import { goHome, interrupt, openSession, openSettings, switchAgent } from '@/state/actions';
+import { checkForUpdate, goHome, interrupt, openSession, openSettings, switchAgent } from '@/state/actions';
 import { RAIL_TABS, railTabKeys } from '@/features/rail/tabs';
 import { getScripts, runScriptInPanel } from '@/features/rail/scripts-store';
 import { focusComposer } from '@/state/hooks';
@@ -127,6 +127,10 @@ export function buildItems(opts: {
   }
 
   act('shortcuts', 'Keyboard shortcuts', 'keyboard', () => openSettings('shortcuts'), { keywords: 'keys hotkeys bindings' });
+  // Desktop only: a dev or standalone bridge has no updates to check.
+  const update = useStore.getState().update;
+  if (update && update.status !== 'unsupported')
+    act('update', 'Check for updates', 'reload', () => void checkForUpdate(), { keywords: 'update upgrade version release new' });
 
   // ── project scripts (run1): "Run dev" for the open session's folder, in its Terminal tab ──
   if (opts.active) {

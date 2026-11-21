@@ -239,11 +239,14 @@ export class ClaudeProvider implements Provider {
 
   async info(force = false): Promise<ProviderInfo> {
     if (!force && this.infoCache && Date.now() - this.infoCache.at < 30_000) return this.infoCache.info;
+    // The same binary the SDK runs (SABLE_CLAUDE_BIN, set by the desktop shell), so the check does
+    // not depend on what PATH the app was started with.
+    const bin = claudeBinary() ?? 'claude';
     const [ver, status, text] = await Promise.all([
-      runCli('claude', ['--version'], { timeoutMs: 12_000, env: this.env() }),
-      runCli('claude', ['auth', 'status', '--json'], { timeoutMs: 12_000, env: this.env() }),
+      runCli(bin, ['--version'], { timeoutMs: 12_000, env: this.env() }),
+      runCli(bin, ['auth', 'status', '--json'], { timeoutMs: 12_000, env: this.env() }),
       // The CLI's own name for the plan ("Login method: Claude Max account"); JSON has only a raw id.
-      runCli('claude', ['auth', 'status', '--text'], { timeoutMs: 12_000, env: this.env() }),
+      runCli(bin, ['auth', 'status', '--text'], { timeoutMs: 12_000, env: this.env() }),
     ]);
     const info: ProviderInfo = { id: 'claude', name: this.name, installed: !ver.missing && ver.code === 0, auth: { loggedIn: false } };
     if (info.installed) info.version = ver.stdout.trim().split(/\s+/)[0];
@@ -1053,7 +1056,7 @@ export function titleOptions(prompt: TitlePrompt, env: NodeJS.ProcessEnv, abortC
     effort: 'low',
     maxTurns: 1,
     persistSession: false,
-    env: { ...env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: TITLE_MAX_TOKENS, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+    env: { ...env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: prompt.maxTokens ?? TITLE_MAX_TOKENS, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
     pathToClaudeCodeExecutable: claudeBinary(),
     abortController,
     stderr: () => {},

@@ -21,7 +21,7 @@ export const CHECK_TOOL = 'sable_check';
 export const CHECK_LEAD = 'Review the changes another coding agent just made in this folder.';
 export const NO_PROBLEMS = 'No problems found.';
 
-const NAMES: Record<ProviderId, string> = { claude: 'Claude Code', codex: 'Codex', demo: 'Demo' };
+const NAMES: Record<ProviderId, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', demo: 'Demo' };
 export const agentName = (id: ProviderId) => NAMES[id] ?? id;
 
 /** The agent that checks a turn of `provider`: the other one. A Demo chat checks with Demo. */

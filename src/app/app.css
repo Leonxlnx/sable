@@ -602,12 +602,13 @@ html[data-wc] .palette {
   top: max(calc(var(--strip-h) + 16px), calc(13 * var(--vh)));
 }
 
-/* macOS: the traffic lights sit at the top left, over the sidebar's first row or the top bar. */
-html[data-desktop='darwin'] .side-brand {
+/* macOS: the traffic lights sit at the top left, over the sidebar's first row or the top bar.
+   In full screen they are hidden (main.tsx sets data-fs), and the room kept for them goes. */
+html[data-desktop='darwin']:not([data-fs]) .side-brand {
   padding-left: calc(78px - var(--gap) - 2px);
 }
 
-html[data-desktop='darwin'] .app[data-sidebar='false'] .topbar {
+html[data-desktop='darwin']:not([data-fs]) .app[data-sidebar='false'] .topbar {
   padding-left: calc(78px - var(--gap));
 }
 
@@ -664,6 +665,10 @@ body:has(.stage-dock) .toasts {
 
 .toast[data-level='error'] svg {
   color: var(--red);
+}
+
+.toast[data-level='warn'] svg {
+  color: var(--amber);
 }
 
 .toast[data-level='success'] svg {

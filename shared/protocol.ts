@@ -9,7 +9,7 @@
 
 // ───────────────────────────── providers & auth ─────────────────────────────
 
-export type ProviderId = 'claude' | 'codex' | 'demo';
+export type ProviderId = 'claude' | 'codex' | 'opencode' | 'demo';
 
 export interface AuthState {
   loggedIn: boolean;
@@ -107,6 +107,8 @@ export interface ModelInfo {
    * Code: every model it reports). Absent when the agent does not say (older caches).
    */
   picker?: boolean;
+  /** The section the model menu lists it under (OpenCode: where the model comes from, "Free", "OpenCode Go"); models of one group are listed together. */
+  group?: string;
   /** Speeds beyond standard the agent can run this model at (Claude Code's fast mode, Codex's service tiers). */
   speeds?: SpeedInfo[];
 }
@@ -167,7 +169,8 @@ export interface McpToolInfo {
 
 export interface McpServerInfo {
   name: string;
-  status: 'connected' | 'failed' | 'needs-auth' | 'pending' | 'disabled';
+  /** `configured`: named in the agent's config; the agent does not report whether it started (OpenCode). */
+  status: 'connected' | 'failed' | 'needs-auth' | 'pending' | 'disabled' | 'configured';
   scope?: string;
   error?: string;
   version?: string;
@@ -1344,6 +1347,8 @@ export interface AppSettings {
   phoneAwake?: boolean;
   /** At a plan limit, a session carries on with the next signed-in account of its agent that has room. Absent means off. */
   continueAtLimit?: boolean;
+  /** At a plan limit with no other account to take over, the chat waits for the reset and then carries on by itself. Absent means off. */
+  continueAtReset?: boolean;
   /** Per account (`${provider}:${accountId}`): carry on with credits or extra usage at a limit, before the next account. Absent means off. */
   creditsAtLimit?: Record<string, boolean>;
   /** A notification when a window of an account at its limit resets. Absent means off. */
@@ -1364,6 +1369,11 @@ export interface AppSettings {
    * (`AppState.chatsDefault`: "Sable chats" on the D: drive when there is one, else in the home folder).
    */
   chatsFolder?: string;
+  /**
+   * Where Sable makes the worktrees of its lanes (one per session that shares a folder). Absent
+   * means `<Sable home>/lanes`; a `~` at the start is the person's home folder.
+   */
+  worktreesFolder?: string;
   /**
    * Per account (`${provider}:${accountId}`): how much of its plan limits Sable may use. Past it, a
    * session moves between turns to the next signed-in account of its agent that is under its own cap.
@@ -1393,14 +1403,26 @@ export interface AgentConfigFile {
   path: string;
   scope: 'user' | 'project' | 'local';
   exists: boolean;
-  format: 'json' | 'toml';
+  /** `jsonc`: shown as text, secrets masked (OpenCode's opencode.json). */
+  format: 'json' | 'toml' | 'jsonc';
   /** The file exists but could not be read or parsed. */
   error?: string;
   permissions?: ConfigPermissions;
   hooks?: ConfigHook[];
-  /** TOML files: the text with secret values masked, capped at 64 KB. */
+  /** TOML and JSONC files: the text with secret values masked, capped at 64 KB. */
   raw?: string;
   truncated?: boolean;
+}
+
+/** A working tree of a repository: the main checkout first, then each linked worktree. */
+export interface GitWorktree {
+  path: string;
+  /** The checked-out branch; undefined when detached. */
+  branch?: string;
+  /** Short hash of HEAD. */
+  head?: string;
+  /** The repository's main checkout (the first entry). */
+  main: boolean;
 }
 
 export interface GitCommitResult {
@@ -1409,6 +1431,29 @@ export interface GitCommitResult {
   hash?: string;
   /** First line of the commit message. */
   summary?: string;
+  error?: string;
+}
+
+/** What a pull request for the folder's branch would bring, and a draft of its title and description. */
+export interface GitPullContext {
+  isRepo: boolean;
+  /** The checked-out branch; undefined when detached. */
+  branch?: string;
+  /** The branch the pull request merges into: the repository's default branch. */
+  base?: string;
+  /** Whether a remote named origin exists. */
+  remote: boolean;
+  /** Subjects of the commits the base does not have, oldest first. */
+  commits: string[];
+  title: string;
+  body: string;
+}
+
+export interface GitPullRequestResult {
+  ok: boolean;
+  /** The pull request's address on GitHub (also when one already existed for the branch). */
+  url?: string;
+  number?: number;
   error?: string;
 }
 
@@ -1428,6 +1473,8 @@ export interface AppState {
   chatsOrder?: number;
   /** Where chats without a folder go when `settings.chatsFolder` is not set. */
   chatsDefault?: string;
+  /** Where lanes' worktrees go when `settings.worktreesFolder` is not set. */
+  worktreesDefault?: string;
   /** Every session's open permission requests and questions, so a window sees what waits on the user without loading each timeline. */
   prompts?: PendingPrompts;
   /** Updates of the desktop app (absent in older bridges and where Sable cannot update itself). */
@@ -2065,8 +2112,16 @@ export interface RpcMethods {
   'git.status': { params: { cwd: string }; result: GitStatus };
   'git.diff': { params: { cwd: string; path?: string; staged?: boolean }; result: FileDiff[] };
   'git.branches': { params: { cwd: string }; result: { current?: string; branches: string[] } };
+  /** The repository's working trees (git worktree list), without locked, prunable or missing ones. */
+  'git.worktrees': { params: { cwd: string }; result: GitWorktree[] };
   /** Stages everything (`git add -A`) and commits it with `message`. */
   'git.commit': { params: { cwd: string; message: string }; result: GitCommitResult };
+  /** A commit message written by a small model from the folder's changes. Stages and commits nothing. */
+  'git.draft': { params: { cwd: string }; result: { ok: boolean; message?: string; error?: string } };
+  /** The branch, its base and a draft title and description for a pull request. Pushes nothing. */
+  'pulls.context': { params: { cwd: string }; result: GitPullContext };
+  /** Pushes the branch to origin, then opens a pull request for it with gh. */
+  'pulls.create': { params: { cwd: string; title: string; body: string; base: string; draft: boolean }; result: GitPullRequestResult };
 
   /** The agent's own settings files (permission rules, hooks), read-only and without secrets. */
   'config.read': { params: { provider: ProviderId; cwd?: string }; result: AgentConfigFile[] };

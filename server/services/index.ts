@@ -9,6 +9,7 @@ import { registerGit } from './git';
 import { registerMemory } from './memory';
 import { registerPhone } from './phone';
 import { registerProfile } from './profile';
+import { registerPulls } from './pulls';
 import { registerScripts } from './scripts';
 import { registerTerm } from './term';
 import { registerUsage } from './usage';
@@ -33,4 +34,5 @@ export function registerServices(app: App, opts: ServiceOptions = {}) {
   registerPhone(app);
   registerProfile(app);
   registerCapture(app);
+  registerPulls(app);
 }

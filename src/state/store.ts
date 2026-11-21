@@ -78,7 +78,7 @@ export interface AuthFlow {
 
 export interface Toast {
   id: number;
-  level: 'info' | 'success' | 'error';
+  level: 'info' | 'success' | 'warn' | 'error';
   text: string;
 }
 
@@ -136,6 +136,8 @@ export interface Store {
   chatsOrder?: number;
   /** Where chats without a folder go when Settings names no place. */
   chatsDefault: string;
+  /** Where lanes' worktrees go when Settings names no place. */
+  worktreesDefault: string;
   /** Updates of the desktop app; absent where Sable cannot update itself. */
   update?: UpdateState;
   settings: AppSettings;
@@ -204,6 +206,16 @@ function touched(d: SessionData, ids: readonly string[], patch?: Partial<Session
 
 let toastId = 1;
 
+/** The release whose "New update available" toast this window already showed. */
+let announcedUpdate: string | undefined;
+
+/** Once per release and window: a downloaded update says so, whether the start check found it or a later one did. */
+function announceUpdate(u: UpdateState | undefined) {
+  if (!u || u.status !== 'ready' || !u.latest || announcedUpdate === u.latest) return;
+  announcedUpdate = u.latest;
+  useStore.getState().toast('New update available');
+}
+
 export const useStore = create<Store>((set, get) => ({
   conn: 'connecting',
   ready: false,
@@ -215,6 +227,7 @@ export const useStore = create<Store>((set, get) => ({
   projects: [],
   groups: [],
   chatsDefault: '',
+  worktreesDefault: '',
   settings: DEFAULT_SETTINGS,
   backdropLive: null,
   sessions: {},
@@ -266,7 +279,7 @@ export const useStore = create<Store>((set, get) => ({
   toast: (text, level = 'info') => {
     const id = toastId++;
     set((s) => ({ toasts: [...s.toasts, { id, level, text }] }));
-    window.setTimeout(() => get().dismissToast(id), level === 'error' ? 7000 : 3800);
+    window.setTimeout(() => get().dismissToast(id), level === 'error' ? 7000 : level === 'warn' ? 6000 : 3800);
   },
 
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
@@ -607,6 +620,7 @@ export function applyEvent(e: BridgeEvent) {
       return;
     case 'update.state':
       useStore.setState({ update: e.state });
+      announceUpdate(e.state);
       return;
     default:
       return;
@@ -649,6 +663,7 @@ async function hello() {
       groups: app.groups ?? [],
       chatsOrder: app.chatsOrder,
       chatsDefault: app.chatsDefault ?? '',
+      worktreesDefault: app.worktreesDefault ?? '',
       update: app.update,
       settings: app.settings,
       sessions,
@@ -657,6 +672,7 @@ async function hello() {
       ui: { ...s.ui, activeSessionId: active, homeProvider, homeAccount, homeCwd: s.ui.homeCwd ?? app.projects[0]?.path ?? null },
     };
   });
+  announceUpdate(app.update);
   const active = useStore.getState().ui.activeSessionId;
   if (active) void loadSession(active);
   // Limits remembered from earlier runs, so nothing waits for an agent to answer.

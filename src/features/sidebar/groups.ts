@@ -95,7 +95,7 @@ function attentionOf(list: SessionMeta[]): Attention {
   return best;
 }
 
-const AGENT_ORDER: ProviderId[] = ['claude', 'codex', 'demo'];
+const AGENT_ORDER: ProviderId[] = ['claude', 'codex', 'opencode', 'demo'];
 
 type Sortable = { name: string; last: number; order: number };
 

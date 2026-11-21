@@ -7,7 +7,7 @@
  */
 
 /** The numbers: how many idle Remote Control processes stay, and how long after a chat's last use. */
-export const REMOTE_KEEP = { max: 6, idleMs: 45 * 60_000 };
+export const REMOTE_KEEP = { max: 2, idleMs: 15 * 60_000 };
 
 export interface RemoteHolder {
   /** The chat (for logs). */

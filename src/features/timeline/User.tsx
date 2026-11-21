@@ -2,6 +2,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import type { UserItem } from '@shared/protocol';
 import { stripWrappers } from '@shared/synthetic';
 import { CopyButton } from '@/components/CopyButton';
+import { ImageView } from '@/components/ImageView';
 import { Icon } from '@/icons';
 import { formatBytes } from '@/lib/format';
 import { rewindTo } from '@/state/actions';
@@ -164,9 +165,9 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
         {images.length > 0 && (
           <div className="user-images">
             {images.map((a) => (
-              <a key={a.id} className="user-thumb" href={a.dataUrl} target="_blank" rel="noopener noreferrer" title={a.name}>
-                <img src={a.dataUrl} alt={a.name} loading="lazy" />
-              </a>
+              <ImageView key={a.id} src={a.dataUrl!} alt={a.name} className="user-thumb">
+                <img src={a.dataUrl} alt="" loading="lazy" />
+              </ImageView>
             ))}
           </div>
         )}

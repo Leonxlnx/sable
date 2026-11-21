@@ -3,13 +3,15 @@ import type { FolderOrder, ProviderId, SessionOptions } from '@shared/protocol';
 import { Icon } from '@/icons';
 import { desktop } from '@/lib/desktop';
 import { tildePath } from '@/lib/format';
-import { setChatsFolder, setDefaultSessionOptions, setSettings } from '@/state/actions';
+import { setChatsFolder, setDefaultSessionOptions, setSettings, setWorktreesFolder } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { Kbd, PathLabel, Segmented, Switch } from '@/ui';
 import { Card, ProviderLabel, Row, useInstalled } from './parts';
 
 export function General() {
   const settings = useStore((s) => s.settings);
+  const chatsDefault = useStore((s) => s.chatsDefault);
+  const worktreesDefault = useStore((s) => s.worktreesDefault);
   const installed = useInstalled();
 
   return (
@@ -37,7 +39,8 @@ export function General() {
             ]}
           />
         </Row>
-        <ChatsFolderRow />
+        <FolderSettingRow label="Chats folder" chosen={settings.chatsFolder?.trim() || ''} fallback={chatsDefault} onSet={setChatsFolder} />
+        <FolderSettingRow label="Worktrees folder" chosen={settings.worktreesFolder?.trim() || ''} fallback={worktreesDefault} onSet={setWorktreesFolder} />
         <Row
           label="Send with Enter"
           help={
@@ -77,12 +80,10 @@ export function General() {
 }
 
 /**
- * Where a chat started without a folder gets its own folder: the system's folder dialog in the
- * desktop app, a field in the browser. "Default" goes back to the place Sable picks.
+ * A folder Sable makes things in (chats, worktrees): the system's folder dialog in the desktop app,
+ * a field in the browser. "Default" goes back to the place Sable picks.
  */
-function ChatsFolderRow() {
-  const chosen = useStore((s) => s.settings.chatsFolder?.trim() || '');
-  const fallback = useStore((s) => s.chatsDefault);
+function FolderSettingRow({ label, chosen, fallback, onSet }: { label: string; chosen: string; fallback: string; onSet: (path: string) => unknown }) {
   const home = useStore((s) => s.home);
   const [editing, setEditing] = useState(false);
   const current = chosen || fallback;
@@ -90,29 +91,29 @@ function ChatsFolderRow() {
   const change = async () => {
     if (desktop?.pickFolder) {
       const picked = await desktop.pickFolder(current).catch(() => null);
-      if (picked) void setChatsFolder(picked);
+      if (picked) void onSet(picked);
       return;
     }
     setEditing(true);
   };
 
   return (
-    <Row label="Chats folder">
+    <Row label={label}>
       {editing ? (
         <input
           className="field set-chats-field"
           defaultValue={current}
-          aria-label="Chats folder"
+          aria-label={label}
           spellCheck={false}
           autoFocus
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
-              void setChatsFolder(e.currentTarget.value);
+              void onSet(e.currentTarget.value);
               setEditing(false);
             } else if (e.key === 'Escape') setEditing(false);
           }}
           onBlur={(e) => {
-            if (e.currentTarget.value.trim() !== current) void setChatsFolder(e.currentTarget.value);
+            if (e.currentTarget.value.trim() !== current) void onSet(e.currentTarget.value);
             setEditing(false);
           }}
         />
@@ -120,7 +121,7 @@ function ChatsFolderRow() {
         <div className="set-chats">
           {current && <PathLabel path={tildePath(current, home)} title={current} className="set-chats-path" />}
           {chosen && (
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => void setChatsFolder('')}>
+            <button type="button" className="btn btn-sm btn-ghost" onClick={() => void onSet('')}>
               Default
             </button>
           )}
@@ -146,7 +147,7 @@ const OWN = new Set<keyof SessionOptions>(['remoteControl', 'browserTab']);
 /** What new sessions start with, per agent, and whether the agent starts before the first send. */
 function SessionDefaults() {
   const settings = useStore((s) => s.settings);
-  const installed: ProviderId[] = useInstalled().filter((p) => p !== 'demo');
+  const installed: ProviderId[] = useInstalled().filter((p) => p !== 'demo' && p !== 'opencode');
   const [provider, setProvider] = useState<ProviderId>(() => (installed.includes(settings.defaultProvider) ? settings.defaultProvider : (installed[0] ?? 'claude')));
   const opts = settings.sessionOptions?.[provider] ?? {};
   // Codex: absent means its own config decides (its plugin is on when installed).

@@ -55,7 +55,7 @@ function Rules({ provider, cwd }: { provider: ProviderId; cwd: string | null }) 
         {!files ? (
           error ? <Empty>Could not read the settings files: {error}</Empty> : <Skeleton rows={3} />
         ) : (
-          files.map((f) => (f.format === 'toml' ? <TomlFile key={f.path} file={f} /> : <RuleFile key={f.path} file={f} cwd={cwd} />))
+          files.map((f) => (f.format !== 'json' ? <TomlFile key={f.path} file={f} /> : <RuleFile key={f.path} file={f} cwd={cwd} />))
         )}
       </Card>
       <p className="set-foot-note">
@@ -66,6 +66,10 @@ function Rules({ provider, cwd }: { provider: ProviderId; cwd: string | null }) 
         ) : provider === 'codex' ? (
           <>
             Read-only. Set <CodeChip text="approval_policy" copy={false} /> and <CodeChip text="sandbox_mode" copy={false} /> in the file to change what Codex may do without asking.
+          </>
+        ) : provider === 'opencode' ? (
+          <>
+            Read-only. Set <CodeChip text="permission" copy={false} /> in <CodeChip text="opencode.json" copy={false} /> to allow, ask or deny what OpenCode may do. Allow all answers every prompt with yes while a chat uses it.
           </>
         ) : (
           'An example of what rules look like. The demo agent does not read any files.'

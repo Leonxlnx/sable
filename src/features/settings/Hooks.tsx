@@ -27,9 +27,17 @@ export function Hooks() {
       <div className="set-toolbar">
         <ProviderPicker id="set-hooks-provider" value={provider} onChange={setProvider} />
         <span className="grow" />
-        {provider !== 'codex' && <Scope cwd={cwd} />}
+        {provider !== 'codex' && provider !== 'opencode' && <Scope cwd={cwd} />}
       </div>
-      {provider === 'codex' ? (
+      {provider === 'opencode' ? (
+        <div className="card set-card">
+          <Empty>
+            <span>
+              OpenCode has no hooks. It loads plugins from <CodeChip text="~/.config/opencode/plugins" copy={false} /> and from a project's <CodeChip text=".opencode/plugins" copy={false} />.
+            </span>
+          </Empty>
+        </div>
+      ) : provider === 'codex' ? (
         <div className="card set-card">
           <Empty>
             <span>

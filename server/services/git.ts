@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { open, stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus } from '../../shared/protocol';
+import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus, GitWorktree } from '../../shared/protocol';
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
 import type { App } from '../app';
 
@@ -368,6 +368,45 @@ export async function gitBranches(cwd: string): Promise<{ current?: string; bran
   return { current, branches };
 }
 
+/**
+ * The working trees of the repository at `cwd`, main checkout first (lanes included). Bare,
+ * locked and prunable entries are left out, and so is any tree whose folder is gone.
+ */
+export async function gitWorktrees(cwd: string): Promise<GitWorktree[]> {
+  const dir = path.resolve(cwd);
+  if (!(await repoRoot(dir))) return [];
+  const r = await runGit(dir, ['worktree', 'list', '--porcelain'], { timeoutMs: 5000 });
+  if (r.code !== 0) return [];
+  const blocks = r.stdout
+    .split(/\r?\n\r?\n/)
+    .map((b) => b.trim())
+    .filter(Boolean);
+  const out: GitWorktree[] = [];
+  for (const [i, block] of blocks.entries()) {
+    const fields = new Map<string, string>();
+    for (const line of block.split(/\r?\n/)) {
+      const sp = line.indexOf(' ');
+      fields.set(sp < 0 ? line : line.slice(0, sp), sp < 0 ? '' : line.slice(sp + 1));
+    }
+    const tree = fields.get('worktree');
+    if (!tree || fields.has('bare') || fields.has('locked') || fields.has('prunable')) continue;
+    const resolved = path.resolve(tree);
+    try {
+      if (!(await stat(resolved)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const ref = fields.get('branch');
+    out.push({
+      path: resolved,
+      branch: ref ? ref.replace(/^refs\/heads\//, '') : undefined,
+      head: fields.get('HEAD')?.slice(0, 7) || undefined,
+      main: i === 0,
+    });
+  }
+  return out;
+}
+
 /** The last meaningful lines of git's complaint, without hint noise. */
 export function gitError(r: GitResult, fallback: string): string {
   if (r.missing) return 'Git is not installed or not on PATH.';
@@ -401,6 +440,34 @@ export async function gitCommit(cwd: string, message: string): Promise<GitCommit
   const head = await runGit(dir, ['log', '-1', '--format=%h%x00%s'], { timeoutMs: 5000 });
   const [hash, summary] = head.stdout.trim().split('\0');
   return { ok: true, hash: hash || undefined, summary: summary ?? msg.split('\n')[0] };
+}
+
+/** What a commit message is written from: the changed files, the start of the diff, the recent subjects. */
+export interface CommitDraftInput {
+  files: string[];
+  patch: string;
+  subjects: string[];
+}
+
+/** The changes of a folder for a commit message, without staging anything. `{ error }` when there is nothing to describe. */
+export async function gitDraftInput(cwd: string): Promise<CommitDraftInput | { error: string }> {
+  const dir = path.resolve(cwd);
+  if (!(await repoRoot(dir))) return { error: 'This folder is not a git repository.' };
+  const st = await runGit(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { timeoutMs: 15_000 });
+  if (st.code !== 0) return { error: gitError(st, 'Could not read the changes.') };
+  const files = st.stdout.split('\0').filter(Boolean).map((e) => e.slice(3));
+  if (!files.length) return { error: 'Nothing to commit.' };
+  const head = await runGit(dir, ['rev-parse', '--verify', '-q', 'HEAD'], { timeoutMs: 5000 });
+  if (head.code !== 0) return { files, patch: '', subjects: [] };
+  const [diff, log] = await Promise.all([
+    runGit(dir, ['diff', 'HEAD', '--no-color', '--no-ext-diff', '-M'], { timeoutMs: 20_000, maxBytes: 4_000_000 }),
+    runGit(dir, ['log', '-8', '--format=%s'], { timeoutMs: 5000 }),
+  ]);
+  return {
+    files,
+    patch: diff.code === 0 ? diff.stdout : '',
+    subjects: log.stdout.split('\n').map((s) => s.trim()).filter(Boolean),
+  };
 }
 
 export function registerGit(app: App) {

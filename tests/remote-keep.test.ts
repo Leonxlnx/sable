@@ -28,7 +28,7 @@ describe('remoteToRelease', () => {
     const now = Date.now();
     const hs = Array.from({ length: 9 }, (_, i) => holder(`s${i}`, now - i * 60_000));
     const out = remoteToRelease(hs.map((h) => h.api), now).map((h) => h.id);
-    expect(out).toEqual(['s6', 's7', 's8']);
+    expect(out).toEqual(hs.slice(REMOTE_KEEP.max).map((h) => h.id));
     const old = holder('old', now - REMOTE_KEEP.idleMs - 1);
     expect(remoteToRelease([old.api], now).map((h) => h.id)).toEqual(['old']);
   });
@@ -56,12 +56,12 @@ describe('the keeper', () => {
   it('a chat used again stays longer', () => {
     const a = holder('a', Date.now());
     holdRemote(a.api);
-    vi.advanceTimersByTime(30 * 60_000);
+    vi.advanceTimersByTime(REMOTE_KEEP.idleMs * 0.6);
     a.at = Date.now();
     holdRemote(a.api);
-    vi.advanceTimersByTime(30 * 60_000);
+    vi.advanceTimersByTime(REMOTE_KEEP.idleMs * 0.6);
     expect(a.released).toBe(0);
-    vi.advanceTimersByTime(20 * 60_000);
+    vi.advanceTimersByTime(REMOTE_KEEP.idleMs * 0.5);
     expect(a.released).toBe(1);
   });
 

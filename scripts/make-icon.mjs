@@ -1,6 +1,9 @@
 // Renders the Sable mark (src/art/Logo.tsx, public/favicon.svg) as the desktop app icon:
 // build/icon.ico (16, 20, 24, 32, 40, 48, 64, 96, 128, 256 px, PNG-compressed entries) and
-// build/icon.png (512 px). Each size is drawn at its own pixel size in headless Edge (or Chrome)
+// build/icon.png (512 px), plus the macOS icon: build/icon.icns (16 to 1024 px, with the 2x sizes)
+// and build/icon-mac.png (1024 px, the Dock icon of `electron .`). A Mac icon is not full bleed: the
+// plate is the "Big Sur" squircle at 80% of the canvas with a soft drop shadow, so it sits in the
+// Dock at the same size as every other app. Each size is drawn at its own pixel size in headless Edge (or Chrome)
 // through playwright-core, the same way scripts/shot.mjs launches it.
 //
 // The mark is a 4 x 4 field of square cells: a solid block whose last corner dissolves into
@@ -49,6 +52,60 @@ function svg(size) {
 </svg>`;
 }
 
+/**
+ * The macOS icon at one pixel size: the plate on an 824/1024 squircle (corner radius 22.4% of the
+ * plate), a short soft shadow under it, and the mark at the same share of the plate as on Windows.
+ */
+function macSvg(size) {
+  const plate = size * (824 / 1024);
+  const at0 = (size - plate) / 2;
+  const radius = plate * 0.2237;
+  // The mark spans 62% of the plate; whole pixels at small sizes so the cells stay sharp.
+  const exact = (plate * 0.62) / 4;
+  const cell = size <= 256 ? Math.max(1, Math.round(exact)) : exact;
+  const nudge = size >= 64 ? Math.round(cell * 0.07) : 0;
+  const at = (size - cell * 4) / 2 + nudge;
+  const hair = size >= 64 ? Math.max(1, Math.round(size / 256)) : 0;
+  const shadow = size >= 32 ? `<filter id="s" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="${(size * 0.011).toFixed(2)}" stdDeviation="${(size * 0.012).toFixed(2)}" flood-color="#000" flood-opacity="0.42"/></filter>` : '';
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+  ${shadow ? `<defs>${shadow}</defs>` : ''}
+  <rect x="${at0}" y="${at0}" width="${plate}" height="${plate}" rx="${radius}" fill="${INK}"${shadow ? ' filter="url(#s)"' : ''}/>
+  ${hair ? `<rect x="${at0 + hair / 2}" y="${at0 + hair / 2}" width="${plate - hair}" height="${plate - hair}" rx="${radius - hair / 2}" fill="none" stroke="#fff" stroke-opacity="0.12" stroke-width="${hair}"/>` : ''}
+  <path transform="translate(${at} ${at}) scale(${cell})" fill="${IVORY}" d="${MARK_PATH}" shape-rendering="crispEdges"/>
+</svg>`;
+}
+
+/** The sizes of an .icns file: [type code, pixel size]. The 2x entries are the next size up under the smaller name. */
+const ICNS = [
+  ['icp4', 16],
+  ['icp5', 32],
+  ['icp6', 64],
+  ['ic07', 128],
+  ['ic08', 256],
+  ['ic09', 512],
+  ['ic10', 1024],
+  ['ic11', 32],
+  ['ic12', 64],
+  ['ic13', 256],
+  ['ic14', 512],
+];
+
+/** An ICNS container: 'icns', its length, then one chunk (type, length, PNG) per size. */
+function icns(images) {
+  const chunks = ICNS.map(([type, size]) => {
+    const png = images.get(size);
+    const head = Buffer.alloc(8);
+    head.write(type, 0, 'ascii');
+    head.writeUInt32BE(png.length + 8, 4);
+    return Buffer.concat([head, png]);
+  });
+  const total = 8 + chunks.reduce((n, c) => n + c.length, 0);
+  const head = Buffer.alloc(8);
+  head.write('icns', 0, 'ascii');
+  head.writeUInt32BE(total, 4);
+  return Buffer.concat([head, ...chunks]);
+}
+
 /** An ICO container with PNG entries: a 6-byte header, a 16-byte directory entry per image, then the PNGs. */
 function ico(images) {
   const header = Buffer.alloc(6 + 16 * images.length);
@@ -85,17 +142,31 @@ try {
     await page.setContent(`<!doctype html><style>html,body{margin:0;background:transparent}svg{display:block}</style>${svg(size)}`);
     return page.locator('svg').screenshot({ omitBackground: true, type: 'png' });
   };
+  const renderMac = async (size) => {
+    await page.setViewportSize({ width: Math.max(size, 64), height: Math.max(size, 64) });
+    await page.setContent(`<!doctype html><style>html,body{margin:0;background:transparent}svg{display:block}</style>${macSvg(size)}`);
+    return page.locator('svg').screenshot({ omitBackground: true, type: 'png' });
+  };
   const images = [];
   for (const size of ICO_SIZES) images.push({ size, png: await render(size) });
   mkdirSync(out, { recursive: true });
   writeFileSync(path.join(out, 'icon.ico'), ico(images));
   writeFileSync(path.join(out, 'icon.png'), await render(512));
+  const mac = new Map();
+  for (const size of new Set(ICNS.map(([, n]) => n))) mac.set(size, await renderMac(size));
+  writeFileSync(path.join(out, 'icon.icns'), icns(mac));
+  writeFileSync(path.join(out, 'icon-mac.png'), mac.get(1024));
+  if (process.argv.includes('--previews')) {
+    const dir = path.join(root, 'scratch', 'icon');
+    mkdirSync(dir, { recursive: true });
+    for (const [size, png] of mac) writeFileSync(path.join(dir, `mac-${size}.png`), png);
+  }
   if (process.argv.includes('--previews')) {
     const dir = path.join(root, 'scratch', 'icon');
     mkdirSync(dir, { recursive: true });
     for (const { size, png } of images) writeFileSync(path.join(dir, `app-${size}.png`), png);
   }
-  console.log(`Wrote build/icon.ico (${ICO_SIZES.join(', ')} px) and build/icon.png (512 px)`);
+  console.log(`Wrote build/icon.ico (${ICO_SIZES.join(', ')} px), build/icon.png (512 px), build/icon.icns and build/icon-mac.png (1024 px)`);
 } finally {
   await browser.close();
 }

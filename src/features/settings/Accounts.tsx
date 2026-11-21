@@ -15,6 +15,7 @@ export function Accounts() {
   const providers = useStore((s) => s.providers);
   const ready = useStore((s) => s.ready);
   const carryOn = useStore((s) => !!s.settings.continueAtLimit);
+  const resumeAtReset = useStore((s) => !!s.settings.continueAtReset);
   const notifyReset = useStore((s) => !!s.settings.notifyLimitReset);
   const backHome = useStore((s) => !!s.settings.returnToPreferred);
   const order = connectableAgents(providers);
@@ -43,6 +44,10 @@ export function Accounts() {
       <label className="acct-auto" data-spot>
         <span className="acct-auto-label">Continue with the next account at a limit</span>
         <Switch checked={carryOn} onChange={(v) => void setSettings({ continueAtLimit: v })} label="Continue with the next account at a limit" />
+      </label>
+      <label className="acct-auto" data-spot>
+        <span className="acct-auto-label">Continue when the usage resets</span>
+        <Switch checked={resumeAtReset} onChange={(v) => void setSettings({ continueAtReset: v })} label="Continue when the usage resets" />
       </label>
       <label className="acct-auto" data-spot>
         <span className="acct-auto-label">Return to the preferred account when its limit resets</span>

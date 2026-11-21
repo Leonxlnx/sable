@@ -273,7 +273,7 @@ function buildCandidates(files: string[]): Candidate[] {
 }
 
 function candidates(cwd: string): Promise<Candidate[]> {
-  const key = process.platform === 'win32' ? cwd.toLowerCase() : cwd;
+  const key = process.platform === 'win32' || process.platform === 'darwin' ? cwd.toLowerCase() : cwd;
   const hit = cache.get(key);
   const now = Date.now();
   if (hit && now - hit.at < CACHE_MS) return hit.list;

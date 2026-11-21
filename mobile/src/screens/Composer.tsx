@@ -49,7 +49,7 @@ const unsure = new Map<string, { text: string; at: number }>();
 const LOST = /connection to the desktop was lost|did not answer in time/i;
 
 /** The agents a chat can switch to, in the desktop's order. */
-const AGENTS: ProviderId[] = ['claude', 'codex'];
+const AGENTS: ProviderId[] = ['claude', 'codex', 'opencode'];
 const signedIn = (p: ProviderInfo | undefined) => !!p?.installed && (p.accounts?.length ? p.accounts.some((a) => a.auth.loggedIn) : !!p.auth?.loggedIn);
 /** `/model <name>` typed as a message: picks the model (or switches the agent), never sent. */
 const MODEL_CMD = /^\/model(?:\s+([\s\S]*))?$/i;

@@ -73,7 +73,7 @@ export function useNewChat(active: boolean): NewChoice {
     });
 
   const agents = useMemo(
-    () => (['claude', 'codex', 'demo'] as ProviderId[]).filter((id) => providers[id]?.installed && (id === 'demo' || providers[id]?.auth.loggedIn)),
+    () => (['claude', 'codex', 'opencode', 'demo'] as ProviderId[]).filter((id) => providers[id]?.installed && (id === 'demo' || providers[id]?.auth.loggedIn)),
     [providers],
   );
   const pick = (id?: ProviderId) => (id && agents.includes(id) ? id : undefined);

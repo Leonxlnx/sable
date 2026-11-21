@@ -21,7 +21,7 @@ const PALETTES: Record<Palette, [RGB, RGB, RGB]> = {
   amber: [hex('#5c3c06'), hex('#e0a838'), hex('#fff0c8')],
 };
 
-export const paletteFor = (p: ProviderId | undefined): Palette => (p === 'codex' ? 'iris' : p === 'demo' ? 'mint' : 'ember');
+export const paletteFor = (p: ProviderId | undefined): Palette => (p === 'codex' ? 'iris' : p === 'demo' || p === 'opencode' ? 'mint' : 'ember');
 
 /** The palette's middle colour, for pieces of the field drawn elsewhere (CSS). */
 export const paletteRgb = (p: Palette) => PALETTES[p];

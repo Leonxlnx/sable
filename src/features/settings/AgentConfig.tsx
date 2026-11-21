@@ -135,20 +135,22 @@ export function RuleFile({ file, cwd }: { file: AgentConfigFile; cwd: string | n
   );
 }
 
-/** A TOML config file shown as text (Codex). */
+/** A config file shown as text: Codex's TOML, OpenCode's JSON with comments. */
 export function TomlFile({ file }: { file: AgentConfigFile }) {
   const home = useStore((s) => s.home);
+  const jsonc = file.format === 'jsonc';
+  const agent = jsonc ? 'OpenCode' : 'Codex';
   return (
     <div className="cfg-file">
       <div className="cfg-head">
         <div className="cfg-head-text">
-          <span className="cfg-scope">Config file</span>
-          <span className="cfg-scope-help">Approval policy, sandbox and everything else Codex reads</span>
+          <span className="cfg-scope">{jsonc ? (file.scope === 'project' ? 'Project config' : 'User config') : 'Config file'}</span>
+          <span className="cfg-scope-help">{jsonc ? 'Permissions, MCP servers, models and everything else OpenCode reads' : 'Approval policy, sandbox and everything else Codex reads'}</span>
         </div>
         <CodeChip text={relPath(file.path, null, home)} label="Copy path" />
       </div>
       {!file.exists ? (
-        <p className="cfg-empty">No config file yet. Codex runs with its defaults.</p>
+        <p className="cfg-empty">No config file yet. {agent} runs with its defaults.</p>
       ) : file.error ? (
         <p className="cfg-empty" data-tone="error">
           <Icon name="warning" size={14} />
@@ -158,7 +160,7 @@ export function TomlFile({ file }: { file: AgentConfigFile }) {
         <p className="cfg-empty">The file is empty.</p>
       ) : (
         <div className="cfg-code">
-          <CodeBlock code={file.raw} lang="toml" title="config.toml" maxHeight={420} />
+          <CodeBlock code={file.raw} lang={jsonc ? 'json' : 'toml'} title={jsonc ? relPath(file.path, null, home).split(/[\/]/).pop() : 'config.toml'} maxHeight={420} />
           <p className="cfg-note">{file.truncated ? 'Showing the first 64 KB. ' : ''}Values that look like secrets are hidden.</p>
         </div>
       )}

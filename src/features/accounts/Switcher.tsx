@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
-import type { AccountInfo, ProviderId } from '@shared/protocol';
+import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId } from '@shared/protocol';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { LimitDot, LimitsGlance } from '@/features/usage';
 import { Icon } from '@/icons';
-import { openSettings, setDefaultAccount } from '@/state/actions';
+import { openSettings, refreshLimits, setDefaultAccount } from '@/state/actions';
 import { accountName, useFocusAccount } from '@/state/hooks';
-import { useStore } from '@/state/store';
+import { accountKey, useStore } from '@/state/store';
 import { AccountUsed, ManyAccounts, MANY_ACCOUNTS, planOf, PoolFigure, usePool } from './ManyAccounts';
 import { poolLeftPercent } from '@/features/usage/plans';
 import { accountAgents, accountsOf, openAddAccount, planWord } from './model';
@@ -28,6 +28,13 @@ export function AccountSwitcher() {
   const reduce = useReducedMotion();
   const contentRef = useRef<HTMLDivElement>(null);
 
+  // OpenCode is listed once its plan limits are known: one read when it is installed and not read yet.
+  const openCodeReady = !!providers.opencode?.installed;
+  const openCodeRead = useStore((s) => s.limitReports[accountKey('opencode', DEFAULT_ACCOUNT)]?.readAt !== undefined);
+  useEffect(() => {
+    if (openCodeReady && !openCodeRead) void refreshLimits('opencode');
+  }, [openCodeReady, openCodeRead]);
+
   // As the menu opens, the account in use takes the focus (pointer or keys alike), so its limits
   // show beside the menu at once. After Radix's own focus on open, at the start of a frame (a focus
   // move forces a style pass, and the menu's styles were just invalidated).
@@ -47,7 +54,8 @@ export function AccountSwitcher() {
     return () => cancelAnimationFrame(r);
   }, [open]);
 
-  const agents = accountAgents(providers);
+  const reports = useStore((s) => s.limitReports);
+  const agents = accountAgents(providers, (id) => reports[accountKey(id, DEFAULT_ACCOUNT)]?.planLimits === true);
   const signedIn = agents.filter((id) => accountsOf(providers[id]).some((a) => a.auth.loggedIn));
   const focus: ProviderId = signedIn.includes(active) || agents.includes(active) ? active : (signedIn[0] ?? agents[0] ?? active);
   const list = accountsOf(providers[focus]);

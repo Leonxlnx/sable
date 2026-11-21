@@ -1367,6 +1367,11 @@ button.xrow-head:disabled:hover {
   width: 96px;
 }
 
+.about-upd-new {
+  color: var(--text);
+  font-weight: var(--w-medium);
+}
+
 .about-upd-error {
   color: var(--red);
 }

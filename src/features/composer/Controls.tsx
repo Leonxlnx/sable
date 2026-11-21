@@ -8,7 +8,9 @@ import { Icon, MODE_ICON } from '@/icons';
 import { baseName, tildePath } from '@/lib/format';
 import { fuzzy } from '@/lib/fuzzy';
 import { modelName, visibleModels } from '@/lib/models';
-import { currentBranch } from '@/lib/workspace';
+import { worktrees } from '@/lib/workspace';
+import { pathKey } from '@/features/sidebar/groups';
+import type { GitWorktree } from '@shared/protocol';
 import { goHomeChat, homeAccountId, openSettings, setHomeAccount, switchAgent } from '@/state/actions';
 import { accountName } from '@/state/hooks';
 import { capsKey, ensureProviderCaps, refreshStaleCaps, useStore } from '@/state/store';
@@ -315,16 +317,28 @@ export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed 
                   </div>
                 )}
                 <div className="mm-list scroll">
-                  {rows.map(({ m, name, hit }) => {
+                  {rows.map(({ m, name, hit }, i) => {
                     const current = m.id === choice.modelId;
+                    // Models in sections (OpenCode: free, Zen, Go...): a label where a section begins.
+                    const section = m.group && m.group !== rows[i - 1]?.m.group ? m.group : undefined;
                     return (
-                      <RM.Item key={m.id} className="menu-item mm-row" data-mrow data-current={current || undefined} onSelect={() => pick(m.id)} {...guard}>
+                      <Fragment key={m.id}>
+                        {section && (
+                          <>
+                            {i > 0 && <RM.Separator className="menu-sep" />}
+                            <div className="mm-group" role="presentation">
+                              {section}
+                            </div>
+                          </>
+                        )}
+                      <RM.Item className="menu-item mm-row" data-mrow data-current={current || undefined} onSelect={() => pick(m.id)} {...guard}>
                         <ProviderMark provider={choice.provider} size={14} className="mm-mark" />
                         <span className="mm-name truncate" data-origin-anchor>
                           <Hits text={name} indices={hit?.indices} />
                         </span>
                         <span className="mm-check">{current && <Icon name="check" size={14} />}</span>
                       </RM.Item>
+                      </Fragment>
                     );
                   })}
                   {away.length > 0 && rows.length > 0 && <RM.Separator className="menu-sep" />}
@@ -359,7 +373,7 @@ export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed 
 });
 
 const NO_OTHERS: { provider: ProviderId; m: ModelInfo }[] = [];
-const AGENTS: ProviderId[] = ['claude', 'codex'];
+const AGENTS: ProviderId[] = ['claude', 'codex', 'opencode'];
 
 /**
  * In a session, the models of the other agents the user is signed in to (what their own pickers
@@ -382,22 +396,6 @@ function useOtherAgentModels(choice: Choice, open: boolean) {
 }
 
 // ───────────────────────── home chips ─────────────────────────
-
-function useBranch(cwd: string | null) {
-  const [branch, setBranch] = useState<string | null>(null);
-  useEffect(() => {
-    setBranch(null);
-    if (!cwd) return;
-    let live = true;
-    currentBranch(cwd)
-      .then((b) => live && setBranch(b ?? null))
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, [cwd]);
-  return branch;
-}
 
 function AgentMenu({ onClosed }: { onClosed: () => void }) {
   const provider = useStore((s) => s.ui.homeProvider);
@@ -555,19 +553,89 @@ function FolderMenu({ onClosed }: { onClosed: () => void }) {
   );
 }
 
+/** The working tree a folder is in: the longest worktree path that holds it. */
+function treeOf(list: GitWorktree[], folder: string): GitWorktree | undefined {
+  const k = pathKey(folder);
+  let best: GitWorktree | undefined;
+  for (const w of list) {
+    const wk = pathKey(w.path);
+    if ((k === wk || k.startsWith(`${wk}/`)) && (!best || wk.length > pathKey(best.path).length)) best = w;
+  }
+  return best;
+}
+
+/** A working tree's name: its branch, or where a detached checkout is. */
+const treeName = (w: GitWorktree) => w.branch ?? `Detached at ${w.head ?? 'HEAD'}`;
+
+/** The repository's working trees for a folder; [] outside a repository. */
+function useTrees(cwd: string | null): GitWorktree[] {
+  const [list, setList] = useState<GitWorktree[]>([]);
+  useEffect(() => {
+    setList([]);
+    if (!cwd) return;
+    let live = true;
+    worktrees(cwd)
+      .then((l) => live && setList(l))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [cwd]);
+  return list;
+}
+
+/**
+ * The working tree of the chosen folder, beside the folder chip. When the repository has other
+ * working trees (a folder per branch), the chip is a menu that switches between them, the main
+ * checkout included.
+ */
 function BranchChip() {
   const cwd = useStore((s) => (s.ui.homeChat ? null : s.ui.homeCwd));
-  const branch = useBranch(cwd);
-  if (!cwd || !branch) return null;
+  const setUi = useStore((s) => s.setUi);
+  const list = useTrees(cwd);
+  const current = cwd ? treeOf(list, cwd) : undefined;
+  if (!cwd || !current) return null;
+  const label = treeName(current);
+  if (list.length < 2) {
+    return (
+      <Tip label="Current branch" side="bottom">
+        <span className="hc hc-static" tabIndex={0} aria-label={`Branch: ${label}`}>
+          <Icon name="branch" size={15} className="hc-icon" />
+          <Morph k={label}>
+            <span className="truncate">{label}</span>
+          </Morph>
+        </span>
+      </Tip>
+    );
+  }
   return (
-    <Tip label="Current branch" side="bottom">
-      <span className="hc hc-static" tabIndex={0} aria-label={`Branch: ${branch}`}>
-        <Icon name="branch" size={15} className="hc-icon" />
-        <Morph k={branch}>
-          <span className="truncate">{branch}</span>
-        </Morph>
-      </span>
-    </Tip>
+    <RM.Root modal={false}>
+      <RM.Trigger asChild>
+        <button type="button" className="hc" aria-label={`Working tree: ${label}`}>
+          <Icon name="branch" size={15} className="hc-icon" />
+          <Morph k={label}>
+            <span className="truncate">{label}</span>
+          </Morph>
+          <Icon name="caret-down" size={10} className="hc-caret" />
+        </button>
+      </RM.Trigger>
+      <RM.Portal>
+        <RM.Content className="pop cm-pop" data-spot side="bottom" align="start" sideOffset={8} collisionPadding={10} style={{ width: 240 }}>
+          {list.map((w) => {
+            const name = treeName(w);
+            const folder = baseName(w.path);
+            return (
+              <RM.Item key={w.path} className="menu-item cm-row" title={w.path} onSelect={() => setUi({ homeCwd: w.path, homeChat: false })}>
+                <Icon name="branch" size={15} className="hc-icon" />
+                <span className="cm-row-name grow truncate">{name}</span>
+                {folder !== name && <span className="cm-row-dim truncate">{folder}</span>}
+                <span className="cm-check">{pathKey(w.path) === pathKey(current.path) && <Icon name="check" size={14} />}</span>
+              </RM.Item>
+            );
+          })}
+        </RM.Content>
+      </RM.Portal>
+    </RM.Root>
   );
 }
 

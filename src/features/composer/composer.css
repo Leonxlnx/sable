@@ -1065,6 +1065,103 @@
   transition: opacity 360ms var(--ease);
 }
 
+/* The rainbow: a conic gradient whose angle turns, drawn only in a ring around the card (the
+   padding area, masked to it). Two rings: a crisp one at the edge and a wider, dimmer bloom.
+   Only the custom angle animates, so the rings repaint and nothing else does. */
+@property --uc-ang {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes uc-spin {
+  to {
+    --uc-ang: 360deg;
+  }
+}
+
+@keyframes uc-ring-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 0.45;
+  }
+}
+
+@keyframes uc-bloom-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 0.14;
+  }
+}
+
+.uc-ring,
+.uc-bloom {
+  position: absolute;
+  pointer-events: none;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box exclude,
+    linear-gradient(#000 0 0);
+  animation: uc-spin 7s linear infinite;
+}
+
+/* One even spectrum around the whole edge, quiet and low in opacity, turning slowly. No bright
+   head and no gaps: the colour is the light, not a shape moving through it. */
+.uc-ring {
+  inset: -1px;
+  padding: 1px;
+  border-radius: 21px;
+  opacity: 0.45;
+  background: conic-gradient(
+    from var(--uc-ang),
+    rgb(255 120 130),
+    rgb(255 190 110),
+    rgb(210 230 130),
+    rgb(110 225 180),
+    rgb(100 200 255),
+    rgb(140 130 255),
+    rgb(220 130 255),
+    rgb(255 120 130)
+  );
+  animation:
+    uc-spin 14s linear infinite,
+    uc-ring-in 480ms var(--ease-out) backwards;
+}
+
+.uc-bloom {
+  inset: -4px;
+  padding: 4px;
+  border-radius: 24px;
+  opacity: 0.14;
+  background: conic-gradient(
+    from var(--uc-ang),
+    rgb(255 120 130),
+    rgb(255 190 110),
+    rgb(210 230 130),
+    rgb(110 225 180),
+    rgb(100 200 255),
+    rgb(140 130 255),
+    rgb(220 130 255),
+    rgb(255 120 130)
+  );
+  animation:
+    uc-spin 14s linear infinite,
+    uc-bloom-in 560ms var(--ease-out) backwards;
+}
+
+.uc[data-phase='drain'] > .uc-ring,
+.uc[data-phase='drain'] > .uc-bloom {
+  opacity: 0;
+  transition: opacity 360ms var(--ease);
+}
+
 /* The charge lands: the whole edge takes the light at once and settles into the hairline (opacity only). */
 .uc-flash {
   position: absolute;
@@ -1091,6 +1188,25 @@
   .uc-flash {
     display: none;
   }
+
+  .uc-ring,
+  .uc-bloom {
+    animation: none;
+  }
+
+  .uc-bloom {
+    opacity: 0.14;
+  }
+}
+
+/* When the governor sheds effects, the rainbow stops turning and the bloom goes. */
+:root[data-quality] .uc-ring,
+:root[data-quality] .uc-bloom {
+  animation: none;
+}
+
+:root[data-quality] .uc-bloom {
+  display: none;
 }
 
 /* ── send and stop keys share one slot ── */
@@ -1535,6 +1651,14 @@
   align-items: center;
 }
 
+/* A working tree's folder name, when it differs from the branch shown beside it. */
+.cm-row-dim {
+  font-size: var(--t-ui);
+  color: var(--text-3);
+  min-width: 0;
+  max-width: 45%;
+}
+
 .cm-row-name {
   font-size: var(--t-ui);
   color: var(--text);
@@ -1575,6 +1699,14 @@
 .mm-list > *,
 .mm-pop > :not(.mm-list) {
   flex-shrink: 0;
+}
+
+.mm-group {
+  padding: 6px 8px 3px;
+  font-size: var(--t-small, 11.5px);
+  font-weight: var(--w-medium);
+  color: var(--text-3);
+  pointer-events: none;
 }
 
 .mm-row {

@@ -1,0 +1,50 @@
+/* Create pull request: the button under a clean working tree, and its dialog. */
+
+.pr-action {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  padding: 4px 16px 16px;
+}
+
+.pr-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pr-form {
+  display: grid;
+  gap: 14px;
+}
+
+.pr-label {
+  display: grid;
+  gap: 6px;
+  font-size: var(--t-ui);
+  color: var(--text-2);
+}
+
+.pr-body {
+  resize: vertical;
+  min-height: 120px;
+  line-height: 1.5;
+}
+
+.pr-route,
+.pr-note {
+  margin: 0;
+  font-size: var(--t-ui);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.pr-route {
+  color: var(--text-3);
+}
+
+.pr-link {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}

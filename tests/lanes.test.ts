@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createLane, forecastLane, landLane, laneSlug, removeLane, renameLane } from '../server/services/git-lanes';
+import { worktreesRoot } from '../server/core/lanes';
 import type { SessionLane } from '@shared/protocol';
 
 const temps: string[] = [];
@@ -195,5 +196,17 @@ describe('lanes', { timeout: 30_000 }, () => {
     expect(await createLane({ folder: home, dir: path.join(home, 'l'), slug: 'x' })).toEqual({ error: 'This folder is not a git repository.' });
     git(home, 'init', '-q');
     expect(await createLane({ folder: home, dir: path.join(home, 'l'), slug: 'x' })).toEqual({ error: 'This repository has no commits yet.' });
+  });
+});
+
+describe('worktrees folder', () => {
+  it('defaults to the lanes folder under Sable home, and resolves a chosen folder and ~', () => {
+    const user = path.resolve('/people/ada');
+    const sable = path.join(user, '.sable');
+    expect(worktreesRoot(undefined, user, sable)).toBe(path.join(sable, 'lanes'));
+    expect(worktreesRoot('  ', user, sable)).toBe(path.join(sable, 'lanes'));
+    expect(worktreesRoot('~/Worktrees', user, sable)).toBe(path.resolve(user, 'Worktrees'));
+    expect(worktreesRoot('~', user, sable)).toBe(path.resolve(user));
+    expect(worktreesRoot(path.resolve('/data/wt'), user, sable)).toBe(path.resolve('/data/wt'));
   });
 });

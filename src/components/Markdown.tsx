@@ -8,6 +8,7 @@ import { PENDING_HREF, lexBlocks, repairTail, type LexState } from '@/lib/md';
 import { FenceWidget, MermaidBlock, WIDGET_FENCE } from '@/features/genui/blocks';
 import { numericColumns, TableCopy, wideColumns } from '@/features/genui/table';
 import { CodeBlock } from './CodeBlock';
+import { ImageView } from './ImageView';
 import './markdown.css';
 
 export interface MarkdownProps {
@@ -143,7 +144,11 @@ function inline(tokens: Token[] | undefined, live: boolean, path: string): React
       case 'image': {
         const im = t as Tokens.Image;
         if (!SAFE_SRC.test(im.href)) return <span key={key}>{im.text}</span>;
-        return <img key={key} className="md-img" src={im.href} alt={im.text} title={im.title ?? undefined} loading="lazy" decoding="async" />;
+        return (
+          <ImageView key={key} src={im.href} alt={im.text}>
+            <img className="md-img" src={im.href} alt={im.text} title={im.title ?? undefined} loading="lazy" decoding="async" />
+          </ImageView>
+        );
       }
       case 'html':
         // Raw HTML is shown as written, never interpreted.

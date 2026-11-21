@@ -15,6 +15,8 @@ export interface TitlePrompt {
   user: string;
   /** The chat's folder (a one-shot agent runs there; it reads nothing of it). */
   cwd: string;
+  /** The output cap in tokens as a string (a title's by default). */
+  maxTokens?: string;
 }
 
 /** Asks a model for a title: its raw answer, or null when it gave none. */

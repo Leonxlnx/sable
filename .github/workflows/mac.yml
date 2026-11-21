@@ -1,0 +1,109 @@
+name: macOS build
+
+# Builds Sable for macOS on GitHub's own Macs (a Mac app can only be built on a Mac), checks that
+# the result is a sound app, and starts it once to prove it runs. Run it by hand from the Actions
+# tab ("Run workflow"), or let it run when a release is published: the disk images and zips are then
+# added to that release (the in-app updater on a Mac reads the zip).
+#
+# The app is signed ad hoc ("-" in package.json > build > mac > identity): it runs, but macOS asks the
+# person to allow it once (README, "Install"). With an Apple Developer ID, remove that line and add
+# the CSC_LINK, CSC_KEY_PASSWORD and APPLE_* secrets; electron-builder then signs and notarizes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the files to (empty: only keep them as a workflow artifact)'
+        required: false
+        default: ''
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    name: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # The Claude Code binary for this chip comes with the Agent SDK as an optional dependency of the
+      # same chip (build-electron.mjs stages it), which is why each chip builds on its own runner.
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build the app
+        run: pnpm desktop:build
+
+      - name: Package (disk image and zip)
+        run: pnpm exec electron-builder --mac --${{ matrix.arch }} --publish never --config.directories.output=release-mac
+
+      - name: Check the app
+        run: |
+          set -euo pipefail
+          APP="release-mac/mac-${{ matrix.arch }}/Sable.app"
+          [ -d "$APP" ] || APP="release-mac/mac/Sable.app"
+          echo "app: $APP"
+          lipo -archs "$APP/Contents/MacOS/Sable"
+          lipo -archs "$APP/Contents/Resources/claude/claude"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dvv "$APP" 2>&1 | grep -E "Identifier|Signature|flags|TeamIdentifier" || true
+          codesign -d --entitlements - "$APP/Contents/Resources/claude/claude" 2>&1 | head -20 || true
+          # The bundled agent has to run on its own.
+          "$APP/Contents/Resources/claude/claude" --version
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+      # Starts the packaged app the way the repository's other checks do: demo agent, throwaway data
+      # folders, one screenshot of the first screen, then it quits. A failure here is reported but
+      # does not stop the files from being published (a runner may have no usable display).
+      - name: Start the app once
+        continue-on-error: true
+        env:
+          SABLE_DEMO: '1'
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/sable-home" "$RUNNER_TEMP/sable-user" shots
+          export SABLE_HOME="$RUNNER_TEMP/sable-home" SABLE_USER_DATA="$RUNNER_TEMP/sable-user"
+          "$APP/Contents/MacOS/Sable" --screenshot="$PWD/shots/first-screen-${{ matrix.arch }}.png" --wait=2500 2>&1 | tee shots/start-${{ matrix.arch }}.log
+          ls -la shots
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sable-mac-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            release-mac/*.dmg
+            release-mac/*.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Sable-mac-${{ matrix.arch }}-first-screen
+          if-no-files-found: ignore
+          path: shots/
+
+      - name: Attach to the release
+        if: github.event_name == 'release' || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" release-mac/*.dmg release-mac/*.zip --clobber
