@@ -58,6 +58,7 @@ import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
 import { Lanes, worktreesRoot } from './core/lanes';
 import { isAllModelsWeekly } from './core/limit-policy';
+import { windowForModel, windowModel } from '../shared/limit-windows';
 import { mergeWindows } from './services/limits';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
 import { ResetConsoles } from './core/reset-console';
@@ -118,6 +119,12 @@ export { VERSION };
 const limitResetVia = (consoles: boolean, p: Provider): NonNullable<ProviderInfo['limitReset']> | undefined => {
   const line = p.limitResetCommand?.().line;
   return line ? { via: consoles ? 'console' : 'terminal', command: line } : undefined;
+};
+
+/** An account's own terminal command for its reset dialog: its config folder in it, never another account's (review wave 8, #19). */
+const resetCommandOf = (p: Provider): { resetCommand?: string } => {
+  const line = p.limitResetCommand?.().line;
+  return line ? { resetCommand: line } : {};
 };
 
 /** The label of each provider's built-in account until the user renames it. */
@@ -235,7 +242,7 @@ export class App {
       const accountId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
       const cap = this.capOf(rt.meta.provider, accountId);
       if (!cap) return undefined;
-      const reached = capReached((await this.knownLimits(rt.meta.provider)).get(accountId)?.limits, cap, rt.meta.model || undefined);
+      const reached = capReached((await this.knownLimits(rt.meta.provider)).get(accountId)?.limits, cap, this.chatModel(rt));
       return reached ? capReason(this.accountLabel(rt.meta.provider, accountId), reached) : undefined;
     },
     accountLabel: (rt) => this.accountLabel(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT),
@@ -250,7 +257,7 @@ export class App {
     sessions: () => this.sessions.values(),
     hydrate: (rt) => this.hydrate(rt),
     busy: (rt) => rt.turnActive || this.opening.has(rt.id) || this.delivering.has(rt.id),
-    model: (rt) => effectiveModel(rt.meta.model, (rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd)))?.models, this.store.state.settings.defaultModels[rt.meta.provider]),
+    model: (rt) => this.chatModel(rt),
     accounts: (provider) => this.spareAccounts(provider),
     refresh: async (provider, accountId) => {
       const key = accountKey(provider, accountId);
@@ -368,9 +375,9 @@ export class App {
         const name = this.accountList(provider).length > 1 ? this.accountLabel(provider, accountId).replace(/["%^&|<>\r\n]/g, '').trim() : '';
         return `${this.provider(provider, accountId).name} reset${name ? ` (${name})` : ''}`;
       },
-      known: (provider, accountId) => this.limitsCache.get(accountKey(provider, accountId)),
-      read: (provider, accountId) => this.call('provider.limits', { provider, accountId, force: true }),
-      cleared: (provider, accountId) => this.limitsCleared(provider, accountId),
+      known: (provider, accountId) => ({ limits: this.limitsCache.get(accountKey(provider, accountId)), signIn: this.signInGen.get(accountKey(provider, accountId)) ?? 0 }),
+      read: (provider, accountId) => this.readLimits(provider, accountId, 'fresh'),
+      cleared: (provider, accountId, windows) => this.limitsCleared(provider, accountId, windows),
       emit: (provider, accountId, run) => this.emit({ type: 'limit.resetRun', provider, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, run }),
       log: (...args) => this.log(...args),
       ...(opts.resetSettleMs !== undefined ? { settleMs: opts.resetSettleMs } : {}),
@@ -640,11 +647,21 @@ export class App {
    * a fresh read showed): what waits for its reset goes on as at a reset by time: chats waiting to
    * continue there, and new chats return to it when it is the preferred one.
    */
-  private limitsCleared(provider: ProviderId, accountId: string) {
-    this.spare.resetCleared(provider, accountId);
+  private limitsCleared(provider: ProviderId, accountId: string, windows: RateLimit[]) {
+    // Chats that waited go on only where every window holding their model has room now (the planner
+    // checks the fresh reading); the windows that cleared say whose wait this was.
+    this.spare.resetCleared(provider, accountId, windows);
     const fb = this.fallbacks.get(provider);
-    if (fb && fb.from === accountId && fb.until && fb.until > Date.now()) {
-      fb.until = Date.now();
+    const now = Date.now();
+    if (fb && fb.from === accountId && fb.until && fb.until > now) {
+      // New chats return only once no window that holds the agent's default model stays full: a
+      // weekly window still full keeps them away until its own reset (review wave 8, #18).
+      const model = effectiveModel(undefined, this.cache.get<Capabilities>(capsCacheKey(provider, accountId))?.models, this.store.state.settings.defaultModels[provider]);
+      const still = (this.limitsCache.get(accountKey(provider, accountId)) ?? []).filter(
+        (l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now) && (!windowModel(l) || !model || windowForModel(l, model)),
+      );
+      if (!still.length) fb.until = now;
+      else if (still.every((l) => l.resetsAt)) fb.until = Math.max(...still.map((l) => l.resetsAt!));
       void this.emitProvider(provider).catch(() => {});
     }
     this.scheduleResetAlert();
@@ -675,25 +692,34 @@ export class App {
     const p = this.provider(provider);
     const base = await p.info(force === DEFAULT_ACCOUNT).catch(() => fallbackInfo(p));
     const defaultId = this.defaultAccountId(provider);
-    const accounts = await Promise.all(
-      this.accountList(provider).map(async (a): Promise<AccountInfo> => {
+    const signIns = await Promise.all(
+      this.accountList(provider).map(async (a) => {
         const own = a.id === DEFAULT_ACCOUNT;
         // A missing CLI has no accounts to ask about.
         const info = own ? base : base.installed ? await this.accountAuth(provider, a.id, force === a.id) : undefined;
-        return {
-          id: a.id,
-          provider,
-          label: a.label,
-          isDefault: a.id === defaultId,
-          auth: info?.auth ?? { loggedIn: false },
-          limits: this.limitsCache.get(accountKey(provider, a.id)),
-          dir: own ? undefined : this.accountDir(provider, a.id),
-          problem: own ? undefined : info?.problem,
-          ...(a.dir ? { external: true } : {}),
-        };
+        return { a, own, info, auth: info?.auth ?? { loggedIn: false } };
       }),
     );
-    this.noteSignIns(provider, accounts);
+    // The sign-ins first: one that changed forgets the old person's limits before any snapshot copies
+    // them (review wave 8, #26).
+    this.noteSignIns(
+      provider,
+      signIns.map((s) => ({ id: s.a.id, auth: s.auth })),
+    );
+    const accounts = signIns.map(
+      ({ a, own, info, auth }): AccountInfo => ({
+        id: a.id,
+        provider,
+        label: a.label,
+        isDefault: a.id === defaultId,
+        auth,
+        limits: this.limitsCache.get(accountKey(provider, a.id)),
+        dir: own ? undefined : this.accountDir(provider, a.id),
+        problem: own ? undefined : info?.problem,
+        ...(a.dir ? { external: true } : {}),
+        ...resetCommandOf(this.provider(provider, a.id)),
+      }),
+    );
     const limitReset = limitResetVia(this.consoles, this.provider(provider));
     return { ...base, accounts, ...(limitReset ? { limitReset } : {}) };
   }
@@ -703,7 +729,7 @@ export class App {
    * subscription replaced by an API key) makes the old reading another account's: it is forgotten
    * (review wave 7, #3).
    */
-  private noteSignIns(provider: ProviderId, accounts: AccountInfo[]) {
+  private noteSignIns(provider: ProviderId, accounts: Pick<AccountInfo, 'id' | 'auth'>[]) {
     for (const a of accounts) {
       if (!a.auth.loggedIn) continue;
       const now = signInOf(a.auth);
@@ -721,8 +747,38 @@ export class App {
     this.limitsCache.delete(key);
     this.limitsPartial.delete(key);
     this.limitsMeta.delete(key);
+    // When: a reading older than this (a transcript's snapshot, a reset's "before") is the old person's.
+    this.cache.set(`limits-forgotten:${key}`, Date.now());
+    this.signInGen.set(key, (this.signInGen.get(key) ?? 0) + 1);
     for (const fn of this.limitsForgetters) fn(provider, accountId);
   }
+
+  /**
+   * Reads an account's limits from its agent. `fresh`: the agent itself announced a reading while
+   * this one ran (a throttled or refused read hands back the last known rows and says nothing).
+   * `force: 'fresh'` goes past the agent's own throttles (a reset's reading after its dialog).
+   */
+  private async readLimits(provider: ProviderId, accountId: string, force: boolean | 'fresh'): Promise<{ limits: RateLimit[]; fresh: boolean; signIn: number }> {
+    const key = accountKey(provider, accountId);
+    const seq = this.limitsSeq.get(key) ?? 0;
+    const signIn = this.signInGen.get(key) ?? 0;
+    const limits = await this.provider(provider, accountId).limits(force);
+    const fresh = (this.limitsSeq.get(key) ?? 0) > seq;
+    // A sign-in that changed meanwhile: this reading may be the previous person's; it is not kept.
+    if ((this.signInGen.get(key) ?? 0) !== signIn) return { limits: this.limitsCache.get(key) ?? [], fresh: false, signIn: this.signInGen.get(key) ?? 0 };
+    this.limitsCache.set(key, limits);
+    // A provider that read them announced it already (with what it knows about the read).
+    if (!fresh) this.emit({ type: 'limits.updated', provider, accountId, limits });
+    return { limits, fresh, signIn };
+  }
+
+  /** When an account's limits were last forgotten for a changed sign-in (0: never). */
+  limitsForgottenAt(provider: ProviderId, accountId: string): number {
+    return this.cache.get<number>(`limits-forgotten:${accountKey(provider, accountId)}`) ?? 0;
+  }
+
+  /** Counts the sign-in changes of each account in this run (a reset's reading before and after must share one). */
+  private signInGen = new Map<string, number>();
 
   /** The usage service forgets an account's limits when they are no longer its own (`noteSignIns`). */
   onLimitsForgotten(fn: (provider: ProviderId, accountId: string) => void) {
@@ -772,6 +828,7 @@ export class App {
         dir: a.id === DEFAULT_ACCOUNT ? undefined : this.accountDir(provider, a.id),
         problem: prev?.problem,
         ...(a.dir ? { external: true } : {}),
+        ...resetCommandOf(this.provider(provider, a.id)),
       };
     });
     // Setup warnings belong to the run that saw them: the fresh read brings this run's.
@@ -1346,6 +1403,15 @@ export class App {
     );
   }
 
+  /**
+   * The model a chat's turns run on, as per-model windows name it (the alias "default" resolved):
+   * one reading for ranking, moves, caps and reset notices (review wave 8, #27).
+   */
+  private chatModel(rt: SessionRuntime): string | undefined {
+    const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd));
+    return effectiveModel(rt.meta.model, caps?.models, this.store.state.settings.defaultModels[rt.meta.provider]);
+  }
+
   // ── caps: "use up to" per account ──
 
   /** The cap set for an account, when it has one below 100%. */
@@ -1362,11 +1428,14 @@ export class App {
    * Where a new session starts when `accountId` is past its cap: the next account under its own
    * cap, with the line that says why. Undefined when it is under its cap, or no account is.
    */
-  private async underCapStart(provider: ProviderId, accountId: string, model: string | undefined): Promise<{ to: string; line: string } | undefined> {
+  private async underCapStart(provider: ProviderId, accountId: string, chosen: string | undefined, cwd?: string): Promise<{ to: string; line: string } | undefined> {
     const cap = this.capOf(provider, accountId);
     if (!cap) return undefined;
     const known = await this.knownLimits(provider);
-    const reached = capReached(known.get(accountId)?.limits, cap, model || undefined);
+    // The alias "default" resolved, as everywhere else that reads per-model windows (review wave 8, #27).
+    const caps = this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, accountId));
+    const model = effectiveModel(chosen || undefined, caps?.models, this.store.state.settings.defaultModels[provider]);
+    const reached = capReached(known.get(accountId)?.limits, cap, model);
     if (!reached) return undefined;
     const next = await this.nextAccount(provider, accountId, { model, byCap: true }).catch(() => undefined);
     if (!next) return undefined;
@@ -1393,7 +1462,7 @@ export class App {
   private async moveOffCap(rt: SessionRuntime) {
     const provider = rt.meta.provider;
     const from = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-    const model = rt.meta.model || undefined;
+    const model = this.chatModel(rt);
     const known = await this.knownLimits(provider);
     const reached = capReached(known.get(from)?.limits, this.capOf(provider, from), model);
     if (!reached) return;
@@ -1423,8 +1492,11 @@ export class App {
     const provider = rt.meta.provider;
     const accountId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
     const known = await this.knownLimits(provider);
-    const own = (known.get(accountId)?.limits ?? []).filter((l) => l.percent >= 100);
-    // Every window that is used up has to reset before the account can work again.
+    // Every window that is used up and holds this chat's model has to reset before the account can
+    // work again; another model's full week is not this chat's wait (review wave 8, #27).
+    const model = this.chatModel(rt);
+    const now = Date.now();
+    const own = (known.get(accountId)?.limits ?? []).filter((l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now) && (!windowModel(l) || !model || windowForModel(l, model)));
     const full = own.sort((a, b) => (b.resetsAt ?? 0) - (a.resetsAt ?? 0))[0];
     // The accounts that already refused this message are not tried again (review wave 7, #10).
     const refused = this.refusedMessage(rt);
@@ -1524,7 +1596,8 @@ export class App {
       return {
         id: a.id,
         signedIn: a.auth.loggedIn,
-        planLimits: r?.planLimits,
+        // An API key now bills per token, whatever a report from before said (review wave 8, #26).
+        planLimits: isApiKeyAuth(a.auth) ? false : r?.planLimits,
         limits: r?.limits.length ? r.limits : (this.limitsCache.get(key) ?? a.limits ?? []),
         pace: r?.pace,
         cap: this.capOf(provider, a.id),
@@ -2238,7 +2311,7 @@ export class App {
     this.provider(p.provider, accountId);
     // An account past its cap: the session starts on the next one under its own (a resumed
     // conversation stays where it lives).
-    const capStart = p.resume ? undefined : await this.underCapStart(p.provider, accountId, p.model ?? settings.defaultModels[p.provider]).catch(() => undefined);
+    const capStart = p.resume ? undefined : await this.underCapStart(p.provider, accountId, p.model ?? settings.defaultModels[p.provider], p.cwd).catch(() => undefined);
     // Its caller (a phone) removed while that was read: no chat, no folder.
     still(ctx);
     if (capStart) accountId = capStart.to;
@@ -2513,15 +2586,7 @@ export class App {
 
     this.register('provider.caps', ({ provider, cwd, accountId, refresh }) => this.capsFast(provider, cwd, accountId, refresh));
     this.register('provider.prewarm', (p) => this.prewarm(p));
-    this.register('provider.limits', async ({ provider, accountId = DEFAULT_ACCOUNT, force }) => {
-      const key = accountKey(provider, accountId);
-      const seq = this.limitsSeq.get(key) ?? 0;
-      const limits = await this.provider(provider, accountId).limits(!!force);
-      this.limitsCache.set(key, limits);
-      // A provider that read them announced it already (with what it knows about the read).
-      if ((this.limitsSeq.get(key) ?? 0) === seq) this.emit({ type: 'limits.updated', provider, accountId, limits });
-      return limits;
-    });
+    this.register('provider.limits', async ({ provider, accountId = DEFAULT_ACCOUNT, force }) => (await this.readLimits(provider, accountId, !!force)).limits);
     // Spends a reset credit: only the confirmed click in the UI calls this, never anything automatic.
     this.register('provider.useReset', async ({ provider, accountId = DEFAULT_ACCOUNT, key }) => {
       const p = this.provider(provider, accountId);

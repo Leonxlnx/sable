@@ -10,12 +10,12 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_ACCOUNT, type BridgeEvent, type NoticeItem, type RateLimit, type ResetRun, type TimelineItem } from '@shared/protocol';
 import { App } from '../server/app';
-import { clearedWindows, fullWindows } from '../server/core/reset-console';
-import { ClaudeProvider } from '../server/providers/claude';
+import { clearedWindows, fullWindows, ResetConsoles, type ResetConsoleHost, type ResetReading } from '../server/core/reset-console';
+import { ClaudeProvider, resetLine } from '../server/providers/claude';
 import { DemoProvider } from '../server/providers/demo';
 import type { ProviderContext } from '../server/providers/types';
 import { registerUsage } from '../server/services/usage';
-import { consoleCommandLine, type ConsoleSpec } from '../server/util/console';
+import { consoleCommandLine, findProgram, type ConsoleSpec } from '../server/util/console';
 
 const H = 3_600_000;
 const apps: App[] = [];
@@ -66,9 +66,12 @@ describe('the console command line', () => {
   // .exe in a folder with spaces, a batch file found on PATH by name (its %~dp0 intact) and one by a
   // path with spaces each got `/limit-reset` as one argument, the account's CLAUDE_CONFIG_DIR and the folder.
   it('starts the program with start /wait in a cmd /c of its own, every argument as given, in one verbatim line', () => {
+    // A native program by its full path is started by `start` itself, its path in quotes the outer cmd keeps.
     expect(consoleCommandLine({ title: 'Claude Code reset', bin: 'C:\\Program Files\\Sable\\resources\\claude\\claude.exe', args: ['/limit-reset'] })).toBe(
-      '"start "Claude Code reset" /wait cmd /d /s /c ""C:\\Program Files\\Sable\\resources\\claude\\claude.exe" "/limit-reset"""',
+      '"start "Claude Code reset" /wait "C:\\Program Files\\Sable\\resources\\claude\\claude.exe" "/limit-reset""',
     );
+    // A batch shim by its full path keeps the inner cmd /c.
+    expect(consoleCommandLine({ title: 't', bin: 'C:\\npm\\claude.cmd', args: ['/limit-reset'] })).toBe('"start "t" /wait cmd /d /s /c "C:\\npm\\claude.cmd "/limit-reset"""');
     expect(consoleCommandLine({ title: 'Claude Code reset (Work)', bin: 'claude', args: ['/limit-reset'] })).toBe('"start "Claude Code reset (Work)" /wait cmd /d /s /c "claude "/limit-reset"""');
     // OpenCode's sign-in through the same helper.
     expect(consoleCommandLine({ title: 'OpenCode login', bin: 'opencode', args: ['auth', 'login'] })).toBe('"start "OpenCode login" /wait cmd /d /s /c "opencode auth login""');
@@ -78,6 +81,39 @@ describe('the console command line', () => {
     for (const bad of ['a"b', '%PATH%', 'a\r\nb', 'a & calc', 'a | b', 'a > f', 'a ^ b'])
       expect(() => consoleCommandLine({ title: 'x', bin: 'claude', args: [bad] })).toThrow();
     expect(() => consoleCommandLine({ title: 'say "hi"', bin: 'claude', args: [] })).toThrow();
+    // Still refused in a native path: what cmd would expand or end the quotes with.
+    for (const bad of ['C:\\%TEMP%\\claude.exe', 'C:\\a"b\\claude.exe', 'C:\\a^b\\claude.exe']) expect(() => consoleCommandLine({ title: 'x', bin: bad, args: [] })).toThrow();
+    // A batch shim under a folder with `&` cannot be started safely through cmd /c: refused.
+    expect(() => consoleCommandLine({ title: 'x', bin: 'C:\\R&D\\claude.cmd', args: [] })).toThrow();
+  });
+
+  // Checked by hand on Windows with `start /b` (no window): node.exe linked into `…\R&D\` ran with its
+  // argument from this line, the `&` taken as text (review wave 8, #32).
+  it('starts a native program under a folder with & in its name (review wave 8, #32)', () => {
+    expect(consoleCommandLine({ title: 'Claude Code reset', bin: 'D:\\R&D\\Sable\\resources\\claude\\claude.exe', args: ['/limit-reset'] })).toBe(
+      '"start "Claude Code reset" /wait "D:\\R&D\\Sable\\resources\\claude\\claude.exe" "/limit-reset""',
+    );
+  });
+
+  it('looks for the program before a window opens (start answers a missing one with a message box)', () => {
+    const dir = temp('sable-find-');
+    writeFileSync(path.join(dir, 'tool.cmd'), '@echo off\r\n');
+    expect(findProgram(path.join(dir, 'tool.cmd'))).toBe(true);
+    expect(findProgram(path.join(dir, 'missing.exe'))).toBe(false);
+    expect(findProgram('tool', { PATH: dir, PATHEXT: '.EXE;.CMD' })).toBe(true);
+    expect(findProgram('missing', { PATH: dir, PATHEXT: '.EXE;.CMD' })).toBe(false);
+    // A relative PATH entry (the window's own folder) is never searched.
+    expect(findProgram('tool', { PATH: '.', PATHEXT: '.CMD' })).toBe(false);
+  });
+});
+
+describe("an account's terminal command (review wave 8, #19)", () => {
+  it('quotes the CLI and the config folder for the shell', () => {
+    expect(resetLine('claude', undefined, 'linux')).toBe('claude "/limit-reset"');
+    expect(resetLine('/opt/Sable App/claude', "/home/me/it's/work", 'darwin')).toBe(`CLAUDE_CONFIG_DIR='/home/me/it'\\''s/work' '/opt/Sable App/claude' "/limit-reset"`);
+    expect(resetLine('C:\\Program Files\\Sable\\claude.exe', 'C:\\Users\\me\\.sable\\accounts\\claude\\w1', 'win32')).toBe(
+      'set "CLAUDE_CONFIG_DIR=C:\\Users\\me\\.sable\\accounts\\claude\\w1" && "C:\\Program Files\\Sable\\claude.exe" "/limit-reset"',
+    );
   });
 });
 
@@ -124,6 +160,12 @@ describe("Claude Code's reset dialog", () => {
       const { account } = await app.call('account.add', { provider: 'claude', label: 'Work' });
       const hello = await app.call('app.hello', {});
       expect(hello.providers.find((p) => p.id === 'claude')?.limitReset).toEqual({ via: 'console', command: 'claude "/limit-reset"' });
+      // Each account's own terminal command names its own config folder (review wave 8, #19).
+      const accs = hello.providers.find((p) => p.id === 'claude')?.accounts ?? [];
+      expect(accs.find((a) => a.id === DEFAULT_ACCOUNT)?.resetCommand).toBe('claude "/limit-reset"');
+      const work = accs.find((a) => a.id === account.id)?.resetCommand;
+      expect(work).toContain(account.dir!);
+      expect(work).toBe(process.platform === 'win32' ? `set "CLAUDE_CONFIG_DIR=${account.dir}" && claude "/limit-reset"` : `CLAUDE_CONFIG_DIR=${account.dir} claude "/limit-reset"`);
 
       // The account is at its weekly limit (as a turn's rate-limit event would say).
       const p = (app as unknown as { provider: (id: string, acc: string) => ClaudeProvider }).provider('claude', account.id);
@@ -290,4 +332,166 @@ describe('a reset in the agent’s own dialog, in the App', () => {
     expect((await plain.call('app.hello', {})).providers.find((p) => p.id === 'demo')?.limitReset).toBeUndefined();
     expect(consoles.opened).toHaveLength(0);
   });
+});
+
+// ───────────────────────────── review wave 8 ─────────────────────────────
+
+/** The controller alone, with a host whose every answer the test sets. */
+function controller(over: Partial<ResetConsoleHost> = {}) {
+  const consoles = fakeConsoles();
+  const runs: (ResetRun | null)[] = [];
+  const cleared: string[][] = [];
+  const now = Date.now();
+  const full: RateLimit[] = [{ id: 'five_hour', label: '5-hour limit', percent: 100, resetsAt: now + 2 * H }];
+  const reads: (() => Promise<ResetReading>)[] = [];
+  let readCount = 0;
+  const host: ResetConsoleHost = {
+    open: consoles.open,
+    command: () => ({ bin: 'demo-cli', args: ['/limit-reset'], env: {} }),
+    cwd: () => tmpdir(),
+    title: () => 'Reset',
+    known: () => ({ limits: full, signIn: 0 }),
+    read: () => {
+      readCount++;
+      const next = reads.shift();
+      return next ? next() : Promise.resolve({ limits: full, fresh: true, signIn: 0 });
+    },
+    cleared: (_p, _a, w) => cleared.push(w.map((l) => l.id)),
+    emit: (_p, _a, run) => runs.push(run && { ...run }),
+    log: () => {},
+    settleMs: 5,
+    ...over,
+  };
+  const c = new ResetConsoles(host);
+  return { c, consoles, runs, cleared, reads, full, readCount: () => readCount };
+}
+
+const room = (): RateLimit[] => [{ id: 'five_hour', label: '5-hour limit', percent: 3, resetsAt: Date.now() + 5 * H }];
+
+describe('a reset: only a fresh reading after the dialog counts (review wave 8, #17)', () => {
+  it('a throttled read that hands back the old rows is read again, and the fresh one clears', async () => {
+    const h = controller();
+    h.reads.push(() => Promise.resolve({ limits: h.full, fresh: false, signIn: 0 }), () => Promise.resolve({ limits: room(), fresh: true, signIn: 0 }));
+    expect(await h.c.start('claude', 'w')).toEqual({ ok: true });
+    h.consoles.opened[0].close();
+    await until(() => h.runs.at(-1)?.state === 'cleared', 'cleared');
+    expect(h.cleared).toEqual([['five_hour']]);
+  });
+
+  it('no fresh reading at all: "could not be read", nothing wakes', async () => {
+    const h = controller();
+    for (let i = 0; i < 3; i++) h.reads.push(() => Promise.resolve({ limits: room(), fresh: false, signIn: 0 }));
+    await h.c.start('claude', 'w');
+    h.consoles.opened[0].close();
+    await until(() => h.runs.at(-1)?.state === 'unchanged', 'unchanged');
+    expect(h.runs.at(-1)?.message).toBe('The limits could not be read');
+    expect(h.cleared).toEqual([]);
+    expect(h.readCount()).toBe(3);
+  });
+
+  it('a reading under another sign-in clears nothing', async () => {
+    const h = controller();
+    h.reads.push(() => Promise.resolve({ limits: room(), fresh: true, signIn: 1 }));
+    await h.c.start('claude', 'w');
+    h.consoles.opened[0].close();
+    await until(() => h.runs.at(-1)?.state === 'unchanged', 'unchanged');
+    expect(h.cleared).toEqual([]);
+  });
+
+  it("Claude Code's probe goes past its once-a-minute throttle for a fresh reading", async () => {
+    const p = new ClaudeProvider({ emit: () => {}, log: () => {} } as unknown as ProviderContext);
+    const anyP = p as unknown as { limitsProbeAt: number; limitsCache: RateLimit[]; baseOptions: () => never };
+    anyP.limitsProbeAt = Date.now();
+    anyP.limitsCache = [{ id: 'five_hour', label: '5-hour limit', percent: 100 }];
+    // Throttled: the last known rows, no process.
+    let probed = false;
+    anyP.baseOptions = () => {
+      probed = true;
+      throw new Error('no process in tests');
+    };
+    expect(await p.limits(true)).toEqual(anyP.limitsCache);
+    expect(probed).toBe(false);
+    // Fresh: it tries (here it fails at once, before any process starts).
+    await p.limits('fresh').catch(() => undefined);
+    expect(probed).toBe(true);
+  });
+});
+
+describe('a reset: Cancel, closing Sable and a window that does not close (review wave 8, #20)', () => {
+  it('Cancel while the limits are read first opens no window', async () => {
+    let release!: (r: ResetReading) => void;
+    const h = controller({ known: () => ({ limits: [], signIn: 0 }), read: () => new Promise((r) => (release = r)) });
+    const started = h.c.start('claude', 'w');
+    expect(h.c.cancel('claude', 'w')).toBe(true);
+    release({ limits: h.full, fresh: true, signIn: 0 });
+    expect(await started).toEqual({ ok: false });
+    expect(h.consoles.opened).toHaveLength(0);
+    // Free for a new attempt.
+    expect(h.c.current('claude', 'w')).toBeUndefined();
+  });
+
+  it('Sable closing while the limits are read opens no window either', async () => {
+    let release!: (r: ResetReading) => void;
+    const h = controller({ known: () => ({ limits: [], signIn: 0 }), read: () => new Promise((r) => (release = r)) });
+    const started = h.c.start('claude', 'w');
+    h.c.dispose();
+    release({ limits: h.full, fresh: true, signIn: 0 });
+    expect(await started).toEqual({ ok: false });
+    expect(h.consoles.opened).toHaveLength(0);
+  });
+
+  it('a window open too long that does not close when asked is given up, and the account is free again', async () => {
+    const stuck = { closeAsked: 0 };
+    const h = controller({
+      maxOpenMs: 10,
+      closeGraceMs: 20,
+      open: () => ({ closed: new Promise<void>(() => {}), close: () => void stuck.closeAsked++ }),
+    });
+    await h.c.start('claude', 'w');
+    await until(() => h.runs.at(-1)?.state === 'failed', 'failed');
+    expect(stuck.closeAsked).toBe(1);
+    expect(h.runs.at(-1)?.message).toBe('Claude Code did not close');
+    expect(h.c.current('claude', 'w')).toBeUndefined();
+    expect(await h.c.start('claude', 'w')).toEqual({ ok: true });
+  });
+
+  it('a program that ended with an error says so, after the limits are read', async () => {
+    const h = controller({ open: () => ({ closed: Promise.resolve(1), close: () => {} }) });
+    await h.c.start('claude', 'w');
+    await until(() => h.runs.at(-1)?.state === 'failed', 'failed');
+    expect(h.runs.at(-1)?.message).toBe('Claude Code ended with an error');
+    expect(h.readCount()).toBeGreaterThan(0);
+    // The person closing the window (Ctrl+C, its X) is not an error.
+    const g = controller({ open: () => ({ closed: Promise.resolve(0xc000013a), close: () => {} }) });
+    await g.c.start('claude', 'w');
+    await until(() => g.runs.at(-1)?.state === 'unchanged', 'unchanged');
+  });
+});
+
+describe('a reset that clears one window wakes only what that window held (review wave 8, #18)', () => {
+  for (const known of [true, false])
+    it(`a weekly window still full${known ? '' : ' with no reset known'} keeps the chat waiting`, { timeout: 20_000 }, async () => {
+      const { app, home, consoles, runs, account } = await demoAt();
+      const week: RateLimit = known ? weekIn(100, 30) : { id: 'seven_day', label: 'Weekly · all models', percent: 100, windowMins: 10_080 };
+      DialogDemo.fixed.set(account.id, [fiveIn(100), week]);
+      await app.call('provider.limits', { provider: 'demo', accountId: account.id });
+      const snap = await app.call('session.create', { provider: 'demo', cwd: path.join(home, 'p'), accountId: account.id });
+      const rt = app.runtime(snap.session.id);
+      await app.call('session.send', { sessionId: rt.id, text: 'hi' });
+      await until(() => rt.items.some((i) => i.type === 'notice' && !!i.limit?.provider), 'limit notice');
+      await app.call('spare.atReset', { sessionId: rt.id });
+      expect(rt.meta.spare).toMatchObject({ reason: 'reset' });
+
+      await app.call('limit.resetInAgent', { provider: 'demo', accountId: account.id });
+      // The dialog cleared the 5-hour window only.
+      DialogDemo.fixed.set(account.id, [fiveIn(0), week]);
+      consoles.opened[0].close();
+      await until(() => runs.at(-1)?.state === 'cleared', 'cleared');
+      expect(runs.at(-1)?.cleared).toEqual(['5-hour limit']);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(texts(rt.items)).toHaveLength(0);
+      expect(rt.items.filter((i) => i.type === 'user')).toHaveLength(1);
+      expect(rt.meta.spare).toMatchObject({ reason: 'reset' });
+      if (known) expect(rt.meta.spare!.at).toBe(week.resetsAt);
+    });
 });

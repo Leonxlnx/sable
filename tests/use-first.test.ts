@@ -41,6 +41,13 @@ describe('use first', () => {
     expect(rankAccount(acct('a', [week(40, 50), fable(100, 20)]), NOW)).toMatchObject({ state: 'now', left: 60 });
   });
 
+  it('a full model week ending soon never hides a shared week short for days (review wave 8, #27)', () => {
+    const r = rankAccount(acct('a', [week(98, 48), fable(100, 2)]), NOW, 'claude-fable-5-2');
+    expect(r).toMatchObject({ state: 'spent', left: 0, expiresAt: NOW + 48 * H });
+    // The shared week with room: the model week only holds it, until its own reset.
+    expect(rankAccount(acct('a', [week(60, 48), fable(100, 2)]), NOW, 'claude-fable-5-2')).toMatchObject({ state: 'held', until: NOW + 2 * H });
+  });
+
   it('a full 5-hour window holds an account; it comes after those that take work now, by when it is free', () => {
     const list = [acct('soon', [five(100, 1), week(10, 20)]), acct('later', [week(10, 90)]), acct('held2', [five(98, 4), week(10, 10)])];
     expect(useFirst(list, NOW).map((r) => `${r.id}:${r.state}`)).toEqual(['later:now', 'soon:held', 'held2:held']);

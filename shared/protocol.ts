@@ -71,6 +71,8 @@ export interface AccountInfo {
   problem?: string;
   /** A folder the user already had ("Use an existing folder"): removing the account forgets it, never deletes it. */
   external?: boolean;
+  /** This account's own terminal command for the agent's reset dialog (`ProviderInfo.limitReset` via `terminal`). */
+  resetCommand?: string;
 }
 
 /** A config folder under the home folder that looks like an agent's own, offered by "Use an existing folder". */

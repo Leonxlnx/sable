@@ -167,6 +167,20 @@ const claudeBinary = () => process.env.SABLE_CLAUDE_BIN || undefined;
 /** The user's own CLAUDE_CONFIG_DIR (usually unset): what the built-in default account uses. */
 const OWN_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
 
+/**
+ * The command a person runs in a terminal for this account's reset dialog, where Sable cannot open a
+ * console window: the resolved CLI and, for an account of its own, its config folder, each quoted for
+ * the shell (review wave 8, #19). Without either it is the plain `claude "/limit-reset"`.
+ */
+export function resetLine(bin: string, configDir: string | undefined, platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') {
+    const q = (s: string) => (/^[\w.:\\-]+$/.test(s) ? s : `"${s}"`);
+    return `${configDir ? `set "CLAUDE_CONFIG_DIR=${configDir}" && ` : ''}${q(bin)} "/limit-reset"`;
+  }
+  const q = (s: string) => (/^[\w./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+  return `${configDir ? `CLAUDE_CONFIG_DIR=${q(configDir)} ` : ''}${q(bin)} "/limit-reset"`;
+}
+
 /** Environment for a Claude Code process: the account's config folder, or the user's own setup. */
 function claudeEnv(configDir: string | undefined): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -243,7 +257,8 @@ export class ClaudeProvider implements Provider {
    * this account's config folder. Sable never runs it itself: only a console window the person sees.
    */
   limitResetCommand() {
-    return { bin: claudeBinary() ?? 'claude', args: ['/limit-reset'], env: this.env(), line: 'claude "/limit-reset"' };
+    const bin = claudeBinary() ?? 'claude';
+    return { bin, args: ['/limit-reset'], env: this.env(), line: resetLine(bin, this.configDir) };
   }
 
   /** Runs an SDK history read against this account's config folder. */
@@ -813,13 +828,21 @@ export class ClaudeProvider implements Provider {
    * `force` (the user asked) and none running, a short process starts just to read them: no
    * settings, plugins or MCP servers, no tokens, at most once a minute.
    */
-  async limits(force = false): Promise<RateLimit[]> {
+  async limits(force: boolean | 'fresh' = false): Promise<RateLimit[]> {
+    const fresh = force === 'fresh';
+    // A read already under way began before this call: a fresh one waits for it and asks again.
+    const read = async (q: Query) => {
+      if (fresh) while (this.limitsRun) await this.limitsRun.catch(() => undefined);
+      return this.readLimits(q, force ? 0 : 15_000);
+    };
     for (const s of this.sessions) {
       const q = s.liveQuery();
-      if (q) return this.readLimits(q, force ? 0 : 15_000);
+      if (q) return read(q);
     }
-    if (this.warm) return this.readLimits(this.warm.q, force ? 0 : 15_000);
-    if (!force || Date.now() - this.limitsProbeAt < 60_000) return this.limitsCache;
+    if (this.warm) return read(this.warm.q);
+    // The probe's once-a-minute throttle holds for clicks, not for a reset's reading after its
+    // dialog: that one must be taken after the dialog closed (review wave 8, #17).
+    if (!force || (!fresh && Date.now() - this.limitsProbeAt < 60_000)) return this.limitsCache;
     this.limitsProbeAt = Date.now();
     const input = new PushQueue<SDKUserMessage>();
     const q = query({ prompt: input, options: { ...this.baseOptions(homedir()), settingSources: [], strictMcpConfig: true, persistSession: false } });
