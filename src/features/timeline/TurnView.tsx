@@ -58,7 +58,7 @@ function settle(b: BuiltState): BuiltState {
 }
 
 const chunkSig = (c: FlowChunk) => (c.kind === 'steps' ? `${c.key}+${c.ids.length}+${c.count}` : c.id);
-const segSig = (s: Segment) => `${s.lead}>${s.flow.map(chunkSig).join(',')}>${s.reply}>${s.answer}>${s.last}>${s.notes.length}>${s.errors.join(',')}`;
+const segSig = (s: Segment) => `${s.lead}>${s.flow.map(chunkSig).join(',')}>${s.reply}>${s.answer}>${s.last}>${s.tail.join(',')}>${s.notes.length}>${s.errors.join(',')}`;
 
 /** A turn `turnsIndex` handed back again, the same object (nothing in it changed): its stable object and its cache entries. */
 interface Kept {
@@ -488,7 +488,7 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, index, place, 
     }
     if (c.kind === 'text') {
       const note = seg.notes.includes(c.id);
-      out.push(<TextPiece key={c.id} id={c.id} open={!note || shown} nest={note && nest} answer={c.id === seg.answer || c.id === seg.reply} />);
+      out.push(<TextPiece key={c.id} id={c.id} open={!note || shown} nest={note && nest} answer={c.id === seg.answer || c.id === seg.reply} tail={seg.tail.includes(c.id)} />);
       continue;
     }
     const head = i === headAt;
@@ -523,11 +523,12 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, index, place, 
  * Something the agent said, in a wrapper that folds it away with the work: a note along the way is
  * in view while the turn runs and inside the turn's line after; the answer, the reply to a steered
  * message and the words of a turn with no work behind them never fold. One element through all of
- * it, so a note that turns out the answer is not made again.
+ * it, so a note that turns out the answer is not made again. `tail`: a nod said after the answer
+ * ("Committed."), in view under it as a quiet last line.
  */
-const TextPiece = memo(function TextPiece({ id, open, nest, answer }: { id: string; open: boolean; nest: boolean; answer: boolean }) {
+const TextPiece = memo(function TextPiece({ id, open, nest, answer, tail }: { id: string; open: boolean; nest: boolean; answer: boolean; tail: boolean }) {
   return (
-    <Collapse open={open} className={`tl-fold fold-text${nest ? ' nest' : ''}`}>
+    <Collapse open={open} className={`tl-fold fold-text${nest ? ' nest' : ''}${tail ? ' fold-tail' : ''}`}>
       <ItemRow id={id} answer={answer} mid={!answer} />
     </Collapse>
   );

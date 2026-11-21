@@ -8,7 +8,9 @@
  * The rule: a lead-in only says what comes next, or nods at what just happened. Every sentence of
  * it is an announcement ("Let me…", "I'll…", "Checking the routes next.", "Running the tests now."),
  * a move to the next thing without a verb ("Now the CSS.", "Next, the tests.") or a nod with nothing
- * in it ("Good.", "That works."). One sentence that says what was found or done makes the text a note.
+ * in it ("Good.", "That works.", the one word "Committed."). One sentence that says what was found
+ * or done makes the text a note. At a turn's end the same rule picks the answer: the last thing said
+ * that is not a lead-in (`turns.ts`).
  *
  * Pure and cheap: `shapeOf` asks on every streamed word of a short text, and gives up at once on a
  * long one.
@@ -19,8 +21,61 @@ export const LEAD_MAX = 200;
 
 /** Words that may open an announcement before its verb: "Now, let me...", "Perfect! Let me...". */
 const OPENERS = ['ok', 'okay', 'alright', 'now', 'next', 'first', 'then', 'so', 'great', 'good', 'perfect', 'excellent', 'nice', 'right', 'sure', 'got it', 'and'];
-/** Nods that stand as a sentence of their own and say nothing the work line does not ("Perfect.", "That works."). */
-const FILLERS = ['ok', 'okay', 'alright', 'great', 'good', 'perfect', 'excellent', 'nice', 'right', 'sure', 'got it', 'done', 'cool', 'fine', 'i see', 'understood', 'makes sense', 'looks good', 'all good', 'that works', 'that worked'];
+/**
+ * Nods that stand as a sentence of their own and say nothing the work line does not ("Perfect.",
+ * "That works."), and the one word for a step that is done ("Committed.", "Pushed."), which only
+ * repeats the step's own row. Never the answer of a turn that said more (`turns.ts`).
+ */
+const FILLERS = [
+  'ok',
+  'okay',
+  'alright',
+  'great',
+  'good',
+  'perfect',
+  'excellent',
+  'nice',
+  'right',
+  'sure',
+  'got it',
+  'done',
+  'cool',
+  'fine',
+  'i see',
+  'understood',
+  'makes sense',
+  'looks good',
+  'all good',
+  'that works',
+  'that worked',
+  'all done',
+  'all set',
+  "that's it",
+  'that is it',
+  "that's all",
+  'that is all',
+  'committed',
+  'pushed',
+  'fixed',
+  'saved',
+  'merged',
+  'landed',
+  'reverted',
+  'applied',
+  'updated',
+  'installed',
+  'deployed',
+  'published',
+  'released',
+  'shipped',
+  'built',
+  'added',
+  'removed',
+  'written',
+  'sent',
+  'finished',
+  'completed',
+];
 /** How an announcement goes on: the agent says what it is about to do. */
 const PHRASES = [
   'let me',
@@ -159,7 +214,10 @@ function mayStart(part: string): boolean {
   if (!rest) return true;
   // "Now the" may end as "Now the CSS." until a verb or a sixth word says otherwise.
   if (MOVING.test(part) && !STATES.test(part)) return true;
-  return [...STARTS, ...MOVES, ...FILLERS].some((p) => p.startsWith(rest) || (rest.startsWith(p) && /^[\s,!.]/.test(rest.slice(p.length) || ' ')));
+  if (STARTS.some((p) => p.startsWith(rest) || (rest.startsWith(p) && /^[\s,!.]/.test(rest.slice(p.length) || ' ')))) return true;
+  // A move or a nod in the making ("On t", "That wo", "Committed"): only while nothing but it is
+  // there. "Committed the fix on main" is a statement from its second word on.
+  return [...MOVES, ...FILLERS].some((p) => p.startsWith(rest) || (rest.startsWith(p) && /^[,!.]*$/.test(rest.slice(p.length))));
 }
 
 /**
@@ -195,11 +253,13 @@ const SUBJECT = /^(?:let me|let's|i'll|i will|i'm (?:now )?going to|i am going t
 /**
  * A lead-in as the live line's title, in the voice of a step's own title: "Now let me run the
  * tests." reads "Run the tests", "I'm checking the routes" reads "Checking the routes", "Now the
- * CSS." reads "The CSS".
+ * CSS." reads "The CSS". A nod alone ("Good.", "Committed.") announces nothing: no title, and the
+ * line keeps the running step's own.
  */
 export function leadTitle(text: string): string {
   const parts = sentences(plain(text).replace(/\s+/g, ' '));
-  const first = parts.find((p) => !FILLER.test(p.toLowerCase())) ?? parts[0] ?? '';
+  const first = parts.find((p) => !FILLER.test(p.toLowerCase()));
+  if (!first) return '';
   let s = first.replace(new RegExp(LEADING.source, 'i'), '');
   s = s.replace(SUBJECT, '').replace(/^i'm\s+(?:now\s+)?/i, '');
   s = s.replace(/[\s.:!…]+$/u, '');

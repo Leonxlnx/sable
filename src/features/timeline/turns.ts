@@ -24,7 +24,7 @@ import { isLeadIn } from './lead-in';
  *      (a slash command opens a turn as a message does, `U`; what it printed is a notice, `n`)
  *   l  a lead-in: a one-line announcement of the next step ("Let me run the tests."), or a text
  *      still being written that may turn out one (see `lead-in.ts`): folded with the steps it
- *      announces, said in view when no step follows it
+ *      announces, said in view when no step follows it, and never the answer of a turn that said more
  *   c  command output (an answer candidate)     p  a plan (an answer candidate)
  *   w  a step: a tool call                      n  any other notice (mode, model, compaction, retry): not a step
  *   h  thinking: part of the work, not counted as a step
@@ -73,16 +73,21 @@ export interface Segment {
   flow: FlowChunk[];
   /** Tool calls in `work` (thinking, task updates and notices are not steps). */
   steps: number;
-  /** The last thing said in this segment: the answer, never folded. */
+  /**
+   * The answer, never folded: the last thing said in this segment that is not a lead-in or a nod
+   * ("Committed.", "Done.", an announcement nothing followed). With nothing but those, the last one.
+   */
   answer: string | null;
   /** A steered segment's first words, when more followed: the direct reply, never folded. */
   reply: string | null;
   /** The last words before a failure, when the segment has no answer: they stay in view over the error. */
   last: string | null;
+  /** What was said after the answer (or after those last words): a nod, in view under it as a quiet last line. */
+  tail: string[];
   /**
    * The texts that fold with the work once the turn has ended: the notes along the way (every text
-   * but the answer, the reply and the last words before a failure). Empty in a turn with no work
-   * at all: with nothing to fold behind, its texts simply stand.
+   * but the answer, a nod after it, the reply and the last words before a failure). Empty in a turn
+   * with no work at all: with nothing to fold behind, its texts simply stand.
    */
   notes: string[];
   /** Error notices, and notices that are all a segment holds: never folded (they stand in the flow as shown pieces). */
@@ -277,20 +282,49 @@ function settleLeads(chars: string[], live: boolean, steered: boolean, final = f
 function buildSegment(raw: Open['segs'][number], index: number, turnKey: string, failed: boolean, live = false, cut = false): Segment {
   const seg = { ...raw, chars: settleLeads(raw.chars, live, raw.steered, !live && !failed && !cut) };
   const errors: string[] = [];
+  // A lead-in or a nod that is said in view after all (nothing followed it): never what the person waits for.
+  const nod = (i: number) => seg.chars[i] === 't' && raw.chars[i] === 'l';
   let answerAt = -1;
-  for (let i = seg.chars.length - 1; i >= 0; i--) {
-    if (ANSWER.has(seg.chars[i])) {
-      answerAt = i;
-      break;
+  // What stays in view of a failed segment's words (`last`).
+  let lastAt = -1;
+  if (live) {
+    for (let i = seg.chars.length - 1; i >= 0; i--) {
+      if (ANSWER.has(seg.chars[i])) {
+        answerAt = i;
+        break;
+      }
+      // While the segment runs, a text the agent has gone on from is a report along the way: it is
+      // the answer only while nothing has come after it.
+      if (seg.chars[i] !== '.' && seg.chars[i] !== 'i' && seg.chars[i] !== 'e') break;
     }
-    // While the segment runs, a text the agent has gone on from is a report along the way: it is
-    // the answer only while nothing has come after it.
-    if (live && seg.chars[i] !== '.' && seg.chars[i] !== 'i' && seg.chars[i] !== 'e') break;
+  } else {
+    // Settled, the answer is the last thing said that is not a lead-in or a nod: a report stays the
+    // answer when "Committed." or "Done." follows it, with steps between or without. A turn that
+    // said nothing but those answers with the last of them.
+    let nodAt = -1;
+    let textAt = -1;
+    for (let i = seg.chars.length - 1; i >= 0 && (answerAt < 0 || lastAt < 0); i--) {
+      const ch = seg.chars[i];
+      if (!ANSWER.has(ch)) continue;
+      if (ch === 't' && textAt < 0) textAt = i;
+      if (nod(i)) {
+        if (nodAt < 0) nodAt = i;
+        continue;
+      }
+      if (answerAt < 0) answerAt = i;
+      if (ch === 't' && lastAt < 0) lastAt = i;
+    }
+    if (answerAt < 0) answerAt = nodAt;
+    if (lastAt < 0) lastAt = textAt;
   }
   // A failed segment answers with its error card; its last text is one more report. So does a
   // segment a steered message cut: the turn went on past it, and its last words were said on the
   // way (they keep their tone when the steer arrives instead of brightening into an answer).
   if (failed || cut) answerAt = -1;
+  if (!failed || cut || answerAt >= 0) lastAt = -1;
+  // What was said after the piece that stays: nods, by the rule above.
+  const keptAt = answerAt >= 0 ? answerAt : lastAt;
+  const tail = !live && keptAt >= 0 ? seg.ids.filter((_, i) => i > keptAt && seg.chars[i] === 't') : [];
   // Nothing but notices (a /compact, a model change on its own): they are the turn, so they show.
   const lone = !seg.chars.some((c) => c !== 'n' && c !== '.' && c !== 'i' && c !== 'e');
   let replyAt = -1;
@@ -300,7 +334,6 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
   }
   const flow: FlowChunk[] = [];
   const work: string[] = [];
-  const texts: string[] = [];
   let steps = 0;
   let run: string[] = [];
   let runCount = 0;
@@ -332,14 +365,12 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
       // does not stand between them: that work goes on under the pair, in the run it began.
       replied = true;
       flow.unshift({ kind: 'text', id });
-      texts.push(id);
       continue;
     }
     if (ch === 't' || SHOW.has(ch)) {
       close();
       narr = [];
       flow.push({ kind: ch === 't' ? 'text' : 'show', id });
-      if (ch === 't') texts.push(id);
       continue;
     }
     if (ch === 'l') narr.push(id);
@@ -353,8 +384,8 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
   close();
   const answer = answerAt >= 0 ? seg.ids[answerAt] : null;
   const reply = replyAt >= 0 ? seg.ids[replyAt] : null;
-  // A failed segment has no answer: the last thing the agent said stays in view, over the error.
-  const last = failed && !answer && texts.length ? texts[texts.length - 1] : null;
+  // A failed segment has no answer: the last thing of substance the agent said stays in view, over the error.
+  const last = lastAt >= 0 ? seg.ids[lastAt] : null;
   return {
     key: seg.lead ?? `${turnKey}:${index}`,
     lead: seg.lead,
@@ -365,6 +396,7 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
     answer,
     reply,
     last,
+    tail,
     // Set for the whole turn once its segments are known (`foldNotes`).
     notes: [],
     errors,
@@ -376,7 +408,7 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
 function foldNotes(segments: Segment[]) {
   if (!segments.some((s) => s.work.length > 0)) return;
   for (const s of segments) {
-    for (const c of s.flow) if (c.kind === 'text' && c.id !== s.answer && c.id !== s.reply && c.id !== s.last) s.notes.push(c.id);
+    for (const c of s.flow) if (c.kind === 'text' && c.id !== s.answer && c.id !== s.reply && c.id !== s.last && !s.tail.includes(c.id)) s.notes.push(c.id);
   }
 }
 

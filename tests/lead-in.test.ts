@@ -32,6 +32,11 @@ describe('isLeadIn', () => {
       'Done. Let me run the tests.',
       'That works. Now the docs.',
       'Makes sense. Let me read the handler.',
+      // The one word for a step that is done says what the step's own row says.
+      'Committed.',
+      'Pushed.',
+      'All done.',
+      'Committed. Now the docs.',
     ])
       expect(isLeadIn(t, false), t).toBe(true);
   });
@@ -55,7 +60,10 @@ describe('isLeadIn', () => {
       // The owner's own example of a progress note: what is done, then what comes next.
       'The account order is committed on the side branch. Now checking how a chat shows when only its sub-agents still run.',
       'Tests pass. Now the type check.',
-      'Committed. Now the docs.',
+      // More than the one word: what was committed, and where.
+      'Committed the fix on main.',
+      'Committed on the side branch. Now the docs.',
+      'Fixed the import in routes.ts.',
       // A move with a verb in it is a statement.
       'Now the tests pass.',
       'Now the build works again.',
@@ -79,6 +87,11 @@ describe('isLeadIn', () => {
     expect(isLeadIn('Now the guard throws', true)).toBe(false);
     expect(isLeadIn('Now the admin guard in the middleware file', true)).toBe(false);
     expect(isLeadIn('That wo', true)).toBe(true);
+    // A nod in the making is held only while nothing but the nod is there.
+    expect(isLeadIn('Commit', true)).toBe(true);
+    expect(isLeadIn('Committed', true)).toBe(true);
+    expect(isLeadIn('Committed the', true)).toBe(false);
+    expect(isLeadIn('Finally the build is', true)).toBe(false);
     expect(isLeadIn('Let me run the tests. They', true)).toBe(false);
     // Finished, a fragment is just a fragment.
     expect(isLeadIn('Now', false)).toBe(false);
@@ -98,5 +111,8 @@ describe('leadTitle', () => {
     expect(leadTitle('Good. Next, the tests.')).toBe('The tests');
     expect(leadTitle('Running the tests now.')).toBe('Running the tests now');
     expect(leadTitle('That works. Now the docs.')).toBe('The docs');
+    // A nod alone announces nothing: the line keeps the step's own title.
+    expect(leadTitle('Committed.')).toBe('');
+    expect(leadTitle('Good.')).toBe('');
   });
 });

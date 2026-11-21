@@ -287,6 +287,61 @@ describe('groupTurns', () => {
   });
 });
 
+describe('the answer of a finished turn', () => {
+  // `l` is a lead-in or a nod ("Committed.", "Done.", an announcement): see lead-in.ts.
+  it('stays the report when a nod follows it: the nod stands under it as a last line', () => {
+    const s = onlyTurn('U1 w2 t3 l4 T5').segments[0];
+    expect(s).toMatchObject({ answer: '3', tail: ['4'], notes: [], work: ['2'] });
+    expect(flowOf(s.flow)).toBe('[2] 3 4');
+  });
+
+  it('stays the report when steps and then a nod follow it', () => {
+    const s = onlyTurn('U1 w2 t3 w4 w5 l6 T7').segments[0];
+    expect(s).toMatchObject({ answer: '3', tail: ['6'], notes: [], work: ['2', '4', '5'] });
+    expect(flowOf(s.flow)).toBe('[2] 3 [4 5] 6');
+    // An earlier note still folds: only the last report is the answer.
+    expect(onlyTurn('U1 w2 t3 w4 t5 w6 l7 T8').segments[0]).toMatchObject({ answer: '5', tail: ['7'], notes: ['3'] });
+    // A task list update or a notice after the nod changes nothing.
+    expect(onlyTurn('U1 w2 t3 w4 l5 k6 n7 T8').segments[0]).toMatchObject({ answer: '3', tail: ['5'] });
+  });
+
+  it('is the nod when the turn said nothing else, the last of several', () => {
+    expect(onlyTurn('U1 w2 l3 T4').segments[0]).toMatchObject({ answer: '3', tail: [], notes: [] });
+    expect(onlyTurn('U1 l2 w3 l4 T5').segments[0]).toMatchObject({ answer: '4', tail: [], work: ['2', '3'] });
+  });
+
+  it('is the last of two real reports: the earlier one folds as a note', () => {
+    const s = onlyTurn('U1 w2 t3 w4 t5 T6').segments[0];
+    expect(s).toMatchObject({ answer: '5', tail: [], notes: ['3'] });
+  });
+
+  it('reads a plan or command output the same way: a nod after it is not the answer', () => {
+    expect(onlyTurn('U1 w2 p3 l4 T5').segments[0]).toMatchObject({ answer: '3', tail: ['4'] });
+    expect(onlyTurn('U1 c2 l3 T4').segments[0]).toMatchObject({ answer: '2', tail: ['3'] });
+  });
+
+  it('keeps the rule in a steered segment and after an interruption', () => {
+    // The reply is the report; "Done." after the work is its last line.
+    const t = onlyTurn('U1 w2 S3 t4 w5 l6 T7');
+    expect(t.segments[1]).toMatchObject({ reply: null, answer: '4', tail: ['6'], work: ['5'] });
+    // A nod as the reply, a report after: the reply stays the reply.
+    expect(onlyTurn('U1 w2 S3 l4 w5 t6 T7').segments[1]).toMatchObject({ reply: '4', answer: '6', tail: [] });
+    expect(onlyTurn('U1 w2 t3 w4 l5 i6').segments[0]).toMatchObject({ answer: '3', tail: ['5'] });
+  });
+
+  it('leaves a running turn as it was: the nod waits in the work for a step', () => {
+    const s = onlyTurn('U1 w2 t3 w4 l5', true).segments[0];
+    expect(s).toMatchObject({ answer: null, tail: [], work: ['2', '4', '5'] });
+  });
+
+  it('keeps the last report of a failed turn in view, and a nod after it', () => {
+    const s = onlyTurn('U1 w2 t3 w4 t5 l6 e7 F8').segments[0];
+    expect(s).toMatchObject({ answer: null, last: '5', tail: ['6'], notes: ['3'] });
+    // Nothing but a nod before the failure: it is those last words.
+    expect(onlyTurn('U1 w2 l3 e4 F5').segments[0]).toMatchObject({ answer: null, last: '3', tail: [] });
+  });
+});
+
 describe('work no message opened (a turn the agent began by itself)', () => {
   it('is a turn of its own, with no message at its head, instead of a row per step', () => {
     // A notification opened a turn and it ended; then the agent went on by itself (a second wake).
@@ -400,7 +455,7 @@ describe('lead-ins', () => {
   });
 
   it('says a lead-in in view when no step follows it', () => {
-    // The last words of a settled turn are its answer, whatever they look like.
+    // The last words of a settled turn that said nothing else are its answer, whatever they look like.
     expect(onlyTurn('U1 w2 l3 T4').segments[0]).toMatchObject({ answer: '3', work: ['2'] });
     // Before more text it is one more report.
     expect(flowOf(onlyTurn('U1 l2 t3 w4 t5 T6').segments[0].flow)).toBe('2 3 [4] 5');
@@ -432,11 +487,13 @@ describe('lead-ins', () => {
     expect(onlyTurn('U1 l2 w3 F4').segments[0].answer).toBeNull();
   });
 
-  it('keeps the last words the answer when a notice or a task list update follows them', () => {
-    // "I'll leave the config as it is." and then "Your message is back in the queue".
+  it('keeps the last words in view when a notice or a task list update follows them', () => {
+    // "I'll leave the config as it is." and then "Your message is back in the queue": said in view,
+    // as the last line under the report before it (the answer), not folded with the notice.
     const s = onlyTurn('U1 t2 w3 l4 n5 T6').segments[0];
-    expect(s.answer).toBe('4');
+    expect(s).toMatchObject({ answer: '2', tail: ['4'], notes: [] });
     expect(flowOf(s.flow)).toBe('2 [3] 4 [5]');
+    // With nothing said before them they are the answer.
     expect(onlyTurn('U1 w2 l3 k4 T5').segments[0]).toMatchObject({ answer: '3', work: ['2', '4'] });
     expect(onlyTurn('U1 w2 l3 h4 n5 T6').segments[0].answer).toBe('3');
     // A notice and then a step: the lead-in announced that step.
