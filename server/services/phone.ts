@@ -46,7 +46,7 @@ import {
 import { canonicalName, isPackageName } from '../../shared/file-name';
 import { partOfTurn, syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
-import { fileLine, scopeLines } from '../core/permission-scope';
+import { fileLine, saveLines, scopeLines } from '../core/permission-scope';
 import { cap, isSnapshot, lines } from '../core/trim';
 import { VERSION } from '../version';
 import { PhoneChangesReader, stepIds } from './phone-changes';
@@ -368,14 +368,19 @@ function askDiff(diff: FileDiff[]): { diff: FileDiff[]; cut: boolean } {
 }
 
 /** Words of a permission request the phone shows, and how long each may be. */
-const ASK_TEXT = { title: 300, description: FULL.field, reason: LIMITS.notice, label: 200, hint: LIMITS.field };
+const ASK_TEXT = { title: 300, description: FULL.field, reason: LIMITS.notice, label: 200, hint: LIMITS.field, id: 200 };
 
 /**
  * A permission request as a phone gets it, cut like a step opened in full (`phone.item`): what it
  * shows (title, command, path, url, plan, the change's first hunks), never an edit's whole text.
  * `incomplete` when any of what it would allow was shortened or left out (a command, a list of
  * folders in its description, the change's lines, an option): then the phone may only decline it
- * (`phoneAllowed`), the desktop has the whole of it.
+ * (`phoneAllowed`), the desktop has the whole of it. An "always" answer whose saves do not all show
+ * whole (each with what it does and where it is kept, review wave 6, #5) is not among the phone's
+ * options: only the desktop offers it.
+ * Every field is its own bounded copy (review wave 6, #15): nothing of the request is passed on as
+ * it came (its `scope` stays on the desktop once it was checked to show), so a record is never
+ * bigger than its caps.
  */
 export function phonePermission(p: PermissionRequest): PhonePermission {
   let cut = false;
@@ -383,6 +388,7 @@ export function phonePermission(p: PermissionRequest): PhonePermission {
     if (s.length > n) cut = true;
     return cap(s, n);
   };
+  const text = (s: unknown) => (typeof s === 'string' ? s : '');
   const d = p.detail ?? {};
   const detail = trimDetail(d, FULL.field, true);
   for (const k of DETAIL_TEXT) if (typeof d[k] === 'string' && (d[k] as string).length > FULL.field) cut = true;
@@ -393,18 +399,40 @@ export function phonePermission(p: PermissionRequest): PhonePermission {
   if (change?.cut) cut = true;
   // An edit's own text is what it allows where no whole change shows it.
   if (!change || change.cut) for (const k of ['oldText', 'newText', 'content'] as const) if (typeof d[k] === 'string' && (d[k] as string).length > FULL.field) cut = true;
-  if (p.options.length > 12) cut = true;
+  const all = Array.isArray(p.options) ? p.options : [];
+  if (all.length > 12) cut = true;
+  // An option is answered by its id: one too long to pass on whole is left out (and the request is the desktop's).
+  const options = all.slice(0, 12).filter((o) => {
+    const ok = !!o && typeof o.id === 'string' && o.id.length <= ASK_TEXT.id;
+    if (!ok) cut = true;
+    return ok;
+  });
   const out: PhonePermission = {
-    ...p,
-    title: c(p.title, ASK_TEXT.title),
+    id: p.id,
+    sessionId: p.sessionId,
+    ...(typeof p.itemId === 'string' && p.itemId.length <= ASK_TEXT.id ? { itemId: p.itemId } : {}),
+    toolName: cap(text(p.toolName), ASK_TEXT.label),
+    kind: p.kind,
+    title: c(text(p.title), ASK_TEXT.title),
     ...(p.description ? { description: c(p.description, ASK_TEXT.description) } : {}),
     ...(p.reason ? { reason: c(p.reason, ASK_TEXT.reason) } : {}),
     detail,
     ...(change ? { diff: change.diff } : {}),
-    options: p.options.slice(0, 12).map((o) => ({ ...o, label: c(o.label, ASK_TEXT.label), ...(o.hint ? { hint: c(o.hint, ASK_TEXT.hint) } : {}) })),
+    options: options.map((o) => ({ id: o.id, label: c(text(o.label), ASK_TEXT.label), ...(o.hint ? { hint: c(o.hint, ASK_TEXT.hint) } : {}), tone: o.tone })),
+    ...(p.allowFeedback ? { allowFeedback: true } : {}),
+    createdAt: p.createdAt,
   };
   if (!scopeShown(p.scope, out)) cut = true;
+  // What "always" saves, all of it in words, or that answer is the desktop's alone.
+  if (p.scope && !savesShown(p.scope, out)) out.options = out.options.filter((o) => o.tone !== 'always');
   return cut ? { ...out, incomplete: true } : out;
+}
+
+/** Whether every save of an "always" answer shows whole as a line of the description or reason (and none is unnamed). */
+function savesShown(scope: NonNullable<PermissionRequest['scope']>, shown: PhonePermission): boolean {
+  if (scope.savesUnknown) return false;
+  const said = new Set([...(shown.description?.split('\n') ?? []), ...(shown.reason?.split('\n') ?? [])]);
+  return saveLines(scope.saves).every((l) => said.has(l));
 }
 
 /**
@@ -417,7 +445,9 @@ function scopeShown(scope: PermissionRequest['scope'], shown: PhonePermission): 
   if (!scope) return true;
   if (scope.unknown) return false;
   const said = new Set([...(shown.description?.split('\n') ?? []), ...(shown.reason?.split('\n') ?? [])]);
-  if (scopeLines(scope).some((l) => !said.has(l))) return false;
+  // What "always" saves is checked on its own (`savesShown`): it decides that answer alone.
+  const saves = new Set(saveLines(scope.saves));
+  if (scopeLines(scope).some((l) => !saves.has(l) && !said.has(l))) return false;
   return (scope.files ?? []).every((f) => said.has(fileLine(f)) || !!shown.diff?.some((d) => d.path === f.path && (f.from ? d.oldPath === f.from : !d.oldPath || d.oldPath === d.path)));
 }
 
@@ -430,7 +460,10 @@ export function phoneAllowed(req: PermissionRequest | undefined, optionId: unkno
   if (!req) return;
   const o = req.options.find((x) => x.id === optionId);
   if (!o) throw new Error('That is not one of the answers to this request.');
-  if (o.tone !== 'deny' && phonePermission(req).incomplete) throw new Error('This request is longer than the phone shows. Answer it on the desktop.');
+  const shown = phonePermission(req);
+  if (o.tone !== 'deny' && shown.incomplete) throw new Error('This request is longer than the phone shows. Answer it on the desktop.');
+  // An answer the phone was not offered (an "always" whose saves it cannot show whole).
+  if (!shown.options.some((x) => x.id === o.id)) throw new Error('That answer is only on the desktop.');
 }
 
 /** Questions and options a phone gets, and how long their words may be (also `incomplete` when two questions read the same). */
@@ -446,16 +479,20 @@ export function phoneQuestion(q: QuestionRequest): PhoneQuestionRequest {
   // a question's words): only the desktop answers those.
   const twice = new Set(q.questions.map((x) => x.question)).size !== q.questions.length;
   const incomplete = twice || q.questions.length > ASK_Q.questions || q.questions.some((x) => x.options.length > ASK_Q.options);
+  // Each field its own bounded copy (review wave 6, #15): nothing else of the request goes along.
   const out: PhoneQuestionRequest = {
-    ...q,
+    id: q.id,
+    sessionId: q.sessionId,
+    ...(typeof q.itemId === 'string' && q.itemId.length <= ASK_TEXT.id ? { itemId: q.itemId } : {}),
+    createdAt: q.createdAt,
     questions: q.questions.slice(0, ASK_Q.questions).map((x, i): PhoneQuestion => {
       const cut = x.question.length > ASK_Q.question || (x.header?.length ?? 0) > ASK_Q.header || x.options.some((o) => o.label.length > ASK_Q.label || (o.description?.length ?? 0) > ASK_Q.description);
       return {
-        ...x,
         id: `q${i}`,
         question: cap(x.question, ASK_Q.question),
         ...(x.header ? { header: cap(x.header, ASK_Q.header) } : {}),
-        options: x.options.slice(0, ASK_Q.options).map((o, j) => ({ ...o, id: `o${j}`, label: cap(o.label, ASK_Q.label), ...(o.description ? { description: cap(o.description, ASK_Q.description) } : {}) })),
+        ...(x.multiSelect ? { multiSelect: true } : {}),
+        options: x.options.slice(0, ASK_Q.options).map((o, j) => ({ id: `o${j}`, label: cap(o.label, ASK_Q.label), ...(o.description ? { description: cap(o.description, ASK_Q.description) } : {}) })),
         ...(cut ? { cut: true as const } : {}),
       };
     }),
@@ -661,7 +698,11 @@ export const PHONE_BYTES = { helloSessions: 6_000_000, helloPrompts: 4_000_000, 
 
 const utf8 = (v: unknown) => Buffer.byteLength(JSON.stringify(v), 'utf8');
 
-/** A place in a list for a cursor: its index and the id there (a list that changed meanwhile goes on from that id). */
+/**
+ * A place in a list for a cursor: its index and the id there. A list that changed meanwhile goes on
+ * from that id; with that entry gone it starts over (entries before it may be gone too, so its old
+ * index could skip one still there; a page may repeat entries, the phone takes them by id).
+ */
 const placeOf = (i: number, id: string) => `${i}:${id}`;
 function placeIn(list: { id: string }[], cursor: unknown): number {
   if (typeof cursor !== 'string') return 0;
@@ -670,7 +711,7 @@ function placeIn(list: { id: string }[], cursor: unknown): number {
   const i = Number(m[1]);
   if (list[i]?.id === m[2]) return i;
   const at = list.findIndex((x) => x.id === m[2]);
-  return at >= 0 ? at : Math.min(i, list.length);
+  return at >= 0 ? at : 0;
 }
 
 /** Chats' list entries from `from` on, within `budget` bytes (one at least); `cursor` where the next page starts. */

@@ -5,9 +5,10 @@
  * saves it under.
  */
 import { describe, expect, it } from 'vitest';
-import type { TimelineItem, ToolItem } from '@shared/protocol';
+import type { PermissionRequest, TimelineItem, ToolItem } from '@shared/protocol';
 import { busyError, isBusy, isTransport, transportError, whileBusy } from '../mobile/src/lib/errors';
-import { phoneDetail } from '../server/services/phone';
+import { phoneDetail, promptsPage } from '../server/services/phone';
+import { canonicalName, isCanonicalName } from '../shared/file-name';
 
 describe('a busy desktop (retry, retryAfterMs)', () => {
   it('is asked again after the wait it names, then the answer is the result', async () => {
@@ -74,5 +75,32 @@ describe("a share's card on the phone", () => {
     const { item } = phoneDetail(items, 'sh');
     const files = (item as ToolItem).detail?.files ?? [];
     expect(files[0]?.name).toBe('setup.apk');
+  });
+});
+
+describe('a canonical name (shared/file-name.ts)', () => {
+  it('is in NFC also when a format character stood between a letter and its accent', () => {
+    // "A", a zero-width joiner, a combining acute: NFC cannot compose them until the joiner is gone.
+    const name = canonicalName('A‍́.txt');
+    expect(name).toBe('Á.txt');
+    expect(name.normalize('NFC')).toBe(name);
+    expect(isCanonicalName(name)).toBe(true);
+  });
+
+  it('is in NFC when the cut falls inside a long decomposed name', () => {
+    const name = canonicalName('e​́'.repeat(130) + '.pdf');
+    expect(name.normalize('NFC')).toBe(name);
+    expect([...name].length).toBeLessThanOrEqual(120);
+    expect(name.endsWith('.pdf')).toBe(true);
+    expect(isCanonicalName(name)).toBe(true);
+  });
+});
+
+describe('a page of what waits from a cursor whose entry is gone (#14)', () => {
+  it('starts over rather than skip one still there', () => {
+    const p = (id: string) => ({ id, sessionId: 's', tool: 'Bash', title: 'Run', input: {} }) as unknown as PermissionRequest;
+    // The cursor named p3 at index 2; p1 and p3 were answered meanwhile.
+    const page = promptsPage({ permissions: [p('p2'), p('p4'), p('p5')], questions: [] }, '2:p3', 1_000_000);
+    expect(page.permissions.map((x) => x.id)).toEqual(['p2', 'p4', 'p5']);
   });
 });

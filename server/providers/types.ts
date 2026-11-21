@@ -44,14 +44,23 @@ export interface ProviderContext {
   runAgent?: (rt: SessionRuntime, call: AgentCall, itemId: string | undefined, signal?: AbortSignal) => Promise<{ ok: boolean; text: string }>;
 }
 
+/** How a message goes to the agent (`ProviderSession.send`). */
+export interface SendOptions {
+  /** Throws when the sender may no longer act: asked right before the message goes. */
+  check?: () => void;
+}
+
 /** A live connection between one SessionRuntime and the provider's agent process. */
 export interface ProviderSession {
   /**
    * Delivers a user message. The UserItem is already on the timeline; when a turn is
    * running its `state` is "queued" and the adapter flips it to "sent" once consumed
    * (`rt.taken`). A `steered` item goes to the running agent now, to be taken at its next step.
+   * `opts.check`: called right before the message goes to the agent (after any wait of the adapter's
+   * own, as Codex loading its thread); it throws when the sender may no longer act (a phone removed
+   * meanwhile), and then nothing goes and `send` rejects with that error.
    */
-  send(item: UserItem): Promise<void>;
+  send(item: UserItem, opts?: SendOptions): Promise<void>;
   interrupt(): Promise<void>;
   setModel(model: string): Promise<void>;
   setEffort(effort: Effort): Promise<void>;

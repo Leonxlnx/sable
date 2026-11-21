@@ -377,7 +377,8 @@ describe('#12: a Codex Stop acts only on its own turn', () => {
 
   it("a Stop whose interrupt answers late never clears the next turn's safety net", async () => {
     const late = gate();
-    const h = await codexFake({ 'turn/interrupt': async (_p, n) => (n === 1 ? (await late.wait(), {}) : {}) });
+    // The thread's store has the second turn stopped (the safety net asks it: review wave 6, #12).
+    const h = await codexFake({ 'turn/interrupt': async (_p, n) => (n === 1 ? (await late.wait(), {}) : {}), 'thread/turns/list': () => ({ data: [{ id: 'turn2', status: 'interrupted', items: [] }] }) });
     await h.send('first');
     await tick();
     h.started('turn1');
@@ -496,13 +497,18 @@ describe('#14: the turn of a stopped command whose id was never known', () => {
     await stopping;
     expect(h.rt.turnActive).toBe(false);
     void h.send('/compact');
-    await until(() => h.count('thread/compact/start') === 2, 'the second compaction');
-    // The stopped compaction's turn shows itself while the second's start is out.
+    // The second's start waits (the store cannot say which turn the first made: review wave 6, #12).
+    await until(() => h.count('thread/turns/list') >= 1, 'the store asked');
+    expect(h.count('thread/compact/start')).toBe(1);
+    // The stopped compaction's turn shows itself while the second waits: it is stopped.
     h.started('cmpA');
-    second.open(undefined);
     await tick();
     expect(h.interrupted('cmpA')).toBe(true);
+    expect(h.count('thread/compact/start')).toBe(1);
     h.complete('cmpA', 'interrupted');
+    await until(() => h.count('thread/compact/start') === 2, 'the second compaction');
+    second.open(undefined);
+    await tick();
     expect(h.rt.turnActive).toBe(true);
     // The second's own turn is its own.
     h.started('cmpB');
@@ -523,10 +529,13 @@ describe('#14: the turn of a stopped command whose id was never known', () => {
     first.open(undefined);
     await stopping;
     void h.send('/compact');
-    await until(() => h.count('thread/compact/start') === 2, 'the second compaction');
+    // The second waits while the first's turn is not told apart (review wave 6, #12).
+    await until(() => h.count('thread/turns/list') >= 1, 'the store asked');
     await tick();
+    expect(h.count('thread/compact/start')).toBe(1);
     // The stopped compaction's end comes (its start was never seen): it began before the second's.
     h.complete('cmpA', 'interrupted');
+    await until(() => h.count('thread/compact/start') === 2, 'the second compaction');
     expect(h.rt.turnActive).toBe(true);
     h.started('cmpB');
     expect(h.interrupted('cmpB')).toBe(false);

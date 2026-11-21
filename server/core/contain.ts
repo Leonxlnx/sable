@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, lstatSync, openSync, realpathSync, statSync, type BigIntStats } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, realpathSync, statSync, type BigIntStats } from 'node:fs';
 import { lstat, open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -44,6 +44,14 @@ import path from 'node:path';
  *   between two lookups while no process works in the chat folder. Either takes a local process
  *   racing the check on purpose, one that could as well copy the file into the folder.
  * - A file with another name elsewhere (a hard link) is that file too: it is never inside.
+ * - Only a plain file is opened at all (review wave 6, #21): another kind of file (a pipe, a device,
+ *   a folder) is refused by its lookup before the open, and the open itself never waits (no blocking
+ *   open of a pipe put there between the two: `O_NONBLOCK` where the system has it); a handle that
+ *   is not a plain file is refused too.
+ * - The chat's folder is the one it was when it became the chat's (review wave 6, #2): `pinFolder`
+ *   records its identity (volume and id) then, `folderNow` says whether the folder at that place is
+ *   still that one (swapped for a junction to another folder, or for another folder: not), and a
+ *   root given as a `FolderRoot` must be that folder in both walks (on Linux, by its own lookup).
  */
 
 export const CONTAIN = {
@@ -63,6 +71,25 @@ export function within(root: string, p: string): boolean {
   return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
 }
 
+/** A chat's folder as it is now (`real`, its canonical place) with the identity it was pinned with (`pinFolder`). */
+export interface FolderRoot {
+  real: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+/** A chat's folder as a root: its canonical place, and its identity where it is known. */
+type RootIn = string | FolderRoot | undefined;
+
+const realOf = (r: RootIn) => (typeof r === 'string' ? r : r?.real);
+
+/** Another kind of file than a plain one (a pipe, a device, a folder): never opened. */
+export class NotAFile extends Error {
+  constructor() {
+    super('Not a plain file.');
+  }
+}
+
 /** The file opened, and whether it is established that it lies in the folder. The caller closes it. */
 export interface Contained<H> {
   handle: H;
@@ -71,16 +98,93 @@ export interface Contained<H> {
   inside: boolean;
 }
 
-/** Opens `file` (its real place) for reading, sync (a share's capture): see the module's comment. Throws when it cannot be opened. */
-export function openContainedSync(file: string, root: string | undefined): { fd: number; st: BigIntStats; inside: boolean } {
+/** Opens `file` (its real place) for reading, sync (a share's capture): see the module's comment. Throws when it cannot be opened or is not a plain file (`NotAFile`). */
+export function openContainedSync(file: string, root: RootIn): { fd: number; st: BigIntStats; inside: boolean } {
   const got = runSync(check<number>(file, root));
   return { fd: got.handle, st: got.st, inside: got.inside };
 }
 
-/** Opens `file` (its real place) for reading, async: see the module's comment. Throws when it cannot be opened. */
-export async function openContained(file: string, root: string | undefined): Promise<{ fh: FileHandle; st: BigIntStats; inside: boolean }> {
+/** Opens `file` (its real place) for reading, async: see the module's comment. Throws when it cannot be opened or is not a plain file (`NotAFile`). */
+export async function openContained(file: string, root: RootIn): Promise<{ fh: FileHandle; st: BigIntStats; inside: boolean }> {
   const got = await runAsync(check<FileHandle>(file, root));
   return { fh: got.handle, st: got.st, inside: got.inside };
+}
+
+/** Opens a plain file for reading, sync, with no containment asked (a share's permission, as shown): another kind of file is refused before and after the open, and the open never waits. */
+export function openPlainSync(file: string): { fd: number; st: BigIntStats } {
+  const got = runSync(opened<number>(file));
+  return { fd: got.handle, st: got.st };
+}
+
+// ── a chat's folder as it was when it became the chat's (review wave 6, #2) ──
+
+/** Each chat folder's identity (volume and id), by its place as sessions name it (resolved, case-folded on Windows). */
+const pins = new Map<string, { dev: bigint; ino: bigint }>();
+
+const pinKey = (cwd: string) => (process.platform === 'win32' ? path.resolve(cwd).toLowerCase() : path.resolve(cwd));
+
+/**
+ * Records the folder at `cwd` as the chat's, when its folder becomes known (a chat made or restored,
+ * a lane entered): its identity, links followed. Once: a later call keeps what was recorded first,
+ * unless `fresh` (a folder Sable has just made there itself, a lane's worktree). False when there is
+ * no folder there to record.
+ */
+export async function pinFolder(cwd: string, fresh = false): Promise<boolean> {
+  if (!cwd) return false;
+  const key = pinKey(cwd);
+  if (pins.has(key) && !fresh) return true;
+  try {
+    const st = await stat(await realpath(path.resolve(cwd)), { bigint: true });
+    if (!st.isDirectory()) return false;
+    if (fresh || !pins.has(key)) pins.set(key, { dev: st.dev, ino: st.ino });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The chat's folder now: the one pinned for it (its canonical place now), `gone` (no folder there), or `changed` (another folder than the one pinned). */
+export type FolderNow = FolderRoot | 'gone' | 'changed';
+
+/**
+ * Whether the folder at `cwd` is still the one pinned for it (`pinFolder`; one never pinned is
+ * pinned now). A folder swapped for a junction to another one, or for another folder, is `changed`:
+ * nothing in it counts as the chat's (no phone listing or diff, no share inside it).
+ */
+export async function folderNow(cwd: string): Promise<FolderNow> {
+  let real: string;
+  let st: BigIntStats;
+  try {
+    real = await realpath(path.resolve(cwd));
+    st = await stat(real, { bigint: true });
+  } catch {
+    return 'gone';
+  }
+  return judged(cwd, real, st);
+}
+
+/** `folderNow`, sync (a share's capture). */
+export function folderNowSync(cwd: string): FolderNow {
+  let real: string;
+  let st: BigIntStats;
+  try {
+    real = realpathSync(path.resolve(cwd));
+    st = statSync(real, { bigint: true });
+  } catch {
+    return 'gone';
+  }
+  return judged(cwd, real, st);
+}
+
+function judged(cwd: string, real: string, st: BigIntStats): FolderNow {
+  if (!st.isDirectory()) return 'gone';
+  const key = pinKey(cwd);
+  let pin = pins.get(key);
+  if (!pin) {
+    pin = { dev: st.dev, ino: st.ino };
+    pins.set(key, pin);
+  }
+  return pin.dev === st.dev && pin.ino === st.ino ? { real, dev: pin.dev, ino: pin.ino } : 'changed';
 }
 
 // ── the check, once for both: it asks for each lookup, the drivers below do it ──
@@ -101,9 +205,11 @@ type Check<T> = Generator<Op, T, unknown>;
 interface Chain {
   paths: string[];
   timedFrom: number;
+  /** The identity the chat's folder (`paths[timedFrom]`) must have, where it was pinned. */
+  id?: { dev: bigint; ino: bigint };
 }
 
-function chainOf(root: string, file: string): Chain | null {
+function chainOf(root: string, file: string, id?: { dev: bigint; ino: bigint }): Chain | null {
   if (!within(root, file)) return null;
   const rel = path.relative(root, file);
   if (!rel) return null;
@@ -123,7 +229,7 @@ function chainOf(root: string, file: string): Chain | null {
   }
   // The chat's folder itself (its own change time moves when it is swapped) and everything below it,
   // never its parent, whose times move with every folder made or removed beside it.
-  return { paths, timedFrom: up.length };
+  return { paths, timedFrom: up.length, ...(id ? { id } : {}) };
 }
 
 interface Seen {
@@ -145,6 +251,8 @@ function* walk(chain: Chain): Check<{ seen: Seen[]; wait: number } | null> {
     const leaf = i === chain.paths.length - 1;
     const s = (yield { k: 'lstat', p: chain.paths[i] }) as BigIntStats;
     if (s.isSymbolicLink() || (leaf ? !s.isFile() : !s.isDirectory())) return null;
+    // The chat's folder is another folder than the one pinned for it: that is final.
+    if (chain.id && i === chain.timedFrom && (s.ino !== chain.id.ino || s.dev !== chain.id.dev)) return null;
     // Its change time (which nothing in Node can set) tells whether its next change would show.
     if (!leaf && i >= chain.timedFrom && now - s.ctimeNs < settle) wait = Math.max(wait, Math.min(CONTAIN.settleMs, Math.ceil(Number(settle - (now - s.ctimeNs)) / 1e6)));
     seen.push({ ino: s.ino, dev: s.dev, m: s.mtimeNs, c: s.ctimeNs, nlink: s.nlink });
@@ -162,10 +270,15 @@ function same(a: Seen[], b: Seen[], timedFrom: number): boolean {
   return true;
 }
 
+/** Opens a plain file: another kind is refused by its lookup before the open and by its handle after it, and the open never waits. */
 function* opened<H>(file: string): Check<{ handle: H; st: BigIntStats }> {
+  const was = (yield { k: 'stat', p: file }) as BigIntStats;
+  if (!was.isFile()) throw new NotAFile();
   const handle = (yield { k: 'open', p: file }) as H;
   try {
-    return { handle, st: (yield { k: 'fstat', h: handle }) as BigIntStats };
+    const st = (yield { k: 'fstat', h: handle }) as BigIntStats;
+    if (!st.isFile()) throw new NotAFile();
+    return { handle, st };
   } catch (err) {
     yield { k: 'close', h: handle };
     throw err;
@@ -181,8 +294,10 @@ function* tryWalk(chain: Chain): Check<{ seen: Seen[]; wait: number } | null | '
   }
 }
 
-function* check<H>(file: string, root: string | undefined): Check<Contained<H>> {
-  const chain = root ? chainOf(root, file) : null;
+function* check<H>(file: string, rootIn: RootIn): Check<Contained<H>> {
+  const root = realOf(rootIn);
+  const id = typeof rootIn === 'object' ? { dev: rootIn.dev, ino: rootIn.ino } : undefined;
+  const chain = root ? chainOf(root, file, id) : null;
   const how = CONTAIN.how;
   // No proof of where an opened file lies here: it is not inside.
   if (!root || !chain || how === 'none') return { ...(yield* opened<H>(file)), inside: false };
@@ -193,16 +308,22 @@ function* check<H>(file: string, root: string | undefined): Check<Contained<H>> 
       const self = (yield { k: 'self', h: got.handle }) as string | null;
       if (self !== null) {
         let ok = false;
-        if (got.st.isFile() && got.st.nlink === 1n && within(root, self)) {
+        // Its own path is the one asked for (the caller resolved it): nothing was followed on the way.
+        const named = within(root, self) && within(self, file) && within(file, self);
+        if (got.st.isFile() && got.st.nlink === 1n && named) {
           try {
             const now = (yield { k: 'stat', p: self }) as BigIntStats;
             ok = now.ino === got.st.ino && now.dev === got.st.dev;
+            if (ok && id) {
+              const dir = (yield { k: 'stat', p: root }) as BigIntStats;
+              ok = dir.ino === id.ino && dir.dev === id.dev;
+            }
           } catch {
             ok = false;
           }
         }
-        // Named outside the folder, another kind of file, or more names: that is final.
-        if (ok || last || !got.st.isFile() || got.st.nlink !== 1n || !within(root, self)) return { ...got, inside: ok };
+        // Named elsewhere, another kind of file, or more names: that is final.
+        if (ok || last || !got.st.isFile() || got.st.nlink !== 1n || !named) return { ...got, inside: ok };
         yield { k: 'close', h: got.handle };
         continue;
       }
@@ -239,6 +360,9 @@ function* check<H>(file: string, root: string | undefined): Check<Contained<H>> 
 
 const SLEEPER = new Int32Array(new SharedArrayBuffer(4));
 
+/** Read-only, and never waiting for a writer (a pipe put there after its lookup) where the system has the flag. */
+const READ_NOW = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
+
 function runSync<T>(g: Check<T>): T {
   let r = g.next();
   for (;;) {
@@ -263,7 +387,7 @@ function doSync(op: Op): unknown {
     case 'stat':
       return statSync(op.p, { bigint: true });
     case 'open':
-      return openSync(op.p, 'r');
+      return openSync(op.p, READ_NOW);
     case 'fstat':
       return fstatSync(op.h as number, { bigint: true });
     case 'close':
@@ -310,7 +434,7 @@ async function doAsync(op: Op): Promise<unknown> {
     case 'stat':
       return stat(op.p, { bigint: true });
     case 'open':
-      return open(op.p, 'r');
+      return open(op.p, READ_NOW);
     case 'fstat':
       return (op.h as FileHandle).stat({ bigint: true });
     case 'close':

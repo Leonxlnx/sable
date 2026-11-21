@@ -45,6 +45,7 @@ import { backgroundRunning, itemsSince, lastSwitch, legOf, rootBefore, undoableS
 import { runSubAgent } from './core/sub-agent';
 import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
 import { cutAt } from './core/fork';
+import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
 import { withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
@@ -747,12 +748,34 @@ export class App {
 
   private lazy = new Set<string>();
 
+  /** Folders being pinned (core/contain.ts `pinFolder`), one at a time so a start with many chats does not crowd the disk. */
+  private pinning: Promise<unknown> = Promise.resolve();
+  /** Each session's folder as last pinned, by session id. */
+  private pinned = new Map<string, string>();
+
+  /**
+   * Pins a session's folder as it is when it becomes the session's (made, restored, or moved to a
+   * lane's worktree, which Sable has just made: pinned anew), so a folder later swapped for another
+   * one (a junction to another repository) is not taken for the chat's (review wave 6, #2).
+   */
+  private pinCwd(rt: SessionRuntime) {
+    const cwd = rt.meta.cwd;
+    if (!cwd || this.pinned.get(rt.id) === cwd) return;
+    this.pinned.set(rt.id, cwd);
+    const lane = rt.meta.lane;
+    const fresh = !!lane && path.resolve(lane.path).toLowerCase() === path.resolve(cwd).toLowerCase();
+    this.pinning = this.pinning.then(() => pinFolder(cwd, fresh)).catch(() => {});
+  }
+
   private makeRuntime(meta: SessionMeta, lazy = false): SessionRuntime {
     if (lazy) this.lazy.add(meta.id);
     const rt = new SessionRuntime(meta, this.emit, (rt, what) => {
-      if (what === 'meta') this.store.saveState();
-      else this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue, dirty: rt.takeDirty() }));
+      if (what === 'meta') {
+        this.pinCwd(rt);
+        this.store.saveState();
+      } else this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue, dirty: rt.takeDirty() }));
     });
+    this.pinCwd(rt);
     rt.onTurnEnd = (r, error, opts) => this.afterTurn(r, error, opts?.hold);
     // A queued message a phone was taking back is released: the queue goes on if it waited for it.
     rt.onQueueReleased = (r) => {
@@ -882,9 +905,22 @@ export class App {
     const runningSince = item.steered ? rt.turnStartedAt : undefined;
     const unhand = this.handOver(rt, item.id);
     try {
-      await handle.send(this.withBrowserPage(rt, this.withHandover(rt, item)));
+      // The guard goes along to the agent's own dispatch (review wave 6, #3): an adapter that waits
+      // first (Codex loading its thread) asks it again right before the message goes.
+      await handle.send(this.withBrowserPage(rt, this.withHandover(rt, item)), { check: () => still(ctx) });
     } catch (err) {
       unhand();
+      if (err instanceof CallerGone) {
+        // Its phone was removed while the agent got ready: nothing of it went to the agent. A turn it
+        // began ends (nothing runs in it); a turn it was steered into goes on.
+        rt.remove(item.id);
+        if (rt.turnActive && !(item.steered && rt.turnStartedAt === runningSince)) {
+          rt.settle('cancelled');
+          rt.endTurn();
+        }
+        rt.notice('info', 'A message from a removed phone was not sent');
+        throw err;
+      }
       // A steer the agent could not take: the turn it was meant for goes on, and the message waits in the queue.
       if (item.steered && rt.turnActive && rt.turnStartedAt === runningSince && rt.get<UserItem>(item.id)?.state === 'queued') {
         this.log('steer failed; back to the queue', (err as Error).message);
@@ -1377,7 +1413,7 @@ export class App {
    * account's folder so the same conversation resumes there; when that is not possible, a new one
    * starts and the next message carries a summary of this one.
    */
-  async switchAccount(rt: SessionRuntime, accountId: string, opts: { retry?: boolean; line?: string } = {}): Promise<RpcMethods['session.switchAccount']['result']> {
+  async switchAccount(rt: SessionRuntime, accountId: string, opts: { retry?: boolean; line?: string } = {}, ctx?: CallContext): Promise<RpcMethods['session.switchAccount']['result']> {
     this.hydrate(rt);
     if (rt.turnActive) throw new Error('The agent is still working. Stop it first.');
     const provider = rt.meta.provider;
@@ -1390,6 +1426,8 @@ export class App {
     rt.cancelPrompts();
     await rt.handle?.close().catch(() => {});
     rt.handle = undefined;
+    // A caller removed while the agent closed (a phone, review wave 6, #3): no conversation is copied, nothing moves.
+    still(ctx);
 
     let carried: 'conversation' | 'summary' | 'none' = 'none';
     const id = rt.meta.providerSessionId;
@@ -1401,6 +1439,7 @@ export class App {
         /* the old account was removed: nothing to copy from */
       }
       const adopted = !!fromHome && !!target.adoptConversation && (await target.adoptConversation(fromHome, id).catch((err) => (this.log('could not carry the conversation over', (err as Error).message), false)));
+      still(ctx);
       if (adopted) carried = 'conversation';
       else {
         rt.update({ providerSessionId: undefined });
@@ -1423,11 +1462,20 @@ export class App {
     }
     if (refused) {
       const handle = await this.ensureHandle(rt);
+      // Asked again once the new account's agent is there, and by the agent's own dispatch.
+      still(ctx);
       const unhand = this.handOver(rt, refused.id);
       try {
-        await handle.send(this.withHandover(rt, this.resumeMessage(rt, refused, carried)));
+        await handle.send(this.withHandover(rt, this.resumeMessage(rt, refused, carried)), { check: () => still(ctx) });
       } catch (err) {
         unhand();
+        if (err instanceof CallerGone) {
+          if (rt.turnActive) {
+            rt.settle('cancelled');
+            rt.endTurn();
+          }
+          throw err;
+        }
         rt.notice('error', 'Could not send the message', (err as Error).message);
         rt.endTurn((err as Error).message);
       }
@@ -2507,6 +2555,7 @@ export class App {
       if (remove) {
         this.sessions.delete(sessionId);
         this.handed.delete(sessionId);
+        this.pinned.delete(sessionId);
         this.store.deleteSession(sessionId);
         this.emit({ type: 'session.removed', id: sessionId });
         // A deleted chat takes its folder along when nothing was ever put in it.
@@ -2571,23 +2620,48 @@ export class App {
       }
       return this.call('session.snapshot', { sessionId: rt.id });
     });
-    this.register('session.switchAccount', async ({ sessionId, accountId, retry }) => {
+    this.register('session.switchAccount', async ({ sessionId, accountId, retry }, ctx) => {
       const rt = this.runtime(sessionId);
       const from = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-      const result = await this.switchAccount(rt, accountId, { retry });
+      const result = await this.switchAccount(rt, accountId, { retry }, ctx);
       // Moved by hand: a wait for the old account's reset is over.
       if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from) this.spare.movedByHand(rt);
       return result;
     });
     this.register('session.context', async ({ sessionId }) => (await this.runtime(sessionId).handle?.context?.()) ?? null);
-    this.register('session.setOptions', async ({ sessionId, options }) => {
+    this.register('session.setOptions', async ({ sessionId, options }, ctx) => {
       const rt = this.runtime(sessionId);
-      const next = { ...rt.meta.options, ...options };
-      rt.update({ options: next });
-      this.persistSessions();
+      const set = () => {
+        const next = { ...rt.meta.options, ...options };
+        rt.update({ options: next });
+        this.persistSessions();
+        return next;
+      };
+      // From the desktop: at once, and the agent takes it once it is there.
+      if (!ctx.allowed) {
+        const next = set();
+        try {
+          const handle = await this.ensureHandle(rt);
+          await handle.setOptions?.(next);
+        } catch (err) {
+          rt.notice('error', 'Could not apply the change', (err as Error).message);
+        }
+        return { ok: true };
+      }
+      // From a phone: set once the agent is there, and only while the phone may still act (review
+      // wave 6, #3); a phone removed meanwhile changes nothing.
+      let handle: ProviderSession | undefined;
+      let failed: Error | undefined;
       try {
-        const handle = await this.ensureHandle(rt);
-        await handle.setOptions?.(next);
+        handle = await this.ensureHandle(rt);
+      } catch (err) {
+        failed = err as Error;
+      }
+      still(ctx);
+      const next = set();
+      try {
+        if (failed) throw failed;
+        await handle?.setOptions?.(next);
       } catch (err) {
         rt.notice('error', 'Could not apply the change', (err as Error).message);
       }

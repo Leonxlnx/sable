@@ -25,14 +25,19 @@ import { openGrant, type FileGrant } from './phone-guard';
  *   (each reads its file whole), a few waiting their turn without holding anything. What goes over a
  *   bound is refused for now (`RetryLater`: phone.ts answers it with `retry: true` and `retryAfterMs`),
  *   never as a failure of the download.
- * - At most `FILE_MAX_TRANSFERS` open per phone (a new one closes its oldest), each closed after
- *   `FILE_IDLE_MS` unused, at `phone.fileEnd`, and at once when its phone is removed, its connection is
- *   no longer authorized, or phone access is turned off.
+ * - At most `FILE_MAX_TRANSFERS` open per phone, each closed after `FILE_IDLE_MS` unused, at
+ *   `phone.fileEnd`, and at once when its phone is removed, its connection is no longer authorized, or
+ *   phone access is turned off. A new one closes the phone's oldest only when that one is no longer in
+ *   use (no read under way, no chunk asked for `FILE_ACTIVE_MS`); while all of them are, the start is
+ *   refused for now (`RetryLater`, review wave 6, #17), before its file is read, so a download under
+ *   way never fails for another's start.
  */
 
 export const FILE_CHUNK = 256 * 1024;
 export const FILE_IDLE_MS = 2 * 60_000;
 export const FILE_MAX_TRANSFERS = 4;
+/** A transfer with a chunk asked for within this is in use: a new start never closes it. */
+export const FILE_ACTIVE_MS = 30_000;
 /**
  * In flight at once: chunk reads of one transfer (the phone's window is two) and of one phone (its
  * transfers' windows), the bytes their buffers take for one phone (a part across a block boundary
@@ -123,8 +128,22 @@ export class PhoneFiles {
     }
   }
 
+  /** Room for one more transfer of `deviceId`: true when there is (closing its oldest one no longer in use if it must), false while all of them are in use. */
+  private room(deviceId: string, close: boolean): boolean {
+    const mine = [...this.open.values()].filter((t) => t.deviceId === deviceId);
+    if (mine.length < FILE_MAX_TRANSFERS) return true;
+    const now = Date.now();
+    const spare = mine.filter((t) => t.reads === 0 && now - t.at >= FILE_ACTIVE_MS).sort((a, b) => a.at - b.at);
+    if (mine.length - spare.length >= FILE_MAX_TRANSFERS) return false;
+    if (close) for (let n = mine.length; n >= FILE_MAX_TRANSFERS; n--) this.close(spare.shift()!.id);
+    return true;
+  }
+
   private async opened(deviceId: string, grant: FileGrant, sha256: string, allowed: () => boolean): Promise<PhoneFileStart> {
     if (!allowed()) throw new Error('This phone was removed on the desktop.');
+    const busy = () => new RetryLater('Other downloads are under way. This one starts when one of them is done.', FILE_RETRY_MS.start);
+    // Before the file is read at all: no room while every transfer of this phone is in use.
+    if (!this.room(deviceId, false)) throw busy();
     let fh: FileHandle | undefined;
     try {
       const opened = await openGrant(grant);
@@ -134,8 +153,8 @@ export class PhoneFiles {
       const now = await blockDigests(fh, grant.size);
       if (!now || now.sha256 !== sha256.toLowerCase()) throw new Error('That file changed after it was shared.');
       if (!allowed()) throw new Error('This phone was removed on the desktop.');
-      const mine = [...this.open.values()].filter((t) => t.deviceId === deviceId).sort((a, b) => a.at - b.at);
-      while (mine.length >= FILE_MAX_TRANSFERS) this.close(mine.shift()!.id);
+      // Its transfers may have come into use while it was read: one in use is never closed for it.
+      if (!this.room(deviceId, true)) throw busy();
       const id = randomBytes(16).toString('base64url');
       const t: Transfer = { id, deviceId, fh, size: grant.size, blocks: now.blocks, reads: 0, at: Date.now(), timer: this.idle(id) };
       this.open.set(id, t);

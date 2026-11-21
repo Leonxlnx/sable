@@ -1042,10 +1042,21 @@ export interface PermissionScope {
   write?: string[];
   /** Every file it changes, a moved or renamed one by both ends (`from`). */
   files?: { path: string; from?: string }[];
-  /** Folders an "always" answer adds to what the agent may reach, and rules it saves (`Tool(content)`). */
+  /** What an "always" answer saves, one entry per change the agent suggested (each its own line in words: `scopeLines`). */
+  saves?: PermissionSave[];
+  /** Part of what an "always" answer saves cannot be named here: only the desktop offers that answer. */
+  savesUnknown?: true;
+  unknown?: true;
+}
+
+/** One change an "always" answer saves: folders it adds, rules it adds with their behaviour, or the mode it sets, and where it is kept. */
+export interface PermissionSave {
   dirs?: string[];
   rules?: string[];
-  unknown?: true;
+  behavior?: 'allow' | 'deny' | 'ask';
+  mode?: string;
+  /** This session, the project's shared or local settings, the person's own settings (every project), or this run's command line. */
+  where: 'session' | 'projectSettings' | 'localSettings' | 'userSettings' | 'cliArg';
 }
 
 export interface QuestionRequest {

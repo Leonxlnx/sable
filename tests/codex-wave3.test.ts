@@ -143,6 +143,8 @@ describe('#10: a command start is tracked like a message', () => {
     await tick();
     expect(h.interrupted('cmp1')).toBe(true);
     expect(h.rt.turnActive).toBe(false);
+    // Codex ends it (a start never goes while it may still run: review wave 6, #12).
+    h.complete('cmp1', 'interrupted');
     // The person's next message is its own turn, with its own id.
     await h.send('next');
     await until(() => h.count('turn/start') === 1, 'turn/start');

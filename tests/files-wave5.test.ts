@@ -378,9 +378,14 @@ describe('#22: chunk reads in flight are bounded before anything is allocated', 
     const other = await files.start('p2', grantOf(grants[1].path, 'p2'), grants[1].sha256, () => true);
     expect(other.transfer).toBeTruthy();
     release();
-    const all = await Promise.all([first, ...waiting]);
-    expect(new Set(all.map((s) => s.transfer)).size).toBe(all.length);
-    expect(files.count('p1')).toBeLessThanOrEqual(4);
+    // Four open at most, and one in use is never closed for a new start: the fifth is refused for now
+    // (review wave 6, #17: tests/boundary-wave6.test.ts), the four before it stay open.
+    const all = await Promise.allSettled([first, ...waiting]);
+    const opened = all.filter((r) => r.status === 'fulfilled').map((r) => (r as PromiseFulfilledResult<{ transfer: string }>).value);
+    expect(opened.length).toBe(4);
+    expect(new Set(opened.map((s) => s.transfer)).size).toBe(4);
+    retryable(all[4]);
+    expect(files.count('p1')).toBe(4);
   });
 });
 

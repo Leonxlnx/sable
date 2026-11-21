@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import type { PermissionOption, PermissionRequest, Question, QuestionRequest } from '@shared/protocol';
 import { fit } from '@m/lib/fit';
 import { pushBack } from '@m/lib/back';
@@ -210,7 +210,17 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
         </div>
       )}
       {d.plan && <div className="md ask-plan no-drag" dangerouslySetInnerHTML={{ __html: renderMarkdown(d.plan) }} />}
-      {req.reason && <p className="ask-reason">{req.reason}</p>}
+      {/* One line per thing it reaches: what "always" saves, each with where it is kept (review wave 6, #5). */}
+      {req.reason && (
+        <p className="ask-reason">
+          {req.reason.split('\n').map((line, i) => (
+            <Fragment key={i}>
+              {i > 0 && <br />}
+              {line}
+            </Fragment>
+          ))}
+        </p>
+      )}
       {desktopOnly && <p className="ask-desk">Answer this one on the desktop. The phone shows only part of it.</p>}
 
       <AutoHeight className="ask-actions-wrap">

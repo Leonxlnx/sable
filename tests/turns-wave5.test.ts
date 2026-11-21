@@ -469,6 +469,8 @@ describe('#15: a start waits until a stopped start\'s turn is told apart', () =>
     // Stopped before its turn showed itself (its answer named none): it never shows one.
     await h.stop();
     expect(h.rt.turnActive).toBe(false);
+    // An empty store may only be behind: it is asked again before the next command goes (review wave 6, #12).
+    (h.session() as unknown as { strayRecheckMs: number[] }).strayRecheckMs = [10, 10];
     void h.send('/compact');
     await until(() => h.count('thread/compact/start') === 2, 'the second compaction');
     // The second's own turn shows itself before its answer.
@@ -493,12 +495,14 @@ describe('#15: a start waits until a stopped start\'s turn is told apart', () =>
     const now = Date.now.bind(Date);
     vi.spyOn(Date, 'now').mockImplementation(() => now() + 61_000);
     void h.send('/compact');
-    await until(() => h.count('thread/compact/start') === 2, 'the second compaction');
+    // The store has the first's turn running: it is stopped, and the second waits for its end (review wave 6, #12).
+    await until(() => h.interrupted('cmpA'), 'the first stopped');
     await tick();
-    // The first's turn, late: it was stopped before the second went out, and its news is nobody's.
+    expect(h.count('thread/compact/start')).toBe(1);
+    // The first's turn, late: its news is nobody's, and its end lets the second go.
     h.started('cmpA');
     h.complete('cmpA', 'interrupted');
-    expect(h.interrupted('cmpA')).toBe(true);
+    await until(() => h.count('thread/compact/start') === 2, 'the second compaction');
     expect(h.rt.turnActive).toBe(true);
     h.started('cmpB');
     await tick();

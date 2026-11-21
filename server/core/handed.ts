@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { close, closeSync, fstat, fstatSync, openSync, read, readSync, realpathSync, type BigIntStats } from 'node:fs';
+import { close, closeSync, fstat, fstatSync, read, readSync, realpathSync, type BigIntStats } from 'node:fs';
 import path from 'node:path';
 import type { HandedFile, SharedFile } from '../../shared/protocol';
-import { openContainedSync, within } from './contain';
+import { folderNowSync, openContainedSync, openPlainSync, within, type FolderRoot } from './contain';
 
 export { within };
 
@@ -36,7 +36,9 @@ export interface Handing {
  * through a link that now leads elsewhere is refused.
  * - In the chat's folder (`inside`) only when that is established against the opened handle
  *   (core/contain.ts): a file reached through a folder flipped for a junction around the open, or one
- *   with another name elsewhere (a hard link), is not; where it cannot be established, not either.
+ *   with another name elsewhere (a hard link), is not; where it cannot be established, not either;
+ *   nor anything while the chat's folder is not the one it was when it became the chat's (swapped for
+ *   a junction to another folder). Only a plain file is opened (a pipe is never waited on).
  *   Only Linux names a handle's file, so on Windows and macOS no file is inside: every file there is
  *   external and reaches a phone only as `granted` (the person allowed that share themselves).
  * - `approved`: what the person allowed themselves, captured when the permission was shown to them
@@ -56,12 +58,10 @@ export interface Handing {
 export function handOver(cwd: string, files: readonly SharedFile[] | undefined, approved?: ApprovedShare, opts: { hashMax?: number; atOnce?: number } = {}): Handing {
   const max = opts.hashMax ?? HASH_MAX;
   let now = opts.atOnce ?? HASH_AT_ONCE;
-  let root: string | undefined;
-  try {
-    root = realpathSync(cwd);
-  } catch {
-    /* the chat's folder is gone: nothing counts as inside it */
-  }
+  // The chat's folder as it was when it became the chat's (core/contain.ts `folderNow`): gone, or
+  // swapped for another folder (a junction to another repository), nothing counts as inside it.
+  const folder = folderNowSync(cwd);
+  const root: FolderRoot | undefined = typeof folder === 'object' ? folder : undefined;
   const held: { fd: number; was: BigIntStats }[] = [];
   const handed = (files ?? []).map((f, i): HandedFile | null => {
     if (!f || typeof f.path !== 'string' || !f.path) return null;
@@ -185,8 +185,9 @@ export function approvedShare(cwd: string, files: readonly SharedFile[] | undefi
       let fd: number | undefined;
       try {
         const real = realpathSync(path.resolve(cwd, f.path));
-        fd = openSync(real, 'r');
-        return recordOf(real, fd, fstatSync(fd, { bigint: true }), false);
+        const got = openPlainSync(real);
+        fd = got.fd;
+        return recordOf(real, fd, got.st, false);
       } catch {
         return null;
       } finally {

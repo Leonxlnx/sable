@@ -59,27 +59,41 @@ const attachName = (v: unknown) =>
     .trim()
     .slice(0, 120) || 'Photo';
 
+/** What a picture the desktop holds weighs against `PHONE_ATTACH.total`: its data URL, or its size as one. */
+const weightOf = (a: Attachment) => (typeof a.dataUrl === 'string' ? a.dataUrl.length : Math.ceil(((a.size ?? 0) * 4) / 3) + 32);
+
 /**
  * Attachments as a phone may send them: pictures as image data within the caps, and nothing that
  * names a place on the computer (a path, a file, text read elsewhere). `known`: the attachments the
  * desktop already holds for this message (a queued message edited on the phone): one the phone names
- * by its id is the desktop's own copy, never what the phone sent with it. Throws when something else
- * was sent.
+ * by its id is the desktop's own copy, never what the phone sent with it. Each id goes once, and
+ * every picture of the resulting list counts against `PHONE_ATTACH.total`, the desktop's own kept
+ * ones too (review wave 6, #24); only a list of the desktop's own pictures alone, as they were, is
+ * not held to it (it is no bigger than the message already was). Throws when something else was sent.
  */
 export function phoneAttachments(list: unknown, known?: readonly Attachment[]): Attachment[] | undefined {
   if (list === undefined || list === null) return undefined;
   if (!Array.isArray(list)) throw new Error('Only pictures can be attached from the phone.');
   if (list.length > PHONE_ATTACH.count) throw new Error(`At most ${PHONE_ATTACH.count} pictures can go with one message.`);
   let total = 0;
+  let kept = 0;
+  const ids = new Set<string>();
   const out = list.map((raw): Attachment => {
     const a = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    if (typeof a.id === 'string') {
+      if (ids.has(a.id)) throw new Error('Each picture can go only once with a message.');
+      ids.add(a.id);
+    }
     const mine = typeof a.id === 'string' ? known?.find((k) => k.id === a.id) : undefined;
-    if (mine) return mine;
+    if (mine) {
+      kept += weightOf(mine);
+      return mine;
+    }
     const data = a.dataUrl;
     if (typeof data !== 'string' || !IMAGE_DATA.test(data)) throw new Error('Only pictures can be attached from the phone.');
     if (data.length > PHONE_ATTACH.each) throw new Error('That picture is too big to send.');
     total += data.length;
-    if (total > PHONE_ATTACH.total) throw new Error('These pictures are too big to send together.');
+    if (total + kept > PHONE_ATTACH.total) throw new Error('These pictures are too big to send together.');
     const comma = data.indexOf(',');
     const pad = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
     return {
@@ -91,6 +105,10 @@ export function phoneAttachments(list: unknown, known?: readonly Attachment[]): 
       size: Math.max(0, Math.floor(((data.length - comma - 1) * 3) / 4) - pad),
     };
   });
+  // New pictures with kept ones: all of them together (a kept one after the new ones counts too).
+  if (total > 0 && total + kept > PHONE_ATTACH.total) throw new Error('These pictures are too big to send together.');
+  // A new picture's id is its own (one made up for it never meets another): two that came out the same are refused too.
+  if (new Set(out.map((x) => x.id)).size !== out.length) throw new Error('Each picture can go only once with a message.');
   return out.length ? out : undefined;
 }
 

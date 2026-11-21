@@ -125,9 +125,10 @@ describe('the untracked-diff reader', () => {
     expect(await readText(path.join(root, 'notes.txt'), 1000, root)).toBeNull();
   });
 
-  it('reads a file reached through a link that stays in the folder (its own place is plain)', async () => {
+  it('never reads through a link below the folder, even one that stays in it (review wave 6, #1: a file is read as named)', async () => {
     const { root } = folders();
     symlinkSync(path.join(root, 'dir'), path.join(root, 'alias'), 'junction');
-    expect((await readText(path.join(root, 'alias', 'a.txt'), 1000, root))?.text).toBe('inside the chat');
+    expect(await readText(path.join(root, 'alias', 'a.txt'), 1000, root)).toBeNull();
+    expect((await readText(path.join(root, 'dir', 'a.txt'), 1000, root))?.text).toBe('inside the chat');
   });
 });

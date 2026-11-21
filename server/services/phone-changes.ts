@@ -246,6 +246,7 @@ export class PhoneChangesReader {
 /** Why a file's diff stays on the computer (`GitFileDiff.withheld`). */
 const WITHHELD: Record<NonNullable<GitFileDiff['withheld']>, string> = {
   outside: "This file's changes show only on the computer: it could not be confirmed to lie in the chat's folder.",
+  link: "This file is a link, so its changes show only on the computer.",
   big: 'This file is too big to show its changes on the phone.',
   unreadable: 'This file could not be read just now.',
 };

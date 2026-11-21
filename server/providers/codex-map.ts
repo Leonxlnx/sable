@@ -464,7 +464,44 @@ export function changesToDiffs(changes: FileUpdateChange[] | null | undefined): 
     // No hunks: for add/delete Codex sends the whole file content.
     if (kind === 'add') out.push(makeFileDiff(ch.path, null, diff));
     else if (kind === 'delete') out.push(makeFileDiff(ch.path, diff, null));
-    else out.push({ path: ch.path, status: 'modified', additions: 0, deletions: 0, hunks: [] });
+    else {
+      // A move with no change to its lines is still a move: both ends (review wave 6, #4).
+      const movedTo = movePath(ch);
+      out.push(movedTo ? { path: movedTo, oldPath: ch.path, status: 'renamed', additions: 0, deletions: 0, hunks: [] } : { path: ch.path, status: 'modified', additions: 0, deletions: 0, hunks: [] });
+    }
+  }
+  return out;
+}
+
+/** Where an update moves its file, when it does. */
+const movePath = (ch: FileUpdateChange): string | undefined => {
+  const to = ch.kind?.type === 'update' ? (ch.kind as { move_path?: string | null }).move_path : undefined;
+  return typeof to === 'string' && to && to !== ch.path ? to : undefined;
+};
+
+/** A change's files as Codex sent them (`FileUpdateChange`), for a step's input: each path, its kind, and where a move takes it (`to`). */
+export function changeRecords(changes: readonly FileUpdateChange[] | null | undefined): { path: string; kind?: string; to?: string }[] {
+  return (changes ?? []).map((c) => {
+    const to = movePath(c);
+    return { path: c.path, kind: c.kind?.type, ...(to ? { to } : {}) };
+  });
+}
+
+/**
+ * What a change reaches, from Codex's own records of it (a step's `input.changes`, `changeRecords`),
+ * never from its diff (a move with no change to its lines has none to tell where it goes): each file,
+ * a moved one by both ends (review wave 6, #4). Undefined when there are no such records, or one
+ * cannot be read.
+ */
+export function changeScope(input: unknown): { path: string; from?: string }[] | undefined {
+  const list = input && typeof input === 'object' ? (input as { changes?: unknown }).changes : undefined;
+  if (!Array.isArray(list) || !list.length) return undefined;
+  const out: { path: string; from?: string }[] = [];
+  for (const r of list) {
+    const rec = r && typeof r === 'object' ? (r as { path?: unknown; to?: unknown }) : {};
+    if (typeof rec.path !== 'string' || !rec.path) return undefined;
+    if (rec.to !== undefined && (typeof rec.to !== 'string' || !rec.to)) return undefined;
+    out.push(typeof rec.to === 'string' && rec.to !== rec.path ? { path: rec.to, from: rec.path } : { path: rec.path });
   }
   return out;
 }
@@ -570,7 +607,7 @@ export function draftItem(item: ThreadItem, opts: { streaming?: boolean } = {}):
         title,
         status,
         detail: { path: changes[0]?.path },
-        input: { changes: changes.map((c) => ({ path: c.path, kind: c.kind?.type })) },
+        input: { changes: changeRecords(changes) },
         result: { diff, isError: status === 'error' || undefined },
         endedAt: done(status),
       });

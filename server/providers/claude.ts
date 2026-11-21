@@ -32,6 +32,7 @@ import type {
   ModelInfo,
   NoticeItem,
   PermissionOption,
+  PermissionSave,
   PermissionScope,
   ProviderInfo,
   RateLimit,
@@ -53,7 +54,7 @@ import { dropRemote, holdRemote, type RemoteHolder } from '../core/remote-keep';
 import { claudeForkPoint, cutAt } from '../core/fork';
 import { killTree, runCli, spawnCli } from '../util/proc';
 import { baseName, describeTool, flattenContent, mapResult, mergeWorkflow, normalizeTodos, peekPartialInput, previewDiff, workflowStart } from './claude-tools';
-import type { Provider, ProviderContext, ProviderSession, WarmChoice } from './types';
+import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoice } from './types';
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { CONCISE_REPLIES_PROMPT } from '../../shared/protocol';
@@ -65,11 +66,13 @@ import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
 import { claimStep } from '../core/sub-agent';
-import { compactScope, withScope } from '../core/permission-scope';
+import { compactScope, WHERE, withScope } from '../core/permission-scope';
 
 type Obj = Record<string, any>;
 
 const IDLE_CLOSE_MS = 8 * 60_000;
+/** The live line of a turn whose messages wait for a stopped turn's result (`held`). */
+const HELD_LINE = 'Waiting for the stopped turn to end';
 
 const MODES: ModeInfo[] = [
   { id: 'default', name: 'Ask first', description: 'Asks before editing files or running commands', tone: 'ask' },
@@ -1134,6 +1137,13 @@ class ClaudeSession implements ProviderSession {
    * late (`late`), and pays for those messages only.
    */
   private owed: Map<string, string>[] = [];
+  /**
+   * Messages held back from the process (`hold`): a result it still owes (`owed`) could not be told
+   * from theirs, and it cannot be let go for a new one while background tasks run in it. They go once
+   * that result comes, the process goes idle or ends, or its last task ends (`release`); a stop sends
+   * them back to the queue.
+   */
+  private held?: SDKUserMessage[];
   /** A new agent process has not said hello yet (system/init): the live line says "Starting", not "Thinking". */
   private booting = false;
   private idleTimer?: NodeJS.Timeout;
@@ -1391,6 +1401,13 @@ class ClaudeSession implements ProviderSession {
     this.owed = [];
     // What the process had not read went with it.
     this.withdrawn.clear();
+    if (this.held && this.rt.turnActive && !this.closed) {
+      // Messages held back from it never reached it (they are all the running turn has): they go to a new one.
+      this.clearLiveState();
+      this.rt.stopBackground();
+      return this.release();
+    }
+    this.held = undefined;
     this.retire(this.sentItems.keys(), 'failed');
     this.clearLiveState();
     // Background sub-agents and workflows lived in this process: they ended with it.
@@ -1446,6 +1463,7 @@ class ClaudeSession implements ProviderSession {
 
   async close() {
     this.closed = true;
+    this.held = undefined;
     clearTimeout(this.interruptTimer);
     this.shutdown();
     this.provider.sessions.delete(this);
@@ -1467,15 +1485,22 @@ class ClaudeSession implements ProviderSession {
 
   // ── commands from the UI ──
 
-  async send(item: UserItem) {
+  async send(item: UserItem, opts?: SendOptions) {
+    // The sender's guard (review wave 6, #3): everything from here to the push into the stream runs at once.
+    opts?.check?.();
     // Otherwise the SDK reports a missing cwd as a binary that "failed to launch".
     if (!existsSync(this.rt.meta.cwd)) throw new Error(`The folder ${this.rt.meta.cwd} does not exist.`);
     this.closed = false;
     this.lastActive = Date.now();
     // A stopped turn still owes its result on a stream that has not shown it names what a result
     // answers: a result naming nothing could then be either turn's. The next turn goes to a new process
-    // (the conversation resumes there), whose results are all its own.
-    if (this.q && !this.rt.turnActive && this.owed.length && !this.namesMessages && !this.liveTasks.size) this.setAside();
+    // (the conversation resumes there), whose results are all its own. With background tasks running in
+    // it, letting it go would end them: the message waits instead (`held`) until that result is told
+    // apart (`release`).
+    if (this.q && !this.rt.turnActive && this.owed.length && !this.namesMessages) {
+      if (this.liveTasks.size) this.held ??= [];
+      else this.setAside();
+    }
     this.ensure();
     clearTimeout(this.idleTimer);
     const uuid = randomUUID();
@@ -1503,7 +1528,7 @@ class ClaudeSession implements ProviderSession {
     if (!this.rt.turnActive) this.rt.beginTurn(command ? `Running ${command}` : this.booting ? 'Starting' : 'Thinking');
     // Steered into a turn the agent began by itself after a stop: the person lifts the stop's hold.
     else this.rt.personSent();
-    this.input!.push({
+    const msg = {
       type: 'user',
       uuid,
       session_id: this.rt.meta.providerSessionId ?? '',
@@ -1512,41 +1537,108 @@ class ClaudeSession implements ProviderSession {
       // Steered: taken at the agent's next step (between tool calls) and nothing it did is discarded.
       // "now" would abort the step in flight; "later" would wait for the turn to end.
       ...(item.steered && this.rt.turnActive ? { priority: 'next' } : {}),
-    } as unknown as SDKUserMessage);
+    } as unknown as SDKUserMessage;
+    if (this.held) {
+      this.held.push(msg);
+      this.rt.update({ activity: HELD_LINE });
+      return;
+    }
+    this.input!.push(msg);
+  }
+
+  /**
+   * Sends the messages held back (`held`) once their results can be told apart: the owed result came,
+   * the process went idle or ended (none is coming any more), or its last background task ended (then
+   * the process, which still owes it, is let go and they go to a new one). Otherwise they wait on.
+   */
+  private release() {
+    const held = this.held;
+    if (!held) return;
+    if (this.q && this.owed.length && !this.namesMessages) {
+      if (this.liveTasks.size) return;
+      this.setAside();
+    }
+    this.held = undefined;
+    this.ensure();
+    for (const m of held) this.input!.push(m);
+    if (this.rt.turnActive && this.rt.meta.activity === HELD_LINE) this.rt.update({ activity: this.booting ? 'Starting' : 'Thinking' });
   }
 
   async interrupt() {
+    if (this.held && this.rt.turnActive) {
+      // Nothing of this turn reached Claude Code: what was held goes back to the queue (finishTurn), and
+      // the process keeps the background tasks it runs, and the result it owes.
+      this.held = undefined;
+      this.interrupted = true;
+      this.finishTurn(undefined, true);
+      return;
+    }
     if (!this.q || !this.rt.turnActive) return;
     // The turn this stop is for: its safety net never ends another (one begun after it settled).
     const turn = this.turnSeq;
     const since = this.rt.turnStartedAt;
     const ours = () => this.turnSeq === turn && this.rt.turnStartedAt === since && this.rt.turnActive;
     this.interrupted = true;
+    let taken = true;
     try {
       await withTimeout(Promise.resolve(this.q.interrupt()), 4_000, 'interrupt');
     } catch {
-      /* fall through to the safety net */
+      taken = false;
     }
     if (!ours()) return;
     // The CLI answers with a result message; if it does not, close the turn ourselves.
     clearTimeout(this.interruptTimer);
     this.interruptTimer = setTimeout(() => {
       if (!this.interrupted || !ours()) return;
+      // Claude Code never said it took the stop, and no end came: it may still be at work.
+      if (!taken) return this.terminate();
       // Settled without its result: should that come after all, it is this turn's, never a newer one's.
       this.owe();
       this.finishTurn(undefined, true);
     }, 2_500);
   }
 
+  /**
+   * A stop Claude Code never confirmed (its interrupt failed or went unanswered) and no end came: it may
+   * still be at work, so the turn is not ended on a guess while it lives. Its process is closed, which
+   * ends whatever it still did, and then the turn ends, stopped; nothing the process writes after this
+   * reaches a turn here (`pump`), and the next message resumes the conversation in a new one.
+   */
+  private terminate() {
+    this.log('claude: the stop was not confirmed; the agent process is closed');
+    this.shutdown();
+    this.owed = [];
+    this.streams.clear();
+    this.liveTasks.clear();
+    this.wakes = 0;
+    // Background sub-agents and workflows lived in that process.
+    this.rt.stopBackground();
+    this.finishTurn(undefined, true);
+    // What it had not read went back to the queue (finishTurn); no process is left to read it.
+    this.withdrawn.clear();
+  }
+
   /** The running turn is settled without its result: the result it still owes is told apart when it comes (`late`). */
   private owe() {
     const names = new Map<string, string>();
-    for (const [u, a] of this.awaiting) if (a.read) names.set(u, u);
+    // On a stream that has not shown it names what a result answers, a message it has not replayed may
+    // have been taken all the same (a replay is not always seen): it may still be answered too.
+    for (const [u, a] of this.awaiting) if (a.read || !this.namesMessages) names.set(u, u);
     for (const [alias, u] of this.aliases) if (names.get(u) === u) names.set(alias, u);
     // Nothing read and nothing that woke it: Claude Code began no turn for it, and owes no result.
     if (!names.size && !this.wakes) return;
     this.owed.push(names);
     if (this.owed.length > 8) this.owed.shift();
+  }
+
+  /** Message `uuid` is answered in a turn of its own after all: no settled turn owes its result any more. */
+  private forgive(uuid: string) {
+    this.owed = this.owed.filter((debt) => {
+      const had = debt.size;
+      for (const [name, u] of [...debt]) if (u === uuid) debt.delete(name);
+      // A turn Claude Code began by itself (no message of anyone's) still owes its own.
+      return !had || debt.size > 0;
+    });
   }
 
   /**
@@ -1722,15 +1814,10 @@ class ClaudeSession implements ProviderSession {
       const always = !o.suppressAlwaysAllowRule && suggestions.length ? describeSuggestion(suggestions[0], view.detail.path) : undefined;
       if (always) {
         options.push({ id: 'always', label: always.label, hint: always.hint, tone: 'always' });
-        // "Always" saves every suggestion, its label names the first (shortened): the folders and rules
-        // it saves whole, in the request's words and as data; a kind of change Sable does not name
-        // (or a mode switch the label does not say) leaves it to the desktop.
-        const unnamed = suggestions.some((s, i) => !(s.type === 'addDirectories' || s.type === 'addRules' || (s.type === 'setMode' && i === 0)));
-        scope = compactScope({
-          dirs: suggestions.flatMap((s) => (s.type === 'addDirectories' ? s.directories : [])),
-          rules: suggestions.flatMap((s) => (s.type === 'addRules' ? s.rules.map((r) => (r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName)) : [])),
-          ...(unnamed ? { unknown: true as const } : {}),
-        });
+        // "Always" saves every suggestion, its label names the first (shortened): each one whole, what
+        // it does and where it is kept, in the request's words and as data (review wave 6, #5); a kind
+        // of change Sable does not name leaves that answer to the desktop.
+        scope = compactScope(alwaysScope(suggestions));
       }
       options.push({ id: 'deny', label: 'Deny', hint: 'Tell Claude what to do instead', tone: 'deny' });
     }
@@ -2006,8 +2093,11 @@ class ClaudeSession implements ProviderSession {
         }
         this.sentItems.set(m.uuid, id);
         this.rt.expectOutcome(id);
+        // Its result answers it in the turn it begins now, never as a settled turn's debt (`owe`).
+        this.forgive(m.uuid);
         // Begun by Claude Code, not the person: the stop's hold on the queue stays through it.
         if (!rt.turnActive) rt.beginTurn('Thinking', { keepHold: true });
+        this.release();
         return;
       }
       if (m.parent_tool_use_id) return;
@@ -2193,6 +2283,8 @@ class ClaudeSession implements ProviderSession {
     // nothing else of it. It answers nothing of the running turn, and never reads that turn's stop.
     const late = this.late(m);
     const answered = late ? [] : this.answer(m);
+    // Messages held back for a result owed go once that result is in (`release` checks what is still owed).
+    this.release();
     // Its own messages are taken when they are replayed: whatever woke the model is answered by now.
     if (!late) this.wakes = 0;
     const total = Number(m.total_cost_usd ?? 0);
@@ -2349,6 +2441,8 @@ class ClaudeSession implements ProviderSession {
       case 'background_tasks_changed':
         // Every live background task (replace, not merge): the process is kept open while any runs.
         this.liveTasks = new Set(((m.tasks as Obj[] | undefined) ?? []).map((t) => String(t.task_id)));
+        // The last one ended: messages held for this process's owed result can go to a new one.
+        if (!this.liveTasks.size) this.release();
         break;
       case 'task_started': {
         if (m.task_id) this.liveTasks.add(String(m.task_id));
@@ -2358,6 +2452,7 @@ class ClaudeSession implements ProviderSession {
       }
       case 'task_notification': {
         if (m.task_id) this.liveTasks.delete(String(m.task_id));
+        if (!this.liveTasks.size) this.release();
         // How a sub-agent ended, with its own figures. For one started in the background this is the only word of it.
         const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
         if (item?.workflow) {
@@ -2383,6 +2478,12 @@ class ClaudeSession implements ProviderSession {
         // Claude Code's own word on its turns (asked for with CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).
         const prev = this.cliState;
         this.cliState = m.state;
+        // Idle: a turn's result comes before it, so what settled turns still owed is not coming (`owed`),
+        // and messages held for it go now.
+        if (m.state === 'idle') {
+          this.owed = [];
+          this.release();
+        }
         // Idle with nothing of Sable's still on its way: whatever no result closed (a message from the Claude
         // app folded into the turn, a background task's notification that woke no model turn) is over.
         // A message of ours it has not read yet keeps the turn: its own turn is still to come.
@@ -2497,21 +2598,44 @@ function isHumanText(text: string) {
 }
 
 function describeSuggestion(s: PermissionUpdate, filePath?: string): { label: string; hint?: string } | undefined {
-  const where = (d: string) => (d === 'session' ? 'this session' : d === 'userSettings' ? 'everywhere' : 'this project');
+  const where = (d: string) => WHERE[d as PermissionSave['where']] ?? 'for this project';
   if (s.type === 'setMode') {
-    if (s.mode === 'acceptEdits') return { label: 'Allow all edits', hint: `for ${where(s.destination)}` };
-    return { label: `Switch to ${s.mode}`, hint: `for ${where(s.destination)}` };
+    if (s.mode === 'acceptEdits') return { label: 'Allow all edits', hint: where(s.destination) };
+    return { label: `Switch to ${s.mode}`, hint: where(s.destination) };
   }
   if (s.type === 'addRules' && s.rules.length) {
     const r = s.rules[0];
-    const what = r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName;
-    return { label: `Always allow ${what.length > 44 ? what.slice(0, 42) + '…' : what}`, hint: `in ${where(s.destination)}` };
+    const what = ruleText(r);
+    const verb = s.behavior === 'deny' ? 'Always deny' : s.behavior === 'ask' ? 'Always ask before' : 'Always allow';
+    return { label: `${verb} ${what.length > 44 ? what.slice(0, 42) + '…' : what}`, hint: where(s.destination) };
   }
   if (s.type === 'addDirectories' && s.directories.length) {
-    return { label: `Allow access to ${baseName(s.directories[0])}`, hint: `for ${where(s.destination)}` };
+    return { label: `Allow access to ${baseName(s.directories[0])}`, hint: where(s.destination) };
   }
   void filePath;
   return undefined;
+}
+
+const ruleText = (r: { toolName: string; ruleContent?: string }) => (r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName);
+
+/**
+ * What an "always" answer saves (it saves every suggestion): each suggestion as one entry, with what
+ * it does (folders added, rules added and their behaviour, a mode) and where it is kept, so every one
+ * shows whole on a phone (review wave 6, #5). A kind Sable does not name (rules replaced or removed,
+ * folders removed) or a destination it does not know makes that answer desktop-only (`savesUnknown`).
+ */
+export function alwaysScope(suggestions: readonly PermissionUpdate[]): PermissionScope {
+  const saves: PermissionSave[] = [];
+  let unknown = false;
+  for (const s of suggestions) {
+    const where = s && typeof s === 'object' && typeof s.destination === 'string' && s.destination in WHERE ? (s.destination as PermissionSave['where']) : undefined;
+    if (!where) unknown = true;
+    else if (s.type === 'addDirectories' && Array.isArray(s.directories) && s.directories.every((d) => typeof d === 'string')) saves.push({ dirs: [...s.directories], where });
+    else if (s.type === 'addRules' && Array.isArray(s.rules) && (s.behavior === 'allow' || s.behavior === 'deny' || s.behavior === 'ask')) saves.push({ rules: s.rules.map(ruleText), behavior: s.behavior, where });
+    else if (s.type === 'setMode' && typeof s.mode === 'string') saves.push({ mode: s.mode, where });
+    else unknown = true;
+  }
+  return { saves, ...(unknown ? { savesUnknown: true as const } : {}) };
 }
 
 function errorLabel(code?: string): string {

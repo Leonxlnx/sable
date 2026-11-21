@@ -375,14 +375,17 @@ describe("what Claude Code's 'always' saves, as data (8)", () => {
       { type: 'addDirectories', directories: [dir], destination: 'session' },
     ]);
     expect(req.options.find((o) => o.id === 'always')?.label.length).toBeLessThan(60);
-    expect(req.scope).toEqual({ dirs: [dir], rules: [`Bash(${rule})`] });
-    expect(req.reason?.split('\n')).toEqual([`Always: access to ${dir}`, `Always: allow Bash(${rule})`]);
+    // Each suggestion with what it does and where it is kept (review wave 6, #5: tests/boundary-wave6.test.ts).
+    expect(req.scope).toEqual({ saves: [{ rules: [`Bash(${rule})`], behavior: 'allow', where: 'localSettings' }, { dirs: [dir], where: 'session' }] });
+    expect(req.reason?.split('\n')).toEqual([`Always: allow Bash(${rule}) in this project's local settings`, `Always: access to ${dir} for this session`]);
     expect(phonePermission(req).incomplete).toBeUndefined();
-    // Without those lines (as before) the phone could allow what it never showed.
-    expect(phonePermission({ ...req, reason: undefined }).incomplete).toBe(true);
+    expect(phonePermission(req).options.map((o) => o.id)).toContain('always');
+    // Without those lines (as before) the phone could allow what it never showed: "always" is the desktop's then.
+    expect(phonePermission({ ...req, reason: undefined }).options.map((o) => o.id)).toEqual(['allow', 'deny']);
     const odd = await h.ask([{ type: 'addRules', rules: [{ toolName: 'Bash' }], behavior: 'allow', destination: 'session' }, { type: 'removeDirectories', directories: ['C:\\x'], destination: 'session' }]);
-    expect(odd.scope?.unknown).toBe(true);
-    expect(phonePermission(odd).incomplete).toBe(true);
+    expect(odd.scope?.savesUnknown).toBe(true);
+    expect(phonePermission(odd).options.map((o) => o.id)).toEqual(['allow', 'deny']);
+    expect(() => phoneAllowed(odd, 'always')).toThrow(/only on the desktop/);
   });
 });
 
