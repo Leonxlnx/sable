@@ -2572,6 +2572,15 @@ export const DEFAULT_SETTINGS: AppSettings = {
 };
 
 /**
+ * Goes to the agent with a message the person sent while it works (a steer), after the person's own
+ * words and never shown in the conversation: the person wrote because they want an answer now, so
+ * the agent replies to it first, briefly, and then goes on. In a `<system-reminder>` (Claude Code
+ * reads those as the app's word; `shared/synthetic.ts` hides them wherever a transcript is read back).
+ */
+export const STEER_FIRST = 'The person sent this while you were working and is waiting for a reply. Answer it first: your next message starts with a direct answer to it in a sentence or two, before any further tool call. Then carry on, adjusted to what they said.';
+export const STEER_FIRST_BLOCK = `<system-reminder>\n${STEER_FIRST}\n</system-reminder>`;
+
+/**
  * Appended to the agent's own system prompt (Claude Code) or developer instructions (Codex)
  * while `AppSettings.conciseReplies` is on. Never replaces what the user configured.
  */

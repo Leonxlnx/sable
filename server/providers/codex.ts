@@ -35,7 +35,7 @@ import type { TitlePrompt } from '../core/titles';
 import { codexForkTurn, cutAt } from '../core/fork';
 import type { Provider, ProviderContext, ProviderSession, SendOptions } from './types';
 import { codexPlan } from './plans';
-import { CONCISE_REPLIES_PROMPT } from '../../shared/protocol';
+import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import { WIDGET_DESCRIPTION, WIDGET_FENCE_HINT, WIDGET_INPUT_SCHEMA, WIDGET_TOOL, dynamicToolAnswer, widgetsEnabled } from './widget-tool';
 import { BROWSER_CORE, BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOLS, browserDynamicAnswer, browserOp, browserTabEnabled } from './browser-tool';
 import { DEVICE_CORE, DEVICE_DESCRIPTIONS, DEVICE_HINT, DEVICE_INPUT_SCHEMAS, DEVICE_NAMESPACE, DEVICE_NAMESPACE_DESCRIPTION, DEVICE_OPS, DEVICE_TOOLS, deviceDynamicAnswer, deviceEnabled, deviceOp } from './device-tool';
@@ -1705,7 +1705,9 @@ class CodexSession implements ProviderSession {
       try {
         const rpc = await this.provider.client();
         check?.();
-        await rpc.request('turn/steer', { threadId: this.threadId, input, expectedTurnId: this.turnId }, 30_000);
+        // The person waits for a reply: the agent is told to answer first (after their words; the
+        // conversation shows only what they wrote, and a transcript read back drops the note).
+        await rpc.request('turn/steer', { threadId: this.threadId, input: [...input, { type: 'text', text: STEER_FIRST_BLOCK, text_elements: [] } as UserInput], expectedTurnId: this.turnId }, 30_000);
         this.rt.patch<UserItem>(item.id, { state: 'sent' });
         return;
       } catch (err) {

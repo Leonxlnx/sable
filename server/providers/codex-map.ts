@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { speedFor } from '../../shared/speed';
-import { STANDARD_SPEED } from '../../shared/protocol';
+import { STANDARD_SPEED, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import type {
   Attachment,
   Effort,
@@ -808,6 +808,8 @@ function userFromItem(item: Extract<ThreadItem, { type: 'userMessage' }>, ts: nu
   const attachments: Attachment[] = [];
   for (const c of item.content ?? []) {
     const x = c as { type: string; text?: string; url?: string; path?: string; name?: string };
+    // The app's own note beside a steered message is not the person's words.
+    if (x.type === 'text' && x.text === STEER_FIRST_BLOCK) continue;
     if (x.type === 'text' && x.text) texts.push(x.text);
     else if (x.type === 'image' && x.url) attachments.push({ id: `${item.id}:${attachments.length}`, kind: 'image', name: 'image', dataUrl: x.url });
     else if (x.type === 'localImage' && x.path) attachments.push({ id: `${item.id}:${attachments.length}`, kind: 'image', name: base(x.path), path: x.path });
