@@ -804,12 +804,14 @@ function Topbar({ panelShown }: { panelShown: boolean }) {
   const raceId = useOpenRace(session?.id ?? null);
   return (
     <header className="topbar">
-      <IconButton icon="sidebar" label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'} keys="mod+b" onClick={() => toggleSidebar(sidebarOpen)} />
+      {/* The mark first, where the sidebar's own mark stands: closing, it stays (sidebar/brand-flight.ts
+          glides it the few pixels between the two) and the toggle rides in on the stage's edge. */}
       {!sidebarOpen && (
         <button type="button" className="topbar-home" onClick={() => goHome()} aria-label="New session">
           <LogoMark size={18} />
         </button>
       )}
+      <IconButton icon="sidebar" label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'} keys="mod+b" onClick={() => toggleSidebar(sidebarOpen)} />
 
       {session ? (
         <div className="topbar-title">

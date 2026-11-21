@@ -15,6 +15,7 @@ import { baseName } from '@/lib/format';
 import { addFolders, addToGroup, arrangeSidebar, closeSession, createGroup, goHome, goHomeChat, openSettings, pinProject, removeFromGroup, removeGroup, removeProject, renameGroup, renameProject } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton, Modal, Tip } from '@/ui';
+import { flyBrand } from './brand-flight';
 import { Flip } from './flip';
 import { nudgeFolder, pressFolder, releaseFolderDrag, type FolderDrop } from './folder-drag';
 import { SideResize } from './Resize';
@@ -1168,8 +1169,11 @@ function useStageFreeze() {
     let anims: Animation[] = [];
     const release = (body: HTMLElement | null) => {
       window.clearTimeout(timer);
-      for (const a of anims) a.cancel();
+      // Released and cancelled in the same task: the views drop their offset on the frame the
+      // freeze ends, never a frame before it (that frame drew the whole view shifted sideways).
+      const was = anims;
       anims = [];
+      for (const a of was) a.cancel();
       if (body) {
         delete body.dataset.freeze;
         body.style.removeProperty('--freeze-w');
@@ -1186,6 +1190,8 @@ function useStageFreeze() {
       const ms = parseFloat(cs.transitionDuration) * (cs.transitionDuration.trim().endsWith('ms') ? 1 : 1000);
       if (!(ms > 20)) return;
       const opening = s.ui.sidebarOpen;
+      const easing = cs.transitionTimingFunction.split(/,(?![^(]*\))/)[0]?.trim() || 'ease-out';
+      flyBrand(opening, ms, easing);
       const gap = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--gap')) || 0;
       const w0 = body.clientWidth;
       const delta = inner.offsetWidth + gap;
@@ -1195,11 +1201,17 @@ function useStageFreeze() {
       const to = opening ? (w0 - w1) / 2 : 0;
       body.style.setProperty('--freeze-w', `${Math.max(w0, w1)}px`);
       body.dataset.freeze = '';
-      const easing = cs.transitionTimingFunction.split(/,(?![^(]*\))/)[0]?.trim() || 'ease-out';
+      // Held at the end (fill) until the freeze is released in the same task as the last one
+      // finishes: without the fill the views snapped back to their frozen place for a frame or
+      // two before the timer released them (the "glitch" on open).
       for (const view of body.querySelectorAll<HTMLElement>(':scope > .stage-view')) {
-        anims.push(view.animate([{ translate: `${from}px 0` }, { translate: `${to}px 0` }], { duration: ms, easing }));
+        anims.push(view.animate([{ translate: `${from}px 0` }, { translate: `${to}px 0` }], { duration: ms, easing, fill: 'forwards' }));
       }
-      timer = window.setTimeout(() => release(body), ms + 20);
+      const mine = anims;
+      const last = mine[mine.length - 1];
+      if (last) last.onfinish = () => anims === mine && release(body);
+      // A backstop for a hidden window, where animations do not run.
+      timer = window.setTimeout(() => anims === mine && release(body), ms + 400);
     });
   }, []);
 }

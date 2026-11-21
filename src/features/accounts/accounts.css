@@ -2,16 +2,147 @@
 
 /* ── switcher (sidebar footer) ── */
 
-.acs-label {
+/* The trigger: one line of one control height, the agent's mark on the footer's icon column, one
+   name, and what is left of the tightest window as a ring and its figure at the end. */
+.acs-trigger {
+  flex: 1;
   min-width: 0;
-  font-size: var(--t-micro);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--ctl-h);
+  padding: 0 9px 0 6px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  transition:
+    background-color var(--d-1) var(--ease),
+    scale var(--d-2) var(--spring);
+}
+
+.acs-trigger:hover,
+.acs-trigger[data-state='open'] {
+  background-color: var(--ctl-hover);
+}
+
+.acs-trigger:active {
+  background-color: var(--ctl-press);
+  scale: 0.985;
+  transition-duration: var(--d-1), 70ms;
+}
+
+.acs-trigger:focus-visible {
+  outline: var(--focus-w) solid var(--focus);
+  outline-offset: var(--focus-inset);
+}
+
+.acs-trigger-mark {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background-color: var(--panel-2);
+}
+
+.acs-trigger-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--t-ui);
+  font-weight: var(--w-medium);
+  color: var(--text-2);
+  transition: color var(--d-1) var(--ease);
+}
+
+.acs-trigger:hover .acs-trigger-name,
+.acs-trigger[data-state='open'] .acs-trigger-name {
+  color: var(--text);
+}
+
+.acs-trigger-name[data-out] {
+  font-weight: var(--w-regular);
   color: var(--text-3);
 }
 
-/* The account's own limit mark, right after its name. */
-.acs-dot {
-  align-self: center;
-  margin-left: -1px;
+/* What is left: a hairline track and an arc of what remains, its figure beside it. */
+.acs-ring {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  color: var(--text-3);
+  transition: color var(--d-1) var(--ease);
+}
+
+.acs-ring svg {
+  display: block;
+  rotate: -90deg;
+}
+
+.acs-ring-track,
+.acs-ring-arc {
+  fill: none;
+  stroke-width: 1.5;
+}
+
+.acs-ring-track {
+  stroke: var(--line-3);
+}
+
+.acs-ring-arc {
+  stroke: currentColor;
+  stroke-linecap: round;
+}
+
+.acs-ring-pct {
+  font-size: var(--t-small);
+  white-space: nowrap;
+}
+
+.acs-trigger:hover .acs-ring:not([data-level]),
+.acs-trigger[data-state='open'] .acs-ring:not([data-level]) {
+  color: var(--text-2);
+}
+
+.acs-ring[data-level='amber'] {
+  color: var(--amber);
+}
+
+.acs-ring[data-level='red'] {
+  color: var(--red);
+}
+
+/* Its tooltip: who it is in full, then each window's use and reset in columns. */
+.acs-tip {
+  display: grid;
+  gap: 3px;
+  padding: 3px 0;
+}
+
+.acs-tip-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 76px;
+  column-gap: 12px;
+  font-weight: var(--w-regular);
+  color: var(--text-2);
+}
+
+.acs-tip-pct {
+  text-align: right;
+}
+
+.acs-tip-pct[data-level='amber'] {
+  color: var(--amber);
+}
+
+.acs-tip-pct[data-level='red'] {
+  color: var(--red);
+}
+
+.acs-tip-reset,
+.acs-tip-pool {
+  font-weight: var(--w-regular);
+  color: var(--text-3);
 }
 
 .acs-row {

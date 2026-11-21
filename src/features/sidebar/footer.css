@@ -1,99 +1,23 @@
-/* The footer: one quiet row. The account (it opens every account with its limits) and Settings. */
+/* The footer: one quiet row of two controls of one height and shape, the account (it opens every
+   account with its limits) and Settings, the way the top's row pairs New session with its tools.
+   Nothing in it wraps: the name gives way first, the limit's figure and Settings keep their size. */
 
 .side-foot {
   flex-shrink: 0;
   padding: 4px 4px 6px 2px;
+  container: side-foot / inline-size;
 }
 
 .account {
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 36px;
+  height: var(--ctl-h);
 }
 
-.account-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  height: 36px;
-  padding: 0 10px 0 9px;
+.account .icon-btn {
+  --ib: var(--ctl-h);
   border-radius: var(--r-sm);
-  text-align: left;
-  transition: background-color var(--d-1) var(--ease);
-}
-
-.account-main:hover,
-.account-main[data-state='open'] {
-  background-color: var(--fill-2);
-}
-
-.account-main:active {
-  background-color: var(--fill-3);
-}
-
-.account-main:focus-visible {
-  outline: var(--focus-w) solid var(--focus);
-  outline-offset: var(--focus-inset);
-}
-
-/* The agent in focus: a small disc on the icon column. */
-.account-mark {
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background-color: var(--panel-2);
-}
-
-.account-who {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-}
-
-.account-plan {
-  flex-shrink: 0;
-  font-size: var(--t-ui);
-  font-weight: var(--w-medium);
-  color: var(--text-2);
-  white-space: nowrap;
-  transition: color var(--d-1) var(--ease);
-}
-
-.account-main:hover .account-plan,
-.account-main[data-state='open'] .account-plan {
-  color: var(--text);
-}
-
-.account-email-dim {
-  min-width: 0;
-  font-size: var(--t-micro);
-  color: var(--text-3);
-}
-
-/* The menu's caret answers the pointer; at rest the row is only who you are. It stands right
-   after the name, so nothing is held open for it at the row's end: what is left across the
-   accounts sits on the row's right edge. */
-.account-caret {
-  flex-shrink: 0;
-  align-self: center;
-  margin-left: -2px;
-  color: var(--text-3);
-  opacity: 0;
-  transition: opacity var(--d-1) var(--ease);
-}
-
-.account-main:hover .account-caret,
-.account-main:focus-visible .account-caret,
-.account-main[data-state='open'] .account-caret {
-  opacity: 1;
 }
 
 /* No agent signed in: the same row, saying what to do. */
@@ -102,9 +26,9 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 10px;
-  height: 36px;
-  padding: 0 10px;
+  gap: 8px;
+  height: var(--ctl-h);
+  padding: 0 8px;
   border-radius: var(--r-sm);
   text-align: left;
   transition: background-color var(--d-1) var(--ease);
@@ -156,9 +80,9 @@
   align-items: center;
   gap: 9px;
   width: 100%;
-  height: 32px;
+  height: var(--ctl-h);
   margin-bottom: 2px;
-  padding: 0 10px 0 11px;
+  padding: 0 8px 0 8px;
   border-radius: var(--r-sm);
   color: var(--text);
   font-size: var(--t-ui);
@@ -196,6 +120,7 @@ button.update-row:focus-visible,
 
 .update-ver {
   flex-shrink: 0;
+  white-space: nowrap;
   color: var(--text-3);
   font-weight: var(--w-regular);
 }
@@ -214,6 +139,30 @@ button.update-row:focus-visible,
 .update-cancel:hover {
   color: var(--text);
   background-color: var(--fill-2);
+}
+
+/* A narrow sidebar keeps the labels whole: the version gives way (Settings › About has it) and
+   Cancel becomes its icon. */
+.update-short {
+  display: none;
+}
+
+@container side-foot (max-width: 214px) {
+  .update-ver,
+  .update-long {
+    display: none;
+  }
+
+  .update-cancel {
+    display: inline-grid;
+    place-items: center;
+    width: 24px;
+    padding: 0;
+  }
+
+  .update-cancel .update-short {
+    display: block;
+  }
 }
 
 @keyframes update-in {

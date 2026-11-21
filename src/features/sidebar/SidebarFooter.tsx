@@ -54,9 +54,11 @@ function UpdateRow() {
     return (
       <div className="update-row" data-pending="">
         <Icon name="reload" size={15} className="update-icon" />
-        <span className="update-label grow truncate">Restarts when the agents finish</span>
-        <button type="button" className="update-cancel" onClick={() => void cancelUpdate()}>
-          Cancel
+        <span className="update-label grow truncate">Waits for agents</span>
+        <button type="button" className="update-cancel" aria-label="Cancel the restart" onClick={() => void cancelUpdate()}>
+          {/* A narrow sidebar keeps the label whole: Cancel becomes its icon (footer.css). */}
+          <span className="update-long">Cancel</span>
+          <Icon name="x" size={13} className="update-short" />
         </button>
       </div>
     );

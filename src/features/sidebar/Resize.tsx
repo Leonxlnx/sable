@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 
 const WIDTH_KEY = 'sable.sidebar.w';
 export const SIDE_DEFAULT_W = 268;
-export const SIDE_MIN_W = 216;
+export const SIDE_MIN_W = 196;
 export const SIDE_MAX_W = 460;
 /** What the stage keeps beside the sidebar, whatever was chosen in a wider window. */
 const STAGE_KEEPS = 620;
@@ -43,7 +43,7 @@ function applyWidth(w: number | null) {
 const zoom = () => parseFloat(document.documentElement.style.zoom) || 1;
 
 /**
- * Drag the sidebar's right edge to resize it (216 to 460 px), double-click or Enter for the
+ * Drag the sidebar's right edge to resize it (196 to 460 px), double-click or Enter for the
  * default, arrows to step, Home and End for the ends. Lives in the gap between sidebar and stage.
  */
 export function SideResize() {

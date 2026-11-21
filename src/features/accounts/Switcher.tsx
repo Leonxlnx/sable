@@ -1,24 +1,30 @@
 import { useEffect, useRef, useState } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
-import type { AccountInfo, ProviderId } from '@shared/protocol';
+import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId, type RateLimit } from '@shared/protocol';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
-import { LimitDot, LimitsGlance } from '@/features/usage';
+import { LimitsGlance } from '@/features/usage';
+import { clock, isScopedWindow, orderWindows, windowLevel } from '@/features/usage/format';
+import { useAccountWindows } from '@/features/usage/Limits';
+import { livePercent, tightest } from '@/features/usage/room';
+import { useNow } from '@/lib/useNow';
+import { Tip } from '@/ui';
 import { Icon } from '@/icons';
 import { openSettings, setDefaultAccount } from '@/state/actions';
 import { accountName, useFocusAccount } from '@/state/hooks';
 import { useStore } from '@/state/store';
-import { AccountUsed, ManyAccounts, MANY_ACCOUNTS, planOf, PoolFigure, usePool } from './ManyAccounts';
+import { AccountUsed, ManyAccounts, MANY_ACCOUNTS, planOf, usePool } from './ManyAccounts';
 import { poolLeftPercent } from '@/features/usage/plans';
 import { accountAgents, accountsOf, openAddAccount, planWord } from './model';
 
 /**
- * The sidebar footer's account switcher. The row names the account in focus by its plan (the label
- * follows when an agent has several, then its limit mark) and, once the agent has several accounts
- * with figures, what is left across them, weighted by plan. It opens every agent's accounts as rows
- * with the plan and how full each is, the default checked. Pointing at a row (or moving to it with
- * the keys) shows that account's limits beside the menu. Picking one makes it the account new
- * sessions use.
+ * The sidebar footer's account switcher. The row is one line that fits the narrowest sidebar: the
+ * agent's mark, one name (the account's label when the agent has several, its plan otherwise) and
+ * what is left of its tightest window as a small ring and figure. The tooltip says it in full
+ * (plan, every window, resets, what is left across the agent's accounts). It opens every agent's
+ * accounts as rows with the plan and how full each is, the default checked. Pointing at a row (or
+ * moving to it with the keys) shows that account's limits beside the menu. Picking one makes it the
+ * account new sessions use.
  */
 export function AccountSwitcher() {
   const providers = useStore((s) => s.providers);
@@ -57,10 +63,9 @@ export function AccountSwitcher() {
   const many = agents.reduce((n, id) => n + accountsOf(providers[id]).length, 0) >= MANY_ACCOUNTS;
 
   const pool = usePool(focus, providers[focus]);
-
-  const name = current ? accountName(current) : PROVIDER_NAME[focus];
-  const headline = current?.auth.loggedIn ? (plan ? `${plan} plan` : PROVIDER_NAME[focus]) : 'Not signed in';
-  const described = [PROVIDER_NAME[focus], several ? name : undefined, headline, pool ? `${poolLeftPercent(pool)}% left across its accounts` : undefined].filter(Boolean).join(', ');
+  const on = !!current?.auth.loggedIn;
+  const name = triggerName(focus, current, several);
+  const described = [PROVIDER_NAME[focus], several && current ? accountName(current) : undefined, on ? (plan ? `${plan} plan` : undefined) : 'not signed in', pool ? `${poolLeftPercent(pool)}% left across its accounts` : undefined].filter(Boolean).join(', ');
 
   return (
     <RM.Root
@@ -71,22 +76,20 @@ export function AccountSwitcher() {
       }}
       modal={false}
     >
-      <RM.Trigger asChild>
-        <button type="button" className="account-main acs-trigger" aria-label={`${described}. Accounts`}>
-          {/* The agent in focus only: the menu lists the others. One mark keeps the plan on the text column. */}
-          <span className="account-mark" aria-hidden>
-            <ProviderMark provider={focus} size={12} />
-          </span>
-          <span className="account-who">
-            <span className="account-plan">{headline}</span>
-            {several && current && <span className="acs-label truncate">{name}</span>}
-            {current && <LimitDot provider={focus} accountId={current.id} className="acs-dot" />}
-            {/* The caret belongs to the name (a pop-up label), so the row's end is the figure's alone. */}
-            <Icon name="caret-updown" size={13} className="account-caret" />
-          </span>
-          <PoolFigure provider={focus} total={pool} />
-        </button>
-      </RM.Trigger>
+      {/* The row is one name and one mark; who it is in full (plan, every window, its reset) is the tooltip's and the menu's. */}
+      <Tip label={<TriggerTip provider={focus} account={current} several={several} plan={plan} pool={pool} />} side="top">
+        <RM.Trigger asChild>
+          <button type="button" className="acs-trigger" aria-label={`${described}. Accounts`}>
+            <span className="acs-trigger-mark" aria-hidden>
+              <ProviderMark provider={focus} size={12} />
+            </span>
+            <span className="acs-trigger-name truncate" data-out={!on || undefined}>
+              {name}
+            </span>
+            {on && current && <LimitRing provider={focus} accountId={current.id} />}
+          </button>
+        </RM.Trigger>
+      </Tip>
       <RM.Portal>
         <RM.Content
           ref={contentRef}
@@ -195,5 +198,72 @@ function Peek({ provider, accountId, onOpenUsage }: { provider: ProviderId; acco
     <div className="acs-peek-in">
       <LimitsGlance provider={provider} accountId={accountId} onOpenUsage={onOpenUsage} />
     </div>
+  );
+}
+
+/**
+ * The row's one name: an agent with several accounts names the one in focus by its label ("Ultra2"),
+ * an agent with one by its plan ("Max"), or by the agent when the plan is not known.
+ */
+function triggerName(provider: ProviderId, account: AccountInfo | undefined, several: boolean): string {
+  if (!account) return PROVIDER_NAME[provider];
+  if (several) return accountName(account);
+  if (!account.auth.loggedIn) return 'Sign in';
+  return planWord(account) ?? planOf(account) ?? PROVIDER_NAME[provider];
+}
+
+/** The window that leaves the whole plan the least room (a model's own window only when there is no other). */
+function planWindow(limits: RateLimit[], now: number): RateLimit | undefined {
+  const whole = limits.filter((l) => !isScopedWindow(l));
+  return tightest(whole.length ? whole : limits, now);
+}
+
+/**
+ * What is left of the account's tightest window, as a small ring and its figure ("78%"). Quiet ink;
+ * amber from 80% used, red when used up (a model's own window at its cap leaves it quiet: the other
+ * models still run). Nothing until the account has figures.
+ */
+function LimitRing({ provider, accountId }: { provider: ProviderId; accountId: string }) {
+  const { limits } = useAccountWindows(provider, accountId);
+  const now = useNow();
+  const tight = planWindow(limits, now);
+  if (!tight) return null;
+  const left = 100 - Math.round(livePercent(tight, now));
+  const level = windowLevel(tight, now);
+  // The arc on the icons' 14 px grid: a hairline track and a 1.5 px arc of what is left.
+  const r = 5.25;
+  const c = 2 * Math.PI * r;
+  return (
+    <span className="acs-ring" data-level={level} aria-hidden>
+      <svg width="14" height="14" viewBox="0 0 14 14">
+        <circle className="acs-ring-track" cx="7" cy="7" r={r} />
+        {left > 0 && <circle className="acs-ring-arc" cx="7" cy="7" r={r} strokeDasharray={`${(Math.max(left, 4) / 100) * c} ${c}`} />}
+      </svg>
+      <span className="acs-ring-pct num">{left}%</span>
+    </span>
+  );
+}
+
+/** The trigger's tooltip: who it is in full, then every window with what is left of it and when it resets. */
+function TriggerTip({ provider, account, several, plan, pool }: { provider: ProviderId; account: AccountInfo | undefined; several: boolean; plan: string | undefined; pool: ReturnType<typeof usePool> }) {
+  const { limits } = useAccountWindows(provider, account?.id ?? DEFAULT_ACCOUNT);
+  const now = useNow();
+  const on = !!account?.auth.loggedIn;
+  const head = [PROVIDER_NAME[provider], account && several ? accountName(account) : undefined, on ? (plan ? `${plan} plan` : undefined) : 'Not signed in'].filter(Boolean).join(' · ');
+  const windows = on ? orderWindows(limits) : [];
+  return (
+    <span className="acs-tip">
+      <span className="acs-tip-head">{head}</span>
+      {windows.map((l) => (
+        <span key={l.id} className="acs-tip-row">
+          <span className="acs-tip-label">{l.label}</span>
+          <span className="acs-tip-pct num" data-level={windowLevel(l, now)}>
+            {100 - Math.round(livePercent(l, now))}% left
+          </span>
+          <span className="acs-tip-reset num">{l.resetsAt && l.resetsAt > now ? clock(l.resetsAt, now) : ''}</span>
+        </span>
+      ))}
+      {pool && <span className="acs-tip-pool num">{poolLeftPercent(pool)}% left across its accounts</span>}
+    </span>
   );
 }
