@@ -5,9 +5,9 @@ import { bridge } from '@/lib/bridge';
 /**
  * Messages across chats for the palette, asked of the bridge (`search.messages`: what the person
  * wrote and what the agents said, newest chats first, a few per chat). Asked once typing pauses; an
- * answer that is partial (chats not read yet) is asked again, each time going on where the last
- * one stopped, until it is whole. A new query drops what the old one was still waiting for (the
- * bridge stops its search too).
+ * answer that is partial (chats not read yet) is asked again with its cursor, each time going on
+ * where the last one stopped, until it is whole. A new query drops what the old one was still
+ * waiting for (the bridge stops this window's search too, never another window's).
  */
 
 export const MIN_QUERY = 2;
@@ -15,6 +15,8 @@ const DEBOUNCE_MS = 170;
 const ROUNDS = 16;
 export const PER_CHAT = 3;
 export const MAX_HITS = 24;
+/** This window, to the bridge: its searches stop only its own. */
+const SCOPE = `w${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
 
 export interface MessageResults {
   /** The query the hits answer (they stay while a newer one is asked, so the list does not blink). */
@@ -22,6 +24,8 @@ export interface MessageResults {
   hits: MessageHit[];
   /** More may come: the search is under way. */
   busy: boolean;
+  /** Chats with a part that could not be read (their messages there were not searched). */
+  skipped?: number;
 }
 
 const NONE: MessageResults = { q: '', hits: [], busy: false };
@@ -40,11 +44,13 @@ export function useMessageSearch(query: string, enabled: boolean): MessageResult
     setFound((f) => ({ q: f.q, hits: f.hits, busy: true }));
     const t = window.setTimeout(async () => {
       try {
+        let cursor: string | undefined;
         for (let round = 0; round < ROUNDS && live; round++) {
-          const r = await bridge.call('search.messages', { query: q, perChat: PER_CHAT, limit: MAX_HITS }, 20_000);
+          const r = await bridge.call('search.messages', { query: q, perChat: PER_CHAT, limit: MAX_HITS, scope: SCOPE, ...(cursor ? { cursor } : {}) }, 20_000);
           if (!live) return;
-          setFound({ q, hits: r.hits, busy: !!r.partial && round < ROUNDS - 1 });
+          setFound({ q, hits: r.hits, busy: !!r.partial && round < ROUNDS - 1, ...(r.skipped ? { skipped: r.skipped } : {}) });
           if (!r.partial) return;
+          cursor = r.cursor;
         }
       } catch {
         // An older bridge, or the search failed: no messages section.

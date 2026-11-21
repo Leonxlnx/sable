@@ -19,8 +19,11 @@ export interface TitlePrompt {
   cwd: string;
 }
 
-/** Asks a model for a title: its raw answer, or null when it gave none. */
-export type TitleModel = (prompt: TitlePrompt, signal: AbortSignal) => Promise<string | null>;
+/**
+ * Asks a model for a title: its raw answer, or null when it gave none. `holds`: whether the chat
+ * still wants it (checked by the model right before the prompt goes out, after any start-up).
+ */
+export type TitleModel = (prompt: TitlePrompt, signal: AbortSignal, holds?: () => boolean) => Promise<string | null>;
 
 /** Whose small model names a chat: the chat's own agent and account, nobody else's. */
 export interface TitleOwner {
@@ -234,7 +237,7 @@ export class ChatTitles {
     const ctrl = (this.current = new AbortController());
     const timer = setTimeout(() => ctrl.abort(), TITLE_TIMEOUT_MS);
     try {
-      const title = cleanTitle(await model(a.prompt, ctrl.signal));
+      const title = cleanTitle(await model(a.prompt, ctrl.signal, () => !ctrl.signal.aborted && this.holds(a)));
       // The person renamed it meanwhile, or it changed otherwise, moved, or closed: theirs stays.
       if (!title || ctrl.signal.aborted || !this.holds(a)) return;
       a.rt.update({ title });

@@ -53,6 +53,15 @@ export function duration(ms: number): string {
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
+/**
+ * A message's own text as it goes into the file: byte for byte, only the blank lines before it and
+ * the blank space after it dropped (the blocks around it set the spacing), never what is inside it
+ * (blank lines in code, indentation).
+ */
+export function body(text: string): string {
+  return text.replace(/^(?:[ \t]*\r?\n)+/, '').replace(/\s+$/, '');
+}
+
 /** A path as the chat shows it: relative to the chat's folder when inside it, with forward slashes. */
 function shownPath(p: string, cwd: string): string {
   if (!p) return p;
@@ -129,7 +138,7 @@ function userWords(it: UserItem): { text: string; command?: boolean } | null {
     const line = syntheticLine(syn);
     return line ? { text: line, command: true } : null;
   }
-  const text = stripWrappers(it.text).trim();
+  const text = body(stripWrappers(it.text));
   return text || it.attachments?.length ? { text } : null;
 }
 
@@ -226,7 +235,7 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
       blocks.push(lines.join('\n\n'));
       speaking = false;
     } else if (it.type === 'text') {
-      const text = it.text.trim();
+      const text = body(it.text);
       if (!text) continue;
       speak();
       blocks.push(text);
@@ -238,7 +247,7 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
         blocks.push(`> Widget${title ? `: ${title}` : ''}`);
       } else if (it.kind === 'plan' && it.detail.plan?.trim()) {
         speak();
-        blocks.push(`**Plan**\n\n${it.detail.plan.trim()}`);
+        blocks.push(`**Plan**\n\n${body(it.detail.plan)}`);
       } else if (it.kind === 'question' && it.detail.questions?.length) {
         speak();
         const answers = it.result?.answers ?? {};
@@ -262,5 +271,6 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
     }
   }
   endTurn();
-  return `${blocks.join('\n\n').replace(/\n{3,}/g, '\n\n').trim()}\n`;
+  // One blank line between blocks; each block's own text is left as it is (no blank lines at its edges).
+  return `${blocks.map((b) => body(b)).filter(Boolean).join('\n\n')}\n`;
 }

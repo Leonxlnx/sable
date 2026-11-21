@@ -20,6 +20,7 @@ import { FileGlyph, kindName } from '@m/ui/FileGlyph';
 import { PROVIDER_NAME, ProviderMark, Ring, StatusMark, Tiles } from '@m/ui/marks';
 import { REVEAL, reduced } from '@m/ui/motion';
 import { keptPic, loadPic } from '@m/lib/pics';
+import { useThumb } from '@m/lib/thumbs';
 import { openViewer, viewerLoaded } from '@m/ui/Viewer';
 import { holdMessage } from './MessageMenu';
 import { SynLine } from './Synthetic';
@@ -972,7 +973,7 @@ const Answer = memo(function Answer({ sid, id, tone = 'answer' }: { sid: string;
         data-streaming={it.streaming || undefined}
         data-cut={cut || undefined}
         onClick={copyCode}
-        onContextMenu={(e) => holdMessage(e, e.currentTarget, () => (cut ? fetchItem(sid, id).then((r) => (r.item as TextItem).text) : it.text))}
+        onContextMenu={(e) => holdMessage(e, e.currentTarget, () => (cut ? fetchItem(sid, id).then((r) => (r.item as TextItem).text) : it.text), 'md')}
         dangerouslySetInnerHTML={{ __html: html }}
       />
       {cut && (
@@ -1031,8 +1032,9 @@ function fileSize(n?: number): string {
 }
 
 /**
- * Files the agent handed over (`share`): one card, a row per file (its kind drawn as a page with an
- * emblem, the name, the size and kind) with a round Download key. The download runs inside the app
+ * Files the agent handed over (`share`): one card, a row per file (a picture of it where the desktop
+ * has one, a photo, a PDF's first page or a video's frame; else its kind drawn as a page with an
+ * emblem; the name, the size and kind) with a round Download key. The download runs inside the app
  * (lib/downloads.ts: Android's DownloadManager into Downloads/Sable): the key fills as a ring with the
  * bytes counted under the name, and the file then opens from the row (an APK goes to the installer).
  */
@@ -1045,15 +1047,17 @@ function ShareCards({ sid, it }: { sid: string; it: ToolItem }) {
       {caption && <p className="share-caption">{caption}</p>}
       <div className="share-card">
         {files.map((f, i) => (
-          <ShareRow key={`${f.path}:${i}`} sid={sid} itemId={it.id} index={i} name={f.name} size={f.size} />
+          <ShareRow key={`${f.path}:${i}`} sid={sid} itemId={it.id} index={i} name={f.name} size={f.size} shared={it.status === 'done'} />
         ))}
       </div>
     </div>
   );
 }
 
-function ShareRow({ sid, itemId, index, name, size }: { sid: string; itemId: string; index: number; name: string; size?: number }) {
+function ShareRow({ sid, itemId, index, name, size, shared }: { sid: string; itemId: string; index: number; name: string; size?: number; shared: boolean }) {
   const key = downloadKey(sid, itemId, index);
+  // A picture of it (a photo, a PDF's first page, a video's frame) once the share went through.
+  const thumb = useThumb(sid, itemId, index, shared ? name : '', size);
   const d = useDownload(key);
   const desktop = useStore((st) => st.desktop);
   const busy = d.state === 'asking' || d.state === 'pending' || d.state === 'running' || d.state === 'paused';
@@ -1084,8 +1088,15 @@ function ShareRow({ sid, itemId, index, name, size }: { sid: string; itemId: str
             : [fileSize(size), kindName(name)].filter(Boolean).join(' · ');
   return (
     <div className="share-row" data-state={d.state}>
-      <span className="share-glyph">
-        <FileGlyph name={name} size={34} />
+      <span className="share-glyph" data-pic={thumb?.kind}>
+        {thumb ? (
+          <span className="share-thumb">
+            <img src={thumb.src} alt="" draggable={false} />
+            {thumb.kind === 'video' && <span className="share-play" />}
+          </span>
+        ) : (
+          <FileGlyph name={name} size={34} />
+        )}
       </span>
       <span className="share-text">
         <span className="share-name">{name}</span>

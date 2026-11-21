@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import os from 'node:os';
 import path from 'node:path';
 import type { Duplex } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import {
   PHONE_METHODS,
@@ -12,11 +13,17 @@ import {
   PHONE_PORT,
   type Attachment,
   type BridgeEvent,
+  type DiffHunk,
+  type FileDiff,
   type PhoneDevice,
   type PhoneFrame,
   type PhoneHello,
   type PhoneItem,
+  type PhonePermission,
+  type PhoneQuestion,
+  type PhoneQuestionRequest,
   type PhoneReset,
+  type PhoneStale,
   type PhoneStatus,
   type PhoneTail,
   type PermissionRequest,
@@ -40,6 +47,7 @@ import { PhoneChangesReader, stepIds } from './phone-changes';
 import { FRAME_MAX, grantFor, openGrant, phoneAttachments, readHello, type FileGrant } from './phone-guard';
 import { qrSvgPath } from './qr';
 import { searchOf, type ChatSearch } from './search';
+import { pictureOf } from './thumbs';
 
 /** The search limits, as the phone's tests read them (the search itself is in search.ts). */
 export { SEARCH } from './search';
@@ -63,6 +71,8 @@ export { SEARCH } from './search';
  *   the conversations it has open, trimmed the same way. Frames over 1 KB are compressed.
  * - A chat's changes and their diffs (`phone.changes`, `phone.diff`, phone-changes.ts): read-only,
  *   named by the chat (never a folder or a path outside what its folder's status lists).
+ * - A small picture of a file the agent handed over (`phone.thumb`, thumbs.ts `pictureOf` by the
+ *   phone's rule: the very file the share step handed over, unchanged, as a download link), for its row.
  */
 
 interface StoredPhone {
@@ -156,6 +166,8 @@ const FULL = { text: 200_000, thinking: 40_000, field: 4000, outLines: 200, outC
 /** Pictures of one step a phone can ask for, and the biggest one it gets (a data URL's length). */
 const MAX_PICS = 12;
 export const IMAGE_MAX = 12 * 1024 * 1024;
+/** How wide a file row's picture is made for the phone (a 40 px tile at up to 4x). */
+const PHONE_THUMB_PX = 160;
 /** `phone.tail` with `to`: how far back a page may reach for the item asked for (roots, bytes). */
 export const REACH = { roots: 2400, bytes: 3_000_000 };
 
@@ -298,36 +310,171 @@ export function phonePatch(patch: Partial<TimelineItem>): Partial<PhoneItem> | n
   return Object.keys(p).length ? (p as Partial<PhoneItem>) : null;
 }
 
+/** A change a phone is asked to allow: whole hunks while they fit (files, lines, characters). */
+const ASK_DIFF = { files: 6, lines: 600, chars: 40_000, line: 2000 };
+
+/** The change of a permission request for the phone, and whether any of it was left out or shortened. */
+function askDiff(diff: FileDiff[]): { diff: FileDiff[]; cut: boolean } {
+  let cut = diff.length > ASK_DIFF.files;
+  let lines = 0;
+  let chars = 0;
+  const out = diff.slice(0, ASK_DIFF.files).map((f): FileDiff => {
+    if (f.path.length > 400 || (f.oldPath?.length ?? 0) > 400) cut = true;
+    const hunks: DiffHunk[] = [];
+    for (const h of f.hunks) {
+      const kept: string[] = [];
+      for (const l of h.lines) {
+        if (lines >= ASK_DIFF.lines || chars + Math.min(l.length, ASK_DIFF.line) > ASK_DIFF.chars) break;
+        if (l.length > ASK_DIFF.line) cut = true;
+        kept.push(cap(l, ASK_DIFF.line));
+        lines++;
+        chars += Math.min(l.length, ASK_DIFF.line);
+      }
+      if (kept.length < h.lines.length) cut = true;
+      if (kept.length || !h.lines.length) hunks.push({ ...h, lines: kept });
+      if (kept.length < h.lines.length) break;
+    }
+    if (hunks.length < f.hunks.length) cut = true;
+    return { path: cap(f.path, 400), ...(f.oldPath ? { oldPath: cap(f.oldPath, 400) } : {}), status: f.status, additions: f.additions, deletions: f.deletions, ...(f.binary ? { binary: true } : {}), hunks };
+  });
+  return { diff: out, cut };
+}
+
+/** Words of a permission request the phone shows, and how long each may be. */
+const ASK_TEXT = { title: 300, description: FULL.field, reason: LIMITS.notice, label: 200, hint: LIMITS.field };
+
 /**
  * A permission request as a phone gets it, cut like a step opened in full (`phone.item`): what it
  * shows (title, command, path, url, plan, the change's first hunks), never an edit's whole text.
+ * `incomplete` when any of what it would allow was shortened or left out (a command, a list of
+ * folders in its description, the change's lines, an option): then the phone may only decline it
+ * (`phoneAllowed`), the desktop has the whole of it.
  */
-export function phonePermission(p: PermissionRequest): PermissionRequest {
-  const detail = trimDetail(p.detail, FULL.field, true);
-  if (typeof p.detail?.plan === 'string') detail.plan = cap(p.detail.plan, FULL.thinking);
-  const diff = p.diff ? trimResult({ diff: p.diff }, true)?.diff : undefined;
-  return {
-    ...p,
-    title: cap(p.title, 300),
-    ...(p.description ? { description: cap(p.description, LIMITS.notice) } : {}),
-    ...(p.reason ? { reason: cap(p.reason, LIMITS.notice) } : {}),
-    detail,
-    ...(diff ? { diff } : {}),
-    options: p.options.slice(0, 12).map((o) => ({ ...o, label: cap(o.label, 200), ...(o.hint ? { hint: cap(o.hint, LIMITS.field) } : {}) })),
+export function phonePermission(p: PermissionRequest): PhonePermission {
+  let cut = false;
+  const c = (s: string, n: number) => {
+    if (s.length > n) cut = true;
+    return cap(s, n);
   };
+  const d = p.detail ?? {};
+  const detail = trimDetail(d, FULL.field, true);
+  for (const k of DETAIL_TEXT) if (typeof d[k] === 'string' && (d[k] as string).length > FULL.field) cut = true;
+  if (typeof d.prompt === 'string' && d.prompt.length > FULL.field) cut = true;
+  if (typeof d.plan === 'string') detail.plan = c(d.plan, FULL.thinking);
+  if (d.files && (d.files.length > 12 || d.files.some((f) => f.path.length > 400 || f.name.length > 200))) cut = true;
+  const change = p.diff ? askDiff(p.diff) : undefined;
+  if (change?.cut) cut = true;
+  // An edit's own text is what it allows where no whole change shows it.
+  if (!change || change.cut) for (const k of ['oldText', 'newText', 'content'] as const) if (typeof d[k] === 'string' && (d[k] as string).length > FULL.field) cut = true;
+  if (p.options.length > 12) cut = true;
+  const out: PhonePermission = {
+    ...p,
+    title: c(p.title, ASK_TEXT.title),
+    ...(p.description ? { description: c(p.description, ASK_TEXT.description) } : {}),
+    ...(p.reason ? { reason: c(p.reason, ASK_TEXT.reason) } : {}),
+    detail,
+    ...(change ? { diff: change.diff } : {}),
+    options: p.options.slice(0, 12).map((o) => ({ ...o, label: c(o.label, ASK_TEXT.label), ...(o.hint ? { hint: c(o.hint, ASK_TEXT.hint) } : {}) })),
+  };
+  return cut ? { ...out, incomplete: true } : out;
 }
 
-/** A question as a phone gets it: a bounded number of questions and options, their words cut. */
-export function phoneQuestion(q: QuestionRequest): QuestionRequest {
-  return {
+/**
+ * Refuses an answer from the phone that allows more than the phone was shown: any option but a
+ * decline of an `incomplete` request (the desktop answers that one). An option the request does not
+ * have is refused too. Nothing for a request that is gone (the bridge says so).
+ */
+export function phoneAllowed(req: PermissionRequest | undefined, optionId: unknown): void {
+  if (!req) return;
+  const o = req.options.find((x) => x.id === optionId);
+  if (!o) throw new Error('That is not one of the answers to this request.');
+  if (o.tone !== 'deny' && phonePermission(req).incomplete) throw new Error('This request is longer than the phone shows. Answer it on the desktop.');
+}
+
+/** Questions and options a phone gets, and how long their words may be. */
+const ASK_Q = { questions: 12, options: 24, question: FULL.field, header: 200, label: 300, description: LIMITS.field, other: 4000 };
+
+/**
+ * A question as a phone gets it: stable ids for each question (`q<i>`) and option (`o<j>`, its place
+ * in that question) to answer by (`phone.answer`), the words for display only, cut (`cut` on that
+ * question). `incomplete` when questions or options were left out: only the desktop answers those.
+ */
+export function phoneQuestion(q: QuestionRequest): PhoneQuestionRequest {
+  const incomplete = q.questions.length > ASK_Q.questions || q.questions.some((x) => x.options.length > ASK_Q.options);
+  const out: PhoneQuestionRequest = {
     ...q,
-    questions: q.questions.slice(0, 12).map((x) => ({
-      ...x,
-      question: cap(x.question, LIMITS.notice),
-      ...(x.header ? { header: cap(x.header, 200) } : {}),
-      options: x.options.slice(0, 24).map((o) => ({ ...o, label: cap(o.label, 300), ...(o.description ? { description: cap(o.description, LIMITS.field) } : {}) })),
-    })),
+    questions: q.questions.slice(0, ASK_Q.questions).map((x, i): PhoneQuestion => {
+      const cut = x.question.length > ASK_Q.question || (x.header?.length ?? 0) > ASK_Q.header || x.options.some((o) => o.label.length > ASK_Q.label || (o.description?.length ?? 0) > ASK_Q.description);
+      return {
+        ...x,
+        id: `q${i}`,
+        question: cap(x.question, ASK_Q.question),
+        ...(x.header ? { header: cap(x.header, ASK_Q.header) } : {}),
+        options: x.options.slice(0, ASK_Q.options).map((o, j) => ({ ...o, id: `o${j}`, label: cap(o.label, ASK_Q.label), ...(o.description ? { description: cap(o.description, ASK_Q.description) } : {}) })),
+        ...(cut ? { cut: true as const } : {}),
+      };
+    }),
   };
+  return incomplete ? { ...out, incomplete: true } : out;
+}
+
+const plainObject = (v: unknown): Record<string, unknown> | null => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+
+/**
+ * `phone.answer`: the phone's picks (per question id, option ids and words of its own) as the
+ * answers the agent gets, keyed by the original question with the original option labels. Throws
+ * for an incomplete request, a question left unanswered, an id that is not there, two answers to a
+ * single-answer question.
+ */
+export function phonePicks(req: QuestionRequest, picks: unknown): Record<string, string[]> {
+  if (phoneQuestion(req).incomplete) throw new Error('These questions are longer than the phone shows. Answer them on the desktop.');
+  const given = plainObject(picks);
+  if (!given) throw new Error('Answer every question.');
+  const ids = new Set(req.questions.map((_, i) => `q${i}`));
+  if (Object.keys(given).some((k) => !ids.has(k))) throw new Error('That answer is for a question that is not there.');
+  const out: Record<string, string[]> = {};
+  req.questions.forEach((q, i) => {
+    const p = plainObject(given[`q${i}`]) ?? {};
+    const opts = p.options === undefined ? [] : p.options;
+    if (!Array.isArray(opts)) throw new Error('That is not one of the answers to this question.');
+    const labels = opts.map((id) => {
+      const m = typeof id === 'string' ? /^o(\d{1,3})$/.exec(id) : null;
+      const o = m ? q.options[Number(m[1])] : undefined;
+      if (!o) throw new Error('That is not one of the answers to this question.');
+      return o.label;
+    });
+    if (new Set(labels).size !== labels.length) throw new Error('That answer was picked twice.');
+    if (p.other !== undefined && typeof p.other !== 'string') throw new Error('Answer every question.');
+    const other = typeof p.other === 'string' ? p.other.trim() : '';
+    if (other.length > ASK_Q.other) throw new Error('That answer is too long.');
+    const list = other ? [...labels, other] : labels;
+    if (!list.length) throw new Error('Answer every question.');
+    if (!q.multiSelect && list.length > 1) throw new Error('Pick one answer to that question.');
+    out[q.question] = list;
+  });
+  return out;
+}
+
+/**
+ * `question.respond` from the phone in the shape keyed by the question's words (a phone app from
+ * before `phone.answer`): taken only when it is not lossy, i.e. the phone got every question and
+ * option whole and the answer names each question by its exact words. Null (skipping) always goes.
+ */
+export function phoneWordAnswers(req: QuestionRequest, answers: unknown): Record<string, string[]> | null {
+  if (answers === null) return null;
+  const shortened = phoneQuestion(req).incomplete || req.questions.some((q) => q.question.length > ASK_Q.question || q.options.some((o) => o.label.length > ASK_Q.label));
+  if (shortened) throw new Error('These questions were shortened on the phone. Answer them on the desktop.');
+  const given = plainObject(answers);
+  if (!given) throw new Error('Answer every question.');
+  const words = new Set(req.questions.map((q) => q.question));
+  if (Object.keys(given).some((k) => !words.has(k))) throw new Error('That answer is for a question that is not there.');
+  const out: Record<string, string[]> = {};
+  for (const q of req.questions) {
+    const v = given[q.question];
+    if (!Array.isArray(v) || !v.length || v.some((x) => typeof x !== 'string' || !x.trim() || x.length > ASK_Q.other)) throw new Error('Answer every question.');
+    out[q.question] = v as string[];
+  }
+  return out;
 }
 
 /** A message that opens a turn: not a steer, not a command's output or a reminder the agent's harness wrote. */
@@ -462,6 +609,20 @@ export function phoneEvent(event: BridgeEvent): BridgeEvent | PhoneReset | null 
   }
 }
 
+/** JSON text over `limit` UTF-8 bytes as it goes out (a character takes up to 3 bytes; counted only when that can matter). */
+export const overBytes = (json: string, limit: number) => json.length > limit || (json.length * 3 > limit && Buffer.byteLength(json, 'utf8') > limit);
+
+/**
+ * `phone.stale` in place of an event too big for a phone: which chat it was about (so the phone
+ * fetches that chat again) and its type. A toast has no state to fetch: none.
+ */
+export function staleOf(event: BridgeEvent | PhoneReset): PhoneStale | null {
+  if (event.type === 'toast') return null;
+  const e = event as { sessionId?: unknown; session?: { id?: unknown }; request?: { sessionId?: unknown } };
+  const sessionId = [e.sessionId, e.session?.id, e.request?.sessionId].find((v): v is string => typeof v === 'string');
+  return { type: 'phone.stale', ...(sessionId ? { sessionId } : {}), of: event.type };
+}
+
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
 function sameSecret(a: string, b: string): boolean {
@@ -506,6 +667,40 @@ export function lanAddresses(): string[] {
 }
 
 /**
+ * `session.create` from the phone, built only from what a phone's new chat may choose: the agent,
+ * its folder (or a chat of its own, `chat`), model, effort, mode, speed, account, a title and Remote
+ * Control. Never `resume` (a transcript or a thread another chat holds), a handover, a lane or any
+ * other desktop-only field. A field of the wrong kind is refused.
+ */
+export function phoneCreate(p: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const text = (k: string, required = false) => {
+    const v = p[k];
+    if (v === undefined || v === null) {
+      if (required) throw new Error(`A new chat needs its ${k}.`);
+      return;
+    }
+    if (typeof v !== 'string' || v.length > 4000) throw new Error(`That ${k} cannot start a chat.`);
+    out[k] = v;
+  };
+  text('provider', true);
+  text('cwd', true);
+  for (const k of ['model', 'effort', 'mode', 'speed', 'accountId', 'title']) text(k);
+  const o = p.options;
+  if (o !== undefined && o !== null) {
+    const opts = plainObject(o);
+    if (!opts) throw new Error('Those options cannot start a chat.');
+    if ('remoteControl' in opts) out.options = { remoteControl: !!opts.remoteControl };
+  }
+  if (p.chat !== undefined && p.chat !== null) {
+    const chat = plainObject(p.chat);
+    if (!chat || (chat.text !== undefined && typeof chat.text !== 'string')) throw new Error('That chat cannot be started.');
+    out.chat = typeof chat.text === 'string' ? { text: chat.text.slice(0, 4000) } : {};
+  }
+  return out;
+}
+
+/**
  * Narrows what a phone may pass to a method beyond the allowlist itself. `queued`: the attachments
  * the desktop holds for a queued message (a phone that edits one names them by id).
  */
@@ -522,11 +717,7 @@ function narrow(method: string, params: Record<string, unknown>, queued?: (sessi
     const o = (p.options ?? {}) as Record<string, unknown>;
     p.options = 'remoteControl' in o ? { remoteControl: !!o.remoteControl } : {};
   }
-  if (method === 'session.create') {
-    const o = p.options as Record<string, unknown> | undefined;
-    if (o && typeof o === 'object') p.options = 'remoteControl' in o ? { remoteControl: !!o.remoteControl } : undefined;
-    delete p.handoverFrom;
-  }
+  if (method === 'session.create') return phoneCreate(p);
   if (method === 'session.update') {
     const patch = (p.patch ?? {}) as Record<string, unknown>;
     const out: Record<string, boolean> = {};
@@ -792,9 +983,23 @@ export class PhoneService {
     return { path: `/f/${token}/${encodeURIComponent(grant.name)}`, name: grant.name, size: grant.size };
   }
 
-  /** The links made for one phone (or all of them) stop working. */
+  /** Downloads under way, per phone: each one's abort (it ends the transfer and closes the file). */
+  private transfers = new Map<string, Set<AbortController>>();
+
+  /** The links made for one phone (or all of them) stop working, and their downloads under way end. */
   private dropLinks(deviceId?: string) {
     for (const [t, f] of this.files) if (!deviceId || f.deviceId === deviceId) this.files.delete(t);
+    for (const [d, set] of this.transfers) if (!deviceId || d === deviceId) for (const ac of set) ac.abort();
+  }
+
+  /** Downloads under way for one phone (tests). */
+  downloads(deviceId: string): number {
+    return this.transfers.get(deviceId)?.size ?? 0;
+  }
+
+  /** This link still serves: its phone paired, phone access on, the link not dropped. */
+  private linkLive(token: string, entry: FileGrant): boolean {
+    return this.files.get(token) === entry && this.data.enabled && this.data.devices.some((d) => d.id === entry.deviceId);
   }
 
   /** `phone.image`: one picture of a step's result in this chat (a data URL of an image, capped), nothing else. */
@@ -837,68 +1042,131 @@ export class PhoneService {
       return fail(410, 'This link has expired. Open the file again in Sable.');
     }
     // The phone it was made for is still paired and phone access is on.
-    if (!this.data.enabled || !this.data.devices.some((d) => d.id === entry.deviceId)) {
+    if (!this.linkLive(token, entry)) {
       this.files.delete(token);
       return fail(404, 'Not found');
     }
     // The file as it was when the link was made, read through the handle that was checked.
     const opened = await openGrant(entry);
     if ('code' in opened) return fail(opened.code, opened.text);
-    const type = /\.apk$/i.test(entry.name) ? 'application/vnd.android.package-archive' : 'application/octet-stream';
-    res.writeHead(200, {
-      'content-type': type,
-      'content-length': String(entry.size),
-      'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(entry.name)}`,
-      'cache-control': 'no-store',
-      'x-content-type-options': 'nosniff',
-    });
-    if (!entry.size) {
+    // Asked again once the file is open: the phone may have been removed (or access turned off) meanwhile.
+    if (!this.linkLive(token, entry)) {
       await opened.fh.close().catch(() => {});
-      return void res.end();
+      return fail(404, 'Not found');
     }
-    opened.fh
-      .createReadStream({ start: 0, end: entry.size - 1 })
-      .on('error', () => res.destroy())
-      .pipe(res);
+    // Tracked per phone: removing it, turning phone access off or the phone going away ends it, and the file closes on every path.
+    const ac = new AbortController();
+    let set = this.transfers.get(entry.deviceId);
+    if (!set) this.transfers.set(entry.deviceId, (set = new Set()));
+    set.add(ac);
+    try {
+      const type = /\.apk$/i.test(entry.name) ? 'application/vnd.android.package-archive' : 'application/octet-stream';
+      res.writeHead(200, {
+        'content-type': type,
+        'content-length': String(entry.size),
+        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(entry.name)}`,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+      });
+      if (!entry.size) return void res.end();
+      await pipeline(opened.fh.createReadStream({ start: 0, end: entry.size - 1, autoClose: true }), res, { signal: ac.signal });
+    } catch {
+      res.destroy();
+    } finally {
+      set.delete(ac);
+      if (!set.size && this.transfers.get(entry.deviceId) === set) this.transfers.delete(entry.deviceId);
+      await opened.fh.close().catch(() => {});
+    }
   }
 
   private onUpgrade(wss: WebSocketServer, req: IncomingMessage, socket: Duplex, head: Buffer) {
-    const ip = req.socket.remoteAddress ?? '?';
-    const url = new URL(req.url ?? '/', 'http://phone');
     const refuse = (code: number, text: string) => {
-      socket.write(`HTTP/1.1 ${code} ${text}\r\nconnection: close\r\n\r\n`);
-      socket.destroy();
+      socket.end(`HTTP/1.1 ${code} ${text}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
+      setTimeout(() => socket.destroy(), 1000).unref();
     };
-    if (url.pathname !== PHONE_PATH) return refuse(404, 'Not Found');
-    if (!originAllowed(req)) return refuse(403, 'Forbidden');
-    if (this.blocked(ip)) return refuse(429, 'Too Many Requests');
-    if (wss.clients.size >= MAX_SOCKETS) return refuse(503, 'Service Unavailable');
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    // Nothing a request carries leaves this listener: a malformed one closes only its own socket.
+    try {
+      const ip = req.socket.remoteAddress ?? '?';
+      // The route compared as the origin-form target it must be (no URL parsing of what was sent).
+      const target = typeof req.url === 'string' ? req.url : '';
+      if (!target.startsWith('/') || target.startsWith('//')) return refuse(400, 'Bad Request');
+      const q = target.indexOf('?');
+      if ((q < 0 ? target : target.slice(0, q)) !== PHONE_PATH) return refuse(404, 'Not Found');
+      if (!originAllowed(req)) return refuse(403, 'Forbidden');
+      if (this.blocked(ip)) return refuse(429, 'Too Many Requests');
+      if (wss.clients.size >= MAX_SOCKETS) return refuse(503, 'Service Unavailable');
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    } catch (err) {
+      this.app.log('phone: an upgrade failed', (err as Error).message);
+      try {
+        refuse(400, 'Bad Request');
+      } catch {
+        socket.destroy();
+      }
+    }
   }
 
   /**
-   * One frame to a phone, within its budget (`FRAME_MAX`): a result too big for it goes as an error,
-   * an event too big is left out (an item event goes as its conversation's newest page instead).
+   * One frame to a phone, within its budget (`FRAME_MAX`, in UTF-8 bytes as it goes out): a result
+   * too big for it goes as an error; an event too big goes as its conversation's newest page (an item
+   * event) or else as `phone.stale`, which makes the phone fetch the current state.
    */
-  private sendFrame(ws: WebSocket, frame: PhoneFrame | ServerFrame) {
-    if (ws.readyState !== ws.OPEN) return;
+  private sendFrame(ws: WebSocket, frame: PhoneFrame | ServerFrame, sent?: (err?: Error) => void) {
+    if (ws.readyState !== ws.OPEN) return void sent?.(new Error('closed'));
     if (ws.bufferedAmount > MAX_BUFFERED) {
       ws.terminate();
-      return;
+      return void sent?.(new Error('behind'));
     }
     let json = JSON.stringify(frame);
     const f = frame as { id?: unknown; event?: BridgeEvent };
-    if (f.event && json.length > FRAME_MAX.event) {
+    if (f.event && overBytes(json, FRAME_MAX.event)) {
       const page = this.pageFor(f.event);
       json = page ? JSON.stringify({ event: page }) : '';
-      if (!json || json.length > FRAME_MAX.event) {
-        this.app.log(`phone: left out a ${f.event.type} event too big for the phone`);
-        return;
+      if (!json || overBytes(json, FRAME_MAX.event)) {
+        this.app.log(`phone: a ${f.event.type} event too big for the phone went as phone.stale`);
+        const stale = staleOf(f.event);
+        if (!stale) return void sent?.(new Error('too big'));
+        json = JSON.stringify({ event: stale });
       }
-    } else if (typeof f.id === 'number' && json.length > FRAME_MAX.result) {
+    } else if (typeof f.id === 'number' && overBytes(json, FRAME_MAX.result)) {
       json = JSON.stringify({ id: f.id, ok: false, error: 'That is too big to send to the phone.' });
     }
-    ws.send(json);
+    ws.send(json, sent);
+  }
+
+  /** The reply as it would go to this phone, or why it cannot go now (closed, behind, over its budget). */
+  private deliverable(ws: WebSocket, frame: ServerFrame): string | null {
+    if (ws.readyState !== ws.OPEN || ws.bufferedAmount > MAX_BUFFERED) return null;
+    const json = JSON.stringify(frame);
+    return overBytes(json, FRAME_MAX.result) ? null : json;
+  }
+
+  /**
+   * `queue.take` from the phone: the message leaves the queue only once its reply can go to this
+   * phone (the socket open and keeping up, the reply within its budget); one that cannot is left
+   * where it is, and one whose send fails after all goes back to the front of the queue.
+   */
+  private async takeQueued(ws: WebSocket, id: number, params: Record<string, unknown>) {
+    const sessionId = String(params.sessionId ?? '');
+    const qid = String(params.id ?? '');
+    const rt = this.app.sessions.get(sessionId);
+    const held = rt?.queue.find((q) => q.id === qid);
+    if (held && !this.deliverable(ws, { id, ok: true, result: phoneResult('queue.take', { message: held }) })) {
+      return this.sendFrame(ws, { id, ok: false, error: 'That message is too big to take back to the phone. Edit it on the desktop.' });
+    }
+    const result = (await this.app.call('queue.take', { sessionId, id: qid })) as { message?: QueuedMessage };
+    const frame: ServerFrame = { id, ok: true, result: phoneResult('queue.take', result) };
+    const json = this.deliverable(ws, frame);
+    const back = () => {
+      if (result.message) this.app.sessions.get(sessionId)?.requeue([result.message]);
+    };
+    if (!json) {
+      back();
+      return this.sendFrame(ws, { id, ok: false, error: 'That message is too big to take back to the phone. Edit it on the desktop.' });
+    }
+    ws.send(json, (err) => {
+      if (err) back();
+    });
   }
 
   /** In place of an item event too big for a phone: the newest page of its conversation. */
@@ -1052,9 +1320,12 @@ export class PhoneService {
         } else if (own === 'phone.diff') {
           result = await this.changes.diff(String(raw.sessionId ?? ''), typeof raw.path === 'string' ? raw.path : '', stepIds(raw.items));
         } else if (own === 'phone.search') {
-          result = await this.finder.search(typeof raw.query === 'string' ? raw.query : '');
+          // Each phone its own search: one phone's query never goes on with, or stops, another's.
+          result = await this.finder.search(typeof raw.query === 'string' ? raw.query : '', { scope: `phone:${device.id}` });
         } else if (own === 'phone.image') {
           result = await this.image(String(raw.sessionId ?? ''), String(raw.itemId ?? ''), Number(raw.index ?? 0));
+        } else if (own === 'phone.thumb') {
+          result = await pictureOf(this.app, { sessionId: raw.sessionId, itemId: raw.itemId, index: Number(raw.index ?? 0), size: PHONE_THUMB_PX }, 'phone');
         } else if (own === 'phone.tail' || own === 'phone.item') {
           const sessionId = String(raw.sessionId ?? '');
           // The session's own snapshot (loads it from disk the first time, marks it read), then trimmed.
@@ -1066,8 +1337,24 @@ export class PhoneService {
             const to = typeof raw.to === 'string' ? raw.to : undefined;
             result = phoneTail(snap, { before, limit, to });
           } else result = phoneDetail(snap.items, String(raw.itemId ?? ''));
+        } else if (own === 'phone.answer') {
+          // By the ids the phone got, into the agent's own keys (the original question and option words).
+          const sessionId = String(raw.sessionId ?? '');
+          const requestId = String(raw.requestId ?? '');
+          const asked = this.app.sessions.get(sessionId)?.prompts().questions.find((q) => q.id === requestId);
+          if (!asked) throw new Error('Those questions were already answered.');
+          result = await this.app.call('question.respond', { sessionId, requestId, answers: phonePicks(asked, raw.picks) });
+        } else if (own === 'queue.take') {
+          return void (await this.takeQueued(ws, req.id, raw));
         } else {
           const params = narrow(req.method, raw, (sessionId, id) => this.app.sessions.get(sessionId)?.queue.find((q) => q.id === id)?.attachments);
+          // An answer from the phone allows only what the phone was shown, and answers questions it got whole.
+          const prompts = own === 'permission.respond' || own === 'question.respond' ? this.app.sessions.get(String(params.sessionId ?? ''))?.prompts() : undefined;
+          if (own === 'permission.respond') phoneAllowed(prompts?.permissions.find((p) => p.id === params.requestId), params.optionId);
+          if (own === 'question.respond') {
+            const asked = prompts?.questions.find((q) => q.id === params.requestId);
+            if (asked) params.answers = phoneWordAnswers(asked, params.answers);
+          }
           result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never));
           // Folder browsing for a new chat: folders only, never file names.
           if (req.method === 'fs.list' && result && typeof result === 'object') {

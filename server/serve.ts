@@ -4,6 +4,7 @@ import path from 'node:path';
 import { BRIDGE_PATH } from '../shared/protocol';
 import { attachBridge } from './bridge';
 import { watchAwake, watchPhoneAwake } from './core/awake';
+import { setThumbHost, type ThumbHost } from './services/thumbs';
 import { registerUpdates, type UpdateHost } from './services/update';
 
 /**
@@ -20,6 +21,8 @@ export interface ServerOptions {
   fallbackToFreePort?: boolean;
   /** The desktop shell: lets Sable install its own updates (`services/update.ts`). */
   updates?: UpdateHost;
+  /** The desktop shell: Windows' own thumbnails for the file cards (`services/thumbs.ts`). */
+  thumbs?: ThumbHost;
 }
 
 export interface RunningServer {
@@ -138,6 +141,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   }
   const bridge = attachBridge(server);
   registerUpdates(bridge.app, opts.updates);
+  setThumbHost(bridge.app, opts.thumbs);
 
   let closing: Promise<void> | undefined;
   const close = () =>

@@ -7,6 +7,7 @@ import { plural } from '@/lib/format';
 import { removePrompt, reorderPrompts, savePrompt, updatePrompt, usePromptsLoaded, useSavedPrompts } from '@/features/saved/prompts-store';
 import { IconButton } from '@/ui';
 import { Empty, Skeleton } from './parts';
+import { promptEdits, type PromptField, type PromptFields } from './prompt-edits';
 import './saved-prompts.css';
 
 /**
@@ -161,16 +162,37 @@ function PromptRow({ prompt: p, index, count, open, reduced, onOpen, onClose, on
   const [confirm, setConfirm] = useState(false);
   const [name, setName] = useState(p.name);
   const [text, setText] = useState(p.text);
+  /** The prompt as this row saw it when the edit began (or a field last settled): a field that differs from it was edited here. */
+  const seen = useRef<PromptFields>({ name: p.name, text: p.text });
+  const now = useRef<PromptFields>({ name, text });
+  now.current = { name, text };
+  /** Fields edited here that another window changed too: held until the person picks. */
+  const [conflict, setConflict] = useState<PromptField[]>([]);
   const nameRef = useRef<HTMLInputElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   useGrow(textRef, open ? text : '');
 
-  // Closed, the fields follow the prompt (a change from elsewhere); opened, the name takes focus.
+  // Closed, the fields follow the prompt (a change from elsewhere). Open, a field not edited here
+  // follows it too, and one edited here that changed elsewhere as well is shown as a conflict.
   useEffect(() => {
+    const s = seen.current;
     if (!open) {
       setName(p.name);
       setText(p.text);
+      seen.current = { name: p.name, text: p.text };
+      setConflict([]);
+      return;
     }
+    const cur = { ...now.current };
+    if (cur.name === s.name && p.name !== s.name) {
+      s.name = cur.name = p.name;
+      setName(p.name);
+    }
+    if (cur.text === s.text && p.text !== s.text) {
+      s.text = cur.text = p.text;
+      setText(p.text);
+    }
+    setConflict(promptEdits(s, cur, p).conflicts);
   }, [open, p.name, p.text]);
   useLayoutEffect(() => {
     if (!open) return;
@@ -179,14 +201,43 @@ function PromptRow({ prompt: p, index, count, open, reduced, onOpen, onClose, on
     nameRef.current?.select();
   }, [open]);
 
-  /** Keeps what was typed (an emptied name keeps the old one; an emptied text is not saved). */
+  /** Sends fields as given; once the bridge took them they are what this row has seen. */
+  const send = (patch: Partial<PromptFields>, was: Partial<PromptFields>) => {
+    if (!Object.keys(patch).length) return;
+    void updatePrompt(p.id, patch, was).then((ok) => ok && Object.assign(seen.current, patch));
+  };
+  /**
+   * Keeps what was typed: only the fields edited since the edit began (an emptied name keeps the old
+   * one; an emptied text is not saved). Returns false while a field waits on a conflict.
+   */
   const save = () => {
-    const n = name.trim() || p.name;
-    if (text.trim() && (n !== p.name || text !== p.text)) void updatePrompt(p.id, { name: n, text });
+    const r = promptEdits(seen.current, { name, text }, p);
+    send(r.patch, r.was);
+    setConflict(r.conflicts);
+    return !r.conflicts.length;
   };
   const close = () => {
-    save();
-    onClose();
+    if (save()) onClose();
+  };
+  /** This window's words win the conflicting fields (over what the other window saved). */
+  const keepMine = () => {
+    const patch: Partial<PromptFields> = {};
+    const was: Partial<PromptFields> = {};
+    for (const f of conflict) {
+      patch[f] = f === 'name' ? name.trim() || p.name : text;
+      was[f] = p[f];
+    }
+    send(patch, was);
+    setConflict([]);
+  };
+  /** The other window's words replace what was typed here in the conflicting fields. */
+  const takeTheirs = () => {
+    for (const f of conflict) {
+      seen.current[f] = p[f];
+      if (f === 'name') setName(p.name);
+      else setText(p.text);
+    }
+    setConflict([]);
   };
   const remove = () => {
     void removePrompt(p.id);
@@ -312,7 +363,20 @@ function PromptRow({ prompt: p, index, count, open, reduced, onOpen, onClose, on
         <div className="sp-body">
           <textarea ref={textRef} className="field sp-field-text scroll" value={text} placeholder="What the prompt says" aria-label="Text" spellCheck onChange={(e) => setText(e.target.value)} onBlur={save} />
           <div className="sp-foot">
-            {confirm ? (
+            {conflict.length ? (
+              <>
+                <span className="sp-conflict" role="status">
+                  Changed in another window
+                </span>
+                <span className="grow" />
+                <button type="button" className="btn btn-sm btn-ghost" onClick={takeTheirs}>
+                  Use theirs
+                </button>
+                <button type="button" className="btn btn-sm" onClick={keepMine}>
+                  Keep mine
+                </button>
+              </>
+            ) : confirm ? (
               <>
                 <button type="button" className="btn btn-sm btn-ghost" autoFocus onClick={() => setConfirm(false)}>
                   Cancel
@@ -327,10 +391,14 @@ function PromptRow({ prompt: p, index, count, open, reduced, onOpen, onClose, on
                 Delete
               </button>
             )}
-            <span className="grow" />
-            <button type="button" className="btn btn-sm" onClick={close}>
-              Done
-            </button>
+            {!conflict.length && (
+              <>
+                <span className="grow" />
+                <button type="button" className="btn btn-sm" onClick={close}>
+                  Done
+                </button>
+              </>
+            )}
           </div>
         </div>
       </Collapse>

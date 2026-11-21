@@ -37,6 +37,29 @@ export function wantsText(name: string, size?: number): number {
   return TEXT.test(name) ? TEXT_BYTES : 0;
 }
 
+/**
+ * Which picture the bridge may have of a file that is not read as text (`file.thumb`): a picture, a
+ * document's first page, a frame of a video; null for anything else (no picture is asked for).
+ */
+export function pictureKind(name: string): 'image' | 'page' | 'video' | null {
+  if (/\.(png|jpe?g|jfif|gif|webp|bmp|tiff?|heic|heif|avif|ico)$/i.test(name)) return 'image';
+  if (/\.(pdf|docx|pptx|xlsx)$/i.test(name)) return 'page';
+  if (/\.(mp4|m4v|mov|webm|mkv|avi|wmv|mpe?g|3gp)$/i.test(name)) return 'video';
+  return null;
+}
+
+/**
+ * How a picture stands on its sheet, from its size in pixels: a document's page keeps the sheet's
+ * shape (its top shows, as with text); a picture or a frame takes its own proportions on the sheet's
+ * width (between a wide strip and the sheet's full height), and a small one (an icon) stands at its
+ * own size in the middle of the page.
+ */
+export function pictureFit(kind: 'image' | 'page' | 'video', w: number, h: number, sheetW = 156, sheetH = 140): { height: number; small: boolean } {
+  if (kind === 'page' || !(w > 0 && h > 0)) return { height: sheetH, small: false };
+  if (kind === 'image' && w < sheetW * 0.75 && h < sheetH * 0.6) return { height: sheetH, small: true };
+  return { height: Math.round(Math.min(sheetH, Math.max(72, (sheetW * h) / w))), small: false };
+}
+
 /** The kind as the cover writes it: the extension as typed, in lower case (".pdf"); "file" when there is none. */
 export function coverWord(name: string): string {
   const base = name.slice(name.lastIndexOf('/') + 1);

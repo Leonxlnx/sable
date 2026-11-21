@@ -19,6 +19,7 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { userText } from '../../shared/synthetic';
+import { handFiles } from './handed';
 
 export type Emit = (event: BridgeEvent) => void;
 
@@ -29,6 +30,9 @@ export interface PermissionAnswer {
   optionId: string;
   message?: string;
 }
+
+/** What one of the person's messages came to, by the agent's result for it. */
+export type MessageOutcome = 'ok' | 'failed' | 'stopped';
 
 type NewItem<T extends TimelineItem> = T extends TimelineItem ? Omit<T, 'id' | 'ts'> & { id?: string; ts?: number } : never;
 
@@ -192,6 +196,7 @@ export class SessionRuntime {
 
   add<T extends TimelineItem>(item: NewItem<T>): T {
     const full = { ...item, id: item.id ?? randomUUID(), ts: item.ts ?? Date.now() } as unknown as T;
+    if (full.type === 'tool' && full.kind === 'share' && full.status === 'done' && !full.handed) full.handed = this.hand(full);
     this.items.push(full);
     this.index.set(full.id, full);
     this.markDirty(full.id);
@@ -223,10 +228,47 @@ export class SessionRuntime {
       const waited = this.waitedBetween(item.ts, endedAt);
       if (waited > 0) patch = { ...patch, waitedMs: waited };
     }
+    // A share that goes through now: the files as they are at this moment are what it handed over.
+    if (item.type === 'tool' && item.kind === 'share' && (patch as Partial<ToolItem>).status === 'done' && item.status !== 'done' && !item.handed) {
+      patch = { ...patch, handed: this.hand({ ...item, ...(patch as Partial<ToolItem>) }) };
+    }
     Object.assign(item, patch);
     this.markDirty(id);
     this.emit({ type: 'item.patch', sessionId: this.id, id, patch: patch as Partial<TimelineItem> });
     this.onDirty(this, 'items');
+  }
+
+  /** Share steps the person allowed themselves (a permission they answered with an allow), by item id. */
+  private allowedShares = new Set<string>();
+
+  /** What share step `item` hands over, captured as it goes through (core/handed.ts). */
+  private hand(item: ToolItem) {
+    const granted = this.allowedShares.delete(item.id);
+    return handFiles(this.meta.cwd, item.detail?.files, granted);
+  }
+
+  /**
+   * What each message of the person's came to, as its agent reported it (Claude Code: one result per
+   * message, so one turn can answer one message failed and the next ok). Only one answered `ok` may
+   * name a chat; a message with no word of its own goes by its turn's end. Kept until the turn's end
+   * has been looked at (`forgetOutcome`).
+   */
+  private outcomes = new Map<string, MessageOutcome>();
+
+  answered(itemIds: readonly string[], outcome: MessageOutcome) {
+    for (const id of itemIds) {
+      this.outcomes.delete(id);
+      this.outcomes.set(id, outcome);
+    }
+    while (this.outcomes.size > 200) this.outcomes.delete(this.outcomes.keys().next().value!);
+  }
+
+  outcomeOf(itemId: string): MessageOutcome | undefined {
+    return this.outcomes.get(itemId);
+  }
+
+  forgetOutcome(itemId: string) {
+    this.outcomes.delete(itemId);
   }
 
   /** Marks a message the agent has taken: a steered one stays where it was sent, a queued one moves down to here. */
@@ -386,9 +428,15 @@ export class SessionRuntime {
     });
   }
 
-  answerPermission(requestId: string, answer: PermissionAnswer) {
+  /**
+   * `person`: the person answered it themselves (the desktop or a phone), not a mode that answers for
+   * them. A share they allowed may hand a file outside the chat's folder to a phone.
+   */
+  answerPermission(requestId: string, answer: PermissionAnswer, opts: { person?: boolean } = {}) {
     const p = this.permissions.get(requestId);
     if (!p) return false;
+    const tone = p.request.options.find((o) => o.id === answer.optionId)?.tone;
+    if (opts.person && p.request.kind === 'share' && p.request.itemId && tone && tone !== 'deny') this.allowedShares.add(p.request.itemId);
     p.resolve(answer);
     return true;
   }

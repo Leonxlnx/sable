@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
 import { pickFolder, type ShowFolderDialog } from './folder';
+import { windowsThumbs } from './thumbs';
 
 /**
  * Sable desktop shell. Runs the production server (UI + bridge) in this process on a localhost
@@ -875,6 +876,8 @@ if (!app.requestSingleInstanceLock()) {
         fallbackToFreePort: true,
         // An installed build updates itself; a build run from a folder (or a test run) does not.
         updates: app.isPackaged && !screenshotFile ? { quit: () => app.quit() } : undefined,
+        // Windows' own thumbnails for the files an agent hands over.
+        thumbs: windowsThumbs,
       });
     } catch (err) {
       dialog.showErrorBox('Sable could not start', String((err as Error)?.message ?? err));

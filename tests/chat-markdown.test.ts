@@ -1,5 +1,5 @@
 /** Export a chat (server/core/chat-markdown.ts, server/services/export.ts): the Markdown of a Demo conversation, and writing it where the person chooses. */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -106,6 +106,35 @@ describe('a Demo conversation as Markdown', () => {
     expect(path.dirname(asked[2])).toBe(path.join(home, 'out'));
   });
 
+  it('writes the path the dialog confirmed: a name without .md whose .md file exists is asked again', async () => {
+    const asked: string[] = [];
+    const answers: (string | undefined)[] = [];
+    const { app, id, home } = await demoChat('hi', {
+      showSave: async ({ defaultPath }) => {
+        asked.push(defaultPath);
+        return answers.shift();
+      },
+    });
+    const keep = path.join(home, 'notes.md');
+    writeFileSync(keep, 'precious');
+    // "notes" came back: notes.md is someone else's file, so the dialog is asked again with that exact name.
+    answers.push(path.join(home, 'notes'), undefined);
+    expect(await app.call('session.export', { sessionId: id })).toEqual({ ok: false, canceled: true });
+    expect(asked.slice(-1)[0]).toBe(keep);
+    expect(readFileSync(keep, 'utf8')).toBe('precious');
+    // Confirmed in the dialog (it asked about overwriting notes.md): written there.
+    answers.push(path.join(home, 'notes'), keep);
+    expect(await app.call('session.export', { sessionId: id })).toEqual({ ok: true, path: keep });
+    expect(readFileSync(keep, 'utf8')).toBe((await app.call('session.markdown', { sessionId: id })).markdown);
+    // A new name gets .md without asking again; a name with an extension is written as it is.
+    const n = asked.length;
+    answers.push(path.join(home, 'fresh'));
+    expect(await app.call('session.export', { sessionId: id })).toEqual({ ok: true, path: path.join(home, 'fresh.md') });
+    answers.push(path.join(home, 'plain.txt'));
+    expect(await app.call('session.export', { sessionId: id })).toEqual({ ok: true, path: path.join(home, 'plain.txt') });
+    expect(asked.length).toBe(n + 2);
+  });
+
   it('has no dialog outside the desktop app: the window downloads instead', async () => {
     const { app, id } = await demoChat('hi');
     expect(await app.call('session.export', { sessionId: id })).toEqual({ ok: false, unsupported: true });
@@ -196,6 +225,15 @@ describe('the Markdown builder', () => {
     expect(md).toContain('> Error: Rate limited');
     expect(md).toContain('> Switched to Codex\n\n## You\n\nGo on\n\n## Codex\n\nOn it.');
     expect(md.split('\n')[2]).toBe('Codex · relay-api · 21 Nov 2026');
+  });
+
+  it('keeps what was written byte for byte: blank lines in code and in messages, indentation; spacing only between blocks', () => {
+    const code = 'Here:\n\n```py\nA = """\nline one\n\n\n\nline five\n"""\n```\n\n\n\nThat is all.';
+    const mine = '    indented first line\n\n\n\nand a gap';
+    const items = [at({ type: 'user', text: `\n\n${mine}\n\n` }), at({ type: 'text', text: `${code}\n\n\n`, streaming: false }), at({ type: 'turn', durationMs: 10 })];
+    const md = chatMarkdown(META, items, { timeZone: 'UTC' });
+    expect(md).toContain(`## You\n\n${mine}\n\n## Claude Code\n\n${code}\n`);
+    expect(md.endsWith(`${code}\n`)).toBe(true);
   });
 
   it('names the file after the chat and codes what has backticks in it', () => {

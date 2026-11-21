@@ -102,21 +102,31 @@ export interface FileGrant {
   size: number;
   mtimeMs: number;
   ino: number;
+  /** The volume it is on (absent: not checked). */
+  dev?: number;
+  /** The exact file id in decimal (`ino` as a number rounds Windows' 64-bit ids; absent: not checked). */
+  fileId?: string;
   expires: number;
 }
 
 /** How long a link works. */
 export const GRANT_MS = 15 * 60_000;
 
-/** The same file, unchanged since `g` was made: its size, time and identity. */
-function sameFile(st: Stats, g: Pick<FileGrant, 'size' | 'mtimeMs' | 'ino'>): boolean {
-  return st.isFile() && st.size === g.size && st.mtimeMs === g.mtimeMs && (!g.ino || st.ino === g.ino);
+/** The same file, unchanged since `g` was made: its size, time and identity (`exact`: the same file's id, read as a bigint). */
+function sameFile(st: Stats, g: Pick<FileGrant, 'size' | 'mtimeMs' | 'ino' | 'dev' | 'fileId'>, exact?: bigint): boolean {
+  if (g.fileId !== undefined && (exact === undefined || exact.toString() !== g.fileId)) return false;
+  return st.isFile() && st.size === g.size && st.mtimeMs === g.mtimeMs && (!g.ino || st.ino === g.ino) && (g.dev === undefined || st.dev === g.dev);
 }
 
+const samePath = (a: string, b: string) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+
 /**
- * The grant for file `index` of share step `itemId` in a chat: only a step that finished (`done`:
- * the share was allowed and went through), its path resolved against the chat's folder, a regular
- * file that is still the size the step recorded. Throws a plain sentence otherwise.
+ * The grant for file `index` of share step `itemId` in a chat: only a step that went through, and
+ * only the file it handed over then (`handed`, captured by the bridge the moment the step turned done
+ * with a successful result: core/handed.ts): in the chat's folder, links followed, or outside it when
+ * the person allowed that share themselves; still at the same real place with the same size, time and
+ * identity. A step restored from a stored transcript has no such record and is refused, as is a file
+ * rewritten, replaced, or reached through a link that now leads elsewhere. Throws a plain sentence otherwise.
  */
 export function grantFor(snap: Pick<SessionSnapshot, 'session' | 'items'>, itemId: string, index: number, deviceId: string, now = Date.now()): FileGrant {
   const item = snap.items.find((i) => i.id === itemId);
@@ -126,17 +136,32 @@ export function grantFor(snap: Pick<SessionSnapshot, 'session' | 'items'>, itemI
   if (share.status !== 'done') throw new Error('That file was not shared.');
   const file = share.detail.files?.[index];
   if (!file || typeof file.path !== 'string' || !file.path) throw new Error('That file is not in this chat.');
+  // No record of what went over (a step restored from a stored transcript, or from before Sable kept one).
+  if (!Array.isArray(share.handed)) throw new Error('Ask the agent to share that file again.');
+  const handed = share.handed[index];
+  if (!handed) throw new Error('That file is no longer on the computer.');
+  const cwd = snap.session.cwd;
+  const listed = path.resolve(cwd, file.path);
+  if (!handed.inside && !handed.granted) {
+    const rel = path.relative(cwd, listed);
+    const named = rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
+    throw new Error(named ? 'That file is a link to another place.' : 'That file is outside the chat\'s folder.');
+  }
   let real: string;
   let st: Stats;
+  let exact: bigint;
   try {
-    real = realpathSync(path.resolve(snap.session.cwd, file.path));
+    real = realpathSync(listed);
     st = statSync(real);
+    exact = statSync(real, { bigint: true }).ino;
   } catch {
     throw new Error('That file is no longer on the computer.');
   }
   if (!st.isFile()) throw new Error('That file is no longer on the computer.');
-  if (typeof file.size === 'number' && file.size !== st.size) throw new Error('That file changed after it was shared.');
-  return { deviceId, path: real, name: file.name || path.basename(real), size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, expires: now + GRANT_MS };
+  const was = { size: handed.size, mtimeMs: handed.mtimeMs, ino: Number(handed.ino), dev: handed.dev, fileId: String(handed.ino) };
+  // The same file at the same place: what a link leads to now, a replacement or a rewrite is not what was shared.
+  if (!samePath(real, handed.path) || !sameFile(st, was, exact)) throw new Error('That file changed after it was shared.');
+  return { deviceId, path: handed.path, name: file.name || path.basename(real), ...was, expires: now + GRANT_MS };
 }
 
 /** Opens a grant's file for serving, or says why not: the handle is checked against the grant, so a file changed or replaced since is refused. */
@@ -144,7 +169,7 @@ export async function openGrant(g: FileGrant): Promise<{ fh: FileHandle } | { co
   let fh: FileHandle | undefined;
   try {
     fh = await openFile(g.path, 'r');
-    if (sameFile(await fh.stat(), g)) return { fh };
+    if (sameFile(await fh.stat(), g, g.fileId !== undefined ? (await fh.stat({ bigint: true })).ino : undefined)) return { fh };
     await fh.close().catch(() => {});
     return { code: 409, text: 'The file changed after it was shared. Open it again in Sable.' };
   } catch {

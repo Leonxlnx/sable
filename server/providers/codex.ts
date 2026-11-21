@@ -187,13 +187,20 @@ export function titleModelOf(models: readonly ModelInfo[]): { id: string; effort
 /**
  * The thread a title is asked in: ephemeral (never written to the account's history), the title's
  * own instructions instead of Codex's, no environment (so no shell and no file of the folder read),
- * read-only and never asking, no web search, no AGENTS.md, the account's known MCP servers and the
- * computer-use plugin off, no tools of Sable's.
+ * read-only and never asking, no web search, no AGENTS.md, and an explicit empty tool configuration
+ * that does not depend on what the inventory knows: the account's MCP servers replaced by none (a
+ * config override replaces the whole table), apps off by default with none listed, the plugins
+ * table replaced by the known ones (`plugins`, the bundled computer-use one always) switched off,
+ * no tools of Sable's and no capability roots. `titleIsolated` then checks the thread itself.
  */
-export function titleThreadParams(prompt: TitlePrompt, model: string, off: { mcp?: string[]; plugin?: string } = {}): Record<string, unknown> {
-  const config: Record<string, unknown> = { web_search: 'disabled', project_doc_max_bytes: 0 };
-  if (off.mcp?.length) config.mcp_servers = Object.fromEntries(off.mcp.map((n) => [n, { enabled: false }]));
-  if (off.plugin) config.plugins = { [off.plugin]: { enabled: false } };
+export function titleThreadParams(prompt: TitlePrompt, model: string, plugins: readonly string[] = []): Record<string, unknown> {
+  const config: Record<string, unknown> = {
+    web_search: 'disabled',
+    project_doc_max_bytes: 0,
+    mcp_servers: {},
+    apps: { _default: { enabled: false, destructive_enabled: false, open_world_enabled: false } },
+    plugins: Object.fromEntries([...new Set([CUA_PLUGIN, ...plugins])].map((id) => [id, { enabled: false }])),
+  };
   return {
     model,
     cwd: existsSync(prompt.cwd) ? prompt.cwd : homedir(),
@@ -202,9 +209,14 @@ export function titleThreadParams(prompt: TitlePrompt, model: string, off: { mcp
     ephemeral: true,
     baseInstructions: prompt.system,
     environments: [],
+    dynamicTools: [],
+    selectedCapabilityRoots: [],
     config,
   };
 }
+
+/** How long the title thread's own MCP listing may take (with no server it answers at once). */
+const TITLE_CHECK_MS = 10_000;
 
 /** The one turn of a title thread: the prompt as text, the lowest effort, no reasoning summary. */
 export function titleTurnParams(threadId: string, prompt: TitlePrompt, effort?: Effort): TurnStartParams & { summary: string } {
@@ -386,17 +398,27 @@ export class CodexProvider implements Provider {
    * A chat's title from Codex's smallest model, on this account (its own app-server and CODEX_HOME):
    * one prompt in an ephemeral thread with no environment, no tools and the title's own instructions,
    * the lowest effort, nothing kept. Null when this account has no small model or gives no answer.
+   * `holds`: whether the chat still wants this title (ChatTitles: still open, titles on, its title
+   * unchanged, the same agent and account); checked with the signal right before the prompt goes
+   * out, so a title given up or no longer wanted while its thread started sends nothing. Null too
+   * when the thread cannot be shown to have no MCP server (`titleIsolated`).
    */
-  async quickTitle(prompt: TitlePrompt, signal: AbortSignal): Promise<string | null> {
-    if (signal.aborted) return null;
+  async quickTitle(prompt: TitlePrompt, signal: AbortSignal, holds?: () => boolean): Promise<string | null> {
+    const wanted = () => !signal.aborted && (holds?.() ?? true);
+    if (!wanted()) return null;
     const caps = await this.caps().catch(() => undefined);
     const pick = titleModelOf(caps?.models ?? []);
-    if (!pick || signal.aborted) return null;
+    if (!pick || !wanted()) return null;
     const rpc = await this.client();
-    if (signal.aborted) return null;
-    const off = { mcp: (this.mcpCache ?? []).filter((s) => !s.scope).map((s) => s.name), plugin: this.computerUsePlugin() };
-    const started = await rpc.request<ThreadStartResponse>('thread/start', titleThreadParams(prompt, pick.id, off), THREAD_TIMEOUT);
+    if (!wanted()) return null;
+    const plugins = (this.mcpCache ?? []).flatMap((s) => (s.scope ? [s.scope] : []));
+    const started = await rpc.request<ThreadStartResponse>('thread/start', titleThreadParams(prompt, pick.id, plugins), THREAD_TIMEOUT);
     const threadId = started.thread.id;
+    // The thread exists from here: whatever happens next, it is let go (thread/unsubscribe) and never gets a prompt it should not.
+    if (!wanted() || !(await this.titleIsolated(rpc, threadId)) || !wanted()) {
+      void rpc.request('thread/unsubscribe', { threadId }, 10_000).catch(() => {});
+      return null;
+    }
     let text = '';
     let deltas = '';
     let turnId: string | undefined;
@@ -430,6 +452,22 @@ export class CodexProvider implements Provider {
     }
     if (signal.aborted) return null;
     return (text || deltas).trim() || null;
+  }
+
+  /**
+   * Whether a title thread is shown to have no MCP server (none of the account's, no plugin's, no
+   * app's): its own listing (`threadId`: that thread's connections) answers with an empty list. Any
+   * server listed, no list, a failure or no answer in time: not shown, so no title.
+   */
+  private async titleIsolated(rpc: CodexRpc, threadId: string): Promise<boolean> {
+    try {
+      const r = await rpc.request<ListMcpServerStatusResponse>('mcpServerStatus/list', { threadId, detail: 'toolsAndAuthOnly', limit: 1 }, TITLE_CHECK_MS);
+      if (Array.isArray(r?.data) && r.data.length === 0) return true;
+      this.ctx.log('[codex] the title thread has MCP servers; no title');
+    } catch (err) {
+      this.ctx.log('[codex] the title thread could not be checked; no title:', errMsg(err));
+    }
+    return false;
   }
 
   private async onServerRequest(method: string, p: any, id: RequestId): Promise<unknown> {
@@ -923,6 +961,11 @@ interface Queued {
 
 /** How long an idle thread waits for its turn's own turn/completed before the turn is ended without it. */
 const THREAD_IDLE_GRACE_MS = 1_500;
+/**
+ * While the thread stays idle and its store still says the turn runs (a stale answer), it is asked
+ * again after each of these waits; after the last the turn ends with nothing queued going out.
+ */
+const IDLE_RECHECK_MS = [2_000, 4_000, 8_000, 16_000];
 
 
 class CodexSession implements ProviderSession {
@@ -946,12 +989,20 @@ class CodexSession implements ProviderSession {
   private idleSeen = false;
   /** The person asked to stop this turn. */
   private interrupting = false;
+  /** News of the thread's state seen (a status change, a turn started): a probe of an idle answers only while nothing newer came. */
+  private statusSeen = 0;
+  /** The waits between rechecks of a stale idle (IDLE_RECHECK_MS; tests make them short). */
+  private idleRecheckMs: readonly number[] = IDLE_RECHECK_MS;
   /** Turns that ended (newest last, a few): a turn/completed for one of them is late news, never the running turn's end. */
   private doneTurns: string[] = [];
   private prompts = new Map<string, AbortController>();
   private reasoningSource = new Map<string, 'summary' | 'content'>();
   private compactSeen = false;
-  private turnError?: string;
+  /**
+   * Errors that ended a turn, by the provider turn id they name ('' for one that names none): only
+   * the running turn's own counts, also while its turn/start is out and its id not known yet.
+   */
+  private turnErrors = new Map<string, string>();
   /** Last thread-wide total seen in this session (undefined until the first usage update). */
   private lastTotal?: TokenUsageBreakdown;
   private turnTokens = { input: 0, output: 0 };
@@ -1231,8 +1282,12 @@ class CodexSession implements ProviderSession {
     // Queued messages move down to where the agent picks them up (steered ones stay where they were sent).
     for (const it of items) if (it.state === 'queued') rt.taken(it.id);
     this.resetTurnState();
+    // This turn's generation, before the first await: a Stop (or anything that ends or replaces the
+    // turn) while the thread reloads changes it, and then nothing is sent.
+    const gen = this.gen;
     if (this.optionsDirty) await this.reloadForOptions();
     await this.ensureLoaded();
+    if (!this.dispatchable(gen)) return;
     const params: TurnStartParams = { threadId: this.threadId, input };
     if (rt.meta.model) params.model = rt.meta.model;
     const effort = this.effortFor();
@@ -1245,12 +1300,15 @@ class CodexSession implements ProviderSession {
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }
-    const gen = this.gen;
     const started = (this.turnStarting = (async () => {
       const rpc = await this.provider.client();
+      // Checked again right before dispatch (client() may have waited for a new app-server).
+      if (!this.dispatchable(gen)) return;
       const r = await rpc.request<{ turn: Turn }>('turn/start', params, 60_000);
       // The turn may have ended already (its turn/completed came first): its id is no running turn's.
       if (this.gen === gen && r.turn?.id && !this.doneTurns.includes(r.turn.id)) this.turnId ??= r.turn.id;
+      // Its generation ended here while the start was out: the turn is over to us, and its late news (an end, an error) belongs to nobody running.
+      else if (this.gen !== gen && r.turn?.id) this.endedTurn(r.turn.id);
       this.policyDirty = false;
     })());
     try {
@@ -1262,6 +1320,16 @@ class CodexSession implements ProviderSession {
     }
   }
 
+  /**
+   * Whether the turn of generation `gen` (captured when it began, before any await) may still go to
+   * Codex: the session open, the turn still the running one, and no stop asked for it. A stop that
+   * came while the thread reloaded has ended the turn here already; one that came while the start
+   * was about to go is ended by interrupt() once the start returns without a turn id.
+   */
+  private dispatchable(gen: number): boolean {
+    return !this.closed && this.rt.turnActive && this.gen === gen && !this.interrupting && !this.rt.stopRequested;
+  }
+
   private resetTurnState() {
     this.gen++;
     this.sawActive = false;
@@ -1269,7 +1337,7 @@ class CodexSession implements ProviderSession {
     this.interrupting = false;
     clearTimeout(this.idleTimer);
     this.turnId = undefined;
-    this.turnError = undefined;
+    this.turnErrors.clear();
     this.compactSeen = false;
     this.turnTokens = { input: 0, output: 0 };
     this.reasoningSource.clear();
@@ -1323,9 +1391,12 @@ class CodexSession implements ProviderSession {
     }
     rt.beginTurn(name === 'compact' ? 'Compacting context' : 'Reviewing');
     this.resetTurnState();
+    // As for a message: the command's generation before the first await, checked right before it goes.
+    const gen = this.gen;
     if (this.optionsDirty) await this.reloadForOptions();
     await this.ensureLoaded();
     const rpc = await this.provider.client();
+    if (!this.dispatchable(gen)) return;
     if (name === 'compact') {
       await rpc.request('thread/compact/start', { threadId: this.threadId }, 60_000);
     } else {
@@ -1379,10 +1450,7 @@ class CodexSession implements ProviderSession {
     clearTimeout(this.idleTimer);
     if (!rt.turnActive) return;
     const ended = t.id ?? this.turnId;
-    if (ended) {
-      this.doneTurns.push(ended);
-      if (this.doneTurns.length > 16) this.doneTurns.shift();
-    }
+    if (ended) this.endedTurn(ended);
     this.abortPrompts();
     if (t.status === 'interrupted') {
       rt.settle('cancelled');
@@ -1390,7 +1458,7 @@ class CodexSession implements ProviderSession {
     } else {
       rt.settle(t.status === 'failed' ? 'error' : 'cancelled');
     }
-    const error = t.status === 'failed' ? (t.error ?? this.turnError ?? 'Turn failed') : undefined;
+    const error = t.status === 'failed' ? (t.error ?? this.errorOf(ended) ?? 'Turn failed') : undefined;
     const inTok = this.turnTokens.input;
     const outTok = this.turnTokens.output;
     rt.add<TurnItem>({
@@ -1408,25 +1476,45 @@ class CodexSession implements ProviderSession {
     if (!t.hold) this.drainQueue();
   }
 
-  /** The thread is idle with this turn open: its own end gets a moment (it normally lands with the idle), then it is ended from what is known. */
-  private armIdleEnd() {
+  /** Remembers a turn that ended (a few, newest last). */
+  private endedTurn(id: string) {
+    if (this.doneTurns.includes(id)) return;
+    this.doneTurns.push(id);
+    if (this.doneTurns.length > 16) this.doneTurns.shift();
+  }
+
+  /** The error that ended turn `turnId`: one naming it, or one naming no turn while this turn ran. */
+  private errorOf(turnId: string | undefined): string | undefined {
+    return (turnId ? this.turnErrors.get(turnId) : undefined) ?? this.turnErrors.get('');
+  }
+
+  /**
+   * The thread is idle with this turn open: its own end gets a moment (it normally lands with the
+   * idle), then it is ended from what is known. `attempt`: rechecks of a stale answer made so far.
+   */
+  private armIdleEnd(wait = THREAD_IDLE_GRACE_MS, attempt = 0) {
     clearTimeout(this.idleTimer);
     const gen = this.gen;
     const turnId = this.turnId;
+    const seen = this.statusSeen;
     if (!turnId) return;
-    this.idleTimer = setTimeout(() => void this.idleEnd(gen, turnId).catch((err) => this.log('idle end failed', errMsg(err))), THREAD_IDLE_GRACE_MS);
+    this.idleTimer = setTimeout(() => void this.idleEnd(gen, turnId, seen, attempt).catch((err) => this.log('idle end failed', errMsg(err))), wait);
   }
 
   /**
    * Ends a turn whose turn/completed never came, with what is known: an error that ended it, a stop
    * asked for, else the outcome the thread has stored for it. When even that is not known it ends
-   * without anything queued going out (`hold`).
+   * without anything queued going out (`hold`). `seen`: the thread's news when the idle was armed;
+   * anything newer (the thread active again, another idle) makes this probe moot, whatever it answers.
+   * A stored "still running" while the thread stays idle is asked again a few times (IDLE_RECHECK_MS),
+   * then the turn ends held.
    */
-  private async idleEnd(gen: number, turnId: string) {
+  private async idleEnd(gen: number, turnId: string, seen: number, attempt: number) {
     const rt = this.rt;
-    const current = () => rt.turnActive && this.gen === gen && this.turnId === turnId && !this.turnStarting && !this.closed;
+    const current = () => rt.turnActive && this.gen === gen && this.turnId === turnId && !this.turnStarting && !this.closed && this.statusSeen === seen;
     if (!current()) return;
-    if (this.turnError) return this.completeTurn({ status: 'failed', error: this.turnError });
+    const failed = this.errorOf(turnId);
+    if (failed) return this.completeTurn({ status: 'failed', error: failed });
     if (this.interrupting || rt.stopRequested) return this.completeTurn({ status: 'interrupted' });
     let stored: Turn | undefined;
     // Asked of the app-server that runs the thread (never one started for this).
@@ -1441,10 +1529,17 @@ class CodexSession implements ProviderSession {
     }
     if (!current()) return;
     // Known by now (an error or a stop came while the thread was asked).
-    if (this.turnError) return this.completeTurn({ status: 'failed', error: this.turnError });
+    const late = this.errorOf(turnId);
+    if (late) return this.completeTurn({ status: 'failed', error: late });
     if (this.interrupting || rt.stopRequested) return this.completeTurn({ status: 'interrupted' });
-    // Still running after all: its end (or the next idle) closes it.
-    if (stored?.status === 'inProgress') return;
+    if (stored?.status === 'inProgress') {
+      // Still running by the store while the thread says idle: its end (or newer news) normally
+      // comes; else it is asked again, a few times, and then ends held.
+      const wait = this.idleRecheckMs[attempt];
+      if (wait !== undefined) return this.armIdleEnd(wait, attempt + 1);
+      this.log('the thread stays idle while its store says turn', turnId, 'runs; it ends without its outcome');
+      return this.completeTurn({ status: 'completed', hold: true });
+    }
     if (stored?.status) return this.completeTurn({ status: stored.status, error: stored.error?.message, durationMs: stored.durationMs });
     this.completeTurn({ status: 'completed', hold: true });
   }
@@ -1466,6 +1561,8 @@ class CodexSession implements ProviderSession {
         if (turn?.id) this.turnId = turn.id;
         this.sawActive = true;
         this.idleSeen = false;
+        // Newer news than any idle probe out now.
+        this.statusSeen++;
         return;
       }
       case 'turn/completed': {
@@ -1479,8 +1576,10 @@ class CodexSession implements ProviderSession {
       case 'thread/status/changed': {
         // The thread's own word that nothing runs: a turn whose turn/completed never came (or was
         // dropped as another turn's) must not keep the chat busy. turn/completed normally lands with
-        // it and carries the real outcome, so it gets a moment first.
+        // it and carries the real outcome, so it gets a moment first. Any newer status makes an idle
+        // probe already out moot (statusSeen): the thread active again must not have its turn closed.
         clearTimeout(this.idleTimer);
+        this.statusSeen++;
         const type = p?.status?.type;
         if (type === 'active') {
           this.sawActive = true;
@@ -1560,7 +1659,14 @@ class CodexSession implements ProviderSession {
       case 'error': {
         const e = p as ErrorNotification;
         const msg = e.error?.message ?? 'Codex error';
-        if (!e.willRetry) this.turnError = msg;
+        // An error belongs to the turn it names: late news of a turn that ended already is never the
+        // running turn's (nor shown in it), also while the next turn/start is out with no id yet.
+        const tid = typeof e.turnId === 'string' ? e.turnId : '';
+        if (tid && this.doneTurns.includes(tid)) {
+          this.log('error of turn', tid, 'after it ended:', msg);
+          return;
+        }
+        if (!e.willRetry) this.turnErrors.set(tid, msg);
         // Refused at a plan limit ("You've hit your usage limit…"): a limit notice the bridge can act on.
         const info = (e.error as { codexErrorInfo?: unknown } | undefined)?.codexErrorInfo;
         if (!e.willRetry && (info === 'usageLimitExceeded' || /usage limit/i.test(msg))) {

@@ -298,11 +298,18 @@ function PaletteBody({ onRun }: { onRun: (item: PaletteItem) => void }) {
             <PaletteRowView key={`${row.group}:${row.item.id}`} row={row} index={i} active={i === safe} pill={i === safe ? pill : undefined} showHead={i === 0 || all[i - 1].group !== row.group} onHover={setCursor} onRun={choose} />
           ))
         )}
-        {searching && (
+        {searching ? (
           <div className="palette-searching" role="status">
             {!messageRows.length && <div className="palette-group">Messages</div>}
             <span className="palette-searching-text shimmer">Searching…</span>
           </div>
+        ) : (
+          !!found.skipped &&
+          found.q === q && (
+            <div className="palette-searching" role="status">
+              <span className="palette-searching-text">{found.skipped === 1 ? 'One chat could not be read in full.' : `${found.skipped} chats could not be read in full.`}</span>
+            </div>
+          )
         )}
       </div>
     </>

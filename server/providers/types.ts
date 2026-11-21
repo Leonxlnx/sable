@@ -115,9 +115,10 @@ export interface Provider {
   discardWarm?(): Promise<void>;
   /**
    * A chat's title from the agent's smallest model, on this provider's account: one prompt, no
-   * tools, nothing kept (core/titles.ts). Resolves to the model's raw answer, or null.
+   * tools, nothing kept (core/titles.ts). Resolves to the model's raw answer, or null. `holds`:
+   * whether the chat still wants the title, to check right before the prompt goes out.
    */
-  quickTitle?(prompt: TitlePrompt, signal: AbortSignal): Promise<string | null>;
+  quickTitle?(prompt: TitlePrompt, signal: AbortSignal, holds?: () => boolean): Promise<string | null>;
   /** The config folder this account's agent reads and writes (its transcripts live there). */
   configHome?(): string;
   /**

@@ -5,6 +5,7 @@ import { bridge } from '../src/lib/bridge';
 import { APP_COMMANDS, appCommandsFor, commandRows, knownTokens } from '../src/features/composer/commands';
 import { getPrompts } from '../src/features/saved/prompts-store';
 import { leadIn, markIndices, wordsOf } from '../src/features/palette/messages';
+import { promptEdits } from '../src/features/settings/prompt-edits';
 
 const prompt = (id: string, name: string, text: string): SavedPrompt => ({ id, name, text, createdAt: 1, updatedAt: 1 });
 
@@ -39,6 +40,26 @@ describe('saved prompts in the / menu', () => {
     push([]);
     expect(appCommandsFor(null).some((c) => c.prompt)).toBe(false);
     expect(commandRows('', undefined, null)[0].group).toBe('Sable');
+  });
+});
+
+describe('an edit in Settings › Prompts', () => {
+  const seen = { name: 'Review', text: 'Review the diff.' };
+  it('sends only the fields edited since the edit began', () => {
+    // Open in A and B; B changes the text; A leaves the name it never touched: nothing goes out.
+    expect(promptEdits(seen, seen, { name: 'Review', text: 'Changed in B.' })).toEqual({ patch: {}, was: {}, conflicts: [] });
+    // A renames: only the name goes, with what A saw in it.
+    expect(promptEdits(seen, { ...seen, name: 'Review it' }, { name: 'Review', text: 'Changed in B.' })).toEqual({ patch: { name: 'Review it' }, was: { name: 'Review' }, conflicts: [] });
+    // An emptied name keeps the old one; an emptied text is not saved.
+    expect(promptEdits(seen, { name: '  ', text: '' }, seen).patch).toEqual({});
+  });
+
+  it('holds a field that was also changed in another window instead of overwriting it', () => {
+    const r = promptEdits(seen, { name: 'Review it', text: 'Changed in A.' }, { name: 'Review', text: 'Changed in B.' });
+    expect(r.conflicts).toEqual(['text']);
+    expect(r.patch).toEqual({ name: 'Review it' });
+    // The same words in both windows are no conflict.
+    expect(promptEdits(seen, { ...seen, text: 'Same.' }, { ...seen, text: 'Same.' })).toEqual({ patch: {}, was: {}, conflicts: [] });
   });
 });
 

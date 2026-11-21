@@ -9,7 +9,7 @@ import { formatBytes, relPath } from '@/lib/format';
 import { useStore } from '@/state/store';
 import { IconButton } from '@/ui';
 import { useTimeline } from './ctx';
-import { coverWord, sheetOf, wantsText, type Sheet } from './file-sheet';
+import { coverWord, pictureFit, pictureKind, sheetOf, wantsText, type Sheet } from './file-sheet';
 import { isActive } from './util';
 import './files.css';
 
@@ -87,7 +87,7 @@ export const FileShare = memo(function FileShare({ item }: { item: ToolItem }) {
       {caption && <Markdown text={caption} className="fshare-caption" />}
       <div className="fshare-list" role="list" aria-label={files.length === 1 ? 'Shared file' : 'Shared files'}>
         {files.map((f, i) => (
-          <FileCard key={`${i}:${f.path}`} file={f} failed={failed} readable={readable} sheet={sheetKey(item.id, i, f.path, f.size)} />
+          <FileCard key={`${i}:${f.path}`} file={f} failed={failed} readable={readable} itemId={item.id} index={i} sheet={sheetKey(item.id, i, f.path, f.size)} />
         ))}
       </div>
     </div>
@@ -129,6 +129,76 @@ function useSheet(file: SharedFile, at: string, key: string, skip: boolean): She
   return sheets.get(key) ?? (read?.key === key ? read.sheet : null);
 }
 
+// ── the picture: what the bridge can show of a picture, a PDF or a video ──
+
+/** A picture of a shared file, decoded, with its size in pixels. */
+interface Picture {
+  src: string;
+  w: number;
+  h: number;
+}
+
+/** Pictures asked for so far, by share step and file (`sheetKey`): null when there is none. */
+const pictures = new Map<string, Picture | null>();
+const PICTURES_MAX = 80;
+
+/** The sheet's width in CSS pixels (files.css `.fcard-sheet`). */
+const SHEET_W = 156;
+
+/**
+ * A picture of the file for its sheet (`file.thumb`: Windows' own thumbnail in the desktop app, the
+ * picture itself in a dev bridge), for pictures, documents and videos once the share went through.
+ * Asked once per step and file and decoded before it shows, so it comes in whole, at its size; until
+ * then (and when there is none) the cover stays.
+ */
+function usePicture(file: SharedFile, itemId: string, index: number, key: string, skip: boolean): Picture | null {
+  const { sessionId } = useTimeline();
+  const want = !skip && !!sessionId && !wantsText(file.name, file.size) && file.size !== 0 && !!pictureKind(file.name);
+  const [got, setGot] = useState<{ key: string; pic: Picture | null } | null>(null);
+  useEffect(() => {
+    if (!want || pictures.has(key)) return;
+    let live = true;
+    const size = Math.round(SHEET_W * Math.min(3, Math.max(1, window.devicePixelRatio || 1)));
+    const done = (pic: Picture | null) => {
+      if (pictures.size >= PICTURES_MAX) pictures.delete(pictures.keys().next().value!);
+      pictures.set(key, pic);
+      if (live) setGot({ key, pic });
+    };
+    bridge
+      .call('file.thumb', { sessionId, itemId, index, size })
+      .then(async ({ data }) => {
+        if (!data) return done(null);
+        const img = new Image();
+        img.src = data;
+        await img.decode();
+        done({ src: data, w: img.naturalWidth, h: img.naturalHeight });
+      })
+      // Not there, changed, or not a picture after all: the cover stays (asked again for a new step).
+      .catch(() => done(null));
+    return () => {
+      live = false;
+    };
+  }, [key, want]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!want) return null;
+  return pictures.get(key) ?? (got?.key === key ? got.pic : null);
+}
+
+const PictureSheet = memo(function PictureSheet({ pic, kind }: { pic: Picture; kind: 'image' | 'page' | 'video' }) {
+  const fit = pictureFit(kind, pic.w, pic.h, SHEET_W);
+  return (
+    <span className="fcard-sheet fcard-pic" data-pic={kind} data-small={fit.small || undefined} style={{ height: fit.height }}>
+      <img className="fcard-pic-img" src={pic.src} alt="" draggable={false} decoding="async" />
+      {kind === 'video' && (
+        <span className="fcard-play">
+          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden>
+            <path d="M5 3.4v9.2a.6.6 0 0 0 .9.5l7.2-4.6a.6.6 0 0 0 0-1L5.9 2.9a.6.6 0 0 0-.9.5Z" fill="currentColor" />
+          </svg>
+        </span>
+      )}
+    </span>
+  );
+});
+
 const Page = memo(function Page({ sheet }: { sheet: Sheet }) {
   if (sheet.kind === 'table') {
     return (
@@ -161,11 +231,12 @@ const Page = memo(function Page({ sheet }: { sheet: Sheet }) {
 });
 
 /**
- * One file as a card: a sheet of it in a small well (its first lines where it is text, a cover
- * with its kind otherwise), its name, its size and where it lies. The whole card opens the file
+ * One file as a card: a sheet of it in a small well (its first lines where it is text, a picture of
+ * it for pictures, documents and videos, a cover with its kind otherwise), its name, its size and
+ * where it lies. The whole card opens the file
  * with its app; Show in folder and Copy path come forward on hover or focus.
  */
-const FileCard = memo(function FileCard({ file, failed, readable, sheet: key }: { file: SharedFile; failed: boolean; readable: boolean; sheet: string }) {
+const FileCard = memo(function FileCard({ file, failed, readable, itemId, index, sheet: key }: { file: SharedFile; failed: boolean; readable: boolean; itemId: string; index: number; sheet: string }) {
   const { cwd, home } = useTimeline();
   // Where it is on the computer: a name relative to the chat's folder lies in it.
   const at = sharedPath(file.path, cwd);
@@ -175,22 +246,28 @@ const FileCard = memo(function FileCard({ file, failed, readable, sheet: key }: 
   const size = formatBytes(file.size);
   const sheet = useSheet(file, at, key, failed || !readable);
   const page = sheet && sheet.kind !== 'cover' ? sheet : null;
+  const pic = usePicture(file, itemId, index, key, failed || !readable);
+  const picKind = pictureKind(file.name);
   return (
     <div className="fcard" role="listitem" data-spot data-failed={failed || undefined}>
       <span className="fcard-stage" aria-hidden>
-        <span className="fcard-sheet">
-          {page ? (
-            <Page sheet={page} />
-          ) : (
-            <span className="fcard-cover">
-              <span className="fcard-ext">{coverWord(file.name)}</span>
-              <span className="fcard-rule" />
-              <span className="fcard-rule" />
-              <span className="fcard-rule" />
-            </span>
-          )}
-          <i className="fcard-fold" />
-        </span>
+        {pic && picKind ? (
+          <PictureSheet pic={pic} kind={picKind} />
+        ) : (
+          <span className="fcard-sheet">
+            {page ? (
+              <Page sheet={page} />
+            ) : (
+              <span className="fcard-cover">
+                <span className="fcard-ext">{coverWord(file.name)}</span>
+                <span className="fcard-rule" />
+                <span className="fcard-rule" />
+                <span className="fcard-rule" />
+              </span>
+            )}
+            <i className="fcard-fold" />
+          </span>
+        )}
       </span>
       <span className="fcard-foot">
         {/* The one button that opens the file: it covers the card, so a click anywhere on it opens. */}

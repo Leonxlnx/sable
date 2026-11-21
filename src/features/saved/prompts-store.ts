@@ -72,16 +72,18 @@ export async function savePrompt(name: string, text: string): Promise<SavedPromp
   }
 }
 
-export async function updatePrompt(id: string, patch: { name?: string; text?: string }): Promise<boolean> {
+export async function updatePrompt(id: string, patch: { name?: string; text?: string }, was?: { name?: string; text?: string }): Promise<boolean> {
   // Shown at once; the bridge's answer (and its event) settle it.
   const before = list;
   set(list.map((p) => (p.id === id ? { ...p, ...(patch.name?.trim() ? { name: patch.name.trim() } : {}), ...(patch.text?.trim() ? { text: patch.text } : {}) } : p)));
   try {
-    const p = await bridge.call('prompts.update', { id, ...patch });
+    const p = await bridge.call('prompts.update', { id, ...patch, ...(was ? { was } : {}) });
     set(list.map((x) => (x.id === id ? p : x)));
     return true;
   } catch (err) {
     set(before);
+    // What the bridge holds now (another window's change may be why it was refused).
+    refresh();
     fail(err);
     return false;
   }

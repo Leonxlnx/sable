@@ -14,6 +14,7 @@ import { registerPrompts } from './prompts';
 import { registerScripts } from './scripts';
 import { registerSearch } from './search';
 import { registerTerm } from './term';
+import { registerThumbs } from './thumbs';
 import { registerUsage } from './usage';
 
 export interface ServiceOptions {
@@ -39,4 +40,5 @@ export function registerServices(app: App, opts: ServiceOptions = {}) {
   registerSearch(app);
   registerExport(app);
   registerPrompts(app);
+  registerThumbs(app);
 }

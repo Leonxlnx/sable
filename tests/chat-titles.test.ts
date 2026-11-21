@@ -436,6 +436,8 @@ describe("Codex's one-shot title", () => {
       request: async (method: string, params: Record<string, unknown>) => {
         calls.push({ method, params });
         if (method === 'thread/start') return { thread: { id: 'tt1' }, model: params.model };
+        // The title thread's own MCP listing: none (tests/codex-titles.test.ts covers the rest).
+        if (method === 'mcpServerStatus/list') return { data: [], nextCursor: null };
         if (method === 'turn/start') {
           if (!opts.hang) setTimeout(() => (opts.events ?? defaultEvents)(notify, 'tt1'), 1);
           return { turn: { id: 'turn-t' } };
@@ -463,11 +465,11 @@ describe("Codex's one-shot title", () => {
     const start = calls.find((c) => c.method === 'thread/start')!.params;
     expect(start).toMatchObject({ model: 'gpt-6-mini', ephemeral: true, environments: [], sandbox: 'read-only', approvalPolicy: 'never', baseInstructions: TITLE_SYSTEM, cwd: process.cwd() });
     expect(start.config).toMatchObject({ web_search: 'disabled', project_doc_max_bytes: 0 });
-    expect(start).not.toHaveProperty('dynamicTools');
+    expect(start.dynamicTools).toEqual([]);
     expect(start).not.toHaveProperty('developerInstructions');
     const turn = calls.find((c) => c.method === 'turn/start')!.params;
     expect(turn).toMatchObject({ threadId: 'tt1', effort: 'minimal', summary: 'none', input: [{ type: 'text', text: prompt.user }] });
-    expect(calls.map((c) => c.method)).toEqual(['thread/start', 'turn/start', 'thread/unsubscribe']);
+    expect(calls.map((c) => c.method)).toEqual(['thread/start', 'mcpServerStatus/list', 'turn/start', 'thread/unsubscribe']);
   });
 
   it('picks the smallest model by its name or its catalog words, a current one before a legacy one', async () => {
@@ -496,7 +498,7 @@ describe("Codex's one-shot title", () => {
     ctrl.abort();
     expect(await asked).toBeNull();
     await tick(5);
-    expect(slow.calls.map((c) => c.method)).toEqual(['thread/start', 'turn/start', 'turn/interrupt', 'thread/unsubscribe']);
+    expect(slow.calls.map((c) => c.method)).toEqual(['thread/start', 'mcpServerStatus/list', 'turn/start', 'turn/interrupt', 'thread/unsubscribe']);
   });
 
   it("a failed title turn is an error, and the title thread's events never reach a chat", async () => {

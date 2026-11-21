@@ -46,7 +46,7 @@ import type {
   TurnItem,
   UserItem,
 } from '../../shared/protocol';
-import type { SessionRuntime } from '../core/runtime';
+import type { MessageOutcome, SessionRuntime } from '../core/runtime';
 import type { TitlePrompt } from '../core/titles';
 import { dropRemote, holdRemote, type RemoteHolder } from '../core/remote-keep';
 import { claudeForkPoint, cutAt } from '../core/fork';
@@ -1109,6 +1109,13 @@ class ClaudeSession implements ProviderSession {
   private namesMessages = false;
   /** A message of ours Claude Code replayed under another uuid (a folded steer): its uuid there → ours. */
   private aliases = new Map<string, string>();
+  /** Our messages whose result has not come yet, by sdk uuid → UserItem id: each result says what its messages came to (`rt.answered`). */
+  private sentItems = new Map<string, string>();
+  /**
+   * Steers Claude Code had not read when the person stopped: they went back to the queue (sdk uuid →
+   * UserItem id). One it reads after all is taken out of the queue again, so it never goes twice.
+   */
+  private withdrawn = new Map<string, string>();
   /** The CLI's own state (session_state_changed), as last reported. */
   private cliState?: 'idle' | 'running' | 'requires_action';
   private interrupted = false;
@@ -1362,6 +1369,9 @@ class ClaudeSession implements ProviderSession {
     this.liveTasks.clear();
     this.wakes = 0;
     this.cliState = undefined;
+    // What the process had not read went with it.
+    this.withdrawn.clear();
+    this.retire(this.sentItems.keys(), 'failed');
     this.clearLiveState();
     // Background sub-agents and workflows lived in this process: they ended with it.
     this.rt.stopBackground();
@@ -1443,6 +1453,7 @@ class ClaudeSession implements ProviderSession {
         ]
       : text;
     this.awaiting.set(uuid, { read: false });
+    this.sentItems.set(uuid, item.id);
     this.interrupted = false;
     // Local commands (/cost, /context) can take a while and never "think".
     const command = /^\/[\w:-]+/.exec(item.text.trim())?.[0];
@@ -1874,6 +1885,21 @@ class ClaudeSession implements ProviderSession {
         rt.taken(itemId, { providerId: m.uuid });
         return;
       }
+      const back = m.uuid ? this.withdrawn.get(m.uuid) : undefined;
+      if (back && !m.parent_tool_use_id) {
+        // A steer withdrawn at a stop that Claude Code read after all: it is this turn's, out of the queue again (never sent twice).
+        this.withdrawn.delete(m.uuid);
+        this.chain.push(m.uuid);
+        this.awaiting.set(m.uuid, { read: true });
+        this.sentItems.set(m.uuid, back);
+        const left = rt.get<UserItem>(back);
+        const queued = left ? undefined : rt.takeQueued(back);
+        if (left?.type === 'user') rt.taken(back, { providerId: m.uuid });
+        else if (queued) rt.add<UserItem>({ id: back, type: 'user', text: queued.text, attachments: queued.attachments, state: 'sent', providerId: m.uuid });
+        else rt.add<UserItem>({ type: 'user', text: replayText(m.message?.content) || '', state: 'sent', providerId: m.uuid });
+        if (!rt.turnActive) rt.beginTurn('Thinking');
+        return;
+      }
       if (m.parent_tool_use_id) return;
       // The same message replayed again (a reconnect, a repeat) is already in the conversation.
       if (m.uuid && (this.chain.includes(m.uuid) || rt.items.some((i) => i.type === 'user' && i.providerId === m.uuid))) return;
@@ -1989,7 +2015,7 @@ class ClaudeSession implements ProviderSession {
    * (a wake); in an older one, one message, the oldest it has read. A message it has not read yet (a
    * steer still on its way) is never answered by a result that does not name it.
    */
-  private answer(m: Obj) {
+  private answer(m: Obj): string[] {
     const named = (Array.isArray(m.user_message_uuids) ? (m.user_message_uuids as unknown[]) : []).filter((u): u is string => typeof u === 'string' && !!u);
     if (!named.length && typeof m.user_message_uuid === 'string' && m.user_message_uuid) named.push(m.user_message_uuid);
     if (named.length) {
@@ -1999,24 +2025,54 @@ class ClaudeSession implements ProviderSession {
       this.takeUsers(ids);
       for (const id of ids) this.awaiting.delete(id);
       for (const u of named) this.aliases.delete(u);
-      return;
+      return ids;
     }
-    if (this.wakes > 0 && this.namesMessages) return;
+    if (this.wakes > 0 && this.namesMessages) return [];
     for (const [id, a] of this.awaiting) {
       if (!a.read) continue;
       this.awaiting.delete(id);
-      return;
+      return [id];
     }
     // A wake's result never answers a message Claude Code has not read (a steer still on its way).
-    if (this.wakes > 0) return;
+    if (this.wakes > 0) return [];
     // None read (a CLI that does not replay, a replay missed): the oldest, as each result answers one.
     const oldest = this.awaiting.keys().next().value;
-    if (oldest !== undefined) this.awaiting.delete(oldest);
+    if (oldest === undefined) return [];
+    this.awaiting.delete(oldest);
+    return [oldest];
+  }
+
+  /** Messages of ours a result (or the turn's end) answered, and what they came to: the bridge names a chat only from one answered ok. */
+  private retire(uuids: Iterable<string>, outcome: MessageOutcome) {
+    const ids: string[] = [];
+    for (const u of [...uuids]) {
+      const id = this.sentItems.get(u);
+      if (id) ids.push(id);
+      this.sentItems.delete(u);
+    }
+    if (ids.length) this.rt.answered(ids, outcome);
+  }
+
+  /**
+   * At a stop: messages Claude Code has not read are no part of the stopped turn. Their bookkeeping
+   * goes, and the bridge puts them back in the queue (runtime `returnUntaken`); one Claude Code reads
+   * after all is taken back out of the queue then (onUser), so it never goes twice.
+   */
+  private withdrawUnread() {
+    for (const [uuid, a] of [...this.awaiting]) {
+      if (a.read) continue;
+      this.awaiting.delete(uuid);
+      const itemId = this.sentItems.get(uuid) ?? this.pendingUsers.get(uuid);
+      this.pendingUsers.delete(uuid);
+      this.sentItems.delete(uuid);
+      if (itemId) this.withdrawn.set(uuid, itemId);
+    }
+    while (this.withdrawn.size > 50) this.withdrawn.delete(this.withdrawn.keys().next().value!);
   }
 
   private onResult(m: Obj) {
     const rt = this.rt;
-    this.answer(m);
+    const answered = this.answer(m);
     // Its own messages are taken when they are replayed: whatever woke the model is answered by now.
     this.wakes = 0;
     const total = Number(m.total_cost_usd ?? 0);
@@ -2043,6 +2099,8 @@ class ClaudeSession implements ProviderSession {
         (typeof m.result === 'string' && m.result ? m.result : undefined) ??
         resultLabel(m.subtype);
     }
+    // What the messages this result answers came to, whatever the turn does next.
+    this.retire(answered, wasInterrupted ? 'stopped' : failed ? 'failed' : 'ok');
     if (!wasInterrupted) {
       rt.add<TurnItem>({
         type: 'turn',
@@ -2056,11 +2114,18 @@ class ClaudeSession implements ProviderSession {
     }
     // Fresh plan limits after every turn (shared with any read in the last few seconds).
     if (this.q) void this.provider.readLimits(this.q);
-    if (this.awaiting.size > 0) {
+    if (this.awaiting.size > 0 && !wasInterrupted) {
       // Messages it has not answered yet are still coming (a steer it has not read): their turn starts right away.
-      this.interrupted = false;
       rt.update({ activity: 'Thinking' });
       return;
+    }
+    // A stop holds through the turn's end: steers it has not read go back to the queue (finishTurn), and
+    // one it read but did not answer yet is stopped too.
+    if (wasInterrupted && [...this.awaiting.values()].some((a) => a.read) && this.q) {
+      const q = this.q;
+      void Promise.resolve()
+        .then(() => q.interrupt())
+        .catch(() => {});
     }
     this.finishTurn(error, wasInterrupted);
   }
@@ -2068,6 +2133,9 @@ class ClaudeSession implements ProviderSession {
   private finishTurn(error: string | undefined, interrupted: boolean) {
     const rt = this.rt;
     if (!rt.turnActive) return;
+    if (interrupted) this.withdrawUnread();
+    // Messages no result named on its own (an older CLI, a steer folded in) come to what the turn did.
+    this.retire(this.sentItems.keys(), interrupted ? 'stopped' : error ? 'failed' : 'ok');
     this.interrupted = false;
     this.awaiting.clear();
     this.aliases.clear();
@@ -2185,7 +2253,8 @@ class ClaudeSession implements ProviderSession {
         // Idle with nothing of Sable's still on its way: whatever no result closed (a message from the Claude
         // app folded into the turn, a background task's notification that woke no model turn) is over.
         // A message of ours it has not read yet keeps the turn: its own turn is still to come.
-        if (m.state === 'idle' && rt.turnActive && !this.unread()) this.finishTurn(undefined, this.interrupted);
+        // After a stop, idle is the end whatever it has not read (that goes back to the queue).
+        if (m.state === 'idle' && rt.turnActive && (this.interrupted || !this.unread())) this.finishTurn(undefined, this.interrupted);
         // Work it started on its own, with no message to replay (a scheduled wake-up): a turn like any other,
         // which its result or the next idle ends. Only from idle: after a prompt it is the same work going on.
         else if (m.state === 'running' && prev === 'idle' && !rt.turnActive && this.q && !this.closed) {
@@ -2238,7 +2307,9 @@ class ClaudeSession implements ProviderSession {
             if ((b.name === 'Write' || b.name === 'Edit') && isPlanFile(input.file_path)) planDraft = b.name === 'Write' ? input.content : planDraft;
             if (b.name === 'ExitPlanMode' && planDraft) input = { ...input, plan: planDraft };
             const view = describeTool(b.name, input);
-            const t = push({ id: b.id, type: 'tool', name: b.name, ...view, input, status: 'done', parentId }) as ToolItem;
+            // Done only by its own result below: a call the agent stopped at (a share still waiting for its
+            // answer when Claude Code stopped) comes back incomplete, never as having gone through.
+            const t = push({ id: b.id, type: 'tool', name: b.name, ...view, input, status: 'cancelled', parentId }) as ToolItem;
             if (b.name === 'Edit' || b.name === 'Write') t.result = { diff: previewDiff(b.name, input) };
             if (b.name === 'Workflow') t.workflow = { ...workflowStart(input), status: 'done' };
             tools.set(b.id, t);

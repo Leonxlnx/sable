@@ -150,10 +150,14 @@ export class App {
    */
   private consumed(rt: SessionRuntime, ok: boolean): string[] {
     const list = this.handed.get(rt.id) ?? [];
-    const taken = list.filter((id) => rt.get<UserItem>(id)?.state === 'sent');
+    // A message its agent answered on its own (Claude Code: a result per message) counts only when that
+    // answer was ok: one that failed while a steer kept the turn going never names the chat.
+    const answeredOk = (id: string) => (rt.outcomeOf(id) ?? 'ok') === 'ok';
+    const taken = list.filter((id) => rt.get<UserItem>(id)?.state === 'sent' && answeredOk(id));
     const waiting = ok ? list.filter((id) => rt.get<UserItem>(id)?.state === 'queued') : [];
     if (waiting.length) this.handed.set(rt.id, waiting);
     else this.handed.delete(rt.id);
+    for (const id of list) if (!waiting.includes(id)) rt.forgetOutcome(id);
     return ok ? taken : [];
   }
   /** Automatic continues already made per session, as `${messageId}:${accountId}` (never the same twice). */
@@ -408,7 +412,7 @@ export class App {
   private titleModel(owner: TitleOwner): TitleModel | undefined {
     try {
       const p = this.provider(owner.provider, owner.accountId);
-      return p.quickTitle ? (prompt: TitlePrompt, signal: AbortSignal) => p.quickTitle!(prompt, signal) : undefined;
+      return p.quickTitle ? (prompt: TitlePrompt, signal: AbortSignal, holds?: () => boolean) => p.quickTitle!(prompt, signal, holds) : undefined;
     } catch {
       return undefined;
     }
@@ -912,13 +916,21 @@ export class App {
   private effortDue = new Set<string>();
   /** Per session, the effort change going to its agent now: the next waits for it (one at a time, in order). */
   private effortRuns = new Map<string, Promise<void>>();
+  /**
+   * Per session, effort calls by the order they went out: those the agent has not answered yet, and the
+   * newest it has answered. A call it answers after a newer one (it stalled past the wait) left the
+   * agent on an old pick: the session's goes again.
+   */
+  private effortCalls = new Map<string, { sent: number; out: Set<number>; landed: number }>();
+  /** How long the next change, or a message, waits for a change the agent has not answered. */
+  private effortWaitMs = EFFORT_WAIT_MS;
 
   /** The effort to the agent before a message, waiting for it a few seconds at most (an agent that never answers does not hold the message). */
   private effortFirst(rt: SessionRuntime, handle: ProviderSession) {
     return Promise.race([
       this.applyEffort(rt, handle),
       new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, EFFORT_WAIT_MS);
+        const t = setTimeout(resolve, this.effortWaitMs);
         t.unref?.();
       }),
     ]);
@@ -927,24 +939,39 @@ export class App {
   /**
    * The session's effort to its running agent (none running: the next start reads it from the session).
    * One change at a time per session, each sending what the session holds when its turn comes (quick
-   * picks coalesce to the latest), so the agent ends with the last pick whatever order it answers in.
-   * Never throws: a refusal leaves it due, and it goes again right before the next message.
+   * picks coalesce to the latest), so the agent ends with the last pick whatever order it answers in:
+   * a change it never answers is waited for a few seconds, and should it answer after a newer one did,
+   * the newest pick goes again. Never throws: a refusal leaves it due, and it goes again right before
+   * the next message.
    */
   private async applyEffort(rt: SessionRuntime, handle: ProviderSession | undefined) {
     if (!handle || !rt.meta.effort) return void this.effortDue.delete(rt.id);
     this.effortDue.add(rt.id);
     // After the change before it (one the agent never answers is waited for a few seconds, not for ever).
     const prev = this.effortRuns.get(rt.id);
-    const ready = prev ? Promise.race([prev, new Promise<void>((r) => setTimeout(r, EFFORT_WAIT_MS).unref?.())]) : Promise.resolve();
+    const ready = prev ? Promise.race([prev, new Promise<void>((r) => setTimeout(r, this.effortWaitMs).unref?.())]) : Promise.resolve();
     const run = ready.then(async () => {
       const effort = rt.meta.effort;
       // Settled meanwhile (a later run sent the same pick), or the agent is another one now (it starts with the session's).
       if (!effort || !this.effortDue.has(rt.id) || (rt.handle && rt.handle !== handle)) return;
+      let calls = this.effortCalls.get(rt.id);
+      if (!calls) this.effortCalls.set(rt.id, (calls = { sent: 0, out: new Set(), landed: 0 }));
+      const n = ++calls.sent;
+      calls.out.add(n);
       try {
         await handle.setEffort(effort);
-        // A later pick came meanwhile: it stays due, and the run queued for it sends it.
+        calls.out.delete(n);
+        const late = calls.landed > n;
+        calls.landed = Math.max(calls.landed, n);
+        if (rt.handle && rt.handle !== handle) return;
+        // A newer call is still out: it is answered after this one and decides.
+        if ([...calls.out].some((m) => m > n)) return;
         if (rt.meta.effort === effort) this.effortDue.delete(rt.id);
+        // Answered after a newer call was: the agent is on this old pick now. The session's goes again.
+        else if (late) void this.applyEffort(rt, handle);
+        // Otherwise a later pick came meanwhile: it stays due, and the run queued for it sends it.
       } catch (err) {
+        calls.out.delete(n);
         this.log('effort change failed; it goes with the next message', (err as Error).message);
       }
     });
@@ -2476,7 +2503,8 @@ export class App {
     });
 
     this.register('permission.respond', ({ sessionId, requestId, optionId, message }) => ({
-      ok: this.runtime(sessionId).answerPermission(requestId, { optionId, message }),
+      // The person's own answer (a window or a phone): a share they allow may hand over a file outside the chat's folder.
+      ok: this.runtime(sessionId).answerPermission(requestId, { optionId, message }, { person: true }),
     }));
     this.register('question.respond', ({ sessionId, requestId, answers }) => ({
       ok: this.runtime(sessionId).answerQuestion(requestId, answers),

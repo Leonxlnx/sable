@@ -63,12 +63,37 @@ export function registerExport(app: App, opts: ExportOptions = {}) {
     const show = opts.showSave ?? (await electronSave());
     if (!show) return { ok: false, unsupported: true };
     const { markdown: text, fileName } = await markdown(sessionId);
-    const file = await show({ title: 'Export chat', defaultPath: path.join(lastDir ?? (await startFolder()), fileName) });
-    if (!file) return { ok: false, canceled: true };
-    const target = path.extname(file) ? file : `${file}.md`;
-    mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, text, 'utf8');
+    const target = await destination(show, path.join(lastDir ?? (await startFolder()), fileName), text);
+    if (!target) return { ok: false, canceled: true };
     lastDir = path.dirname(target);
     return { ok: true, path: target };
   });
+}
+
+/**
+ * Asks where to save and writes there; the file written is always one the dialog confirmed. A name
+ * that came back without an extension gets `.md` only when no file has that name (written so that it
+ * never replaces one made meanwhile); when one does, the dialog is asked again with that exact name,
+ * so it is the dialog that asks about replacing it. Undefined when the person cancelled.
+ */
+async function destination(show: SaveDialog, defaultPath: string, text: string): Promise<string | undefined> {
+  let file = await show({ title: 'Export chat', defaultPath });
+  for (let round = 0; file; round++) {
+    if (path.extname(file) || round >= 3) {
+      // What the dialog returned (it confirmed replacing it).
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, text, 'utf8');
+      return file;
+    }
+    const md = `${file}.md`;
+    mkdirSync(path.dirname(md), { recursive: true });
+    try {
+      writeFileSync(md, text, { encoding: 'utf8', flag: 'wx' });
+      return md;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    file = await show({ title: 'Export chat', defaultPath: md });
+  }
+  return undefined;
 }

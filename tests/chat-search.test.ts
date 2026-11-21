@@ -1,12 +1,12 @@
 /** Search across chats (server/services/search.ts): matching, bounds, resuming where it stopped, the desktop RPC beside the phone's. */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { TimelineItem } from '@shared/protocol';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
-import { matches, queryWords, saidOf, searchOf, registerSearch, SEARCH, snippetOf } from '../server/services/search';
+import { FieldScan, matches, queryWords, saidOf, searchOf, registerSearch, SEARCH, snippetOf } from '../server/services/search';
 import { registerPhone } from '../server/services/phone';
 
 const homes: string[] = [];
@@ -139,8 +139,189 @@ describe('searching chats', () => {
     await chat(app, ['narwhal'], 1_000);
     const signal = { aborted: true };
     const r = await searchOf(app).search('narwhal', { signal });
-    expect(r).toEqual({ hits: [], partial: true });
+    expect(r).toMatchObject({ hits: [], partial: true });
   });
+
+  it('reads one huge chat within the budget of each call, going on from the file offset where it stopped', async () => {
+    const first = makeApp();
+    const id = (await first.app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    const rt = first.app.sessions.get(id)!;
+    rt.add({ type: 'user', text: 'first heron' } as never);
+    for (let i = 0; i < 6; i++) rt.add({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'done', detail: {}, output: `${i}`.repeat(1_500_000) } as never);
+    rt.add({ type: 'text', text: 'last heron', streaming: false } as never);
+    rt.add({ type: 'turn', durationMs: 10 } as never);
+    await first.app.dispose();
+    apps.splice(apps.indexOf(first.app), 1);
+
+    const { app } = makeApp(first.home);
+    const search = searchOf(app);
+    const budget = 2 * 1024 * 1024;
+    let r = await search.search('heron', { bytes: budget });
+    expect(r.partial).toBe(true);
+    expect(r.cursor).toBeTruthy();
+    expect(search.lastRead).toBeLessThanOrEqual(budget + 1024 * 1024);
+    let rounds = 1;
+    while (r.partial && rounds < 20) {
+      r = await search.search('heron', { bytes: budget, cursor: r.cursor });
+      expect(search.lastRead).toBeLessThanOrEqual(budget + 1024 * 1024);
+      rounds++;
+    }
+    expect(rounds).toBeGreaterThan(2);
+    expect(r.partial).toBeUndefined();
+    expect(r.hits.map((h) => h.text)).toEqual(['last heron', 'first heron']);
+  });
+
+  it('a chat too big for what search keeps does not hold back the chats after it', async () => {
+    const first = makeApp();
+    const older = await chat(first.app, ['the pelican'], 1_000);
+    await chat(first.app, Array.from({ length: 40 }, (_, i) => `long talk ${i} ${'words '.repeat(20)}`), 2_000);
+    await first.app.dispose();
+    apps.splice(apps.indexOf(first.app), 1);
+
+    const { app } = makeApp(first.home);
+    const keep = SEARCH.keep;
+    SEARCH.keep = 200;
+    try {
+      let found: string[] = [];
+      for (let i = 0; i < 4 && !found.length; i++) found = (await searchOf(app).search('pelican', { bytes: 1 })).hits.map((h) => h.sessionId);
+      expect(found).toEqual([older, older]);
+    } finally {
+      SEARCH.keep = keep;
+    }
+  });
+
+  it('an open chat obeys the time budget too, and goes on from the item where it stopped', async () => {
+    const { app } = makeApp();
+    await chat(app, ['the ibis', ...Array.from({ length: 1500 }, (_, i) => `filler ${i}`)], 1_000);
+    const search = searchOf(app);
+    let r = await search.search('ibis', { ms: -1 });
+    expect(r.partial).toBe(true);
+    let rounds = 1;
+    while (r.partial && rounds < 40) {
+      r = await search.search('ibis', { ms: -1, cursor: r.cursor });
+      rounds++;
+    }
+    expect(rounds).toBeGreaterThan(2);
+    expect(r.hits.map((h) => h.text)).toEqual(['Answer 0 about the ibis.', 'question 0: the ibis']);
+  });
+
+  it('a search in one window does not stop another window’s', async () => {
+    const first = makeApp();
+    for (let i = 0; i < 30; i++) await chat(first.app, [`kraken ${i}`], 1_000 + i);
+    await first.app.dispose();
+    apps.splice(apps.indexOf(first.app), 1);
+    const { app } = makeApp(first.home);
+    const ms = SEARCH.ms;
+    SEARCH.ms = 60_000;
+    try {
+      const one = app.call('search.messages', { query: 'kraken', scope: 'window-a' });
+      const two = app.call('search.messages', { query: 'kraken 2', scope: 'window-b' });
+      const [a, b] = await Promise.all([one, two]);
+      expect(a.partial).toBeUndefined();
+      expect(a.hits.length).toBeGreaterThan(0);
+      expect(b.hits.length).toBeGreaterThan(0);
+    } finally {
+      SEARCH.ms = ms;
+    }
+  });
+});
+
+describe('what a closed chat’s files give search', () => {
+  /** A chat written to disk and the app opened again, so search reads its files. */
+  async function closed(fill: (app: App, id: string) => void | Promise<void>) {
+    const first = makeApp();
+    const id = (await first.app.call('session.create', { provider: 'demo', cwd: path.resolve('.') })).session.id;
+    await fill(first.app, id);
+    await first.app.dispose();
+    apps.splice(apps.indexOf(first.app), 1);
+    const again = makeApp(first.home);
+    return { ...again, id, base: path.join(again.app.store.dir, 'sessions', `${id}.json`) };
+  }
+
+  it('finds the words of a message that carries a big picture, wherever the picture sits in it', async () => {
+    const { app, id } = await closed((a, sid) => {
+      const rt = a.sessions.get(sid)!;
+      rt.add({ type: 'user', attachments: [{ id: 'p1', kind: 'image', name: 'shot.png', dataUrl: `data:image/png;base64,${'A'.repeat(3_000_000)}` }], text: 'the capybara in this caption' } as never);
+      rt.add({ type: 'text', text: 'A capybara indeed.', streaming: false } as never);
+      rt.add({ type: 'turn', durationMs: 10 } as never);
+    });
+    const r = await searchOf(app).search('capybara');
+    expect(r.hits.map((h) => [h.sessionId, h.role, h.text])).toEqual([
+      [id, 'agent', 'A capybara indeed.'],
+      [id, 'user', 'the capybara in this caption'],
+    ]);
+  });
+
+  it('reads a tail of any size the session reader reads, as the reader does', async () => {
+    const { app, id, base } = await closed((a, sid) => {
+      const rt = a.sessions.get(sid)!;
+      rt.add({ type: 'user', text: 'an early aardvark' } as never);
+      rt.add({ type: 'turn', durationMs: 10 } as never);
+    });
+    const head = readFileSync(base, 'utf8').split('\n')[0];
+    const gen = Number(/"gen":(\d+)/.exec(head)![1]);
+    const big = { id: 'big', type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'done', detail: {}, output: 'z'.repeat(17 * 1024 * 1024), ts: 3 };
+    const late = { id: 'late', type: 'text', text: 'a recent aardvark reply', streaming: false, ts: 4 };
+    writeFileSync(base.replace(/\.json$/, '.tail.json'), JSON.stringify({ baseGen: gen, from: 2, items: [big, late], todos: [] }));
+    const r = await searchOf(app).search('aardvark');
+    expect(r.hits.map((h) => h.itemId)).toEqual(['late', expect.any(String)]);
+    expect(r.hits[1].text).toBe('an early aardvark');
+    // The reader gives the chat the same items.
+    const snap = await app.call('session.snapshot', { sessionId: id });
+    expect(snap.items.some((i) => i.id === 'late')).toBe(true);
+  });
+
+  it('says when part of a chat could not be read, instead of answering as if it had none', async () => {
+    const { app, base } = await closed((a, sid) => {
+      const rt = a.sessions.get(sid)!;
+      rt.add({ type: 'user', text: 'a lost walrus' } as never);
+    });
+    writeFileSync(base, '{"gen":1,"items":[\n{"id":"x","type":"user","text":"a walrus but bro');
+    const r = await searchOf(app).search('walrus');
+    expect(r.hits).toEqual([]);
+    expect(r.partial).toBeUndefined();
+    expect(r.skipped).toBe(1);
+  });
+});
+
+describe('reading JSON as it streams', () => {
+  /** Feeds `text` to a scanner in pieces of `size` bytes and gives the items' fields back as values. */
+  function scan(text: string, doc: boolean, size: number) {
+    const got: Record<string, unknown>[] = [];
+    const s = new FieldScan(doc, (f) => {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(f)) out[k] = v!.kind === 'str' ? JSON.parse(`"${v!.raw}"`) : JSON.parse(v!.raw);
+      got.push(out);
+    });
+    const b = Buffer.from(text, 'utf8');
+    for (let i = 0; i < b.length; i += size) s.push(b, i, Math.min(b.length, i + size));
+    s.end();
+    return { got, s };
+  }
+
+  it('keeps the fields search reads, whatever splits the pieces, and skips the rest', () => {
+    const item = { id: 'u1', type: 'user', attachments: [{ id: 'a', dataUrl: `data:x;base64,${'Q'.repeat(5000)}`, text: 'not "this" one' }], text: 'say "hi" \\ back\\slash é 😀\n', ts: 12, until: { check: false }, extra: [1, { text: 'nested' }] };
+    const line = `${JSON.stringify(item)},`;
+    for (const size of [1, 2, 3, 7, 64, 100_000]) {
+      const { got, s } = scan(line, false, size);
+      expect(got, `pieces of ${size}`).toEqual([{ id: 'u1', type: 'user', text: item.text, ts: 12, until: { check: false } }]);
+      expect(s.closed && !s.broken).toBe(true);
+    }
+  });
+
+  it('reads a whole file’s items and its root fields', () => {
+    const doc = JSON.stringify({ baseGen: 77, from: 3, items: [{ id: 'a', type: 'text', text: 'one' }, { id: 'b', type: 'tool', output: 'x'.repeat(3000), detail: { items: [{ id: 'no' }] } }, { id: 'c', type: 'user', text: 'two', parentId: 'b' }], todos: [{ id: 't', text: 'todo' }] });
+    for (const size of [1, 5, 4096]) {
+      const { got, s } = scan(doc, true, size);
+      expect(got.map((g) => g.id)).toEqual(['a', 'b', 'c']);
+      expect(got[2]).toEqual({ id: 'c', type: 'user', text: 'two', parentId: 'b' });
+      expect(s.root).toEqual({ baseGen: '77', from: '3' });
+      expect(s.closed && s.hasItems && !s.broken).toBe(true);
+    }
+  });
+});
+
+describe('searching chats, the desktop RPC', () => {
 
   it('a newer desktop search stops the one still running', async () => {
     const first = makeApp();

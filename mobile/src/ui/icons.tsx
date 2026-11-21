@@ -81,6 +81,7 @@ export const ICON_NAMES = {
   diff: 'GitDiff',
   branch: 'GitBranch',
   wrap: 'ArrowUDownLeft',
+  select: 'CursorText',
 } as const;
 
 

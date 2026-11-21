@@ -183,6 +183,13 @@ textarea.sp-field-text {
   color: var(--text-3);
 }
 
+/* A field this window and another both changed: held until the person picks. */
+.sp-conflict {
+  padding-left: 4px;
+  font-size: var(--t-small);
+  color: var(--text-2);
+}
+
 .sp-delete:hover {
   color: var(--red-text);
 }

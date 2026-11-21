@@ -1,5 +1,5 @@
 /** Saved prompts (server/services/prompts.ts): kept in their own file under the data folder, in the person's order, pushed to windows when they change. */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -80,6 +80,65 @@ describe('the prompt store', () => {
     expect(readFileSync(path.join(dir, PROMPTS_FILE), 'utf8')).toBe('{ not json');
     writeFileSync(path.join(dir, PROMPTS_FILE), JSON.stringify({ version: 1, prompts: [{ id: 'a', name: 'One', text: 'One text' }, { id: 'a', name: 'Dup', text: 'x' }, { name: 'No id', text: 'y' }, null] }));
     expect(new PromptStore(dir).all().map((p) => p.name)).toEqual(['One']);
+  });
+});
+
+describe('the prompt store when the file fails', () => {
+  it('changes nothing it could not write: a failed delete keeps the prompt, and a later save does not carry the deletion', () => {
+    const dir = tmp();
+    const pushed: string[][] = [];
+    const store = new PromptStore(dir, (list) => pushed.push(list.map((p) => p.name)));
+    const a = store.add('Keep', 'Keep this one.');
+    const b = store.add('Other', 'Another one.');
+    const n = pushed.length;
+    // The file cannot be replaced (here: a folder in its place, as a sharing violation would on Windows).
+    const file = path.join(dir, PROMPTS_FILE);
+    rmSync(file);
+    mkdirSync(file);
+    expect(() => store.remove(a.id)).toThrow();
+    expect(store.all().map((p) => p.id)).toEqual([b.id, a.id]);
+    expect(pushed.length).toBe(n);
+    expect(existsSync(`${file}.tmp`)).toBe(false);
+    // Once it can be written again, the next change keeps the prompt the failed delete left.
+    rmSync(file, { recursive: true });
+    store.update(b.id, { name: 'Other one' });
+    expect(new PromptStore(dir).all().map((p) => p.name)).toEqual(['Other one', 'Keep']);
+  });
+
+  it('never replaces a damaged file blindly: it is kept beside the new one', () => {
+    const dir = tmp();
+    const file = path.join(dir, PROMPTS_FILE);
+    writeFileSync(file, '{ "version": 1, "prompts": [ { "id": "a", "name": "Half');
+    const store = new PromptStore(dir);
+    expect(store.all()).toEqual([]);
+    store.add('New', 'A new prompt.');
+    const kept = readdirSync(dir).filter((f) => f.startsWith('prompts.damaged-'));
+    expect(kept).toHaveLength(1);
+    expect(readFileSync(path.join(dir, kept[0]), 'utf8')).toBe('{ "version": 1, "prompts": [ { "id": "a", "name": "Half');
+    expect(new PromptStore(dir).all().map((p) => p.name)).toEqual(['New']);
+  });
+
+  it('a file it cannot read is not an empty list: changes are refused, and it is read again later', () => {
+    const dir = tmp();
+    const file = path.join(dir, PROMPTS_FILE);
+    mkdirSync(file);
+    const store = new PromptStore(dir);
+    expect(store.all()).toEqual([]);
+    expect(() => store.add('New', 'A new prompt.')).toThrow(/could not be read/);
+    rmSync(file, { recursive: true });
+    writeFileSync(file, JSON.stringify({ version: 1, prompts: [{ id: 'a', name: 'One', text: 'One text' }] }));
+    expect(store.all().map((p) => p.name)).toEqual(['One']);
+  });
+
+  it('refuses a change to a field another window changed since this edit began', () => {
+    const store = new PromptStore(tmp());
+    const a = store.add('Name', 'First text.');
+    store.update(a.id, { text: 'Changed in B.' });
+    expect(() => store.update(a.id, { text: 'Changed in A.' }, { text: 'First text.' })).toThrow(/another window/);
+    expect(store.all()[0].text).toBe('Changed in B.');
+    // A field that was not changed elsewhere goes through; so does one changed to the same words.
+    expect(store.update(a.id, { name: 'Renamed in A' }, { name: 'Name' }).name).toBe('Renamed in A');
+    expect(store.update(a.id, { text: 'Changed in B.' }, { text: 'First text.' }).text).toBe('Changed in B.');
   });
 });
 

@@ -103,6 +103,34 @@ describe('the effort a person picks', () => {
     expect(h.applied).toEqual(['low']);
   }, 20_000);
 
+  it('a change the agent answers only after a newer one was answered leaves it on the newest pick', async () => {
+    const h = await demo();
+    // The wait for an unanswered change, short here (6 s in the app).
+    (h.app as unknown as { effortWaitMs: number }).effortWaitMs = 40;
+    const waits: { effort: Effort; done: () => void }[] = [];
+    h.handle.setEffort = (e) => new Promise<void>((r) => waits.push({ effort: e, done: () => (h.applied.push(e), r()) }));
+    void h.setEffort('max');
+    await until(() => waits.length === 1, 'max asked');
+    // max stalls past the wait: low goes out meanwhile and is answered first.
+    const low = h.setEffort('low');
+    await until(() => waits.length === 2, 'low asked', 8000);
+    expect(waits.map((w) => w.effort)).toEqual(['max', 'low']);
+    waits[1].done();
+    await low;
+    // Then the agent answers max: it now runs at max while the session says low.
+    waits[0].done();
+    // The session's pick goes again, and the agent ends with it.
+    await until(() => waits.length === 3, 'low asked again', 2000);
+    expect(waits[2].effort).toBe('low');
+    waits[2].done();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.applied).toEqual(['low', 'max', 'low']);
+    expect(h.rt.meta.effort).toBe('low');
+    // Nothing left due: the next message sends no effort.
+    await h.app.call('session.send', { sessionId: h.id, text: 'hi' });
+    expect(waits).toHaveLength(3);
+  }, 20_000);
+
   it('picks made while the agent answers coalesce to the latest', async () => {
     const h = await demo();
     const waits: (() => void)[] = [];

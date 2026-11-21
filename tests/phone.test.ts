@@ -6,6 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import {
+  PHONE_OWN_METHODS,
   PHONE_PATH,
   type Capabilities,
   type ModelInfo,
@@ -28,6 +29,7 @@ import type { Provider, ProviderContext } from '../server/providers/types';
 import { registerFs } from '../server/services/fs';
 import { LIMITS, phoneDetail, phoneEvent, phonePage, REACH, registerPhone, SEARCH, type PhoneService } from '../server/services/phone';
 import { qrMatrix } from '../server/services/qr';
+import { registerThumbs } from '../server/services/thumbs';
 import { mergeHosts } from '../mobile/src/lib/hosts';
 
 const homes: string[] = [];
@@ -399,7 +401,8 @@ describe('files the agent hands over', () => {
   it('gives a short-lived link for a shared file of the chat, serves only that file, and refuses others', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const created = (await c.call('session.create', { provider: 'demo', cwd: path.resolve('.') })) as { result: PhoneTail };
+    // The chat's own folder: a file outside it goes to a phone only when the person allowed the share (tests/share-handed.test.ts).
+    const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
     const id = created.result.session.id;
     const file = path.join(home, 'build.apk');
     writeFileSync(file, 'apk bytes');
@@ -417,6 +420,48 @@ describe('files the agent hands over', () => {
     expect(((await c.call('phone.fileLink', { sessionId: id, itemId: 'read1', index: 0 })) as { ok: boolean }).ok).toBe(false);
     expect(((await c.call('phone.fileLink', { sessionId: id, itemId: 'share1', index: 3 })) as { ok: boolean }).ok).toBe(false);
     expect((await fetch(`http://127.0.0.1:${port}/f/not-a-token/build.apk`)).status).toBe(404);
+    c.ws.close();
+  });
+
+  it("gives a small picture of a shared file for its row, by the bridge's rules, at the row's width", async () => {
+    const { app, port, home } = await setup();
+    const asked: { file: string; px: number }[] = [];
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0xff, 0xd9]);
+    registerThumbs(app, { pdf: null, host: { thumbnail: async (file, px) => (asked.push({ file, px }), { mime: 'image/jpeg', data: jpeg }) } });
+    expect(PHONE_OWN_METHODS).toContain('phone.thumb');
+    const { c } = await pairPhone(app, port);
+    const id = (await app.call('session.create', { provider: 'demo', cwd: home })).session.id;
+    const other = (await app.call('session.create', { provider: 'demo', cwd: home })).session.id;
+    const shot = path.join(home, 'shot.png');
+    writeFileSync(shot, 'png bytes');
+    const files = [
+      { path: shot, name: 'shot.png', size: 9 },
+      { path: path.join(home, 'notes.zip'), name: 'notes.zip', size: 3 },
+    ];
+    writeFileSync(files[1].path, 'zip');
+    const rt = app.sessions.get(id)!;
+    rt.add({ id: 'share1', type: 'tool', name: 'SendUserFile', kind: 'share', title: 'shot.png', status: 'done', detail: { files } } as never);
+    rt.add({ id: 'ask1', type: 'tool', name: 'SendUserFile', kind: 'share', title: 'shot.png', status: 'awaiting', detail: { files } } as never);
+    rt.add({ id: 'read1', type: 'tool', name: 'Read', kind: 'read', title: 'Read', status: 'done', detail: { path: shot } } as never);
+    const thumb = (params: Record<string, unknown>) => c.call('phone.thumb', params) as Promise<{ ok: boolean; result?: { data: string | null }; error?: string }>;
+    const ok = await thumb({ sessionId: id, itemId: 'share1', index: 0, size: 4096 });
+    expect(ok.result?.data).toBe(`data:image/jpeg;base64,${jpeg.toString('base64')}`);
+    // The row's width, whatever the phone asked for; a kind with no picture is none, nothing tried.
+    expect(asked).toEqual([{ file: shot, px: 160 }]);
+    expect((await thumb({ sessionId: id, itemId: 'share1', index: 1 })).result?.data).toBeNull();
+    // Waiting for "Allow", not a share, past the list, another chat, a path of its own: nothing.
+    for (const params of [
+      { sessionId: id, itemId: 'ask1', index: 0 },
+      { sessionId: id, itemId: 'read1', index: 0 },
+      { sessionId: id, itemId: 'share1', index: 2 },
+      { sessionId: other, itemId: 'share1', index: 0 },
+      { sessionId: id, path: shot },
+    ])
+      expect((await thumb(params)).ok, JSON.stringify(params)).toBe(false);
+    // Changed since it was shared: nothing.
+    writeFileSync(shot, 'png bytes, rewritten');
+    expect((await thumb({ sessionId: id, itemId: 'share1', index: 0 })).error).toBe('That file changed after it was shared.');
+    expect(asked).toHaveLength(1);
     c.ws.close();
   });
 });
@@ -483,7 +528,9 @@ describe('searching chats from the phone', () => {
     const port = (await app.call('phone.setEnabled', { on: true })).port;
     const { c } = await pairPhone(app, port);
     expect(app.sessions.get(a)!.items).toHaveLength(0);
-    const r = (await c.call('phone.search', { query: 'walrus' })) as { result: PhoneSearch };
+    let r = (await c.call('phone.search', { query: 'walrus' })) as { result: PhoneSearch };
+    // A chat bigger than one call's budget is read over a few calls: the phone asks again while partial.
+    for (let i = 0; i < 4 && r.result.partial; i++) r = (await c.call('phone.search', { query: 'walrus' })) as { result: PhoneSearch };
     expect(r.result.hits.map((h) => h.text)).toEqual(['Answer 38 about walrus again, late.', 'question 38: walrus again, late', 'Answer 3 about the walrus plan.', 'question 3: the walrus plan']);
     // The chat was not opened (nor marked read); the second search reads nothing from disk.
     expect(app.sessions.get(a)!.items).toHaveLength(0);

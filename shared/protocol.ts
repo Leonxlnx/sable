@@ -829,6 +829,25 @@ export interface SharedFile {
   size?: number;
 }
 
+/**
+ * A shared file as it was when its share went through (the step turned `done` live, with a successful
+ * result), captured by the bridge: the one file a phone may download for it. Never made from a stored
+ * transcript, never from the step's input.
+ */
+export interface HandedFile {
+  /** The file itself, links followed. */
+  path: string;
+  size: number;
+  mtimeMs: number;
+  /** The exact file id, in decimal (a number would round Windows' 64-bit ids). */
+  ino: string;
+  dev: number;
+  /** It lay in the chat's folder (links followed) when it was shared. */
+  inside: boolean;
+  /** Outside it, and the person allowed this share themselves (a permission they answered). */
+  granted?: boolean;
+}
+
 export interface ToolResult {
   text?: string;
   stderr?: string;
@@ -922,6 +941,8 @@ export interface ToolItem extends BaseItem {
   workflow?: WorkflowRun;
   /** A check of a finished turn by the other agent (`turn.check`): a root step, shown under the turn it checks, never part of a turn. */
   check?: TurnCheck;
+  /** A `share` step that went through: each listed file as it was then (null: it could not be read), by its place in `detail.files`. */
+  handed?: (HandedFile | null)[];
   /**
    * Set by the bridge only, on a finished step in a whole timeline sent to a window (a snapshot,
    * `timeline.reset`): its long output or result was cut (the start and end of long texts kept,
@@ -1732,9 +1753,20 @@ export interface PhoneMethods {
   'phone.search': { params: { query: string }; result: PhoneSearch };
   /** One picture of a step's result (`PhoneItem.pics`), as a data URL; nothing else can be read this way. */
   'phone.image': { params: { sessionId: string; itemId: string; index: number }; result: { data: string } };
+  /**
+   * A small picture of a file the agent handed over, for its row, by a download link's rules (the
+   * very file the finished share step handed over, unchanged), or null when there is none.
+   */
+  'phone.thumb': { params: { sessionId: string; itemId: string; index: number }; result: { data: string | null } };
+  /**
+   * Answers the agent's questions by the ids the phone got (`PhoneQuestion.id`, `PhoneQuestionOption.id`):
+   * per question the options picked and any words of the person's own. Every question needs an
+   * answer; refused for `incomplete` questions. Skipping stays `question.respond` with `answers: null`.
+   */
+  'phone.answer': { params: { sessionId: string; requestId: string; picks: Record<string, { options?: string[]; other?: string }> }; result: { ok: boolean } };
 }
 
-export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image'] as const satisfies readonly (keyof PhoneMethods)[];
+export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image', 'phone.thumb', 'phone.answer'] as const satisfies readonly (keyof PhoneMethods)[];
 
 /** A message that matched a search across chats (`search.messages` on the desktop, `phone.search` on the phone). */
 export interface MessageHit {
@@ -1751,6 +1783,10 @@ export interface MessageSearch {
   hits: MessageHit[];
   /** Some chats were not read in this call (time or bytes ran out): ask again for more. */
   partial?: boolean;
+  /** Where this call stopped (with `partial`): passed back, the next call goes on from there; the hits add up. */
+  cursor?: string;
+  /** Chats with a part that could not be read (a damaged file): their messages there were not searched. */
+  skipped?: number;
 }
 
 /** The phone's names for the same search (`phone.search`). */
@@ -1803,6 +1839,42 @@ export interface PhoneReset {
   items: PhoneItem[];
   cursor?: string;
   total?: number;
+}
+
+/**
+ * In place of an event too big for a phone (`of`: its type): the phone fetches the current state,
+ * `phone.tail` for `sessionId` when that chat is open (its queue, prompts and newest page), and
+ * `app.hello` without a `sessionId` or for a chat's list entry.
+ */
+export interface PhoneStale {
+  type: 'phone.stale';
+  sessionId?: string;
+  of: string;
+}
+
+/**
+ * A permission request as a phone gets it. `incomplete`: some of what it would allow was shortened
+ * for the phone (a command, a list of folders, a change's lines); the phone may decline it, only the
+ * desktop allows it (`permission.respond` with any other option is refused from the phone).
+ */
+export type PhonePermission = PermissionRequest & { incomplete?: true };
+
+/** An option as a phone gets it: `id` is what the phone answers with (`phone.answer`); the label is for display. */
+export interface PhoneQuestionOption extends QuestionOption {
+  id: string;
+}
+
+/** A question as a phone gets it: `id` to answer by; `cut` when its words were shortened for display. */
+export interface PhoneQuestion extends Omit<Question, 'options'> {
+  id: string;
+  options: PhoneQuestionOption[];
+  cut?: true;
+}
+
+/** Questions as a phone gets them. `incomplete`: questions or options were left out; only the desktop answers them. */
+export interface PhoneQuestionRequest extends Omit<QuestionRequest, 'questions'> {
+  questions: PhoneQuestion[];
+  incomplete?: true;
 }
 
 // ───────────────────────────── project scripts ─────────────────────────────
@@ -2099,6 +2171,15 @@ export interface RpcMethods {
   /** Opens the file with the system's default app, or with `reveal` shows it in the file manager. */
   'fs.open': { params: { path: string; reveal?: boolean }; result: { ok: boolean } };
   'fs.roots': { params: Record<string, never>; result: { roots: DirEntry[]; home: string } };
+  /**
+   * A small picture of a file the agent handed over (a `share` step's `detail.files[index]`, once it
+   * went through, as it is now at that place: in the chat's folder, or outside it only where the
+   * person allowed that share; never through a link that leads out): Windows' own thumbnail in the
+   * desktop app (pictures, videos, PDFs), a PDF's first page, or a picture file itself in a dev
+   * bridge. `size`: the width wanted in pixels. A PNG or JPEG data URL (a GIF or WebP when the file
+   * itself is given), or null when there is none. Nothing else can be read this way.
+   */
+  'file.thumb': { params: { sessionId: string; itemId: string; index: number; size?: number }; result: { data: string | null } };
 
   'git.status': { params: { cwd: string }; result: GitStatus };
   'git.diff': { params: { cwd: string; path?: string; staged?: boolean }; result: FileDiff[] };
@@ -2153,10 +2234,11 @@ export interface RpcMethods {
   /**
    * Messages across the chats that are not archived (the palette): as `phone.search` reads them,
    * through the same searcher, with at most `limit` hits and `perChat` per chat. Bounded per call;
-   * `partial` when some chats were not read yet (asking again goes on where it stopped). A newer
-   * call stops one still running, which answers partial.
+   * `partial` when some chats were not read yet (asking again with its `cursor` goes on where it
+   * stopped). A newer call from the same window (`scope`) stops one still running, which answers
+   * partial; another window's goes on.
    */
-  'search.messages': { params: { query: string; limit?: number; perChat?: number }; result: MessageSearch };
+  'search.messages': { params: { query: string; limit?: number; perChat?: number; cursor?: string; scope?: string }; result: MessageSearch };
 
   /** The conversation as Markdown (`server/core/chat-markdown.ts`) and a file name for it. */
   'session.markdown': { params: { sessionId: string }; result: { markdown: string; fileName: string } };
@@ -2170,7 +2252,8 @@ export interface RpcMethods {
   'prompts.list': { params: Record<string, never>; result: SavedPrompt[] };
   /** Saves a new prompt (first in the list). An empty name is made from the text. */
   'prompts.save': { params: { name: string; text: string }; result: SavedPrompt };
-  'prompts.update': { params: { id: string; name?: string; text?: string }; result: SavedPrompt };
+  /** `was`: a field's value when the window's edit began; a field changed since in another window is refused, not overwritten. */
+  'prompts.update': { params: { id: string; name?: string; text?: string; was?: { name?: string; text?: string } }; result: SavedPrompt };
   'prompts.remove': { params: { id: string }; result: { ok: boolean } };
   /** The prompts in this order (ids; any not named keep their place after them). */
   'prompts.reorder': { params: { ids: string[] }; result: SavedPrompt[] };

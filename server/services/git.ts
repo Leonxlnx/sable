@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { open, realpath, stat } from 'node:fs/promises';
+import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus } from '../../shared/protocol';
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
@@ -130,13 +130,25 @@ export function inside(p: string, dir: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
+/** The canonical path of the file a handle has open, where the system names it (Linux); else null. */
+async function handlePath(fh: FileHandle): Promise<string | null> {
+  if (process.platform !== 'linux') return null;
+  try {
+    return await realpath(`/proc/self/fd/${fh.fd}`);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Reads a file prefix; null when unreadable. `binary` when NUL bytes appear in the first 8 KB.
  * `within`: only a file that really lies in that folder (its links followed, `within` itself canonical);
- * one that leads out of it (a link, a junction on the way) is not read.
+ * one that leads out of it (a link, a junction on the way) is not read. Checked again on the handle
+ * once it is open: the file it refers to must lie in the folder, so a folder on the way that became a
+ * junction between the first check and the open is caught.
  */
-async function readText(file: string, maxBytes: number, within?: string): Promise<{ text: string; binary: boolean; size: number } | null> {
-  let fh;
+export async function readText(file: string, maxBytes: number, within?: string): Promise<{ text: string; binary: boolean; size: number } | null> {
+  let fh: FileHandle | undefined;
   try {
     if (within) {
       const real = await realpath(file);
@@ -146,9 +158,12 @@ async function readText(file: string, maxBytes: number, within?: string): Promis
     fh = await open(file, 'r');
     const st = await fh.stat();
     if (!st.isFile()) return null;
-    // The file opened is the one checked (not swapped for a link meanwhile).
     if (within) {
-      const now = await stat(file);
+      // Where the handle's file is: its own path (Linux), else the path opened resolved again now,
+      // which must still lie in the folder and name this very file (same volume and file id).
+      const final = (await handlePath(fh)) ?? (await realpath(file));
+      if (!inside(final, within)) return null;
+      const now = await stat(final);
       if (now.ino !== st.ino || now.dev !== st.dev) return null;
     }
     const len = Math.min(st.size, maxBytes);
