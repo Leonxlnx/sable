@@ -41,6 +41,12 @@ export const BUILD_STATE_FILE = 'custom-build.json';
 export const REPO_URL = 'https://github.com/Leonxlnx/sable.git';
 /** The longest stylesheet served (bytes); a bigger one is not applied. */
 export const MAX_STYLES = 2_000_000;
+/**
+ * Your build ships in this release: false, so nothing offers it, its methods answer `BUILD_OFF`, the
+ * served root is always the app's own and the brief never mentions it (see the list in the header).
+ */
+export const BUILD_SHIPS = false;
+export const BUILD_OFF = 'Your own build of the interface is not available in this version.';
 
 // ─────────────────────────────── the stylesheet ───────────────────────────────
 
@@ -141,6 +147,8 @@ export interface CustomOptions {
   ignore?: boolean;
   /** The bridge serves the built interface (the desktop app): a custom build can be served. */
   serving?: boolean;
+  /** Your build is offered at all (`BUILD_SHIPS`; tests of its code turn it on). */
+  build?: boolean;
   runner?: CustomRunner;
   /** Where the reference material lies (packaged: the app's resources); absent: this source tree. */
   reference?: string;
@@ -213,6 +221,15 @@ export class Customizer {
     renameSync(tmp, this.buildFile);
   }
 
+  /** Your build is offered in this version. */
+  private get buildOn(): boolean {
+    return this.opts.build ?? BUILD_SHIPS;
+  }
+
+  private offered() {
+    if (!this.buildOn) throw new Error(BUILD_OFF);
+  }
+
   stylesOn(): boolean {
     return this.opts.settings().customStyles !== false;
   }
@@ -252,7 +269,7 @@ export class Customizer {
   /** The custom interface is what windows get now. */
   serving(): boolean {
     const f = this.file;
-    if (!this.opts.serving || this.opts.ignore || !f.active || f.failed || f.builtFor !== this.version || !f.index) return false;
+    if (!this.buildOn || !this.opts.serving || this.opts.ignore || !f.active || f.failed || f.builtFor !== this.version || !f.index) return false;
     return this.indexHash() === f.index;
   }
 
@@ -266,7 +283,7 @@ export class Customizer {
       ...(this.sessionId ? { sessionId: this.sessionId } : {}),
       styles: { exists: s.exists, on: this.stylesOn(), rev: this.rev, size: s.size, ...(s.changedAt ? { changedAt: s.changedAt } : {}), ...(s.blocked ? { blocked: s.blocked } : {}) },
       build: {
-        supported: !!this.opts.serving,
+        supported: !!this.opts.serving && this.buildOn,
         workspace: this.hasWorkspace(),
         active: !!f.active,
         serving: this.serving(),
@@ -456,7 +473,7 @@ export class Customizer {
 
   /** The brief appended to the Customize chat's system prompt (only that chat's). */
   brief(): string {
-    return customBrief({ dir: this.dir, reference: this.referenceDir(), workspace: this.hasWorkspace() ? this.workspace : undefined, version: this.version });
+    return customBrief({ dir: this.dir, reference: this.referenceDir(), build: this.buildOn, workspace: this.buildOn && this.hasWorkspace() ? this.workspace : undefined, version: this.version });
   }
 
   // ── your build: serving it ──
@@ -557,6 +574,7 @@ export class Customizer {
 
   /** Clones the public repository at the running version's tag, on a branch `mine`, and installs. */
   setup(): Promise<CustomState> {
+    if (!this.buildOn) return Promise.reject(new Error(BUILD_OFF));
     return this.exclusive(async () => {
       if (this.hasWorkspace()) return this.state();
       this.setStep('checking');
@@ -596,6 +614,7 @@ export class Customizer {
 
   /** Builds the workspace; with `use`, switches to it (the window reloads into it). */
   build(use = false): Promise<CustomState> {
+    if (!this.buildOn) return Promise.reject(new Error(BUILD_OFF));
     return this.exclusive(async () => {
       if (!this.hasWorkspace()) this.fail('Set up your build first.');
       await this.buildNow();
@@ -609,6 +628,7 @@ export class Customizer {
 
   /** The person's switch for a finished build. */
   use(on: boolean): CustomState {
+    this.offered();
     if (on) this.switchOn();
     else this.saveBuild({ active: false });
     this.switched();
@@ -633,6 +653,7 @@ export class Customizer {
    * go to the Customize chat), installed again when the lockfile changed, built and switched on.
    */
   bring(): Promise<CustomState & { conflict?: string[] }> {
+    if (!this.buildOn) return Promise.reject(new Error(BUILD_OFF));
     return this.exclusive(async () => {
       if (!this.hasWorkspace()) this.fail('Set up your build first.');
       const tag = `v${this.version}`;
@@ -699,19 +720,22 @@ export function conflictMessage(version: string, from: string, files: string[]):
  * The Customize chat's brief, appended to its agent's system prompt (Claude Code's appended prompt,
  * Codex's developer instructions). Short: it is paid for on every turn of that chat.
  */
-export function customBrief(p: { dir: string; reference: string; workspace?: string; version: string }): string {
+export function customBrief(p: { dir: string; reference: string; workspace?: string; version: string; build?: boolean }): string {
   const f = (s: string) => s.replace(/\\/g, '/');
   const dir = f(p.dir);
   const ref = f(p.reference);
+  const build = p.build ?? BUILD_SHIPS;
   return [
     '<customize_sable>',
-    `This is Sable's Customize chat. Sable (version ${p.version}) is the desktop app the person is using to talk to you: an Electron and React interface for Claude Code and Codex. Here they ask you to change Sable itself: how it looks, and sometimes how it works.`,
+    `This is Sable's Customize chat. Sable (version ${p.version}) is the desktop app the person is using to talk to you: an Electron and React interface for Claude Code and Codex. Here they ask you to change how Sable looks.`,
     `Reference: ${ref}/CLAUDE.md (architecture and design language) and ${ref}/styles/ (every stylesheet of the app, by source path; tokens in styles/styles/tokens.css). Read the rules you override before you write; use only classes, data attributes and tokens you found there.`,
-    `Styles first. Write plain CSS to ${dir}/styles.css. Sable loads it after its own styles and applies every save within a moment, with no reload or build, and it survives updates. Override tokens on :root and the app's classes; raise specificity where a rule does not win.`,
-    p.workspace
-      ? `Only when CSS cannot do it (behaviour, new controls), change the interface's source in ${f(p.workspace)} (Sable's repository at its version, branch mine; the interface only: src/, no new dependencies). The person then builds and switches to it themselves; never build, switch or edit anything that would switch it on.`
-      : 'When CSS cannot do it (behaviour, new controls), say so: it needs their own build of the interface, which they set up in Settings, Customize.',
-    `Rules: write only inside ${dir}; never touch the installed app or Sable's other data; nothing from the internet in the stylesheet (a remote url() or @import keeps the whole sheet from loading; images as data: URIs); keep the file readable, one commented section per area, edited in place; after each change say in one sentence what changed.`,
+    `Write plain CSS to ${dir}/styles.css. Sable loads it after its own styles and applies every save within a moment, with no reload, and it survives updates. Override tokens on :root and the app's classes; raise specificity where a rule does not win.`,
+    !build
+      ? 'When CSS cannot do it (behaviour, new controls), say so plainly: here Sable changes by its stylesheet only.'
+      : p.workspace
+        ? `Only when CSS cannot do it (behaviour, new controls), change the interface's source in ${f(p.workspace)} (Sable's repository at its version, branch mine; the interface only: src/, no new dependencies). The person then builds and switches to it themselves; never build, switch or edit anything that would switch it on.`
+        : 'When CSS cannot do it (behaviour, new controls), say so: it needs their own build of the interface, which they set up in Settings, Customize.',
+    `Rules: write only inside ${dir}; never touch the installed app or Sable's other data; nothing from the internet in the stylesheet (a remote url(), an @import, or an address it cannot tell keeps the whole sheet from loading; images as data: URIs); keep the file readable, one commented section per area, edited in place; after each change say in one sentence what changed.`,
     '</customize_sable>',
   ].join('\n');
 }

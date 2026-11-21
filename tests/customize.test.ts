@@ -16,7 +16,7 @@ import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
 import { createStaticServer } from '../server/serve';
-import { BUILD_STATE_FILE, conflictMessage, customBrief, Customizer, ownOrigin, registerCustom, remoteRef, type CustomRunner, type RunResult } from '../server/services/custom';
+import { BUILD_OFF, BUILD_SHIPS, BUILD_STATE_FILE, conflictMessage, customBrief, Customizer, ownOrigin, registerCustom, remoteRef, type CustomRunner, type RunResult } from '../server/services/custom';
 
 const dirs: string[] = [];
 const tmp = () => {
@@ -166,7 +166,7 @@ function built(home: string, opts: Partial<ConstructorParameters<typeof Customiz
   writeFileSync(path.join(ws, 'dist', 'index.html'), '<title>Sable</title>mine');
   writeFileSync(path.join(home, BUILD_STATE_FILE), JSON.stringify({ builtFor: '0.3.0', builtAt: 1 }));
   let timer: (() => void) | undefined;
-  const made = make(home, { serving: true, setTimer: (fn) => ((timer = fn), 1), clearTimer: () => (timer = undefined), ...opts });
+  const made = make(home, { serving: true, build: true, setTimer: (fn) => ((timer = fn), 1), clearTimer: () => (timer = undefined), ...opts });
   return { ...made, ws, fire: () => timer?.(), pending: () => !!timer };
 }
 
@@ -199,7 +199,7 @@ describe('your build: served instead of the app’s own', () => {
     const home = tmp();
     const { c } = built(home);
     c.use(true);
-    const next = new Customizer({ home, version: '0.3.1', watch: false, serving: true, settings: () => DEFAULT_SETTINGS });
+    const next = new Customizer({ home, version: '0.3.1', watch: false, serving: true, build: true, settings: () => DEFAULT_SETTINGS });
     const own = ownDist();
     expect(next.root(own)).toBe(own);
     expect(next.state().build).toMatchObject({ active: true, serving: false, builtFor: '0.3.0' });
@@ -210,8 +210,45 @@ describe('your build: served instead of the app’s own', () => {
     const home = tmp();
     built(home).c.use(true);
     const own = ownDist();
-    expect(new Customizer({ home, version: '0.3.0', watch: false, serving: true, ignore: true, settings: () => DEFAULT_SETTINGS }).root(own)).toBe(own);
+    expect(new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, ignore: true, settings: () => DEFAULT_SETTINGS }).root(own)).toBe(own);
     expect(new Customizer({ home, version: '0.3.0', watch: false, serving: false, settings: () => DEFAULT_SETTINGS }).root(own)).toBe(own);
+  });
+});
+
+describe('your build: not in this version', () => {
+  it('nothing offers it: not supported, never served, every step answers that it is not available', async () => {
+    const home = tmp();
+    const own = ownDist();
+    // A workspace with a finished build that was switched on (an older run, or a hand-made file).
+    const ws = path.join(home, 'custom', 'src');
+    mkdirSync(path.join(ws, '.git'), { recursive: true });
+    mkdirSync(path.join(ws, 'dist'), { recursive: true });
+    writeFileSync(path.join(ws, 'dist', 'index.html'), 'mine');
+    writeFileSync(path.join(home, BUILD_STATE_FILE), JSON.stringify({ builtFor: '0.3.0', builtAt: 1 }));
+    const on = new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, settings: () => DEFAULT_SETTINGS });
+    on.use(true);
+    expect(on.serving()).toBe(true);
+    const { calls, run } = fakeRunner(() => {});
+    const { c } = make(home, { serving: true, runner: run });
+    expect(c.state().build).toMatchObject({ supported: false, serving: false });
+    expect(c.root(own)).toBe(own);
+    const { get } = await serve(own, c);
+    expect((await get('/')).body).toContain('own');
+    await expect(c.setup()).rejects.toThrow(BUILD_OFF);
+    await expect(c.build(true)).rejects.toThrow(BUILD_OFF);
+    await expect(c.bring()).rejects.toThrow(BUILD_OFF);
+    expect(() => c.use(true)).toThrow(BUILD_OFF);
+    expect(calls).toEqual([]);
+    expect(BUILD_SHIPS).toBe(false);
+  });
+
+  it('the bridge’s build methods answer the same', async () => {
+    const home = tmp();
+    const app = new App({ home, quiet: true, providers: [(ctx) => new DemoProvider(ctx, { speed: 0 })] });
+    apps.push(app);
+    registerCustom(app);
+    for (const m of ['custom.setup', 'custom.build', 'custom.bring'] as const) await expect(app.call(m, {} as never)).rejects.toThrow(BUILD_OFF);
+    await expect(app.call('custom.use', { on: true })).rejects.toThrow(BUILD_OFF);
   });
 });
 
@@ -276,7 +313,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
   it('says in one line what the machine lacks', async () => {
     const home = tmp();
     const { run } = fakeRunner((cmd) => (cmd === 'pnpm' ? { code: 1 } : undefined));
-    const { c } = make(home, { serving: true, runner: run });
+    const { c } = make(home, { serving: true, build: true, runner: run });
     await expect(c.setup()).rejects.toThrow(/pnpm is missing: npm install -g pnpm/);
     expect(c.state().build.missing).toMatch(/pnpm/);
   });
@@ -291,7 +328,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
         writeFileSync(path.join(ws, 'dist', 'index.html'), 'built');
       }
     });
-    const { c, events } = make(home, { serving: true, runner: run });
+    const { c, events } = make(home, { serving: true, build: true, runner: run });
     const reloads: string[] = [];
     c.onReload((w) => reloads.push(w));
     await c.setup();
@@ -314,7 +351,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     const { ws } = built(home);
     void ws;
     const { run } = fakeRunner((cmd) => (cmd === 'pnpm' ? { code: 1, stderr: 'error TS2304: Cannot find name x' } : undefined));
-    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS });
+    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS });
     rmSync(path.join(home, 'custom', 'src', 'dist'), { recursive: true });
     await expect(c.build(true)).rejects.toThrow(/The build failed: error TS2304/);
     expect(c.state().build).toMatchObject({ active: false, error: expect.stringMatching(/TS2304/) });
@@ -331,7 +368,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
       if (cmd === 'git' && args.includes('rebase')) lock = 'bbb';
       if (cmd === 'pnpm' && args.includes('build')) writeFileSync(path.join(ws, 'dist', 'index.html'), 'built for 0.3.1');
     });
-    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS });
+    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS });
     const r = await c.bring();
     expect(r.conflict).toBeUndefined();
     expect(calls).toEqual([
@@ -357,7 +394,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
       if (cmd === 'git' && args.includes('rebase') && args.includes('--onto')) return { code: 1, stderr: 'CONFLICT (content): Merge conflict in src/features/sidebar/Sidebar.tsx' };
       if (cmd === 'git' && args[0] === 'diff') return { stdout: 'src/features/sidebar/Sidebar.tsx\n' };
     });
-    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS, tell: async (t) => told.push(t) });
+    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS, tell: async (t) => told.push(t) });
     const r = await c.bring();
     expect(r.conflict).toEqual(['src/features/sidebar/Sidebar.tsx']);
     expect(calls).toContain('git rebase --abort');
@@ -373,7 +410,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     built(home);
     let release!: () => void;
     const run: CustomRunner = () => new Promise((r) => (release = () => r({ code: 0, stdout: '', stderr: '' })));
-    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS });
+    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS });
     const first = c.build(false);
     await expect(c.build(false)).rejects.toThrow(/already working/);
     release();
@@ -389,10 +426,14 @@ describe('the brief, only in the Customize chat', () => {
   it('says where the reference is, styles first, the file, and the rules', () => {
     expect(brief).toContain('C:/data/custom/reference/CLAUDE.md');
     expect(brief).toContain('C:/data/custom/styles.css');
-    expect(brief).toMatch(/Styles first/);
     expect(brief).toMatch(/write only inside C:\/data\/custom/);
-    expect(brief).toMatch(/Settings, Customize/);
-    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', workspace: 'C:/d/custom/src', version: '0.3.0' })).toMatch(/never build, switch/);
+    // Your build does not ship in this version: the brief never mentions one.
+    expect(brief).not.toMatch(/build|Settings, Customize|branch mine/i);
+    expect(brief).toMatch(/stylesheet only/);
+    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', workspace: 'C:/d/custom/src', version: '0.3.0' })).not.toMatch(/C:\/d\/custom\/src/);
+    // Its code is kept: switched on, the brief names the workspace again.
+    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', workspace: 'C:/d/custom/src', version: '0.3.0', build: true })).toMatch(/never build, switch/);
+    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', version: '0.3.0', build: true })).toMatch(/Settings, Customize/);
     // Short: it is paid for on every turn.
     expect(brief.length).toBeLessThan(2000);
   });
