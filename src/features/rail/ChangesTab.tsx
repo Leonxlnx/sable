@@ -19,10 +19,37 @@ import { splitPath, useArrivals, useToolIds } from './util';
 /** How many files the Changes tab lists (working tree, or this session's edits outside a repo). */
 export function useChangeCount(sessionId: string, cwd: string): number {
   const repo = useRepo(cwd);
-  const edits = useSessionEdits(sessionId, cwd);
+  const plain = !!repo?.status && !repo.status.isRepo;
+  const edited = useEditedCount(sessionId, cwd, plain);
   if (repo?.status?.isRepo) return repo.status.files.length;
-  if (repo?.status && !repo.status.isRepo) return edits.length;
-  return 0;
+  return plain ? edited : 0;
+}
+
+const isDoneEdit = (it: ToolItem) => (it.kind === 'edit' || it.kind === 'write') && it.status === 'done' && !!it.result?.diff?.length;
+/** Each edit's files as the tab names them, per item object (items are immutable) and folder. */
+const editPaths = new WeakMap<ToolItem, { cwd: string; paths: string[] }>();
+
+/**
+ * How many files this session edited (the tab's figure outside a repository), counted without
+ * building the diffs, and not at all in a repository. Building them for the figure on every new
+ * edit read every edit again: with thousands of steps (the Demo's fleet) that was a third of a
+ * second per second of the burst (perf1).
+ */
+function useEditedCount(sessionId: string, cwd: string, on: boolean): number {
+  const ids = useToolIds(sessionId, isDoneEdit);
+  return useMemo(() => {
+    if (!on) return 0;
+    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const seen = new Set<string>();
+    for (const id of ids) {
+      const it = items[id] as ToolItem | undefined;
+      if (!it) continue;
+      let known = editPaths.get(it);
+      if (!known || known.cwd !== cwd) editPaths.set(it, (known = { cwd, paths: (it.result?.diff ?? []).map((d) => relPath(d.path, cwd)) }));
+      for (const p of known.paths) seen.add(p);
+    }
+    return seen.size;
+  }, [ids, sessionId, cwd, on]);
 }
 
 export function ChangesTab({ sessionId, cwd }: { sessionId: string; cwd: string }) {

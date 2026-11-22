@@ -337,6 +337,19 @@ function patchData(sessionId: string, fn: (d: SessionData) => Partial<SessionDat
  * nothing (then nothing is written).
  */
 function editItems(sessionId: string, fn: (d: SessionData) => { ids: readonly string[]; patch?: Partial<SessionData> } | null) {
+  if (batch) {
+    // Gathered (flushEvents): the items change in place as ever; the session's new revision is written once.
+    const cur = batch.get(sessionId);
+    const base = cur?.view ?? useStore.getState().data[sessionId];
+    if (!base?.loaded) return;
+    const view = cur ? cur.view : { ...base };
+    const edit = fn(view);
+    if (!edit) return;
+    if (edit.patch) Object.assign(view, edit.patch);
+    if (cur) for (const id of edit.ids) cur.ids.add(id);
+    else batch.set(sessionId, { view, since: base.rev, ids: new Set(edit.ids) });
+    return;
+  }
   useStore.setState((s) => {
     const d = s.data[sessionId];
     if (!d?.loaded) return s;
@@ -706,6 +719,80 @@ async function hello() {
     .catch(() => {});
 }
 
+// ───────────────────────── events gathered per frame ─────────────────────────
+//
+// The bridge sends one frame per event, each its own task in the page; applied as they came, every
+// event was a store write and a React commit of its own. A burst (the Demo's fleet: 34 sub-agents,
+// about 5,800 steps in a few seconds) made thousands of commits, each with the side panel's layout
+// reads, and held the page for 1-2 s at a time (perf1). Events are now held and applied together,
+// in order, once per frame (and before any answer from the bridge, `bridge.beforeAnswer`, so an
+// answer never overtakes the events sent before it): many writes, one commit. A hidden window that
+// draws no frames is caught up by a timer.
+
+const heldEvents: BridgeEvent[] = [];
+/** While held events are applied: each session's timeline as changed so far, written to the store once (`commitBatch`). */
+let batch: Map<string, { view: SessionData; since: number; ids: Set<string> }> | null = null;
+
+function commitBatch() {
+  if (!batch?.size) return;
+  const done = [...batch];
+  batch.clear();
+  useStore.setState((s) => {
+    const data = { ...s.data };
+    for (const [sessionId, b] of done) {
+      // Dropped or replaced meanwhile (only item events are gathered, so nothing else wrote it): skip.
+      if (!data[sessionId]?.loaded) continue;
+      data[sessionId] = { ...b.view, rev: nextRev(), changed: { since: b.since, ids: [...b.ids] } };
+    }
+    return { data };
+  });
+}
+let heldFrame = 0;
+let heldTimer: ReturnType<typeof setTimeout> | undefined;
+/** The longest an event waits when no frame comes (a hidden window), ms. */
+export const HOLD_EVENTS_MS = 50;
+
+function holdEvent(e: BridgeEvent) {
+  heldEvents.push(e);
+  if (heldFrame || heldTimer) return;
+  if (typeof requestAnimationFrame === 'function') heldFrame = requestAnimationFrame(flushEvents);
+  heldTimer = setTimeout(flushEvents, HOLD_EVENTS_MS);
+}
+
+/** Applies every event held, in order (also before an answer from the bridge is handed back). */
+export function flushEvents() {
+  if (heldFrame) cancelAnimationFrame(heldFrame);
+  clearTimeout(heldTimer);
+  heldFrame = 0;
+  heldTimer = undefined;
+  if (!heldEvents.length) return;
+  const list = heldEvents.splice(0);
+  // Words buffered by a direct call come first; from here on the held ones are gathered with the rest.
+  if (deltaFrame) cancelAnimationFrame(deltaFrame);
+  flushDeltas();
+  // Timeline events are gathered per session into one store write; any other event writes what was
+  // gathered first, so everything applies in the order it came.
+  batch = new Map();
+  try {
+    for (const e of list) {
+      if (e.type === 'item.delta') {
+        editItems(e.sessionId, (d) => {
+          const item = d.items[e.id] as (TimelineItem & Record<string, unknown>) | undefined;
+          if (!item) return null;
+          d.items[e.id] = { ...item, [e.field]: ((item[e.field] as string | undefined) ?? '') + e.delta } as TimelineItem;
+          return { ids: [e.id] };
+        });
+        continue;
+      }
+      if (e.type !== 'item.added' && e.type !== 'item.patch' && e.type !== 'item.removed') commitBatch();
+      applyEvent(e);
+    }
+  } finally {
+    commitBatch();
+    batch = null;
+  }
+}
+
 export function startBridge() {
   bridge.on((e) => {
     if (e.type === 'term.data' || e.type === 'term.exit') {
@@ -718,8 +805,10 @@ export function startBridge() {
       void import('@/features/rail/browser-agent').then((m) => m.handleBrowserRequest(request)).catch(() => {});
       return;
     }
-    applyEvent(e);
+    holdEvent(e);
   });
+  // An answer never overtakes the events sent before it: they are applied first.
+  bridge.beforeAnswer = flushEvents;
   bridge.onStatus((conn) => {
     useStore.setState({ conn });
     if (conn === 'open') bootMark('ws-open');

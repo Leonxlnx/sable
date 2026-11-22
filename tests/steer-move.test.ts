@@ -4,12 +4,18 @@ import { describe, expect, it } from 'vitest';
 import { MOVE_GLIDE_MS, rowLeft, rowMoved, willMove } from '../src/features/timeline/user-card';
 
 describe('a steered message the agent takes glides to where it was taken', () => {
-  it('knows the move in a change of the roots: the same messages, this one now at the end', () => {
+  it('knows the move in a change of the roots: the message now stands behind what stood after it', () => {
     expect(willMove('s', ['u', 'w', 's', 't', 'x'], ['u', 'w', 't', 'x', 's'])).toBe(true);
+    // A frame's events are one write: the reply's first item is behind the moved message already.
+    expect(willMove('s', ['u', 'w', 's', 't', 'x'], ['u', 'w', 't', 'x', 's', 'reply'])).toBe(true);
+    // Behind only some of what stood after it: not the bridge's move.
+    expect(willMove('s', ['u', 's', 't', 'x'], ['u', 't', 's', 'x', 'reply'])).toBe(false);
     // Already last, a new message, a removal, another message moving, the same list: not its move.
     expect(willMove('s', ['u', 'w', 's'], ['u', 'w', 's'])).toBe(false);
+    expect(willMove('s', ['u', 'w', 's'], ['u', 'w', 's', 'n'])).toBe(false);
     expect(willMove('s', ['u', 's', 't'], ['u', 's', 't', 'n'])).toBe(false);
     expect(willMove('s', ['u', 's', 't'], ['u', 't'])).toBe(false);
+    expect(willMove('s', ['u', 's', 't'], ['u', 's'])).toBe(false);
     expect(willMove('s', ['u', 's', 'q', 't'], ['u', 's', 't', 'q'])).toBe(false);
     expect(willMove('s', ['u', 't'], ['t', 's'])).toBe(false);
     const same = ['u', 's', 't'];

@@ -21,6 +21,8 @@ export class Bridge {
   private statusListeners = new Set<(s: ConnStatus) => void>();
   private retry = 0;
   private started = false;
+  /** Run before an answer is handed to its caller (the store applies the events it holds). */
+  beforeAnswer?: () => void;
 
   start() {
     if (this.started) return;
@@ -56,6 +58,8 @@ export class Bridge {
       if (!p) return;
       this.pending.delete(frame.id);
       clearTimeout(p.timer);
+      // Events that came before this answer are applied before it is handed back (the store gathers them per frame).
+      this.beforeAnswer?.();
       if (frame.ok) p.resolve(frame.result);
       else p.reject(new Error(frame.error));
     };

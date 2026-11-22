@@ -24,6 +24,8 @@ const MOST = 6;
 const gliding = new WeakMap<HTMLElement, Animation>();
 /** Above this many rows the list changes without the motion (see getSnapshotBeforeUpdate). */
 const LONG = 40;
+/** A list that changed this recently (ms) is in a burst: it changes without the motion too. */
+const BUSY_MS = 250;
 
 export class LeaveList extends Component<Props> {
   private el: HTMLDivElement | null = null;
@@ -35,8 +37,18 @@ export class LeaveList extends Component<Props> {
     return this.el ? [...this.el.querySelectorAll<HTMLElement>(':scope > [data-flip]')] : [];
   }
 
+  /** When the order last changed. */
+  private changed = 0;
+
   getSnapshotBeforeUpdate(prev: Props): Snap {
     if (prev.order === this.props.order || !this.el || reducedMotion()) return null;
+    // Changes a few times a second (many sub-agents starting and ending at once): each motion would be
+    // cut by the next, and measuring the rows before and after each forced two layouts of the window
+    // per change (perf1: over a second of the fleet's 10 s). The rows simply change until it calms.
+    const now = performance.now();
+    const busy = now - this.changed < BUSY_MS;
+    this.changed = now;
+    if (busy) return null;
     // A pane that is not the one on screen has nothing to show.
     if (!this.el.closest('.rail-pane[data-active]')) return null;
     // A long list (137 sub-agents, one finishing every few hundred ms) simply changes: measuring

@@ -33,12 +33,21 @@ export const isLongMessage = (text: string) => text.length > LONG_CHARS || text.
 export const MOVE_GLIDE_MS = 320;
 
 /**
- * Whether this change of a chat's roots is the bridge's move of `id`: it stood somewhere in the
- * list and now stands at its end, with the same messages round it (nothing added or removed).
+ * Whether this change of a chat's roots is the bridge's move of `id`: something stood after it, and
+ * it now stands behind all of that. Read by order, not by its place at the end: the window applies
+ * a frame's events in one write (store.ts `flushEvents`), so the reply's first item is usually
+ * behind the moved message already.
  */
 export function willMove(id: string, before: readonly string[] | undefined, after: readonly string[] | undefined): boolean {
-  if (!before || !after || before === after || before.length !== after.length) return false;
-  return after[after.length - 1] === id && before[before.length - 1] !== id && before.includes(id);
+  if (!before || !after || before === after) return false;
+  const was = before.indexOf(id);
+  if (was < 0 || was === before.length - 1) return false;
+  const now = after.indexOf(id);
+  if (now < 0) return false;
+  const behind = new Set(before.slice(was + 1));
+  for (let i = now + 1; i < after.length; i++) if (behind.has(after[i])) return false;
+  for (let i = 0; i < now; i++) if (behind.has(after[i])) return true;
+  return false;
 }
 
 export interface LeftRow {

@@ -82,6 +82,19 @@ describe('nothing holds the bridge for long', () => {
     expect(rail).toMatch(/if \(last\.current && last\.current\.tab === tab\) \{\s*const raf = requestAnimationFrame/);
   });
 
+  it('a burst of sub-agents measures nothing per change (the fleet)', () => {
+    const read = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8');
+    // A list that changes a few times a second changes without the motion (no measuring per change).
+    expect(read('src/features/rail/leave.tsx')).toMatch(/const busy = now - this\.changed < BUSY_MS;[\s\S]*if \(busy\) return null;/);
+    // The conversation's map reads its layout after the frame was laid out, never inside its callbacks.
+    expect(read('src/features/timeline/Navigator.tsx')).toMatch(/requestAnimationFrame\(\(\) => \(t = window\.setTimeout\(check, 0\)\)\)/);
+    // The tab's figure for edits outside a repository counts paths; it never builds the diffs, and in a repository it reads nothing.
+    const changes = read('src/features/rail/ChangesTab.tsx');
+    const count = changes.slice(changes.indexOf('export function useChangeCount'), changes.indexOf('export function ChangesTab'));
+    expect(count).not.toMatch(/useSessionEdits/);
+    expect(count).toMatch(/if \(!on\) return 0;/);
+  });
+
   it('a background sub-agent finishing long after its turn saves the tail, not the whole base', async () => {
     const dir = tmp();
     const store = new Store(dir);

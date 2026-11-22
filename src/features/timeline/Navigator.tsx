@@ -287,11 +287,17 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
     if (tr !== g.track || crosses) setGeo((geoRef.current = { ...g, track: tr, sH: crosses ? sH : g.sH }));
   }, [feed, scroller, measure]);
 
-  // The turn list committed a new layout: look in the next frame, when the browser lays it out anyway.
+  // The turn list committed a new layout: look once the next frame has been laid out (right after
+  // it, so the reads find the layout done). Read inside the frame's callbacks they forced a layout
+  // of their own before the frame's, every frame of a burst of steps (perf1: the fleet).
   useEffect(() => {
     if (!layout) return;
-    const raf = requestAnimationFrame(check);
-    return () => cancelAnimationFrame(raf);
+    let t = 0;
+    const raf = requestAnimationFrame(() => (t = window.setTimeout(check, 0)));
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(t);
+    };
   }, [layout, marks, check]);
 
   /**
