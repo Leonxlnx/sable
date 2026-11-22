@@ -430,7 +430,6 @@ const EndedEarly = memo(function EndedEarly({ turn }: { turn: TurnGroup }) {
         </span>
         {canContinue && (
           <button type="button" className="btn btn-sm" onClick={carryOn} disabled={sent}>
-            <Icon name="play" size={13} />
             Continue
           </button>
         )}

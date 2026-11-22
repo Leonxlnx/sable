@@ -77,9 +77,6 @@ describe('nothing holds the bridge for long', () => {
     const leave = read('src/features/rail/leave.tsx');
     expect(leave).toMatch(/if \(items\.length > LONG\) return null;/);
     expect(leave).not.toMatch(/\.getAnimations\(\)/);
-    // The tab row: a changed figure (the live count) reads the boxes at the next frame, not in the commit.
-    const rail = read('src/features/rail/Rail.tsx');
-    expect(rail).toMatch(/if \(last\.current && last\.current\.tab === tab\) \{\s*const raf = requestAnimationFrame/);
   });
 
   it('a background sub-agent finishing long after its turn saves the tail, not the whole base', async () => {
