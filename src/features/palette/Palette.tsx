@@ -430,7 +430,7 @@ function SessionEnd({ session }: { session: SessionMeta }) {
         <span className="truncate shimmer">{label}</span>
       </span>
     );
-  if (session.status === 'awaiting') return <span className="palette-status is-amber">Needs approval</span>;
+  if (session.status === 'awaiting') return <span className="palette-status is-amber">Waiting for you</span>;
   if (session.status === 'error') return <span className="palette-status is-red">Error</span>;
   return (
     <span className="palette-time num">

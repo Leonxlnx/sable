@@ -205,7 +205,7 @@ export function StatusMark({ session }: { session: SessionMeta }) {
 export function statusLabel(s: SessionMeta): string | null {
   if (s.status === 'running' || s.status === 'starting') return s.activity || 'Working';
   if (s.status === 'idle' && s.until?.phase === 'checking') return 'Running the check';
-  if (s.status === 'awaiting') return 'Needs approval';
+  if (s.status === 'awaiting') return 'Waiting for you';
   if (s.status === 'error') return s.lastError ? `Error: ${s.lastError}` : 'Error';
   if ((s.background ?? 0) > 0) return backgroundLabel(s.background!);
   return null;

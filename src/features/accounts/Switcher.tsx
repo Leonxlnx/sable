@@ -4,7 +4,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId, type ProviderInfo, type RateLimit } from '@shared/protocol';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { LimitsGlance } from '@/features/usage';
-import { clock, isScopedWindow, orderWindows, windowLevel } from '@/features/usage/format';
+import { clock, orderWindows, windowLevel } from '@/features/usage/format';
 import { useAccountWindows } from '@/features/usage/Limits';
 import { livePercent, tightest } from '@/features/usage/room';
 import { useNow } from '@/lib/useNow';
@@ -22,8 +22,9 @@ import { accountAgents, accountsOf, openAddAccount, planWord } from './model';
 /**
  * The sidebar footer's account switcher. The row is one line that fits the narrowest sidebar: the
  * agent's mark, one name (the account's label when the agent has several, its plan otherwise) and
- * what is left of its tightest window as a small ring and figure. The tooltip says it in full
- * (plan, every window, resets, what is left across the agent's accounts). It opens every agent's
+ * how much of its most used window is used as a small ring and figure, the same figure its row in
+ * the menu shows. The tooltip says it in full (plan, every window, resets, what is left across the
+ * agent's accounts). It opens every agent's
  * accounts as rows with the plan and how full each is, the default checked. Pointing at a row (or
  * moving to it with the keys) shows that account's limits beside the menu. Picking one makes it the
  * account new sessions use.
@@ -233,39 +234,34 @@ function triggerName(provider: ProviderId, account: AccountInfo | undefined, sev
   return planWord(account) ?? planOf(account) ?? PROVIDER_NAME[provider];
 }
 
-/** The window that leaves the whole plan the least room (a model's own window only when there is no other). */
-function planWindow(limits: RateLimit[], now: number): RateLimit | undefined {
-  const whole = limits.filter((l) => !isScopedWindow(l));
-  return tightest(whole.length ? whole : limits, now);
-}
-
 /**
- * What is left of the account's tightest window, as a small ring and its figure ("78%"). Quiet ink;
- * amber from 80% used, red when used up (a model's own window at its cap leaves it quiet: the other
- * models still run). Nothing until the account has figures.
+ * How much of the account's most used window is used, as a small ring and its figure ("59%"): the
+ * same window and the same figure as the account's row in the menu and one of the bars beside it.
+ * (It used to show what was left of another window: "55%" in the footer over "59%" in its own menu.)
+ * Quiet ink; amber from 80% used, red when used up. Nothing until the account has figures.
  */
 function LimitRing({ provider, accountId }: { provider: ProviderId; accountId: string }) {
   const { limits } = useAccountWindows(provider, accountId);
   const now = useNow();
-  const tight = planWindow(limits, now);
+  const tight = tightest(limits, now);
   if (!tight) return null;
-  const left = 100 - Math.round(livePercent(tight, now));
+  const used = Math.round(livePercent(tight, now));
   const level = windowLevel(tight, now);
-  // The arc on the icons' 14 px grid: a hairline track and a 1.5 px arc of what is left.
+  // The arc on the icons' 14 px grid: a hairline track and a 1.5 px arc of what is used.
   const r = 5.25;
   const c = 2 * Math.PI * r;
   return (
     <span className="acs-ring" data-level={level} aria-hidden>
       <svg width="14" height="14" viewBox="0 0 14 14">
         <circle className="acs-ring-track" cx="7" cy="7" r={r} />
-        {left > 0 && <circle className="acs-ring-arc" cx="7" cy="7" r={r} strokeDasharray={`${(Math.max(left, 4) / 100) * c} ${c}`} />}
+        {used > 0 && <circle className="acs-ring-arc" cx="7" cy="7" r={r} strokeDasharray={`${(Math.max(used, 4) / 100) * c} ${c}`} />}
       </svg>
-      <span className="acs-ring-pct num">{left}%</span>
+      <span className="acs-ring-pct num">{used}%</span>
     </span>
   );
 }
 
-/** The trigger's tooltip: who it is in full, then every window with what is left of it and when it resets. */
+/** The trigger's tooltip: who it is in full, then every window with how much of it is used and when it resets. */
 function TriggerTip({ provider, account, several, plan, pool }: { provider: ProviderId; account: AccountInfo | undefined; several: boolean; plan: string | undefined; pool: ReturnType<typeof usePool> }) {
   const { limits } = useAccountWindows(provider, account?.id ?? DEFAULT_ACCOUNT);
   const now = useNow();
@@ -279,7 +275,7 @@ function TriggerTip({ provider, account, several, plan, pool }: { provider: Prov
         <span key={l.id} className="acs-tip-row">
           <span className="acs-tip-label">{l.label}</span>
           <span className="acs-tip-pct num" data-level={windowLevel(l, now)}>
-            {100 - Math.round(livePercent(l, now))}% left
+            {Math.round(livePercent(l, now))}% used
           </span>
           <span className="acs-tip-reset num">{l.resetsAt && l.resetsAt > now ? clock(l.resetsAt, now) : ''}</span>
         </span>

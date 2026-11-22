@@ -3,7 +3,7 @@
 /* ── switcher (sidebar footer) ── */
 
 /* The trigger: one line of one control height, the agent's mark on the footer's icon column, one
-   name, and what is left of the tightest window as a ring and its figure at the end. */
+   name, and how much of the most used window is used as a ring and its figure at the end. */
 .acs-trigger {
   flex: 1;
   min-width: 0;
@@ -119,9 +119,10 @@
   padding: 3px 0;
 }
 
+/* The reset's column fits its longest form on one line ("29 Nov, 00:00", a week away). */
 .acs-tip-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 76px;
+  grid-template-columns: minmax(0, 1fr) auto 92px;
   column-gap: 12px;
   font-weight: var(--w-regular);
   color: var(--text-2);
@@ -143,6 +144,10 @@
 .acs-tip-pool {
   font-weight: var(--w-regular);
   color: var(--text-3);
+}
+
+.acs-tip-reset {
+  white-space: nowrap;
 }
 
 .acs-row {
