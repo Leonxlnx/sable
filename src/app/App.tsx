@@ -809,12 +809,12 @@ function Topbar({ panelShown }: { panelShown: boolean }) {
   return (
     <header className="topbar">
       {/* The mark first, where the sidebar's own mark stands: closing, it stays (sidebar/brand-flight.ts
-          glides it the few pixels between the two) and the toggle rides in on the stage's edge. */}
-      {!sidebarOpen && (
-        <button type="button" className="topbar-home" onClick={() => goHome()} aria-label="New session">
-          <LogoMark size={18} />
-        </button>
-      )}
+          glides it the few pixels between the two) and the toggle rides in on the stage's edge. Its slot
+          is always here, closed while the sidebar shows: it opens and closes on the sidebar's own frames
+          (app.css), so the toggle and the title never step by its width. */}
+      <button type="button" className="topbar-home" onClick={() => goHome()} aria-label="New session" inert={sidebarOpen} aria-hidden={sidebarOpen || undefined} tabIndex={sidebarOpen ? -1 : undefined}>
+        <LogoMark size={18} />
+      </button>
       <IconButton icon="sidebar" label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'} keys="mod+b" onClick={() => toggleSidebar(sidebarOpen)} />
 
       {session ? (

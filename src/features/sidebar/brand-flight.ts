@@ -4,9 +4,15 @@
  * it flies back. One copy of the mark, fixed over the window, moves on transform alone for the
  * sidebar's own duration and curve while the two real marks are hidden; they show again on the
  * frame it lands. Nothing it passes over is laid out again.
+ *
+ * The bar's slot for the mark is always in the bar, closed while the sidebar shows; it opens and
+ * closes with the sidebar's column (app.css), so the mark's rest is worked out from where the slot
+ * starts and how wide it will be, not from where the mark stands on the first frame. Until the mark
+ * has landed the slot takes no pointer: it opens under the pointer that pressed the toggle, and its
+ * hover fill travelled with it as a dark square.
  */
 
-let live: { ghost: HTMLElement; hidden: HTMLElement[]; anim: Animation } | null = null;
+let live: { ghost: HTMLElement; hidden: HTMLElement[]; anim: Animation; slot: HTMLElement | null } | null = null;
 /** The frame a glide waits for (it measures where the mark will rest once the view has rendered). */
 let pending = 0;
 
@@ -14,16 +20,18 @@ const zoom = () => parseFloat(document.documentElement.style.zoom) || 1;
 
 function land() {
   if (!live) return;
-  const { ghost, hidden, anim } = live;
+  const { ghost, hidden, anim, slot } = live;
   live = null;
   anim.cancel();
   ghost.remove();
   for (const el of hidden) el.style.removeProperty('visibility');
+  slot?.style.removeProperty('pointer-events');
 }
 
 /** The mark the sidebar's first row shows, and the one the top bar shows while the sidebar is away. */
 const brandMark = () => document.querySelector<HTMLElement>('.app-side .brand .logo-mark');
 const barMark = () => document.querySelector<HTMLElement>('.topbar-home .logo-mark');
+const barSlot = () => document.querySelector<HTMLElement>('.topbar > .topbar-home');
 
 /**
  * Call synchronously when the sidebar's open state changes (before the view renders the change):
@@ -42,6 +50,7 @@ export function flyBrand(opening: boolean, ms: number, easing: string) {
     if (!side || !stage || !target) return;
     const sideBox = side.getBoundingClientRect();
     const r = target.getBoundingClientRect();
+    const z = zoom();
     let left: number;
     if (opening) {
       // The sidebar's contents glide in from a small offset to the column's left edge, which stays put.
@@ -49,11 +58,14 @@ export function flyBrand(opening: boolean, ms: number, easing: string) {
       if (!inner) return;
       left = sideBox.left + (r.left - inner.getBoundingClientRect().left);
     } else {
-      // The bar rides on the stage, whose left edge ends where the sidebar's column starts.
-      left = r.left - (stage.getBoundingClientRect().left - sideBox.left);
+      // The bar rides on the stage, whose left edge ends where the sidebar's column starts; the
+      // slot is only beginning to open, and the mark rests in the middle of it once it has.
+      const slot = barSlot();
+      if (!slot) return;
+      const wide = (parseFloat(getComputedStyle(slot).getPropertyValue('--tb-slot')) || 28) * z;
+      left = slot.getBoundingClientRect().left + (wide - r.width) / 2 - (stage.getBoundingClientRect().left - sideBox.left);
     }
     const top = r.top;
-    const z = zoom();
     const ghost = target.cloneNode(true) as HTMLElement;
     ghost.removeAttribute('class');
     Object.assign(ghost.style, {
@@ -74,10 +86,13 @@ export function flyBrand(opening: boolean, ms: number, easing: string) {
     const k = from.width / r.width;
     const dx = (from.left - left) / z;
     const dy = (from.top - top) / z;
-    const hidden = [target, opening ? null : brandMark()].filter((el): el is HTMLElement => !!el);
+    // Both real marks stay out of sight while the one copy flies (the bar's is still there while its slot closes).
+    const hidden = [brandMark(), barMark()].filter((el): el is HTMLElement => !!el);
     for (const el of hidden) el.style.visibility = 'hidden';
+    const slot = opening ? null : barSlot();
+    if (slot) slot.style.pointerEvents = 'none';
     const anim = ghost.animate([{ transform: `translate(${dx}px, ${dy}px) scale(${k})` }, { transform: 'none' }], { duration: ms, easing, fill: 'forwards' });
-    live = { ghost, hidden, anim };
+    live = { ghost, hidden, anim, slot };
     anim.onfinish = () => {
       if (live?.anim === anim) land();
     };

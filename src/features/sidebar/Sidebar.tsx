@@ -1158,23 +1158,26 @@ function onListKey(e: KeyboardEvent<HTMLDivElement>) {
 
 /**
  * While the sidebar opens or closes, the stage's box animates its width (the sidebar's width
- * transition in app.css) but the view inside it keeps one width, the wider of the two, anchored
- * to the stage's right edge, and slides by half the difference so its centre column glides
- * exactly where the resizing stage puts it. One layout at the start (when the stage grows) or
- * at the end (when it narrows) instead of one per frame; the backdrop's canvas resizes once.
+ * transition in app.css) but the view inside it keeps one width, the wider of the two, and stays
+ * centred on the stage, so its centre column glides exactly where the resizing stage puts it. One
+ * layout at the start (when the stage grows) or at the end (when it narrows) instead of one per
+ * frame; the backdrop's canvas resizes once.
+ *
+ * The centring is layout's own (`data-freeze='side'` in app.css: `left: 50%` and half its own
+ * width back), not an animation: the view moves on the very frames the stage's edge and the dock
+ * do. A slide on the compositor kept its own time: whenever the page was busy (the sidebar's rows
+ * rendering as it opens) the conversation left its place before the edge and the composer did.
  */
 function useStageFreeze() {
   useEffect(() => {
     let timer = 0;
-    let anims: Animation[] = [];
+    let off = () => {};
     const release = (body: HTMLElement | null) => {
       window.clearTimeout(timer);
-      // Released and cancelled in the same task: the views drop their offset on the frame the
-      // freeze ends, never a frame before it (that frame drew the whole view shifted sideways).
-      const was = anims;
-      anims = [];
-      for (const a of was) a.cancel();
-      if (body) {
+      off();
+      off = () => {};
+      // One attribute: the views drop their width and their centring on the same frame.
+      if (body?.dataset.freeze === 'side') {
         delete body.dataset.freeze;
         body.style.removeProperty('--freeze-w');
       }
@@ -1197,21 +1200,22 @@ function useStageFreeze() {
       const delta = inner.offsetWidth + gap;
       const w1 = opening ? w0 - delta : w0 + delta;
       if (w1 <= 0) return;
-      const from = opening ? 0 : (w1 - w0) / 2;
-      const to = opening ? (w0 - w1) / 2 : 0;
+      // The panel's own freeze is under way (it holds the narrower width and places the views itself).
+      if (body.dataset.freeze != null) return;
       body.style.setProperty('--freeze-w', `${Math.max(w0, w1)}px`);
-      body.dataset.freeze = '';
-      // Held at the end (fill) until the freeze is released in the same task as the last one
-      // finishes: without the fill the views snapped back to their frozen place for a frame or
-      // two before the timer released them (the "glitch" on open).
-      for (const view of body.querySelectorAll<HTMLElement>(':scope > .stage-view')) {
-        anims.push(view.animate([{ translate: `${from}px 0` }, { translate: `${to}px 0` }], { duration: ms, easing, fill: 'forwards' }));
-      }
-      const mine = anims;
-      const last = mine[mine.length - 1];
-      if (last) last.onfinish = () => anims === mine && release(body);
-      // A backstop for a hidden window, where animations do not run.
-      timer = window.setTimeout(() => anims === mine && release(body), ms + 400);
+      body.dataset.freeze = 'side';
+      // Let go when the column's width has arrived (the transition's own end, however busy the page was).
+      const done = (e: TransitionEvent) => {
+        if (e.target === side && e.propertyName === 'width') release(body);
+      };
+      side.addEventListener('transitionend', done);
+      side.addEventListener('transitioncancel', done);
+      off = () => {
+        side.removeEventListener('transitionend', done);
+        side.removeEventListener('transitioncancel', done);
+      };
+      // A backstop for a hidden window, where transitions do not run.
+      timer = window.setTimeout(() => release(body), ms + 400);
     });
   }, []);
 }

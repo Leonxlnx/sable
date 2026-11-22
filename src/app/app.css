@@ -59,6 +59,16 @@
   contain: layout style;
 }
 
+/* The sidebar's toggle: the frozen view stays centred on the stage by layout alone, so it moves on
+   the frames the stage's edge and the dock move on (Sidebar.tsx, useStageFreeze). On a layer of
+   its own meanwhile: placing it again paints nothing. */
+.stage-body[data-freeze='side'] > .stage-view {
+  left: 50%;
+  right: auto;
+  translate: -50% 0;
+  will-change: transform;
+}
+
 .stage {
   position: relative;
   flex: 1;
@@ -126,15 +136,37 @@
   flex-shrink: 0;
 }
 
+/* The mark's slot, there while the sidebar is away. It opens and closes with the sidebar's column:
+   the same duration and curve, laid out on the same frames, so the toggle and the title after it
+   travel in one motion with the stage's edge. (A slot that came at once stepped them by its width
+   in the first frame, against the way the stage travels; one that left at once put the toggle
+   under the flying mark.) */
 .topbar-home {
+  --tb-slot: 28px;
   display: grid;
   place-items: center;
-  width: 28px;
+  flex-shrink: 0;
+  width: var(--tb-slot);
   height: 28px;
+  overflow: hidden;
   border-radius: var(--r-ctl);
   transition:
     background-color var(--d-1) var(--ease),
-    scale var(--d-spring-soft) var(--spring-soft);
+    scale var(--d-spring-soft) var(--spring-soft),
+    width calc(var(--d-3) * 1.3) var(--ease-out),
+    margin-right calc(var(--d-3) * 1.3) var(--ease-out);
+}
+
+/* Closed: no width, and the bar's gap after it taken back; out of reach once it has closed. */
+.app[data-sidebar='true'] .topbar-home {
+  width: 0;
+  margin-right: -4px;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    width calc(var(--d-3) * 1.3) var(--ease-out),
+    margin-right calc(var(--d-3) * 1.3) var(--ease-out),
+    visibility 0s linear calc(var(--d-3) * 1.3);
 }
 
 .topbar-home:hover {
@@ -144,7 +176,7 @@
 .topbar-home:active {
   background-color: var(--ctl-press);
   scale: var(--press-icon);
-  transition-duration: var(--d-1), 70ms;
+  transition-duration: var(--d-1), 70ms, calc(var(--d-3) * 1.3), calc(var(--d-3) * 1.3);
 }
 
 .topbar-title {
