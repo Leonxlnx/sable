@@ -53,6 +53,9 @@ import { remoteRef } from './css-scan';
  *   - #1  The build's methods (`custom.setup`, `custom.build`, `custom.use`, `custom.bring`) change
  *         what every window runs: require a capability bound to the trusted main window for them, and
  *         the canonical origin (no loopback aliases) at the HTTP and WebSocket entry points.
+ *   - `defaultRunner` runs `git` and `pnpm` by bare name with a working folder an agent can write to
+ *         (on Windows the current folder is searched first): resolve each program once from PATH
+ *         entries outside that folder (`findProgram` in `server/util/which.ts`, Part B of wave 8).
  *   - Run the whole path (set up, build, switch, fall back, bring) in a packaged app.
  * Done already: #14 (setup never deletes a folder Sable did not make, clones beside it and is set up
  * only once installed) and #29 (the static server opens a file before its headers).
