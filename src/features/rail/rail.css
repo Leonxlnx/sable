@@ -416,6 +416,8 @@
 
 .rail-row-acts .icon-btn {
   color: var(--text-2);
+  /* 2px in from the row's top and bottom: its corner less that. */
+  border-radius: calc(var(--r-sm) - 2px);
 }
 
 /* They take the pointer in the frame they begin to show (pointer-events steps with the opacity's
@@ -534,7 +536,7 @@
   width: 18px;
   height: 18px;
   flex-shrink: 0;
-  border-radius: 5px;
+  border-radius: var(--r-xs);
   font-size: 10.5px;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
@@ -659,7 +661,7 @@ textarea.field.ch-commit-field {
   width: 100%;
   height: var(--rail-row-h);
   padding: 0 8px;
-  border-radius: var(--r-sm);
+  border-radius: calc(var(--r-md) - 1px);
   text-align: left;
 }
 
@@ -741,6 +743,8 @@ textarea.field.ch-commit-field {
 .ch-diff .dv {
   --code-size: 12px;
   --code-lh: 19px;
+  /* 7px in from the card's edge: its corner less that, at the floor of 4. */
+  border-radius: max(4px, calc(var(--r-md) - 7px));
 }
 
 .ch-note {

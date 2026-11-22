@@ -410,7 +410,7 @@
 /* Over a long name's end, never through it: a short fade in the header's own fill backs them. */
 .sgroup-tools {
   position: absolute;
-  right: 3px;
+  right: 4px;
   top: 50%;
   translate: 0 -50%;
   display: flex;
@@ -452,7 +452,8 @@
   place-items: center;
   width: var(--ctl-h-xs);
   height: var(--ctl-h-xs);
-  border-radius: var(--r-ctl-xs);
+  /* The row's corner less the 4px to its edges. */
+  border-radius: calc(var(--r-sm) - 4px);
   color: var(--text-3);
   transition:
     background-color var(--d-1) var(--ease),
@@ -735,7 +736,7 @@
   bottom: 0;
   display: flex;
   align-items: center;
-  padding: 0 3px 0 18px;
+  padding: 0 4px 0 18px;
   border-radius: 0 var(--r-sm) var(--r-sm) 0;
   background: linear-gradient(to right, transparent, var(--row-bg) 16px);
   opacity: 0;
@@ -774,7 +775,7 @@
   margin: 0 4px 0 30px;
   padding: 0 6px;
   border: 1px solid var(--focus-field);
-  border-radius: var(--r-ctl-xs);
+  border-radius: calc(var(--r-sm) - 3px);
   font-size: var(--t-ui);
   color: var(--text);
   background-color: var(--well-strong);

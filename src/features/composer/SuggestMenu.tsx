@@ -143,7 +143,7 @@ export function SuggestMenu({
   }, [active, rows]);
 
   // One selection pill that travels between rows for arrow keys and lands under the pointer at once.
-  const pill = useSlidePill(rows[active]?.id ?? null, 10, byKeys);
+  const pill = useSlidePill(rows[active]?.id ?? null, 12, byKeys);
 
   return createPortal(
     <div ref={box} className="sg pop" data-spot data-placement={placement} style={style} onMouseDown={(e) => e.preventDefault()}>

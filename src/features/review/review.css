@@ -28,7 +28,7 @@
   width: var(--chip);
   height: var(--chip);
   margin-top: calc(var(--chip) / -2);
-  border-radius: 5px;
+  border-radius: var(--r-xs);
   color: var(--text-2);
   background:
     linear-gradient(currentColor 0 0) center / 8px 1.5px no-repeat,

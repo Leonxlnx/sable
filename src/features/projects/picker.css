@@ -114,7 +114,8 @@
   place-items: center;
   width: 28px;
   height: 28px;
-  border-radius: var(--r-ctl);
+  /* 7px in from the section's corner. */
+  border-radius: calc(var(--r-lg) - 7px);
   color: var(--text-3);
   flex-shrink: 0;
   transition:
@@ -411,7 +412,7 @@
   max-width: 50%;
   height: 22px;
   padding: 0 8px;
-  border-radius: 7px;
+  border-radius: var(--r-ctl-sm);
   font-size: var(--t-micro);
   border: 1px solid var(--line);
 

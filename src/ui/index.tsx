@@ -478,7 +478,7 @@ export function Segmented<T extends string>({
   className?: string;
 }) {
   void id;
-  const pill = useSlidePill(value, 6);
+  const pill = useSlidePill(value, 5);
   return (
     <div className={cx('seg', className)} role="tablist">
       {options.map((o) => (

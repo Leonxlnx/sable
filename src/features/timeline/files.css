@@ -83,7 +83,7 @@
   display: block;
   height: 118px;
   overflow: hidden;
-  border-radius: 9px;
+  border-radius: calc(var(--r-xl) - 6px);
   background-color: var(--fc-well);
   /* A shallow well: a shade under its top edge, a faint line around it. */
   box-shadow:
@@ -99,7 +99,7 @@
   width: 156px;
   height: 140px;
   margin-left: -78px;
-  border-radius: 5px 0 0 0;
+  border-radius: var(--r-xs) 0 0 0;
   background-color: var(--fc-sheet);
   /* Lit from the top, slightly left, like everything else: a light top edge, a hairline, and the
      shadow it casts into the well. Static. */
@@ -379,7 +379,7 @@ svg.fcover[data-ai] {
 
 .fcard-pic {
   overflow: hidden;
-  border-radius: 5px;
+  border-radius: var(--r-xs);
 }
 
 .fcard-pic-img {

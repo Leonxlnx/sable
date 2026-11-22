@@ -724,7 +724,8 @@ textarea.field {
   gap: 6px;
   height: 24px;
   padding: 0 10px;
-  border-radius: 6px;
+  /* The track's corner less the 3px between their edges. */
+  border-radius: calc(var(--r-sm) - 3px);
   font-size: var(--t-small);
   font-weight: var(--w-medium);
   color: var(--text-3);
@@ -757,7 +758,7 @@ textarea.field {
 
 .seg-item:focus-visible {
   outline-offset: -1px;
-  border-radius: 6px;
+  border-radius: calc(var(--r-sm) - 3px);
 }
 
 .seg-item:disabled {
@@ -769,7 +770,7 @@ textarea.field {
   position: absolute;
   inset: 0;
   z-index: -1;
-  border-radius: 6px;
+  border-radius: calc(var(--r-sm) - 3px);
   background-color: var(--fill-3);
   box-shadow: var(--press-up);
 }
@@ -791,7 +792,7 @@ textarea.field {
   z-index: calc(var(--z-modal) + 2);
   min-width: 200px;
   padding: 4px;
-  border-radius: 16px;
+  border-radius: var(--r-float);
   /* Glass (see "material: glass" below): the rim is ::before, the shadow a layer behind the pane. */
   background: var(--grain) 0 0 / var(--grain-size), var(--glass-menu);
   -webkit-backdrop-filter: var(--blur);
@@ -853,7 +854,7 @@ textarea.field {
   z-index: -1;
   translate: var(--o-x, 0px) var(--o-y, 0px);
   zoom: var(--ui-zoom, 1);
-  border-radius: 16px;
+  border-radius: var(--r-float);
   box-shadow: var(--shadow-glass);
   pointer-events: none;
   transform-origin: 0 0;
@@ -1196,7 +1197,7 @@ textarea.field {
   max-height: calc(100 * var(--vh) - 48px);
   display: flex;
   flex-direction: column;
-  border-radius: var(--r-xl);
+  border-radius: var(--r-float);
   background: var(--grain) 0 0 / var(--grain-size), var(--panel);
   box-shadow: var(--rim-inner), var(--shadow-glass);
   animation:
@@ -1439,6 +1440,20 @@ textarea.field {
   height: calc(var(--spot-r) * 2);
   background: radial-gradient(circle closest-side, var(--spot), transparent);
   transform: translate(-9999px, -9999px);
+}
+
+/* On a surface with a 1px border the ring lies inside it, so its corner is the border's inner
+   curve: the surface's radius less that pixel (inherited whole, it would cut the corner short). */
+:is(.card, .plan, .picker-browse, .acct-auto, .cc:not([data-compact]), .ts) > .spot-ring {
+  border-radius: calc(var(--r-lg) - 1px);
+}
+
+:is(.rail, .glass-card:not(.ts)) > .spot-ring {
+  border-radius: calc(var(--r-xl) - 1px);
+}
+
+.agx-card > .spot-ring {
+  border-radius: calc(var(--r-md) - 1px);
 }
 
 [data-spot-on] > .spot-ring {

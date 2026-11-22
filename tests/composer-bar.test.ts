@@ -78,7 +78,8 @@ describe('a menu the bar opens stands clear of the pane', () => {
     // A menu's corner is 16 and its rows stand 4 in: 12, for the row and the highlight under it.
     const css = read('src/features/composer/composer.css');
     expect(css).toMatch(/\.cm-pop \.menu-item,\n\.cm-pop > \.menu-glide \{\n  border-radius: 12px;/);
-    expect(Number(/\.pop \{[^}]*border-radius: (\d+)px;/s.exec(read('src/styles/ui.css'))?.[1]) - Number(/\.cm-pop \{\n  padding: (\d+)px;/.exec(css)?.[1])).toBe(12);
+    expect(read('src/styles/ui.css')).toMatch(/\.pop \{[^}]*border-radius: var\(--r-float\);/s);
+    expect(Number(/--r-float: (\d+)px;/.exec(read('src/styles/tokens.css'))?.[1]) - Number(/\.cm-pop \{\n  padding: (\d+)px;/.exec(css)?.[1])).toBe(12);
   });
 });
 

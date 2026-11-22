@@ -1,7 +1,7 @@
 /* DiffView: a flat well like code, with a file header above a hairline. */
 
 .dv {
-  border-radius: var(--r-md);
+  border-radius: var(--r-lg);
   border: 1px solid var(--line);
   background-color: rgb(0 0 0 / 0.3);
   overflow: hidden;

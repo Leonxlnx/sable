@@ -243,7 +243,7 @@
   left: calc(100% + 8px);
   bottom: 0;
   width: 284px;
-  border-radius: 16px;
+  border-radius: var(--r-float);
   background:
     var(--grain) 0 0 / var(--grain-size),
     linear-gradient(var(--glass-strong), var(--glass-strong)),

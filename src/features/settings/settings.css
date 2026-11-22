@@ -438,7 +438,7 @@
   height: 24px;
   padding: 0 8px;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: var(--r-ctl-sm);
   vertical-align: middle;
   background-color: rgb(0 0 0 / 0.24);
 }
@@ -459,7 +459,7 @@
 
 .code-chip .code-chip-copy {
   --ib: 20px;
-  border-radius: var(--r-ctl-xs);
+  border-radius: calc(var(--r-ctl-sm) - 2px);
 }
 
 /* Search */
@@ -519,7 +519,7 @@
 .set-skel-tile {
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   flex-shrink: 0;
 }
 
@@ -538,7 +538,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 6px;
+  padding: 3px;
 }
 
 .pick {
@@ -548,9 +548,10 @@
   gap: 12px;
   width: 100%;
   min-height: 52px;
-  padding: 8px 12px 8px 9px;
+  padding: 8px 15px 8px 12px;
   border: 1px solid transparent;
-  border-radius: var(--r-md);
+  /* The card's corner less the 4px to its edge. */
+  border-radius: calc(var(--r-lg) - 4px);
   text-align: left;
   transition: background-color var(--d-1) var(--ease);
 }
@@ -998,7 +999,7 @@ button.xrow-head:disabled:hover {
 .rule-chip {
   max-width: 100%;
   padding: 3px 8px;
-  border-radius: 7px;
+  border-radius: var(--r-ctl-sm);
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 18px;
@@ -1071,7 +1072,7 @@ button.xrow-head:disabled:hover {
 .hook-type {
   flex-shrink: 0;
   padding: 0 7px;
-  border-radius: 6px;
+  border-radius: var(--r-ctl-xs);
   font-size: var(--t-micro);
   line-height: 20px;
   color: var(--text-2);

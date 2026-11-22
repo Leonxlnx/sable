@@ -153,13 +153,14 @@ describe('the account switcher', () => {
   it('what nests in a pane takes the pane’s radius less its distance to the edge', () => {
     const pop = rule(ui, '.pop {');
     expect(pop).toMatch(/padding: 4px;/);
-    expect(pop).toMatch(/border-radius: 16px;/);
+    expect(pop).toMatch(/border-radius: var\(--r-float\);/);
+    expect(tokens).toMatch(/--r-float: 16px;/);
     expect(tokens).toMatch(/--r-lg: 12px;/);
     // A row and the highlight under it.
     expect(rule(ui, '.menu-item {')).toMatch(/border-radius: var\(--r-lg\);/);
     expect(rule(ui, '.menu-glide {')).toMatch(/border-radius: var\(--r-lg\);/);
     // The limits pane: the menu's radius, 4px of padding, and its last row a row of the menu.
-    expect(rule(accounts, '.acs-peek {')).toMatch(/border-radius: 16px;/);
+    expect(rule(accounts, '.acs-peek {')).toMatch(/border-radius: var\(--r-float\);/);
     expect(rule(accounts, '.acs-peek-in {')).toMatch(/padding: 4px;/);
     const usageRow = rule(usage, '.ul-glance-open {');
     expect(usageRow).toMatch(/border-radius: var\(--r-lg\);/);

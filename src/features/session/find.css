@@ -11,7 +11,7 @@
   width: min(380px, calc(100% - 36px));
   height: 40px;
   padding: 0 5px 0 6px;
-  border-radius: var(--r-lg);
+  border-radius: var(--r-xl);
 }
 
 .cfind {
@@ -47,7 +47,7 @@
   margin-right: 4px;
   padding: 0 9px 0 8px;
   border: 1px solid var(--line-2);
-  border-radius: var(--r-sm);
+  border-radius: calc(var(--r-xl) - 6px);
   background-color: var(--well-strong);
   color: var(--text-3);
   cursor: text;

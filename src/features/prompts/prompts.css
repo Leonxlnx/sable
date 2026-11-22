@@ -58,7 +58,7 @@
   display: inline-flex;
   align-items: center;
   padding: 0 8px;
-  border-radius: 7px;
+  border-radius: var(--r-ctl-sm);
   font-size: var(--t-micro);
   font-weight: var(--w-medium);
   color: var(--text-2);
@@ -124,6 +124,7 @@
 /* A diff keeps its full height and the list scrolls; shrunk to fit, it would clip its own lines. */
 .pc-diffs > .dv {
   flex-shrink: 0;
+  border-radius: var(--r-md);
 }
 
 /* The lower edge fades into the diff's well (black at .3 over the card) while more is below, so
@@ -299,7 +300,7 @@
   align-items: center;
   height: 24px;
   padding: 0 9px;
-  border-radius: 7px;
+  border-radius: var(--r-ctl-sm);
   font-size: var(--t-small);
   font-weight: var(--w-medium);
   color: var(--text-2);
@@ -426,7 +427,7 @@ button.qc-opt:active {
 }
 
 .qc-box {
-  border-radius: 5px;
+  border-radius: var(--r-xs);
 }
 
 .qc-opt[data-on] .qc-mark {
@@ -482,7 +483,7 @@ button.qc-opt:active {
   height: 38px;
   padding: 0 12px;
   text-align: left;
-  border-radius: inherit;
+  border-radius: calc(var(--r-lg) - 1px);
   transition: background-color var(--d-1) var(--ease);
 }
 

@@ -65,7 +65,7 @@
   width: 100%;
   padding: 0;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--r-ctl-xs);
   background: none;
   pointer-events: auto;
   cursor: pointer;
@@ -219,7 +219,7 @@
   width: min(320px, 64cqw);
   max-width: 100%;
   max-height: 100%;
-  border-radius: 14px;
+  border-radius: var(--r-float);
   pointer-events: auto;
   transform-origin: 100% 50%;
   animation: nav-index-in 160ms var(--ease-out) backwards;
@@ -318,7 +318,7 @@
   gap: 8px;
   height: 28px;
   padding: 0 9px 0 31px;
-  border-radius: var(--r-sm);
+  border-radius: calc(var(--r-float) - 4px);
   font-size: var(--t-ui);
   color: var(--text-2);
   cursor: pointer;

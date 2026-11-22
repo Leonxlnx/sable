@@ -10,7 +10,7 @@
   line-height: 0;
   text-align: left;
   cursor: zoom-in;
-  border-radius: var(--r-md);
+  border-radius: var(--r-lg);
 }
 
 .image-open:focus-visible {
@@ -22,7 +22,7 @@
 .image-open.user-thumb {
   display: block;
   border: 1px solid var(--line-2);
-  border-radius: 10px;
+  border-radius: var(--r-md);
   background-color: var(--well-strong);
 }
 

@@ -204,7 +204,7 @@ function PaletteBody({ onRun }: { onRun: (item: PaletteItem) => void }) {
   useEffect(() => setCursor(0), [q, scope]);
   const safe = Math.min(cursor, Math.max(0, all.length - 1));
   // One selection pill that travels between rows for arrow keys and lands under the pointer at once.
-  const pill = useSlidePill(all[safe] ? `${all[safe].group}:${all[safe].item.id}` : null, 8, byKeys);
+  const pill = useSlidePill(all[safe] ? `${all[safe].group}:${all[safe].item.id}` : null, 12, byKeys);
 
   // Keep the cursor row in view, smoothly.
   useLayoutEffect(() => {

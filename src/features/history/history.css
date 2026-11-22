@@ -227,7 +227,7 @@
 .skel-bar {
   display: block;
   height: 10px;
-  border-radius: 5px;
+  border-radius: var(--r-xs);
 }
 
 .skel-sub {

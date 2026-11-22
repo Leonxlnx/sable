@@ -1,5 +1,12 @@
 /* The side panel's Device tab: a picker in the bar, the device's screen on the ground, its keys, the log. */
 
+/* The tab's column also carries a diff well's class (components/diff.css, .dv) and with it that
+   well's corners: it ends in the panel's bottom corners instead, on the panel's inner curve, and is
+   square under the tabs. */
+.rail-col.dv {
+  border-radius: 0 0 calc(var(--r-xl) - 1px) calc(var(--r-xl) - 1px);
+}
+
 .dv-bar {
   display: flex;
   align-items: center;
@@ -112,7 +119,7 @@
   width: 180px;
   aspect-ratio: 9 / 20;
   overflow: hidden;
-  border-radius: 18px;
+  border-radius: var(--r-2xl);
   outline: 1px solid var(--line-2);
   outline-offset: 0;
   background-color: var(--panel);

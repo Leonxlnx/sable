@@ -38,7 +38,7 @@ export function QuickSwitch() {
   const [shown, setShown] = useState(false);
   const live = useRef<{ list: SessionMeta[]; index: number } | null>(null);
   // The selection pill travels with Tab (and lands under the pointer at once), as in the palette.
-  const pill = useSlidePill(list && shown ? index : null, 10, byKeys);
+  const pill = useSlidePill(list && shown ? index : null, 12, byKeys);
 
   useEffect(() => {
     watchVisits();

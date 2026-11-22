@@ -110,13 +110,23 @@
   --w-semi: 580;
   --w-bold: 660;
 
-  /* ── shape ── */
+  /* ── shape: one family of corners ──
+     A thing has the radius of its kind. What nests in a rounded surface within 8px of its edge
+     takes that surface's radius less its distance to the edge, written as a calc on the holder's
+     token (never under 4px); nothing in flow is rounder than what holds it.
+     5 marks in a line of text (inline code, a key, a badge) · 8 controls, fields and list rows
+     (26px and 22px controls: --r-ctl-sm, --r-ctl-xs below) · 10 wells set into a card or a panel
+     · 12 cards in flow, and the rows of a floating pane · 14 the sheets (stage, side panel) and
+     cards that hold a well · 16 glass that floats (menus, popovers, the palette, dialogs; rows
+     12 at 4px) · 20 the composer's pane and its key, the triage deck's cards. */
   --r-xs: 5px;
   --r-sm: 8px;
   --r-md: 10px;
   --r-lg: 12px;
   --r-xl: 14px;
+  --r-float: 16px;
   --r-2xl: 18px;
+  --r-pane: 20px;
   --r-pill: 999px;
 
   /* ── depth: in-flow surfaces cast nothing; floating layers cast one soft shadow ──

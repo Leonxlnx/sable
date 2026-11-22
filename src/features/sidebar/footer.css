@@ -129,7 +129,7 @@ button.update-row:focus-visible,
   flex-shrink: 0;
   height: 24px;
   padding: 0 8px;
-  border-radius: 6px;
+  border-radius: var(--r-ctl-xs);
   color: var(--text-2);
   transition:
     background-color var(--d-1) var(--ease),
