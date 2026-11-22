@@ -479,6 +479,8 @@ export function applyEvent(e: BridgeEvent) {
         const known = !!d.items[e.item.id];
         d.items[e.item.id] = e.item;
         const ids = [e.item.id];
+        // A root item the bridge moved (a message the agent has just taken): to the end, in this one update.
+        if (known && e.moved && !e.item.parentId && d.roots.at(-1) !== e.item.id) return { ids, patch: { roots: [...d.roots.filter((id) => id !== e.item.id), e.item.id] } };
         // An item the timeline already holds is replaced where it stands.
         if (known) return { ids };
         if (e.item.parentId) return { ids, patch: { children: { ...d.children, [e.item.parentId]: [...(d.children[e.item.parentId] ?? []), e.item.id] } } };
@@ -495,6 +497,8 @@ export function applyEvent(e: BridgeEvent) {
       });
       return;
     case 'item.removed':
+      // The bridge is moving it: the `item.added` right behind carries it to its place, so no frame is painted without it.
+      if (e.moving) return;
       editItems(e.sessionId, (d) => {
         const item = d.items[e.id];
         if (!item) return null;

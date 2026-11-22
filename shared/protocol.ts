@@ -1721,10 +1721,12 @@ export type BridgeEvent =
   | { type: 'session.updated'; id: string; patch: Partial<SessionMeta> }
   | { type: 'session.removed'; id: string }
   | { type: 'session.caps'; id: string; caps: Capabilities }
-  | { type: 'item.added'; sessionId: string; item: TimelineItem }
+  /** `moved`: a root item the timeline already holds now stands at its end (the `item.removed` before it said `moving`). */
+  | { type: 'item.added'; sessionId: string; item: TimelineItem; moved?: boolean }
   | { type: 'item.delta'; sessionId: string; id: string; field: 'text' | 'inputText' | 'output'; delta: string }
   | { type: 'item.patch'; sessionId: string; id: string; patch: Partial<TimelineItem> }
-  | { type: 'item.removed'; sessionId: string; id: string }
+  /** `moving`: the item is not gone, the `item.added` right behind carries it to its new place (a reader may treat the pair as one move). */
+  | { type: 'item.removed'; sessionId: string; id: string; moving?: boolean }
   | { type: 'timeline.reset'; sessionId: string; items: TimelineItem[] }
   | { type: 'permission.added'; request: PermissionRequest }
   | { type: 'permission.removed'; sessionId: string; id: string }

@@ -242,3 +242,25 @@ describe('chats kept in the window', () => {
     expect(snapCalls().map((c) => c.params.sessionId)).toEqual(['b']);
   });
 });
+
+describe('a message the agent has taken moves in one update', () => {
+  it('never a state without the row: the pair of events is one change of the list', async () => {
+    actions.openSession('a');
+    await answer('a', 3);
+    const seen: string[][] = [];
+    const stop = useStore.subscribe((s, prev) => {
+      if (s.data.a !== prev.data.a) seen.push([...s.data.a.roots]);
+    });
+    const moved = { ...useStore.getState().data.a.items['a-0'], text: 'taken' } as TimelineItem;
+    store.applyEvent({ type: 'item.removed', sessionId: 'a', id: 'a-0', moving: true });
+    store.applyEvent({ type: 'item.added', sessionId: 'a', item: moved, moved: true });
+    stop();
+    expect(seen).toEqual([['a-1', 'a-2', 'a-0']]);
+    expect(useStore.getState().data.a.items['a-0']).toMatchObject({ text: 'taken' });
+    // A plain removal still removes, and a plain add of a known item replaces it where it stands.
+    store.applyEvent({ type: 'item.added', sessionId: 'a', item: { ...moved, text: 'again' } as TimelineItem });
+    expect(useStore.getState().data.a.roots).toEqual(['a-1', 'a-2', 'a-0']);
+    store.applyEvent({ type: 'item.removed', sessionId: 'a', id: 'a-1' });
+    expect(useStore.getState().data.a.roots).toEqual(['a-2', 'a-0']);
+  });
+});

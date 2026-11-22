@@ -101,6 +101,19 @@ describe('a message steered into a turn', () => {
     expect(rt.get(steer.id)).toMatchObject({ state: 'sent', steered: true, ts: 5 });
   });
 
+  it('says the move as the two events every reader knows, marked as one move', () => {
+    const { rt, events } = make();
+    rt.add({ type: 'user', text: 'fix the bug', state: 'sent' } as never);
+    const steer = rt.add({ type: 'user', text: 'which account?', state: 'queued', steered: true } as never);
+    rt.add<TextItem>({ type: 'text', text: 'Reading the recovery code.', streaming: false });
+    events.length = 0;
+    rt.taken(steer.id);
+    expect(events).toEqual([
+      { type: 'item.removed', sessionId: 's1', id: steer.id, moving: true },
+      { type: 'item.added', sessionId: 's1', item: expect.objectContaining({ id: steer.id, state: 'sent' }), moved: true },
+    ]);
+  });
+
   it('stays in its place when nothing was written meanwhile, and when only a step of its own nests after it', () => {
     const { rt, events } = make();
     rt.add({ type: 'user', text: 'fix the bug', state: 'sent' } as never);

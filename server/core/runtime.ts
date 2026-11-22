@@ -564,8 +564,9 @@ export class SessionRuntime {
     this.markDirty(id);
     this.items.splice(at, 1);
     this.items.push(item);
-    this.emit({ type: 'item.removed', sessionId: this.id, id });
-    this.emit({ type: 'item.added', sessionId: this.id, item: { ...item } });
+    // One move, said as the two events every reader knows; the marks let the window make it one update.
+    this.emit({ type: 'item.removed', sessionId: this.id, id, moving: true });
+    this.emit({ type: 'item.added', sessionId: this.id, item: { ...item }, moved: true });
     this.onDirty(this, 'items');
   }
 
