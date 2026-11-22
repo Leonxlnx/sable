@@ -2,8 +2,11 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { branchLike, createPull, shownRemote, draftFrom, gitHubOwner, parseLog, pullContext, type GhResult, type GhRunner, type PullApproval } from '../server/services/pulls';
+
+// Every test here runs real git several times: on a busy machine that passes the default 5 s.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 let base = '';
 let repo = '';
