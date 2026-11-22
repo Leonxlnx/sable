@@ -23,6 +23,7 @@ import { syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
 import { BrowserCapturer, CELL, findBrowser, type Capturer, type Picture } from './capture-browser';
 import { diffRegions, toPixels } from './capture-diff';
+import { anyPageHeld } from './sign-ins';
 
 // ───────────────────────────── local pages in text ─────────────────────────────
 
@@ -517,7 +518,8 @@ export function registerCapture(app: App, opts: { enabled?: boolean } = {}) {
       dir: path.join(app.store.dir, 'captures'),
       items: (id) => app.sessions.get(id)?.items ?? [],
       item: (sid, id) => app.sessions.get(sid)?.get(id),
-      page: (id) => app.sessions.get(id)?.browserPage?.url,
+      // A page held for a sign-in is never captured (its picture would be published).
+      page: (id) => (anyPageHeld() ? undefined : app.sessions.get(id)?.browserPage?.url),
       sessions: () => app.store.state.sessions.map((s) => s.id),
       emit: (e) => app.emit(e),
       log: app.log,

@@ -9,22 +9,22 @@ import { randomBytes } from 'node:crypto';
  * the document that is filled.
  *
  * A sign-in, step by step:
- * 1. `begin`: the window that shows the guest asks for a ticket for the guest's current page. Refused
- *    while the guest has a sign-in under way or a filled document still shown. The hold is armed now
- *    (one id per hold), before anything is filled; the approved address (origin and path) and the
- *    login form (its action and its fields' names, read in an isolated world) are pinned.
- * 2. The person chooses on the visible card. `fill` checks the ticket belongs to that window and hold,
- *    that the guest still shows the same document at the pinned address, then loads the pinned
- *    address again: a fresh credential-entry document no agent script has run in, which must land at
- *    the pinned address. It stamps that document (in an isolated world the page cannot see: the
- *    document's root, the pinned form and its two fields as references), checks the stamped document
- *    is the one it means, and fills there: both values set before any page code runs, then the events,
- *    then the two fields and the form checked again, then a submit only of a same-origin POST that
- *    stays in the page.
- * 3. While the password is in play, every request of that guest that has a body must be a POST to the
- *    exact origin, every request whose address holds the password is cancelled, and a 307 or 308 of
- *    the form's POST to another origin is cancelled (`requestVerdict`, `redirectVerdict`).
- * 4. A new document after the fill releases that hold (and its guard). Nothing else does.
+ * 1. `begin`, before any card: refused while the guest is held. The hold is armed (one id per hold);
+ *    the page is loaded again at its address, a fresh credential-entry document no agent script has
+ *    run in, which must land at that address; main finds its one sign-in form there and stamps it (in
+ *    an isolated world the page cannot see: the document's root, the form, its fields, the submitter,
+ *    its number of controls). The card shows the address and where the form sends, as main found
+ *    them. An unfilled ticket ends by time in main (`TICKET_MS`).
+ * 2. The person chooses on the visible card. `fill` checks the ticket belongs to that window, guest
+ *    and hold, and that the stamped document is still the one shown at the same address; it fills
+ *    there: every check (exact action, same controls, same document) before any value, both values
+ *    before any event, everything again after the events, then the submit.
+ * 3. While the password is in play, only the approved submission carries a body (the page's own
+ *    navigation, a POST to exactly the approved action; a redirect of it judged again by request id),
+ *    and no request carries the password in its address or a header (`requestVerdict`, `headerVerdict`).
+ * 4. After a fill only the person ends the hold: Continue (they have seen the page) or Close (the page
+ *    goes blank first); a page that comes back with the password still in a field is never handed over
+ *    by a navigation. `HOLD_MS` closes it by itself. Every outcome is a fixed code (`SIGN_IN_CODES`).
  */
 
 /** `scheme://host[:port]` exactly as a browser compares origins (host lower-cased and in punycode by URL); http and https only. */
@@ -100,28 +100,62 @@ export function passwordForms(pw: string): string[] {
 }
 
 export interface WireRequest {
+  /** Electron's request id: the same request seen again (a redirect) keeps it. */
+  id?: number;
   url: string;
   method: string;
+  /** 'mainFrame' for the page's own navigation (a form's submission). */
+  resourceType?: string;
   /** The request body's parts as far as Electron gives them; present (even empty) when the request has a body. */
   body?: Uint8Array[];
 }
 
+/** What a guard knows: the exact submission the person approved, and the password in play. */
+export interface Guard {
+  origin: string;
+  /** The approved form's action: origin, path and query, no fragment. */
+  action: string;
+  password: string;
+  /** Requests already let through as the approved submission (their redirects are judged again by id). */
+  passed: Set<number>;
+}
+
+/** An address without its fragment, for comparing a request with the approved action. */
+export const bareAddress = (raw: string) => {
+  try {
+    const u = new URL(raw);
+    u.hash = '';
+    return u.href;
+  } catch {
+    return '';
+  }
+};
+
+const holdsPassword = (s: string, password: string) => passwordForms(password).some((f) => s.includes(f)) || safeDecode(s).includes(password);
+
 /**
- * The network rule while a password is in play on a guest. It does not depend on recognising the
- * password in a body: every request of that guest that has a body is a POST to the exact origin or
- * is cancelled, and every request whose address holds the password (in any form above) is cancelled.
+ * The network rule while a password is in play on a guest. Only the approved submission carries a
+ * body: the page's own navigation (`mainFrame`) as a POST to exactly the approved action (origin,
+ * path and query). Every other request with a body is cancelled, whatever the body holds; every
+ * request whose address holds the password is cancelled. A request seen again under the same id is a
+ * redirect: with a body (a 307 or 308 keeps it) it must still be the approved action, so a body that
+ * would go anywhere else is cancelled; without a body (a 303) it goes on.
  */
-export function requestVerdict(req: WireRequest, guard: { origin: string; password: string }): 'allow' | 'cancel' {
-  const forms = passwordForms(guard.password);
-  const url = req.url;
-  if (forms.some((f) => url.includes(f)) || safeDecode(url).includes(guard.password)) return 'cancel';
-  if (req.body !== undefined) return req.method.toUpperCase() === 'POST' && sameOrigin(url, guard.origin) ? 'allow' : 'cancel';
+export function requestVerdict(req: WireRequest, guard: Guard): 'allow' | 'cancel' {
+  if (holdsPassword(req.url, guard.password)) return 'cancel';
+  if (req.body === undefined) return 'allow';
+  const ok = req.method.toUpperCase() === 'POST' && req.resourceType === 'mainFrame' && bareAddress(req.url) === guard.action;
+  if (!ok) return 'cancel';
+  if (typeof req.id === 'number') guard.passed.add(req.id);
   return 'allow';
 }
 
-/** A redirect while the password is in play: a 307 or 308 (which keeps the method and the body) only to the exact origin. */
-export function redirectVerdict(status: number, to: string, guard: { origin: string }): 'allow' | 'cancel' {
-  if ((status === 307 || status === 308) && !sameOrigin(to, guard.origin)) return 'cancel';
+/** Request headers while a password is in play: a header that holds it cancels the request (a bodyless request carries it no other way). */
+export function headerVerdict(headers: Record<string, string | string[] | undefined>, guard: Guard): 'allow' | 'cancel' {
+  for (const v of Object.values(headers)) {
+    const all = Array.isArray(v) ? v : [v ?? ''];
+    if (all.some((x) => holdsPassword(String(x), guard.password))) return 'cancel';
+  }
   return 'allow';
 }
 
@@ -157,11 +191,14 @@ export function openPlain(plain: string, origin: string, username: string): stri
 /** The isolated world Sable fills from: its globals and prototypes are its own, per document. */
 export const SIGN_IN_WORLD = 1087;
 
-/** The login form as pinned at `begin`: where it sends and what its two fields are called. */
-export interface FormPin {
+/** The form as main found it in the fresh document: what the card shows and what the fill must still find. */
+export interface FormSeen {
+  /** Where it sends (origin, path and query). */
   action: string;
   user: string;
   pass: string;
+  /** How many controls the form has: a form whose controls changed is not the one approved. */
+  controls: number;
 }
 
 /**
@@ -204,54 +241,43 @@ const FIND = `
   };
 `;
 
-/** At `begin`, in the document the person sees: the login form to pin. */
-export function describeScript(origin: string): string {
+/**
+ * In the fresh document main loaded: finds the sign-in form, checks it is a same-origin POST that
+ * stays in the page, keeps the document's root, the form, its fields and the submitter as references
+ * in this world under `nonce`, and says what it found (where the form sends, its fields, how many
+ * controls it has) for the card. A document opened anew or a form replaced later no longer matches.
+ */
+export function stampScript(nonce: string, origin: string): string {
   return `(() => {${FIND}
   if (window.top !== window || location.origin !== ${JSON.stringify(origin)}) return { error: 'moved' };
   const p = pick();
   if (p.error) return p;
   const bad = check(p.form, p.sub, ${JSON.stringify(origin)});
   if (bad) return { error: bad };
-  return { action: sends(p.form, p.sub).bare, user: nameOf(p.user), pass: nameOf(p.pass) };
+  window.__sableSignIn = { nonce: ${JSON.stringify(nonce)}, root: document.documentElement, form: p.form, user: p.user, pass: p.pass, sub: p.sub, controls: p.form.elements.length };
+  return { ok: true, origin: location.origin, top: true, action: sends(p.form, p.sub).bare, user: nameOf(p.user), pass: nameOf(p.pass), controls: p.form.elements.length };
 })()`;
 }
 
 /**
- * In the fresh document: finds the pinned form again (same action, same field names), checks it, and
- * keeps the document's root, the form, its fields and the submitter as references in this world, under
- * `nonce`. A document opened anew or a form replaced later no longer matches them.
+ * Fills the stamped form and submits it. Every check comes before any value is set, among them that
+ * the form still sends exactly to the approved action and has the same controls; both values are set
+ * before any event is dispatched (setting a value runs no page code); after the events everything is
+ * checked again, and only then is it submitted. A refusal before the values answers its reason; one
+ * after them answers `changed` (the password may be in the page: the hold stays).
  */
-export function stampScript(nonce: string, origin: string, pin: FormPin): string {
-  return `(() => {${FIND}
-  if (window.top !== window || location.origin !== ${JSON.stringify(origin)}) return { error: 'moved' };
-  const p = pick();
-  if (p.error) return p;
-  const pin = ${JSON.stringify(pin)};
-  if (sends(p.form, p.sub).bare !== pin.action || nameOf(p.user) !== pin.user || nameOf(p.pass) !== pin.pass) return { error: 'otherform' };
-  const bad = check(p.form, p.sub, ${JSON.stringify(origin)});
-  if (bad) return { error: bad };
-  window.__sableSignIn = { nonce: ${JSON.stringify(nonce)}, root: document.documentElement, form: p.form, user: p.user, pass: p.pass, sub: p.sub };
-  return { ok: true, origin: location.origin, top: true };
-})()`;
-}
-
-/**
- * Fills the stamped form and submits it. Every check comes before any value is set; both values are
- * set before any event is dispatched (setting a value runs no page code); after the events the two
- * fields, the form and where it sends are checked again, and only then is it submitted. A refusal
- * before the values answers its reason; one after them answers `changed` (the password may be in the
- * page: the hold stays).
- */
-export function fillScript(nonce: string, origin: string, username: string, password: string): string {
+export function fillScript(nonce: string, origin: string, action: string, username: string, password: string): string {
   return `(() => {${FIND}
   const s = window.__sableSignIn;
   if (!s || s.nonce !== ${JSON.stringify(nonce)}) return { error: 'replaced' };
   const same = () => window.top === window && location.origin === ${JSON.stringify(origin)} && document.documentElement === s.root && s.form.isConnected && s.user.isConnected && s.pass.isConnected
     && s.user.form === s.form && s.pass.form === s.form && s.user.ownerDocument === document && s.pass.ownerDocument === document && s.pass.type === 'password'
-    && (!s.sub || (s.sub.isConnected && s.sub.form === s.form));
+    && (!s.sub || (s.sub.isConnected && s.sub.form === s.form)) && s.form.elements.length === s.controls;
+  const exact = () => !check(s.form, s.sub, ${JSON.stringify(origin)}) && sends(s.form, s.sub).bare === ${JSON.stringify(action)};
   if (!same()) return { error: 'replaced' };
   const bad = check(s.form, s.sub, ${JSON.stringify(origin)});
   if (bad) return { error: bad };
+  if (!exact()) return { error: 'otherform' };
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
   setter.call(s.user, ${JSON.stringify(username)});
   setter.call(s.pass, ${JSON.stringify(password)});
@@ -259,7 +285,7 @@ export function fillScript(nonce: string, origin: string, username: string, pass
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
-  if (!same() || check(s.form, s.sub, ${JSON.stringify(origin)})) return { error: 'changed' };
+  if (!same() || !exact()) return { error: 'changed' };
   if (s.sub) s.form.requestSubmit(s.sub); else s.form.requestSubmit();
   return { ok: true };
 })()`;
@@ -277,20 +303,42 @@ export function stillThereScript(nonce: string): string {
 })()`;
 }
 
-/** What a refused sign-in tells the agent: plain words, never a value. */
-export const FILL_REFUSALS: Record<string, string> = {
-  replaced: 'the page was replaced before the sign-in could be filled.',
-  moved: 'the page moved to another site before the sign-in.',
-  several: 'the page has more than one password field, so Sable does not know which form signs in.',
-  noform: 'the page shows no sign-in form.',
-  nouser: 'the sign-in form has no user name field.',
-  otherform: 'the page shows another sign-in form than the one approved.',
-  method: 'the sign-in form does not send with POST, so Sable does not fill it.',
-  action: 'the sign-in form sends to another site, so Sable does not fill it.',
-  target: 'the sign-in form sends to another window or frame, so Sable does not fill it.',
-};
-/** After the values were set: the password may be in the page, so the hold stays. */
-const CHANGED = 'the sign-in form changed while it was being filled; it was not sent.';
+/**
+ * Every outcome of a sign-in as a fixed code: main answers with these and nothing else, and the
+ * bridge turns them into the agent's words (browser-tool.ts). No free text from a page or a window.
+ */
+export const SIGN_IN_CODES = [
+  'signed-in',
+  'cancelled',
+  'not-looking',
+  'unavailable',
+  'busy',
+  'not-approved',
+  'expired',
+  'gone',
+  'changed-before',
+  'moved-on-load',
+  'replaced',
+  'moved',
+  'several',
+  'noform',
+  'nouser',
+  'otherform',
+  'method',
+  'action',
+  'target',
+  'no-user',
+  'no-password',
+  'unreadable',
+  'damaged',
+  'changed',
+  'failed',
+  'still-form',
+] as const;
+export type SignInCode = (typeof SIGN_IN_CODES)[number];
+
+/** The codes a page script answers with, before any value was set. */
+const BEFORE_VALUES: ReadonlySet<string> = new Set(['replaced', 'moved', 'several', 'noform', 'nouser', 'otherform', 'method', 'action', 'target']);
 
 /* ── the gate: tickets, holds and the guard, per guest ── */
 
@@ -318,20 +366,30 @@ export interface SignInDeps {
   used(id: string): void;
   /** A saved entry whose sealed origin or user name is not its own: reported, never filled. */
   damaged?(id: string): void;
-  /** That hold was released (a new document after the fill, or the sign-in ended before any fill). */
+  /** That hold was released (by the person, a cancel, a timeout, or before anything was filled). */
   released(guestId: number, holdId: string): void;
   now?(): number;
   sleep?(ms: number): Promise<void>;
+  /** A timer (tests give their own). */
+  timer?(ms: number, fn: () => void): { cancel(): void };
 }
 
 export type Credential = { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string };
 
 export interface FillResult {
   ok: boolean;
-  signedIn?: boolean;
+  code: SignInCode;
+  /** The user name, when signed in. */
   user?: string;
-  /** Plain words for the agent when not signed in. */
-  error?: string;
+}
+
+export interface BeginResult {
+  ticket: string;
+  hold: string;
+  canSave: boolean;
+  /** For the card: the page's address (origin and path) and where its form sends, as main found them. */
+  address: string;
+  action: string;
 }
 
 interface Ticket {
@@ -340,64 +398,82 @@ interface Ticket {
   guestId: number;
   hostId: number;
   origin: string;
-  /** The approved address: loaded again for the fresh document; its origin and path must hold. */
-  url: string;
   address: string;
-  form: FormPin;
-  /** The document the approval is for. */
+  action: string;
+  nonce: string;
+  /** The stamped fresh document. */
   doc: number;
   expires: number;
+  timer?: { cancel(): void };
 }
 
 interface Hold {
   id: string;
   /** The document that may hold the password, once the fill began writing. */
   filledDoc?: number;
+  /** After a fill: ends by the person (continue or close) or by `HOLD_MS`. */
+  timer?: { cancel(): void };
 }
 
-/** How long a ticket waits for the person. */
-export const TICKET_MS = 5 * 60_000;
+/** How long a ticket waits for the person; then main cancels it and the hold ends. */
+export const TICKET_MS = 3 * 60_000;
+/** How long a filled page stays held for the person to look at it; then main closes it. */
+export const HOLD_MS = 10 * 60_000;
 /** How long the gate waits for the submitted sign-in to leave its form. */
 export const SETTLE_MS = 8_000;
 const MAX_PASSWORD = 1_000;
 const MAX_USERNAME = 200;
 
+const defaultTimer = (ms: number, fn: () => void) => {
+  const t = setTimeout(fn, ms);
+  (t as { unref?: () => void }).unref?.();
+  return { cancel: () => clearTimeout(t) };
+};
+
 export class SignInGate {
   /** Committed main-frame documents per guest: a navigation, a replacement or a crash moves it on. */
   private docs = new Map<number, number>();
   private tickets = new Map<string, Ticket>();
-  /** Guests whose page is held: armed at `begin`, released by a new document after the fill. */
+  /** Guests whose page is held: armed at `begin`, released only by the person, a cancel or a timeout. */
   private holds = new Map<number, Hold>();
   /** The password in play per guest, for the network rule, while its hold lasts. */
-  private guards = new Map<number, { holdId: string; origin: string; password: string }>();
+  private guards = new Map<number, Guard & { holdId: string }>();
+  /** Holds armed per guest so far: an attestation that saw another number saw a hold begin. */
+  private epochs = new Map<number, number>();
 
   constructor(private deps: SignInDeps) {}
 
   private now = () => this.deps.now?.() ?? Date.now();
   private sleep = (ms: number) => this.deps.sleep?.(ms) ?? new Promise<void>((r) => setTimeout(r, ms));
+  private timer = (ms: number, fn: () => void) => (this.deps.timer ?? defaultTimer)(ms, fn);
 
   doc(guestId: number): number {
     return this.docs.get(guestId) ?? 0;
   }
 
-  /** A main-frame document committed in the guest (did-navigate, a crash). */
+  epoch(guestId: number): number {
+    return this.epochs.get(guestId) ?? 0;
+  }
+
+  /** A main-frame document committed in the guest (did-navigate, a crash). It releases nothing: a page that comes back with the password still in it stays held. */
   committed(guestId: number) {
-    const doc = this.doc(guestId) + 1;
-    this.docs.set(guestId, doc);
-    const h = this.holds.get(guestId);
-    if (h?.filledDoc !== undefined && doc > h.filledDoc) this.release(guestId, h.id);
+    this.docs.set(guestId, this.doc(guestId) + 1);
   }
 
   gone(guestId: number) {
     this.docs.delete(guestId);
-    this.guards.delete(guestId);
     const h = this.holds.get(guestId);
     if (h) this.release(guestId, h.id);
-    for (const [id, t] of this.tickets) if (t.guestId === guestId) this.tickets.delete(id);
+    this.guards.delete(guestId);
   }
 
   held(guestId: number): boolean {
     return this.holds.has(guestId);
+  }
+
+  /** The hold's id on this guest, if it is held. */
+  holdOf(guestId: number): string | undefined {
+    return this.holds.get(guestId)?.id;
   }
 
   /** Any guest held: what the bridge asks when an answer cannot say which guest it came from. */
@@ -409,9 +485,14 @@ export class SignInGate {
   private release(guestId: number, holdId: string) {
     const h = this.holds.get(guestId);
     if (!h || h.id !== holdId) return;
+    h.timer?.cancel();
     this.holds.delete(guestId);
     if (this.guards.get(guestId)?.holdId === holdId) this.guards.delete(guestId);
-    for (const [id, t] of this.tickets) if (t.holdId === holdId) this.tickets.delete(id);
+    for (const [id, t] of this.tickets) {
+      if (t.holdId !== holdId) continue;
+      t.timer?.cancel();
+      this.tickets.delete(id);
+    }
     this.deps.released(guestId, holdId);
   }
 
@@ -422,70 +503,100 @@ export class SignInGate {
     return g ? requestVerdict(req, g) : 'allow';
   }
 
-  /** The redirect rule for one redirect of a guest. */
-  redirect(guestId: number | undefined, status: number, to: string): 'allow' | 'cancel' {
+  /** The header rule for one request of a guest. */
+  headers(guestId: number | undefined, headers: Record<string, string | string[] | undefined>): 'allow' | 'cancel' {
     if (guestId === undefined) return 'allow';
     const g = this.guards.get(guestId);
-    return g ? redirectVerdict(status, to, g) : 'allow';
+    return g ? headerVerdict(headers, g) : 'allow';
   }
 
-  /** Step 1: a ticket for what the guest shows now. The hold is armed here; the address and the form are pinned. */
-  async begin(hostId: number, guest: GuestPage, origin: string): Promise<{ ticket: string; hold: string; canSave: boolean }> {
-    if (!this.deps.ships()) throw new Error('Sign-ins are not available in this version of Sable.');
-    if (guest.destroyed() || guest.hostId !== hostId) throw new Error('That page is gone.');
-    // One sign-in at a time per page: not while one is under way or a filled document is still shown.
-    if (this.holds.has(guest.id)) throw new Error('A sign-in is already under way on this page.');
+  /**
+   * Step 1, before any card: refused while the guest is held. The hold is armed, the page is loaded
+   * again at its address (a fresh credential-entry document no agent script has run in, which must
+   * land at that address), and main finds and stamps its form there. The card then shows what main
+   * found: the address and where the form sends.
+   */
+  async begin(hostId: number, guest: GuestPage, origin: string): Promise<BeginResult> {
+    if (!this.deps.ships()) throw new SignInError('unavailable');
+    if (guest.destroyed() || guest.hostId !== hostId) throw new SignInError('gone');
+    if (this.holds.has(guest.id)) throw new SignInError('busy');
     const o = fillableOrigin(origin);
     const url = guest.url();
     const address = pageAddress(url);
-    if (!o || !address || !sameOrigin(url, o)) throw new Error('The page is not on that site.');
+    if (!o || !address || !sameOrigin(url, o)) throw new SignInError('moved');
     const hold: Hold = { id: randomBytes(12).toString('hex') };
     this.holds.set(guest.id, hold);
-    const doc = this.doc(guest.id);
-    const fail = (why: string): never => {
+    this.epochs.set(guest.id, this.epoch(guest.id) + 1);
+    const fail = (code: SignInCode): never => {
       this.release(guest.id, hold.id);
-      throw new Error(why);
+      throw new SignInError(code);
     };
-    const pin = (await guest.isolated(describeScript(o)).catch(() => null)) as (Partial<FormPin> & { error?: string }) | null;
-    if (!pin || pin.error || typeof pin.action !== 'string' || typeof pin.user !== 'string' || typeof pin.pass !== 'string') return fail(FILL_REFUSALS[pin?.error ?? ''] ?? 'the page shows no sign-in form.');
-    if (this.doc(guest.id) !== doc || pageAddress(guest.url()) !== address) return fail('the page changed while the sign-in was being prepared.');
+    try {
+      await guest.loadFresh(withoutHash(url));
+    } catch {
+      return fail('moved-on-load');
+    }
+    const doc = this.doc(guest.id);
+    if (guest.destroyed() || pageAddress(guest.url()) !== address) return fail('moved-on-load');
+    const nonce = randomBytes(16).toString('hex');
+    const seen = (await guest.isolated(stampScript(nonce, o)).catch(() => null)) as (Partial<FormSeen> & { ok?: boolean; error?: string; origin?: string; top?: boolean }) | null;
+    if (!seen?.ok || seen.top !== true || seen.origin !== o || typeof seen.action !== 'string') return fail(BEFORE_VALUES.has(seen?.error ?? '') ? (seen!.error as SignInCode) : 'noform');
+    if (this.doc(guest.id) !== doc || pageAddress(guest.url()) !== address) return fail('changed-before');
     const id = randomBytes(16).toString('hex');
-    this.tickets.set(id, { id, holdId: hold.id, guestId: guest.id, hostId, origin: o, url: withoutHash(url), address, form: { action: pin.action, user: pin.user, pass: pin.pass }, doc, expires: this.now() + TICKET_MS });
-    return { ticket: id, hold: hold.id, canSave: this.deps.canSave() };
+    const ticket: Ticket = { id, holdId: hold.id, guestId: guest.id, hostId, origin: o, address, action: seen.action, nonce, doc, expires: this.now() + TICKET_MS };
+    // An unfilled ticket ends by time in main, whatever the window does (a hidden card, a closed pane).
+    ticket.timer = this.timer(TICKET_MS, () => this.cancel(hostId, id));
+    this.tickets.set(id, ticket);
+    return { ticket: id, hold: hold.id, canSave: this.deps.canSave(), address, action: seen.action };
   }
 
-  /** The person said no (or the card went away): the hold ends when nothing was filled. */
+  /** The person said no (or the card went away, or the ticket ran out): the hold ends when nothing was filled. */
   cancel(hostId: number, ticketId: string) {
     const t = this.tickets.get(ticketId);
     if (!t || t.hostId !== hostId) return;
+    t.timer?.cancel();
     this.tickets.delete(ticketId);
     const h = this.holds.get(t.guestId);
     if (h && h.id === t.holdId && h.filledDoc === undefined) this.release(t.guestId, h.id);
   }
 
-  /** Step 2: the chosen fill. Answers only whether it signed in, and the user name. */
+  /**
+   * After a fill, the person ends the hold: `continue` gives the page back to the agent as it is (they
+   * have seen it), `close` first takes the page away (it loads a blank one) so nothing of it reaches the
+   * agent. Only the window that hosts the guest, only for the hold it was given.
+   */
+  async finish(hostId: number, guest: GuestPage, holdId: string, how: 'continue' | 'close') {
+    const h = this.holds.get(guest.id);
+    if (!h || h.id !== holdId || guest.hostId !== hostId) return false;
+    if (how === 'close') await guest.loadFresh('about:blank').catch(() => {});
+    this.release(guest.id, holdId);
+    return true;
+  }
+
+  /** Step 2: the chosen fill. Answers with a fixed code and, when signed in, the user name. */
   async fill(hostId: number, guest: GuestPage, ticketId: string, cred: Credential): Promise<FillResult> {
     const t = this.tickets.get(ticketId);
-    const no = (error: string): FillResult => ({ ok: false, error });
-    if (!this.deps.ships()) return no('sign-ins are not available in this version of Sable.');
-    if (!t || t.hostId !== hostId || t.guestId !== guest.id || guest.hostId !== hostId) return no('the sign-in was not approved for this page.');
+    const no = (code: SignInCode): FillResult => ({ ok: false, code });
+    if (!this.deps.ships()) return no('unavailable');
+    if (!t || t.hostId !== hostId || t.guestId !== guest.id || guest.hostId !== hostId) return no('not-approved');
     const hold = this.holds.get(guest.id);
-    if (!hold || hold.id !== t.holdId) return no('the sign-in was not approved for this page.');
+    if (!hold || hold.id !== t.holdId) return no('not-approved');
+    t.timer?.cancel();
     this.tickets.delete(ticketId);
-    const endEarly = (error: string) => {
+    const endEarly = (code: SignInCode) => {
       if (hold.filledDoc === undefined) this.release(guest.id, hold.id);
-      return no(error);
+      return no(code);
     };
-    if (this.now() > t.expires) return endEarly('the sign-in waited too long.');
-    if (guest.destroyed()) return endEarly('the page is gone.');
-    // The document the person approved is still the one shown, at the pinned address.
-    if (this.doc(guest.id) !== t.doc || pageAddress(guest.url()) !== t.address) return endEarly('the page changed before the sign-in.');
+    if (this.now() > t.expires) return endEarly('expired');
+    if (guest.destroyed()) return endEarly('gone');
+    // The stamped document the person approved is still the one shown, at the same address.
+    if (this.doc(guest.id) !== t.doc || pageAddress(guest.url()) !== t.address) return endEarly('changed-before');
 
     const username = String(cred.username ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, MAX_USERNAME);
-    if (!username) return endEarly('no user name was given.');
+    if (!username) return endEarly('no-user');
     let password = '';
     if (cred.kind === 'typed') {
-      if (typeof cred.password !== 'string' || !cred.password || cred.password.length > MAX_PASSWORD) return endEarly('no password was given.');
+      if (typeof cred.password !== 'string' || !cred.password || cred.password.length > MAX_PASSWORD) return endEarly('no-password');
       password = cred.password;
     } else {
       const entry = this.deps.entryOf(cred.id, t.origin);
@@ -495,55 +606,30 @@ export class SignInGate {
       } catch {
         plain = '';
       }
-      if (!entry || !plain) return endEarly('the saved sign-in cannot be read on this computer.');
+      if (!entry || !plain) return endEarly('unreadable');
       // Bound to its entry: a ciphertext moved to another origin or user name is refused.
       const opened = openPlain(plain, t.origin, entry.username);
       if (!opened || entry.username !== username) {
         this.deps.damaged?.(cred.id);
-        return endEarly('the saved sign-in is damaged and was not used.');
+        return endEarly('damaged');
       }
       password = opened;
     }
 
-    // The guard is up before anything could carry the password.
-    this.guards.set(guest.id, { holdId: hold.id, origin: t.origin, password });
-    const dropGuard = () => {
-      if (this.guards.get(guest.id)?.holdId === hold.id) this.guards.delete(guest.id);
-    };
-    // A fresh credential-entry document at the pinned address: the one the agent's scripts ran in is replaced.
-    try {
-      await guest.loadFresh(t.url);
-    } catch {
-      dropGuard();
-      return endEarly('the page did not load again for the sign-in.');
-    }
-    const fresh = this.doc(guest.id);
-    if (guest.destroyed() || fresh === t.doc || pageAddress(guest.url()) !== t.address) {
-      dropGuard();
-      return endEarly('the page went somewhere else when it loaded again.');
-    }
-    const nonce = randomBytes(16).toString('hex');
-    const stamp = (await guest.isolated(stampScript(nonce, t.origin, t.form)).catch(() => null)) as { ok?: boolean; error?: string; origin?: string; top?: boolean } | null;
-    if (!stamp?.ok || stamp.top !== true || stamp.origin !== t.origin) {
-      dropGuard();
-      return endEarly((stamp?.error && FILL_REFUSALS[stamp.error]) || 'the page changed before the sign-in.');
-    }
-    // The stamped document is the fresh one, at the pinned address, nothing committed since.
-    if (this.doc(guest.id) !== fresh || pageAddress(guest.url()) !== t.address) {
-      dropGuard();
-      return endEarly('the page changed before the sign-in.');
-    }
-    // From here the password may be in the page: only a new document releases the hold.
-    hold.filledDoc = fresh;
-    const r = (await guest.isolated(fillScript(nonce, t.origin, username, password)).catch(() => null)) as { ok?: boolean; error?: string } | null;
+    // The guard is up before anything could carry the password: only the approved submission passes.
+    this.guards.set(guest.id, { holdId: hold.id, origin: t.origin, action: t.action, password, passed: new Set() });
+    // From here the password may be in the page: only the person (or the timeout) ends the hold.
+    hold.filledDoc = t.doc;
+    hold.timer = this.timer(HOLD_MS, () => void this.finish(hostId, guest, hold.id, 'close'));
+    const r = (await guest.isolated(fillScript(t.nonce, t.origin, t.action, username, password)).catch(() => null)) as { ok?: boolean; error?: string } | null;
     if (!r?.ok) {
       // Refused before any value was set: nothing is in the page, the hold ends.
-      if (r?.error && FILL_REFUSALS[r.error]) {
+      if (r?.error && BEFORE_VALUES.has(r.error)) {
         hold.filledDoc = undefined;
         this.release(guest.id, hold.id);
-        return no(FILL_REFUSALS[r.error]);
+        return no(r.error as SignInCode);
       }
-      return no(r?.error === 'changed' ? CHANGED : 'the sign-in form could not be filled.');
+      return no(r?.error === 'changed' ? 'changed' : 'failed');
     }
 
     // Through: a new document came, or the filled field went away. Still there after a while: refused.
@@ -552,17 +638,17 @@ export class SignInGate {
     while (this.now() < until) {
       await this.sleep(250);
       if (guest.destroyed()) break;
-      if (this.doc(guest.id) > fresh) {
+      if (this.doc(guest.id) > t.doc) {
         signedIn = true;
         break;
       }
-      const still = (await guest.isolated(stillThereScript(nonce)).catch(() => ({ gone: false }))) as { gone?: boolean };
+      const still = (await guest.isolated(stillThereScript(t.nonce)).catch(() => ({ gone: false }))) as { gone?: boolean };
       if (still?.gone) {
         signedIn = true;
         break;
       }
     }
-    if (!signedIn) return no('the page still shows the sign-in form; it may have refused the user name or password.');
+    if (!signedIn) return no('still-form');
     if (cred.kind === 'typed' && cred.save && this.deps.canSave()) {
       try {
         this.deps.save(t.origin, username, this.deps.encrypt(sealPlain(t.origin, username, password)));
@@ -572,6 +658,68 @@ export class SignInGate {
     }
     if (cred.kind === 'saved') this.deps.used(cred.id);
     password = '';
-    return { ok: true, signedIn: true, user: username };
+    return { ok: true, code: 'signed-in', user: username };
+  }
+}
+
+/** A refusal of `begin`, carrying only its code (IPC passes the message: the code alone). */
+export class SignInError extends Error {
+  constructor(readonly code: SignInCode) {
+    super(code);
+  }
+}
+
+/** A code out of an error message from main (the IPC wrapper adds words around it), or 'failed'. */
+export function codeOf(message: unknown): SignInCode {
+  const m = String(message ?? '');
+  const found = SIGN_IN_CODES.filter((c) => new RegExp(`(^|[^a-z-])${c}($|[^a-z-])`).test(m));
+  return found.sort((a, b) => b.length - a.length)[0] ?? 'failed';
+}
+
+/* ── what the bridge may believe about an answer: attested by main ── */
+
+/** How long an attestation waits for its answer (a card can take minutes). */
+export const ATTEST_MS = 6 * 60_000;
+const ATTEST_MAX = 2_000;
+
+/**
+ * The window asks main for a token before it serves a request of the agent's tools, naming the guest
+ * that serves it; main checks the window hosts that guest and notes the guest's hold epoch. The answer
+ * carries the token to the bridge, which asks main (in-process, never over the bridge) what it stands
+ * for: the guest, whether it is held now or a hold began on it since the request started, and, for a
+ * sign-in, main's own outcome as a fixed code. An id a client supplies is never believed: a token is
+ * unguessable, single-use, issued only to the app's window over IPC, and it expires.
+ */
+export class Attestations {
+  private tokens = new Map<string, { guestId: number; epoch: number; expires: number; signIn?: { code: SignInCode; user?: string } }>();
+
+  constructor(
+    private gate: SignInGate,
+    private now: () => number = Date.now,
+  ) {}
+
+  issue(guestId: number): string {
+    const t = this.now();
+    for (const [k, v] of this.tokens) if (v.expires < t) this.tokens.delete(k);
+    if (this.tokens.size >= ATTEST_MAX) this.tokens.delete(this.tokens.keys().next().value as string);
+    const token = randomBytes(18).toString('hex');
+    this.tokens.set(token, { guestId, epoch: this.gate.epoch(guestId), expires: t + ATTEST_MS });
+    return token;
+  }
+
+  /** Main's outcome of a sign-in, bound to the token of the request it answers and to its guest. */
+  record(token: string, guestId: number, code: SignInCode, user?: string) {
+    const a = this.tokens.get(token);
+    if (a && a.guestId === guestId) a.signIn = { code, ...(code === 'signed-in' && user ? { user } : {}) };
+  }
+
+  /** What the token stands for, once: undefined when it is unknown, used or expired. */
+  take(token: unknown): { guestId: number; held: boolean; signIn?: { code: SignInCode; user?: string } } | undefined {
+    if (typeof token !== 'string') return undefined;
+    const a = this.tokens.get(token);
+    if (!a) return undefined;
+    this.tokens.delete(token);
+    if (a.expires < this.now()) return undefined;
+    return { guestId: a.guestId, held: this.gate.held(a.guestId) || this.gate.epoch(a.guestId) !== a.epoch, ...(a.signIn ? { signIn: a.signIn } : {}) };
   }
 }

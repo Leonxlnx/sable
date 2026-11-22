@@ -1,6 +1,6 @@
 import { app, ipcMain, safeStorage, session, webContents, type BrowserWindow, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import { setSignInHolds, SIGN_IN_OFF, SignInStore, signInShips } from '../server/services/sign-ins';
-import { SignInGate, SIGN_IN_WORLD, type Credential, type GuestPage } from './sign-in-core';
+import { Attestations, codeOf, SignInError, SignInGate, SIGN_IN_WORLD, type Credential, type GuestPage, type SignInCode } from './sign-in-core';
 
 /**
  * Saved sign-ins in Electron's main process: the only place a saved password is decrypted and the
@@ -71,6 +71,9 @@ export function installSignIn(opts: { partition: string; home: string; window: (
       });
     }
     ipcMain.handle('sable:signin-cancel', () => {});
+    // No attestation and nothing to finish: with sign-ins off the bridge believes no hold anyway.
+    ipcMain.handle('sable:browser-attest', () => null);
+    ipcMain.handle('sable:signin-finish', () => false);
     return;
   }
   const store = new SignInStore(opts.home);
@@ -90,11 +93,9 @@ export function installSignIn(opts: { partition: string; home: string; window: (
     released: (id, hold) => tell({ type: 'signin-released', id, hold }),
   });
   const g = gate;
-  // The bridge asks these at delivery: while a guest is held, nothing of its page reaches the agent.
-  setSignInHolds({ held: (id) => g.held(id), anyHeld: () => g.anyHeld() });
-
-  /** The last redirect each guest's network saw (its status), for the navigation's own redirect check. */
-  const lastRedirect = new Map<number, { status: number; to: string }>();
+  const att = new Attestations(g);
+  // The bridge asks these at delivery, in-process: what an answer's token stands for, and whether any page is held.
+  setSignInHolds({ take: (token) => att.take(token), anyHeld: () => g.anyHeld() });
 
   // Every committed main-frame document (a navigation, a reload, a crash) moves a guest's count on.
   app.on('web-contents-created', (_e, wc) => {
@@ -102,26 +103,18 @@ export function installSignIn(opts: { partition: string; home: string; window: (
     const id = wc.id;
     wc.on('did-navigate', () => g.committed(id));
     wc.on('render-process-gone', () => g.committed(id));
-    // A 307 or 308 of the form's POST to another origin, while the password is in play, does not happen.
-    wc.on('will-redirect', (e) => {
-      const r = lastRedirect.get(id);
-      if (r && r.to === e.url && g.redirect(id, r.status, e.url) === 'cancel') e.preventDefault();
-    });
-    wc.once('destroyed', () => {
-      lastRedirect.delete(id);
-      g.gone(id);
-    });
+    wc.once('destroyed', () => g.gone(id));
   });
 
-  // While a password is in play: a request with a body goes only as a POST to the exact origin, and a
-  // request whose address holds the password does not go at all.
+  // While a password is in play: only the approved submission carries a body, judged again by request
+  // id when it is redirected; no request carries the password in its address or in a header.
   const ses = session.fromPartition(opts.partition);
   ses.webRequest.onBeforeRequest((d, cb) => {
     const body = d.uploadData ? d.uploadData.map((u) => u.bytes ?? new Uint8Array()) : undefined;
-    cb({ cancel: g.verdict(d.webContentsId, { url: d.url, method: d.method, body }) === 'cancel' });
+    cb({ cancel: g.verdict(d.webContentsId, { id: d.id, url: d.url, method: d.method, resourceType: d.resourceType, body }) === 'cancel' });
   });
-  ses.webRequest.onBeforeRedirect((d) => {
-    if (typeof d.webContentsId === 'number') lastRedirect.set(d.webContentsId, { status: d.statusCode, to: d.redirectURL });
+  ses.webRequest.onBeforeSendHeaders((d, cb) => {
+    cb(g.headers(d.webContentsId, d.requestHeaders) === 'cancel' ? { cancel: true } : { requestHeaders: d.requestHeaders });
   });
 
   /** The guest, only when the asking window hosts it. */
@@ -131,12 +124,21 @@ export function installSignIn(opts: { partition: string; home: string; window: (
     if (!wc || wc.isDestroyed() || wc.getType() !== 'webview' || wc.hostWebContents !== e.sender) throw new Error('That page is gone');
     return wc;
   };
+  const tokenOf = (v: unknown) => (typeof v === 'string' ? v : '');
 
-  ipcMain.handle('sable:signin-begin', (e, id: unknown, origin: unknown) => {
+  // A token for one request of the agent's tools, for the guest that serves it (see Attestations).
+  ipcMain.handle('sable:browser-attest', (e, id: unknown) => att.issue(guestOf(e, id).id));
+  ipcMain.handle('sable:signin-begin', async (e, id: unknown, origin: unknown, token: unknown) => {
     const wc = guestOf(e, id);
-    return g.begin(e.sender.id, guestPage(wc), String(origin ?? ''));
+    try {
+      return await g.begin(e.sender.id, guestPage(wc), String(origin ?? ''));
+    } catch (err) {
+      const code: SignInCode = err instanceof SignInError ? err.code : codeOf((err as Error)?.message);
+      att.record(tokenOf(token), wc.id, code);
+      throw new Error(code);
+    }
   });
-  ipcMain.handle('sable:signin-fill', async (e, id: unknown, ticket: unknown, cred: unknown) => {
+  ipcMain.handle('sable:signin-fill', async (e, id: unknown, ticket: unknown, cred: unknown, token: unknown) => {
     const wc = guestOf(e, id);
     const c = (cred ?? {}) as Record<string, unknown>;
     const credential: Credential | undefined =
@@ -145,12 +147,20 @@ export function installSignIn(opts: { partition: string; home: string; window: (
         : c.kind === 'saved' && typeof c.id === 'string'
           ? { kind: 'saved', id: c.id, username: String(c.username ?? '') }
           : undefined;
-    if (!credential) return { ok: false, error: 'the sign-in was not understood.' };
-    // The answer is whether it signed in and the user name: never the password, in no error either.
-    return g.fill(e.sender.id, guestPage(wc), String(ticket ?? ''), credential);
+    const r = credential ? await g.fill(e.sender.id, guestPage(wc), String(ticket ?? ''), credential) : { ok: false, code: 'failed' as SignInCode };
+    // The outcome goes to the bridge from here, bound to the request's token: a fixed code and the user name.
+    att.record(tokenOf(token), wc.id, r.code, 'user' in r ? r.user : undefined);
+    return { ok: r.ok, code: r.code, ...('user' in r && r.user ? { user: r.user } : {}) };
   });
-  ipcMain.handle('sable:signin-cancel', (e, ticket: unknown) => {
-    if (!opts.fromApp(e)) return;
-    g.cancel(e.sender.id, String(ticket ?? ''));
+  // The card went away: by the person (cancelled) or because they were not looking.
+  ipcMain.handle('sable:signin-cancel', (e, id: unknown, ticket: unknown, token: unknown, why: unknown) => {
+    const wc = guestOf(e, id);
+    if (typeof ticket === 'string' && ticket) g.cancel(e.sender.id, ticket);
+    att.record(tokenOf(token), wc.id, why === 'not-looking' ? 'not-looking' : 'cancelled');
+  });
+  // After a fill, the person ends the hold from the tab's own line: Continue or Close.
+  ipcMain.handle('sable:signin-finish', (e, id: unknown, hold: unknown, how: unknown) => {
+    const wc = guestOf(e, id);
+    return g.finish(e.sender.id, guestPage(wc), String(hold ?? ''), how === 'continue' ? 'continue' : 'close');
   });
 }

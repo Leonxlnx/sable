@@ -1243,3 +1243,14 @@
   line-height: 1.45;
   color: var(--text-3);
 }
+
+/* The page's address and where its form sends, under the origin (BrowserAgentUi.tsx). */
+.bw-signin-where {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: -8px 0 0;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}

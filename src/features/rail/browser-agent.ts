@@ -3,7 +3,7 @@ import { listSignIns, reportBrowserPage, respondBrowser } from '@/state/actions'
 import { useStore } from '@/state/store';
 import { activeTab, getLog, getPage, getTabs, onPages, openTab, setPage, type AgentWork } from './browser-store';
 import { clickScript, evalScript, focusedScript, locateScript, pickCancelScript, keyProbeRead, keyProbeScript, pressScript, requestsScript, scrollScript, signInProbeScript, snapshotScript, typeScript, userIdleScript, waitScript } from './browser-scripts';
-import { askSignIn, SIGNED_LINE_MS, type SignInChoice } from './sign-in';
+import { askSignIn, type SignInChoice } from './sign-in';
 
 /**
  * The window's side of the agent's browser tools (server/providers/browser-tool.ts): the bridge asks
@@ -196,20 +196,28 @@ async function pointAt(c: PageController, q: { ref?: string; selector?: string; 
  */
 const held = (tab: string) => !!getPage(tab).filled;
 
+/** A token from Electron main for this request, for the page that serves it (null where there is none: the dev build, sign-ins off). */
+async function attestFor(guestId: number | undefined): Promise<string | undefined> {
+  const fn = (desktop as { browser?: { attest?: (id: number) => Promise<string | null> } } | undefined)?.browser?.attest;
+  if (!fn || !guestId) return undefined;
+  return (await fn(guestId).catch(() => null)) ?? undefined;
+}
+
 export async function handleBrowserRequest(req: BrowserRequest) {
+  // Asked of main before the work starts, for the page that will serve it: the bridge believes main's
+  // word about this token (which page, whether it is or became held), never the answer's own.
+  const attest = await attestFor(controllers.get(activeTab(req.sessionId))?.guestId?.());
   let answer: BrowserAnswer;
   try {
-    answer = await serve(req);
+    answer = await serve(req, attest);
   } catch (err) {
     answer = { ok: false, error: (err as Error)?.message || 'The Browser tab could not do that.' };
   }
-  // Which page view the answer is of: the bridge holds back everything of a page Electron main holds for a sign-in.
-  const guestId = controllers.get(activeTab(req.sessionId))?.guestId?.();
-  if (guestId) answer = { ...answer, guestId };
+  if (attest) answer = { ...answer, attest };
   void respondBrowser(req.sessionId, req.id, answer);
 }
 
-async function serve(req: BrowserRequest): Promise<BrowserAnswer> {
+async function serve(req: BrowserRequest, attest?: string): Promise<BrowserAnswer> {
   if (!native && !devFrames) return { ok: false, weak: true, error: 'The Browser tab is only available in the desktop app.' };
   const st = useStore.getState();
   if (st.ui.activeSessionId !== req.sessionId) {
@@ -294,7 +302,7 @@ async function serve(req: BrowserRequest): Promise<BrowserAnswer> {
     return { ok: false, url, error: 'This page holds a sign-in. Scripts, screenshots and logs are refused until it loads another page (browser_navigate reload works); browser_snapshot and browser_read work.' };
   }
 
-  if (req.op === 'signIn') return marked(tab, 'signIn', () => signIn(req, c, url));
+  if (req.op === 'signIn') return marked(tab, 'signIn', () => signIn(req, c, url, attest ?? ''));
 
   if (req.op !== 'screenshot') return marked(tab, req.op, () => work(req, c, url));
 
@@ -454,60 +462,67 @@ export function signInAllowed(url: string): string | undefined {
 
 /** The desktop shell's sign-in calls (electron/preload.ts): main fills, the window never holds a saved password. */
 type SignInShell = {
-  begin(webContentsId: number, origin: string): Promise<{ ticket: string; hold: string; canSave: boolean }>;
-  fill(webContentsId: number, ticket: string, cred: { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string }): Promise<{ ok: boolean; signedIn?: boolean; user?: string; error?: string }>;
-  cancel(ticket: string): Promise<void>;
+  begin(webContentsId: number, origin: string, token: string): Promise<{ ticket: string; hold: string; canSave: boolean; address: string; action: string }>;
+  fill(webContentsId: number, ticket: string, cred: { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string }, token: string): Promise<{ ok: boolean; code: string; user?: string }>;
+  cancel(webContentsId: number, ticket: string, token: string, why: 'cancelled' | 'not-looking'): Promise<void>;
+  finish(webContentsId: number, hold: string, how: 'continue' | 'close'): Promise<boolean>;
 };
 const shell = () => (desktop as { browser?: { signIn?: SignInShell } } | undefined)?.browser?.signIn;
 
+/** After a fill, the person ends the hold from the tab's own line (BrowserAgentUi.tsx): Continue or Close. */
+export async function finishSignIn(tabId: string, how: 'continue' | 'close') {
+  const c = controllers.get(tabId);
+  const hold = getPage(tabId).hold;
+  const wc = c?.guestId?.();
+  if (!hold || !wc) return;
+  await shell()?.finish(wc, hold, how).catch(() => false);
+}
+
 /**
  * browser_sign_in on the tab's page. The agent named the fields; the person (or a sign-in they saved
- * for exactly this origin) supplies the values; Electron main loads the page again, fills that fresh
- * document and submits (electron/sign-in-core.ts). The window asks main for a ticket first, which
- * arms the hold before any card shows; it hands a typed password straight to main and never sees a
- * saved one. Only in the desktop app: the dev build's frame cannot sign in.
+ * for exactly this origin) supplies the values; Electron main fills and submits (electron/sign-in-core.ts).
+ * Every outcome the agent hears is main's, as a fixed code bound to this request's token: what this
+ * function answers itself is never passed on. Only in the desktop app: the dev build's frame cannot sign in.
  */
-async function signIn(req: BrowserRequest, c: PageController, url: string): Promise<BrowserAnswer> {
+async function signIn(req: BrowserRequest, c: PageController, url: string, token: string): Promise<BrowserAnswer> {
   const tab = c.tabId;
   const sh = shell();
   const wc = c.guestId?.() ?? 0;
-  if (!native || !sh || !wc) return { ok: false, url, error: 'sign-ins work only in the desktop app.' };
+  const no: BrowserAnswer = { ok: false, url };
+  if (!native || !sh || !wc || !token) return no;
   const origin = signInAllowed(url);
-  if (!origin) return { ok: false, url, error: 'Sable signs in only on https sites (and on localhost for tests).' };
-  if (req.expectOrigin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
+  if (!origin || req.expectOrigin !== origin) return no;
   const refs = { userRef: req.userRef ?? '', passRef: req.passRef ?? '', ...(req.submitRef ? { submitRef: req.submitRef } : {}) };
-  if (!/^e\d{1,6}$/.test(refs.userRef) || !/^e\d{1,6}$/.test(refs.passRef)) return { ok: false, url, error: 'Name the fields by their references from browser_snapshot.' };
+  if (!/^e\d{1,6}$/.test(refs.userRef) || !/^e\d{1,6}$/.test(refs.passRef)) return no;
+  // Where the fields stand, for the pointer only, read before main replaces the page (no value is read or written).
+  const probe = (await within(c.run(signInProbeScript(refs, false)), 5_000).catch(() => null)) as { error?: string; origin?: string; user?: Rect; pass?: Rect; submit?: Rect | null; vw?: number } | null;
 
-  // The ticket arms the hold (in main and here) before anything else: no tool of the agent reaches this page from now on.
   // The card is only for a person who is looking: this window focused and its Browser tab on screen.
   useStore.getState().setUi({ railOpen: true, railTab: 'browser' });
   const looking = () => document.visibilityState === 'visible' && document.hasFocus() && activeTab(c.sessionId) === tab && useStore.getState().ui.activeSessionId === c.sessionId;
-  if (!looking()) return { ok: false, url, error: 'the person is not looking at the Browser tab. Ask them to open it, then try again.' };
-  let begun: { ticket: string; hold: string; canSave: boolean };
+  if (!looking()) {
+    void sh.cancel(wc, '', token, 'not-looking').catch(() => {});
+    return no;
+  }
+  // Main arms the hold, loads the page again and finds its form before any card shows.
+  let begun: { ticket: string; hold: string; canSave: boolean; address: string; action: string };
   try {
-    begun = await sh.begin(wc, origin);
-  } catch (err) {
-    // Main's words (a form it will not fill, a sign-in already under way): plain, never a value.
-    const said = String((err as Error)?.message ?? '').replace(/^.*Error: /, '');
-    return { ok: false, url, error: (said || 'sign-ins are not available here.').slice(0, 200) };
+    begun = await sh.begin(wc, origin, token);
+  } catch {
+    return no;
   }
   setPage(tab, { filled: true, signing: true, hold: begun.hold });
   let filling = false;
   try {
-    // Where the fields stand, for the pointer only (no value is read or written here).
-    const probe = (await within(c.run(signInProbeScript(refs, false)), 5_000).catch(() => null)) as { error?: string; origin?: string; user?: Rect; pass?: Rect; submit?: Rect | null; vw?: number } | null;
-    if (!probe || probe.error) return { ok: false, url, error: String(probe?.error ?? 'The page did not answer.').slice(0, 300) };
-    if (probe.origin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
-
     const saved = await listSignIns(origin).catch(() => []);
     const here = () => signInAllowed(c.url() || getPage(tab).url) === origin && controllers.get(tab) === c;
     const alive = { cancelled: () => !here() || document.visibilityState !== 'visible' || activeTab(c.sessionId) !== tab };
-    // Always asked: the person chooses on the visible card every time, a saved sign-in too (nothing picks one by itself).
-    const choice: SignInChoice = await askSignIn({ tabId: tab, origin, saved, canSave: begun.canSave }, alive);
-    if (choice.kind === 'cancel') return { ok: false, url, error: here() ? 'the user cancelled the sign-in.' : 'the page moved on before the sign-in.' };
+    // Always asked: the person chooses on the visible card every time (nothing picks an entry by itself).
+    const choice: SignInChoice = await askSignIn({ tabId: tab, origin, address: begun.address, action: begun.action, saved, canSave: begun.canSave }, alive);
+    if (choice.kind === 'cancel') return no;
 
     // Watch it: the pointer goes to each field and the submit control; main then fills and sends.
-    if (c.point && probe.vw) {
+    if (c.point && probe?.vw && !probe.error) {
       for (const r of [probe.user, probe.pass, probe.submit]) {
         if (!r) continue;
         await c.point(r, probe.vw);
@@ -516,16 +531,14 @@ async function signIn(req: BrowserRequest, c: PageController, url: string): Prom
     }
     filling = true;
     const cred = choice.kind === 'saved' ? { kind: 'saved' as const, id: choice.id, username: choice.username } : { kind: 'typed' as const, username: choice.username, password: choice.password, save: choice.save };
-    const r = await sh.fill(wc, begun.ticket, cred).catch(() => ({ ok: false, error: 'the sign-in did not happen.' }) as { ok: boolean; signedIn?: boolean; user?: string; error?: string });
-    if (!r.ok || !r.signedIn) return { ok: false, url, error: String(r.error ?? 'the sign-in did not happen.').slice(0, 300) };
-    const user = String(r.user ?? '').slice(0, 200);
-    setPage(tab, { signedInAs: user });
-    setTimeout(() => getPage(tab).signedInAs === user && setPage(tab, { signedInAs: undefined }), SIGNED_LINE_MS);
-    return { ok: true, url: c.url() || getPage(tab).url, title: getPage(tab).title, signedIn: true, user };
+    const r = await sh.fill(wc, begun.ticket, cred, token).catch(() => ({ ok: false, code: 'failed' }) as { ok: boolean; code: string; user?: string });
+    if (!r.ok || r.code !== 'signed-in') return no;
+    setPage(tab, { signedInAs: String(r.user ?? '').slice(0, 200) });
+    return { ok: true, url };
   } finally {
     setPage(tab, { signing: undefined });
     // Nothing was handed to main: the ticket ends here, and with it the hold (main says when).
-    if (!filling) void sh.cancel(begun.ticket).catch(() => {});
+    if (!filling) void sh.cancel(wc, begun.ticket, token, 'cancelled').catch(() => {});
   }
 }
 

@@ -66,7 +66,7 @@ import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
 import { allowsEverything, withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
-import { registerSignIns } from './services/sign-ins';
+import { anyPageHeld, registerSignIns } from './services/sign-ins';
 import { CUSTOM_AGENT_ONLY, customAgent, customOf } from './services/custom';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
@@ -4122,7 +4122,8 @@ export class App {
     this.register('browser.page', ({ sessionId, page }) => {
       const rt = this.sessions.get(sessionId);
       if (!rt) return { ok: false };
-      rt.browserPage = page && typeof page.url === 'string' ? { url: page.url.slice(0, 2000), title: String(page.title ?? '').slice(0, 300) } : null;
+      // A page held for a sign-in: its address and title are not even kept (they would reach the next message after the hold).
+      rt.browserPage = page && typeof page.url === 'string' && !anyPageHeld() ? { url: page.url.slice(0, 2000), title: String(page.title ?? '').slice(0, 300) } : null;
       return { ok: true };
     });
     // The Browser tab's saved sign-ins (desktop windows only: not on the phone's allowlist).

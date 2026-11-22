@@ -373,8 +373,12 @@ export interface BrowserAnswer {
   /** signIn: whether the page was signed in, and as whom (the user name only, never the password). */
   signedIn?: boolean;
   user?: string;
-  /** The desktop's page view the answer is of (its webContents id): the bridge holds back a page held for a sign-in. */
-  guestId?: number;
+  /**
+   * A token Electron main issued to the window for this request (electron/sign-in-core.ts `Attestations`):
+   * the bridge asks main what it stands for (which page served it, whether that page is held, a
+   * sign-in's outcome) and never believes the answer's own claims.
+   */
+  attest?: string;
 }
 
 /** A saved sign-in as the windows see it: never the password (`server/services/sign-ins.ts`). */

@@ -1,6 +1,6 @@
 import type { BrowserAnswer, BrowserRequest, PermissionOption, SessionMeta, ToolDetail, ToolItem } from '../../shared/protocol';
 import type { SessionRuntime } from '../core/runtime';
-import { anyPageHeld, deliveryHeld, onSignInShips, signInOrigin, signInShips } from '../services/sign-ins';
+import { anyPageHeld, deliveryCheck, onSignInShips, signInOrigin, signInShips } from '../services/sign-ins';
 import { WIDGET_SERVER } from './widget-tool';
 
 /**
@@ -278,9 +278,14 @@ export function browserTitle(op: BrowserOp, url?: string, input?: unknown, targe
 /** A call before it ran: open knows its address; the others learn it when they run (or from the result's first line). */
 export function describeBrowser(name: string, input: unknown, resultText?: string): { kind: 'browser'; title: string; detail: ToolDetail } {
   const op = browserOp(name) ?? 'read';
-  const o = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
-  let url = typeof o.url === 'string' && isHttpUrl(o.url) ? o.url : undefined;
-  if (!url && resultText) url = /^(?:Page: |Screenshot of |Opened )(https?:\/\/[^\s,()]+)/m.exec(resultText)?.[1];
+  // Display fields come from the cleaned input only, and an address without its query or fragment (a token may live there).
+  const clean = cleanToolInput(name, input);
+  const o = (clean && typeof clean === 'object' ? clean : {}) as Record<string, unknown>;
+  let url = typeof o.url === 'string' && isHttpUrl(o.url) ? bareUrl(o.url) : undefined;
+  if (!url && resultText) {
+    const said = /^(?:Page: |Screenshot of |Opened )(https?:\/\/[^\s,()]+)/m.exec(resultText)?.[1];
+    url = said ? bareUrl(said) : undefined;
+  }
   return { kind: 'browser', title: browserTitle(op, url, o), detail: url ? { url } : {} };
 }
 
@@ -486,18 +491,47 @@ export function formatWork(op: BrowserOp, o: Record<string, unknown>, a: Browser
 const KEY_RE =/^(?:(?:Control|Ctrl|Shift|Alt|Meta|Cmd)\+){0,3}(?:[A-Za-z][A-Za-z0-9]{1,14}|[\x21-\x7e])$/;
 
 /** What every tool answers while the page is held for a sign-in. */
-export const BROWSER_HELD = 'The page in the Browser tab is held for a sign-in: nothing of it reaches you until it loads another page.';
+export const BROWSER_HELD = 'The page in the Browser tab is held for a sign-in: nothing of it reaches you until the user gives it back.';
 
 /**
- * Asks the window, and holds the answer back at delivery when it is of a page Electron main holds
- * for a sign-in (services/sign-ins.ts `deliveryHeld`): an answer that was already on its way when the
- * hold began is held back too. Only the sign-in's own answer passes (it carries the user name alone).
+ * Asks the window, and holds the answer back at delivery when main attests that the page that served
+ * it is held, or that a hold began on it while the request ran (services/sign-ins.ts `deliveryCheck`).
+ * The answer's own claims count for nothing: only main's attestation of its token.
  */
 async function ask(rt: SessionRuntime, req: Omit<BrowserRequest, 'id' | 'sessionId'>, timeout: number, signal?: AbortSignal): Promise<BrowserAnswer> {
   const a = await rt.browserRequest(req, timeout, signal);
-  if (req.op !== 'signIn' && deliveryHeld(a.guestId)) return { ok: false, error: BROWSER_HELD };
+  if (deliveryCheck(a.attest).held) return { ok: false, error: BROWSER_HELD };
   return a;
 }
+
+/** The agent's words for main's sign-in outcomes: fixed, so nothing a page or a window writes reaches it. */
+export const SIGN_IN_TEXT: Record<string, string> = {
+  cancelled: 'the user cancelled the sign-in.',
+  'not-looking': 'the user is not looking at the Browser tab. Ask them to open it, then try again.',
+  unavailable: 'sign-ins are not available here.',
+  busy: 'a sign-in is already under way on this page, or the page still holds one the user has not given back.',
+  'not-approved': 'the sign-in was not approved for this page.',
+  expired: 'the sign-in waited too long.',
+  gone: 'the page is gone.',
+  'changed-before': 'the page changed before the sign-in.',
+  'moved-on-load': 'the page went somewhere else when it loaded again.',
+  replaced: 'the page was replaced before the sign-in could be filled.',
+  moved: 'the page moved to another site before the sign-in.',
+  several: 'the page has more than one password field, so Sable does not know which form signs in.',
+  noform: 'the page shows no sign-in form.',
+  nouser: 'the sign-in form has no user name field.',
+  otherform: 'the sign-in form is not the one the user approved.',
+  method: 'the sign-in form does not send with POST, so Sable does not fill it.',
+  action: 'the sign-in form sends to another site, so Sable does not fill it.',
+  target: 'the sign-in form sends to another window or frame, so Sable does not fill it.',
+  'no-user': 'no user name was given.',
+  'no-password': 'no password was given.',
+  unreadable: 'the saved sign-in cannot be read on this computer.',
+  damaged: 'the saved sign-in is damaged and was not used.',
+  changed: 'the sign-in form changed while it was being filled; it was not sent.',
+  failed: 'the sign-in did not happen.',
+  'still-form': 'the page still shows the sign-in form; it may have refused the user name or password.',
+};
 
 /**
  * The input of a browser step as it may stand in the timeline. For browser_sign_in only references
@@ -508,6 +542,9 @@ async function ask(rt: SessionRuntime, req: Omit<BrowserRequest, 'id' | 'session
  * Whether a name is Sable's own browser_sign_in, exactly: the bare name (Codex's dynamic tool, the Demo) or
  * the name under Sable's own MCP server (Claude Code). Another server's tool that ends the same is not it.
  */
+/** The namespace Codex lists Sable's deferred browser tools under (codex.ts BROWSER_NAMESPACE is this). */
+export const SABLE_BROWSER_NAMESPACE = 'sable_browser';
+
 export const isSignInTool = (name: string | undefined) => name === BROWSER_TOOLS.sign_in || name === `mcp__${WIDGET_SERVER}__${BROWSER_TOOLS.sign_in}`;
 
 export function cleanToolInput(name: string | undefined, input: unknown): unknown {
@@ -671,13 +708,16 @@ async function signIn(rt: SessionRuntime, o: Record<string, unknown>, url: strin
   // While the card may wait for the person: a phone shows this line, and the card is the desktop's to answer.
   title(`Sign-in on ${host} waits on the desktop`);
   const a = await rt.browserRequest({ op: 'signIn', userRef: refs.username_ref, passRef: refs.password_ref, submitRef: refs.submit_ref, expectOrigin: origin }, SIGN_IN_TIMEOUT, signal);
-  const user = typeof a.user === 'string' ? clipLine(a.user.replace(/[\u0000-\u001f\u007f]/g, ''), 100) : '';
-  if (a.ok && a.signedIn) {
+  // Only main's outcome counts, as a fixed code bound to this request's token: the window's own words never reach the agent.
+  const outcome = deliveryCheck(a.attest).signIn;
+  const code = outcome && SIGN_IN_TEXT[outcome.code] !== undefined ? outcome.code : outcome?.code === 'signed-in' ? 'signed-in' : 'failed';
+  const user = outcome?.user ? clipLine(outcome.user.replace(/[\u0000-\u001f\u007f]/g, ''), 100) : '';
+  if (code === 'signed-in') {
     title(user ? `Signed in on ${host} as ${short(user, 40)}` : `Signed in on ${host}`);
-    return { ok: true, text: `Signed in on ${origin}${user ? ` as ${user}` : ''}. Sable filled and submitted the form itself; the password is never shown to you. Take a browser_snapshot to see the page now.` };
+    return { ok: true, text: `Signed in on ${origin}${user ? ` as ${user}` : ''}. Sable filled and submitted the form itself; the password is never shown to you. The user looks at the page first and gives it back to you; until then the Browser tab tools answer that it is held.` };
   }
   title(`Sign in on ${host}`);
-  return fail(`Not signed in: ${clipLine(a.error ?? 'the sign-in did not happen.', 200)}`);
+  return fail(`Not signed in: ${SIGN_IN_TEXT[code]}`);
 }
 
 /** Codex's `item/tool/call` answer for a browser tool (text, and the picture as an image item). */

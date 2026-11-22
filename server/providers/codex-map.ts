@@ -23,7 +23,7 @@ import type {
 } from '../../shared/protocol';
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
 import { WIDGET_TOOL, describeWidget, isWidgetTool } from './widget-tool';
-import { browserOp, cleanToolInput, describeBrowser } from './browser-tool';
+import { browserOp, cleanToolInput, describeBrowser, SABLE_BROWSER_NAMESPACE } from './browser-tool';
 import { describeDevice, deviceOp } from './device-tool';
 import { agentOfTool, describeAgentCall } from './agent-tool';
 import { describeProfileCall, isProfileTool } from './profile-tool';
@@ -659,8 +659,9 @@ export function draftItem(item: ThreadItem, opts: { streaming?: boolean } = {}):
           ...(status !== 'running' ? { result: { text, isError: status === 'error' || undefined }, endedAt: done(status) } : {}),
         });
       }
-      // The Browser tab tools: one line with the host, the picture in the details.
-      if (browserOp(item.tool)) {
+      // The Browser tab tools: one line with the host, the picture in the details. Only Sable's own: a bare name or
+      // Sable's namespace; another namespace's tool of the same leaf name goes through the generic mapper below.
+      if (browserOp(item.tool) && (!item.namespace || item.namespace === SABLE_BROWSER_NAMESPACE)) {
         const images = (item.contentItems as { type: string; imageUrl?: string }[] | null | undefined)?.flatMap((c) => (c.type === 'inputImage' && c.imageUrl?.startsWith('data:image/') ? [c.imageUrl] : [])) ?? [];
         const plain = item.contentItems?.filter((c) => c.type === 'inputText').map((c) => c.text ?? '').join('\n');
         return tool({

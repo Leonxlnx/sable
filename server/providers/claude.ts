@@ -2745,7 +2745,8 @@ class ClaudeSession implements ProviderSession {
           if (b.type === 'text' && b.text) push({ type: 'text', text: b.text, streaming: false, parentId });
           else if (b.type === 'thinking' && b.thinking) push({ type: 'thinking', text: b.thinking, streaming: false, endedAt: real, parentId });
           else if (b.type === 'tool_use') {
-            let input: Obj = b.input ?? {};
+            // Read back from a transcript (child steps too): browser_sign_in keeps only valid references.
+            let input: Obj = cleanToolInput(b.name, b.input ?? {}) as Obj;
             // The plan lives in the plan file the agent wrote just before; the stored call is often empty.
             if ((b.name === 'Write' || b.name === 'Edit') && isPlanFile(input.file_path)) planDraft = b.name === 'Write' ? input.content : planDraft;
             if (b.name === 'ExitPlanMode' && planDraft) input = { ...input, plan: planDraft };

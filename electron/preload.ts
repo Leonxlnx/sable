@@ -76,11 +76,15 @@ contextBridge.exposeInMainWorld('sableDesktop', {
      * Saved sign-ins (electron/sign-in.ts): main fills the page itself. `begin` arms the hold and gives a
      * ticket for the page's document; `fill` answers only whether it signed in and the user name.
      */
+    /** A token from main for one request of the agent's tools, served by this page (electron/sign-in-core.ts Attestations). */
+    attest: (webContentsId: number): Promise<string | null> => ipcRenderer.invoke('sable:browser-attest', Number(webContentsId)),
     signIn: {
-      begin: (webContentsId: number, origin: string): Promise<{ ticket: string; canSave: boolean }> => ipcRenderer.invoke('sable:signin-begin', Number(webContentsId), String(origin)),
-      fill: (webContentsId: number, ticket: string, cred: { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string }): Promise<{ ok: boolean; signedIn?: boolean; user?: string; error?: string }> =>
-        ipcRenderer.invoke('sable:signin-fill', Number(webContentsId), String(ticket), cred),
-      cancel: (ticket: string): Promise<void> => ipcRenderer.invoke('sable:signin-cancel', String(ticket)),
+      begin: (webContentsId: number, origin: string, token: string): Promise<{ ticket: string; hold: string; canSave: boolean; address: string; action: string }> =>
+        ipcRenderer.invoke('sable:signin-begin', Number(webContentsId), String(origin), String(token)),
+      fill: (webContentsId: number, ticket: string, cred: { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string }, token: string): Promise<{ ok: boolean; code: string; user?: string }> =>
+        ipcRenderer.invoke('sable:signin-fill', Number(webContentsId), String(ticket), cred, String(token)),
+      cancel: (webContentsId: number, ticket: string, token: string, why: 'cancelled' | 'not-looking'): Promise<void> => ipcRenderer.invoke('sable:signin-cancel', Number(webContentsId), String(ticket), String(token), why),
+      finish: (webContentsId: number, hold: string, how: 'continue' | 'close'): Promise<boolean> => ipcRenderer.invoke('sable:signin-finish', Number(webContentsId), String(hold), how),
     },
     /** Which page is in front: the others are muted and slowed down by the shell. */
     setShown: (webContentsId: number, shown: boolean) => ipcRenderer.send('sable:browser-shown', Number(webContentsId), !!shown),

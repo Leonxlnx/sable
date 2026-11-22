@@ -11,7 +11,7 @@ import { useStore } from '@/state/store';
 import { IconButton, Menu, MenuContent, MenuItem, MenuSep, MenuTrigger, Spinner, Tip } from '@/ui';
 import { createPointer, type AgentPointer } from './agent-pointer';
 import { AgentLine, SignInCard } from './BrowserAgentUi';
-import { readScript, registerPage, type PageController } from './browser-agent';
+import { finishSignIn, readScript, registerPage, type PageController } from './browser-agent';
 import { connectDevFrame } from './dev-frame';
 import { cancelSignIn } from './sign-in';
 import { parseKey, pickCancelScript, pickScript, type Picked } from './browser-scripts';
@@ -353,6 +353,8 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
           /* not attached yet */
         }
         if (v.wcId) syncShown();
+        // A new page view starts with no sign-in hold of its own: one an earlier view had (whose release may have been missed) is not inherited.
+        if (v.wcId) setPage(tid, { filled: undefined, hold: undefined, signing: undefined, signedInAs: undefined });
       };
       on('did-attach', learnId);
       on('dom-ready', () => {
@@ -531,7 +533,7 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         logDropped(v.tabId, e.count ?? 0);
       } else if (e.type === 'hang') setPage(v.tabId, { hung: e.on ? true : undefined });
       // Electron main ended a sign-in's hold (a new document replaced the filled one, or nothing was filled).
-      else if (e.type === 'signin-released' && e.hold && getPage(v.tabId).hold === e.hold) setPage(v.tabId, { filled: undefined, signing: undefined, hold: undefined });
+      else if (e.type === 'signin-released' && e.hold && getPage(v.tabId).hold === e.hold) setPage(v.tabId, { filled: undefined, signing: undefined, hold: undefined, signedInAs: undefined });
       else if (e.type === 'flood') setPage(v.tabId, { flooded: true });
     });
     const all = views.current;
@@ -1008,7 +1010,7 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         </div>
       )}
 
-      <AgentLine key={`line:${tabId}`} tabId={tabId} provider={provider} running={running} onStop={stopAgent} />
+      <AgentLine key={`line:${tabId}`} tabId={tabId} provider={provider} running={running} onStop={stopAgent} onFinish={(how) => void finishSignIn(tabId, how)} />
 
       <div className="bw-view" ref={viewBox} data-device={stage ? page.device : undefined} data-empty={!page.url || undefined}>
         {stageInfo && (

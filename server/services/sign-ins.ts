@@ -101,6 +101,59 @@ import type { App } from '../app';
  *      page may carry it off by means no HTTP rule sees (a WebSocket, storage kept for later).
  *   5. Once signed in, the agent acts in that session, and the Browser tab's pages share one stored
  *      profile: a site that keeps a token where scripts can read it gives it to the agent's eval.
+ *
+ * The third review (scratch/reviews/out-day5e.md, of a8ac3ac) said no again; its numbers. Third
+ * rebuild, still off (`SIGN_IN_SHIPS` false); 10 and 11 were fixed apart (a191459, b73141f).
+ *   2. A page that came back from the submit with the password still in a field was handed to the
+ *      agent by its navigation. Now: after a fill no navigation releases the hold (`SignInGate.committed`
+ *      releases nothing); the person ends it on the tab's own line, Continue (they have seen the page;
+ *      the agent gets it as it is) or Close page (it goes blank first), and `HOLD_MS` closes it by itself
+ *      (`SignInGate.finish`). Open: a person who presses Continue on a page that still shows the
+ *      password hands it over; the line says Continue gives the agent the page.
+ *   3. The guard let any same-origin POST pass. Now: only the approved submission carries a body (the
+ *      page's own navigation, `mainFrame`, a POST to exactly the approved action, origin, path and
+ *      query); its redirects are judged again by Electron's request id (a 307 or 308 that keeps the body
+ *      must still go to the action), with no shared redirect record; a header holding the password
+ *      cancels its request (`requestVerdict`, `headerVerdict`, `onBeforeSendHeaders`). Open: that
+ *      Electron calls `onBeforeRequest` again for a redirect is not verified in the pinned binary; a
+ *      site that signs in by script (fetch) cannot be used.
+ *   4. The bridge believed the answer's page id and the window's words. Now: before it serves a request
+ *      the window asks main for a token for the page that serves it (`sable:browser-attest`, only for a
+ *      guest that window hosts); the answer carries the token and the bridge asks main, in-process, what
+ *      it stands for (`Attestations.take` through `deliveryCheck`): the page, whether it is held or a hold
+ *      began on it while the request ran (an epoch per guest). A token is unguessable, single-use and
+ *      expires; an answer without one is held back while any page is held. A sign-in's outcome is main's
+ *      fixed code bound to that token (`SIGN_IN_CODES`), turned into words by the bridge
+ *      (`SIGN_IN_TEXT`); nothing the window writes reaches the agent. Open: a compromised app window can
+ *      still ask for a token for a page it hosts; the document is noted by the epoch, not by a document id.
+ *   5. Held metadata and attached pictures slipped past. Now: a page report that arrives while a page is
+ *      held is not kept (app.ts `browser.page`); before / after takes no picture while a page is held
+ *      (capture.ts); main refuses every capture of a held page, the person's own attachment included.
+ *   6. The card named an origin only, and a same-origin path change passed. Now: `begin` loads the page
+ *      again before any card and main describes the fresh form there (`stampScript`); the card shows the
+ *      page's address and where its form sends; the fill checks the exact action (origin, path, query) and
+ *      the same number of controls before any value and again before the submit.
+ *   7. Raw arguments reached display fields and history. Now: display fields are derived from cleaned
+ *      input, and an address is shown without its query or fragment (`describeBrowser`); a transcript read
+ *      back cleans browser_sign_in's input, child steps included (claude.ts); a Codex tool of another
+ *      namespace with the same leaf name keeps its namespace and arguments (codex-map.ts).
+ *   8. A saved entry could be used by Enter without a choice, and the sentence was not always there.
+ *      Now: nothing is chosen when the card opens, focus goes to the first entry (or the user name),
+ *      Sign in is no default button (Enter signs in only from the typed password), and the risk sentence
+ *      shows on every use, saved or once; the vault's own sentence where a sign-in is saved.
+ *   9. A hidden card could keep a page held forever, and a new page view inherited a hold. Now: an
+ *      unfilled ticket ends by time in main (`TICKET_MS`), and a new page view starts with no hold.
+ *  12. Tests stopped short of their boundary. Now: delivery is asserted at each tool's own answer through
+ *      real attestations; native serialization, a same-origin path change, an added control, a replaced
+ *      document and a field moved into a frame in a real browser; the hold's end by person, close and
+ *      timeout. Open: the card's activation is not driven in a rendered card (no DOM test here).
+ *
+ * The limit no code removes, for the owner to decide (review 3, finding 1; with 3 and 5 of the second):
+ *   An agent that can run a command runs it as the person, and what Windows protects for the person
+ *   (safeStorage, DPAPI) is readable by any program that runs as the person, agents included; the same
+ *   holds for a browser's own saved passwords. Sable does not build around it. The person reads, where a
+ *   sign-in is saved: "Saved like your browser's passwords: safe from other people on this computer, not
+ *   from programs or agents that run as you." (`SIGN_IN_SAVED_RISK`).
  */
 
 /** Saved sign-ins ship at all. Tests of its code turn it on with `setSignInShips`. */
@@ -131,7 +184,12 @@ export const SIGN_IN_OFF = 'SIGN_IN_OFF: sign-ins are not available in this vers
  * Absent (no desktop shell, or sign-ins off): nothing is held.
  */
 export interface SignInHolds {
-  held(guestId: number): boolean;
+  /**
+   * What main attests about an answer's token (electron/sign-in-core.ts `Attestations`): the guest that
+   * served it, whether that guest is held or a hold began on it while the request ran, and for a sign-in
+   * main's own outcome as a fixed code. Once per token; undefined for a token main never issued.
+   */
+  take(token: unknown): { guestId: number; held: boolean; signIn?: { code: string; user?: string } } | undefined;
   anyHeld(): boolean;
 }
 
@@ -141,10 +199,16 @@ export function setSignInHolds(h: SignInHolds | undefined) {
   holds = h;
 }
 
-/** An answer from that guest (or, when it does not say which, from any guest while one is held) must not reach the agent. */
-export function deliveryHeld(guestId: number | undefined): boolean {
-  if (!holds) return false;
-  return typeof guestId === 'number' && guestId > 0 ? holds.held(guestId) : holds.anyHeld();
+/**
+ * At delivery of a window's answer: whether it must not reach the agent, and main's outcome of a
+ * sign-in. The answer's own claims are never believed: only main's attestation of its token counts,
+ * and an answer without a token main issued is held back while any page is held.
+ */
+export function deliveryCheck(token: unknown): { held: boolean; signIn?: { code: string; user?: string } } {
+  if (!holds) return { held: false };
+  const a = holds.take(token);
+  if (!a) return { held: holds.anyHeld() };
+  return { held: a.held, ...(a.signIn ? { signIn: a.signIn } : {}) };
 }
 
 /** Some page is held: the line about the Browser tab's page (address and title) is left out. */

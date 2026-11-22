@@ -17,6 +17,9 @@ export interface SignInAsk {
   tabId: string;
   /** Scheme, host and port as the browser has them: what the card shows, large. */
   origin: string;
+  /** The page's address (origin and path) and where its form sends, as Electron main found them in the fresh page. */
+  address: string;
+  action: string;
   /** Saved for exactly this origin: each one is offered on the card, and the person picks (nothing picks one by itself). */
   saved: SignInInfo[];
   /** This computer can save a sign-in (the desktop's safeStorage); else the card says it is used once. */

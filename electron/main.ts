@@ -516,8 +516,8 @@ function hardenBrowser() {
     if (!fromApp(e)) throw new Error('Not allowed');
     const guest = webContents.fromId(Number(id));
     if (!guest || guest.getType() !== 'webview' || guest.hostWebContents !== e.sender) throw new Error('That page is gone');
-    // No picture for the agent while a sign-in is under way or a filled document is still shown.
-    if (forAgent === true && signInHeld(guest.id)) throw new Error('A sign-in holds this page');
+    // No picture of a page held for a sign-in: neither for the agent nor for a message (it would be sent on).
+    if (signInHeld(guest.id)) throw new Error('A sign-in holds this page');
     // A page that hangs may never paint again: the capture gives up rather than keep the caller waiting.
     const image = await Promise.race([guest.capturePage(), sleep(8000).then(() => Promise.reject(new Error('The page did not answer in time')))]);
     const { width, height } = image.getSize();

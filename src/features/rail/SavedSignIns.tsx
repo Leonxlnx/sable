@@ -4,7 +4,7 @@ import { listSignIns, removeSignIn } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton } from '@/ui';
 import { Card, Empty } from '../settings/parts';
-import { SIGN_IN_RISK } from './BrowserAgentUi';
+import { SIGN_IN_RISK, SIGN_IN_SAVED_RISK } from './BrowserAgentUi';
 import { originParts } from './sign-in';
 import './saved-sign-ins.css';
 
@@ -56,7 +56,9 @@ export function SavedSignIns() {
           </ul>
         )}
       </Card>
-      <p className="set-foot-note">{SIGN_IN_RISK}</p>
+      <p className="set-foot-note">
+        {SIGN_IN_SAVED_RISK} {SIGN_IN_RISK}
+      </p>
     </>
   );
 }

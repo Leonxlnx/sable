@@ -3,7 +3,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright-core';
-import { describeScript, fillScript, formEncode, requestVerdict, stampScript, stillThereScript, type FormPin } from '../electron/sign-in-core';
+import { fillScript, formEncode, requestVerdict, stampScript, stillThereScript } from '../electron/sign-in-core';
 import { signInProbeScript, snapshotScript } from '../src/features/rail/browser-scripts';
 
 /**
@@ -73,20 +73,21 @@ describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
     await browser?.close();
   }, 30_000);
 
-  /** begin's description, then the fresh document's stamp, as main does them (here in one document). */
+  /** The fresh document's stamp, as main does it at begin; the action it found is what the fill must still find. */
+  let action = '';
   const prepare = async (p: Page, path: string) => {
     await p.goto(`${a.url}${path}`);
-    const pin = (await p.evaluate(describeScript(a.url))) as FormPin & { error?: string };
-    if (pin.error) return { error: pin.error };
-    const stamp = (await p.evaluate(stampScript('n0nce', a.url, pin))) as { ok?: boolean; error?: string };
-    return stamp.ok ? { pin } : { error: stamp.error };
+    const stamp = (await p.evaluate(stampScript('n0nce', a.url))) as { ok?: boolean; error?: string; action?: string };
+    action = stamp.action ?? '';
+    return stamp.ok ? { pin: stamp.action } : { error: stamp.error };
   };
+  const fillNow = (p: Page) => p.evaluate(fillScript('n0nce', a.url, action, 'student.one', PASSWORD));
   const state = (p: Page) => p.evaluate(`({ submitted: window.submitted, pass: (document.getElementById('p') || {}).value || '' })`) as Promise<{ submitted: unknown; pass: string }>;
 
   it('a same-origin POST form is filled and submitted', async () => {
     const p = await browser.newPage();
     expect(await prepare(p, '/')).toHaveProperty('pin');
-    expect(await p.evaluate(fillScript('n0nce', a.url, 'student.one', PASSWORD))).toEqual({ ok: true });
+    expect(await fillNow(p)).toEqual({ ok: true });
     expect((await state(p)).submitted).toEqual({ user: 'student.one', pass: true });
     expect(await p.evaluate(stillThereScript('n0nce'))).toEqual({ gone: false });
     await p.close();
@@ -107,15 +108,30 @@ describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
       expect((await state(p)).pass, path).toBe('');
       await p.close();
     }
-  });
+  }, 30_000);
 
   it('an action changed after the stamp is caught by the fill before any value is set', async () => {
     const p = await browser.newPage();
     await prepare(p, '/');
     await p.evaluate(`document.getElementById('f').action = ${JSON.stringify(`${b.url}/steal`)}`);
-    expect(await p.evaluate(fillScript('n0nce', a.url, 'student.one', PASSWORD))).toEqual({ error: 'action' });
+    expect(await fillNow(p)).toEqual({ error: 'action' });
     expect((await state(p)).pass).toBe('');
     await p.close();
+  });
+
+  it('the approved action exactly: another path on the same origin after the stamp, or a control added, stops the fill before any value', async () => {
+    const path = await browser.newPage();
+    await prepare(path, '/');
+    await path.evaluate(`document.getElementById('f').action = '/collect'`);
+    expect(await fillNow(path)).toEqual({ error: 'otherform' });
+    expect((await state(path)).pass).toBe('');
+    await path.close();
+    const added = await browser.newPage();
+    await prepare(added, '/');
+    await added.evaluate(`const i = document.createElement('input'); i.name = 'extra'; document.getElementById('f').appendChild(i);`);
+    expect(await fillNow(added)).toEqual({ error: 'replaced' });
+    expect((await state(added)).pass).toBe('');
+    await added.close();
   });
 
   it('a stamped document opened anew, or its form replaced, is not filled', async () => {
@@ -123,13 +139,13 @@ describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
     await prepare(reopened, '/');
     // document.open() keeps the window (and the stamp's world) but replaces the document's content.
     await reopened.evaluate(`document.open(); document.write(${JSON.stringify(page(FORM()))}); document.close();`);
-    expect(await reopened.evaluate(fillScript('n0nce', a.url, 'student.one', PASSWORD))).toEqual({ error: 'replaced' });
+    expect(await fillNow(reopened)).toEqual({ error: 'replaced' });
     expect((await state(reopened)).pass).toBe('');
     await reopened.close();
     const swapped = await browser.newPage();
     await prepare(swapped, '/');
     await swapped.evaluate(`document.getElementById('f').outerHTML = document.getElementById('f').outerHTML`);
-    expect(await swapped.evaluate(fillScript('n0nce', a.url, 'student.one', PASSWORD))).toEqual({ error: 'replaced' });
+    expect(await fillNow(swapped)).toEqual({ error: 'replaced' });
     expect((await state(swapped)).pass).toBe('');
     await swapped.close();
   });
@@ -137,7 +153,7 @@ describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
   it('a field moved into a frame by the page during the fill\'s events stops the submit', async () => {
     const p = await browser.newPage();
     await prepare(p, '/mover');
-    expect(await p.evaluate(fillScript('n0nce', a.url, 'student.one', PASSWORD))).toEqual({ error: 'changed' });
+    expect(await fillNow(p)).toEqual({ error: 'changed' });
     expect((await state(p)).submitted).toBeNull();
     await p.close();
   });
@@ -156,10 +172,14 @@ describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
       expect(sent, path).toBeTruthy();
       expect(sent.body + sent.url, path).toContain(formEncode(PASSWORD));
       // The same request sent anywhere else: cancelled (the body, or the address that holds the password).
-      const elsewhere = { url: `https://evil.example.test${sent.url}`, method: sent.method, ...(sent.method === 'POST' ? { body: [new TextEncoder().encode(sent.body)] } : {}) };
-      expect(requestVerdict(elsewhere, { origin: a.url, password: PASSWORD }), path).toBe('cancel');
+      const guard = () => ({ origin: a.url, action: `${a.url}/session`, password: PASSWORD, passed: new Set<number>() });
+      const bodyOf = sent.method === 'POST' ? { body: [new TextEncoder().encode(sent.body)] } : {};
+      const elsewhere = { url: `https://evil.example.test${sent.url}`, method: sent.method, resourceType: 'mainFrame', ...bodyOf };
+      expect(requestVerdict(elsewhere, guard()), path).toBe('cancel');
+      // The browser's own POST to exactly the approved action passes.
+      if (sent.method === 'POST') expect(requestVerdict({ url: `${a.url}${sent.url}`, method: 'POST', resourceType: 'mainFrame', ...bodyOf }, guard())).toBe('allow');
       // A GET to the right origin that holds it in its address: cancelled too.
-      if (sent.method === 'GET') expect(requestVerdict({ url: `${a.url}${sent.url}`, method: 'GET' }, { origin: a.url, password: PASSWORD })).toBe('cancel');
+      if (sent.method === 'GET') expect(requestVerdict({ url: `${a.url}${sent.url}`, method: 'GET' }, guard())).toBe('cancel');
       await p.close();
     }
   });
@@ -171,9 +191,8 @@ describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
     await frame.waitForSelector('#p');
     const top = (await p.evaluate(snapshotScript(4000))) as { text: string };
     expect(top.text).not.toMatch(/password field/);
-    expect(await frame.evaluate(describeScript(b.url))).toEqual({ error: 'moved' });
-    expect(await frame.evaluate(stampScript('n0nce', b.url, { action: `${b.url}/session`, user: 'username', pass: 'password' }))).toEqual({ error: 'moved' });
-    expect(await frame.evaluate(fillScript('n0nce', b.url, 'student.one', PASSWORD))).toEqual({ error: 'replaced' });
+    expect(await frame.evaluate(stampScript('n0nce', b.url))).toEqual({ error: 'moved' });
+    expect(await frame.evaluate(fillScript('n0nce', b.url, `${b.url}/session`, 'student.one', PASSWORD))).toEqual({ error: 'replaced' });
     expect(await frame.evaluate(`document.getElementById('p').value`)).toBe('');
     expect(await frame.evaluate(signInProbeScript({ userRef: 'e1', passRef: 'e2' }))).toMatchObject({ error: expect.stringMatching(/never inside a frame|no longer points/) });
     await p.close();

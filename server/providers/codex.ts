@@ -38,7 +38,7 @@ import type { Provider, ProviderContext, ProviderSession, SendOptions } from './
 import { codexPlan } from './plans';
 import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import { WIDGET_DESCRIPTION, WIDGET_FENCE_HINT, WIDGET_INPUT_SCHEMA, WIDGET_TOOL, dynamicToolAnswer, widgetsEnabled } from './widget-tool';
-import { BROWSER_CORE, BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOLS, browserDynamicAnswer, browserOp, browserTabEnabled } from './browser-tool';
+import { BROWSER_CORE, BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOLS, browserDynamicAnswer, browserOp, browserTabEnabled, SABLE_BROWSER_NAMESPACE } from './browser-tool';
 import { DEVICE_CORE, DEVICE_DESCRIPTIONS, DEVICE_HINT, DEVICE_INPUT_SCHEMAS, DEVICE_NAMESPACE, DEVICE_NAMESPACE_DESCRIPTION, DEVICE_OPS, DEVICE_TOOLS, deviceDynamicAnswer, deviceEnabled, deviceOp } from './device-tool';
 import { CodexRpc, RpcError, resolveCodexCommand, type ExitInfo } from './codex-rpc';
 import { serviceTierFor } from './codex-map';
@@ -243,7 +243,7 @@ export function titleTurnParams(threadId: string, prompt: TitlePrompt, effort?: 
 }
 
 /** The namespace that holds the deferred Browser tab tools. */
-export const BROWSER_NAMESPACE = 'sable_browser';
+export const BROWSER_NAMESPACE = SABLE_BROWSER_NAMESPACE;
 const BROWSER_NAMESPACE_DESCRIPTION = "Tools that work the page open in Sable's Browser tab: snapshot, click, type, press, scroll, evaluate, logs, wait, navigate.";
 
 /** Codex's asks for approval (not its questions, which always wait for the person). */
