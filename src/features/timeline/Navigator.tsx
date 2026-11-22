@@ -666,8 +666,17 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
         closeIndex();
       }
     };
+    // The palette's "Go to a message": the first conversation on screen answers (in a race, the left one).
+    const onAsk = () => {
+      if (!marksRef.current.length || document.querySelector('.tl') !== track.current?.closest('.tl')) return;
+      if (paneRef.current !== 'open') openIndex();
+    };
     window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('sable:go-to-message', onAsk);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('sable:go-to-message', onAsk);
+    };
   }, [openIndex, closeIndex]);
 
   useEffect(() => {

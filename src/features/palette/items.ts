@@ -130,6 +130,8 @@ export function buildItems(opts: {
 
   if (opts.active) {
     const id = opts.active.id;
+    // The navigator's index of every prompt (timeline/Navigator.tsx listens): after the palette has closed and given focus back.
+    act('go-message', 'Go to a message', 'search', () => void setTimeout(() => window.dispatchEvent(new Event('sable:go-to-message')), 90), { keys: 'mod+g', keywords: 'prompt navigator jump find index earlier' });
     act('export', 'Export chat', 'export', () => void exportChat(id), { keywords: 'export save markdown file download conversation chat md' });
     act('copy-markdown', 'Copy as Markdown', 'copy', () => void copyChatMarkdown(id), { keywords: 'copy markdown clipboard export conversation chat md' });
     act('toggle-panel', ui().railOpen ? 'Hide panel' : 'Show panel', 'sidebar', () => setUi({ railOpen: !ui().railOpen }), { keys: 'mod+j', keywords: 'toggle panel rail' });
