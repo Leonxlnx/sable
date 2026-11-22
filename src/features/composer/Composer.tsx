@@ -934,7 +934,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
           placement={variant === 'home' ? 'down' : 'up'}
           originX={originX}
           loading={trigger?.kind === 'mention' && filesLoading}
-          empty={trigger?.kind === 'mention' ? 'No matching files' : trigger?.kind === 'skill' ? 'No matching skills' : 'No matching commands. Enter sends it to the agent'}
+          empty={trigger?.kind === 'mention' ? 'No file matches.' : trigger?.kind === 'skill' ? 'No skill matches.' : 'No command matches. Enter sends it to the agent.'}
           onHover={setActive}
           onPick={(i) => {
             accept(rows[i]);

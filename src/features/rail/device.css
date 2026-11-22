@@ -94,6 +94,13 @@
   background-color: var(--bg);
 }
 
+/* The screen's ground ends in the panel's bottom corners: cut to the panel's inner curve there, as the
+   Browser tab's page is (browser.css `.bw-view:last-child`), or its square corners paint over the
+   panel's hairline. Not with the log drawer under it. */
+.dv-view:last-child {
+  border-radius: 0 0 calc(var(--r-xl) - 1px) calc(var(--r-xl) - 1px);
+}
+
 .dv-stage {
   display: flex;
   flex-direction: column;

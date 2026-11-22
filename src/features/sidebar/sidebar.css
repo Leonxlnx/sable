@@ -116,9 +116,10 @@
   outline-offset: var(--focus-inset);
 }
 
-/* 28 px like every icon button; their glyphs share a centre line with the footer's Settings. */
+/* The row's height and square, as the footer's Settings is: their glyphs share a centre line with it
+   and with the tools at a folder's end (a 28 px button stood a pixel off both). */
 .side-tool {
-  height: 30px;
+  --ib: var(--ctl-h);
 }
 
 /* ── list ── */

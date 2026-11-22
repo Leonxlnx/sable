@@ -1762,8 +1762,9 @@
 
 .sg-empty {
   padding: 7px 8px;
-  font-size: var(--t-small);
+  font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* ── menus and popovers opened from the composer ── */
@@ -2013,8 +2014,9 @@
 
 .mm-empty {
   padding: 7px 8px 8px;
-  font-size: var(--t-small);
+  font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* ── queued messages: a tray tucked behind the composer's top edge ──

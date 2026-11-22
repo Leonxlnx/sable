@@ -43,26 +43,49 @@ export function Accounts() {
         ))}
       </div>
       <AccountCaps agents={order} />
-      <label className="acct-auto" data-spot>
-        <span className="acct-auto-label">Continue with the next account at a limit</span>
-        <Switch checked={carryOn} onChange={(v) => void setSettings({ continueAtLimit: v })} label="Continue with the next account at a limit" />
-      </label>
-      <label className="acct-auto" data-spot>
-        <span className="acct-auto-label">Continue when the usage resets</span>
-        <Switch checked={resumeAtReset} onChange={(v) => void setSettings({ continueAtReset: v })} label="Continue when the usage resets" />
-      </label>
-      <label className="acct-auto" data-spot>
-        <span className="acct-auto-label">Use the account whose week ends soonest first</span>
-        <Switch checked={useFirst} onChange={(v) => void setSettings({ accountsBy: v ? 'useFirst' : 'manual' })} label="Use the account whose week ends soonest first" />
-      </label>
-      <label className="acct-auto" data-spot>
-        <span className="acct-auto-label">Return to the preferred account when its limit resets</span>
-        <Switch checked={backHome} onChange={(v) => void setSettings({ returnToPreferred: v })} label="Return to the preferred account when its limit resets" />
-      </label>
-      <label className="acct-auto" data-spot>
-        <span className="acct-auto-label">Notify when a limit resets</span>
-        <Switch checked={notifyReset} onChange={(v) => void setSettings({ notifyLimitReset: v })} label="Notify when a limit resets" />
-      </label>
+      {/* One card, a row each, in the measures of a row on every other page (settings.css `.set-row`). */}
+      <div className="card set-card" data-spot>
+        <label className="set-row">
+          <span className="set-row-text">
+            <span className="set-row-label">Continue with the next account at a limit</span>
+          </span>
+          <span className="set-row-control">
+            <Switch checked={carryOn} onChange={(v) => void setSettings({ continueAtLimit: v })} label="Continue with the next account at a limit" />
+          </span>
+        </label>
+        <label className="set-row">
+          <span className="set-row-text">
+            <span className="set-row-label">Continue when the usage resets</span>
+          </span>
+          <span className="set-row-control">
+            <Switch checked={resumeAtReset} onChange={(v) => void setSettings({ continueAtReset: v })} label="Continue when the usage resets" />
+          </span>
+        </label>
+        <label className="set-row">
+          <span className="set-row-text">
+            <span className="set-row-label">Use the account whose week ends soonest first</span>
+          </span>
+          <span className="set-row-control">
+            <Switch checked={useFirst} onChange={(v) => void setSettings({ accountsBy: v ? 'useFirst' : 'manual' })} label="Use the account whose week ends soonest first" />
+          </span>
+        </label>
+        <label className="set-row">
+          <span className="set-row-text">
+            <span className="set-row-label">Return to the preferred account when its limit resets</span>
+          </span>
+          <span className="set-row-control">
+            <Switch checked={backHome} onChange={(v) => void setSettings({ returnToPreferred: v })} label="Return to the preferred account when its limit resets" />
+          </span>
+        </label>
+        <label className="set-row">
+          <span className="set-row-text">
+            <span className="set-row-label">Notify when a limit resets</span>
+          </span>
+          <span className="set-row-control">
+            <Switch checked={notifyReset} onChange={(v) => void setSettings({ notifyLimitReset: v })} label="Notify when a limit resets" />
+          </span>
+        </label>
+      </div>
       {order.flatMap((id) =>
         (providers[id]?.accounts ?? [])
           .filter((a) => a.auth.loggedIn)

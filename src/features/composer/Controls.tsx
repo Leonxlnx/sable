@@ -457,7 +457,7 @@ export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed 
                       </Fragment>
                     );
                   })}
-                  {!rows.length && <div className="mm-empty">{q ? `No models match “${q}”` : 'No models'}</div>}
+                  {!rows.length && <div className="mm-empty">{q ? `No model matches “${q}”.` : 'This agent lists no models.'}</div>}
                 </div>
               </>
             )}

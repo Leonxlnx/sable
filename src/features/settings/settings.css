@@ -42,9 +42,11 @@
   pointer-events: none;
 }
 
+/* Its words stand on the rows' label column (2px inset, a row's 10px, the 16px icon, the 10px gap),
+   less the field's own 1px border. */
 .set-nav-filter .field {
   height: 32px;
-  padding: 0 10px 0 31px;
+  padding: 0 10px 0 35px;
   font-size: var(--t-ui);
 }
 

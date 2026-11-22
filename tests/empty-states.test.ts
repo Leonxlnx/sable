@@ -25,6 +25,10 @@ const PLACES: [string, string][] = [
   ['src/features/race/race.css', '.race-empty'],
   ['src/features/sidebar/sidebar.css', '.side-empty'],
   ['src/features/sidebar/sidebar.css', '.sset-empty'],
+  // A menu's filter that finds nothing: the model menu, the composer's suggestions, the account list.
+  ['src/features/composer/composer.css', '.mm-empty'],
+  ['src/features/composer/composer.css', '.sg-empty'],
+  ['src/features/accounts/accounts.css', '.acs-empty'],
 ];
 
 describe('empty states', () => {
@@ -60,6 +64,9 @@ describe('empty states', () => {
       ['src/features/settings/Hooks.tsx', /className="cfg-empty">(No hooks[^<]+)</],
       ['src/features/rail/TasksTab.tsx', /className="rail-empty">([^<]+)</],
       ['src/features/rail/AgentsTab.tsx', /className="rail-empty">([^<]+)</],
+      ['src/features/accounts/ManyAccounts.tsx', /className="acs-empty">([^<]+)</],
+      ['src/features/composer/Controls.tsx', /className="mm-empty">\{q \? `([^`]+)`/],
+      ['src/features/composer/Controls.tsx', /className="mm-empty">\{q \? `[^`]+` : '([^']+)'/],
     ];
     for (const [file, re] of words) {
       const m = read(file).match(re);

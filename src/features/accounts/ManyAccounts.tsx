@@ -188,7 +188,7 @@ export function ManyAccounts({
       </label>
       <RM.Separator className="menu-sep" />
       <div className="acs-list scroll" ref={list}>
-        {shown.length === 0 && <p className="acs-empty">No account matches</p>}
+        {shown.length === 0 && <p className="acs-empty">No account matches “{q}”.</p>}
         {shown.map((g) => {
           const folded = !q && collapsed.has(g.id);
           const free = g.rows.filter((r) => r.state === 'room' || r.state === 'unknown').length;

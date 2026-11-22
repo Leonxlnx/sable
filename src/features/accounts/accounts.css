@@ -3,15 +3,17 @@
 /* ── switcher (sidebar footer) ── */
 
 /* The trigger: one line of one control height, the agent's mark on the footer's icon column, one
-   name, and how much of the most used window is used as a ring and its figure at the end. */
+   name, and how much of the most used window is used as a ring and its figure at the end. The mark
+   and the name stand on the sidebar's two columns (a row's mark 12 in from its pill, its words 36
+   in), which are also the columns of the menu that opens above it. */
 .acs-trigger {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   height: var(--ctl-h);
-  padding: 0 9px 0 6px;
+  padding: 0 9px;
   border-radius: var(--r-sm);
   text-align: left;
   transition:
@@ -630,6 +632,8 @@
 
 /* ── Settings › Accounts ── */
 
+/* An account's credits switch with its note (usage `CreditsSetting`): a card of its own. The page's
+   plain switches are rows of one Settings card (Accounts.tsx, settings.css `.set-row`). */
 .acct-auto {
   display: flex;
   align-items: center;
@@ -638,13 +642,6 @@
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background-color: var(--panel);
-}
-
-.acct-auto-label {
-  flex: 1;
-  min-width: 0;
-  font-size: var(--t-ui);
-  color: var(--text);
 }
 
 /* ── the switcher with many accounts: filter, folding groups, room left (ManyAccounts.tsx) ── */
@@ -794,6 +791,7 @@
   padding: 0 8px 0 31px;
   font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* The footer's figure once the agent in focus has several accounts: what is left across them. */

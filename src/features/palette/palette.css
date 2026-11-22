@@ -52,12 +52,13 @@
 
 /* ── input ── */
 
+/* The field's icon and words stand on the rows' two columns: the list's 4px and a row's 8px in. */
 .palette-head {
   display: flex;
   align-items: center;
   gap: 10px;
   height: 52px;
-  padding: 0 14px 0 16px;
+  padding: 0 14px 0 12px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -70,6 +71,8 @@
   flex: 1;
   min-width: 0;
   height: 100%;
+  /* None of the browser's own 2px: the words start where a row's title does. */
+  padding: 0;
   border: 0;
   background: none;
   font-size: 15px;

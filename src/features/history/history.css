@@ -88,11 +88,12 @@
   border-top: 1px solid var(--line);
 }
 
+/* On the rows' text edge (the list's 10px and a row's 12px), which is the title's too. */
 .history-day {
   position: sticky;
   top: 0;
   z-index: 1;
-  padding: 12px 10px 6px;
+  padding: 12px 12px 6px;
   font-size: var(--t-micro);
   font-weight: var(--w-medium);
   color: var(--text-3);
