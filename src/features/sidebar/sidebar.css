@@ -270,6 +270,7 @@
 
 .sgroup[data-dragging][data-into] .sgroup-tools {
   opacity: 0;
+  pointer-events: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -415,15 +416,24 @@
   padding-left: 18px;
   background: linear-gradient(to right, transparent, var(--head-bg) 16px);
   opacity: 0;
+  pointer-events: none;
 }
 
 /* Pointed at, its menu open, or reached with the keys. Not on any focus inside: a header (or a
-   row) a click or a closing menu left focused would keep its tools up after the pointer left. */
+   row) a click or a closing menu left focused would keep its tools up after the pointer left.
+   They take the pointer in the frame they begin to show; reached with the keys, at once. */
 .sgroup-head:hover .sgroup-tools,
 .sgroup-head:has(:focus-visible) .sgroup-tools,
 .sgroup-head[data-menu] .sgroup-tools {
   opacity: 1;
-  transition: opacity var(--d-1) var(--ease) var(--row-rest);
+  pointer-events: auto;
+  transition:
+    opacity var(--d-1) var(--ease) var(--row-rest),
+    pointer-events 0s linear var(--row-rest) allow-discrete;
+}
+
+.sgroup-head:has(:focus-visible) :is(.sgroup-tools, .sgroup-end) {
+  transition-delay: 0s;
 }
 
 /* Row tools are .icon-btn-xs sitting on a lit row: the row shifts the tone scale up one step
@@ -730,12 +740,16 @@
   pointer-events: none;
 }
 
+/* They take the pointer in the frame they begin to show, never while the time still stands there
+   (pointer-events steps with the opacity's delay). Reached with the keys, they are there at once. */
 .srow:hover .srow-acts,
 .srow:has(:focus-visible) .srow-acts,
 .srow[data-menu] .srow-acts {
   opacity: 1;
   pointer-events: auto;
-  transition: opacity var(--d-1) var(--ease) var(--row-rest);
+  transition:
+    opacity var(--d-1) var(--ease) var(--row-rest),
+    pointer-events 0s linear var(--row-rest) allow-discrete;
 }
 
 .srow:hover :is(.srow-time, .srow-state),
@@ -743,6 +757,10 @@
 .srow[data-menu] :is(.srow-time, .srow-state) {
   opacity: 0;
   transition: opacity 1ms linear var(--row-rest);
+}
+
+.srow:has(:focus-visible) :is(.srow-acts, .srow-time, .srow-state) {
+  transition-delay: 0s;
 }
 
 

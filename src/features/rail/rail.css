@@ -382,15 +382,24 @@
   color: var(--text-2);
 }
 
+/* They take the pointer in the frame they begin to show (pointer-events steps with the opacity's
+   delay); reached with the keys, they are there at once. */
 .rail-row-host:is(:hover, :focus-within) > .rail-row-acts {
   opacity: 1;
   pointer-events: auto;
-  transition: opacity var(--d-1) var(--ease) 50ms;
+  transition:
+    opacity var(--d-1) var(--ease) 50ms,
+    pointer-events 0s linear 50ms allow-discrete;
 }
 
 .rail-row-host:is(:hover, :focus-within) .rail-row-deco {
   opacity: 0;
   transition: opacity 1ms linear 50ms;
+}
+
+.rail-row-host:has(:focus-visible) > .rail-row-acts,
+.rail-row-host:has(:focus-visible) .rail-row-deco {
+  transition-delay: 0s;
 }
 
 .rail-col {

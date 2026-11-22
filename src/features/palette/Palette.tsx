@@ -15,6 +15,7 @@ import { byKeys, Kbd, PathLabel, cx, useSlidePill } from '@/ui';
 import { Highlight } from './Highlight';
 import { buildItems, loadRecent, pushRecent, type PaletteGroup, type PaletteItem } from './items';
 import { openMessage } from './jump';
+import { takeRun } from './once';
 import { leadIn, markIndices, MAX_HITS, MIN_QUERY, useMessageSearch, wordsOf } from './messages';
 import './palette.css';
 
@@ -58,7 +59,7 @@ export function Palette() {
           <PaletteBody
             key={session}
             onRun={(item) => {
-              ran.current = true;
+              if (!takeRun(ran)) return;
               // A message is found again by searching; it never crowds out what was run.
               if (item.group !== 'Messages') pushRecent(item.id);
               setUi({ paletteOpen: false });
