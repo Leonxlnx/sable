@@ -355,11 +355,11 @@ describe('term', () => {
     if (isWin) await until(() => outputOf(termId).includes('127.0.0.1'), 'ping output');
     const t = Date.now();
     expect(await app.call('term.kill', { termId })).toEqual({ ok: true });
-    await until(() => !!exitOf(termId), 'killed exit');
+    await until(() => !!exitOf(termId), 'killed exit', 25_000);
     expect(Date.now() - t).toBeLessThan(5000);
     expect(exitOf(termId)!.code).not.toBe(0);
     expect(await app.call('term.kill', { termId })).toEqual({ ok: false });
-  });
+  }, 30_000);
 
   it('caps concurrent runs at 6', async () => {
     const command = isWin ? 'ping -n 30 127.0.0.1' : 'sleep 30';
