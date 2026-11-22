@@ -2,19 +2,25 @@ import { existsSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { chromium, type Browser, type Page } from 'playwright-core';
-import { signInCheckScript, signInFillScript, signInProbeScript, snapshotScript } from '../src/features/rail/browser-scripts';
+import { chromium, type Browser } from 'playwright-core';
+import { fillScript, stampScript, stillThereScript } from '../electron/sign-in-core';
+import { signInProbeScript, snapshotScript } from '../src/features/rail/browser-scripts';
 
 /**
- * The sign-in's page scripts in a real browser (the installed Edge, headless; skipped where there is
- * none): the threats of the brief, one by one, against made-up local pages. Runs one browser; take
- * scratch/heavy.lock when running it by hand.
+ * The scripts Electron main fills a sign-in with (electron/sign-in-core.ts), in a real browser (the
+ * installed Edge, headless; skipped where there is none), against made-up local pages. Main runs
+ * them in an isolated world; here they run in the page's world, which is stricter for the test (the
+ * page could interfere more). One browser: take scratch/heavy.lock when running it by hand.
  */
 
 const EDGE = ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find((p) => existsSync(p));
 const PASSWORD = 'made-up-pass-7351';
 
-const FORM = `<form id="f"><input id="u" name="username"><input id="p" type="password"><button id="b">Sign in</button></form>`;
+const page = (form: string) => `<!doctype html><title>portal</title>${form}<script>
+  window.submitted = null;
+  document.addEventListener('submit', (e) => { e.preventDefault(); window.submitted = { user: document.getElementById('u').value, pass: !!document.getElementById('p').value }; }, true);
+</script>`;
+const FORM = (attrs = 'method="post" action="/session"', button = '<button>Sign in</button>') => `<form id="f" ${attrs}><input id="u" name="username" autocomplete="username"><input id="p" name="password" type="password">${button}</form>`;
 
 function serve(html: (path: string) => string): Promise<{ url: string; close: () => void }> {
   return new Promise((resolve) => {
@@ -23,31 +29,23 @@ function serve(html: (path: string) => string): Promise<{ url: string; close: ()
   });
 }
 
-/** The refs of an outline, by the line's start ("textbox", "password field", "button"). */
-async function refs(page: Page, frame = page.mainFrame()) {
-  const r = (await frame.evaluate(snapshotScript(4000))) as { text: string };
-  const ref = (what: string) => new RegExp(`^\\[(e\\d+)\\] ${what}`, 'm').exec(r.text)?.[1] ?? '';
-  return { userRef: ref('textbox'), passRef: ref('password field'), submitRef: ref('button') };
-}
-
-describe.skipIf(!EDGE)('a sign-in in a real page', () => {
+describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
   let browser: Browser;
   let a: { url: string; close: () => void };
   let b: { url: string; close: () => void };
+  const pages: Record<string, string> = {};
   beforeAll(async () => {
     browser = await chromium.launch({ executablePath: EDGE, headless: true });
-    // Two origins: the site, and another one that frames it or is framed by it.
-    b = await serve(() => `<!doctype html><title>other</title>${FORM}`);
-    a = await serve((p) =>
-      p.startsWith('/framed')
-        ? `<!doctype html><title>site</title><iframe id="x" src="${b.url}/"></iframe>`
-        : `<!doctype html><title>site</title>${FORM}<script>
-  window.seenBeforeSubmit = []; window.submitted = false;
-  document.getElementById('f').addEventListener('submit', (e) => { e.preventDefault(); window.submitted = true; });
-  setInterval(() => { const v = document.getElementById('p').value; if (v && !window.submitted) window.seenBeforeSubmit.push(v); }, 0);
-  new MutationObserver(() => {}).observe(document.body, { subtree: true, attributes: true });
-</script>`,
-    );
+    b = await serve(() => page(FORM()));
+    a = await serve((p) => (p.startsWith('/framed') ? `<!doctype html><iframe id="x" src="${b.url}/"></iframe>` : (pages[p] ?? page(FORM()))));
+    Object.assign(pages, {
+      '/get': page(FORM('method="get" action="/session"')),
+      '/away': page(FORM(`method="post" action="${b.url}/session"`)),
+      '/override-action': page(FORM('method="post" action="/session"', `<button formaction="${b.url}/x">Sign in</button>`)),
+      '/override-method': page(FORM('method="post" action="/session"', '<button formmethod="get">Sign in</button>')),
+      '/target': page(FORM('method="post" action="/session" target="_blank"')),
+      '/two': page(FORM() + '<form><input type="password"></form>'),
+    });
   }, 30_000);
   afterAll(async () => {
     await browser?.close();
@@ -55,65 +53,66 @@ describe.skipIf(!EDGE)('a sign-in in a real page', () => {
     b?.close();
   });
 
-  it('fills and submits in one task: a timer of the page never sees the password before the submit', async () => {
-    const page = await browser.newPage();
-    await page.goto(`${a.url}/`);
-    const r = await refs(page);
-    expect(await page.evaluate(signInProbeScript(r))).toMatchObject({ origin: a.url });
-    expect(await page.evaluate(signInFillScript(r, a.url, 'student.one', PASSWORD))).toEqual({ ok: true });
-    await page.waitForTimeout(50);
-    expect(await page.evaluate('window.submitted')).toBe(true);
-    expect(await page.evaluate('window.seenBeforeSubmit.length')).toBe(0);
-    await page.close();
+  const fill = async (path: string, stamp = true) => {
+    const p = await browser.newPage();
+    await p.goto(`${a.url}${path}`);
+    if (stamp) await p.evaluate(stampScript('n0nce'));
+    const r = await p.evaluate(fillScript('n0nce', a.url, 'student.one', PASSWORD));
+    const after = await p.evaluate(`({ submitted: window.submitted, pass: document.getElementById('p').value })`);
+    await p.close();
+    return { r, after: after as { submitted: unknown; pass: string } };
+  };
+
+  it('a same-origin POST form is filled and submitted', async () => {
+    const { r, after } = await fill('/');
+    expect(r).toEqual({ ok: true });
+    expect(after.submitted).toEqual({ user: 'student.one', pass: true });
   });
 
-  it('a page that moved to another origin between the ask and the fill gets nothing', async () => {
-    const page = await browser.newPage();
-    await page.goto(`${b.url}/`);
-    const r = await refs(page);
-    // The card was for the first site; the page is the other one now.
-    expect(await page.evaluate(signInFillScript(r, a.url, 'student.one', PASSWORD))).toEqual({ error: 'moved' });
-    expect(await page.evaluate(`document.getElementById('p').value`)).toBe('');
-    await page.close();
+  it('refuses before setting any value: GET, another action, a submitter\'s override, another target, two password fields', async () => {
+    for (const [path, error] of [
+      ['/get', 'method'],
+      ['/away', 'action'],
+      ['/override-action', 'action'],
+      ['/override-method', 'method'],
+      ['/target', 'target'],
+      ['/two', 'several'],
+    ] as const) {
+      const { r, after } = await fill(path);
+      expect(r, path).toEqual({ error });
+      expect(after.pass, path).toBe('');
+      expect(after.submitted, path).toBeNull();
+    }
   });
 
-  it('never in a frame: neither a cross-origin frame nor fields that are not the page\'s own', async () => {
-    const page = await browser.newPage();
-    await page.goto(`${a.url}/framed`);
-    const frame = page.frames().find((f) => f.url().startsWith(b.url))!;
+  it('a document that was not stamped (a replaced one) is not filled', async () => {
+    const { r, after } = await fill('/', false);
+    expect(r).toEqual({ error: 'replaced' });
+    expect(after.pass).toBe('');
+  });
+
+  it('never inside a frame: the frame\'s fields have no reference in the outline, and the fill refuses there', async () => {
+    const p = await browser.newPage();
+    await p.goto(`${a.url}/framed`);
+    const frame = p.frames().find((f) => f.url().startsWith(b.url))!;
     await frame.waitForSelector('#p');
-    // The top page's outline does not list the frame's fields at all: they have no reference to name.
-    const top = await refs(page);
-    expect(top.passRef).toBe('');
-    // Run inside the frame (as if the agent pointed there), the scripts refuse.
-    const r = await refs(page, frame);
-    expect(await frame.evaluate(signInProbeScript(r))).toMatchObject({ error: expect.stringMatching(/never inside a frame/) });
-    expect(await frame.evaluate(signInFillScript(r, b.url, 'student.one', PASSWORD))).toEqual({ error: 'moved' });
+    const top = (await p.evaluate(snapshotScript(4000))) as { text: string };
+    expect(top.text).not.toMatch(/password field/);
+    await frame.evaluate(stampScript('n0nce'));
+    expect(await frame.evaluate(fillScript('n0nce', b.url, 'student.one', PASSWORD))).toEqual({ error: 'moved' });
     expect(await frame.evaluate(`document.getElementById('p').value`)).toBe('');
-    await page.close();
+    expect(await frame.evaluate(signInProbeScript({ userRef: 'e1', passRef: 'e2' }))).toMatchObject({ error: expect.stringMatching(/never inside a frame|no longer points/) });
+    await p.close();
   });
 
-  it('while the filled field holds the password the outline lists no values, and the hold ends only when it is cleared', async () => {
-    const page = await browser.newPage();
-    await page.goto(`${a.url}/`);
-    const r = await refs(page);
-    await page.evaluate(signInFillScript(r, a.url, 'student.one', PASSWORD));
-    // A "show password" switch turns it into a text field: still no value in the outline without values.
-    await page.evaluate(`document.getElementById('p').type = 'text'`);
-    const held = (await page.evaluate(snapshotScript(4000, false))) as { text: string };
-    expect(held.text).not.toContain(PASSWORD);
-    expect(held.text).not.toContain('student.one');
-    expect(await page.evaluate(signInCheckScript)).toMatchObject({ cleared: false });
-    // The page deleting Sable's mark does not end the hold (unknown is not cleared).
-    await page.evaluate(`delete window.__sableFilled`);
-    expect(await page.evaluate(signInCheckScript)).toEqual({ unknown: true });
-    await page.close();
-    const again = await browser.newPage();
-    await again.goto(`${a.url}/`);
-    const r2 = await refs(again);
-    await again.evaluate(signInFillScript(r2, a.url, 'student.one', PASSWORD));
-    await again.evaluate(`document.getElementById('p').value = ''`);
-    expect(await again.evaluate(signInCheckScript)).toMatchObject({ cleared: true });
-    await again.close();
+  it('after the submit, a page that keeps the filled field reads as not through', async () => {
+    const p = await browser.newPage();
+    await p.goto(`${a.url}/`);
+    await p.evaluate(stampScript('n0nce'));
+    await p.evaluate(fillScript('n0nce', a.url, 'student.one', PASSWORD));
+    expect(await p.evaluate(stillThereScript('n0nce'))).toEqual({ gone: false });
+    await p.evaluate(`document.getElementById('f').remove()`);
+    expect(await p.evaluate(stillThereScript('n0nce'))).toEqual({ gone: true });
+    await p.close();
   });
 });

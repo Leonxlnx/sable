@@ -1,8 +1,8 @@
 import type { BrowserAnswer, BrowserRequest } from '@shared/protocol';
-import { listSignIns, markSignInUsed, reportBrowserPage, respondBrowser, revealSignIn, saveSignIn, signInState } from '@/state/actions';
+import { listSignIns, reportBrowserPage, respondBrowser } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { activeTab, getLog, getPage, getTabs, onPages, openTab, setPage, type AgentWork } from './browser-store';
-import { clickScript, evalScript, focusedScript, locateScript, pickCancelScript, keyProbeRead, keyProbeScript, pressScript, requestsScript, scrollScript, signInCheckScript, signInFillScript, signInProbeScript, snapshotScript, typeScript, userIdleScript, waitScript } from './browser-scripts';
+import { clickScript, evalScript, focusedScript, locateScript, pickCancelScript, keyProbeRead, keyProbeScript, pressScript, requestsScript, scrollScript, signInProbeScript, snapshotScript, typeScript, userIdleScript, waitScript } from './browser-scripts';
 import { askSignIn, SIGNED_LINE_MS, type SignInChoice } from './sign-in';
 
 /**
@@ -35,6 +35,8 @@ export interface PageController {
    */
   point?(rect: { x: number; y: number; w: number; h: number }, vw: number): Promise<void>;
   press?(): Promise<void>;
+  /** The desktop app: the page view's webContents id (Electron main fills sign-ins into it). */
+  guestId?(): number;
 }
 
 const TEXT_MAX = 20_000;
@@ -188,19 +190,11 @@ async function pointAt(c: PageController, q: { ref?: string; selector?: string; 
 }
 
 /**
- * A password Sable filled is still in this document: asks the page whether the field was cleared
- * (then the hold ends early); an answer that cannot be read keeps the hold until the page navigates.
+ * The page is held for a sign-in: armed when the sign-in begins (before any card or fill) and ended
+ * only by Electron main (electron/sign-in.ts), when a new document replaced the filled one or the
+ * sign-in ended before anything was filled. Nothing the page does releases it.
  */
-async function stillFilled(c: PageController): Promise<boolean> {
-  const tab = c.tabId;
-  if (!getPage(tab).filled) return false;
-  const r = (await within(c.run(signInCheckScript), 3_000).catch(() => null)) as { cleared?: boolean } | null;
-  if (r && r.cleared === true) {
-    setPage(tab, { filled: undefined });
-    return false;
-  }
-  return true;
-}
+const held = (tab: string) => !!getPage(tab).filled;
 
 export async function handleBrowserRequest(req: BrowserRequest) {
   let answer: BrowserAnswer;
@@ -263,6 +257,8 @@ async function serve(req: BrowserRequest): Promise<BrowserAnswer> {
   }
   const url = c.url() || p.url;
   if (req.op === 'state') return { ok: true, url, title: p.title };
+  // While a sign-in is under way on this page, the agent gets nothing of it.
+  if (p.signing && req.op !== 'signIn') return { ok: false, url, error: 'A sign-in is under way on this page. Wait for it to finish.' };
   if (!/^https?:/i.test(url)) return { ok: false, error: 'Sable reads only web pages (http or https).' };
   if (req.expectOrigin && originOf(url) !== req.expectOrigin) return { ok: false, error: 'The page changed while it was being checked. Try again.' };
   if (p.crashed) return { ok: false, url, error: 'The page stopped working. The user can reload it.' };
@@ -290,9 +286,9 @@ async function serve(req: BrowserRequest): Promise<BrowserAnswer> {
     });
   }
 
-  // While a password Sable filled is in the page: no scripts and no pictures for the agent, until the page moves on or the field is cleared.
-  if ((req.op === 'eval' || req.op === 'screenshot') && (await stillFilled(c))) {
-    return { ok: false, url, error: 'A password Sable filled is still in a field of this page. Scripts and screenshots are refused until the page moves on or the field is cleared; browser_snapshot and browser_read work.' };
+  // While the page is held for a sign-in: no scripts, pictures or logs for the agent, until a new document replaces it.
+  if ((req.op === 'eval' || req.op === 'screenshot' || req.op === 'logs') && held(tab)) {
+    return { ok: false, url, error: 'This page holds a sign-in. Scripts, screenshots and logs are refused until it loads another page (browser_navigate reload works); browser_snapshot and browser_read work.' };
   }
 
   if (req.op === 'signIn') return marked(tab, 'signIn', () => signIn(req, c, url));
@@ -345,7 +341,7 @@ async function work(req: BrowserRequest, c: PageController, url: string): Promis
 
   switch (req.op) {
     case 'snapshot': {
-      const values = !(await stillFilled(c));
+      const values = !held(c.tabId);
       const r = plain(await within(c.run(snapshotScript(SNAPSHOT_MAX, values)), 8_000));
       return { ok: true, url: before, title: text(r.title, 300) || getPage(tab).title, text: text(r.text, SNAPSHOT_MAX) ?? '', count: Number(r.count) || 0, truncated: r.truncated === true };
     }
@@ -442,9 +438,6 @@ async function work(req: BrowserRequest, c: PageController, url: string): Promis
   }
 }
 
-/** How long a submitted sign-in may take to leave its form before it counts as refused. */
-export const SIGN_IN_SETTLE_MS = 6_000;
-
 /** The origin a sign-in may be filled on: https anywhere, http on this machine only. */
 export function signInAllowed(url: string): string | undefined {
   try {
@@ -456,98 +449,77 @@ export function signInAllowed(url: string): string | undefined {
   return undefined;
 }
 
+/** The desktop shell's sign-in calls (electron/preload.ts): main fills, the window never holds a saved password. */
+type SignInShell = {
+  begin(webContentsId: number, origin: string): Promise<{ ticket: string; canSave: boolean }>;
+  fill(webContentsId: number, ticket: string, cred: { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string }): Promise<{ ok: boolean; signedIn?: boolean; user?: string; error?: string }>;
+  cancel(ticket: string): Promise<void>;
+};
+const shell = () => (desktop as { browser?: { signIn?: SignInShell } } | undefined)?.browser?.signIn;
+
 /**
  * browser_sign_in on the tab's page. The agent named the fields; the person (or a sign-in they saved
- * for exactly this origin) supplies the values, Sable fills and submits in one step, and the answer
- * is only whether it worked and the user name. The origin is the page's own as the view reports it
- * (never a name the page or the agent supplies), checked when the call comes, again right before the
- * values are fetched, and inside the page at the moment of filling.
+ * for exactly this origin) supplies the values; Electron main loads the page again, fills that fresh
+ * document and submits (electron/sign-in-core.ts). The window asks main for a ticket first, which
+ * arms the hold before any card shows; it hands a typed password straight to main and never sees a
+ * saved one. Only in the desktop app: the dev build's frame cannot sign in.
  */
 async function signIn(req: BrowserRequest, c: PageController, url: string): Promise<BrowserAnswer> {
   const tab = c.tabId;
+  const sh = shell();
+  const wc = c.guestId?.() ?? 0;
+  if (!native || !sh || !wc) return { ok: false, url, error: 'sign-ins work only in the desktop app.' };
   const origin = signInAllowed(url);
   if (!origin) return { ok: false, url, error: 'Sable signs in only on https sites (and on localhost for tests).' };
-  if (req.expectOrigin && req.expectOrigin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
+  if (req.expectOrigin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
   const refs = { userRef: req.userRef ?? '', passRef: req.passRef ?? '', ...(req.submitRef ? { submitRef: req.submitRef } : {}) };
   if (!/^e\d{1,6}$/.test(refs.userRef) || !/^e\d{1,6}$/.test(refs.passRef)) return { ok: false, url, error: 'Name the fields by their references from browser_snapshot.' };
-  const probe = (await within(c.run(signInProbeScript(refs, !native)), 5_000)) as { error?: string; origin?: string; user?: Rect; pass?: Rect; submit?: Rect | null; vw?: number } | null;
-  if (!probe || probe.error) return { ok: false, url, error: String(probe?.error ?? 'The page did not answer.').slice(0, 300) };
-  if (probe.origin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
 
-  // The bridge answers off while sign-ins do not ship (services/sign-ins.ts): then no card ever opens.
-  let state: { canSave: boolean };
+  // The ticket arms the hold (in main and here) before anything else: no tool of the agent reaches this page from now on.
+  let begun: { ticket: string; canSave: boolean };
   try {
-    state = await signInState();
+    begun = await sh.begin(wc, origin);
   } catch {
-    return { ok: false, url, error: 'sign-ins are not available in this version of Sable.' };
+    return { ok: false, url, error: 'sign-ins are not available here.' };
   }
-  const saved = await listSignIns(origin).catch(() => []);
-  const here = () => signInAllowed(c.url() || getPage(tab).url) === origin && controllers.get(tab) === c;
-  const alive = { cancelled: () => !here() };
-  // The card and the line are the Browser tab's: it comes to the front for them.
-  useStore.getState().setUi({ railOpen: true, railTab: 'browser' });
-  let choice: SignInChoice = saved.length === 1 ? await askSignIn({ tabId: tab, origin, mode: 'auto', saved, canSave: state.canSave }, alive) : { kind: 'notNow' };
-  if (choice.kind === 'notNow') choice = await askSignIn({ tabId: tab, origin, mode: 'card', saved: saved.length > 1 ? saved : [], canSave: state.canSave }, alive);
-  if (choice.kind === 'cancel' || choice.kind === 'notNow') return { ok: false, url, error: here() ? 'the user cancelled the sign-in.' : 'the page moved on before the sign-in.' };
-
-  let username = choice.username;
-  let password = '';
-  if (choice.kind === 'saved') {
-    // Fetched only now, for exactly this origin, and only into this function.
-    if (!here()) return { ok: false, url, error: 'the page moved on before the sign-in.' };
-    try {
-      password = (await revealSignIn(choice.id, origin)).password;
-    } catch {
-      return { ok: false, url, error: 'the saved sign-in cannot be read on this computer. The user can sign in again.' };
-    }
-  } else password = choice.password;
-
-  // Watch it: the pointer goes to each field and the submit control, then the form is filled and sent at once.
-  if (c.point && probe.vw) {
-    for (const r of [probe.user, probe.pass, probe.submit]) {
-      if (!r) continue;
-      await c.point(r, probe.vw);
-      await c.press?.();
-    }
-  }
-  if (!here()) return { ok: false, url, error: 'the page moved on before the sign-in.' };
-  const before = c.url() || getPage(tab).url;
-  let filled: { ok?: boolean; error?: string } | null;
+  setPage(tab, { filled: true, signing: true });
+  let filling = false;
   try {
-    filled = (await within(c.run(signInFillScript(refs, origin, username, password, !native)), 5_000)) as typeof filled;
-  } catch {
-    filled = null;
-  }
-  // Nothing of it is kept here past the fill (and it never went anywhere but the page).
-  password = '';
-  if (!filled?.ok) return { ok: false, url, error: filled?.error === 'moved' ? 'the page moved to another site before the sign-in.' : 'the sign-in form changed before it could be filled. Take a new browser_snapshot.' };
-  setPage(tab, { filled: true });
+    // Where the fields stand, for the pointer only (no value is read or written here).
+    const probe = (await within(c.run(signInProbeScript(refs, false)), 5_000).catch(() => null)) as { error?: string; origin?: string; user?: Rect; pass?: Rect; submit?: Rect | null; vw?: number } | null;
+    if (!probe || probe.error) return { ok: false, url, error: String(probe?.error ?? 'The page did not answer.').slice(0, 300) };
+    if (probe.origin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
 
-  // Through: the page moved on, or the password field went away. Still there after a while: refused.
-  const t0 = Date.now();
-  let through = false;
-  while (Date.now() - t0 < SIGN_IN_SETTLE_MS) {
-    await sleep(250);
-    const p = getPage(tab);
-    if (p.loading || (c.url() || p.url).split('#')[0] !== before.split('#')[0]) {
-      through = true;
-      break;
+    const saved = await listSignIns(origin).catch(() => []);
+    const here = () => signInAllowed(c.url() || getPage(tab).url) === origin && controllers.get(tab) === c;
+    const alive = { cancelled: () => !here() };
+    // The card and the line are the Browser tab's: it comes to the front for them.
+    useStore.getState().setUi({ railOpen: true, railTab: 'browser' });
+    let choice: SignInChoice = saved.length === 1 ? await askSignIn({ tabId: tab, origin, mode: 'auto', saved, canSave: begun.canSave }, alive) : { kind: 'notNow' };
+    if (choice.kind === 'notNow') choice = await askSignIn({ tabId: tab, origin, mode: 'card', saved: saved.length > 1 ? saved : [], canSave: begun.canSave }, alive);
+    if (choice.kind === 'cancel' || choice.kind === 'notNow') return { ok: false, url, error: here() ? 'the user cancelled the sign-in.' : 'the page moved on before the sign-in.' };
+
+    // Watch it: the pointer goes to each field and the submit control; main then fills and sends.
+    if (c.point && probe.vw) {
+      for (const r of [probe.user, probe.pass, probe.submit]) {
+        if (!r) continue;
+        await c.point(r, probe.vw);
+        await c.press?.();
+      }
     }
-    const r = (await within(c.run(signInCheckScript), 2_000).catch(() => null)) as { gone?: boolean; cleared?: boolean } | null;
-    if (r?.cleared) setPage(tab, { filled: undefined });
-    if (r?.gone) {
-      through = true;
-      break;
-    }
+    filling = true;
+    const cred = choice.kind === 'saved' ? { kind: 'saved' as const, id: choice.id, username: choice.username } : { kind: 'typed' as const, username: choice.username, password: choice.password, save: choice.save };
+    const r = await sh.fill(wc, begun.ticket, cred).catch(() => ({ ok: false, error: 'the sign-in did not happen.' }) as { ok: boolean; signedIn?: boolean; user?: string; error?: string });
+    if (!r.ok || !r.signedIn) return { ok: false, url, error: String(r.error ?? 'the sign-in did not happen.').slice(0, 300) };
+    const user = String(r.user ?? '').slice(0, 200);
+    setPage(tab, { signedInAs: user });
+    setTimeout(() => getPage(tab).signedInAs === user && setPage(tab, { signedInAs: undefined }), SIGNED_LINE_MS);
+    return { ok: true, url: c.url() || getPage(tab).url, title: getPage(tab).title, signedIn: true, user };
+  } finally {
+    setPage(tab, { signing: undefined });
+    // Nothing was handed to main: the ticket ends here, and with it the hold (main says when).
+    if (!filling) void sh.cancel(begun.ticket).catch(() => {});
   }
-  if (!through) return { ok: false, url, error: 'the page still shows the sign-in form; it may have refused the user name or password.' };
-  if (choice.kind === 'typed' && choice.save && state.canSave) await saveSignIn(origin, username, choice.password).catch(() => {});
-  if (choice.kind === 'saved') void markSignInUsed(choice.id);
-  setPage(tab, { signedInAs: username });
-  setTimeout(() => getPage(tab).signedInAs === username && setPage(tab, { signedInAs: undefined }), SIGNED_LINE_MS);
-  const user = username;
-  username = '';
-  return { ok: true, url: c.url() || getPage(tab).url, title: getPage(tab).title, signedIn: true, user };
 }
 
 type Rect = { x: number; y: number; w: number; h: number };

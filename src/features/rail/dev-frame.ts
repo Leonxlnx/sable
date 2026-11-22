@@ -7,7 +7,8 @@ import { getPage, setPage, stepHistory } from './browser-store';
  * `{ sableDevPage: 1 }`, as the Demo's test page does) runs Sable's page scripts on request, so the
  * agent's tools, the pointer and the sign-in card work against it and can be filmed headless. Never
  * in the desktop app (its <webview> is scripted by the shell) and never for a page that is not on
- * this machine or does not answer.
+ * this machine or does not answer. It never signs in: only the desktop's main process fills a
+ * password (electron/sign-in.ts), so no password goes through this script runner.
  */
 
 interface Reply {
@@ -22,6 +23,16 @@ interface Reply {
 }
 
 const RUN_MS = 60_000;
+
+/** The exact origin of an address (scheme, host, port), or '' when it has none. */
+export function originOf(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.origin : '';
+  } catch {
+    return '';
+  }
+}
 
 export function connectDevFrame(
   frame: HTMLIFrameElement,
@@ -50,7 +61,8 @@ export function connectDevFrame(
     if (e.source !== frame.contentWindow || e.origin !== target) return;
     const d = e.data as Reply;
     if (!d || typeof d !== 'object' || d.sableDevPage !== 1) return;
-    if (typeof d.href === 'string' && d.href.startsWith(target)) href = d.href;
+    // The page's own word for where it is counts only at exactly the frame's origin (never a prefix: 127.0.0.1:41 is not 127.0.0.1:4100).
+    if (typeof d.href === 'string' && originOf(d.href) === target) href = d.href;
     if (typeof d.title === 'string' && d.title !== getPage(tabId).title) setPage(tabId, { title: d.title.slice(0, 300) });
     if (d.hello) {
       if (!unregister) unregister = register(controller);
@@ -109,7 +121,6 @@ export function connectDevFrame(
     }
     waiting.clear();
     href = frame.src;
-    setPage(tabId, { filled: undefined });
     post({ sable: 'hello' });
   };
   window.addEventListener('message', onMessage);

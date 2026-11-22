@@ -2546,15 +2546,11 @@ export interface RpcMethods {
   /** What the session's Browser tab shows now (null: nothing, or the tab is closed), for the line the agent gets with the next message. */
   'browser.page': { params: { sessionId: string; page: { url: string; title: string } | null }; result: { ok: boolean } };
   /**
-   * Sign-ins for the Browser tab (`server/services/sign-ins.ts`), desktop windows only (never on the
-   * phone's allowlist). `canSave`: this computer can encrypt them (Electron's safeStorage); without it
-   * nothing is saved. `reveal` answers the asking window alone, for an exact origin.
+   * Saved sign-ins for the Browser tab (`server/services/sign-ins.ts`): names to list and remove,
+   * never a secret (decrypting and filling happen only in Electron main, `electron/sign-in.ts`).
+   * Desktop windows only, never on the phone's allowlist.
    */
-  'signIn.state': { params: Record<string, never>; result: { canSave: boolean } };
   'signIn.list': { params: { origin?: string }; result: SignInInfo[] };
-  'signIn.reveal': { params: { id: string; origin: string }; result: { password: string } };
-  'signIn.save': { params: { origin: string; username: string; password: string }; result: { ok: boolean; saved: boolean } };
-  'signIn.used': { params: { id: string }; result: { ok: boolean } };
   'signIn.remove': { params: { id: string }; result: { ok: boolean } };
 
   /** Before / after pictures of a local page for the session's turns that edited it, oldest first (`capture.updated` follows changes). */

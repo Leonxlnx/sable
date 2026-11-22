@@ -8,32 +8,48 @@ import type { App } from '../app';
  * Sign-ins for the Browser tab: a user name and a password per site, which Sable fills into the
  * page itself (the agent's `browser_sign_in` names the fields; it never sees or passes a value).
  *
- * Kept on this computer only, in `<home>/sign-ins.json`: the origin, the user name, dates and the
- * password as ciphertext from Electron's `safeStorage` (Windows DPAPI, the macOS keychain, the Linux
- * secret store), which the desktop shell hands over with `setSignInVault` as it does for updates and
- * thumbnails. Without a vault (the dev server, a standalone bridge, a Linux machine with no secret
- * store) nothing is saved: the card says the sign-in is used once. A copied file cannot be read on
- * another machine or account: the vault there cannot decrypt it, and such an entry reads as missing.
- *
- * The password leaves this module only as the answer to `signIn.reveal`, an RPC answer to the one
- * window that asked, for the exact origin it was saved for. Never in an event, a log, an error
- * message or a tool result. None of these methods is on the phone's allowlist.
+ * This module is the bridge's part and holds no password: `<home>/sign-ins.json` keeps the origin,
+ * the user name, dates and the password as ciphertext from Electron's `safeStorage`. Encrypting,
+ * decrypting, filling and guarding the submission happen only in Electron's main process
+ * (`electron/sign-in-core.ts` `SignInGate`, wired in `electron/sign-in.ts`), which reads the
+ * ciphertext through `cipherOf` in-process. Over the bridge there is only `signIn.list` (names, never
+ * a secret) and `signIn.remove`. None of it is on the phone's allowlist.
  *
  * NOT IN THIS VERSION (`SIGN_IN_SHIPS` is false): `browser_sign_in` is offered to no agent and answers
- * that it is not available, every `signIn.*` method answers `SIGN_IN_OFF` (no list, no reveal, no
- * save, nothing read from or written to disk, the vault never called), the window never opens the
- * card, and Settings shows no saved sign-ins. The Demo's portal is signed into with plain typing.
- * Before it is switched on, an independent review (scratch/reviews/out-wave16.md) must be cleared:
- *   1. Any client of the desktop bridge can list the vault and reveal a password: decryption and
- *      filling belong in Electron main, bound to the window and the guest document, never an RPC.
- *   2. A listener left in the page by an earlier `browser_eval` sees the fill, and `browser_logs` keeps
- *      returning console output during the hold: fill only a credential-entry document no agent script
- *      has touched, and hold the logs too.
- *   3. The form's action and method are not checked: a cross-origin action or a GET form leaks the
- *      password. Same-origin POST only.
- *   4. A replaced input releases the hold (the check reads only the element it filled): arm the hold
- *      before the fill and end it only with a new document.
- *   5. The dev frame's origin is compared by prefix (`href.startsWith(target)`): compare exact origins.
+ * that it is not available, every `signIn.*` method answers `SIGN_IN_OFF` (nothing read from or
+ * written to disk), main's sign-in handlers refuse, the window never opens the card, and Settings
+ * shows no saved sign-ins. The Demo's portal is signed into with plain typing. It stays off until a
+ * review has cleared the rebuild below.
+ *
+ * The review of wave 16 (scratch/reviews/out-wave16.md), finding by finding: what answers it now, and
+ * what is still open.
+ *   1. Any client of the desktop bridge could reveal a password. Now: no RPC returns or takes a
+ *      password (`signIn.reveal`, `signIn.save` are gone); decryption, encryption and the fill are in
+ *      Electron main (`SignInGate.fill`), behind IPC that only the app's own window may call, bound to
+ *      a ticket of that window (`begin`) for one guest it hosts. Open: a compromised app renderer can
+ *      still ask main to fill a saved sign-in into a page at that sign-in's own origin (it never gets
+ *      the value back); any bridge client can still list origins and user names.
+ *   2. A listener left by an earlier `browser_eval` saw the fill; `browser_logs` ran during the hold.
+ *      Now: on approval main loads the page again and fills only that fresh document, stamped with a
+ *      nonce in an isolated world (`SIGN_IN_WORLD`) and checked to be the stamped, same-origin
+ *      document; the window refuses every agent tool on the page from `begin` until the hold ends
+ *      (`signing` in browser-agent.ts), and eval, screenshots and logs for as long as it is held.
+ *      Open: the site's own scripts see what is filled (they are the site the password is for); the
+ *      window's refusal is the renderer's (main also refuses the agent's screenshots while held).
+ *   3. A cross-origin or GET form could carry the password away. Now: the fill script requires a POST
+ *      form whose effective action (the submitter's formaction, formmethod and formtarget included) is
+ *      exactly the approved origin and whose target is the page itself (`fillScript`); and while the
+ *      password is in play, every request of that guest that carries it (address or body, as typed,
+ *      percent- or form-encoded) must be a POST to the exact origin or it is cancelled
+ *      (`requestVerdict`, from the session's webRequest). Open: an encoding the guard does not know
+ *      (a script of the site that transforms the password first) is not recognised.
+ *   4. A replaced input released the hold. Now: the hold is armed at `begin`, before any card or fill,
+ *      and after a fill only a new committed document releases it (`SignInGate.committed`); a fill
+ *      refused before any value was set, or a cancel, ends it. Open: a site that signs in without a new
+ *      document keeps the page held until it navigates or is reloaded.
+ *   5. The dev frame's origin was compared by prefix. Now: origins are compared exactly (scheme, host
+ *      in punycode, port; `sameOrigin`), the dev frame compares parsed origins, and the dev frame
+ *      cannot fill at all (only the desktop's main process fills).
  */
 
 /** Saved sign-ins ship at all. Tests of its code turn it on with `setSignInShips`. */
@@ -62,24 +78,11 @@ export const SIGN_INS_FILE = 'sign-ins.json';
 /** How many sign-ins are kept (the oldest used go first). */
 export const MAX_SIGN_INS = 200;
 export const MAX_USERNAME = 200;
-export const MAX_PASSWORD = 1_000;
-
-/** What the desktop shell gives: encryption bound to this computer and this person's account. */
-export interface SignInVault {
-  available(): boolean;
-  encrypt(plain: string): string;
-  decrypt(cipher: string): string;
-}
-
-let vault: SignInVault | undefined;
-
-/** The desktop shell's vault (electron/main.ts). Absent: nothing is saved. */
-export function setSignInVault(v: SignInVault | undefined) {
-  vault = v;
-}
+/** The longest ciphertext kept (base64 characters). */
+export const MAX_CIPHER = 8_000;
 
 interface Entry extends SignInInfo {
-  /** The password as the vault's ciphertext (base64). */
+  /** The password as safeStorage's ciphertext (base64); only Electron main can read it. */
   secret: string;
 }
 
@@ -122,38 +125,23 @@ const newId = () => randomBytes(8).toString('hex');
 
 function isEntry(e: unknown): e is Entry {
   const x = e as Entry;
-  return !!x && typeof x === 'object' && typeof x.id === 'string' && /^[a-f0-9]{8,32}$/.test(x.id) && typeof x.username === 'string' && typeof x.secret === 'string' && !!signInOrigin(x.origin);
+  return !!x && typeof x === 'object' && typeof x.id === 'string' && /^[a-f0-9]{8,32}$/.test(x.id) && typeof x.username === 'string' && typeof x.secret === 'string' && x.secret.length <= MAX_CIPHER && !!signInOrigin(x.origin);
 }
 
 const info = (e: Entry): SignInInfo => ({ id: e.id, origin: e.origin, username: e.username, createdAt: e.createdAt, ...(e.usedAt ? { usedAt: e.usedAt } : {}) });
 
+/**
+ * The file. Read on every use (it is small), so the bridge and Electron main, which each hold one,
+ * never act on a stale copy. Never decrypts: it keeps and hands over ciphertext only.
+ */
 export class SignInStore {
   readonly file: string;
-  private list?: Entry[];
 
-  constructor(
-    dir: string,
-    private getVault: () => SignInVault | undefined = () => vault,
-  ) {
+  constructor(dir: string) {
     this.file = path.join(dir, SIGN_INS_FILE);
   }
 
-  /** The vault when it can encrypt on this computer now. */
-  private v(): SignInVault | undefined {
-    const v = this.getVault();
-    try {
-      return v && v.available() ? v : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  canSave(): boolean {
-    return !!this.v();
-  }
-
   private load(): Entry[] {
-    if (this.list) return this.list;
     let f: Partial<SignInsFile> | undefined;
     try {
       f = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<SignInsFile>;
@@ -167,8 +155,7 @@ export class SignInStore {
       seen.add(e.id);
       out.push({ id: e.id, origin: e.origin, username: cleanUser(e.username), secret: e.secret, createdAt: Number(e.createdAt) || 0, ...(Number(e.usedAt) ? { usedAt: Number(e.usedAt) } : {}) });
     }
-    this.list = out.slice(0, MAX_SIGN_INS);
-    return this.list;
+    return out.slice(0, MAX_SIGN_INS);
   }
 
   /** Written to a file beside it, then moved over it: a cut-off write never leaves half a file. */
@@ -182,55 +169,35 @@ export class SignInStore {
       rmSync(tmp, { force: true });
       throw new Error(`Sign-ins could not be written (${(err as NodeJS.ErrnoException).code ?? 'error'}).`);
     }
-    this.list = list;
   }
 
-  /** Every saved sign-in (or one origin's), newest used first; never a password. */
+  /** Every saved sign-in (or one origin's), newest used first; never a secret. */
   all(origin?: string): SignInInfo[] {
     const list = this.load().filter((e) => !origin || e.origin === origin);
     return [...list].sort((a, b) => (b.usedAt ?? b.createdAt) - (a.usedAt ?? a.createdAt)).map(info);
   }
 
-  /** The password of one sign-in, for exactly the origin it was saved for; undefined when it cannot be read here. */
-  reveal(id: string, origin: string): string | undefined {
+  /** The ciphertext of one sign-in, for exactly the origin it was saved for. Electron main only (never an RPC). */
+  cipherOf(id: string, origin: string): string | undefined {
     const o = signInOrigin(origin);
     const e = this.load().find((x) => x.id === id);
-    if (!o || !e || e.origin !== o) return undefined;
-    const v = this.v();
-    if (!v) return undefined;
-    try {
-      const plain = v.decrypt(e.secret);
-      return typeof plain === 'string' && plain ? plain : undefined;
-    } catch {
-      // Another machine's or account's ciphertext, or a damaged entry.
-      return undefined;
-    }
+    return o && e && e.origin === o ? e.secret : undefined;
   }
 
-  /** Saves (or replaces the password of) the sign-in for this origin and user name. False when nothing can be saved here. */
-  put(origin: string, username: unknown, password: unknown): boolean {
+  /** Saves (or replaces) the ciphertext for this origin and user name. */
+  put(origin: string, username: unknown, cipher: unknown): void {
     const o = signInOrigin(origin);
     const user = cleanUser(username);
     if (!o) throw new Error('Sign-ins are saved only for https sites.');
     if (!user) throw new Error('A sign-in needs a user name.');
-    if (typeof password !== 'string' || !password || password.length > MAX_PASSWORD) throw new Error('A sign-in needs a password.');
-    const v = this.v();
-    if (!v) return false;
-    let secret: string;
-    try {
-      secret = v.encrypt(password);
-    } catch {
-      return false;
-    }
+    if (typeof cipher !== 'string' || !cipher || cipher.length > MAX_CIPHER) throw new Error('Nothing to save.');
     const now = Date.now();
     const list = this.load();
     const old = list.find((e) => e.origin === o && e.username === user);
-    const entry: Entry = { id: old?.id ?? newId(), origin: o, username: user, secret, createdAt: old?.createdAt ?? now, usedAt: now };
+    const entry: Entry = { id: old?.id ?? newId(), origin: o, username: user, secret: cipher, createdAt: old?.createdAt ?? now, usedAt: now };
     const rest = list.filter((e) => e !== old);
     // Bounded: the least recently used go first.
-    const kept = [entry, ...rest].sort((a, b) => (b.usedAt ?? b.createdAt) - (a.usedAt ?? a.createdAt)).slice(0, MAX_SIGN_INS);
-    this.save(kept);
-    return true;
+    this.save([entry, ...rest].sort((a, b) => (b.usedAt ?? b.createdAt) - (a.usedAt ?? a.createdAt)).slice(0, MAX_SIGN_INS));
   }
 
   used(id: string): boolean {
@@ -249,45 +216,23 @@ export class SignInStore {
   }
 }
 
-const stores = new WeakMap<App, SignInStore>();
-
-export function signInsOf(app: App): SignInStore {
-  let s = stores.get(app);
-  if (!s) {
-    s = new SignInStore(app.store.dir);
-    stores.set(app, s);
-  }
-  return s;
-}
-
 const idOf = (v: unknown) => {
   if (typeof v !== 'string' || !/^[a-f0-9]{8,32}$/.test(v)) throw new Error('No such sign-in.');
   return v;
 };
 
+/** The bridge's methods: names to list and remove, nothing that holds a secret. */
 export function registerSignIns(app: App) {
-  // Off: every method refuses before anything is read, written or asked of the vault.
+  // Off: every method refuses before anything is read or written.
   const store = () => {
     if (!signInShips()) throw new Error(SIGN_IN_OFF);
-    return signInsOf(app);
+    return new SignInStore(app.store.dir);
   };
-  app.register('signIn.state', () => ({ canSave: store().canSave() }));
   app.register('signIn.list', ({ origin } = {}) => {
-    store();
-    if (origin === undefined) return store().all();
+    const s = store();
+    if (origin === undefined) return s.all();
     const o = signInOrigin(origin);
-    return o ? store().all(o) : [];
+    return o ? s.all(o) : [];
   });
-  app.register('signIn.reveal', ({ id, origin }) => {
-    const password = store().reveal(idOf(id), String(origin ?? ''));
-    // The same words whatever failed: nothing about the entry is told.
-    if (!password) throw new Error('This sign-in cannot be read on this computer.');
-    return { password };
-  });
-  app.register('signIn.save', ({ origin, username, password }) => {
-    const saved = store().put(String(origin ?? ''), username, password);
-    return { ok: true, saved };
-  });
-  app.register('signIn.used', ({ id }) => ({ ok: store().used(idOf(id)) }));
   app.register('signIn.remove', ({ id }) => ({ ok: store().remove(idOf(id)) }));
 }

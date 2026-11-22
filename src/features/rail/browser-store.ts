@@ -50,6 +50,8 @@ export interface PageState {
    * or the field is cleared, the agent's outline lists no values, and scripts and screenshots are refused.
    */
   filled?: boolean;
+  /** A sign-in is under way on this page: every agent tool but the sign-in itself is refused. */
+  signing?: boolean;
   /** One line after a sign-in ("Signed in as name"), for a few seconds. */
   signedInAs?: string;
 }

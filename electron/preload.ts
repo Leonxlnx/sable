@@ -68,6 +68,16 @@ contextBridge.exposeInMainWorld('sableDesktop', {
     /** `forAgent`: smaller, as JPEG, for the agent's browser_screenshot. */
     capture: (webContentsId: number, opts?: { forAgent?: boolean }): Promise<string> => ipcRenderer.invoke('sable:browser-capture', Number(webContentsId), !!opts?.forAgent),
     clearData: (): Promise<void> => ipcRenderer.invoke('sable:browser-clear'),
+    /**
+     * Saved sign-ins (electron/sign-in.ts): main fills the page itself. `begin` arms the hold and gives a
+     * ticket for the page's document; `fill` answers only whether it signed in and the user name.
+     */
+    signIn: {
+      begin: (webContentsId: number, origin: string): Promise<{ ticket: string; canSave: boolean }> => ipcRenderer.invoke('sable:signin-begin', Number(webContentsId), String(origin)),
+      fill: (webContentsId: number, ticket: string, cred: { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string }): Promise<{ ok: boolean; signedIn?: boolean; user?: string; error?: string }> =>
+        ipcRenderer.invoke('sable:signin-fill', Number(webContentsId), String(ticket), cred),
+      cancel: (ticket: string): Promise<void> => ipcRenderer.invoke('sable:signin-cancel', String(ticket)),
+    },
     /** Which page is in front: the others are muted and slowed down by the shell. */
     setShown: (webContentsId: number, shown: boolean) => ipcRenderer.send('sable:browser-shown', Number(webContentsId), !!shown),
     /**

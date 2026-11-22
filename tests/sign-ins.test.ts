@@ -1,4 +1,3 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -10,28 +9,9 @@ import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
 import { BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOL_IDS, BROWSER_TOOLS, runBrowserTool, SIGN_IN_KEYS } from '../server/providers/browser-tool';
 import { DemoProvider } from '../server/providers/demo';
-import { MAX_SIGN_INS, SIGN_IN_SHIPS, setSignInShips, setSignInVault, SignInStore, signInOrigin, type SignInVault } from '../server/services/sign-ins';
+import { MAX_SIGN_INS, SIGN_IN_SHIPS, setSignInShips, SignInStore, signInOrigin } from '../server/services/sign-ins';
 import { DEFAULT_SETTINGS } from '@shared/protocol';
-import { signInFillScript, signInProbeScript, snapshotScript } from '../src/features/rail/browser-scripts';
-
-/** A stand-in for Electron's safeStorage: AES-GCM under a key that belongs to "this machine". */
-function vaultWith(key = randomBytes(32)): SignInVault {
-  return {
-    available: () => true,
-    encrypt: (plain) => {
-      const iv = randomBytes(12);
-      const c = createCipheriv('aes-256-gcm', key, iv);
-      const body = Buffer.concat([c.update(plain, 'utf8'), c.final()]);
-      return Buffer.concat([iv, c.getAuthTag(), body]).toString('base64');
-    },
-    decrypt: (cipher) => {
-      const b = Buffer.from(cipher, 'base64');
-      const d = createDecipheriv('aes-256-gcm', key, b.subarray(0, 12));
-      d.setAuthTag(b.subarray(12, 28));
-      return Buffer.concat([d.update(b.subarray(28)), d.final()]).toString('utf8');
-    },
-  };
-}
+import { signInProbeScript, snapshotScript } from '../src/features/rail/browser-scripts';
 
 const PASSWORD = 'made-up-pass-7351';
 const dirs: string[] = [];
@@ -64,66 +44,44 @@ describe('not in this version: the switch is off', () => {
     expect(t.requests).toHaveLength(0);
   });
 
-  it('every signIn method answers off, reads and writes nothing and never calls the vault', async () => {
+  it('every signIn method answers off and reads or writes nothing; none of them carries a secret', async () => {
     const home = temp();
-    const calls: string[] = [];
-    setSignInVault({ available: () => (calls.push('available'), true), encrypt: (p) => (calls.push('encrypt'), p), decrypt: (c) => (calls.push('decrypt'), c) });
     const app = new App({ home, providers: [(c) => new DemoProvider(c, { speed: 0 })], quiet: true });
     try {
       const before = readdirSync(home).sort();
-      const calls2: [string, Record<string, unknown>][] = [
-        ['signIn.state', {}],
+      const calls: [string, Record<string, unknown>][] = [
         ['signIn.list', {}],
         ['signIn.list', { origin: 'https://portal.example.test' }],
-        ['signIn.reveal', { id: '0123456789abcdef', origin: 'https://portal.example.test' }],
-        ['signIn.save', { origin: 'https://portal.example.test', username: 'student.one', password: PASSWORD }],
-        ['signIn.used', { id: '0123456789abcdef' }],
         ['signIn.remove', { id: '0123456789abcdef' }],
       ];
-      for (const [m, p] of calls2) await expect(app.call(m as never, p as never)).rejects.toThrow(/SIGN_IN_OFF/);
+      for (const [m, p] of calls) await expect(app.call(m as never, p as never)).rejects.toThrow(/SIGN_IN_OFF/);
       expect(existsSync(path.join(home, 'sign-ins.json'))).toBe(false);
       expect(readdirSync(home).sort()).toEqual(before);
-      expect(calls).toEqual([]);
+      // Finding 1: no method of the bridge reveals or takes a password, switched on or off.
+      for (const m of ['signIn.reveal', 'signIn.save', 'signIn.state', 'signIn.used']) await expect(app.call(m as never, {} as never)).rejects.toThrow(/Unknown method/);
     } finally {
-      setSignInVault(undefined);
       await app.dispose();
     }
   });
 });
 
 describe('the saved sign-ins (server/services/sign-ins.ts)', () => {
-  it('keeps only ciphertext on disk and gives the password back for the exact origin only', () => {
+  it('keeps ciphertext and names only, and hands the ciphertext over for the exact origin only', () => {
     const dir = temp();
-    const s = new SignInStore(dir, () => vaultWith(Buffer.alloc(32, 7)));
-    expect(s.put('https://portal.example.test', 'student.one', PASSWORD)).toBe(true);
+    const s = new SignInStore(dir);
+    s.put('https://portal.example.test', 'student.one', 'CIPHER-made-up');
     const raw = readFileSync(path.join(dir, 'sign-ins.json'), 'utf8');
-    expect(raw).not.toContain(PASSWORD);
     expect(raw).toContain('student.one');
     const [one] = s.all('https://portal.example.test');
     expect(one).toMatchObject({ origin: 'https://portal.example.test', username: 'student.one' });
     expect(Object.keys(one)).not.toContain('secret');
-    expect(s.reveal(one.id, 'https://portal.example.test')).toBe(PASSWORD);
+    expect(s.cipherOf(one.id, 'https://portal.example.test')).toBe('CIPHER-made-up');
     // Never a look-alike, a subdomain, another port or the plain-http twin.
-    for (const o of ['https://portal.example.test.evil.test', 'https://login.portal.example.test', 'https://portal.example.test:8443', 'http://portal.example.test', 'https://portal-example.test']) expect(s.reveal(one.id, o)).toBeUndefined();
+    for (const o of ['https://portal.example.test.evil.test', 'https://login.portal.example.test', 'https://portal.example.test:8443', 'http://portal.example.test', 'https://portal-example.test']) expect(s.cipherOf(one.id, o)).toBeUndefined();
     // Written atomically: no temporary file is left beside it.
     expect(readdirSync(dir)).toEqual(['sign-ins.json']);
-  });
-
-  it('a file copied to another machine cannot be read there', () => {
-    const dir = temp();
-    new SignInStore(dir, () => vaultWith(Buffer.alloc(32, 1))).put('https://portal.example.test', 'student.one', PASSWORD);
-    const elsewhere = new SignInStore(dir, () => vaultWith(Buffer.alloc(32, 2)));
-    const [one] = elsewhere.all();
-    expect(one.username).toBe('student.one');
-    expect(elsewhere.reveal(one.id, 'https://portal.example.test')).toBeUndefined();
-  });
-
-  it('saves nothing where nothing can encrypt (dev server, standalone bridge)', () => {
-    const dir = temp();
-    const s = new SignInStore(dir, () => undefined);
-    expect(s.canSave()).toBe(false);
-    expect(s.put('https://portal.example.test', 'student.one', PASSWORD)).toBe(false);
-    expect(existsSync(path.join(dir, 'sign-ins.json'))).toBe(false);
+    // Read on every use: a second store on the same folder (Electron main's) sees the same list.
+    expect(new SignInStore(dir).all()).toEqual(s.all());
   });
 
   it('only https origins (and http on this machine), written exactly as the browser has them', () => {
@@ -135,13 +93,12 @@ describe('the saved sign-ins (server/services/sign-ins.ts)', () => {
 
   it('is bounded, one entry per origin and user name, and removable', () => {
     const dir = temp();
-    const v = vaultWith();
-    const s = new SignInStore(dir, () => v);
-    s.put('https://a.example.test', 'one', 'p1');
-    s.put('https://a.example.test', 'one', 'p2');
+    const s = new SignInStore(dir);
+    s.put('https://a.example.test', 'one', 'c1');
+    s.put('https://a.example.test', 'one', 'c2');
     expect(s.all()).toHaveLength(1);
-    expect(s.reveal(s.all()[0].id, 'https://a.example.test')).toBe('p2');
-    for (let i = 0; i < MAX_SIGN_INS + 5; i++) s.put(`https://s${i}.example.test`, 'u', 'p');
+    expect(s.cipherOf(s.all()[0].id, 'https://a.example.test')).toBe('c2');
+    for (let i = 0; i < MAX_SIGN_INS + 5; i++) s.put(`https://s${i}.example.test`, 'u', 'c');
     expect(s.all()).toHaveLength(MAX_SIGN_INS);
     const id = s.all()[0].id;
     expect(s.remove(id)).toBe(true);
@@ -238,14 +195,12 @@ describe('browser_sign_in, with the switch on (server/providers/browser-tool.ts)
   });
 });
 
-describe('the page scripts of a sign-in (browser-scripts.ts)', () => {
-  it('parse, carry values only as data, refuse frames and check the origin at the moment of filling', () => {
+describe('the outline script of a sign-in (browser-scripts.ts)', () => {
+  it('parses, refuses frames and never fills anything (the fill is Electron main\'s)', () => {
     const probe = signInProbeScript({ userRef: 'e1', passRef: 'e2' });
-    const fill = signInFillScript({ userRef: 'e1', passRef: 'e2' }, 'https://portal.example.test', 'a"b', `x'); alert(1); ('`);
-    for (const s of [probe, fill, snapshotScript(100, false)]) expect(() => new Function(`return ${s}`)).not.toThrow();
+    for (const x of [probe, snapshotScript(100, false)]) expect(() => new Function(`return ${x}`)).not.toThrow();
     expect(probe).toContain('window.top !== window');
     expect(probe).toContain('ownerDocument !== document');
-    expect(fill).toContain(`location.origin !== "https://portal.example.test"`);
-    expect(fill).toContain(JSON.stringify(`x'); alert(1); ('`));
+    expect(probe).not.toMatch(/\.value\s*=|requestSubmit|\.click\(/);
   });
 });

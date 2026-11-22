@@ -390,8 +390,7 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         resetLog(tid);
         // A reload of the same address keeps its title and icon: the engine reports them again only when they change.
         const same = getPage(tid).url === e.url;
-        // A new document holds no password Sable filled: the agent's tools work in full again.
-        setPage(tid, { url: e.url, ...(same ? {} : { title: '', favicon: undefined }), phase: 2, filled: undefined });
+        setPage(tid, { url: e.url, ...(same ? {} : { title: '', favicon: undefined }), phase: 2 });
         refreshNav(v);
         if (tid === activeTab(sessionId)) setFound(null);
       });
@@ -486,6 +485,7 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
           }
         },
         ...pointerRef.current(() => (v.ready ? el : null)),
+        guestId: () => v.wcId,
       });
       return true;
     },
@@ -520,6 +520,8 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         for (const l of e.lines ?? []) if (l.text) logLine(v.tabId, { level: levelOf(l.level), text: l.text, source: l.source });
         logDropped(v.tabId, e.count ?? 0);
       } else if (e.type === 'hang') setPage(v.tabId, { hung: e.on ? true : undefined });
+      // Electron main ended a sign-in's hold (a new document replaced the filled one, or nothing was filled).
+      else if (e.type === 'signin-released') setPage(v.tabId, { filled: undefined, signing: undefined });
       else if (e.type === 'flood') setPage(v.tabId, { flooded: true });
     });
     const all = views.current;

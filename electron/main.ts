@@ -1,9 +1,9 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, safeStorage, screen, session, shell, webContents, type MenuItemConstructorOptions, type Rectangle, type WebContents } from 'electron';
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, screen, session, shell, webContents, type MenuItemConstructorOptions, type Rectangle, type WebContents } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import nodeModule from 'node:module';
 import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
-import { setSignInVault } from '../server/services/sign-ins';
+import { installSignIn, signInHeld } from './sign-in';
 import { bootMark } from '../server/util/boot';
 import { fixPathFromLoginShell } from '../server/util/login-env';
 import { pageHeaders as csp } from './csp';
@@ -500,10 +500,15 @@ function hardenBrowser() {
     if (win && !win.isDestroyed()) win.webContents.send('sable:browser-event', { type: 'download-blocked', name: item.getFilename() });
   });
 
+  // Saved sign-ins: decrypted and filled only here, in main (electron/sign-in.ts). The same folder the bridge's store uses.
+  installSignIn({ partition: BROWSER_PARTITION, home: process.env.SABLE_HOME ?? path.join(app.getPath('home'), '.sable'), window: () => win, fromApp });
+
   ipcMain.handle('sable:browser-capture', async (e, id: unknown, forAgent: unknown) => {
     if (!fromApp(e)) throw new Error('Not allowed');
     const guest = webContents.fromId(Number(id));
     if (!guest || guest.getType() !== 'webview' || guest.hostWebContents !== e.sender) throw new Error('That page is gone');
+    // No picture for the agent while a sign-in is under way or a filled document is still shown.
+    if (forAgent === true && signInHeld(guest.id)) throw new Error('A sign-in holds this page');
     // A page that hangs may never paint again: the capture gives up rather than keep the caller waiting.
     const image = await Promise.race([guest.capturePage(), sleep(8000).then(() => Promise.reject(new Error('The page did not answer in time')))]);
     const { width, height } = image.getSize();
@@ -978,13 +983,6 @@ if (!app.requestSingleInstanceLock()) {
         .finally(() => app.quit());
     }
   };
-  // The Browser tab's saved sign-ins are encrypted for this computer and account (server/services/sign-ins.ts).
-  // Asked only once Electron is ready; on Linux only with a real secret store (never the plain-text fallback).
-  setSignInVault({
-    available: () => app.isReady() && safeStorage.isEncryptionAvailable() && (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text'),
-    encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
-    decrypt: (cipher) => safeStorage.decryptString(Buffer.from(cipher, 'base64')),
-  });
   const serve = () =>
     startServer({
       root: path.join(app.getAppPath(), 'dist'),

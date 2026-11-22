@@ -339,14 +339,10 @@ export const respondBrowser = (sessionId: string, requestId: string, answer: Bro
 export const reportBrowserPage = (sessionId: string, page: { url: string; title: string } | null) => bridge.call('browser.page', { sessionId, page }).catch(() => {});
 
 /*
- * The Browser tab's saved sign-ins (server/services/sign-ins.ts). The password goes only into the
- * page's field: never into the store, a toast or an error. These reject; callers say what failed.
+ * The Browser tab's saved sign-ins (server/services/sign-ins.ts): names only. A password never goes
+ * over the bridge: the desktop's main process fills it (electron/sign-in.ts). These reject.
  */
-export const signInState = () => bridge.call('signIn.state', {});
 export const listSignIns = (origin?: string) => bridge.call('signIn.list', origin ? { origin } : {});
-export const revealSignIn = (id: string, origin: string) => bridge.call('signIn.reveal', { id, origin });
-export const saveSignIn = (origin: string, username: string, password: string) => bridge.call('signIn.save', { origin, username, password });
-export const markSignInUsed = (id: string) => bridge.call('signIn.used', { id }).catch(() => {});
 export const removeSignIn = (id: string) => bridge.call('signIn.remove', { id });
 
 /** Changes what new sessions with `provider` start with (Settings › General). */
