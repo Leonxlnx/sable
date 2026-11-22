@@ -24,28 +24,39 @@ export function appBundleOf(execPath: string): string | null {
 /**
  * The script: arguments are the pid to wait for, the zip and the app bundle. Every failure ends
  * in reopening whatever app is installed, so a failed update never leaves the person without Sable.
+ * The old bundle is deleted only once a sound new one is in place or the old one is back: if neither
+ * can be had, it stays in the work folder and Finder shows it (review wave 8, #25).
+ * `SABLE_DITTO`, `SABLE_OPEN` and `SABLE_XATTR` are for tests only: `installMac` starts the script with
+ * an environment of its own, without them.
  */
 export const MAC_INSTALL_SCRIPT = `#!/bin/sh
 PID="$1"; ZIP="$2"; APP="$3"
+DITTO="\${SABLE_DITTO:-/usr/bin/ditto}"; OPEN="\${SABLE_OPEN:-/usr/bin/open}"; XATTR="\${SABLE_XATTR:-/usr/bin/xattr}"
 PARENT="$(dirname "$APP")"
 NAME="$(basename "$APP")"
 n=0
 while kill -0 "$PID" 2>/dev/null && [ "$n" -lt 150 ]; do sleep 0.2; n=$((n+1)); done
 if kill -0 "$PID" 2>/dev/null; then exit 1; fi
-WORK="$(mktemp -d "$PARENT/.sable-update.XXXXXX")" || { /usr/bin/open "$APP"; exit 1; }
-if /usr/bin/ditto -x -k "$ZIP" "$WORK" && [ -d "$WORK/$NAME" ]; then
+WORK="$(mktemp -d "$PARENT/.sable-update.XXXXXX")" || { "$OPEN" "$APP"; exit 1; }
+sound() { [ -d "$1/Contents/MacOS" ] && [ -f "$1/Contents/Info.plist" ]; }
+if "$DITTO" -x -k "$ZIP" "$WORK" && sound "$WORK/$NAME"; then
   OLD="$WORK/previous.app"
   if mv "$APP" "$OLD"; then
-    if mv "$WORK/$NAME" "$APP"; then
-      /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null
+    if mv "$WORK/$NAME" "$APP" && sound "$APP"; then
+      "$XATTR" -dr com.apple.quarantine "$APP" 2>/dev/null
     else
-      rm -rf "$APP"
-      mv "$OLD" "$APP"
+      # The new bundle could not be put in place whole: what came of it goes, the old one comes back.
+      if [ -e "$APP" ]; then rm -rf "$APP"; fi
+      if [ -e "$APP" ] || ! mv "$OLD" "$APP"; then
+        # The old app could not be put back: it is the only copy left, so it stays, and Finder shows it.
+        "$OPEN" -R "$OLD"
+        exit 1
+      fi
     fi
   fi
 fi
 rm -rf "$WORK"
-/usr/bin/open "$APP"
+"$OPEN" "$APP"
 `;
 
 /** Whether this process may replace the app bundle (it needs to write next to it, as /Applications allows an admin). */
@@ -74,5 +85,10 @@ export function installMac(zip: string, opts: { execPath?: string; pid?: number 
     }
     throw new Error(`Sable cannot replace itself here. Open ${path.basename(zip)} from the Finder window that appeared and drag Sable into Applications.`);
   }
-  spawn('/bin/sh', ['-c', MAC_INSTALL_SCRIPT, 'sable-update', String(opts.pid ?? process.pid), zip, bundle], { detached: true, stdio: 'ignore' }).unref();
+  // An environment of its own: the system's tools only, nothing of this process's (no test overrides).
+  spawn('/bin/sh', ['-c', MAC_INSTALL_SCRIPT, 'sable-update', String(opts.pid ?? process.pid), zip, bundle], {
+    detached: true,
+    stdio: 'ignore',
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: process.env.HOME ?? '/', TMPDIR: process.env.TMPDIR ?? '/tmp' },
+  }).unref();
 }
