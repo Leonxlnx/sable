@@ -25,7 +25,7 @@ import { remoteRef } from './css-scan';
  *
  * The Customize chat runs only with an agent that gets its brief (`customAgent`: Claude Code or Codex;
  * the Demo agent when named, for development). A phone cannot reach the sheet through a chat
- * (`phoneRefusal`): no chat or folder of a phone's in the data folder, and the Customize chat (or any
+ * (`phoneRefusal`): no chat of a phone's in the data folder, and the Customize chat (or any
  * chat in `<data>/custom`) is only read and stopped from a phone; `custom.*` is not on its allowlist.
  *
  * Any local process that can reach the bridge (review wave 8, #1: out of scope for now) can call these
@@ -925,7 +925,7 @@ export const PHONE_DATA_REFUSED = "A chat from the phone cannot start in Sable's
 /**
  * Why a phone's request is refused because of Customize Sable, or undefined. The phone's allowlist keeps
  * `custom.*` out; this keeps the stylesheet out of reach through a chat: a phone may not start a chat
- * (or make a folder) anywhere in Sable's data folder, and may only read and stop a chat that can write
+ * anywhere in Sable's data folder, and may only read and stop a chat that can write
  * `<data>/custom`.
  */
 export function phoneRefusal(app: App, method: string, params: Record<string, unknown>): string | undefined {
@@ -936,7 +936,6 @@ export function phoneRefusal(app: App, method: string, params: Record<string, un
     if (cwd && within(cwd, data)) return PHONE_DATA_REFUSED;
     return undefined;
   }
-  if (method === 'phone.mkdir') return typeof params.parent === 'string' && within(params.parent, data) ? PHONE_DATA_REFUSED : undefined;
   const id = params.sessionId;
   if (typeof id !== 'string' || PHONE_CUSTOM_READS.has(method)) return undefined;
   const meta = app.sessions.get(id)?.meta;

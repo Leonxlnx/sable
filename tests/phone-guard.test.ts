@@ -16,7 +16,7 @@ import { DemoProvider } from '../server/providers/demo';
 import { registerFs } from '../server/services/fs';
 import { phoneEvent, phonePermission, phoneResult, registerPhone } from '../server/services/phone';
 import { FRAME_MAX, phoneAttachments, readHello } from '../server/services/phone-guard';
-import { fetchSecure, helloPlain, helloSecure, legacyPairing, pairSecure, wireClient } from './phone-wire';
+import { beside, fetchSecure, helloPlain, helloSecure, legacyPairing, pairSecure, wireClient } from './phone-wire';
 import { CONTAIN } from '../server/core/contain';
 
 // These tests are about the phone's download links and changes, not containment. Where no handle names its file (Windows), the
@@ -68,7 +68,7 @@ describe('download links from the phone', () => {
   it('only for a share that went through, its path resolved against the chat folder', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const cwd = path.join(home, 'chat');
+    const cwd = beside(home, 'chat');
     const rt = await chatIn(app, c, cwd);
     mkdirSync(path.join(cwd, 'reports'));
     writeFileSync(path.join(cwd, 'reports', 'audit.txt'), 'the audit');
@@ -96,7 +96,7 @@ describe('download links from the phone', () => {
     const { app, port, home, old } = await setup(2);
     const c = await helloPlain(port, old[0].token);
     const deviceId = old[0].deviceId;
-    const cwd = path.join(home, 'chat');
+    const cwd = beside(home, 'chat');
     const rt = await chatIn(app, c, cwd);
     writeFileSync(path.join(cwd, 'build.zip'), 'zip bytes');
     rt.add(share('s1', 'done', [{ path: path.join(cwd, 'build.zip'), name: 'build.zip', size: 9 }]));
@@ -123,7 +123,7 @@ describe('download links from the phone', () => {
     // Plain HTTP links: a phone paired before the secure channel.
     const { app, port, home, old } = await setup(1);
     const c = await helloPlain(port, old[0].token);
-    const cwd = path.join(home, 'chat');
+    const cwd = beside(home, 'chat');
     const rt = await chatIn(app, c, cwd);
     const file = path.join(cwd, 'notes.txt');
     writeFileSync(file, 'version one');
@@ -280,7 +280,7 @@ describe("a chat's changes from the phone, in a repository's subfolder", () => {
 
   it('lists and diffs only the chat folder, never a sibling folder or a link out of it', async () => {
     const { app, port, home } = await setup();
-    const repo = path.join(home, 'repo');
+    const repo = beside(home, 'repo');
     mkdirSync(path.join(repo, 'app'), { recursive: true });
     mkdirSync(path.join(repo, 'private'), { recursive: true });
     git(repo, 'init', '-q', '-b', 'main');

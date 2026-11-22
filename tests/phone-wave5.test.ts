@@ -25,7 +25,7 @@ import type { ProviderSession } from '../server/providers/types';
 import { registerFs } from '../server/services/fs';
 import { PHONE_BYTES, phoneAllowed, phonePermission, phoneResult, registerPhone, sessionsPage, type PhoneService } from '../server/services/phone';
 import { pskOfKey } from '../mobile/src/lib/secure';
-import { fingerprintIn, handshake, helloPlain, keyOf, legacyPairing, pairSecure, wireClient, type WireClient } from './phone-wire';
+import { beside, fingerprintIn, handshake, helloPlain, keyOf, legacyPairing, pairSecure, wireClient, type WireClient } from './phone-wire';
 
 // Pages of many megabytes, sealed and compressed, take seconds when the whole suite runs at once.
 vi.setConfig({ testTimeout: 60_000 });
@@ -96,7 +96,7 @@ async function setup(opts: { legacy?: { id?: string; name?: string }[]; home?: s
 }
 
 async function chatOf(app: App, c: WireClient, home: string) {
-  const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
+  const created = (await c.call('session.create', { provider: 'demo', cwd: beside(home) })) as { result: PhoneTail };
   return app.sessions.get(created.result.session.id)!;
 }
 
@@ -396,7 +396,7 @@ describe('a send that waits, from a phone removed meanwhile (9)', () => {
     const { app, phone, port, home, gates, sent } = await setup();
     const { c, deviceId } = await pairSecure(app, port);
     gates.open = gate();
-    const created = (await c.call('session.create', { provider: 'demo', cwd: home }, 6000)) as { ok: boolean; result: PhoneTail };
+    const created = (await c.call('session.create', { provider: 'demo', cwd: beside(home) }, 6000)) as { ok: boolean; result: PhoneTail };
     expect(created.ok).toBe(true);
     const rt = app.sessions.get(created.result.session.id)!;
     void c.call('session.send', { sessionId: rt.id, text: 'rm -rf the project' }).catch(() => {});
@@ -632,11 +632,11 @@ describe('a file the desktop cannot prove is in the chat folder (7)', () => {
     const { c } = await pairSecure(app, port);
     const rt = await chatOf(app, c, home);
     const shareOf = (id: string, file: string) => ({ id, type: 'tool', name: 'SendUserFile', kind: 'share', title: 'Shared', status: 'done', detail: { files: [{ path: file, name: path.basename(file), size: statSync(file).size }] } }) as unknown as ToolItem;
-    writeFileSync(path.join(home, 'plain.txt'), 'plain words');
-    writeFileSync(path.join(home, 'target.txt'), 'linked words');
-    linkSync(path.join(home, 'target.txt'), path.join(home, 'linked.txt'));
-    rt.add(shareOf('s1', path.join(home, 'plain.txt')));
-    rt.add(shareOf('s2', path.join(home, 'linked.txt')));
+    writeFileSync(path.join(rt.meta.cwd, 'plain.txt'), 'plain words');
+    writeFileSync(path.join(rt.meta.cwd, 'target.txt'), 'linked words');
+    linkSync(path.join(rt.meta.cwd, 'target.txt'), path.join(rt.meta.cwd, 'linked.txt'));
+    rt.add(shareOf('s1', path.join(rt.meta.cwd, 'plain.txt')));
+    rt.add(shareOf('s2', path.join(rt.meta.cwd, 'linked.txt')));
     await rt.handing('s1');
     await rt.handing('s2');
     const plain = await c.call('phone.fileStart', { sessionId: rt.id, itemId: 's1', index: 0 });
@@ -658,10 +658,10 @@ describe('a plain download link serves only the bytes the share recorded (5)', (
     const { app, port, home, old } = await setup({ legacy: [{ id: 'old-a' }] });
     const plain = await helloPlain(port, old[0].token);
     cleanups.push(() => plain.ws.close());
-    const created = (await plain.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
+    const created = (await plain.call('session.create', { provider: 'demo', cwd: beside(home) })) as { result: PhoneTail };
     const rt = app.sessions.get(created.result.session.id)!;
     const { FILE_CHUNK } = await import('../server/services/phone-files');
-    const file = path.join(home, 'notes.bin');
+    const file = path.join(rt.meta.cwd, 'notes.bin');
     // Big enough that the serve waits for the phone (a paused reader) long before its end.
     const body = Buffer.alloc(FILE_CHUNK * 64, 'a');
     writeFileSync(file, body);

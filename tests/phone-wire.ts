@@ -4,15 +4,31 @@
  * Frames come in order, opened; `call` seals an RPC and waits for its answer.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { expect } from 'vitest';
+import { afterEach, expect } from 'vitest';
 import WebSocket from 'ws';
 import { PHONE_PATH, type PhoneStatus } from '@shared/protocol';
 import type { App } from '../server/app';
 import { pskOfKey, pskOfToken, startHandshake, type Channel } from '../mobile/src/lib/secure';
 
 export type Frame = Record<string, unknown>;
+
+const besides: string[] = [];
+afterEach(() => {
+  for (const d of besides.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+});
+
+/**
+ * A folder for a phone's chat next to the app's data folder `home` (made, and removed after the test):
+ * a phone may not start a chat anywhere inside Sable's data folder (`phoneRefusal` in services/custom.ts).
+ */
+export function beside(home: string, name = 'work'): string {
+  const d = `${home}-${name}`;
+  mkdirSync(d, { recursive: true });
+  besides.push(d);
+  return d;
+}
 
 export interface WireClient {
   ws: WebSocket;

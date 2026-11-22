@@ -1,7 +1,7 @@
 /**
  * Customize Sable and the phone (review wave 8, #6): a paired phone cannot reach the person's live
  * stylesheet through a chat. It may not start a chat anywhere in Sable's data folder (the custom folder
- * included, a chat folder there or a link into it), may not make a folder there, and may only read and
+ * included, a chat folder there or a link into it), and may only read and
  * stop the Customize chat (or any chat in `<data>/custom`): no message, steer, answer, mode or model.
  * `custom.*` stays off its allowlist. Demo agent and local sockets only: nothing real is started.
  */
@@ -59,8 +59,6 @@ describe('a phone and the person’s stylesheet', () => {
     // Chats without a folder land in the chats folder: refused when that is inside the data folder.
     await app.call('app.setSettings', { patch: { chatsFolder: custom } });
     expect(await phone.call('session.create', { provider: 'demo', cwd: root, chat: { text: 'make the sidebar pink' } })).toMatchObject({ ok: false, error: PHONE_DATA_REFUSED });
-    // Nor a folder made there.
-    expect(await phone.call('phone.mkdir', { parent: custom, name: 'x' })).toMatchObject({ ok: false, error: PHONE_DATA_REFUSED });
     expect([...app.sessions.values()]).toHaveLength(0);
     // Elsewhere as before.
     await app.call('app.setSettings', { patch: { chatsFolder: path.join(root, 'chats') } });
