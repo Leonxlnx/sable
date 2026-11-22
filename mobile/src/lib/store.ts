@@ -473,8 +473,12 @@ export function applyEvent(e: BridgeEvent) {
         // waiting message the agent took, which now stands at the end): read on from the last root
         // here instead (a page that starts at a root the phone has adds only what follows it), or
         // everything between would be skipped.
-        const last = (out.roots ?? d.roots).at(-1);
+        const left = out.roots ?? d.roots;
+        const last = left.at(-1);
         if (d.next === e.id && last) out.next = last;
+        // The same for the page before the ones here, which was asked for as "before this root": it
+        // is asked before the first root still here (an answer for the old one is dropped, `applyOlder`).
+        if (d.cursor === e.id && left[0]) out.cursor = left[0];
         return out;
       });
     case 'timeline.reset': {

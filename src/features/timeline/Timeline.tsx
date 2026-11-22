@@ -1,6 +1,6 @@
 import { syntheticOf } from '@shared/synthetic';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion, useIsPresent } from 'motion/react';
 import { Icon } from '@/icons';
 import { EASE_OUT, play, reducedMotion } from '@/lib/motion';
 import { interrupt } from '@/state/actions';
@@ -387,8 +387,11 @@ export function Timeline({ sessionId }: { sessionId: string }) {
   }, [sessionId]);
 
   // Esc stops the turn, unless something else (a menu, a dialog, a field with its own Esc) wants the key.
+  // Not in a view on its way out: while the veil closes over a change of chat both conversations
+  // stand in the page, and one Escape would stop the turn of the chat just left too.
+  const present = useIsPresent();
   useEffect(() => {
-    if (!busy) return;
+    if (!busy || !present) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing || e.repeat) return;
       if (document.querySelector('[data-radix-popper-content-wrapper], [role="dialog"], [role="menu"], [role="listbox"]')) return;
@@ -396,7 +399,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [busy, sessionId]);
+  }, [busy, present, sessionId]);
 
   // A chat whose first message waits for spare quota (or a reset) is not empty: the strip above the composer says when it starts.
   const waiting = useStore((s) => !!s.sessions[sessionId]?.spare);

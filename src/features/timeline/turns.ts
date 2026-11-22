@@ -222,7 +222,16 @@ export function shapeIndex() {
     // Roots change only by joining at the end or leaving: the old last root still in its place
     // means nothing before it left (as `grow` in the Agents tab reads it).
     const grew = roots === ids || (roots.length >= n && (n === 0 || (roots[0] === ids[0] && roots[n - 1] === ids[n - 1])));
-    if (!changed || !grew) {
+    // A root the bridge moved (a message the agent took) is a changed item no longer at its place.
+    // Two taken in one write leave the first and last root where they were, so the ends alone do not say.
+    const moved =
+      !!changed &&
+      roots !== ids &&
+      changed.some((id) => {
+        const i = pos.get(id);
+        return i !== undefined && roots[i] !== id;
+      });
+    if (!changed || !grew || moved) {
       chars = new Array<string>(roots.length);
       pos = new Map();
       for (let i = 0; i < roots.length; i++) {

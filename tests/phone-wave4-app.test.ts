@@ -147,6 +147,17 @@ describe('a message the agent takes while the phone reads far back', () => {
     expect(store.getState().data.held.roots.at(-1)).toBe(sent.id);
   });
 
+  it('the first root here moves to the end: the page before is asked before what is still first', async () => {
+    const roots = chat('first', 200);
+    await store.openAt('first', roots[100].id);
+    const d0 = store.getState().data.first as unknown as { cursor?: string; roots: string[] };
+    expect(d0.cursor).toBe(d0.roots[0]);
+    take('first', d0.roots[0]);
+    const d1 = store.getState().data.first as unknown as { cursor?: string; roots: string[] };
+    expect(d1.roots).not.toContain(d0.roots[0]);
+    expect(d1.cursor).toBe(d1.roots[0]);
+  });
+
   it('at the newest the message simply moves to the end', async () => {
     const roots = chat('live', 30);
     await store.openAt('live', roots[20].id);

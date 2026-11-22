@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { TimelineItem } from '@shared/protocol';
-import { groupTurns, lastResponse, responseText, shapeOf, turnsIndex, type FlowChunk, type TurnGroup } from '@/features/timeline/turns';
+import { groupTurns, lastResponse, responseText, shapeIndex, shapeOf, turnsIndex, type FlowChunk, type TurnGroup } from '@/features/timeline/turns';
 
 /** Builds ids and a shape string from a compact spec: "U1 w2 t3 T4" (shape char + id). */
 function spec(s: string) {
@@ -52,6 +52,33 @@ describe('shapeOf', () => {
       [{ ...base, type: 'turn', durationMs: 1, error: 'x' }, 'F'],
     ];
     for (const [item, ch] of cases) expect(shapeOf(item)).toBe(ch);
+  });
+});
+
+describe('shapeIndex', () => {
+  const text = (id: string): TimelineItem => ({ id, ts: 0, type: 'text', text: 'Reading the code first.', streaming: false });
+  const tool = (id: string): TimelineItem => ({ id, ts: 0, type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'done', detail: {} });
+  const user = (id: string, steer = false): TimelineItem => ({ id, ts: 0, type: 'user', text: 'hi', ...(steer ? { steered: true, state: 'queued' as const } : {}) });
+  const whole = (items: Record<string, TimelineItem>, roots: string[]) => roots.map((id) => shapeOf(items[id])).join('');
+
+  it('two messages the agent takes in one write: the ends stay where they were, the order between them does not', () => {
+    const index = shapeIndex();
+    const items: Record<string, TimelineItem> = { m: user('m'), s1: user('s1', true), w: tool('w'), s2: user('s2', true) };
+    let roots = ['m', 's1', 'w', 's2'];
+    let d = { items, rev: 1, changed: { since: 0, ids: ['m', 's1', 'w', 's2'] } };
+    expect(index(d, roots)).toBe('USwS');
+    // Both taken: they stand behind the step, in their order (first and last root unchanged).
+    items.s1 = { ...items.s1, state: 'sent' } as TimelineItem;
+    items.s2 = { ...items.s2, state: 'sent' } as TimelineItem;
+    roots = ['m', 'w', 's1', 's2'];
+    d = { items, rev: 2, changed: { since: 1, ids: ['s1', 's2'] } };
+    expect(index(d, roots)).toBe(whole(items, roots));
+    expect(index(d, roots)).toBe('UwSS');
+    // And it follows on from there as before: an appended root, an edited one.
+    items.t = text('t');
+    roots = [...roots, 't'];
+    d = { items, rev: 3, changed: { since: 2, ids: ['t'] } };
+    expect(index(d, roots)).toBe(whole(items, roots));
   });
 });
 

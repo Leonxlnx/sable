@@ -59,7 +59,12 @@ export class Bridge {
       this.pending.delete(frame.id);
       clearTimeout(p.timer);
       // Events that came before this answer are applied before it is handed back (the store gathers them per frame).
-      this.beforeAnswer?.();
+      // Whatever happens there, the caller gets its answer.
+      try {
+        this.beforeAnswer?.();
+      } catch (err) {
+        console.error('Events before an answer could not be applied', err);
+      }
       if (frame.ok) p.resolve(frame.result);
       else p.reject(new Error(frame.error));
     };

@@ -154,12 +154,37 @@ export function isBackgroundCommand(it: TimelineItem | undefined): it is ToolIte
   return !!it.detail.background || (it.input as { run_in_background?: unknown } | undefined)?.run_in_background === true;
 }
 
+/** A shell step still being written or running: it may yet turn out to be sent to the background. */
+const isOpenCommand = (it: TimelineItem | undefined) => it?.type === 'tool' && it.kind === 'bash' && (it.status === 'pending' || it.status === 'running' || it.status === 'awaiting');
+
 /** The chat's own background commands, oldest first: the same array until one is started. */
 export function commandIndex(): (t: Timeline | undefined) => readonly string[] {
   let scan: Scan<string> | undefined;
+  // Shell steps seen while still open and not (yet) in the background. A streamed call arrives with
+  // empty input and gets its `run_in_background` in a later patch, which changes no list: these few
+  // are looked at again each time, and one that turned reads the roots afresh (to keep their order).
+  let open: string[] = [];
   return (t) => {
     if (!t) return NONE;
-    scan = grow(scan, t.roots, (id) => (isBackgroundCommand(t.items[id]) ? id : undefined));
+    if (open.length) {
+      const still: string[] = [];
+      let turned = false;
+      for (const id of open) {
+        const it = t.items[id];
+        if (isBackgroundCommand(it)) turned = true;
+        else if (isOpenCommand(it)) still.push(id);
+      }
+      open = still;
+      if (turned) scan = undefined;
+    }
+    const fresh = !scan;
+    if (fresh) open = [];
+    scan = grow(scan, t.roots, (id) => {
+      const it = t.items[id];
+      if (isBackgroundCommand(it)) return id;
+      if (isOpenCommand(it)) open.push(id);
+      return undefined;
+    });
     return scan.found;
   };
 }
@@ -378,14 +403,26 @@ export interface Group {
 }
 
 /**
- * Finished agents under the message whose turn started them (the latest message sent before the
+ * Finished agents under the message whose turn started them (the latest message before the
  * agent), newest message first, newest agent first within it. `ids` and `users` come oldest first.
+ * With `roots`, "before" is the conversation's own order (a nested agent stands where its topmost
+ * parent does); without, the time each was sent. The order is the truth: a message sent into a
+ * running turn keeps the time it was sent but stands where the agent took it, so an agent started
+ * in between never saw it and is not filed under it.
  */
-export function groupDone(ids: readonly string[], items: Items, users: readonly string[]): Group[] {
-  const ts = users.map((u) => items[u]?.ts ?? 0);
+export function groupDone(ids: readonly string[], items: Items, users: readonly string[], roots?: readonly string[]): Group[] {
+  const place = new Map<string, number>();
+  if (roots) roots.forEach((id, i) => place.set(id, i));
+  const placeOf = (id: string): number => {
+    if (!roots) return items[id]?.ts ?? 0;
+    let it = items[id];
+    for (let up = 0; it?.parentId && up < 64; up++) it = items[it.parentId];
+    return (it && place.get(it.id)) ?? -1;
+  };
+  const ts = users.map(placeOf);
   const byUser = new Map<string, string[]>();
   for (const id of ids) {
-    const t = items[id]?.ts ?? 0;
+    const t = placeOf(id);
     // The last message at or before the agent's start (binary search: messages are in order).
     let lo = 0;
     let hi = ts.length - 1;
@@ -402,7 +439,7 @@ export function groupDone(ids: readonly string[], items: Items, users: readonly 
     if (list) list.push(id);
     else byUser.set(key, [id]);
   }
-  const order = (u: string) => (u ? (items[u]?.ts ?? 0) : -1);
+  const order = (u: string) => (u ? placeOf(u) : -1);
   return [...byUser]
     .map(([user, list]) => ({ user, ids: list.reverse() }))
     .sort((a, b) => order(b.user) - order(a.user));
@@ -438,12 +475,12 @@ export interface Overview {
  * The tab's list at a glance: who works now, then what finished, by the message that set it going.
  * `ids`, `users` oldest first (`agentIndex`, `userIndex`); `live` from `liveKey`.
  */
-export function overview(ids: readonly string[], live: string, items: Items, users: readonly string[]): Overview {
+export function overview(ids: readonly string[], live: string, items: Items, users: readonly string[], roots?: readonly string[]): Overview {
   const working: string[] = [];
   const done: string[] = [];
   ids.forEach((id, i) => (live[i] === '1' ? working : done).push(id));
   let failed = 0;
-  const waves = groupDone(done, items, users).map((g): Wave => {
+  const waves = groupDone(done, items, users, roots).map((g): Wave => {
     const bad: string[] = [];
     const rest: string[] = [];
     for (const id of g.ids) {

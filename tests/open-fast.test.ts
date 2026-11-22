@@ -13,7 +13,7 @@
  *   other kept chat may have missed events, so it is fetched afresh when opened.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SessionMeta, SessionSnapshot, TimelineItem } from '@shared/protocol';
+import type { PermissionRequest, SessionMeta, SessionSnapshot, TimelineItem } from '@shared/protocol';
 
 type Call = { method: string; params: Record<string, unknown>; resolve: (v: unknown) => void; reject: (e: unknown) => void };
 const calls: Call[] = [];
@@ -208,19 +208,27 @@ describe('chats kept in the window', () => {
     expect(s.data.r1.loaded).toBe(true);
   });
 
-  it('starting into a chat asks for it right behind hello, once, and applies it once hello is in', async () => {
+  it('starting into a chat asks for it right behind hello, once; answered first it is applied at once, and what follows lands on it', async () => {
     useStore.setState((s) => ({ ready: false, sessions: {}, data: {}, ui: { ...s.ui, activeSessionId: 'a' } }));
     store.startBridge();
     statusListener?.('open');
     expect(calls.map((c) => c.method).slice(0, 2)).toEqual(['app.hello', 'session.snapshot']);
-    // The snapshot answers first: it waits for hello.
+    // The snapshot answers first: applied at once (held until hello it went stale, and what came between was lost).
     snapCalls()[0].resolve(snap('a'));
     await flush();
-    expect(useStore.getState().data.a).toBeUndefined();
-    calls.find((c) => c.method === 'app.hello')!.resolve({ version: '0', platform: 'win32', home: 'C:/', providers: [], projects: [], sessions: [meta('a')], settings: useStore.getState().settings, prompts: { permissions: [], questions: [] } });
-    await flush();
-    await flush();
     expect(useStore.getState().data.a?.loaded).toBe(true);
+    // The chat goes on before hello answers: an item, and an approval the agent now waits on.
+    store.applyEvent({ type: 'item.added', sessionId: 'a', item: { id: 'late', ts: 9, type: 'text', text: 'late', streaming: false } as TimelineItem });
+    const ask = { id: 'p1', sessionId: 'a', kind: 'bash', title: 'Run', options: [] } as unknown as PermissionRequest;
+    calls.find((c) => c.method === 'app.hello')!.resolve({ version: '0', platform: 'win32', home: 'C:/', providers: [], projects: [], sessions: [meta('a', { status: 'awaiting' })], settings: useStore.getState().settings, prompts: { permissions: [ask], questions: [] } });
+    await flush();
+    await flush();
+    const s = useStore.getState();
+    // Nothing of it is lost: the item, hello's newer meta and the approval all stand.
+    expect(s.data.a.roots).toContain('late');
+    expect(s.sessions.a.status).toBe('awaiting');
+    expect(s.data.a.permissions.map((p) => p.id)).toEqual(['p1']);
+    // And it was not asked for again.
     expect(snapCalls()).toHaveLength(1);
   });
 

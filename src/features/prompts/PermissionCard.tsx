@@ -206,7 +206,7 @@ export function PermissionCard({ sessionId, req, more }: { sessionId: string; re
   const respond = (o: PermissionOption, msg?: string) => {
     if (sent) return;
     setSent(true);
-    leaveCard(req.id);
+    leaveCard(req.id, () => setSent(false));
     void respondPermission(sessionId, req.id, o.id, msg);
     focusComposer();
   };

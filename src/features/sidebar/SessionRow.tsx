@@ -256,9 +256,10 @@ interface MenuAction {
 function togglePin(s: SessionMeta) {
   const row = document.querySelector<HTMLElement>(`.side-list .srow[data-row="${CSS.escape(s.id)}"]`);
   const back = row ? liftRow(row, s.pinned ? 'down' : 'up') : undefined;
-  const was = !!s.pinned;
-  // Shown again only when the bridge refused (the list may render the change a moment after its answer).
-  void updateSession(s.id, { pinned: !s.pinned }).then(() => back && window.setTimeout(() => !!useStore.getState().sessions[s.id]?.pinned === was && back(), 500));
+  // An archived chat that is pinned comes out of the archive (Pinned lists no archived chat: it would
+  // be pinned and nowhere to be seen). A row that is still in the page a moment after the answer was
+  // not moved by the list (the bridge refused, or its place did not change): it shows again.
+  void updateSession(s.id, { pinned: !s.pinned, ...(s.archived && !s.pinned ? { archived: false } : {}) }).then(() => back && window.setTimeout(back, 500));
 }
 /**
  * Archived from the list: the row is put away in the frame of the click (`leave.ts`). Brought back

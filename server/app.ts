@@ -205,8 +205,10 @@ export class App {
   private compacting = new Map<string, (error?: string) => void>();
   /** Chats moving to another account right now: a message sent meanwhile waits in the queue (`queuedWhileMoving`). */
   private moving = new Set<string>();
-  /** Where each of them is going (`accountKey`): that account is not removed while the move runs. */
-  private movingTo = new Map<string, string>();
+  /** How many chats are on their way to each account (`accountKey`): it is not removed meanwhile. */
+  private movingTo = new Map<string, number>();
+  /** Accounts being removed right now (`accountKey`): no chat starts a move to one. */
+  private removingAccounts = new Set<string>();
   /** Chats whose file is there but could not be read: their timeline is empty, so no move may start them over from it. */
   private unreadable = new Set<string>();
   /** Returns due at the same moment go this far apart (`RETURN_AT_START_MS.gap`; tests shorten it). */
@@ -2341,29 +2343,44 @@ export class App {
     // at its limit and is refused with its next request, so it stops at the limit and the chat moves.
     const atLimit = opts.retry ? rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId) : undefined;
     const target = this.provider(rt.meta.provider, accountId);
-    if (atLimit?.limit && rt.items.some((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)) && (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId && !this.moving.has(rt.id)) await this.stopLiveBackground(rt, atLimit.limit);
-    // Work a limit's stop could not end does not hold the move (it stays on the account it ran on).
-    const left = this.unstoppable.get(rt.id);
-    if (rt.items.some((i) => worksInBackground(i) && !left?.has(i.id))) throw new Error('Background work is still running in this chat. Move when it is done.');
-    if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) return { ok: true, carried: 'none' };
-    this.moving.add(rt.id);
-    this.movingTo.set(rt.id, accountKey(rt.meta.provider, accountId));
+    const to = accountKey(rt.meta.provider, accountId);
+    if (this.removingAccounts.has(to)) throw new Error('This account is being removed. Pick another account for this agent.');
+    // The destination is held from here, before the first wait (stopping background work at a limit
+    // takes a moment): it is not removed while a chat is on its way to it.
+    this.movingTo.set(to, (this.movingTo.get(to) ?? 0) + 1);
+    let moving = false;
     let compacted = false;
     const stops = this.stopsOf(rt);
     try {
+      if (atLimit?.limit && rt.items.some((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)) && (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId && !this.moving.has(rt.id)) await this.stopLiveBackground(rt, atLimit.limit);
+      // Work a limit's stop could not end does not hold the move (it stays on the account it ran on).
+      const left = this.unstoppable.get(rt.id);
+      if (rt.items.some((i) => worksInBackground(i) && !left?.has(i.id))) throw new Error('Background work is still running in this chat. Move when it is done.');
+      if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) return { ok: true, carried: 'none' };
+      // Another move of this chat began while the background work was stopped: one at a time.
+      if (this.moving.has(rt.id)) throw new Error('This chat is moving to another account already.');
+      this.moving.add(rt.id);
+      moving = true;
       return await this.moveAccount(rt, accountId, target, opts, ctx, () => (compacted = true));
     } finally {
-      this.moving.delete(rt.id);
-      this.movingTo.delete(rt.id);
-      // What was sent meanwhile (or waited behind the compaction) goes out on the new account; after a
-      // Stop or a close meanwhile it waits for the person (review wave 8, #21).
-      const waited = this.queuedWhileMoving.delete(rt.id);
-      if ((waited || compacted) && rt.queue.length) {
-        setTimeout(() => {
-          if (rt.turnActive || rt.stopRequested || this.stopsOf(rt) !== stops || this.moving.has(rt.id) || this.sessions.get(rt.id) !== rt) return;
-          this.sendNextQueued(rt);
-        }, 0);
-      }
+      const holds = (this.movingTo.get(to) ?? 1) - 1;
+      if (holds > 0) this.movingTo.set(to, holds);
+      else this.movingTo.delete(to);
+      if (moving) this.moved(rt, stops, compacted);
+    }
+  }
+
+  /** A move ended, however: what was sent meanwhile goes out. */
+  private moved(rt: SessionRuntime, stops: number, compacted: boolean) {
+    this.moving.delete(rt.id);
+    // What was sent meanwhile (or waited behind the compaction) goes out on the new account; after a
+    // Stop or a close meanwhile it waits for the person (review wave 8, #21).
+    const waited = this.queuedWhileMoving.delete(rt.id);
+    if ((waited || compacted) && rt.queue.length) {
+      setTimeout(() => {
+        if (rt.turnActive || rt.stopRequested || this.stopsOf(rt) !== stops || this.moving.has(rt.id) || this.sessions.get(rt.id) !== rt) return;
+        this.sendNextQueued(rt);
+      }, 0);
     }
   }
 
@@ -3346,18 +3363,24 @@ export class App {
       const busy = mine.filter((rt) => rt.meta.status === 'running' || rt.meta.status === 'awaiting' || rt.meta.status === 'starting');
       if (busy.length) throw new Error(busy.length === 1 ? 'A session with this account is still working. Stop it first.' : `${busy.length} sessions with this account are still working. Stop them first.`);
       // A chat on its way here (a big one compacts first, which takes a while) would arrive on an account that is gone.
-      if ([...this.movingTo.values()].includes(accountKey(provider, accountId))) throw new Error('A chat is moving to this account. Remove it when the move is done.');
-      for (const rt of mine) {
-        rt.cancelPrompts();
-        await rt.handle?.close().catch(() => {});
-        rt.handle = undefined;
-      }
       const key = accountKey(provider, accountId);
-      const inst = this.instances.get(key);
-      this.instances.delete(key);
-      if (inst) {
-        await inst.cancelLogin().catch(() => {});
-        await inst.dispose().catch(() => {});
+      if (this.movingTo.get(key)) throw new Error('A chat is moving to this account. Remove it when the move is done.');
+      // Held the other way round too: no move to it begins while its agents are closed below.
+      this.removingAccounts.add(key);
+      try {
+        for (const rt of mine) {
+          rt.cancelPrompts();
+          await rt.handle?.close().catch(() => {});
+          rt.handle = undefined;
+        }
+        const inst = this.instances.get(key);
+        this.instances.delete(key);
+        if (inst) {
+          await inst.cancelLogin().catch(() => {});
+          await inst.dispose().catch(() => {});
+        }
+      } finally {
+        this.removingAccounts.delete(key);
       }
       this.infoCache.delete(key);
       this.limitsCache.delete(key);

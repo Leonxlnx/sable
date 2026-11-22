@@ -16,6 +16,8 @@ export function promptKeyAllowed(e: KeyboardEvent): boolean {
     if ((e.key === 'Enter' || e.key === ' ') && /^(BUTTON|A)$/.test(t.tagName)) return false;
   }
   if (document.querySelector('[data-radix-popper-content-wrapper], [role="dialog"], [role="listbox"], [role="menu"]')) return false;
+  // The effort scale is being dragged: Escape takes the drag back (composer/Thinking.tsx), nothing else.
+  if (document.querySelector('.th-chip[data-scrub]')) return false;
   return true;
 }
 

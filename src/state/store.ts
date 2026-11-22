@@ -213,6 +213,8 @@ function touched(d: SessionData, ids: readonly string[], patch?: Partial<Session
 }
 
 let toastId = 1;
+/** When each toast in view leaves by itself (a repeat of its words starts its time anew). */
+const toastTimers = new Map<number, number>();
 
 export const useStore = create<Store>((set, get) => ({
   conn: 'connecting',
@@ -278,12 +280,20 @@ export const useStore = create<Store>((set, get) => ({
     }),
 
   toast: (text, level = 'info') => {
-    const id = toastId++;
-    set((s) => ({ toasts: [...s.toasts, { id, level, text }] }));
-    window.setTimeout(() => get().dismissToast(id), level === 'error' ? 7000 : level === 'warn' ? 6000 : 3800);
+    // The same words while they still stand are one toast, whoever says them again (two watchers,
+    // two accounts at one limit, a click repeated): the one in view stays and its time starts anew.
+    const same = get().toasts.find((t) => t.text === text && t.level === level);
+    const id = same?.id ?? toastId++;
+    if (!same) set((s) => ({ toasts: [...s.toasts, { id, level, text }] }));
+    window.clearTimeout(toastTimers.get(id));
+    toastTimers.set(id, window.setTimeout(() => get().dismissToast(id), level === 'error' ? 7000 : level === 'warn' ? 6000 : 3800));
   },
 
-  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+  dismissToast: (id) => {
+    window.clearTimeout(toastTimers.get(id));
+    toastTimers.delete(id);
+    set((s) => (s.toasts.some((t) => t.id === id) ? { toasts: s.toasts.filter((t) => t.id !== id) } : s));
+  },
 }));
 
 // ───────────────────────── event application ─────────────────────────
@@ -710,8 +720,9 @@ async function hello() {
       ui: { ...s.ui, activeSessionId: active, homeProvider, homeAccount, homeCwd: s.ui.homeCwd ?? app.projects[0]?.path ?? null },
     };
   });
-  // At start the open chat was asked for with hello (`startBridge`): that request is shared.
-  for (const id of onScreen(useStore.getState())) void loadSession(id, { fresh: again }).catch(() => {});
+  // At start the open chat was asked for with hello (`startBridge`): that request is shared, and a
+  // chat it has already brought is not asked for again.
+  for (const id of onScreen(useStore.getState())) if (again || !useStore.getState().data[id]?.loaded) void loadSession(id, { fresh: again }).catch(() => {});
   // Limits remembered from earlier runs, so nothing waits for an agent to answer.
   void bridge
     .call('usage.limits', {})
@@ -773,22 +784,33 @@ export function flushEvents() {
   // Timeline events are gathered per session into one store write; any other event writes what was
   // gathered first, so everything applies in the order it came.
   batch = new Map();
+  // One event that throws (in its handler, or in a listener of the store's write) never takes the
+  // rest of the frame with it: a prompt behind it would be lost and the agent would wait for ever.
+  const safely = (what: string, run: () => void) => {
+    try {
+      run();
+    } catch (err) {
+      console.error(`An event could not be applied (${what})`, err);
+    }
+  };
   try {
     for (const e of list) {
       if (e.type === 'item.delta') {
-        editItems(e.sessionId, (d) => {
-          const item = d.items[e.id] as (TimelineItem & Record<string, unknown>) | undefined;
-          if (!item) return null;
-          d.items[e.id] = { ...item, [e.field]: ((item[e.field] as string | undefined) ?? '') + e.delta } as TimelineItem;
-          return { ids: [e.id] };
-        });
+        safely(e.type, () =>
+          editItems(e.sessionId, (d) => {
+            const item = d.items[e.id] as (TimelineItem & Record<string, unknown>) | undefined;
+            if (!item) return null;
+            d.items[e.id] = { ...item, [e.field]: ((item[e.field] as string | undefined) ?? '') + e.delta } as TimelineItem;
+            return { ids: [e.id] };
+          }),
+        );
         continue;
       }
-      if (e.type !== 'item.added' && e.type !== 'item.patch' && e.type !== 'item.removed') commitBatch();
-      applyEvent(e);
+      if (e.type !== 'item.added' && e.type !== 'item.patch' && e.type !== 'item.removed') safely('write', commitBatch);
+      safely(e.type, () => applyEvent(e));
     }
   } finally {
-    commitBatch();
+    safely('write', commitBatch);
     batch = null;
   }
 }
@@ -838,17 +860,6 @@ const used = new Map<string, { at: number; items: number }>();
 let useSeq = 0;
 /** Snapshot requests in flight, one per chat. */
 const fetching = new Map<string, Promise<void>>();
-
-function whenReady(): Promise<void> {
-  return new Promise((resolve) => {
-    if (useStore.getState().ready) return resolve();
-    const off = useStore.subscribe((s) => {
-      if (!s.ready) return;
-      off();
-      resolve();
-    });
-  });
-}
 
 /** For tests: forgets what was opened and fetched. */
 export function resetKept() {
@@ -919,12 +930,14 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
   if (inFlight && !opts.fresh) return inFlight;
   const p: Promise<void> = bridge
     .call('session.snapshot', opts.peek ? { sessionId, peek: true } : { sessionId })
-    .then(async (snap) => {
-      // Asked before hello was answered (start-up): applied once the window knows its chats.
-      if (!useStore.getState().ready) await whenReady();
+    .then((snap) => {
       // A newer request replaced this one: its answer wins.
       if (fetching.get(sessionId) !== p) return;
-      if (!useStore.getState().sessions[sessionId]) return;
+      // Asked with hello at start-up and answered first: applied at once, so the events that follow
+      // are applied on top of it, and hello then brings the chats' newer meta and what waits on the
+      // person. (Held back until hello it went stale: events for a chat that is not loaded are
+      // dropped, and the older answer then replaced hello's prompts, so an approval could vanish.)
+      if (useStore.getState().ready && !useStore.getState().sessions[sessionId]) return;
       applySnapshot(snap);
       used.set(sessionId, { at: used.get(sessionId)?.at ?? ++useSeq, items: snap.items.length });
       trimKept();

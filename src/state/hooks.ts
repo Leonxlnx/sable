@@ -64,8 +64,9 @@ export function useCapsState(sessionId: string | null): { caps: Capabilities | u
   const sessionCaps = useStore((s) => (sessionId ? s.data[sessionId]?.caps : undefined));
   const providerCaps = useStore((s) => (provider ? s.providerCaps[capsKey(provider, cwd, accountId)] : undefined));
   // A folder seen for the first time takes as long as an agent start to answer: until then the
-  // agent's caps from anywhere (same models and modes) fill the controls instead of skeletons.
-  const anyCaps = useStore((s) => (provider && cwd ? (s.providerCaps[capsKey(provider, null, accountId)] ?? s.providerCaps[capsKey(provider, null)]) : undefined));
+  // same account's caps without a folder (same models and modes) fill the controls instead of
+  // skeletons. Never another account's: what the menu shows can be picked and is kept for the chat.
+  const anyCaps = useStore((s) => (provider && cwd ? s.providerCaps[capsKey(provider, null, accountId)] : undefined));
   const failed = useStore((s) => (provider ? !!s.capsFailed[capsKey(provider, cwd, accountId)] : true));
   const ready = useStore((s) => s.ready);
   useEffect(() => {

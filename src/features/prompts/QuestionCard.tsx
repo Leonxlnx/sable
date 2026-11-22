@@ -48,7 +48,7 @@ export interface QuestionAnswers {
   advance: () => void;
 }
 
-export function useQuestionAnswers(req: QuestionRequest, deliver: (answers: Record<string, string[]> | null) => void): QuestionAnswers {
+export function useQuestionAnswers(req: QuestionRequest, deliver: (answers: Record<string, string[]> | null, back: () => void) => void): QuestionAnswers {
   const qs = req.questions;
   const [step, setStep] = useState(0);
   const [dir, setDir] = useState(1);
@@ -88,7 +88,8 @@ export function useQuestionAnswers(req: QuestionRequest, deliver: (answers: Reco
       const x = answers[i];
       out[qq.question] = [...x.picked, ...(x.other?.trim() ? [x.other.trim()] : [])];
     });
-    deliver(skip ? null : out);
+    // `back`: the answer was not taken, so the card may send again.
+    deliver(skip ? null : out, () => setSent(false));
   };
 
   const advance = () => {
@@ -231,8 +232,8 @@ export function QuestionPage({ x, onFieldEscape }: { x: QuestionAnswers; onField
 
 /** Structured questions from the agent: pick options, or write your own answer. */
 export function QuestionCard({ sessionId, req, more }: { sessionId: string; req: QuestionRequest; more: number }) {
-  const x = useQuestionAnswers(req, (answers) => {
-    leaveCard(req.id);
+  const x = useQuestionAnswers(req, (answers, back) => {
+    leaveCard(req.id, back);
     void respondQuestion(sessionId, req.id, answers);
     focusComposer();
   });

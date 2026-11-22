@@ -31,12 +31,13 @@ export function fullTarget(limits: RateLimit[] | undefined, now = Date.now()): R
  */
 export function windowPhrase(l: RateLimit | undefined): string {
   if (!l) return 'the limits';
-  const [head = '', tail = ''] = l.label.split(/\s*·\s*/);
+  const label = l.label ?? '';
+  const [head = '', tail = ''] = label.split(/\s*·\s*/);
   // Claude Code labels a model's window "Weekly · Fable", Codex "GPT-5.3-Codex-Spark · 5-hour limit".
   const scoped = !!windowModel(l);
   const modelFirst = scoped && l.id.includes(':');
   const model = scoped ? (modelFirst ? head : tail).trim() : '';
-  const window = ((modelFirst ? tail : head) || l.label).trim();
+  const window = ((modelFirst ? tail : head) || label).trim();
   const kind = (l.windowMins ?? 0) >= 10_080 ? 'weekly' : `${window.charAt(0).toLowerCase()}${window.slice(1)}`.replace(/\s*limit$/i, '');
   return `the ${[kind, model].filter(Boolean).join(' ')} limit`;
 }

@@ -66,6 +66,33 @@ describe('a burst of events', () => {
     expect(d.todos).toHaveLength(1);
   });
 
+  it('one event that throws never takes the rest of the frame with it', () => {
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // A listener of the store that throws on one write (as a view reading a field that is not there would).
+    let thrown = false;
+    const off = useStore.subscribe((s) => {
+      if (s.data.s?.todos.length !== 1 || thrown) return;
+      thrown = true;
+      throw new Error('a listener broke');
+    });
+    send({ type: 'item.added', sessionId: 's', item: text('x') });
+    send({ type: 'todos.updated', sessionId: 's', todos: [{ content: 't', status: 'pending' }] as never });
+    send({ type: 'item.added', sessionId: 's', item: text('y') });
+    send({ type: 'permission.added', request: { id: 'p1', sessionId: 's', kind: 'bash', title: 'Run', options: [] } as never });
+    expect(() => store.flushEvents()).not.toThrow();
+    off();
+    quiet.mockRestore();
+    const d = useStore.getState().data.s;
+    expect(thrown).toBe(true);
+    // What stood behind the event that threw is all there: the item, and the approval the agent waits on.
+    expect(d.roots).toEqual(['a', 'x', 'y']);
+    expect(d.permissions.map((p) => p.id)).toEqual(['p1']);
+    // The next frame's events are held and applied as ever.
+    send({ type: 'item.added', sessionId: 's', item: text('z') });
+    store.flushEvents();
+    expect(useStore.getState().data.s.roots).toContain('z');
+  });
+
   it('an answer from the bridge is handed back only after the events sent before it', () => {
     send({ type: 'item.added', sessionId: 's', item: text('before') });
     expect(bridgeMock.beforeAnswer).toBe(store.flushEvents);

@@ -11,11 +11,19 @@ import { reducedMotion } from '@/lib/motion';
  * once, so the strip and the conversation start their glide (SessionView.tsx, Timeline.tsx) on the
  * frame the copy starts to go. Should the answer not be taken, the card comes back.
  */
-export function leaveCard(requestId: string) {
-  if (reducedMotion()) return;
+export function leaveCard(requestId: string, back?: () => void) {
   const slot = document.querySelector<HTMLElement>(`.pd-slot[data-req="${CSS.escape(requestId)}"]`);
-  if (!slot) return;
+  // Still there after a while: the answer was not taken (the connection went). The card stands
+  // again, and `back` lets it be answered again (it had locked itself against a second answer).
+  window.setTimeout(() => {
+    if (slot && !slot.isConnected) return;
+    if (slot) slot.style.display = '';
+    back?.();
+  }, RETURN_MS);
+  if (!slot || reducedMotion()) return;
   putAway(slot, 0, 8, 150, { anchor: 'bottom' });
   slot.style.display = 'none';
-  window.setTimeout(() => slot.isConnected && (slot.style.display = ''), 4000);
 }
+
+/** How long an answered card stays away before it is taken as not answered. */
+export const RETURN_MS = 4000;

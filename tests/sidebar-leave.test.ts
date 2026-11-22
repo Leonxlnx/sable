@@ -109,16 +109,21 @@ describe('an answered card leaves in the frame of the answer', () => {
     expect(leave.indexOf('putAway(')).toBeLessThan(leave.indexOf("slot.style.display = 'none'"));
     // The dock's ground grows upward: a copy held by its top would drop with the dock's top edge.
     expect(dissolve).toMatch(/opts\.anchor === 'bottom' \? `bottom:\$\{bottom\}px` : `top:\$\{top\}px`/);
-    // Not taken by the bridge: it comes back.
-    expect(leave).toMatch(/slot\.isConnected && \(slot\.style\.display = ''\)/);
+    // Not taken by the bridge: it comes back, and may be answered again (the card had locked itself).
+    expect(leave).toMatch(/if \(slot\) slot\.style\.display = '';\n\s+back\?\.\(\);/);
+    expect(read('src/features/prompts/PermissionCard.tsx')).toContain('leaveCard(req.id, () => setSent(false));');
+    expect(read('src/features/prompts/QuestionCard.tsx')).toContain('deliver(skip ? null : out, () => setSent(false));');
   });
 
   it('is asked to leave before the bridge is asked', () => {
     const card = read('src/features/prompts/PermissionCard.tsx');
-    expect(card.indexOf('leaveCard(req.id)')).toBeGreaterThan(-1);
-    expect(card.indexOf('leaveCard(req.id)')).toBeLessThan(card.indexOf('void respondPermission(sessionId, req.id, o.id, msg)'));
+    expect(card.indexOf('leaveCard(req.id, ')).toBeGreaterThan(-1);
+    expect(card.indexOf('leaveCard(req.id, ')).toBeLessThan(card.indexOf('void respondPermission(sessionId, req.id, o.id, msg)'));
     const question = read('src/features/prompts/QuestionCard.tsx');
-    expect(question.indexOf('leaveCard(req.id)')).toBeLessThan(question.indexOf('void respondQuestion(sessionId, req.id, answers)'));
+    expect(question.indexOf('leaveCard(req.id, back)')).toBeGreaterThan(-1);
+    expect(question.indexOf('leaveCard(req.id, back)')).toBeLessThan(question.indexOf('void respondQuestion(sessionId, req.id, answers)'));
+    // A key during a drag of the effort scale is the drag's: Escape never skips a waiting question.
+    expect(read('src/features/prompts/keys.ts')).toContain("if (document.querySelector('.th-chip[data-scrub]')) return false;");
     expect(read('src/features/prompts/PromptDock.tsx')).toContain('data-req={head.req.id}');
   });
 });

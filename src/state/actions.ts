@@ -199,7 +199,9 @@ export function homeChoice(): NewSessionChoice | null {
   if (!ui.homeCwd) return null;
   const provider = ui.homeProvider;
   const accountId = homeAccountId(provider);
-  const caps = providerCaps[capsKey(provider, ui.homeCwd, accountId)] ?? providerCaps[capsKey(provider, ui.homeCwd)];
+  // The chosen account's own answer only: another account's default model may not exist on this one
+  // (without an answer the agent starts with its own default).
+  const caps = providerCaps[capsKey(provider, ui.homeCwd, accountId)];
   const model = ui.homeModel[provider] ?? settings.defaultModels[provider] ?? caps?.models.find((m) => m.isDefault)?.id ?? caps?.models[0]?.id;
   const mode = ui.homeMode[provider] ?? settings.defaultModes[provider] ?? caps?.modes[0]?.id;
   const effort = ui.homeEffort[provider] ?? settings.defaultEfforts[provider];

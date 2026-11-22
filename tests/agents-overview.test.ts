@@ -169,6 +169,24 @@ describe('background commands', () => {
     expect(agentIndex()(t)).toEqual(['a']);
   });
 
+  it('a call that says it is a background command only in a later patch is found all the same', () => {
+    // Claude Code streams a call: the step arrives with empty input, and `run_in_background` comes in a patch.
+    const index = commandIndex();
+    const t = new Tl().add(user('u1', 1)).add(bash('build', { ts: 2 })).add(tool('late', { kind: 'bash', ts: 3, status: 'running', detail: {}, input: {} }));
+    expect(index(t)).toEqual(['build']);
+    t.items.late = { ...(t.items.late as ToolItem), input: { run_in_background: true } };
+    t.add(bash('tests', { ts: 4 }));
+    // In the roots' order, not at the end.
+    expect(index(t)).toEqual(['build', 'late', 'tests']);
+    // A step that ended in the foreground is looked at no more, and the list keeps its identity.
+    const t2 = new Tl().add(tool('fg', { kind: 'bash', ts: 1, status: 'running', detail: {}, input: {} }));
+    const i2 = commandIndex();
+    const first = i2(t2);
+    t2.items.fg = { ...(t2.items.fg as ToolItem), status: 'done' };
+    expect(i2(t2)).toBe(first);
+    expect(first).toEqual([]);
+  });
+
   it('end as their notification says, and are never called running without word of it', () => {
     const t = new Tl()
       .add(user('u1', 1))

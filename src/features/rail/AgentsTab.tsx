@@ -77,7 +77,10 @@ function AgentsList({ sessionId }: { sessionId: string }) {
   const home = useStore((s) => s.home);
   const ctx = useMemo<TimelineCtxValue>(() => ({ sessionId, cwd, home, live: ON, stuck: ON }), [sessionId, cwd, home]);
 
-  const view = useMemo(() => overview(ids, live, useStore.getState().data[sessionId]?.items ?? {}, asked), [ids, live, asked, sessionId]);
+  const view = useMemo(() => {
+    const d = useStore.getState().data[sessionId];
+    return overview(ids, live, d?.items ?? {}, asked, d?.roots);
+  }, [ids, live, asked, sessionId]);
   const cmds = useMemo(() => commandRows(started, useStore.getState().data[sessionId]?.items ?? {}, ended), [started, ended, sessionId]);
 
   // What the person opened or closed (waves, the commands) and where they asked for every row.

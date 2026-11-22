@@ -412,10 +412,10 @@ describe('back to the account a limit moved the chat from', { timeout: 20_000 },
 
   it('an account a chat is moving to is not removed meanwhile', async () => {
     const h = await moved();
-    const app = h.app as unknown as { movingTo: Map<string, string> };
-    app.movingTo.set(h.rt.id, `demo:${h.max3.id}`);
+    const app = h.app as unknown as { movingTo: Map<string, number> };
+    app.movingTo.set(`demo:${h.max3.id}`, 1);
     await expect(h.app.call('account.remove', { provider: 'demo', accountId: h.max3.id })).rejects.toThrow(/moving to this account/);
-    app.movingTo.delete(h.rt.id);
+    app.movingTo.delete(`demo:${h.max3.id}`);
   });
 });
 

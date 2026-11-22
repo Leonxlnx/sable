@@ -205,6 +205,25 @@ describe('groupDone', () => {
       { user: '', ids: ['z'] },
     ]);
   });
+
+  it('goes by where things stand, not by when a message was sent: an agent started before the agent took a message is not under it', () => {
+    // u2 was sent into the running turn at 105 and taken after agent a had started: it stands behind a.
+    const items: Record<string, TimelineItem> = {
+      u1: user('u1', 100),
+      a: agent('a', { ts: 110 }),
+      n: agent('n', { ts: 112, parentId: 'a' }),
+      u2: user('u2', 105),
+      b: agent('b', { ts: 130 }),
+    };
+    const roots = ['u1', 'a', 'u2', 'b'];
+    expect(groupDone(['a', 'n', 'b'], items, ['u1', 'u2'], roots)).toEqual([
+      { user: 'u2', ids: ['b'] },
+      // The nested agent stands where its parent does.
+      { user: 'u1', ids: ['n', 'a'] },
+    ]);
+    // By the times alone a and its child would be filed under the message they never saw.
+    expect(groupDone(['a', 'n', 'b'], items, ['u1', 'u2'])[0]).toEqual({ user: 'u2', ids: ['b', 'n', 'a'] });
+  });
 });
 
 describe('workflowNow', () => {
