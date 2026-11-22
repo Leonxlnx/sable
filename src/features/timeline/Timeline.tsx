@@ -65,23 +65,9 @@ export function Timeline({ sessionId }: { sessionId: string }) {
 
   const glide = useRef({ raf: 0, pos: 0, v: 0, last: 0 });
 
-  /**
-   * The live line where it stands under what the agent writes (a reply with no steps before it):
-   * its place in the content as last laid out, and how far above that place it is drawn right now.
-   * `hold` is the part the follower runs out as it scrolls (a `translate`), `anim` the rest.
-   */
-  const lineAt = useRef<{ el: HTMLElement; top: number; hold: number; anim: Animation | null } | null>(null);
-  const dropHold = useCallback(() => {
-    const l = lineAt.current;
-    if (!l || !l.hold) return;
-    l.hold = 0;
-    l.el.style.translate = '';
-  }, []);
-
   const pin = useCallback(() => {
     const el = scroller.current;
     if (!el) return;
-    dropHold();
     el.scrollTop = el.scrollHeight;
     lastTop.current = el.scrollTop;
     glide.current.pos = el.scrollTop;
@@ -110,7 +96,6 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       g.raf = 0;
       if (!stuck.current) {
         g.v = 0;
-        dropHold();
         return;
       }
       const target = el.scrollHeight - el.clientHeight;
@@ -124,70 +109,16 @@ export function Timeline({ sessionId }: { sessionId: string }) {
         g.v = 0;
         el.scrollTop = target;
         lastTop.current = el.scrollTop;
-        dropHold();
         return;
       }
-      // A live line pushed down by a new line of the reply stays where it is on screen while the
-      // view catches up: it is drawn above its place by what is left to scroll (glideLine).
       el.scrollTop = g.pos;
       lastTop.current = el.scrollTop;
-      const l = lineAt.current;
-      if (l?.hold) {
-        // From the position the browser took (whole pixels), so the line does not tremble.
-        const h = Math.min(-l.hold, target - lastTop.current);
-        l.hold = -h;
-        l.el.style.translate = `0 ${-h}px`;
-      }
       g.raf = requestAnimationFrame(tick);
     };
     g.raf = requestAnimationFrame(tick);
-  }, [pin, dropHold]);
+  }, [pin]);
 
   useEffect(() => () => cancelAnimationFrame(glide.current.raf), []);
-
-  /**
-   * Each new line of a plain reply pushed the live line under it one line down in one frame (and
-   * the first words took its very place). It keeps its place on screen instead and gets to the new
-   * one smoothly: where the view follows the end, the follower's own scroll carries it there (the
-   * text above glides up, the line never moves); in a chat shorter than the view it glides down.
-   * Only under text that is being written, only by a line or three, never while the layout holds
-   * it at the top of the view.
-   */
-  const glideLine = useCallback(() => {
-    const el = scroller.current;
-    const inner = content.current;
-    const line = inner?.querySelector<HTMLElement>('.tl-work[data-live]');
-    const prev = lineAt.current;
-    if (!el || !inner || !line) {
-      lineAt.current = null;
-      return;
-    }
-    const was = prev && prev.el === line ? prev : null;
-    const hold = was ? was.hold : 0;
-    const running = was?.anim?.playState === 'running';
-    const wa = running ? new DOMMatrixReadOnly(getComputedStyle(line).transform).m42 : 0;
-    const box = line.getBoundingClientRect();
-    const top = box.top - inner.getBoundingClientRect().top - wa - hold;
-    const next = { el: line, top, hold, anim: was ? was.anim : null };
-    lineAt.current = next;
-    if (!was || !live.current || reducedMotion()) return;
-    const d = top - was.top;
-    if (d < 6 || d > 90) return;
-    if (!line.parentElement?.previousElementSibling?.querySelector('.md[data-streaming]')) return;
-    if (box.top - wa - hold < el.getBoundingClientRect().top + 36) return;
-    // How far above its new place the line is drawn at this moment.
-    const behind = d - wa - hold;
-    const gap = stuck.current ? Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop) : 0;
-    const h = Math.min(gap, behind);
-    next.hold = -h;
-    line.style.translate = h > 0 ? `0 ${(-h).toFixed(2)}px` : '';
-    if (running) was.anim?.cancel();
-    const rest = behind - h;
-    // The first words take the line's very place (a whole block arrives, not one more line): the
-    // line steps out of sight for that moment and comes back as it gets clear of them.
-    if (d > 28) play(line, [{ opacity: 0 }, { opacity: 0, offset: 0.4 }, { opacity: 1 }], { duration: 240, easing: 'linear' });
-    next.anim = rest >= 2 ? play(line, [{ transform: `translateY(${(-rest).toFixed(2)}px)` }, { transform: 'translateY(0px)' }], { duration: 200, easing: EASE_OUT }) : null;
-  }, []);
 
   // The working line glides to its new place when content appears above it, instead of jumping.
   const tailAt = useRef<{ top: number; anim: Animation | null } | null>(null);
@@ -314,7 +245,6 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       pad = padNow;
       room.current = el.scrollHeight - el.clientHeight - el.scrollTop;
       glideTail();
-      glideLine();
       if (restoreTo.current !== null && restore()) return;
       if (stuck.current) {
         if (rewrapped) pin();
@@ -325,28 +255,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     ro.observe(inner, { box: 'border-box' });
     ro.observe(el);
     return () => ro.disconnect();
-  }, [follow, glideLine, glideTail, pin, restore]);
-
-  // A chat shorter than the view keeps its box while the reply grows (the content fills the
-  // scroller), so the observer above never hears of it: the running turn is watched for the live line.
-  useEffect(() => {
-    if (!busy) return;
-    const ro = new ResizeObserver(glideLine);
-    let raf = 0;
-    let tries = 0;
-    // The turn's row is built a moment after its message arrives (TurnList): looked for until it is there.
-    const find = () => {
-      raf = 0;
-      const turn = content.current?.querySelector<HTMLElement>(':scope > .tg[data-state="running"]');
-      if (turn) ro.observe(turn);
-      else if (++tries < 40) raf = requestAnimationFrame(find);
-    };
-    find();
-    return () => {
-      cancelAnimationFrame(raf);
-      ro.disconnect();
-    };
-  }, [busy, roots.length, glideLine]);
+  }, [follow, glideTail, pin, restore]);
 
   // Only the reader lets go of the end. Layout moving the scroll position (rows above built
   // or settling to their real height, scroll anchoring, the dock resizing) never does.

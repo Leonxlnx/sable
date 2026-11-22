@@ -410,6 +410,95 @@
   gap: 14px;
 }
 
+/* ── checkpoints (TurnView): each piece of a turn in a box of its own, so it can fold, nest and glide ── */
+.tp {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* a checkpoint's two lines stand close: its work line, then the note that closed it */
+.tp[data-k='run'] + .tp[data-k='text'] {
+  margin-top: -8px;
+}
+
+/* the turn has ended: the pieces that fold into its line fade first (opacity only), then fold at once */
+.tp[data-leaving] {
+  opacity: 0;
+  transition: opacity 160ms cubic-bezier(0.3, 0, 0.7, 1);
+}
+
+/* the work of a turn, opened: its checkpoints one level in from the line that holds them */
+.tp[data-nest],
+.tp-in[data-nest] {
+  padding-left: 16px;
+  animation: tp-in 220ms var(--ease-out) both;
+}
+
+.tp[data-nest] .work[data-live]::before {
+  display: none;
+}
+
+/* the answer after the opened checkpoints: a little more air */
+.tp[data-nest] + .tp:not([data-nest])[data-k='text'] {
+  margin-top: 4px;
+}
+
+@keyframes tp-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+/* a nod said after the answer ("Committed."): a quiet last line, smaller and one tone back */
+.tp[data-tail] {
+  margin-top: -6px;
+}
+
+.tp[data-tail] .md {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+/* the live line of a later checkpoint arrives under the note before it, with no travel */
+.turn[data-live] .tp[data-k='run'] > .seg-work > .work[data-live] {
+  animation: fade-in 200ms var(--ease-out) backwards;
+}
+
+/* the agent is writing in view: the words are the signal, the line steps back until they end */
+.work[data-quiet] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* the chat's own turn is over; sub-agents it sent to the background still work */
+.bg-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 44px;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.bg-line-text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: var(--w-medium);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tp[data-nest],
+  .tp-in[data-nest],
+  .turn[data-live] .tp[data-k='run'] > .seg-work > .work[data-live] {
+    animation: none;
+  }
+}
+
 .work {
   display: flex;
   min-width: 0;
@@ -526,8 +615,11 @@
 }
 
 /* the live line settles into the quiet summary: the words step back */
-.work[data-landed] .work-title {
-  animation: work-title-land 560ms var(--ease-out) both;
+.work[data-landed] .work-title,
+.work[data-landed] .work-meta {
+  animation:
+    label-in 260ms var(--ease-out) both,
+    work-title-land 560ms var(--ease-out) both;
 }
 
 @keyframes work-title-land {

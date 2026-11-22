@@ -14,34 +14,51 @@ import { shapeOf, type Group, type TurnGroup } from './turns';
 /** A rough height for an item that is not built yet (items.tsx `estimate`), handed in so this stays pure. */
 export type Estimate = (item: TimelineItem | undefined) => number;
 
+/** A work line's height: a checkpoint's, the live line's, a finished turn's one line. */
+const LINE_H = 34;
+
 /**
  * A group's estimated height, as the spacer for unbuilt groups counts it, and where in it each of
- * its items starts (`at`): a segment's message and what it says in view, the work line's place for
- * the steps folded behind it.
+ * its items starts (`at`). A finished turn is its messages, one line for everything folded behind
+ * it (every run of steps, every note along the way, a notification taken up mid-turn: all placed
+ * at that line) and what never folds; a running turn shows a line per checkpoint with its note,
+ * and the live line.
  */
 export function groupHeight(g: Group, items: Record<string, TimelineItem | undefined>, est: Estimate, at?: (id: string, y: number) => void): number {
   if (g.kind === 'item') {
     at?.(g.id, 0);
     return est(items[g.id]);
   }
+  const running = g.state === 'running';
   let h = 0;
+  // The finished turn's line is counted once, where its first folded piece stands.
+  let lined = false;
+  const fold = () => {
+    if (lined) return;
+    lined = true;
+    h += LINE_H;
+  };
   for (const s of g.segments) {
     if (s.lead) {
       at?.(s.lead, h);
-      h += est(items[s.lead]);
+      // A notification after the line is one more folded piece; a message never folds.
+      if (running || !lined || s.steered) h += est(items[s.lead]);
     }
     for (const c of s.flow) {
-      if (c.kind === 'line') h += 34;
-      else if (c.kind === 'steps') {
+      if (c.kind === 'steps') {
+        if (running) h += LINE_H;
+        else fold();
         if (at) for (const id of c.ids) at(id, h);
+      } else if (!running && c.kind === 'text' && s.notes.includes(c.id)) {
+        fold();
+        at?.(c.id, h);
       } else {
         at?.(c.id, h);
-        h += est(items[c.id]);
+        h += s.errors.includes(c.id) ? 64 : est(items[c.id]);
       }
     }
-    if (at) for (const id of s.errors) at(id, h);
-    h += s.errors.length * 64;
   }
+  if (running) h += LINE_H;
   // The foot under the answer.
   return h + 30 + (g.checks?.length ?? 0) * 80;
 }

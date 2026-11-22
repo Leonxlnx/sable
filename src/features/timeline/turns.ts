@@ -8,6 +8,11 @@ import { isLeadIn } from './lead-in';
  * reads, and what folds away as the work behind it. Pure and string-driven, so the view
  * recomputes it only when the shape of the timeline changes, never on a streamed word.
  *
+ * A turn is a sequence of checkpoints: a run of work (steps, thinking, task updates, lead-ins)
+ * closed by something in view (a note the agent wrote, a widget, files, a plan, an error). While the
+ * turn runs each closed checkpoint reads as its work line and its note, and the live line stands
+ * under the newest; once it has ended the turn is one line and what never folds (see `Segment`).
+ *
  * Each root item is reduced to one character (`shapeOf`):
  *   U  a sent message that starts a turn       Q  a queued message, not taken yet (floats to the end)
  *   S  a message steered into the running turn  t  assistant prose (an answer candidate)
@@ -19,7 +24,7 @@ import { isLeadIn } from './lead-in';
  *      (a slash command opens a turn as a message does, `U`; what it printed is a notice, `n`)
  *   l  a lead-in: a one-line announcement of the next step ("Let me run the tests."), or a text
  *      still being written that may turn out one (see `lead-in.ts`): folded with the steps it
- *      announces, said in view when no step follows it
+ *      announces, said in view when no step follows it, and never the answer of a turn that said more
  *   c  command output (an answer candidate)     p  a plan (an answer candidate)
  *   w  a step: a tool call                      n  any other notice (mode, model, compaction, retry): not a step
  *   h  thinking: part of the work, not counted as a step
@@ -34,41 +39,60 @@ import { isLeadIn } from './lead-in';
  */
 
 /**
- * One piece of a segment as it reads, in order:
- * - `text`: something the agent said (a report along the way, the reply to a steered message, the answer): always in view;
- * - `show`: command output, a widget, files handed over or a plan: always in view;
- * - `steps`: a run of work between them (tool calls, thinking, task updates, notices): folded
- *   behind the work line, opened all at once by it;
- * - `line`: where the work line stands (the live line while the agent works, the summary after).
+ * One piece of a segment, in the order it happened:
+ * - `text`: something the agent said: a note along the way (it closes a checkpoint, and folds with
+ *   the work once the turn has ended: `Segment.notes`), the reply to a steered message, the answer;
+ * - `show`: what never folds: command output, a widget, files handed over, a plan, an error notice;
+ * - `steps`: a run of work between them (tool calls, thinking, task updates, notices, lead-ins): one
+ *   checkpoint's work, behind its own line (`count`: its tool calls).
  */
-export type FlowChunk = { kind: 'text'; id: string } | { kind: 'show'; id: string } | { kind: 'steps'; key: string; ids: string[]; count: number } | { kind: 'line' };
-
-/** The work line's place in a flow (one shared object, so a flow can be searched by identity). */
-export const LINE: FlowChunk = { kind: 'line' };
+export type FlowChunk = { kind: 'text'; id: string } | { kind: 'show'; id: string } | StepsChunk;
+export interface StepsChunk {
+  kind: 'steps';
+  key: string;
+  ids: string[];
+  count: number;
+}
 
 export interface Segment {
   key: string;
   /** The message that opened this segment (the turn's own message, or one steered into it). */
   lead: string | null;
   steered: boolean;
-  /** Everything folded behind the work line, in order (the ids of the `steps` chunks). */
+  /** Every item of the segment's work, in order (the ids of the `steps` chunks). */
   work: string[];
   /**
-   * The segment as it reads. The line stands before the first run of steps, and at the end while
-   * there is none yet, so it never moves once placed: what the agent says before its first step
-   * sits above it, everything after below it. A steered segment keeps its reply above the line:
-   * there the line waits for the first text.
+   * The segment in the order it happened: runs of work, and what closed each (a text, something
+   * shown). A steered segment starts with the reply to its message, whatever ran before it came.
+   * While the turn runs every run reads as a line of its own with its closer under it, and the
+   * live line stands at the end. Once the turn has ended one line stands where its first folded
+   * piece stood (the first run, or a note before it) and holds every run and every note of every
+   * segment; what never folds keeps its place after it, in order: things shown, a steered message
+   * and its reply, the answer.
    */
   flow: FlowChunk[];
   /** Tool calls in `work` (thinking, task updates and notices are not steps). */
   steps: number;
-  /** The last thing said in this segment: it reads at full strength. */
+  /**
+   * The answer, never folded: the last thing said in this segment that is not a lead-in or a nod
+   * ("Committed.", "Done.", an announcement nothing followed). With nothing but those, the last one.
+   */
   answer: string | null;
-  /** A steered segment's first words, when more followed: the direct reply, at full strength too. */
+  /** A steered segment's first words, when more followed: the direct reply, never folded. */
   reply: string | null;
-  /** Error notices, and notices that are all a segment holds: never folded, after the flow. */
+  /** The last words before a failure, when the segment has no answer: they stay in view over the error. */
+  last: string | null;
+  /** What was said after the answer (or after those last words): a nod, in view under it as a quiet last line. */
+  tail: string[];
+  /**
+   * The texts that fold with the work once the turn has ended: the notes along the way (every text
+   * but the answer, a nod after it, the reply and the last words before a failure). Empty in a turn
+   * with no work at all: with nothing to fold behind, its texts simply stand.
+   */
+  notes: string[];
+  /** Error notices, and notices that are all a segment holds: never folded (they stand in the flow as shown pieces). */
   errors: string[];
-  /** The lead-ins folded into the work since the agent last said something in view, oldest first: the live line names the newest. */
+  /** The lead-ins folded into the work since the last piece in view, oldest first: the live line names the newest. */
   narr: string[];
 }
 
@@ -206,6 +230,9 @@ interface Open {
   quiet?: boolean;
 }
 
+/** What the agent does or says: outside any turn, it opens one of its own (see `groupFrom`). */
+const OWN = new Set(['w', 'h', 'k', 'l', 't', 'g', 'f', 'p']);
+
 /** What may follow a lead-in for it to fold with the work it announces. */
 const WORK_AFTER = new Set(['w', 'h', 'k', 'n', 'l']);
 /** What the bridge or the agent may write after its last words without doing more work: notices, task list updates, thinking. */
@@ -255,20 +282,49 @@ function settleLeads(chars: string[], live: boolean, steered: boolean, final = f
 function buildSegment(raw: Open['segs'][number], index: number, turnKey: string, failed: boolean, live = false, cut = false): Segment {
   const seg = { ...raw, chars: settleLeads(raw.chars, live, raw.steered, !live && !failed && !cut) };
   const errors: string[] = [];
+  // A lead-in or a nod that is said in view after all (nothing followed it): never what the person waits for.
+  const nod = (i: number) => seg.chars[i] === 't' && raw.chars[i] === 'l';
   let answerAt = -1;
-  for (let i = seg.chars.length - 1; i >= 0; i--) {
-    if (ANSWER.has(seg.chars[i])) {
-      answerAt = i;
-      break;
+  // What stays in view of a failed segment's words (`last`).
+  let lastAt = -1;
+  if (live) {
+    for (let i = seg.chars.length - 1; i >= 0; i--) {
+      if (ANSWER.has(seg.chars[i])) {
+        answerAt = i;
+        break;
+      }
+      // While the segment runs, a text the agent has gone on from is a report along the way: it is
+      // the answer only while nothing has come after it.
+      if (seg.chars[i] !== '.' && seg.chars[i] !== 'i' && seg.chars[i] !== 'e') break;
     }
-    // While the segment runs, a text the agent has gone on from is a report along the way: it is
-    // the answer only while nothing has come after it.
-    if (live && seg.chars[i] !== '.' && seg.chars[i] !== 'i' && seg.chars[i] !== 'e') break;
+  } else {
+    // Settled, the answer is the last thing said that is not a lead-in or a nod: a report stays the
+    // answer when "Committed." or "Done." follows it, with steps between or without. A turn that
+    // said nothing but those answers with the last of them.
+    let nodAt = -1;
+    let textAt = -1;
+    for (let i = seg.chars.length - 1; i >= 0 && (answerAt < 0 || lastAt < 0); i--) {
+      const ch = seg.chars[i];
+      if (!ANSWER.has(ch)) continue;
+      if (ch === 't' && textAt < 0) textAt = i;
+      if (nod(i)) {
+        if (nodAt < 0) nodAt = i;
+        continue;
+      }
+      if (answerAt < 0) answerAt = i;
+      if (ch === 't' && lastAt < 0) lastAt = i;
+    }
+    if (answerAt < 0) answerAt = nodAt;
+    if (lastAt < 0) lastAt = textAt;
   }
   // A failed segment answers with its error card; its last text is one more report. So does a
   // segment a steered message cut: the turn went on past it, and its last words were said on the
   // way (they keep their tone when the steer arrives instead of brightening into an answer).
   if (failed || cut) answerAt = -1;
+  if (!failed || cut || answerAt >= 0) lastAt = -1;
+  // What was said after the piece that stays: nods, by the rule above.
+  const keptAt = answerAt >= 0 ? answerAt : lastAt;
+  const tail = !live && keptAt >= 0 ? seg.ids.filter((_, i) => i > keptAt && seg.chars[i] === 't') : [];
   // Nothing but notices (a /compact, a model change on its own): they are the turn, so they show.
   const lone = !seg.chars.some((c) => c !== 'n' && c !== '.' && c !== 'i' && c !== 'e');
   let replyAt = -1;
@@ -279,18 +335,14 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
   const flow: FlowChunk[] = [];
   const work: string[] = [];
   let steps = 0;
-  let lined = false;
-  // A steered segment's line waits for the reply: the question, its answer, then the work.
-  let ready = !seg.steered;
   let run: string[] = [];
   let runCount = 0;
   let narr: string[] = [];
-  const flush = () => {
+  // The reply to a steered message stands right under it: see below.
+  let replied = !seg.steered;
+  // A piece in view closes the run before it: one checkpoint.
+  const close = () => {
     if (!run.length) return;
-    if (!lined && ready) {
-      flow.push(LINE);
-      lined = true;
-    }
     flow.push({ kind: 'steps', key: run[0], ids: run, count: runCount });
     run = [];
     runCount = 0;
@@ -299,17 +351,26 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
     const ch = seg.chars[i];
     const id = seg.ids[i];
     if (ch === '.' || ch === 'i') continue;
+    // An error, or a notice that is all the segment holds: shown where it happened.
     if (ch === 'e' || (lone && ch === 'n')) {
+      close();
+      narr = [];
       errors.push(id);
+      flow.push({ kind: 'show', id });
+      continue;
+    }
+    if (ch === 't' && !replied) {
+      // The first words after a steered message are the reply to it: the pair reads as one, the
+      // reply right under the message. A step that was still under way when the message came
+      // does not stand between them: that work goes on under the pair, in the run it began.
+      replied = true;
+      flow.unshift({ kind: 'text', id });
       continue;
     }
     if (ch === 't' || SHOW.has(ch)) {
-      flush();
+      close();
+      narr = [];
       flow.push({ kind: ch === 't' ? 'text' : 'show', id });
-      if (ch === 't') {
-        ready = true;
-        narr = [];
-      }
       continue;
     }
     if (ch === 'l') narr.push(id);
@@ -320,9 +381,11 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
       runCount++;
     }
   }
-  flush();
-  // No run after the place the line waits for (yet): it stands at the end.
-  if (!lined && (live || work.length)) flow.push(LINE);
+  close();
+  const answer = answerAt >= 0 ? seg.ids[answerAt] : null;
+  const reply = replyAt >= 0 ? seg.ids[replyAt] : null;
+  // A failed segment has no answer: the last thing of substance the agent said stays in view, over the error.
+  const last = lastAt >= 0 ? seg.ids[lastAt] : null;
   return {
     key: seg.lead ?? `${turnKey}:${index}`,
     lead: seg.lead,
@@ -330,19 +393,32 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
     work,
     flow,
     steps,
-    answer: answerAt >= 0 ? seg.ids[answerAt] : null,
-    reply: replyAt >= 0 ? seg.ids[replyAt] : null,
+    answer,
+    reply,
+    last,
+    tail,
+    // Set for the whole turn once its segments are known (`foldNotes`).
+    notes: [],
     errors,
     narr,
   };
+}
+
+/** Which texts of a turn fold with its work (`Segment.notes`): every one that is not kept in view, when the turn has work at all. */
+function foldNotes(segments: Segment[]) {
+  if (!segments.some((s) => s.work.length > 0)) return;
+  for (const s of segments) {
+    for (const c of s.flow) if (c.kind === 'text' && c.id !== s.answer && c.id !== s.reply && c.id !== s.last && !s.tail.includes(c.id)) s.notes.push(c.id);
+  }
 }
 
 /**
  * Groups root items into turns. A turn runs from a sent message to its closing turn item; when
  * there is none (an interrupted turn, history from a provider that keeps no turn records), the
  * next sent message closes it. Messages steered into a turn split it into segments, each with
- * its own answer, so a question asked mid-turn gets its reply right under it. Items outside any
- * turn (notices between turns, anything before the first message) stay single items.
+ * its own answer, so a question asked mid-turn gets its reply right under it. Work the agent began
+ * with no message before it is a turn too, with no message at its head. Notices outside any turn
+ * (a mode change between turns, one before the first message) stay single items.
  * `busy`: the session is working, so a turn left open at the end is the running one.
  * `checkOf`: the turn a check (`x`) belongs to (its first message); a check goes under that turn,
  * wherever it sits in the timeline, or stands on its own where it is when that turn is gone.
@@ -398,6 +474,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
         break;
       }
     }
+    foldNotes(segments);
     groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids });
   };
 
@@ -465,8 +542,14 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
         prev.ids.push(id);
         continue;
       }
-      groups.push({ kind: 'item', key: id, id });
-      continue;
+      if (!OWN.has(ch)) {
+        groups.push({ kind: 'item', key: id, id });
+        continue;
+      }
+      // The agent's own work with no message before it (a turn it began by itself: a wake-up, the
+      // turn of a second notification after the end of the first one's): a turn of its own, with no
+      // message at its head. Left outside a turn, every step and thought stood as a row of its own.
+      open = { ids: [], chars: [], segs: [{ lead: null, steered: false, ids: [], chars: [] }], interrupted: false, failed: false };
     }
     // An interrupted turn has ended even without its record: a notice after it (a lane landed, a
     // model changed) stands on its own instead of folding into that turn's work and its time.

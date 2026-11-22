@@ -74,20 +74,30 @@ describe('marks', () => {
 });
 
 describe('group heights and offsets', () => {
-  it('counts what a turn shows, the work line for its folded steps, and its foot', () => {
+  it('counts what a finished turn shows: its message, one line for everything folded, the answer and its foot', () => {
     const { groups, items } = chat('U1 w2 t3 w4 t5 T6');
     const at: Record<string, number> = {};
     const h = groupHeight(groups[0], items, est, (id, y) => (at[id] = y));
-    // message 100, line 34, text 200, text 200, foot 30
-    expect(h).toBe(100 + 34 + 200 + 200 + 30);
-    expect(at).toMatchObject({ 1: 0, 2: 134, 3: 134, 4: 334, 5: 334 });
+    // message 100, line 34, the answer 200, foot 30: the note along the way is behind the line.
+    expect(h).toBe(100 + 34 + 200 + 30);
+    expect(at).toMatchObject({ 1: 0, 2: 134, 3: 134, 4: 134, 5: 134 });
   });
 
-  it('places a steered message inside its turn', () => {
-    const { groups, items } = chat('U1 w2 t3 S4 t5 T6');
+  it('counts a running turn by its checkpoints: a line per run, each note, and the live line', () => {
+    const { ids, shape, items } = chat('U1 w2 t3 w4 t5 w6');
+    const running = groupTurns(ids, shape, true).groups[0];
+    // message 100, line 34, note 200, line 34, note 200, line 34 (the run under way), the live line 34, foot 30
+    expect(groupHeight(running, items, est)).toBe(100 + 34 + 200 + 34 + 200 + 34 + 34 + 30);
+  });
+
+  it('places a steered message inside its turn, after the line, with its reply under it', () => {
+    const { groups, items } = chat('U1 w2 t3 S4 t5 w6 t7 T8');
     const at: Record<string, number> = {};
-    groupHeight(groups[0], items, est, (id, y) => (at[id] = y));
-    expect(at[4]).toBe(100 + 34 + 200);
+    const h = groupHeight(groups[0], items, est, (id, y) => (at[id] = y));
+    expect(at[4]).toBe(100 + 34);
+    expect(at[5]).toBe(100 + 34 + 100);
+    // message, line, steered message, reply, answer, foot
+    expect(h).toBe(100 + 34 + 100 + 200 + 200 + 30);
   });
 });
 

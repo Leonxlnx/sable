@@ -11,10 +11,10 @@ import { homeFolder, openRace, swapTo } from '@m/lib/race';
 import { applyOlder, closeGap, fetchNewer, fetchOlder, getState, openAt, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
 import { around, growDown, growUp, MOUNT_MAX, rangeOf, SpacerSums, trimTop, type Win } from '@m/lib/window';
 import { matchRanges, searchWords } from '@m/lib/find';
-import { groupTurns, stabilize } from '@m/lib/turns';
+import { backgroundLabel, groupTurns, stabilize } from '@m/lib/turns';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
-import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark } from '@m/ui/marks';
+import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles } from '@m/ui/marks';
 import { IME_EASE, SNAP } from '@m/ui/motion';
 import { Sheet } from '@m/ui/Sheet';
 import { Composer } from './Composer';
@@ -312,6 +312,16 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     [],
   );
 
+  // Something opened by a tap (a turn's line, a checkpoint's steps) stays where it is: the
+  // conversation stops following the newest line until you scroll back to it.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const onHold = () => (atBottom.current = false);
+    el.addEventListener('sable:hold', onHold);
+    return () => el.removeEventListener('sable:hold', onHold);
+  }, []);
+
   // Only your own scrolling lets go of the newest line (a smooth jump or a growing answer never does).
   const touch = useRef({ down: false, at: 0 });
   const frame = useRef(0);
@@ -561,6 +571,7 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
           layout.queued.map((q) => (
             <ItemRow key={q} sid={id} id={q} queued />
           ))}
+        {!gapped && range.hi >= keys.length && !busy && <BackgroundLine id={id} />}
       </div>
       <AnimatePresence>
         {showJump && (
@@ -589,6 +600,20 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
           </motion.button>
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+/** Under the conversation once the chat's own turn has ended while sub-agents it sent to the background still work. */
+function BackgroundLine({ id }: { id: string }) {
+  const n = useStore((st) => st.sessions[id]?.background ?? 0);
+  if (!n) return null;
+  return (
+    <div className="bg-line" role="status">
+      <span className="work-ind">
+        <Tiles size={13} />
+      </span>
+      <span className="bg-line-text">{backgroundLabel(n)}</span>
     </div>
   );
 }

@@ -86,7 +86,8 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
   const [checking, setChecking] = useState(false);
   const limitHolds = useLimitHolds(sessionId, turn.ids, turn.state === 'failed');
   if (!settled) return null;
-  const canCheck = !!checker && checkerReady && changed && !checked;
+  // A check is asked for by the message that opened the turn: a turn the agent began by itself has none.
+  const canCheck = !!checker && checkerReady && changed && !checked && !!turn.segments[0]?.lead;
 
   const check = async () => {
     if (checking) return;

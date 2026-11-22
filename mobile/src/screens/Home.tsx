@@ -10,6 +10,7 @@ import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
 import { homeFolder, openRace } from '@m/lib/race';
+import { backgroundLabel } from '@m/lib/turns';
 import { getState, refresh, setState, useStore, type State } from '@m/lib/store';
 import { useNow } from '@m/lib/useNow';
 import { Field, fieldBeat, fieldWake, paletteFor, type Horizon } from '@m/ui/Field';
@@ -31,7 +32,18 @@ const Deck = lazy(() => loadDeck().then((m) => ({ default: m.Deck })));
 const FIRST_ROWS = 30;
 
 export const toneOf = (s: SessionMeta): Tone =>
-  s.status === 'running' || s.status === 'starting' ? 'working' : s.status === 'awaiting' ? 'awaiting' : s.status === 'error' ? 'error' : s.unread ? 'unread' : 'idle';
+  s.status === 'running' || s.status === 'starting'
+    ? 'working'
+    : s.status === 'awaiting'
+      ? 'awaiting'
+      : s.status === 'error'
+        ? 'error'
+        : // Its own turn ended, but sub-agents it sent to the background still work: the chat is not at rest.
+          (s.background ?? 0) > 0
+          ? 'working'
+          : s.unread
+            ? 'unread'
+            : 'idle';
 
 const isLive = (s: SessionMeta) => !s.archived && (s.status === 'running' || s.status === 'starting' || s.status === 'awaiting');
 
@@ -978,7 +990,7 @@ export const Row = memo(function Row({ id, onMenu, swipe = true, search }: { id:
         <span className="row-main">
           <span className="row-title">{s.title}</span>
           <span className="row-sub">
-            {tone === 'awaiting' ? <span className="row-wait">Waiting for you</span> : <span className="row-folder">{folder}</span>}
+            {tone === 'awaiting' ? <span className="row-wait">Waiting for you</span> : (s.background ?? 0) > 0 && tone === 'working' ? <span className="row-folder">{backgroundLabel(s.background!)}</span> : <span className="row-folder">{folder}</span>}
           </span>
         </span>
         <span className="row-end">

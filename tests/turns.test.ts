@@ -13,8 +13,8 @@ const turns = (s: string, busy = false) => {
   return groupTurns(ids, shape, busy);
 };
 
-/** A flow in short: text and shown pieces by id, runs of steps as `[ids]`, the line as `|`. */
-const flowOf = (flow: FlowChunk[]) => flow.map((c) => (c.kind === 'line' ? '|' : c.kind === 'steps' ? `[${c.ids.join(' ')}]` : c.kind === 'show' ? `*${c.id}` : c.id)).join(' ');
+/** A flow in short: texts by id, shown pieces as `*id`, runs of steps as `[ids]`. */
+const flowOf = (flow: FlowChunk[]) => flow.map((c) => (c.kind === 'steps' ? `[${c.ids.join(' ')}]` : c.kind === 'show' ? `*${c.id}` : c.id)).join(' ');
 
 const onlyTurn = (s: string, busy = false) => {
   const { groups } = turns(s, busy);
@@ -52,7 +52,7 @@ describe('shapeOf', () => {
 });
 
 describe('groupTurns', () => {
-  it('keeps every text in view, in order, and folds the steps between them behind one line', () => {
+  it('reads a turn as checkpoints: runs of steps, each closed by the note that followed it', () => {
     const t = onlyTurn('U1 w2 t3 w4 w5 w6 t7 w8 t9 T10');
     expect(t.state).toBe('done');
     expect(t.end).toBe('10');
@@ -63,7 +63,6 @@ describe('groupTurns', () => {
     expect(s.work).toEqual(['2', '4', '5', '6', '8']);
     expect(s.steps).toBe(5);
     expect(s.flow).toEqual([
-      { kind: 'line' },
       { kind: 'steps', key: '2', ids: ['2'], count: 1 },
       { kind: 'text', id: '3' },
       { kind: 'steps', key: '4', ids: ['4', '5', '6'], count: 3 },
@@ -71,47 +70,56 @@ describe('groupTurns', () => {
       { kind: 'steps', key: '8', ids: ['8'], count: 1 },
       { kind: 'text', id: '9' },
     ]);
+    // The notes along the way fold with the work once the turn has ended; the answer never does.
+    expect(s.notes).toEqual(['3', '7']);
     expect(t.ids).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']);
   });
 
-  it('puts the line before the first run of steps, so it never moves as the turn goes on', () => {
+  it('only ever grows at its end as the turn goes on: a run, then what closed it', () => {
     const steps = ['U1', 'U1 t2', 'U1 t2 h3', 'U1 t2 h3 w4', 'U1 t2 h3 w4 t5', 'U1 t2 h3 w4 t5 w6', 'U1 t2 h3 w4 t5 w6 t7'];
-    expect(steps.map((s) => flowOf(onlyTurn(s, true).segments[0].flow))).toEqual(['|', '2 |', '2 | [3]', '2 | [3 4]', '2 | [3 4] 5', '2 | [3 4] 5 [6]', '2 | [3 4] 5 [6] 7']);
-    // Settled the same way; with no work at all there is no line.
-    expect(flowOf(onlyTurn('U1 t2 h3 w4 t5 w6 t7 T8').segments[0].flow)).toBe('2 | [3 4] 5 [6] 7');
-    expect(flowOf(onlyTurn('U1 t2 T3').segments[0].flow)).toBe('2');
+    expect(steps.map((s) => flowOf(onlyTurn(s, true).segments[0].flow))).toEqual(['', '2', '2 [3]', '2 [3 4]', '2 [3 4] 5', '2 [3 4] 5 [6]', '2 [3 4] 5 [6] 7']);
+    // Settled the same way: what was said before the first step is a note too.
+    const s = onlyTurn('U1 t2 h3 w4 t5 w6 t7 T8').segments[0];
+    expect(flowOf(s.flow)).toBe('2 [3 4] 5 [6] 7');
+    expect(s.notes).toEqual(['2', '5']);
+    // With no work at all there is nothing to fold behind: the texts simply stand.
+    expect(onlyTurn('U1 t2 T3').segments[0]).toMatchObject({ notes: [], answer: '2' });
+    expect(onlyTurn('U1 t2 t3 T4').segments[0]).toMatchObject({ notes: [], answer: '3' });
   });
 
-  it('keeps widgets and plans in view in their place, not as steps', () => {
+  it('keeps widgets and plans in view in their place, not as steps: each closes a checkpoint', () => {
     const s = onlyTurn('U1 w2 p3 w4 g5 t6 T7').segments[0];
-    expect(flowOf(s.flow)).toBe('| [2] *3 [4] *5 6');
+    expect(flowOf(s.flow)).toBe('[2] *3 [4] *5 6');
     expect(s.steps).toBe(2);
     expect(s.work).toEqual(['2', '4']);
+    expect(s.notes).toEqual([]);
   });
 
-  it('starts a segment for every steered message; a segment the steer cut has reports, no answer', () => {
+  it('starts a segment for every steered message; what a segment the steer cut said are notes', () => {
     const t = onlyTurn('U1 w2 t3 S4 t5 w6 w7 t8 T9');
-    expect(t.segments.map((s) => [s.lead, s.steered, s.reply, s.answer, s.work])).toEqual([
-      ['1', false, null, null, ['2']],
-      ['4', true, '5', '8', ['6', '7']],
+    expect(t.segments.map((s) => [s.lead, s.steered, s.reply, s.answer, s.work, s.notes])).toEqual([
+      ['1', false, null, null, ['2'], ['3']],
+      ['4', true, '5', '8', ['6', '7'], []],
     ]);
-    // The question, the reply, then the line for the work that went on.
-    expect(flowOf(t.segments[1].flow)).toBe('5 | [6 7] 8');
+    // The message, the reply to it, then the work that went on and the answer.
+    expect(flowOf(t.segments[1].flow)).toBe('5 [6 7] 8');
   });
 
-  it('keeps the direct reply to a steered question above the line', () => {
+  it('stands the reply to a steered message right under it, whatever was still running', () => {
     const t = onlyTurn('U1 w2 S3 w4 t5 w6 t7 t8 T9');
-    expect(t.segments[1]).toMatchObject({ reply: '5', answer: '8', work: ['4', '6'] });
-    // Steps taken before the reply fold above it; the line waits for the reply.
-    expect(flowOf(t.segments[1].flow)).toBe('[4] 5 | [6] 7 8');
+    expect(t.segments[1]).toMatchObject({ reply: '5', answer: '8', work: ['4', '6'], notes: ['7'] });
+    // A step still under way when the message came does not stand between the pair: it goes on in the run under it.
+    expect(flowOf(t.segments[1].flow)).toBe('5 [4 6] 7 8');
     // A reply that is also the last word is the answer, shown once.
     expect(onlyTurn('U1 w2 S3 t4 T5').segments[1]).toMatchObject({ reply: null, answer: '4', work: [] });
     expect(flowOf(onlyTurn('U1 w2 S3 t4 T5').segments[1].flow)).toBe('4');
+    // With steps before it and nothing after: the pair, then that work.
+    expect(flowOf(onlyTurn('U1 w2 S3 w4 t5 T6').segments[1].flow)).toBe('5 [4]');
   });
 
-  it('holds the line of a live steered segment at the end until the reply has come', () => {
+  it('keeps the work of a live steered segment under the message until the reply comes, then under the pair', () => {
     const flows = ['U1 w2 S3', 'U1 w2 S3 w4', 'U1 w2 S3 w4 t5', 'U1 w2 S3 w4 t5 w6', 'U1 w2 S3 w4 t5 w6 t7'].map((s) => flowOf(onlyTurn(s, true).segments[1].flow));
-    expect(flows).toEqual(['|', '[4] |', '[4] 5 |', '[4] 5 | [6]', '[4] 5 | [6] 7']);
+    expect(flows).toEqual(['', '[4]', '5 [4]', '5 [4 6]', '5 [4 6] 7']);
   });
 
   it('keeps a steered message that is not answered yet as its own live segment', () => {
@@ -120,7 +128,15 @@ describe('groupTurns', () => {
     expect(t.segments).toHaveLength(2);
     expect(t.segments[0].answer).toBeNull();
     expect(t.segments[1]).toMatchObject({ lead: '4', steered: true, answer: null, work: [], steps: 0 });
-    expect(flowOf(t.segments[1].flow)).toBe('|');
+    expect(t.segments[1].flow).toEqual([]);
+  });
+
+  it('folds what any segment said along the way once the turn has work, also a segment with none of its own', () => {
+    const t = onlyTurn('U1 t2 S3 t4 w5 t6 T7');
+    expect(t.segments.map((s) => [s.notes, s.reply, s.answer])).toEqual([
+      [['2'], null, null],
+      [[], '4', '6'],
+    ]);
   });
 
   it('treats a steered message outside a turn as an ordinary one', () => {
@@ -133,7 +149,7 @@ describe('groupTurns', () => {
     expect(t.state).toBe('running');
     expect(t.segments[0].answer).toBeNull();
     expect(t.segments[0].work).toEqual(['2', '4']);
-    expect(flowOf(t.segments[0].flow)).toBe('| [2] 3 [4]');
+    expect(flowOf(t.segments[0].flow)).toBe('[2] 3 [4]');
     const writing = onlyTurn('U1 w2 t3 w4 t5', true);
     expect(writing.segments[0].answer).toBe('5');
     // Settled, the last text is the answer again, wherever it stands.
@@ -144,6 +160,7 @@ describe('groupTurns', () => {
     const t = onlyTurn('U1 n2 T3');
     expect(t.segments[0].work).toEqual([]);
     expect(t.segments[0].errors).toEqual(['2']);
+    expect(flowOf(t.segments[0].flow)).toBe('*2');
     // Among steps, a notice is part of the story.
     expect(onlyTurn('U1 w2 n3 t4 T5').segments[0].work).toEqual(['2', '3']);
   });
@@ -152,7 +169,7 @@ describe('groupTurns', () => {
     const t = onlyTurn('U1 h2 g3 t4 T5');
     expect(t.segments[0].steps).toBe(0);
     expect(t.segments[0].work).toEqual(['2']);
-    expect(flowOf(t.segments[0].flow)).toBe('| [2] *3 4');
+    expect(flowOf(t.segments[0].flow)).toBe('[2] *3 4');
   });
 
   it('does not count task list updates as steps', () => {
@@ -193,19 +210,24 @@ describe('groupTurns', () => {
     expect((groups[0] as TurnGroup).state).toBe('interrupted');
   });
 
-  it('answers a failed turn with its error', () => {
-    const t = onlyTurn('U1 w2 t3 F4');
+  it('answers a failed turn with its error, and keeps the last words before it in view', () => {
+    const t = onlyTurn('U1 w2 t3 w4 t5 F6');
     expect(t.state).toBe('failed');
     expect(t.segments[0].answer).toBeNull();
-    expect(t.segments[0].work).toEqual(['2']);
-    expect(flowOf(t.segments[0].flow)).toBe('| [2] 3');
+    expect(t.segments[0].work).toEqual(['2', '4']);
+    expect(flowOf(t.segments[0].flow)).toBe('[2] 3 [4] 5');
+    // Where it stopped stays readable; what came before folds.
+    expect(t.segments[0]).toMatchObject({ last: '5', notes: ['3'] });
+    // A turn that ended well has no such words: its answer stands.
+    expect(onlyTurn('U1 w2 t3 T4').segments[0].last).toBeNull();
   });
 
-  it('keeps error notices out of the fold', () => {
+  it('keeps error notices out of the fold, where they happened', () => {
     const t = onlyTurn('U1 w2 e3');
     expect(t.state).toBe('failed');
     expect(t.segments[0].errors).toEqual(['3']);
     expect(t.segments[0].work).toEqual(['2']);
+    expect(flowOf(t.segments[0].flow)).toBe('[2] *3');
   });
 
   it('does not fail a turn that recovered after an error', () => {
@@ -213,6 +235,8 @@ describe('groupTurns', () => {
     expect(t.state).toBe('done');
     expect(t.segments[0].answer).toBe('4');
     expect(t.segments[0].errors).toEqual(['2']);
+    // The error stays where it happened, before the work that went on.
+    expect(flowOf(t.segments[0].flow)).toBe('*2 [3] 4');
   });
 
   it('derives turns from messages in history without turn records', () => {
@@ -222,7 +246,7 @@ describe('groupTurns', () => {
     expect(ts.map((t) => t.state)).toEqual(['done', 'done', 'done']);
     expect(ts.map((t) => t.segments[0].answer)).toEqual(['3', '7', '9']);
     expect(ts[1].segments[0].work).toEqual(['6']);
-    expect(flowOf(ts[1].segments[0].flow)).toBe('5 | [6] 7');
+    expect(flowOf(ts[1].segments[0].flow)).toBe('5 [6] 7');
   });
 
   it('marks only the open turn at the end as running', () => {
@@ -253,13 +277,105 @@ describe('groupTurns', () => {
     const s = onlyTurn('U1 t2 w3 .4 T5').segments[0];
     expect(s.answer).toBe('2');
     expect(s.work).toEqual(['3']);
-    expect(flowOf(s.flow)).toBe('2 | [3]');
+    expect(flowOf(s.flow)).toBe('2 [3]');
   });
 
   it('handles a turn with no answer at all', () => {
     const s = onlyTurn('U1 w2 w3 T4').segments[0];
     expect(s.answer).toBeNull();
     expect(s.steps).toBe(2);
+  });
+});
+
+describe('the answer of a finished turn', () => {
+  // `l` is a lead-in or a nod ("Committed.", "Done.", an announcement): see lead-in.ts.
+  it('stays the report when a nod follows it: the nod stands under it as a last line', () => {
+    const s = onlyTurn('U1 w2 t3 l4 T5').segments[0];
+    expect(s).toMatchObject({ answer: '3', tail: ['4'], notes: [], work: ['2'] });
+    expect(flowOf(s.flow)).toBe('[2] 3 4');
+  });
+
+  it('stays the report when steps and then a nod follow it', () => {
+    const s = onlyTurn('U1 w2 t3 w4 w5 l6 T7').segments[0];
+    expect(s).toMatchObject({ answer: '3', tail: ['6'], notes: [], work: ['2', '4', '5'] });
+    expect(flowOf(s.flow)).toBe('[2] 3 [4 5] 6');
+    // An earlier note still folds: only the last report is the answer.
+    expect(onlyTurn('U1 w2 t3 w4 t5 w6 l7 T8').segments[0]).toMatchObject({ answer: '5', tail: ['7'], notes: ['3'] });
+    // A task list update or a notice after the nod changes nothing.
+    expect(onlyTurn('U1 w2 t3 w4 l5 k6 n7 T8').segments[0]).toMatchObject({ answer: '3', tail: ['5'] });
+  });
+
+  it('is the nod when the turn said nothing else, the last of several', () => {
+    expect(onlyTurn('U1 w2 l3 T4').segments[0]).toMatchObject({ answer: '3', tail: [], notes: [] });
+    expect(onlyTurn('U1 l2 w3 l4 T5').segments[0]).toMatchObject({ answer: '4', tail: [], work: ['2', '3'] });
+  });
+
+  it('is the last of two real reports: the earlier one folds as a note', () => {
+    const s = onlyTurn('U1 w2 t3 w4 t5 T6').segments[0];
+    expect(s).toMatchObject({ answer: '5', tail: [], notes: ['3'] });
+  });
+
+  it('reads a plan or command output the same way: a nod after it is not the answer', () => {
+    expect(onlyTurn('U1 w2 p3 l4 T5').segments[0]).toMatchObject({ answer: '3', tail: ['4'] });
+    expect(onlyTurn('U1 c2 l3 T4').segments[0]).toMatchObject({ answer: '2', tail: ['3'] });
+  });
+
+  it('keeps the rule in a steered segment and after an interruption', () => {
+    // The reply is the report; "Done." after the work is its last line.
+    const t = onlyTurn('U1 w2 S3 t4 w5 l6 T7');
+    expect(t.segments[1]).toMatchObject({ reply: null, answer: '4', tail: ['6'], work: ['5'] });
+    // A nod as the reply, a report after: the reply stays the reply.
+    expect(onlyTurn('U1 w2 S3 l4 w5 t6 T7').segments[1]).toMatchObject({ reply: '4', answer: '6', tail: [] });
+    expect(onlyTurn('U1 w2 t3 w4 l5 i6').segments[0]).toMatchObject({ answer: '3', tail: ['5'] });
+  });
+
+  it('leaves a running turn as it was: the nod waits in the work for a step', () => {
+    const s = onlyTurn('U1 w2 t3 w4 l5', true).segments[0];
+    expect(s).toMatchObject({ answer: null, tail: [], work: ['2', '4', '5'] });
+  });
+
+  it('keeps the last report of a failed turn in view, and a nod after it', () => {
+    const s = onlyTurn('U1 w2 t3 w4 t5 l6 e7 F8').segments[0];
+    expect(s).toMatchObject({ answer: null, last: '5', tail: ['6'], notes: ['3'] });
+    // Nothing but a nod before the failure: it is those last words.
+    expect(onlyTurn('U1 w2 l3 e4 F5').segments[0]).toMatchObject({ answer: null, last: '3', tail: [] });
+  });
+});
+
+describe('work no message opened (a turn the agent began by itself)', () => {
+  it('is a turn of its own, with no message at its head, instead of a row per step', () => {
+    // A notification opened a turn and it ended; then the agent went on by itself (a second wake).
+    const { groups } = turns('U1 t2 T3 N4 t5 T6 h7 t8 w9 w10 h11 w12', true);
+    expect(groups.map((g) => g.kind)).toEqual(['turn', 'turn', 'turn']);
+    const own = groups[2] as TurnGroup;
+    expect(own.key).toBe('7');
+    expect(own.state).toBe('running');
+    expect(own.segments).toHaveLength(1);
+    expect(own.segments[0]).toMatchObject({ lead: null, steered: false, work: ['7', '9', '10', '11', '12'], steps: 3 });
+    expect(flowOf(own.segments[0].flow)).toBe('[7] 8 [9 10 11 12]');
+    expect(own.ids).toEqual(['7', '8', '9', '10', '11', '12']);
+  });
+
+  it('ends at its turn record, or at the next message', () => {
+    const { groups } = turns('U1 t2 T3 w4 t5 T6 w7 t8 U9 t10 T11');
+    expect(groups.map((g) => (g as TurnGroup).key)).toEqual(['1', '4', '7', '9']);
+    expect((groups[1] as TurnGroup).segments[0]).toMatchObject({ lead: null, answer: '5', work: ['4'] });
+    expect((groups[1] as TurnGroup).end).toBe('6');
+    expect((groups[2] as TurnGroup).segments[0]).toMatchObject({ lead: null, answer: '8' });
+  });
+
+  it('takes a steered message and a notification as any turn does', () => {
+    const t = turns('U1 t2 T3 w4 S5 t6 w7 t8 T9').groups[1] as TurnGroup;
+    expect(t.segments.map((s) => [s.lead, s.steered, s.reply, s.answer])).toEqual([
+      [null, false, null, null],
+      ['5', true, '6', '8'],
+    ]);
+  });
+
+  it('leaves notices outside any turn as single items, and an error too', () => {
+    expect(turns('n0 U1 t2 T3 n4 e5 w6 t7 T8').groups.map((g) => (g.kind === 'item' ? g.id : `turn:${g.key}`))).toEqual(['0', 'turn:1', '4', '5', 'turn:6']);
+    // Before the first message as well: what the agent wrote there is a turn.
+    expect(turns('t0 U1 t2 T3').groups.map((g) => g.kind)).toEqual(['turn', 'turn']);
   });
 });
 
@@ -331,7 +447,7 @@ describe('lead-ins', () => {
   it('folds a lead-in with the steps it announces, and keeps reports and the answer in view', () => {
     const t = onlyTurn('U1 l2 w3 l4 w5 w6 t7 l8 w9 t10 T11');
     const s = t.segments[0];
-    expect(flowOf(s.flow)).toBe('| [2 3 4 5 6] 7 [8 9] 10');
+    expect(flowOf(s.flow)).toBe('[2 3 4 5 6] 7 [8 9] 10');
     expect(s.work).toEqual(['2', '3', '4', '5', '6', '8', '9']);
     expect(s.steps).toBe(4);
     expect(s.answer).toBe('10');
@@ -339,15 +455,15 @@ describe('lead-ins', () => {
   });
 
   it('says a lead-in in view when no step follows it', () => {
-    // The last words of a settled turn are its answer, whatever they look like.
+    // The last words of a settled turn that said nothing else are its answer, whatever they look like.
     expect(onlyTurn('U1 w2 l3 T4').segments[0]).toMatchObject({ answer: '3', work: ['2'] });
     // Before more text it is one more report.
-    expect(flowOf(onlyTurn('U1 l2 t3 w4 t5 T6').segments[0].flow)).toBe('2 3 | [4] 5');
+    expect(flowOf(onlyTurn('U1 l2 t3 w4 t5 T6').segments[0].flow)).toBe('2 3 [4] 5');
   });
 
   it('keeps the newest lead-in of a running turn folded while it waits for its step', () => {
     const s = onlyTurn('U1 w2 t3 w4 l5', true).segments[0];
-    expect(flowOf(s.flow)).toBe('| [2] 3 [4 5]');
+    expect(flowOf(s.flow)).toBe('[2] 3 [4 5]');
     expect(s.answer).toBeNull();
     expect(s.narr).toEqual(['5']);
   });
@@ -360,7 +476,7 @@ describe('lead-ins', () => {
     // "Let me fix the typo." then the edit, and the turn ends: the announcement is the answer, in view.
     const s = onlyTurn('U1 l2 w3 T4').segments[0];
     expect(s).toMatchObject({ answer: '2', work: ['3'], steps: 1 });
-    expect(flowOf(s.flow)).toBe('2 | [3]');
+    expect(flowOf(s.flow)).toBe('2 [3]');
     // The newest of several.
     expect(onlyTurn('U1 l2 w3 l4 w5 T6').segments[0]).toMatchObject({ answer: '4', work: ['2', '3', '5'] });
     // While it runs it stays folded with its step.
@@ -371,11 +487,13 @@ describe('lead-ins', () => {
     expect(onlyTurn('U1 l2 w3 F4').segments[0].answer).toBeNull();
   });
 
-  it('keeps the last words the answer when a notice or a task list update follows them', () => {
-    // "I'll leave the config as it is." and then "Your message is back in the queue".
+  it('keeps the last words in view when a notice or a task list update follows them', () => {
+    // "I'll leave the config as it is." and then "Your message is back in the queue": said in view,
+    // as the last line under the report before it (the answer), not folded with the notice.
     const s = onlyTurn('U1 t2 w3 l4 n5 T6').segments[0];
-    expect(s.answer).toBe('4');
-    expect(flowOf(s.flow)).toBe('2 | [3] 4 [5]');
+    expect(s).toMatchObject({ answer: '2', tail: ['4'], notes: [] });
+    expect(flowOf(s.flow)).toBe('2 [3] 4 [5]');
+    // With nothing said before them they are the answer.
     expect(onlyTurn('U1 w2 l3 k4 T5').segments[0]).toMatchObject({ answer: '3', work: ['2', '4'] });
     expect(onlyTurn('U1 w2 l3 h4 n5 T6').segments[0].answer).toBe('3');
     // A notice and then a step: the lead-in announced that step.
@@ -396,7 +514,7 @@ describe('lead-ins', () => {
   it('always shows the reply to a steered message, even when it reads as a lead-in', () => {
     const t = onlyTurn('U1 w2 S3 l4 l5 w6 t7 T8');
     expect(t.segments[1]).toMatchObject({ reply: '4', answer: '7', work: ['5', '6'] });
-    expect(flowOf(t.segments[1].flow)).toBe('4 | [5 6] 7');
+    expect(flowOf(t.segments[1].flow)).toBe('4 [5 6] 7');
   });
 });
 
@@ -443,7 +561,7 @@ describe("what Claude Code writes in the person's place (shared/synthetic.ts)", 
     expect(t.segments[1]).toMatchObject({ work: ['4'], answer: '5' });
     const live = onlyTurn('U1 w2 N3 w4', true);
     expect(live.state).toBe('running');
-    expect(flowOf(live.segments[1].flow)).toBe('| [4]');
+    expect(flowOf(live.segments[1].flow)).toBe('[4]');
   });
 
   it('opens a turn of its own for a notification after an interruption', () => {
