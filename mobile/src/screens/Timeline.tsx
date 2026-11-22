@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { NoticeItem, PhoneItem, ProviderId, TextItem, ThinkingItem, TimelineItem, ToolItem, TurnItem, UntilCheck, UserItem } from '@shared/protocol';
 import { stripWrappers, syntheticOf } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
@@ -16,6 +16,8 @@ import { putDraft } from '@m/lib/put-draft';
 import { readReview, type PhoneReview } from '@m/lib/review';
 import { applyChildren, applyFull, fetchItem, getState, sessionData, setState, useStore, type State } from '@m/lib/store';
 import { claimFlight } from '@m/lib/flight';
+import { checkOpener, foldTarget, showKind, turnChanges } from '@m/lib/chat-rules';
+import { useChanges } from '@m/lib/changes';
 import type { Segment, StepsChunk, TurnGroup } from '@m/lib/turns';
 import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
 import { FileGlyph, kindName } from '@m/ui/FileGlyph';
@@ -91,9 +93,14 @@ function useSecond(active: boolean): number {
  * once, and what stays glides from where it stood to its new place (FLIP), the reader's place kept:
  * at the newest the answer stays where it is, scrolled up the first thing in view that stays.
  */
-export const TurnView = memo(function TurnView({ sid, turn, newest }: { sid: string; turn: TurnGroup; newest?: boolean }) {
+export const TurnView = memo(function TurnView({ sid, turn, newest, reveal }: { sid: string; turn: TurnGroup; newest?: boolean; reveal?: string }) {
   const running = turn.state === 'running';
   const [open, setOpen] = useState(false);
+  // Asked to show an item it holds (a search hit): the folds around it open, the line and its checkpoint.
+  const target = useMemo(() => (reveal ? foldTarget(turn, reveal) : null), [turn, reveal]);
+  useLayoutEffect(() => {
+    if (target?.fold && !running) setOpen(true);
+  }, [target, running]);
   // 'live' laid out as while it ran; 'closing' the same, the pieces that fold fading; 'settled' folded.
   const [phase, setPhase] = useState<'live' | 'closing' | 'settled'>(running ? 'live' : 'settled');
   const laidLive = running || phase !== 'settled';
@@ -151,7 +158,7 @@ export const TurnView = memo(function TurnView({ sid, turn, newest }: { sid: str
             ) : p.k === 'total' ? (
               <WorkHead sid={sid} mode="total" run={null} from={null} until={null} turn={turn} open={open} onToggle={toggle} />
             ) : (
-              <RunPiece sid={sid} p={p} settled={!laidLive} open={shownOpen} multi={multi} nest={nest} turn={p.head ? turn : undefined} onToggle={toggle} />
+              <RunPiece sid={sid} p={p} settled={!laidLive} open={shownOpen} multi={multi} nest={nest} turn={p.head ? turn : undefined} onToggle={toggle} reveal={!!target?.run && target.run === p.run?.key} />
             )}
           </div>
         );
@@ -164,6 +171,31 @@ export const TurnView = memo(function TurnView({ sid, turn, newest }: { sid: str
     </section>
   );
 });
+
+/**
+ * The backstop around each turn (and each item outside one): a piece that cannot be drawn costs that
+ * turn one calm line, never the conversation. Tries again when the turn changes.
+ */
+export class TurnGuard extends Component<{ id: string; turn: unknown; children: ReactNode }, { failed: unknown }> {
+  state = { failed: null as unknown };
+  static getDerivedStateFromError(err: unknown) {
+    return { failed: err ?? true };
+  }
+  componentDidCatch(err: unknown) {
+    console.error('A turn could not be shown', err);
+  }
+  componentDidUpdate(prev: { turn: unknown }) {
+    if (this.state.failed && prev.turn !== this.props.turn) this.setState({ failed: null });
+  }
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div className="turn-broken" data-turn={this.props.id}>
+        This part of the conversation could not be shown.
+      </div>
+    );
+  }
+}
 
 /** How long the pieces that fold take to fade before the turn gathers (ms). */
 const LEAVE_MS = 170;
@@ -321,9 +353,13 @@ function hold(el: Element | null) {
  * ("Run the tests · 12s · 2 steps") through the closed checkpoint ("Worked 45s · 5 steps") to its
  * place in the finished turn's fold; on the turn's first run the line then reads the whole turn.
  */
-const RunPiece = memo(function RunPiece({ sid, p, settled, open, multi, nest, turn, onToggle }: { sid: string; p: RunP; settled: boolean; open: boolean; multi: boolean; nest: boolean; turn?: TurnGroup; onToggle: () => void }) {
+const RunPiece = memo(function RunPiece({ sid, p, settled, open, multi, nest, turn, onToggle, reveal }: { sid: string; p: RunP; settled: boolean; open: boolean; multi: boolean; nest: boolean; turn?: TurnGroup; onToggle: () => void; reveal?: boolean }) {
   const [runOpen, setRunOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  // Holds the item looked for: its steps open.
+  useLayoutEffect(() => {
+    if (reveal) setRunOpen(true);
+  }, [reveal]);
   const toggleRun = useCallback(() => {
     haptic('select');
     hold(ref.current);
@@ -373,20 +409,37 @@ const StepRow = memo(function StepRow({ sid, id }: { sid: string; id: string }) 
   const it = useItem<TimelineItem>(sid, id);
   if (!it) return null;
   if (it.type === 'tool' && (it.kind === 'agent' || it.workflow || it.name === 'Workflow')) return <Block sid={sid} id={id} />;
-  if (it.type === 'notice') return <div className="step-text step-note">{it.text}</div>;
+  if (it.type === 'notice') return <div className="step-text step-note" data-id={id}>{it.text}</div>;
   // What a command printed, in the work: its line (shown by the bubble's own reading).
   if (it.type === 'user') return <UserBubble sid={sid} id={id} />;
   return <Step sid={sid} id={id} />;
 });
 
-/** In view in its place: command output, a widget, a plan, files, an error. */
+/**
+ * In view in its place: command output, a widget, a plan, files, an error. Read by the item's own
+ * type, never by where it stands: what a command printed is a user item Claude Code wrote (a line
+ * under the command, Synthetic.tsx), not a step; a type it does not know shows nothing.
+ */
 function Show({ sid, id }: { sid: string; id: string }) {
   const it = useItem<TimelineItem>(sid, id);
-  if (!it) return null;
-  if (it.type === 'notice') return <Notice sid={sid} id={id} />;
-  if (it.type === 'tool' && it.kind === 'plan') return <PlanBlock sid={sid} it={it} />;
-  if (it.type === 'tool' && it.kind === 'share') return <ShareCards sid={sid} it={it} />;
-  return <Block sid={sid} id={id} />;
+  switch (showKind(it)) {
+    case 'user':
+      return <UserBubble sid={sid} id={id} />;
+    case 'text':
+      return <Answer sid={sid} id={id} tone="mid" />;
+    case 'notice':
+      return <Notice sid={sid} id={id} />;
+    case 'check':
+      return <CheckBlock sid={sid} id={id} />;
+    case 'plan':
+      return <PlanBlock sid={sid} it={it as ToolItem} />;
+    case 'share':
+      return <ShareCards sid={sid} it={it as ToolItem} />;
+    case 'block':
+      return <Block sid={sid} id={id} />;
+    default:
+      return null;
+  }
 }
 
 /** A plan: one row; a tap fetches it from the desktop and shows it. */
@@ -497,27 +550,22 @@ function RunLine({ sid, run, from, until, open, onToggle, landed }: { sid: strin
 
 /** "Worked 15m 52s · 36 steps", and the change: the whole of a finished turn behind one line. The change opens what it changed. */
 function TotalLine({ sid, turn, open, onToggle, landed }: { sid: string; turn: TurnGroup; open: boolean; onToggle?: () => void; landed: boolean }) {
+  // Read again when a sub-agent's steps arrive or a step that writes files settles (its edits count too).
+  const children = useStore((s) => sessionData(s, sid).children);
+  const fileSteps = useStore((s) => sessionData(s, sid).fileSteps);
   const { span, add, del, thought, edits, files, steps } = useMemo(() => {
     const items = sessionData(getState(), sid).items;
-    let a = 0;
-    let d = 0;
     let n = 0;
-    const paths = new Set<string>();
-    // The steps that change files (and sub-agents, whose own steps may): the desktop gathers the turn's changes from them.
-    const changed: string[] = [];
     let thinking = false;
     for (const s of turn.segments) {
       n += s.steps;
-      for (const id of s.work) {
-        const it = items[id];
-        if (it?.type === 'thinking') thinking = true;
-        if (it?.type !== 'tool') continue;
-        for (const f of it.result?.diff ?? []) (a += f.additions), (d += f.deletions), paths.add(f.path);
-        if (it.kind === 'edit' || it.kind === 'write' || it.kind === 'agent') changed.push(id);
-      }
+      for (const id of s.work) if (items[id]?.type === 'thinking') thinking = true;
     }
-    return { span: turnSpan(items, turn), add: a, del: d, thought: !n && thinking, edits: changed, files: paths.size, steps: n };
-  }, [sid, turn]);
+    // The steps that change files, sub-agents' included (the desktop gathers the turn's changes from them).
+    const c = turnChanges(items, children, turn.ids);
+    return { span: turnSpan(items, turn), add: c.add, del: c.del, thought: !n && thinking, edits: c.edits, files: c.files, steps: n };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sid, turn, children, fileSteps]);
   const took = span && span >= 1000 ? shortDuration(span) : '';
   const lead = turn.segments[0]?.lead;
   return (
@@ -683,7 +731,8 @@ export const ItemRow = memo(function ItemRow({ sid, id, queued }: { sid: string;
 });
 
 const UserBubble = memo(function UserBubble({ sid, id, steered, queued }: { sid: string; id: string; steered?: boolean; queued?: boolean }) {
-  const it = useItem<UserItem>(sid, id);
+  const got = useItem<TimelineItem>(sid, id);
+  const it = got?.type === 'user' ? got : undefined;
   const ref = useRef<HTMLDivElement>(null);
   const [long, setLong] = useState(false);
   const [open, setOpen] = useState(false);
@@ -805,7 +854,7 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
   const [full, setFull] = useState<ToolItem>();
   if (!it) return null;
   if (it.type === 'thinking') return <ThinkingStep sid={sid} it={it} quiet={quiet} />;
-  if (it.type === 'text') return <div className="step-text">{inlineCode(it.text.length > 280 ? `${it.text.slice(0, 280)}…` : it.text)}</div>;
+  if (it.type === 'text') return <div className="step-text" data-id={id}>{inlineCode(it.text.length > 280 ? `${it.text.slice(0, 280)}…` : it.text)}</div>;
   if (it.type !== 'tool') return null;
   const more = !!(it as PhoneItem).more;
   const detail = toolDetail(full ?? it);
@@ -817,7 +866,7 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
     setOpen((v) => !v);
   };
   return (
-    <div className="step" data-status={status} data-open={open || undefined}>
+    <div className="step" data-id={id} data-status={status} data-open={open || undefined}>
       <button type="button" className="step-line" onClick={toggle} disabled={quiet || !(detail || more)}>
         <span className="step-icon">{status === 'running' || status === 'pending' ? <Ring size={13} /> : <Icon name={TOOL_ICON[it.kind] ?? 'tool'} size={16} />}</span>
         <span className="step-title">{it.title}</span>
@@ -922,7 +971,7 @@ function ThinkingStep({ sid, it, quiet }: { sid: string; it: ThinkingItem; quiet
 
 /** What a step did, for its detail: the command or target, the first lines of output, the first hunks of a change. */
 function toolDetail(it: ToolItem): { head?: string; out?: string; diff?: string } | null {
-  const d = it.detail;
+  const d = it.detail ?? {};
   const head = d.command ? `$ ${d.command}` : d.path || d.url || (d.query || d.pattern ? String(d.query ?? d.pattern) : undefined);
   let out: string | undefined;
   const res = it.output || it.result?.text || it.result?.stderr;
@@ -970,7 +1019,8 @@ function DiffStat({ diff }: { diff: NonNullable<ToolItem['result']>['diff'] }) {
 const Block = memo(function Block({ sid, id }: { sid: string; id: string }) {
   const it = useItem<ToolItem>(sid, id);
   const known = useStore((s) => sessionData(s, sid).children[id]?.length ?? 0);
-  if (!it) return null;
+  // Only a step is a block (anything else that reaches here shows nothing rather than break the turn).
+  if (it?.type !== 'tool') return null;
   const kids = Math.max(known, (it as PhoneItem).kids ?? 0);
   if (it.kind === 'widget') {
     const title = (it.input as { title?: string } | undefined)?.title ?? it.title;
@@ -1023,7 +1073,7 @@ const Block = memo(function Block({ sid, id }: { sid: string; id: string }) {
   const stats = it.result?.agent;
   const bg = stats?.background;
   const runningNow = it.status === 'running' || it.status === 'pending' || bg === 'running';
-  const name = it.detail.subagent || it.title;
+  const name = it.detail?.subagent || it.title;
   return <AgentBlock sid={sid} id={id} it={it} name={name} running={runningNow} background={!!bg} kids={kids} />;
 });
 
@@ -1049,7 +1099,7 @@ function AgentBlock({ sid, id, it, name, running, background, kids }: { sid: str
           <span className="block-title">{name}</span>
           <span className="block-aside">{it.status === 'error' ? 'Failed' : running ? (background ? 'In the background' : 'Working') : 'Done'}</span>
         </span>
-        {it.detail.description && it.detail.description !== name && <span className="block-desc">{it.detail.description}</span>}
+        {it.detail?.description && it.detail.description !== name && <span className="block-desc">{it.detail.description}</span>}
         <span className="block-sub num">
           {[stats?.steps ? plural(stats.steps, 'step') : kids ? plural(kids, 'step') : '', stats?.tokens && `${formatTokens(stats.tokens)} tokens`, stats?.durationMs && formatDuration(stats.durationMs)].filter(Boolean).join(' · ')}
           {kids > 0 && <Icon name="caretDown" size={12} weight="bold" className="block-caret" />}
@@ -1070,9 +1120,9 @@ function AgentBlock({ sid, id, it, name, running, background, kids }: { sid: str
 
 /** The agent a cross-agent sub-agent runs on, from its tool's name or the name it carries. */
 function otherAgent(it: ToolItem): ProviderId | undefined {
-  const n = it.name.toLowerCase();
-  if (n.includes('delegate_to_codex') || it.detail.subagent === 'Codex') return 'codex';
-  if (n.includes('delegate_to_claude') || it.detail.subagent === 'Claude Code') return 'claude';
+  const n = (it.name ?? '').toLowerCase();
+  if (n.includes('delegate_to_codex') || it.detail?.subagent === 'Codex') return 'codex';
+  if (n.includes('delegate_to_claude') || it.detail?.subagent === 'Claude Code') return 'claude';
   return undefined;
 }
 
@@ -1271,12 +1321,15 @@ function useStreamed(box: React.RefObject<HTMLDivElement | null>, text: string, 
 }
 
 const Answer = memo(function Answer({ sid, id, tone = 'answer' }: { sid: string; id: string; tone?: 'answer' | 'mid' }) {
-  const it = useItem<TextItem>(sid, id);
+  const got = useItem<TimelineItem>(sid, id);
+  // Only the agent's words are an answer (anything else that reaches here shows nothing).
+  const it = got?.type === 'text' ? (got as TextItem) : undefined;
   const streaming = !!it?.streaming;
   const html = useMemo(() => (it && !it.streaming ? renderMarkdown(it.text) : ''), [it]);
   const box = useRef<HTMLDivElement>(null);
   useStreamed(box, it?.text ?? '', streaming);
   const [busy, setBusy] = useState(false);
+  if (got?.type === 'user') return <UserBubble sid={sid} id={id} />;
   if (!it || !it.text.trim()) return null;
   const cut = (it as PhoneItem).cut && !it.streaming;
   return (
@@ -1356,8 +1409,8 @@ function fileSize(n?: number): string {
  * bytes counted under the name, and the file then opens from the row (an APK goes to the installer).
  */
 function ShareCards({ sid, it }: { sid: string; it: ToolItem }) {
-  const files = it.detail.files ?? [];
-  const caption = it.detail.caption?.trim();
+  const files = it.detail?.files ?? [];
+  const caption = it.detail?.caption?.trim();
   if (!files.length) return null;
   return (
     <div className="share">
@@ -1554,21 +1607,39 @@ function CheckOffer({ sid, turn }: { sid: string; turn: TurnGroup }) {
   const checker = checkerOf(provider);
   const ready = useStore((s) => (checker ? !!s.providers[checker]?.installed && !!s.providers[checker]?.auth?.loggedIn : false));
   const online = useStore((s) => s.conn === 'open');
-  const changed = useMemo(() => {
+  const children = useStore((s) => sessionData(s, sid).children);
+  const fileSteps = useStore((s) => sessionData(s, sid).fileSteps);
+  // The message that opened the turn (`turn.check` takes it), and what the turn changed, sub-agents' edits included.
+  const { opener, changes } = useMemo(() => {
     const items = sessionData(getState(), sid).items;
-    return turn.ids.some((x) => {
-      const t = items[x];
-      return t?.type === 'tool' && (!!t.result?.diff?.length || ((t.kind === 'edit' || t.kind === 'write') && t.status === 'done'));
-    });
-  }, [sid, turn]);
+    return { opener: checkOpener(turn, items), changes: turnChanges(items, children, turn.ids) };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sid, turn, children, fileSteps]);
   const checked = useStore((s) =>
     (turn.checks ?? []).some((x) => {
       const t = sessionData(s, sid).items[x];
       return t?.type === 'tool' && (t.status === 'running' || t.status === 'pending' || t.status === 'done');
     }),
   );
+  if (!checker || !ready || !opener || checked) return null;
+  // A sub-agent whose steps are not here may have made the change: the desktop says (only when nothing here did).
+  if (!changes.files && changes.unknown.length) return <AskedOffer sid={sid} turn={turn} ids={changes.unknown} checker={checker} online={online} />;
+  if (!changes.files) return null;
+  return <OfferKey sid={sid} turn={turn} checker={checker} online={online} />;
+}
+
+/** The offer for a turn whose only edits may be a sub-agent's the phone has not got: shown once the desktop counts a change. */
+function AskedOffer({ sid, turn, ids, checker, online }: { sid: string; turn: TurnGroup; ids: string[]; checker: ProviderId; online: boolean }) {
+  const key = ids.join();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const scope = useMemo(() => ({ sid, items: ids }), [sid, key]);
+  const changes = useChanges(scope, true);
+  if (!changes.data?.files.length) return null;
+  return <OfferKey sid={sid} turn={turn} checker={checker} online={online} />;
+}
+
+function OfferKey({ sid, turn, checker, online }: { sid: string; turn: TurnGroup; checker: ProviderId; online: boolean }) {
   const [busy, setBusy] = useState(false);
-  if (!checker || !ready || !changed || checked || turn.state !== 'done') return null;
   const who = PROVIDER_NAME[checker];
   return (
     <button

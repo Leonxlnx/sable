@@ -22,7 +22,7 @@ export const SynLine = memo(function SynLine({ sid, it, syn }: { sid: string; it
   const parts = syn.parts.filter((p) => p.kind !== 'hidden');
   const cut = !!(it as PhoneItem).cut;
   return (
-    <div className="syn" data-role={syn.role}>
+    <div className="syn" data-id={it.id} data-role={syn.role}>
       {parts.map((p, i) => (
         <Part key={i} part={p} ts={it.ts} first={i === 0} more={cut ? () => fetchItem(sid, it.id).then((r) => applyFull(sid, r.item)) : undefined} />
       ))}

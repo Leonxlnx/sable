@@ -11,6 +11,7 @@ import { homeFolder, openRace, swapTo } from '@m/lib/race';
 import { applyOlder, closeGap, fetchNewer, fetchOlder, getState, openAt, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
 import { around, growDown, growUp, MOUNT_MAX, rangeOf, SpacerSums, trimTop, type Win } from '@m/lib/window';
 import { matchRanges, searchWords } from '@m/lib/find';
+import { canStop, followSent, newestSent } from '@m/lib/chat-rules';
 import { backgroundLabel, groupTurns, stabilize } from '@m/lib/turns';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
@@ -20,10 +21,14 @@ import { Sheet } from '@m/ui/Sheet';
 import { Composer } from './Composer';
 import { Prompts } from './Prompts';
 import { ReviewLine } from './Review';
-import { ItemRow, TurnView } from './Timeline';
+import { ItemRow, TurnGuard, TurnView } from './Timeline';
 
 const PAGE = 24;
 const FIRST = 5;
+/** Frames a search hit that was folded away is waited for once its folds were told to open. */
+const REVEAL_FRAMES = 24;
+/** Then the steps it is in finish unfolding before it is measured (ms). */
+const REVEAL_SETTLE_MS = 260;
 
 /**
  * A conversation: header, turns (the newest ones mounted, older ones as you scroll up), composer.
@@ -108,11 +113,9 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         </div>
       )}
       {s.custom ? (
-        // The Customize chat can change the desktop's look: it is read here and answered on the computer.
+        // The Customize chat can change the desktop's look: it is read here and answered on the computer (a running turn can still be stopped).
         <div className="chat-foot">
-          <p className="empty" style={{ margin: '12px 28px 16px' }}>
-            Answered on {desktop ?? 'the computer'}
-          </p>
+          <ReadOnlyFoot id={id} status={s.status} desktop={desktop} />
         </div>
       ) : (
         <div className="chat-foot">
@@ -122,6 +125,26 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         </div>
       )}
       <RemoteSheet id={id} open={remote} onClose={() => setRemote(false)} />
+    </div>
+  );
+}
+
+/** The foot of a chat answered on the computer: says so, with the stop key while its turn can be stopped. */
+function ReadOnlyFoot({ id, status, desktop }: { id: string; status: SessionMeta['status']; desktop?: string }) {
+  const online = useStore((st) => st.conn === 'open');
+  const stoppable = canStop(status);
+  const stop = () => {
+    haptic('warning');
+    void conn.call('session.interrupt', { sessionId: id }).catch((err: Error) => setState({ toast: { text: err.message, level: 'error', at: Date.now() } }));
+  };
+  return (
+    <div className="ro-foot" data-stop={stoppable || undefined}>
+      <p className="ro-foot-text">Answered on {desktop ?? 'the computer'}</p>
+      {stoppable && (
+        <button type="button" className="send" data-stop aria-label="Stop" disabled={!online} onClick={stop}>
+          <span className="stop-square" />
+        </button>
+      )}
     </div>
   );
 }
@@ -429,18 +452,19 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     for (let i = turns.length - 1; i >= 0; i--) if (turns[i].kind === 'turn') return turns[i];
     return undefined;
   }, [turns]);
-  const lastUser = useMemo(() => {
-    for (let i = turns.length - 1; i >= 0; i--) {
-      const g = turns[i];
-      if (g.kind === 'turn') return g.key;
-    }
-    return undefined;
-  }, [turns]);
+  // Only a message the person sent, newer than the one followed last: a turn a notification or a
+  // background tool began, or a rewind that leaves an older message last, leaves a reader scrolled up where they are.
+  const sent = useMemo(() => newestSent(roots, sessionData(getState(), id).items), [roots, id]);
+  const followed = useRef(sent);
   useEffect(() => {
+    const prev = followed.current;
+    followed.current = sent;
+    if (!followSent(prev, sent)) return;
     if (goal.current || gappedRef.current || (winRef.current && winRef.current.hi !== null)) return;
     atBottom.current = true;
     toBottom(true);
-  }, [lastUser, toBottom]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sent?.id, toBottom]);
 
   // Opened at a place: the turns that hold it are mounted, and it comes to the top of the screen, lit
   // for a moment. Waits for the desktop's page (not the cached one); a message far back comes as a
@@ -448,6 +472,8 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   // no longer has, or that cannot be reached, is said so.
   const goal = useRef<{ at: string; seq?: number; find?: string } | null>(at ? { at, seq, find } : null);
   const [aim, setAim] = useState(0);
+  // The item looked for, while the folds around it open (the turn that holds it is told).
+  const [reveal, setReveal] = useState<string>();
   useEffect(() => {
     if (!at) return;
     goal.current = { at, seq, find };
@@ -501,9 +527,25 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
       }
       const sc = scroller.current;
       const group = all[idx];
+      const exact = () => (sc && target !== 'turn' ? sc.querySelector<HTMLElement>(`[data-id="${CSS.escape(target)}"]`) : null);
+      let hitEl = exact();
+      // Folded away (a note of a finished turn, a step in a checkpoint): the folds around it open, and
+      // it is waited for (bounded) before anything scrolls; the turn stands in only when it never comes.
+      if (target !== 'turn' && !hitEl) {
+        setReveal(target);
+        for (let n = 0; n < REVEAL_FRAMES && !hitEl; n++) {
+          await new Promise((r) => requestAnimationFrame(r));
+          if (!live) return;
+          hitEl = exact();
+        }
+        // The steps it is in may still be unfolding: their height settles before it is measured.
+        if (hitEl) await new Promise((r) => window.setTimeout(r, REVEAL_SETTLE_MS));
+        if (!live) return;
+      }
       const turnEl = sc?.querySelector<HTMLElement>(`[data-turn="${CSS.escape(group.key)}"]`);
-      const el = (target !== 'turn' && sc?.querySelector<HTMLElement>(`[data-id="${CSS.escape(target)}"]`)) || turnEl;
+      const el = hitEl || turnEl;
       goal.current = null;
+      setReveal(undefined);
       if (!sc || !el) return;
       const topOf = () => el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop;
       // The newest turn, short enough to read whole: the newest line stays in view as always.
@@ -530,6 +572,7 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     })();
     return () => {
       live = false;
+      setReveal(undefined);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aim, fresh, id]);
@@ -553,11 +596,15 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
         {turns.length === 0 && <p className="empty thread-empty">Send a message to start.</p>}
         {shown.map((g) =>
           g.kind === 'turn' ? (
-            <TurnView key={g.key} sid={id} turn={g} newest={g === newestTurn} />
+            <TurnGuard key={g.key} id={g.key} turn={g}>
+              <TurnView sid={id} turn={g} newest={g === newestTurn} reveal={reveal && g.ids.includes(reveal) ? reveal : undefined} />
+            </TurnGuard>
           ) : (
-            <div key={g.key} data-turn={g.key}>
-              <ItemRow sid={id} id={g.id} />
-            </div>
+            <TurnGuard key={g.key} id={g.key} turn={g}>
+              <div data-turn={g.key}>
+                <ItemRow sid={id} id={g.id} />
+              </div>
+            </TurnGuard>
           ),
         )}
         {space.bottom > 0 && <div className="thread-space" style={{ height: space.bottom }} aria-hidden />}
@@ -569,7 +616,9 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
         {!gapped &&
           range.hi >= keys.length &&
           layout.queued.map((q) => (
-            <ItemRow key={q} sid={id} id={q} queued />
+            <TurnGuard key={q} id={q} turn={q}>
+              <ItemRow sid={id} id={q} queued />
+            </TurnGuard>
           ))}
         {!gapped && range.hi >= keys.length && !busy && <BackgroundLine id={id} />}
       </div>

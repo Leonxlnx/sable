@@ -2397,13 +2397,19 @@ button.queued-text[data-busy] {
 
 /* ── opened at a place (a search hit): the message lit for a moment ── */
 .user-row[data-flash],
-.md[data-flash] {
+.md[data-flash],
+.step[data-flash],
+.step-text[data-flash],
+.syn[data-flash] {
   position: relative;
   isolation: isolate;
 }
 
 .user-row[data-flash]::before,
-.md[data-flash]::before {
+.md[data-flash]::before,
+.step[data-flash]::before,
+.step-text[data-flash]::before,
+.syn[data-flash]::before {
   content: '';
   position: absolute;
   z-index: -1;
@@ -2709,4 +2715,35 @@ button.queued-text[data-busy] {
   padding: 0 14px;
   font-size: 12px;
   color: var(--text-3);
+}
+
+/* ── the Customize chat: read here, answered on the computer; a running turn can still be stopped ── */
+.ro-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 2px 6px 6px;
+}
+
+.ro-foot-text {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  text-align: center;
+  color: var(--text-3);
+  font-size: var(--t-ui);
+  line-height: 1.5;
+}
+
+.ro-foot[data-stop] .ro-foot-text {
+  padding-left: 16px;
+  text-align: left;
+}
+
+/* ── a turn that could not be drawn: one calm line in its place ── */
+.turn-broken {
+  padding: 10px 4px;
+  color: var(--text-3);
+  font-size: var(--t-sm);
 }

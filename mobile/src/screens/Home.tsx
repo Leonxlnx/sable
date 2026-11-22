@@ -11,6 +11,7 @@ import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
 import { homeFolder, openRace } from '@m/lib/race';
 import { backgroundLabel } from '@m/lib/turns';
+import { worksNow } from '@m/lib/chat-rules';
 import { getState, refresh, setState, useStore, type State } from '@m/lib/store';
 import { useNow } from '@m/lib/useNow';
 import { Field, fieldBeat, fieldWake, paletteFor, type Horizon } from '@m/ui/Field';
@@ -45,9 +46,11 @@ export const toneOf = (s: SessionMeta): Tone =>
             ? 'unread'
             : 'idle';
 
-const isLive = (s: SessionMeta) => !s.archived && (s.status === 'running' || s.status === 'starting' || s.status === 'awaiting');
+/** At work (its turn, or sub-agents it left working: lib/chat-rules.ts `worksNow`) or waiting on you. */
+const isLive = (s: SessionMeta) => !s.archived && (worksNow(s) || s.status === 'awaiting');
 
-const isWorking = (s: SessionMeta) => s.status === 'running' || s.status === 'starting';
+/** One predicate for the row, the count of chats at work and the moment a chat is done. */
+const isWorking = worksNow;
 
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 
@@ -585,7 +588,9 @@ const LiveRow = memo(function LiveRow({ id, done, now }: { id: string; done: boo
   if (s && !done) began.current = s.updatedAt;
   if (!s) return null;
   const failed = done && s.status === 'error';
-  const line = done ? (failed ? (s.lastError ?? 'Stopped with an error') : 'Done') : s.status === 'starting' ? 'Starting' : s.activity || 'Working';
+  // Its own turn over, sub-agents it sent to the background still at work: they are what it does now.
+  const background = s.status !== 'running' && s.status !== 'starting' && (s.background ?? 0) > 0;
+  const line = done ? (failed ? (s.lastError ?? 'Stopped with an error') : 'Done') : s.status === 'starting' ? 'Starting' : background ? backgroundLabel(s.background!) : s.activity || 'Working';
   return (
     <motion.li layout="position" className="rrow" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0, transition: { duration: 0.22 } }} transition={SNAP}>
       <button
