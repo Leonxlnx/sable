@@ -1,8 +1,9 @@
 import type { BrowserAnswer, BrowserRequest } from '@shared/protocol';
-import { reportBrowserPage, respondBrowser } from '@/state/actions';
+import { listSignIns, markSignInUsed, reportBrowserPage, respondBrowser, revealSignIn, saveSignIn, signInState } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { activeTab, getLog, getPage, getTabs, onPages, openTab, setPage, type AgentWork } from './browser-store';
-import { clickScript, evalScript, focusedScript, pickCancelScript, keyProbeRead, keyProbeScript, pressScript, requestsScript, scrollScript, snapshotScript, typeScript, waitScript } from './browser-scripts';
+import { clickScript, evalScript, focusedScript, locateScript, pickCancelScript, keyProbeRead, keyProbeScript, pressScript, requestsScript, scrollScript, signInCheckScript, signInFillScript, signInProbeScript, snapshotScript, typeScript, userIdleScript, waitScript } from './browser-scripts';
+import { askSignIn, SIGNED_LINE_MS, type SignInChoice } from './sign-in';
 
 /**
  * The window's side of the agent's browser tools (server/providers/browser-tool.ts): the bridge asks
@@ -28,6 +29,12 @@ export interface PageController {
   key(combo: string): Promise<boolean>;
   /** Back, forward or reload; false when there is nowhere to go. */
   history(action: 'back' | 'forward' | 'reload'): boolean;
+  /**
+   * The agent's pointer (agent-pointer.ts): travels to the centre of `rect` (the page's CSS pixels,
+   * `vw` its viewport width), and presses there. Absent where the tab draws none.
+   */
+  point?(rect: { x: number; y: number; w: number; h: number }, vw: number): Promise<void>;
+  press?(): Promise<void>;
 }
 
 const TEXT_MAX = 20_000;
@@ -39,6 +46,11 @@ const controllers = new Map<string, PageController>();
 
 const desktop = (window as { sableDesktop?: { browser?: unknown } }).sableDesktop;
 const native = !!desktop?.browser;
+/**
+ * The dev build's frames: a local page that answers Sable's messages (dev-frame.ts, the Demo's test
+ * page) can be worked there too, so the pointer and the sign-in card can be filmed without the desktop app.
+ */
+const devFrames = !native && import.meta.env.DEV;
 
 /** A tab of `c.sessionId` has a live page: the agent can look at it while it is in front. */
 export function registerPage(c: PageController): () => void {
@@ -127,7 +139,7 @@ const originOf = (url: string) => {
 /** Shows the agent's work in the bar for its moment (at least long enough to be seen). */
 async function marked<T>(tabId: string, op: AgentWork, fn: () => Promise<T>): Promise<T> {
   const started = Date.now();
-  setPage(tabId, { agent: op });
+  setPage(tabId, { agent: op, ...(DRIVES.has(op) ? { driving: true } : {}) });
   try {
     return await fn();
   } finally {
@@ -135,6 +147,59 @@ async function marked<T>(tabId: string, op: AgentWork, fn: () => Promise<T>): Pr
     if (left > 0) await sleep(left);
     if (getPage(tabId).agent === op) setPage(tabId, { agent: undefined });
   }
+}
+
+/** The tools that use the page as a person would: while one runs in a turn, the tab says the agent is driving. */
+const DRIVES: ReadonlySet<AgentWork> = new Set<AgentWork>(['click', 'type', 'press', 'scroll', 'navigate', 'signIn']);
+
+/** How long the agent keeps its hands off after the person used the page, and how long it waits for them at most. */
+export const YIELD_QUIET_MS = 900;
+export const YIELD_MAX_MS = 12_000;
+
+/**
+ * The person's pointer always wins: when they moved, clicked, scrolled or typed in the page a moment
+ * ago, the agent's next action waits until they have been still for `YIELD_QUIET_MS` (at most `YIELD_MAX_MS`).
+ */
+async function yieldToPerson(c: PageController) {
+  const tab = c.tabId;
+  const until = Date.now() + YIELD_MAX_MS;
+  try {
+    for (;;) {
+      const idle = Number(await within(c.run(userIdleScript), 3_000).catch(() => -1));
+      if (!(idle >= 0 && idle < YIELD_QUIET_MS) || Date.now() > until) return;
+      setPage(tab, { yielding: true });
+      await sleep(YIELD_QUIET_MS - idle + 60);
+    }
+  } finally {
+    if (getPage(tab).yielding) setPage(tab, { yielding: undefined });
+  }
+}
+
+/** The pointer travels to an element and presses on it; a page or view without a pointer does nothing. */
+async function pointAt(c: PageController, q: { ref?: string; selector?: string; text?: string }): Promise<{ error?: string }> {
+  if (!c.point) return {};
+  const loc = (await within(c.run(locateScript(q)), 4_000).catch(() => null)) as { error?: string; none?: boolean; rect?: { x: number; y: number; w: number; h: number }; vw?: number } | null;
+  if (!loc || loc.none) return {};
+  if (loc.error) return { error: String(loc.error).slice(0, 400) };
+  if (!loc.rect || !(Number(loc.vw) > 0)) return {};
+  await c.point(loc.rect, Number(loc.vw));
+  await c.press?.();
+  return {};
+}
+
+/**
+ * A password Sable filled is still in this document: asks the page whether the field was cleared
+ * (then the hold ends early); an answer that cannot be read keeps the hold until the page navigates.
+ */
+async function stillFilled(c: PageController): Promise<boolean> {
+  const tab = c.tabId;
+  if (!getPage(tab).filled) return false;
+  const r = (await within(c.run(signInCheckScript), 3_000).catch(() => null)) as { cleared?: boolean } | null;
+  if (r && r.cleared === true) {
+    setPage(tab, { filled: undefined });
+    return false;
+  }
+  return true;
 }
 
 export async function handleBrowserRequest(req: BrowserRequest) {
@@ -148,7 +213,7 @@ export async function handleBrowserRequest(req: BrowserRequest) {
 }
 
 async function serve(req: BrowserRequest): Promise<BrowserAnswer> {
-  if (!native) return { ok: false, weak: true, error: 'The Browser tab is only available in the desktop app.' };
+  if (!native && !devFrames) return { ok: false, weak: true, error: 'The Browser tab is only available in the desktop app.' };
   const st = useStore.getState();
   if (st.ui.activeSessionId !== req.sessionId) {
     return { ok: false, weak: true, error: 'The Browser tab shows another session right now. It works while the user has this session open.' };
@@ -170,10 +235,12 @@ async function serve(req: BrowserRequest): Promise<BrowserAnswer> {
         () => {
           const p = getPage(tab);
           if (p.loading) sawLoad = true;
-          return !!controllers.get(tab) && sawLoad && !p.loading && !!p.url;
+          return (devFrames || !!controllers.get(tab)) && sawLoad && !p.loading && !!p.url;
         },
         35_000,
       );
+      // A dev frame registers once its page answered (dev-frame.ts); a page that never does is not worked.
+      if (devFrames && settled) await waitFor(tab, () => !!controllers.get(tab), 1_500);
       const p = getPage(tab);
       if (!getTabs(sessionId).ids.includes(tab)) return { ok: false, error: 'The user closed the tab before the page loaded.' };
       if (!settled) return p.loading ? { ok: false, error: `The page is still loading after 35 seconds (${p.url || url}).` } : { ok: false, error: 'The Browser tab did not open the page.' };
@@ -223,9 +290,17 @@ async function serve(req: BrowserRequest): Promise<BrowserAnswer> {
     });
   }
 
+  // While a password Sable filled is in the page: no scripts and no pictures for the agent, until the page moves on or the field is cleared.
+  if ((req.op === 'eval' || req.op === 'screenshot') && (await stillFilled(c))) {
+    return { ok: false, url, error: 'A password Sable filled is still in a field of this page. Scripts and screenshots are refused until the page moves on or the field is cleared; browser_snapshot and browser_read work.' };
+  }
+
+  if (req.op === 'signIn') return marked(tab, 'signIn', () => signIn(req, c, url));
+
   if (req.op !== 'screenshot') return marked(tab, req.op, () => work(req, c, url));
 
   return marked(tab, 'screenshot', async () => {
+    if (!native) return { ok: false, url, error: 'Screenshots need the desktop app.' };
     const image = await c.capture();
     const size = await imageSize(image);
     return { ok: true, url: c.url() || url, title: getPage(tab).title, image, ...size };
@@ -266,18 +341,28 @@ async function work(req: BrowserRequest, c: PageController, url: string): Promis
 
   // The person's pick mode swallows clicks and keys in the page: an action of the agent ends it first.
   if (req.op === 'click' || req.op === 'type' || req.op === 'press') await within(c.run(pickCancelScript), 3_000).catch(() => {});
+  if (req.op === 'click' || req.op === 'type' || req.op === 'press' || req.op === 'scroll') await yieldToPerson(c);
 
   switch (req.op) {
     case 'snapshot': {
-      const r = plain(await within(c.run(snapshotScript(SNAPSHOT_MAX)), 8_000));
+      const values = !(await stillFilled(c));
+      const r = plain(await within(c.run(snapshotScript(SNAPSHOT_MAX, values)), 8_000));
       return { ok: true, url: before, title: text(r.title, 300) || getPage(tab).title, text: text(r.text, SNAPSHOT_MAX) ?? '', count: Number(r.count) || 0, truncated: r.truncated === true };
     }
     case 'click': {
+      // The pointer travels there and presses; only then the click.
+      const pointed = await pointAt(c, { ...q, text: req.find });
+      if (pointed.error) return { ok: false, url: before, error: pointed.error };
       const r = plain(await within(c.run(clickScript({ ...q, text: req.find })), 8_000));
       if (r.error) return { ok: false, url: before, error: String(r.error).slice(0, 400) };
       return after({ target: text(r.target, 200) });
     }
     case 'type': {
+      // Shows where it types: the pointer goes to the field and presses into it.
+      if (q.ref || q.selector) {
+        const pointed = await pointAt(c, q);
+        if (pointed.error) return { ok: false, url: before, error: pointed.error };
+      }
       const r = plain(await within(c.run(typeScript(q, (req.text ?? '').slice(0, 2_000), req.submit === true)), 8_000));
       if (r.error) return { ok: false, url: before, error: String(r.error).slice(0, 400) };
       return after({ target: text(r.target, 200) });
@@ -297,7 +382,8 @@ async function work(req: BrowserRequest, c: PageController, url: string): Promis
       return after({ target: text(focus.target, 200) });
     }
     case 'scroll': {
-      const r = plain(await within(c.run(scrollScript(q, req.to, req.by)), 5_000));
+      // The page glides while the pointer rests where it is.
+      const r = plain(await within(c.run(scrollScript(q, req.to, req.by, !!c.point)), 5_000));
       if (r.error) return { ok: false, url: before, error: String(r.error).slice(0, 400) };
       return { ok: true, url: before, title: getPage(tab).title, target: text(r.target, 200), text: text(r.text, 120) };
     }
@@ -355,6 +441,116 @@ async function work(req: BrowserRequest, c: PageController, url: string): Promis
       return { ok: false, error: 'The Browser tab does not know that request.' };
   }
 }
+
+/** How long a submitted sign-in may take to leave its form before it counts as refused. */
+export const SIGN_IN_SETTLE_MS = 6_000;
+
+/** The origin a sign-in may be filled on: https anywhere, http on this machine only. */
+export function signInAllowed(url: string): string | undefined {
+  try {
+    const u = new URL(url);
+    if (u.protocol === 'https:' || (u.protocol === 'http:' && isLocal(url))) return u.origin;
+  } catch {
+    /* not an address */
+  }
+  return undefined;
+}
+
+/**
+ * browser_sign_in on the tab's page. The agent named the fields; the person (or a sign-in they saved
+ * for exactly this origin) supplies the values, Sable fills and submits in one step, and the answer
+ * is only whether it worked and the user name. The origin is the page's own as the view reports it
+ * (never a name the page or the agent supplies), checked when the call comes, again right before the
+ * values are fetched, and inside the page at the moment of filling.
+ */
+async function signIn(req: BrowserRequest, c: PageController, url: string): Promise<BrowserAnswer> {
+  const tab = c.tabId;
+  const origin = signInAllowed(url);
+  if (!origin) return { ok: false, url, error: 'Sable signs in only on https sites (and on localhost for tests).' };
+  if (req.expectOrigin && req.expectOrigin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
+  const refs = { userRef: req.userRef ?? '', passRef: req.passRef ?? '', ...(req.submitRef ? { submitRef: req.submitRef } : {}) };
+  if (!/^e\d{1,6}$/.test(refs.userRef) || !/^e\d{1,6}$/.test(refs.passRef)) return { ok: false, url, error: 'Name the fields by their references from browser_snapshot.' };
+  const probe = (await within(c.run(signInProbeScript(refs, !native)), 5_000)) as { error?: string; origin?: string; user?: Rect; pass?: Rect; submit?: Rect | null; vw?: number } | null;
+  if (!probe || probe.error) return { ok: false, url, error: String(probe?.error ?? 'The page did not answer.').slice(0, 300) };
+  if (probe.origin !== origin) return { ok: false, url, error: 'The page moved to another site. Take a new browser_snapshot.' };
+
+  // The bridge answers off while sign-ins do not ship (services/sign-ins.ts): then no card ever opens.
+  let state: { canSave: boolean };
+  try {
+    state = await signInState();
+  } catch {
+    return { ok: false, url, error: 'sign-ins are not available in this version of Sable.' };
+  }
+  const saved = await listSignIns(origin).catch(() => []);
+  const here = () => signInAllowed(c.url() || getPage(tab).url) === origin && controllers.get(tab) === c;
+  const alive = { cancelled: () => !here() };
+  // The card and the line are the Browser tab's: it comes to the front for them.
+  useStore.getState().setUi({ railOpen: true, railTab: 'browser' });
+  let choice: SignInChoice = saved.length === 1 ? await askSignIn({ tabId: tab, origin, mode: 'auto', saved, canSave: state.canSave }, alive) : { kind: 'notNow' };
+  if (choice.kind === 'notNow') choice = await askSignIn({ tabId: tab, origin, mode: 'card', saved: saved.length > 1 ? saved : [], canSave: state.canSave }, alive);
+  if (choice.kind === 'cancel' || choice.kind === 'notNow') return { ok: false, url, error: here() ? 'the user cancelled the sign-in.' : 'the page moved on before the sign-in.' };
+
+  let username = choice.username;
+  let password = '';
+  if (choice.kind === 'saved') {
+    // Fetched only now, for exactly this origin, and only into this function.
+    if (!here()) return { ok: false, url, error: 'the page moved on before the sign-in.' };
+    try {
+      password = (await revealSignIn(choice.id, origin)).password;
+    } catch {
+      return { ok: false, url, error: 'the saved sign-in cannot be read on this computer. The user can sign in again.' };
+    }
+  } else password = choice.password;
+
+  // Watch it: the pointer goes to each field and the submit control, then the form is filled and sent at once.
+  if (c.point && probe.vw) {
+    for (const r of [probe.user, probe.pass, probe.submit]) {
+      if (!r) continue;
+      await c.point(r, probe.vw);
+      await c.press?.();
+    }
+  }
+  if (!here()) return { ok: false, url, error: 'the page moved on before the sign-in.' };
+  const before = c.url() || getPage(tab).url;
+  let filled: { ok?: boolean; error?: string } | null;
+  try {
+    filled = (await within(c.run(signInFillScript(refs, origin, username, password, !native)), 5_000)) as typeof filled;
+  } catch {
+    filled = null;
+  }
+  // Nothing of it is kept here past the fill (and it never went anywhere but the page).
+  password = '';
+  if (!filled?.ok) return { ok: false, url, error: filled?.error === 'moved' ? 'the page moved to another site before the sign-in.' : 'the sign-in form changed before it could be filled. Take a new browser_snapshot.' };
+  setPage(tab, { filled: true });
+
+  // Through: the page moved on, or the password field went away. Still there after a while: refused.
+  const t0 = Date.now();
+  let through = false;
+  while (Date.now() - t0 < SIGN_IN_SETTLE_MS) {
+    await sleep(250);
+    const p = getPage(tab);
+    if (p.loading || (c.url() || p.url).split('#')[0] !== before.split('#')[0]) {
+      through = true;
+      break;
+    }
+    const r = (await within(c.run(signInCheckScript), 2_000).catch(() => null)) as { gone?: boolean; cleared?: boolean } | null;
+    if (r?.cleared) setPage(tab, { filled: undefined });
+    if (r?.gone) {
+      through = true;
+      break;
+    }
+  }
+  if (!through) return { ok: false, url, error: 'the page still shows the sign-in form; it may have refused the user name or password.' };
+  if (choice.kind === 'typed' && choice.save && state.canSave) await saveSignIn(origin, username, choice.password).catch(() => {});
+  if (choice.kind === 'saved') void markSignInUsed(choice.id);
+  setPage(tab, { signedInAs: username });
+  setTimeout(() => getPage(tab).signedInAs === username && setPage(tab, { signedInAs: undefined }), SIGNED_LINE_MS);
+  const user = username;
+  username = '';
+  return { ok: true, url: c.url() || getPage(tab).url, title: getPage(tab).title, signedIn: true, user };
+}
+
+type Rect = { x: number; y: number; w: number; h: number };
 
 function imageSize(src: string): Promise<{ width?: number; height?: number }> {
   return new Promise((resolve) => {

@@ -1027,3 +1027,211 @@
     animation: none;
   }
 }
+
+/* ── the agent on the page: its line, its pointer, the sign-in card ──
+   All drawn by the tab over the page, never inside it. The pointer is one layer that moves by
+   transform only (agent-pointer.ts holds every number of its motion); nothing paints at rest. */
+
+.bw-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  height: 36px;
+  padding: 0 6px 0 12px;
+  font-size: var(--t-small);
+  color: var(--text-2);
+  background-color: var(--fill-1);
+  border-bottom: 1px solid var(--line);
+  animation: bw-rise var(--d-3) var(--ease-out);
+}
+
+.bw-line-mark,
+.bw-line-icon {
+  flex-shrink: 0;
+}
+
+.bw-line-icon {
+  color: var(--text-2);
+}
+
+.bw-line-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.bw-line .btn {
+  flex-shrink: 0;
+}
+
+.bw-pointer-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.bw-pointer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.bw-pointer[data-on] {
+  display: block;
+}
+
+/* The point of the arrow is the pointer's origin. */
+.bw-pointer-mark {
+  position: absolute;
+  left: -1.5px;
+  top: -1.5px;
+  overflow: visible;
+  transform-origin: 1.5px 1.5px;
+}
+
+.bw-pointer-face {
+  fill: var(--text);
+  stroke: var(--bg);
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+}
+
+.bw-pointer-drop {
+  fill: var(--bg);
+  opacity: 0.4;
+}
+
+.bw-pointer-ring {
+  position: absolute;
+  left: -14px;
+  top: -14px;
+  width: 28px;
+  height: 28px;
+  border: 1.5px solid var(--text);
+  border-radius: 50%;
+  opacity: 0;
+}
+
+.bw-signin-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 28px 12px 12px;
+  overflow: auto;
+}
+
+.bw-signin {
+  width: min(340px, 100%);
+  padding: 18px;
+  border-radius: var(--r-xl);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: bw-signin-in var(--d-3) var(--ease-out);
+}
+
+@keyframes bw-signin-in {
+  from {
+    opacity: 0;
+    translate: 0 6px;
+  }
+}
+
+.bw-signin-origin {
+  margin: 0;
+  font-size: var(--t-h3);
+  font-weight: var(--w-semi);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.bw-signin-scheme {
+  color: var(--text-3);
+  font-weight: var(--w-medium);
+}
+
+.bw-signin-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bw-signin-fields .field {
+  width: 100%;
+}
+
+.bw-signin-picks {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bw-signin-pick {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-ui);
+  color: var(--text-2);
+  text-align: left;
+  transition: background-color var(--d-1) var(--ease-out), color var(--d-1) var(--ease-out);
+}
+
+.bw-signin-pick:hover {
+  background-color: var(--fill-1);
+  color: var(--text);
+}
+
+.bw-signin-pick[data-on] {
+  background-color: var(--fill-2);
+  color: var(--text);
+}
+
+.bw-signin-pick:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.bw-signin-pick > .truncate {
+  flex: 1;
+  min-width: 0;
+}
+
+.bw-signin-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.bw-signin-save {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--t-small);
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.bw-signin-once {
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bw-signin,
+  .bw-line {
+    animation: none;
+  }
+}

@@ -41,10 +41,21 @@ export interface PageState {
   device: Device;
   /** What the agent is doing with the page right now (shown in the bar for that moment). */
   agent?: AgentWork;
+  /** The agent acts on this page during its turn: the tab says who is driving, with Stop. */
+  driving?: boolean;
+  /** The person used the page a moment ago: the agent's next action waits. */
+  yielding?: boolean;
+  /**
+   * A field of this document holds a password Sable filled: until the page loads another document
+   * or the field is cleared, the agent's outline lists no values, and scripts and screenshots are refused.
+   */
+  filled?: boolean;
+  /** One line after a sign-in ("Signed in as name"), for a few seconds. */
+  signedInAs?: string;
 }
 
 /** The agent's tools, as the bar names them. */
-export type AgentWork = 'read' | 'screenshot' | 'open' | 'snapshot' | 'click' | 'type' | 'press' | 'scroll' | 'eval' | 'logs' | 'wait' | 'navigate';
+export type AgentWork = 'read' | 'screenshot' | 'open' | 'snapshot' | 'click' | 'type' | 'press' | 'scroll' | 'eval' | 'logs' | 'wait' | 'navigate' | 'signIn';
 
 /* ── what a developer looks at next: the page's console problems and failed requests, since it loaded ── */
 

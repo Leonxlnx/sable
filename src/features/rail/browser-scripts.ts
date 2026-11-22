@@ -80,6 +80,8 @@ const nameOf = (el) => {
   return clip(el.innerText || el.textContent || el.getAttribute('title') || '', 80);
 };
 const describe = (el) => { const n = nameOf(el); return roleOf(el) + (n ? ' "' + n + '"' : ''); };
+const inView = (el) => { const r = el.getBoundingClientRect(); return r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth; };
+const rectOf = (el) => { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; };
 const USABLE = 'a[href],button,input:not([type="hidden"]),select,textarea,summary,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[role="radio"],[role="switch"],[role="option"],[role="combobox"],[role="textbox"],[contenteditable=""],[contenteditable="true"],[onclick]';
 const find = (q) => {
   if (q.ref) {
@@ -109,8 +111,12 @@ const find = (q) => {
 };
 `;
 
-/** The outline: what can be used, and the headings, in page order, one line each with its reference. */
-export function snapshotScript(max: number): string {
+/**
+ * The outline: what can be used, and the headings, in page order, one line each with its reference.
+ * `values` false (while a field holds a password Sable filled): no field's value is listed at all, so a
+ * page that shows the password as text (a "show password" switch) cannot pass it on.
+ */
+export function snapshotScript(max: number, values = true): string {
   return `(() => {${PRELUDE}
   const lines = [];
   let size = 0, count = 0, total = 0, cut = false;
@@ -123,7 +129,7 @@ export function snapshotScript(max: number): string {
     if (!name && (role === 'link' || role === 'heading' || role === 'anchor')) continue;
     let line = '[' + refOf(el) + '] ' + role + (role === 'heading' ? ' ' + el.tagName.slice(1) : '') + (name ? ' "' + name + '"' : '');
     if (role === 'link') { const h = here(el.getAttribute('href')); if (h) line += ' -> ' + clip(h, 80); }
-    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+    if (${values ? 'true' : 'false'} && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')) {
       if (el.type === 'checkbox' || el.type === 'radio') line += el.checked ? ' (checked)' : '';
       else if (secret(el)) line += el.value ? ' (filled)' : '';
       else if (el.tagName === 'SELECT') line += ' = "' + clip(el.selectedOptions[0] ? el.selectedOptions[0].textContent : '', 40) + '"';
@@ -147,7 +153,8 @@ export function clickScript(q: { ref?: string; selector?: string; text?: string 
   if (f.none) return { error: 'Say what to click.' };
   const el = f.el;
   if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { error: describe(el) + ' is disabled.' };
-  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  // Already brought into view by locateScript while the pointer travelled: the page does not jump again.
+  if (!inView(el)) el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
   const r = el.getBoundingClientRect();
   const o = { bubbles: true, cancelable: true, composed: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
   const p = { ...o, pointerId: 1, pointerType: 'mouse', isPrimary: true };
@@ -225,7 +232,7 @@ export function parseKey(combo: string): { key: string; mods: ('control' | 'shif
 }
 
 /** Notes whether a real key press reached the page (the shell's input event), so a press is never reported that did not happen. */
-export const keyProbeScript = `(() => { window.__sableKey = 0; window.addEventListener('keydown', () => { window.__sableKey = 1; }, { capture: true, once: true }); return true; })()`;
+export const keyProbeScript = `(() => { window.__sableKey = 0; if (window.__sableUser) window.__sableUser.ownUntil = performance.now() + 400; window.addEventListener('keydown', () => { window.__sableKey = 1; }, { capture: true, once: true }); return true; })()`;
 export const keyProbeRead = `(() => { const v = window.__sableKey === 1; try { delete window.__sableKey; } catch (e) {} return v; })()`;
 
 /** The press as events on whatever has focus, with Enter submitting a field's form: the fallback when the shell's input did not arrive. */
@@ -252,20 +259,79 @@ export const focusedScript = `(() => {${PRELUDE}
   return { target: !el || el === document.body ? '' : describe(el), secret: secret(el) };
 })()`;
 
-export function scrollScript(q: { ref?: string; selector?: string }, to: string | undefined, by: number | undefined): string {
-  return `(() => {${PRELUDE}
+/**
+ * Scrolls the page. `smooth` (the person is watching the agent work): the page glides there and the
+ * script answers once it stopped (or after `SCROLL_SETTLE_MS`), so the answer reads the final place.
+ */
+export function scrollScript(q: { ref?: string; selector?: string }, to: string | undefined, by: number | undefined, smooth = false): string {
+  return `new Promise((resolve) => {${PRELUDE}
   const f = find(${j(q)});
-  if (f.error) return { error: f.error };
+  if (f.error) return resolve({ error: f.error });
   let target = '';
+  const behavior = ${smooth ? "'smooth'" : "'instant'"};
   const root = document.scrollingElement || document.documentElement;
-  if (!f.none) { f.el.scrollIntoView({ block: 'center', behavior: 'instant' }); target = describe(f.el); }
-  else if (${j(to)} === 'top') root.scrollTo({ top: 0, behavior: 'instant' });
-  else if (${j(to)} === 'bottom') root.scrollTo({ top: root.scrollHeight, behavior: 'instant' });
-  else root.scrollBy({ top: ${Number(by) || 0}, behavior: 'instant' });
-  const max = Math.max(0, root.scrollHeight - innerHeight);
-  return { target, text: Math.round(root.scrollTop) + ' of ' + Math.round(max) + ' px' + (max <= 0 ? ' (the page does not scroll)' : root.scrollTop >= max - 1 ? ' (at the bottom)' : root.scrollTop <= 0 ? ' (at the top)' : '') };
-})()`;
+  const before = root.scrollTop;
+  if (!f.none) { f.el.scrollIntoView({ block: 'center', behavior }); target = describe(f.el); }
+  else if (${j(to)} === 'top') root.scrollTo({ top: 0, behavior });
+  else if (${j(to)} === 'bottom') root.scrollTo({ top: root.scrollHeight, behavior });
+  else root.scrollBy({ top: ${Number(by) || 0}, behavior });
+  const answer = () => {
+    const max = Math.max(0, root.scrollHeight - innerHeight);
+    resolve({ target, text: Math.round(root.scrollTop) + ' of ' + Math.round(max) + ' px' + (max <= 0 ? ' (the page does not scroll)' : root.scrollTop >= max - 1 ? ' (at the bottom)' : root.scrollTop <= 0 ? ' (at the top)' : '') });
+  };
+  if (behavior === 'instant') return answer();
+  ${settleJs('answer')}
+})`;
 }
+
+/** How long a smooth scroll is given before the script reads where the page is. */
+export const SCROLL_SETTLE_MS = 700;
+
+/** Waits for a smooth scroll to end (scrollend, or the position holding still), then calls `done`. */
+const settleJs = (done: string) => `{
+    let last = -1, still = 0, over = false;
+    const end = () => { if (over) return; over = true; removeEventListener('scrollend', end, true); ${done}(); };
+    addEventListener('scrollend', end, true);
+    setTimeout(end, ${SCROLL_SETTLE_MS});
+    const poll = () => { if (over) return; const y = (document.scrollingElement || document.documentElement).scrollTop; still = y === last ? still + 1 : 0; last = y; if (still >= 3) return end(); requestAnimationFrame(poll); };
+    requestAnimationFrame(poll);
+  }`;
+
+/**
+ * Finds the element a click or a typing is about to land on and brings it into view (smoothly when
+ * it is out of view), then answers where it stands: its box in the page's own CSS pixels and the
+ * page's viewport, from which the tab places its pointer over the view (zoom and a device size
+ * included: the view's box divided by the viewport).
+ */
+export function locateScript(q: { ref?: string; selector?: string; text?: string }): string {
+  return `new Promise((resolve) => {${PRELUDE}
+  const f = find(${j(q)});
+  if (f.error) return resolve({ error: f.error });
+  if (f.none) return resolve({ none: true });
+  const el = f.el;
+  const answer = () => resolve({ rect: rectOf(el), vw: innerWidth, vh: innerHeight, target: describe(el) });
+  if (inView(el)) return answer();
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+  ${settleJs('answer')}
+})`;
+}
+
+/**
+ * The person's own hand: the time since their last real input in the page (a trusted pointer
+ * move, press, wheel or key), so the agent's next action waits while they are using it. The
+ * listeners go in once per document; a key Sable itself sends through the shell is not counted
+ * (`keyProbeScript` marks it). -1 before the first input.
+ */
+export const userIdleScript = `(() => {
+  let s = window.__sableUser;
+  if (!s) {
+    s = { at: -1, ownUntil: 0 };
+    Object.defineProperty(window, '__sableUser', { value: s, enumerable: false, configurable: true });
+    const mark = (e) => { if (e.isTrusted && performance.now() > s.ownUntil) s.at = performance.now(); };
+    for (const t of ['pointermove', 'pointerdown', 'wheel', 'keydown', 'touchstart']) addEventListener(t, mark, { capture: true, passive: true });
+  }
+  return s.at < 0 ? -1 : Math.round(performance.now() - s.at);
+})()`;
 
 /**
  * The agent's own script, as the body of an async function, stopped after `ms`. A one-line
@@ -440,3 +506,92 @@ export const pickScript = `new Promise((resolve) => {${PRELUDE}
 })`;
 
 export const pickCancelScript = `(() => { if (window.__sablePick) window.__sablePick(); return true; })()`;
+
+/* ── sign-ins: Sable fills a form the agent named, the agent never sees a value ── */
+
+/**
+ * Not the tab's own page: a frame inside it. In the desktop app the page is the top document of its
+ * view; in the dev build's frame (dev-frame.ts) it sits one level under the app, so its parent is the top.
+ */
+const topJs = (inDevFrame: boolean) => (inDevFrame ? 'window.parent !== window.top || window === window.top' : 'window.top !== window');
+
+/** The fields of a sign-in, by their snapshot references. */
+export interface SignInRefs {
+  userRef: string;
+  passRef: string;
+  submitRef?: string;
+}
+
+/**
+ * Checks the fields the agent named before anything is shown or filled: the page is the top page
+ * (never a frame), each reference is an element of this document (a frame's element, of whatever
+ * origin, never is), the user name is a text field, the password a password field, both in the same
+ * form when they are in one, the submit control (if named) in that form or a button. Answers where
+ * they stand for the pointer, never a value.
+ */
+export function signInProbeScript(r: SignInRefs, inDevFrame = false): string {
+  return `(() => {${PRELUDE}
+  if (${topJs(inDevFrame)}) return { error: 'Sable signs in only on the page itself, never inside a frame.' };
+  const q = ${j(r)};
+  const user = byRef(q.userRef), pass = byRef(q.passRef), sub = q.submitRef ? byRef(q.submitRef) : null;
+  if (!user || !pass || (q.submitRef && !sub)) return { error: 'A reference no longer points at an element. Take a new browser_snapshot.' };
+  for (const el of [user, pass, sub]) if (el && el.ownerDocument !== document) return { error: 'Sable signs in only on the page itself, never inside a frame.' };
+  if (pass.tagName !== 'INPUT' || pass.type !== 'password') return { error: q.passRef + ' is not a password field.' };
+  if (user.tagName !== 'INPUT' || !/^(text|email|tel|search|)$/.test(user.type || '') ) return { error: q.userRef + ' is not a user name field.' };
+  if (user === pass) return { error: 'The user name and the password must be two fields.' };
+  if (user.disabled || user.readOnly || pass.disabled || pass.readOnly) return { error: 'The sign-in form cannot be filled right now.' };
+  if (!shown(user) || !shown(pass)) return { error: 'The sign-in form is not visible on the page.' };
+  if (user.form && pass.form && user.form !== pass.form) return { error: 'The two fields belong to different forms.' };
+  if (sub && !(sub.form && sub.form === pass.form) && roleOf(sub) !== 'button') return { error: q.submitRef + ' is not a button of the sign-in form.' };
+  return { origin: location.origin, user: rectOf(user), pass: rectOf(pass), submit: sub ? rectOf(sub) : null, vw: innerWidth, vh: innerHeight };
+})()`;
+}
+
+/**
+ * Fills and submits in one task, so no script of the page runs between the fill and the submit
+ * other than what the page itself attached to these fields (it is the site the password is for).
+ * The origin is checked again here, at the moment of filling: a page that moved to another site
+ * since the card was shown gets nothing. The filled field is remembered (out of sight of a plain
+ * enumeration) so the tab can tell when it is cleared.
+ */
+export function signInFillScript(r: SignInRefs, expectOrigin: string, username: string, password: string, inDevFrame = false): string {
+  return `(() => {${PRELUDE}
+  const q = ${j(r)};
+  if (${topJs(inDevFrame)} || location.origin !== ${j(expectOrigin)}) return { error: 'moved' };
+  const user = byRef(q.userRef), pass = byRef(q.passRef), sub = q.submitRef ? byRef(q.submitRef) : null;
+  if (!user || !pass || user.ownerDocument !== document || pass.ownerDocument !== document || pass.type !== 'password') return { error: 'gone' };
+  const set = (el, v) => {
+    el.focus({ preventScroll: true });
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: v }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  set(user, ${j(username)});
+  set(pass, ${j(password)});
+  Object.defineProperty(window, '__sableFilled', { value: new WeakRef(pass), enumerable: false, configurable: true });
+  if (sub && !sub.disabled) sub.click();
+  else if (pass.form) { if (pass.form.requestSubmit) pass.form.requestSubmit(); else pass.form.submit(); }
+  else {
+    const k = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+    pass.dispatchEvent(new KeyboardEvent('keydown', k));
+    pass.dispatchEvent(new KeyboardEvent('keyup', k));
+  }
+  return { ok: true };
+})()`;
+}
+
+/**
+ * Where the filled password field is now: gone (removed, hidden, or the page moved on) means the
+ * sign-in went through; still there, holding the value, means the page has not accepted it (yet).
+ * `cleared`: the field Sable filled is empty or gone, so the page no longer holds the password.
+ * An unknown answer (the mark is missing) is never read as cleared.
+ */
+export const signInCheckScript = `(() => {
+  const w = window.__sableFilled;
+  if (!w) return { unknown: true };
+  const el = w.deref();
+  if (!el || !el.isConnected) return { gone: true, cleared: true };
+  const r = el.getBoundingClientRect();
+  const hidden = r.width < 1 || r.height < 1 || getComputedStyle(el).visibility === 'hidden';
+  return { gone: hidden, cleared: !el.value };
+})()`;

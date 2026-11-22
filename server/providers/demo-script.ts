@@ -46,6 +46,7 @@ const BROWSER_ACTIVITY: Partial<Record<BrowserOp, string>> = {
   logs: "Reading the page's log",
   wait: 'Waiting for the page',
   navigate: 'Loading the page',
+  sign_in: 'Signing in',
 };
 
 export class Aborted extends Error {

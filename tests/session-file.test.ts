@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { TextItem, TimelineItem } from '../shared/protocol';
-import { READ, readBaseByLine, SessionFiles, SMALL_BASE, TAIL_KEEP, TAIL_MAX, settledEnd, type SessionSave } from '../server/core/session-file';
+import { OVER_MAX, READ, readBaseByLine, SessionFiles, SMALL_BASE, TAIL_KEEP, TAIL_MAX, settledEnd, type SessionSave } from '../server/core/session-file';
 import { SessionRuntime } from '../server/core/runtime';
 
 const dirs: string[] = [];
@@ -69,22 +69,56 @@ describe('session files: a base and a small tail', () => {
     expect((back.items[4] as TextItem).text).toBe('Hello there');
   });
 
-  it('writes the base again when an item it settles changes, moves or goes, and drops the tail', async () => {
+  it('a late change to an item the base settles goes in the tail, never rewrites the base, and reads back in its place', async () => {
     const { files, pathOf, tail } = setup();
     const items = big();
     await files.save('s', save(items, 'all'));
+    const baseBefore = readFileSync(pathOf('s'), 'utf8');
+    items.push(text('new', 'n'));
+    await files.save('s', save(items, new Set(['n'])));
+
+    // A late patch to an old step (a background sub-agent that finished hours after its turn).
+    (items[1] as TextItem).text = 'a, patched';
+    await files.save('s', save(items, new Set(['a'])));
+    expect(readFileSync(pathOf('s'), 'utf8')).toBe(baseBefore);
+    expect(raw(tail('s'))).toMatchObject({ from: 4, items: [{ id: 'n' }], over: [{ id: 'a', text: 'a, patched' }] });
+    // Later saves keep carrying it until the base is written again.
+    items.push(text('more', 'm'));
+    await files.save('s', save(items, new Set(['m'])));
+    expect(raw(tail('s')).over).toEqual([items[1]]);
+    expect(readFileSync(pathOf('s'), 'utf8')).toBe(baseBefore);
+    const back = new SessionFiles(pathOf).load('s');
+    expect(ids(back.items)).toEqual(['big', 'a', 'b', 't0', 'n', 'm']);
+    expect((back.items[1] as TextItem).text).toBe('a, patched');
+    // A reader that picks up from the files carries the change on too.
+    const again = new SessionFiles(pathOf);
+    again.load('s');
+    items.push(text('last', 'l'));
+    await again.save('s', save(items, new Set(['l'])));
+    expect(raw(tail('s')).over).toEqual([items[1]]);
+    expect(readFileSync(pathOf('s'), 'utf8')).toBe(baseBefore);
+  });
+
+  it('writes the base again once the changed settled items pass their bound, and drops the tail', async () => {
+    const { files, pathOf, tail } = setup();
+    const items = big();
+    for (let i = 0; i < OVER_MAX.items + 2; i++) items.splice(items.length - 1, 0, text(`o${i}`, `o${i}`));
+    await files.save('s', save(items, 'all'));
     const gen1 = raw(pathOf('s')).gen;
+    for (let i = 0; i <= OVER_MAX.items; i++) (items[1 + i] as TextItem).text += '!';
+    await files.save('s', save(items, new Set(items.slice(1, OVER_MAX.items + 2).map((i) => i.id))));
+    expect(existsSync(tail('s'))).toBe(false);
+    expect(raw(pathOf('s')).gen).toBeGreaterThan(gen1);
+    expect(raw(pathOf('s')).items[1].text).toBe('a!');
+  });
+
+  it('writes the base again when an item it settles moves or goes, and drops the tail', async () => {
+    const { files, pathOf, tail } = setup();
+    const items = big();
+    await files.save('s', save(items, 'all'));
     items.push(text('new', 'n'));
     await files.save('s', save(items, new Set(['n'])));
     expect(existsSync(tail('s'))).toBe(true);
-
-    // A late patch to an old step.
-    (items[1] as TextItem).text = 'a, patched';
-    await files.save('s', save(items, new Set(['a'])));
-    expect(existsSync(tail('s'))).toBe(false);
-    expect(raw(pathOf('s')).gen).toBeGreaterThan(gen1);
-    expect(ids(raw(pathOf('s')).items)).toEqual(['big', 'a', 'b', 't0', 'n']);
-    expect(raw(pathOf('s')).items[1].text).toBe('a, patched');
 
     // A rewind removes items.
     items.splice(2);

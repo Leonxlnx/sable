@@ -181,6 +181,10 @@ function loadUi(): Partial<Ui> {
 }
 
 const persistedUi = loadUi();
+/** Counts changes of what the stage shows (`setUi` with `activeSessionId` or `race`): see `navigationCount`. */
+let navigations = 0;
+/** Read before waiting on something; changed afterwards means the person went elsewhere meanwhile. */
+export const navigationCount = () => navigations;
 /** Whether the user has picked a home agent yet (a fresh profile follows `settings.defaultProvider`). */
 let homeChosen = !!persistedUi.homeProvider;
 
@@ -255,6 +259,8 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setUi: (patch) => {
+    // A change of what the stage shows: an open still waiting for its chat (actions.openSession) yields to it.
+    if ('activeSessionId' in patch || 'race' in patch) navigations++;
     set((s) => ({ ui: { ...s.ui, ...patch } }));
     if (patch.homeProvider) homeChosen = true;
     const { activeSessionId, sidebarOpen, railOpen, railTab, homeProvider, homeCwd, homeChat, homeModel, homeMode, homeEffort, homeAccount, homeUltracode } = get().ui;
@@ -644,6 +650,7 @@ async function hello() {
   bootMark('hello-sent');
   const app = await bridge.call('app.hello', {});
   bootMark('hello');
+  const again = useStore.getState().ready;
   useStore.setState((s) => {
     const sessions = Object.fromEntries(app.sessions.map((m) => [m.id, m]));
     const active = s.ui.activeSessionId && sessions[s.ui.activeSessionId] ? s.ui.activeSessionId : null;
@@ -657,6 +664,9 @@ async function hello() {
       const chosen = s.ui.homeAccount?.[p.id];
       if (chosen && (!p.accounts || p.accounts.some((a) => a.id === chosen))) homeAccount[p.id] = chosen;
     }
+    // A second hello is a socket that came back: events may have been missed meanwhile, so every
+    // kept chat but those on screen is dropped (fetched afresh when opened); those on screen are fetched again below.
+    const held = s.ready ? forgetKept(s.data, onScreen({ ...s, sessions, ui: { ...s.ui, activeSessionId: active } })) : s.data;
     return {
       ready: true,
       version: app.version,
@@ -674,12 +684,12 @@ async function hello() {
       settings: app.settings,
       sessions,
       // Older bridges send no list: what this window already holds stays.
-      data: app.prompts ? withPrompts(s.data, app.prompts, sessions) : s.data,
+      data: app.prompts ? withPrompts(held, app.prompts, sessions) : held,
       ui: { ...s.ui, activeSessionId: active, homeProvider, homeAccount, homeCwd: s.ui.homeCwd ?? app.projects[0]?.path ?? null },
     };
   });
-  const active = useStore.getState().ui.activeSessionId;
-  if (active) void loadSession(active);
+  // At start the open chat was asked for with hello (`startBridge`): that request is shared.
+  for (const id of onScreen(useStore.getState())) void loadSession(id, { fresh: again }).catch(() => {});
   // Limits remembered from earlier runs, so nothing waits for an agent to answer.
   void bridge
     .call('usage.limits', {})
@@ -705,13 +715,127 @@ export function startBridge() {
     useStore.setState({ conn });
     if (conn === 'open') bootMark('ws-open');
     if (conn === 'open') void hello().catch((err) => useStore.getState().toast(String(err.message ?? err), 'error'));
+    // Starting into a chat (the one open when the window last closed): its conversation is asked
+    // right behind hello instead of after hello's answer was applied, so the bridge reads it while
+    // the window builds the rest. Applied once hello is (an unknown chat's answer is dropped).
+    const first = useStore.getState();
+    if (conn === 'open' && !first.ready && first.ui.activeSessionId) void loadSession(first.ui.activeSessionId).catch(() => {});
   });
   bridge.start();
 }
 
-export async function loadSession(sessionId: string) {
-  const snap = await bridge.call('session.snapshot', { sessionId });
-  applySnapshot(snap);
+// ───────────────────────── chats kept in the window ─────────────────────────
+//
+// A chat's conversation, once fetched, stays in the store and is kept current by the bridge's
+// events (they reach the window for every chat), so opening it again shows it in the first frame.
+// Bounded: besides the chats on screen at most `KEEP.chats` stay, holding at most `KEEP.items`
+// items between them; the least recently opened (or fetched ahead) go first, back to an entry
+// that holds only their waiting prompts. A dropped chat is fetched again when it is opened.
+// After the socket dropped, kept chats may have missed events: they are dropped too (`hello`).
+
+/** How many chats stay loaded besides those on screen, and how many items they may hold between them. */
+export const KEEP = { chats: 8, items: 20_000 };
+/** When each chat was last opened or fetched ahead (a counter, not a clock), and how many items it held then. */
+const used = new Map<string, { at: number; items: number }>();
+let useSeq = 0;
+/** Snapshot requests in flight, one per chat. */
+const fetching = new Map<string, Promise<void>>();
+
+function whenReady(): Promise<void> {
+  return new Promise((resolve) => {
+    if (useStore.getState().ready) return resolve();
+    const off = useStore.subscribe((s) => {
+      if (!s.ready) return;
+      off();
+      resolve();
+    });
+  });
+}
+
+/** For tests: forgets what was opened and fetched. */
+export function resetKept() {
+  used.clear();
+  fetching.clear();
+}
+
+/** Marks a chat as just used (opened, fetched ahead): the last to be dropped. */
+export function touchKept(sessionId: string) {
+  used.set(sessionId, { at: ++useSeq, items: used.get(sessionId)?.items ?? 0 });
+}
+
+/** The chats on screen: the open one, or both of the race shown. Never dropped. */
+function onScreen(s: Pick<Store, 'ui' | 'sessions'>): string[] {
+  if (s.ui.activeSessionId) return [s.ui.activeSessionId];
+  const race = s.ui.race;
+  if (!race) return [];
+  return Object.values(s.sessions)
+    .filter((m) => m.race?.id === race)
+    .map((m) => m.id);
+}
+
+/** A loaded entry back to one that holds only its prompts (what the triage deck needs). */
+const unloaded = (d: SessionData): SessionData => ({ ...emptyData(), permissions: d.permissions, questions: d.questions });
+
+/** Every loaded chat but `keep` dropped (after the socket came back). */
+function forgetKept(data: Record<string, SessionData>, keep: string[]): Record<string, SessionData> {
+  let next = data;
+  for (const [id, d] of Object.entries(data)) {
+    if (!d.loaded || keep.includes(id)) continue;
+    if (next === data) next = { ...data };
+    next[id] = unloaded(d);
+    used.delete(id);
+  }
+  return next;
+}
+
+/** Drops the least recently used loaded chats beyond `KEEP` (never those on screen). */
+export function trimKept() {
+  const s = useStore.getState();
+  const keep = new Set(onScreen(s));
+  const kept = Object.entries(s.data)
+    .filter(([id, d]) => d.loaded && !keep.has(id))
+    .sort((a, b) => (used.get(b[0])?.at ?? 0) - (used.get(a[0])?.at ?? 0));
+  const drop: string[] = [];
+  let items = 0;
+  kept.forEach(([id, d], i) => {
+    items += used.get(id)?.items ?? d.roots.length;
+    if (i >= KEEP.chats || (i > 0 && items > KEEP.items)) drop.push(id);
+  });
+  if (!drop.length) return;
+  useStore.setState((st) => {
+    const data = { ...st.data };
+    for (const id of drop) if (data[id]?.loaded) data[id] = unloaded(data[id]);
+    return { data };
+  });
+  for (const id of drop) used.delete(id);
+}
+
+/**
+ * Fetches a chat's conversation into the store: one request per chat at a time (a fetch ahead and
+ * the click that follows share it). `peek`: fetched ahead, so the bridge leaves it unread. An
+ * answer for a chat removed meanwhile is dropped. `fresh`: a new request even when one is in
+ * flight (the socket came back; the one in flight may hold what was before).
+ */
+export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: boolean } = {}): Promise<void> {
+  const inFlight = fetching.get(sessionId);
+  if (inFlight && !opts.fresh) return inFlight;
+  const p: Promise<void> = bridge
+    .call('session.snapshot', opts.peek ? { sessionId, peek: true } : { sessionId })
+    .then(async (snap) => {
+      // Asked before hello was answered (start-up): applied once the window knows its chats.
+      if (!useStore.getState().ready) await whenReady();
+      // A newer request replaced this one: its answer wins.
+      if (fetching.get(sessionId) !== p) return;
+      if (!useStore.getState().sessions[sessionId]) return;
+      applySnapshot(snap);
+      used.set(sessionId, { at: used.get(sessionId)?.at ?? ++useSeq, items: snap.items.length });
+      trimKept();
+    })
+    .finally(() => {
+      if (fetching.get(sessionId) === p) fetching.delete(sessionId);
+    });
+  fetching.set(sessionId, p);
+  return p;
 }
 
 /** Stores limit reports, and their limits where the store has none yet or older ones. */

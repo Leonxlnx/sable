@@ -37,11 +37,11 @@ export const toneOf = (s: SessionMeta): Tone =>
     ? 'working'
     : s.status === 'awaiting'
       ? 'awaiting'
-      : s.status === 'error'
-        ? 'error'
-        : // Its own turn ended, but sub-agents it sent to the background still work: the chat is not at rest.
-          (s.background ?? 0) > 0
-          ? 'working'
+      : // Its own turn ended (also with an error), but sub-agents it sent to the background still work: the chat is not at rest.
+        (s.background ?? 0) > 0
+        ? 'working'
+        : s.status === 'error'
+          ? 'error'
           : s.unread
             ? 'unread'
             : 'idle';

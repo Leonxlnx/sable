@@ -1,5 +1,5 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, rmSync, statSync } from 'node:fs';
-import { open, rename, writeFile } from 'node:fs/promises';
+import { open, rename } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
 import type { QueuedMessage, TimelineItem, Todo } from '../../shared/protocol';
 
@@ -12,12 +12,18 @@ import type { QueuedMessage, TimelineItem, Todo } from '../../shared/protocol';
  *
  * - `<id>.json`, the base: `{ gen, items, todos, queue }`, the same JSON as before (older files
  *   have no `gen`), each item on a line of its own. It always holds the whole timeline as it was
- *   when written. It is written again only when an item it settles changes, moves or goes (a
- *   rewind, a late patch to an old step), or when the tail has grown past `TAIL_MAX`. That write goes
+ *   when written. It is written again only when an item it settles moves or goes (a rewind),
+ *   when the items changed in it (`over`) pass `OVER_MAX`, or when the tail has grown past `TAIL_MAX`.
+ *   (Before, any late patch to a settled item rewrote the whole base: a chat of 90 MB whose
+ *   background sub-agents kept finishing wrote 90 MB on every save, every 1.5 s, and froze the window.) That write goes
  *   out in pieces of about a megabyte, so it never blocks for long.
- * - `<id>.tail.json`: `{ baseGen, from, items, todos, queue }`: the timeline from item `from` on.
- *   The base settles only the items before the live end of the chat (`from`), so streaming into the
- *   last items never forces the base to be written again. Small; written on every save.
+ * - `<id>.tail.json`: `{ baseGen, from, items, over?, todos, queue }`: the timeline from item `from`
+ *   on, and `over`: items the base settles that changed since it was written (a background sub-agent
+ *   that finished hours after its turn, a late patch to an old step), each in its newest form, read
+ *   in place of the base's copy. The base settles only the items before the live end of the chat
+ *   (`from`), so streaming into the last items never forces the base to be written again, and a late
+ *   change to an old item costs that item, not the whole base. Small; written on every save, in
+ *   pieces like the base, so even a big tail never holds the event loop for long.
  *
  * Every write goes to a temporary file first and is renamed into place, so a crash leaves either
  * the old or the new file, and the base is complete on its own. The tail names the base it
@@ -47,6 +53,8 @@ export interface SessionSave extends SessionData {
 export const TAIL_MAX = 8 * 1024 * 1024;
 /** A base smaller than this is simply written whole every time (as before). */
 export const SMALL_BASE = 4 * 1024 * 1024;
+/** Changed settled items the tail carries (`over`) before the base is written again with them: count, and characters. */
+export const OVER_MAX = { items: 512, chars: 4 * 1024 * 1024 };
 /** Items at the end of the chat a new base leaves to the tail (where streaming happens). */
 export const TAIL_KEEP = 24;
 /** Above this size a base is read line by line (one string cannot hold much more than 512 MB). */
@@ -111,6 +119,8 @@ interface Base {
   size: number;
   /** Read from a file of an older version (no generation): the first save writes the base anew. */
   old?: boolean;
+  /** Settled items changed since the base was written: every tail carries them (`over`) until the base is written again. */
+  over: Set<string>;
 }
 
 type Read<T> = { ok: true; value: T | null } | { ok: false };
@@ -249,16 +259,28 @@ export class SessionFiles {
     const old = typeof base.gen !== 'number';
     const gen = old ? 0 : (base.gen as number);
     const items = Array.isArray(base.items) ? base.items : [];
-    const tailRead = old ? ({ ok: true, value: null } as const) : readJson<SessionData & { baseGen?: number; from?: number }>(this.tailOf(id));
+    const tailRead = old ? ({ ok: true, value: null } as const) : readJson<SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] }>(this.tailOf(id));
     const tail = tailRead.ok ? tailRead.value : null;
     let from = items.length;
     let data: SessionData = { items, todos: base.todos ?? [], queue: base.queue };
+    const over = new Set<string>();
     if (tail && tail.baseGen === gen && Array.isArray(tail.items)) {
       from = typeof tail.from === 'number' && tail.from >= 0 && tail.from <= items.length ? tail.from : items.length;
-      data = { items: items.slice(0, from).concat(tail.items), todos: tail.todos ?? base.todos ?? [], queue: tail.queue ?? base.queue };
+      let head = items.slice(0, from);
+      // Settled items changed since the base was written: their newest form, in their place.
+      if (Array.isArray(tail.over) && tail.over.length) {
+        const newer = new Map(tail.over.filter((i) => i && typeof i.id === 'string').map((i) => [i.id, i]));
+        head = head.map((i) => {
+          const n = newer.get(i.id);
+          if (!n) return i;
+          over.add(i.id);
+          return n;
+        });
+      }
+      data = { items: head.concat(tail.items), todos: tail.todos ?? base.todos ?? [], queue: tail.queue ?? base.queue };
     }
     const settled = items.slice(0, from).map((i) => i.id);
-    this.bases.set(id, { gen, ids: settled, idSet: new Set(settled), size, old });
+    this.bases.set(id, { gen, ids: settled, idSet: new Set(settled), size, old, over });
     return data;
   }
 
@@ -309,30 +331,42 @@ export class SessionFiles {
           break;
         }
       }
-      if (!whole && save.dirty !== 'all') {
-        for (const d of save.dirty) {
-          if (base.idSet.has(d)) {
-            whole = true;
-            break;
-          }
-        }
-      }
     }
+    // Settled items changed since the base was written travel in the tail (`over`), up to a bound.
+    let over: Set<string> | undefined;
     if (!whole && base) {
+      over = new Set(base.over);
+      if (save.dirty !== 'all') for (const d of save.dirty) if (base.idSet.has(d)) over.add(d);
+      if (over.size > OVER_MAX.items) whole = true;
+    }
+    if (!whole && base && over) {
       const from = base.ids.length;
-      const tail = JSON.stringify({ baseGen: base.gen, from, items: items.slice(from), todos: save.todos, queue: save.queue });
+      const byId = new Map<string, TimelineItem>();
+      if (over.size) for (let i = 0; i < from; i++) if (over.has(items[i].id)) byId.set(items[i].id, items[i]);
+      const overItems = [...byId.values()];
+      const tmp = `${this.tailOf(id)}.${process.pid}.tmp`;
+      const head = `{"baseGen":${base.gen},"from":${from},"items":[\n`;
+      const end = `\n],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
+      const sizes = await writePieces(tmp, head, items.slice(from), '\n],"over":[\n', overItems, end);
       // A big tail folds into the base only when that moves the boundary well on: otherwise a few
-      // huge items at the end would have the whole base written again on every save.
-      if (tail.length <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP) {
-        await atomicWrite(this.tailOf(id), tail);
+      // huge items at the end would have the whole base written again on every save. Changed
+      // settled items past their bound go into the base too.
+      if ((sizes.items <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP) && sizes.over <= OVER_MAX.chars) {
+        await renameRetry(tmp, this.tailOf(id));
+        base.over = over;
         return;
+      }
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* a leftover temporary file is written over next time */
       }
     }
     const gen = nextGen();
     const size = await writeBase(this.pathOf(id), gen, { ...save, items });
     const end = settledEnd(items);
     const settled = items.slice(0, end).map((i) => i.id);
-    this.bases.set(id, { gen, ids: settled, idSet: new Set(settled), size });
+    this.bases.set(id, { gen, ids: settled, idSet: new Set(settled), size, over: new Set() });
     this.force.delete(id);
     // The new base holds everything: the old tail no longer matches it (and is ignored if this fails).
     try {
@@ -341,12 +375,6 @@ export class SessionFiles {
       /* ignored on the next read: its baseGen is another */
     }
   }
-}
-
-async function atomicWrite(file: string, text: string) {
-  const tmp = `${file}.${process.pid}.tmp`;
-  await writeFile(tmp, text, 'utf8');
-  await renameRetry(tmp, file);
 }
 
 /** Windows refuses a rename while another program (a virus scanner, a reader) has the file open for a moment: try again briefly. */
@@ -360,6 +388,38 @@ async function renameRetry(from: string, to: string) {
       await new Promise((r) => setTimeout(r, 40 * (i + 1)));
     }
   }
+}
+
+/**
+ * `head`, the items of `first` one per line, `mid`, the items of `second` likewise, `end`: written
+ * in pieces of about a megabyte (each item serialized on its own), so a big tail never holds the
+ * event loop for long. Returns the characters `first` and `second` took.
+ */
+async function writePieces(file: string, head: string, first: TimelineItem[], mid: string, second: TimelineItem[], end: string): Promise<{ items: number; over: number }> {
+  const fh = await open(file, 'w');
+  const sizes = { items: 0, over: 0 };
+  try {
+    let buf = head;
+    const put = async (list: TimelineItem[], key: 'items' | 'over') => {
+      for (let i = 0; i < list.length; i++) {
+        const line = JSON.stringify(list[i]) + (i < list.length - 1 ? ',\n' : '');
+        sizes[key] += line.length;
+        buf += line;
+        if (buf.length >= CHUNK) {
+          await fh.write(buf, null, 'utf8');
+          buf = '';
+        }
+      }
+    };
+    await put(first, 'items');
+    buf += mid;
+    await put(second, 'over');
+    buf += end;
+    await fh.write(buf, null, 'utf8');
+  } finally {
+    await fh.close();
+  }
+  return sizes;
 }
 
 /**

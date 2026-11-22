@@ -879,3 +879,9 @@
 .acct-cap-field[data-set] .acct-cap-pct {
   color: var(--text-3);
 }
+
+/* A chat signed out of its account (AuthNotice.tsx): the notice's line with "Sign in" on its centre line. */
+.auth-notice .notice-error-head {
+  align-items: center;
+  gap: 12px;
+}

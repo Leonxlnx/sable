@@ -1,4 +1,5 @@
 import { VERSION } from '../version';
+import { authGate, noteAuthFailure } from '../core/auth-gate';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -301,7 +302,9 @@ export class CodexProvider implements Provider {
 
   private armIdle(ms = IDLE_STOP_MS) {
     clearTimeout(this.idleTimer);
-    this.idleTimer = setTimeout(() => this.stopIfIdle(ms), ms);
+    // After a sleep the stop falls due while the app-server may be renewing its sign-in: spread out (auth-gate.ts).
+    const due = Date.now() + ms;
+    this.idleTimer = setTimeout(() => authGate.afterWake(() => this.stopIfIdle(ms), due), ms);
     this.idleTimer.unref?.();
   }
 
@@ -2224,6 +2227,8 @@ class CodexSession implements ProviderSession {
           return;
         }
         if (!e.willRetry) this.turnErrors.set(tid, msg);
+        // Refused for the sign-in: no notice per request; the bridge asks again and says it once (auth-gate.ts).
+        if (!e.willRetry && codexSignInRefused((e.error as { codexErrorInfo?: unknown } | undefined)?.codexErrorInfo, msg)) return void noteAuthFailure(rt.id);
         // Refused at a plan limit ("You've hit your usage limit…"): a limit notice the bridge can act on.
         const info = (e.error as { codexErrorInfo?: unknown } | undefined)?.codexErrorInfo;
         if (!e.willRetry && (info === 'usageLimitExceeded' || /usage limit/i.test(msg))) {
@@ -2271,6 +2276,16 @@ class CodexSession implements ProviderSession {
    * same spawn step, so the thread stays tied to it until the thread itself goes (review wave 8, #28).
    */
   onReceiverNews(tid: string, method: string, p: any) {
+    // A sub-agent refused at a plan limit: its spawn step stops at the limit, and the chat says it once.
+    if (method === 'error' && !p?.willRetry && (p?.error?.codexErrorInfo === 'usageLimitExceeded' || /usage limit/i.test(String(p?.error?.message ?? '')))) {
+      const spawn = this.receivers.get(tid);
+      const full = this.provider.fullWindow();
+      if (spawn) this.rt.limitInBackground({ stepId: spawn, window: full?.label, resetsAt: full?.resetsAt });
+      return;
+    }
+    // The receiver's running turn, so a limit can stop it for real (`stopBackgroundWork`).
+    if (method === 'turn/started' && typeof p?.turn?.id === 'string') this.receiverTurns.set(tid, p.turn.id);
+    else if (method === 'turn/completed' || method === 'thread/closed') this.receiverTurns.delete(tid);
     if (method === 'turn/started') this.receiverState(tid, 'running');
     else if (method === 'turn/completed') this.receiverState(tid, p?.turn?.status === 'failed' ? 'failed' : p?.turn?.status === 'interrupted' ? 'stopped' : 'done');
     else if (method === 'thread/closed') this.receiverState(tid, 'stopped', true);
@@ -2300,6 +2315,34 @@ class CodexSession implements ProviderSession {
     this.rt.patch<ToolItem>(spawn, { result: { ...item.result, agent: { ...item.result?.agent, background: shown } } });
   }
   private receiverLive = new Set<string>();
+  /** Each working receiver's running turn (thread id → turn id). */
+  private receiverTurns = new Map<string, string>();
+
+  /**
+   * At a plan limit: every sub-agent still working is stopped for real (its turn interrupted on the
+   * app-server), so nothing goes on on the account at its limit. True only when every stop was taken.
+   */
+  async stopBackgroundWork(): Promise<boolean> {
+    const live = [...this.receiverLive];
+    if (!live.length) return true;
+    let rpc: CodexRpc;
+    try {
+      rpc = await this.provider.client();
+    } catch {
+      return false;
+    }
+    const taken = await Promise.all(
+      live.map((tid) => {
+        const turnId = this.receiverTurns.get(tid);
+        if (!turnId) return Promise.resolve(false);
+        return rpc.request('turn/interrupt', { threadId: tid, turnId }, 10_000).then(
+          () => true,
+          (err) => (this.log('turn/interrupt of a sub-agent failed', errMsg(err)), false),
+        );
+      }),
+    );
+    return taken.every(Boolean);
+  }
 
   /** The sub-agents' app-server is gone, or this chat lets go of them: their steps work no more here. */
   private dropReceivers() {
@@ -2307,6 +2350,7 @@ class CodexSession implements ProviderSession {
     for (const tid of this.receivers.keys()) if (this.provider.receivers.get(tid) === this) this.provider.receivers.delete(tid);
     this.receivers.clear();
     this.receiverLive.clear();
+    this.receiverTurns.clear();
     if (spawns.size) this.rt.stopBackground((i) => spawns.has(i.id));
   }
 
@@ -2704,4 +2748,10 @@ class CodexSession implements ProviderSession {
     if (answer?.optionId === 'denied') return { decision: { denied: { rejection: answer.message || 'The user declined this change.' } } };
     return { decision: 'abort' };
   }
+}
+
+/** A Codex error that refuses the sign-in (`unauthorized`, a refresh token spent or refused). */
+export function codexSignInRefused(info: unknown, message: string): boolean {
+  if (info === 'unauthorized') return true;
+  return /refresh token (?:was already used|could not be refreshed|has expired|is invalid)|access token could not be refreshed|refresh_token_reused|log ?in again|sign in again|401 Unauthorized/i.test(message);
 }

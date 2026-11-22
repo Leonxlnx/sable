@@ -72,7 +72,7 @@ const notices = (items: TimelineItem[]) => items.filter((i): i is NoticeItem => 
 // ───────────────────────────── carrying a conversation ─────────────────────────────
 
 describe('carrying a conversation between config folders', () => {
-  it('copies one Claude conversation with its side files and checkpoints, and nothing else', () => {
+  it('copies one Claude conversation with its side files and checkpoints, and nothing else', async () => {
     const a = temp();
     const b = temp();
     const key = 'D--work-app';
@@ -83,7 +83,7 @@ describe('carrying a conversation between config folders', () => {
     put(path.join(a, '.credentials.json'), 'secret');
     put(path.join(b, 'projects', 'elsewhere', 'keep.jsonl'), 'mine');
 
-    expect(carryClaudeConversation(a, b, 'abc-123')).toBe(true);
+    expect(await carryClaudeConversation(a, b, 'abc-123')).toBe(true);
     expect(readFileSync(path.join(b, 'projects', key, 'abc-123.jsonl'), 'utf8')).toBe('{"type":"user"}\n');
     expect(existsSync(path.join(b, 'projects', key, 'abc-123', 'subagents', 'agent-1.jsonl'))).toBe(true);
     expect(existsSync(path.join(b, 'file-history', 'abc-123', 'f1@v1'))).toBe(true);
@@ -94,27 +94,27 @@ describe('carrying a conversation between config folders', () => {
     expect(readFileSync(path.join(a, 'projects', key, 'abc-123.jsonl'), 'utf8')).toBe('{"type":"user"}\n');
   });
 
-  it('says no when the conversation is missing or the id is not a plain id', () => {
+  it('says no when the conversation is missing or the id is not a plain id', async () => {
     const a = temp();
     const b = temp();
     put(path.join(a, 'projects', 'k', 'abc.jsonl'));
-    expect(carryClaudeConversation(a, b, 'nope')).toBe(false);
-    expect(carryClaudeConversation(a, b, '../abc')).toBe(false);
-    expect(carryClaudeConversation(path.join(a, 'missing'), b, 'abc')).toBe(false);
+    expect(await carryClaudeConversation(a, b, 'nope')).toBe(false);
+    expect(await carryClaudeConversation(a, b, '../abc')).toBe(false);
+    expect(await carryClaudeConversation(path.join(a, 'missing'), b, 'abc')).toBe(false);
     // The same folder: nothing to copy, and it can resume.
-    expect(carryClaudeConversation(a, a, 'abc')).toBe(true);
+    expect(await carryClaudeConversation(a, a, 'abc')).toBe(true);
   });
 
-  it('copies a Codex rollout to the same place under the other CODEX_HOME', () => {
+  it('copies a Codex rollout to the same place under the other CODEX_HOME', async () => {
     const a = temp();
     const b = temp();
     const rel = path.join('2026', '11', '16', 'rollout-2026-11-16T09-00-00-thread-77.jsonl');
     put(path.join(a, 'sessions', rel), '{"type":"session_meta"}\n');
     put(path.join(a, 'auth.json'), 'secret');
-    expect(carryCodexConversation(a, b, 'thread-77')).toBe(true);
+    expect(await carryCodexConversation(a, b, 'thread-77')).toBe(true);
     expect(readFileSync(path.join(b, 'sessions', rel), 'utf8')).toBe('{"type":"session_meta"}\n');
     expect(existsSync(path.join(b, 'auth.json'))).toBe(false);
-    expect(carryCodexConversation(a, b, 'thread-78')).toBe(false);
+    expect(await carryCodexConversation(a, b, 'thread-78')).toBe(false);
   });
 
   it('lets a Claude account resume a conversation from another account’s folder', async () => {
@@ -429,7 +429,9 @@ describe('at a plan limit', () => {
     const sent: string[] = [];
     const { app, home } = start({ make: (ctx) => new NoCarryDemo(ctx, sent) });
     const other = await demoAccount(app, 'Work', 'light');
-    const snap = await app.call('session.create', { provider: 'demo', cwd: path.join(home, 'p') });
+    // Bypass: the Demo reads only the person's words ("and now the tests", the handover taken off), and
+    // the scenario its rotation picks for them edits files, which in Ask first waits for a permission.
+    const snap = await app.call('session.create', { provider: 'demo', cwd: path.join(home, 'p'), mode: 'bypassPermissions' });
     const rt = app.runtime(snap.session.id);
     await app.call('session.send', { sessionId: rt.id, text: 'hi' });
     await until(() => rt.meta.status === 'idle' && rt.items.some((i) => i.type === 'text'), 'first answer');

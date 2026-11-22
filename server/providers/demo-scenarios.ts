@@ -12,6 +12,8 @@ import { COMMANDS, SKILLS, contextBreakdown } from './demo-catalog';
 import { BASE_CONTEXT, Denied, type OutLine, type Script, between } from './demo-script';
 import * as W from './demo-widgets';
 import { browserLineUrl, stripBrowserLine } from './browser-tool';
+import { demoPortal } from './demo-portal';
+import { signInShips } from '../services/sign-ins';
 import { demoSite, LOOKS, siteCss, siteHtml } from './demo-site';
 import { AUTH_FIXED, AUTH_JS, SESSION_FIXED, SESSION_JS, seedUntilFixture, untilFixture } from './demo-until';
 import { briefFiles, CHECK_LEAD, NO_PROBLEMS } from '../core/check';
@@ -1526,6 +1528,58 @@ async function browserTour(s: Parameters<Scenario>[0]['s']) {
 }
 
 /**
+ * "log into the portal": the agent works a made-up school portal served on this machine
+ * (demo-portal.ts). It opens it, outlines it, signs in with browser_sign_in (the card the first
+ * time, a saved sign-in after), then clicks a course, types into the search, presses Find and
+ * scrolls, so the pointer and the sign-in can be watched and filmed.
+ */
+const signin: Scenario = async ({ s }) => {
+  // While sign-ins do not ship, the made-up portal is signed into with plain typing (a made-up password
+  // in a text field drawn as dots: a demo page, no secret), so the pointer can still be seen.
+  const ships = signInShips();
+  const url = (await demoPortal()) + (ships ? '' : '?typing');
+  await s.think('Open the portal in the Browser tab, sign in there, then find the maths course.');
+  const opened = await s.browser('open', { url });
+  if (!opened.ok) {
+    await s.say(`The portal did not open: ${opened.text}`);
+    return s.finish({});
+  }
+  const snap = await s.browser('snapshot', {});
+  const user = /^\[(e\d+)\] textbox "User name"/m.exec(snap.text)?.[1];
+  const pass = (ships ? /^\[(e\d+)\] password field/m : /^\[(e\d+)\] textbox "Password"/m).exec(snap.text)?.[1];
+  const submit = /^\[(e\d+)\] button "Sign in"/m.exec(snap.text)?.[1];
+  if (!user || !pass) {
+    await s.say('The portal shows no sign-in form.');
+    return s.finish({});
+  }
+  let signed: { ok: boolean; text: string };
+  if (ships) signed = await s.browser('sign_in', { username_ref: user, password_ref: pass, ...(submit ? { submit_ref: submit } : {}) });
+  else {
+    await s.browser('type', { ref: user, text: 'student.one' });
+    await s.browser('type', { ref: pass, text: 'made-up-pass' });
+    const clicked = submit ? await s.browser('click', { ref: submit }) : await s.browser('press', { key: 'Enter' });
+    await s.browser('wait', { selector: '#home', timeout: 3000 });
+    signed = clicked.ok ? { ok: true, text: 'Signed in on the portal as student.one. Sable filled' } : { ok: false, text: clicked.text };
+  }
+  if (!signed.ok) {
+    await s.say(`I did not sign in: ${signed.text.replace(/^Not signed in: /, '')}`);
+    return s.finish({});
+  }
+  const home = await s.browser('snapshot', {});
+  const course = /^\[(e\d+)\] button "Mathematics 10b[^"]*"/m.exec(home.text)?.[1];
+  const find = /^\[(e\d+)\] textbox "Find a course"/m.exec(home.text)?.[1];
+  const go = /^\[(e\d+)\] button "Find"/m.exec(home.text)?.[1];
+  if (find) await s.browser('type', { ref: find, text: 'Mathematics' });
+  if (go) await s.browser('click', { ref: go });
+  if (course) await s.browser('click', { ref: course });
+  await s.browser('scroll', { by: 420 });
+  await s.browser('scroll', { to: 'top' });
+  const who = /as (.+?)\. Sable filled/.exec(signed.text)?.[1];
+  await s.say(`Signed in${who ? ` as **${who}**` : ''} and opened **Mathematics 10b**: it has 3 new tasks.`);
+  s.finish({});
+};
+
+/**
  * The Browser tab tools: open a local page (an address in the prompt, else the one the Browser tab
  * already shows, else localhost:3000), read it and take a screenshot, through the real tools' path.
  */
@@ -1966,6 +2020,7 @@ export const SCENARIOS = {
   previews,
   share,
   browser,
+  signin,
   beforeafter,
   untilSetup,
   untilFix,
@@ -1985,6 +2040,8 @@ const KEYWORDS: [RegExp, ScenarioId][] = [
   [/\bnotifications?\b/i, 'notifications'],
   // Before / after captures of a local page (demo-site.ts).
   [/\bbefore\s*\/?\s*after\b|\bbeforeafter\b/i, 'beforeafter'],
+  // Signing in on a page in the Browser tab, watched (demo-portal.ts): before the plain browser tools.
+  [/\b(log\s?in|sign\s?in|mebis|portal)\b/i, 'signin'],
   // The Browser tab tools.
   [/\bbrowser\b/i, 'browser'],
   // Files handed to the person (SendUserFile): file cards.

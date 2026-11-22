@@ -2,18 +2,57 @@ import { DEFAULT_ACCOUNT, type AccountCap, type AccountInfo, type Attachment, ty
 import { DEFAULT_BACKDROP, normalizeBackdrop } from '@shared/backdrop';
 import { bridge } from '@/lib/bridge';
 import { addComment, clearReview, editComment, removeComment, reviewMessage, type ReviewComment } from '@/features/review/model';
-import { applySnapshot, applyWholeItem, capsKey, loadSession, useStore, type RailTab, type SettingsSection, type Store } from './store';
+import { applySnapshot, applyWholeItem, capsKey, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
 import type { PullFailures, PullStatus } from '@shared/protocol';
 
 /** Everything the UI can ask the bridge to do. Components call these, never bridge.call directly. */
 
 const fail = (err: unknown) => useStore.getState().toast((err as Error)?.message ?? String(err), 'error');
 
+/**
+ * The longest a chat whose conversation is not in the window yet waits before the view switches to
+ * it anyway (ms). Its answer usually comes well within it, so the first frame of the new view shows
+ * the conversation and the composer complete instead of an empty view filled a moment later.
+ */
+export const OPEN_HOLD_MS = 160;
+let opens = 0;
+
 export function openSession(id: string) {
   const s = useStore.getState();
-  s.setUi({ activeSessionId: id, race: null });
-  if (!s.data[id]?.loaded) void loadSession(id).catch(fail);
-  else if (s.sessions[id]?.unread) void bridge.call('session.update', { sessionId: id, patch: { unread: false } }).catch(() => {});
+  const seq = ++opens;
+  touchKept(id);
+  if (s.sessions[id]?.unread) void bridge.call('session.update', { sessionId: id, patch: { unread: false } }).catch(() => {});
+  const show = () => {
+    useStore.getState().setUi({ activeSessionId: id, race: null });
+    trimKept();
+  };
+  if (s.data[id]?.loaded || !s.sessions[id]) return show();
+  // Not here yet: the view switches when it is, or after the hold. Anything else opened meanwhile
+  // (another chat, home, a race) wins and this switch never happens; the answer stays as a kept chat.
+  const nav = navigationCount();
+  let done = false;
+  const go = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(t);
+    if (seq === opens && nav === navigationCount() && useStore.getState().sessions[id]) show();
+  };
+  const t = setTimeout(go, OPEN_HOLD_MS);
+  loadSession(id).then(go, (err) => {
+    go();
+    fail(err);
+  });
+}
+
+/**
+ * The pointer rests on a chat's row (or focus moved to it): its conversation is fetched ahead, so
+ * the click finds it here. Left unread; bounded with the other kept chats.
+ */
+export function prefetchSession(id: string) {
+  const s = useStore.getState();
+  if (!s.sessions[id] || s.data[id]?.loaded) return;
+  touchKept(id);
+  void loadSession(id, { peek: true }).catch(() => {});
 }
 
 const wholeAsked = new Map<string, Promise<void>>();
@@ -298,6 +337,17 @@ export const respondBrowser = (sessionId: string, requestId: string, answer: Bro
 
 /** What the session's Browser tab shows now, for the line the agent gets with the next message. */
 export const reportBrowserPage = (sessionId: string, page: { url: string; title: string } | null) => bridge.call('browser.page', { sessionId, page }).catch(() => {});
+
+/*
+ * The Browser tab's saved sign-ins (server/services/sign-ins.ts). The password goes only into the
+ * page's field: never into the store, a toast or an error. These reject; callers say what failed.
+ */
+export const signInState = () => bridge.call('signIn.state', {});
+export const listSignIns = (origin?: string) => bridge.call('signIn.list', origin ? { origin } : {});
+export const revealSignIn = (id: string, origin: string) => bridge.call('signIn.reveal', { id, origin });
+export const saveSignIn = (origin: string, username: string, password: string) => bridge.call('signIn.save', { origin, username, password });
+export const markSignInUsed = (id: string) => bridge.call('signIn.used', { id }).catch(() => {});
+export const removeSignIn = (id: string) => bridge.call('signIn.remove', { id });
 
 /** Changes what new sessions with `provider` start with (Settings › General). */
 export function setDefaultSessionOptions(provider: ProviderId, patch: SessionOptions) {

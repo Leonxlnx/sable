@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import type { SessionMeta } from '@shared/protocol';
 import { ProviderMark, StatusGlyph } from '@/art/Logo';
 import { baseName, timeAgo } from '@/lib/format';
-import { openSession } from '@/state/actions';
+import { openSession, prefetchSession } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { byKeys, useSlidePill } from '@/ui';
 import { cycle, firstIndex, recentOrder, visit } from './quick';
@@ -61,6 +61,8 @@ export function QuickSwitch() {
         if (cur) {
           cur.index = cycle(cur.index, cur.list.length, dir);
           setIndex(cur.index);
+          // The chat picked so far is fetched ahead: releasing Ctrl finds it here.
+          prefetchSession(cur.list[cur.index].id);
           return;
         }
         // Not from under a dialog (Settings, a confirmation): the session behind it stays.
@@ -70,6 +72,7 @@ export function QuickSwitch() {
         const at = firstIndex(next.map((s) => s.id), st.ui.activeSessionId, dir);
         if (at < 0) return;
         live.current = { list: next, index: at };
+        prefetchSession(next[at].id);
         setList(next);
         setIndex(at);
         timer = window.setTimeout(() => setShown(true), SHOW_AFTER);

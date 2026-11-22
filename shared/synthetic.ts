@@ -262,6 +262,10 @@ export function parseSynthetic(text: string): Synthetic | null {
   const src = text.replace(/\r\n?/g, '\n');
   const lead = src.trimStart();
   if (CONTINUED.test(lead)) return { role: 'summary', parts: [{ kind: 'summary', text: lead.trim() }] };
+  // Sable's own words sent in the person's place (a turn carried on after a limit, an /until round),
+  // read back from an agent's transcript: nothing of the person's to show.
+  const own = sableMessage(lead);
+  if (own) return { role: 'hidden', parts: [{ kind: 'hidden', tag: 'sable', text: own }] };
   const found = scan(src);
   if (!found) return null;
   const parts: SyntheticPart[] = [];
@@ -328,7 +332,7 @@ export function maybeSynthetic(text: string): boolean {
   while (i < text.length && (text.charCodeAt(i) <= 32 || text.charCodeAt(i) === 0xfeff)) i++;
   const c = text[i];
   if (c === '<' || c === '[') return true;
-  return text.startsWith('Caveat:', i) || text.startsWith('This session is being continued', i);
+  return text.startsWith('Caveat:', i) || text.startsWith('This session is being continued', i) || SABLE_OPENERS.some((o) => text.startsWith(o, i));
 }
 
 const cache = new WeakMap<object, Synthetic | null>();
@@ -416,10 +420,108 @@ export function syntheticLine(s: Synthetic): string {
   return partLine(tasks[0] ?? shown[0]);
 }
 
-/** A person's message without the wrappers the harness may have added to it. */
+// ───────────────────────── what Sable itself writes ─────────────────────────
+//
+// Every text Sable gives an agent with or as a message, known here so no reader shows it as the
+// person's: the agents keep it in their transcripts, and a conversation read back from there (after
+// a restart, a move, a switch) would otherwise show it in the person's bubble.
+// - `STEER_FIRST_BLOCK`, the note after a move (`moveNote`), the compaction opener: `<system-reminder>`
+//   blocks, stripped above.
+// - The handover before the person's words after a switch of agent or a move without the
+//   conversation (`handoverText`): a head, the exchanges, `HANDOVER_TAIL`, then `HANDOVER_JOIN`.
+// - A turn carried on after a limit (`RESUME_*`): the whole message, or a trailer after the
+//   person's words.
+// - An `/until` round's failure (`server/core/until.ts` `failureMessage`): the whole message.
+// - The Browser tab's line after the person's words (`server/providers/browser-tool.ts`).
+
+/** Claude Code's own stand-in for an answer: written when a conversation is resumed after a turn was cut, and as a refused request's words at some limits. Never the agent's answer. */
+export const STAND_IN_ANSWER = 'No response requested.';
+
+/** Whether a text is only Claude Code's stand-in answer (`STAND_IN_ANSWER`). */
+export const isStandIn = (text: string | undefined | null): boolean => typeof text === 'string' && text.trim() === STAND_IN_ANSWER;
+
+/**
+ * Claude Code's own words for a request refused for the sign-in, which it writes as a synthetic
+ * assistant message ("Failed to authenticate: OAuth session expired and could not be refreshed",
+ * "Failed to refresh OAuth token: another Claude Code process is refreshing it…"). Never the agent's
+ * answer: the chat says it once in its own notice (server/core/auth-gate.ts). Only ever applied to
+ * messages the CLI marks as its own (`<synthetic>`), so an answer that quotes it stays.
+ */
+export const AUTH_FAILURE_TEXT = 'Failed to authenticate: OAuth session expired and could not be refreshed';
+const AUTH_FAILURE = /^(?:Failed to authenticate\b|Failed to refresh OAuth token\b|OAuth (?:session|token) (?:has )?expired\b|Invalid API key\b|Not logged in\b|API Error: 401\b)/i;
+
+/** Whether a text is Claude Code's own words for a request refused for the sign-in (`AUTH_FAILURE_TEXT` and its kin). */
+export const isAuthFailure = (text: string | undefined | null): boolean => typeof text === 'string' && text.length < 1200 && AUTH_FAILURE.test(text.trim());
+
+/** The handover's heads: after a move to another account, a switch of agent, a return to an agent. */
+export const HANDOVER_HEAD_ACCOUNT = 'This continues a conversation that started under another account. Here is what happened so far, oldest first:';
+export const handoverHeadAgent = (from: string) => `This continues a conversation the user had with ${from} in this folder. Here is what happened so far, oldest first:`;
+export const handoverHeadSince = (from: string) => `Since your last reply here, the user went on with ${from} in this conversation. Here is what happened since, oldest first:`;
+export const HANDOVER_TAIL = 'Carry on from there. The next message is the one to answer now.';
+/** Between the handover and the person's words. */
+export const HANDOVER_JOIN = '\n\n---\n\n';
+
+/** A turn cut by a usage limit carries on (server/app.ts `resumeMessage`, `resumeRefused`). */
+export const RESUME_AFTER_RESET = 'The last turn was cut off by a usage limit, which has reset now. Carry on with the task from where it stopped. Do not repeat steps that are already done.';
+export const RESUME_UNDER_ANOTHER = 'The last turn was cut off by a usage limit; the conversation now continues under another account. Carry on with the task from where it stopped. Do not repeat steps that are already done.';
+export const RESUME_LIMIT_RESET = 'The usage limit has reset. Carry on with the task from where it stopped.';
+/** After the person's words, when the turn carries on from a summary. */
+export const RESUME_SUMMARY_TRAILER = '\n\n(Part of this was already done before a usage limit cut the turn off: the summary above shows how far it got. Carry on from there.)';
+/** After a carry-on (`RESUME_*`, or the summary trailer) when the same limit stopped background agents: which ones (`resumeBackgroundNote`). */
+const RESUME_BACKGROUND_HEAD = '\n\nThe same limit stopped these background agents before they finished: ';
+const RESUME_BACKGROUND_TAIL = '. Start again those whose work is still needed, and do not redo what they already finished.';
+const RESUME_BACKGROUND = /\n\nThe same limit stopped these background agents before they finished: [^\n]{1,2000}\. Start again those whose work is still needed, and do not redo what they already finished\./;
+export const resumeBackgroundNote = (names: string[]) => (names.length ? `${RESUME_BACKGROUND_HEAD}${names.join('; ')}${RESUME_BACKGROUND_TAIL}` : '');
+
+/** A turn cut by a failed sign-in carries on once the account is signed in (server/app.ts `retryAuth`). */
+export const RESUME_AFTER_SIGN_IN = 'The last turn was cut off because the sign-in failed; it works again now. Carry on with the task from where it stopped. Do not repeat steps that are already done.';
+const SIGN_IN_BACKGROUND_HEAD = '\n\nThe failed sign-in also stopped these background agents: ';
+const SIGN_IN_BACKGROUND = /\n\nThe failed sign-in also stopped these background agents: [^\n]{1,2000}\. Start again those whose work is still needed, and do not redo what they already finished\.$/;
+/** After a carry-on at a sign-in, which background agents the same failure stopped. */
+export const signInBackgroundNote = (names: string[]) => (names.length ? `${SIGN_IN_BACKGROUND_HEAD}${names.join('; ')}${RESUME_BACKGROUND_TAIL}` : '');
+
+const SABLE_OPENERS = ['This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, 'The check `'];
+const HANDOVER_HEAD = /^(?:This continues a conversation (?:that started under another account|the user had with [^\n]{1,200} in this folder)|Since your last reply here, the user went on with [^\n]{1,200} in this conversation)\. Here is what happened (?:so far|since), oldest first:\n/;
+/** The whole of an `/until` round's failure (server/core/until.ts `failureMessage`): its head, then the output fenced or "It printed nothing.", and nothing after. */
+const UNTIL_FAILURE = /^The check `[^`\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n[\s\S]*\n\1)$/;
+const BROWSER_LINE = /\n\n\[Sable: the user's Browser tab shows \S+?(?: titled "[^"\n]*")?\. browser_read reads it\.\]\s*$/;
+
+/** A whole message of Sable's own (a turn carried on, an /until round): the message, else ''. */
+function sableMessage(lead: string): string {
+  // Known outer wrappers come off first: a continuation after a move carries its note (a trailing
+  // `<system-reminder>`), and read back from a transcript it must still be known as Sable's.
+  let bare = lead;
+  for (const tag of STRIP_TAGS) bare = bare.replace(new RegExp(`\\s*<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?(?:</${tag}>|$)`, 'g'), '');
+  const t = bare.replace(BROWSER_LINE, '').trimEnd().replace(RESUME_BACKGROUND, '').replace(SIGN_IN_BACKGROUND, '').trim();
+  if (t === RESUME_AFTER_RESET || t === RESUME_UNDER_ANOTHER || t === RESUME_LIMIT_RESET || t === RESUME_AFTER_SIGN_IN) return t;
+  if (UNTIL_FAILURE.test(t)) return t;
+  // A handover with nothing of the person's after it.
+  const words = withoutHandover(t);
+  if (words !== t && (!words.trim() || sableMessage(words))) return t;
+  return '';
+}
+
+/** The person's words without a handover Sable put before them. */
+function withoutHandover(text: string): string {
+  if (!HANDOVER_HEAD.test(text)) return text;
+  const tail = text.indexOf(`${HANDOVER_TAIL}${HANDOVER_JOIN}`);
+  if (tail >= 0) return text.slice(tail + HANDOVER_TAIL.length + HANDOVER_JOIN.length);
+  // A handover alone (nothing after it).
+  if (text.trimEnd().endsWith(HANDOVER_TAIL)) return '';
+  if (text.includes(HANDOVER_JOIN)) return text.slice(text.lastIndexOf(HANDOVER_JOIN) + HANDOVER_JOIN.length);
+  // Cut short (a phone's page): only when what follows the head reads as its exchanges. A head with
+  // words of the person's own under it (pasted) stays theirs.
+  return /^[^\n]*\n(?:User|Agent): /.test(text) ? '' : text;
+}
+
+/** Whether a message holds words Sable added to the person's (a handover, a carry-on trailer, the Browser tab's line). */
+const SABLE_ADDED = (text: string) => HANDOVER_HEAD.test(text.trimStart()) || text.includes(RESUME_SUMMARY_TRAILER) || BROWSER_LINE.test(text) || RESUME_BACKGROUND.test(text);
+
+/** A person's message without the wrappers the harness may have added to it, nor the words Sable added. */
 export function stripWrappers(text: string): string {
-  if (!text.includes('<')) return text;
   let out = text;
+  if (SABLE_ADDED(out)) out = withoutHandover(out.replace(/\r\n?/g, '\n').trimStart()).replace(BROWSER_LINE, '').replace(RESUME_BACKGROUND, '').replace(RESUME_SUMMARY_TRAILER, '');
+  if (!out.includes('<')) return out === text ? text : out.trim();
   for (const tag of STRIP_TAGS) out = out.replace(new RegExp(`<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?(?:</${tag}>|$)`, 'g'), '');
   return out === text ? text : out.trim();
 }

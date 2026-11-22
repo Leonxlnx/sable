@@ -839,6 +839,9 @@ export function transcript(turns: Turn[]): TimelineItem[] {
       if (d.type === 'tool' && (d.status === 'running' || d.status === 'pending') && turn.status !== 'inProgress') {
         (d as ToolItem).status = 'cancelled';
       }
+      // A stored step's time runs from its own start to its own end: an item without either took
+      // its place from the one before (or the time of this read), so it shows no time at all.
+      if ((d.type === 'tool' || d.type === 'thinking') && (item.startedAtMs == null || item.completedAtMs == null)) delete (d as { endedAt?: number }).endedAt;
       out.push({ ts, ...d, id } as TimelineItem);
     }
     if (turn.status !== 'inProgress') {

@@ -35,6 +35,17 @@ export interface PermissionAnswer {
 /** What one of the person's messages came to, by the agent's result for it. */
 export type MessageOutcome = 'ok' | 'failed' | 'stopped';
 
+/** A plan limit met outside the chat's own turn (`SessionRuntime.limitInBackground`). */
+export interface BackgroundLimit {
+  /** The background step whose request it refused; none when it was the agent's own. */
+  stepId?: string;
+  /** Which window, as the limit rows name it, and when it resets, when known. */
+  window?: string;
+  resetsAt?: number;
+  /** The agent's own words for it. */
+  detail?: string;
+}
+
 type NewItem<T extends TimelineItem> = T extends TimelineItem ? Omit<T, 'id' | 'ts'> & { id?: string; ts?: number } : never;
 
 
@@ -106,6 +117,12 @@ export class SessionRuntime {
   onTurnEnd?: (rt: SessionRuntime, error?: string, opts?: { hold?: boolean }) => void;
   /** Called as a turn begins (an until loop's check in flight gives way to it). */
   onTurnStart?: (rt: SessionRuntime) => void;
+  /** A plan limit refused work of the chat outside its own turn (a background agent's request, or the agent's own): the bridge decides (`limitInBackground`). */
+  onBackgroundLimit?: (rt: SessionRuntime, hit: BackgroundLimit) => void;
+  /** The last background work ended with no turn running: the chat is at rest. */
+  onRest?: (rt: SessionRuntime) => void;
+  /** The limit notice the bridge wrote when work outside a turn met a limit: a turn refused at it says it there (one notice). */
+  limitCard?: string;
 
   private index = new Map<string, TimelineItem>();
   /** `share`: for a share's permission, the files as it showed them (core/handed.ts `approvedShare`). */
@@ -191,6 +208,55 @@ export class SessionRuntime {
     if (now) this.working.add(item.id);
     else this.working.delete(item.id);
     this.update({ background: this.working.size });
+    if (!this.working.size && !this.turnActive) this.onRest?.(this);
+  }
+
+  /**
+   * A plan limit refused work outside the chat's own turn. `stepId`: the background sub-agent or
+   * workflow whose request it was (its own step or one under it): it works no more, and says why
+   * ("Stopped · 5-hour limit reached"). The bridge hears of every refusal and decides once.
+   */
+  limitInBackground(hit: BackgroundLimit) {
+    const step = hit.stepId ? this.backgroundStepOf(hit.stepId) : undefined;
+    if (step) this.stopAtLimit((i) => i.id === step.id, hit);
+    else if (hit.stepId && this.get(hit.stepId)?.type === 'tool') this.limitStopped.add(hit.stepId);
+    this.onBackgroundLimit?.(this, { ...hit, ...(step ? { stepId: step.id } : {}) });
+  }
+
+  /** Steps a plan limit stopped since the chat last carried on (the bridge names them to the agent, `takeLimitStopped`). */
+  private limitStopped = new Set<string>();
+
+  /** Steps whose stop was not confirmed after all: never named to the agent as stopped. */
+  forgetLimitStopped(ids: Iterable<string>) {
+    for (const id of ids) this.limitStopped.delete(id);
+  }
+
+  /** The steps a plan limit stopped since the last call. */
+  takeLimitStopped(): Set<string> {
+    const out = this.limitStopped;
+    this.limitStopped = new Set();
+    return out;
+  }
+
+  /** The background step a step belongs to: itself or the nearest of its parents that works in the background. */
+  private backgroundStepOf(id: string): ToolItem | undefined {
+    for (let i = this.get(id), n = 0; i && n < 32; i = i.parentId ? this.get(i.parentId) : undefined, n++) if (worksInBackground(i)) return i as ToolItem;
+    return undefined;
+  }
+
+  /** Background steps (`only`, else every one) stopped by a plan limit: stopped, with the window that refused them. */
+  stopAtLimit(only: ((item: TimelineItem) => boolean) | undefined, limit: { window?: string; resetsAt?: number }): string[] {
+    const marked: string[] = [];
+    for (const item of this.items) {
+      if (!worksInBackground(item) || (only && !only(item))) continue;
+      const stopped = stoppedBackground(item) as ToolItem;
+      const window = limit.window ?? 'Plan limit';
+      const agent = { ...stopped.result?.agent, limit: { window, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}) } };
+      this.limitStopped.add(item.id);
+      marked.push(item.id);
+      this.patch<ToolItem>(item.id, { result: { ...stopped.result, agent }, ...(stopped.workflow !== (item as ToolItem).workflow ? { workflow: stopped.workflow } : {}) });
+    }
+    return marked;
   }
 
   // ── queue ──
@@ -583,6 +649,8 @@ export class SessionRuntime {
     this.turnStartedAt = Date.now();
     this.stopped = hold;
     this.carried = hold;
+    // A turn of the person's own is past the limit notice its background work met; one the agent begins by itself (a notification) is not.
+    if (!opts.keepHold) this.limitCard = undefined;
     this.setSuggestion(undefined);
     this.update({ status: 'running', lastError: undefined, activity, updatedAt: Date.now() });
     this.onTurnStart?.(this);
@@ -781,14 +849,17 @@ export class SessionRuntime {
     }
   }
 
-  settle(reason: 'cancelled' | 'error' = 'cancelled') {
+  settle(reason: 'cancelled' | 'error' = 'cancelled', opts: { endUnknown?: boolean } = {}) {
     const keep = this.apart.size ? this.subtree(this.apart) : undefined;
+    // `endUnknown`: read from disk after a restart, when these ended is not known (now is when the chat
+    // was opened, maybe long after): they get no end, so no time of theirs counts as work.
+    const end = opts.endUnknown ? {} : { endedAt: Date.now() };
     for (const item of this.items) {
       if (keep?.has(item.id)) continue;
       if ((item.type === 'text' || item.type === 'thinking') && item.streaming) {
-        this.patch(item.id, { streaming: false, ...(item.type === 'thinking' ? { endedAt: Date.now() } : {}) } as Partial<TimelineItem>);
+        this.patch(item.id, { streaming: false, ...(item.type === 'thinking' ? end : {}) } as Partial<TimelineItem>);
       } else if (item.type === 'tool' && (item.status === 'running' || item.status === 'pending' || item.status === 'awaiting')) {
-        this.patch(item.id, { status: reason, endedAt: Date.now() } as Partial<TimelineItem>);
+        this.patch(item.id, { status: reason, ...end } as Partial<TimelineItem>);
       }
     }
   }

@@ -1,5 +1,5 @@
 import type { TimelineItem } from '@shared/protocol';
-import { syntheticOf } from '@shared/synthetic';
+import { isStandIn, syntheticOf } from '@shared/synthetic';
 import { changedSince, type ItemsRevision } from '@/state/revision';
 import { isLeadIn } from './lead-in';
 
@@ -116,6 +116,33 @@ export interface TurnGroup {
   ids: string[];
   /** Checks of this turn by the other agent ("Check with Codex"), shown under it, oldest first. */
   checks?: string[];
+  /**
+   * The turn ended before the agent finished (`endedEarly`): no record of its end came, and its last
+   * act was work (a step, thinking, a task update) with nothing said after it. Only a settled turn.
+   */
+  early?: true;
+}
+
+/** What may stand after a turn's last act without saying anything: empty texts and notices. */
+const AFTER_LAST = new Set(['.', 'n']);
+/** Acts that leave something to say: a turn whose last act was one of these had more to do. */
+const UNFINISHED = new Set(['w', 'h', 'k']);
+
+/**
+ * Whether a settled turn ended before the agent finished, from what its provider wrote: no turn
+ * record closed it (Claude Code writes one for every turn it finishes, Codex one for every turn it
+ * ends, also an interrupted or failed one), it was not stopped and did not fail (those say so
+ * themselves), and its last act was work with nothing said after it (cut after a step, or while
+ * thinking). `closedBy`: what closed it, when not the next message or the end of the timeline.
+ */
+export function endedEarly(state: TurnState, end: string | null, lastChars: readonly string[], closedBy?: 'line'): boolean {
+  if (state !== 'done' || end || closedBy) return false;
+  for (let i = lastChars.length - 1; i >= 0; i--) {
+    const ch = lastChars[i];
+    if (AFTER_LAST.has(ch)) continue;
+    return UNFINISHED.has(ch);
+  }
+  return false;
 }
 
 export interface ItemGroup {
@@ -145,7 +172,8 @@ export function shapeOf(item: TimelineItem | undefined): string {
       return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : syn.role === 'output' ? 'c' : 'n';
     }
     case 'text':
-      if (!item.streaming && !item.text.trim()) return '.';
+      // Claude Code's stand-in where a cut turn has no answer ("No response requested."): nobody's words.
+      if (!item.streaming && (!item.text.trim() || isStandIn(item.text))) return '.';
       return isLeadIn(item.text, !!item.streaming) ? 'l' : 't';
     case 'thinking':
       return 'h';
@@ -521,7 +549,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
   const { groups, queued, checks } = g;
   let open: Open | null = null;
 
-  const close = (end: string | null, failedEnd: boolean, atEnd: boolean) => {
+  const close = (end: string | null, failedEnd: boolean, atEnd: boolean, closedBy?: 'line') => {
     if (!open) return;
     const o = open;
     open = null;
@@ -545,7 +573,8 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
       }
     }
     foldNotes(segments);
-    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids });
+    const early = endedEarly(state, end, o.segs[last].chars, closedBy);
+    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(early ? { early } : {}) });
   };
 
   const start = (id: string, steered: boolean, quiet = false) => {
@@ -595,7 +624,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
       continue;
     }
     if (ch === 'Z') {
-      close(null, false, false);
+      close(null, false, false, 'line');
       groups.push({ kind: 'item', key: id, id });
       continue;
     }
@@ -645,7 +674,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
   close(null, false, true);
 }
 
-const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' ? it.text.trim() : '');
+const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' && !isStandIn(it.text) ? it.text.trim() : '');
 
 /**
  * The words of what a turn can show as its answer (`ANSWER`): a text as written, a plan as its

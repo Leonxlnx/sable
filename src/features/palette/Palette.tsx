@@ -424,7 +424,8 @@ function HitEnd({ hit }: { hit: MessageHit }) {
 function SessionEnd({ session }: { session: SessionMeta }) {
   const now = useNow();
   const label = statusLabel(session);
-  if (session.status === 'running' || session.status === 'starting')
+  // Its sub-agents still work: working, as the sidebar says (the label names them).
+  if (session.status === 'running' || session.status === 'starting' || (session.status !== 'awaiting' && (session.background ?? 0) > 0))
     return (
       <span className="palette-status">
         <span className="truncate shimmer">{label}</span>

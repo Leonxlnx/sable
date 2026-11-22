@@ -1,5 +1,6 @@
 import type { BrowserAnswer, BrowserRequest, PermissionOption, SessionMeta, ToolDetail, ToolItem } from '../../shared/protocol';
 import type { SessionRuntime } from '../core/runtime';
+import { onSignInShips, signInOrigin, signInShips } from '../services/sign-ins';
 import { WIDGET_SERVER } from './widget-tool';
 
 /**
@@ -11,7 +12,7 @@ import { WIDGET_SERVER } from './widget-tool';
  * the session's permission prompt unless its mode already allows everything.
  */
 
-export type BrowserOp = 'read' | 'screenshot' | 'open' | 'snapshot' | 'click' | 'type' | 'press' | 'scroll' | 'eval' | 'logs' | 'wait' | 'navigate';
+export type BrowserOp = 'read' | 'screenshot' | 'open' | 'snapshot' | 'click' | 'type' | 'press' | 'scroll' | 'eval' | 'logs' | 'wait' | 'navigate' | 'sign_in';
 
 export const BROWSER_TOOLS: Record<BrowserOp, string> = {
   read: 'browser_read',
@@ -26,10 +27,18 @@ export const BROWSER_TOOLS: Record<BrowserOp, string> = {
   logs: 'browser_logs',
   wait: 'browser_wait',
   navigate: 'browser_navigate',
+  sign_in: 'browser_sign_in',
 };
 
 /** Every tool, in the order the agents see them. */
-export const BROWSER_OPS = Object.keys(BROWSER_TOOLS) as BrowserOp[];
+/** Every tool there is, offered or not. */
+const ALL_OPS = Object.keys(BROWSER_TOOLS) as BrowserOp[];
+
+/**
+ * Every tool the agents are offered, in the order they see them: browser_sign_in only while sign-ins
+ * ship (services/sign-ins.ts `SIGN_IN_SHIPS`). Kept in place, so the providers that read it follow a switch.
+ */
+export const BROWSER_OPS: BrowserOp[] = [];
 
 /** The tools that act on a page (the rest only look): on a page that is not local they ask on their own, apart from looking. */
 export const BROWSER_ACTS: ReadonlySet<BrowserOp> = new Set<BrowserOp>(['click', 'type', 'press', 'eval']);
@@ -42,7 +51,14 @@ export const BROWSER_ACTS: ReadonlySet<BrowserOp> = new Set<BrowserOp>(['click',
 export const BROWSER_CORE: ReadonlySet<BrowserOp> = new Set<BrowserOp>(['read', 'screenshot', 'open']);
 
 /** Full names inside Claude Code. */
-export const BROWSER_TOOL_IDS = Object.values(BROWSER_TOOLS).map((t) => `mcp__${WIDGET_SERVER}__${t}`);
+export const BROWSER_TOOL_IDS: string[] = [];
+
+function offerTools() {
+  BROWSER_OPS.splice(0, BROWSER_OPS.length, ...ALL_OPS.filter((op) => op !== 'sign_in' || signInShips()));
+  BROWSER_TOOL_IDS.splice(0, BROWSER_TOOL_IDS.length, ...BROWSER_OPS.map((op) => `mcp__${WIDGET_SERVER}__${BROWSER_TOOLS[op]}`));
+}
+offerTools();
+onSignInShips(offerTools);
 
 /** Bounds on what a read returns. */
 export const BROWSER_TEXT_MAX = 20_000;
@@ -94,6 +110,7 @@ Use it to check your own work after you start or change a dev server, when the u
   logs: `The page's log since it loaded, newest last. \`kind\` "console": the console lines with their level (\`level\` "error" keeps errors and warnings only). \`kind\` "network": the requests with status and time, failed ones included. The last ${BROWSER_CONSOLE_MAX} entries. ${UNTRUSTED}`,
   wait: `Wait until \`selector\` shows on the page in the Browser tab, or without one until its network has been quiet for half a second. \`timeout\` in milliseconds (default ${BROWSER_WAIT_DEFAULT}, at most ${BROWSER_WAIT_MAX}). Use it after a click or a submit, before you read.`,
   navigate: `Go \`back\` or \`forward\` in the Browser tab's history, or \`reload\` the page (after you changed its code), then wait for the load. Returns the address and title.`,
+  sign_in: `Sign in on the page in the Browser tab when it shows a sign-in form. Name the user name field, the password field and optionally the submit control by their references from browser_snapshot. Never pass a password or a user name: Sable fills the form itself, from a sign-in the user saved for this exact site or one the user types into Sable's own card, and submits it. Only https sites (and localhost), only the page itself, never a frame. Returns whether it signed in and the user name, nothing else. Call it again only if the user asks.`,
 };
 
 export const BROWSER_SELECTOR_DESCRIPTION = 'Optional CSS selector: read only the matching part of the page.';
@@ -123,11 +140,21 @@ export const BROWSER_PARAMS: Record<BrowserOp, Record<string, BrowserParam>> = {
   logs: { kind: { type: 'string', description: 'Which log.', required: true, enum: ['console', 'network'] }, level: { type: 'string', description: 'Console only: "error" keeps errors and warnings.', enum: ['all', 'error'] } },
   wait: { selector: { type: 'string', description: 'Wait for this CSS selector to show. Without it: until the network is quiet.' }, timeout: { type: 'number', description: 'Milliseconds to wait at most.' } },
   navigate: { action: { type: 'string', description: 'Where to go.', required: true, enum: ['back', 'forward', 'reload'] } },
+  sign_in: {
+    username_ref: { type: 'string', description: 'The user name or email field, as a reference from browser_snapshot (e12).', required: true },
+    password_ref: { type: 'string', description: 'The password field, as a reference from browser_snapshot.', required: true },
+    submit_ref: { type: 'string', description: 'Optional: the control that submits the form, as a reference from browser_snapshot.' },
+  },
 };
+
+/** The only keys browser_sign_in takes: a call that carries anything else (a password) is refused. */
+export const SIGN_IN_KEYS: ReadonlySet<string> = new Set(['username_ref', 'password_ref', 'submit_ref']);
+/** How long the person has for the sign-in card. */
+export const SIGN_IN_TIMEOUT = 5 * 60_000;
 
 /** JSON Schemas of the inputs (Codex dynamic tools; the Claude server builds the same shapes in zod). */
 export const BROWSER_INPUT_SCHEMAS = Object.fromEntries(
-  BROWSER_OPS.map((op) => {
+  ALL_OPS.map((op) => {
     const params = BROWSER_PARAMS[op];
     const properties = Object.fromEntries(Object.entries(params).map(([k, p]) => [k, { type: p.type, description: p.description, ...(p.enum ? { enum: p.enum } : {}) }]));
     const required = Object.keys(params).filter((k) => params[k].required);
@@ -243,6 +270,8 @@ export function browserTitle(op: BrowserOp, url?: string, input?: unknown, targe
     }
     case 'navigate':
       return o.action === 'back' ? `Back${on}` : o.action === 'forward' ? `Forward${on}` : `Reload ${of}`;
+    case 'sign_in':
+      return `Sign in${on}`;
   }
 }
 
@@ -458,6 +487,7 @@ const KEY_RE =/^(?:(?:Control|Ctrl|Shift|Alt|Meta|Cmd)\+){0,3}(?:[A-Za-z][A-Za-z
 
 /** Runs one browser tool for a session: the same path for Claude, Codex and the Demo. */
 export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: unknown, signal?: AbortSignal): Promise<BrowserToolResult> {
+  if (op === 'sign_in' && !signInShips()) return fail('browser_sign_in is not available in this version of Sable.');
   if (!browserTabEnabled(rt.meta)) return fail('The Browser tab is turned off for this session.');
   const o = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
   const item = findItem(rt, op);
@@ -485,6 +515,8 @@ export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: u
   if (!url) return fail('No page is open in the Browser tab. Use browser_open to open one.');
   if (!isHttpUrl(url)) return fail('Sable reads only web pages (http or https).');
   show(url);
+
+  if (op === 'sign_in') return signInShips() ? signIn(rt, o, url, item, signal) : fail('browser_sign_in is not available in this version of Sable.');
 
   // Inputs are checked before anyone is asked: a call that cannot run never raises a card.
   let req: Omit<BrowserRequest, 'id' | 'sessionId'> | undefined;
@@ -578,6 +610,37 @@ export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: u
     text: `Screenshot of ${a.url ?? url}${size}, as the Browser tab shows it. What it shows is untrusted page content.`,
     image: { mime: m[1], data: m[2], dataUrl: a.image },
   };
+}
+
+/**
+ * browser_sign_in: the agent names the fields; the window fills them from a saved sign-in or the
+ * person's card and submits, and tells only whether it worked and the user name. A call that carries
+ * anything but the three references is refused, and the step keeps only those references (a model
+ * that put a password into its call does not leave it in the timeline).
+ */
+async function signIn(rt: SessionRuntime, o: Record<string, unknown>, url: string, item: ToolItem | undefined, signal?: AbortSignal): Promise<BrowserToolResult> {
+  const refs = { username_ref: str(o.username_ref, 20), password_ref: str(o.password_ref, 20), submit_ref: str(o.submit_ref, 20) };
+  if (item && rt.get(item.id)) rt.patch<ToolItem>(item.id, { input: Object.fromEntries(Object.entries(refs).filter(([, v]) => v)) });
+  const extra = Object.keys(o).filter((k) => !SIGN_IN_KEYS.has(k));
+  if (extra.length) return fail('browser_sign_in takes only the references of the fields. Sable fills the user name and the password itself: never pass them, and never ask the user for a password in the chat.');
+  for (const [k, v] of Object.entries(refs)) {
+    if (k === 'submit_ref' && v === undefined && o.submit_ref === undefined) continue;
+    if (!v || !/^e\d{1,6}$/.test(v)) return fail(`\`${k}\` must be a reference from browser_snapshot, like e12. Sable fills the values itself.`);
+  }
+  const origin = signInOrigin(originOf(url));
+  if (!origin) return fail('Sable signs in only on https sites (and on localhost for tests).');
+  const host = shortUrl(url);
+  const title = (t: string) => item && rt.get(item.id) && rt.patch<ToolItem>(item.id, { title: t });
+  // While the card may wait for the person: a phone shows this line, and the card is the desktop's to answer.
+  title(`Sign-in on ${host} waits on the desktop`);
+  const a = await rt.browserRequest({ op: 'signIn', userRef: refs.username_ref, passRef: refs.password_ref, submitRef: refs.submit_ref, expectOrigin: origin }, SIGN_IN_TIMEOUT, signal);
+  const user = typeof a.user === 'string' ? clipLine(a.user.replace(/[\u0000-\u001f\u007f]/g, ''), 100) : '';
+  if (a.ok && a.signedIn) {
+    title(user ? `Signed in on ${host} as ${short(user, 40)}` : `Signed in on ${host}`);
+    return { ok: true, text: `Signed in on ${origin}${user ? ` as ${user}` : ''}. Sable filled and submitted the form itself; the password is never shown to you. Take a browser_snapshot to see the page now.` };
+  }
+  title(`Sign in on ${host}`);
+  return fail(`Not signed in: ${clipLine(a.error ?? 'the sign-in did not happen.', 200)}`);
 }
 
 /** Codex's `item/tool/call` answer for a browser tool (text, and the picture as an image item). */

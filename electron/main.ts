@@ -1,8 +1,9 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, screen, session, shell, webContents, type MenuItemConstructorOptions, type Rectangle, type WebContents } from 'electron';
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, safeStorage, screen, session, shell, webContents, type MenuItemConstructorOptions, type Rectangle, type WebContents } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import nodeModule from 'node:module';
 import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
+import { setSignInVault } from '../server/services/sign-ins';
 import { bootMark } from '../server/util/boot';
 import { fixPathFromLoginShell } from '../server/util/login-env';
 import { pageHeaders as csp } from './csp';
@@ -977,6 +978,13 @@ if (!app.requestSingleInstanceLock()) {
         .finally(() => app.quit());
     }
   };
+  // The Browser tab's saved sign-ins are encrypted for this computer and account (server/services/sign-ins.ts).
+  // Asked only once Electron is ready; on Linux only with a real secret store (never the plain-text fallback).
+  setSignInVault({
+    available: () => app.isReady() && safeStorage.isEncryptionAvailable() && (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text'),
+    encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
+    decrypt: (cipher) => safeStorage.decryptString(Buffer.from(cipher, 'base64')),
+  });
   const serve = () =>
     startServer({
       root: path.join(app.getAppPath(), 'dist'),

@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
-  query,
+  query as sdkQuery,
   listSessions,
   getSessionMessages,
   forkSession,
@@ -53,12 +53,12 @@ import type { TitlePrompt } from '../core/titles';
 import { dropRemote, holdRemote, type RemoteHolder } from '../core/remote-keep';
 import { claudeForkPoint, cutAt } from '../core/fork';
 import { killTree, runCli, spawnCli } from '../util/proc';
-import { baseName, describeTool, flattenContent, mapResult, mergeWorkflow, normalizeTodos, peekPartialInput, previewDiff, workflowStart } from './claude-tools';
+import { agentLimitOf, baseName, describeTool, flattenContent, mapResult, mergeWorkflow, normalizeTodos, peekPartialInput, previewDiff, workflowStart } from './claude-tools';
 import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoice } from './types';
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
-import { parseSynthetic, syntheticLine } from '../../shared/synthetic';
+import { isAuthFailure, isStandIn, parseSynthetic, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
@@ -66,9 +66,17 @@ import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
 import { claimStep } from '../core/sub-agent';
+import { authFailurePending, authGate, gateKey, noteAuthFailure, refusedForSignIn } from '../core/auth-gate';
 import { compactScope, WHERE, withScope } from '../core/permission-scope';
 
 type Obj = Record<string, any>;
+
+/**
+ * Every Claude Code process Sable starts goes through its account's gate (server/core/auth-gate.ts):
+ * starts of one config folder one at a time, and no process let go while it may be renewing the
+ * sign-in. The options' own stderr callback still gets what the process writes there.
+ */
+const query: typeof sdkQuery = (p) => sdkQuery({ ...p, options: { ...p.options, spawnClaudeCodeProcess: p.options?.spawnClaudeCodeProcess ?? authGate.spawner(p.options?.stderr) } });
 
 const IDLE_CLOSE_MS = 8 * 60_000;
 /** The live line of a turn whose messages wait for a stopped turn's result (`held`). */
@@ -271,11 +279,15 @@ export class ClaudeProvider implements Provider {
     // The same binary the SDK runs (SABLE_CLAUDE_BIN, set by the desktop shell), so the check does
     // not depend on what PATH the app was started with.
     const bin = claudeBinary() ?? 'claude';
-    const [ver, status, text] = await Promise.all([
+    // `auth status` may renew the sign-in: one at a time per account, never beside a start of it
+    // (server/core/auth-gate.ts); both end inside the gate's lease for it (`auxLeaseMs`, 20 s).
+    const [ver, [status, text]] = await Promise.all([
       runCli(bin, ['--version'], { timeoutMs: 12_000, env: this.env() }),
-      runCli(bin, ['auth', 'status', '--json'], { timeoutMs: 12_000, env: this.env() }),
-      // The CLI's own name for the plan ("Login method: Claude Max account"); JSON has only a raw id.
-      runCli(bin, ['auth', 'status', '--text'], { timeoutMs: 12_000, env: this.env() }),
+      authGate.run(gateKey('claude', this.configHome()), async () => {
+        const json = await runCli(bin, ['auth', 'status', '--json'], { timeoutMs: 12_000, env: this.env() });
+        // The CLI's own name for the plan ("Login method: Claude Max account"); JSON has only a raw id.
+        return [json, await runCli(bin, ['auth', 'status', '--text'], { timeoutMs: 6_000, env: this.env() })] as const;
+      }),
     ]);
     const info: ProviderInfo = { id: 'claude', name: this.name, installed: !ver.missing && ver.code === 0, auth: { loggedIn: false } };
     if (info.installed) info.version = ver.stdout.trim().split(/\s+/)[0];
@@ -699,7 +711,8 @@ export class ClaudeProvider implements Provider {
     // The usage endpoint refused lately (the CLI remembers that for up to an hour): asking again
     // only adds load. Turns keep the windows current through rate_limit_event meanwhile.
     if (minGapMs > 0 && Date.now() < this.limitsRefusedUntil) return Promise.resolve(this.limitsCache);
-    const run = this.readLimitsNow(q).finally(() => {
+    // An auxiliary request: never beside another one of this account, nor beside a start of it (auth-gate.ts).
+    const run = authGate.run(gateKey('claude', this.configHome()), () => this.readLimitsNow(q)).finally(() => {
       if (this.limitsRun === run) this.limitsRun = undefined;
     });
     this.limitsRun = run;
@@ -1510,17 +1523,34 @@ class ClaudeSession implements ProviderSession {
     }
   }
 
+  /**
+   * At a plan limit: every background task of this process is stopped for real, so nothing goes on
+   * on the account at its limit. False while a turn runs (that turn's end decides).
+   */
+  async stopBackgroundWork(): Promise<boolean> {
+    const q = this.q as (Query & { stopTask?: (taskId: string) => Promise<void> }) | undefined;
+    if (!q || this.rt.turnActive) return !q;
+    // Each task asked to stop first; then the process goes, and whatever it ran (also a task whose
+    // start never reached here) ends with it. The next message resumes the conversation in a new one.
+    if (typeof q.stopTask === 'function') await Promise.all([...this.liveTasks].map((task) => withTimeout(Promise.resolve(q.stopTask!(task)), 5_000, 'stopTask').catch(() => {})));
+    if (this.q === q) this.shutdown();
+    return true;
+  }
+
   private scheduleIdleClose() {
     clearTimeout(this.idleTimer);
     this.lastActive = Date.now();
     // Remote Control lives in this process: the keeper (server/core/remote-keep.ts) decides when it closes.
     if (this.q && this.rt.meta.options?.remoteControl) holdRemote(this.remoteHolder);
+    const due = Date.now() + IDLE_CLOSE_MS;
     this.idleTimer = setTimeout(() => {
       if (this.rt.turnActive || this.rt.meta.options?.remoteControl) return;
       // Background agents and shells live in this process too, and wake the agent when they end:
       // it stays while any runs, and the idle clock starts again once the last one is done.
       if (this.liveTasks.size) return this.scheduleIdleClose();
-      this.shutdown();
+      // After a sleep every chat's close falls due at once, while each process renews its sign-in:
+      // spread out (server/core/auth-gate.ts), and only when the chat is still idle then.
+      authGate.afterWake(() => !this.rt.turnActive && !this.liveTasks.size && this.shutdown(), due);
     }, IDLE_CLOSE_MS);
   }
 
@@ -2124,7 +2154,16 @@ class ClaudeSession implements ProviderSession {
     }
     const streamed = msg.id && this.streamedMessages.has(msg.id);
     // Refused at a plan limit: the CLI's own words ("usage limit reached…") become the limit notice, not a reply.
-    const atLimit = m.error === 'rate_limit' && !parentId;
+    // The turn's own request: its notice. A sub-agent's, or anything outside a turn (background agents
+    // working on after the turn ended): no notice of its own; the step stops at the limit and the
+    // bridge says it once for the chat (`SessionRuntime.limitInBackground`).
+    const refusedAtLimit = m.error === 'rate_limit';
+    const atLimit = refusedAtLimit && !parentId && rt.turnActive;
+    // Claude Code's own words for a request that failed (an API error, a refusal at a limit): said by
+    // the notice below, never as the agent's answer. Its stand-in "No response requested." (written
+    // when a cut conversation is taken up again, and as a refused request's words) is nobody's words.
+    const standIn = synthetic && texts.length > 0 && texts.every(isStandIn);
+    const failedWords = (!!m.error || texts.some(isAuthFailure)) && synthetic;
     if (synthetic) for (const t of texts) this.syntheticTexts.add(t);
     for (const b of (msg.content as Obj[] | undefined) ?? []) {
       if (b.type === 'tool_use' || b.type === 'server_tool_use') {
@@ -2133,21 +2172,43 @@ class ClaudeSession implements ProviderSession {
           rt.add<ToolItem>({ id: b.id, type: 'tool', name: b.name, ...view, status: 'pending', parentId });
         }
         this.toolReady(b.id, b.name, b.input ?? {});
-      } else if (!streamed && !atLimit && b.type === 'text' && b.text) {
+      } else if (!streamed && !refusedAtLimit && !standIn && !failedWords && b.type === 'text' && b.text) {
         rt.add<TextItem>({ type: 'text', text: b.text, streaming: false, parentId });
       } else if (!streamed && b.type === 'thinking' && b.thinking) {
         rt.add<ThinkingItem>({ type: 'thinking', text: b.thinking, streaming: false, endedAt: Date.now(), parentId });
       }
     }
-    if (atLimit) {
+    if (refusedAtLimit && !atLimit) {
+      const said = texts.join(' ');
+      const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(said)?.[1]));
+      const named = agentLimitOf(said);
+      const words = said.replace(/\|\d{9,13}\b/, '').trim();
+      rt.limitInBackground({
+        stepId: parentId,
+        window: this.limitHit?.window ?? named?.window,
+        resetsAt: this.limitHit?.resetsAt ?? stamp ?? named?.resetsAt,
+        ...(words && !isStandIn(words) ? { detail: words } : {}),
+      });
+    } else if (atLimit) {
+      // One notice for the chat: one written while its background work met the limit is this turn's too.
+      if (!this.limitNoticeId && rt.limitCard && rt.get(rt.limitCard)) this.limitNoticeId = rt.limitCard;
       if (!this.limitNoticeId) {
         const said = texts.join(' ');
         // Older CLIs say "Claude AI usage limit reached|<reset time in epoch seconds>".
         const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(said)?.[1]));
-        const detail = said.replace(/\|\d{9,13}\b/, '').trim() || undefined;
+        const words = said.replace(/\|\d{9,13}\b/, '').trim();
+        const detail = words && !isStandIn(words) ? words : undefined;
         this.limitNoticeId = rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: errorLabel(m.error), detail, limit: { resetsAt: this.limitHit?.resetsAt ?? stamp, window: this.limitHit?.window } }).id;
       }
-    } else if (m.error) rt.notice('error', errorLabel(m.error));
+    } else if (refusedForSignIn(m.error, synthetic ? texts : [])) {
+      // Refused for the sign-in (its words are Claude Code's, never an answer): no red box per request.
+      // When the turn ends the bridge asks the CLI whether the account is signed in, sends once more
+      // when it is, and says it once for the chat when it is not (server/core/auth-gate.ts).
+      noteAuthFailure(rt.id, parentId ? rt.get<ToolItem>(parentId)?.title : undefined);
+    } else if (m.error) {
+      const words = failedWords ? texts.join('\n').trim() : '';
+      rt.notice('error', errorLabel(m.error), words && !isStandIn(words) && words !== errorLabel(m.error) ? words : undefined);
+    }
     // Local command output carries zero usage: it says nothing about the context size.
     if (!parentId && !synthetic) {
       const u = msg.usage as Obj | undefined;
@@ -2416,6 +2477,32 @@ class ClaudeSession implements ProviderSession {
         (typeof m.result === 'string' && m.result ? m.result : undefined) ??
         resultLabel(m.subtype);
     }
+    // Refused for the sign-in: the bridge says it once for the chat (or sends once more), never the CLI's words on the turn's line.
+    const signIn = !!error && (refusedForSignIn(undefined, [error]) || authFailurePending(rt.id));
+    if (signIn && error) noteAuthFailure(rt.id);
+    // Cut off at a plan limit while it worked ("You've hit your 5-hour limit · resets 6pm (Europe/Berlin)",
+    // a 429): a limit like one met at the start, said by the chat's one limit notice (the bridge moves
+    // it at the turn's end), never as "The turn ended with an error" with "Try again".
+    const cutAtLimit = !!error && !signIn && (m.error === 'rate_limit' || Number(m.api_error_status) === 429 || !!agentLimitOf(error) || /usage limit reached/i.test(error));
+    if (cutAtLimit && error) {
+      if (!this.limitNoticeId && rt.limitCard && rt.get(rt.limitCard)) this.limitNoticeId = rt.limitCard;
+      if (!this.limitNoticeId) {
+        const named = agentLimitOf(error);
+        const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(error)?.[1]));
+        this.limitNoticeId = rt.add<NoticeItem>({
+          type: 'notice',
+          variant: 'error',
+          text: errorLabel('rate_limit'),
+          detail: error.replace(/\|\d{9,13}\b/, '').trim() || undefined,
+          limit: { resetsAt: this.limitHit?.resetsAt ?? stamp ?? named?.resetsAt, window: this.limitHit?.window ?? named?.window },
+        }).id;
+      } else {
+        // The notice learns the reset from the words when no event gave it.
+        const n = rt.get<NoticeItem>(this.limitNoticeId);
+        const named = agentLimitOf(error);
+        if (n?.limit && named && (!n.limit.resetsAt || !n.limit.window)) rt.patch<NoticeItem>(n.id, { limit: { ...n.limit, resetsAt: n.limit.resetsAt ?? named.resetsAt, window: n.limit.window ?? named.window } });
+      }
+    }
     // What the messages this result answers came to, whatever the turn does next, and the result's
     // line in the timeline that closes their answer.
     const resultId = wasInterrupted ? undefined : randomUUID();
@@ -2429,7 +2516,7 @@ class ClaudeSession implements ProviderSession {
         inputTokens: Number(m.usage?.input_tokens ?? 0) + Number(m.usage?.cache_read_input_tokens ?? 0) + Number(m.usage?.cache_creation_input_tokens ?? 0),
         outputTokens: Number(m.usage?.output_tokens ?? 0),
         stopReason: m.stop_reason ?? undefined,
-        error,
+        error: signIn || cutAtLimit ? undefined : error,
       });
     }
     // Fresh plan limits after every turn (shared with any read in the last few seconds).
@@ -2569,8 +2656,13 @@ class ClaudeSession implements ProviderSession {
         }
         if (item?.kind !== 'agent' || !item.result) break;
         const agent = { ...item.result.agent, ...taskFigures(m.usage) };
+        const wasRunning = agent.background === 'running';
         if (agent.background) agent.background = m.status === 'completed' ? 'done' : m.status === 'failed' ? 'failed' : 'stopped';
+        // Ended by a plan limit: stopped at the limit, said once by the chat (never a notice of its own).
+        const limit = m.status !== 'completed' && !agent.limit ? agentLimitOf(String(m.summary ?? '')) : undefined;
+        if (limit) agent.limit = limit;
         rt.patch<ToolItem>(item.id, { result: { ...item.result, agent } });
+        if (limit && wasRunning) rt.limitInBackground({ stepId: item.id, window: this.limitHit?.window ?? limit.window, resetsAt: this.limitHit?.resetsAt ?? limit.resetsAt });
         break;
       }
       case 'commands_changed':
@@ -2617,6 +2709,7 @@ class ClaudeSession implements ProviderSession {
     const messages = (await this.provider.withHistory(() => getSessionMessages(id, { dir: rt.meta.cwd }))) as Obj[];
     const items: TimelineItem[] = [];
     const tools = new Map<string, ToolItem>();
+    const unstamped = new Set<string>();
     // Stored messages may carry no timestamps: then keep the order but invent no durations.
     const firstStamp = messages.map((m) => Date.parse(String(m.timestamp ?? ''))).find(Number.isFinite);
     const stamped = firstStamp !== undefined;
@@ -2639,6 +2732,8 @@ class ClaudeSession implements ProviderSession {
       if (m.type === 'assistant' && Array.isArray(content)) {
         if (!parentId) this.chain.push(m.uuid);
         for (const b of content as Obj[]) {
+          // Claude Code's stand-in where a cut turn has no answer: nobody's words.
+          if (b.type === 'text' && b.text && msg.model === '<synthetic>' && (isStandIn(String(b.text)) || isAuthFailure(String(b.text)))) continue;
           if (b.type === 'text' && b.text) push({ type: 'text', text: b.text, streaming: false, parentId });
           else if (b.type === 'thinking' && b.thinking) push({ type: 'thinking', text: b.thinking, streaming: false, endedAt: real, parentId });
           else if (b.type === 'tool_use') {
@@ -2653,6 +2748,8 @@ class ClaudeSession implements ProviderSession {
             if (b.name === 'Edit' || b.name === 'Write') t.result = { diff: previewDiff(b.name, input) };
             if (b.name === 'Workflow') t.workflow = { ...workflowStart(input), status: 'done' };
             tools.set(b.id, t);
+            // A call whose own message carries no time took its place from the item before it: its start is not known.
+            if (!real) unstamped.add(b.id);
           }
         }
       } else if (m.type === 'user') {
@@ -2671,7 +2768,8 @@ class ClaudeSession implements ProviderSession {
             const result = mapResult(t.name, (t.input as Obj) ?? {}, undefined, b.content, !!b.is_error);
             t.result = { ...t.result, ...result, diff: result.diff ?? t.result?.diff };
             t.status = !b.is_error ? 'done' : isDenial(flattenContent(b.content).text) ? 'denied' : 'error';
-            if (real) t.endedAt = real;
+            // A step's time runs from its own start to its result: with either not known it shows none.
+            if (real && !unstamped.has(t.id)) t.endedAt = real;
           }
           if (text && isHumanText(text) && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) {
             firstPrompt ??= text;

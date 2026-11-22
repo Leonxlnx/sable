@@ -6,6 +6,8 @@
  * remote status says it reconnects, and the next message starts it again (with a new link).
  */
 
+import { authGate } from './auth-gate';
+
 /** The numbers: how many idle Remote Control processes stay, and how long after a chat's last use. */
 export const REMOTE_KEEP = { max: 6, idleMs: 45 * 60_000 };
 
@@ -44,11 +46,14 @@ export function dropRemote(h: RemoteHolder) {
 export function enforceRemote(now = Date.now(), keep = REMOTE_KEEP) {
   for (const h of remoteToRelease([...holders], now, keep)) {
     holders.delete(h);
-    try {
-      h.release();
-    } catch {
-      /* already gone */
-    }
+    // After a sleep every idle one is due at once, while each renews its sign-in: spread out (auth-gate.ts).
+    authGate.afterWake(() => {
+      try {
+        h.release();
+      } catch {
+        /* already gone */
+      }
+    });
   }
   schedule(now, keep);
 }
@@ -61,7 +66,8 @@ function schedule(now = Date.now(), keep = REMOTE_KEEP) {
   // Busy chats are looked at again later (their turn ends through scheduleIdleClose, which holds again).
   if (!Number.isFinite(next) && holders.size) next = now + keep.idleMs;
   if (!Number.isFinite(next)) return;
-  timer = setTimeout(() => enforceRemote(Date.now(), keep), Math.max(1000, next - now + 50));
+  const wait = Math.max(1000, next - now + 50);
+  timer = setTimeout(() => (authGate.noteTimer(now + wait), enforceRemote(Date.now(), keep)), wait);
   timer.unref?.();
 }
 

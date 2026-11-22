@@ -56,7 +56,7 @@ export function showKind(it: TimelineItem | undefined): ShowKind | null {
  * chats at work and the moment a chat is done.
  */
 export const worksNow = (s: Pick<SessionMeta, 'status' | 'background'>): boolean =>
-  s.status === 'running' || s.status === 'starting' || (s.status !== 'awaiting' && s.status !== 'error' && (s.background ?? 0) > 0);
+  s.status === 'running' || s.status === 'starting' || (s.status !== 'awaiting' && (s.background ?? 0) > 0);
 
 /** The chat's turn can be stopped (`session.interrupt`): it runs, starts, or waits on a prompt. */
 export const canStop = (status: SessionMeta['status'] | undefined): boolean => status === 'running' || status === 'starting' || status === 'awaiting';

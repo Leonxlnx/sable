@@ -97,6 +97,8 @@ export interface LimitHit {
   continuedWith?: string;
   /** It carried on with the same account once the window reset ("Continue at reset", `SpareWait`). */
   atReset?: boolean;
+  /** The bridge moves the chat to `next` by itself now (continue at a limit): no button for it meanwhile. */
+  moving?: boolean;
 }
 
 /** Reasoning effort, lowest first. `ultra` is Codex's level above `max` (the model may delegate to sub-agents). */
@@ -273,7 +275,11 @@ export interface BrowserRequest {
   id: string;
   sessionId: string;
   /** state: address and title only; read: the page's text and logs; screenshot: a picture; open: load `url` and wait. */
-  op: 'state' | 'read' | 'screenshot' | 'open' | 'snapshot' | 'click' | 'type' | 'press' | 'scroll' | 'eval' | 'logs' | 'wait' | 'navigate';
+  op: 'state' | 'read' | 'screenshot' | 'open' | 'snapshot' | 'click' | 'type' | 'press' | 'scroll' | 'eval' | 'logs' | 'wait' | 'navigate' | 'signIn';
+  /** signIn: the fields by their snapshot references (never a value: the person or the saved sign-in fills them). */
+  userRef?: string;
+  passRef?: string;
+  submitRef?: string;
   url?: string;
   /** open: in a new tab rather than the one in front. Every other op works on the tab in front. */
   newTab?: boolean;
@@ -362,6 +368,19 @@ export interface BrowserAnswer {
   /** logs. */
   lines?: BrowserConsoleLine[];
   requests?: BrowserNetRequest[];
+  /** signIn: whether the page was signed in, and as whom (the user name only, never the password). */
+  signedIn?: boolean;
+  user?: string;
+}
+
+/** A saved sign-in as the windows see it: never the password (`server/services/sign-ins.ts`). */
+export interface SignInInfo {
+  id: string;
+  /** Scheme, host and port exactly as the browser has them. */
+  origin: string;
+  username: string;
+  createdAt: number;
+  usedAt?: number;
 }
 
 /** State of an optional capability the user may need to act on. */
@@ -407,6 +426,8 @@ export interface SessionMeta {
   speed?: string;
   /** The limit handover moved this session here from this account (its preferred one). */
   movedFrom?: string;
+  /** When `movedFrom` is expected to take work again (the reset of the window that moved the chat): the chat returns then, at rest or before the next message (`App.returnAfterLimit`). */
+  returnAt?: number;
   /** A chat started without a folder: it runs in a fresh folder Sable made for it under the chats folder (`AppSettings.chatsFolder`). */
   chat?: boolean;
   /** Claude Code ultracode is on for this session (see `Capabilities.features.ultracode`). */
@@ -1016,6 +1037,21 @@ export interface NoticeItem extends BaseItem {
   until?: UntilMark;
   /** The chat switched agents here (shown as one line with "Switch back" while it is the latest switch). */
   agentSwitch?: AgentSwitchMark;
+  /** A request was refused for the sign-in (server/core/auth-gate.ts; shown by `features/accounts`' AuthNotice). */
+  auth?: AuthHit;
+}
+
+/**
+ * A chat's request was refused for the sign-in and the agent's CLI, asked again, says the account is
+ * signed out: one notice per chat, with "Sign in". It goes once the account is signed in again and
+ * the chat carried on (a refusal while the CLI still says signed in is retried once and shows nothing).
+ */
+export interface AuthHit {
+  state: 'signedOut';
+  provider?: ProviderId;
+  accountId?: string;
+  /** The account's name when the agent has several ("Ultra1"). */
+  label?: string;
 }
 
 /** Closes a turn: duration, cost, token counts. */
@@ -2378,7 +2414,8 @@ export interface RpcMethods {
     };
     result: SessionSnapshot;
   };
-  'session.snapshot': { params: { sessionId: string }; result: SessionSnapshot };
+  /** `peek`: fetched ahead of an open (the pointer resting on its row), so the chat stays unread. */
+  'session.snapshot': { params: { sessionId: string; peek?: boolean }; result: SessionSnapshot };
   /** One item whole, as the bridge holds it (a step a window got cut, `ToolItem.more`). */
   'session.item': { params: { sessionId: string; itemId: string }; result: { item: TimelineItem } };
   /**
@@ -2500,6 +2537,17 @@ export interface RpcMethods {
   'browser.respond': { params: { sessionId: string; requestId: string; answer: BrowserAnswer }; result: { ok: boolean } };
   /** What the session's Browser tab shows now (null: nothing, or the tab is closed), for the line the agent gets with the next message. */
   'browser.page': { params: { sessionId: string; page: { url: string; title: string } | null }; result: { ok: boolean } };
+  /**
+   * Sign-ins for the Browser tab (`server/services/sign-ins.ts`), desktop windows only (never on the
+   * phone's allowlist). `canSave`: this computer can encrypt them (Electron's safeStorage); without it
+   * nothing is saved. `reveal` answers the asking window alone, for an exact origin.
+   */
+  'signIn.state': { params: Record<string, never>; result: { canSave: boolean } };
+  'signIn.list': { params: { origin?: string }; result: SignInInfo[] };
+  'signIn.reveal': { params: { id: string; origin: string }; result: { password: string } };
+  'signIn.save': { params: { origin: string; username: string; password: string }; result: { ok: boolean; saved: boolean } };
+  'signIn.used': { params: { id: string }; result: { ok: boolean } };
+  'signIn.remove': { params: { id: string }; result: { ok: boolean } };
 
   /** Before / after pictures of a local page for the session's turns that edited it, oldest first (`capture.updated` follows changes). */
   'capture.list': { params: { sessionId: string }; result: TurnCapture[] };

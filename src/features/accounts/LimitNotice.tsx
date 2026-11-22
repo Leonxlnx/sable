@@ -39,19 +39,24 @@ export function resetLine(resetsAt: number | undefined, now: number): string | u
  * conversation, the same message). Mounted by the timeline's Notice for notices with `limit`.
  */
 export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item: NoticeItem; sessionId?: string }) {
-  const limit = item.limit!;
+  const fallbackSession = useStore((s) => s.ui.activeSessionId);
+  const sid = sessionId ?? fallbackSession;
+  // Until the bridge has said which account refused it (it does as it decides), it is the chat's own.
+  const ownProvider = useStore((s) => (sid && !item.limit?.provider ? s.sessions[sid]?.provider : undefined));
+  const ownAccount = useStore((s) => (sid && !item.limit?.provider ? s.sessions[sid]?.accountId : undefined));
+  const limit = ownProvider ? { ...item.limit!, provider: ownProvider, accountId: ownAccount } : item.limit!;
   const now = useNow();
   const provider = limit.provider;
   const accounts = useStore((s) => (provider ? s.providers[provider]?.accounts : undefined));
-  const fallbackSession = useStore((s) => s.ui.activeSessionId);
-  const sid = sessionId ?? fallbackSession;
   const busy = useStore((s) => (sid ? s.sessions[sid]?.status === 'running' || s.sessions[sid]?.status === 'starting' : false));
   const [moving, setMoving] = useState(false);
 
   const self = accounts?.find((a) => a.id === (limit.accountId ?? DEFAULT_ACCOUNT));
   const next = limit.next ? accounts?.find((a) => a.id === limit.next && a.auth.loggedIn) : undefined;
   const nextLevel = useLimitLevel(provider, next?.id);
-  const offer = next && nextLevel !== 'cap' ? next : undefined;
+  // Moving there by itself (continue at a limit): no button for what happens anyway.
+  const offer = next && nextLevel !== 'cap' && !limit.moving ? next : undefined;
+  const auto = limit.moving && !limit.continuedWith && next ? next : undefined;
   const went = limit.continuedWith ? accounts?.find((a) => a.id === limit.continuedWith) : undefined;
 
   const who = accounts && accounts.length > 1 && self ? accountName(self) : provider ? PROVIDER_NAME[provider] : 'This account';
@@ -60,7 +65,7 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
   // Spare: with no other account to go on with, the chat can wait for this window's reset and carry on then.
   const waiting = useStore((s) => (sid ? !!s.sessions[sid]?.spare : false));
   const [pinning, setPinning] = useState(false);
-  const canWait = !offer && !limit.continuedWith && !!sid && !waiting && !!limit.resetsAt && limit.resetsAt > now;
+  const canWait = !offer && !auto && !limit.continuedWith && !!sid && !waiting && !!limit.resetsAt && limit.resetsAt > now;
   const waitButton = canWait && (
     <button
       type="button"
@@ -164,6 +169,11 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
         <span className="lim-went">
           <Icon name="check" size={13} />
           Limit reset
+        </span>
+      ) : auto ? (
+        <span className="lim-went">
+          <Spinner size={12} />
+          Continuing with {accountName(auto)}
         </span>
       ) : canReset && n > 0 ? (
         <span className="lim-ask">

@@ -205,8 +205,10 @@ describe('wave 9 #22: a chat whose sub-agents still work is working', () => {
     expect(rules.worksNow({ status: 'idle', background: 1 })).toBe(true);
     expect(rules.worksNow({ status: 'idle', background: 0 })).toBe(false);
     expect(rules.worksNow({ status: 'idle' })).toBe(false);
-    // Waiting on you, or stopped with an error, reads as that, whatever still runs behind it.
+    // Waiting on you reads as that, whatever still runs behind it. A turn that ended with an error
+    // while its sub-agents work on is still a chat at work (day 5: "show you are working when SUBAGENTS are").
     expect(rules.worksNow({ status: 'awaiting', background: 1 })).toBe(false);
-    expect(rules.worksNow({ status: 'error', background: 1 })).toBe(false);
+    expect(rules.worksNow({ status: 'error', background: 1 })).toBe(true);
+    expect(rules.worksNow({ status: 'error', background: 0 })).toBe(false);
   });
 });

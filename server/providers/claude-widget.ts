@@ -100,6 +100,7 @@ export function widgetServer(
       logs: 'Console and requests of the Browser tab',
       wait: 'Wait for the Browser tab',
       navigate: 'Back, forward or reload in the Browser tab',
+      sign_in: 'Sign in on the page in the Browser tab',
     };
     const LOOKS = new Set<BrowserOp>(['read', 'screenshot', 'snapshot', 'logs', 'wait', 'scroll']);
     for (const op of BROWSER_OPS) {

@@ -284,10 +284,11 @@ describe('the note and the summary go only with a message the agent took (review
     const again = second.app.runtime(rt.id);
     expect(again.meta.moveNote?.summary).toBeDefined();
     ctl.sent.length = 0;
-    await second.app.call('session.send', { sessionId: rt.id, text: 'two' });
+    // The Demo picks its scenario from the person's words alone (the summary before them is Sable's): a greeting is quick.
+    await second.app.call('session.send', { sessionId: rt.id, text: 'hi two' });
     await until(() => ctl.sent.length === 1, 'the next message');
     expect(ctl.sent[0].home).toBe(work.dir);
-    expect(ctl.sent[0].text).toMatch(/User: hi[\s\S]*---\n\ntwo\n\n<system-reminder>\nThis conversation moved/);
+    expect(ctl.sent[0].text).toMatch(/User: hi[\s\S]*---\n\nhi two\n\n<system-reminder>\nThis conversation moved/);
     await until(() => again.meta.status === 'idle', 'idle');
     expect(again.meta.moveNote).toBeNull();
   });

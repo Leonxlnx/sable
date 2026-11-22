@@ -5,7 +5,7 @@ import { Collapse } from '@/components/Collapse';
 import { Icon } from '@/icons';
 import { plural } from '@/lib/format';
 import { reducedMotion } from '@/lib/motion';
-import { showRailTab } from '@/state/actions';
+import { sendMessage, showRailTab } from '@/state/actions';
 import { useStore, type Store } from '@/state/store';
 import { useFresh, useItem, useTimeline } from './ctx';
 import { foldKey, setFold, useFold } from './fold';
@@ -393,11 +393,49 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
           onToggle={toggle}
         />
       ))}
+      {turn.early && <EndedEarly turn={turn} />}
       <TurnFoot turn={turn} />
       {turn.checks?.map((id) => (
         <ItemRow key={id} id={id} />
       ))}
     </section>
+  );
+});
+
+/**
+ * A turn that ended before the agent finished (`TurnGroup.early`: cut after a step, the process
+ * gone, a conversation taken up again): one quiet line in the turn's own style, so it never reads as
+ * a finished turn, and while it is the conversation's last and nothing runs, one way to carry on.
+ */
+const EndedEarly = memo(function EndedEarly({ turn }: { turn: TurnGroup }) {
+  const { sessionId } = useTimeline();
+  const last = turn.ids[turn.ids.length - 1];
+  const canContinue = useStore((s) => {
+    const roots = s.data[sessionId]?.roots;
+    const status = s.sessions[sessionId]?.status;
+    return !!roots && roots[roots.length - 1] === last && status !== 'running' && status !== 'awaiting' && status !== 'starting';
+  });
+  const [sent, setSent] = useState(false);
+  const carryOn = () => {
+    if (sent) return;
+    setSent(true);
+    void sendMessage(sessionId, 'Continue').then((r) => !r.ok && setSent(false));
+  };
+  return (
+    <div className="tl-item turn" data-state="early">
+      <div className="turn-line">
+        <span className="turn-note">
+          <Icon name="circle-dashed" size={12} />
+          Ended early
+        </span>
+        {canContinue && (
+          <button type="button" className="btn btn-sm" onClick={carryOn} disabled={sent}>
+            <Icon name="play" size={13} />
+            Continue
+          </button>
+        )}
+      </div>
+    </div>
   );
 });
 

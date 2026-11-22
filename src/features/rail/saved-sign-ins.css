@@ -1,0 +1,35 @@
+/* Settings › Permissions: saved sign-ins (SavedSignIns.tsx). */
+.si-list {
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+}
+
+.si-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 0 8px 0 16px;
+  font-size: var(--t-ui);
+}
+
+.si-row + .si-row {
+  border-top: 1px solid var(--line);
+}
+
+.si-site {
+  flex: 1 1 50%;
+  min-width: 0;
+  color: var(--text);
+}
+
+.si-scheme {
+  color: var(--text-3);
+}
+
+.si-user {
+  flex: 1 1 40%;
+  min-width: 0;
+  color: var(--text-2);
+}

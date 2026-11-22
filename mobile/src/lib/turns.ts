@@ -1,5 +1,5 @@
 import type { TimelineItem } from '@shared/protocol';
-import { syntheticOf } from '@shared/synthetic';
+import { isStandIn, syntheticOf } from '@shared/synthetic';
 import { isLeadIn } from '@desk/features/timeline/lead-in';
 
 /**
@@ -82,6 +82,27 @@ export interface TurnGroup {
   ids: string[];
   /** Checks of this turn by the other agent, oldest first. */
   checks?: string[];
+  /** Ended before the agent finished (`endedEarly`), as the desktop reads it. Only a settled turn. */
+  early?: true;
+}
+
+const AFTER_LAST = new Set(['.', 'n']);
+const UNFINISHED = new Set(['w', 'h', 'k']);
+
+/**
+ * Whether a settled turn ended before the agent finished, by the desktop's rule
+ * (src/features/timeline/turns.ts `endedEarly`): no turn record closed it, it was not stopped and
+ * did not fail, and its last act was work with nothing said after it. `closedBy`: what closed it,
+ * when not the next message or the end of the timeline.
+ */
+export function endedEarly(state: TurnState, end: string | null, lastChars: readonly string[], closedBy?: 'line'): boolean {
+  if (state !== 'done' || end || closedBy) return false;
+  for (let i = lastChars.length - 1; i >= 0; i--) {
+    const ch = lastChars[i];
+    if (AFTER_LAST.has(ch)) continue;
+    return UNFINISHED.has(ch);
+  }
+  return false;
 }
 
 export interface ItemGroup {
@@ -111,7 +132,8 @@ function shapeRaw(item: TimelineItem): string {
       return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : syn.role === 'output' ? 'c' : 'n';
     }
     case 'text':
-      if (!item.streaming && !item.text.trim()) return '.';
+      // Claude Code's stand-in where a cut turn has no answer ("No response requested."): nobody's words.
+      if (!item.streaming && (!item.text.trim() || isStandIn(item.text))) return '.';
       return isLeadIn(item.text, !!item.streaming) ? 'l' : 't';
     case 'thinking':
       return 'h';
@@ -420,7 +442,7 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
   const checks: { id: string; at: number }[] = [];
   let open: Open | null = null;
 
-  const close = (end: string | null, failedEnd: boolean, atEnd: boolean) => {
+  const close = (end: string | null, failedEnd: boolean, atEnd: boolean, closedBy?: 'line') => {
     if (!open) return;
     const o: Open = open;
     open = null;
@@ -444,7 +466,8 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
       }
     }
     foldNotes(segments);
-    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids });
+    const early = endedEarly(state, end, o.segs[last].chars, closedBy);
+    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(early ? { early } : {}) });
   };
 
   const start = (id: string, steered: boolean, quiet = false) => {
@@ -489,7 +512,7 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
       continue;
     }
     if (ch === 'Z') {
-      close(null, false, false);
+      close(null, false, false, 'line');
       groups.push({ kind: 'item', key: id, id });
       continue;
     }

@@ -20,6 +20,10 @@ type Snap = { rows: Map<string, { el: HTMLElement; top: number; left: number; wi
 
 const MOVE = spring(440, 40);
 const MOST = 6;
+/** The glide each row is on (cancelled when the next change catches it moving). */
+const gliding = new WeakMap<HTMLElement, Animation>();
+/** Above this many rows the list changes without the motion (see getSnapshotBeforeUpdate). */
+const LONG = 40;
 
 export class LeaveList extends Component<Props> {
   private el: HTMLDivElement | null = null;
@@ -35,8 +39,12 @@ export class LeaveList extends Component<Props> {
     if (prev.order === this.props.order || !this.el || reducedMotion()) return null;
     // A pane that is not the one on screen has nothing to show.
     if (!this.el.closest('.rail-pane[data-active]')) return null;
+    // A long list (137 sub-agents, one finishing every few hundred ms) simply changes: measuring
+    // every row before and after each change forced two layouts of the window per change (perf1).
+    const items = this.items();
+    if (items.length > LONG) return null;
     const rows: NonNullable<Snap>['rows'] = new Map();
-    for (const el of this.items()) {
+    for (const el of items) {
       const r = el.getBoundingClientRect();
       rows.set(el.dataset.flip!, { el, top: r.top, left: r.left, width: r.width });
     }
@@ -59,7 +67,8 @@ export class LeaveList extends Component<Props> {
     for (const el of now) {
       const was = snap.rows.get(el.dataset.flip!);
       if (!was) continue;
-      for (const a of el.getAnimations()) if (a.id === 'leave') a.cancel();
+      // Its own glide, kept here: `getAnimations()` flushed the window's style once per row.
+      gliding.get(el)?.cancel();
       moves.push([el, was.top]);
     }
     const tops = moves.map(([el]) => el.getBoundingClientRect().top);
@@ -89,7 +98,7 @@ export class LeaveList extends Component<Props> {
       if (Math.abs(dy) < 0.5) return;
       // The others wait a beat, so the dissolve is seen before the gap closes.
       const a = play(el, [{ transform: `translateY(${dy}px)` }, { transform: 'translateY(0)' }], { duration: MOVE.duration, easing: MOVE.easing, delay: gone.length ? 70 : 0, fill: 'backwards' });
-      if (a) a.id = 'leave';
+      if (a) gliding.set(el, a);
     });
   }
 

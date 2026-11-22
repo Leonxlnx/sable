@@ -6,7 +6,7 @@ import { fieldBeat } from '@/art/events';
 import { SpareClock, spareLine } from '@/features/composer/SpareStrip';
 import { Icon, type IconName } from '@/icons';
 import { timeAgo } from '@/lib/format';
-import { interrupt, openSession, renameSession, updateSession } from '@/state/actions';
+import { interrupt, openSession, prefetchSession, renameSession, updateSession } from '@/state/actions';
 import { accountName } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { cx } from '@/ui';
@@ -189,9 +189,9 @@ export function statusTone(s: SessionMeta): StatusTone {
   // Between an /until loop's turns Sable runs the check: the chat is still at work.
   if (s.status === 'running' || s.status === 'starting' || (s.status === 'idle' && s.until?.phase === 'checking')) return 'working';
   if (s.status === 'awaiting') return 'awaiting';
-  if (s.status === 'error') return 'error';
-  // Its own turn ended, but sub-agents it sent to the background still work: the chat is not at rest.
+  // Its own turn ended (also with an error), but sub-agents it sent to the background still work: the chat is not at rest.
   if ((s.background ?? 0) > 0) return 'working';
+  if (s.status === 'error') return 'error';
   return s.unread ? 'unread' : 'idle';
 }
 
@@ -206,8 +206,8 @@ export function statusLabel(s: SessionMeta): string | null {
   if (s.status === 'running' || s.status === 'starting') return s.activity || 'Working';
   if (s.status === 'idle' && s.until?.phase === 'checking') return 'Running the check';
   if (s.status === 'awaiting') return 'Waiting for you';
-  if (s.status === 'error') return s.lastError ? `Error: ${s.lastError}` : 'Error';
   if ((s.background ?? 0) > 0) return backgroundLabel(s.background!);
+  if (s.status === 'error') return s.lastError ? `Error: ${s.lastError}` : 'Error';
   return null;
 }
 
@@ -332,6 +332,26 @@ function whoLabel(s: SessionMeta, mix: RowMix): string | null {
 }
 
 /**
+ * The pointer (or focus) resting on a row this long fetches its chat ahead (`prefetchSession`), so
+ * the click finds the conversation here. Passing over rows on the way elsewhere fetches nothing.
+ * One timer for the whole list: one row is under the pointer at a time.
+ */
+export const REST_MS = 70;
+let restTimer: ReturnType<typeof setTimeout> | undefined;
+let restId = '';
+function restOn(id: string) {
+  if (restId === id) return;
+  clearTimeout(restTimer);
+  restId = id;
+  restTimer = setTimeout(() => prefetchSession(id), REST_MS);
+}
+function restOff(id: string) {
+  if (restId !== id) return;
+  clearTimeout(restTimer);
+  restId = '';
+}
+
+/**
  * A sidebar row: one line, the agent's mark at the folder icon's column, the title, and at the
  * right end a quiet time, or the session's state in its place (a ring while it works, a dot when
  * it wants you), both of which the hover actions cover. It reads its own session and active state
@@ -394,8 +414,18 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
       data-unread={session.unread || undefined}
       // A moving pointer, not an entering one: rows passing under a still pointer while the list
       // scrolls must not each build their tools.
-      onPointerMove={arm}
-      onFocus={arm}
+      onPointerMove={() => {
+        arm?.();
+        restOn(id);
+      }}
+      onPointerLeave={() => restOff(id)}
+      onFocus={() => {
+        arm?.();
+        restOn(id);
+      }}
+      onBlur={() => restOff(id)}
+      // Pressed before it rested: the fetch starts with the press, not with the click a moment later.
+      onPointerDown={(e) => e.button === 0 && prefetchSession(id)}
     >
       {active && <ActivePill />}
       <div className="srow-in">

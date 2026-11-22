@@ -347,6 +347,7 @@ function glide(box: HTMLElement, s: Snap) {
 /** Under a turn: an interruption, or an error the turn ended with that no notice showed. */
 function TurnFoot({ sid, turn }: { sid: string; turn: TurnGroup }) {
   const end = useItem<TurnItem>(sid, turn.end);
+  if (turn.early) return <EndedEarly sid={sid} turn={turn} />;
   if (turn.state === 'interrupted')
     return (
       <div className="turn-note">
@@ -361,6 +362,39 @@ function TurnFoot({ sid, turn }: { sid: string; turn: TurnGroup }) {
       </div>
     );
   return null;
+}
+
+/**
+ * A turn that ended before the agent finished (`TurnGroup.early`, the desktop's rule): one quiet line,
+ * and while it is the chat's last and nothing runs, one way to carry on.
+ */
+function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
+  const last = turn.ids[turn.ids.length - 1];
+  const canContinue = useStore((s) => {
+    const roots = sessionData(s, sid).roots;
+    const status = s.sessions[sid]?.status;
+    return roots[roots.length - 1] === last && status !== 'running' && status !== 'awaiting' && status !== 'starting';
+  });
+  const [sent, setSent] = useState(false);
+  return (
+    <div className="turn-note">
+      <Icon name="warning" size={14} /> Ended early
+      {canContinue && (
+        <button
+          type="button"
+          className="btn btn-sm notice-action"
+          disabled={sent}
+          onClick={() => {
+            setSent(true);
+            haptic('send');
+            void conn.call('session.send', { sessionId: sid, text: 'Continue' }).catch(() => setSent(false));
+          }}
+        >
+          Continue
+        </button>
+      )}
+    </div>
+  );
 }
 
 /** Tells the conversation the reader opened something here: it stops following the newest line, so what opened stays where it is. */

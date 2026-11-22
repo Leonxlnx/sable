@@ -4,6 +4,7 @@ import { PROVIDER_NAME } from '@/art/Logo';
 import { setSettings } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { Kbd } from '@/ui';
+import { SavedSignIns } from '../rail/SavedSignIns';
 import { RuleFile, TomlFile, useAgentConfig } from './AgentConfig';
 import { fileKey } from './files';
 import { useInitialProvider } from './Models';
@@ -42,6 +43,8 @@ export function Permissions() {
       <p className="set-foot-note">Switch the mode of a running session from its composer, or with <Kbd combo="shift+tab" />.</p>
 
       <Rules provider={provider} cwd={cwd} />
+
+      <SavedSignIns />
     </div>
   );
 }

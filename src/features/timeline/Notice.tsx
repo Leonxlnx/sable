@@ -2,6 +2,7 @@ import { memo } from 'react';
 import type { NoticeItem } from '@shared/protocol';
 import { Icon, type IconName } from '@/icons';
 import { LimitNotice } from '@/features/accounts';
+import { AuthNotice } from '@/features/accounts/AuthNotice';
 import { AgentSwitchLine } from './AgentSwitch';
 import { CommandOutput } from './Synthetic';
 import { readErrorDetail } from './error-detail';
@@ -32,6 +33,8 @@ function ErrorDetailLine({ detail }: { detail: string }) {
 
 /** Things that happened to the conversation rather than in it: dividers, errors, command output. */
 export const Notice = memo(function Notice({ item }: { item: NoticeItem }) {
+  // Refused for the sign-in: one line with "Sign in" once the CLI says the account is signed out (AuthNotice.tsx).
+  if (item.auth) return <AuthNotice item={item} />;
   // A turn refused at a plan limit: the accounts feature says when it resets and offers another account.
   if (item.limit) return <LimitNotice item={item} />;
   // The chat switched agents here (AgentSwitch.tsx).

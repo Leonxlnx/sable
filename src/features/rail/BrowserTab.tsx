@@ -9,7 +9,11 @@ import * as actions from '@/state/actions';
 import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { IconButton, Menu, MenuContent, MenuItem, MenuSep, MenuTrigger, Spinner, Tip } from '@/ui';
-import { readScript, registerPage } from './browser-agent';
+import { createPointer, type AgentPointer } from './agent-pointer';
+import { AgentLine, SignInCard } from './BrowserAgentUi';
+import { readScript, registerPage, type PageController } from './browser-agent';
+import { connectDevFrame } from './dev-frame';
+import { cancelSignIn } from './sign-in';
 import { parseKey, pickCancelScript, pickScript, type Picked } from './browser-scripts';
 import {
   activeTab,
@@ -212,6 +216,62 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
   const [finding, setFinding] = useState(false);
   const [found, setFound] = useState<{ active: number; total: number } | null>(null);
 
+  /* ── the agent's pointer: one layer over the page, placed in the page's own pixels ── */
+
+  const pointerLayer = useRef<HTMLDivElement>(null);
+  const pointer = useRef<AgentPointer | null>(null);
+  useEffect(() => {
+    const layer = pointerLayer.current;
+    if (!layer) return;
+    const p = createPointer(layer);
+    pointer.current = p;
+    return () => {
+      p.dispose();
+      pointer.current = null;
+    };
+  }, []);
+  /**
+   * The pointer for one page view: a point of the page (CSS pixels, its viewport `vw` wide) lands on
+   * the view's box as laid out, which takes in the page's zoom and a device size's scale at once
+   * (box width / viewport width). Only while this tab is the one in front and the pane shows.
+   */
+  const pointerFor = (view: () => HTMLElement | null): Pick<PageController, 'point' | 'press'> => ({
+    point: async (rect, vw) => {
+      const el = view();
+      const layer = pointerLayer.current;
+      const p = pointer.current;
+      if (!el || !layer || !p || !activeRef.current || el.hasAttribute('data-hidden')) return;
+      const box = el.getBoundingClientRect();
+      const lb = layer.getBoundingClientRect();
+      if (box.width < 1 || !(vw > 0)) return;
+      const k = box.width / vw;
+      await p.moveTo({ x: box.left - lb.left + (rect.x + rect.w / 2) * k, y: box.top - lb.top + (rect.y + rect.h / 2) * k });
+    },
+    press: async () => {
+      if (activeRef.current) await pointer.current?.press();
+    },
+  });
+  const pointerRef = useRef(pointerFor);
+  pointerRef.current = pointerFor;
+
+  // The agent drives only within its turn: when the turn ends (or Stop), the page is handed back.
+  const provider = useStore((s) => s.sessions[sessionId]?.provider ?? 'demo');
+  const running = useStore((s) => {
+    const st = s.sessions[sessionId]?.status;
+    return st === 'running' || st === 'awaiting' || st === 'starting';
+  });
+  useEffect(() => {
+    if (running) return;
+    for (const id of getTabs(sessionId).ids) if (getPage(id).driving) setPage(id, { driving: undefined, yielding: undefined });
+    pointer.current?.hide();
+  }, [running, sessionId]);
+  const stopAgent = () => {
+    void actions.interrupt(sessionId);
+    cancelSignIn(activeTab(sessionId));
+    setPage(activeTab(sessionId), { driving: undefined, yielding: undefined });
+    pointer.current?.hide();
+  };
+
   /* ── desktop: one webview per tab, created when the tab first shows a page ── */
 
   /** The view of the tab in front, when its page can take calls. */
@@ -330,7 +390,8 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         resetLog(tid);
         // A reload of the same address keeps its title and icon: the engine reports them again only when they change.
         const same = getPage(tid).url === e.url;
-        setPage(tid, { url: e.url, ...(same ? {} : { title: '', favicon: undefined }), phase: 2 });
+        // A new document holds no password Sable filled: the agent's tools work in full again.
+        setPage(tid, { url: e.url, ...(same ? {} : { title: '', favicon: undefined }), phase: 2, filled: undefined });
         refreshNav(v);
         if (tid === activeTab(sessionId)) setFound(null);
       });
@@ -424,6 +485,7 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
             return false;
           }
         },
+        ...pointerRef.current(() => (v.ready ? el : null)),
       });
       return true;
     },
@@ -934,6 +996,8 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         </div>
       )}
 
+      <AgentLine key={`line:${tabId}`} tabId={tabId} provider={provider} running={running} onStop={stopAgent} />
+
       <div className="bw-view" ref={viewBox} data-device={stage ? page.device : undefined} data-empty={!page.url || undefined}>
         {stageInfo && (
           <div className="bw-device">
@@ -947,8 +1011,10 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
           </div>
         )}
         <div className="bw-host" ref={host} style={stage}>
-          {!native && tabs.ids.map((id) => <TabFrame key={id} tabId={id} shown={id === tabId} />)}
+          {!native && tabs.ids.map((id) => <TabFrame key={id} sessionId={sessionId} tabId={id} shown={id === tabId} pointer={pointerRef} />)}
         </div>
+        <div className="bw-pointer-layer" ref={pointerLayer} aria-hidden />
+        <SignInCard tabId={tabId} />
         {native && page.url && page.crashed ? (
           <PageState title={page.flooded ? 'This page was stopped' : 'This page stopped working'} detail={page.flooded ? 'It logged faster than Sable can keep up' : addressParts(page.url).host}>
             <button type="button" className="btn btn-sm" onClick={() => reload()}>
@@ -989,13 +1055,32 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
 }
 
 /** Web build: one sandboxed frame per tab; only the tab in front is shown. */
-function TabFrame({ tabId, shown }: { tabId: string; shown: boolean }) {
+function TabFrame({
+  sessionId,
+  tabId,
+  shown,
+  pointer,
+}: {
+  sessionId: string;
+  tabId: string;
+  shown: boolean;
+  pointer: React.RefObject<(view: () => HTMLElement | null) => Pick<PageController, 'point' | 'press'>>;
+}) {
   const page = usePage(tabId);
   const frameUrl = page.history[page.index] ?? '';
+  const frame = useRef<HTMLIFrameElement>(null);
+  const frameKey = `${page.index}:${page.nonce}:${frameUrl}`;
+  // Dev build only: a local page that answers Sable's messages can be worked by the agent (dev-frame.ts).
+  useEffect(() => {
+    const el = frame.current;
+    if (!import.meta.env.DEV || !el || !frameUrl) return;
+    return connectDevFrame(el, tabId, sessionId, registerPage, pointer.current(() => frame.current));
+  }, [frameKey, frameUrl, tabId, sessionId, pointer]);
   if (!frameUrl) return null;
   return (
     <iframe
-      key={`${page.index}:${page.nonce}:${frameUrl}`}
+      ref={frame}
+      key={frameKey}
       className="bw-frame"
       data-hidden={!shown || undefined}
       src={frameUrl}
@@ -1468,6 +1553,7 @@ const AGENT_WORD: Record<AgentWork, string> = {
   logs: 'Reading',
   wait: 'Waiting',
   navigate: 'Loading',
+  signIn: 'Signing in',
 };
 const AGENT_SAYS: Record<AgentWork, string> = {
   read: 'The agent is reading this page',
@@ -1482,6 +1568,7 @@ const AGENT_SAYS: Record<AgentWork, string> = {
   logs: "The agent is reading this page's log",
   wait: 'The agent is waiting for this page',
   navigate: 'The agent is moving through this page\'s history',
+  signIn: 'The agent is signing in on this page',
 };
 
 /**
