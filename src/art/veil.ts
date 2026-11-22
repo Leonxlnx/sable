@@ -163,6 +163,7 @@ interface Cover {
   revealing: boolean;
   offs?: Animation[];
   offAt?: number[];
+  gate?: Animation;
   /** What stands on the solid veil when the new view takes long (unseen until then). */
   wait?: HTMLElement;
 }
@@ -234,6 +235,7 @@ export function veilCover(host: HTMLElement | null, opts: { color?: string; cell
     el = old.el;
     layers = old.layers;
     for (const l of [el, ...layers]) for (const a of l.getAnimations()) a.cancel();
+    old.gate?.cancel();
     // A waiting state already fading out (a reveal was under way) has gone: the next cover brings its own.
     if (old.revealing) el.querySelector('.veil-wait')?.remove();
   } else {
@@ -349,10 +351,26 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
   }
   // Off in the reverse of the order they came on, so the content resolves sparse last.
   const offAt = cover.layers.map((_, q) => hold + (3 - q) * VEIL_STEP_OUT);
-  const offs = cover.layers.map((layer, q) => layer.animate([{ opacity: 1 }, { opacity: 0 }], { duration: FRAME, delay: offAt[q], easing: 'linear', fill: 'forwards' }));
+  // Each quarter's whole way in its own keyframes, on from the first frame: never a delay with the
+  // cover's finished animation showing through it meanwhile.
+  const out = hold + 3 * VEIL_STEP_OUT + FRAME;
+  const offs = cover.layers.map((layer, q) =>
+    layer.animate(
+      [
+        { opacity: 1, offset: 0 },
+        { opacity: 1, offset: at(offAt[q], out) },
+        { opacity: 0, offset: at(offAt[q] + FRAME, out) },
+        { opacity: 0, offset: 1 },
+      ],
+      { duration: out, easing: 'linear', fill: 'forwards' },
+    ),
+  );
   cover.offs = offs;
   cover.offAt = offAt;
-  const gate = cover.el.animate([{ opacity: 1 }, { opacity: 1 }], { duration: Math.max(1, hold) });
+  // The gate is a clock only: an animation of nothing, on the same timeline.
+  const gate = new Animation(new KeyframeEffect(null, null, { duration: Math.max(1, hold) }), document.timeline);
+  gate.play();
+  cover.gate = gate;
   const end = () => {
     window.clearTimeout(cap);
     // A new cover took the element over meanwhile: it is that one's now.

@@ -83,6 +83,8 @@ export interface Toast {
   id: number;
   level: 'info' | 'success' | 'warn' | 'error';
   text: string;
+  /** How often it was said again while it stood: each time it is read out anew, in place. */
+  again?: number;
 }
 
 export interface Draft {
@@ -286,6 +288,7 @@ export const useStore = create<Store>((set, get) => ({
     const same = get().toasts.find((t) => t.text === text && t.level === level);
     const id = same?.id ?? toastId++;
     if (!same) set((s) => ({ toasts: [...s.toasts, { id, level, text }] }));
+    else set((s) => ({ toasts: s.toasts.map((t) => (t.id === id ? { ...t, again: (t.again ?? 0) + 1 } : t)) }));
     window.clearTimeout(toastTimers.get(id));
     toastTimers.set(id, window.setTimeout(() => get().dismissToast(id), level === 'error' ? 7000 : level === 'warn' ? 6000 : 3800));
   },

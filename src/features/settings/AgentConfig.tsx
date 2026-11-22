@@ -85,7 +85,7 @@ export function RuleFile({ file, cwd }: { file: AgentConfigFile; cwd: string | n
           {file.error}
         </p>
       ) : !ruleCount(p) && !extras ? (
-        <p className="cfg-empty">No rules in this file</p>
+        <p className="cfg-empty">No rules in this file.</p>
       ) : (
         <div className="cfg-rules">
           {KINDS.map(({ id, label, icon }) =>

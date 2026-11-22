@@ -83,8 +83,8 @@ describe('a row leaves the list in the frame of the click', () => {
   it('keeps a list whole once it was shown whole', () => {
     // Counted in rows, a list that grew by one dropped its last row for a task: the row came back as
     // a new one (fading in) and everything below jumped a row without a slide.
-    const list = sidebar.slice(sidebar.indexOf('const SessionList = memo'), sidebar.indexOf('const FOLD ='));
-    expect(list).toMatch(/const n = rowsNow\(all\.length\);\s*return n >= all\.length \? Infinity : n;/);
+    const list = sidebar.slice(sidebar.indexOf('const SessionList = memo'), sidebar.indexOf('function GroupBody'));
+    expect(list).toMatch(/const n = [^;]*rowsNow\(all\.length\);\s*return n >= all\.length \? Infinity : n;/);
   });
 
   it('knows how far a scrolled list comes down when it loses a row', () => {

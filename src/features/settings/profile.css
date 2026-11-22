@@ -108,4 +108,5 @@
   padding: 14px 16px;
   font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }

@@ -1,14 +1,16 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { AnimatePresence, motion, Reorder, useDragControls, useReducedMotion } from 'motion/react';
 import type { QueuedMessage } from '@shared/protocol';
 import { Icon } from '@/icons';
 import { Tip } from '@/ui';
-import { shatter } from './shatter';
+import { dissolve } from '@/lib/dissolve';
+import { play, reducedMotion, spring } from '@/lib/motion';
 import { landInTray, launchFromTray } from './flight';
 import { removeQueued, reorderQueue, sendQueuedNow } from '@/state/actions';
 import { Roll } from './Roll';
 
 const NONE: QueuedMessage[] = [];
+const NOBODY: ReadonlySet<string> = new Set();
 /** Rows the person removed or took back to edit: they leave without flying. */
 const gone = new Set<string>();
 export const NO_QUEUE = NONE;
@@ -19,6 +21,40 @@ const firstLine = (t: string) => t.split('\n').find((l) => l.trim())?.trim() ?? 
 const UNFOLD = { type: 'spring' as const, stiffness: 700, damping: 40 };
 /** Rows making room, closing up and settling after a drag. */
 const ROW = { type: 'spring' as const, stiffness: 520, damping: 38 };
+/** The same spring for the tray closing after a row was removed by hand, on the compositor. */
+const CLOSE = spring(ROW.stiffness, ROW.damping);
+/** How deep the tray is tucked behind the composer's top edge (composer.css `.cq-clip`, `.cq`). */
+const TUCK = 20;
+/** The beat the leaving row has to itself before the tray closes over it (ms), as in the sidebar. */
+const BEAT = 50;
+
+/**
+ * The tray closes over a row that was taken out of its layout in this task.
+ *
+ * The tray stands on the composer and grows upward: without the row its box is shorter and its top
+ * edge lower, at once. So the whole tray starts lifted and springs home, and what did not move in
+ * the layout (the rows under the removed one, the dissolving copy) is held still by the opposite
+ * slide. Translate only, one spring, started together: it runs on the compositor, and a queue is
+ * used exactly while a turn streams and the page is busy (the height animated by script got five
+ * frames a second there: the gap stood for 200 ms and closed in two steps). The lift is at most the
+ * tuck's depth, so the tray's lower edge never comes out from behind the composer: the rest of a
+ * row's height is taken in the first frame. The list is a scroller and would cut the rows held
+ * still at its lower edge: it does not clip meanwhile (it is only closed this way while it has
+ * nothing to scroll).
+ */
+function closeTray(clip: HTMLElement, list: HTMLElement, still: (HTMLElement | null | undefined)[], height: number) {
+  const by = Math.min(height, TUCK);
+  const timing = { duration: CLOSE.duration, easing: CLOSE.easing, delay: BEAT, fill: 'backwards' as const };
+  list.style.overflow = 'visible';
+  const edge = play(clip, [{ translate: `0 ${-by}px` }, { translate: '0 0' }], timing);
+  for (const el of still) if (el) play(el, [{ translate: `0 ${by}px` }, { translate: '0 0' }], timing);
+  const done = () => {
+    // A second removal right behind this one holds the list open itself.
+    if (!clip.getAnimations().some((a) => a !== edge && a.playState === 'running')) list.style.overflow = '';
+  };
+  if (edge) edge.finished.then(done, done);
+  else done();
+}
 
 export interface QueueTrayProps {
   sessionId: string;
@@ -41,6 +77,28 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
   // up to the conversation. Rows removed or taken back to edit just go. Read here, not in the
   // tray's body: a tray that empties keeps its last rows on screen while it folds away.
   const clip = useRef<HTMLDivElement>(null);
+  // Removed by the person: out of the tray in the frame of the click, before the bridge has said so
+  // (the row broke up where it stood and the tray closed some hundred ms later, in steps). A
+  // removal the bridge did not take brings the row back.
+  const [left, setLeft] = useState(NOBODY);
+  // A row that comes back is a new element (its key counts its returns): the one that left may still
+  // be in the page, hidden and folding away, and would have come back unseen.
+  const lives = useRef(new Map<string, number>());
+  const leave = useCallback((id: string, on: boolean) => {
+    if (!on) {
+      lives.current.set(id, (lives.current.get(id) ?? 0) + 1);
+      // Not taken by the bridge after all: when the agent takes it later, it flies as any row.
+      gone.delete(id);
+    }
+    setLeft((prev) => {
+      if (prev.has(id) === on) return prev;
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+  const shown = left.size ? queue.filter((q) => !left.has(q.id)) : queue;
   const before = useRef<QueuedMessage[]>(NONE);
   const beforeSession = useRef(sessionId);
   useLayoutEffect(() => {
@@ -53,7 +111,8 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
     if (!host || prev === queue || !same) return;
     const now = new Set(queue.map((q) => q.id));
     const was = new Set(prev.map((q) => q.id));
-    const textOf = (id: string) => host.querySelector<HTMLElement>(`[data-qid="${CSS.escape(id)}"] .cq-text`);
+    // (The row itself, never one removed by hand that is still folding away, hidden.)
+    const textOf = (id: string) => [...host.querySelectorAll<HTMLElement>(`[data-qid="${CSS.escape(id)}"]`)].find((el) => el.style.display !== 'none')?.querySelector<HTMLElement>('.cq-text') ?? null;
     for (const q of queue) {
       if (was.has(q.id)) continue;
       const el = textOf(q.id);
@@ -68,7 +127,7 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
   return (
     <div className="cq-clip" ref={clip}>
       <AnimatePresence initial={false}>
-        {queue.length > 0 && (
+        {shown.length > 0 && (
           <motion.section
             key="tray"
             className="cq"
@@ -79,7 +138,7 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
             exit={reduced ? { opacity: 0 } : { y: '100%', transition: { duration: 0.12, ease: [0.4, 0, 1, 1] } }}
             transition={reduced ? { duration: 0.12, layout: { duration: 0 } } : UNFOLD}
           >
-            <TrayBody sessionId={sessionId} queue={queue} running={running} steerable={steerable} onEdit={onEdit} onFocusComposer={onFocusComposer} reduced={!!reduced} />
+            <TrayBody sessionId={sessionId} queue={shown} held={queue} lives={lives.current} running={running} steerable={steerable} onEdit={onEdit} onFocusComposer={onFocusComposer} reduced={!!reduced} onLeave={leave} />
           </motion.section>
         )}
       </AnimatePresence>
@@ -87,7 +146,7 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
   );
 });
 
-function TrayBody({ sessionId, queue, running, steerable, onEdit, onFocusComposer, reduced }: QueueTrayProps & { reduced: boolean }) {
+function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, onFocusComposer, reduced, onLeave }: QueueTrayProps & { held: QueuedMessage[]; lives: ReadonlyMap<string, number>; reduced: boolean; onLeave: (id: string, on: boolean) => void }) {
   // While a row is dragged the order is local; it goes to the bridge when the row is dropped.
   const [order, setOrder] = useState(queue);
   const dragging = useRef(false);
@@ -102,6 +161,10 @@ function TrayBody({ sessionId, queue, running, steerable, onEdit, onFocusCompose
   for (const q of queue) if (!rows.some((r) => r.id === q.id)) rows.push(q);
   const shown = useRef(rows);
   shown.current = rows;
+  // When motion measures the rows for its own slides (a drag, a row the agent took): whenever the
+  // bridge's queue or the order in hand changes, but not when a row is removed by hand, which is
+  // not in the bridge's answer yet: that close is `closeTray`'s, and two slides would add up.
+  const measure = `${held.map((q) => q.id).join()}/${order.map((q) => q.id).join()}`;
 
   const commit = (next: QueuedMessage[]) => {
     const ids = next.map((q) => q.id);
@@ -110,18 +173,40 @@ function TrayBody({ sessionId, queue, running, steerable, onEdit, onFocusCompose
 
   const focusRow = (i: number) => {
     window.requestAnimationFrame(() => {
-      const els = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-qrow]') ?? [])];
+      // (A row removed by hand is out of the layout but still in the page for a moment.)
+      const els = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-qrow]') ?? [])].filter((el) => el.style.display !== 'none');
       const el = els[Math.min(i, els.length - 1)];
       if (el) el.focus({ preventScroll: true });
       else onFocusComposer();
     });
   };
 
+  // The row breaks into the tray's own dither where it stood and is out of the list in this frame,
+  // so the tray closes on the click. Its dead copy (`lib/dissolve.ts`) is held by the list's lower
+  // edge, which stays while the tray's top comes down, and stands under the rows: one that comes
+  // down into its place covers it.
   const remove = (q: QueuedMessage, i: number, el: Element | null) => {
     gone.add(q.id);
-    shatter(el);
-    void removeQueued(sessionId, q.id);
-    if (el?.contains(document.activeElement)) focusRow(i);
+    const focused = !!el?.contains(document.activeElement);
+    const list = listRef.current;
+    const row = el instanceof HTMLElement ? el : null;
+    const clip = row?.closest<HTMLElement>('.cq-clip');
+    const first = list?.firstElementChild;
+    if (row && list && clip && first instanceof HTMLElement && !reducedMotion()) {
+      // Reads: the row's height, whether the tray gets shorter without it (a list that scrolls does
+      // not), and the rows that stay where they are.
+      const height = row.offsetHeight;
+      const shrinks = rows.length > 1 && list.scrollHeight <= list.clientHeight + 1;
+      const under: HTMLElement[] = [];
+      for (let n = row.nextElementSibling; n; n = n.nextElementSibling) if (n instanceof HTMLElement && n.hasAttribute('data-qrow')) under.push(n);
+      // Writes.
+      const leaving = dissolve(row, { ground: '--panel', anchor: 'bottom', before: first });
+      row.style.display = 'none';
+      if (shrinks) closeTray(clip, list, [...under, leaving?.ghost], height);
+    } else if (row) row.style.display = 'none';
+    onLeave(q.id, true);
+    void removeQueued(sessionId, q.id).finally(() => window.setTimeout(() => onLeave(q.id, false), 600));
+    if (focused) focusRow(i);
   };
 
   const move = (i: number, by: -1 | 1) => {
@@ -145,13 +230,14 @@ function TrayBody({ sessionId, queue, running, steerable, onEdit, onFocusCompose
         <AnimatePresence initial={false}>
           {rows.map((q, i) => (
             <Row
-              key={q.id}
+              key={`${q.id}/${lives.get(q.id) ?? 0}`}
               q={q}
               i={i}
               count={rows.length}
               running={running}
               steerable={steerable}
               reduced={reduced}
+              measure={measure}
               onDragStart={() => (dragging.current = true)}
               onDragEnd={() => {
                 dragging.current = false;
@@ -205,9 +291,11 @@ interface RowProps {
   onEdit: () => void;
   onRemove: (el: Element | null) => void;
   onKey: (e: KeyboardEvent<HTMLLIElement>) => void;
+  /** When motion measures this row for a slide of its own (see `measure`). */
+  measure: string;
 }
 
-function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd, onSend, onEdit, onRemove, onKey }: RowProps) {
+function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd, onSend, onEdit, onRemove, onKey, measure }: RowProps) {
   const controls = useDragControls();
   const ref = useRef<HTMLLIElement>(null);
   const [lifted, setLifted] = useState(false);
@@ -228,6 +316,7 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
       dragListener={false}
       dragControls={controls}
       layout="position"
+      layoutDependency={measure}
       className="cq-row"
       data-qrow
       data-qid={q.id}

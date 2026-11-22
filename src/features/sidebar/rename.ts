@@ -7,6 +7,18 @@
  * not the app focusing something of its own (a chat's composer as the chat opens).
  */
 
+// ── the name shown while the bridge is asked ──
+
+/**
+ * For the row's "name just given", once the bridge has answered that rename: it takes away the
+ * name it gave and no other. A chat renamed twice before the first answer lost the second name to
+ * the first answer, and its old title stood until the second.
+ */
+export const ownName =
+  (title: string) =>
+  (shown: string | null): string | null =>
+    shown === title ? null : shown;
+
 // ── focus, in the same frame the field appears ──
 
 /**

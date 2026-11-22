@@ -342,8 +342,9 @@
 
 .race-empty {
   margin: auto;
-  font-size: var(--t-body);
+  font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* ── compare: both lanes file by file ── */

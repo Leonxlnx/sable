@@ -496,6 +496,11 @@
   text-wrap: balance;
 }
 
+/* Arrives as every empty sentence does (ui.css); the loading line keeps its own, longer wait. */
+.rail-empty {
+  animation: var(--empty-in);
+}
+
 .rail-loading {
   display: flex;
   align-items: center;

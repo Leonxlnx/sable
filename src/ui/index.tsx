@@ -1,10 +1,9 @@
 import { cloneElement, forwardRef, isValidElement, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type FocusEvent, type PointerEvent, type ReactNode, type Ref, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { Dialog as RD, DropdownMenu as RM, Popover as RP, Slider as RSl, Switch as RS, Tooltip as RT } from 'radix-ui';
-import { AnimatePresence, motion } from 'motion/react';
 import { Icon, type IconName } from '@/icons';
 import { isMac, shortcutKeys } from '@/lib/format';
-import { play, spring } from '@/lib/motion';
+import { fadeShown, play, reducedMotion, slideLeft, spring } from '@/lib/motion';
 import { useStore } from '@/state/store';
 import './grow';
 import { movedByKeys } from './glide';
@@ -537,9 +536,113 @@ export const byKeys = movedByKeys;
 
 // ── toasts ──
 
+/** The stack's one spring, the short rise of a toast that arrives alone, and how one leaves (ms, px). */
+const TOAST_SPRING = spring(420, 34);
+const TOAST_RISE = 14;
+const TOAST_SINK = 6;
+const TOAST_OUT = 140;
+/** A toast that arrives is whole at this share of its slide's way. */
+const TOAST_FADE = 0.55;
+
+/** A toast's place: how far its lower edge stands above the stack's (the stack grows upward from there). */
+type ToastPlace = { el: HTMLElement; up: number };
+
+/**
+ * A slide of a toast that is under way. Two can run on one toast and add up, one on `translate` and
+ * one on `transform`: a second change of the stack right behind the first starts nothing again.
+ */
+interface ToastSlide {
+  anim: Animation;
+  from: number;
+  /** The slide a toast arrives on: it fades in on it. */
+  fade: boolean;
+}
+const toastSlides = new WeakMap<HTMLElement, (ToastSlide | undefined)[]>();
+
+const sliding = (s: ToastSlide | undefined): s is ToastSlide => !!s && s.anim.playState !== 'finished' && s.anim.playState !== 'idle';
+const leftOf = (s: ToastSlide | undefined, now: number) => (sliding(s) ? slideLeft(TOAST_SPRING, s.from, s.anim.startTime as number | null, now) : 0);
+/** How much of a toast shows at `now`: all of it, unless it still arrives. */
+const shownOf = (s: ToastSlide | undefined, now: number) => (sliding(s) && s.fade ? fadeShown(TOAST_SPRING, TOAST_FADE, s.anim.startTime as number | null, now) : 1);
+
+/** Slides `el` home from `by` px off its place, on top of whatever slides it already has. */
+function slideToast(el: HTMLElement, by: number, fade = false) {
+  // Where the toast will be when this takes over (a frame from now), never a computed style.
+  const now = performance.now() + 16;
+  const slides = toastSlides.get(el) ?? [];
+  const left = [leftOf(slides[0], now), leftOf(slides[1], now)];
+  // A free slot, else the one that has less left to go: what it still held goes into the new slide.
+  const i = Math.abs(left[0]) < 0.5 ? 0 : Math.abs(left[1]) < 0.5 ? 1 : Math.abs(left[0]) <= Math.abs(left[1]) ? 0 : 1;
+  slides[i]?.anim.cancel();
+  const from = by + left[i];
+  const y = (v: number) => (i === 0 ? { translate: `0 ${v}px` } : { transform: `translateY(${v}px)` });
+  const frames: Keyframe[] = fade ? [{ opacity: 0, ...y(from) }, { opacity: 1, offset: TOAST_FADE }, { opacity: 1, ...y(0) }] : [y(from), y(0)];
+  const anim = play(el, frames, { duration: TOAST_SPRING.duration, easing: TOAST_SPRING.easing });
+  slides[i] = anim ? { anim, from, fade } : undefined;
+  toastSlides.set(el, slides);
+}
+
 export function Toasts() {
   const toasts = useStore((s) => s.toasts);
   const dismiss = useStore((s) => s.dismissToast);
+  const box = useRef<HTMLDivElement>(null);
+  const places = useRef(new Map<string, ToastPlace>());
+  const order = toasts.map((t) => t.id).join(' ');
+
+  // The stack moves as one body, on one spring, started in one task (opacity, translate and
+  // transform only, so it runs on the compositor): a toast that arrives where others stand comes up
+  // from one place lower while they go up by its height, so no two ever share a place (a toast used
+  // to fade in over the one before it for three frames: two panes, two lines of text in one spot).
+  // One that leaves is taken out of the layout at once: its own element stays as a dead copy, held
+  // by its lower edge and under the others, sinking and fading, while the ones above come down.
+  // Nothing is read back from the page: where a toast stands mid-slide is worked out (`slideLeft`).
+  useLayoutEffect(() => {
+    const host = box.current;
+    if (!host) return;
+    const before = places.current;
+    const now = new Map<string, ToastPlace>();
+    const els = [...host.querySelectorAll<HTMLElement>(':scope > .toast:not([data-gone])')];
+    // Reads: each toast's place in the new layout.
+    const height = host.offsetHeight;
+    const gap = parseFloat(getComputedStyle(host).rowGap) || 0;
+    const read = els.map((el) => ({ el, id: el.dataset.toast!, up: height - el.offsetTop - el.offsetHeight, h: el.offsetHeight }));
+    const gone = [...before].filter(([id]) => !read.some((r) => r.id === id)).map(([, was]) => was);
+    for (const r of read) now.set(r.id, { el: r.el, up: r.up });
+    places.current = now;
+    if (reducedMotion()) return;
+    // Writes.
+    const at = performance.now() + 16;
+    for (const was of gone) {
+      const el = was.el;
+      const slides = toastSlides.get(el) ?? [];
+      const held = leftOf(slides[0], at) + leftOf(slides[1], at);
+      // Dismissed while it still arrived: it goes from what shows of it (from whole, it flashed up for a frame).
+      const shown = Math.min(shownOf(slides[0], at), shownOf(slides[1], at));
+      for (const s of slides) s?.anim.cancel();
+      // React has let go of it: the element itself is the copy, back in the stack but out of its flow,
+      // under the others (one that comes up into its place while it goes covers it).
+      el.setAttribute('data-gone', '');
+      el.setAttribute('aria-hidden', 'true');
+      el.inert = true;
+      el.style.cssText = `position:absolute;right:0;bottom:${was.up}px;z-index:-1;margin:0;pointer-events:none;`;
+      host.appendChild(el);
+      const out = play(el, [{ opacity: shown, translate: `0 ${held}px` }, { opacity: 0, translate: `0 ${held + TOAST_SINK}px` }], { duration: TOAST_OUT, easing: 'cubic-bezier(0.4, 0, 1, 1)', fill: 'both' });
+      const off = () => el.remove();
+      if (out) out.finished.then(off, off);
+      else off();
+    }
+    const pushed = read.some((r) => before.has(r.id));
+    for (const r of read) {
+      const was = before.get(r.id);
+      if (!was) {
+        // Alone it rises a little; under a stack it comes from one place lower, as the stack makes room.
+        slideToast(r.el, pushed ? r.h + gap : TOAST_RISE, true);
+      } else if (Math.abs(r.up - was.up) >= 0.5) {
+        // Up when the stack grew under it, down when one below it left.
+        slideToast(r.el, r.up - was.up);
+      }
+    }
+  }, [order]);
+
   // On body, above any dialog: `.app` isolates its own stacking context. Pointer events are kept
   // from reaching an open dialog's outside-click handler, so dismissing a toast leaves the dialog open.
   // A toast never takes focus: a click on it moves no focus (the press is kept from doing so) and
@@ -547,29 +650,14 @@ export function Toasts() {
   // the caret out of the composer, or leave focus on nothing when it goes. It says its text
   // through the live region and leaves by itself.
   return createPortal(
-    <div className="toasts" aria-live="polite" onPointerDown={(e) => e.nativeEvent.stopPropagation()} onMouseDown={(e) => e.preventDefault()}>
-      {/* A toast rises in on a spring and, dismissed or timed out, sinks back and fades while the
-          others close the gap; it never just vanishes. */}
-      <AnimatePresence initial={false} mode="popLayout">
-        {toasts.map((t) => (
-          <motion.button
-            key={t.id}
-            layout="position"
-            initial={{ opacity: 0, y: 14, scale: 0.96 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.97, transition: { duration: 0.14, ease: [0.4, 0, 1, 1] } }}
-            transition={{ type: 'spring', stiffness: 420, damping: 34 }}
-            className="toast"
-            tabIndex={-1}
-            data-level={t.level}
-            aria-label={`${t.text}. Dismiss`}
-            onClick={() => dismiss(t.id)}
-          >
-            <Icon name={t.level === 'error' ? 'error' : t.level === 'warn' ? 'warning' : t.level === 'success' ? 'check-circle' : 'info'} size={16} />
-            <span>{t.text}</span>
-          </motion.button>
-        ))}
-      </AnimatePresence>
+    <div ref={box} className="toasts" aria-live="polite" onPointerDown={(e) => e.nativeEvent.stopPropagation()} onMouseDown={(e) => e.preventDefault()}>
+      {toasts.map((t) => (
+        <button key={t.id} type="button" className="toast" tabIndex={-1} data-toast={t.id} data-level={t.level} aria-label={`${t.text}. Dismiss`} onClick={() => dismiss(t.id)}>
+          <Icon name={t.level === 'error' ? 'error' : t.level === 'warn' ? 'warning' : t.level === 'success' ? 'check-circle' : 'info'} size={16} />
+          {/* Said again while it stands: the same words in a new node, so the live region reads them out again. */}
+          <span key={t.again ?? 0}>{t.text}</span>
+        </button>
+      ))}
     </div>,
     document.body,
   );

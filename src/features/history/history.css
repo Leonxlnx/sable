@@ -209,13 +209,16 @@
 
 .history-note {
   display: flex;
-  align-items: center;
+  /* 40px under the bar: where a pane's empty sentence stands (rail.css, palette.css). */
+  align-items: flex-start;
   justify-content: center;
   gap: 8px;
   min-height: 160px;
-  padding: 24px;
+  padding: 40px 24px 24px;
   text-align: center;
+  font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 .history-note.is-error {

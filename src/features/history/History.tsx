@@ -295,7 +295,7 @@ function HistoryBody({ onClose }: { onClose: () => void }) {
       <div className="history-foot">
         <span className="grow" />
         {/* An empty list says so in its own sentence: no "0 conversations" under it. */}
-        {entries && (rows.length > 0 || !!query.trim()) && <span className="history-count num">{rows.length === entries.length || (onlyNew && !query.trim()) ? plural(rows.length, 'conversation') : `${rows.length} of ${entries.length}`}</span>}
+        {entries && rows.length > 0 && <span className="history-count num">{rows.length === entries.length || (onlyNew && !query.trim()) ? plural(rows.length, 'conversation') : `${rows.length} of ${entries.length}`}</span>}
       </div>
     </div>
   );

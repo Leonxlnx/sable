@@ -13,6 +13,12 @@ export interface SpringCurve {
   easing: string;
   /** Milliseconds until the spring has settled. */
   duration: number;
+  /**
+   * The spring's value (0 to about 1) at a share `p` of its duration: where a move that is under
+   * way stands, worked out and not read from the page (a computed style is as of the page's last
+   * frame, and of an animation that has not started yet it is the first keyframe).
+   */
+  value: (p: number) => number;
 }
 
 const springs = new Map<string, SpringCurve>();
@@ -41,9 +47,29 @@ export function spring(stiffness: number, damping: number): SpringCurve {
   const n = Math.max(14, Math.min(48, Math.round(settle * 90)));
   const stops: string[] = [];
   for (let i = 0; i <= n; i++) stops.push(i === n ? '1' : (Math.round(at((settle * i) / n) * 1000) / 1000).toString());
-  const curve = { easing: `linear(${stops.join(', ')})`, duration: Math.round(settle * 1000) };
+  const curve = { easing: `linear(${stops.join(', ')})`, duration: Math.round(settle * 1000), value: (p: number) => (p >= 1 ? 1 : p <= 0 ? 0 : at(settle * p)) };
   springs.set(key, curve);
   return curve;
+}
+
+/**
+ * How far a slide that runs on `curve` from `from` px home to 0 still holds its element at `now`
+ * (`performance.now()`, the clock an animation's `startTime` counts on). Worked out from the
+ * slide's own start, never read from the page: a computed style is as of the page's last frame.
+ * A slide whose start is not known yet has not moved.
+ */
+export function slideLeft(curve: SpringCurve, from: number, started: number | null, now: number): number {
+  return started == null ? from : from * (1 - curve.value((now - started) / curve.duration));
+}
+
+/**
+ * How much of a thing shows at `now` (0 to 1) when it fades in on a slide's own curve and is whole
+ * at the share `full` of the way (keyframes `opacity: 0`, then `opacity: 1` at offset `full`).
+ * Worked out, as `slideLeft`: what leaves while it arrives goes on from here, not from whole.
+ */
+export function fadeShown(curve: SpringCurve, full: number, started: number | null, now: number): number {
+  if (started == null) return 0;
+  return Math.min(1, Math.max(0, curve.value((now - started) / curve.duration) / full));
 }
 
 export const EASE_OUT = 'cubic-bezier(0.16, 1, 0.3, 1)';

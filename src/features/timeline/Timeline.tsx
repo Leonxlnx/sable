@@ -410,7 +410,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       <div className="tl">
         <div className="tl-scroll scroll" ref={scroller} tabIndex={-1}>
           <div className="tl-content" ref={content} data-empty={empty || undefined}>
-            {empty ? <p className="tl-empty">Send a message to start</p> : loaded && <TurnList ids={roots} />}
+            {empty ? <p className="tl-empty">Send a message to start.</p> : loaded && <TurnList ids={roots} />}
           </div>
         </div>
         {!NO_NAV && mapped && <Navigator key={sessionId} sessionId={sessionId} feed={feed} scroller={scroller} content={content} hold={hold} />}

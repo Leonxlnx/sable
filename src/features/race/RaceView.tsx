@@ -477,7 +477,7 @@ function RaceCompare({ pair, names }: { pair: [string, string]; names: { provide
                 <ProviderMark provider={names[i].provider} size={14} />
                 <span className="truncate">{names[i].label}</span>
               </div>
-              <div className="race-cmp-body scroll">{f ? <DiffView key={`${current.path}:${i}`} diff={f} showHeader={false} /> : <p className="race-empty">Not changed here</p>}</div>
+              <div className="race-cmp-body scroll">{f ? <DiffView key={`${current.path}:${i}`} diff={f} showHeader={false} /> : <p className="race-empty">Not changed here.</p>}</div>
             </div>
           ))}
         </div>

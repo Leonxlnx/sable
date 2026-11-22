@@ -1,4 +1,4 @@
-import { createContext, memo, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent, type ReactNode } from 'react';
+import { createContext, memo, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type KeyboardEvent, type ReactNode, type SetStateAction } from 'react';
 import { ContextMenu as RC, DropdownMenu as RM } from 'radix-ui';
 import { DEFAULT_ACCOUNT, type SessionMeta } from '@shared/protocol';
 import { PROVIDER_NAME, ProviderMark, StatusGlyph, type StatusTone } from '@/art/Logo';
@@ -14,7 +14,7 @@ import { cx } from '@/ui';
 import type { Mix } from './groups';
 import { leaveRow, liftRow } from './leave';
 import { NameField } from './NameField';
-import { holdFocus, onCloseAutoFocus } from './rename';
+import { holdFocus, onCloseAutoFocus, ownName } from './rename';
 
 // ── shared row state (rename / delete confirm) ──
 
@@ -321,15 +321,23 @@ const Frag = ({ children }: { children: ReactNode }) => <>{children}</>;
 
 // ── rename field ──
 
-/** The chat's title in place (NameField: what ends the edit). An empty field keeps the old title. */
-function RenameField({ session, onDone }: { session: SessionMeta; onDone: () => void }) {
+/**
+ * The chat's title in place (NameField: what ends the edit). An empty field keeps the old title.
+ * `onGiven`: the new name, for the row to show until the bridge has said it (taken away again once
+ * it has answered, `ownName`): between the field going and the answer the old title stood again for
+ * two frames.
+ */
+function RenameField({ session, title: shown, onGiven, onDone }: { session: SessionMeta; title: string; onGiven: Dispatch<SetStateAction<string | null>>; onDone: () => void }) {
   return (
     <NameField
-      value={session.title}
+      value={shown}
       label="Session title"
       className="srow-rename"
       onDone={(title, back) => {
-        if (title && title !== session.title) void renameSession(session.id, title);
+        if (title && title !== shown) {
+          onGiven(title);
+          void renameSession(session.id, title).finally(() => onGiven(ownName(title)));
+        }
         onDone();
         // Ended from the keyboard: back to the row, so the keys carry on from where they were.
         if (back) requestAnimationFrame(() => document.querySelector<HTMLElement>(`.srow[data-row="${CSS.escape(session.id)}"] .srow-main`)?.focus());
@@ -387,10 +395,13 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
   const [armed, setArmed] = useState(false);
   const [menuArmed, setMenuArmed] = useState(false);
   const [animateIn] = useState(!!enter);
+  // A name just given, shown until the bridge has answered (its answer comes after the store has it).
+  const [given, setGiven] = useState<string | null>(null);
   const rowRef = useRef<HTMLDivElement>(null);
   useStartBeat(rowRef, !!session?.spare, !!session && statusTone(session) === 'working');
   if (!session) return null;
   const tone = statusTone(session);
+  const title = given ?? session.title;
   // Waiting to start by itself (Spare): a small clock where the time or the status mark sits. A chat
   // that stopped at a limit and now waits for its reset shows the wait, not the limit's error.
   const waits = !!session.spare && tone !== 'working' && tone !== 'awaiting';
@@ -414,7 +425,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
   };
 
   const more = (
-    <button type="button" className="srow-act" tabIndex={-1} aria-label={`More actions for ${session.title}`} aria-haspopup="menu" onClick={menuArmed ? undefined : openMenu}>
+    <button type="button" className="srow-act" tabIndex={-1} aria-label={`More actions for ${title}`} aria-haspopup="menu" onClick={menuArmed ? undefined : openMenu}>
       <Icon name="dots" size={15} />
     </button>
   );
@@ -452,7 +463,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
           <ProviderMark provider={session.provider} size={12} className="srow-agent" />
         </span>
         {renaming ? (
-          <RenameField session={session} onDone={() => ctx.setRenaming(null)} />
+          <RenameField session={session} title={title} onGiven={setGiven} onDone={() => ctx.setRenaming(null)} />
         ) : (
           <button
             type="button"
@@ -470,7 +481,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
             onDoubleClick={() => ctx.setRenaming(session.id)}
             onKeyDown={onKeyDown}
           >
-            <span className="srow-title truncate">{session.title}</span>
+            <span className="srow-title truncate">{title}</span>
             <span className="sr-only">{[who ?? PROVIDER_NAME[session.provider], label].filter(Boolean).join(', ')}</span>
           </button>
         )}

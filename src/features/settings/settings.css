@@ -123,9 +123,10 @@
 
 .set-nav-empty {
   padding: 8px 10px;
-  font-size: var(--t-small);
+  font-size: var(--t-ui);
   line-height: 1.45;
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* ── section pane ── */
@@ -426,7 +427,9 @@
   place-items: center;
   padding: 30px 20px;
   text-align: center;
+  font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* Mono chip for paths, commands and config keys. */
@@ -951,8 +954,9 @@ button.xrow-head:disabled:hover {
   align-items: center;
   gap: 7px;
   margin-top: 10px;
-  font-size: var(--t-small);
+  font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 .cfg-empty[data-tone='error'] {

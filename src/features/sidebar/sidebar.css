@@ -195,6 +195,8 @@
   color: var(--text-3);
   font-size: var(--t-ui);
   line-height: 1.5;
+  /* Arrives as every empty sentence does (ui.css): unseen for 150 ms, then a fade. */
+  animation: var(--empty-in);
 }
 
 /* The first chat arrives: the empty state fades where it stood (out of the flow, so the list takes
@@ -481,8 +483,17 @@
   opacity: 0.6;
 }
 
-/* .sgroup-body is clipped only while its height animates (motion sets overflow and clears it at the
-   end), so rows sliding into a gap that closes are never cut off. */
+/* .sgroup-body is clipped only while it folds or unfolds (fold.tsx), so rows sliding into a gap
+   that closes are never cut off. Its box slides over what is above it meanwhile (its rows slide the
+   other way and stand still): it takes no click there, its rows do. */
+.sgroup-body[data-folding] {
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.sgroup-body[data-folding] > * {
+  pointer-events: auto;
+}
 
 .srows {
   display: flex;
@@ -787,6 +798,18 @@
   outline: none;
 }
 
+/* The chat's title as a field: its words stay where the title stood, to the pixel and in its weight
+   (29 + the field's 1px edge + 6 = the title's 36; an open or unread chat's title is medium), so
+   taking the field and giving it back moves no letter. */
+.srow-rename {
+  margin-left: 29px;
+}
+
+.srow[data-active] .srow-rename,
+.srow[data-unread] .srow-rename {
+  font-weight: var(--w-medium);
+}
+
 /* The folder's name as a field: its words stay where the name stood. */
 .sgroup-rename {
   margin: 0 -4px 0 -7px;
@@ -1018,8 +1041,9 @@
 .sset-empty {
   margin: 0;
   padding: 5px 10px 6px 36px;
-  font-size: var(--t-small);
-  color: var(--text-4);
+  font-size: var(--t-ui);
+  color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* A folder held over a project: its header answers with a soft ivory edge, its guide lights up. */

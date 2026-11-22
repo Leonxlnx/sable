@@ -27,7 +27,23 @@ const GAP = 'gap';
 const gapOf = (el: HTMLElement) => el.getAnimations().find((a) => (a as Animation & { id: string }).id === GAP);
 /** How far a slide still running holds its element from its place (layout pixels). */
 const offsetNow = (el: HTMLElement) => parseFloat(getComputedStyle(el).translate.split(' ')[1] ?? '0') || 0;
-const shown = (el: Element | null): el is HTMLElement => el instanceof HTMLElement && !el.classList.contains('ghost') && el.offsetHeight > 0;
+const shown = (el: Element | null): el is HTMLElement => el instanceof HTMLElement && !el.classList.contains('ghost') && !el.hasAttribute('data-gone') && el.offsetHeight > 0;
+
+/** A mover taller than this is taken apart: a folder of hundreds of rows would slide as one layer thousands of pixels tall. */
+const TALL = 900;
+
+/**
+ * What of `el` a slide moves, when the slide can be seen between `top` and `bottom` (screen px, as
+ * `el` is laid out now): `el` itself, or, when it is tall, those of its parts that are there.
+ */
+export function partsInView(el: Element, top: number, bottom: number, out: HTMLElement[] = []): HTMLElement[] {
+  if (!shown(el)) return out;
+  const r = el.getBoundingClientRect();
+  if (r.bottom < top || r.top > bottom) return out;
+  if (r.height <= TALL || !el.children.length) out.push(el);
+  else for (const c of el.children) partsInView(c, top, bottom, out);
+  return out;
+}
 
 /**
  * How far a scrolled list comes down when it loses `room` at its end: nothing while what is left
@@ -126,10 +142,8 @@ export function leaveRow(row: HTMLElement, kind: LeaveKind): () => void {
     if (!kept) {
       for (let n = el.nextElementSibling; n; n = n.nextElementSibling) {
         if (!shown(n)) continue;
-        const r = n.getBoundingClientRect();
-        if (r.bottom < view.top - 40) continue;
-        if (r.top > view.bottom + 40) break;
-        movers.push({ el: n, from: gapOf(n) ? offsetNow(n) : 0 });
+        if (n.getBoundingClientRect().top > view.bottom + 40) break;
+        for (const part of partsInView(n, view.top - 40, view.bottom + 40)) movers.push({ el: part, from: gapOf(part) ? offsetNow(part) : 0 });
       }
     }
     // Past the folder that keeps its height nothing moves.

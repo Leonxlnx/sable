@@ -24,14 +24,20 @@ function rise(el: Element | null, delay: number) {
 
 const TITLE = 'What are we building?';
 
+/** Home has arrived in this window (the launch, or the short form that stands in for it). */
+let arrived = false;
+
 /**
- * The arrival, one composed movement each time the home screen appears:
+ * The arrival, one composed movement, once per window:
  * - at launch the piece is the launch's (art/LaunchLayer.tsx): its mark recedes from the middle of the
  *   window onto the home mark while the wave opens the ink, the headline resolves glyph by glyph
  *   and the composer rises. It stages all of that itself;
- * - otherwise (coming back from a session, after the welcome) the short form of the same idea, in
- *   about half a second: the mark builds in dither order a little large and settles to its size,
+ * - where no launch plays (after the welcome, a development page) the short form of the same idea,
+ *   in about half a second: the mark builds in dither order a little large and settles to its size,
  *   a soft ring leaves it through the field, the headline resolves and the composer rises.
+ * Coming back from a chat home is simply there: the stage's veil resolves it (App.tsx), and a second
+ * effect behind that one (the mark and the letters building on a stage that had already resolved,
+ * about 280 ms on every return) made the way home the slowest change of view.
  * Under reduced motion everything is simply there.
  */
 function useArrival(mark: RefObject<HTMLDivElement | null>, title: RefObject<HTMLElement | null>, composer: RefObject<HTMLDivElement | null>) {
@@ -39,13 +45,17 @@ function useArrival(mark: RefObject<HTMLDivElement | null>, title: RefObject<HTM
   const ran = useRef(false);
   useLayoutEffect(() => {
     bootMark('home');
-    if (ran.current || reducedMotion()) return;
+    if (ran.current) return;
     ran.current = true;
+    const first = !arrived;
+    arrived = true;
+    if (reducedMotion()) return;
     const m = mark.current;
     if (launchArrival({ mark: m, title: title.current, composer: composer.current })) return;
     // After the welcome its own mark travels onto ours (Onboarding.tsx measures and reveals it):
     // ours stays as it is, and the rest arrives as that one lands.
     const welcome = !!document.querySelector('.onb');
+    if (!first && !welcome) return;
     const at = welcome ? 160 : 0;
     if (!welcome) {
       buildMark(m, 40);

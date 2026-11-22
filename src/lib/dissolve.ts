@@ -11,7 +11,7 @@ import { reducedMotion, uiZoom } from './motion';
  */
 
 /** Attributes a copy must not carry: it would be found as the row, counted by a list, or take the keys. */
-const LIVE = ['id', 'data-flip', 'data-row', 'data-nav', 'data-id', 'data-enter', 'data-folder', 'data-req', 'tabindex', 'aria-current', 'aria-live'];
+const LIVE = ['id', 'data-flip', 'data-row', 'data-nav', 'data-id', 'data-enter', 'data-folder', 'data-req', 'data-qrow', 'data-qid', 'data-toast', 'tabindex', 'aria-current', 'aria-live', 'aria-label'];
 /** What a copy keeps of the look the element had under the pointer (a copy is never hovered). */
 const LOOK = ['color', 'opacity', 'background-color', 'visibility'] as const;
 

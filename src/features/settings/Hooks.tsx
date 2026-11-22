@@ -85,7 +85,7 @@ function HookFile({ file, cwd }: { file: AgentConfigFile; cwd: string | null }) 
           {file.error}
         </p>
       ) : !groups.length ? (
-        <p className="cfg-empty">No hooks in this file</p>
+        <p className="cfg-empty">No hooks in this file.</p>
       ) : (
         <div className="hook-events">
           {groups.map(([event, hooks]) => {

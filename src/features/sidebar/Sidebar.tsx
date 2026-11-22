@@ -1,5 +1,5 @@
-import { memo, useCallback, useEffect, useMemo, useState, type ComponentType, type CSSProperties, type DragEvent, type FocusEvent, type HTMLAttributes, type KeyboardEvent, type ReactNode, type Ref } from 'react';
-import { AnimatePresence, MotionConfig, motion, useReducedMotion } from 'motion/react';
+import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType, type CSSProperties, type DragEvent, type FocusEvent, type HTMLAttributes, type KeyboardEvent, type ReactNode, type Ref } from 'react';
+import { MotionConfig } from 'motion/react';
 import { ContextMenu as RC, DropdownMenu as RM } from 'radix-ui';
 import type { SessionMeta } from '@shared/protocol';
 import { afterLaunch } from '@/art/LaunchLayer';
@@ -9,7 +9,7 @@ import { QuickSwitch } from '@/features/session/QuickSwitch';
 import { pathForFile } from '@/lib/desktop';
 import { useLaggedStore } from '@/lib/lagged';
 import { afterSend } from '@/features/composer/settle';
-import { reducedMotion } from '@/lib/motion';
+import { reducedMotion, uiZoom } from '@/lib/motion';
 import { isNarrow } from '@/lib/narrow';
 import { baseName } from '@/lib/format';
 import { addFolders, addToGroup, arrangeSidebar, closeSession, createGroup, goHome, goHomeChat, openSettings, pinProject, removeFromGroup, removeGroup, removeProject, renameGroup, renameProject } from '@/state/actions';
@@ -17,10 +17,12 @@ import { useStore } from '@/state/store';
 import { IconButton, Modal, Tip } from '@/ui';
 import { flyBrand } from './brand-flight';
 import { Flip } from './flip';
+import { FoldBody, foldCue, screenful, Unfolding } from './fold';
 import { nudgeFolder, pressFolder, releaseFolderDrag, type FolderDrop } from './folder-drag';
 import { holdListEnd, leaveRow } from './leave';
 import { SideResize } from './Resize';
 import { createGroupsSelector, idsOf, loadCollapsed, pathKey, saveCollapsed, toggleCollapsed, unfoldKeys, type ChatsGroup, type Mix, type ProjectGroup, type SetGroup, type TopEntry } from './groups';
+import { arrive, cued, moveCue } from './move';
 import { NameField } from './NameField';
 import { holdFocus, onCloseAutoFocus } from './rename';
 import { RowContextMenu, SessionRow, SidebarRowContext, setRenaming, type RowCtx } from './SessionRow';
@@ -327,8 +329,7 @@ function rowsNow(count: number): number {
   const now = performance.now();
   if (!FIRST_ROWS.until) {
     FIRST_ROWS.until = now + 1000;
-    // A screenful of rows (about 28 px each) and a few more.
-    FIRST_ROWS.left = Math.ceil(window.innerHeight / 28) + 6;
+    FIRST_ROWS.left = screenful(window.innerHeight, uiZoom());
   }
   if (now > FIRST_ROWS.until) return count;
   const n = Math.min(count, Math.max(0, FIRST_ROWS.left));
@@ -343,8 +344,11 @@ const SessionList = memo(function SessionList({ ids, mix }: { ids: string; mix: 
   const all = ids ? ids.split(' ') : [];
   // A list shown whole stays whole: counted in rows, a list that then grew by one dropped its last
   // row for a task (it came back as a new row, fading in), and what stood below jumped a row.
+  // In a folder that unfolds right now: a screenful first, the rest once the unfold has ended (fold.tsx).
+  const unfolding = useContext(Unfolding);
+  const [wait] = useState(() => Math.max(0, unfolding.until - performance.now()));
   const [shown, setShown] = useState(() => {
-    const n = rowsNow(all.length);
+    const n = wait ? Math.min(all.length, screenful(window.innerHeight, uiZoom())) : rowsNow(all.length);
     return n >= all.length ? Infinity : n;
   });
   // The rows left for a moment later belong to the first paint: they never animate in.
@@ -352,6 +356,10 @@ const SessionList = memo(function SessionList({ ids, mix }: { ids: string; mix: 
   const later = shown < all.length;
   useEffect(() => {
     if (!later) return;
+    if (wait) {
+      const rest = window.setTimeout(() => setShown(Infinity), wait);
+      return () => window.clearTimeout(rest);
+    }
     let t = 0;
     const all = () => {
       window.clearTimeout(t);
@@ -365,7 +373,7 @@ const SessionList = memo(function SessionList({ ids, mix }: { ids: string; mix: 
       window.clearTimeout(t);
       window.clearTimeout(cap);
     };
-  }, [later]);
+  }, [later, wait]);
   const enter = performance.now() - drawnAt > 400;
   return (
     <Flip order={ids} className="srows" role="list">
@@ -376,50 +384,56 @@ const SessionList = memo(function SessionList({ ids, mix }: { ids: string; mix: 
   );
 });
 
-/**
- * A folder's rows fold open and shut on a spring: a click that comes while the last fold still runs
- * turns it back from where it is, with the speed it had (AnimatePresence brings an exiting body back).
- * Under reduced motion the rows are simply there or not.
- */
-const FOLD = { height: { type: 'spring', stiffness: 500, damping: 40 }, opacity: { duration: 0.16, ease: EASE } } as const;
-const STILL = { duration: 0 } as const;
-const useFold = () => (useReducedMotion() ? STILL : FOLD);
-const FOLD_SHUT = { height: 0, opacity: 0, overflow: 'hidden' } as const;
-const FOLD_OPEN = { height: 'auto', opacity: 1, transitionEnd: { overflow: 'visible' } } as const;
+/** Whether the component has been in the page before this render (false in its first). */
+function useStood() {
+  const stood = useRef(false);
+  useEffect(() => {
+    stood.current = true;
+  }, []);
+  return stood;
+}
 
-/** A section's rows and its archived ones, folding open and shut. */
+/** A section's rows and its archived ones, folding open and shut (`fold.tsx`: the layout in one step, the rest slides). */
 function GroupBody({ open, sessions, archived, mix, children }: { open: boolean; sessions: SessionMeta[]; archived: SessionMeta[]; mix: Mix; children?: ReactNode }) {
   const [showArchived, setShowArchived] = useState(false);
   // The "Archived" line of a folder that had none when it was drawn arrives (sidebar.css).
   const [hadArchived] = useState(archived.length > 0);
-  const fold = useFold();
+  // A body unfolds when its folder is opened, never when the whole section mounts with it (a new
+  // folder, one moved into a project): the list's Flip moves what is below then, and the two added up.
+  const stood = useStood();
+  if (!open) return null;
   return (
-    <AnimatePresence initial={false}>
-      {open && (
-        <motion.div key="body" className="sgroup-body" initial={FOLD_SHUT} animate={FOLD_OPEN} exit={FOLD_SHUT} transition={fold}>
-          {children}
-          {sessions.length > 0 && <SessionList ids={idsOf(sessions)} mix={mix} />}
-          {archived.length > 0 && (
-            <>
-              <button type="button" className="sarchived" data-nav tabIndex={-1} data-enter={!hadArchived || undefined} aria-expanded={showArchived} onClick={() => setShowArchived((v) => !v)}>
-                <span className="srow-mark">
-                  <Icon name="archive" size={14} />
-                </span>
-                <span className="grow">Archived</span>
-                <span className="sarchived-count num">{archived.length}</span>
-              </button>
-              <AnimatePresence initial={false}>
-                {showArchived && (
-                  <motion.div key="archived" className="sgroup-body" initial={FOLD_SHUT} animate={FOLD_OPEN} exit={FOLD_SHUT} transition={fold}>
-                    <SessionList ids={idsOf(archived)} mix={undefined} />
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </>
+    <FoldBody className="sgroup-body" enter={stood.current}>
+      {children}
+      {sessions.length > 0 && <SessionList ids={idsOf(sessions)} mix={mix} />}
+      {archived.length > 0 && (
+        <>
+          <button
+            type="button"
+            className="sarchived"
+            data-nav
+            tabIndex={-1}
+            data-enter={!hadArchived || undefined}
+            aria-expanded={showArchived}
+            onClick={(e) => {
+              foldCue(e.currentTarget);
+              setShowArchived((v) => !v);
+            }}
+          >
+            <span className="srow-mark">
+              <Icon name="archive" size={14} />
+            </span>
+            <span className="grow">Archived</span>
+            <span className="sarchived-count num">{archived.length}</span>
+          </button>
+          {showArchived && (
+            <FoldBody className="sgroup-body" enter>
+              <SessionList ids={idsOf(archived)} mix={undefined} />
+            </FoldBody>
           )}
-        </motion.div>
+        </>
       )}
-    </AnimatePresence>
+    </FoldBody>
   );
 }
 
@@ -449,13 +463,21 @@ const sameSection = (a: SectionProps, b: SectionProps) => a.collapsed === b.coll
 const ProjectSection = memo(function ProjectSection({ group, collapsed, onToggle, current, inSet }: SectionProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenamingFolder] = useState(false);
-  const [enter] = useState(lateMount);
+  // Here by a move (into a project, out of one): it slides from where it stood and plays no entrance (move.ts).
+  const [moved] = useState(() => cued(group.key));
+  const [enter] = useState(() => !moved && lateMount());
+  const section = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    if (moved) arrive(section.current, group.key);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const rename = useCallback(() => setRenamingFolder(true), []);
   const hasSessions = group.sessions.length > 0 || group.archived.length > 0;
   const open = hasSessions && !collapsed;
 
   return (
     <section
+      ref={section}
       className="sgroup"
       data-flip={group.key}
       data-folder={group.key}
@@ -488,6 +510,7 @@ const ProjectSection = memo(function ProjectSection({ group, collapsed, onToggle
                 onClick={(e) => {
                   if (!hasSessions) return goHome(group.path);
                   holdListEnd(e.currentTarget);
+                  foldCue(e.currentTarget);
                   onToggle(group.key);
                 }}
                 onPointerDown={(e) => pressFolder(e, group.key, inSet ? innerDrop(inSet) : TOP_DROP)}
@@ -584,13 +607,13 @@ function ProjectItems({ group, inSet, onRename, M }: { group: ProjectGroup; inSe
         <M.Portal>
           <M.SubContent className="pop side-pop" sideOffset={6} alignOffset={-4} collisionPadding={10} style={{ minWidth: 200 }}>
             {others.map((g) => (
-              <M.Item key={g.id} className="menu-item" onSelect={() => void addToGroup(group.path, g.id)}>
+              <M.Item key={g.id} className="menu-item" onSelect={() => (moveCue(group.key), void addToGroup(group.path, g.id))}>
                 <Icon name="stack" size={16} />
                 <span className="grow truncate">{g.name}</span>
               </M.Item>
             ))}
             {others.length > 0 && <M.Separator className="menu-sep" />}
-            <M.Item className="menu-item" onSelect={holdFocus(() => void newProject([group.path]))}>
+            <M.Item className="menu-item" onSelect={holdFocus(() => (moveCue(group.key), void newProject([group.path])))}>
               <Icon name="plus" size={16} />
               <span className="grow">New project</span>
             </M.Item>
@@ -598,7 +621,7 @@ function ProjectItems({ group, inSet, onRename, M }: { group: ProjectGroup; inSe
         </M.Portal>
       </M.Sub>
       {inSet && (
-        <M.Item className="menu-item" onSelect={() => void removeFromGroup(group.path, topArrangeKeys())}>
+        <M.Item className="menu-item" onSelect={() => (moveCue(group.key), void removeFromGroup(group.path, topArrangeKeys()))}>
           <Icon name="arrow-up" size={16} />
           <span className="grow">Take out of project</span>
         </M.Item>
@@ -692,8 +715,8 @@ const SetSection = memo(function SetSection({ set, collapsed, onToggle, activeKe
     return () => void renameListeners.delete(l);
   }, [set.id]);
   const rename = useCallback(() => setRenamingSet(true), []);
+  const stood = useStood();
   const open = !collapsed.has(set.key);
-  const fold = useFold();
   const current = set.folders.some((f) => f.key === activeKey);
   const inner = set.folders.map(folderOrder).join('\n');
   const one = set.folders.length === 1 ? set.folders[0] : undefined;
@@ -731,6 +754,7 @@ const SetSection = memo(function SetSection({ set, collapsed, onToggle, activeKe
                 aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown F2"
                 onClick={(e) => {
                   holdListEnd(e.currentTarget);
+                  foldCue(e.currentTarget);
                   onToggle(set.key);
                 }}
                 onPointerDown={(e) => pressFolder(e, set.key, TOP_DROP)}
@@ -811,21 +835,19 @@ const SetSection = memo(function SetSection({ set, collapsed, onToggle, activeKe
         </RC.Portal>
       </RC.Root>
 
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.div key="body" className="sgroup-body sset-body" initial={FOLD_SHUT} animate={FOLD_OPEN} exit={FOLD_SHUT} transition={fold}>
-            {set.folders.length ? (
-              <Flip order={inner} className="sset-folders" beforeMeasure={releaseFolderDrag}>
-                {set.folders.map((f) => (
-                  <ProjectSection key={f.key} group={f} collapsed={collapsed.has(f.key)} onToggle={onToggle} current={activeKey === f.key} inSet={set.id} />
-                ))}
-              </Flip>
-            ) : (
-              <p className="sset-empty">Drag a folder here</p>
-            )}
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {open && (
+        <FoldBody className="sgroup-body sset-body" enter={stood.current}>
+          {set.folders.length ? (
+            <Flip order={inner} className="sset-folders" beforeMeasure={releaseFolderDrag}>
+              {set.folders.map((f) => (
+                <ProjectSection key={f.key} group={f} collapsed={collapsed.has(f.key)} onToggle={onToggle} current={activeKey === f.key} inSet={set.id} />
+              ))}
+            </Flip>
+          ) : (
+            <p className="sset-empty">Drag a folder here.</p>
+          )}
+        </FoldBody>
+      )}
     </section>
   );
 });
@@ -908,6 +930,7 @@ const ChatsSection = memo(function ChatsSection({ chats, collapsed, onToggle, cu
               aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
               onClick={(e) => {
                 holdListEnd(e.currentTarget);
+                foldCue(e.currentTarget);
                 onToggle('chats');
               }}
               onPointerDown={(e) => pressFolder(e, 'chats', TOP_DROP)}
@@ -985,7 +1008,9 @@ const TOP_DROP: FolderDrop = {
   reorder: moveTop,
   into: (key, into) => {
     const f = folderByKey(key);
-    if (f && into.startsWith('group:')) void addToGroup(f.path, into.slice(6));
+    if (!f || !into.startsWith('group:')) return;
+    moveCue(key);
+    void addToGroup(f.path, into.slice(6));
   },
 };
 
@@ -999,6 +1024,7 @@ function innerDrop(setId: string): FolderDrop {
       out: (key, from, side) => {
         const f = folderByKey(key);
         if (!f) return;
+        moveCue(key);
         const top = topArrangeKeys();
         const at = top.indexOf(from);
         top.splice(at < 0 ? top.length : side === 'before' ? at : at + 1, 0, f.path);

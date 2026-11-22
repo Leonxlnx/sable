@@ -249,9 +249,12 @@
 }
 
 .palette-empty {
-  padding: 26px 12px 28px;
+  /* 40px under the field's line: where a pane's empty sentence stands (rail.css, history.css). */
+  padding: 40px 12px 28px;
   text-align: center;
+  font-size: var(--t-ui);
   color: var(--text-3);
+  animation: var(--empty-in);
 }
 
 /* Fuzzy-matched characters: brighter and underlined, not coloured. */

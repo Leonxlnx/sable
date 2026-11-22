@@ -1622,6 +1622,22 @@ textarea.field {
   --meter-color: var(--red);
 }
 
+/* Empty and waiting states: one calm sentence where the content would be, 13px (--t-ui) in
+   --text-3, a whole sentence with its full stop, never a picture. It is unseen for its first
+   150 ms and then fades in (opacity only): what arrives within that time never had a sentence
+   before it, so a quick load or a filter that finds something a moment later shows no flash.
+   Each place keeps its own rule for where the sentence stands (a pane: centred, 40px under its
+   bar; a list or a menu: the first row's place) and takes `animation: var(--empty-in)`. */
+:root {
+  --empty-in: empty-in var(--d-3) var(--ease) 150ms backwards;
+}
+
+@keyframes empty-in {
+  from {
+    opacity: 0;
+  }
+}
+
 /* Skeleton: a flat placeholder with a dithered band of light passing over it. */
 .skel {
   position: relative;

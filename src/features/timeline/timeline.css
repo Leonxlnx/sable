@@ -64,7 +64,7 @@
 
 .tl-empty {
   color: var(--text-3);
-  font-size: var(--t-body);
+  font-size: var(--t-ui);
   /* Late on purpose: a session started from home has its first message on the way, and this
      sentence must not flash before it lands. */
   animation: fade-in var(--d-4) var(--ease) 900ms backwards;

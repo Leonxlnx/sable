@@ -58,6 +58,13 @@ describe('a change of view: one veil, one clock, one direction', () => {
     expect(reveal).toMatch(/for \(const el of sw\.show \?\? \[\]\)[\s\S]*?el\.animate\(/);
     // The quarters go off after the hold, in the reverse of the order they came on.
     expect(reveal).toContain('hold + (3 - q) * VEIL_STEP_OUT');
+    // Each quarter's way out is whole in its keyframes, on from the first frame. As a short animation
+    // behind a delay, the quarters went off early when the page committed the new view: what had been
+    // covered showed for some frames under a quarter of the veil, then the veil was solid again.
+    expect(reveal).not.toMatch(/delay:/);
+    expect(reveal).toMatch(/\{ opacity: 1, offset: at\(offAt\[q\], out\) \},\s*\{ opacity: 0, offset: at\(offAt\[q\] \+ FRAME, out\) \}/);
+    // The gate is a clock on the same timeline, not an animation of the veil.
+    expect(reveal).toContain('new Animation(new KeyframeEffect(null, null,');
     // In a swap the stage's own variants move nothing and fade nothing.
     expect(app).toContain("const STILL = { opacity: 1, y: 0, transition: { duration: 0 } } as const;");
     expect(app).not.toContain('VEIL_SWAP_AT');
