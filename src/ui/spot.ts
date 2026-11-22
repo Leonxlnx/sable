@@ -8,7 +8,8 @@
  * hovered (and again if a re-render drops it). Only the disc's transform changes, so a move
  * restyles one childless element and repaints nothing (the disc is its own layer while lit; the
  * ring's mask never changes). Nothing runs while the pointer
- * is still, and nothing at all for touch or when the user prefers reduced motion. Features only
+ * is still, and nothing at all for touch, when the user prefers reduced motion or while the governor
+ * sheds effects (`<html data-quality>`). Features only
  * add the attribute; they never listen themselves.
  *
  * A surface whose outline is not a rounded box (the composer and its cove) draws its own ring: a
@@ -17,6 +18,15 @@
  */
 
 let started = false;
+
+/**
+ * Whether a pointer move lights anything: a fine pointer, motion allowed, and the governor not
+ * shedding effects (`<html data-quality>`, art/DitherField.tsx): under load no frame is asked for,
+ * nothing is read and no light moves. Pure, for tests.
+ */
+export function spotLive(e: { pointerType: string }, env: { reduce: boolean; fine: boolean; shed: boolean }): boolean {
+  return e.pointerType !== 'touch' && !env.reduce && env.fine && !env.shed;
+}
 
 /** The disc inside a ring (or inside one part of a ring), created the first time it is needed. */
 function discIn(host: HTMLElement): HTMLElement {
@@ -95,8 +105,12 @@ export function startSpot() {
     if (!raf) raf = requestAnimationFrame(frame);
   };
 
+  const root = document.documentElement;
+  // Read from the attribute itself (no layout): set and cleared by the governor.
+  let shed = root.hasAttribute('data-quality');
+
   const onMove = (e: PointerEvent) => {
-    if (e.pointerType === 'touch' || reduce.matches || !fine.matches) return;
+    if (!spotLive(e, { reduce: reduce.matches, fine: fine.matches, shed })) return;
     x = e.clientX;
     y = e.clientY;
     target = e.target instanceof Element ? e.target : null;
@@ -105,7 +119,7 @@ export function startSpot() {
 
   // The surface moved under a still pointer (a scroll): place the light again.
   const onScroll = () => {
-    if (current) schedule();
+    if (current && !shed) schedule();
   };
 
   const clear = () => {
@@ -120,4 +134,11 @@ export function startSpot() {
   document.documentElement.addEventListener('pointerleave', clear);
   window.addEventListener('blur', clear);
   reduce.addEventListener('change', clear);
+  // The governor sheds effects: the lit surface goes dark at once and stays so until it lets go.
+  new MutationObserver(() => {
+    const now = root.hasAttribute('data-quality');
+    if (now === shed) return;
+    shed = now;
+    if (shed) clear();
+  }).observe(root, { attributes: true, attributeFilter: ['data-quality'] });
 }

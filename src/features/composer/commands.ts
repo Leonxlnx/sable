@@ -13,6 +13,7 @@ import { spareCommand } from './spare';
 import { raceCommand } from '@/features/race/race';
 import { getPrompts, subscribePrompts } from '@/features/saved/prompts-store';
 import { openCustomize } from '@/features/customize/custom-store';
+import { lastResponse } from '@/features/timeline/turns';
 
 /** Slash commands Sable handles itself, before anything reaches the agent. */
 
@@ -35,7 +36,12 @@ export interface AppCommand {
   session?: boolean;
   /** A saved prompt (Settings › Prompts): listed under Prompts by its name; choosing it puts its text into the composer. */
   prompt?: SavedPrompt;
-  run: (ctx: CommandCtx, arg: string) => void;
+  /**
+   * Runs it. A command that asks the bridge for something (open a chat, start a race) answers
+   * whether it happened (a promise of a boolean): on `false` the composer puts the command back in
+   * the field. What any other command returns means nothing.
+   */
+  run: (ctx: CommandCtx, arg: string) => unknown;
 }
 
 const ui = () => useStore.getState().setUi;
@@ -44,15 +50,15 @@ function copyLastAnswer(sessionId: string) {
   const s = useStore.getState();
   const d = s.data[sessionId];
   if (!d) return;
-  for (let i = d.roots.length - 1; i >= 0; i--) {
-    const item = d.items[d.roots[i]];
-    if (item?.type === 'text' && item.text.trim()) {
-      navigator.clipboard.writeText(item.text).then(
-        () => s.toast('Copied the last answer', 'success'),
-        () => s.toast('Could not reach the clipboard', 'error'),
-      );
-      return;
-    }
+  // The same text as the newest turn's "Copy response": its answer, never a nod said after it.
+  const status = s.sessions[sessionId]?.status;
+  const text = lastResponse(d.items, d.roots, status === 'running' || status === 'starting' || status === 'awaiting');
+  if (text) {
+    navigator.clipboard.writeText(text).then(
+      () => s.toast('Copied the last answer', 'success'),
+      () => s.toast('Could not reach the clipboard', 'error'),
+    );
+    return;
   }
   s.toast('There is no answer to copy yet');
 }
@@ -124,13 +130,13 @@ const BUILT_IN: AppCommand[] = [
     name: 'race',
     description: 'Give the task to two agents at once, each in a lane of its own',
     argumentHint: '<task>',
-    run: ({ sessionId }, arg) => void raceCommand(sessionId, arg),
+    run: ({ sessionId }, arg) => raceCommand(sessionId, arg),
   },
   {
     name: 'customize',
     description: 'Change how Sable looks with an agent',
     argumentHint: '<what you want>',
-    run: (_c, arg) => void openCustomize(arg),
+    run: async (_c, arg) => (await openCustomize(arg)) !== null,
   },
   { name: 'stop', description: 'Stop the current turn', session: true, run: ({ sessionId }) => sessionId && void interrupt(sessionId) },
   { name: 'copy', description: 'Copy the last answer', session: true, run: ({ sessionId }) => sessionId && copyLastAnswer(sessionId) },

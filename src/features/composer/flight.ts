@@ -64,6 +64,10 @@ export interface Sample {
 interface Flight {
   key: string;
   dest: FlightDest;
+  /** The chat it was sent in (null from home until the chat exists, see `scope`): only that chat's rows claim it. */
+  session: string | null;
+  /** When it left, on the bridge's clock (ms since epoch): a message older than that is history, never its landing. */
+  wall: number;
   steer: boolean;
   /**
    * Time zero of the message, on the page's clock: the frame its gathering words first show in
@@ -138,6 +142,10 @@ export interface FlightHandle {
    * for the words to be put back).
    */
   settle(ok: boolean): Promise<void>;
+  /** The chat the message went to, once known (a first message from home). */
+  scope(sessionId: string): void;
+  /** The view it left from is gone (or the message goes back elsewhere): what is in the air fades where it is. */
+  release(): void;
 }
 
 const pending: Flight[] = [];
@@ -145,7 +153,7 @@ const pending: Flight[] = [];
  * Messages that mounted in the conversation with no message in the air yet (a tray row may still
  * leave): claimed within `UNCLAIMED_MS`, forgotten after (so no old conversation is held).
  */
-const unclaimed: { key: string; root: HTMLElement; at: number }[] = [];
+const unclaimed: { key: string; root: HTMLElement; at: number; session: string | null; ts: number | null }[] = [];
 const UNCLAIMED_MS = 400;
 const pruneUnclaimed = (now: number) => {
   for (let i = unclaimed.length - 1; i >= 0; i--) if (now - unclaimed[i].at >= UNCLAIMED_MS || !unclaimed[i].root.isConnected) unclaimed.splice(i, 1);
@@ -168,6 +176,33 @@ const matches = (flightKey: string, text: string) => {
   const k = norm(text);
   return !!flightKey && (k === flightKey || k.startsWith(flightKey) || flightKey.startsWith(k));
 };
+
+/** How much older than the launch a row's message may be and still be the one sent (two clocks of one machine, a little skew). */
+export const FRESH_SLACK_MS = 2000;
+
+/** Where a row (or a tray row) that might take a message in the air belongs. */
+export interface LandingSite {
+  /** The chat it is shown in. */
+  session?: string | null;
+  /** Its message's time (`UserItem.ts`): a message from before the launch is history. */
+  ts?: number | null;
+}
+
+/**
+ * Whether a message in the air may land on a row with `text` at `site`: the same destination, the
+ * same words, the same chat (when both are known), and a message no older than the launch. So a
+ * chat switched to never takes another chat's message, and an old row with the same words ("Continue")
+ * mounting in view never takes a new one. Pure, for tests.
+ */
+export function claimable(f: Pick<Flight, 'dest' | 'key' | 'session' | 'wall'> & { target?: unknown; ending?: boolean }, dest: FlightDest, text: string, site: LandingSite = {}): boolean {
+  if (f.dest !== dest || f.target || f.ending || !matches(f.key, text)) return false;
+  if (f.session && site.session && f.session !== site.session) return false;
+  if (site.ts != null && site.ts < f.wall - FRESH_SLACK_MS) return false;
+  return true;
+}
+
+/** A flight's matching fields, for `claimable` (and the tests). */
+export const flightKey = (text: string, dest: FlightDest, session: string | null, wall: number) => ({ key: norm(text), dest, session, wall });
 
 /** Words for the tray that nothing has claimed fade after this long; none outlives the last. */
 const NO_CLAIM_MS = 1400;
@@ -545,7 +580,7 @@ const BAR_HOLD = BORN + 200;
  * time. What is no layer (the timers, the backdrop's beats and its still) follows right after
  * that frame (`after`).
  */
-export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: boolean; first?: boolean }): FlightHandle | null {
+export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: boolean; first?: boolean; session?: string | null }): FlightHandle | null {
   if (reducedMotion() || !source.text.trim()) return null;
   const t0 = performance.now();
   const bubble = opts.dest === 'timeline';
@@ -616,6 +651,8 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   const f: Flight = {
     key: norm(source.text),
     dest: opts.dest,
+    session: opts.session ?? null,
+    wall: Date.now(),
     steer,
     t0,
     started: false,
@@ -681,7 +718,7 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   let early: HTMLElement | null = null;
   if (bubble) {
     pruneUnclaimed(t0);
-    const i = unclaimed.findIndex((u) => matches(f.key, u.key));
+    const i = unclaimed.findIndex((u) => claimable(f, 'timeline', u.key, u));
     if (i >= 0) early = unclaimed.splice(i, 1)[0].root;
     else if (room > 0.5) scrollAhead(f, room, g);
   }
@@ -690,11 +727,38 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   // first frame, it shows on time even while the main thread is busy mounting the row it waits for.
   if (bubble) waitFrom(f, waitStart(f.plan.end));
   begin(f, g, lead);
-  if (early) landInTimeline(early, source.text, { steer, late: true });
+  if (early) landInTimeline(early, source.text, { steer, late: true, session: f.session });
   // Whatever happens on the way, nothing outlives this: the real message always shows.
   window.setTimeout(() => abort(f), bubble ? HOLD_MS + 2000 : MAX_LIFE_MS);
   if (import.meta.env.DEV) devHook();
-  return { settle: (ok) => settle(f, ok) };
+  return {
+    settle: (ok) => settle(f, ok),
+    scope: (id) => {
+      f.session = id;
+    },
+    release: () => abort(f),
+  };
+}
+
+/** The composers showing each chat, counted (a remount, or React's strict double mount, is no close). */
+const views = new Map<string, number>();
+
+/**
+ * A composer of `sessionId` is on screen; the returned function says it left. When the last one
+ * has left (a switch to another chat, the view closing), the chat's messages still in the air fade
+ * where they are, so none is left to land on whatever the next view mounts.
+ */
+export function holdFlights(sessionId: string): () => void {
+  views.set(sessionId, (views.get(sessionId) ?? 0) + 1);
+  return () => {
+    const n = (views.get(sessionId) ?? 1) - 1;
+    if (n > 0) views.set(sessionId, n);
+    else views.delete(sessionId);
+    queueMicrotask(() => {
+      if (views.has(sessionId)) return;
+      for (const f of [...pending]) if (f.session === sessionId) abort(f);
+    });
+  };
 }
 
 /** A queue row's place: the tray's newest row, just above the bar, inside the tray that unfolds behind it. */
@@ -1288,8 +1352,8 @@ function drop(f: Flight) {
   if (i >= 0) pending.splice(i, 1);
 }
 
-function claim(dest: FlightDest, text: string): Flight | null {
-  const i = pending.findIndex((f) => f.dest === dest && !f.target && !f.ending && matches(f.key, text));
+function claim(dest: FlightDest, text: string, site: LandingSite): Flight | null {
+  const i = pending.findIndex((f) => claimable(f, dest, text, site));
   return i >= 0 ? pending[i] : null;
 }
 
@@ -1360,14 +1424,14 @@ function aim(f: Flight) {
  * the air, it lands here: the row skips its own entrance and stays clear until the card sits on
  * it, then the two swap. Returns true when a message in the air took it.
  */
-export function landInTimeline(root: HTMLElement, text: string, opts: { steer?: boolean; late?: boolean } = {}): boolean {
+export function landInTimeline(root: HTMLElement, text: string, opts: { steer?: boolean; late?: boolean } & LandingSite = {}): boolean {
   if (reducedMotion()) return false;
-  const f = claim('timeline', text);
+  const f = claim('timeline', text, opts);
   if (!f) {
     if (!opts.late) {
       const now = performance.now();
       pruneUnclaimed(now);
-      unclaimed.push({ key: text, root, at: now });
+      unclaimed.push({ key: text, root, at: now, session: opts.session ?? null, ts: opts.ts ?? null });
       if (unclaimed.length > 4) unclaimed.shift();
       // Forgotten once it can no longer be claimed, so a conversation left behind is not held.
       window.setTimeout(() => pruneUnclaimed(performance.now()), UNCLAIMED_MS + 20);
@@ -1434,9 +1498,9 @@ function watch(f: Flight) {
 }
 
 /** A queued message's row appeared in the tray: the words land on it. */
-export function landInTray(textEl: HTMLElement, text: string): boolean {
+export function landInTray(textEl: HTMLElement, text: string, session?: string | null): boolean {
   if (reducedMotion()) return false;
-  const f = claim('tray', text);
+  const f = claim('tray', text, { session });
   if (!f) return false;
   // The words take the row's type and stand where its text starts.
   const row = textEl.closest<HTMLElement>('[data-qrow]');
@@ -1454,9 +1518,9 @@ export function landInTray(textEl: HTMLElement, text: string): boolean {
 }
 
 /** A queued message left the tray for the conversation: it gathers at the row's end and rises from there. */
-export function launchFromTray(textEl: HTMLElement, text: string) {
+export function launchFromTray(textEl: HTMLElement, text: string, session?: string | null) {
   if (reducedMotion()) return;
-  launchFlight({ el: textEl, text, oneLine: true }, { dest: 'timeline' });
+  launchFlight({ el: textEl, text, oneLine: true }, { dest: 'timeline', session });
 }
 
 /** For tests and the dev console: messages in the air. */

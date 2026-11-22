@@ -8,7 +8,7 @@ import { Icon } from '@/icons';
 import { pathForFile } from '@/lib/desktop';
 import { isUltraEffort, toggledSpeed } from '@/lib/models';
 import { EASE_OUT, play, reducedMotion } from '@/lib/motion';
-import { launchFlight } from './flight';
+import { holdFlights, launchFlight } from './flight';
 import { launchKey } from './launch';
 import { fieldBeat } from '@/art/events';
 import { searchFiles, type FileHit } from '@/lib/workspace';
@@ -22,6 +22,8 @@ import { useChoice } from './choice';
 import { paidAsk, paidConfirmed } from './paid-speed';
 import { APP_COMMANDS, appCommandsFor, commandRows, expandCommand, mentionRows, skillRows, type CommandCtx, type SuggestRow } from './commands';
 import { keepDrafts } from './drafts';
+import { leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
+import { watchWidth } from './width-watch';
 import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut } from './Controls';
 import { CoveSkin } from './Cove';
 import { PROVIDER_NAME } from '@/art/Logo';
@@ -260,9 +262,10 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const [files, setFiles] = useState<FileHit[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [recall, setRecall] = useState<number | null>(null);
-  // Ultracode as just switched here, over the value the session had then: it shows at once, and
-  // stops counting the moment the session says anything else (no effect, no second render).
-  const [ultraPick, setUltraPick] = useState<{ on: boolean; over: boolean } | null>(null);
+  // Ultracode as just switched here, over the value the session had then: it shows at once, until
+  // the bridge answers that request (restore.ts `UltraPick`), or the session says anything else.
+  const [ultraPick, setUltraPick] = useState<UltraPick | null>(null);
+  const ultraSeq = useRef(0);
   const searchSeq = useRef(0);
 
   const opening = useStore((s) => variant === 'session' && !!sessionId && !s.data[sessionId]?.loaded);
@@ -281,7 +284,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const popSide = variant === 'home' ? 'bottom' : 'top';
   const steerable = !!caps?.features.steer;
   const ultraOffered = !!caps?.features.ultracode;
-  const ultra = ultraOffered && (ultraPick && ultraPick.over === storedUltra ? ultraPick.on : storedUltra);
+  const ultra = ultraOffered && shownUltra(storedUltra, ultraPick?.session === sessionId ? ultraPick : null);
   // "Ultra" is one look across agents: ultracode on (a mode), or an Ultra level (an effort).
   const ultraLook = ultra || isUltraEffort(choice.effort);
   const images = !!caps?.features.images;
@@ -345,21 +348,24 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     syncHighlight();
   }, [measure, syncHighlight]);
 
+  // One observer for the field's life: a new width measures again with the text of the moment.
+  const measureRef = useRef(measure);
+  measureRef.current = measure;
   useEffect(() => {
     const ta = ref.current;
     if (!ta) return;
-    let w = ta.clientWidth;
-    const ro = new ResizeObserver(() => {
-      if (ta.clientWidth !== w) {
-        w = ta.clientWidth;
-        measure();
-      }
-    });
-    ro.observe(ta);
+    const stop = watchWidth(ta, () => measureRef.current());
     // The first measurement never animates.
-    requestAnimationFrame(() => ta.setAttribute('data-ready', ''));
-    return () => ro.disconnect();
-  }, [measure]);
+    const raf = requestAnimationFrame(() => ta.setAttribute('data-ready', ''));
+    return () => {
+      stop();
+      cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  // A chat left (a switch, or its view closing) takes its messages still in the air with it (rows
+  // of another chat never take them in any case: flight.ts `claimable`).
+  useEffect(() => (sessionId ? holdFlights(sessionId) : undefined), [sessionId]);
 
   // ── the home-to-session hand-off lands on this card ──
 
@@ -631,8 +637,14 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     if (m && !attachments.length) {
       const cmd = appCommandsFor(sessionId).find((c) => c.name === m[1]);
       if (cmd) {
+        const typed = { text, attachments: EMPTY };
         clear();
-        cmd.run(ctx, (m[2] ?? '').trim());
+        // A command that answers (opening a chat, starting a race) and fails: its words come back.
+        const ran = await cmd.run(ctx, (m[2] ?? '').trim());
+        if (ran === false) {
+          setDraft(key, putBack(useStore.getState().drafts[key], typed));
+          pendingCaret.current = typed.text.length;
+        }
         return;
       }
     }
@@ -645,7 +657,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     const steering = steer && busy && steerable;
     const ta = ref.current;
     const flew = !!ta && !!body && !reducedMotion();
-    const flight = flew ? launchFlight({ el: ta, text: body }, { dest: sessionId && busy && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId }) : null;
+    const flight = flew ? launchFlight({ el: ta, text: body }, { dest: sessionId && busy && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId, session: sessionId }) : null;
     if (variant === 'session') launchKey(card.current);
     // In a session the next placeholder is always the queueing one: the turn is running (or about to).
     // A queued message's words rise through the field into the tray: the placeholder waits for them.
@@ -661,34 +673,43 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     await afterFrame();
     if (sent.current === draft) sent.current = null;
     const now = useStore.getState().drafts[key];
-    // Words typed meanwhile stay (onChange let go of the hold); the sent ones and their files go.
-    if ((now?.text ?? '') === draft.text) {
-      setDraft(key, { text: '', attachments: [] });
-      pendingCaret.current = 0;
-    } else if (now?.attachments === draft.attachments) setDraft(key, { attachments: [] });
+    // Words typed meanwhile stay (onChange let go of the hold), and files attached meanwhile; the
+    // sent words and their own files go (restore.ts).
+    const left = leaveField(now, draft);
+    setDraft(key, left);
+    if (!left.text) pendingCaret.current = 0;
     setRecall(null);
-    // Refused: the words fly back into the field and are put back there (before anything typed since).
-    const putBack = async () => {
+    // Refused: the words fly back into the field and are put back there, with their files (before
+    // anything typed or attached since).
+    const giveBack = async () => {
       await flight?.settle(false);
       // The next placeholder may still be rising under the words.
       card.current?.querySelector('.cmp-roll')?.remove();
       card.current?.removeAttribute('data-rolling');
-      const cur = useStore.getState().drafts[key]?.text ?? '';
-      setDraft(key, { text: cur.trim() ? `${draft.text}
-${cur}` : draft.text, attachments: draft.attachments });
+      setDraft(key, putBack(useStore.getState().drafts[key], draft));
       pendingCaret.current = draft.text.length;
     };
     if (sessionId) {
       const res = await sendMessage(sessionId, out.text, out.attachments, steer && busy ? { steer: true } : {});
       if (res.ok) void flight?.settle(true);
-      else await putBack();
+      else await giveBack();
       return;
     }
-    if (await startFromHome(out.text, out.attachments)) void flight?.settle(true);
-    else {
-      cancelHandoff();
-      await putBack();
+    const res = await startFromHome(out.text, out.attachments, { onCreated: (id) => flight?.scope(id) });
+    if (res.ok) {
+      void flight?.settle(true);
+      return;
     }
+    cancelHandoff();
+    if (!res.sessionId) {
+      await giveBack();
+      return;
+    }
+    // The chat was made and is open, and only the message was refused: home has gone, so the words
+    // go back into that chat's field (a retry sends them there), merged with what is there already.
+    flight?.release();
+    const st = useStore.getState();
+    st.setDraft(res.sessionId, putBack(st.drafts[res.sessionId], draft));
   };
   const submitRef = useRef(submit);
   submitRef.current = submit;
@@ -705,16 +726,18 @@ ${cur}` : draft.text, attachments: draft.attachments });
     async (q: QueuedMessage) => {
       if (!sessionId) return;
       const d = useStore.getState().drafts[key];
-      const curText = d?.text ?? '';
-      const curAtts = d?.attachments ?? [];
+      const before = { text: d?.text ?? '', attachments: d?.attachments ?? EMPTY };
       let got: QueuedMessage | null = q;
-      if (curText.trim() || curAtts.length) {
-        const out = parcel(curText.trim(), curAtts);
-        await updateQueued(sessionId, q.id, out.text, out.attachments);
+      if (before.text.trim() || before.attachments.length) {
+        const out = parcel(before.text.trim(), before.attachments);
+        // The agent may have taken the message meanwhile: then nothing swaps and the draft stays.
+        if (!(await updateQueued(sessionId, q.id, out.text, out.attachments)).ok) return;
       } else got = await takeQueued(sessionId, q.id);
       if (!got) return;
-      setDraft(key, { attachments: got.attachments ?? [] });
-      setText(got.text);
+      // What was typed or attached while the bridge answered stays, after the message.
+      const next = swapIn(useStore.getState().drafts[key], before, { text: got.text, attachments: got.attachments ?? EMPTY });
+      setDraft(key, { attachments: next.attachments });
+      setText(next.text, got.text.length);
       setRecall(null);
       window.requestAnimationFrame(focus);
     },
@@ -725,9 +748,12 @@ ${cur}` : draft.text, attachments: draft.attachments });
 
   const toggleUltra = useCallback(
     (on: boolean) => {
-      setUltraPick({ on, over: !on });
-      if (sessionId) void setUltracode(sessionId, on);
-      else setHomeUltracode(on);
+      // Home keeps the choice in the store at once: nothing to wait for.
+      if (!sessionId) return setHomeUltracode(on);
+      const seq = ++ultraSeq.current;
+      setUltraPick({ on, over: !on, seq, session: sessionId });
+      // Taken or refused, the session's own value is the truth from the answer on.
+      void setUltracode(sessionId, on).then(() => setUltraPick((p) => ultraAnswered(p, seq)));
     },
     [sessionId],
   );

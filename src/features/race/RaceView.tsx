@@ -2,6 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import type { FileDiff, LaneForecast, ProviderId } from '@shared/protocol';
 import { PROVIDER_NAME, ProviderMark, Tiles } from '@/art/Logo';
 import { DiffView } from '@/components/DiffView';
+import { CoveSkin } from '@/features/composer/Cove';
+import { putBack } from '@/features/composer/restore';
 import { SendKey } from '@/features/composer/SendKey';
 import { PromptDock } from '@/features/prompts/PromptDock';
 import { useLaneForecast } from '@/features/session/lane';
@@ -523,7 +525,8 @@ function RaceDock({ pair, names, target, setTarget, field }: { pair: [string, st
     if (!trimmed) return;
     setText('');
     const results = await Promise.all(to.map((id) => sendMessage(id, trimmed)));
-    if (results.some((r) => !r.ok)) setText((cur) => cur || trimmed);
+    // Refused: the words come back, before anything typed since.
+    if (results.some((r) => !r.ok)) setText((cur) => putBack({ text: cur, attachments: [] }, { text: trimmed, attachments: [] }).text);
   };
   const stop = () => to.forEach((id) => void interrupt(id));
   const placeholder = target === 'both' ? (busy ? 'Queue a follow-up for both' : 'Message both') : `Message ${names[Number(target)].label}`;
@@ -532,6 +535,8 @@ function RaceDock({ pair, names, target, setTarget, field }: { pair: [string, st
     <div className="race-dock" ref={dock}>
       <div className="composer" data-variant="session">
         <div className="cmp-card" data-spot data-empty={!text ? '' : undefined}>
+          {/* The chat's own pane: the glass, its rim and shade, and the cove the key rests in. */}
+          <CoveSkin />
           <div className="cmp-field">
             <textarea
               ref={field}
@@ -578,10 +583,9 @@ function RaceDock({ pair, names, target, setTarget, field }: { pair: [string, st
                 ]}
               />
             </div>
-            <div className="cmp-side cmp-right">
-              <SendKey canSend={!!trimmed} busy={false} showStop={busy && !trimmed} steerable={false} sendWithEnter={sendWithEnter} shell={false} stoppable onSend={() => void send()} onStop={stop} />
-            </div>
           </div>
+          {/* The key is no part of the pane: it rests in the cove the pane's corner makes for it. */}
+          <SendKey canSend={!!trimmed} busy={false} showStop={busy && !trimmed} steerable={false} sendWithEnter={sendWithEnter} shell={false} stoppable onSend={() => void send()} onStop={stop} />
         </div>
       </div>
     </div>

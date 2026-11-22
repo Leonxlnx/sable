@@ -61,7 +61,7 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
   // The message sent from the composer (or a queue row) lands here: it flies in as this bubble and the two swap.
   const root = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
-    if (root.current && item.text) landInTimeline(root.current, item.text, { steer: item.steered });
+    if (root.current && item.text) landInTimeline(root.current, item.text, { steer: item.steered, session: sessionId, ts: item.ts });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A steer the agent has just taken: the card comes out of its waiting tone into the turn, and

@@ -88,11 +88,9 @@ export async function raceCommand(sessionId: string | null, task: string): Promi
   }
   const provider = meta?.provider ?? s.ui.homeProvider;
   const modes: Partial<Record<ProviderId, string>> = meta ? { [meta.provider]: meta.mode } : { ...s.ui.homeMode };
-  const ok = await startRace(cwd, task, provider, modes);
-  // Refused: the words go back into the field they were typed in (unless something new is there).
-  const key = sessionId ?? 'home';
-  if (!ok && task.trim() && !useStore.getState().drafts[key]?.text.trim()) useStore.getState().setDraft(key, { text: `/race ${task.trim()}` });
-  return ok;
+  // Refused: the composer puts the command back into the field it was typed in (composer/restore.ts),
+  // merged with anything typed since.
+  return startRace(cwd, task, provider, modes);
 }
 
 /** The lane ends with a land or a discard: the header's mark plays its last moment (see LaneMark). */

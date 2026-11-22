@@ -166,17 +166,22 @@ export function homeChoice(): NewSessionChoice | null {
 /** The home composer's ultracode choice (sent with the next new session where the agent offers it). */
 export const setHomeUltracode = (on: boolean) => useStore.getState().setUi({ homeUltracode: on });
 
-/** Sends the first message of a new session from the home screen. */
-export async function startFromHome(text: string, attachments: Attachment[] = []): Promise<boolean> {
+/**
+ * Sends the first message of a new session from the home screen. `sessionId` is set once the
+ * session exists, also when the message itself was then refused: the chat is open by then, so a
+ * refused message goes back into that chat's field (and a retry sends it there).
+ */
+export async function startFromHome(text: string, attachments: Attachment[] = [], opts: { onCreated?: (sessionId: string) => void } = {}): Promise<{ ok: boolean; sessionId?: string }> {
   const choice = homeChoice();
   if (!choice) {
     useStore.getState().setUi({ projectPicker: true });
-    return false;
+    return { ok: false };
   }
   const session = await createSession(choice.chat ? { ...choice, chat: { text } } : choice);
-  if (!session) return false;
-  await sendMessage(session.id, text, attachments);
-  return true;
+  if (!session) return { ok: false };
+  opts.onCreated?.(session.id);
+  const res = await sendMessage(session.id, text, attachments);
+  return { ok: res.ok, sessionId: session.id };
 }
 
 /**
@@ -197,9 +202,16 @@ export const interrupt = (sessionId: string) => bridge.call('session.interrupt',
 
 // ── queued messages (held by the bridge while a turn runs) ──
 
-/** Replaces a queued message's text, and its attachments when given; left empty, it is removed. */
-export const updateQueued = (sessionId: string, id: string, text: string, attachments?: Attachment[]) =>
-  bridge.call('queue.update', { sessionId, id, text, ...(attachments ? { attachments } : {}) }).catch(fail);
+/**
+ * Replaces a queued message's text, and its attachments when given; left empty, it is removed.
+ * `ok: false` when the message is no longer in the queue (the agent took it meanwhile) or the
+ * bridge could not be reached.
+ */
+export const updateQueued = (sessionId: string, id: string, text: string, attachments?: Attachment[]): Promise<{ ok: boolean }> =>
+  bridge.call('queue.update', { sessionId, id, text, ...(attachments ? { attachments } : {}) }).catch((err) => {
+    fail(err);
+    return { ok: false };
+  });
 export const removeQueued = (sessionId: string, id: string) => bridge.call('queue.remove', { sessionId, id }).catch(fail);
 /** Takes a queued message out to edit it (e.g. back into the composer). Null when it already went out. */
 export async function takeQueued(sessionId: string, id: string): Promise<QueuedMessage | null> {
@@ -256,7 +268,11 @@ export async function sendReview(sessionId: string): Promise<boolean> {
 export const setModel = (sessionId: string, model: string) => bridge.call('session.setModel', { sessionId, model }).catch(fail);
 
 /** Claude Code ultracode on or off for a session (where `caps.features.ultracode`). */
-export const setUltracode = (sessionId: string, on: boolean) => bridge.call('session.setUltracode', { sessionId, on }).catch(fail);
+export const setUltracode = (sessionId: string, on: boolean): Promise<{ ok: boolean }> =>
+  bridge.call('session.setUltracode', { sessionId, on }).catch((err) => {
+    fail(err);
+    return { ok: false };
+  });
 
 /** The session's speed; the bridge falls back to standard when the model does not offer it. */
 export const setSpeed = (sessionId: string, speed: string) => bridge.call('session.setSpeed', { sessionId, speed }).catch(fail);

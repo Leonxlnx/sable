@@ -42,25 +42,29 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
   // tray's body: a tray that empties keeps its last rows on screen while it folds away.
   const clip = useRef<HTMLDivElement>(null);
   const before = useRef<QueuedMessage[]>(NONE);
+  const beforeSession = useRef(sessionId);
   useLayoutEffect(() => {
     const host = clip.current;
     const prev = before.current;
     before.current = queue;
-    if (!host || prev === queue) return;
+    // Another chat's queue (a switch): its rows neither land nor leave here.
+    const same = beforeSession.current === sessionId;
+    beforeSession.current = sessionId;
+    if (!host || prev === queue || !same) return;
     const now = new Set(queue.map((q) => q.id));
     const was = new Set(prev.map((q) => q.id));
     const textOf = (id: string) => host.querySelector<HTMLElement>(`[data-qid="${CSS.escape(id)}"] .cq-text`);
     for (const q of queue) {
       if (was.has(q.id)) continue;
       const el = textOf(q.id);
-      if (el) landInTray(el, q.text);
+      if (el) landInTray(el, q.text, sessionId);
     }
     for (const q of prev) {
       if (now.has(q.id) || gone.delete(q.id)) continue;
       const el = textOf(q.id);
-      if (el) launchFromTray(el, q.text);
+      if (el) launchFromTray(el, q.text, sessionId);
     }
-  }, [queue]);
+  }, [queue, sessionId]);
   return (
     <div className="cq-clip" ref={clip}>
       <AnimatePresence initial={false}>
