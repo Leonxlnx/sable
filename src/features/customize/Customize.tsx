@@ -22,7 +22,10 @@ const ago = (t: number) => {
   return a === 'now' ? 'just now' : /\d$/.test(a) ? a : `${a} ago`;
 };
 
-/** Settings › Customize: the Customize chat, your styles and your build, and the way back to Sable's own look. */
+/**
+ * Settings › Customize: the Customize chat, your styles, and the way back to Sable's own look. Your build
+ * has its row only where the bridge offers it (`build.supported`; not in this version, see `server/services/custom.ts`).
+ */
 export function Customize() {
   const c = useCustom();
   const home = useStore((s) => s.home);

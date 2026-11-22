@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { close, createReadStream, existsSync, fstat, open, statSync } from 'node:fs';
 import path from 'node:path';
 import { BRIDGE_PATH } from '../shared/protocol';
 import { attachBridge } from './bridge';
@@ -98,8 +98,6 @@ export interface StaticCustom {
  * next request on, with no restart.
  */
 export function createStaticServer(own: string, extra?: (pathname: string) => Record<string, string>, custom?: () => StaticCustom | undefined): Server {
-  // Build assets carry their content hash in their names: their size is looked up once.
-  const sizes = new Map<string, number>();
   return createServer((req, res) => {
     bootMark('server:first-request');
     const c = custom?.();
@@ -123,33 +121,53 @@ export function createStaticServer(own: string, extra?: (pathname: string) => Re
       return;
     }
     const hashed = file.startsWith(path.join(root, 'assets') + path.sep);
-    const known = hashed ? sizes.get(file) : undefined;
-    if (known === undefined && !isFile(file)) {
+    if (!isFile(file)) {
       // A missing build asset is a 404 (serving index.html would fail as a script with a MIME error);
       // any other path is a client route and gets the app.
-      if (pathname.startsWith('/assets/') || path.extname(pathname)) {
-        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('Not found');
-        return;
-      }
+      if (pathname.startsWith('/assets/') || path.extname(pathname)) return void notFound(res);
       file = path.join(root, 'index.html');
     }
-    if (known === undefined && !isFile(file)) {
-      res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }).end('Sable is not built yet. Run "pnpm build" first.');
-      return;
-    }
-    const size = known ?? statSync(file).size;
-    if (hashed) sizes.set(file, size);
-    if (path.basename(file) === 'index.html' && path.dirname(file) === root) c?.served(root);
-    res.writeHead(200, {
-      ...extra?.(pathname),
-      'content-type': types[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
-      'content-length': size,
-      'cache-control': hashed ? 'public, max-age=31536000, immutable' : 'no-cache',
-      'x-content-type-options': 'nosniff',
+    // Opened before anything is sent, its size from that handle: a file removed or rebuilt between the
+    // look and the read is a 404 (or a cut response), never an error the process does not handle.
+    open(file, 'r', (err, fd) => {
+      if (err) {
+        if (path.basename(file) === 'index.html') res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' }).end('Sable is not built yet. Run "pnpm build" first.');
+        else notFound(res);
+        return;
+      }
+      fstat(fd, (statErr, st) => {
+        if (statErr || !st.isFile()) {
+          close(fd, () => {});
+          return void notFound(res);
+        }
+        // Only a real navigation (GET) starts a custom page's clock; HEAD asks for nothing to run.
+        if (req.method === 'GET' && path.basename(file) === 'index.html' && path.dirname(file) === root) c?.served(root);
+        res.writeHead(200, {
+          ...extra?.(pathname),
+          'content-type': types[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+          'content-length': st.size,
+          'cache-control': hashed ? 'public, max-age=31536000, immutable' : 'no-cache',
+          'x-content-type-options': 'nosniff',
+        });
+        if (req.method === 'HEAD') {
+          close(fd, () => {});
+          return void res.end();
+        }
+        const stream = createReadStream('', { fd, start: 0, end: Math.max(0, st.size - 1), autoClose: true });
+        stream.on('error', () => res.destroy());
+        res.on('close', () => stream.destroy());
+        if (st.size === 0) {
+          stream.destroy();
+          return void res.end();
+        }
+        stream.pipe(res);
+      });
     });
-    if (req.method === 'HEAD') res.end();
-    else createReadStream(file).pipe(res);
   });
+}
+
+function notFound(res: ServerResponse) {
+  res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('Not found');
 }
 
 function listen(server: Server, port: number): Promise<number> {

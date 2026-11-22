@@ -20,7 +20,7 @@ import { pairLink, phoneEvent, QUEUE_PAGE, registerPhone, type PhoneService } fr
 import { FILE_CHUNK } from '../server/services/phone-files';
 import { answerHello, loadIdentity, readSecHello, transcript } from '../server/services/phone-secure';
 import { pskOfKey, startHandshake } from '../mobile/src/lib/secure';
-import { fetchSecure, fingerprintIn, handshake, helloPlain, keyOf, legacyPairing, pairSecure, wireClient, type WireClient } from './phone-wire';
+import { beside, fetchSecure, fingerprintIn, handshake, helloPlain, keyOf, legacyPairing, pairSecure, wireClient, type WireClient } from './phone-wire';
 import { CONTAIN } from '../server/core/contain';
 
 // These tests are about the endpoint after review wave 4, not containment. Where no handle names its file (Windows), the
@@ -66,7 +66,7 @@ function deskSocket(phone: PhoneService) {
 }
 
 async function chatOf(app: App, c: WireClient, home: string) {
-  const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
+  const created = (await c.call('session.create', { provider: 'demo', cwd: beside(home) })) as { result: PhoneTail };
   return app.sessions.get(created.result.session.id)!;
 }
 
@@ -271,8 +271,8 @@ describe('files over the secure channel (4, 6, 10)', () => {
     const rt = await chatOf(app, c, home);
     const body = Buffer.alloc(FILE_CHUNK * 2 + 77);
     for (let i = 0; i < body.length; i++) body[i] = (i * 7) % 256;
-    writeFileSync(path.join(home, 'data.bin'), body);
-    rt.add(shareOf('s1', path.join(home, 'data.bin')));
+    writeFileSync(path.join(rt.meta.cwd, 'data.bin'), body);
+    rt.add(shareOf('s1', path.join(rt.meta.cwd, 'data.bin')));
     const s = (await c.call('phone.fileStart', { sessionId: rt.id, itemId: 's1', index: 0 })) as { result: { transfer: string; size: number; sha256: string; chunk: number } };
     expect(s.result).toMatchObject({ size: body.length, sha256: createHash('sha256').update(body).digest('hex'), chunk: FILE_CHUNK });
     // Never more than a chunk, whatever is asked; from where the phone asks.
@@ -293,7 +293,7 @@ describe('files over the secure channel (4, 6, 10)', () => {
     const { app, port, home } = await setup();
     const { c } = await pairSecure(app, port);
     const rt = await chatOf(app, c, home);
-    const file = path.join(home, 'app-release.apk');
+    const file = path.join(rt.meta.cwd, 'app-release.apk');
     writeFileSync(file, 'the real build');
     // Whole seconds, so the time can be put back exactly (the share's record and the link check it).
     utimesSync(file, 1_700_000_000, 1_700_000_000);
@@ -315,10 +315,10 @@ describe('files over the secure channel (4, 6, 10)', () => {
     const { app, port, home, old } = await setup({ legacy: 1 });
     const c = await helloPlain(port, old[0].token);
     const rt = await chatOf(app, c, home);
-    mkdirSync(path.join(home, 'out'));
+    mkdirSync(path.join(rt.meta.cwd, 'out'));
     const names = ['app.apk', 'app.apk ', 'app.APK.', 'app.apk​'];
     names.forEach((n, i) => {
-      const file = path.join(home, 'out', `f${i}`);
+      const file = path.join(rt.meta.cwd, 'out', `f${i}`);
       writeFileSync(file, 'apk bytes');
       rt.add(shareOf(`a${i}`, file, n));
     });
@@ -328,8 +328,8 @@ describe('files over the secure channel (4, 6, 10)', () => {
     }
     // A plain pairing cannot use the secure channel's transfer either.
     expect(((await c.call('phone.fileStart', { sessionId: rt.id, itemId: 'a0', index: 0 })) as { error?: string }).error).toBe('Pair again for a secure connection to get this file.');
-    writeFileSync(path.join(home, 'notes.txt'), 'notes');
-    rt.add(shareOf('n1', path.join(home, 'notes.txt')));
+    writeFileSync(path.join(rt.meta.cwd, 'notes.txt'), 'notes');
+    rt.add(shareOf('n1', path.join(rt.meta.cwd, 'notes.txt')));
     const link = (await c.call('phone.fileLink', { sessionId: rt.id, itemId: 'n1', index: 0 })) as { ok: boolean; result: { path: string } };
     expect(link.ok).toBe(true);
     const res = await fetch(`http://127.0.0.1:${port}${link.result.path}`);

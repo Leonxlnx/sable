@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,7 @@ import type { AppSettings, CustomBuild, CustomState, ProviderId, SessionMeta, Se
 import { CUSTOM_READY_MS } from '../../shared/protocol';
 import type { App } from '../app';
 import { VERSION } from '../version';
+import { remoteRef } from './css-scan';
 
 /**
  * Customize Sable: the person changes the app they are using, with an agent.
@@ -17,10 +18,49 @@ import { VERSION } from '../version';
  * (`src/boot.ts`); the folder is watched, and every change of the file is pushed as `custom.updated`
  * with a new `rev`, so the page swaps the sheet in place. Nothing to build, and an update changes
  * nothing about it. Off with `AppSettings.customStyles: false` (or "Use Sable's own look"), and for one
- * run with `--original` (the shell passes `ignore`). A sheet that asks for anything from the internet
- * is not applied at all (`remoteRef`).
+ * run with `--original` (the shell passes `ignore`). A sheet that asks for anything from the internet,
+ * or that cannot be read safely, is not applied at all (`remoteRef`, a CSS tokenizer in `css-scan.ts`).
+ * The whole `/custom/` namespace answers the app's own origin only; the desktop's pages cannot be framed
+ * (`frame-ancestors 'none'`, `electron/csp.ts`).
  *
- * Your build (depth B): `<data>/custom/src`, a clone of the public repository at the running version's
+ * The Customize chat runs only with an agent that gets its brief (`customAgent`: Claude Code or Codex;
+ * the Demo agent when named, for development). A phone cannot reach the sheet through a chat
+ * (`phoneRefusal`): no chat of a phone's in the data folder, and the Customize chat (or any
+ * chat in `<data>/custom`) is only read and stopped from a phone; `custom.*` is not on its allowlist.
+ *
+ * Any local process that can reach the bridge (review wave 8, #1: out of scope for now) can call these
+ * methods, but none gives it more than the bridge already does: `custom.open` starts a chat in the
+ * person's default mode, which `session.create` can do in a mode that never asks; `custom.original` turns a
+ * setting off, as `app.setSettings` does; the build's methods answer `BUILD_OFF`.
+ *
+ * NOT IN THIS VERSION, your build (`BUILD_SHIPS` is false): nothing offers it (no row in Settings, no
+ * strip above the composer), its methods answer `BUILD_OFF`, the served root is always the app's own
+ * and the brief never mentions it. Its code is kept and tested with `build: true`. Before it is
+ * switched on, clear this list (Codex review wave 8):
+ *   - #2  Approval covers only `index.html`: a changed asset at an existing path runs after approval,
+ *         and the served folder is checked lexically (a link or junction in `dist` escapes it). Publish
+ *         an immutable snapshot into a folder of the bridge's own, refuse links and reparse points
+ *         while copying, and serve only the files in the approved manifest.
+ *   - #8  `vite build` loads the checkout's own config and plugins, which the agent can edit, as the
+ *         desktop user with Sable's environment: build with a trusted config and toolchain, a narrowed
+ *         environment and file system, and publish only its validated output.
+ *   - #9  An old interface can talk to a newer bridge: verify the source base before activation, bind
+ *         a bridge connection to the active build and protocol generation, and keep a custom build's
+ *         storage and service workers away from the recovery interface (`--original`).
+ *   - #15 The start deadline is one absolute timer per bridge (no longer moved on by reloads, never
+ *         started by HEAD, `--original` honoured by a second start): tie a deadline and a readiness
+ *         token to the main window's own navigation, so another tab cannot acknowledge it.
+ *   - #1  The build's methods (`custom.setup`, `custom.build`, `custom.use`, `custom.bring`) change
+ *         what every window runs: require a capability bound to the trusted main window for them, and
+ *         the canonical origin (no loopback aliases) at the HTTP and WebSocket entry points.
+ *   - `defaultRunner` runs `git` and `pnpm` by bare name with a working folder an agent can write to
+ *         (on Windows the current folder is searched first): resolve each program once from PATH
+ *         entries outside that folder (`findProgram` in `server/util/which.ts`, Part B of wave 8).
+ *   - Run the whole path (set up, build, switch, fall back, bring) in a packaged app.
+ * Done already: #14 (setup never deletes a folder Sable did not make, clones beside it and is set up
+ * only once installed) and #29 (the static server opens a file before its headers).
+ *
+ * Your build (depth B), as designed: `<data>/custom/src`, a clone of the public repository at the running version's
  * tag on a branch `mine`; its `vite build` output is served instead of the app's own `dist` while the
  * person has switched it on, it was built for the running version, and its `index.html` is the very one
  * they switched on (an agent that rebuilds cannot swap what is served without their click). A page
@@ -41,34 +81,17 @@ export const BUILD_STATE_FILE = 'custom-build.json';
 export const REPO_URL = 'https://github.com/Leonxlnx/sable.git';
 /** The longest stylesheet served (bytes); a bigger one is not applied. */
 export const MAX_STYLES = 2_000_000;
+/**
+ * Your build ships in this release: false, so nothing offers it, its methods answer `BUILD_OFF`, the
+ * served root is always the app's own and the brief never mentions it (see the list in the header).
+ */
+export const BUILD_SHIPS = false;
+export const BUILD_OFF = 'Your own build of the interface is not available in this version.';
 
 // ─────────────────────────────── the stylesheet ───────────────────────────────
 
-/** CSS escapes decoded (`\75 rl(` is `url(`), for looking at what the sheet asks for. */
-function unescapeCss(s: string): string {
-  return s.replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_m, hex: string) => {
-    const n = parseInt(hex, 16);
-    return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : '';
-  }).replace(/\\(.)/g, '$1');
-}
-
-/**
- * What in a stylesheet would reach beyond this computer: a remote address in any form (`url()`,
- * `@import`, `image-set()`, a bare string), protocol-relative ones included, escapes decoded first.
- * Addresses inside `data:` URIs fetch nothing (an SVG image cannot load anything) and do not count.
- * Undefined when there is none.
- */
-export function remoteRef(css: string): string | undefined {
-  let s = css.replace(/\/\*[\s\S]*?(\*\/|$)/g, ' ');
-  s = unescapeCss(s);
-  // data: URIs, quoted or bare inside url(), are dropped before looking.
-  s = s.replace(/(["'])\s*data:[\s\S]*?\1/gi, '""').replace(/url\(\s*data:[^)]*\)/gi, 'url()');
-  const m = /(?:\b[a-z][a-z0-9+.-]*:)?\/\/[^\s"')]+/i.exec(s);
-  if (m) return m[0].slice(0, 120);
-  // A scheme that fetches without slashes.
-  const other = /\b(?:https?|ftp|wss?|file|blob|javascript):[^\s"')]*/i.exec(s);
-  return other ? other[0].slice(0, 120) : undefined;
-}
+/** What a sheet asks for beyond this computer (`css-scan.ts`): a sheet with any of it is not applied. */
+export { remoteRef };
 
 /** Whether a request comes from the app's own page (same origin, a loopback host on this server). */
 export function ownOrigin(req: IncomingMessage): boolean {
@@ -128,6 +151,8 @@ interface BuildFile {
   index?: string;
   /** The tag the branch `mine` stands on. */
   base?: string;
+  /** Setup finished: the workspace installed (a failed install leaves it unset, and setup installs again). */
+  installed?: boolean;
   failed?: { at: number; reason: string };
 }
 
@@ -141,6 +166,8 @@ export interface CustomOptions {
   ignore?: boolean;
   /** The bridge serves the built interface (the desktop app): a custom build can be served. */
   serving?: boolean;
+  /** Your build is offered at all (`BUILD_SHIPS`; tests of its code turn it on). */
+  build?: boolean;
   runner?: CustomRunner;
   /** Where the reference material lies (packaged: the app's resources); absent: this source tree. */
   reference?: string;
@@ -171,7 +198,9 @@ export class Customizer {
   private missing?: string;
   private changedAt?: number;
   private watchers: FSWatcher[] = [];
-  private debounce?: NodeJS.Timeout;
+  private stylesTimer?: NodeJS.Timeout;
+  private sourceTimer?: NodeJS.Timeout;
+  private sourceWatched = false;
   private watchdog?: unknown;
   private reloadListeners = new Set<(why: 'fallback' | 'switch') => void>();
   private busy?: Promise<unknown>;
@@ -213,6 +242,15 @@ export class Customizer {
     renameSync(tmp, this.buildFile);
   }
 
+  /** Your build is offered in this version. */
+  private get buildOn(): boolean {
+    return this.opts.build ?? BUILD_SHIPS;
+  }
+
+  private offered() {
+    if (!this.buildOn) throw new Error(BUILD_OFF);
+  }
+
   stylesOn(): boolean {
     return this.opts.settings().customStyles !== false;
   }
@@ -252,7 +290,7 @@ export class Customizer {
   /** The custom interface is what windows get now. */
   serving(): boolean {
     const f = this.file;
-    if (!this.opts.serving || this.opts.ignore || !f.active || f.failed || f.builtFor !== this.version || !f.index) return false;
+    if (!this.buildOn || !this.opts.serving || this.opts.ignore || !f.active || f.failed || f.builtFor !== this.version || !f.index) return false;
     return this.indexHash() === f.index;
   }
 
@@ -266,7 +304,7 @@ export class Customizer {
       ...(this.sessionId ? { sessionId: this.sessionId } : {}),
       styles: { exists: s.exists, on: this.stylesOn(), rev: this.rev, size: s.size, ...(s.changedAt ? { changedAt: s.changedAt } : {}), ...(s.blocked ? { blocked: s.blocked } : {}) },
       build: {
-        supported: !!this.opts.serving,
+        supported: !!this.opts.serving && this.buildOn,
         workspace: this.hasWorkspace(),
         active: !!f.active,
         serving: this.serving(),
@@ -310,7 +348,8 @@ export class Customizer {
         else {
           body = readFileSync(this.stylesFile, 'utf8');
           const remote = remoteRef(body);
-          if (remote) blocked = `It asks for ${remote}`;
+          // An address it asks for, or what keeps it from being read safely ("an unfinished comment").
+          if (remote) blocked = /^an? /.test(remote) ? `It has ${remote}` : `It asks for ${remote}`;
         }
       }
     } catch {
@@ -335,13 +374,25 @@ export class Customizer {
   /** Answers `/custom/styles.css`; false when the request is for something else. */
   serveStyles(req: IncomingMessage, res: ServerResponse): boolean {
     const url = new URL(req.url ?? '/', 'http://localhost');
-    if (url.pathname !== STYLES_PATH) return false;
+    let pathname = url.pathname;
+    try {
+      pathname = decodeURIComponent(pathname);
+    } catch {
+      /* looked at as sent */
+    }
+    // The whole `/custom/` namespace is reserved, in any case and spelling: only the stylesheet is in it.
+    const lower = pathname.toLowerCase();
+    if (lower !== '/custom' && !lower.startsWith('/custom/')) return false;
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.writeHead(405, { allow: 'GET, HEAD' }).end();
       return true;
     }
     if (!ownOrigin(req)) {
       res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }).end('Forbidden');
+      return true;
+    }
+    if (url.pathname !== STYLES_PATH) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('Not found');
       return true;
     }
     const body = Buffer.from(this.stylesheet(), 'utf8');
@@ -362,11 +413,7 @@ export class Customizer {
       mkdirSync(this.dir, { recursive: true });
       const w = watch(this.dir, (_ev, name) => {
         if (name && String(name).toLowerCase() !== STYLES_FILE) return;
-        clearTimeout(this.debounce);
-        // Editors and agents write in bursts (truncate, write, rename): one read after it settles.
-        this.debounce = setTimeout(() => {
-          if (this.readStyles()) this.changed();
-        }, 60);
+        this.stylesTouched();
       });
       w.on('error', () => {});
       this.watchers.push(w);
@@ -376,18 +423,37 @@ export class Customizer {
     this.watchSource();
   }
 
+  /**
+   * The stylesheet was written. Editors and agents write in bursts (truncate, write, rename): one read
+   * after it settles. A timer of its own: a source change at the same moment never cancels this read.
+   */
+  private stylesTouched() {
+    clearTimeout(this.stylesTimer);
+    this.stylesTimer = setTimeout(() => {
+      this.stylesTimer = undefined;
+      if (this.readStyles()) this.changed();
+    }, 60);
+  }
+
+  /** The workspace's source changed: the state goes out once the burst settles (its own timer). */
+  private sourceTouched() {
+    this.changedAt = this.now();
+    clearTimeout(this.sourceTimer);
+    this.sourceTimer = setTimeout(() => {
+      this.sourceTimer = undefined;
+      this.changed();
+    }, 200);
+  }
+
   /** The workspace's own source: a change an agent made means there is something to build. */
   private watchSource() {
     const src = path.join(this.workspace, 'src');
-    if (!existsSync(src) || this.watchers.length > 1) return;
+    if (!this.buildOn || this.sourceWatched || !existsSync(src)) return;
     try {
-      const w = watch(src, { recursive: true }, () => {
-        this.changedAt = this.now();
-        clearTimeout(this.debounce);
-        this.debounce = setTimeout(() => this.changed(), 200);
-      });
+      const w = watch(src, { recursive: true }, () => this.sourceTouched());
       w.on('error', () => {});
       this.watchers.push(w);
+      this.sourceWatched = true;
     } catch {
       /* not watched: the build button is always offered */
     }
@@ -456,7 +522,7 @@ export class Customizer {
 
   /** The brief appended to the Customize chat's system prompt (only that chat's). */
   brief(): string {
-    return customBrief({ dir: this.dir, reference: this.referenceDir(), workspace: this.hasWorkspace() ? this.workspace : undefined, version: this.version });
+    return customBrief({ dir: this.dir, reference: this.referenceDir(), build: this.buildOn, workspace: this.buildOn && this.hasWorkspace() ? this.workspace : undefined, version: this.version });
   }
 
   // ── your build: serving it ──
@@ -469,7 +535,8 @@ export class Customizer {
   /** A page was served from `root`: a custom one has `CUSTOM_READY_MS` to call `custom.ready`. */
   served(root: string) {
     if (path.resolve(root) !== path.resolve(this.workspace, 'dist')) return;
-    this.clearWatchdog();
+    // One absolute deadline: a page that reloads again and again does not move it on.
+    if (this.watchdog !== undefined) return;
     const set = this.opts.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms).unref());
     this.watchdog = set(() => this.fallback('It did not start within 15 seconds'), CUSTOM_READY_MS);
   }
@@ -557,23 +624,51 @@ export class Customizer {
 
   /** Clones the public repository at the running version's tag, on a branch `mine`, and installs. */
   setup(): Promise<CustomState> {
+    if (!this.buildOn) return Promise.reject(new Error(BUILD_OFF));
     return this.exclusive(async () => {
-      if (this.hasWorkspace()) return this.state();
+      // Set up only once it installed: a workspace whose install failed installs again.
+      if (this.hasWorkspace() && this.file.installed) return this.state();
       this.setStep('checking');
       this.missing = await this.tools();
       if (this.missing) this.fail(this.missing);
-      this.setStep('cloning');
-      const tag = `v${this.version}`;
-      mkdirSync(this.dir, { recursive: true });
-      if (existsSync(this.workspace)) rmSync(this.workspace, { recursive: true, force: true });
-      const r = await this.run('git', ['clone', '--filter=blob:none', '--branch', tag, REPO_URL, this.workspace], { cwd: this.dir, timeoutMs: 900_000 });
-      if (r.code !== 0) {
-        rmSync(this.workspace, { recursive: true, force: true });
-        this.fail(`Cloning failed: ${lastLine(r)}`);
+      if (!this.hasWorkspace()) {
+        // Never a folder Sable did not make: files of the person's there stay, and setup stops.
+        if (existsSync(this.workspace)) {
+          let kept = true;
+          try {
+            kept = !statSync(this.workspace).isDirectory() || readdirSync(this.workspace).length > 0;
+            if (!kept) rmdirSync(this.workspace);
+          } catch {
+            kept = true;
+          }
+          if (kept) this.fail(`${this.workspace} already has files in it. Sable leaves them alone: move them out to set up your build.`);
+        }
+        this.setStep('cloning');
+        const tag = `v${this.version}`;
+        mkdirSync(this.dir, { recursive: true });
+        // Cloned beside it, in a folder of Sable's own, and moved into place only once it is whole.
+        const fresh = `${this.workspace}.new-${randomBytes(4).toString('hex')}`;
+        const drop = () => rmSync(fresh, { recursive: true, force: true });
+        const r = await this.run('git', ['clone', '--filter=blob:none', '--branch', tag, REPO_URL, fresh], { cwd: this.dir, timeoutMs: 900_000 });
+        if (r.code !== 0) {
+          drop();
+          this.fail(`Cloning failed: ${lastLine(r)}`);
+        }
+        const branch = await this.run('git', ['checkout', '-b', 'mine'], { cwd: fresh });
+        if (branch.code !== 0) {
+          drop();
+          this.fail(`Making the branch failed: ${lastLine(branch)}`);
+        }
+        try {
+          renameSync(fresh, this.workspace);
+        } catch (err) {
+          drop();
+          this.fail(`Setting up failed: ${(err as Error).message}`);
+        }
+        this.saveBuild({ base: tag, installed: undefined });
       }
-      await this.git(['checkout', '-b', 'mine'], 'Making the branch failed');
-      this.saveBuild({ base: tag });
       await this.install();
+      this.saveBuild({ installed: true });
       this.watchSource();
       return this.state();
     });
@@ -596,6 +691,7 @@ export class Customizer {
 
   /** Builds the workspace; with `use`, switches to it (the window reloads into it). */
   build(use = false): Promise<CustomState> {
+    if (!this.buildOn) return Promise.reject(new Error(BUILD_OFF));
     return this.exclusive(async () => {
       if (!this.hasWorkspace()) this.fail('Set up your build first.');
       await this.buildNow();
@@ -609,6 +705,7 @@ export class Customizer {
 
   /** The person's switch for a finished build. */
   use(on: boolean): CustomState {
+    this.offered();
     if (on) this.switchOn();
     else this.saveBuild({ active: false });
     this.switched();
@@ -633,6 +730,7 @@ export class Customizer {
    * go to the Customize chat), installed again when the lockfile changed, built and switched on.
    */
   bring(): Promise<CustomState & { conflict?: string[] }> {
+    if (!this.buildOn) return Promise.reject(new Error(BUILD_OFF));
     return this.exclusive(async () => {
       if (!this.hasWorkspace()) this.fail('Set up your build first.');
       const tag = `v${this.version}`;
@@ -665,7 +763,8 @@ export class Customizer {
   }
 
   dispose() {
-    clearTimeout(this.debounce);
+    clearTimeout(this.stylesTimer);
+    clearTimeout(this.sourceTimer);
     this.clearWatchdog();
     for (const w of this.watchers) w.close();
     this.watchers = [];
@@ -699,19 +798,22 @@ export function conflictMessage(version: string, from: string, files: string[]):
  * The Customize chat's brief, appended to its agent's system prompt (Claude Code's appended prompt,
  * Codex's developer instructions). Short: it is paid for on every turn of that chat.
  */
-export function customBrief(p: { dir: string; reference: string; workspace?: string; version: string }): string {
+export function customBrief(p: { dir: string; reference: string; workspace?: string; version: string; build?: boolean }): string {
   const f = (s: string) => s.replace(/\\/g, '/');
   const dir = f(p.dir);
   const ref = f(p.reference);
+  const build = p.build ?? BUILD_SHIPS;
   return [
     '<customize_sable>',
-    `This is Sable's Customize chat. Sable (version ${p.version}) is the desktop app the person is using to talk to you: an Electron and React interface for Claude Code and Codex. Here they ask you to change Sable itself: how it looks, and sometimes how it works.`,
+    `This is Sable's Customize chat. Sable (version ${p.version}) is the desktop app the person is using to talk to you: an Electron and React interface for Claude Code and Codex. Here they ask you to change how Sable looks.`,
     `Reference: ${ref}/CLAUDE.md (architecture and design language) and ${ref}/styles/ (every stylesheet of the app, by source path; tokens in styles/styles/tokens.css). Read the rules you override before you write; use only classes, data attributes and tokens you found there.`,
-    `Styles first. Write plain CSS to ${dir}/styles.css. Sable loads it after its own styles and applies every save within a moment, with no reload or build, and it survives updates. Override tokens on :root and the app's classes; raise specificity where a rule does not win.`,
-    p.workspace
-      ? `Only when CSS cannot do it (behaviour, new controls), change the interface's source in ${f(p.workspace)} (Sable's repository at its version, branch mine; the interface only: src/, no new dependencies). The person then builds and switches to it themselves; never build, switch or edit anything that would switch it on.`
-      : 'When CSS cannot do it (behaviour, new controls), say so: it needs their own build of the interface, which they set up in Settings, Customize.',
-    `Rules: write only inside ${dir}; never touch the installed app or Sable's other data; nothing from the internet in the stylesheet (a remote url() or @import keeps the whole sheet from loading; images as data: URIs); keep the file readable, one commented section per area, edited in place; after each change say in one sentence what changed.`,
+    `Write plain CSS to ${dir}/styles.css. Sable loads it after its own styles and applies every save within a moment, with no reload, and it survives updates. Override tokens on :root and the app's classes; raise specificity where a rule does not win.`,
+    !build
+      ? 'When CSS cannot do it (behaviour, new controls), say so plainly: here Sable changes by its stylesheet only.'
+      : p.workspace
+        ? `Only when CSS cannot do it (behaviour, new controls), change the interface's source in ${f(p.workspace)} (Sable's repository at its version, branch mine; the interface only: src/, no new dependencies). The person then builds and switches to it themselves; never build, switch or edit anything that would switch it on.`
+        : 'When CSS cannot do it (behaviour, new controls), say so: it needs their own build of the interface, which they set up in Settings, Customize.',
+    `Rules: write only inside ${dir}; never touch the installed app or Sable's other data; nothing from the internet in the stylesheet (a remote url(), an @import, or an address it cannot tell keeps the whole sheet from loading; images as data: URIs); keep the file readable, one commented section per area, edited in place; after each change say in one sentence what changed.`,
     '</customize_sable>',
   ].join('\n');
 }
@@ -747,14 +849,102 @@ export function customOf(app: App): Customizer {
   return c;
 }
 
-/** The Customize chat: the newest kept one, if any. */
+/** The agents whose Customize chat gets the brief (`customBrief`: Claude Code's appended prompt, Codex's developer instructions). */
+const BRIEFED: readonly ProviderId[] = ['claude', 'codex'];
+export const CUSTOM_AGENT_ONLY = 'The Customize chat runs with Claude Code or Codex.';
+
+/**
+ * Whether the Customize chat may run with `provider`: one that gets its brief. The scripted Demo agent
+ * too (development and tests only, and only when named): it writes nothing.
+ */
+export function customAgent(provider: ProviderId): boolean {
+  return BRIEFED.includes(provider) || provider === 'demo';
+}
+
+/** The Customize chat: the newest kept one with an agent that gets its brief, if any. */
 function customChat(app: App): SessionMeta | undefined {
   let best: SessionMeta | undefined;
   for (const rt of app.sessions.values()) {
     const m = rt.meta;
-    if (m.custom && !m.archived && (!best || m.createdAt > best.createdAt)) best = m;
+    if (m.custom && customAgent(m.provider) && !m.archived && (!best || m.createdAt > best.createdAt)) best = m;
   }
   return best;
+}
+
+// ─────────────────────────────── what a phone may not do ───────────────────────────────
+
+/** A folder as the file system has it (links and junctions followed as far as it exists), compared case-blind where the disk is. */
+function canonical(p: string): string {
+  let at = path.resolve(p);
+  let rest = '';
+  for (;;) {
+    try {
+      at = path.join(realpathSync.native(at), rest);
+      break;
+    } catch {
+      const up = path.dirname(at);
+      if (up === at) break;
+      rest = path.join(path.basename(at), rest);
+      at = up;
+    }
+  }
+  return process.platform === 'win32' || process.platform === 'darwin' ? at.toLowerCase() : at;
+}
+
+/** `p` is `dir` or inside it. */
+export function within(p: string, dir: string): boolean {
+  const a = canonical(p);
+  const b = canonical(dir);
+  return a === b || a.startsWith(b.endsWith(path.sep) ? b : b + path.sep);
+}
+
+/**
+ * What a phone may still do with a chat that can write the person's stylesheet (the Customize chat, or
+ * any chat in `<data>/custom`): read it and stop it, never send, steer, answer or change how it works.
+ * Allowed by name, so a method added later is refused there until it is listed.
+ */
+const PHONE_CUSTOM_READS = new Set([
+  'session.snapshot',
+  'session.interrupt',
+  'session.update',
+  'phone.tail',
+  'phone.item',
+  'phone.queue',
+  'phone.prompts',
+  'phone.changes',
+  'phone.diff',
+  'phone.image',
+  'phone.thumb',
+  'phone.fileLink',
+  'phone.fileStart',
+  'phone.fileChunk',
+  'phone.fileEnd',
+  'turn.checkStop',
+]);
+
+export const PHONE_CUSTOM_REFUSED = 'The Customize chat is answered on the computer.';
+export const PHONE_DATA_REFUSED = "A chat from the phone cannot start in Sable's own folder.";
+
+/**
+ * Why a phone's request is refused because of Customize Sable, or undefined. The phone's allowlist keeps
+ * `custom.*` out; this keeps the stylesheet out of reach through a chat: a phone may not start a chat
+ * anywhere in Sable's data folder, and may only read and stop a chat that can write
+ * `<data>/custom`.
+ */
+export function phoneRefusal(app: App, method: string, params: Record<string, unknown>): string | undefined {
+  const data = app.store.dir;
+  if (method === 'session.create') {
+    const chat = params.chat !== undefined && params.chat !== null;
+    const cwd = chat ? app.chatsRoot() : typeof params.cwd === 'string' ? params.cwd : '';
+    if (cwd && within(cwd, data)) return PHONE_DATA_REFUSED;
+    return undefined;
+  }
+  const id = params.sessionId;
+  if (typeof id !== 'string' || PHONE_CUSTOM_READS.has(method)) return undefined;
+  const meta = app.sessions.get(id)?.meta;
+  if (!meta) return undefined;
+  if (meta.custom || within(meta.cwd, customOf(app).dir)) return PHONE_CUSTOM_REFUSED;
+  return undefined;
 }
 
 export function registerCustom(app: App) {
@@ -780,7 +970,10 @@ export function registerCustom(app: App) {
     if (meta) snap = await app.call('session.snapshot', { sessionId: meta.id });
     else {
       const settings = app.store.state.settings;
-      const pick: ProviderId = provider && app.providers.has(provider) ? provider : app.providers.has(settings.defaultProvider) ? settings.defaultProvider : ([...app.providers.keys()][0] as ProviderId);
+      // Only an agent that gets the brief: the one asked for, else the default when it is one, else the first there is.
+      if (provider && (!customAgent(provider) || !app.providers.has(provider))) throw new Error(CUSTOM_AGENT_ONLY);
+      const pick = provider ?? [settings.defaultProvider, ...BRIEFED].find((p): p is ProviderId => BRIEFED.includes(p) && app.providers.has(p));
+      if (!pick) throw new Error(CUSTOM_AGENT_ONLY);
       mkdirSync(c.dir, { recursive: true });
       snap = await app.startSession({ provider: pick, cwd: c.dir, title: 'Customize Sable' }, { custom: true });
       meta = snap.session;

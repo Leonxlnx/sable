@@ -15,8 +15,9 @@ import { App } from '../server/app';
 import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
+import { pageHeaders } from '../electron/csp';
 import { createStaticServer } from '../server/serve';
-import { BUILD_STATE_FILE, conflictMessage, customBrief, Customizer, ownOrigin, registerCustom, remoteRef, type CustomRunner, type RunResult } from '../server/services/custom';
+import { BUILD_OFF, BUILD_SHIPS, BUILD_STATE_FILE, CUSTOM_AGENT_ONLY, customAgent, conflictMessage, customBrief, Customizer, ownOrigin, registerCustom, remoteRef, type CustomRunner, type RunResult } from '../server/services/custom';
 
 const dirs: string[] = [];
 const tmp = () => {
@@ -47,7 +48,7 @@ function make(home: string, extra: Partial<ConstructorParameters<typeof Customiz
 describe('what a stylesheet may ask for', () => {
   it('flags every way of reaching the internet', () => {
     expect(remoteRef('.a { background: url(https://example.com/x.png) }')).toBe('https://example.com/x.png');
-    expect(remoteRef('@import "http://example.com/a.css";')).toMatch(/^http:\/\/example\.com/);
+    expect(remoteRef('@import "http://example.com/a.css";')).toMatch(/@import/);
     expect(remoteRef('.a { background: url(//example.com/x.png) }')).toBe('//example.com/x.png');
     expect(remoteRef('.a { background: image-set("https://e.com/a.png" 1x) }')).toMatch(/^https:\/\/e\.com/);
     // Escapes are decoded before looking.
@@ -58,8 +59,44 @@ describe('what a stylesheet may ask for', () => {
   it('leaves local and data: references alone, and comments out of it', () => {
     expect(remoteRef(':root { --bg: #000 } .sidebar { width: 200px }')).toBeUndefined();
     expect(remoteRef(".a { background: url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>\") }")).toBeUndefined();
-    expect(remoteRef(".a { background: url(data:image/svg+xml;utf8,<svg%20xmlns='http://www.w3.org/2000/svg'/>) }")).toBeUndefined();
+    expect(remoteRef('.a { background: url(data:image/svg+xml;utf8,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22/%3E) }')).toBeUndefined();
     expect(remoteRef('/* from https://example.com */ .a { background: url(/assets/x.svg) }')).toBeUndefined();
+    expect(remoteRef('@font-face { font-family: X; src: local("Inter"), url("/assets/inter.woff2") format("woff2"); unicode-range: U+0025-00FF }')).toBeUndefined();
+    expect(remoteRef('.a::before { content: "Note: a // b" } .b:hover { color: #fff; width: calc(100% - 2px) }')).toBeUndefined();
+    expect(remoteRef('.a { background: image-set("/assets/a.png" 1x type("image/png")) }')).toBeUndefined();
+  });
+
+  it('reads strings and comments as the browser does: a comment delimiter in a string hides nothing (review 7)', () => {
+    // The old scanner dropped everything from the first "/*" to the last "*/", strings or not.
+    expect(remoteRef('.a { content: "/*" } .b { background: url(https://e.com/x.png) } .c { content: "*/" }')).toBe('https://e.com/x.png');
+    expect(remoteRef(".a { content: '/*' } .b { background: url('https://e.com/x.png') } .c { content: '*/' }")).toBe('https://e.com/x.png');
+    // A quote inside a comment is not a string.
+    expect(remoteRef('/* it\'s */ .b { background: url(https://e.com/y.png) } /* \' */')).toBe('https://e.com/y.png');
+    // A line continuation inside a string, an escaped quote.
+    expect(remoteRef('.a { background: url("https://e\\\n.com/z.png") }')).toMatch(/^https:\/\/e\.com/);
+    expect(remoteRef('.a { background: url("x\\"y") } .b { background: url(https://e.com/w.png) }')).toBe('https://e.com/w.png');
+  });
+
+  it('finds every form of address, and refuses what it cannot tell', () => {
+    // Escaped names of the functions and at-rules.
+    expect(remoteRef('.a { background: u\\72l(https://e.com/a.png) }')).toMatch(/^https:/);
+    expect(remoteRef('@\\69mport "/custom/other.css";')).toMatch(/@import/);
+    expect(remoteRef('@import url(/assets/a.css);')).toMatch(/@import/);
+    // A scheme without slashes still parses as a host; slashes either way; tabs and newlines dropped.
+    expect(remoteRef('.a { background: url("https:e.com/a.png") }')).toBe('https:e.com/a.png');
+    expect(remoteRef('.a { background: url("\\\\\\\\e.com/a.png") }')).toBeDefined();
+    expect(remoteRef('.a { background: url("/\\\\e.com/a.png") }')).toBeDefined();
+    expect(remoteRef('.a { background: url("ht\\9 tps://e.com/a.png") }')).toBeDefined();
+    // Through a custom property and var().
+    expect(remoteRef(':root { --pic: "https:e.com/a.png" } .a { background: image-set(var(--pic) 1x) }')).toBe('https:e.com/a.png');
+    expect(remoteRef('.a { background: -webkit-image-set("//e.com/a.png" 1x) }')).toBe('//e.com/a.png');
+    expect(remoteRef('.a { mask: src("javascript:x") }')).toBe('javascript:x');
+    // What the browser itself cannot read is refused rather than guessed at.
+    expect(remoteRef('.a { content: "unfinished }')).toMatch(/unfinished string/);
+    expect(remoteRef('.a { color: red } /* never closed')).toMatch(/unfinished comment/);
+    expect(remoteRef('.a { background: url(https://e.com/a.png')).toMatch(/unfinished url/);
+    expect(remoteRef(".a { background: url(x'y) }")).toMatch(/cannot read/);
+    expect(remoteRef('.a { content: "line\nbreak" }')).toMatch(/broken across lines/);
   });
 });
 
@@ -81,17 +118,19 @@ async function serve(own: string, c: Customizer) {
   servers.push(server);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
   const port = (server.address() as AddressInfo).port;
-  const get = (p: string, headers: Record<string, string> = {}) =>
-    new Promise<{ status: number; body: string; type?: string; cache?: string }>((resolve, reject) => {
-      const r = request({ host: '127.0.0.1', port, path: p, headers }, (res) => {
+  const ask = (method: string, p: string, headers: Record<string, string> = {}) =>
+    new Promise<{ status: number; body: string; type?: string; cache?: string; length?: string; csp?: string }>((resolve, reject) => {
+      const r = request({ host: '127.0.0.1', port, path: p, headers, method }, (res) => {
         let body = '';
         res.on('data', (d) => (body += d));
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, body, type: res.headers['content-type'], cache: res.headers['cache-control'] }));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body, type: res.headers['content-type'], cache: res.headers['cache-control'], length: res.headers['content-length'], csp: res.headers['content-security-policy'] as string | undefined }));
       });
       r.on('error', reject);
       r.end();
     });
-  return { get };
+  const get = (p: string, headers: Record<string, string> = {}) => ask('GET', p, headers);
+  const head = (p: string) => ask('HEAD', p);
+  return { get, head };
 }
 
 const ownDist = () => {
@@ -131,6 +170,49 @@ describe('the stylesheet route', () => {
     expect(ignored.state().ignored).toBe(true);
   });
 
+  it('the whole /custom/ namespace is reserved: the origin check for all of it, nothing else served there (review 16)', async () => {
+    const home = tmp();
+    const { c } = make(home);
+    writeStyles(home, '.a{}');
+    c.readStyles();
+    const { get } = await serve(ownDist(), c);
+    for (const p of ['/custom/', '/custom/other', '/custom/reference/CLAUDE.md', '/CUSTOM/styles.css', '/%63ustom/x']) {
+      expect((await get(p, { 'sec-fetch-site': 'cross-site' })).status, p).toBe(403);
+      expect((await get(p)).status, p).toBe(404);
+    }
+    expect((await get('/custom/styles.css')).body).toBe('.a{}');
+    // Anything else is the app.
+    expect((await get('/customize')).body).toContain('own');
+  });
+
+  it('the desktop app’s pages cannot be framed by any page; the widget page keeps its own policy (review 16)', () => {
+    const app = pageHeaders('http://127.0.0.1:47317', '/')['content-security-policy'];
+    expect(app).toContain("frame-ancestors 'none'");
+    expect(app).toContain("frame-src 'self'");
+    expect(pageHeaders('http://127.0.0.1:47317', '/some/route')['content-security-policy']).toBe(app);
+    const widget = pageHeaders('http://127.0.0.1:47317', '/widget-frame.html')['content-security-policy'];
+    expect(widget).toContain("connect-src 'none'");
+    // Framed by the app (and framing its srcdoc child, which inherits this policy): no frame-ancestors to refuse either.
+    expect(widget).not.toContain('frame-ancestors');
+  });
+
+  it('a source change right after a save of the sheet does not cancel its read (review 30)', async () => {
+    const home = tmp();
+    const { c, events } = make(home, { build: true });
+    const touch = c as unknown as { stylesTouched(): void; sourceTouched(): void };
+    try {
+      writeStyles(home, '.sidebar { width: 170px }');
+      touch.stylesTouched();
+      touch.sourceTouched();
+      await new Promise((r) => setTimeout(r, 400));
+      expect(c.stylesheet()).toBe('.sidebar { width: 170px }');
+      expect(events.some((e) => e.styles.exists)).toBe(true);
+      expect(c.state().build.changedAt).toBeDefined();
+    } finally {
+      c.dispose();
+    }
+  });
+
   it('a change of the file moves the rev; reading the same file again does not', () => {
     const home = tmp();
     const { c } = make(home);
@@ -166,7 +248,7 @@ function built(home: string, opts: Partial<ConstructorParameters<typeof Customiz
   writeFileSync(path.join(ws, 'dist', 'index.html'), '<title>Sable</title>mine');
   writeFileSync(path.join(home, BUILD_STATE_FILE), JSON.stringify({ builtFor: '0.3.0', builtAt: 1 }));
   let timer: (() => void) | undefined;
-  const made = make(home, { serving: true, setTimer: (fn) => ((timer = fn), 1), clearTimer: () => (timer = undefined), ...opts });
+  const made = make(home, { serving: true, build: true, setTimer: (fn) => ((timer = fn), 1), clearTimer: () => (timer = undefined), ...opts });
   return { ...made, ws, fire: () => timer?.(), pending: () => !!timer };
 }
 
@@ -199,7 +281,7 @@ describe('your build: served instead of the app’s own', () => {
     const home = tmp();
     const { c } = built(home);
     c.use(true);
-    const next = new Customizer({ home, version: '0.3.1', watch: false, serving: true, settings: () => DEFAULT_SETTINGS });
+    const next = new Customizer({ home, version: '0.3.1', watch: false, serving: true, build: true, settings: () => DEFAULT_SETTINGS });
     const own = ownDist();
     expect(next.root(own)).toBe(own);
     expect(next.state().build).toMatchObject({ active: true, serving: false, builtFor: '0.3.0' });
@@ -210,8 +292,70 @@ describe('your build: served instead of the app’s own', () => {
     const home = tmp();
     built(home).c.use(true);
     const own = ownDist();
-    expect(new Customizer({ home, version: '0.3.0', watch: false, serving: true, ignore: true, settings: () => DEFAULT_SETTINGS }).root(own)).toBe(own);
+    expect(new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, ignore: true, settings: () => DEFAULT_SETTINGS }).root(own)).toBe(own);
     expect(new Customizer({ home, version: '0.3.0', watch: false, serving: false, settings: () => DEFAULT_SETTINGS }).root(own)).toBe(own);
+  });
+});
+
+describe('the static server', () => {
+  it('an asset removed or rebuilt after it was served: a 404 or its new size, never a crash', async () => {
+    const home = tmp();
+    const own = ownDist();
+    mkdirSync(path.join(own, 'assets'), { recursive: true });
+    const asset = path.join(own, 'assets', 'index-abc.js');
+    writeFileSync(asset, 'console.log(1)');
+    const { get } = await serve(own, make(home).c);
+    let r = await get('/assets/index-abc.js');
+    expect([r.status, r.body, r.length]).toEqual([200, 'console.log(1)', '14']);
+    writeFileSync(asset, 'console.log("rebuilt")');
+    r = await get('/assets/index-abc.js');
+    expect([r.status, r.body, r.length]).toEqual([200, 'console.log("rebuilt")', '22']);
+    rmSync(asset);
+    r = await get('/assets/index-abc.js');
+    expect(r.status).toBe(404);
+    // An empty file is an empty answer.
+    writeFileSync(asset, '');
+    r = await get('/assets/index-abc.js');
+    expect([r.status, r.body, r.length]).toEqual([200, '', '0']);
+    // Still serving.
+    expect((await get('/')).body).toContain('own');
+  });
+});
+
+describe('your build: not in this version', () => {
+  it('nothing offers it: not supported, never served, every step answers that it is not available', async () => {
+    const home = tmp();
+    const own = ownDist();
+    // A workspace with a finished build that was switched on (an older run, or a hand-made file).
+    const ws = path.join(home, 'custom', 'src');
+    mkdirSync(path.join(ws, '.git'), { recursive: true });
+    mkdirSync(path.join(ws, 'dist'), { recursive: true });
+    writeFileSync(path.join(ws, 'dist', 'index.html'), 'mine');
+    writeFileSync(path.join(home, BUILD_STATE_FILE), JSON.stringify({ builtFor: '0.3.0', builtAt: 1 }));
+    const on = new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, settings: () => DEFAULT_SETTINGS });
+    on.use(true);
+    expect(on.serving()).toBe(true);
+    const { calls, run } = fakeRunner(() => {});
+    const { c } = make(home, { serving: true, runner: run });
+    expect(c.state().build).toMatchObject({ supported: false, serving: false });
+    expect(c.root(own)).toBe(own);
+    const { get } = await serve(own, c);
+    expect((await get('/')).body).toContain('own');
+    await expect(c.setup()).rejects.toThrow(BUILD_OFF);
+    await expect(c.build(true)).rejects.toThrow(BUILD_OFF);
+    await expect(c.bring()).rejects.toThrow(BUILD_OFF);
+    expect(() => c.use(true)).toThrow(BUILD_OFF);
+    expect(calls).toEqual([]);
+    expect(BUILD_SHIPS).toBe(false);
+  });
+
+  it('the bridge’s build methods answer the same', async () => {
+    const home = tmp();
+    const app = new App({ home, quiet: true, providers: [(ctx) => new DemoProvider(ctx, { speed: 0 })] });
+    apps.push(app);
+    registerCustom(app);
+    for (const m of ['custom.setup', 'custom.build', 'custom.bring'] as const) await expect(app.call(m, {} as never)).rejects.toThrow(BUILD_OFF);
+    await expect(app.call('custom.use', { on: true })).rejects.toThrow(BUILD_OFF);
   });
 });
 
@@ -252,6 +396,21 @@ describe('the start watchdog', () => {
     expect(c.state().build.failed).toBeUndefined();
   });
 
+  it('one absolute deadline: reloads do not move it on, and HEAD starts none', async () => {
+    const home = tmp();
+    const own = ownDist();
+    let arms = 0;
+    const { c } = built(home, { setTimer: () => (++arms, 1), clearTimer: () => {} });
+    c.use(true);
+    const { get, head } = await serve(own, c);
+    await head('/');
+    expect(arms).toBe(0);
+    await get('/');
+    await get('/');
+    await get('/some/route');
+    expect(arms).toBe(1);
+  });
+
   it('the app’s own page starts no watchdog', async () => {
     const home = tmp();
     const { c, pending } = built(home);
@@ -276,7 +435,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
   it('says in one line what the machine lacks', async () => {
     const home = tmp();
     const { run } = fakeRunner((cmd) => (cmd === 'pnpm' ? { code: 1 } : undefined));
-    const { c } = make(home, { serving: true, runner: run });
+    const { c } = make(home, { serving: true, build: true, runner: run });
     await expect(c.setup()).rejects.toThrow(/pnpm is missing: npm install -g pnpm/);
     expect(c.state().build.missing).toMatch(/pnpm/);
   });
@@ -285,18 +444,20 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     const home = tmp();
     const ws = path.join(home, 'custom', 'src');
     const { run, calls } = fakeRunner((cmd, args) => {
-      if (cmd === 'git' && args[0] === 'clone') mkdirSync(path.join(ws, '.git'), { recursive: true });
+      if (cmd === 'git' && args[0] === 'clone') mkdirSync(path.join(args.at(-1)!, '.git'), { recursive: true });
       if (cmd === 'pnpm' && args.includes('build')) {
         mkdirSync(path.join(ws, 'dist'), { recursive: true });
         writeFileSync(path.join(ws, 'dist', 'index.html'), 'built');
       }
     });
-    const { c, events } = make(home, { serving: true, runner: run });
+    const { c, events } = make(home, { serving: true, build: true, runner: run });
     const reloads: string[] = [];
     c.onReload((w) => reloads.push(w));
     await c.setup();
-    expect(calls.filter((x) => !x.endsWith('--version'))).toEqual([
-      `git clone --filter=blob:none --branch v0.3.0 https://github.com/Leonxlnx/sable.git ${ws}`,
+    // Cloned into a folder of Sable's own beside the workspace, moved into place once whole.
+    expect(calls.find((x) => x.startsWith('git clone'))).toMatch(/^git clone --filter=blob:none --branch v0\.3\.0 https:\/\/github\.com\/Leonxlnx\/sable\.git .*src\.new-[0-9a-f]{8}$/);
+    expect(existsSync(path.join(ws, '.git'))).toBe(true);
+    expect(calls.filter((x) => !x.endsWith('--version') && !x.startsWith('git clone'))).toEqual([
       'git checkout -b mine',
       'pnpm install --frozen-lockfile',
     ]);
@@ -309,12 +470,57 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     expect(JSON.parse(readFileSync(path.join(home, BUILD_STATE_FILE), 'utf8')).index).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  it('setup never deletes a folder Sable did not make; a failed install is installed again, not skipped', async () => {
+    const home = tmp();
+    const ws = path.join(home, 'custom', 'src');
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(path.join(ws, 'App.tsx'), 'the person’s own interface');
+    let installs = 0;
+    const { run, calls } = fakeRunner((cmd, args) => {
+      if (cmd === 'git' && args[0] === 'clone') mkdirSync(path.join(args.at(-1)!, '.git'), { recursive: true });
+      if (cmd === 'pnpm' && args[0] === 'install') return ++installs === 1 ? { code: 1, stderr: 'ERR_PNPM_FETCH_404' } : undefined;
+    });
+    const { c } = make(home, { serving: true, build: true, runner: run });
+    await expect(c.setup()).rejects.toThrow(/already has files in it/);
+    expect(readFileSync(path.join(ws, 'App.tsx'), 'utf8')).toBe('the person’s own interface');
+    expect(calls.some((x) => x.startsWith('git clone'))).toBe(false);
+    // Moved out: setup clones, and its install fails.
+    rmSync(ws, { recursive: true });
+    await expect(c.setup()).rejects.toThrow(/Installing failed: ERR_PNPM_FETCH_404/);
+    expect(c.state().build.workspace).toBe(true);
+    // Again: no second clone, the install runs again and only then is it set up.
+    await c.setup();
+    expect(calls.filter((x) => x.startsWith('git clone'))).toHaveLength(1);
+    expect(installs).toBe(2);
+    expect(JSON.parse(readFileSync(path.join(home, BUILD_STATE_FILE), 'utf8')).installed).toBe(true);
+    await c.setup();
+    expect(installs).toBe(2);
+  });
+
+  it('a clone that fails removes only its own folder', async () => {
+    const home = tmp();
+    let into = '';
+    const { run } = fakeRunner((cmd, args) => {
+      if (cmd === 'git' && args[0] === 'clone') {
+        into = args.at(-1)!;
+        mkdirSync(into, { recursive: true });
+        return { code: 128, stderr: 'fatal: unable to access' };
+      }
+    });
+    mkdirSync(path.join(home, 'custom'), { recursive: true });
+    writeFileSync(path.join(home, 'custom', 'styles.css'), '.a{}');
+    const { c } = make(home, { serving: true, build: true, runner: run });
+    await expect(c.setup()).rejects.toThrow(/Cloning failed: fatal/);
+    expect(existsSync(into)).toBe(false);
+    expect(readFileSync(path.join(home, 'custom', 'styles.css'), 'utf8')).toBe('.a{}');
+  });
+
   it('a failed build says why and switches nothing', async () => {
     const home = tmp();
     const { ws } = built(home);
     void ws;
     const { run } = fakeRunner((cmd) => (cmd === 'pnpm' ? { code: 1, stderr: 'error TS2304: Cannot find name x' } : undefined));
-    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS });
+    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS });
     rmSync(path.join(home, 'custom', 'src', 'dist'), { recursive: true });
     await expect(c.build(true)).rejects.toThrow(/The build failed: error TS2304/);
     expect(c.state().build).toMatchObject({ active: false, error: expect.stringMatching(/TS2304/) });
@@ -331,7 +537,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
       if (cmd === 'git' && args.includes('rebase')) lock = 'bbb';
       if (cmd === 'pnpm' && args.includes('build')) writeFileSync(path.join(ws, 'dist', 'index.html'), 'built for 0.3.1');
     });
-    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS });
+    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS });
     const r = await c.bring();
     expect(r.conflict).toBeUndefined();
     expect(calls).toEqual([
@@ -357,7 +563,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
       if (cmd === 'git' && args.includes('rebase') && args.includes('--onto')) return { code: 1, stderr: 'CONFLICT (content): Merge conflict in src/features/sidebar/Sidebar.tsx' };
       if (cmd === 'git' && args[0] === 'diff') return { stdout: 'src/features/sidebar/Sidebar.tsx\n' };
     });
-    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS, tell: async (t) => told.push(t) });
+    const c = new Customizer({ home, version: '0.3.1', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS, tell: async (t) => told.push(t) });
     const r = await c.bring();
     expect(r.conflict).toEqual(['src/features/sidebar/Sidebar.tsx']);
     expect(calls).toContain('git rebase --abort');
@@ -373,7 +579,7 @@ describe('your build: the workspace’s steps (fake runner)', () => {
     built(home);
     let release!: () => void;
     const run: CustomRunner = () => new Promise((r) => (release = () => r({ code: 0, stdout: '', stderr: '' })));
-    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, runner: run, settings: () => DEFAULT_SETTINGS });
+    const c = new Customizer({ home, version: '0.3.0', watch: false, serving: true, build: true, runner: run, settings: () => DEFAULT_SETTINGS });
     const first = c.build(false);
     await expect(c.build(false)).rejects.toThrow(/already working/);
     release();
@@ -389,10 +595,14 @@ describe('the brief, only in the Customize chat', () => {
   it('says where the reference is, styles first, the file, and the rules', () => {
     expect(brief).toContain('C:/data/custom/reference/CLAUDE.md');
     expect(brief).toContain('C:/data/custom/styles.css');
-    expect(brief).toMatch(/Styles first/);
     expect(brief).toMatch(/write only inside C:\/data\/custom/);
-    expect(brief).toMatch(/Settings, Customize/);
-    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', workspace: 'C:/d/custom/src', version: '0.3.0' })).toMatch(/never build, switch/);
+    // Your build does not ship in this version: the brief never mentions one.
+    expect(brief).not.toMatch(/build|Settings, Customize|branch mine/i);
+    expect(brief).toMatch(/stylesheet only/);
+    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', workspace: 'C:/d/custom/src', version: '0.3.0' })).not.toMatch(/C:\/d\/custom\/src/);
+    // Its code is kept: switched on, the brief names the workspace again.
+    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', workspace: 'C:/d/custom/src', version: '0.3.0', build: true })).toMatch(/never build, switch/);
+    expect(customBrief({ dir: 'C:/d/custom', reference: 'C:/d/custom/reference', version: '0.3.0', build: true })).toMatch(/Settings, Customize/);
     // Short: it is paid for on every turn.
     expect(brief.length).toBeLessThan(2000);
   });
@@ -410,6 +620,34 @@ describe('the brief, only in the Customize chat', () => {
     (p as unknown as { client: () => Promise<unknown> }).client = async () => ({ request: async () => ({ config: {} }) });
     expect(await p.developerInstructions(process.cwd(), { options: {}, custom: true })).toContain(brief);
     expect(await p.developerInstructions(process.cwd(), { options: {} })).not.toContain('customize_sable');
+  });
+});
+
+describe('the Customize chat, only with an agent that gets its brief (review 31)', () => {
+  /** The scripted agent under another agent's id: nothing real runs. */
+  const as = (id: 'opencode' | 'claude') => (ctx: ConstructorParameters<typeof DemoProvider>[0]) => Object.assign(new DemoProvider(ctx, { speed: 0 }), { id }) as unknown as DemoProvider;
+
+  it('OpenCode as the default: never picked, never accepted; Claude Code when it is there', async () => {
+    const home = tmp();
+    const only = new App({ home, quiet: true, providers: [as('opencode'), (ctx) => new DemoProvider(ctx, { speed: 0 })] });
+    apps.push(only);
+    await only.call('app.setSettings', { patch: { defaultProvider: 'opencode' } });
+    registerCustom(only);
+    await expect(only.call('custom.open', {})).rejects.toThrow(CUSTOM_AGENT_ONLY);
+    await expect(only.call('custom.open', { provider: 'opencode' })).rejects.toThrow(CUSTOM_AGENT_ONLY);
+    expect([...only.sessions.values()].some((rt) => rt.meta.custom)).toBe(false);
+
+    const home2 = tmp();
+    const both = new App({ home: home2, quiet: true, providers: [as('opencode'), as('claude')] });
+    apps.push(both);
+    await both.call('app.setSettings', { patch: { defaultProvider: 'opencode' } });
+    registerCustom(both);
+    const snap = await both.call('custom.open', {});
+    expect(snap.session).toMatchObject({ provider: 'claude', custom: true });
+    // Not moved to OpenCode in place either.
+    await expect(both.call('session.switchAgent', { sessionId: snap.session.id, provider: 'opencode' })).rejects.toThrow(CUSTOM_AGENT_ONLY);
+    expect(customAgent('opencode')).toBe(false);
+    expect(customAgent('codex')).toBe(true);
   });
 });
 

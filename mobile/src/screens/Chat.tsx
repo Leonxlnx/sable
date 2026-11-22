@@ -107,11 +107,20 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
           {error ? <p className="empty">{error}</p> : connState === 'offline' ? <p className="empty">This chat opens when {desktop ?? 'the computer'} is back.</p> : <ThreadSkeleton />}
         </div>
       )}
-      <div className="chat-foot">
-        <Prompts sid={id} />
-        <ReviewLine sid={id} />
-        <Composer sid={id} />
-      </div>
+      {s.custom ? (
+        // The Customize chat can change the desktop's look: it is read here and answered on the computer.
+        <div className="chat-foot">
+          <p className="empty" style={{ margin: '12px 28px 16px' }}>
+            Answered on {desktop ?? 'the computer'}
+          </p>
+        </div>
+      ) : (
+        <div className="chat-foot">
+          <Prompts sid={id} />
+          <ReviewLine sid={id} />
+          <Composer sid={id} />
+        </div>
+      )}
       <RemoteSheet id={id} open={remote} onClose={() => setRemote(false)} />
     </div>
   );

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
 import { bootMark } from '../server/util/boot';
 import { fixPathFromLoginShell } from '../server/util/login-env';
+import { pageHeaders as csp } from './csp';
 import { pickFolder, type ShowFolderDialog } from './folder';
 import { windowsThumbs } from './thumbs';
 
@@ -605,48 +606,8 @@ function harden() {
   windowCalls();
 }
 
-/**
- * The Content-Security-Policy of every page the app's server sends (passed to startServer, which adds
- * it to each response: set by the server itself, no response waits on this process for its headers).
- */
-function pageHeaders(pathname: string): Record<string, string> {
-  // The page only loads its own code; agent output may show images (data, blob, https) and nothing else.
-  const csp = [
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: https:",
-    "font-src 'self' data:",
-    "media-src 'self' data: blob:",
-    `connect-src 'self' ${appOrigin.replace(/^http/, 'ws')}`,
-    "worker-src 'self' blob:",
-    "object-src 'none'",
-    // The panel browser is a <webview>; its pages run in a separate guest and are not framed by the app.
-    // The only frame the app embeds is its own widget page (generative UI), sandboxed without same-origin.
-    "frame-src 'self'",
-    "base-uri 'none'",
-    "form-action 'none'",
-  ].join('; ');
-  // The widget page runs code an agent wrote: no network of any kind, inline code only, and it can
-  // frame nothing but its own srcdoc child, which inherits this policy.
-  const widgetCsp = [
-    "default-src 'none'",
-    "script-src 'unsafe-inline'",
-    "style-src 'unsafe-inline'",
-    "img-src data: blob:",
-    "font-src data:",
-    "media-src data: blob:",
-    "connect-src 'none'",
-    "frame-src 'none'",
-    "child-src 'none'",
-    "worker-src 'none'",
-    "object-src 'none'",
-    "form-action 'none'",
-    "base-uri 'none'",
-    "manifest-src 'none'",
-  ].join('; ');
-  return { 'content-security-policy': pathname === '/widget-frame.html' ? widgetCsp : csp };
-}
+/** The Content-Security-Policy of every page the app sends (`csp.ts`), for the origin it runs on now. */
+const pageHeaders = (pathname: string) => csp(appOrigin, pathname);
 
 /* ── menu and shortcuts ── */
 
@@ -977,7 +938,9 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => app.quit
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_e, argv) => {
+    // Started again with `--original`: the running app leaves the person's changes out from now on.
+    if (argv.includes('--original') && server && server.ignoreCustom() && win && !win.isDestroyed()) win.webContents.reload();
     if (!win || win.isDestroyed()) {
       // A Mac keeps the app running without a window: opening it again brings one back.
       if (server && !quitting) win = createWindow(server.url);

@@ -53,7 +53,7 @@ import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
 import { allowsEverything, withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
-import { customOf } from './services/custom';
+import { CUSTOM_AGENT_ONLY, customAgent, customOf } from './services/custom';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
 import { Lanes, worktreesRoot } from './core/lanes';
@@ -2050,6 +2050,8 @@ export class App {
       return { ok: true };
     }
     if (!this.providers.has(provider)) throw new Error(`Provider not available: ${provider}`);
+    // The Customize chat only with an agent that gets its brief (`services/custom.ts`).
+    if (rt.meta.custom && !customAgent(provider)) throw new Error(CUSTOM_AGENT_ONLY);
     if (rt.turnActive || this.opening.has(rt.id) || this.delivering.has(rt.id) || this.capChecks.has(rt.id)) throw new Error('The agent is still working. Switch when it is done.');
     // Never over a move of account, nor two switches at once (review wave 8, #10).
     if (this.moving.has(rt.id) || this.switching.has(rt.id)) throw new Error('This chat is changing account or agent. Switch when it is done.');
