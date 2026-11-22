@@ -18,6 +18,7 @@ import { useAccountOrder } from './order';
 import type { UseFirstRank } from '@shared/use-first';
 import { poolLeftPercent } from '@/features/usage/plans';
 import { accountAgents, accountInUse, accountMark, accountsOf, markWords, openAddAccount, planWord } from './model';
+import { signedOut } from '@/lib/sign-in';
 
 /** How long a menu takes to unfold (`--d-open` in ui.css). */
 export const OPEN_MS = 130;
@@ -103,7 +104,7 @@ export function AccountSwitcher() {
   const described = [
     PROVIDER_NAME[focus],
     several && current ? accountName(current) : undefined,
-    on ? (plan ? `${plan} plan` : undefined) : 'not signed in',
+    on ? (plan ? `${plan} plan` : undefined) : current?.auth.checking ? undefined : 'not signed in',
     tight ? `${Math.round(livePercent(tight, now))}% of ${tight.label} used` : undefined,
     pool ? `${poolLeftPercent(pool)}% left across its accounts` : undefined,
   ]
@@ -127,7 +128,7 @@ export function AccountSwitcher() {
             <span className="acs-trigger-mark" aria-hidden>
               <ProviderMark provider={focus} size={12} />
             </span>
-            <span className="acs-trigger-name truncate" data-out={!on || undefined}>
+            <span className="acs-trigger-name truncate" data-out={(!on && !current?.auth.checking) || undefined}>
               {name}
             </span>
             {on && current && <LimitRing provider={focus} accountId={current.id} />}
@@ -274,7 +275,8 @@ function Peek({ provider, accountId, onOpenUsage }: { provider: ProviderId; acco
 function triggerName(provider: ProviderId, account: AccountInfo | undefined, several: boolean): string {
   if (!account) return PROVIDER_NAME[provider];
   if (several) return accountName(account);
-  if (!account.auth.loggedIn) return 'Sign in';
+  if (signedOut(account.auth)) return 'Sign in';
+  if (!account.auth.loggedIn) return PROVIDER_NAME[provider];
   return planWord(account) ?? planOf(account) ?? PROVIDER_NAME[provider];
 }
 
@@ -310,7 +312,7 @@ function TriggerTip({ provider, account, several, plan, pool }: { provider: Prov
   const { limits } = useAccountWindows(provider, account?.id ?? DEFAULT_ACCOUNT);
   const now = useNow();
   const on = !!account?.auth.loggedIn;
-  const head = [PROVIDER_NAME[provider], account && several ? accountName(account) : undefined, on ? (plan ? `${plan} plan` : undefined) : 'Not signed in'].filter(Boolean).join(' · ');
+  const head = [PROVIDER_NAME[provider], account && several ? accountName(account) : undefined, on ? (plan ? `${plan} plan` : undefined) : account?.auth.checking ? undefined : 'Not signed in'].filter(Boolean).join(' · ');
   const windows = on ? orderWindows(limits) : [];
   return (
     <span className="acs-tip">

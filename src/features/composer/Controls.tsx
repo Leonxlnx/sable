@@ -23,6 +23,7 @@ import { type Choice } from './choice';
 import { Chip, type ChipPart } from './Chip';
 import { Later } from './later';
 import { NEAR, placeMenu, type Placed } from './menu-place';
+import { signedOut } from '@/lib/sign-in';
 
 /**
  * A chip of an agent nothing is known of yet (never seen on this machine, caps-seen.ts): a still,
@@ -550,11 +551,11 @@ function AgentMenu({ onClosed }: { onClosed: () => void }) {
                   const chosen = accountOf(p.id);
                   return (
                     <RM.Group key={p.id} className="hc-group">
-                      <RM.Item className="menu-item cm-row" onSelect={() => (p.auth.loggedIn || several ? setUi({ homeProvider: p.id }) : openSettings('accounts'))}>
+                      <RM.Item className="menu-item cm-row" onSelect={() => (!signedOut(p.auth) || several ? setUi({ homeProvider: p.id }) : openSettings('accounts'))}>
                         <ProviderMark provider={p.id} size={15} className="hc-mark" />
                         <span className="cm-row-name grow">{PROVIDER_NAME[p.id]}</span>
                         {/* With several accounts the check goes on the account, not twice. */}
-                        <span className="cm-check">{p.id === provider && !several ? <Icon name="check" size={14} /> : !p.auth.loggedIn && !several && <span className="hc-signin">Sign in</span>}</span>
+                        <span className="cm-check">{p.id === provider && !several ? <Icon name="check" size={14} /> : signedOut(p.auth) && !several && <span className="hc-signin">Sign in</span>}</span>
                       </RM.Item>
                       {several &&
                         accounts.map((a) => (
@@ -563,13 +564,13 @@ function AgentMenu({ onClosed }: { onClosed: () => void }) {
                             className="menu-item hc-acct"
                             data-current={(p.id === provider && a.id === chosen) || undefined}
                             onSelect={() => {
-                              if (!a.auth.loggedIn) return openSettings('accounts');
+                              if (signedOut(a.auth)) return openSettings('accounts');
                               setHomeAccount(p.id, a.id);
                               setUi({ homeProvider: p.id });
                             }}
                           >
                             <span className="grow truncate">{accountName(a)}</span>
-                            <span className="hc-plan">{a.auth.loggedIn ? planWord(a) : 'Sign in'}</span>
+                            <span className="hc-plan">{signedOut(a.auth) ? 'Sign in' : planWord(a)}</span>
                             <span className="hc-acct-end">
                               <LimitDot provider={p.id} accountId={a.id} />
                               {p.id === provider && a.id === chosen && <Icon name="check" size={14} />}
@@ -793,13 +794,16 @@ function BranchChip({ onClosed }: { onClosed: () => void }) {
 
 /** The agent chosen on the home screen is installed but its chosen account is not signed in. */
 export function useHomeSignedOut(): boolean {
-  return useStore((s) => {
-    const id = s.ui.homeProvider;
-    const p = s.providers[id];
-    if (!p?.installed) return false;
-    const acct = p.accounts?.find((a) => a.id === homeAccountId(id, s));
-    return !(acct ? acct.auth.loggedIn : p.auth.loggedIn);
-  });
+  return useStore(homeSignedOut);
+}
+
+export function homeSignedOut(s: Pick<ReturnType<typeof useStore.getState>, 'ui' | 'providers'>): boolean {
+  const id = s.ui.homeProvider;
+  const p = s.providers[id];
+  if (!p?.installed) return false;
+  const acct = p.accounts?.find((a) => a.id === homeAccountId(id, s));
+  // Not read yet (a first start): neither in nor out, so no Sign in that may vanish a moment later.
+  return signedOut(acct ? acct.auth : p.auth);
 }
 
 /** Beside the agent chip while that agent is not signed in: one step to Settings › Accounts. */

@@ -44,8 +44,8 @@ export function ConnectCard({ provider, primary = false, compact = false }: { pr
   return (
     <article className="cc" data-provider={provider} data-compact={compact || undefined} data-multi={multi || undefined} data-spot={compact ? undefined : ''} aria-label={name}>
 
-      {!info || !info.installed ? (
-        <AgentState provider={provider} mark={mark} phase={!info ? 'loading' : 'missing'} />
+      {!info || !info.installed || info.auth.checking ? (
+        <AgentState provider={provider} mark={mark} phase={!info || info.auth.checking ? 'loading' : 'missing'} />
       ) : multi ? (
         <>
           <header className="cc-head">

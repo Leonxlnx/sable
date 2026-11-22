@@ -26,6 +26,7 @@ import type {
 import { DEFAULT_ACCOUNT, DEFAULT_SETTINGS } from '@shared/protocol';
 import { bridge, type ConnStatus } from '@/lib/bridge';
 import { bootMark } from '@/lib/boot';
+import { correctsGuess, helloProviders, homeAgent } from '@/lib/sign-in';
 import type { Reviews } from '@/features/review/model';
 
 export { changedSince } from './revision';
@@ -602,7 +603,12 @@ export function applyEvent(e: BridgeEvent) {
       patchData(e.sessionId, () => ({ suggestion: e.text || undefined }));
       return;
     case 'provider.updated':
-      useStore.setState((s) => ({ providers: { ...s.providers, [e.provider.id]: e.provider }, limits: withAccountLimits(s.limits, [e.provider]) }));
+      useStore.setState((s) => {
+        const providers = { ...s.providers, [e.provider.id]: e.provider };
+        // Hello picked home's agent, at a first start from a guess (lib/sign-in.ts): the agent's own answer corrects the pick.
+        const homeProvider = correctsGuess(s.providers[e.provider.id], e.provider) ? homeAgent(Object.values(providers), { current: s.ui.homeProvider, chosen: homeChosen, preferred: s.settings.defaultProvider }) : s.ui.homeProvider;
+        return { providers, limits: withAccountLimits(s.limits, [e.provider]), ...(homeProvider !== s.ui.homeProvider ? { ui: { ...s.ui, homeProvider } } : {}) };
+      });
       return;
     case 'auth.progress': {
       const key = accountKey(e.provider, e.accountId);
@@ -686,10 +692,10 @@ async function hello() {
   useStore.setState((s) => {
     const sessions = Object.fromEntries(app.sessions.map((m) => [m.id, m]));
     const active = s.ui.activeSessionId && sessions[s.ui.activeSessionId] ? s.ui.activeSessionId : null;
-    const installed = app.providers.filter((p) => p.installed);
+    // An agent hello says is still `checking` keeps an answer an event already brought (lib/sign-in.ts).
+    const providers = helloProviders(s.providers, app.providers);
     // A fresh profile starts on the agent chosen in settings; after that the home choice sticks.
-    const wanted = homeChosen || !installed.some((p) => p.id === app.settings.defaultProvider) ? s.ui.homeProvider : app.settings.defaultProvider;
-    const homeProvider = installed.some((p) => p.id === wanted) ? wanted : (installed.find((p) => p.id !== 'demo')?.id ?? installed[0]?.id ?? 'claude');
+    const homeProvider = homeAgent(Object.values(providers), { current: s.ui.homeProvider, chosen: homeChosen, preferred: app.settings.defaultProvider });
     // Forget home account choices whose account is gone.
     const homeAccount: Partial<Record<ProviderId, string>> = {};
     for (const p of app.providers) {
@@ -705,7 +711,7 @@ async function hello() {
       platform: app.platform,
       home: app.home,
       dataDir: app.dataDir ?? '',
-      providers: Object.fromEntries(app.providers.map((p) => [p.id, p])),
+      providers,
       limits: withAccountLimits(s.limits, app.providers),
       projects: app.projects,
       groups: app.groups ?? [],

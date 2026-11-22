@@ -9,6 +9,7 @@ import { bootMark } from '../server/util/boot';
 import { fixPathFromLoginShell } from '../server/util/login-env';
 import { pageHeaders as csp } from './csp';
 import { pickFolder, type ShowFolderDialog } from './folder';
+import { preferredPort } from './port';
 import { windowsThumbs } from './thumbs';
 
 // Start-up marks (server/util/boot.ts): the process, the entry (main.cjs) and the bundle (its banner)
@@ -42,8 +43,8 @@ bootMark('main:body');
 const isMac = process.platform === 'darwin';
 const isWin = process.platform === 'win32';
 
-/** Preferred port: a stable origin keeps the page's local storage and zoom between runs. */
-const PREFERRED_PORT = 47_317;
+/** Preferred port: a stable origin keeps the page's local storage and zoom between runs (`SABLE_PORT` for a test app, port.ts). */
+const PREFERRED_PORT = preferredPort(process.env.SABLE_PORT);
 const BG = '#070708';
 /** The panel browser's own persistent session: its cookies and storage never mix with the app's. */
 const BROWSER_PARTITION = 'persist:sable-browser';

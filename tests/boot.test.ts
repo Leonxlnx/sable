@@ -1,5 +1,99 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { LAUNCH, LAUNCH_FORMED, launchClock, launchColours, launchGeometry, launchMeasure } from '../src/art/launch-light';
+import { DEFAULT_PORT, preferredPort } from '../electron/port';
+import { shortWait } from '../src/art/launch-wait';
+import { hurryFactor, LAUNCH, LAUNCH_FORMED, launchClock, launchColours, launchGeometry, launchMeasure } from '../src/art/launch-light';
+
+describe('the launch waits for a chat it starts into, and a key or a click ends that wait', () => {
+  /** A wait whose end the test decides, as the launch's look for the chat's first frame. */
+  const manual = () => {
+    const w = { over: null as (() => void) | null, cancelled: 0 };
+    const wait = (over: () => void) => {
+      w.over = over;
+      return () => void w.cancelled++;
+    };
+    return { w, wait };
+  };
+
+  it('opens when the chat is there', () => {
+    const { w, wait } = manual();
+    let opened = 0;
+    shortWait(wait, () => void opened++);
+    expect(opened).toBe(0);
+    w.over!();
+    expect(opened).toBe(1);
+    // Never twice, whatever the wait says afterwards.
+    w.over!();
+    expect(opened).toBe(1);
+  });
+
+  it('opens at once on a key or a click, and the look for the chat stops', () => {
+    const { w, wait } = manual();
+    let opened = 0;
+    const s = shortWait(wait, () => void opened++);
+    s.now();
+    expect(opened).toBe(1);
+    expect(w.cancelled).toBe(1);
+    // The chat's frame arriving later opens nothing again.
+    w.over!();
+    s.now();
+    expect(opened).toBe(1);
+  });
+
+  it('has nothing to wait for on home, and a cancelled wait never opens', () => {
+    let opened = 0;
+    // Home: the wait is over straight away.
+    const home = shortWait(
+      (over) => {
+        over();
+        return () => {};
+      },
+      () => void opened++,
+    );
+    expect(opened).toBe(1);
+    home.now();
+    expect(opened).toBe(1);
+    // The layer went (the effect's cleanup): nothing opens later.
+    const { w, wait } = manual();
+    const s = shortWait(wait, () => void opened++);
+    s.cancel();
+    w.over!();
+    s.now();
+    expect(opened).toBe(1);
+    expect(w.cancelled).toBe(1);
+  });
+
+  it('is wired to the piece: a key before the app, or during the wait, gives way now', () => {
+    const layer = readFileSync('src/art/LaunchLayer.tsx', 'utf8').replace(/\r\n/g, '\n');
+    const yieldNow = layer.slice(layer.indexOf('function yieldNow'), layer.indexOf('function end('));
+    // Not ready yet: the wait for the chat, if that is all that is waited for, ends here.
+    expect(yieldNow).toMatch(/if \(!r\.ready\) \{\s*r\.impatient = true;[^}]*r\.readyNow\?\.\(\);\s*return;/);
+    const effect = layer.slice(layer.indexOf('const wait = shortWait(whenViewShown'), layer.indexOf('}, [ready]);'));
+    // A key that came before the app was there does not wait for the chat either.
+    expect(effect).toMatch(/if \(r\.impatient\) wait\.now\(\);\s*else r\.readyNow = wait\.now;/);
+    expect(effect).toMatch(/return \(\) => \{\s*r\.readyNow = null;\s*wait\.cancel\(\);/);
+    // The reveal is the crest's own length, and clicks belong to the app a third of the way in.
+    expect(layer).toContain('const TRAVEL = 300;');
+    expect(LAUNCH.burst).toBe(300);
+    expect(layer).toContain("cue(r, L.inhale + Math.round(L.burst * 0.35), () => (r.root.dataset.phase = 'open'));");
+  });
+});
+
+describe('the port a test app asks for', () => {
+  it('is taken when it is a user port Chromium loads from', () => {
+    expect(preferredPort('47400')).toBe(47400);
+    expect(preferredPort(' 5173 ')).toBe(5173);
+    expect(preferredPort('65535')).toBe(65535);
+  });
+
+  it('falls back to the app\'s own for a port Chromium refuses, a system port or anything else', () => {
+    // ERR_UNSAFE_PORT: the window stayed blank.
+    for (const p of ['6000', '6665', '6666', '6667', '6668', '6669', '6697', '10080', '2049', '5060', '5061', '4045', '1719', '1720', '1723', '3659', '4190', '6566', '6679']) expect(preferredPort(p)).toBe(DEFAULT_PORT);
+    for (const p of ['80', '1023', '65536', '0', '-1', '47317.5', '0x1f90', '1e4', 'abc', '', undefined]) expect(preferredPort(p)).toBe(DEFAULT_PORT);
+    expect(DEFAULT_PORT).toBe(47317);
+    expect(readFileSync('electron/main.ts', 'utf8')).toContain('const PREFERRED_PORT = preferredPort(process.env.SABLE_PORT);');
+  });
+});
 
 describe('the launch clock', () => {
   it('is real time until the app asks it to hurry', () => {
@@ -10,9 +104,9 @@ describe('the launch clock', () => {
   it('builds the mark faster once hurried, then runs at the real pace again, without a jump', () => {
     const at = 100;
     expect(launchClock(at, at)).toBe(at);
-    expect(launchClock(at + 40, at)).toBeCloseTo(at + 40 * LAUNCH.hurry);
+    expect(launchClock(at + 40, at)).toBeCloseTo(at + 40 * hurryFactor(at));
     // Whole sooner than it would be at the real pace.
-    const whole = at + (LAUNCH_FORMED - at) / LAUNCH.hurry;
+    const whole = at + (LAUNCH_FORMED - at) / hurryFactor(at);
     expect(whole).toBeLessThan(LAUNCH_FORMED);
     expect(launchClock(whole, at)).toBeCloseTo(LAUNCH_FORMED);
     expect(launchClock(whole + 100, at) - launchClock(whole, at)).toBeCloseTo(100);
@@ -23,6 +117,15 @@ describe('the launch clock', () => {
       expect(c).toBeGreaterThan(last);
       last = c;
     }
+  });
+
+  it('stands whole at most LAUNCH.hurryMax after the hurry, never slower than LAUNCH.hurry times', () => {
+    for (const at of [0, 20, 100, 250, LAUNCH_FORMED - 30]) {
+      expect(hurryFactor(at)).toBeGreaterThanOrEqual(LAUNCH.hurry);
+      expect(launchClock(at + LAUNCH.hurryMax + 0.01, at)).toBeGreaterThanOrEqual(LAUNCH_FORMED);
+    }
+    // Hurried before its first frame (the app was there first): the whole build within the limit.
+    expect(launchClock(LAUNCH.hurryMax, 0)).toBeCloseTo(LAUNCH_FORMED);
   });
 
   it('changes nothing once the mark already stands', () => {

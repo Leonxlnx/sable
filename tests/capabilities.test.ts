@@ -87,10 +87,13 @@ describe('start-up cache', () => {
   it('answers app.hello and provider.caps from the cache, then pushes fresh answers', async () => {
     const home = tmp();
     const state = { infoCalls: 0, capsCalls: 0, models: ['opus', 'haiku'], delay: 150 };
-    // First start: nothing cached, the agent is asked and the answers are kept.
+    // First start: nothing cached, the agent is asked and the answers are kept (hello does not wait
+    // for it: the answer comes as provider.updated, see 'a first start').
     const first = makeApp(home, [fakeClaude(state)]);
-    const hello1 = await first.app.call('app.hello', {});
-    expect(hello1.providers[0].version).toBe('2.1');
+    await first.app.call('app.hello', {});
+    for (let i = 0; i < 100 && !first.events.some((e) => e.type === 'provider.updated'); i++) await wait(20);
+    const info1 = first.events.find((e) => e.type === 'provider.updated');
+    expect(info1 && info1.type === 'provider.updated' && info1.provider.version).toBe('2.1');
     const caps1 = await first.app.call('provider.caps', { provider: 'claude', cwd: home });
     expect(caps1.models.map((m) => m.id)).toEqual(['opus', 'haiku']);
     await first.app.dispose();
@@ -117,6 +120,108 @@ describe('start-up cache', () => {
     expect(capsEvent && capsEvent.type === 'caps.updated' && capsEvent.cwd).toBe(home);
     const infoEvent = second.events.find((e) => e.type === 'provider.updated');
     expect(infoEvent && infoEvent.type === 'provider.updated' && infoEvent.provider.version).not.toBe('2.1');
+  });
+
+  it('a first start: app.hello never waits for an agent\'s CLI, and its answer follows as provider.updated', async () => {
+    const home = tmp();
+    // The CLI is there by its override (the desktop shell sets it for the bundled Claude Code).
+    const bin = path.join(home, 'claude.exe');
+    writeFileSync(bin, '');
+    const was = process.env.SABLE_CLAUDE_BIN;
+    process.env.SABLE_CLAUDE_BIN = bin;
+    try {
+      const state = { infoCalls: 0, capsCalls: 0, models: ['opus'], delay: 1500 };
+      const { app, events } = makeApp(home, [fakeClaude(state), (ctx) => new DemoProvider(ctx, { speed: 0 })]);
+      const t = performance.now();
+      const hello = await app.call('app.hello', {});
+      expect(performance.now() - t).toBeLessThan(700);
+      const claude = hello.providers.find((p) => p.id === 'claude')!;
+      // Installed, sign-in not known yet: neither in nor out.
+      expect(claude.installed).toBe(true);
+      expect(claude.auth).toEqual({ loggedIn: false, checking: true });
+      expect(claude.accounts?.[0].auth.checking).toBe(true);
+      // An agent that answers at once (the Demo) is taken as it is.
+      const demo = hello.providers.find((p) => p.id === 'demo')!;
+      expect(demo.auth.checking).toBeUndefined();
+      expect(demo.auth.loggedIn).toBe(true);
+      // Asked once; the answer arrives as an event and is kept for the next start.
+      for (let i = 0; i < 100 && !events.some((e) => e.type === 'provider.updated' && e.provider.id === 'claude'); i++) await wait(50);
+      const upd = events.find((e) => e.type === 'provider.updated' && e.provider.id === 'claude');
+      expect(upd && upd.type === 'provider.updated' && upd.provider.auth).toEqual({ loggedIn: true, email: 'a@example.com' });
+      expect(state.infoCalls).toBe(1);
+      expect(app.cache.get<ProviderInfo>('info:claude')?.auth.loggedIn).toBe(true);
+    } finally {
+      if (was === undefined) delete process.env.SABLE_CLAUDE_BIN;
+      else process.env.SABLE_CLAUDE_BIN = was;
+    }
+  });
+
+  it('a phone\'s hello never says "not known yet": it waits for the agent\'s own answer', async () => {
+    const home = tmp();
+    const bin = path.join(home, 'claude.exe');
+    writeFileSync(bin, '');
+    const was = process.env.SABLE_CLAUDE_BIN;
+    process.env.SABLE_CLAUDE_BIN = bin;
+    try {
+      const state = { infoCalls: 0, capsCalls: 0, models: ['opus'], delay: 400 };
+      const { app } = makeApp(home, [fakeClaude(state), (ctx) => new DemoProvider(ctx, { speed: 0 })]);
+      // The window's hello, a moment before: answered at once, the sign-in not known.
+      const first = await app.call('app.hello', {});
+      expect(first.providers.find((p) => p.id === 'claude')!.auth.checking).toBe(true);
+      // A phone reads a sign-in as in or out and keeps what it read (`settled`): its hello is the answer.
+      const hello = await app.call('app.hello', {}, { settled: true });
+      const claude = hello.providers.find((p) => p.id === 'claude')!;
+      expect(claude.auth).toEqual({ loggedIn: true, email: 'a@example.com' });
+      expect(claude.accounts?.every((a) => !a.auth.checking)).toBe(true);
+      // One question to the agent for both.
+      expect(state.infoCalls).toBe(1);
+      // Once it is known, nothing waits.
+      const t = performance.now();
+      const again = await app.call('app.hello', {}, { settled: true });
+      expect(performance.now() - t).toBeLessThan(300);
+      expect(again.providers.find((p) => p.id === 'claude')!.auth.loggedIn).toBe(true);
+    } finally {
+      if (was === undefined) delete process.env.SABLE_CLAUDE_BIN;
+      else process.env.SABLE_CLAUDE_BIN = was;
+    }
+  });
+
+  it('a phone\'s hello is bounded: an agent that does not answer is told as it is', async () => {
+    const home = tmp();
+    const bin = path.join(home, 'claude.exe');
+    writeFileSync(bin, '');
+    const was = process.env.SABLE_CLAUDE_BIN;
+    process.env.SABLE_CLAUDE_BIN = bin;
+    try {
+      const state = { infoCalls: 0, capsCalls: 0, models: ['opus'], delay: 1500 };
+      const app = new App({ home, providers: [fakeClaude(state)], quiet: true, refreshDelays: { info: 20, caps: 20, settledInfo: 120 } });
+      apps.push(app);
+      const t = performance.now();
+      const hello = await app.call('app.hello', {}, { settled: true });
+      expect(performance.now() - t).toBeLessThan(1200);
+      expect(hello.providers[0].auth.checking).toBe(true);
+    } finally {
+      if (was === undefined) delete process.env.SABLE_CLAUDE_BIN;
+      else process.env.SABLE_CLAUDE_BIN = was;
+    }
+  });
+
+  it('a first start without the CLI: not installed at once, and no sign-in to wait for', async () => {
+    const home = tmp();
+    // (process.env is case-blind on Windows: PATH and Path are one variable there.)
+    const was = { bin: process.env.SABLE_CLAUDE_BIN, path: process.env.PATH };
+    delete process.env.SABLE_CLAUDE_BIN;
+    process.env.PATH = home;
+    try {
+      const state = { infoCalls: 0, capsCalls: 0, models: ['opus'], delay: 1500 };
+      const { app } = makeApp(home, [fakeClaude(state)]);
+      const hello = await app.call('app.hello', {});
+      expect(hello.providers[0].installed).toBe(false);
+      expect(hello.providers[0].auth.checking).toBeUndefined();
+    } finally {
+      if (was.bin !== undefined) process.env.SABLE_CLAUDE_BIN = was.bin;
+      process.env.PATH = was.path;
+    }
   });
 
   it('does not push caps.updated when the fresh answer is the same', async () => {

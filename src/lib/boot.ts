@@ -7,11 +7,12 @@ import type { LaunchGeometry } from '@/art/launch-light';
  */
 const seen = new Set<string>();
 
-export function bootMark(name: string) {
+export function bootMark(name: string, at?: number) {
   if (seen.has(name)) return;
   seen.add(name);
   try {
-    performance.mark(`boot:${name}`);
+    // `at`: when it happened elsewhere (the launch light's worker), as epoch ms; the page may hear of it later.
+    performance.mark(`boot:${name}`, at === undefined ? undefined : { startTime: Math.max(0, at - performance.timeOrigin) });
   } catch {
     /* no timeline */
   }

@@ -2,8 +2,10 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { dropBootLight, fieldWorkerPort } from './DitherField';
 import { FIELD_EVENT, type FieldEventDetail } from './events';
 import { LAUNCH, LAUNCH_MARK_CELLS, launchColours, launchMeasure, type LaunchGeometry, type LaunchMessage, type LaunchReply } from './launch-light';
+import { shortWait } from './launch-wait';
 import { MARK_PATH, markCell } from './Logo';
 import { bootMark, takeBootLaunch, type BootLaunch } from '@/lib/boot';
+import { useStore } from '@/state/store';
 
 /**
  * The launch: one piece from the window's first frame to the home screen at rest.
@@ -74,6 +76,8 @@ interface Run {
   yielded: boolean;
   /** A key or a click arrived before the bridge did. */
   impatient: boolean;
+  /** The app is there and only a chat's first frame is waited for: ends that wait now. */
+  readyNow: (() => void) | null;
   /** What was typed before there was a composer to type into. */
   typed: string;
   /** A hand-over of `typed` to the composer is waiting for a frame. */
@@ -192,6 +196,7 @@ function start(root: HTMLDivElement, mark: HTMLDivElement, onDone: () => void, o
     released: false,
     yielded: false,
     impatient: false,
+    readyNow: null,
     typed: '',
     ended: false,
     parts: null,
@@ -312,10 +317,11 @@ function onReply(r: Run, m: LaunchReply) {
 
 function answer(r: Run, m: LaunchReply) {
   if (m.launch === 'ignite') {
-    bootMark('launch-ignite');
+    bootMark('launch-ignite', m.at);
     r.ignited = true;
   } else if (m.launch === 'formed') {
-    bootMark('launch-formed');
+    bootMark('launch-formed', m.at);
+    bootMark('launch-formed-heard');
     // The element takes over from the canvas's copy of the mark: the same pixels, so nothing shows.
     r.mark.style.opacity = '1';
     r.root.dataset.lit = '';
@@ -368,8 +374,8 @@ function tryRelease(r: Run) {
 
 /** Samples of an eased move as linear keyframes (the easing is applied here, in scale's own space). */
 const TRAVEL_STEPS = 30;
-/** The mark's glide to its place, ms, and how far it draws in before it leaves. */
-const TRAVEL = 520;
+/** The mark's glide to its place, ms (the crest's own length, `LAUNCH.burst`; it was 520), and how far it draws in before it leaves. */
+const TRAVEL = 300;
 const INHALED = 0.955;
 
 /**
@@ -445,14 +451,16 @@ function release(r: Run) {
   cue(r, L.inhale, () => {
     window.dispatchEvent(new CustomEvent<FieldEventDetail>(FIELD_EVENT, { detail: { kind: 'send', x: box.left + half, y: box.top + half, strength: 1 } }));
   });
-  // Soon the app shows through most of the window: clicks belong to it from here.
-  cue(r, L.inhale + 180, () => (r.root.dataset.phase = 'open'));
+  // Soon the app shows through most of the window: clicks belong to it from here (a third of the
+  // crest's way, LAUNCH.burst: it was inhale + 180 with a 520 ms burst).
+  cue(r, L.inhale + Math.round(L.burst * 0.35), () => (r.root.dataset.phase = 'open'));
 
+  // The home screen arrives on the crest's clock (it was 150 / 200 ms in, over 460 / 480 ms, with a 520 ms burst).
   const parts = r.parts;
   if (parts) {
-    resolveGlyphs(parts.title, L.inhale + 150, 10, (a) => track(r, a));
-    animate(r, parts.title, [{ transform: 'translateY(12px)' }, { transform: 'translateY(0px)' }], { duration: 460, delay: L.inhale + 150, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)', fill: 'backwards' });
-    animate(r, parts.composer, [{ opacity: 0, transform: 'translateY(22px)' }, { opacity: 1, transform: 'translateY(0px)' }], { duration: 480, delay: L.inhale + 200, easing: 'cubic-bezier(0.16, 1, 0.3, 1)', fill: 'backwards' });
+    resolveGlyphs(parts.title, L.inhale + 60, 6, (a) => track(r, a));
+    animate(r, parts.title, [{ transform: 'translateY(12px)' }, { transform: 'translateY(0px)' }], { duration: 300, delay: L.inhale + 60, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)', fill: 'backwards' });
+    animate(r, parts.composer, [{ opacity: 0, transform: 'translateY(22px)' }, { opacity: 1, transform: 'translateY(0px)' }], { duration: 320, delay: L.inhale + 80, easing: 'cubic-bezier(0.16, 1, 0.3, 1)', fill: 'backwards' });
   }
   // Whatever happens to the worker, the window opens.
   cue(r, L.inhale + L.burst + 500, () => end(r));
@@ -491,6 +499,8 @@ function yieldNow(r: Run) {
   if (r.ended || r.yielded) return;
   if (!r.ready) {
     r.impatient = true;
+    // The app is there and the piece only waits for a chat's first frame: that wait ends here.
+    r.readyNow?.();
     return;
   }
   r.yielded = true;
@@ -599,6 +609,40 @@ export function resolveGlyphs(title: Element | null | undefined, delay: number, 
   });
 }
 
+/** How long the launch waits for a chat it starts into to show its conversation before it opens anyway. */
+const CHAT_WAIT_MS = 1500;
+
+/**
+ * Calls `fn` once what the app starts into stands under the ink: at once for home; for a chat left
+ * open (`ui.activeSessionId`), the first frame its conversation (or, for a chat with nothing in it,
+ * its composer) is in the page, its snapshot asked right behind hello. Looked for once a frame, at
+ * most `CHAT_WAIT_MS`. Returns a cancel.
+ */
+function whenViewShown(fn: () => void): () => void {
+  const s = useStore.getState();
+  const id = s.ui.activeSessionId;
+  if (!id || !s.sessions[id]) {
+    fn();
+    return () => {};
+  }
+  const t0 = performance.now();
+  let raf = 0;
+  const look = () => {
+    const st = useStore.getState();
+    const d = st.ui.activeSessionId === id ? st.data[id] : undefined;
+    const shown = !!d?.loaded && !!document.querySelector(d.roots.length ? '.session .tl-item' : '.composer[data-variant=session]');
+    // Navigated elsewhere meanwhile (a click on home): nothing to wait for.
+    if (shown || st.ui.activeSessionId !== id || performance.now() - t0 > CHAT_WAIT_MS) {
+      if (shown) bootMark('chat');
+      fn();
+      return;
+    }
+    raf = requestAnimationFrame(look);
+  };
+  look();
+  return () => cancelAnimationFrame(raf);
+}
+
 /** The launch layer. Mount it from the first render; it calls `onDone` when nothing of it is left. */
 export function Launch({ ready, onDone }: { ready: boolean; onDone: () => void }) {
   const root = useRef<HTMLDivElement>(null);
@@ -622,15 +666,34 @@ export function Launch({ ready, onDone }: { ready: boolean; onDone: () => void }
   useEffect(() => {
     const r = run;
     if (!ready || !r || r.ready) return;
-    r.ready = true;
-    // From here the window is the app's: no longer a drag region, and a click skips the piece.
-    r.root.dataset.ready = '';
     // The app is there before the mark stands whole: the build quickens, so the piece gives way as
     // soon as it can (launch-light.ts, LAUNCH.hurry).
-    if (r.port && !r.painted && !r.frozen) r.port.post({ type: 'launch', id: r.port.id, op: 'hurry' } satisfies LaunchMessage);
-    tryRelease(r);
-    // The app is there: if the light cannot finish forming (a hidden window draws no frames), the ink goes anyway.
-    if (!r.ended && !r.released) cue(r, 2600, () => !r.released && end(r));
+    if (r.port && !r.painted && !r.frozen) {
+      bootMark('launch-hurry');
+      r.port.post({ type: 'launch', id: r.port.id, op: 'hurry' } satisfies LaunchMessage);
+    }
+    // A start into a chat opens onto the conversation, never onto an empty stage that fills.
+    const wait = shortWait(whenViewShown, () => {
+      r.readyNow = null;
+      if (r.ended || r.ready) return;
+      r.ready = true;
+      bootMark('launch-ready');
+      // From here the window is the app's: no longer a drag region, and a click skips the piece.
+      r.root.dataset.ready = '';
+      tryRelease(r);
+      // The app is there: if the light cannot finish forming (a hidden window draws no frames), the ink goes anyway.
+      if (!r.ended && !r.released) cue(r, 2600, () => !r.released && end(r));
+    });
+    // A key or a click is the person asking for the window: one that came before the app was there
+    // ends the wait for the chat now, one that comes during it ends it then (`yieldNow`).
+    if (!r.ready && !r.ended) {
+      if (r.impatient) wait.now();
+      else r.readyNow = wait.now;
+    }
+    return () => {
+      r.readyNow = null;
+      wait.cancel();
+    };
   }, [ready]);
 
   return (

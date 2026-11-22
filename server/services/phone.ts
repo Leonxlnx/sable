@@ -2130,7 +2130,8 @@ export class PhoneService {
           }
           act();
           // The guard goes along: a handler that waits (a send for the agent to start, a model change to apply) asks it again before it acts.
-          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed }));
+          // (`settled`: a phone knows a sign-in only as in or out, so its hello never says "not known yet".)
+          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed, settled: true }));
           // Folder browsing for a new chat: folders only, never file names.
           if (req.method === 'fs.list' && result && typeof result === 'object') {
             const r = result as { entries?: { dir: boolean }[] };

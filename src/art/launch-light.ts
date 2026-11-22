@@ -33,18 +33,24 @@ export const LAUNCH = {
   placeStep: 12,
   placeFill: 140,
   /** The light gathers on the mark before the crest leaves. */
-  inhale: 80,
-  /** The crest and the opening behind it: from the mark to past the far corner. */
-  burst: 520,
+  inhale: 60,
+  /**
+   * The crest and the opening behind it: from the mark to past the far corner. With the inhale
+   * about 360 ms: short, so the app the piece reveals is not held back by it (it was 520), and long
+   * enough to be read (at 240 the crest crossed the window in four or five frames).
+   */
+  burst: 300,
   /** A yielded piece opens in this. */
   finish: 150,
   /** One ring per this while held. */
   breath: 1900,
   /**
-   * The app was ready before the mark stood whole: the build runs this many times faster until it
-   * does, so the piece gives way as soon as it can (the same build, only quicker).
+   * The app was ready before the mark stood whole: the build runs at least this many times faster
+   * until it does, so the piece gives way as soon as it can (the same build, only quicker)...
    */
   hurry: 2.5,
+  /** ...and faster still where needed, so the mark stands whole at most this long after the app is ready. */
+  hurryMax: 100,
 } as const;
 
 /** When the mark stands whole. */
@@ -356,6 +362,8 @@ export interface LaunchReply {
   /** Frames drawn and the slowest one, with `done` (for the counts). */
   frames?: number;
   worst?: number;
+  /** When, as epoch ms (`ignite`, `formed`): the page's start-up marks take the worker's own time. */
+  at?: number;
 }
 
 interface Host {
@@ -404,7 +412,8 @@ export function launchMessage(m: { type: string }, post: (r: LaunchReply) => voi
       h.piece.finish(now());
       break;
     case 'hurry':
-      if (!h.formed && !h.hurried && h.frozen == null && h.t0 >= 0) h.hurried = { r0: performance.now() - h.t0 };
+      // Before the first frame (the app was ready before the light could start): hurried from it.
+      if (!h.formed && !h.hurried && h.frozen == null) h.hurried = { r0: h.t0 < 0 ? 0 : performance.now() - h.t0 };
       break;
     case 'clock':
       h.frozen = msg.t;
@@ -425,10 +434,16 @@ export function launchMessage(m: { type: string }, post: (r: LaunchReply) => voi
  */
 export function launchClock(real: number, hurriedAt: number | null): number {
   if (hurriedAt === null || real <= hurriedAt || hurriedAt >= LAUNCH_FORMED) return real;
-  const fast = hurriedAt + (real - hurriedAt) * LAUNCH.hurry;
+  const k = hurryFactor(hurriedAt);
+  const fast = hurriedAt + (real - hurriedAt) * k;
   if (fast <= LAUNCH_FORMED) return fast;
-  const whole = hurriedAt + (LAUNCH_FORMED - hurriedAt) / LAUNCH.hurry;
+  const whole = hurriedAt + (LAUNCH_FORMED - hurriedAt) / k;
   return LAUNCH_FORMED + (real - whole);
+}
+
+/** How many times faster the build runs when hurried at `hurriedAt`: whole within `LAUNCH.hurryMax`. */
+export function hurryFactor(hurriedAt: number): number {
+  return Math.max(LAUNCH.hurry, (LAUNCH_FORMED - hurriedAt) / LAUNCH.hurryMax);
 }
 
 const clock = (h: Host, real: number) => launchClock(real, h.hurried ? h.hurried.r0 : null);
@@ -455,10 +470,11 @@ function frame(id: number, h: Host, post: (r: LaunchReply) => void) {
   const cost = performance.now() - start;
   h.frames++;
   if (cost > h.worst) h.worst = cost;
-  if (first) post({ id, launch: 'ignite' });
+  const at = performance.timeOrigin + performance.now();
+  if (first) post({ id, launch: 'ignite', at });
   if (!h.formed && h.piece.whole) {
     h.formed = true;
-    post({ id, launch: 'formed' });
+    post({ id, launch: 'formed', at });
   }
   if (h.piece.done) {
     post({ id, launch: 'done', frames: h.frames, worst: Math.round(h.worst * 100) / 100 });

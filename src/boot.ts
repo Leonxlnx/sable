@@ -83,10 +83,10 @@ function startLight() {
     canvas.remove();
   };
   const launch: BootLaunch = { worker, canvas, id: LAUNCH_ID, cell, geometry, replies: [], failed: false, timer: window.setTimeout(give, ORPHAN_MS) };
-  worker.onmessage = (e: MessageEvent<{ id?: number; launch?: string }>) => {
+  worker.onmessage = (e: MessageEvent<{ id?: number; launch?: string; at?: number }>) => {
     if (e.data?.id !== LAUNCH_ID) return;
-    // When it happened (the layer hears of it later).
-    if (e.data.launch === 'ignite' || e.data.launch === 'formed') bootMark(`launch-${e.data.launch}`);
+    // When it happened, by the worker's own clock (the page may hear of it later).
+    if (e.data.launch === 'ignite' || e.data.launch === 'formed') bootMark(`launch-${e.data.launch}`, e.data.at);
     launch.replies.push(e.data);
   };
   worker.onerror = () => {

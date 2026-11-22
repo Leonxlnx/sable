@@ -80,6 +80,7 @@ import { Submissions, messagePrint } from './core/submissions';
 import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
+import { cliPresent } from './util/cli-present';
 
 /**
  * Who asks, beside the params: `allowed` (the phone endpoint's guard, services/phone.ts) says whether
@@ -87,6 +88,11 @@ import { bootMark } from './util/boot';
  */
 export interface CallContext {
   allowed?: () => boolean;
+  /**
+   * The caller knows a sign-in only as in or out and keeps what it read (a phone): `app.hello`
+   * waits for an agent's own answer where it would say `checking`.
+   */
+  settled?: boolean;
 }
 
 /** The caller of a call may no longer act (a phone removed while its request waited). */
@@ -115,7 +121,7 @@ export interface AppOptions {
   providers: ((ctx: ProviderContext) => Provider)[];
   quiet?: boolean;
   /** How long after serving a cached answer the fresh one is fetched (tests shorten these). */
-  refreshDelays?: { info?: number; caps?: number; signIn?: number };
+  refreshDelays?: { info?: number; caps?: number; signIn?: number; firstInfo?: number; settledInfo?: number };
   /** The user's home folder, where "Use an existing folder" looks for agent config folders (tests point it elsewhere). */
   userHome?: string;
   /** How long a sign-in may wait for the browser before it is given up (tests shorten it). */
@@ -846,7 +852,7 @@ export class App {
    */
   private providerInfoFast(provider: ProviderId): Promise<ProviderInfo> {
     const cached = this.cache.get<ProviderInfo>(`info:${provider}`);
-    if (!cached?.installed) return this.providerInfo(provider).then((info) => (this.cache.set(`info:${provider}`, info), info));
+    if (!cached?.installed) return this.providerInfoNoWait(provider, cached);
     if (!this.refreshing.has(provider)) {
       // Not right away: start-up stays quiet (starting a CLI can make it sync plugins over the
       // network), and anything that needs the agent sooner asks it then.
@@ -879,6 +885,90 @@ export class App {
     });
     // Setup warnings belong to the run that saw them: the fresh read brings this run's.
     return Promise.resolve({ ...cached, accounts, warnings: undefined });
+  }
+
+  /** The agent's own answer when nothing usable was cached, asked once at a time. */
+  private asking = new Map<ProviderId, Promise<ProviderInfo>>();
+
+  /**
+   * The provider for app.hello when nothing usable is cached (the first start, or an agent that was
+   * not installed last time): the agent is asked now, and hello takes its answer only if it comes
+   * within a moment (`FIRST_INFO_WAIT_MS`: the Demo's, a missing CLI's). Otherwise hello answers with
+   * what is known without the CLI (installed by a look at PATH, the sign-in `checking`: neither in
+   * nor out) and the answer goes out as `provider.updated` when it is in.
+   */
+  private providerInfoNoWait(provider: ProviderId, cached: ProviderInfo | undefined): Promise<ProviderInfo> {
+    let asked = this.asking.get(provider);
+    if (!asked) {
+      const p = this.provider(provider);
+      asked = this.providerInfo(provider)
+        .catch(() => fallbackInfo(p) as ProviderInfo)
+        .then((info) => {
+          if (!this.disposed) this.cache.set(`info:${provider}`, info);
+          return info;
+        });
+      this.asking.set(provider, asked);
+      asked.finally(() => this.asking.delete(provider)).catch(() => {});
+    }
+    let late = false;
+    const answered = asked;
+    void answered.then((info) => {
+      if (late && !this.disposed) this.emit({ type: 'provider.updated', provider: info });
+    });
+    return Promise.race([
+      answered,
+      new Promise<ProviderInfo>((resolve) => {
+        const t = setTimeout(() => {
+          late = true;
+          resolve(this.provisionalInfo(provider, cached));
+        }, this.delays.firstInfo ?? FIRST_INFO_WAIT_MS);
+        t.unref?.();
+        void answered.then(() => clearTimeout(t));
+      }),
+    ]);
+  }
+
+  /**
+   * The provider for a caller that cannot show "not known yet" (`CallContext.settled`): where hello
+   * would say `checking`, the agent's own answer, which is on its way, is waited for. Bounded past
+   * the CLIs' own time limits; an agent that has not answered by then is told as it is.
+   */
+  private async providerInfoSettled(provider: ProviderId): Promise<ProviderInfo> {
+    const info = await this.providerInfoFast(provider);
+    if (!info.auth.checking) return info;
+    const asked = this.asking.get(provider);
+    // Answered in the meantime: the answer is the cached one.
+    if (!asked) return this.cache.get<ProviderInfo>(`info:${provider}`) ?? info;
+    return Promise.race([
+      asked,
+      new Promise<ProviderInfo>((resolve) => {
+        const t = setTimeout(() => resolve(info), this.delays.settledInfo ?? SETTLED_INFO_WAIT_MS);
+        t.unref?.();
+        void asked.then(() => clearTimeout(t));
+      }),
+    ]);
+  }
+
+  /** What hello says of an agent before its CLI answered: nothing that needs the CLI. */
+  private provisionalInfo(provider: ProviderId, cached: ProviderInfo | undefined): ProviderInfo {
+    const p = this.provider(provider);
+    const installed = cliPresent(provider);
+    const auth: AuthState = installed ? { loggedIn: false, checking: true } : { loggedIn: false };
+    const defaultId = this.defaultAccountId(provider);
+    const accounts = this.accountList(provider).map(
+      (a): AccountInfo => ({
+        id: a.id,
+        provider,
+        label: a.label,
+        isDefault: a.id === defaultId,
+        auth,
+        limits: this.limitsCache.get(accountKey(provider, a.id)),
+        dir: a.id === DEFAULT_ACCOUNT ? undefined : this.accountDir(provider, a.id),
+        ...(a.dir ? { external: true } : {}),
+        ...resetCommandOf(this.provider(provider, a.id)),
+      }),
+    );
+    return { id: provider, name: p.name, installed, ...(installed && cached?.version ? { version: cached.version } : {}), auth, accounts, ...(installed ? {} : { problem: cached?.problem }) };
   }
 
   /**
@@ -3030,8 +3120,8 @@ export class App {
     this.store.saveState();
   }
 
-  async state(): Promise<AppState> {
-    const providers = await Promise.all([...this.providers.values()].map((p) => this.providerInfoFast(p.id).catch(() => fallbackInfo(p))));
+  async state(settled = false): Promise<AppState> {
+    const providers = await Promise.all([...this.providers.values()].map((p) => (settled ? this.providerInfoSettled(p.id) : this.providerInfoFast(p.id)).catch(() => fallbackInfo(p))));
     return {
       version: VERSION,
       platform: process.platform,
@@ -3212,9 +3302,9 @@ export class App {
   }
 
   private registerCore() {
-    this.register('app.hello', async () => {
+    this.register('app.hello', async (_params, ctx) => {
       bootMark('hello:asked');
-      const state = await this.state();
+      const state = await this.state(ctx.settled);
       bootMark('hello:answered');
       return state;
     });
@@ -4083,6 +4173,10 @@ const LOGIN_TIMEOUT_MS = 10 * 60_000;
 
 /** How long after start-up cached provider info is checked against the CLI. */
 const INFO_REFRESH_DELAY_MS = 15_000;
+/** How long app.hello waits for an agent that has nothing cached before it answers without it. */
+const FIRST_INFO_WAIT_MS = 50;
+/** How long a hello that must not say `checking` (a phone's) waits for an agent's own answer: past the CLIs' own limits. */
+const SETTLED_INFO_WAIT_MS = 15_000;
 /** How long after a cached capabilities answer the fresh one is fetched. */
 const CAPS_REFRESH_DELAY_MS = 2_500;
 

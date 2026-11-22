@@ -13,6 +13,8 @@ export type ProviderId = 'claude' | 'codex' | 'opencode' | 'demo';
 
 export interface AuthState {
   loggedIn: boolean;
+  /** Not read yet in this run (a start with nothing cached): neither signed in nor out; `provider.updated` brings the answer. */
+  checking?: boolean;
   /** e.g. "claude.ai", "chatgpt", "apiKey" */
   method?: string;
   email?: string;

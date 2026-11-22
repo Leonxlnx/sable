@@ -67,10 +67,11 @@ describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
     });
   }, 30_000);
   afterAll(async () => {
-    await browser?.close();
     a?.close();
     b?.close();
-  });
+    // Closing the browser can take longer than a hook's ten seconds while the whole suite runs.
+    await browser?.close();
+  }, 30_000);
 
   /** begin's description, then the fresh document's stamp, as main does them (here in one document). */
   const prepare = async (p: Page, path: string) => {
