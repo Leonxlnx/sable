@@ -157,6 +157,26 @@ describe('chats kept in the window', () => {
     expect(Object.keys(s.data.k0.items)).toHaveLength(0);
   });
 
+  it('a chat that left the window and comes on screen some other way (a notification) is fetched, never shown empty', async () => {
+    const ids = Array.from({ length: KEEP.chats + 3 }, (_, i) => `k${i}`);
+    reset(ids);
+    for (const id of ids) {
+      actions.openSession(id);
+      await answer(id);
+    }
+    expect(useStore.getState().data.k0.loaded).toBe(false);
+    calls.length = 0;
+    // What a notification's click does: the chat is put on screen directly.
+    useStore.getState().setUi({ activeSessionId: 'k0', race: null });
+    expect(snapCalls().map((c) => c.params.sessionId)).toEqual(['k0']);
+    await answer('k0');
+    expect(useStore.getState().data.k0.loaded).toBe(true);
+    // A chat that is here asks nothing.
+    calls.length = 0;
+    useStore.getState().setUi({ activeSessionId: ids.at(-1)!, race: null });
+    expect(snapCalls()).toHaveLength(0);
+  });
+
   it('keeps fewer when the kept chats are long (KEEP.items)', async () => {
     reset(['big1', 'big2', 'small']);
     for (const id of ['big1', 'big2']) {

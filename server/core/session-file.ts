@@ -260,7 +260,13 @@ export class SessionFiles {
     const gen = old ? 0 : (base.gen as number);
     const items = Array.isArray(base.items) ? base.items : [];
     const tailRead = old ? ({ ok: true, value: null } as const) : readJson<SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] }>(this.tailOf(id));
-    const tail = tailRead.ok ? tailRead.value : null;
+    // A tail that is there but cannot be read (held by another program for a moment) is not a missing tail:
+    // the base alone is an older conversation, and the next save would write a tail over the newer one.
+    if (!tailRead.ok) {
+      this.unreadable.add(id);
+      return { items: [], todos: [], unreadable: true };
+    }
+    const tail = tailRead.value;
     let from = items.length;
     let data: SessionData = { items, todos: base.todos ?? [], queue: base.queue };
     const over = new Set<string>();

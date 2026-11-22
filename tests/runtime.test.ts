@@ -82,6 +82,37 @@ describe('timeline', () => {
   });
 });
 
+describe('a message steered into a turn', () => {
+  it('stands where the agent took it: what was written before it had the message stays above it', () => {
+    const { rt } = make();
+    rt.add({ type: 'user', text: 'fix the bug', state: 'sent' } as never);
+    rt.add<ToolItem>({ type: 'tool', name: 'Read', kind: 'read', title: 'Read a.ts', status: 'done' } as never);
+    const steer = rt.add({ type: 'user', text: 'which account are you on?', state: 'queued', steered: true, ts: 5 } as never);
+    // Written before the agent had the message: a note and the step it announces.
+    const note = rt.add<TextItem>({ type: 'text', text: 'Reading the recovery code; the fix looks small.', streaming: false });
+    const step = rt.add<ToolItem>({ type: 'tool', name: 'Read', kind: 'read', title: 'Read b.ts', status: 'done' } as never);
+    const child = rt.add<ToolItem>({ type: 'tool', name: 'Grep', kind: 'search', title: 'inside', status: 'done', parentId: step.id } as never);
+    rt.taken(steer.id);
+    const reply = rt.add<TextItem>({ type: 'text', text: 'On Max1.', streaming: false });
+    const roots = rt.items.filter((i) => !i.parentId).map((i) => i.id);
+    expect(roots.slice(-4)).toEqual([note.id, step.id, steer.id, reply.id]);
+    expect(rt.items.some((i) => i.id === child.id)).toBe(true);
+    // Taken, and it keeps the time it was sent.
+    expect(rt.get(steer.id)).toMatchObject({ state: 'sent', steered: true, ts: 5 });
+  });
+
+  it('stays in its place when nothing was written meanwhile, and when only a step of its own nests after it', () => {
+    const { rt, events } = make();
+    rt.add({ type: 'user', text: 'fix the bug', state: 'sent' } as never);
+    const steer = rt.add({ type: 'user', text: 'and the tests', state: 'queued', steered: true } as never);
+    events.length = 0;
+    rt.taken(steer.id);
+    expect(rt.items.at(-1)?.id).toBe(steer.id);
+    expect(events.some((e) => e.type === 'item.removed')).toBe(false);
+    expect(rt.get(steer.id)).toMatchObject({ state: 'sent' });
+  });
+});
+
 describe('turns and prompts', () => {
   it('goes running → awaiting → running → idle around a permission', async () => {
     const { rt, statuses, events } = make();

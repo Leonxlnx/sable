@@ -20,6 +20,7 @@ import { App } from '../server/app';
 import { SessionRuntime } from '../server/core/runtime';
 import { backgroundLimitDue, limitStoppedAgents, readingShowsRoom, returnRetryMs, returnTarget } from '../server/core/limit-policy';
 import { ClaudeProvider } from '../server/providers/claude';
+import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
 import type { ProviderContext, ProviderSession } from '../server/providers/types';
 import { agentLine } from '../src/features/timeline/agent-line';
@@ -464,6 +465,169 @@ describe('review wave 16', { timeout: 20_000 }, () => {
     const bg = '\n\nThe same limit stopped these background agents before they finished: "Audit" (Explore, call toolu_1). Start again those whose work is still needed, and do not redo what they already finished.';
     expect(parseSynthetic(`${RESUME_UNDER_ANOTHER}${bg}${note}`)?.role).toBe('hidden');
     expect(parseSynthetic(`${RESUME_UNDER_ANOTHER}${note}`)?.role).toBe('hidden');
+  });
+});
+
+describe('review wave 17', { timeout: 25_000 }, () => {
+  /** Max3 runs on credits past its full window (the Demo's at-limit account says so); the setting says no. */
+  const onForbiddenCredits = async (opts: { ultra?: boolean } = {}) => {
+    const h = await crewOnMax3({ capped: true, ultra: opts.ultra });
+    for (let i = 1; i <= 7; i++) h.rt.patch<ToolItem>(`toolu_${i}`, { result: { agent: { background: 'done' } } });
+    return h;
+  };
+
+  it('#5 a send while the stop of background work runs waits behind it, and goes after the move on the new account', async () => {
+    const h = await crewOnMax3();
+    let release!: () => void;
+    const stopping = new Promise<void>((r) => (release = r));
+    (h.rt.handle as unknown as { stopBackgroundWork: () => Promise<boolean> }).stopBackgroundWork = async () => (await stopping, true);
+    for (let i = 1; i <= 5; i++) h.rt.limitInBackground(hit(i));
+    // The decision is under way: the two left are being stopped.
+    await until(() => !!cards(h.rt.items)[0]?.limit?.moving, 'the stop');
+    await h.app.call('session.send', { sessionId: h.rt.id, text: 'next step' });
+    expect(h.sent).toHaveLength(0);
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.rt.queue.map((q) => q.text)).toEqual(['next step']);
+    release();
+    await until(() => h.sent.length === 2 && h.rt.meta.status === 'idle', 'the continuation, then the message');
+    expect(h.sent[0].text.startsWith(RESUME_UNDER_ANOTHER)).toBe(true);
+    expect(h.sent.map((x) => x.account)).toEqual([h.ultra3.id, h.ultra3.id]);
+    expect(h.sent[1].text.startsWith('next step')).toBe(true);
+  });
+
+  it("#5 Claude Code's stop never closes a process a turn now uses", async () => {
+    const h = await claudeChat();
+    let closed = 0;
+    const q = (h.session as unknown as { q: Record<string, unknown> }).q;
+    q.close = () => void closed++;
+    q.stopTask = async () => {
+      // Meanwhile the agent began a turn on the same process.
+      h.rt.beginTurn('Thinking', { keepHold: true });
+    };
+    (h.session as unknown as { liveTasks: Set<string> }).liveTasks.add('t1');
+    const ok = await (h.session as unknown as { stopBackgroundWork(): Promise<boolean> }).stopBackgroundWork();
+    expect(ok).toBe(false);
+    expect(closed).toBe(0);
+    expect((h.session as unknown as { q?: unknown }).q).toBe(q);
+  });
+
+  it('#2 a first message that went while the agent was still opening is checked right before it goes', async () => {
+    const h = await onForbiddenCredits({ ultra: false });
+    // As after session.create answered early: the agent is not there yet.
+    await h.rt.handle!.close();
+    h.rt.handle = undefined;
+    await h.app.call('session.send', { sessionId: h.rt.id, text: 'first thing' });
+    await until(() => cards(h.rt.items).length === 1 && !h.rt.turnActive, 'the refusal');
+    expect(h.sent).toHaveLength(0);
+    expect(h.rt.items.filter((i) => i.type === 'user').pop()).toMatchObject({ text: 'first thing' });
+  });
+
+  it('#2 a steer on forbidden credits is held in the queue and the running turn goes on', async () => {
+    const h = await onForbiddenCredits({ ultra: false });
+    h.rt.beginTurn('Thinking');
+    await h.app.call('session.send', { sessionId: h.rt.id, text: 'also this' });
+    expect(h.sent).toHaveLength(0);
+    expect(h.rt.turnActive).toBe(true);
+    expect(h.rt.queue.map((q) => q.text)).toEqual(['also this']);
+    expect(h.rt.items.some((i) => i.type === 'user' && i.text === 'also this')).toBe(false);
+  });
+
+  it("#3 a removed phone's refused message never goes on the next account", async () => {
+    const h = await onForbiddenCredits();
+    let paired = true;
+    await h.app.call('session.send', { sessionId: h.rt.id, text: 'from the phone' }, { allowed: () => paired });
+    // Refused there (credits forbidden); the phone is removed before the move carries it on.
+    expect(cards(h.rt.items)).toHaveLength(1);
+    paired = false;
+    await until(() => h.rt.meta.accountId === h.ultra3.id, 'the move');
+    await tick(150);
+    expect(h.sent).toHaveLength(0);
+    expect(notices(h.rt.items).some((n) => n.text === 'A message from a removed phone was not sent')).toBe(true);
+  });
+
+  it('#6 a sub-agent whose interrupt fails keeps running, is not named, and the move goes ahead', async () => {
+    const h = await crewOnMax3();
+    (h.rt.handle as unknown as { stopBackgroundWork: () => Promise<{ failed: string[] }> }).stopBackgroundWork = async () => ({ failed: ['toolu_7'] });
+    for (let i = 1; i <= 5; i++) h.rt.limitInBackground(hit(i));
+    await until(() => h.rt.meta.accountId === h.ultra3.id && h.sent.length > 0, 'the move');
+    expect(h.rt.get<ToolItem>('toolu_6')!.result!.agent).toMatchObject({ background: 'stopped', limit: { window: '5-hour limit' } });
+    expect(h.rt.get<ToolItem>('toolu_7')!.result!.agent!.limit).toBeUndefined();
+    expect(h.sent[0].text).toContain('call toolu_6');
+    expect(h.sent[0].text).not.toContain('call toolu_7');
+    expect(notices(h.rt.items).some((n) => n.text === 'A sub-agent could not be stopped')).toBe(true);
+  });
+
+  it("#6 Codex: a sub-agent whose turn started before its spawn registered it is still interrupted", async () => {
+    const home = temp('sable-limit-codex-');
+    const cwd = path.join(home, 'proj');
+    mkdirSync(cwd);
+    const asked: { method: string; params: Record<string, unknown> }[] = [];
+    const rpc = {
+      request: async (method: string, params: Record<string, unknown>) => {
+        asked.push({ method, params });
+        if (method === 'thread/start') return { thread: { id: 'th1', model: 'm' }, model: 'm' };
+        if (method === 'turn/start') return { turn: { id: 'turn1' } };
+        if (method === 'account/read') return { account: { type: 'apiKey' }, requiresOpenaiAuth: true };
+        if (method === 'thread/turns/list') return { data: params.threadId === 'sub2' ? [{ id: 'late2', status: 'inProgress', items: [] }] : [] };
+        return {};
+      },
+    };
+    let provider!: InstanceType<typeof CodexProvider>;
+    const app = new App({
+      home: path.join(home, 'data'),
+      quiet: true,
+      providers: [
+        (ctx) => {
+          const p = new CodexProvider(ctx);
+          const anyP = p as unknown as Record<string, unknown>;
+          anyP.client = async () => rpc;
+          anyP.version = async () => ({ installed: true, version: '1' });
+          anyP.caps = async () => ({ models: [{ id: 'm', name: 'M', isDefault: true }], modes: [], commands: [], skills: [], agents: [], mcpServers: [], tools: [], skillTrigger: '$', features: { steer: true, compact: true } });
+          provider ??= p;
+          return p;
+        },
+      ],
+    });
+    cleanups.push(() => app.dispose());
+    const snap = await app.call('session.create', { provider: 'codex', cwd, mode: 'auto', model: 'm' });
+    const rt = app.runtime(snap.session.id);
+    await app.call('session.send', { sessionId: rt.id, text: 'split the work' });
+    await until(() => provider.sessions.size > 0 && rt.turnActive, 'the turn');
+    const notify = (method: string, p: unknown) => (provider as unknown as { onNotification(m: string, p: unknown): void }).onNotification(method, p);
+    // sub1's turn starts before the spawn's result registers it; sub2's start is never seen.
+    notify('turn/started', { threadId: 'sub1', turn: { id: 'early1', status: 'inProgress', items: [] } });
+    notify('item/completed', {
+      threadId: 'th1',
+      turnId: 'turn1',
+      item: { type: 'collabAgentToolCall', id: 'sp1', tool: 'spawnAgent', status: 'completed', receiverThreadIds: ['sub1', 'sub2'], prompt: 'look', model: null, agentsStates: { sub1: { status: 'running', message: null }, sub2: { status: 'running', message: null } } },
+    });
+    const r = await (rt.handle as unknown as { stopBackgroundWork(): Promise<{ failed: string[] }> }).stopBackgroundWork();
+    const interrupts = asked.filter((a) => a.method === 'turn/interrupt').map((a) => `${a.params.threadId}:${a.params.turnId}`);
+    expect(interrupts.sort()).toEqual(['sub1:early1', 'sub2:late2']);
+    expect(r.failed).toEqual([]);
+  });
+
+  it('#8 a send whose wait for the return runs out queues against it and goes once it settles', async () => {
+    const m = await crewOnMax3();
+    for (let i = 1; i <= 7; i++) m.rt.limitInBackground(hit(i));
+    await until(() => m.rt.meta.accountId === m.ultra3.id && m.sent.length > 0 && m.rt.meta.status === 'idle', 'the move');
+    m.sent.length = 0;
+    await setProfile(m.app, m.max3, 'Max3', 'light');
+    const internals = m.app as unknown as Internals;
+    const read = internals.readLimits.bind(m.app);
+    let release!: () => void;
+    const slow = new Promise<void>((r) => (release = r));
+    internals.readLimits = async (...a) => (await slow, read(...a));
+    m.rt.update({ returnAt: Date.now() - 1 });
+    // The send's wait is short here: it runs out while the reading still hangs.
+    const send = m.app.call('session.send', { sessionId: m.rt.id, text: 'next step' });
+    await tick(16_000);
+    await send;
+    expect(m.sent).toHaveLength(0);
+    expect(m.rt.queue.map((q) => q.text)).toEqual(['next step']);
+    release();
+    await until(() => m.sent.length === 1, 'the drain');
+    expect(m.sent[0].account).toBe(m.max3.id);
   });
 });
 

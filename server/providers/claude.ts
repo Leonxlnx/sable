@@ -189,6 +189,9 @@ export function resetLine(bin: string, configDir: string | undefined, platform: 
   return `${configDir ? `CLAUDE_CONFIG_DIR=${q(configDir)} ` : ''}${q(bin)} "/limit-reset"`;
 }
 
+/** The turn a chat is in: its last message from the person (a refusal for the sign-in is kept under it). */
+const turnOf = (rt: SessionRuntime): string | undefined => rt.items.findLast((i) => i.type === 'user' && !i.parentId)?.id;
+
 /** Environment for a Claude Code process: the account's config folder, or the user's own setup. */
 function claudeEnv(configDir: string | undefined): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -1533,6 +1536,8 @@ class ClaudeSession implements ProviderSession {
     // Each task asked to stop first; then the process goes, and whatever it ran (also a task whose
     // start never reached here) ends with it. The next message resumes the conversation in a new one.
     if (typeof q.stopTask === 'function') await Promise.all([...this.liveTasks].map((task) => withTimeout(Promise.resolve(q.stopTask!(task)), 5_000, 'stopTask').catch(() => {})));
+    // Never the process a turn now uses (one the agent began meanwhile): then nothing is confirmed (review wave 17, #5).
+    if (this.rt.turnActive) return false;
     if (this.q === q) this.shutdown();
     return true;
   }
@@ -2204,7 +2209,7 @@ class ClaudeSession implements ProviderSession {
       // Refused for the sign-in (its words are Claude Code's, never an answer): no red box per request.
       // When the turn ends the bridge asks the CLI whether the account is signed in, sends once more
       // when it is, and says it once for the chat when it is not (server/core/auth-gate.ts).
-      noteAuthFailure(rt.id, parentId ? rt.get<ToolItem>(parentId)?.title : undefined);
+      noteAuthFailure(rt.id, parentId ? rt.get<ToolItem>(parentId)?.title : undefined, turnOf(rt));
     } else if (m.error) {
       const words = failedWords ? texts.join('\n').trim() : '';
       rt.notice('error', errorLabel(m.error), words && !isStandIn(words) && words !== errorLabel(m.error) ? words : undefined);
@@ -2232,7 +2237,7 @@ class ClaudeSession implements ProviderSession {
         this.pendingUsers.delete(m.uuid);
         this.markRead(m.uuid);
         this.chain.push(m.uuid);
-        // Replayed when the agent takes it: a steered message stays where it was sent.
+        // Replayed when the agent takes it: from here on what it writes was written knowing the message.
         rt.taken(itemId, { providerId: m.uuid });
         return;
       }
@@ -2478,8 +2483,8 @@ class ClaudeSession implements ProviderSession {
         resultLabel(m.subtype);
     }
     // Refused for the sign-in: the bridge says it once for the chat (or sends once more), never the CLI's words on the turn's line.
-    const signIn = !!error && (refusedForSignIn(undefined, [error]) || authFailurePending(rt.id));
-    if (signIn && error) noteAuthFailure(rt.id);
+    const signIn = !!error && (refusedForSignIn(undefined, [error]) || authFailurePending(rt.id, turnOf(rt)));
+    if (signIn && error) noteAuthFailure(rt.id, undefined, turnOf(rt));
     // Cut off at a plan limit while it worked ("You've hit your 5-hour limit · resets 6pm (Europe/Berlin)",
     // a 429): a limit like one met at the start, said by the chat's one limit notice (the bridge moves
     // it at the turn's end), never as "The turn ended with an error" with "Try again".

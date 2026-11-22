@@ -535,24 +535,32 @@ export class SessionRuntime {
     for (const id of [...this.answers.keys()]) if (!kept.has(id)) this.answers.delete(id);
   }
 
-  /** Marks a message the agent has taken: a steered one stays where it was sent, a queued one moves down to here. */
+  /**
+   * Marks a message the agent has taken: it stands where the agent took it. A queued one moves down
+   * to here; so does a steered one when the agent wrote something after it was sent and before it
+   * had it (a note, another step): that stays above the message, and the first words under the
+   * message are the reply to it, never a line written without having read it. A steered message
+   * keeps the time it was sent.
+   */
   taken(id: string, patch: Partial<UserItem> = {}) {
     const item = this.index.get(id);
     if (item?.type !== 'user') return;
-    if (item.steered || item.state !== 'queued') this.patch<UserItem>(id, { state: 'sent', ...patch });
-    else this.move(id, { state: 'sent', ...patch } as Partial<TimelineItem>);
+    if (item.state !== 'queued') this.patch<UserItem>(id, { state: 'sent', ...patch });
+    else this.move(id, { state: 'sent', ...patch } as Partial<TimelineItem>, !!item.steered);
   }
 
-  /** Moves a root item to the end of the timeline (a queued message once the agent takes it). */
-  move(id: string, patch: Partial<TimelineItem> = {}) {
+  /** Moves a root item to the end of the timeline (a message once the agent takes it); `keepTime`: its time stays. */
+  move(id: string, patch: Partial<TimelineItem> = {}, keepTime = false) {
     const item = this.index.get(id);
     if (!item) return;
     const at = this.items.indexOf(item);
-    if (at < 0 || at === this.items.length - 1 || item.parentId) {
+    // Only its own children after it (none for a message): it is already the last thing said.
+    const last = at >= 0 && this.items.slice(at + 1).every((i) => !!i.parentId);
+    if (at < 0 || last || item.parentId) {
       this.patch(id, patch);
       return;
     }
-    Object.assign(item, patch, { ts: Date.now() });
+    Object.assign(item, patch, keepTime ? {} : { ts: Date.now() });
     this.markDirty(id);
     this.items.splice(at, 1);
     this.items.push(item);

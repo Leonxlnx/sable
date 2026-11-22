@@ -279,6 +279,16 @@ describe('session files: a base and a small tail', () => {
       expect(inWorker).toEqual(new SessionFiles(pathOf).load('s'));
       writeFileSync(pathOf('bad'), '{"items":[');
       expect(await new SessionFiles(pathOf).loadAsync('bad')).toMatchObject({ unreadable: true, items: [] });
+      // A tail that is there but cannot be read is not a missing tail: nothing is shown as the older base,
+      // nothing is written over it, and once it reads again the whole conversation is back.
+      const whole = readFileSync(tail('s'), 'utf8');
+      writeFileSync(tail('s'), whole.slice(0, Math.floor(whole.length / 2)));
+      const held = new SessionFiles(pathOf);
+      expect(held.load('s')).toMatchObject({ unreadable: true, items: [] });
+      await held.save('s', save([text('lost', 'x')], 'all'));
+      expect(readFileSync(tail('s'), 'utf8')).toBe(whole.slice(0, Math.floor(whole.length / 2)));
+      writeFileSync(tail('s'), whole);
+      expect(held.load('s').items).toEqual(items);
     } finally {
       Object.assign(READ, was);
     }

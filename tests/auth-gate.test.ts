@@ -15,7 +15,7 @@ import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
 import type { ProviderContext, ProviderSession } from '../server/providers/types';
 import type { SessionRuntime } from '../server/core/runtime';
-import { AuthGate, GATE, gateKey, noteAuthFailure, refusedForSignIn, resetAuthFailures, type GatedProcess } from '../server/core/auth-gate';
+import { AuthGate, GATE, claudeHomeOf, gateKey, noteAuthFailure, refusedForSignIn, resetAuthFailures, type GatedProcess } from '../server/core/auth-gate';
 
 const temps: string[] = [];
 const apps: App[] = [];
@@ -259,6 +259,8 @@ interface Log {
   refuse: number;
   /** A sub-agent of the turn is refused with it. */
   background?: boolean;
+  /** Only a sub-agent is refused; the turn itself is answered. */
+  subOnly?: boolean;
 }
 
 /** The Demo agent, whose sends can be refused for the sign-in as Claude Code's are (`noteAuthFailure`, a failed turn). */
@@ -274,6 +276,8 @@ class AuthDemo extends DemoProvider {
     const send = s.send.bind(s);
     s.send = async (item, o) => {
       this.log.sent.push(item.text);
+      // Only a sub-agent of the turn is refused; the turn itself goes on and finishes.
+      if (this.log.subOnly) noteAuthFailure(rt.id, 'Map auth error responses');
       if (this.log.refuse <= 0) return send(item, o);
       this.log.refuse--;
       rt.beginTurn('Thinking');
@@ -368,5 +372,55 @@ describe('a refusal for the sign-in is not believed at once', () => {
     expect(log.sent[2]).toContain(RESUME_AFTER_SIGN_IN);
     expect(log.sent[2]).toContain('Map auth error responses');
     expect(people(rt.items)).toEqual(['hi there', 'try again']);
+  });
+});
+
+describe('a refusal belongs to its turn (review wave 17, #7)', () => {
+  it('a sub-agent refused in a turn that went on to finish is followed by nothing', async () => {
+    const { app, log, rt } = await setup();
+    log.subOnly = true;
+    await app.call('session.send', { sessionId: rt.id, text: 'hi there' });
+    await until(() => rt.meta.status === 'idle' && rt.items.some((i) => i.type === 'text'), 'the answer');
+    await new Promise((r) => setTimeout(r, 300));
+    expect(log.sent).toEqual(['hi there']);
+    expect(notices(rt.items).filter((n) => n.variant === 'error')).toEqual([]);
+    // Nor does it wait for the next turn: that one fails for another reason and is not taken for a sign-in.
+    log.subOnly = false;
+    await app.call('session.send', { sessionId: rt.id, text: 'hi again' });
+    await until(() => log.sent.length === 2 && rt.meta.status === 'idle', 'the second answer');
+    await new Promise((r) => setTimeout(r, 300));
+    expect(log.sent).toEqual(['hi there', 'hi again']);
+  });
+
+  it('a chat closed while it waited for the sign-in is not started again', async () => {
+    const { app, log, rt, account, signIn, signOut } = await setup();
+    signOut();
+    log.refuse = 1;
+    await app.call('session.send', { sessionId: rt.id, text: 'hi there' });
+    await until(() => notices(rt.items).some((n) => !!n.auth), 'the sign-in notice');
+    await until(() => rt.meta.status !== 'running', 'idle');
+    await app.call('session.close', { sessionId: rt.id });
+    signIn();
+    await app.call('auth.refresh', { provider: 'demo', accountId: account.id });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(log.sent).toEqual(['hi there']);
+  });
+});
+
+describe("the gate's key for a Claude Code process", () => {
+  it("comes from the child's environment alone: the bridge's own variable, pointed at another account for a moment, is not asked", () => {
+    const was = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = path.join(tmpdir(), 'another-account');
+    try {
+      const builtIn = claudeHomeOf({ PATH: 'x' });
+      expect(builtIn).not.toContain('another-account');
+      expect(builtIn).toMatch(/\.claude$/);
+      expect(claudeHomeOf({ CLAUDE_CONFIG_DIR: 'C:/accounts/one' })).toBe('C:/accounts/one');
+      // No environment given: the process's own.
+      expect(claudeHomeOf(undefined)).toContain('another-account');
+    } finally {
+      if (was === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = was;
+    }
   });
 });

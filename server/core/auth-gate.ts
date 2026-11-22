@@ -74,7 +74,10 @@ export function gateKey(provider: string, configDir: string): string {
 
 /** The Claude Code config folder a process environment points at (the CLI's own default without one). */
 export function claudeHomeOf(env: Record<string, string | undefined> | undefined): string {
-  return env?.CLAUDE_CONFIG_DIR || process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), '.claude');
+  // A supplied environment is the child's whole environment: its own folder, or the CLI's default. The
+  // bridge's own variable is not asked then: reading another account's history points it elsewhere for a
+  // moment, and a start for the built-in account would take that account's gate instead of its own.
+  return (env ? env.CLAUDE_CONFIG_DIR : process.env.CLAUDE_CONFIG_DIR) || path.join(homedir(), '.claude');
 }
 
 export class AuthGate {
@@ -376,21 +379,31 @@ export function refusedForSignIn(error?: string, texts: readonly (string | undef
 
 interface Refusal {
   at: number;
+  /** The person's message whose turn was running when it happened (the chat's last one then). */
+  turn?: string;
   /** Steps of the chat's sub-agents and background tasks that were refused with it (their titles). */
   background: string[];
 }
 
 const refusals = new Map<string, Refusal>();
 
-/** A request of chat `chatId` was refused for the sign-in (`step`: the sub-agent or task step it ran in). */
-export function noteAuthFailure(chatId: string, step?: string) {
-  const r = refusals.get(chatId) ?? { at: Date.now(), background: [] };
+/**
+ * A request of chat `chatId` was refused for the sign-in (`step`: the sub-agent or task step it ran in;
+ * `turn`: the message whose turn it happened in). A refusal noted in an earlier turn does not count for
+ * a later one: it starts over.
+ */
+export function noteAuthFailure(chatId: string, step?: string, turn?: string) {
+  const known = refusals.get(chatId);
+  const r: Refusal = known && known.turn === turn ? known : { at: Date.now(), turn, background: [] };
   if (step && !r.background.includes(step) && r.background.length < 12) r.background.push(step.slice(0, 120));
   refusals.set(chatId, r);
 }
 
-/** Whether a refusal of chat `chatId` waits to be read. */
-export const authFailurePending = (chatId: string) => refusals.has(chatId);
+/** Whether a refusal of chat `chatId` waits to be read (`turn` given: one that happened in that turn). */
+export const authFailurePending = (chatId: string, turn?: string) => {
+  const r = refusals.get(chatId);
+  return !!r && (turn === undefined || r.turn === undefined || r.turn === turn);
+};
 
 /** The chat's refusal, once: the bridge reads it when the turn ends. */
 export function takeAuthFailure(chatId: string): Refusal | undefined {

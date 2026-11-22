@@ -482,8 +482,8 @@ export const signInBackgroundNote = (names: string[]) => (names.length ? `${SIGN
 
 const SABLE_OPENERS = ['This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, 'The check `'];
 const HANDOVER_HEAD = /^(?:This continues a conversation (?:that started under another account|the user had with [^\n]{1,200} in this folder)|Since your last reply here, the user went on with [^\n]{1,200} in this conversation)\. Here is what happened (?:so far|since), oldest first:\n/;
-/** The whole of an `/until` round's failure (server/core/until.ts `failureMessage`): its head, then the output fenced or "It printed nothing.", and nothing after. */
-const UNTIL_FAILURE = /^The check `[^`\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n[\s\S]*\n\1)$/;
+/** The whole of an `/until` round's failure (server/core/until.ts `failureMessage`): its head, then the output fenced or "It printed nothing.", and nothing after: the output ends at the first line that is the closing fence, so words and a fenced block of the person's own after a pasted failure stay theirs. */
+const UNTIL_FAILURE = /^The check `[^`\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n(?:(?!\1[ \t]*(?:\n|$))[^\n]*\n)*\1)$/;
 const BROWSER_LINE = /\n\n\[Sable: the user's Browser tab shows \S+?(?: titled "[^"\n]*")?\. browser_read reads it\.\]\s*$/;
 
 /** A whole message of Sable's own (a turn carried on, an /until round): the message, else ''. */

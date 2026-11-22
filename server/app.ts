@@ -58,6 +58,7 @@ import { atCap, findAccountFolders, folderLabel, labelFromAuth, pickNextAccount 
 import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, moveNote, type MoveOutcome } from './core/move-context';
 import { handoverText } from './accounts/handover';
 import { backgroundRunning, itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
+import { worksInBackground } from '../shared/background';
 import { runSubAgent } from './core/sub-agent';
 import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
 import { cutAt } from './core/fork';
@@ -1063,7 +1064,7 @@ export class App {
 
   /**
    * Puts a message in the timeline and hands it to the agent. Mid-turn it is steered: the agent
-   * takes it at its next step and it stays where it was sent.
+   * takes it at its next step; it waits where it was sent and then stands where the agent took it.
    */
   private async deliver(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: Pick<UserItem, 'until'>, ctx?: CallContext) {
     // From here to its dispatch no return to another account begins (review wave 16, #11): a message
@@ -1090,6 +1091,9 @@ export class App {
       this.queuedWhileMoving.add(rt.id);
       return;
     }
+    // A limit's transition runs (background work being stopped, the move after it): the message waits
+    // in the queue, with its sender's guard, and goes once that is over (review wave 17, #5).
+    if (this.sendHolds.has(rt.id)) return void this.queueBehindHold(rt, text, attachments, ctx);
     if (!extra?.until && !rt.items.some((i) => i.type === 'user')) await this.lanes.beforeFirstSend(rt, text);
     still(ctx);
     if (!rt.turnActive && !this.opening.has(rt.id)) {
@@ -1098,10 +1102,18 @@ export class App {
       // right before the message). A return already under way is waited for (bounded): the message
       // never goes out on the account it is leaving.
       this.sendWaits.add(rt.id);
+      const back = this.returnAfterLimit(rt).catch((err) => this.log('return after a limit failed', (err as Error).message));
+      let waited: unknown;
       try {
-        await Promise.race([this.returnAfterLimit(rt).catch((err) => this.log('return after a limit failed', (err as Error).message)), new Promise((r) => void setTimeout(r, RETURN_SEND_WAIT_MS).unref?.())]);
+        waited = await Promise.race([back.then(() => 'done'), new Promise((r) => void setTimeout(() => r('timeout'), RETURN_SEND_WAIT_MS).unref?.())]);
       } finally {
         this.sendWaits.delete(rt.id);
+      }
+      // The return still reads the limits: the message queues against it and goes once it settles,
+      // whichever account the chat is on then (review wave 17, #8).
+      if (waited === 'timeout' && this.returnRuns.has(rt.id)) {
+        this.holdSends(rt, back);
+        return void this.queueBehindHold(rt, text, attachments, ctx);
       }
       // The return is still moving the chat (compacting first): the message goes there once it is done.
       if (this.moving.has(rt.id)) {
@@ -1111,18 +1123,6 @@ export class App {
         return;
       }
       await this.checkCap(rt);
-      // Past its limit on paid usage the account's own setting does not allow: held, never charged.
-      if (this.stopsOf(rt) === stops && !rt.turnActive && (await this.heldForCredits(rt))) {
-        // As if the agent refused it at the limit, without asking it: the message stands, the limit's
-        // notice follows, and the turn's end decides as for any refusal (`onLimitHit`: the next
-        // account carries the same message on, or "Continue with" / "Continue at reset" are offered).
-        rt.touch();
-        rt.add<UserItem>({ type: 'user', text, attachments: attachments?.length ? attachments : undefined, state: 'sent' });
-        rt.beginTurn('Thinking');
-        rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'You have reached your usage limit.', limit: { ...this.creditsWindow(rt) } });
-        rt.endTurn('You have reached your usage limit.');
-        return;
-      }
       // Stopped (or closed) while the cap check moved the chat (compacting first): the message starts
       // no turn after the Stop; it waits in the queue for the person (review wave 8, #21).
       if (this.stopsOf(rt) !== stops) {
@@ -1186,6 +1186,30 @@ export class App {
     gone();
     // A model chosen since the agent started takes effect now, with this message (never inside a running turn).
     await this.applyDue(rt, handle);
+    gone();
+    // Right before the dispatch, whatever came first (a first message while the agent opened, a queued
+    // one, a steer): never on credits the account's own setting forbids (review wave 17, #2).
+    if (await this.heldForCredits(rt)) {
+      // Its sender is asked again before anything of it is recorded (#3).
+      gone();
+      if (rt.turnActive) {
+        // A steer: held in the queue with its guard; the running turn goes on, and at its end the
+        // message is looked at again like any other.
+        if (early) rt.remove(early.id);
+        const q = rt.enqueue(text, attachments);
+        if (ctx?.allowed) this.queueGuards.set(q.id, ctx);
+        return;
+      }
+      // As if the agent refused it at the limit, without asking it: the message stands, the limit's
+      // notice follows, and the turn's end decides as for any refusal (`onLimitHit`: the next account
+      // carries the same message on, with its sender's guard, or "Continue with" / "Continue at reset").
+      const refused = early ?? addUser();
+      if (ctx?.allowed) this.refusedGuards.set(refused.id, ctx);
+      rt.beginTurn('Thinking');
+      rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'You have reached your usage limit.', limit: { ...this.creditsWindow(rt) } });
+      rt.endTurn('You have reached your usage limit.');
+      return;
+    }
     gone();
     const item = early ?? addUser();
     const runningSince = item.steered ? rt.turnStartedAt : undefined;
@@ -1617,8 +1641,9 @@ export class App {
     rt.patch<NoticeItem>(notice.id, { limit: willMove ? { ...limit, moving: true } : limit });
     if (spare) return;
     if (!moves && !rt.turnActive) {
-      // Nothing goes on on the account at its limit, whatever comes next (review wave 16, #6).
-      await this.settleBackground(rt, limit, settleMs);
+      // Nothing goes on on the account at its limit, whatever comes next (review wave 16, #6); sends
+      // queue behind the stop (review wave 17, #5).
+      await this.holdSends(rt, this.settleBackground(rt, limit, settleMs));
       if (!open()) return;
       // No other account takes over: the chat waits for this account's reset and then carries on by itself.
       if (settings.continueAtReset) this.spare.atReset(rt);
@@ -1633,12 +1658,19 @@ export class App {
     // The move happens by itself: the notice offers no button for it meanwhile (`LimitHit.moving`).
     rt.patch<NoticeItem>(notice.id, { limit: { ...limit, moving: true } });
     try {
-      // Background work still running on this account meets the same limit with its next request: it
-      // gets a short while to end by itself, then what is left stops at the limit (limit-policy.ts).
-      await this.settleBackground(rt, limit, settleMs);
-      if (rt.turnActive || this.moving.has(rt.id) || rt.get<NoticeItem>(notice.id)?.limit?.continuedWith || !open()) return;
-      this.movedByLimit(rt, accountId, next, full?.resetsAt ?? limit.resetsAt);
-      await this.switchAccount(rt, next, { retry: true });
+      // One transition, reserved before anything is awaited: sends queue behind it and go once it is
+      // over, on the account the chat is on then (review wave 17, #5).
+      await this.holdSends(
+        rt,
+        (async () => {
+          // Background work still running on this account meets the same limit with its next request: it
+          // gets a short while to end by itself, then what is left stops at the limit (limit-policy.ts).
+          await this.settleBackground(rt, limit, settleMs);
+          if (rt.turnActive || this.moving.has(rt.id) || rt.get<NoticeItem>(notice.id)?.limit?.continuedWith || !open()) return;
+          this.movedByLimit(rt, accountId, next, full?.resetsAt ?? limit.resetsAt);
+          await this.switchAccount(rt, next, { retry: true });
+        })(),
+      );
     } finally {
       // Not moved after all (it failed, or something took over): the notice offers the move again.
       const card = rt.get<NoticeItem>(notice.id);
@@ -1707,30 +1739,41 @@ export class App {
 
   /**
    * What still runs in the background on an account at its limit is stopped for real (review wave
-   * 16, #6): the agent's own stop where it has one (`stopBackgroundWork`: Claude Code's process
-   * goes, Codex's sub-agent turns are interrupted), else its process is let go and its tasks end
-   * with it. The steps are marked stopped at the limit; only those whose stop was confirmed are
-   * named to the agent after a move (`resumeMessage`).
+   * 16, #6): the agent's own stop where it has one (`stopBackgroundWork`: Claude Code's tasks and
+   * process, Codex's sub-agent turns interrupted), else its process is let go and its tasks end with
+   * it. A step is marked stopped at the limit, and named to the agent after a move, only once its
+   * stop was confirmed (review wave 17, #6); one that could not be stopped keeps running in the
+   * Agents tab, the chat says so plainly, and a move still goes ahead (`unstoppable`).
    */
   private async stopLiveBackground(rt: SessionRuntime, limit: { window?: string; resetsAt?: number }) {
-    const marked = rt.stopAtLimit(undefined, limit);
-    const h = rt.handle as (ProviderSession & { stopBackgroundWork?: () => Promise<boolean> }) | undefined;
-    let confirmed = !h;
-    const bounded = (p: Promise<boolean>) => Promise.race([p.catch(() => false), new Promise<boolean>((r) => setTimeout(() => r(false), MOVE_CLOSE_MS))]);
-    if (h?.stopBackgroundWork) confirmed = await bounded(h.stopBackgroundWork());
+    // Work already found unstoppable is not asked again.
+    const running = rt.items.filter((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)).map((i) => i.id);
+    if (!running.length) return;
+    type Stop = boolean | { failed: string[] };
+    const h = rt.handle as (ProviderSession & { stopBackgroundWork?: () => Promise<Stop> }) | undefined;
+    const bounded = (p: Promise<Stop>) => Promise.race([p.catch((): Stop => false), new Promise<Stop>((r) => setTimeout(() => r(false), MOVE_CLOSE_MS))]);
+    let result: Stop = true;
+    if (h?.stopBackgroundWork) result = await bounded(h.stopBackgroundWork());
     else if (h) {
       rt.handle = undefined;
-      confirmed = await bounded(
+      result = await bounded(
         Promise.resolve()
           .then(() => h.close())
           .then(() => true),
       );
     }
-    if (!confirmed) {
-      this.log('background work at a limit: its stop was not confirmed');
-      rt.forgetLimitStopped(marked);
-    }
+    const failed = new Set(result === true ? [] : result === false ? running : result.failed.filter((id) => running.includes(id)));
+    const done = new Set(running.filter((id) => !failed.has(id)));
+    if (done.size) rt.stopAtLimit((i) => done.has(i.id), limit);
+    if (!failed.size) return;
+    this.log('background work at a limit: its stop was not confirmed for', failed.size);
+    this.unstoppable.set(rt.id, new Set([...(this.unstoppable.get(rt.id) ?? []), ...failed]));
+    const n = failed.size;
+    rt.notice('info', `${n === 1 ? 'A sub-agent' : `${n} sub-agents`} could not be stopped`, `${n === 1 ? 'It' : 'They'} may still be working on ${this.accountLabel(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT)}.`);
   }
+
+  /** Per chat, background steps whose stop at a limit was not confirmed: a move goes ahead beside them. */
+  private unstoppable = new Map<string, Set<string>>();
 
   /** Remembers a limit handover: the session's preferred account, and where new sessions go meanwhile. */
   private movedByLimit(rt: SessionRuntime, from: string, to: string, until?: number) {
@@ -1761,6 +1804,48 @@ export class App {
   private sending = new Map<string, number>();
   /** Chats whose send waits for the return in flight: that return may go on. */
   private sendWaits = new Set<string>();
+  /** Per chat, limit transitions running now (a stop of background work, the move after it): sends queue behind them. */
+  private sendHolds = new Map<string, Set<Promise<unknown>>>();
+  /** Chats with messages queued behind a hold: the queue goes on once every hold is over. */
+  private heldSends = new Set<string>();
+  /** The sender's guard of a message refused at a limit, kept until it is really dispatched (review wave 17, #3). */
+  private refusedGuards = new Map<string, CallContext>();
+
+  /** Sends to the chat queue behind `p` until it settles (with any other hold). */
+  private holdSends<T>(rt: SessionRuntime, p: Promise<T>): Promise<T> {
+    let set = this.sendHolds.get(rt.id);
+    if (!set) this.sendHolds.set(rt.id, (set = new Set()));
+    set.add(p);
+    const release = () => {
+      set!.delete(p);
+      if (set!.size || this.sendHolds.get(rt.id) !== set) return;
+      this.sendHolds.delete(rt.id);
+      // Drained once, with each message's own guard, on the account the chat is on now.
+      if (this.heldSends.delete(rt.id))
+        setTimeout(() => {
+          if (this.sessions.get(rt.id) !== rt || this.sendHolds.has(rt.id)) return;
+          if (this.moving.has(rt.id)) return void this.queuedWhileMoving.add(rt.id);
+          if (!rt.turnActive && !rt.stopRequested) this.sendNextQueued(rt);
+        }, 0);
+    };
+    p.then(release, release);
+    return p;
+  }
+
+  private queueBehindHold(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], ctx?: CallContext) {
+    const q = rt.enqueue(text, attachments);
+    if (ctx?.allowed) this.queueGuards.set(q.id, ctx);
+    this.heldSends.add(rt.id);
+  }
+
+  /** The refused message's sender may still act (a phone not removed meanwhile); said once when not. */
+  private refusedAllowed(rt: SessionRuntime, id: string): boolean {
+    const guard = this.refusedGuards.get(id);
+    if (!guard?.allowed || guard.allowed()) return true;
+    this.refusedGuards.delete(id);
+    rt.notice('info', 'A message from a removed phone was not sent');
+    return false;
+  }
 
   /** `inMs`: one more try after an inconclusive reading; otherwise at `returnAt`. */
   private armReturn(rt: SessionRuntime, inMs?: number) {
@@ -2044,11 +2129,15 @@ export class App {
       : { id: randomUUID(), ts: Date.now(), type: 'user', text: RESUME_LIMIT_RESET, state: 'sent' };
     const handle = await this.ensureHandle(rt);
     await this.applyDue(rt, handle);
+    // Its sender (a phone) removed meanwhile, or credits the setting forbids: nothing goes (review wave 17, #2, #3).
+    if (refused && !this.refusedAllowed(rt, refused.id)) return;
+    if (await this.heldForCredits(rt)) return;
     // The turn carries on with the refused message: it is the one this turn answers.
     const unhand = refused ? this.handOver(rt, refused.id) : undefined;
     try {
       const out = this.withHandover(rt, item);
-      await handle.send(out.item);
+      await handle.send(out.item, { check: () => (refused ? still(this.refusedGuards.get(refused.id)) : undefined) });
+      if (refused) this.refusedGuards.delete(refused.id);
       out.taken();
     } catch (err) {
       unhand?.();
@@ -2064,6 +2153,9 @@ export class App {
     ask: async (provider, accountId) => !!(await this.accountAuth(provider as ProviderId, accountId, true)).auth?.loggedIn,
     delayMs: () => this.delays.signIn ?? 1500,
   });
+
+  /** Chats waiting for a sign-in: how often they had been stopped and closed when the wait began. */
+  private signInWaits = new Map<string, { stops: number; closes: number }>();
 
   /** What a refusal for the sign-in was, taken when it is noted: the message, its turn's closing line, the chat's agent, account and generations. */
   private refusalMark(rt: SessionRuntime): RefusalMark {
@@ -2100,6 +2192,8 @@ export class App {
     void this.emitProvider(provider).catch(() => {});
     if (signedIn) return void rt.notice('error', 'The sign-in was refused again');
     this.signIns.wait(provider, accountId, rt.id, refusal.background);
+    // What the chat was when it began to wait: closed or stopped meanwhile, it is not started again.
+    this.signInWaits.set(rt.id, { stops: mark.stops, closes: mark.closes });
     // One notice for the chat, however many requests and sub-agents were refused.
     if (rt.items.some((i) => i.type === 'notice' && !!i.auth)) return;
     const label = this.accountList(provider).length > 1 ? this.accountLabel(provider, accountId) : undefined;
@@ -2117,6 +2211,8 @@ export class App {
   private resumeSignedIn(provider: ProviderId, accountId: string) {
     for (const [id, background] of this.signIns.take(provider, accountId)) {
       const rt = this.sessions.get(id);
+      const since = this.signInWaits.get(id);
+      this.signInWaits.delete(id);
       if (!rt || rt.turnActive || (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId) continue;
       const notice = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.auth);
       if (!notice) continue;
@@ -2125,7 +2221,10 @@ export class App {
       const at = rt.items.findLastIndex((i) => i.type === 'user' && !i.parentId);
       const refused = at >= 0 ? (rt.items[at] as UserItem) : undefined;
       const answered = rt.items.slice(at + 1).some((i) => i.type === 'text' && !i.parentId && !!i.text.trim());
-      if (refused && !answered) void this.sendAfterSignIn(rt, refused, background, this.refusalMark(rt)).catch((err) => this.log('carrying on after a sign-in failed', (err as Error).message));
+      // The message may be a newer one (the person tried again meanwhile); the stops and closes are those
+      // of the moment the chat began to wait, so a chat closed or stopped since stays as the person left it.
+      const mark = { ...this.refusalMark(rt), ...since };
+      if (refused && !answered) void this.sendAfterSignIn(rt, refused, background, mark).catch((err) => this.log('carrying on after a sign-in failed', (err as Error).message));
     }
   }
 
@@ -2208,8 +2307,10 @@ export class App {
     // at its limit and is refused with its next request, so it stops at the limit and the chat moves.
     const atLimit = opts.retry ? rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId) : undefined;
     const target = this.provider(rt.meta.provider, accountId);
-    if (atLimit?.limit && backgroundRunning(rt.items) && (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId && !this.moving.has(rt.id)) await this.stopLiveBackground(rt, atLimit.limit);
-    if (backgroundRunning(rt.items)) throw new Error('Background work is still running in this chat. Move when it is done.');
+    if (atLimit?.limit && rt.items.some((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)) && (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId && !this.moving.has(rt.id)) await this.stopLiveBackground(rt, atLimit.limit);
+    // Work a limit's stop could not end does not hold the move (it stays on the account it ran on).
+    const left = this.unstoppable.get(rt.id);
+    if (rt.items.some((i) => worksInBackground(i) && !left?.has(i.id))) throw new Error('Background work is still running in this chat. Move when it is done.');
     if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) return { ok: true, carried: 'none' };
     this.moving.add(rt.id);
     let compacted = false;
@@ -2483,11 +2584,14 @@ export class App {
       // Asked again once the new account's agent is there, and by the agent's own dispatch.
       live();
       if (this.stopsOf(rt) !== stops) return { ok: true, carried };
+      // Its sender (a phone) removed meanwhile: the refused message never goes (review wave 17, #3).
+      if (!this.refusedAllowed(rt, refused.id)) return { ok: true, carried };
       await this.applyModeDue(rt, handle);
       const unhand = this.handOver(rt, refused.id);
       try {
         const out = this.withHandover(rt, this.resumeMessage(rt, refused, carried));
-        await handle.send(out.item, { check: () => still(ctx) });
+        await handle.send(out.item, { check: () => (still(ctx), still(this.refusedGuards.get(refused.id))) });
+        this.refusedGuards.delete(refused.id);
         out.taken();
       } catch (err) {
         unhand();
@@ -2638,8 +2742,13 @@ export class App {
     if (compacted) return compacted(error);
     // Refused for the sign-in: asked again before it is believed (server/core/auth-gate.ts).
     const signIn = takeAuthFailure(rt.id);
-    // What was refused is taken now, before anything is awaited (review wave 16, #8).
-    if (signIn) void this.onSignInRefused(rt, signIn, this.refusalMark(rt)).catch((err) => this.log('sign-in follow-up failed', (err as Error).message));
+    // What was refused is taken now, before anything is awaited (review wave 16, #8). Only a turn that
+    // failed, and only a refusal of this very turn: a sub-agent refused in a turn that went on to
+    // finish needs nothing, and one refused in an earlier turn says nothing about this one (wave 17, #7).
+    const mark = signIn ? this.refusalMark(rt) : undefined;
+    if (signIn && mark && error && (signIn.turn === undefined || signIn.turn === mark.refusedId)) {
+      void this.onSignInRefused(rt, signIn, mark).catch((err) => this.log('sign-in follow-up failed', (err as Error).message));
+    }
     // A spare turn's end frees its place; waiting chats are looked at again.
     const ran = this.spare.turnEnded(rt);
     const hit = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.provider && !i.parentId);

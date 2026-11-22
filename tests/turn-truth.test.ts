@@ -267,6 +267,13 @@ describe("Sable's own texts", () => {
     const t = failureMessage({ command: 'pnpm test', round: 1, rounds: 5, exitCode: 1, output: 'FAIL a.test.ts' } as never);
     expect(parseSynthetic(t)?.role).toBe('hidden');
     expect(userText(t)).toBe('');
+    // Output of several lines, with a fence of its own inside (the outer one grows past it).
+    const long = failureMessage({ command: 'pnpm test', round: 2, rounds: 5, exitCode: 1, output: 'FAIL a.test.ts\n\n```\nexpected 1\n```\n\n2 failed' } as never);
+    expect(parseSynthetic(long)?.role).toBe('hidden');
+    // Pasted by the person with a question and a fenced fix of their own under it: all of it is theirs.
+    const pasted = t + '\n\nWhy does this still fail? I tried:\n\n```text\nretry()\n```';
+    expect(parseSynthetic(pasted)).toBeNull();
+    expect(stripWrappers(pasted)).toBe(pasted);
   });
 
   it("the Browser tab's line after the words", () => {

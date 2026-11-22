@@ -434,7 +434,12 @@ function onStatusChange(session: SessionMeta, prev: SessionMeta['status']) {
     const n = new Notification(title, { body: session.title, tag: session.id });
     n.onclick = () => {
       window.focus();
-      useStore.getState().setUi({ activeSessionId: session.id });
+      // The chat may have left the window's memory meanwhile (`trimKept`): shown here, it is fetched (below).
+      if (useStore.getState().sessions[session.id]) {
+        touchKept(session.id);
+        useStore.getState().setUi({ activeSessionId: session.id, race: null });
+        trimKept();
+      }
       n.close();
     };
   } catch {
@@ -837,6 +842,15 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
   fetching.set(sessionId, p);
   return p;
 }
+
+// Whichever way a chat came on screen (a notification's click, anything that sets it directly): a
+// chat whose conversation is not in the window is fetched, never shown empty. `openSession` asks
+// before it switches, so its request is the one in flight here and nothing is asked twice.
+useStore.subscribe((s, prev) => {
+  const id = s.ui.activeSessionId;
+  if (!id || id === prev.ui.activeSessionId || !s.ready) return;
+  if (s.sessions[id] && !s.data[id]?.loaded) void loadSession(id).catch(() => {});
+});
 
 /** Stores limit reports, and their limits where the store has none yet or older ones. */
 function applyLimitReports(s: Store, reports: LimitsReport[]): Partial<Store> {

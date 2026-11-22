@@ -257,6 +257,8 @@ export class CodexProvider implements Provider {
   readonly sessions = new Map<string, CodexSession>();
   /** Codex's own sub-agents by their thread, to the chat whose spawn step shows them (news of their threads goes there). */
   readonly receivers = new Map<string, CodexSession>();
+  /** Turns of threads no spawn registered yet (thread id → turn id): taken when the spawn registers them. */
+  readonly earlyTurns = new Map<string, string>();
   private rpc: CodexRpc | null = null;
   private starting: Promise<CodexRpc> | null = null;
   private disposed = false;
@@ -417,7 +419,14 @@ export class CodexProvider implements Provider {
         if (title) return title(method, p);
         const session = this.sessions.get(tid);
         if (session) return session.onNotification(method, p);
-        this.receivers.get(tid)?.onReceiverNews(tid, method, p);
+        const owner = this.receivers.get(tid);
+        if (owner) return owner.onReceiverNews(tid, method, p);
+        // A sub-agent's turn can start before its spawn call registered the thread: its turn id is
+        // kept, so a limit can still interrupt it (review wave 17, #6). Bounded.
+        if (method === 'turn/started' && typeof p?.turn?.id === 'string') {
+          this.earlyTurns.set(tid, p.turn.id);
+          while (this.earlyTurns.size > 200) this.earlyTurns.delete(this.earlyTurns.keys().next().value!);
+        } else if (method === 'turn/completed' || method === 'thread/closed') this.earlyTurns.delete(tid);
       }
     }
   }
@@ -2265,6 +2274,11 @@ class CodexSession implements ProviderSession {
       for (const tid of item.receiverThreadIds ?? []) {
         this.receivers.set(tid, id);
         this.provider.receivers.set(tid, this);
+        const early = this.provider.earlyTurns.get(tid);
+        if (early) {
+          this.receiverTurns.set(tid, early);
+          this.provider.earlyTurns.delete(tid);
+        }
       }
     }
     for (const [tid, state] of Object.entries(item.agentsStates ?? {})) if (state) this.receiverState(tid, receiverStatus(state.status));
@@ -2320,28 +2334,45 @@ class CodexSession implements ProviderSession {
 
   /**
    * At a plan limit: every sub-agent still working is stopped for real (its turn interrupted on the
-   * app-server), so nothing goes on on the account at its limit. True only when every stop was taken.
+   * app-server), so nothing goes on on the account at its limit. A turn id not seen yet is asked of
+   * the app-server. `failed`: the spawn steps one of whose sub-agents could not be stopped (review
+   * wave 17, #6): they keep working, and the bridge says so.
    */
-  async stopBackgroundWork(): Promise<boolean> {
+  async stopBackgroundWork(): Promise<{ failed: string[] }> {
     const live = [...this.receiverLive];
-    if (!live.length) return true;
+    const spawnsOf = (tids: string[]) => [...new Set(tids.map((t) => this.receivers.get(t)).filter((x): x is string => !!x))];
+    if (!live.length) return { failed: [] };
     let rpc: CodexRpc;
     try {
       rpc = await this.provider.client();
     } catch {
-      return false;
+      return { failed: spawnsOf(live) };
     }
-    const taken = await Promise.all(
-      live.map((tid) => {
-        const turnId = this.receiverTurns.get(tid);
-        if (!turnId) return Promise.resolve(false);
-        return rpc.request('turn/interrupt', { threadId: tid, turnId }, 10_000).then(
-          () => true,
-          (err) => (this.log('turn/interrupt of a sub-agent failed', errMsg(err)), false),
-        );
+    const turnOf = async (tid: string): Promise<string | undefined> => {
+      const known = this.receiverTurns.get(tid);
+      if (known) return known;
+      try {
+        const r = await rpc.request<{ data?: Turn[] }>('thread/turns/list', { threadId: tid, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' }, 10_000);
+        const t = r.data?.[0];
+        return t && (t.status as string) === 'inProgress' ? t.id : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const failed: string[] = [];
+    await Promise.all(
+      live.map(async (tid) => {
+        const turnId = await turnOf(tid);
+        const ok = turnId
+          ? await rpc.request('turn/interrupt', { threadId: tid, turnId }, 10_000).then(
+              () => true,
+              (err) => (this.log('turn/interrupt of a sub-agent failed', errMsg(err)), false),
+            )
+          : false;
+        if (!ok) failed.push(tid);
       }),
     );
-    return taken.every(Boolean);
+    return { failed: spawnsOf(failed) };
   }
 
   /** The sub-agents' app-server is gone, or this chat lets go of them: their steps work no more here. */

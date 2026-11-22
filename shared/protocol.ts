@@ -757,8 +757,8 @@ export interface UserItem extends BaseItem {
   text: string;
   attachments?: Attachment[];
   /**
-   * 'queued': handed to the agent while it works, not taken yet (a steered message stays where
-   * it was sent; other queued items move down to where the agent takes them). 'sent': taken.
+   * 'queued': handed to the agent while it works, not taken yet (a steered message waits where
+   * it was sent). 'sent': taken; it stands where the agent took it, after anything written before.
    */
   state?: 'queued' | 'sent';
   /** Sent into a running turn (`session.send` with `steer`, or `queue.sendNow`): the agent takes it at its next step. */
