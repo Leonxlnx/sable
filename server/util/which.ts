@@ -79,11 +79,11 @@ export function trustedPathDirs(value: string, platform: NodeJS.Platform = proce
  * is none, and for a home folder or a drive that is itself a repository (dotfiles): tools installed
  * under it are the person's own.
  */
-export function checkoutTop(dir: string, o: { exists?: (p: string) => boolean; home?: string; real?: (p: string) => string } = {}): string | null {
+export function checkoutTop(dir: string, o: { exists?: (p: string) => boolean; home?: string; real?: (p: string) => string; realDir?: string } = {}): string | null {
   const real = o.real ?? defaultReal;
   const exists = o.exists ?? existsSync;
-  const home = real(path.resolve(o.home ?? os.homedir()));
-  let at = real(path.resolve(dir));
+  const home = o.home === undefined && !o.real ? realHome() : real(path.resolve(o.home ?? os.homedir()));
+  let at = o.realDir ?? real(path.resolve(dir));
   for (let i = 0; i < 64; i++) {
     const up = path.dirname(at);
     if (exists(path.join(at, '.git'))) return up === at || inside(at, home) ? null : at;
@@ -93,11 +93,34 @@ export function checkoutTop(dir: string, o: { exists?: (p: string) => boolean; h
   return null;
 }
 
-/** The folders a tool that works in `dir` must not come from: the folder (as named and as it really is) and the checkout it belongs to. */
-export function projectFolders(dir: string): string[] {
+let homeIs: string | undefined;
+/** The home folder's real path: looked up once (it does not move while Sable runs). */
+function realHome(): string {
+  return (homeIs ??= defaultReal(path.resolve(os.homedir())));
+}
+
+/** Checkouts found a moment ago, by the folder as named. Only found ones: "none" is looked up afresh, a folder can become a checkout at any moment. */
+const found = new Map<string, { at: number; list: string[] }>();
+const FOUND_MS = 5000;
+
+/**
+ * The folders a tool that works in `dir` must not come from: the folder (as named and as it really
+ * is) and the checkout it belongs to. Asked for every git and gh call, so the folder's real path is
+ * read once per call and a checkout that was found is kept for a few seconds (a Changes refresh is
+ * four git calls; on a slow share each look is a round trip that holds up the bridge).
+ */
+export function projectFolders(dir: string, now = Date.now()): string[] {
   const start = path.resolve(dir);
-  const top = checkoutTop(start);
-  return [...new Set([start, defaultReal(start), ...(top ? [top] : [])])];
+  const known = found.get(start);
+  if (known && now - known.at < FOUND_MS) return known.list;
+  const realDir = defaultReal(start);
+  const top = checkoutTop(start, { realDir });
+  const list = [...new Set([start, realDir, ...(top ? [top] : [])])];
+  if (top) {
+    if (found.size >= 128) found.clear();
+    found.set(start, { at: now, list });
+  }
+  return list;
 }
 
 const cache = new Map<string, string>();

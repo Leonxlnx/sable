@@ -170,7 +170,8 @@ export function createPullWatch(deps: PullWatchDeps) {
     if (o.force || now() - e.askedAt >= floor) return start(e);
     // Held back by the long quiet: a pull request opened elsewhere meanwhile would never show while
     // the tab simply stays in view, so the folder is asked once when the quiet ends.
-    if (floor === QUIET_MS) e.quiet = true;
+    // (Only for an answer that names a branch: a detached HEAD has no pull request to wait for.)
+    if (floor === QUIET_MS && e.view.status?.branch) e.quiet = true;
     if (wants && e.want !== 'changed') e.want = wants;
     show(e);
     plan(e);
@@ -341,12 +342,26 @@ export function withFailures(typed: string, failures: string): string {
   // Before anything else: a draft that begins with ! or / and already holds the report (the `!`
   // typed in front of it later) gets the report moved to the front, once.
   if (/^\s*[!/]/.test(typed)) {
-    const rest = typed.split(failures).join('').trim();
+    const rest = (withoutBlock(typed, failures) ?? typed).trim();
     return rest ? `${failures}\n\n${rest}` : failures;
   }
   if (typed.includes(failures)) return typed;
   if (!typed.trim()) return failures;
   return `${typed.replace(/\s+$/, '')}\n\n${failures}`;
+}
+
+/**
+ * `text` without the block `block` (the report as the button put it in: on lines of its own), or
+ * null when it holds no such block. The same words quoted inside the person's own sentence are theirs
+ * and stay.
+ */
+function withoutBlock(text: string, block: string): string | null {
+  for (let at = text.lastIndexOf(block); at >= 0; at = at === 0 ? -1 : text.lastIndexOf(block, at - 1)) {
+    const before = text.slice(0, at);
+    const after = text.slice(at + block.length);
+    if ((before === '' || /\n\s*$/.test(before)) && (after === '' || /^\s*(?:\n|$)/.test(after))) return `${before.replace(/\s+$/, '')}${before.trim() && after.trim() ? '\n\n' : ''}${after.replace(/^\s+/, '')}`;
+  }
+  return null;
 }
 
 /** The pull request the dialog just opened, as the row shows it until GitHub is read: no checks yet. Null for an address that is not on github.com. */

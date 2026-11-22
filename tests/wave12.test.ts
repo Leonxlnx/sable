@@ -131,3 +131,77 @@ describe('#8: a result inside a subordinate clause does not make an announcement
     for (const t of ["I'll retry, but checking the logs showed the backup failed.", "I'll rerun CI, but running it locally already failed."]) expect(isLeadIn(t, false), t).toBe(false);
   });
 });
+
+// ── review wave 13: what the corrections above left wrong ──
+
+describe('wave 13 #1: a reported failure never folds for a determiner or a closing "first"', () => {
+  it('"running that test failed" and "…failed first" stay in view', () => {
+    for (const t of ["I'll retry, but running that test failed.", "I'll retry, but running the migration failed first.", "I'll look again, but checking that file showed the key is missing."]) expect(isLeadIn(t, false), t).toBe(false);
+  });
+
+  it('an indirect question still announces', () => {
+    for (const t of ["I'll update the docs — checking what the command returns first.", "I'll fix it, but checking whether the build passes first."]) expect(isLeadIn(t, false), t).toBe(true);
+  });
+});
+
+describe('wave 13 #2: only the report\'s own block is moved, never the same words inside a sentence', () => {
+  const R = '2 of 5 checks failed on pull request #128\n- lint';
+
+  it('a quoted report in the person\'s own line stays', () => {
+    const typed = `/review Explain the quoted output "${R}"\n\n${R}`;
+    const out = withFailures(typed, R);
+    expect(out).toBe(`${R}\n\n/review Explain the quoted output "${R}"`);
+    expect(withFailures(out, R)).toBe(out);
+  });
+
+  it('with no block of its own the report is added in front and the line is untouched', () => {
+    const typed = `!echo "${R}"`;
+    expect(withFailures(typed, R)).toBe(`${R}\n\n${typed}`);
+  });
+});
+
+describe('wave 13 #4: a detached HEAD is not read again when the quiet ends', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('no branch in the answer: nothing is scheduled', async () => {
+    const waiting: ((v: PullStatus | null) => void)[] = [];
+    const read = vi.fn(() => new Promise<PullStatus | null>((res) => waiting.push(res)));
+    const w = createPullWatch({ read, branchOf: () => undefined, seen: () => true });
+    w.watch('/repo');
+    waiting.shift()!({});
+    await vi.advanceTimersByTimeAsync(60_000);
+    void w.ask('/repo');
+    await vi.advanceTimersByTimeAsync(QUIET_MS * 2);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('wave 13 #3: the folders of a project are worked out once per call', () => {
+  it('names the folder, its real path and the checkout, and keeps a found checkout for a moment', async () => {
+    const { mkdtempSync, mkdirSync, rmSync, realpathSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { projectFolders } = await import('../server/util/which');
+    const base = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'sable-w13-')));
+    try {
+      const sub = path.join(base, 'repo', 'packages', 'web');
+      mkdirSync(sub, { recursive: true });
+      // Not a checkout yet: only the folder, and nothing is remembered.
+      expect(projectFolders(sub, 1000)).toEqual([sub]);
+      mkdirSync(path.join(base, 'repo', '.git'));
+      // It became one: seen at the very next look.
+      expect(projectFolders(sub, 1001)).toEqual([sub, path.join(base, 'repo')]);
+      // Found: the same list within a few seconds without looking again (the folder is gone meanwhile).
+      rmSync(path.join(base, 'repo', '.git'), { recursive: true });
+      expect(projectFolders(sub, 3000)).toEqual([sub, path.join(base, 'repo')]);
+      // And looked up afresh after that.
+      expect(projectFolders(sub, 1001 + 5001)).toEqual([sub]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
