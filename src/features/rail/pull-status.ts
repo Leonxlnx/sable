@@ -23,6 +23,12 @@ import { gitKey, useGit } from './git-state';
 export const FLOOR_MS = 20_000;
 /** While checks run and the tab shows: how often the pull request is read again. */
 export const POLL_MS = 30_000;
+/**
+ * A branch that has no pull request is asked about again only after this long when nothing says it
+ * changed (the tab shown again, the window back): on `main` every focus would otherwise start gh
+ * for an answer that is "none". A push, a creation, another branch and the row's refresh ask at once.
+ */
+export const QUIET_MS = 5 * 60_000;
 /** After a pull request was created or a push was seen: how long checks are expected though none runs yet. */
 export const EXPECT_MS = 90_000;
 
@@ -156,7 +162,9 @@ export function createPullWatch(deps: PullWatchDeps) {
       show(e);
       return e.inflight;
     }
-    if (o.force || now() - e.askedAt >= FLOOR_MS) return start(e);
+    // Nothing new is known and the last answer was "none": the longer quiet applies.
+    const floor = !wants && !e.view.status?.pull ? QUIET_MS : FLOOR_MS;
+    if (o.force || now() - e.askedAt >= floor) return start(e);
     if (wants && e.want !== 'changed') e.want = wants;
     show(e);
     plan(e);

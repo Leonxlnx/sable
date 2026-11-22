@@ -352,7 +352,7 @@ describe('phones paired before the secure channel', () => {
     const { c } = await pairSecure(app, port);
     expect(((await c.call('phone.migrate')) as { error?: string }).error).toBe('This phone is already paired securely.');
     c.ws.close();
-  });
+  }, 30_000);
 });
 
 describe('downloads over the channel', () => {

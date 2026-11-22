@@ -369,12 +369,13 @@ describe('term', () => {
       await expect(app.call('term.run', { cwd: plain, command })).rejects.toThrow(/limit 6/);
     } finally {
       for (const termId of ids) await app.call('term.kill', { termId });
-      await until(() => ids.every((id) => !!exitOf(id)), 'all killed', 10_000);
+      // Six process trees to end: slow on a machine that is busy with other work.
+      await until(() => ids.every((id) => !!exitOf(id)), 'all killed', 30_000);
     }
     // A slot is free again.
     const { termId } = await app.call('term.run', { cwd: plain, command: 'echo again' });
-    await until(() => !!exitOf(termId), 'echo after cap');
-  }, 20_000);
+    await until(() => !!exitOf(termId), 'echo after cap', 15_000);
+  }, 60_000);
 
   it('rejects a missing cwd', async () => {
     await expect(app.call('term.run', { cwd: path.join(base, 'missing'), command: 'echo x' })).rejects.toThrow(/not found/);

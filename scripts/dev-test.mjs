@@ -22,7 +22,8 @@ else {
 }
 
 console.log(`[dev-test] data folder: ${home}`);
-const child = spawn('pnpm', ['dev'], { stdio: 'inherit', shell: true, env: { ...process.env, SABLE_HOME: home } });
+// Never GitHub from here either: the Changes tab's pull request row would start gh on the owner's sign-in.
+const child = spawn('pnpm', ['dev'], { stdio: 'inherit', shell: true, env: { ...process.env, SABLE_HOME: home, SABLE_NO_GITHUB: '1' } });
 const stop = () => child.kill();
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);

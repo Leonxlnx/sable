@@ -700,6 +700,33 @@ describe('when the window asks', () => {
     expect(shown()).toMatchObject({ pull: undefined, known: true });
   });
 
+  it('asks about a branch that has no pull request only every five minutes, unless something changed', async () => {
+    const { w, read, answer, shown } = setup('main');
+    w.watch('/repo');
+    await answer({ branch: 'main' });
+    expect(shown()).toMatchObject({ pull: undefined, known: true, loading: false });
+    // The tab shown again, the window back: past the 20 s, but nothing says the answer is old.
+    await vi.advanceTimersByTimeAsync(60_000);
+    void w.ask('/repo');
+    await vi.advanceTimersByTimeAsync(P.QUIET_MS - 61_000);
+    void w.ask('/repo');
+    expect(read).toHaveBeenCalledTimes(1);
+    // Five minutes on, a plain ask goes out again.
+    await vi.advanceTimersByTimeAsync(2_000);
+    void w.ask('/repo');
+    expect(read).toHaveBeenCalledTimes(2);
+    await answer({ branch: 'main' });
+    // A push or a creation is news: asked once the 20 s allow, not after the long quiet.
+    await vi.advanceTimersByTimeAsync(25_000);
+    void w.ask('/repo', { changed: true });
+    expect(read).toHaveBeenCalledTimes(3);
+    await answer({ branch: 'main' });
+    // And the row's own refresh always asks at once.
+    void w.ask('/repo', { force: true });
+    expect(read).toHaveBeenCalledTimes(4);
+    await answer({ branch: 'main' });
+  });
+
   it('lets the row’s own refresh ask at once, but not beside a request under way', async () => {
     const { w, read, answer } = setup();
     w.watch('/repo');
