@@ -23,6 +23,7 @@ import { isLeadIn } from '@desk/features/timeline/lead-in';
  *     a line that opens a turn, or in a running one a segment of its own
  *   u such a message with nothing to show (a reminder): opens a turn between turns, left out when
  *     nothing comes in it (a slash command opens a turn as a message does, U; what it printed is n)
+ *   ? an item of a type this phone does not know (a newer desktop's): one calm line in its place
  *   . nothing to show
  */
 
@@ -105,7 +106,9 @@ function shapeRaw(item: TimelineItem): string {
       if (item.state === 'queued') return 'Q';
       const syn = syntheticOf(item);
       if (!syn) return 'U';
-      return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : 'n';
+      // What a command printed is command output: in view in its place, never folded with the work
+      // (a compaction's summary keeps its own path: a notice that folds).
+      return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : syn.role === 'output' ? 'c' : 'n';
     }
     case 'text':
       if (!item.streaming && !item.text.trim()) return '.';
@@ -127,7 +130,8 @@ function shapeRaw(item: TimelineItem): string {
     case 'turn':
       return item.error ? 'F' : 'T';
     default:
-      return '.';
+      // A type a newer desktop sends that this phone does not know: one calm line in its place.
+      return '?';
   }
 }
 
@@ -166,8 +170,8 @@ export function reshape(shape: string, roots: readonly string[], items: Record<s
 }
 
 const ANSWER = new Set(['t', 'c', 'p']);
-/** Always in view, in their place: command output, widgets and files, plans. */
-const SHOW = new Set(['c', 'g', 'p']);
+/** Always in view, in their place: command output, widgets and files, plans, and what the phone cannot draw (its line). */
+const SHOW = new Set(['c', 'g', 'p', '?']);
 /** What the agent does or says: outside any turn, it opens one of its own. */
 const OWN = new Set(['w', 'h', 'k', 'l', 't', 'g', 'p']);
 const WORK_AFTER = new Set(['w', 'h', 'k', 'n', 'l']);

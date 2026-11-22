@@ -9,6 +9,7 @@ import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
 import { onPutDraft } from '@m/lib/put-draft';
 import { onForget } from '@m/lib/forget';
+import { notSentHere, sentHere } from '@m/lib/follow';
 import { getDraft, onDraft, pendingTakes, setDraft, settleTaken, stageTaken } from '@m/lib/drafts';
 import { epoch, still } from '@m/lib/epoch';
 import { confirmTake, STILL_QUEUED, takeBack, type TakeDeps } from '@m/lib/take';
@@ -297,9 +298,13 @@ export function Composer({ sid }: { sid: string }) {
     // Opened far back (a search hit): the chat goes to its newest, where the message lands.
     void closeGap(sid).catch(() => {});
     const e = epoch();
+    // The conversation follows this message to the end (lib/follow.ts); not when the desktop queues it.
+    sentHere(sid);
     try {
-      await conn.call('session.send', { sessionId: sid, text: t, attachments });
+      const r = await conn.call('session.send', { sessionId: sid, text: t, attachments });
+      if (r.queued || !r.ok) notSentHere(sid);
     } catch (err) {
+      notSentHere(sid);
       const msg = (err as Error).message;
       dropFlight();
       // Forgotten (or replaced by another computer) while it went: its words are not put back.
@@ -494,7 +499,8 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
               aria-label="Send now"
               onClick={() => {
                 haptic('send');
-                void conn.call('queue.sendNow', { sessionId: sid, id: q.id }).catch(() => {});
+                sentHere(sid);
+                void conn.call('queue.sendNow', { sessionId: sid, id: q.id }).catch(() => notSentHere(sid));
               }}
             >
               <Icon name="steer" size={18} />

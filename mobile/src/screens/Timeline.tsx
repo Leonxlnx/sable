@@ -17,7 +17,7 @@ import { readReview, type PhoneReview } from '@m/lib/review';
 import { applyChildren, applyFull, fetchItem, getState, sessionData, setState, useStore, type State } from '@m/lib/store';
 import { claimFlight } from '@m/lib/flight';
 import { checkOpener, foldTarget, showKind, turnChanges } from '@m/lib/chat-rules';
-import { foldKey, keepOpen, wasOpen } from '@m/lib/folds';
+import { foldKey, keepDetail, keepOpen, keptDetail, stepKey, wasOpen } from '@m/lib/folds';
 import { useChanges } from '@m/lib/changes';
 import type { Segment, StepsChunk, TurnGroup } from '@m/lib/turns';
 import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
@@ -115,14 +115,29 @@ export const TurnView = memo(function TurnView({ sid, turn, newest, reveal }: { 
   // The fade before the gather: its own timer, not tied to the phase it starts (a phase change must not cancel it).
   const leave = useRef(0);
   useEffect(() => () => window.clearTimeout(leave.current), []);
+  // The turn's height while it ran: when it ends, the live line under the answer goes at once, and
+  // a reader at the newest (the view pinned to the bottom) would see the answer drop by that much in
+  // one frame. The turn keeps that height until it gathers (the gather keeps the answer in place).
+  // (The answer grows the turn without rendering it again: its size is followed while it runs.)
+  const ranH = useRef(0);
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!running || !el) return;
+    ranH.current = el.offsetHeight;
+    const ro = new ResizeObserver(() => (ranH.current = el.offsetHeight));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [running]);
   useLayoutEffect(() => {
     if (running) {
       window.clearTimeout(leave.current);
+      if (box.current) box.current.style.minHeight = '';
       if (phase !== 'live') setPhase('live');
       return;
     }
     if (phase !== 'live') return;
     if (reduced() || !head) return setPhase('settled');
+    if (box.current && ranH.current) box.current.style.minHeight = `${ranH.current}px`;
     setPhase('closing');
     leave.current = window.setTimeout(() => {
       snap.current = box.current ? snapshot(box.current) : null;
@@ -131,6 +146,7 @@ export const TurnView = memo(function TurnView({ sid, turn, newest, reveal }: { 
   }, [running, phase, head]);
 
   useLayoutEffect(() => {
+    if (phase === 'settled' && box.current) box.current.style.minHeight = '';
     const s = snap.current;
     if (phase !== 'settled' || !s || !box.current) return;
     snap.current = null;
@@ -424,7 +440,7 @@ const StepRow = memo(function StepRow({ sid, id }: { sid: string; id: string }) 
 /**
  * In view in its place: command output, a widget, a plan, files, an error. Read by the item's own
  * type, never by where it stands: what a command printed is a user item Claude Code wrote (a line
- * under the command, Synthetic.tsx), not a step; a type it does not know shows nothing.
+ * under the command, Synthetic.tsx), not a step; a type it does not know is one calm line.
  */
 function Show({ sid, id }: { sid: string; id: string }) {
   const it = useItem<TimelineItem>(sid, id);
@@ -444,8 +460,17 @@ function Show({ sid, id }: { sid: string; id: string }) {
     case 'block':
       return <Block sid={sid} id={id} />;
     default:
-      return null;
+      return it ? <UnknownLine id={id} /> : null;
   }
+}
+
+/** An item of a type this phone does not know (a newer desktop's): one calm line where it stands. */
+function UnknownLine({ id }: { id: string }) {
+  return (
+    <div className="turn-broken" data-id={id}>
+      Shown on the desktop
+    </div>
+  );
 }
 
 /** A plan: one row; a tap fetches it from the desktop and shows it. */
@@ -733,7 +758,8 @@ export const ItemRow = memo(function ItemRow({ sid, id, queued }: { sid: string;
         <StepRow sid={sid} id={id} />
       </div>
     );
-  return null;
+  if (it.type === 'thinking' || it.type === 'turn') return null;
+  return <UnknownLine id={id} />;
 });
 
 const UserBubble = memo(function UserBubble({ sid, id, steered, queued }: { sid: string; id: string; steered?: boolean; queued?: boolean }) {
@@ -855,9 +881,30 @@ function ReviewList({ sid, id, review }: { sid: string; id: string; review: Phon
 
 const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; quiet?: boolean }) {
   const it = useItem<TimelineItem>(sid, id);
-  const [open, setOpen] = useState(false);
-  // The desktop keeps a step's output and change: asked for when the step opens.
-  const [full, setFull] = useState<ToolItem>();
+  // Opened or not is remembered per chat and step (lib/folds.ts): a turn folded and opened again shows it as it was left.
+  const [open, setOpen] = useState(() => wasOpen(stepKey(sid, id)));
+  // (A thought keeps its own, in ThinkingStep.)
+  const tool = it?.type === 'tool';
+  useEffect(() => {
+    if (tool) keepOpen(stepKey(sid, id), open);
+  }, [sid, id, open, tool]);
+  // The desktop keeps a step's output and change: asked for when the step opens, and kept (a few) so reopening asks nothing.
+  const [full, setFull] = useState<ToolItem | undefined>(() => keptDetail<ToolItem>(sid, id));
+  const wantsFull = open && !full && !!(it as PhoneItem | undefined)?.more;
+  useEffect(() => {
+    if (!wantsFull) return;
+    let live = true;
+    void fetchItem(sid, id).then(
+      (r) => {
+        keepDetail(sid, id, r.item);
+        if (live) setFull(r.item as ToolItem);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [wantsFull, sid, id]);
   if (!it) return null;
   if (it.type === 'thinking') return <ThinkingStep sid={sid} it={it} quiet={quiet} />;
   if (it.type === 'text') return <div className="step-text" data-id={id}>{inlineCode(it.text.length > 280 ? `${it.text.slice(0, 280)}…` : it.text)}</div>;
@@ -868,7 +915,6 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
   const toggle = () => {
     if (quiet || !(detail || more)) return;
     haptic('select');
-    if (more && !full && !open) void fetchItem(sid, id).then((r) => setFull(r.item as ToolItem), () => {});
     setOpen((v) => !v);
   };
   return (
@@ -950,7 +996,8 @@ function inlineCode(text: string): ReactNode {
 }
 
 function ThinkingStep({ sid, it, quiet }: { sid: string; it: ThinkingItem; quiet?: boolean }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => wasOpen(stepKey(sid, it.id)));
+  useEffect(() => keepOpen(stepKey(sid, it.id), open), [sid, it.id, open]);
   const secs = it.endedAt ? Math.max(1, Math.round((it.endedAt - it.ts) / 1000)) : 0;
   const toggle = () => {
     if (quiet || !it.text) return;

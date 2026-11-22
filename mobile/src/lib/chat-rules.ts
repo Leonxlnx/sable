@@ -91,6 +91,16 @@ export function newestSent(roots: readonly string[], items: Record<string, Timel
  */
 export const followSent = (prev: Sent | undefined, next: Sent | undefined): boolean => !!next && next.id !== prev?.id && (!prev || next.ts >= prev.ts);
 
+/**
+ * A search hit opened in its chat whose words are not in what the phone shows of the item: the item
+ * came cut (a long text, a long message), so it is fetched whole and the words looked for again.
+ */
+export function wholeForFind(it: TimelineItem | undefined, found: boolean): boolean {
+  if (found || !it) return false;
+  if (it.type === 'text' && it.streaming) return false;
+  return !!(it as { cut?: boolean }).cut;
+}
+
 // ───────────────────────── what a turn changed ─────────────────────────
 
 export interface TurnChanges {

@@ -8,10 +8,11 @@ import { onKeyboard } from '@m/lib/keyboard';
 import { haptic, openExternal } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { homeFolder, openRace, swapTo } from '@m/lib/race';
-import { applyOlder, closeGap, fetchNewer, fetchOlder, getState, openAt, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
+import { applyFull, applyOlder, closeGap, fetchItem, fetchNewer, fetchOlder, getState, openAt, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
 import { around, growDown, growUp, MOUNT_MAX, rangeOf, SpacerSums, trimTop, type Win } from '@m/lib/window';
 import { matchRanges, searchWords } from '@m/lib/find';
-import { canStop, followSent, newestSent } from '@m/lib/chat-rules';
+import { canStop, followSent, newestSent, wholeForFind } from '@m/lib/chat-rules';
+import { takeSentHere } from '@m/lib/follow';
 import { backgroundLabel, groupTurns, stabilize } from '@m/lib/turns';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
@@ -460,6 +461,9 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
     const prev = followed.current;
     followed.current = sent;
     if (!followSent(prev, sent)) return;
+    // Only a message this phone sent or steered just now (lib/follow.ts): a queued one the desktop
+    // starts, or one from another client, leaves the reader where they are.
+    if (!takeSentHere(id)) return;
     if (goal.current || gappedRef.current || (winRef.current && winRef.current.hi !== null)) return;
     atBottom.current = true;
     toBottom(true);
@@ -560,13 +564,27 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
       if (!live) return;
       const top = topOf();
       // The words searched for, in a long message: they come into view (a third down) and are lit.
-      const hit = target !== 'turn' && g.find ? findWords(el, g.find) : null;
+      let hit = target !== 'turn' && g.find ? findWords(el, g.find) : null;
+      let place: HTMLElement = el;
+      // Not in what the phone got of it (a long text comes cut): the item is fetched whole, shown
+      // whole, and the words looked for again; still not there, its top is shown as before.
+      if (target !== 'turn' && g.find && wholeForFind(sessionData(getState(), id).items[target], !!hit)) {
+        const whole = await fetchItem(id, target).catch(() => null);
+        if (!live) return;
+        if (whole) {
+          applyFull(id, whole.item);
+          await frames();
+          if (!live) return;
+          place = exact() ?? el;
+          hit = findWords(place, g.find);
+        }
+      }
       const rect = hit?.getBoundingClientRect();
       const y = rect && rect.height ? rect.top - sc.getBoundingClientRect().top + sc.scrollTop - sc.clientHeight * 0.32 : top - 84;
-      sc.scrollTo({ top: Math.max(0, Math.min(y, top - 84 + Math.max(0, el.offsetHeight - 120))), behavior: 'auto' });
+      sc.scrollTo({ top: Math.max(0, Math.min(y, top - 84 + Math.max(0, place.offsetHeight - 120))), behavior: 'auto' });
       if (target !== 'turn') {
-        el.setAttribute('data-flash', '');
-        window.setTimeout(() => el.removeAttribute('data-flash'), 1600);
+        place.setAttribute('data-flash', '');
+        window.setTimeout(() => place.removeAttribute('data-flash'), 1600);
         if (hit) lightWords(hit);
       }
     })();

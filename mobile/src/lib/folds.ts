@@ -13,6 +13,9 @@ const open = new Set<string>();
 /** The key of a turn's line, or of one piece inside it. */
 export const foldKey = (sid: string, turn: string, piece = '') => `${sid}\n${turn}\n${piece}`;
 
+/** The key of one step's own disclosure (a command's output opened inside a checkpoint): per chat and item, wherever it stands. */
+export const stepKey = (sid: string, id: string) => `${sid}\n\u0000step\n${id}`;
+
 export const wasOpen = (key: string) => open.has(key);
 
 export function keepOpen(key: string, on: boolean) {
@@ -22,4 +25,25 @@ export function keepOpen(key: string, on: boolean) {
   if (open.size > FOLDS_MAX) open.delete(open.values().next().value as string);
 }
 
-onForget(() => open.clear());
+/**
+ * A step's detail fetched from the desktop when it opened (its output, its change), kept so that
+ * reopening the turn shows it again without asking twice. Small: the newest few only.
+ */
+export const DETAILS_MAX = 40;
+const details = new Map<string, unknown>();
+
+export function keptDetail<T>(sid: string, id: string): T | undefined {
+  return details.get(stepKey(sid, id)) as T | undefined;
+}
+
+export function keepDetail(sid: string, id: string, item: unknown) {
+  const key = stepKey(sid, id);
+  details.delete(key);
+  details.set(key, item);
+  if (details.size > DETAILS_MAX) details.delete(details.keys().next().value as string);
+}
+
+onForget(() => {
+  open.clear();
+  details.clear();
+});

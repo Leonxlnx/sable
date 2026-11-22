@@ -4,6 +4,7 @@ import { packReviews, unpackReviews } from '@desk/features/review/persist';
 import { conn } from './conn';
 import { onForget } from './forget';
 import { epoch, still } from './epoch';
+import { notSentHere, sentHere } from './follow';
 
 /**
  * A chat's review written on the phone: comments on lines of its diffs, kept per chat until sent
@@ -71,7 +72,12 @@ export async function sendReview(sid: string): Promise<{ queued: boolean }> {
   if (!list.length) return { queued: false };
   const lead = leadOf(sid).trim();
   const e = epoch();
-  const r = await conn.call('session.send', { sessionId: sid, text: reviewMessage(list, lead) });
+  sentHere(sid);
+  const r = await conn.call('session.send', { sessionId: sid, text: reviewMessage(list, lead) }).catch((err) => {
+    notSentHere(sid);
+    throw err;
+  });
+  if (r.queued || !r.ok) notSentHere(sid);
   // Forgotten while it went: nothing of that computer is written again.
   if (!still(e)) return { queued: !!r.queued };
   if (!r.ok) throw new Error(r.error ?? 'The review was not sent');

@@ -224,7 +224,10 @@ describe("phone turns with what Claude Code writes in the person's place", () =>
   it('reads them as the desktop does, a message the phone got cut short too', () => {
     expect(shapeOf(user(NOTE, { cut: true }))).toBe('N');
     expect(shapeOf(user('<command-name>/model</command-name><command-args>opus</command-args>'))).toBe('U');
-    expect(shapeOf(user('<local-command-stdout>Set model to Opus 5.5</local-command-stdout>'))).toBe('n');
+    // What a command printed is command output (in view in its place); a compaction's summary keeps its own path.
+    expect(shapeOf(user('<local-command-stdout>Set model to Opus 5.5</local-command-stdout>'))).toBe('c');
+    expect(shapeOf(user('<local-command-stderr>Migration failed</local-command-stderr>'))).toBe('c');
+    expect(shapeOf(user('This session is being continued from a previous conversation that ran out of context.'))).toBe('n');
     expect(shapeOf(user('<local-command-caveat>Caveat: x</local-command-caveat>'))).toBe('u');
     expect(shapeOf(user('Build it'))).toBe('U');
   });
@@ -243,10 +246,14 @@ describe("phone turns with what Claude Code writes in the person's place", () =>
   });
 
   it('shows a command with its output and nothing for the caveat before it', () => {
-    const { ids, shape } = spec('U1 t2 T3 u4 U5 n6 T7');
+    const { ids, shape } = spec('U1 t2 T3 u4 U5 c6 T7');
     const { groups } = groupTurns(ids, shape, false);
     expect(groups).toHaveLength(2);
     expect(groups[1]).toMatchObject({ kind: 'turn', key: '5' });
+    // Its output stays in view beside a step, never folded with the work.
+    const seg = onlyTurn('U1 w2 c3 w4 t5 T6').segments[0];
+    expect(flowOf(seg.flow)).toBe('[2] *3 [4] 5');
+    expect(seg.notes).toEqual([]);
     const reminder = spec('U1 t2 T3 u4 w5 t6 T7');
     expect(groupTurns(reminder.ids, reminder.shape, false).groups).toHaveLength(2);
     const alone = spec('U1 t2 T3 u4');

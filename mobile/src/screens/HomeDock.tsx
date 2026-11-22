@@ -10,6 +10,7 @@ import { fit } from '@m/lib/fit';
 import { haptic, isNative } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { onForget } from '@m/lib/forget';
+import { notSentHere, sentHere } from '@m/lib/follow';
 import { epoch, still } from '@m/lib/epoch';
 import { openFrom } from '@m/lib/open';
 import { applySnapshot, setState, useStore } from '@m/lib/store';
@@ -111,6 +112,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
     else haptic('tap');
     update('');
     const e = epoch();
+    let sid = '';
     try {
       const snap = await createChat(c, t);
       applySnapshot(snap);
@@ -119,8 +121,11 @@ export function HomeDock({ covered }: { covered: boolean }) {
       window.setTimeout(() => area.current?.blur(), Math.max(0, 200 - (performance.now() - at)));
       nav.chat(snap.session.id);
       // The message goes once the chat is there (it may have opened in a fresh folder named after it).
+      sentHere(snap.session.id);
+      sid = snap.session.id;
       await conn.call('session.send', { sessionId: snap.session.id, text: t });
     } catch (err) {
+      if (sid) notSentHere(sid);
       dropFlight();
       // Forgotten (or replaced by another computer) while the chat was being made: its words are not put back.
       if (!still(e)) return;
