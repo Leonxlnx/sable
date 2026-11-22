@@ -15,9 +15,13 @@
 :root {
   color-scheme: dark;
 
-  /* ── ink: canvas & surfaces, one small step per layer ── */
+  /* ── ink: canvas & surfaces, one small step per layer ──
+     The window's body (--shell: the sidebar and the frame between the sheets) is one clear step
+     above the sheets (--sheet: the stage and the side panel), which are wells of the deepest ink in
+     it, where the field's light lives. Panels are the steps above a sheet; what floats is glass. */
   --bg: #070708;
   --sheet: #0c0c0e;
+  --shell: #151518;
   --panel: #121214;
   --panel-2: #18181b;
   --panel-3: #1f1f23;
@@ -46,6 +50,9 @@
   --text-2: #aeada9;
   --text-3: #7a7975;
   --text-4: #54534f;
+  /* The dimmest words on the window's body (the sidebar's times and counts): a hair up, so they
+     read there as --text-4 does on a sheet. */
+  --text-4-shell: #5a5955;
   --text-inverse: #0a0a0b;
 
   /* ── colour: the backdrop and meaningful marks only ──

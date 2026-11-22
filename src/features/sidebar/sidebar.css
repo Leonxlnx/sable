@@ -1,13 +1,15 @@
 /*
- * The sidebar sits on the same ground as the stage (app.css): no panel, no border, no step in
- * tone. Light comes from rows. One grid for everything: an icon column 16 px wide whose centre
- * is 20 px from the sidebar's left edge (brand mark, action icon, folder icons, status marks,
- * account mark), a text column at 38 px (wordmark, labels, folder names, titles), and one right
- * edge for times, counts and hover tools.
+ * The sidebar sits right on the window's body (app.css, --shell): no panel and no border of its
+ * own, one step lighter than the stage's sheet beside it. Light comes from rows. One grid for
+ * everything: an icon column 16 px wide whose centre is 20 px from the sidebar's left edge (brand
+ * mark, action icon, folder icons, status marks, account mark), a text column at 38 px (wordmark,
+ * labels, folder names, titles), and one right edge for times, counts and hover tools.
  */
 
 .side {
-  --side-bg: var(--sheet);
+  --side-bg: var(--shell);
+  /* The dimmest words keep their contrast on the lighter ground (times, counts, folder icons). */
+  --text-4: var(--text-4-shell);
   /* What a row's hover tools fade over: the row's own fill composited on the ground. */
   --row-hover: color-mix(in srgb, var(--side-bg) 94%, white);
   --row-active: color-mix(in srgb, var(--side-bg) 91%, white);

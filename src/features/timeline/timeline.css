@@ -1842,30 +1842,130 @@ button:hover > .row-caret {
   text-wrap: balance;
 }
 
-/* An error reads at a glance by its mark alone: flat ink, a red icon, the words in the text tone. */
+/* A notice that stands in the conversation as a card (Notice.tsx; Turn.tsx writes the same card
+   for a turn that ended with an error, hence the class's first name). One hairline, as wide as its
+   words, and a small mark that says its level and is its only colour: it informs (a quiet mark, no
+   fill, the words one tone back), warns (the amber mark) or reports a failure (the red mark, one
+   fill step, the words a weight up). */
 .notice-error {
-  display: flex;
-  gap: 10px;
-  padding: 10px 14px 11px 12px;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 10px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 9px 14px 10px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
-  background-color: var(--panel);
+  background-color: var(--fill-1);
 }
 
+.notice-error:is([data-level='info'], [data-level='warn']) {
+  background-color: transparent;
+}
+
+/* On the first line's middle (a 20 px line, a 16 px mark). */
 .notice-error > svg {
-  flex-shrink: 0;
-  margin-top: 1.5px;
+  margin-top: 2px;
   color: var(--red);
+}
+
+.notice-error[data-level='warn'] > svg {
+  color: var(--amber);
+}
+
+.notice-error[data-level='info'] > svg {
+  color: var(--text-3);
 }
 
 .notice-error-body {
   min-width: 0;
 }
 
+/* The first sentence, and at its end the caret that opens the rest of a long notice. */
+.notice-error-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
 .notice-error-text {
+  min-width: 0;
   font-size: var(--t-ui);
+  line-height: 20px;
   font-weight: var(--w-medium);
   color: var(--text);
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+.notice-error[data-level='warn'] .notice-error-text {
+  font-weight: var(--w-regular);
+}
+
+.notice-error[data-level='info'] .notice-error-text {
+  font-weight: var(--w-regular);
+  color: var(--text-2);
+}
+
+/* How often the same notice came in a row: a figure after its words. */
+.notice-count {
+  font-weight: var(--w-regular);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* 22 px on a 20 px line: it keeps the line's height. */
+.notice-more {
+  flex-shrink: 0;
+  margin: -1px -7px -1px 0;
+}
+
+/* The rest of a long notice, under its first sentence and never wider than it: the card keeps its
+   width when it opens (no width of its own goes into the card's). */
+.notice-error-rest {
+  width: 0;
+  min-width: 100%;
+  padding-top: 2px;
+  font-size: var(--t-ui);
+  line-height: 20px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
+}
+
+/* An address in a notice (notice-read.ts): its host and page, underlined as a link in an answer is. */
+.notice-link {
+  border-radius: 3px;
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--text) 32%, transparent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  cursor: pointer;
+  transition:
+    color var(--d-1) var(--ease),
+    text-decoration-color var(--d-1) var(--ease);
+}
+
+.notice-link:hover {
+  text-decoration-color: var(--text);
+}
+
+/* In a divider's quiet line it stays one tone above the words, no more. */
+:is(.notice-label, .notice-detail) .notice-link {
+  color: var(--text-2);
+  text-decoration-color: color-mix(in oklab, var(--text-2) 40%, transparent);
+}
+
+:is(.notice-label, .notice-detail) .notice-link:hover {
+  color: var(--text);
+  text-decoration-color: var(--text);
+}
+
+/* The same notice right after itself shows once, with its count (Notice.tsx): the rows of the
+   others hold nothing and take no room. */
+:is(.tl-item, .tl-sub)[data-t='notice']:empty {
+  display: none;
 }
 
 .notice-error-detail {

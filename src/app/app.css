@@ -1,5 +1,7 @@
-/* The shell: the sidebar and the stage on one ground (the stage's tone), the stage framed by one
-   hairline, an optional rail. No step in tone between sidebar and stage: the frame is the edge. */
+/* The shell: the window's body (--shell) with the sidebar's rows right on it, and the sheets set
+   into it as wells of the deepest ink (--sheet): the stage, framed by one hairline, and the side
+   panel beside it. One clear step in tone between the body and a sheet, so the sidebar, the stage
+   and the panel each read at a glance; the field glows on the darkest ground. */
 
 .app {
   position: relative;
@@ -7,7 +9,7 @@
   height: 100%;
   padding: var(--gap);
   isolation: isolate;
-  background-color: var(--sheet);
+  background-color: var(--shell);
   /* The side panel's width as drawn: the chosen width (--rail-w), narrowed so the stage beside it
      keeps room for the conversation (about 460 px) in a small window. */
   --rail-fit: clamp(300px, calc(100vw / var(--ui-zoom, 1) - 2 * var(--gap) - 460px), var(--rail-w));
@@ -120,7 +122,68 @@
   position: absolute;
   top: 0;
   right: 0;
+  background-color: var(--shell);
+}
+
+/* The body and the sheet differ in tone, so the stage's right end is drawn on every frame the
+   panel moves apart from it: sliding in over the stage (`data-step`), and on its way out (no
+   `data-open`), when it leaves its column before the column closes. The column reaches a corner's
+   width over the stage's own end and is cut there (a clip, not `overflow`, so that reach shows). */
+.app-rail:not([data-open]) {
+  position: relative;
+  z-index: 10;
+  overflow: visible;
+  clip-path: inset(0 0 0 calc(var(--r-xl) * -1 - 1px));
+}
+
+.app-rail:not([data-open]) > .app-rail-inner {
+  background-color: var(--shell);
+}
+
+/* Under the moving panel the column reads as stage (the sheet's ink, its top and bottom hairline,
+   its round end where the stage will end), never as an empty block of the body. With no width it
+   lies exactly over the stage's own end. */
+.app-rail:is([data-step], :not([data-open]))::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 0 calc(var(--r-xl) * -1 - 1px);
+  border: 1px solid var(--line);
+  border-left: 0;
+  border-radius: 0 var(--r-xl) var(--r-xl) 0;
   background-color: var(--sheet);
+  pointer-events: none;
+}
+
+/* And with the panel travels the stage's round end, at the gap's inner side (the body's tone
+   behind its corners): the stage ends before the panel wherever the panel is. */
+.app-rail:is([data-step], :not([data-open])) > .app-rail-inner::before,
+.app-rail:is([data-step], :not([data-open])) > .app-rail-inner::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 100%;
+  bottom: 0;
+  width: calc(var(--r-xl) + 1px);
+  pointer-events: none;
+}
+
+.app-rail:is([data-step], :not([data-open])) > .app-rail-inner::before {
+  background-color: var(--shell);
+}
+
+.app-rail:is([data-step], :not([data-open])) > .app-rail-inner::after {
+  border: 1px solid var(--line);
+  border-left: 0;
+  border-radius: 0 var(--r-xl) var(--r-xl) 0;
+  background-color: var(--sheet);
+}
+
+/* The veil that resolves the panel's contents is ink of the sheet: it stays on the sheet (not over
+   the gap beside it, which is the body's tone) and inside its round corners. */
+.app-rail-inner > .veil {
+  left: var(--gap);
+  border-radius: var(--r-xl);
+  overflow: hidden;
 }
 
 /* ── topbar ── */
