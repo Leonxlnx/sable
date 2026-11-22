@@ -95,8 +95,10 @@
 
 /* ── lines ── */
 
+/* 7px above and below: the well's corner (radius 10) is 0.5px in by then, so the 2px edge of a
+   first or last changed line is whole. At 5px the corner cut 1.3px off it. */
 .dv-body {
-  padding: 5px 0;
+  padding: 7px 0;
   font-family: var(--font-mono);
   font-size: var(--code-size);
   line-height: var(--code-lh);
