@@ -178,6 +178,47 @@ describe('the updater', () => {
     expect(quit).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps looking while a version waits for the restart: a newer release takes its place', async () => {
+    const rel = release('0.2.5');
+    const { u, states, ran, dir, gh } = updater(rel);
+    expect(await u.check()).toMatchObject({ status: 'ready', latest: '0.2.5' });
+    const first = path.join(dir, 'Sable-Setup-0.2.5.exe');
+    // Nothing newer: the check goes out, and what is ready stays.
+    const before = gh.calls.length;
+    expect(await u.check()).toMatchObject({ status: 'ready', latest: '0.2.5' });
+    expect(gh.calls.length).toBe(before + 1);
+    expect(existsSync(first)).toBe(true);
+
+    // Two releases later, the app still open.
+    Object.assign(rel, release('0.2.7'));
+    states.length = 0;
+    expect(await u.check()).toMatchObject({ status: 'ready', latest: '0.2.7', progress: 1 });
+    // The button never left: no step through "downloading" or "checking".
+    expect(states.every((x) => x.status === 'ready')).toBe(true);
+    const second = path.join(dir, 'Sable-Setup-0.2.7.exe');
+    expect(readFileSync(second).equals(BYTES)).toBe(true);
+    expect(existsSync(first)).toBe(false);
+    expect(readdirSync(dir)).toEqual(['Sable-Setup-0.2.7.exe']);
+    // And the restart installs the newest.
+    u.install();
+    expect(ran).toEqual([second]);
+  });
+
+  it('a newer release that does not check out leaves the ready one in place', async () => {
+    const rel = release('0.2.5');
+    const { u, ran, dir } = updater(rel);
+    await u.check();
+    const first = path.join(dir, 'Sable-Setup-0.2.5.exe');
+    // 0.2.7 is announced with another hash than its bytes have.
+    const bad = release('0.2.7');
+    (bad.assets[1] as { digest: string }).digest = `sha256:${'0'.repeat(64)}`;
+    Object.assign(rel, bad);
+    expect(await u.check()).toMatchObject({ status: 'ready', latest: '0.2.5' });
+    expect(readdirSync(dir)).toEqual(['Sable-Setup-0.2.5.exe']);
+    u.install();
+    expect(ran).toEqual([first]);
+  });
+
   it('throws a download away that does not match the release', async () => {
     const wrong = Buffer.from(BYTES);
     wrong[100] = 0x41 === wrong[100] ? 0x42 : 0x41;

@@ -20,7 +20,8 @@ import { installMac } from './update-mac';
 
 export const RELEASES_URL = 'https://api.github.com/repos/Leonxlnx/sable/releases/latest';
 const FIRST_CHECK_MS = 30_000;
-const EVERY_MS = 6 * 3600_000;
+/** Also while a downloaded version waits for the restart: a newer release then takes its place (see `supersede`). */
+const EVERY_MS = 2 * 3600_000;
 
 export interface UpdateHost {
   /** Ends the app so the installer can replace it. */
@@ -125,8 +126,45 @@ export class Updater {
   /** Asks for the newest release; a newer one downloads now. `manual`: the person asked, so a failure is shown. */
   check(manual = false): Promise<UpdateState> {
     if (this.state.status === 'unsupported') return Promise.resolve(this.state);
-    if (this.state.status === 'downloading' || this.state.status === 'ready') return Promise.resolve(this.state);
+    if (this.state.status === 'downloading') return Promise.resolve(this.state);
+    // A version is downloaded and waits for the restart: it is not the end of looking. (It was:
+    // someone who left the app open over three releases was offered the first, and had to restart
+    // once per release.)
+    if (this.state.status === 'ready') return (this.checking ??= this.supersede().finally(() => (this.checking = undefined)));
     return (this.checking ??= this.doCheck(manual).finally(() => (this.checking = undefined)));
+  }
+
+  /**
+   * While a downloaded version waits for the restart, a release newer than it is fetched beside it,
+   * checked, and only then takes its place: "Restart to update" stays there the whole time and
+   * always installs the newest version that is whole on disk. Quiet: a failure changes nothing.
+   */
+  private async supersede(): Promise<UpdateState> {
+    const have = this.release?.version ?? this.state.latest;
+    try {
+      const res = await this.fetcher(RELEASES_URL, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'Sable' }, signal: AbortSignal.timeout(20_000) });
+      if (!res.ok) return this.state;
+      const rel = pickRelease(await res.json(), this.opts.platform, this.opts.arch);
+      if (this.state.status !== 'ready') return this.state;
+      if (!rel || !have || !newer(rel.version, have)) {
+        this.set({ checkedAt: Date.now() });
+        return this.state;
+      }
+      const file = await this.fetchFile(rel);
+      // The app is on its way out, or the state moved on meanwhile: what was ready stays the one.
+      if (this.state.status !== 'ready' || this.left) {
+        if (file !== this.file) rmSync(file, { force: true });
+        return this.state;
+      }
+      const old = this.file;
+      this.release = rel;
+      this.file = file;
+      this.set({ latest: rel.version, checkedAt: Date.now() });
+      if (old && old !== file) rmSync(old, { force: true });
+    } catch {
+      /* the version that was ready is still ready */
+    }
+    return this.state;
   }
 
   private async doCheck(manual: boolean): Promise<UpdateState> {
@@ -155,15 +193,18 @@ export class Updater {
 
   private async download(rel: Release) {
     mkdirSync(this.dir, { recursive: true });
-    const file = path.join(this.dir, rel.name);
     // Older downloads go.
     for (const f of readdirSync(this.dir)) if (f !== rel.name) rmSync(path.join(this.dir, f), { force: true, recursive: true });
-    if (existsSync(file) && statSync(file).size === rel.size && (await this.verified(file, rel))) {
-      this.file = file;
-      this.set({ status: 'ready', progress: 1 });
-      return;
-    }
-    this.set({ status: 'downloading', progress: 0 });
+    this.file = await this.fetchFile(rel, (p) => this.set(p === 0 ? { status: 'downloading', progress: 0 } : { progress: p }));
+    this.set({ status: 'ready', progress: 1 });
+  }
+
+  /** The release's file in the download folder, whole and checked: taken as it is when it is already there, else fetched. */
+  private async fetchFile(rel: Release, progress?: (p: number) => void): Promise<string> {
+    mkdirSync(this.dir, { recursive: true });
+    const file = path.join(this.dir, rel.name);
+    if (existsSync(file) && statSync(file).size === rel.size && (await this.verified(file, rel))) return file;
+    progress?.(0);
     const res = await this.fetcher(rel.url, { headers: { 'user-agent': 'Sable' }, redirect: 'follow' });
     if (!res.ok || !res.body) throw new Error(`The download failed (${res.status}).`);
     const part = `${file}.part`;
@@ -180,7 +221,7 @@ export class Updater {
         const p = got / rel.size;
         if (p - shown >= 0.02) {
           shown = p;
-          this.set({ progress: Math.min(0.99, p) });
+          progress?.(Math.min(0.99, p));
         }
       }
       await new Promise<void>((resolve, reject) => out.end((err?: Error | null) => (err ? reject(err) : resolve())));
@@ -194,8 +235,7 @@ export class Updater {
       throw new Error('The download did not match the release.');
     }
     renameSync(part, file);
-    this.file = file;
-    this.set({ status: 'ready', progress: 1 });
+    return file;
   }
 
   private async verified(file: string, rel: Release): Promise<boolean> {
@@ -237,8 +277,12 @@ export class Updater {
     this.busyCheck?.();
   }
 
+  /** The installer was started: nothing replaces its file any more. */
+  private left = false;
+
   private go() {
     const file = this.file!;
+    this.left = true;
     const run =
       this.opts.run ??
       ((f: string) => {
