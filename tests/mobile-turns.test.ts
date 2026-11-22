@@ -13,30 +13,43 @@ vi.mock('@desk/features/review/model', async () => await import('../src/features
 vi.mock('@desk/lib/word-diff', async () => await import('../src/lib/word-diff'));
 
 // Loaded by a path the root type check does not follow: the phone's module resolves `@desk` through its own config.
-type FlowChunk = { kind: 'text' | 'show'; id: string } | { kind: 'steps'; key: string; ids: string[] } | { kind: 'line' };
+type FlowChunk = { kind: 'text' | 'show'; id: string } | { kind: 'steps'; key: string; ids: string[]; count: number };
 interface Segment {
+  lead: string | null;
+  steered: boolean;
   flow: FlowChunk[];
   work: string[];
   steps: number;
   answer: string | null;
   reply: string | null;
+  last: string | null;
+  tail: string[];
+  notes: string[];
+  errors: string[];
+  narr: string[];
 }
-type TurnGroup = { kind: 'turn'; segments: Segment[] };
+type TurnGroup = { kind: 'turn'; key: string; state: string; end: string | null; ids: string[]; segments: Segment[] };
 type Group = TurnGroup | { kind: 'item'; id: string };
+type Layout = { groups: Group[]; queued: string[] };
 const TURNS = '../mobile/src/lib/turns';
-const { groupTurns, shapeOf } = (await import(/* @vite-ignore */ TURNS)) as {
-  groupTurns: (ids: readonly string[], shape: string, busy: boolean) => { groups: Group[] };
+const { groupTurns, shapeOf, stabilize } = (await import(/* @vite-ignore */ TURNS)) as {
+  groupTurns: (ids: readonly string[], shape: string, busy: boolean) => Layout;
   shapeOf: (item: TimelineItem) => string;
+  stabilize: (next: Layout, prev: Map<string, unknown>) => Layout;
 };
 
 function spec(s: string) {
   const parts = s.split(/\s+/).filter(Boolean);
   return { ids: parts.map((p) => p.slice(1)), shape: parts.map((p) => p[0]).join('') };
 }
-const flowOf = (flow: FlowChunk[]) => flow.map((c) => (c.kind === 'line' ? '|' : c.kind === 'steps' ? `[${c.ids.join(' ')}]` : c.kind === 'show' ? `*${c.id}` : c.id)).join(' ');
-const onlyTurn = (s: string, busy = false) => {
+/** A flow in short: texts by id, shown pieces as `*id`, runs of steps as `[ids]`. */
+const flowOf = (flow: FlowChunk[]) => flow.map((c) => (c.kind === 'steps' ? `[${c.ids.join(' ')}]` : c.kind === 'show' ? `*${c.id}` : c.id)).join(' ');
+const turns = (s: string, busy = false) => {
   const { ids, shape } = spec(s);
-  const { groups } = groupTurns(ids, shape, busy);
+  return groupTurns(ids, shape, busy);
+};
+const onlyTurn = (s: string, busy = false) => {
+  const { groups } = turns(s, busy);
   expect(groups).toHaveLength(1);
   expect(groups[0].kind).toBe('turn');
   return groups[0] as TurnGroup;
@@ -54,17 +67,17 @@ describe('phone turns', () => {
   it('answers a settled turn with its lead-in when nothing else was said', () => {
     const s = onlyTurn('U1 l2 w3 T4').segments[0];
     expect(s).toMatchObject({ answer: '2', work: ['3'], steps: 1 });
-    expect(flowOf(s.flow)).toBe('2 | [3]');
+    expect(flowOf(s.flow)).toBe('2 [3]');
     expect(onlyTurn('U1 l2 w3 l4 w5 T6').segments[0]).toMatchObject({ answer: '4', work: ['2', '3', '5'] });
     expect(onlyTurn('U1 l2 w3', true).segments[0]).toMatchObject({ answer: null, work: ['2', '3'] });
     expect(onlyTurn('U1 t2 l3 w4 T5').segments[0]).toMatchObject({ answer: '2', work: ['3', '4'] });
     expect(onlyTurn('U1 l2 w3 F4').segments[0].answer).toBeNull();
   });
 
-  it('keeps the last words the answer when a notice or a task list update follows them', () => {
+  it('keeps the last words in view under the report when a notice or a task list update follows them', () => {
     const s = onlyTurn('U1 t2 w3 l4 n5 T6').segments[0];
-    expect(s.answer).toBe('4');
-    expect(flowOf(s.flow)).toBe('2 | [3] 4 [5]');
+    expect(s).toMatchObject({ answer: '2', tail: ['4'], notes: [] });
+    expect(flowOf(s.flow)).toBe('2 [3] 4 [5]');
     expect(onlyTurn('U1 w2 l3 k4 T5').segments[0]).toMatchObject({ answer: '3', work: ['2', '4'] });
     expect(onlyTurn('U1 w2 l3 h4 n5 T6').segments[0].answer).toBe('3');
     expect(onlyTurn('U1 t2 l3 n4 w5 T6').segments[0]).toMatchObject({ answer: '2', work: ['3', '4', '5'] });
@@ -80,6 +93,7 @@ describe('phone turns', () => {
   it('always shows the reply to a steered message, even when it reads as a lead-in', () => {
     const t = onlyTurn('U1 w2 S3 l4 l5 w6 t7 T8');
     expect(t.segments[1]).toMatchObject({ reply: '4', answer: '7', work: ['5', '6'] });
+    expect(flowOf(t.segments[1].flow)).toBe('4 [5 6] 7');
   });
 
   it('reads the low-confidence openers as reports, through the desktop rules', () => {
@@ -87,6 +101,76 @@ describe('phone turns', () => {
     expect(shapeOf({ ...base, text: 'I should note the key is read from .env.' } as TimelineItem)).toBe('t');
     expect(shapeOf({ ...base, text: 'Looking at the logs, the guard throws before the handler runs.' } as TimelineItem)).toBe('t');
     expect(shapeOf({ ...base, text: 'Looking good, let me run the tests.' } as TimelineItem)).toBe('l');
+  });
+
+  it('reads the bare done-words as nods, through the desktop rules', () => {
+    const base = { id: 'x', ts: 0, type: 'text' as const, streaming: false };
+    for (const text of ['Committed.', 'Pushed.', 'Fixed.', 'All done.', 'Done.']) expect(shapeOf({ ...base, text } as TimelineItem)).toBe('l');
+  });
+});
+
+describe('phone turns as checkpoints (the desktop since f79fd71)', () => {
+  it('reads a turn as runs of steps, each closed by the note after it; the notes fold once it ends', () => {
+    const t = onlyTurn('U1 w2 t3 w4 w5 w6 t7 w8 t9 T10');
+    const s = t.segments[0];
+    expect(flowOf(s.flow)).toBe('[2] 3 [4 5 6] 7 [8] 9');
+    expect(s.flow.filter((c) => c.kind === 'steps').map((c) => (c as { count: number }).count)).toEqual([1, 3, 1]);
+    expect(s).toMatchObject({ answer: '9', notes: ['3', '7'], steps: 5 });
+    // With no work at all there is nothing to fold behind: the texts simply stand.
+    expect(onlyTurn('U1 t2 t3 T4').segments[0]).toMatchObject({ notes: [], answer: '3' });
+  });
+
+  it('only ever grows at its end while it runs: a run, then what closed it', () => {
+    const steps = ['U1', 'U1 t2', 'U1 t2 h3', 'U1 t2 h3 w4', 'U1 t2 h3 w4 t5', 'U1 t2 h3 w4 t5 w6', 'U1 t2 h3 w4 t5 w6 t7'];
+    expect(steps.map((s) => flowOf(onlyTurn(s, true).segments[0].flow))).toEqual(['', '2', '2 [3]', '2 [3 4]', '2 [3 4] 5', '2 [3 4] 5 [6]', '2 [3 4] 5 [6] 7']);
+    expect(onlyTurn('U1 t2 h3 w4 t5 w6 t7 T8').segments[0].notes).toEqual(['2', '5']);
+  });
+
+  it('stands the reply to a steered message right under it, whatever was still running', () => {
+    const t = onlyTurn('U1 w2 S3 w4 t5 w6 t7 t8 T9');
+    expect(t.segments[1]).toMatchObject({ reply: '5', answer: '8', work: ['4', '6'], notes: ['7'] });
+    expect(flowOf(t.segments[1].flow)).toBe('5 [4 6] 7 8');
+    const flows = ['U1 w2 S3', 'U1 w2 S3 w4', 'U1 w2 S3 w4 t5', 'U1 w2 S3 w4 t5 w6'].map((s) => flowOf(onlyTurn(s, true).segments[1].flow));
+    expect(flows).toEqual(['', '[4]', '5 [4]', '5 [4 6]']);
+  });
+
+  it('puts errors in the flow where they happened, and keeps the last words of a failed turn in view', () => {
+    expect(flowOf(onlyTurn('U1 w2 e3').segments[0].flow)).toBe('[2] *3');
+    expect(flowOf(onlyTurn('U1 e2 w3 t4 T5').segments[0].flow)).toBe('*2 [3] 4');
+    const f = onlyTurn('U1 w2 t3 w4 t5 F6').segments[0];
+    expect(f).toMatchObject({ answer: null, last: '5', notes: ['3'] });
+    expect(onlyTurn('U1 n2 T3').segments[0]).toMatchObject({ errors: ['2'], work: [] });
+  });
+
+  it('keeps the report the answer when a nod follows it, with or without steps between', () => {
+    expect(onlyTurn('U1 w2 t3 l4 T5').segments[0]).toMatchObject({ answer: '3', tail: ['4'], notes: [] });
+    expect(onlyTurn('U1 w2 t3 w4 t5 w6 l7 T8').segments[0]).toMatchObject({ answer: '5', tail: ['7'], notes: ['3'] });
+    expect(onlyTurn('U1 w2 p3 l4 T5').segments[0]).toMatchObject({ answer: '3', tail: ['4'] });
+    expect(onlyTurn('U1 w2 S3 t4 w5 l6 T7').segments[1]).toMatchObject({ reply: null, answer: '4', tail: ['6'] });
+    expect(onlyTurn('U1 w2 t3 w4 l5 i6').segments[0]).toMatchObject({ answer: '3', tail: ['5'] });
+    expect(onlyTurn('U1 w2 t3 w4 t5 l6 e7 F8').segments[0]).toMatchObject({ answer: null, last: '5', tail: ['6'], notes: ['3'] });
+    // Running, the nod waits in the work for a step.
+    expect(onlyTurn('U1 w2 t3 w4 l5', true).segments[0]).toMatchObject({ answer: null, tail: [], work: ['2', '4', '5'] });
+  });
+
+  it('opens a turn of its own for work no message opened', () => {
+    const { groups } = turns('U1 t2 T3 N4 t5 T6 h7 t8 w9 w10 h11 w12', true);
+    expect(groups.map((g) => g.kind)).toEqual(['turn', 'turn', 'turn']);
+    const own = groups[2] as TurnGroup;
+    expect(own).toMatchObject({ key: '7', state: 'running', ids: ['7', '8', '9', '10', '11', '12'] });
+    expect(own.segments[0]).toMatchObject({ lead: null, work: ['7', '9', '10', '11', '12'], steps: 3 });
+    expect(turns('n0 U1 t2 T3 n4 e5 w6 t7 T8').groups.map((g) => (g.kind === 'item' ? g.id : `turn:${g.key}`))).toEqual(['0', 'turn:1', '4', '5', 'turn:6']);
+  });
+
+  it('keeps the objects of checkpoints that did not change when a step joins the live one', () => {
+    const kept = new Map<string, unknown>();
+    const a = stabilize(turns('U1 w2 t3 w4', true), kept);
+    const b = stabilize(turns('U1 w2 t3 w4 w5', true), kept);
+    const runs = (l: Layout) => (l.groups[0] as TurnGroup).segments[0].flow.filter((c) => c.kind === 'steps');
+    expect(runs(b)[0]).toBe(runs(a)[0]);
+    expect(runs(b)[1]).not.toBe(runs(a)[1]);
+    // Nothing changed: the same turn.
+    expect(stabilize(turns('U1 w2 t3 w4 w5', true), kept).groups[0]).toBe(b.groups[0]);
   });
 });
 

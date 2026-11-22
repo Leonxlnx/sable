@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { NoticeItem, PhoneItem, ProviderId, TextItem, ThinkingItem, TimelineItem, ToolItem, TurnItem, UntilCheck, UserItem } from '@shared/protocol';
 import { stripWrappers, syntheticOf } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
@@ -16,7 +16,7 @@ import { putDraft } from '@m/lib/put-draft';
 import { readReview, type PhoneReview } from '@m/lib/review';
 import { applyChildren, applyFull, fetchItem, getState, sessionData, setState, useStore, type State } from '@m/lib/store';
 import { claimFlight } from '@m/lib/flight';
-import { LINE, type FlowChunk, type Segment, type TurnGroup } from '@m/lib/turns';
+import type { Segment, StepsChunk, TurnGroup } from '@m/lib/turns';
 import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
 import { FileGlyph, kindName } from '@m/ui/FileGlyph';
 import { PROVIDER_NAME, ProviderMark, Ring, StatusMark, Tiles } from '@m/ui/marks';
@@ -79,17 +79,83 @@ function useSecond(active: boolean): number {
 }
 
 /**
- * One turn, as the desktop reads it: each segment (your message, what the agent said along the
- * way, one line for the work, the answer), and how it ended when that needs saying.
+ * One turn, as the desktop reads it (src/features/timeline/TurnView.tsx), at hand size: a sequence
+ * of checkpoints. While it runs, each closed checkpoint is two lines (its work, folded: "Worked 45s ·
+ * 5 steps", and the note that closed it) and the live line stands under the newest; no step rows.
+ * Once it has ended everything gathers into one line ("Worked 15m 52s · 36 steps", the change) with
+ * what never folds after it, in order: things shown, a steered message with its reply, the answer.
+ * The line opens the checkpoints one level in, each opening to its own steps; a turn with one run
+ * opens straight to its steps.
+ *
+ * The end is one calm motion (transform and opacity only): the pieces that fold fade, then fold at
+ * once, and what stays glides from where it stood to its new place (FLIP), the reader's place kept:
+ * at the newest the answer stays where it is, scrolled up the first thing in view that stays.
  */
 export const TurnView = memo(function TurnView({ sid, turn, newest }: { sid: string; turn: TurnGroup; newest?: boolean }) {
-  const last = turn.segments.length - 1;
   const running = turn.state === 'running';
+  const [open, setOpen] = useState(false);
+  // 'live' laid out as while it ran; 'closing' the same, the pieces that fold fading; 'settled' folded.
+  const [phase, setPhase] = useState<'live' | 'closing' | 'settled'>(running ? 'live' : 'settled');
+  const laidLive = running || phase !== 'settled';
+  const box = useRef<HTMLElement>(null);
+  const snap = useRef<Snap | null>(null);
+  const { pieces, multi, head } = useMemo(() => piecesOf(turn), [turn]);
+
+  // The fade before the gather: its own timer, not tied to the phase it starts (a phase change must not cancel it).
+  const leave = useRef(0);
+  useEffect(() => () => window.clearTimeout(leave.current), []);
+  useLayoutEffect(() => {
+    if (running) {
+      window.clearTimeout(leave.current);
+      if (phase !== 'live') setPhase('live');
+      return;
+    }
+    if (phase !== 'live') return;
+    if (reduced() || !head) return setPhase('settled');
+    setPhase('closing');
+    leave.current = window.setTimeout(() => {
+      snap.current = box.current ? snapshot(box.current) : null;
+      setPhase('settled');
+    }, LEAVE_MS);
+  }, [running, phase, head]);
+
+  useLayoutEffect(() => {
+    const s = snap.current;
+    if (phase !== 'settled' || !s || !box.current) return;
+    snap.current = null;
+    glide(box.current, s);
+  }, [phase]);
+
+  const toggle = useCallback(() => {
+    haptic('select');
+    setOpen((v) => !v);
+  }, []);
+  const shownOpen = !laidLive && open;
   return (
-    <section className="turn" data-live={running || undefined} data-turn={turn.key}>
-      {turn.segments.map((seg, i) => (
-        <SegmentView key={seg.key} sid={sid} seg={seg} turn={turn} index={i} live={running && i === last} />
-      ))}
+    <section ref={box} className="turn" data-live={running || undefined} data-turn={turn.key}>
+      {pieces.map((p) => {
+        const fold = folds(p);
+        // Hidden: not mounted at all (a long turn's folded work costs nothing).
+        if (!laidLive && fold && !shownOpen && !(p.k === 'run' && p.head)) return null;
+        if (laidLive && p.k === 'total') return null;
+        const nest = shownOpen && fold && !(p.k === 'run' && p.head);
+        const leaving = phase === 'closing' && fold && !(p.k === 'run' && p.head);
+        return (
+          <div key={p.key} className="tp" data-fp={p.key} data-k={p.k} data-nest={nest || undefined} data-leaving={leaving || undefined} data-tail={(p.k === 'text' && p.tail) || undefined}>
+            {p.k === 'lead' ? (
+              <UserBubble sid={sid} id={p.id} steered={p.steered} />
+            ) : p.k === 'text' ? (
+              <Answer sid={sid} id={p.id} tone={p.answer ? 'answer' : 'mid'} />
+            ) : p.k === 'show' ? (
+              <Show sid={sid} id={p.id} />
+            ) : p.k === 'total' ? (
+              <WorkHead sid={sid} mode="total" run={null} from={null} until={null} turn={turn} open={open} onToggle={toggle} />
+            ) : (
+              <RunPiece sid={sid} p={p} settled={!laidLive} open={shownOpen} multi={multi} nest={nest} turn={p.head ? turn : undefined} onToggle={toggle} />
+            )}
+          </div>
+        );
+      })}
       <TurnFoot sid={sid} turn={turn} />
       {turn.checks?.map((id) => (
         <CheckBlock key={id} sid={sid} id={id} />
@@ -98,6 +164,133 @@ export const TurnView = memo(function TurnView({ sid, turn, newest }: { sid: str
     </section>
   );
 });
+
+/** How long the pieces that fold take to fade before the turn gathers (ms). */
+const LEAVE_MS = 170;
+
+type RunP = { k: 'run'; key: string; run: StepsChunk | null; from: string | null; until: string | null; head: boolean; live: boolean; seg?: Segment };
+type Piece =
+  | { k: 'lead'; key: string; id: string; steered: boolean; fold: boolean }
+  | { k: 'text'; key: string; id: string; note: boolean; answer: boolean; tail: boolean }
+  | { k: 'show'; key: string; id: string }
+  | { k: 'total'; key: string }
+  | RunP;
+
+/** A piece that folds into the turn's line once the turn has ended (the head run keeps its place: it becomes the line). */
+const folds = (p: Piece) => (p.k === 'lead' ? p.fold : p.k === 'text' ? p.note : p.k === 'run');
+
+/**
+ * The turn's pieces in the order they happened, each with what it is: the messages, the agent's
+ * words (notes fold, the answer, a reply and a nod do not), what is shown, the runs of work (the
+ * first is the head: it becomes the turn's line), and the live line at the end of a running turn.
+ */
+function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boolean } {
+  const segs = turn.segments;
+  const last = segs.length - 1;
+  const running = turn.state === 'running';
+  let headSeg = -1;
+  let runs = 0;
+  for (let i = 0; i <= last; i++) {
+    const s = segs[i];
+    if (headSeg < 0 && (s.work.length > 0 || s.notes.length > 0)) headSeg = i;
+    for (const c of s.flow) if (c.kind === 'steps') runs++;
+  }
+  const out: Piece[] = [];
+  for (let si = 0; si <= last; si++) {
+    const seg = segs[si];
+    const place = headSeg < 0 || si < headSeg ? -1 : si === headSeg ? 0 : 1;
+    const after = segs[si + 1]?.lead ?? turn.end;
+    // A notification taken up mid-turn is part of the work: it folds with it.
+    if (seg.lead) out.push({ k: 'lead', key: seg.lead, id: seg.lead, steered: seg.steered, fold: si > 0 && !seg.steered && place === 1 });
+    const flow = seg.flow;
+    const headAt = place === 0 ? flow.findIndex((c) => c.kind === 'steps' || (c.kind === 'text' && seg.notes.includes(c.id))) : -1;
+    let ord = 0;
+    for (let i = 0; i < flow.length; i++) {
+      const c = flow[i];
+      if (i === headAt && c.kind !== 'steps') out.push({ k: 'total', key: `${seg.key}:total` });
+      if (c.kind === 'show') {
+        out.push({ k: 'show', key: c.id, id: c.id });
+        continue;
+      }
+      if (c.kind === 'text') {
+        out.push({ k: 'text', key: c.id, id: c.id, note: seg.notes.includes(c.id), answer: c.id === seg.answer || c.id === seg.reply, tail: seg.tail.includes(c.id) });
+        continue;
+      }
+      const next = flow[i + 1];
+      const live = running && si === last && i === flow.length - 1;
+      out.push({
+        k: 'run',
+        key: `${seg.key}:w${ord++}`,
+        run: c,
+        from: i === 0 && seg.lead ? seg.lead : c.ids[0],
+        until: (next ? (next.kind === 'steps' ? next.ids[0] : next.id) : after) ?? null,
+        head: i === headAt,
+        live,
+        ...(live ? { seg } : {}),
+      });
+    }
+    // Nothing to do yet, or the agent is saying something: the live line waits at the end for its run.
+    if (running && si === last && (!flow.length || flow[flow.length - 1].kind !== 'steps'))
+      out.push({ k: 'run', key: `${seg.key}:w${ord}`, run: null, from: flow.length ? null : seg.lead, until: null, head: false, live: true, seg });
+  }
+  return { pieces: out, multi: runs > 1, head: headSeg >= 0 };
+}
+
+interface Snap {
+  tops: Map<string, number>;
+  bottom: boolean;
+}
+
+/** Where each piece of the turn stands now, and whether the reader is at the newest. */
+function snapshot(box: HTMLElement): Snap {
+  const tops = new Map<string, number>();
+  for (const el of box.querySelectorAll<HTMLElement>(':scope > [data-fp]')) tops.set(el.dataset.fp!, el.getBoundingClientRect().top);
+  const sc = box.closest<HTMLElement>('.thread');
+  return { tops, bottom: !sc || sc.scrollHeight - sc.scrollTop - sc.clientHeight < 48 };
+}
+
+const GLIDE = { duration: 420, easing: 'cubic-bezier(0.2, 0, 0, 1)' };
+
+/**
+ * The turn has gathered: the reader's place is kept (the newest stays at the bottom, or the first
+ * piece in view that stayed keeps its place), then every piece that stayed glides from where it
+ * stood to where it is (transform only), with what stood above the turn on screen; the line that
+ * is new fades in.
+ */
+function glide(box: HTMLElement, s: Snap) {
+  const sc = box.closest<HTMLElement>('.thread');
+  const els = [...box.querySelectorAll<HTMLElement>(':scope > [data-fp]')];
+  if (sc) {
+    if (s.bottom) sc.scrollTop = sc.scrollHeight;
+    else {
+      const view = sc.getBoundingClientRect().top + 56;
+      const anchor = els.find((el) => {
+        const t = s.tops.get(el.dataset.fp!);
+        return t !== undefined && t >= view;
+      });
+      if (anchor) sc.scrollTop += anchor.getBoundingClientRect().top - s.tops.get(anchor.dataset.fp!)!;
+    }
+  }
+  let first: number | null = null;
+  for (const el of els) {
+    const was = s.tops.get(el.dataset.fp!);
+    if (was === undefined) {
+      el.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 260, delay: 120, easing: 'cubic-bezier(0.2, 0, 0, 1)', fill: 'backwards' });
+      continue;
+    }
+    const dy = was - el.getBoundingClientRect().top;
+    if (first === null) first = dy;
+    if (Math.abs(dy) > 1) el.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], GLIDE);
+  }
+  // What stood above the turn on screen moved as its top did: it glides the same way.
+  if (!sc || !first || Math.abs(first) <= 1) return;
+  const top = sc.getBoundingClientRect().top;
+  let prev = box.previousElementSibling as HTMLElement | null;
+  for (let n = 0; prev && n < 4; n++, prev = prev.previousElementSibling as HTMLElement | null) {
+    if (prev.getBoundingClientRect().bottom < top) break;
+    prev.animate([{ transform: `translateY(${first}px)` }, { transform: 'none' }], GLIDE);
+  }
+}
 
 /** Under a turn: an interruption, or an error the turn ended with that no notice showed. */
 function TurnFoot({ sid, turn }: { sid: string; turn: TurnGroup }) {
@@ -118,43 +311,43 @@ function TurnFoot({ sid, turn }: { sid: string; turn: TurnGroup }) {
   return null;
 }
 
+/** Tells the conversation the reader opened something here: it stops following the newest line, so what opened stays where it is. */
+function hold(el: Element | null) {
+  el?.dispatchEvent(new CustomEvent('sable:hold', { bubbles: true }));
+}
+
 /**
- * A segment as it reads: the message, each thing the agent says in order (reports, the answer and a
- * steered message's reply, all at full strength; only thinking sits back), and one line for the work: live
- * while it runs (what it does now, the time, how many steps), the summary once it settled. A tap
- * on the line opens every run of steps in its place between the texts.
+ * One checkpoint's work: its line and, opened, its steps. The same element from the live line
+ * ("Run the tests · 12s · 2 steps") through the closed checkpoint ("Worked 45s · 5 steps") to its
+ * place in the finished turn's fold; on the turn's first run the line then reads the whole turn.
  */
-const SegmentView = memo(function SegmentView({ sid, seg, turn, index, live }: { sid: string; seg: Segment; turn: TurnGroup; index: number; live: boolean }) {
-  const [open, setOpen] = useState(false);
-  const hasWork = seg.work.length > 0;
-  const toggle = hasWork
-    ? () => {
-        haptic('select');
-        setOpen((v) => !v);
-      }
-    : undefined;
-  const shown = open && hasWork;
-  const at = seg.flow.indexOf(LINE);
-  const piece = (c: FlowChunk) => {
-    if (c.kind === 'line') return null;
-    if (c.kind === 'steps') return <Run key={`s:${c.key}`} sid={sid} ids={c.ids} open={shown} />;
-    if (c.kind === 'show') return <Show key={c.id} sid={sid} id={c.id} />;
-    return <Answer key={c.id} sid={sid} id={c.id} tone={c.id === seg.answer || c.id === seg.reply ? 'answer' : 'mid'} />;
-  };
+const RunPiece = memo(function RunPiece({ sid, p, settled, open, multi, nest, turn, onToggle }: { sid: string; p: RunP; settled: boolean; open: boolean; multi: boolean; nest: boolean; turn?: TurnGroup; onToggle: () => void }) {
+  const [runOpen, setRunOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const toggleRun = useCallback(() => {
+    haptic('select');
+    hold(ref.current);
+    setRunOpen((v) => !v);
+  }, []);
+  const toggleTurn = useCallback(() => {
+    hold(ref.current);
+    onToggle();
+  }, [onToggle]);
+  const total = p.head && settled;
+  // A turn with a single run opens straight to its steps: no line of its own inside the fold.
+  const bare = settled && !multi;
+  const stepsOpen = settled ? open && (bare || runOpen) : runOpen;
+  const mode: LineMode = p.live && !settled ? 'live' : total ? 'total' : 'run';
   return (
-    <>
-      {seg.lead && <UserBubble sid={sid} id={seg.lead} steered={seg.steered} />}
-      {(at < 0 ? seg.flow : seg.flow.slice(0, at)).map(piece)}
-      {at >= 0 && (
-        <div className="seg-work">
-          <WorkHead sid={sid} seg={seg} turn={turn} index={index} live={live} open={shown} onToggle={toggle} />
-          {seg.flow.slice(at + 1).map(piece)}
+    <div className="seg-work" ref={ref}>
+      {!(bare && nest) && <WorkHead sid={sid} mode={mode} run={p.run} from={p.from} until={p.until} seg={p.seg} turn={turn} open={total ? open : stepsOpen} onToggle={total ? toggleTurn : p.run ? toggleRun : undefined} />}
+      {total && p.run && open && multi && (
+        <div className="tp-in" data-nest>
+          <WorkHead sid={sid} mode="run" run={p.run} from={p.from} until={p.until} open={stepsOpen} onToggle={toggleRun} />
         </div>
       )}
-      {seg.errors.map((id) => (
-        <Notice key={id} sid={sid} id={id} />
-      ))}
-    </>
+      {p.run && <Run sid={sid} ids={p.run.ids} open={stepsOpen} />}
+    </div>
   );
 });
 
@@ -186,7 +379,7 @@ const StepRow = memo(function StepRow({ sid, id }: { sid: string; id: string }) 
   return <Step sid={sid} id={id} />;
 });
 
-/** In view in its place: command output, a widget, a plan. */
+/** In view in its place: command output, a widget, a plan, files, an error. */
 function Show({ sid, id }: { sid: string; id: string }) {
   const it = useItem<TimelineItem>(sid, id);
   if (!it) return null;
@@ -228,69 +421,110 @@ function PlanBlock({ sid, it }: { sid: string; it: ToolItem }) {
   );
 }
 
-/** The work line in its place: live while the segment runs, the summary once it settled. */
-function WorkHead({ sid, seg, turn, index, live, open, onToggle }: { sid: string; seg: Segment; turn: TurnGroup; index: number; live: boolean; open: boolean; onToggle?: () => void }) {
-  const hasWork = seg.work.length > 0;
-  const was = useRef(live);
+/** What a work line reads as: the running checkpoint, a closed one, or the whole finished turn. */
+type LineMode = 'live' | 'run' | 'total';
+
+/** A work line in its place: live while its checkpoint runs, its summary once closed, the turn's once the turn has ended. */
+function WorkHead({ sid, mode, run, from, until, seg, turn, open, onToggle }: { sid: string; mode: LineMode; run: StepsChunk | null; from: string | null; until: string | null; seg?: Segment; turn?: TurnGroup; open: boolean; onToggle?: () => void }) {
+  // A checkpoint closing, and the turn ending: the line hands over to its summary, once.
+  const was = useRef(mode);
   const [landed, setLanded] = useState(false);
   useLayoutEffect(() => {
-    const ended = was.current && !live;
-    was.current = live;
-    if (!ended || !hasWork || reduced()) return;
+    const before = was.current;
+    was.current = mode;
+    if (before === mode || mode === 'live' || reduced()) return;
     setLanded(true);
     const t = window.setTimeout(() => setLanded(false), 700);
     return () => window.clearTimeout(t);
-  }, [live, hasWork]);
-  if (!live && !hasWork) return null;
-  return live ? <LiveLine sid={sid} seg={seg} open={open} onToggle={onToggle} /> : <WorkLine sid={sid} seg={seg} turn={turn} index={index} open={open} onToggle={onToggle} landed={landed} />;
+  }, [mode]);
+  if (mode === 'live' && seg) return <LiveLine sid={sid} seg={seg} run={run} from={from} open={open} onToggle={run ? onToggle : undefined} />;
+  if (mode === 'total' && turn) return <TotalLine sid={sid} turn={turn} open={open} onToggle={onToggle} landed={landed} />;
+  if (run) return <RunLine sid={sid} run={run} from={from} until={until} open={open} onToggle={onToggle} landed={landed} />;
+  return null;
 }
 
-/** Start to end of a settled segment (ms), or null. */
-function segmentSpan(items: Record<string, TimelineItem>, turn: TurnGroup, index: number): number | null {
-  const seg = turn.segments[index];
-  const first = seg.flow.find((c): c is Exclude<FlowChunk, { kind: 'line' }> => c.kind !== 'line');
-  const firstId = !first ? '' : first.kind === 'steps' ? first.ids[0] : first.id;
-  const start = (seg.lead ? items[seg.lead]?.ts : undefined) ?? items[firstId]?.ts;
+/** How long one checkpoint's work took (ms): from what opened it to what closed it, or to the last thing in it. */
+function runSpan(items: Record<string, TimelineItem>, run: StepsChunk, from: string, until: string | null): number | null {
+  const start = items[from]?.ts ?? items[run.ids[0]]?.ts;
   if (!start) return null;
-  const nextLead = turn.segments[index + 1]?.lead;
-  if (nextLead && items[nextLead]) return items[nextLead].ts - start;
-  const end = turn.end ? items[turn.end] : undefined;
-  if (end?.type === 'turn') {
-    const wall = end.ts - start;
-    if (turn.segments.length === 1 && end.durationMs > wall) return end.durationMs;
-    return wall;
-  }
+  const closer = until ? items[until] : undefined;
+  if (closer) return closer.ts - start;
   let last = start;
-  for (const id of seg.work) {
+  for (const id of run.ids) {
     const it = items[id];
     if (it) last = Math.max(last, it.ts, ('endedAt' in it && it.endedAt) || 0);
   }
   return last - start;
 }
 
-/** "Worked 12s · 20 steps", and the change: the folded work of a settled segment. The change opens what it changed. */
-function WorkLine({ sid, seg, turn, index, open, onToggle, landed }: { sid: string; seg: Segment; turn: TurnGroup; index: number; open: boolean; onToggle?: () => void; landed: boolean }) {
-  const { span, add, del, thought, edits, files } = useMemo(() => {
+/** How long a finished turn took (ms), as the live lines counted it; the agent's own figure where the items' times say less. */
+function turnSpan(items: Record<string, TimelineItem>, turn: TurnGroup): number | null {
+  const lead = turn.segments[0]?.lead;
+  const start = (lead ? items[lead]?.ts : undefined) ?? items[turn.ids[0]]?.ts;
+  if (!start) return null;
+  const end = turn.end ? items[turn.end] : undefined;
+  if (end?.type === 'turn') {
+    const wall = end.ts - start;
+    return end.durationMs > wall ? end.durationMs : wall;
+  }
+  let last = start;
+  for (const id of turn.ids) {
+    const it = items[id];
+    if (it) last = Math.max(last, it.ts, ('endedAt' in it && it.endedAt) || 0);
+  }
+  return last - start;
+}
+
+const workedLabel = (thought: boolean, took: string) => (thought ? (took ? `Thought for ${took}` : 'Thought') : took ? `Worked ${took}` : 'Worked');
+
+/** "Worked 45s · 5 steps": one closed checkpoint, opening to its steps. */
+function RunLine({ sid, run, from, until, open, onToggle, landed }: { sid: string; run: StepsChunk; from: string | null; until: string | null; open: boolean; onToggle?: () => void; landed: boolean }) {
+  const { span, thought } = useMemo(() => {
     const items = sessionData(getState(), sid).items;
-    let a = 0;
-    let d = 0;
-    const paths = new Set<string>();
-    // The steps that change files (and sub-agents, whose own steps may): the desktop gathers this segment's changes from them.
-    const steps: string[] = [];
-    for (const id of seg.work) {
-      const it = items[id];
-      if (it?.type !== 'tool') continue;
-      for (const f of it.result?.diff ?? []) (a += f.additions), (d += f.deletions), paths.add(f.path);
-      if (it.kind === 'edit' || it.kind === 'write' || it.kind === 'agent') steps.push(id);
-    }
-    return { span: segmentSpan(items, turn, index), add: a, del: d, thought: !seg.steps && seg.work.some((id) => items[id]?.type === 'thinking'), edits: steps, files: paths.size };
-  }, [sid, turn, index, seg]);
+    return { span: runSpan(items, run, from ?? run.ids[0], until), thought: !run.count && run.ids.some((id) => items[id]?.type === 'thinking') };
+  }, [sid, run, from, until]);
   const took = span && span >= 1000 ? shortDuration(span) : '';
   return (
     <div className="work" data-landed={landed || undefined} data-open={open || undefined}>
       <button type="button" className="work-line" aria-expanded={open} onClick={onToggle}>
-        <span className="work-title">{thought ? (took ? `Thought for ${took}` : 'Thought') : took ? `Worked ${took}` : 'Worked'}</span>
-        {seg.steps > 0 && <span className="work-meta num">{plural(seg.steps, 'step')}</span>}
+        <span className="work-title">{workedLabel(thought, took)}</span>
+        {run.count > 0 && <span className="work-meta num">{plural(run.count, 'step')}</span>}
+        <Icon name="caretDown" size={12} weight="bold" className="work-caret" />
+      </button>
+    </div>
+  );
+}
+
+/** "Worked 15m 52s · 36 steps", and the change: the whole of a finished turn behind one line. The change opens what it changed. */
+function TotalLine({ sid, turn, open, onToggle, landed }: { sid: string; turn: TurnGroup; open: boolean; onToggle?: () => void; landed: boolean }) {
+  const { span, add, del, thought, edits, files, steps } = useMemo(() => {
+    const items = sessionData(getState(), sid).items;
+    let a = 0;
+    let d = 0;
+    let n = 0;
+    const paths = new Set<string>();
+    // The steps that change files (and sub-agents, whose own steps may): the desktop gathers the turn's changes from them.
+    const changed: string[] = [];
+    let thinking = false;
+    for (const s of turn.segments) {
+      n += s.steps;
+      for (const id of s.work) {
+        const it = items[id];
+        if (it?.type === 'thinking') thinking = true;
+        if (it?.type !== 'tool') continue;
+        for (const f of it.result?.diff ?? []) (a += f.additions), (d += f.deletions), paths.add(f.path);
+        if (it.kind === 'edit' || it.kind === 'write' || it.kind === 'agent') changed.push(id);
+      }
+    }
+    return { span: turnSpan(items, turn), add: a, del: d, thought: !n && thinking, edits: changed, files: paths.size, steps: n };
+  }, [sid, turn]);
+  const took = span && span >= 1000 ? shortDuration(span) : '';
+  const lead = turn.segments[0]?.lead;
+  return (
+    <div className="work" data-total data-landed={landed || undefined} data-open={open || undefined}>
+      <button type="button" className="work-line" aria-expanded={open} onClick={onToggle}>
+        <span className="work-title">{workedLabel(thought, took)}</span>
+        {steps > 0 && <span className="work-meta num">{plural(steps, 'step')}</span>}
         <Icon name="caretDown" size={12} weight="bold" className="work-caret" />
       </button>
       {(add > 0 || del > 0) && (
@@ -300,7 +534,7 @@ function WorkLine({ sid, seg, turn, index, open, onToggle, landed }: { sid: stri
           aria-label={`Changes in this turn: ${plural(files, 'file')}, ${add} added, ${del} removed`}
           onClick={() => {
             haptic('tap');
-            nav.push({ name: 'changes', id: sid, items: edits, ...(seg.lead ? { lead: seg.lead } : {}) });
+            nav.push({ name: 'changes', id: sid, items: edits, ...(lead ? { lead } : {}) });
           }}
         >
           <span className="diffstat num">
@@ -315,16 +549,20 @@ function WorkLine({ sid, seg, turn, index, open, onToggle, landed }: { sid: stri
 
 const TITLE_HOLD_MS = 600;
 const RECENT_MS = 2000;
+/** How long the live line stays back after the agent stopped writing (ms): a turn that ends right after its answer never shows it under the words. */
+const QUIET_LINGER_MS = 450;
+const NO_IDS: string[] = [];
 
-/** The newest lead-in since the agent last said something in view, while the steps it announced run; else ''. */
-function currentLead(items: Record<string, TimelineItem>, seg: Segment): string {
+/** The newest lead-in since the last piece in view, while the steps it announced run; else ''. */
+function currentLead(items: Record<string, TimelineItem>, seg: Segment, work: string[]): string {
   const id = seg.narr[seg.narr.length - 1];
   const it = id ? items[id] : undefined;
   if (it?.type !== 'text' || it.streaming) return '';
-  const at = seg.work.lastIndexOf(id);
+  const at = work.lastIndexOf(id);
+  if (at < 0) return '';
   let ended = Infinity;
-  for (let i = at + 1; i < seg.work.length; i++) {
-    const step = items[seg.work[i]];
+  for (let i = at + 1; i < work.length; i++) {
+    const step = items[work[i]];
     if (!step) continue;
     if (step.type !== 'tool' || step.ts > ended) return '';
     if (step.endedAt) ended = Math.min(ended, step.endedAt);
@@ -332,8 +570,13 @@ function currentLead(items: Record<string, TimelineItem>, seg: Segment): string 
   return leadTitle(it.text);
 }
 
-/** What the running segment does right now, as `${waiting}|${title}` (a string, so the line renders only when it changes). */
-function liveSelector(sid: string, seg: Segment, held: { title: string }) {
+/**
+ * What the running checkpoint does right now, as `${waiting}|${quiet}|${title}` (a string, so the line
+ * renders only when it changes). Quiet: the agent is writing something in view and no step runs, so
+ * the words are the signal and the line steps back until they end.
+ */
+function liveSelector(sid: string, seg: Segment, run: StepsChunk | null, held: { title: string }) {
+  const work = run?.ids ?? NO_IDS;
   const pieces: string[] = [];
   for (let i = seg.flow.length - 1; i >= 0 && pieces.length < 4; i--) {
     const c = seg.flow[i];
@@ -342,16 +585,18 @@ function liveSelector(sid: string, seg: Segment, held: { title: string }) {
   return (s: State): string => {
     const d = s.data[sid];
     const meta = s.sessions[sid];
-    if (!d || !meta) return '0|Working';
+    if (!d || !meta) return '0|0|Working';
     let waiting = meta.status === 'awaiting' || d.permissions.length > 0 || d.questions.length > 0;
     let title = '';
     let agents = 0;
     let recent = '';
     let writing = false;
-    for (let i = seg.work.length - 1, n = 0; i >= 0 && n < 60; i--, n++) {
-      const it = d.items[seg.work[i]];
+    let stepping = false;
+    for (let i = work.length - 1, n = 0; i >= 0 && n < 60; i--, n++) {
+      const it = d.items[work[i]];
       if (!it) continue;
       if (it.type === 'tool' && (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting')) {
+        stepping = true;
         if (it.status === 'awaiting') waiting = true;
         if (it.kind === 'agent') agents++;
         if (!title) title = it.title;
@@ -361,44 +606,58 @@ function liveSelector(sid: string, seg: Segment, held: { title: string }) {
     }
     if (agents > 1) title = `Running ${agents} sub-agents`;
     else if (writing && held.title) title = held.title;
-    else title = currentLead(d.items, seg) || title;
+    else title = currentLead(d.items, seg, work) || title;
+    let speaking = false;
     for (const id of pieces) {
-      if (title) break;
       const it = d.items[id];
-      if (it?.type === 'tool' && (it.status === 'pending' || it.status === 'running')) title = it.title;
-      else if (it?.type === 'text' && it.streaming) title = 'Writing';
+      if (it?.type === 'text' && it.streaming) speaking = true;
+      else if (!title && it?.type === 'tool' && (it.status === 'pending' || it.status === 'running')) title = it.title;
     }
     if (!title) title = recent || (meta.status === 'starting' ? 'Starting' : meta.activity || 'Working');
     held.title = title;
-    return `${waiting ? 1 : 0}|${title}`;
+    return `${waiting ? 1 : 0}|${speaking && !waiting && !stepping ? 1 : 0}|${title}`;
   };
 }
 
+/** True while `on`, and for `ms` after it turns off. */
+function useLinger(on: boolean, ms: number): boolean {
+  const [held, setHeld] = useState(on);
+  useEffect(() => {
+    if (on) return setHeld(true);
+    const t = window.setTimeout(() => setHeld(false), ms);
+    return () => window.clearTimeout(t);
+  }, [on, ms]);
+  return on || held;
+}
+
 /**
- * The running segment's one line: the working tiles, what it does now (the agent's own words while
- * the steps it announced run), the time so far and how many steps. It stays in view under the
- * header while what the agent says grows past the top. Waiting on you, it stills in amber.
+ * The running checkpoint's one line: the working tiles, what it does now (the agent's own words
+ * while the steps it announced run), the time since the checkpoint began and how many steps. Plain
+ * dim words, no pill, no shimmer. A tap opens its steps; waiting on you it stills in amber; quiet
+ * while the agent writes.
  */
-function LiveLine({ sid, seg, open, onToggle }: { sid: string; seg: Segment; open: boolean; onToggle?: () => void }) {
+function LiveLine({ sid, seg, run, from, open, onToggle }: { sid: string; seg: Segment; run: StepsChunk | null; from: string | null; open: boolean; onToggle?: () => void }) {
   const [last] = useState(() => ({ title: '' }));
-  const info = useStore(useMemo(() => liveSelector(sid, seg, last), [sid, seg, last]));
-  const lead = useItem<TimelineItem>(sid, seg.lead ?? seg.work[0]);
+  const info = useStore(useMemo(() => liveSelector(sid, seg, run, last), [sid, seg, run, last]));
+  const lead = useItem<TimelineItem>(sid, from);
   const now = useSecond(true);
-  const cut = info.indexOf('|');
-  const waiting = info.slice(0, cut) === '1';
-  const title = useHeld(info.slice(cut + 1), TITLE_HOLD_MS);
+  const [w, q, ...rest] = info.split('|');
+  const waiting = w === '1';
+  const quiet = useLinger(q === '1', QUIET_LINGER_MS);
+  const title = useHeld(rest.join('|'), TITLE_HOLD_MS);
   const elapsed = lead ? now - lead.ts : 0;
+  const steps = run?.count ?? 0;
   const tiles = useMemo(() => <Tiles size={13} />, []);
   return (
-    <div className="work" data-live data-waiting={waiting || undefined} data-open={open || undefined} role="status" aria-live="off">
-      <button type="button" className="work-line" aria-expanded={onToggle ? open : undefined} onClick={onToggle} disabled={!onToggle}>
+    <div className="work" data-live data-waiting={waiting || undefined} data-quiet={(quiet && !waiting) || undefined} data-open={open || undefined} role="status" aria-live="off">
+      <button type="button" className="work-line" aria-expanded={onToggle ? open : undefined} onClick={onToggle} disabled={!onToggle || quiet}>
         <span className="work-ind">{waiting ? <StatusMark tone="awaiting" size={11} /> : tiles}</span>
         {/* No shimmer: it paints on every frame of the turn; the tiles beside it say it works. */}
         <span key={waiting ? '\u0000' : title} className="work-title">
           {waiting ? 'Waiting for you' : title}
         </span>
         {elapsed >= 1000 && <span className="work-meta num">{shortDuration(elapsed)}</span>}
-        {seg.steps > 0 && <span className="work-meta num">{plural(seg.steps, 'step')}</span>}
+        {steps > 0 && <span className="work-meta num">{plural(steps, 'step')}</span>}
         {onToggle && <Icon name="caretDown" size={12} weight="bold" className="work-caret" />}
       </button>
     </div>
