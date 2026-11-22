@@ -1536,18 +1536,24 @@ textarea.field.ch-commit-field {
 
 /* ───────────── context ───────────── */
 
-/* Cards sit on the rows' 8 px inset; section headings align their text with the bar's. */
+/* One left edge: the bar's text, the section headings and the cards under them (a heading stands on
+   its card's edge, as in Settings). One inset inside every card: 14 px and the hairline. */
 .cx-stack {
   gap: 20px;
-  padding: 0 8px 16px;
+  padding: 0 16px 16px;
 }
 
 .cx-stack .rail-h {
-  margin: 0 8px 8px;
+  margin: 0 0 8px;
 }
 
 .cx-card {
-  padding: 16px;
+  padding: 16px 14px;
+}
+
+/* A heading's buttons end where the bar's button ends: one column down the panel. */
+.cx-stack .ul-rail-actions {
+  margin-right: -8px;
 }
 
 .cx-figure {
@@ -1557,8 +1563,11 @@ textarea.field.ch-commit-field {
   gap: 18px;
 }
 
+/* The drawing's own 6 px of air goes out of the card's inset: the ring's outer edge stands on the
+   column of the words under it. */
 .cx-ring {
   flex-shrink: 0;
+  margin-left: -6px;
 }
 
 .cx-arc {
@@ -1700,7 +1709,7 @@ textarea.field.ch-commit-field {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 11px 12px 10px;
+  padding: 11px 14px 10px;
   border-radius: var(--r-md);
   min-width: 0;
 }
@@ -1735,6 +1744,7 @@ textarea.field.ch-commit-field {
   .cx-ring {
     width: 100px;
     height: 100px;
+    margin-left: -5px;
   }
   .cx-pct {
     font-size: 36px;

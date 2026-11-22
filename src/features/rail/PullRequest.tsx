@@ -103,37 +103,37 @@ export function PullRow({
             <span className="pr-num num">#{pull.number}</span>
             <span className="pr-title-slot">
               <span className="pr-title">{pull.title}</span>
-            </span>
-            {/* Written last to first: where the rail is narrow the words shed whole, the state first,
-                then the review; the checks stay (pull-request.css). Read as: state, review, checks. */}
-            <span className="pr-words">
-              {checks && (
-                <span className="pr-word">
-                  {checks.kind === 'failed' ? (
-                    <>
-                      <span className="pr-failed-n num">{checks.failed}</span> {checks.rest}
-                    </>
-                  ) : (
-                    <>
-                      {checks.kind === 'running' && <Tiles size={10} className="pr-tiles" />}
-                      {checks.text}
-                    </>
-                  )}
-                </span>
-              )}
-              {review && (
-                <span className="pr-word">
-                  {REVIEW_WORD[review]}
-                  {checks && <Dot />}
-                </span>
-              )}
-              {/* "Open" is not said beside a review decision, which says it: the title gets the room. */}
-              {!(pull.state === 'open' && review) && (
-                <span className="pr-word">
-                  {STATE_WORD[pull.state]}
-                  {(review || checks) && <Dot />}
-                </span>
-              )}
+              {/* Written last to first: where the rail is narrow the words shed whole, the state first,
+                  then the review; the checks stay (pull-request.css). Read as: state, review, checks. */}
+              <span className="pr-words">
+                {checks && (
+                  <span className="pr-word">
+                    {checks.kind === 'failed' ? (
+                      <>
+                        <span className="pr-failed-n num">{checks.failed}</span> {checks.rest}
+                      </>
+                    ) : (
+                      <>
+                        {checks.kind === 'running' && <Tiles size={10} className="pr-tiles" />}
+                        {checks.text}
+                      </>
+                    )}
+                  </span>
+                )}
+                {review && (
+                  <span className="pr-word">
+                    {REVIEW_WORD[review]}
+                    {checks && <Dot />}
+                  </span>
+                )}
+                {/* "Open" is not said beside a review decision, which says it: the title gets the room. */}
+                {!(pull.state === 'open' && review) && (
+                  <span className="pr-word">
+                    {STATE_WORD[pull.state]}
+                    {(review || checks) && <Dot />}
+                  </span>
+                )}
+              </span>
             </span>
           </span>
           <Icon name="external" size={11} className="pr-out rail-row-deco" />

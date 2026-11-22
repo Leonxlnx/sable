@@ -147,15 +147,22 @@
 
 /* The title takes what the number and the words leave, cut with an ellipsis. Left with less than
    48 px it is not shown at all (a few letters of a title say nothing): the slot is one line of a
-   wrapping row, and a title that does not fit beside the slot's empty first item wraps out of
-   sight. The number names the pull request, the words are the news; the words shorten last. */
+   wrapping row that holds the title and the words, filled from the right with the words first
+   (`order`), so a title that does not fit beside them wraps out of sight. With the title in, it
+   takes all the room and the words stand at the row's end; with it out, the words follow the
+   number (the line packs to its far end, the left), never a hole between them. The number names
+   the pull request, the words are the news; the words shorten last.
+   21 px: the words are a size smaller on the title's baseline, so their line stands 1 px lower;
+   the row's text keeps the height and the place it had when the words stood beside the slot. */
 .pr-title-slot {
   display: flex;
+  flex-direction: row-reverse;
   flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: baseline;
   flex: 1 1 0;
   min-width: 0;
-  height: 20px;
+  height: 21px;
   overflow: hidden;
 }
 
@@ -164,9 +171,12 @@
   content: '\200b';
 }
 
+/* 12 px to the words, part of the title: they go out together. */
 .pr-title {
+  order: 2;
   flex: 1 1 48px;
   min-width: 0;
+  margin-right: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -174,16 +184,20 @@
 /* The words stand at the row's end and never break in the middle while they can shed whole: one
    line of a wrapping row filled from the right, the checks first, then the review, then the state.
    What does not fit wraps out of sight, so a narrow rail drops "Open", then the review, and keeps
-   the checks; only the checks alone, with no room left, end in an ellipsis. */
+   the checks; only the checks alone, with no room left, end in an ellipsis.
+   Never wider than the slot, or they would wrap out of it whole; the words that stay after some
+   were shed follow the number too (their line packs to the left). */
 .pr-words {
   display: flex;
   flex-direction: row-reverse;
   flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: baseline;
+  order: 1;
   flex: 0 1 auto;
   min-width: 0;
+  max-width: 100%;
   height: 20px;
-  margin-left: 6px;
   overflow: hidden;
   font-size: var(--t-small);
   color: var(--text-2);
