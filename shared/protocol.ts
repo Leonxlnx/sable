@@ -2585,7 +2585,8 @@ export interface RpcMethods {
    * Your build, each a click of the person's (a phone or an agent never gets these): `setup` clones the
    * public repository at the running version and installs; `build` builds the workspace and, with `use`,
    * switches to it; `use` switches a finished build on or off; `bring` brings the changes to the running
-   * version (rebase, install, build, switch). Progress arrives as `custom.updated`.
+   * version (rebase, install, build, switch). Progress arrives as `custom.updated`. Not in this version:
+   * each answers that it is not available (`BUILD_SHIPS` in `server/services/custom.ts`).
    */
   'custom.setup': { params: Record<string, never>; result: CustomState };
   'custom.build': { params: { use?: boolean }; result: CustomState };

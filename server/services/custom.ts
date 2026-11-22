@@ -18,10 +18,46 @@ import { remoteRef } from './css-scan';
  * (`src/boot.ts`); the folder is watched, and every change of the file is pushed as `custom.updated`
  * with a new `rev`, so the page swaps the sheet in place. Nothing to build, and an update changes
  * nothing about it. Off with `AppSettings.customStyles: false` (or "Use Sable's own look"), and for one
- * run with `--original` (the shell passes `ignore`). A sheet that asks for anything from the internet
- * is not applied at all (`remoteRef`).
+ * run with `--original` (the shell passes `ignore`). A sheet that asks for anything from the internet,
+ * or that cannot be read safely, is not applied at all (`remoteRef`, a CSS tokenizer in `css-scan.ts`).
+ * The whole `/custom/` namespace answers the app's own origin only; the desktop's pages cannot be framed
+ * (`frame-ancestors 'none'`, `electron/csp.ts`).
  *
- * Your build (depth B): `<data>/custom/src`, a clone of the public repository at the running version's
+ * The Customize chat runs only with an agent that gets its brief (`customAgent`: Claude Code or Codex;
+ * the Demo agent when named, for development). A phone cannot reach the sheet through a chat
+ * (`phoneRefusal`): no chat or folder of a phone's in the data folder, and the Customize chat (or any
+ * chat in `<data>/custom`) is only read and stopped from a phone; `custom.*` is not on its allowlist.
+ *
+ * Any local process that can reach the bridge (review wave 8, #1: out of scope for now) can call these
+ * methods, but none gives it more than the bridge already does: `custom.open` starts a chat in the
+ * person's default mode, which `session.create` can do in a mode that never asks; `custom.original` turns a
+ * setting off, as `app.setSettings` does; the build's methods answer `BUILD_OFF`.
+ *
+ * NOT IN THIS VERSION, your build (`BUILD_SHIPS` is false): nothing offers it (no row in Settings, no
+ * strip above the composer), its methods answer `BUILD_OFF`, the served root is always the app's own
+ * and the brief never mentions it. Its code is kept and tested with `build: true`. Before it is
+ * switched on, clear this list (Codex review wave 8):
+ *   - #2  Approval covers only `index.html`: a changed asset at an existing path runs after approval,
+ *         and the served folder is checked lexically (a link or junction in `dist` escapes it). Publish
+ *         an immutable snapshot into a folder of the bridge's own, refuse links and reparse points
+ *         while copying, and serve only the files in the approved manifest.
+ *   - #8  `vite build` loads the checkout's own config and plugins, which the agent can edit, as the
+ *         desktop user with Sable's environment: build with a trusted config and toolchain, a narrowed
+ *         environment and file system, and publish only its validated output.
+ *   - #9  An old interface can talk to a newer bridge: verify the source base before activation, bind
+ *         a bridge connection to the active build and protocol generation, and keep a custom build's
+ *         storage and service workers away from the recovery interface (`--original`).
+ *   - #15 The start deadline is one absolute timer per bridge (no longer moved on by reloads, never
+ *         started by HEAD, `--original` honoured by a second start): tie a deadline and a readiness
+ *         token to the main window's own navigation, so another tab cannot acknowledge it.
+ *   - #1  The build's methods (`custom.setup`, `custom.build`, `custom.use`, `custom.bring`) change
+ *         what every window runs: require a capability bound to the trusted main window for them, and
+ *         the canonical origin (no loopback aliases) at the HTTP and WebSocket entry points.
+ *   - Run the whole path (set up, build, switch, fall back, bring) in a packaged app.
+ * Done already: #14 (setup never deletes a folder Sable did not make, clones beside it and is set up
+ * only once installed) and #29 (the static server opens a file before its headers).
+ *
+ * Your build (depth B), as designed: `<data>/custom/src`, a clone of the public repository at the running version's
  * tag on a branch `mine`; its `vite build` output is served instead of the app's own `dist` while the
  * person has switched it on, it was built for the running version, and its `index.html` is the very one
  * they switched on (an agent that rebuilds cannot swap what is served without their click). A page
