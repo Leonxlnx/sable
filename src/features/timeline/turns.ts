@@ -1,4 +1,5 @@
 import type { TimelineItem } from '@shared/protocol';
+import { noticeLevel } from '@shared/notice';
 import { isNobodysWords, syntheticOf } from '@shared/synthetic';
 import { changedSince, type ItemsRevision } from '@/state/revision';
 import { isLeadIn } from './lead-in';
@@ -186,7 +187,8 @@ export function shapeOf(item: TimelineItem | undefined): string {
       // open (a rewind to a steered message keeps a turn with no end; its result must not fold into it).
       if (item.until || item.agentSwitch || item.variant === 'rewind') return 'Z';
       if (item.variant === 'interrupted') return 'i';
-      if (item.variant === 'error') return 'e';
+      // A card either way; only a real error is a failure of its turn ('a': a warning, or words that only inform).
+      if (item.variant === 'error') return noticeLevel(item) === 'error' ? 'e' : 'a';
       if (item.variant === 'command') return 'c';
       return 'n';
     case 'turn':
@@ -334,7 +336,7 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
       }
       // While the segment runs, a text the agent has gone on from is a report along the way: it is
       // the answer only while nothing has come after it.
-      if (seg.chars[i] !== '.' && seg.chars[i] !== 'i' && seg.chars[i] !== 'e') break;
+      if (seg.chars[i] !== '.' && seg.chars[i] !== 'i' && seg.chars[i] !== 'e' && seg.chars[i] !== 'a') break;
     }
   } else {
     // Settled, the answer is the last thing said that is not a lead-in or a nod: a report stays the
@@ -365,7 +367,7 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
   const keptAt = answerAt >= 0 ? answerAt : lastAt;
   const tail = !live && keptAt >= 0 ? seg.ids.filter((_, i) => i > keptAt && seg.chars[i] === 't') : [];
   // Nothing but notices (a /compact, a model change on its own): they are the turn, so they show.
-  const lone = !seg.chars.some((c) => c !== 'n' && c !== '.' && c !== 'i' && c !== 'e');
+  const lone = !seg.chars.some((c) => c !== 'n' && c !== '.' && c !== 'i' && c !== 'e' && c !== 'a');
   let replyAt = -1;
   if (seg.steered) {
     const first = seg.chars.indexOf('t');
@@ -399,7 +401,7 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
     if (ch === '.' || ch === 'i') continue;
     // An error, or a notice that is all the segment holds: shown where it happened. Only an error
     // counts as the failure shown (`errors`): a model change in view says nothing of what went wrong.
-    if (ch === 'e' || (lone && ch === 'n')) {
+    if (ch === 'e' || ch === 'a' || (lone && ch === 'n')) {
       close();
       narr = [];
       if (ch === 'e') errors.push(id);

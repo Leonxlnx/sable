@@ -2611,7 +2611,9 @@ class ClaudeSession implements ProviderSession {
         if (m.content) rt.notice('command', 'Command output', String(m.content));
         break;
       case 'informational':
-        if (m.content && m.level !== 'suggestion') rt.notice(m.level === 'warning' ? 'error' : 'info', String(m.content));
+        // A warning stands as a card (variant `error`, for every reader) and says its own level: it is no failure.
+        if (m.content && m.level === 'warning') rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: String(m.content), level: 'warn' });
+        else if (m.content && m.level !== 'suggestion') rt.notice('info', String(m.content));
         break;
       case 'permission_denied': {
         const item = rt.get<ToolItem>(m.tool_use_id);

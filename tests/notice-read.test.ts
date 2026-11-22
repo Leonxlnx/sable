@@ -27,6 +27,10 @@ describe('noticeLevel', () => {
     expect(noticeLevel({ variant: 'info', text: 'x', level: 'error' })).toBe('error');
     expect(noticeLevel({ variant: 'error', text: 'x', level: 'loud' })).toBe('error');
   });
+  it('a warning whose words only inform still informs: the agent says "warning", nothing is to do', () => {
+    expect(noticeLevel({ variant: 'error', text: MOVED, level: 'warn' })).toBe('info');
+    expect(noticeLevel({ variant: 'error', text: MOVED, level: 'error' })).toBe('error');
+  });
 });
 
 describe('standsAsCard', () => {

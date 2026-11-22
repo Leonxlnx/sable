@@ -224,6 +224,16 @@ describe('the Markdown builder', () => {
     expect(md).toContain('- Changed `src/x.ts`: +1 −1');
     expect(md).toContain('> Error: Rate limited');
     expect(md).toContain('> Switched to Codex\n\n## You\n\nGo on\n\n## Codex\n\nOn it.');
+    // A notice that stood as a card is named by its level.
+    const leveled = chatMarkdown(META, [
+      at({ type: 'user', text: 'Go' }),
+      at({ type: 'notice', variant: 'error', text: 'A hook was skipped', level: 'warn' }),
+      at({ type: 'notice', variant: 'error', text: "Claude can't use thinking from another organization." }),
+      at({ type: 'notice', variant: 'error', text: 'The agent process ended' }),
+    ], { timeZone: 'UTC' });
+    expect(leveled).toContain('> Warning: A hook was skipped');
+    expect(leveled).toContain("> Note: Claude can't use thinking from another organization.");
+    expect(leveled).toContain('> Error: The agent process ended');
     expect(md.split('\n')[2]).toBe('Codex · relay-api · 21 Nov 2026');
   });
 

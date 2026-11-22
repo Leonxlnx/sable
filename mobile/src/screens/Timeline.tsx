@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from 'motion/react';
 import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { NoticeItem, PhoneItem, ProviderId, TextItem, ThinkingItem, TimelineItem, ToolItem, TurnItem, UntilCheck, UserItem } from '@shared/protocol';
+import { noticeLevel } from '@shared/notice';
 import { stripWrappers, syntheticOf } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
 import { leadTitle } from '@desk/features/timeline/lead-in';
@@ -1229,7 +1230,7 @@ const Notice = memo(function Notice({ sid, id }: { sid: string; id: string }) {
   if (it.until) return <UntilEnd it={it} />;
   if (it.agentSwitch) return <AgentSwitchLine sid={sid} it={it} />;
   return (
-    <div className="notice" data-variant={it.variant}>
+    <div className="notice" data-variant={it.variant} data-level={noticeLevel(it)}>
       {it.variant === 'error' ? <span className="notice-dot" aria-hidden /> : <span className="notice-rule" aria-hidden />}
       <span className="notice-body">
         {it.text}

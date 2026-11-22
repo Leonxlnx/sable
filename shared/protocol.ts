@@ -1031,6 +1031,12 @@ export interface NoticeItem extends BaseItem {
   variant: 'info' | 'error' | 'interrupted' | 'compact' | 'retry' | 'mode' | 'model' | 'command' | 'rewind';
   text: string;
   detail?: string;
+  /**
+   * The level the agent itself gave its message, where it gave one (read with `noticeLevel` in
+   * `shared/notice.ts`). A warning travels as variant `error` with level `warn`: it stands as a
+   * card, and is no failure of its turn.
+   */
+  level?: 'info' | 'warn' | 'error';
   /** The turn was refused at a plan limit (shown by `features/accounts`' LimitNotice). */
   limit?: LimitHit;
   /** A `/until` loop ended here (shown as its end line, under its last check). */

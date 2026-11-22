@@ -42,6 +42,10 @@ describe('shapeOf', () => {
       [{ ...base, type: 'tool', name: 'SendUserFile', kind: 'share', title: 'a.pdf', status: 'done', detail: { files: [{ path: '/a.pdf', name: 'a.pdf' }] } }, 'f'],
       [{ ...base, type: 'notice', variant: 'interrupted', text: 'Interrupted' }, 'i'],
       [{ ...base, type: 'notice', variant: 'error', text: 'Boom' }, 'e'],
+      // A card all the same, and no failure: a warning, or words that only inform.
+      [{ ...base, type: 'notice', variant: 'error', text: 'A hook was skipped', level: 'warn' }, 'a'],
+      [{ ...base, type: 'notice', variant: 'error', text: "Claude can't use thinking from another organization." }, 'a'],
+      [{ ...base, type: 'notice', variant: 'error', text: 'Boom', level: 'error' }, 'e'],
       [{ ...base, type: 'notice', variant: 'command', text: '/context' }, 'c'],
       [{ ...base, type: 'notice', variant: 'mode', text: 'Plan mode' }, 'n'],
       [{ ...base, type: 'turn', durationMs: 1 }, 'T'],
@@ -229,6 +233,22 @@ describe('groupTurns', () => {
     expect(t.segments[0].errors).toEqual(['3']);
     expect(t.segments[0].work).toEqual(['2']);
     expect(flowOf(t.segments[0].flow)).toBe('[2] *3');
+  });
+
+  it('a warning stands where it happened and is no failure of its turn', () => {
+    // The same places as an error: never folded, shown in the flow.
+    const t = onlyTurn('U1 w2 a3 T4');
+    expect(t.state).toBe('done');
+    expect(t.segments[0].errors).toEqual([]);
+    expect(flowOf(t.segments[0].flow)).toBe('[2] *3');
+    // With an error in its place the same turn reads failed.
+    expect(onlyTurn('U1 w2 e3 T4').state).toBe('failed');
+    // The answer after it is the answer; alone in a turn it shows.
+    expect(onlyTurn('U1 a2 w3 t4 T5').segments[0]).toMatchObject({ answer: '4', errors: [] });
+    expect(flowOf(onlyTurn('U1 a2 T3').segments[0].flow)).toBe('*2');
+    // While the turn runs, a text is still the newest thing said when only a warning came after it; an error there takes it away.
+    expect(onlyTurn('U1 w2 t3 a4', true).segments[0].answer).toBe('3');
+    expect(onlyTurn('U1 w2 t3 e4', true).segments[0].answer).toBeNull();
   });
 
   it('does not fail a turn that recovered after an error', () => {

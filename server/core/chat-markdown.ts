@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { ProviderId, SessionMeta, TimelineItem, ToolItem, UserItem } from '../../shared/protocol';
 import { partOfTurn, stripWrappers, syntheticLine, syntheticOf } from '../../shared/synthetic';
+import { noticeLevel } from '../../shared/notice';
 
 /**
  * A conversation as clean Markdown, for "Export chat" and "Copy as Markdown": the title and a line
@@ -19,6 +20,9 @@ export interface ChatMarkdownOptions {
 }
 
 const AGENT: Record<string, string> = { claude: 'Claude Code', codex: 'Codex', demo: 'Demo' };
+
+/** How a notice that stood as a card is named in the export, by its level. */
+const NOTICE_WORD = { info: 'Note', warn: 'Warning', error: 'Error' } as const;
 
 /** A name for the file: the chat's title without what file systems refuse, at most 80 characters. */
 export function markdownFileName(title: string): string {
@@ -261,7 +265,7 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
         agent = it.agentSwitch.to;
         blocks.push(`> Switched to ${agentName(agent)}`);
         speaking = false;
-      } else if (it.variant === 'error') blocks.push(`> Error: ${it.text.replace(/\s+/g, ' ').trim()}`);
+      } else if (it.variant === 'error') blocks.push(`> ${NOTICE_WORD[noticeLevel(it)]}: ${it.text.replace(/\s+/g, ' ').trim()}`);
       else if (it.variant === 'interrupted') blocks.push('> Stopped');
     } else if (it.type === 'turn') {
       // The turn ends here: its steps go under what it said.

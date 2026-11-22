@@ -4,27 +4,8 @@
  */
 import type { NoticeItem, TimelineItem } from '@shared/protocol';
 
-/** info: it tells. warn: something was left out or will not hold. error: something failed. */
-export type NoticeLevel = 'info' | 'warn' | 'error';
-
-/**
- * What the agents write at warning level that only informs: nothing failed and nothing is to do.
- * Claude Code after a chat moved to another account: "Claude can't use thinking from another
- * organization … See docs for more: <address>".
- */
-const INFORMS: readonly RegExp[] = [/\bthinking from another organi[sz]ation\b/i, /\bpreserved[- ]thinking\b/i];
-
-/**
- * A notice's level. The item's own `level` wins where the bridge carries one; else the variant
- * says it: an error is an error unless its words are a known message that only informs, a retry
- * is a warning, everything else tells.
- */
-export function noticeLevel(item: Pick<NoticeItem, 'variant' | 'text'> & { level?: unknown }): NoticeLevel {
-  if (item.level === 'info' || item.level === 'warn' || item.level === 'error') return item.level;
-  if (item.variant === 'retry') return 'warn';
-  if (item.variant !== 'error') return 'info';
-  return INFORMS.some((r) => r.test(item.text)) ? 'info' : 'error';
-}
+// The level itself is read in one place for the window, the phone and the turn models.
+export { noticeLevel, type NoticeLevel } from '@shared/notice';
 
 /**
  * Whether a notice stands as a card with its level's mark, or is one of the quiet dividers: an

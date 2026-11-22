@@ -139,6 +139,13 @@ describe('phone turns as checkpoints (the desktop since f79fd71)', () => {
     expect(flowOf(onlyTurn('U1 e2 w3 t4 T5').segments[0].flow)).toBe('*2 [3] 4');
     const f = onlyTurn('U1 w2 t3 w4 t5 F6').segments[0];
     expect(f).toMatchObject({ answer: null, last: '5', notes: ['3'] });
+    // A warning stands in the flow like an error and is no failure (the desktop's rule, `shared/notice.ts`).
+    expect(shapeOf({ id: 'x', ts: 0, type: 'notice', variant: 'error', text: 'A hook was skipped', level: 'warn' })).toBe('a');
+    expect(shapeOf({ id: 'x', ts: 0, type: 'notice', variant: 'error', text: 'Boom' })).toBe('e');
+    expect(onlyTurn('U1 w2 a3 T4')).toMatchObject({ state: 'done' });
+    expect(onlyTurn('U1 w2 e3 T4')).toMatchObject({ state: 'failed' });
+    expect(flowOf(onlyTurn('U1 w2 a3 T4').segments[0].flow)).toBe('[2] *3');
+    expect(onlyTurn('U1 w2 a3 T4').segments[0].errors).toEqual([]);
     // A notice that is all the turn holds shows, but is not an error (the footer still says a failure).
     expect(onlyTurn('U1 n2 T3').segments[0]).toMatchObject({ errors: [], work: [] });
     expect(onlyTurn('U1 n2 T3').segments[0].flow).toEqual([{ kind: 'show', id: '2' }]);

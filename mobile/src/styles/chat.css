@@ -953,6 +953,15 @@
   flex-shrink: 0;
 }
 
+/* The dot says the level: red only where something failed. */
+.notice[data-level='warn'] .notice-dot {
+  background: var(--amber);
+}
+
+.notice[data-level='info'] .notice-dot {
+  background: var(--text-3);
+}
+
 .notice[data-variant='error'] .notice-body {
   color: var(--text-2);
 }
