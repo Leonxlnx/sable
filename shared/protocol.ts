@@ -71,6 +71,8 @@ export interface AccountInfo {
   problem?: string;
   /** A folder the user already had ("Use an existing folder"): removing the account forgets it, never deletes it. */
   external?: boolean;
+  /** This account's own terminal command for the agent's reset dialog (`ProviderInfo.limitReset` via `terminal`). */
+  resetCommand?: string;
 }
 
 /** A config folder under the home folder that looks like an agent's own, offered by "Use an existing folder". */
@@ -453,7 +455,16 @@ export interface SessionMeta {
    * The chat moved to another account at `line` (its switch line): the next message the person sends
    * carries a short note for the agent (`server/core/move-context.ts` `moveNote`); null once sent.
    */
-  moveNote?: { line: string } | null;
+  moveNote?: {
+    line: string;
+    /**
+     * The move could not carry the conversation: the next message also starts with a summary of the
+     * chat before this item (kept here, not in memory, so a restart or a send that never reached the
+     * agent does not lose it), leaving out `skip` (the refused message, which goes again itself).
+     */
+    summary?: string;
+    skip?: string;
+  } | null;
   /** The Customize chat (`custom.open`): its agent gets the brief about changing Sable itself (`server/services/custom.ts`). */
   custom?: boolean;
 }

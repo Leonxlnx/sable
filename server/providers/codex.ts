@@ -2253,19 +2253,27 @@ class CodexSession implements ProviderSession {
     for (const [tid, state] of Object.entries(item.agentsStates ?? {})) if (state) this.receiverState(tid, receiverStatus(state.status));
   }
 
-  /** News of a sub-agent's own thread: its turn ended, its thread closed or failed. */
+  /**
+   * News of a sub-agent's own thread: a turn started or ended, its thread closed, unloaded or failed.
+   * A turn's end is not the receiver's: Codex may send it a follow-up, which works again under the
+   * same spawn step, so the thread stays tied to it until the thread itself goes (review wave 8, #28).
+   */
   onReceiverNews(tid: string, method: string, p: any) {
-    if (method === 'turn/completed') this.receiverState(tid, p?.turn?.status === 'failed' ? 'failed' : p?.turn?.status === 'interrupted' ? 'stopped' : 'done');
-    else if (method === 'thread/closed') this.receiverState(tid, 'stopped');
+    if (method === 'turn/started') this.receiverState(tid, 'running');
+    else if (method === 'turn/completed') this.receiverState(tid, p?.turn?.status === 'failed' ? 'failed' : p?.turn?.status === 'interrupted' ? 'stopped' : 'done');
+    else if (method === 'thread/closed') this.receiverState(tid, 'stopped', true);
     else if (method === 'thread/status/changed' && p?.status?.type === 'systemError') this.receiverState(tid, 'failed');
+    else if (method === 'thread/status/changed' && p?.status?.type === 'notLoaded') this.receiverState(tid, 'stopped', true);
+    else if (method === 'thread/status/changed' && p?.status?.type === 'active') this.receiverState(tid, 'running');
   }
 
-  private receiverState(tid: string, state: AgentBackground | undefined) {
+  /** `gone`: the receiver's thread closed or unloaded; nothing more comes of it. */
+  private receiverState(tid: string, state: AgentBackground | undefined, gone = false) {
     const spawn = this.receivers.get(tid);
     if (!spawn || !state) return;
     if (state === 'running') this.receiverLive.add(tid);
-    else {
-      this.receiverLive.delete(tid);
+    else this.receiverLive.delete(tid);
+    if (gone) {
       this.receivers.delete(tid);
       if (this.provider.receivers.get(tid) === this) this.provider.receivers.delete(tid);
     }

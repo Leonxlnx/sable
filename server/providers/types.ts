@@ -103,8 +103,10 @@ export interface Provider {
   /**
    * Plan limits. Emits `limits.updated` with `meta` when it actually read them; returns the last
    * known ones otherwise. `force`: the user asked (the agent may start a short process to read them).
+   * `'fresh'`: as `force`, past the agent's own throttles: a reading taken after this call began (a
+   * reset's reading after its dialog closed).
    */
-  limits(force?: boolean): Promise<RateLimit[]>;
+  limits(force?: boolean | 'fresh'): Promise<RateLimit[]>;
   /**
    * Spends one of the account's reset credits (only on the user's confirmed click), then reads
    * the limits again. Present only for agents that report resets. `key` makes a retry idempotent.

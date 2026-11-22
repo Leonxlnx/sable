@@ -301,6 +301,27 @@ describe("Codex's own sub-agents (7)", () => {
     expect(h.rt.meta.background).toBe(0);
   });
 
+  it('a receiver that finished and gets a follow-up counts again, until its thread closes (review wave 8, #28)', async () => {
+    const h = await codexChat();
+    h.collab('sp1', 'spawnAgent', { sub1: 'running' });
+    h.notify('turn/completed', { threadId: 'sub1', turn: { id: 'x', status: 'completed', items: [] } });
+    expect(h.rt.meta.background).toBe(0);
+    // Codex sends the same child a follow-up: its next turn works under the same spawn step.
+    h.notify('turn/started', { threadId: 'sub1', turn: { id: 'x2', status: 'inProgress', items: [] } });
+    expect(h.rt.get<ToolItem>('turn1:sp1')?.result?.agent?.background).toBe('running');
+    expect(h.rt.meta.background).toBe(1);
+    h.notify('turn/completed', { threadId: 'sub1', turn: { id: 'x2', status: 'completed', items: [] } });
+    expect(h.rt.meta.background).toBe(0);
+    // A send_input reported by the parent counts it too.
+    h.collab('si1', 'sendInput', { sub1: 'running' });
+    expect(h.rt.meta.background).toBe(1);
+    h.notify('thread/closed', { threadId: 'sub1' });
+    expect(h.rt.meta.background).toBe(0);
+    // Gone for good: later news of that thread is no one's.
+    h.notify('turn/started', { threadId: 'sub1', turn: { id: 'x3', status: 'inProgress', items: [] } });
+    expect(h.rt.meta.background).toBe(0);
+  });
+
   it('a spawn whose receiver is done at once never counts; a closed chat stops what still runs', async () => {
     const h = await codexChat();
     h.collab('sp1', 'spawnAgent', { sub1: 'completed' });

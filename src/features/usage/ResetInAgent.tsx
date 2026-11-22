@@ -30,6 +30,8 @@ const RESULT_MS = 30 * 60_000;
 
 export function useResetInAgent(provider: ProviderId | undefined, accountId = DEFAULT_ACCOUNT): ResetInAgentState | undefined {
   const offer = useStore((s) => (provider ? s.providers[provider]?.limitReset : undefined));
+  // The account's own command (its config folder in it); the provider's names the built-in account only.
+  const own = useStore((s) => (provider ? s.providers[provider]?.accounts?.find((a) => a.id === accountId)?.resetCommand : undefined));
   const agent = useStore((s) => (provider ? s.providers[provider]?.name : undefined));
   const run = useStore((s) => (provider ? s.resetRuns[accountKey(provider, accountId)] : undefined));
   const atLimit = useLimitLevel(provider, accountId) === 'cap';
@@ -39,9 +41,12 @@ export function useResetInAgent(provider: ProviderId | undefined, accountId = DE
     return !!(s.limitReports[key]?.limits?.length || s.limits[key]?.length);
   });
   if (!provider || !offer) return undefined;
+  const command = own ?? (accountId === DEFAULT_ACCOUNT || offer.via === 'console' ? offer.command : undefined);
+  // In a terminal, a command that would open another account's dialog is never shown (review wave 8, #19).
+  if (command === undefined) return undefined;
   const settled = run && run.state !== 'open' && run.state !== 'reading';
   const stale = settled && (Date.now() - run.startedAt > RESULT_MS || (run.state === 'cleared' && atLimit));
-  return { via: offer.via, command: offer.command, agent: agent ?? 'the agent', run: stale ? undefined : run, atLimit, known };
+  return { via: offer.via, command, agent: agent ?? 'the agent', run: stale ? undefined : run, atLimit, known };
 }
 
 /** What the attempt is doing or showed, in one line; undefined when there is nothing to say. */
