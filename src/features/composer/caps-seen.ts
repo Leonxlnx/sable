@@ -34,16 +34,15 @@ function read(): Record<string, Seen> {
 
 const usable = (s: Seen | undefined): s is Seen => !!s && Array.isArray(s.models) && Array.isArray(s.modes) && !!s.features && typeof s.features === 'object';
 
-/** The agent's last known answer for this account (any account of the agent when this one never asked); undefined when the agent was never seen. */
+/**
+ * The agent's last known answer for this account; undefined when this account never answered here.
+ * Never another account's answer: the model menu lets what stands here be picked, and a pick is
+ * kept for the chat (`session.setModel`), so one account's models must not show for another.
+ */
 export function seenCaps(provider: ProviderId, accountId: string | undefined): Capabilities | undefined {
   const store = read();
-  let key = keyOf(provider, accountId);
-  if (!usable(store[key])) {
-    const head = `${provider}@`;
-    const other = Object.keys(store).find((k) => k.startsWith(head) && usable(store[k]));
-    if (!other) return undefined;
-    key = other;
-  }
+  const key = keyOf(provider, accountId);
+  if (!usable(store[key])) return undefined;
   const have = built.get(key);
   if (have) return have;
   const s = store[key];

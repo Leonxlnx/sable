@@ -43,6 +43,12 @@ describe('the effort scale', () => {
     expect(scrubStop(2, -SCRUB_PX, claude)).toBe(1);
     expect(scrubStop(2, SCRUB_PX * 3, claude)).toBe(5);
     expect(scrubStop(2, 900, claude)).toBe(5);
+    // From "nothing set" (the agent decides the level): back where it began, or dragged down, nothing is set.
+    expect(scrubStop(-1, 0, claude)).toBe(-1);
+    expect(scrubStop(-1, SCRUB_PX - 1, claude)).toBe(-1);
+    expect(scrubStop(-1, -SCRUB_PX * 3, claude)).toBe(-1);
+    expect(scrubStop(-1, SCRUB_PX, claude)).toBe(0);
+    expect(scrubStop(-1, SCRUB_PX * 2, claude)).toBe(1);
     expect(scrubStop(2, -900, claude)).toBe(0);
     expect(scrubStop(1, 900, plain)).toBe(2);
     // A scale that is ultracode alone: off is one step to the left.

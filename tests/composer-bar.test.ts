@@ -133,10 +133,11 @@ describe('the agent’s last known answer fills the bar’s first frame', () => 
     expect(seenCaps('claude', undefined)?.models[0].name).toBe('Opus 6');
   });
 
-  it('is kept per account, another account of the agent standing in for one never asked', () => {
+  it('is kept per account, and one account never stands in for another: what shows can be picked', () => {
     rememberCaps('claude', 'work', caps('Fable 5.2'));
     expect(seenCaps('claude', 'work')?.models[0].name).toBe('Fable 5.2');
-    expect(seenCaps('claude', undefined)?.models[0].name).toBe('Fable 5.2');
+    expect(seenCaps('claude', undefined)).toBeUndefined();
+    expect(seenCaps('claude', 'other')).toBeUndefined();
     expect(seenCaps('codex', undefined)).toBeUndefined();
     rememberCaps('claude', undefined, caps('Opus 5.5'));
     expect(seenCaps('claude', undefined)?.models[0].name).toBe('Opus 5.5');

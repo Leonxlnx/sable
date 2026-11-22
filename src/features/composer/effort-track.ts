@@ -44,6 +44,8 @@ export function scrubStop(from: number, dx: number, s: Scale, px = SCRUB_PX): nu
   if (lastStop(s) < 0) return from;
   // Toward zero, so the first stop needs a whole step in either direction.
   const steps = dx >= 0 ? Math.floor(dx / px) : -Math.floor(-dx / px);
+  // Back where it began, or down from "nothing set" (-1, which is no stop to clamp to): what it began with.
+  if (steps === 0 || (from < floor(s) && steps < 0)) return from;
   return clampStop(from + steps, s);
 }
 

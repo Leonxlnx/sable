@@ -212,6 +212,27 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
       if (landed && d.to !== d.from) go(d.to, 'drag');
     } else if (landed) setOpen(!d.wasOpen);
   };
+  // Escape while the scale is dragged takes the drag back: nothing is set, and the key goes no
+  // further (the field has the focus meanwhile, so the chip's own key handler never sees it).
+  useEffect(() => {
+    if (!scrub) return;
+    const onKey = (e: { key: string; preventDefault(): void; stopPropagation(): void }) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      const d = drag.current;
+      drag.current = null;
+      try {
+        if (d) chip.current?.releasePointerCapture(d.id);
+      } catch {
+        /* already let go */
+      }
+      setScrub(false);
+      setPreview(null);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [scrub]);
   const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
     if (e.ctrlKey || e.metaKey || e.altKey || !SCALE_KEYS.test(e.key)) return;
     const to = keyStop(at, e.key, scale);
