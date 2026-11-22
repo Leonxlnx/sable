@@ -124,8 +124,8 @@ export interface TurnGroup {
   early?: true;
 }
 
-/** What may stand after a turn's last act without saying anything: empty texts and notices. */
-const AFTER_LAST = new Set(['.', 'n']);
+/** What may stand after a turn's last act without saying anything: empty texts, notices, a warning's card. */
+const AFTER_LAST = new Set(['.', 'n', 'a']);
 /** Acts that leave something to say: a turn whose last act was one of these had more to do. */
 const UNFINISHED = new Set(['w', 'h', 'k']);
 

@@ -454,13 +454,18 @@ const AUTH_FAILURE = /^(?:Failed to authenticate\b|Failed to refresh OAuth token
 export const isAuthFailure = (text: string | undefined | null): boolean => typeof text === 'string' && text.length < 1200 && AUTH_FAILURE.test(text.trim());
 
 /**
- * A saved text that is only one of Claude Code's own sign-in failure lines, word for word at its
- * start and a single short line: what chats saved before 0.2.20 hold as a text of the agent (since
- * then the provider never stores it). Stricter than `isAuthFailure`, which is only asked about
- * messages the CLI marks as its own: here nothing says who wrote the text, so an answer that begins
- * "Not logged in…" or runs on for a paragraph stays the agent's.
+ * A saved text that is only one of Claude Code's own sign-in failure lines, the whole of it and a
+ * single short line: what chats saved before 0.2.20 hold as a text of the agent (since then the
+ * provider never stores it). Far stricter than `isAuthFailure`, which is only asked about messages
+ * the CLI marks as its own: here nothing says who wrote the text, so only the CLI's lines as it
+ * writes them count (the expired session; a refresh that failed, said in one clause, or the line
+ * about another process whatever follows on it; the 401 with the service's answer), each with or
+ * without its "Please run /login". An answer that begins like one and then says more ("Failed to
+ * refresh OAuth token: the staging client used the wrong credentials. I fixed its configuration.")
+ * stays the agent's.
  */
-const AUTH_FAILURE_LINE = /^(?:Failed to authenticate: OAuth session expired and could not be refreshed|Failed to refresh OAuth token: |Failed to authenticate\. API Error: 401\b)/;
+const AUTH_FAILURE_LINE =
+  /^(?:Failed to authenticate: OAuth session expired and could not be refreshed\.?|Failed to refresh OAuth token: another Claude Code process is refreshing it[^\n]{0,160}|Failed to refresh OAuth token: (?:[^.!?\n]|[.!?](?=\S)){1,200}[.!?…]?|Failed to authenticate\. API Error: 401(?: \{.*\})?)(?: · Please run \/login\.?)?$/;
 export const isAuthFailureLine = (text: string | undefined | null): boolean => {
   if (typeof text !== 'string') return false;
   const t = text.trim();

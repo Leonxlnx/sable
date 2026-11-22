@@ -5,6 +5,7 @@
 import type { NoticeItem, TimelineItem } from '@shared/protocol';
 
 // The level itself is read in one place for the window, the phone and the turn models.
+import { noticeLevel } from '@shared/notice';
 export { noticeLevel, type NoticeLevel } from '@shared/notice';
 
 /**
@@ -24,16 +25,25 @@ export const ADDRESS_MAX = 48;
 const ADDRESS = /\bhttps?:\/\/[^\s<>"'`‘’“”]+/gi;
 const CLOSERS: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
 
-/** The address without what only ends the sentence around it: stops, quotes, a bracket it never opened. */
+/**
+ * The address without what only ends the sentence around it: stops, quotes, a bracket it never
+ * opened. The brackets are counted once: these are an agent's words, or a page's, and a long run
+ * of closers must not cost a pass over the address each.
+ */
 function trimAddress(raw: string): string {
-  let s = raw;
+  const count: Record<string, number> = { '(': 0, ')': 0, '[': 0, ']': 0, '{': 0, '}': 0 };
+  for (let i = 0; i < raw.length; i++) if (raw[i] in count) count[raw[i]]++;
+  let end = raw.length;
   for (;;) {
-    const last = s[s.length - 1];
-    if (!last) return s;
-    if ('.,;:!?…*_~'.includes(last)) s = s.slice(0, -1);
-    else if (CLOSERS[last] && s.split(last).length > s.split(CLOSERS[last]).length) s = s.slice(0, -1);
-    else return s;
+    const last = raw[end - 1];
+    if (!last) break;
+    if ('.,;:!?…*_~'.includes(last)) end--;
+    else if (CLOSERS[last] && count[last] > count[CLOSERS[last]]) {
+      count[last]--;
+      end--;
+    } else break;
   }
+  return raw.slice(0, end);
 }
 
 /** A web address as it is opened, or null: http and https only, a host, no name or password in it. */
@@ -99,7 +109,7 @@ export function linkParts(text: string): NoticePart[] {
 export const NOTICE_LONG = 110;
 
 /** Where a sentence ends: a stop (and the quote or bracket it closes) before a new sentence's capital or figure, or a line break. */
-const SENTENCE_END = /[.!?]["')\]]?(?=\s+["'([]?[A-Z0-9])|\s*\n+/g;
+const SENTENCE_END = /[.!?]["')\]]?(?=\s+["'([]?[A-Z0-9])|\n+/g;
 
 /**
  * A long notice as its first sentence and the rest. `rest` is empty when the notice is short, is
@@ -128,7 +138,8 @@ export function firstSentence(text: string): { head: string; rest: string } {
 export function sameNotice(a: TimelineItem | undefined, b: TimelineItem | undefined): boolean {
   if (a?.type !== 'notice' || b?.type !== 'notice') return false;
   if (a.limit || b.limit || a.auth || b.auth || a.agentSwitch || b.agentSwitch || a.until || b.until) return false;
-  return a.variant === b.variant && a.text === b.text && (a.detail ?? '') === (b.detail ?? '');
+  // The level too: a warning and then an error in the same words are two cards, and the error is never the one hidden.
+  return a.variant === b.variant && a.text === b.text && (a.detail ?? '') === (b.detail ?? '') && noticeLevel(a) === noticeLevel(b);
 }
 
 /**

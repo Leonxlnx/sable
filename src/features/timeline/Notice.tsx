@@ -35,7 +35,8 @@ const MARK: Record<NoticeLevel, IconName> = { info: 'info', warn: 'warning', err
 function Linked({ text }: { text: string }) {
   return linkParts(text).map((p, i) =>
     'href' in p ? (
-      <a key={i} className="notice-link" href={p.href} title={p.href} target="_blank" rel="noopener noreferrer" onClick={onLinkClick}>
+      // `dir` isolates the label: a direction override in the words before it cannot reorder the host it shows.
+      <a key={i} className="notice-link" dir="ltr" href={p.href} title={p.href} target="_blank" rel="noopener noreferrer" onClick={onLinkClick}>
         {/* In a narrow column the address breaks after a slash, not inside a word. */}
         {p.label.split('/').map((part, j) => (
           <Fragment key={j}>

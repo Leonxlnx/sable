@@ -1937,6 +1937,8 @@ button:hover > .row-caret {
 
 /* An address in a notice (notice-read.ts): its host and page, underlined as a link in an answer is. */
 .notice-link {
+  /* Laid out by itself: a direction override in the words before it cannot reorder the host it shows. */
+  unicode-bidi: isolate;
   border-radius: 3px;
   color: var(--text);
   text-decoration: underline;

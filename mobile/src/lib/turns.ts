@@ -87,7 +87,7 @@ export interface TurnGroup {
   early?: true;
 }
 
-const AFTER_LAST = new Set(['.', 'n']);
+const AFTER_LAST = new Set(['.', 'n', 'a']);
 const UNFINISHED = new Set(['w', 'h', 'k']);
 
 /**

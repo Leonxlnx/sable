@@ -68,6 +68,16 @@ describe('the stand-in answer', () => {
     expect(isNobodysWords('Not logged in: the test user has no session, so the route redirects.')).toBe(false);
     expect(isNobodysWords('Failed to authenticate: OAuth session expired and could not be refreshed\n\nThat line comes from the CLI; here is why.')).toBe(false);
     expect(isNobodysWords('Failed to authenticate against staging, so I mocked the client.')).toBe(false);
+    // The whole line is the CLI's, or it is the agent's: a second sentence, or other words after the known ones.
+    expect(isNobodysWords('Failed to refresh OAuth token: the staging client used the wrong credentials. I fixed its configuration.')).toBe(false);
+    expect(isNobodysWords('Failed to authenticate: OAuth session expired and could not be refreshed is what the CLI prints here.')).toBe(false);
+    expect(isNobodysWords('Failed to authenticate. API Error: 401 on the staging route, so the token is stale.')).toBe(false);
+    // The CLI's own variants still count.
+    expect(isNobodysWords('Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh.')).toBe(true);
+    expect(isNobodysWords('Failed to refresh OAuth token: Request failed with status code 400')).toBe(true);
+    expect(isNobodysWords('Failed to refresh OAuth token: getaddrinfo ENOTFOUND console.anthropic.com')).toBe(true);
+    expect(isNobodysWords('Failed to authenticate: OAuth session expired and could not be refreshed · Please run /login')).toBe(true);
+    expect(isNobodysWords('Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}} · Please run /login')).toBe(true);
   });
 
   for (const phone of [false, true]) {
@@ -112,6 +122,9 @@ describe('a turn that ended before the agent finished', () => {
     expect(endedEarly('done', null, ['l', 'w', '.'])).toBe(true);
     expect(endedEarly('done', null, ['w', 'h'])).toBe(true);
     expect(endedEarly('done', null, ['w', 't', 'n'])).toBe(false);
+    // A warning after the last act says nothing about how the turn ended: the act before it decides.
+    expect(endedEarly('done', null, ['w', 'a'])).toBe(true);
+    expect(endedEarly('done', null, ['w', 't', 'a'])).toBe(false);
     expect(endedEarly('done', 'end', ['w'])).toBe(false);
     expect(endedEarly('done', null, ['w'], 'line')).toBe(false);
     expect(endedEarly('interrupted', null, ['w'])).toBe(false);

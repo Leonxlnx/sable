@@ -112,6 +112,34 @@ describe('addressLabel', () => {
   });
 });
 
+describe('hostile words cost a pass, not a pass per character', () => {
+  const timed = (run: () => unknown) => {
+    const t0 = performance.now();
+    run();
+    return performance.now() - t0;
+  };
+  it('an address followed by a long run of closers', () => {
+    const text = `see https://example.com/a${')'.repeat(200_000)}`;
+    let parts: ReturnType<typeof linkParts> = [];
+    expect(timed(() => (parts = linkParts(text)))).toBeLessThan(400);
+    expect(parts[1]).toEqual({ href: 'https://example.com/a', label: 'example.com/a' });
+    // Brackets the address opened stay with it, the rest ends the sentence.
+    expect(linkParts('(https://example.com/a_(b)))')[1]).toMatchObject({ href: 'https://example.com/a_(b)' });
+    expect(linkParts('https://example.com/[x]]].')[0]).toMatchObject({ href: 'https://example.com/[x]' });
+  });
+  it('a long run of spaces with no line break', () => {
+    const text = `${'This sentence goes on for a while without any stop at all '.repeat(3)}${' '.repeat(200_000)}end`;
+    expect(timed(() => firstSentence(text))).toBeLessThan(400);
+    expect(firstSentence(text).rest).toBe('');
+  });
+  it('a link is laid out by itself, left to right', () => {
+    const card = readFileSync(path.join(__dirname, '../src/features/timeline/Notice.tsx'), 'utf8');
+    expect(card).toMatch(/<a key=\{i\} className="notice-link" dir="ltr"/);
+    const css = readFileSync(path.join(__dirname, '../src/features/timeline/timeline.css'), 'utf8');
+    expect(/\.notice-link \{[^}]*unicode-bidi: isolate;/.test(css)).toBe(true);
+  });
+});
+
 describe('firstSentence', () => {
   it('a short notice stays whole', () => {
     expect(firstSentence('Could not send the message. Try again.')).toEqual({ head: 'Could not send the message. Try again.', rest: '' });
@@ -146,6 +174,13 @@ describe('repeatRun', () => {
   };
   it('the same notice seven times in a row is one with a count', () => {
     expect(run(Array.from({ length: 7 }, (_, i) => notice(`n${i}`, 'You have reached your usage limit.')))).toEqual([7, 0, 0, 0, 0, 0, 0]);
+  });
+  it('a warning and an error in the same words are two cards', () => {
+    const warn = notice('w', 'The hook failed', { level: 'warn' });
+    const err = notice('e', 'The hook failed');
+    expect(sameNotice(warn, err)).toBe(false);
+    expect(sameNotice(warn, notice('w2', 'The hook failed', { level: 'warn' }))).toBe(true);
+    expect(run([warn, err])).toEqual([1, 1]);
   });
   it('a notice on its own counts one', () => {
     expect(run([notice('a', 'One'), notice('b', 'Two'), notice('c', 'One')])).toEqual([1, 1, 1]);
