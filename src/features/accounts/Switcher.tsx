@@ -76,7 +76,19 @@ export function AccountSwitcher() {
   const pool = usePool(focus, providers[focus]);
   const on = !!current?.auth.loggedIn;
   const name = triggerName(focus, current, several);
-  const described = [PROVIDER_NAME[focus], several && current ? accountName(current) : undefined, on ? (plan ? `${plan} plan` : undefined) : 'not signed in', pool ? `${poolLeftPercent(pool)}% left across its accounts` : undefined].filter(Boolean).join(', ');
+  // The ring is drawn, not read: its figure goes into the control's name.
+  const windows = useAccountWindows(focus, current?.id ?? DEFAULT_ACCOUNT).limits;
+  const now = useNow();
+  const tight = on ? tightest(windows, now) : undefined;
+  const described = [
+    PROVIDER_NAME[focus],
+    several && current ? accountName(current) : undefined,
+    on ? (plan ? `${plan} plan` : undefined) : 'not signed in',
+    tight ? `${Math.round(livePercent(tight, now))}% of ${tight.label} used` : undefined,
+    pool ? `${poolLeftPercent(pool)}% left across its accounts` : undefined,
+  ]
+    .filter(Boolean)
+    .join(', ');
 
   return (
     <RM.Root

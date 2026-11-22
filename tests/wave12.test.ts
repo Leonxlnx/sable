@@ -205,3 +205,55 @@ describe('wave 13 #3: the folders of a project are worked out once per call', ()
     }
   });
 });
+
+// ── review wave 14 ──
+
+describe('wave 14 #2: a read that failed is tried again after the 20 s, not after the long quiet', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('no answer is not "none"', async () => {
+    const waiting: ((v: PullStatus | null) => void)[] = [];
+    const read = vi.fn(() => new Promise<PullStatus | null>((res) => waiting.push(res)));
+    const w = createPullWatch({ read, branchOf: () => 'feature/a', seen: () => true });
+    w.watch('/repo');
+    // The bridge could not be asked.
+    waiting.shift()!(null);
+    await vi.advanceTimersByTimeAsync(25_000);
+    void w.ask('/repo');
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('wave 14 #3: a moved report takes only blank lines with it', () => {
+  it("keeps the next line's indentation", () => {
+    const R = '2 of 5 checks failed on pull request #128\n- lint';
+    const typed = `/review look at this\n\n${R}\n\n    const a = 1;\n    const b = 2;`;
+    expect(withFailures(typed, R)).toBe(`${R}\n\n/review look at this\n\n    const a = 1;\n    const b = 2;`);
+  });
+});
+
+describe('wave 14 #1: a kept checkout is reused only for the same real folder', () => {
+  it('reads the real path every time and compares it', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(path.join(__dirname, '..', 'server/util/which.ts'), 'utf8');
+    const fn = src.slice(src.indexOf('export function projectFolders'));
+    expect(fn.indexOf('const realDir = defaultReal(start);')).toBeLessThan(fn.indexOf('const known = found.get(start);'));
+    expect(fn).toContain('known.real === realDir');
+  });
+});
+
+describe('wave 14 #4, #5: a fitted path is measured in layout pixels and refitted when the window changes', () => {
+  it('uses offsetWidth, one pixel of room, and a window listener', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(path.join(__dirname, '..', 'src/ui/path-fit.ts'), 'utf8');
+    expect(src).toContain('s.offsetWidth');
+    expect(src).not.toContain('getBoundingClientRect');
+    expect(src).toMatch(/Math\.ceil\(widths\[candidates\.indexOf\(pick\)\]\) \+ 1/);
+    expect(src).toContain("window.addEventListener('resize', refitAll)");
+  });
+});

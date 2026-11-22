@@ -166,12 +166,15 @@ export function createPullWatch(deps: PullWatchDeps) {
       return e.inflight;
     }
     // Nothing new is known and the last answer was "none": the longer quiet applies.
-    const floor = !wants && !e.view.status?.pull ? QUIET_MS : FLOOR_MS;
+    // (Only an answer that said so: a read that failed leaves no answer, and is tried again after the 20 s.)
+    const answered = e.view.status;
+    const floor = !wants && answered && !answered.pull ? QUIET_MS : FLOOR_MS;
     if (o.force || now() - e.askedAt >= floor) return start(e);
     // Held back by the long quiet: a pull request opened elsewhere meanwhile would never show while
     // the tab simply stays in view, so the folder is asked once when the quiet ends.
     // (Only for an answer that names a branch: a detached HEAD has no pull request to wait for.)
-    if (floor === QUIET_MS && e.view.status?.branch) e.quiet = true;
+    // (And only for an answer that names a branch: a detached HEAD has no pull request to wait for.)
+    if (floor === QUIET_MS && answered?.branch) e.quiet = true;
     if (wants && e.want !== 'changed') e.want = wants;
     show(e);
     plan(e);
@@ -359,7 +362,7 @@ function withoutBlock(text: string, block: string): string | null {
   for (let at = text.lastIndexOf(block); at >= 0; at = at === 0 ? -1 : text.lastIndexOf(block, at - 1)) {
     const before = text.slice(0, at);
     const after = text.slice(at + block.length);
-    if ((before === '' || /\n\s*$/.test(before)) && (after === '' || /^\s*(?:\n|$)/.test(after))) return `${before.replace(/\s+$/, '')}${before.trim() && after.trim() ? '\n\n' : ''}${after.replace(/^\s+/, '')}`;
+    if ((before === '' || /\n\s*$/.test(before)) && (after === '' || /^\s*(?:\n|$)/.test(after))) return `${before.replace(/\s+$/, '')}${before.trim() && after.trim() ? '\n\n' : ''}${after.replace(/^(?:[ \t]*\n)+/, '')}`;
   }
   return null;
 }

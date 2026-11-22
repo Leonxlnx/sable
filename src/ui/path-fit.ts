@@ -47,7 +47,9 @@ function widthsOf(el: HTMLElement, texts: string[]): number[] {
     });
     el.appendChild(box);
     if (known.size > 4000) known.clear();
-    spans.forEach((s, i) => known.set(key + missing[i], s.getBoundingClientRect().width));
+    // In layout pixels, the units of `clientWidth` and `max-width`: at another Interface size the
+    // page is zoomed and a rectangle's width is in zoomed pixels. Whole pixels, so one is added below.
+    spans.forEach((s, i) => known.set(key + missing[i], s.offsetWidth));
     box.remove();
   }
   return texts.map((t) => known.get(key + t) ?? 0);
@@ -74,10 +76,21 @@ export function fitDir(el: HTMLElement) {
   const widths = widthsOf(el, candidates);
   const pick = pickDir(candidates, widths, room);
   if (shown.textContent !== pick) shown.textContent = pick;
-  el.style.maxWidth = `${Math.ceil(widths[candidates.indexOf(pick)])}px`;
+  el.style.maxWidth = `${Math.ceil(widths[candidates.indexOf(pick)]) + 1}px`;
 }
 
 let observer: ResizeObserver | undefined;
+/** Every fitted label on the page: a label held to its cut sits in a box sized by that cut, which says nothing when the window grows. */
+const all = new Set<HTMLElement>();
+let listening = false;
+let due = 0;
+function refitAll() {
+  cancelAnimationFrame(due);
+  due = requestAnimationFrame(() => {
+    for (const el of all) if (el.isConnected) fitDir(el);
+  });
+}
+
 /** The labels inside each watched box (a held label no longer grows by itself: its surroundings say when there is more room). */
 const inside = new WeakMap<Element, Set<HTMLElement>>();
 
@@ -92,7 +105,13 @@ export function watchDir(el: HTMLElement): () => void {
   if (!set) inside.set(around, (set = new Set()));
   set.add(el);
   observer.observe(around);
+  all.add(el);
+  if (!listening) {
+    listening = true;
+    window.addEventListener('resize', refitAll);
+  }
   return () => {
+    all.delete(el);
     set.delete(el);
     if (!set.size) observer?.unobserve(around);
   };

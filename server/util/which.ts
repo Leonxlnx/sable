@@ -100,7 +100,7 @@ function realHome(): string {
 }
 
 /** Checkouts found a moment ago, by the folder as named. Only found ones: "none" is looked up afresh, a folder can become a checkout at any moment. */
-const found = new Map<string, { at: number; list: string[] }>();
+const found = new Map<string, { at: number; real: string; list: string[] }>();
 const FOUND_MS = 5000;
 
 /**
@@ -111,15 +111,17 @@ const FOUND_MS = 5000;
  */
 export function projectFolders(dir: string, now = Date.now()): string[] {
   const start = path.resolve(dir);
-  const known = found.get(start);
-  if (known && now - known.at < FOUND_MS) return known.list;
+  // The folder's real path is read every time: a junction can be pointed at another checkout, and
+  // what was found for the old one says nothing about the new (review wave 14, #1).
   const realDir = defaultReal(start);
+  const known = found.get(start);
+  if (known && known.real === realDir && now - known.at < FOUND_MS) return known.list;
   const top = checkoutTop(start, { realDir });
   const list = [...new Set([start, realDir, ...(top ? [top] : [])])];
   if (top) {
     if (found.size >= 128) found.clear();
-    found.set(start, { at: now, list });
-  }
+    found.set(start, { at: now, real: realDir, list });
+  } else found.delete(start);
   return list;
 }
 
