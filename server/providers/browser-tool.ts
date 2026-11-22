@@ -278,15 +278,14 @@ export function browserTitle(op: BrowserOp, url?: string, input?: unknown, targe
 /** A call before it ran: open knows its address; the others learn it when they run (or from the result's first line). */
 export function describeBrowser(name: string, input: unknown, resultText?: string): { kind: 'browser'; title: string; detail: ToolDetail } {
   const op = browserOp(name) ?? 'read';
-  // Display fields come from the cleaned input only, and an address without its query or fragment (a token may live there).
+  // Display fields come from the cleaned input only. The title names the address without its query
+  // or fragment; `detail.url` stays the address the step worked on, whole: before / after photographs
+  // that page (services/capture.ts), and `/?tab=2` is another page than `/`.
   const clean = cleanToolInput(name, input);
   const o = (clean && typeof clean === 'object' ? clean : {}) as Record<string, unknown>;
-  let url = typeof o.url === 'string' && isHttpUrl(o.url) ? bareUrl(o.url) : undefined;
-  if (!url && resultText) {
-    const said = /^(?:Page: |Screenshot of |Opened )(https?:\/\/[^\s,()]+)/m.exec(resultText)?.[1];
-    url = said ? bareUrl(said) : undefined;
-  }
-  return { kind: 'browser', title: browserTitle(op, url, o), detail: url ? { url } : {} };
+  let url = typeof o.url === 'string' && isHttpUrl(o.url) ? o.url : undefined;
+  if (!url && resultText) url = /^(?:Page: |Screenshot of |Opened )(https?:\/\/[^\s,()]+)/m.exec(resultText)?.[1];
+  return { kind: 'browser', title: browserTitle(op, url ? bareUrl(url) : undefined, o), detail: url ? { url } : {} };
 }
 
 // ── what the tools answer ──

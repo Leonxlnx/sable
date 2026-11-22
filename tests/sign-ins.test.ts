@@ -7,7 +7,7 @@ import { SessionRuntime } from '../server/core/runtime';
 import { App } from '../server/app';
 import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
-import { BROWSER_DESCRIPTIONS, BROWSER_HELD, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOL_IDS, BROWSER_TOOLS, browserContextLine, cleanToolInput, runBrowserTool, SIGN_IN_KEYS, streamsInput } from '../server/providers/browser-tool';
+import { BROWSER_DESCRIPTIONS, BROWSER_HELD, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOL_IDS, BROWSER_TOOLS, browserContextLine, cleanToolInput, describeBrowser, runBrowserTool, SIGN_IN_KEYS, streamsInput } from '../server/providers/browser-tool';
 import { draftItem } from '../server/providers/codex-map';
 import { DemoProvider } from '../server/providers/demo';
 import { MAX_SIGN_INS, SIGN_IN_SHIPS, setSignInHolds, setSignInShips, SignInStore, signInOrigin } from '../server/services/sign-ins';
@@ -322,9 +322,21 @@ describe('finding 9: a sign-in step is clean in the first event that publishes i
     expect(own.input).toEqual({ username_ref: 'e1' });
   });
 
-  it('display fields come from cleaned input: an address keeps no query', () => {
+  it('a step keeps the address it worked on whole (before / after photographs it); its title names it without the query', () => {
+    const d = describeBrowser('browser_open', { url: 'http://localhost:5173/?gallery&strip#icons' });
+    expect(d.detail).toEqual({ url: 'http://localhost:5173/?gallery&strip#icons' });
+    expect(d.title).not.toContain('gallery');
+    // From a result's first line too.
+    expect(describeBrowser('browser_read', {}, 'Page: http://localhost:3000/list?tab=2\nTitle: x').detail).toEqual({ url: 'http://localhost:3000/list?tab=2' });
+    // With sign-ins off the window asks main for a token once, hears there are none, and never waits again.
+    const agent = readFileSync(new URL('../src/features/rail/browser-agent.ts', import.meta.url), 'utf8');
+    expect(agent).toContain('if (!fn || !guestId || noTokens) return undefined;');
+    expect(agent).toContain('if (token === null) noTokens = true;');
+  });
+
+  it('display fields come from cleaned input: a title keeps no query', () => {
     const d = draftItem({ type: 'dynamicToolCall', id: 'c4', namespace: null, tool: 'browser_open', arguments: { url: 'https://portal.example.test/x?token=made-up-secret#frag' }, status: 'inProgress', contentItems: null, success: null } as never) as ToolItem;
-    expect(JSON.stringify(d.detail)).not.toContain('made-up-secret');
+    expect(d.title).not.toContain('made-up-secret');
   });
 
   it('Claude: the input never streams; once complete it is cleaned before it is set', () => {

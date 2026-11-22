@@ -196,11 +196,22 @@ async function pointAt(c: PageController, q: { ref?: string; selector?: string; 
  */
 const held = (tab: string) => !!getPage(tab).filled;
 
-/** A token from Electron main for this request, for the page that serves it (null where there is none: the dev build, sign-ins off). */
+/** Main said there are no tokens (sign-ins are off, for as long as the app runs): no later call waits to ask. */
+let noTokens = false;
+
+/** A token from Electron main for this request, for the page that serves it (none in the dev build, or with sign-ins off). */
 async function attestFor(guestId: number | undefined): Promise<string | undefined> {
   const fn = (desktop as { browser?: { attest?: (id: number) => Promise<string | null> } } | undefined)?.browser?.attest;
-  if (!fn || !guestId) return undefined;
-  return (await fn(guestId).catch(() => null)) ?? undefined;
+  if (!fn || !guestId || noTokens) return undefined;
+  try {
+    const token = await fn(guestId);
+    // Null is main's answer with sign-ins off (a page it will not vouch for is refused, not null):
+    // the wait before the work is then for nothing, and in it the tab in front can change.
+    if (token === null) noTokens = true;
+    return token ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function handleBrowserRequest(req: BrowserRequest) {
