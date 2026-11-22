@@ -215,6 +215,21 @@ function PaletteBody({ onRun }: { onRun: (item: PaletteItem) => void }) {
     else if (bottom > list.scrollTop + list.clientHeight) list.scrollTo({ top: bottom - list.clientHeight, behavior: 'smooth' });
   }, [safe, all]);
 
+  // The list never shrinks under the hands: while the palette is open it keeps the tallest it has
+  // been, so typing filters the rows inside a pane that stands still (no jump with each key).
+  const tallest = useRef(0);
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    // A list drawn afresh (back from naming a prompt) starts over.
+    if (!list.style.minHeight) tallest.current = 0;
+    const h = list.offsetHeight;
+    if (h > tallest.current) {
+      tallest.current = h;
+      list.style.minHeight = `${h}px`;
+    }
+  });
+
   const choose = (item: PaletteItem) => {
     if (item.mode === 'save-prompt') {
       setSaving(draft);

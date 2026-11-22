@@ -314,6 +314,14 @@
 .sgroup-head[data-state='open'] {
   background-color: var(--fill-1);
   --head-bg: color-mix(in srgb, var(--head-ground) 96.5%, white);
+  transition-duration: 0s;
+}
+
+/* Under the pointer (see "session row" below): a header the pointer moved on from, to another
+   row of the list, lets go in that frame; only leaving the list fades. */
+.side-list:hover .sgroup-head:not(:hover),
+.side-list:hover .sgroup-head:not(:hover) :is(.sgroup-name, .sgroup-icon) {
+  transition-duration: 0s;
 }
 
 .sgroup[data-dragging] > .sgroup-head {
@@ -366,12 +374,14 @@
 .sgroup-head:has(:focus-visible) .sgroup-name,
 .sgroup-head[data-current] .sgroup-name {
   color: var(--text-2);
+  transition-duration: 0s;
 }
 
 .sgroup-head:hover .sgroup-icon,
 .sgroup-head:has(:focus-visible) .sgroup-icon,
 .sgroup-head[data-current] .sgroup-icon {
   color: var(--text-3);
+  transition-duration: 0s;
 }
 
 /* A collapsed folder: its count, or the most pressing state inside it. */
@@ -380,7 +390,6 @@
   place-items: center end;
   margin-left: auto;
   min-width: 16px;
-  transition: opacity var(--d-1) var(--ease);
 }
 
 .sgroup-count {
@@ -392,6 +401,7 @@
 .sgroup-head:has(:focus-visible) .sgroup-end,
 .sgroup-head[data-menu] .sgroup-end {
   opacity: 0;
+  transition: opacity 1ms linear var(--row-rest);
 }
 
 /* Over a long name's end, never through it: a short fade in the header's own fill backs them. */
@@ -405,7 +415,6 @@
   padding-left: 18px;
   background: linear-gradient(to right, transparent, var(--head-bg) 16px);
   opacity: 0;
-  transition: opacity var(--d-1) var(--ease);
 }
 
 /* Pointed at, its menu open, or reached with the keys. Not on any focus inside: a header (or a
@@ -414,6 +423,7 @@
 .sgroup-head:has(:focus-visible) .sgroup-tools,
 .sgroup-head[data-menu] .sgroup-tools {
   opacity: 1;
+  transition: opacity var(--d-1) var(--ease) var(--row-rest);
 }
 
 /* Row tools are .icon-btn-xs sitting on a lit row: the row shifts the tone scale up one step
@@ -435,7 +445,7 @@
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .sgroup-tool:hover,
@@ -470,6 +480,18 @@
 
 /* ── session row ── */
 
+/* Under the pointer. The row's light is there in the frame the pointer is (fill, title, mark:
+   nothing fades in) and gone in the frame the pointer moved on to another row, so a fast pointer
+   never leaves a trail of rows fading out; only when the pointer leaves the list does the last
+   row's fill ease away. The tools at the row's end wait until the pointer rests (--row-rest):
+   the time gives way in the same frame they begin to arrive, never one over the other, and a
+   pointer passing through changes nothing at the row's end. Leaving, they are gone at once.
+   (The time's step is a 1 ms fade, not 0 s: both are then opacity transitions the compositor
+   starts on one clock, so a busy main thread cannot show the tools over the time for a frame.) */
+.side-list {
+  --row-rest: 50ms;
+}
+
 .srow {
   position: relative;
   height: 30px;
@@ -488,7 +510,12 @@
   border-radius: inherit;
   background: var(--fill-2);
   opacity: 0;
-  transition: opacity var(--d-1) var(--ease);
+  transition: opacity var(--d-2) var(--ease);
+}
+
+.side-list:hover .srow:not(:hover)::before,
+.side-list:hover .srow:not(:hover) :is(.srow-title, .srow-agent) {
+  transition-duration: 0s;
 }
 
 .srow:hover,
@@ -502,6 +529,7 @@
 .srow[data-menu]::before,
 .srow[data-state='open']::before {
   opacity: 1;
+  transition-duration: 0s;
 }
 
 .srow[data-active] {
@@ -576,6 +604,7 @@
 .srow:has(:focus-visible) .srow-agent,
 .srow[data-active] .srow-agent {
   opacity: 1;
+  transition-duration: 0s;
 }
 
 .srow-archived .srow-agent {
@@ -619,6 +648,7 @@
 .srow:hover .srow-title,
 .srow[data-status='awaiting'] .srow-title {
   color: var(--text);
+  transition-duration: 0s;
 }
 
 .srow[data-active] .srow-title,
@@ -651,7 +681,6 @@
   padding-right: 10px;
   font-size: var(--t-micro);
   color: var(--text-4);
-  transition: opacity var(--d-1) var(--ease);
 }
 
 .srow[data-active] .srow-time,
@@ -666,7 +695,6 @@
   width: 12px;
   height: 12px;
   margin-right: 10px;
-  transition: opacity var(--d-1) var(--ease);
 }
 
 /* A quieter ring on rows you are not looking at. */
@@ -700,7 +728,6 @@
   background: linear-gradient(to right, transparent, var(--row-bg) 16px);
   opacity: 0;
   pointer-events: none;
-  transition: opacity var(--d-1) var(--ease);
 }
 
 .srow:hover .srow-acts,
@@ -708,12 +735,14 @@
 .srow[data-menu] .srow-acts {
   opacity: 1;
   pointer-events: auto;
+  transition: opacity var(--d-1) var(--ease) var(--row-rest);
 }
 
 .srow:hover :is(.srow-time, .srow-state),
 .srow:has(:focus-visible) :is(.srow-time, .srow-state),
 .srow[data-menu] :is(.srow-time, .srow-state) {
   opacity: 0;
+  transition: opacity 1ms linear var(--row-rest);
 }
 
 

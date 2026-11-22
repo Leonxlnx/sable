@@ -148,7 +148,7 @@ function Section({ title, children, id }: { title: string; children: ReactNode; 
 
 const dis = (s: State) => s === 'disabled';
 
-function MenuRows({ highlight }: { highlight?: number }) {
+function MenuRows({ highlight, picked }: { highlight?: number; picked?: number }) {
   const rows: { icon?: IconName; label: string; keys?: string; checked?: boolean; sub?: boolean; disabled?: boolean; danger?: boolean }[] = [
     { label: 'Plain row' },
     { icon: 'pencil', label: 'Rename', keys: 'f2' },
@@ -161,7 +161,7 @@ function MenuRows({ highlight }: { highlight?: number }) {
     <div className="pop gal-pop" data-static="">
       <div className="menu-label">Section</div>
       {rows.map((r, i) => (
-        <div key={r.label} className="menu-item" data-highlighted={i === highlight ? '' : undefined} data-disabled={r.disabled ? '' : undefined} role="menuitem">
+        <div key={r.label} className="menu-item" data-highlighted={i === highlight ? '' : undefined} data-picked={i === picked ? '' : undefined} data-disabled={r.disabled ? '' : undefined} role="menuitem">
           {r.icon && <Icon name={r.icon} size={16} />}
           <span className="grow truncate">{r.label}</span>
           {r.keys && <Kbd combo={r.keys} />}
@@ -543,6 +543,10 @@ export default function Gallery() {
             <div>
               <div className="gal-caption">Highlighted row</div>
               <MenuRows highlight={2} />
+            </div>
+            <div>
+              <div className="gal-caption">Picked row (held 40 ms, then the menu leaves)</div>
+              <MenuRows picked={2} />
             </div>
             <div>
               <div className="gal-caption">Danger highlighted</div>

@@ -57,13 +57,25 @@ export function Settings() {
   // A section switch renders the nav (its pill starts to slide) first and the new section after,
   // in a background render that yields to the frame instead of one long task.
   const shown = useDeferredValue(current);
+  // The first section comes in with the dialog (a rise and a fade under the dialog's own); a
+  // section changed to afterwards replaces the last one in place and only settles (settings.css):
+  // fading it in from nothing would blank the pane for a frame between two pages.
+  const first = useRef<SettingsSection | null>(null);
+  const swap = useRef(false);
+  if (!section) {
+    first.current = null;
+    swap.current = false;
+  } else if (body) {
+    if (first.current === null) first.current = shown;
+    else if (first.current !== shown) swap.current = true;
+  }
 
   return (
     <Modal open={!!section} onOpenChange={(open) => !open && setUi({ settings: null })} title="Settings" className="settings-dialog" bare onCloseAutoFocus={takeComposerFocus}>
       <Nav current={current} open={!!section} />
       <div className="set-main">
         <IconButton icon="x" label="Close" keys="esc" className="set-close" tipSide="left" onClick={() => setUi({ settings: null })} />
-        {body && <Section key={shown} id={shown} />}
+        {body && <Section key={shown} id={shown} swap={swap.current} />}
       </div>
     </Modal>
   );
@@ -216,13 +228,13 @@ function Nav({ current, open }: { current: SettingsSection; open: boolean }) {
   );
 }
 
-function Section({ id }: { id: SettingsSection }) {
+function Section({ id, swap }: { id: SettingsSection; swap: boolean }) {
   const meta = SECTIONS.find((s) => s.id === id)!;
   const View = VIEWS[id];
   // A plain element with a CSS entrance (settings.css): a motion element here would make motion
   // measure the page's layout every time a section mounts.
   return (
-    <div className="set-section" id="set-panel" role="tabpanel" aria-labelledby={`set-tab-${id}`}>
+    <div className="set-section" data-swap={swap || undefined} id="set-panel" role="tabpanel" aria-labelledby={`set-tab-${id}`}>
       <header className="set-head">
         <h2 className="set-title">{meta.label}</h2>
       </header>

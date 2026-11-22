@@ -161,7 +161,7 @@
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .rail-tab svg {
@@ -364,10 +364,10 @@
   position: relative;
 }
 
-.rail-row-deco {
-  transition: opacity var(--d-1) var(--ease);
-}
-
+/* A row's tools wait until the pointer rests on it (50 ms): what stood at the row's end gives way
+   in the frame they begin to arrive, never one over the other, and a pointer passing through
+   changes nothing there. Leaving, they are gone at once (as the sidebar's rows do; the step is a
+   1 ms fade so both run on the compositor's clock). */
 .rail-row-acts {
   position: absolute;
   top: 2px;
@@ -376,7 +376,6 @@
   gap: 1px;
   opacity: 0;
   pointer-events: none;
-  transition: opacity var(--d-1) var(--ease);
 }
 
 .rail-row-acts .icon-btn {
@@ -386,10 +385,12 @@
 .rail-row-host:is(:hover, :focus-within) > .rail-row-acts {
   opacity: 1;
   pointer-events: auto;
+  transition: opacity var(--d-1) var(--ease) 50ms;
 }
 
 .rail-row-host:is(:hover, :focus-within) .rail-row-deco {
   opacity: 0;
+  transition: opacity 1ms linear 50ms;
 }
 
 .rail-col {
@@ -604,6 +605,8 @@ textarea.field.ch-commit-field {
   margin: 4px 0;
 }
 
+/* A row of a list lights in the frame the pointer is on it and lets go in the frame it moved on:
+   a fast pointer leaves no trail of rows fading out. */
 .ch-row {
   display: flex;
   align-items: center;
@@ -613,7 +616,6 @@ textarea.field.ch-commit-field {
   padding: 0 8px;
   border-radius: var(--r-sm);
   text-align: left;
-  transition: background-color var(--d-1) var(--ease);
 }
 
 .ch-row:hover {
@@ -799,7 +801,7 @@ textarea.field.ch-commit-field {
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .fl-clear:hover {
@@ -829,9 +831,7 @@ textarea.field.ch-commit-field {
   font-size: var(--t-ui);
   color: var(--text-2);
   user-select: none;
-  transition:
-    background-color var(--d-1) var(--ease),
-    color var(--d-1) var(--ease);
+  /* Lit and let go in the frame, as every list row (no trail under a fast pointer). */
 }
 
 /* Indent guides: one hairline per level. */
@@ -1188,7 +1188,7 @@ textarea.field.ch-commit-field {
   transition:
     color var(--d-1) var(--ease),
     background-color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .tm-act:hover {

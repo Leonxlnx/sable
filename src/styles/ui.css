@@ -1,5 +1,35 @@
 /* Primitive controls. Class-based so any component (or Radix part) can wear them. */
 
+/* ───────────── the feel of the primitives ─────────────
+   Curves and times the primitives share (the general ones are tokens). Feedback is in the first
+   frame: a colour or a fill steps at once where it lands on what the pointer is on, and eases only
+   on the way back; things that travel (a pane unfolding, a pill, a thumb) move on a curve the eye
+   can follow, never a two-frame pop. */
+:root {
+  /* A pane that unfolds: a third of the way in its first frame, landed softly by the sixth. */
+  --ease-unfold: cubic-bezier(0.3, 0.75, 0.25, 1);
+  /* A small part that travels (a switch's thumb): a spring that lands a hair past its mark
+     (stiffness 1200, damping 48; 260 ms). */
+  --spring-soft: linear(0, 0.081, 0.26, 0.465, 0.654, 0.807, 0.917, 0.989, 1.029, 1.046, 1.049, 1.043, 1.033, 1.023, 1.015, 1.008, 1.003, 1, 0.998, 0.998, 1);
+  --d-spring-soft: 260ms;
+  /* A menu opens in about 130 ms, leaves in 95, and holds a picked row's light for 40 before it goes. */
+  --d-open: 130ms;
+  --d-close: 95ms;
+  --d-pick: 40ms;
+  /* A dialog (a bigger pane, a longer way) comes forward in 170 and leaves in the same 95. */
+  --d-dialog: 170ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --d-open: 1ms;
+    --d-close: 1ms;
+    --d-pick: 0ms;
+    --d-dialog: 1ms;
+    --d-spring-soft: 1ms;
+  }
+}
+
 /* ───────────── buttons ───────────── */
 
 /* One family. Every control here (and the feature controls built on these tokens) steps through
@@ -32,7 +62,7 @@
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
     opacity var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
   user-select: none;
   flex-shrink: 0;
 }
@@ -204,7 +234,7 @@
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
     opacity var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
   flex-shrink: 0;
 }
 
@@ -384,8 +414,9 @@ p .kbds,
 
 /* ───────────── fields ───────────── */
 
-/* A field is a darker well with a hairline. Hover lifts the hairline a step, focus turns it soft
-   ivory, an error (aria-invalid) turns it red. Nothing else moves. */
+/* A field is a darker well with a hairline. Hover lifts the hairline a step; focus turns it soft
+   ivory in that frame (a focus mark is never late) while the well deepens over a moment, so the
+   focus arrives instead of only snapping. An error (aria-invalid) turns the hairline red. */
 .field {
   width: 100%;
   height: var(--ctl-h);
@@ -406,11 +437,13 @@ p .kbds,
   border-color: var(--line-3);
 }
 
-/* Focus: the hairline turns soft ivory, nothing else. */
+/* Focus: the hairline turns soft ivory at once; the well deepens behind it. */
 .field:focus,
 .field:focus-visible {
   outline: none;
   border-color: var(--focus-field);
+  background-color: var(--well-strong);
+  transition-duration: var(--d-2);
 }
 
 .field[aria-invalid='true'] {
@@ -453,6 +486,7 @@ textarea.field {
   background-color: var(--well);
   color: var(--text-3);
   cursor: text;
+  transition: background-color var(--d-1) var(--ease);
 }
 
 .field-wrap:hover {
@@ -461,6 +495,8 @@ textarea.field {
 
 .field-wrap:focus-within {
   border-color: var(--focus-field);
+  background-color: var(--well-strong);
+  transition-duration: var(--d-2);
 }
 
 .field-wrap > svg {
@@ -473,7 +509,8 @@ textarea.field {
 }
 
 .field-wrap > input,
-.field-wrap > .field {
+.field-wrap > .field,
+.field-wrap > .field:focus {
   flex: 1;
   min-width: 0;
   height: 100%;
@@ -509,8 +546,10 @@ textarea.field {
 
 /* ───────────── switch ───────────── */
 
-/* A 30 x 18 track with a 14px thumb, both flat. The thumb travels on a short spring and, while
-   pressed, stretches toward where it is going; the track takes the colour. */
+/* A 30 x 18 track with a 14px thumb, both flat. Held, the thumb stretches toward where it is
+   going (in a frame); let go, it travels on a soft spring and draws itself back together as it
+   lands, a hair past its mark. One transform and one scale about the thumb's centre, so nothing
+   jumps when the side changes; the track takes the colour. */
 .switch {
   position: relative;
   width: 30px;
@@ -554,30 +593,41 @@ textarea.field {
   background-color: #d6d5d1;
   /* A flat ivory disc with a short drop (--thumb-up). */
   box-shadow: var(--thumb-up);
-  transform-origin: left center;
   transition:
-    transform 220ms var(--spring),
-    scale var(--d-1) var(--ease-out),
+    transform var(--d-spring-soft) var(--spring-soft),
+    scale var(--d-spring-soft) var(--spring-soft),
     background-color var(--d-2) var(--ease);
 }
 
 .switch[data-state='checked'] .switch-thumb {
   transform: translateX(12px);
-  transform-origin: right center;
   background-color: var(--panel);
   box-shadow: none;
 }
 
+/* Held: 22% wider, leaning toward the other side (the lean keeps its near edge where it was). */
 .switch:active .switch-thumb {
+  transform: translateX(1.5px);
   scale: 1.22 1;
+  transition-duration: 80ms, 80ms, var(--d-2);
+  transition-timing-function: var(--ease-out), var(--ease-out), var(--ease);
+}
+
+.switch[data-state='checked']:active .switch-thumb {
+  transform: translateX(10.5px);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .switch-thumb {
+  .switch-thumb,
+  .switch:active .switch-thumb {
     transition: background-color var(--d-2) var(--ease);
   }
   .switch:active .switch-thumb {
+    transform: none;
     scale: none;
+  }
+  .switch[data-state='checked']:active .switch-thumb {
+    transform: translateX(12px);
   }
 }
 
@@ -629,7 +679,7 @@ textarea.field {
   background-color: var(--text);
   box-shadow: var(--thumb-up);
   transition:
-    scale var(--d-2) var(--spring),
+    scale var(--d-spring-soft) var(--spring-soft),
     background-color var(--d-1) var(--ease);
 }
 
@@ -681,7 +731,7 @@ textarea.field {
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
   white-space: nowrap;
 }
 
@@ -742,28 +792,41 @@ textarea.field {
   min-width: 200px;
   padding: 4px;
   border-radius: 16px;
-  /* Glass (see "material: glass" below): the rim is ::before, the shadow ::after. */
+  /* Glass (see "material: glass" below): the rim is ::before, the shadow a layer behind the pane. */
   background: var(--grain) 0 0 / var(--grain-size), var(--glass-menu);
   -webkit-backdrop-filter: var(--blur);
   backdrop-filter: var(--blur);
   box-shadow: var(--rim-inner);
   color: var(--text);
   font-size: var(--t-ui);
-  /* Grows out of its trigger and shrinks back into it: a clip, so the content is never scaled.
-     ui/grow.ts measures the origin when the animation starts and sets --g-* and --o-*. */
+  /* Unfolds out of its trigger and folds back into it: a clip, so the content is never scaled.
+     ui/grow.ts measures the origin when the animation starts and sets --g-* (and --o-* on the
+     positioning box). A third of the way in the first frame, landed by the sixth: the eye can
+     follow it. The rows arrive just behind the pane (grow.ts), nearest the trigger first. */
   position: relative;
   translate: var(--o-x, 0px) var(--o-y, 0px);
   animation:
-    pop-grow 110ms var(--ease-out) backwards,
-    pop-fade 70ms linear backwards;
+    pop-grow var(--d-open) var(--ease-unfold) backwards,
+    pop-fade 50ms linear backwards;
 }
 
-/* A menu on its way out takes no pointer: its rows cannot take focus back from what the person picked (a rename field). */
+/* A menu on its way out takes no pointer: its rows cannot take focus back from what the person
+   picked (a rename field). It leaves quicker than it came. */
 .pop[data-state='closed'] {
   pointer-events: none;
+  animation: pop-shrink var(--d-close) cubic-bezier(0.4, 0, 0.7, 1) forwards;
 }
 
-/* The drop shadow is its own layer: it would be cut by the clip, so it fades in once the box is open. */
+/* After a pick the row holds its light for a moment (ui/glide.ts marks it), then the menu leaves. */
+.pop[data-state='closed'][data-picked] {
+  animation-delay: var(--d-pick);
+}
+
+/* The drop shadow is a layer of its own: the clip would cut it. Under a positioned pane it lies
+   behind the pane on the positioning box and is scaled from the same origin on the same curve
+   (grow.ts gives --g-sx / --g-sy), so at every frame it hugs exactly the part of the pane that
+   shows: it never arrives late, never snaps off, never stands as an empty frame round a pane
+   that is folding away. A pane that is placed by hand keeps its shadow here and gets it once open. */
 .pop::after {
   content: '';
   position: absolute;
@@ -772,15 +835,58 @@ textarea.field {
   box-shadow: var(--shadow-glass);
   pointer-events: none;
   opacity: 0;
-  animation: pop-shadow 160ms var(--ease) 100ms forwards;
-}
-
-.pop[data-state='closed'] {
-  animation: pop-shrink 100ms cubic-bezier(0.4, 0, 0.6, 1) forwards;
+  animation: pop-shadow 140ms var(--ease) var(--d-open) forwards;
 }
 
 .pop[data-state='closed']::after {
   animation: none;
+}
+
+[data-radix-popper-content-wrapper] > .pop::after {
+  content: none;
+}
+
+[data-radix-popper-content-wrapper]:has(> .pop)::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  translate: var(--o-x, 0px) var(--o-y, 0px);
+  zoom: var(--ui-zoom, 1);
+  border-radius: 16px;
+  box-shadow: var(--shadow-glass);
+  pointer-events: none;
+  transform-origin: 0 0;
+  animation:
+    pop-shadow-grow var(--d-open) var(--ease-unfold) backwards,
+    pop-fade var(--d-open) linear backwards;
+}
+
+[data-radix-popper-content-wrapper]:has(> .pop[data-state='closed'])::after {
+  animation: pop-shadow-shrink var(--d-close) cubic-bezier(0.4, 0, 0.7, 1) forwards;
+}
+
+[data-radix-popper-content-wrapper]:has(> .pop[data-state='closed'][data-picked])::after {
+  animation-delay: var(--d-pick);
+}
+
+@keyframes pop-shadow-grow {
+  from {
+    transform: translate(var(--g-l, 0px), var(--g-t, 0px)) scale(var(--g-sx, 1), var(--g-sy, 1));
+  }
+}
+
+@keyframes pop-shadow-shrink {
+  from {
+    opacity: 1;
+  }
+  55% {
+    opacity: 1;
+  }
+  to {
+    transform: translate(var(--g-l, 0px), var(--g-t, 0px)) scale(var(--g-sx, 1), var(--g-sy, 1));
+    opacity: 0;
+  }
 }
 
 @keyframes pop-grow {
@@ -809,7 +915,7 @@ textarea.field {
     clip-path: inset(0px round 16px);
     opacity: 1;
   }
-  65% {
+  55% {
     opacity: 1;
   }
   to {
@@ -836,30 +942,41 @@ textarea.field {
   user-select: none;
   outline: none;
   scroll-margin: 6px;
-  transition:
-    background-color 80ms var(--ease-out),
-    color 80ms var(--ease-out);
+  /* Its words light in the frame the row is reached (below) and dim just behind the highlight as
+     it leaves. A row that lights by itself (no glide) steps its fill both ways: a fast pointer
+     leaves no trail of rows fading out. */
+  transition: color 70ms linear;
 }
 
 .menu-item svg {
   flex-shrink: 0;
   color: var(--text-3);
-  transition: color 80ms var(--ease-out);
+  transition: color 70ms linear;
 }
 
 /* The highlighted row is one step lighter than the menu: light, not a press. */
 .menu-item[data-highlighted],
 .menu-item[data-active='true'],
+.menu-item[data-picked],
 .menu-item:hover {
   background-color: var(--hl);
   color: var(--text);
+  transition-duration: 0s;
+}
+
+/* Picked: one fill step more, held for the moment before the menu leaves (in a menu with a glide
+   the pill carries it, below). */
+.menu-item[data-picked] {
+  background-color: var(--fill-4);
 }
 
 /* An agent's mark keeps its own colour on a lit row (art.css). */
 .menu-item[data-highlighted] svg:not(.provider-mark),
 .menu-item[data-active='true'] svg:not(.provider-mark),
+.menu-item[data-picked] svg:not(.provider-mark),
 .menu-item:hover svg:not(.provider-mark) {
   color: var(--text);
+  transition-duration: 0s;
 }
 
 /* A row that opens a submenu stays lit while its submenu is open. */
@@ -895,9 +1012,10 @@ textarea.field {
 }
 
 /* ── one highlight that glides (ui/glide.ts) ──
-   A menu with rows gets a single fill under them that travels to the focused row. The rows then
-   only change colour; their own fill steps aside. Pointer hover alone (a disabled row, a row the
-   pointer crosses before Radix focuses it) never lights a row on its own. */
+   A menu with rows gets a single fill under them that travels to the focused row, for the keys
+   and the pointer alike: two thirds of the way in its first frame, retargeted when the pointer
+   moves on. The rows then only change colour; their own fill steps aside. Pointer hover alone (a
+   disabled row, a row the pointer crosses before Radix focuses it) never lights a row on its own. */
 .menu-glide {
   position: absolute;
   top: 0;
@@ -909,34 +1027,49 @@ textarea.field {
   pointer-events: none;
   transition:
     transform 110ms var(--ease-out),
-    background-color var(--d-1) var(--ease),
-    opacity 80ms var(--ease-out);
+    opacity 90ms linear;
 }
 
 .menu-glide[data-on] {
   opacity: 1;
   will-change: transform;
+  transition:
+    transform 110ms var(--ease-out),
+    opacity 50ms linear;
 }
 
-/* Jumping into place (the first row, or a row scrolled under the pointer): no travel. */
+/* Landing in place (the first row of a visit, or a row scrolled under the pointer): no travel. */
 .menu-glide[data-jump] {
-  transition: opacity 80ms var(--ease-out);
+  transition: opacity 50ms linear;
 }
 
 .menu-glide[data-tone='danger'] {
   background-color: var(--red-dim);
 }
 
-.pop[data-glide] .menu-item:is([data-highlighted], :hover, [data-active='true']):not([data-state='open']) {
+/* Held, the highlight steps up one fill in the same frame; picked, it keeps that light while the
+   menu leaves (glide.ts sets data-picked, --d-pick holds the menu). Light, never a give in scale. */
+.pop:has(.menu-item:active:not([data-disabled])) > .menu-glide,
+.pop[data-picked] > .menu-glide {
+  background-color: var(--fill-4);
+}
+
+.pop:has(.menu-item:active:not([data-disabled])) > .menu-glide[data-tone='danger'],
+.pop[data-picked] > .menu-glide[data-tone='danger'] {
+  background-color: color-mix(in oklab, var(--red) 22%, transparent);
+}
+
+.pop[data-glide] .menu-item:is([data-highlighted], :hover, [data-active='true'], [data-picked]):not([data-state='open']),
+.pop[data-glide] .menu-item[data-state='open'][data-glide-on] {
   background-color: transparent;
 }
 
 /* The pointer resting on a row Radix has not highlighted (it opened under the pointer) lights nothing. */
-.pop[data-glide] .menu-item:hover:not([data-highlighted], [data-state='open'], [data-active='true']) {
+.pop[data-glide] .menu-item:hover:not([data-highlighted], [data-state='open'], [data-active='true'], [data-picked]) {
   color: var(--text-2);
 }
 
-.pop[data-glide] .menu-item:hover:not([data-highlighted], [data-state='open'], [data-active='true']) svg:not(.provider-mark) {
+.pop[data-glide] .menu-item:hover:not([data-highlighted], [data-state='open'], [data-active='true'], [data-picked]) svg:not(.provider-mark) {
   color: var(--text-3);
 }
 
@@ -945,8 +1078,9 @@ textarea.field {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .menu-glide {
-    transition: opacity 80ms linear;
+  .menu-glide,
+  .menu-glide[data-on] {
+    transition: opacity 50ms linear;
   }
 }
 
@@ -989,9 +1123,37 @@ textarea.field {
      layer, no blur. */
   background-color: var(--panel-3);
   box-shadow: var(--shadow-tip);
-  animation: pop-in var(--d-1) var(--ease-out);
-  transform-origin: var(--radix-tooltip-content-transform-origin);
+  /* Arrives from its control: three pixels along the side it sits on, with a short fade. */
+  animation: tip-in 110ms var(--ease-out);
   pointer-events: none;
+}
+
+.tooltip[data-side='top'] {
+  --tip-y: 3px;
+}
+
+.tooltip[data-side='bottom'] {
+  --tip-y: -3px;
+}
+
+.tooltip[data-side='left'] {
+  --tip-x: 3px;
+}
+
+.tooltip[data-side='right'] {
+  --tip-x: -3px;
+}
+
+/* Moving along a row of controls, the next tip is simply there: only the first one arrives. */
+.tooltip[data-state='instant-open'] {
+  animation: none;
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+    transform: translate(var(--tip-x, 0px), var(--tip-y, 0px));
+  }
 }
 
 /* The positioning box around a tip takes no pointer either, or it would hold a neighbour's hover. */
@@ -1001,16 +1163,25 @@ textarea.field {
 
 /* ───────────── dialog ───────────── */
 
+/* A dialog comes forward over a scrim: the scrim fades in with it, the pane rises the last few
+   pixels on the curve a menu unfolds on (a third of the way in its first frame), and both leave
+   quicker than they came, the pane sinking back the way it rose. */
 .overlay {
   position: fixed;
   inset: 0;
   z-index: var(--z-modal);
   background: rgb(0 0 0 / 0.62);
-  animation: fade-in var(--d-2) var(--ease);
+  animation: fade-in var(--d-dialog) linear;
 }
 
 .overlay[data-state='closed'] {
-  animation: fade-in var(--d-1) var(--ease) reverse forwards;
+  animation: fade-out var(--d-close) linear forwards;
+}
+
+@keyframes fade-out {
+  to {
+    opacity: 0;
+  }
 }
 
 .dialog {
@@ -1026,25 +1197,26 @@ textarea.field {
   border-radius: var(--r-xl);
   background: var(--grain) 0 0 / var(--grain-size), var(--panel);
   box-shadow: var(--rim-inner), var(--shadow-glass);
-  animation: dialog-in 140ms var(--ease-out);
+  animation:
+    dialog-in var(--d-dialog) var(--ease-unfold),
+    fade-in 120ms var(--ease-unfold);
   overflow: hidden;
 }
 
 .dialog[data-state='closed'] {
-  animation: dialog-out var(--d-1) var(--ease-in) forwards;
+  animation: dialog-out var(--d-close) var(--ease-in) forwards;
 }
 
 @keyframes dialog-in {
   from {
-    opacity: 0;
-    transform: scale(0.98) translateY(6px);
+    transform: scale(0.975) translateY(8px);
   }
 }
 
 @keyframes dialog-out {
   to {
     opacity: 0;
-    transform: scale(0.98);
+    transform: scale(0.985) translateY(4px);
   }
 }
 

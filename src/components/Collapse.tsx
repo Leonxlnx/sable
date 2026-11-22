@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import './collapse.css';
 
 /**
@@ -6,14 +6,20 @@ import './collapse.css';
  * (or closing), so collapsed details cost nothing. The first render never animates:
  * a transcript loaded from history appears in its final shape. Once fully open it stops
  * clipping (`data-settled`), so rings, shadows and labels can reach past its edges.
+ *
+ * Opening starts in the frame of the click: the children mount closed in the same commit, the
+ * closed shape is computed once (one layout read before paint), and the height begins to move in
+ * the first frame painted; the content fades in just behind it (collapse.css). Several rows
+ * opening in one commit share that one read.
  */
 export function Collapse({ open, children, className }: { open: boolean; children: ReactNode; className?: string }) {
   const [mounted, setMounted] = useState(open);
   const [shown, setShown] = useState(open);
   const [settled, setSettled] = useState(open);
   const first = useRef(true);
+  const el = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (first.current) {
       first.current = false;
       return;
@@ -21,18 +27,12 @@ export function Collapse({ open, children, className }: { open: boolean; childre
     setSettled(false);
     if (open) {
       setMounted(true);
-      // Two frames: one to mount at height 0, one to start the transition.
-      let b = 0;
-      const a = requestAnimationFrame(() => {
-        b = requestAnimationFrame(() => setShown(true));
-      });
+      // The closed shape has to exist before the open one replaces it, or nothing would move.
+      void el.current?.offsetHeight;
+      setShown(true);
       // Fallback in case the transition never ends (reduced motion, hidden tab).
       const t = window.setTimeout(() => setSettled(true), 450);
-      return () => {
-        cancelAnimationFrame(a);
-        cancelAnimationFrame(b);
-        window.clearTimeout(t);
-      };
+      return () => window.clearTimeout(t);
     }
     setShown(false);
     // Fallback only (transitionend unmounts first): longer than the slowest close, the turn's gather.
@@ -43,6 +43,7 @@ export function Collapse({ open, children, className }: { open: boolean; childre
   if (!mounted && !open) return null;
   return (
     <div
+      ref={el}
       className={`collapse ${className ?? ''}`}
       data-open={shown && open ? '' : undefined}
       data-settled={settled && open ? '' : undefined}

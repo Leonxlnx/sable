@@ -541,8 +541,12 @@ export function Toasts() {
   const dismiss = useStore((s) => s.dismissToast);
   // On body, above any dialog: `.app` isolates its own stacking context. Pointer events are kept
   // from reaching an open dialog's outside-click handler, so dismissing a toast leaves the dialog open.
+  // A toast never takes focus: a click on it moves no focus (the press is kept from doing so) and
+  // Tab passes it by, so it cannot close an open popover (focus leaving one dismisses it), take
+  // the caret out of the composer, or leave focus on nothing when it goes. It says its text
+  // through the live region and leaves by itself.
   return createPortal(
-    <div className="toasts" aria-live="polite" onPointerDown={(e) => e.nativeEvent.stopPropagation()}>
+    <div className="toasts" aria-live="polite" onPointerDown={(e) => e.nativeEvent.stopPropagation()} onMouseDown={(e) => e.preventDefault()}>
       {/* A toast rises in on a spring and, dismissed or timed out, sinks back and fades while the
           others close the gap; it never just vanishes. */}
       <AnimatePresence initial={false} mode="popLayout">
@@ -555,6 +559,7 @@ export function Toasts() {
             exit={{ opacity: 0, y: 6, scale: 0.97, transition: { duration: 0.14, ease: [0.4, 0, 1, 1] } }}
             transition={{ type: 'spring', stiffness: 420, damping: 34 }}
             className="toast"
+            tabIndex={-1}
             data-level={t.level}
             aria-label={`${t.text}. Dismiss`}
             onClick={() => dismiss(t.id)}

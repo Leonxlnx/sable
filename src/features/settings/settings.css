@@ -152,6 +152,23 @@
   animation: rise-in var(--d-3) var(--ease-out) backwards;
 }
 
+/* Changing pages: the new page stands where the last one stood in the same frame, at full
+   strength (its title at once, never a blank or dimmed pane between two pages: a dip in light
+   reads as a flicker), and its content settles up the last few pixels. */
+.set-section[data-swap] {
+  animation: none;
+}
+
+.set-section[data-swap] > .set-body > .set-col {
+  animation: set-settle 180ms var(--ease-unfold) backwards;
+}
+
+@keyframes set-settle {
+  from {
+    transform: translateY(5px);
+  }
+}
+
 .set-head {
   flex-shrink: 0;
   padding: 19px 64px 16px 32px;

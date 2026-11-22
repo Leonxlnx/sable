@@ -1,15 +1,21 @@
+/* A row that opens. The height leads on a curve the eye can follow (a fifth of the way in the first
+   frame, never a jump), and the content fades in just behind it; closing, the content steps back
+   first and the height follows it shut. */
 .collapse {
   display: grid;
   grid-template-rows: 0fr;
   opacity: 0;
   transition:
-    grid-template-rows var(--d-3) var(--ease-out),
+    grid-template-rows var(--d-3) var(--ease-unfold, var(--ease-out)),
     opacity var(--d-1) var(--ease);
 }
 
 .collapse[data-open] {
   grid-template-rows: 1fr;
   opacity: 1;
+  transition:
+    grid-template-rows var(--d-3) var(--ease-unfold, var(--ease-out)),
+    opacity var(--d-2) linear 30ms;
 }
 
 /* Clips while animating. Content that draws outside its box (rings, shadows) pads itself. */
@@ -21,4 +27,10 @@
 
 .collapse[data-settled] > .collapse-inner {
   overflow: visible;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .collapse[data-open] {
+    transition-delay: 0s;
+  }
 }

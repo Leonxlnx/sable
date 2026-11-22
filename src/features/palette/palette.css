@@ -5,11 +5,11 @@
   inset: 0;
   z-index: var(--z-modal);
   background: rgb(0 0 0 / 0.5);
-  animation: fade-in var(--d-2) var(--ease);
+  animation: fade-in var(--d-open) linear;
 }
 
 .palette-overlay[data-state='closed'] {
-  animation: palette-fade var(--d-1) var(--ease-in) forwards;
+  animation: palette-fade var(--d-close) linear forwards;
 }
 
 .palette {
@@ -27,17 +27,19 @@
   box-shadow: var(--rim-inner), var(--shadow-glass);
   overflow: hidden;
   transform-origin: 50% 0;
-  animation: palette-in var(--d-2) var(--ease-out);
+  /* Comes down the last few pixels on the curve a menu unfolds on; leaves quicker (ui.css). */
+  animation:
+    palette-in 150ms var(--ease-unfold),
+    fade-in 110ms var(--ease-unfold);
 }
 
 .palette[data-state='closed'] {
-  animation: palette-fade var(--d-1) var(--ease-in) forwards;
+  animation: palette-fade var(--d-close) var(--ease-in) forwards;
 }
 
 @keyframes palette-in {
   from {
-    opacity: 0;
-    transform: scale(0.98) translateY(-4px);
+    transform: scale(0.98) translateY(-6px);
   }
 }
 
