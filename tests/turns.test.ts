@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { TimelineItem } from '@shared/protocol';
-import { groupTurns, shapeOf, turnsIndex, type FlowChunk, type TurnGroup } from '@/features/timeline/turns';
+import { groupTurns, lastResponse, responseText, shapeOf, turnsIndex, type FlowChunk, type TurnGroup } from '@/features/timeline/turns';
 
 /** Builds ids and a shape string from a compact spec: "U1 w2 t3 T4" (shape char + id). */
 function spec(s: string) {
@@ -159,7 +159,8 @@ describe('groupTurns', () => {
   it('shows notices that are all a turn holds (a /compact) instead of folding them', () => {
     const t = onlyTurn('U1 n2 T3');
     expect(t.segments[0].work).toEqual([]);
-    expect(t.segments[0].errors).toEqual(['2']);
+    // Shown, but not an error: it does not stand for a failure the turn's foot would otherwise say.
+    expect(t.segments[0].errors).toEqual([]);
     expect(flowOf(t.segments[0].flow)).toBe('*2');
     // Among steps, a notice is part of the story.
     expect(onlyTurn('U1 w2 n3 t4 T5').segments[0].work).toEqual(['2', '3']);
@@ -575,7 +576,8 @@ describe("what Claude Code writes in the person's place (shared/synthetic.ts)", 
     const { groups } = turns('U1 t2 T3 u4 U5 n6 T7');
     expect(groups.map((g) => g.key)).toEqual(['1', '5']);
     const t = groups[1] as TurnGroup;
-    expect(t.segments[0]).toMatchObject({ lead: '5', errors: ['6'], work: [], answer: null });
+    expect(t.segments[0]).toMatchObject({ lead: '5', errors: [], work: [], answer: null });
+    expect(flowOf(t.segments[0].flow)).toBe('*6');
     // Without a turn record, the next message closes it.
     expect(turns('U1 t2 T3 u4 U5 n6 U7 t8 T9').groups.map((g) => g.key)).toEqual(['1', '5', '7']);
   });
@@ -595,5 +597,84 @@ describe("what Claude Code writes in the person's place (shared/synthetic.ts)", 
 
   it('keeps an output with no command before it as a line of its own', () => {
     expect(turns('U1 t2 T3 n4').groups.map((g) => g.kind)).toEqual(['turn', 'item']);
+  });
+});
+
+describe('nothing the person must read folds away (review wave 9)', () => {
+  it('keeps a report as the answer when a steered message is answered by a nod', () => {
+    // "The migration requires index X." · "Commit it" · "Committed."
+    const t = onlyTurn('U1 w2 t3 S4 l5 T6');
+    expect(t.segments[0]).toMatchObject({ answer: '3', notes: [] });
+    expect(t.segments[1]).toMatchObject({ lead: '4', reply: '5', answer: null, notes: [] });
+    // Work after the steer, then the nod: the nod is still the reply under the message.
+    const u = onlyTurn('U1 w2 t3 w4 S5 w6 l7 T8');
+    expect(u.segments[0].answer).toBe('3');
+    expect(u.segments[1]).toMatchObject({ reply: '7', answer: null });
+    // A notification taken up mid-turn, then a nod: the nod is a quiet line, the report the answer.
+    const n = onlyTurn('U1 w2 t3 N4 w5 l6 T7');
+    expect(n.segments[0].answer).toBe('3');
+    expect(n.segments[1]).toMatchObject({ answer: null, tail: ['6'] });
+    // A steer answered by something of substance keeps its own answer.
+    const s = onlyTurn('U1 w2 t3 S4 w5 t6 T7');
+    expect(s.segments[0].answer).toBeNull();
+    expect(s.segments[1].answer).toBe('6');
+  });
+
+  it('keeps the last report in view over a failure that came after a steer', () => {
+    const t = onlyTurn('U1 w2 t3 S4 w5 e6 F7');
+    expect(t.state).toBe('failed');
+    expect(t.segments[0].last).toBe('3');
+    expect(t.segments[0].notes).toEqual([]);
+    expect(t.segments[1].errors).toEqual(['6']);
+  });
+
+  it('never takes a notice in view for the failure shown: the terminal error still shows', () => {
+    // A model change, then the turn record with "Authentication expired".
+    const t = onlyTurn('U1 n2 F3');
+    expect(t.state).toBe('failed');
+    expect(t.segments.some((s) => s.errors.length)).toBe(false);
+    // An error notice is the failure shown.
+    expect(onlyTurn('U1 w2 e3 F4').segments[0].errors).toEqual(['3']);
+  });
+
+  it('gives a rewind its own line, out of the turn it cut', () => {
+    const base = { id: 'x', ts: 0 };
+    expect(shapeOf({ ...base, type: 'notice', variant: 'rewind', text: 'Rewound the conversation', detail: 'Files could not be restored.' })).toBe('Z');
+    const { groups } = turns('U1 w2 t3 S4 w5 Z6');
+    expect(groups.map((g) => g.kind)).toEqual(['turn', 'item']);
+    expect((groups[0] as TurnGroup).ids).not.toContain('6');
+  });
+
+  it('keeps a checkpoint the same checkpoint when the lead-in that opened it becomes the answer', () => {
+    const live = onlyTurn('U1 w2 g3 l4 w5', true);
+    const done = onlyTurn('U1 w2 g3 l4 w5 T6');
+    const keyOf = (t: TurnGroup) => t.segments[0].flow.flatMap((c) => (c.kind === 'steps' && c.ids.includes('5') ? [c.key] : []))[0];
+    expect(done.segments[0].answer).toBe('4');
+    expect(keyOf(live)).toBe('5');
+    expect(keyOf(done)).toBe(keyOf(live));
+  });
+});
+
+describe('/copy copies what "Copy response" copies (review wave 9)', () => {
+  const at = (id: string, ts: number) => ({ id, ts });
+  const items: Record<string, TimelineItem> = {
+    u1: { ...at('u1', 1), type: 'user', text: 'Add the migration' },
+    w2: { ...at('w2', 2), type: 'tool', name: 'Edit', kind: 'edit', title: 'Edit', status: 'done', detail: {} },
+    t3: { ...at('t3', 3), type: 'text', text: 'The migration requires index X.', streaming: false },
+    w4: { ...at('w4', 4), type: 'tool', name: 'Bash', kind: 'bash', title: 'git commit', status: 'done', detail: {} },
+    t5: { ...at('t5', 5), type: 'text', text: 'Committed.', streaming: false },
+    e6: { ...at('e6', 6), type: 'turn', durationMs: 5 },
+  };
+  const roots = Object.keys(items);
+
+  it('copies the report, not the nod after it', () => {
+    const { groups } = groupTurns(roots, roots.map((id) => shapeOf(items[id])).join(''), false);
+    const turn = groups[0] as TurnGroup;
+    expect(responseText(items, turn)).toBe('The migration requires index X.');
+    expect(lastResponse(items, roots, false)).toBe(responseText(items, turn));
+  });
+
+  it('has nothing to copy before a turn has answered', () => {
+    expect(lastResponse({ u1: items.u1 }, ['u1'], true)).toBeNull();
   });
 });

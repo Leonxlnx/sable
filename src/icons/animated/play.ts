@@ -164,6 +164,44 @@ export function playIcons(root: Element, kind: 'hover' | 'press' = 'hover') {
   for (const svg of svgs) (kind === 'hover' ? start : beat)(svg);
 }
 
+/**
+ * Watches each pressed control for an icon that changes under it (a copy button turns to a check
+ * and back after a second), each on its own for `ms` after its own last press: pressing another
+ * control never keeps an earlier one watched, so an icon that changes later, after its control
+ * has scrolled away, does not move.
+ */
+export function pressWatch(arrived: (svg: Element) => void, ms = WATCH): (ctl: Element) => void {
+  const watched = new Map<Element, { mo: MutationObserver; timer: ReturnType<typeof setTimeout> }>();
+  const seen = (records: MutationRecord[]) => {
+    for (const r of records) {
+      if (r.type === 'attributes') {
+        if (r.target instanceof Element && r.target.matches(ICONS)) arrived(r.target);
+        continue;
+      }
+      for (const n of r.addedNodes) {
+        if (!(n instanceof Element)) continue;
+        if (n.matches(ICONS)) arrived(n);
+        else if (n.firstElementChild) for (const svg of n.querySelectorAll(ICONS)) arrived(svg);
+      }
+    }
+  };
+  return (ctl) => {
+    const was = watched.get(ctl);
+    if (was) clearTimeout(was.timer);
+    let mo = was?.mo;
+    if (!mo) {
+      mo = new MutationObserver(seen);
+      mo.observe(ctl, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-icon'] });
+    }
+    const own = mo;
+    const timer = setTimeout(() => {
+      own.disconnect();
+      watched.delete(ctl);
+    }, ms);
+    watched.set(ctl, { mo: own, timer });
+  };
+}
+
 let started = false;
 
 export function startIconMotion() {
@@ -237,27 +275,7 @@ export function startIconMotion() {
   };
 
   // ── an icon that changes under a control just pressed ──
-  let watching: MutationObserver | null = null;
-  let unwatch = 0;
-  const watch = (ctl: Element) => {
-    watching ??= new MutationObserver((records) => {
-      for (const r of records) {
-        if (r.type === 'attributes') {
-          if (r.target instanceof Element && r.target.matches(ICONS)) arrive(r.target);
-          continue;
-        }
-        for (const n of r.addedNodes) {
-          if (!(n instanceof Element)) continue;
-          if (n.matches(ICONS)) arrive(n);
-          else if (n.firstElementChild) for (const svg of n.querySelectorAll(ICONS)) arrive(svg);
-        }
-      }
-    });
-    // Every control pressed lately stays watched (a copy button turns back after a second); all are let go together.
-    watching.observe(ctl, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-icon'] });
-    window.clearTimeout(unwatch);
-    unwatch = window.setTimeout(() => watching?.disconnect(), WATCH);
-  };
+  const watch = pressWatch(arrive);
 
   const press = (ctl: Element) => {
     if (still() || !kindOf(ctl)) return;

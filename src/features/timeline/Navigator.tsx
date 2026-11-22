@@ -12,7 +12,7 @@ import { Kbd } from '@/ui';
 import { useTimeline } from './ctx';
 import { estimate } from './items';
 import { findMarks, onFindMarks, takeSteps, type NavFeed, type NavLayout } from './nav-bus';
-import { firstLine, groupAt, groupBoxes, groupHeight, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
+import { firstLine, groupAt, groupBoxes, groupHeight, indexLines, indexWindow, isBuilt, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, rowsMoved, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
 import { revealItem, rootOf } from './reveal';
 import type { Group, TurnGroup } from './turns';
 import { stampParts } from './util';
@@ -74,6 +74,8 @@ interface Measure {
   /** The newest built group's element and its top: when it has not moved, nothing above it has. */
   anchor: HTMLElement | null;
   anchorTop: number;
+  /** The steered messages' rows inside the newest group, and their offsets when measured: a fold opened above one moves it, not the group. */
+  inner: { el: HTMLElement; y: number }[];
 }
 
 const sigOf = (l: NavLayout) => `${l.built.lead}|${l.built.gapFrom}|${l.built.hidden}|${l.groups.length}`;
@@ -165,7 +167,7 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   geoRef.current = geo;
   const marksRef = useRef(marks);
   marksRef.current = marks;
-  const last = useRef<Measure>({ boxes: null, layout: null, sig: '', marks: null, anchor: null, anchorTop: 0 });
+  const last = useRef<Measure>({ boxes: null, layout: null, sig: '', marks: null, anchor: null, anchorTop: 0, inner: [] });
   const settleTimer = useRef(0);
   useEffect(() => () => window.clearTimeout(settleTimer.current), []);
   const [boxesRev, setBoxesRev] = useState(0);
@@ -208,12 +210,39 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
       (i) => shape(L.groups[i]).h,
     );
     const ms = marksRef.current;
-    const ys = placeMarks(ms, boxes, (gi, id) => {
-      const s = shape(L.groups[gi]);
-      const at = s.at.get(id);
-      return at && s.h > 0 ? at / s.h : undefined;
-    });
-    last.current = { boxes, layout: L, sig: sigOf(L), marks: ms, anchor, anchorTop: anchor ? anchor.offsetTop : 0 };
+    // A steered message whose row is built is measured where it stands (a checkpoint opened above it
+    // moves it inside its turn); only a row that is not built is placed by the estimate.
+    const host = ct.offsetParent;
+    const rowY = (el: HTMLElement): number => {
+      let y = 0;
+      for (let n: HTMLElement | null = el; n; n = n.offsetParent as HTMLElement | null) {
+        if (n === host) return y - base;
+        y += n.offsetTop;
+      }
+      return (el.getBoundingClientRect().top - ct.getBoundingClientRect().top) / uiZoom();
+    };
+    const inner: { el: HTMLElement; y: number }[] = [];
+    const newest = L.groups.length - 1;
+    const ys = placeMarks(
+      ms,
+      boxes,
+      (gi, id) => {
+        const s = shape(L.groups[gi]);
+        const at = s.at.get(id);
+        return at && s.h > 0 ? at / s.h : undefined;
+      },
+      (i) => {
+        const m = ms[i];
+        if (!m.steered || !isBuilt(L.built, m.group)) return undefined;
+        const el = byKey.get(L.groups[m.group]?.key ?? '')?.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(m.id)}"]`);
+        if (!el) return undefined;
+        const y = rowY(el);
+        // The newest group's own top never moves for what opens inside it: its rows are watched themselves (`check`).
+        if (m.group === newest) inner.push({ el, y: el.offsetTop });
+        return y;
+      },
+    );
+    last.current = { boxes, layout: L, sig: sigOf(L), marks: ms, anchor, anchorTop: anchor ? anchor.offsetTop : 0, inner };
     if (findMarks(sessionId)) setBoxesRev((r) => r + 1);
     const g = geoRef.current;
     const cH = sc.clientHeight;
@@ -238,8 +267,10 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
     const cH = sc.clientHeight;
     if (l.sig !== sigOf(L) || l.marks !== marksRef.current || (l.anchor && !l.anchor.isConnected) || cH !== g.cH) return measure();
     // Something above the newest group changed height (older turns drawn for the first time as
-    // the reader scrolls through them, a fold opened): measured once that settles.
-    if (l.anchor && l.anchor.offsetTop !== l.anchorTop) {
+    // the reader scrolls through them, a fold opened), or a checkpoint opened inside it above one of
+    // its steered messages: measured once that settles.
+    const inner = l.inner;
+    if ((l.anchor && l.anchor.offsetTop !== l.anchorTop) || (inner.length > 0 && rowsMoved(inner.map((r) => r.y), (i) => (inner[i].el.isConnected ? inner[i].el.offsetTop : undefined)))) {
       if (!settleTimer.current)
         settleTimer.current = window.setTimeout(() => {
           settleTimer.current = 0;
@@ -899,7 +930,28 @@ const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked,
   /** The row was lit by a key: it is brought into view. */
   const byKey = useRef(false);
 
-  const rowEl = (i: number) => list.current?.querySelector<HTMLElement>(`[data-i="${i}"]`) ?? null;
+  // The list as lines of the rows' grid (a run's head and every row are `ROW` tall): only the lines
+  // near the view are made, so moving the lit row among 300 messages renders a few dozen.
+  const lines = useMemo(() => indexLines(runs, order, !!found), [runs, order, found]);
+  const [win, setWin] = useState(() => {
+    const at = Math.max(0, lines.rowAt.get(asked || !aim ? here : aim.mark) ?? 0);
+    const from = Math.max(0, at - WINDOW);
+    return { from, to: Math.min(lines.list.length, at + WINDOW) };
+  });
+  /** The lines in and near the view, read from where the list is scrolled. */
+  const sync = useCallback(() => {
+    const el = list.current;
+    if (!el) return;
+    const { from, to } = indexWindow(el.scrollTop, el.clientHeight, lines.list.length, ROW, PAD, OVERSCAN);
+    setWin((w) => (w.from === from && w.to === to ? w : { from, to }));
+  }, [lines]);
+  useLayoutEffect(sync, [sync]);
+
+  /** Where a message's row stands in the list (its offset from the list's top), or -1 when it is not listed. */
+  const rowTop = (i: number) => {
+    const at = lines.rowAt.get(i);
+    return at === undefined ? -1 : PAD + at * ROW;
+  };
 
   /** Moves the list (by a glide when asked for), always onto the rows' grid: no row is cut at its edges. */
   const scrollList = (top: number, smooth = false) => {
@@ -908,23 +960,27 @@ const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked,
     const to = Math.max(0, Math.min(el.scrollHeight - el.clientHeight, Math.round(top / ROW) * ROW));
     const d = to - el.scrollTop;
     if (Math.abs(d) < 1) return;
-    if (!smooth || reducedMotion()) return void (el.scrollTop = to);
+    if (!smooth || reducedMotion()) {
+      el.scrollTop = to;
+      return sync();
+    }
     if (Math.abs(d) > ROWS_GLIDE * ROW) el.scrollTop = to - Math.sign(d) * ROWS_GLIDE * ROW;
+    sync();
     el.scrollTo({ top: to, behavior: 'smooth' });
   };
 
   /** A run from its head at the top of the list: as much of it as fits is in view. */
   const toRun = (r: number, smooth: boolean) => {
-    const head = list.current?.querySelector<HTMLElement>(`[data-run="${r}"]`);
-    if (head) scrollList(head.offsetTop - PAD, smooth);
+    const at = lines.headAt.get(r);
+    if (at !== undefined) scrollList(at * ROW, smooth);
   };
 
   /** A message's row in view, moving the list no further than that takes. */
   const toRow = (i: number, smooth = false) => {
     const el = list.current;
-    const row = rowEl(i);
-    if (!el || !row) return;
-    const top = row.offsetTop - PAD;
+    const row = rowTop(i);
+    if (!el || row < 0) return;
+    const top = row - PAD;
     if (top < el.scrollTop) scrollList(top, smooth);
     else if (top + ROW + PAD * 2 > el.scrollTop + el.clientHeight) scrollList(top + ROW + PAD * 2 - el.clientHeight, smooth);
   };
@@ -932,8 +988,8 @@ const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked,
   /** A message's row in the middle of the list. */
   const centre = (i: number) => {
     const el = list.current;
-    const row = rowEl(i);
-    if (el && row) scrollList(row.offsetTop - PAD - Math.floor((el.clientHeight - PAD * 2) / ROW / 2) * ROW);
+    const row = rowTop(i);
+    if (el && row >= 0) scrollList(row - PAD - Math.floor((el.clientHeight - PAD * 2) / ROW / 2) * ROW);
   };
 
   /** What the rail points at: a closed run from its head, a message of the run being read by its row. */
@@ -973,6 +1029,7 @@ const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked,
     if (q) {
       setCur(order[0] ?? -1);
       if (list.current) list.current.scrollTop = 0;
+      sync();
     } else {
       setCur(here);
       centre(here);
@@ -1012,28 +1069,52 @@ const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked,
 
   const field = asked || marks.length >= FIELD_FROM;
   const flagOf = (i: number) => (i === waitAt ? 'wait' : marks[i].failed ? 'fail' : undefined);
+  // Only the lines near the view (`win`); spacers of the grid's height stand for the rest.
   const sections: ReactNode[] = [];
+  const from = Math.min(win.from, lines.list.length);
+  const to = Math.min(win.to, lines.list.length);
   if (found) {
     // What was typed: the messages that have it, one list, each with when it was sent.
-    for (const i of order) {
-      const hit = found[i];
-      if (hit) sections.push(<Row key={marks[i].id} i={i} id={rowId(i)} line={hit.line} marked={hit.indices} when={whenOf(marks[i].ts)} here={i === here} cur={i === cur} flag={flagOf(i)} onPick={onPick} onPoint={point} />);
+    for (let k = from; k < to; k++) {
+      const line = lines.list[k];
+      const hit = line.kind === 'row' ? found[line.i] : null;
+      if (line.kind === 'row' && hit) {
+        const i = line.i;
+        sections.push(<Row key={marks[i].id} i={i} id={rowId(i)} line={hit.line} marked={hit.indices} when={whenOf(marks[i].ts)} here={i === here} cur={i === cur} flag={flagOf(i)} onPick={onPick} onPoint={point} />);
+      }
     }
   } else {
-    runs.forEach((run, r) => {
+    // Each run in view as its group: its head when that is in view, and its rows that are.
+    let k = from;
+    while (k < to) {
+      const first = lines.list[k];
+      const r = first.kind === 'head' ? first.run : runOf(runs, first.i);
+      const run = runs[r];
       const when = whenOf(marks[run.from].ts);
       const body: ReactNode[] = [];
-      for (let i = run.from; i < run.to; i++) body.push(<Row key={marks[i].id} i={i} id={rowId(i)} line={rows[i].line} marked={NONE} here={i === here} cur={i === cur} flag={flagOf(i)} onPick={onPick} onPoint={point} />);
+      for (; k < to; k++) {
+        const line = lines.list[k];
+        if (line.kind === 'head') {
+          if (line.run !== r) break;
+          body.push(
+            <div key="when" className="nav-when num" data-run={r} data-aim={aim?.run === r || undefined} aria-hidden>
+              {when}
+            </div>,
+          );
+          continue;
+        }
+        const i = line.i;
+        body.push(<Row key={marks[i].id} i={i} id={rowId(i)} line={rows[i].line} marked={NONE} here={i === here} cur={i === cur} flag={flagOf(i)} onPick={onPick} onPoint={point} />);
+      }
       sections.push(
         <div key={marks[run.from].id} className="nav-run" role="group" aria-label={when}>
-          <div className="nav-when num" data-run={r} data-aim={aim?.run === r || undefined} aria-hidden>
-            {when}
-          </div>
           {body}
         </div>,
       );
-    });
+    }
   }
+  const above = from * ROW;
+  const below = Math.max(0, lines.list.length - to) * ROW;
 
   return (
     <motion.div
@@ -1075,15 +1156,21 @@ const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked,
           {!asked && <Kbd combo="mod+g" />}
         </label>
       )}
-      <div ref={list} id={`${uid}list`} className="nav-list scroll" role="listbox" aria-label="Your messages" data-found={found ? '' : undefined}>
+      <div ref={list} id={`${uid}list`} className="nav-list scroll" role="listbox" aria-label="Your messages" data-found={found ? '' : undefined} onScroll={sync}>
+        {above > 0 && <div className="nav-space" style={{ height: above }} aria-hidden />}
         {sections}
-        {!sections.length && <p className="nav-none">No message matches “{q}”.</p>}
+        {below > 0 && <div className="nav-space" style={{ height: below }} aria-hidden />}
+        {!lines.list.length && <p className="nav-none">No message matches “{q}”.</p>}
       </div>
     </motion.div>
   );
 });
 
 const NONE: number[] = [];
+
+/** Lines made beyond the view on each side, and around the lit row before the list is first measured. */
+const OVERSCAN = 10;
+const WINDOW = 24;
 
 interface RowProps {
   i: number;

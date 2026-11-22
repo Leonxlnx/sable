@@ -14,20 +14,10 @@ import { IconButton, Tip } from '@/ui';
 import { changesOf } from './changes';
 import { canCheckWith, checkedAlready, checkerOf } from './check-turn';
 import { useItem, useTimeline } from './ctx';
-import type { TurnGroup } from './turns';
+import { responseText, type TurnGroup } from './turns';
 import { stampParts } from './util';
 
 const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' ? it.text.trim() : '');
-
-/** What a copy of the response holds: the answers of every segment, or failing that every text. */
-function responseText(items: Record<string, TimelineItem>, turn: TurnGroup): string {
-  const answers = turn.segments.map((s) => textOf(s.answer ? items[s.answer] : undefined)).filter(Boolean);
-  if (answers.length) return answers.join('\n\n');
-  return turn.ids
-    .map((id) => textOf(items[id]))
-    .filter(Boolean)
-    .join('\n\n');
-}
 
 /**
  * Whether a plan limit refused this turn and its window has not reset yet. Its notice then offers

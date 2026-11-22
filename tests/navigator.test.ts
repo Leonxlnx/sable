@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import type { TimelineItem, UserItem } from '@shared/protocol';
 import {
   firstLine,
+  indexLines,
+  indexWindow,
+  rowsMoved,
   groupAt,
   groupBoxes,
   groupHeight,
@@ -317,5 +320,70 @@ describe('words', () => {
     expect(m?.line).toContain('needle');
     const at = m!.line.indexOf('needle');
     expect(m!.indices).toEqual([0, 1, 2, 3, 4, 5].map((i) => at + i));
+  });
+});
+
+describe('the navigator with long sittings and moving rows (review wave 9)', () => {
+  it('keeps a 285-message sitting inside its track: the rail never runs past it', () => {
+    // Fifteen one-message sittings an hour apart, then one long sitting of 285.
+    const ts: number[] = [];
+    for (let i = 0; i < 15; i++) ts.push(T0 + i * 2 * 60 * 60_000);
+    for (let i = 0; i < 285; i++) ts.push(T0 + 40 * 60 * 60_000 + i * 60_000);
+    const runs = runsOf(ts);
+    expect(runs.length).toBeLessThanOrEqual(16);
+    const sizes = runs.map((r) => r.to - r.from);
+    const open = runs.length - 1;
+    for (const track of [500, 300, 160]) {
+      const rail = railOf(sizes, open, track);
+      expect(rail.h, `track ${track}`).toBeLessThanOrEqual(track);
+      // The last message's line stands on the track, and a place on it points back at a message of the run.
+      const lastY = markY(rail, runs, 299);
+      expect(lastY).toBeLessThanOrEqual(track);
+      expect(railAt(rail, runs, open, lastY)?.mark).toBeGreaterThanOrEqual(runs[open].from);
+    }
+    // Room to spare: the lines keep their usual distance.
+    expect(railOf([3, 4], 1, 500).pitch).toBe(5);
+  });
+
+  it('places a built steered message where its row was measured, the estimate only for one not built', () => {
+    const marks: NavMark[] = [
+      { id: 'a', group: 0, steered: false, ts: 1, failed: false },
+      { id: 'b', group: 0, steered: true, ts: 2, failed: false },
+      { id: 'c', group: 1, steered: true, ts: 3, failed: false },
+    ];
+    const boxes = { top: Float64Array.from([0, 1000]), height: Float64Array.from([600, 400]) };
+    const ys = placeMarks(marks, boxes, () => 0.5, (i) => (i === 1 ? 520 : undefined));
+    // b: a checkpoint opened above it moved it to 520 (the estimate said 300); c is not built.
+    expect(Array.from(ys)).toEqual([300, 520, 1200]);
+  });
+
+  it('notices a steered message that moved inside the newest turn', () => {
+    expect(rowsMoved([120, 400], (i) => [120, 400][i])).toBe(false);
+    expect(rowsMoved([120, 400], (i) => [120, 640][i])).toBe(true);
+    expect(rowsMoved([120], () => undefined)).toBe(true);
+  });
+
+  it('makes only the index lines near the view, wherever the lit row is among 300', () => {
+    const runs = [
+      { from: 0, to: 15 },
+      { from: 15, to: 300 },
+    ];
+    const all = Array.from({ length: 300 }, (_, i) => i);
+    const lines = indexLines(runs, all, false);
+    expect(lines.list).toHaveLength(302);
+    expect(lines.headAt.get(1)).toBe(16);
+    expect(lines.rowAt.get(15)).toBe(17);
+    expect(lines.rowAt.get(299)).toBe(301);
+    // A list 392px tall scrolled to row 250: a few dozen lines, around it.
+    const w = indexWindow(4 + 250 * 28, 392, lines.list.length, 28, 4, 10);
+    expect(w.to - w.from).toBeLessThanOrEqual(40);
+    expect(w.from).toBeLessThanOrEqual(250);
+    expect(w.to).toBeGreaterThan(250 + 14);
+    // With something typed: the matches alone, no heads.
+    const flat = indexLines(runs, [3, 200], true);
+    expect(flat.list).toEqual([
+      { kind: 'row', i: 3 },
+      { kind: 'row', i: 200 },
+    ]);
   });
 });

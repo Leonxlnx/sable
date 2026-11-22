@@ -33,7 +33,8 @@ import { isLeadIn } from './lead-in';
  *   T  turn end                                 F  turn end with an error
  *   g  a widget (generative UI): never folded, shown in its place
  *   f  files the agent hands over (SendUserFile): their cards, never folded, shown in their place
- *   Z  an until loop's end line: closes a turn left open (an interrupted one), stands on its own
+ *   Z  an until loop's end line, a switch of agent, a rewind's result: closes a turn left open (an
+ *      interrupted one, the kept part of a rewound one), stands on its own
  *   x  a check of a turn by the other agent: never part of a turn, shown under the turn it checks
  *   .  nothing to show (an empty, finished text)
  */
@@ -90,7 +91,11 @@ export interface Segment {
    * with no work at all: with nothing to fold behind, its texts simply stand.
    */
   notes: string[];
-  /** Error notices, and notices that are all a segment holds: never folded (they stand in the flow as shown pieces). */
+  /**
+   * The error notices shown in the flow: the failure is in view, so the turn's foot does not say it
+   * again. Notices that are all a segment holds (a /compact, a model change) stand in the flow as
+   * shown pieces too, but are not errors: a turn that then fails still says why.
+   */
   errors: string[];
   /** The lead-ins folded into the work since the last piece in view, oldest first: the live line names the newest. */
   narr: string[];
@@ -144,8 +149,9 @@ export function shapeOf(item: TimelineItem | undefined): string {
       if (item.check) return 'x';
       return item.kind === 'plan' ? 'p' : item.kind === 'widget' ? 'g' : item.kind === 'share' ? 'f' : item.kind === 'todo' ? 'k' : 'w';
     case 'notice':
-      // An until loop's end, or a switch of agent: a line of its own that closes a turn left open.
-      if (item.until || item.agentSwitch) return 'Z';
+      // An until loop's end, a switch of agent, a rewind: a line of its own that closes a turn left
+      // open (a rewind to a steered message keeps a turn with no end; its result must not fold into it).
+      if (item.until || item.agentSwitch || item.variant === 'rewind') return 'Z';
       if (item.variant === 'interrupted') return 'i';
       if (item.variant === 'error') return 'e';
       if (item.variant === 'command') return 'c';
@@ -337,25 +343,33 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
   let steps = 0;
   let run: string[] = [];
   let runCount = 0;
+  /**
+   * A checkpoint's identity (its `key`, what its open state is kept under): its first item that is
+   * not a lead-in. A lead-in that opens a run may be said in view once the turn settles (it becomes
+   * the answer), and the run must stay the same checkpoint when it does.
+   */
+  let runAt: string | null = null;
   let narr: string[] = [];
   // The reply to a steered message stands right under it: see below.
   let replied = !seg.steered;
   // A piece in view closes the run before it: one checkpoint.
   const close = () => {
     if (!run.length) return;
-    flow.push({ kind: 'steps', key: run[0], ids: run, count: runCount });
+    flow.push({ kind: 'steps', key: runAt ?? run[0], ids: run, count: runCount });
     run = [];
     runCount = 0;
+    runAt = null;
   };
   for (let i = 0; i < seg.chars.length; i++) {
     const ch = seg.chars[i];
     const id = seg.ids[i];
     if (ch === '.' || ch === 'i') continue;
-    // An error, or a notice that is all the segment holds: shown where it happened.
+    // An error, or a notice that is all the segment holds: shown where it happened. Only an error
+    // counts as the failure shown (`errors`): a model change in view says nothing of what went wrong.
     if (ch === 'e' || (lone && ch === 'n')) {
       close();
       narr = [];
-      errors.push(id);
+      if (ch === 'e') errors.push(id);
       flow.push({ kind: 'show', id });
       continue;
     }
@@ -376,6 +390,7 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
     if (ch === 'l') narr.push(id);
     work.push(id);
     run.push(id);
+    if (runAt === null && raw.chars[i] !== 'l') runAt = id;
     if (ch === 'w') {
       steps++;
       runCount++;
@@ -402,6 +417,56 @@ function buildSegment(raw: Open['segs'][number], index: number, turnKey: string,
     errors,
     narr,
   };
+}
+
+/** The last thing of substance a raw segment said (a text that is not a lead-in or a nod; with `any`, also command output or a plan), or -1. */
+function lastSaid(raw: Open['segs'][number], any: boolean): number {
+  for (let i = raw.chars.length - 1; i >= 0; i--) if (any ? ANSWER.has(raw.chars[i]) : raw.chars[i] === 't') return i;
+  return -1;
+}
+
+/** Whether `id` is something of substance the raw segment said (not a lead-in or a nod said in view). */
+function said(raw: Open['segs'][number], id: string | null, any: boolean): boolean {
+  if (!id) return false;
+  const i = raw.ids.indexOf(id);
+  return i >= 0 && (any ? ANSWER.has(raw.chars[i]) : raw.chars[i] === 't');
+}
+
+/**
+ * A settled turn keeps the last report it holds in view, across its segments: a report before a
+ * steered message is never replaced by the nod that answered the steer ("The migration requires
+ * index X." then "Commit it" and "Committed."). The report is the turn's answer (or, after a
+ * failure, its last words over the error); the nod stays in view where it was said: the reply to
+ * its message, or a quiet line under it.
+ */
+function keepReport(segments: Segment[], raws: Open['segs'], turnKey: string, failed: boolean) {
+  const last = segments.length - 1;
+  const end = segments[last];
+  if (failed) {
+    if (said(raws[last], end.last, false) || said(raws[last], end.answer, true)) return;
+    for (let i = last - 1; i >= 0; i--) {
+      const at = lastSaid(raws[i], false);
+      if (at < 0) continue;
+      segments[i] = { ...segments[i], last: raws[i].ids[at] };
+      return;
+    }
+    return;
+  }
+  if (said(raws[last], end.answer, true)) return;
+  for (let i = last - 1; i >= 0; i--) {
+    if (lastSaid(raws[i], true) < 0) continue;
+    // Built again as a settled segment: its answer is its last report, nods after it its tail.
+    segments[i] = buildSegment(raws[i], i, turnKey, false);
+    const nod = end.answer;
+    if (nod) {
+      const first = end.flow[0];
+      segments[last] =
+        end.steered && !end.reply && first?.kind === 'text' && first.id === nod
+          ? { ...end, answer: null, reply: nod }
+          : { ...end, answer: null, tail: [nod, ...end.tail] };
+    }
+    return;
+  }
 }
 
 /** Which texts of a turn fold with its work (`Segment.notes`): every one that is not kept in view, when the turn has work at all. */
@@ -464,6 +529,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
     const key = o.ids[0];
     const last = o.segs.length - 1;
     const segments = o.segs.map((s, i) => buildSegment(s, i, key, failed && i === last, state === 'running' && i === last, i < last));
+    if (state !== 'running') keepReport(segments, o.segs, key, state === 'failed');
     // A settled turn whose last segment said nothing (only steps after a steered message): the
     // newest segment that did say something answers it, so the turn keeps its answer and its foot.
     if ((state === 'done' || state === 'interrupted') && !segments.some((s) => s.answer)) {
@@ -573,6 +639,34 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
     else if (ANSWER.has(ch)) o.failed = false;
   }
   close(null, false, true);
+}
+
+const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' ? it.text.trim() : '');
+
+/** What a copy of a turn's response holds: the answers of every segment, or failing that every text. */
+export function responseText(items: Record<string, TimelineItem | undefined>, turn: TurnGroup): string {
+  const answers = turn.segments.map((s) => textOf(s.answer ? items[s.answer] : undefined)).filter(Boolean);
+  if (answers.length) return answers.join('\n\n');
+  return turn.ids
+    .map((id) => textOf(items[id]))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+/**
+ * What `/copy` copies: the response of the newest settled turn with an answer, the same text as
+ * that turn's "Copy response" (`responseText`), or null when there is none yet.
+ */
+export function lastResponse(items: Record<string, TimelineItem | undefined>, roots: readonly string[], busy: boolean): string | null {
+  const shape = roots.map((id) => shapeOf(items[id])).join('');
+  const { groups } = groupTurns(roots, shape, busy);
+  for (let i = groups.length - 1; i >= 0; i--) {
+    const g = groups[i];
+    if (g.kind !== 'turn' || g.state === 'running' || !g.segments.some((s) => s.answer)) continue;
+    const text = responseText(items, g);
+    if (text) return text;
+  }
+  return null;
 }
 
 /**

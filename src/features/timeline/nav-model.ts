@@ -190,18 +190,43 @@ export function groupAt(top: ArrayLike<number>, y: number): number {
 }
 
 /**
- * Each mark's content offset: its group's top, or for a later segment's message, its estimated
- * place inside the group scaled to the group's height (`offsetIn`).
+ * Each mark's content offset: where its row was measured (`exact`: a message's row that is built),
+ * else its group's top, or for a later segment's message its estimated place inside the group
+ * scaled to the group's height (`offsetIn`). Estimates are only for rows that are not built: a
+ * checkpoint opened above a steered message moves its row, and only the row itself says where.
  */
-export function placeMarks(marks: readonly NavMark[], boxes: { top: Float64Array; height: Float64Array }, offsetIn: (group: number, id: string) => number | undefined): Float64Array {
+export function placeMarks(
+  marks: readonly NavMark[],
+  boxes: { top: Float64Array; height: Float64Array },
+  offsetIn: (group: number, id: string) => number | undefined,
+  exact?: (mark: number) => number | undefined,
+): Float64Array {
   const ys = new Float64Array(marks.length);
   for (let i = 0; i < marks.length; i++) {
     const m = marks[i];
+    const y = exact?.(i);
+    if (y !== undefined) {
+      ys[i] = y;
+      continue;
+    }
     const top = boxes.top[m.group] ?? 0;
     const f = offsetIn(m.group, m.id);
     ys[i] = f === undefined ? top : top + f * (boxes.height[m.group] ?? 0);
   }
   return ys;
+}
+
+/**
+ * Whether rows measured inside a group have moved since (`was`, their offsets then; `now` reads
+ * one again, undefined when it is gone): the group's own top stays put when a fold opens inside
+ * it, so its steered messages are looked at themselves.
+ */
+export function rowsMoved(was: readonly number[], now: (i: number) => number | undefined): boolean {
+  for (let i = 0; i < was.length; i++) {
+    const y = now(i);
+    if (y === undefined || Math.abs(y - was[i]) >= 0.5) return true;
+  }
+  return false;
 }
 
 /** Where an item stands inside its group, as a fraction of the group's estimated height (`groupHeight`). */
@@ -343,10 +368,15 @@ export interface Rail {
   pitch: number;
 }
 
+/** The least share of their height the closed stacks and the gaps keep when the track runs out. */
+const SHRINK_MIN = 0.4;
+
 /**
  * The rail: the runs under each other, each closed one a stack, the open one (`open`, -1 for
  * none) fanned out into a line per message. When the track is too short for it, the open run's
- * lines close up first, then the stacks and the gaps shrink.
+ * lines close up first (to `PITCH_MIN`), then the stacks and the gaps shrink; when even that is not
+ * enough (a sitting of hundreds of messages), the lines close up further, so the rail never runs
+ * past its track.
  */
 export function railOf(sizes: readonly number[], open: number, track: number): Rail {
   const count = sizes.length;
@@ -355,8 +385,16 @@ export function railOf(sizes: readonly number[], open: number, track: number): R
   for (let i = 0; i < count; i++) if (i !== open) rest += stackHeight(sizes[i]);
   let pitch = PITCH;
   if (n > 1 && rest + n * pitch > track) pitch = Math.max(PITCH_MIN, Math.min(PITCH, Math.floor((track - rest) / n)));
-  const openH = n > 1 ? n * pitch : n === 1 ? LINE : 0;
-  const k = rest > 0 && rest + openH > track ? Math.max(0.4, (track - openH) / rest) : 1;
+  let openH = n > 1 ? n * pitch : n === 1 ? LINE : 0;
+  const k = rest > 0 && rest + openH > track ? Math.max(SHRINK_MIN, (track - openH) / rest) : 1;
+  const gap = Math.max(2, Math.round(RAIL_GAP * k));
+  // The rest of the rail as drawn (stacks and gaps at their share): what is left of the track is the open run's.
+  let others = Math.max(0, count - 1) * gap;
+  for (let i = 0; i < count; i++) if (i !== open) others += Math.max(LINE, Math.round(stackHeight(sizes[i]) * k));
+  if (n > 1 && track > 0 && others + openH > track) {
+    pitch = Math.max(0.25, (track - others) / n);
+    openH = n * pitch;
+  }
   const top: number[] = [];
   const height: number[] = [];
   let y = 0;
@@ -364,7 +402,7 @@ export function railOf(sizes: readonly number[], open: number, track: number): R
     const h = i === open ? openH : Math.max(LINE, Math.round(stackHeight(sizes[i]) * k));
     top.push(y);
     height.push(h);
-    y += h + (i < count - 1 ? Math.max(2, Math.round(RAIL_GAP * k)) : 0);
+    y += h + (i < count - 1 ? gap : 0);
   }
   return { h: y, top, height, pitch };
 }
@@ -393,6 +431,43 @@ export function railAt(rail: Rail, runs: readonly NavRun[], open: number, y: num
   if (run !== open || to - from < 2) return { run, mark: from };
   const at = Math.floor((y - rail.top[run]) / (rail.pitch || 1));
   return { run, mark: from + Math.max(0, Math.min(to - from - 1, at)) };
+}
+
+// ── the index ──
+
+/** A line of the index's grid: a run's head (when it began) or a message's row; every line is one row tall. */
+export type IndexLine = { kind: 'head'; run: number } | { kind: 'row'; i: number };
+
+/**
+ * The index as lines of its grid: every run's head and its rows, or with something typed (`flat`)
+ * the matching rows alone (`order`), and where each row and head stands (the line's number).
+ */
+export function indexLines(runs: readonly NavRun[], order: readonly number[], flat: boolean): { list: IndexLine[]; rowAt: Map<number, number>; headAt: Map<number, number> } {
+  const list: IndexLine[] = [];
+  const rowAt = new Map<number, number>();
+  const headAt = new Map<number, number>();
+  if (flat) {
+    for (const i of order) {
+      rowAt.set(i, list.length);
+      list.push({ kind: 'row', i });
+    }
+    return { list, rowAt, headAt };
+  }
+  runs.forEach((r, k) => {
+    headAt.set(k, list.length);
+    list.push({ kind: 'head', run: k });
+    for (let i = r.from; i < r.to; i++) {
+      rowAt.set(i, list.length);
+      list.push({ kind: 'row', i });
+    }
+  });
+  return { list, rowAt, headAt };
+}
+
+/** The lines of a list of `n` (each `row` tall, after `pad`) to make for a view scrolled to `top`, `height` tall: those in it and `over` more on each side. */
+export function indexWindow(top: number, height: number, n: number, row: number, pad: number, over: number): { from: number; to: number } {
+  const from = Math.max(0, Math.min(n, Math.floor((top - pad) / row) - over));
+  return { from, to: Math.min(n, from + Math.ceil(height / row) + over * 2) };
 }
 
 // ── words ──

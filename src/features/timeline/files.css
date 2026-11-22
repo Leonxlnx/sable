@@ -9,8 +9,8 @@
    its depth is the well and the sheet, both static paint.
 
    Motion (all transform, opacity and stroke dashes, each one-shot, nothing at rest):
-   - arriving (`[data-arrive]` on the row, set by FileCard.tsx only for a share that happens on
-     screen while you watch): the sheet rises into the well and settles, its corner turns down, and
+   - arriving (`[data-arrive]` on each card, set by FileCard.tsx only for a share that happens
+     while you watch, and only on the cards that are on screen):the sheet rises into the well and settles, its corner turns down, and
      what is on it draws in: the lines of a page one after another, a cover's drawing stroke by
      stroke, a picture as it develops; cards of one share a beat apart;
    - pointed at: the lift above, and the cover's drawing gives its kind's one small motion (the icon
@@ -572,24 +572,25 @@ button.fcard-open::after {
 }
 
 /* ── arriving ──
-   Only while the row carries `data-arrive` (FileCard.tsx `useArrival`: a share that happens on
-   screen while you watch; "wait" holds every part at its first frame until the row's first look at
-   the screen, then "go" runs it and the mark is taken away). Cards of one share come a beat apart
+   Only while a card carries `data-arrive` (FileCard.tsx `useArrival`: a share that happens while
+   you watch; "wait" holds every part at its first frame until that card's own first look at the
+   screen, then "go" runs it when it is in view and the mark is taken away; a card off screen
+   simply stands there).Cards of one share come a beat apart
    (`--i`, the sixth and later together); what is on a page comes line by line (`--l`).
    A rule here only ever adds to an element's animations and keeps the ones it has at rest (a page's
    and a picture's own short fade), so taking the mark away starts nothing again. */
 
-.fshare-list[data-arrive] .fcard {
+.fcard[data-arrive] {
   --fc-at: calc(min(var(--i, 0), 5) * 80ms);
 }
 
 /* the sheet rises into the well, a hair past its place, and settles */
-.fshare-list[data-arrive] .fcard-sheet {
+.fcard[data-arrive] .fcard-sheet {
   animation: var(--fc-in, fc-sheet-in) 560ms var(--fc-at) var(--ease-out) backwards;
 }
 
 /* the first card takes over from the one that waited: its sheet is already there and only settles */
-.fshare-list[data-arrive][data-waited] .fcard:first-child {
+.fshare-list[data-waited] .fcard[data-arrive]:first-child {
   --fc-in: fc-sheet-settle;
 }
 
@@ -607,7 +608,7 @@ button.fcard-open::after {
 }
 
 /* its corner turns down once it stands */
-.fshare-list[data-arrive] .fcard-fold {
+.fcard[data-arrive] .fcard-fold {
   animation: fc-fold-in 420ms calc(var(--fc-at) + 260ms) var(--ai-back) backwards;
 }
 
@@ -616,7 +617,7 @@ button.fcard-open::after {
 }
 
 /* a page: its lines and rows come in one after another */
-.fshare-list[data-arrive] :is(.fcard-line, .fcard-tr) {
+.fcard[data-arrive] :is(.fcard-line, .fcard-tr) {
   animation: fc-line-in 320ms calc(var(--fc-at) + 120ms + min(var(--l, 0), 12) * 28ms) var(--ease-out) backwards;
 }
 
@@ -625,7 +626,7 @@ button.fcard-open::after {
 }
 
 /* a picture develops: it comes up out of the dark, a little close, and settles back */
-.fshare-list[data-arrive] :is(.fcard-pic-img, .fcard-img) {
+.fcard[data-arrive] :is(.fcard-pic-img, .fcard-img) {
   animation:
     fade-in 220ms var(--ease) backwards,
     fc-develop 620ms calc(var(--fc-at) + 120ms) var(--ease-out) backwards;
@@ -635,7 +636,7 @@ button.fcard-open::after {
   from { opacity: 0; scale: 1.08; }
 }
 
-.fshare-list[data-arrive] .fcard-play {
+.fcard[data-arrive] .fcard-play {
   animation: fc-pop 420ms calc(var(--fc-at) + 420ms) var(--ai-back) backwards;
 }
 
@@ -644,11 +645,11 @@ button.fcard-open::after {
 }
 
 /* a cover: its word comes up, its drawing is drawn stroke by stroke */
-.fshare-list[data-arrive] .fcard-ext {
+.fcard[data-arrive] .fcard-ext {
   animation: fc-line-in 320ms calc(var(--fc-at) + 140ms) var(--ease-out) backwards;
 }
 
-.fshare-list[data-arrive] .fcover :is(.r, .hd, .col, .fr, .hill) {
+.fcard[data-arrive] .fcover :is(.r, .hd, .col, .fr, .hill) {
   animation: an-draw 460ms calc(var(--fc-at) + 220ms + var(--n, 0) * 60ms) var(--ease-out) backwards;
 }
 
@@ -657,16 +658,16 @@ button.fcard-open::after {
 .fcover .r3 { --n: 3; }
 .fcover .r4 { --n: 4; }
 
-.fshare-list[data-arrive] .fcover :is(.sun, .tri, .caret, .perf) {
+.fcard[data-arrive] .fcover :is(.sun, .tri, .caret, .perf) {
   animation: fc-pop 420ms calc(var(--fc-at) + 520ms) var(--ai-back) backwards;
 }
 
 /* the zip is closed from the left: the pull runs to its place, the teeth close behind it */
-.fshare-list[data-arrive] .fcover .pull {
+.fcard[data-arrive] .fcover .pull {
   animation: fc-pull-in 620ms calc(var(--fc-at) + 220ms) var(--ai-io) backwards;
 }
 
-.fshare-list[data-arrive] .fcover .teeth {
+.fcard[data-arrive] .fcover .teeth {
   animation: an-draw 620ms calc(var(--fc-at) + 220ms) var(--ai-io) backwards;
 }
 
@@ -675,7 +676,7 @@ button.fcard-open::after {
 }
 
 /* the bars of a sound stand up one after another */
-.fshare-list[data-arrive] .fcover .bar {
+.fcard[data-arrive] .fcover .bar {
   animation: fc-bar-in 380ms calc(var(--fc-at) + 220ms + var(--b) * 22ms) var(--ai-back) backwards;
 }
 
@@ -684,7 +685,7 @@ button.fcard-open::after {
 }
 
 /* waiting for its first look at the screen: held at the first frame */
-.fshare-list[data-arrive='wait'] .fcard * {
+.fcard[data-arrive='wait'] * {
   animation-play-state: paused !important;
 }
 
@@ -699,13 +700,13 @@ button.fcard-open::after {
 }
 
 /* opened while it still arrives: the beat joins the arrival, which runs on (and is not begun again when the beat is over) */
-.fshare-list[data-arrive] .fcard[data-beat] .fcard-sheet {
+.fcard[data-arrive][data-beat] .fcard-sheet {
   animation:
     var(--fc-in, fc-sheet-in) 560ms var(--fc-at) var(--ease-out) backwards,
     fc-open 380ms var(--ease-out);
 }
 
-.fshare-list[data-arrive] .fcard[data-beat] .fcard-fold {
+.fcard[data-arrive][data-beat] .fcard-fold {
   animation:
     fc-fold-in 420ms calc(var(--fc-at) + 260ms) var(--ai-back) backwards,
     fc-fold-flick 380ms var(--ease-out);

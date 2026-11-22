@@ -139,7 +139,9 @@ describe('phone turns as checkpoints (the desktop since f79fd71)', () => {
     expect(flowOf(onlyTurn('U1 e2 w3 t4 T5').segments[0].flow)).toBe('*2 [3] 4');
     const f = onlyTurn('U1 w2 t3 w4 t5 F6').segments[0];
     expect(f).toMatchObject({ answer: null, last: '5', notes: ['3'] });
-    expect(onlyTurn('U1 n2 T3').segments[0]).toMatchObject({ errors: ['2'], work: [] });
+    // A notice that is all the turn holds shows, but is not an error (the footer still says a failure).
+    expect(onlyTurn('U1 n2 T3').segments[0]).toMatchObject({ errors: [], work: [] });
+    expect(onlyTurn('U1 n2 T3').segments[0].flow).toEqual([{ kind: 'show', id: '2' }]);
   });
 
   it('keeps the report the answer when a nod follows it, with or without steps between', () => {
@@ -512,5 +514,42 @@ describe('streaming cost on the phone', async () => {
     const again = reshape(shape, roots, changed, ['w5']);
     expect(again).toBe(shapeString(roots, { ...items, w5: changed.w5 }));
     expect(again).not.toBe(shape);
+  });
+});
+
+describe('phone turns: nothing the person must read folds away (review wave 9, as the desktop)', () => {
+  it('keeps a report as the answer when a steered message is answered by a nod', () => {
+    const t = onlyTurn('U1 w2 t3 S4 l5 T6');
+    expect(t.segments[0]).toMatchObject({ answer: '3', notes: [] });
+    expect(t.segments[1]).toMatchObject({ lead: '4', reply: '5', answer: null, notes: [] });
+    const n = onlyTurn('U1 w2 t3 N4 w5 l6 T7');
+    expect(n.segments[0].answer).toBe('3');
+    expect(n.segments[1]).toMatchObject({ answer: null, tail: ['6'] });
+    expect(onlyTurn('U1 w2 t3 S4 w5 t6 T7').segments[1].answer).toBe('6');
+  });
+
+  it('keeps the last report in view over a failure that came after a steer', () => {
+    const t = onlyTurn('U1 w2 t3 S4 w5 e6 F7');
+    expect(t.segments[0]).toMatchObject({ last: '3', notes: [] });
+    expect(t.segments[1].errors).toEqual(['6']);
+  });
+
+  it('never takes a notice in view for the failure shown', () => {
+    expect(onlyTurn('U1 n2 F3').segments.some((s) => s.errors.length)).toBe(false);
+    expect(onlyTurn('U1 w2 e3 F4').segments[0].errors).toEqual(['3']);
+  });
+
+  it('gives a rewind its own line, out of the turn it cut', () => {
+    expect(shapeOf({ id: 'x', ts: 0, type: 'notice', variant: 'rewind', text: 'Rewound the conversation', detail: 'Files could not be restored.' } as TimelineItem)).toBe('Z');
+    expect(turns('U1 w2 t3 S4 w5 Z6').groups.map((g) => g.kind)).toEqual(['turn', 'item']);
+  });
+
+  it('keeps a checkpoint the same checkpoint when the lead-in that opened it becomes the answer', () => {
+    const keyOf = (t: TurnGroup) => t.segments[0].flow.flatMap((c) => (c.kind === 'steps' && c.ids.includes('5') ? [c.key] : []))[0];
+    const live = onlyTurn('U1 w2 g3 l4 w5', true);
+    const done = onlyTurn('U1 w2 g3 l4 w5 T6');
+    expect(done.segments[0].answer).toBe('4');
+    expect(keyOf(live)).toBe('5');
+    expect(keyOf(done)).toBe('5');
   });
 });

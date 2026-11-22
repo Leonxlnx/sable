@@ -52,13 +52,37 @@ export const sheetKey = (itemId: string, index: number, path: string, size?: num
 const ARRIVE_MS = 1700;
 
 /**
- * The arrival of a row of cards (files.css, `[data-arrive]`): only for a share that happens while you
- * watch (`fresh`), and only if the row is on screen when its files are named. Before the row's first
- * paint it is marked waiting (`data-arrive="wait"`: every part held at its first frame), and its
- * first look at the screen decides, once: in view, the motion runs (`go`) and the mark is taken away
- * when it is over; out of view, the mark goes at once and the cards simply stand there. Nothing
- * ever moves off screen, and nothing is left running. (The mark is written here, never rendered, so
- * a later render of the row does not bring it back.)
+ * One observer for every card waiting for its first look at the screen: each card is decided on its
+ * own (a share of many cards in a narrow pane is several rows, some of them off screen).
+ */
+const firstLooks = new Map<Element, (seen: boolean) => void>();
+let looker: IntersectionObserver | null = null;
+export function firstLook(el: Element, then: (seen: boolean) => void): () => void {
+  looker ??= new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const cb = firstLooks.get(e.target);
+      if (!cb) continue;
+      firstLooks.delete(e.target);
+      looker?.unobserve(e.target);
+      cb(e.isIntersecting);
+    }
+  });
+  firstLooks.set(el, then);
+  looker.observe(el);
+  return () => {
+    if (!firstLooks.delete(el)) return;
+    looker?.unobserve(el);
+  };
+}
+
+/**
+ * The arrival of a row of cards (files.css, `.fcard[data-arrive]`): only for a share that happens
+ * while you watch (`fresh`), and only for the cards on screen when its files are named. Before the
+ * row's first paint every card is marked waiting (`data-arrive="wait"`: every part held at its first
+ * frame), and each card's own first look at the screen decides, once: in view, its motion runs
+ * (`go`) and the mark is taken away when it is over; out of view, the mark goes at once and the card
+ * simply stands there. Nothing ever moves off screen, and nothing is left running. (The marks are
+ * written here, never rendered, so a later render of the row does not bring them back.)
  */
 function useArrival(fresh: boolean, named: boolean) {
   const row = useRef<HTMLDivElement>(null);
@@ -70,23 +94,21 @@ function useArrival(fresh: boolean, named: boolean) {
       decided.current = true;
       return;
     }
-    el.dataset.arrive = 'wait';
-    let timer = 0;
-    const io = new IntersectionObserver((entries) => {
-      io.disconnect();
-      decided.current = true;
-      if (!entries.some((e) => e.isIntersecting)) {
-        delete el.dataset.arrive;
-        return;
-      }
-      el.dataset.arrive = 'go';
-      timer = window.setTimeout(() => delete el.dataset.arrive, ARRIVE_MS);
+    const cards = Array.from(el.children).filter((c): c is HTMLElement => c instanceof HTMLElement && c.classList.contains('fcard'));
+    const timers: number[] = [];
+    const offs = cards.map((card) => {
+      card.dataset.arrive = 'wait';
+      return firstLook(card, (seen) => {
+        decided.current = true;
+        if (!seen) return void delete card.dataset.arrive;
+        card.dataset.arrive = 'go';
+        timers.push(window.setTimeout(() => delete card.dataset.arrive, ARRIVE_MS));
+      });
     });
-    io.observe(el);
     return () => {
-      io.disconnect();
-      window.clearTimeout(timer);
-      delete el.dataset.arrive;
+      offs.forEach((off) => off());
+      timers.forEach((t) => window.clearTimeout(t));
+      for (const card of cards) delete card.dataset.arrive;
     };
   }, [fresh, named]);
   return row;

@@ -98,6 +98,41 @@ describe('isLeadIn', () => {
   });
 });
 
+describe('isLeadIn: what must be read never folds (review wave 9)', () => {
+  it('keeps a requirement or a result in view even when it starts like an announcement', () => {
+    for (const t of [
+      'Installing this package requires administrator approval.',
+      "I'm installing it, but the package needs a restart afterwards.",
+      'Running the migration needs the database offline.',
+      'We need to bump Node to 22 for this to build.',
+      'I should mention nothing.'.replace('mention nothing', 'restart the server before this takes effect'),
+      'Checking out main may discard your local changes.',
+    ])
+      expect(isLeadIn(t, false), t).toBe(false);
+    // Once the verb is there it shows while it is still being written.
+    expect(isLeadIn('Installing this package requires', true)).toBe(false);
+    // Plain announcements stay lead-ins.
+    for (const t of ['Installing the dependencies.', 'I need to check the config first.', 'Running the tests now.', 'Looking good, let me run the tests.']) expect(isLeadIn(t, false), t).toBe(true);
+  });
+
+  it('stays linear in the length of what is written: a long build id never stalls a streamed sentence', () => {
+    const id = 'a1b2c3d4e5'.repeat(22);
+    for (const head of ['Now ', 'Now the ', 'Next, ', 'Good. Now ', 'On to ']) {
+      const started = performance.now();
+      for (const tail of ['.', '', '!', ' x.']) {
+        isLeadIn(`${head}${id}${tail}`, true);
+        isLeadIn(`${head}${id}${tail}`, false);
+        isLeadIn(`${head}${id.slice(0, 150)} ${id.slice(0, 30)}${tail}`, true);
+      }
+      expect(performance.now() - started, head).toBeLessThan(200);
+    }
+    // The moves themselves still read as before.
+    expect(isLeadIn('Now the CSS.', false)).toBe(true);
+    expect(isLeadIn('Now the admin guard in the middleware file', true)).toBe(false);
+    expect(isLeadIn('Now the guard', true)).toBe(true);
+  });
+});
+
 describe('leadTitle', () => {
   it('names what the step does, in the voice of a step title', () => {
     expect(leadTitle('Now let me run the tests.')).toBe('Run the tests');

@@ -174,9 +174,14 @@ const ANNOUNCE = new RegExp(`^${OPENER}*(?:${[...PHRASES, ...DOING].map(esc).joi
 const SAYS = new RegExp(`^${OPENER}*(?:${PHRASES.map(esc).join('|')})\\s+(?:(?:also|just|briefly|quickly|first)\\s+)?(?:${SAYING.map(esc).join('|')})\\b`);
 /** "Looking at the logs, the guard throws first.": a bare doing word that leads into a finding. */
 const FINDING = new RegExp(`^${OPENER}*(?:${DOING.join('|')})\\b[^,]*,\\s*\\S`);
-/** "Running the tests showed two failures.": a doing word as the subject of what happened, a finding too. */
-const BARE_DOING = new RegExp(`^${OPENER}*(?:${DOING.join('|')})\\b`);
+/** A doing word in front ("Running the tests", "I'm installing the package"): what it is doing now, unless a verb says what is so. */
+const DOING_HEAD = new RegExp(`^${OPENER}*(?:i'm (?:now )?)?(?:${DOING.map(esc).join('|')})\\b`);
+/** Openers that may say what is needed rather than what comes next ("We need to bump Node for this to build."). */
+const MODAL_HEAD = new RegExp(`^${OPENER}*(?:i need to|we need to|i should)\\b`);
 const HAPPENED = /\b(?:showed|shows|broke|failed|passed|worked|fixed|found|gave|took|caused|made|revealed|turned out|did|didn't|was|were|is|are)\b/;
+/** What a requirement or a condition reads like: "requires administrator approval", "needs a restart", "may break". */
+const REQUIRES =
+  /\b(?:requires?|required|needs?|needed|depends?|depended|wants?|expects?|blocks?|blocked|prevents?|prevented|asks?|asked|involves?|affects?|affected|means|may|might|won't|cannot|wouldn't|shouldn't|couldn't|unless|otherwise|for (?:this|that|it|them) to|in order to|so that|before you|you'll|you will|you need|you must)\b/;
 const FILLER = new RegExp(`^(?:${FILLERS.map(esc).join('|')})[,!.]*$`);
 const LEADING = new RegExp(`^${OPENER}*`);
 const STARTS = [...PHRASES, ...DOING, ...DOING.map((d) => `i'm ${d}`), ...OPENERS];
@@ -189,13 +194,60 @@ const STARTS = [...PHRASES, ...DOING, ...DOING.map((d) => `i'm ${d}`), ...OPENER
 const MOVES = ['now', 'next', 'then', 'first', 'second', 'third', 'finally', 'lastly', 'next up', 'up next', 'on to', 'onto', 'back to', 'time for', 'and now', 'now for', 'now on to'];
 const NOD = `(?:(?:${[...FILLERS, 'and', 'so'].map(esc).join('|')})[,!.]?\\s+)`;
 const NAMES = 'the|a|an|this|that|these|those|its|their|my|our|each|every|all|both|some|another|one|two|three|four|other|same|remaining';
-const MOVE_HEAD = `^${NOD}*(?:${MOVES.map(esc).join('|')})[,:]?\\s+(?:for\\s+|to\\s+)?`;
-const MOVE = new RegExp(`${MOVE_HEAD}(?:${NAMES})\\b(?:\\s+[^\\s,;]+){0,4}[.:!…]*$`);
-/** The same sentence while it is being written: it may still end as a move. */
-const MOVING = new RegExp(`${MOVE_HEAD}(?:[^\\s,;.!?]+\\s*){0,5}$`);
+/**
+ * Only the head of a move is a regular expression (anchored, each repeat ending on required white
+ * space); the words after it are counted, never matched by a pattern that could split one long
+ * word in many ways (a build id streamed in would stall the page).
+ */
+const MOVE_HEAD = new RegExp(`^${NOD}*(?:${MOVES.map(esc).join('|')})[,:]?\\s+(?:for\\s+|to\\s+)?`);
+const NAME_SET = new Set(NAMES.split('|'));
+/** The words after a move's head, or null when the sentence does not start as one. */
+function afterMove(p: string): string[] | null {
+  const head = MOVE_HEAD.exec(p);
+  if (!head) return null;
+  const rest = p.slice(head[0].length).trim();
+  return rest ? rest.split(/\s+/) : [];
+}
+/** "Now the CSS.": the head, a naming word and at most four more words, no comma, ending on its stop. */
+function moveShape(p: string): boolean {
+  const words = afterMove(p);
+  if (!words?.length || words.length > 5 || words.some((w) => /[,;]/.test(w))) return false;
+  // The naming word stands alone, or carries the stop when it is the last word ("Next, the tests." / "Now this.").
+  const first = words.length === 1 ? words[0].replace(/[.:!…]+$/u, '') : words[0];
+  return NAME_SET.has(first);
+}
+/** The same sentence while it is being written: it may still end as a move (at most five words, no stop yet). */
+function movingShape(p: string): boolean {
+  const words = afterMove(p);
+  return !!words && words.length <= 5 && !words.some((w) => /[,;.!?]/.test(w));
+}
 const STATES =
   /\b(?:is|are|was|were|isn't|aren't|wasn't|has|have|had|does|do|did|doesn't|don't|can|can't|could|will|would|should|must|pass(?:es|ed)?|fail(?:s|ed)?|work(?:s|ed)?|throws?|ran|compiles?|built|match(?:es|ed)?|renders?|holds?|stays?|answers?|returns?|looks?|reads?|fits?|lands?|stands?|exists?|agrees?|differs?|behaves?|breaks?|broke|hangs?|crash(?:es|ed)?|succeed(?:s|ed)?|got|gets?|seems?|appears?|remains?|takes?|gives?|goes|went|comes?|came|became|becomes?|happens?|happened|keeps?|lets?|makes?|means?|says?|said|only|not|no|never|still|already|also)\b/;
-const isMove = (p: string) => MOVE.test(p) && !STATES.test(p);
+const isMove = (p: string) => moveShape(p) && !STATES.test(p);
+
+/**
+ * A sentence that starts like an announcement but says what is so: "Installing this package
+ * requires administrator approval.", "Running the tests showed two failures.", "We need to bump
+ * Node for this to build.". When in doubt it is a note: it stays in view.
+ */
+function states(p: string): boolean {
+  const doing = DOING_HEAD.exec(p);
+  if (doing) {
+    const rest = p.slice(doing[0].length);
+    // Up to a comma: "Looking good, let me run the tests." is still an announcement (a finding after a comma is `FINDING`).
+    const clause = rest.split(',')[0];
+    if (HAPPENED.test(rest) || STATES.test(clause) || REQUIRES.test(clause)) return true;
+    // "I'm installing it, but it needs a restart": what follows the comma says what is so.
+    const after = rest.slice(clause.length + 1).trim();
+    return !!after && !ANNOUNCE.test(after) && (STATES.test(after) || REQUIRES.test(after));
+  }
+  const modal = MODAL_HEAD.exec(p);
+  if (modal) {
+    const rest = p.slice(modal[0].length);
+    return HAPPENED.test(rest) || STATES.test(rest) || REQUIRES.test(rest);
+  }
+  return false;
+}
 
 /** Plain words: no code ticks, emphasis or link targets; curly apostrophes made straight. */
 function plain(text: string): string {
@@ -213,7 +265,7 @@ function mayStart(part: string): boolean {
   const rest = part.replace(LEADING, '');
   if (!rest) return true;
   // "Now the" may end as "Now the CSS." until a verb or a sixth word says otherwise.
-  if (MOVING.test(part) && !STATES.test(part)) return true;
+  if (movingShape(part) && !STATES.test(part)) return true;
   if (STARTS.some((p) => p.startsWith(rest) || (rest.startsWith(p) && /^[\s,!.]/.test(rest.slice(p.length) || ' ')))) return true;
   // A move or a nod in the making ("On t", "That wo", "Committed"): only while nothing but it is
   // there. "Committed the fix on main" is a statement from its second word on.
@@ -237,8 +289,10 @@ export function isLeadIn(text: string, streaming: boolean): boolean {
     if (SAYS.test(p)) return false;
     // "Looking at the logs, the guard throws": a finding. "Looking good, let me run the tests": not.
     if (FINDING.test(p) && !ANNOUNCE.test(p.slice(p.indexOf(',') + 1).trim())) return false;
-    // "Running the tests showed two failures": what happened, told with a doing word in front.
-    if (BARE_DOING.test(p) && HAPPENED.test(p)) return false;
+    // "Running the tests showed two failures", "Installing this package requires approval": what is
+    // so, told with a doing word in front. Also while it is still being written: once a verb says
+    // so, it shows.
+    if (states(p)) return false;
     if (ANNOUNCE.test(p) || FILLER.test(p) || isMove(p)) continue;
     // The sentence being written: it may still become one.
     if (streaming && i === parts.length - 1 && mayStart(p)) continue;

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Capabilities } from '@shared/protocol';
 import { capsFromAnywhere } from '@/features/composer/choice';
 import { folderOf, shareReadable, sharedPath, sheetKey } from '@/features/timeline/FileCard';
@@ -118,5 +118,87 @@ describe('the cover of a file that has no page', () => {
     expect(coverKind('LICENSE')).toBe('file');
     expect(coverKind('data.xyz')).toBe('file');
     expect(coverKind('')).toBe('file');
+  });
+});
+
+describe('file cards and icons never move off screen (review wave 9)', () => {
+  it('decides each card of a share on its own first look at the screen, with one observer', async () => {
+    const observers: FakeIO[] = [];
+    class FakeIO {
+      targets = new Set<object>();
+      constructor(public cb: (entries: { target: object; isIntersecting: boolean }[]) => void) {
+        observers.push(this);
+      }
+      observe(t: object) {
+        this.targets.add(t);
+      }
+      unobserve(t: object) {
+        this.targets.delete(t);
+      }
+      disconnect() {
+        this.targets.clear();
+      }
+    }
+    const saved = (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver;
+    (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver = FakeIO;
+    try {
+      const { firstLook } = await import('@/features/timeline/FileCard');
+      // A share of three cards in a narrow pane: two rows, the second off screen.
+      const [a, b, c] = [{}, {}, {}] as Element[];
+      const seen: string[] = [];
+      firstLook(a, (v) => seen.push(`a:${v}`));
+      firstLook(b, (v) => seen.push(`b:${v}`));
+      const offC = firstLook(c, (v) => seen.push(`c:${v}`));
+      expect(observers).toHaveLength(1);
+      observers[0].cb([
+        { target: a, isIntersecting: true },
+        { target: b, isIntersecting: false },
+      ]);
+      expect(seen).toEqual(['a:true', 'b:false']);
+      // Decided once: neither is looked at again.
+      expect([...observers[0].targets]).toEqual([c]);
+      offC();
+      expect(observers[0].targets.size).toBe(0);
+    } finally {
+      (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver = saved;
+    }
+  });
+
+  it('lets go of each pressed control on its own, however close the presses came', async () => {
+    vi.useFakeTimers();
+    const made: { target: object; on: boolean }[] = [];
+    const saved = (globalThis as { MutationObserver?: unknown }).MutationObserver;
+    (globalThis as { MutationObserver?: unknown }).MutationObserver = class {
+      rec: { target: object; on: boolean } = { target: {}, on: false };
+      observe(t: object) {
+        this.rec = { target: t, on: true };
+        made.push(this.rec);
+      }
+      disconnect() {
+        this.rec.on = false;
+      }
+    };
+    try {
+      const { pressWatch } = await import('@/icons/animated/play');
+      const watch = pressWatch(() => {}, 4000);
+      const [a, b] = [{}, {}] as Element[];
+      watch(a);
+      vi.advanceTimersByTime(3000);
+      watch(b);
+      vi.advanceTimersByTime(1500);
+      // A's four seconds are over though B was pressed after it; B is still watched.
+      expect(made.find((m) => m.target === a)?.on).toBe(false);
+      expect(made.find((m) => m.target === b)?.on).toBe(true);
+      // Pressed again: the same control keeps one observer, and its time starts over.
+      watch(b);
+      vi.advanceTimersByTime(3000);
+      expect(made.filter((m) => m.target === b)).toHaveLength(1);
+      expect(made.find((m) => m.target === b)?.on).toBe(true);
+      vi.advanceTimersByTime(1000);
+      expect(made.find((m) => m.target === b)?.on).toBe(false);
+    } finally {
+      (globalThis as { MutationObserver?: unknown }).MutationObserver = saved;
+      vi.useRealTimers();
+    }
   });
 });
