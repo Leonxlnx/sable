@@ -1111,8 +1111,9 @@ function revealRow(id: string): () => void {
   return () => window.clearTimeout(timer);
 }
 
-// Collapsed folders unmount their rows, so every match is a visible item (no layout read per key).
-const navItems = (list: HTMLElement) => [...list.querySelectorAll<HTMLElement>('[data-nav]')];
+// Collapsed folders unmount their rows, so every match is a visible item (no layout read per key),
+// but for the rows of a folder that is folding away right now: its body is a dead copy (fold.tsx).
+const navItems = (list: HTMLElement) => [...list.querySelectorAll<HTMLElement>('[data-nav]')].filter((el) => !el.closest('[data-gone]'));
 
 function focusItem(el: HTMLElement | undefined) {
   if (!el) return;

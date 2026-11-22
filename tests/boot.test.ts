@@ -72,6 +72,21 @@ describe('the launch waits for a chat it starts into, and a key or a click ends 
     // A key that came before the app was there does not wait for the chat either.
     expect(effect).toMatch(/if \(r\.impatient\) wait\.now\(\);\s*else r\.readyNow = wait\.now;/);
     expect(effect).toMatch(/return \(\) => \{\s*r\.readyNow = null;\s*wait\.cancel\(\);/);
+    // The window stops being a drag region when the wait starts, not when it ends: a click on a
+    // drag region never reaches the page, so on Windows it could not end the wait.
+    const ready = layer.slice(layer.indexOf('if (!ready || !r || r.ready) return;'), layer.indexOf('}, [ready]);'));
+    expect(ready.indexOf("r.root.dataset.ready = '';")).toBeGreaterThan(-1);
+    expect(ready.indexOf("r.root.dataset.ready = '';")).toBeLessThan(ready.indexOf('shortWait(whenViewShown'));
+    expect((layer.match(/r\.root\.dataset\.ready = '';/g) ?? []).length).toBe(1);
+    // Words typed into a piece that ended before the chat's composer exists are all kept, not the first letter alone.
+    const end = layer.slice(layer.indexOf('function end('), layer.indexOf('let settled = false;'));
+    expect(end.indexOf('for (const off of r.off) off();')).toBeLessThan(end.indexOf('if (!silent) keepLateKeys(r);'));
+    const late = layer.slice(layer.indexOf('function keepLateKeys'), layer.indexOf('/** A key or a click: the piece gives way at once. */'));
+    expect(late).toContain('if (at && at !== document.body) return;');
+    expect(late).toContain('r.typed += e.key;');
+    const hand = layer.slice(layer.indexOf('function handOver'), layer.indexOf('function keepLateKeys'));
+    // The listener goes when the words are in the field, or when no field came.
+    expect((hand.match(/over\(\)/g) ?? []).length).toBe(3);
     // The reveal is the crest's own length, and clicks belong to the app a third of the way in.
     expect(layer).toContain('const TRAVEL = 300;');
     expect(LAUNCH.burst).toBe(300);

@@ -83,10 +83,26 @@ describe('guest log: every entry carries its own document', () => {
     const out = log.commit(G); // the second navigation's document = 2
     expect(out.map((e) => e.type)).toEqual(['doc']);
     expect(log.flush()).toEqual([]);
-    // Redirect hops begin the same request again: the last hop's document counts.
+    // A navigation that redirects begins the same request again: still the document after the one it started on.
     log.begin(G, 503, true);
     log.begin(G, 503, true);
     expect(log.end(503, G)).toBe(3);
+  });
+
+  it('a redirected request keeps the document it first started on', () => {
+    const log = new GuestLog();
+    log.commit(G); // A = 1
+    // A keepalive request of A; B commits; then the redirect sends its next hop under the same id.
+    log.begin(G, 600);
+    log.commit(G); // B = 2
+    log.begin(G, 600);
+    log.net(G, log.end(600, G), { url: 'https://a.test/moved', method: 'POST', status: 404 });
+    expect(log.flush().filter((e) => e.type === 'net').map((e) => e.doc)).toEqual([1]);
+    // Another guest's request under an id seen before starts afresh.
+    log.begin(G, 601);
+    log.begin(9, 601);
+    log.commit(9);
+    expect(log.end(601, 9)).toBe(0);
   });
 
   it('a request whose start was not seen reads as the document current when it ended', () => {

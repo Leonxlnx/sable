@@ -217,8 +217,12 @@ export const setHomeUltracode = (on: boolean) => useStore.getState().setUi({ hom
  * session exists, also when the message itself was then refused: the chat is open by then, so a
  * refused message goes back into that chat's field (and a retry sends it there).
  */
-export async function startFromHome(text: string, attachments: Attachment[] = [], opts: { onCreated?: (sessionId: string) => void; submitId?: string } = {}): Promise<{ ok: boolean; sessionId?: string }> {
-  const choice = homeChoice();
+export async function startFromHome(
+  text: string,
+  attachments: Attachment[] = [],
+  opts: { onCreated?: (sessionId: string) => void; submitId?: string; /** What home showed when Send was pressed (read then, not now). */ choice?: ReturnType<typeof homeChoice> } = {},
+): Promise<{ ok: boolean; sessionId?: string }> {
+  const choice = opts.choice ?? homeChoice();
   if (!choice) {
     useStore.getState().setUi({ projectPicker: true });
     return { ok: false };

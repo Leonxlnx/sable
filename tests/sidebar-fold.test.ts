@@ -100,6 +100,14 @@ describe('a folder folds and unfolds without its height being animated', () => {
     expect(gone.indexOf('if (plain) return;')).toBeLessThan(gone.indexOf('host.appendChild(body);'));
   });
 
+  it('keeps the arrow keys off the rows of a folder that is folding away', () => {
+    // The folded body stays in the page as a dead copy (`data-gone`, inert) until its edge has closed:
+    // Down right after Left tried to focus its first row, and focus stayed on the folder.
+    expect(fold).toContain("body.setAttribute('data-gone', '');");
+    expect(fold).toContain('body.inert = true;');
+    expect(sidebar).toContain("const navItems = (list: HTMLElement) => [...list.querySelectorAll<HTMLElement>('[data-nav]')].filter((el) => !el.closest('[data-gone]'));");
+  });
+
   it('is plain under reduced motion', () => {
     expect(fold).toMatch(/if \(!host \|\| !list \|\| !rows \|\| reducedMotion\(\)\) return;/);
     expect(fold).toContain('if (reducedMotion()) return void stop(host);');

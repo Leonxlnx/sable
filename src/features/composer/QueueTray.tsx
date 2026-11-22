@@ -7,6 +7,7 @@ import { dissolve } from '@/lib/dissolve';
 import { play, reducedMotion, spring } from '@/lib/motion';
 import { landInTray, launchFromTray } from './flight';
 import { removeQueued, reorderQueue, sendQueuedNow } from '@/state/actions';
+import { useStore } from '@/state/store';
 import { Roll } from './Roll';
 
 const NONE: QueuedMessage[] = [];
@@ -84,11 +85,16 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
   // A row that comes back is a new element (its key counts its returns): the one that left may still
   // be in the page, hidden and folding away, and would have come back unseen.
   const lives = useRef(new Map<string, number>());
+  const held = useRef(queue);
+  held.current = queue;
   const leave = useCallback((id: string, on: boolean) => {
     if (!on) {
-      lives.current.set(id, (lives.current.get(id) ?? 0) + 1);
-      // Not taken by the bridge after all: when the agent takes it later, it flies as any row.
-      gone.delete(id);
+      if (held.current.some((q) => q.id === id)) {
+        // Still in the queue: the bridge did not take the removal. The row comes back, and when the
+        // agent takes it later it flies as any row.
+        lives.current.set(id, (lives.current.get(id) ?? 0) + 1);
+        gone.delete(id);
+      } else lives.current.delete(id);
     }
     setLeft((prev) => {
       if (prev.has(id) === on) return prev;
@@ -205,7 +211,12 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
       if (shrinks) closeTray(clip, list, [...under, leaving?.ghost], height);
     } else if (row) row.style.display = 'none';
     onLeave(q.id, true);
-    void removeQueued(sessionId, q.id).finally(() => window.setTimeout(() => onLeave(q.id, false), 600));
+    void removeQueued(sessionId, q.id)
+      .then((res) => {
+        // Gone from the queue but not removed: the agent took it between the row and the click.
+        if (res && res.ok === false && !shown.current.some((x) => x.id === q.id)) useStore.getState().toast('That message had already gone out.');
+      })
+      .finally(() => window.setTimeout(() => onLeave(q.id, false), 600));
     if (focused) focusRow(i);
   };
 
@@ -251,13 +262,15 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
               onRemove={(el) => remove(q, i, el)}
               onKey={(e) => {
                 if (e.target !== e.currentTarget) return;
-                const els = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-qrow]') ?? [])];
+                // (Live rows only: one removed by hand is still in the page for a moment, hidden.)
+                const els = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-qrow]') ?? [])].filter((el) => el.style.display !== 'none');
+                const at = els.indexOf(e.currentTarget);
                 if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
                   e.preventDefault();
                   move(i, e.key === 'ArrowUp' ? -1 : 1);
                 } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                   e.preventDefault();
-                  els[(i + (e.key === 'ArrowDown' ? 1 : els.length - 1)) % els.length]?.focus();
+                  els[((at < 0 ? i : at) + (e.key === 'ArrowDown' ? 1 : els.length - 1)) % els.length]?.focus();
                 } else if (e.key === 'Enter' || e.key === 'F2') {
                   e.preventDefault();
                   gone.add(q.id);

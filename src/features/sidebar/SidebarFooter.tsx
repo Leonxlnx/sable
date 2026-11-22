@@ -4,6 +4,7 @@ import { ProviderMark } from '@/art/Logo';
 import { AccountSwitcher, AddAccountDialog } from '@/features/accounts';
 import { connectableAgents, isSignedIn } from '@/features/connect/plan';
 import { Icon } from '@/icons';
+import { anyChecking } from '@/lib/sign-in';
 import { cancelUpdate, installUpdate, openSettings, refreshLimits } from '@/state/actions';
 import { useFocusAccount } from '@/state/hooks';
 import { useStore } from '@/state/store';
@@ -83,6 +84,8 @@ function Account() {
   // An agent without an account to connect still shows while it is the one in focus.
   if (!connected.includes(active) && isSignedIn(providers[active])) connected.push(active);
   if (!connected.length) {
+    // Not known yet: the row waits; it does not ask to connect an agent that may be connected.
+    if (anyChecking(providers, connectableAgents(providers))) return <div className="account" aria-hidden />;
     return (
       <div className="account">
         <button type="button" className="connect" onClick={() => openSettings('accounts')}>

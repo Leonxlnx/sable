@@ -192,6 +192,20 @@ describe('a queued message removed leaves in the frame of the click', () => {
     expect(tray).toContain(".find((el) => el.style.display !== 'none')?.querySelector<HTMLElement>('.cq-text')");
   });
 
+  it('says so when the agent had already taken the message, and steps over rows that are leaving', () => {
+    const remove = tray.slice(tray.indexOf('const remove = ('), tray.indexOf('const move = ('));
+    // The bridge's answer is read: not removed and no longer in the queue means it went out.
+    expect(remove).toMatch(/\.then\(\(res\) => \{[^}]*res\.ok === false && !shown\.current\.some\(\(x\) => x\.id === q\.id\)\) useStore\.getState\(\)\.toast\('That message had already gone out\.'\);/);
+    // A return is counted only for a row that is really back in the queue.
+    const leave = tray.slice(tray.indexOf('const leave = useCallback('), tray.indexOf('const shown = left.size'));
+    expect(leave).toMatch(/if \(held\.current\.some\(\(q\) => q\.id === id\)\) \{[^}]*lives\.current\.set\(id,[^}]*\} else lives\.current\.delete\(id\);/);
+    // Arrow keys count live rows only: a hidden row still in the page shifted the focus by one,
+    // and Delete then removed the wrong message.
+    const keys = tray.slice(tray.indexOf('onKey={(e) => {'), tray.indexOf("} else if (e.key === 'Enter' || e.key === 'F2') {"));
+    expect(keys).toContain(".filter((el) => el.style.display !== 'none');");
+    expect(keys).toContain('const at = els.indexOf(e.currentTarget);');
+  });
+
   it('closes the tray on the compositor: translate only, one spring, never a height by script', () => {
     // A queue is used while a turn streams: the height animated by script got five frames a second.
     const close = tray.slice(tray.indexOf('function closeTray'), tray.indexOf('export interface QueueTrayProps'));

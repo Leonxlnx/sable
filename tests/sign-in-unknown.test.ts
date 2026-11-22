@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { AccountInfo, ProviderInfo } from '@shared/protocol';
-import { correctsGuess, helloProviders, homeAgent, signedOut } from '@/lib/sign-in';
+import { anyChecking, correctsGuess, helloProviders, homeAgent, signedOut } from '@/lib/sign-in';
 
 const info = (auth: AccountInfo['auth']): ProviderInfo => ({ id: 'claude', name: 'Claude Code', installed: true, auth, accounts: [{ id: 'default', provider: 'claude', label: 'Main', isDefault: true, auth }] });
 const checking = { loggedIn: false, checking: true };
@@ -22,6 +22,21 @@ describe('a sign-in not read yet', () => {
     expect(src('features/composer/Controls.tsx')).toMatch(/return signedOut\(acct \? acct\.auth : p\.auth\);/);
     expect(src('features/accounts/Switcher.tsx')).toMatch(/if \(signedOut\(account\.auth\)\) return 'Sign in';/);
     expect(src('features/connect/Connect.tsx')).toMatch(/info\.auth\.checking \? 'loading'/);
+  });
+
+  it('asks nobody to sign in or to connect an agent while an answer is on its way', () => {
+    expect(anyChecking({ claude: info(checking) }, ['claude', 'codex'])).toBe(true);
+    expect(anyChecking({ claude: info(out) }, ['claude', 'codex'])).toBe(false);
+    expect(anyChecking({ claude: info(signedIn) }, ['claude'])).toBe(false);
+    expect(anyChecking({}, ['claude', 'codex'])).toBe(false);
+    // Home's banner and the sidebar footer's "Connect an agent" wait for it.
+    expect(src('features/connect/Connect.tsx')).toMatch(/const checking = useStore\(\(s\) => anyChecking\(s\.providers, connectableAgents\(s\.providers\)\)\);\s*if \(!ready \|\| signedIn \|\| checking\) return null;/);
+    expect(src('features/sidebar/SidebarFooter.tsx')).toMatch(/if \(anyChecking\(providers, connectableAgents\(providers\)\)\) return <div className="account" aria-hidden \/>;/);
+    // The account menu sends nobody to Settings for it, and the chat's own menu does not call it signed out.
+    const menu = src('features/accounts/Switcher.tsx');
+    expect((menu.match(/if \(signedOut\(a\.auth\)\) return openSettings\('accounts'\);/g) ?? []).length).toBe(2);
+    expect(menu).not.toContain("if (!a.auth.loggedIn) return openSettings('accounts');");
+    expect(src('features/accounts/SessionAccount.tsx')).toContain("a.auth.loggedIn ? planOf(a) : a.auth.checking ? '' : 'Signed out'");
   });
 
   it('keeps the answer an event brought before hello was applied', () => {
@@ -66,6 +81,16 @@ describe('the agent home starts on', () => {
     // An answer that changes neither (a plan, a version) moves nothing, nor does a first word about an agent.
     expect(correctsGuess(found, agent('claude', true))).toBe(false);
     expect(correctsGuess(undefined, found)).toBe(false);
+  });
+
+  it('gets the message that was sent while it showed, whatever is corrected in the frame after', () => {
+    // The composer reads home's choice once, in the press, and hands exactly that to the start.
+    const composer = src('features/composer/Composer.tsx').replace(/\r\n/g, '\n');
+    expect(composer).toContain('const choice = sessionId ? null : homeChoice();');
+    expect((composer.match(/homeChoice\(\)/g) ?? []).length).toBe(1);
+    expect(composer).toMatch(/startFromHome\(out\.text, out\.attachments, \{\s*submitId: pending\.id,\s*choice,/);
+    expect(composer.indexOf('const choice = sessionId ? null : homeChoice();')).toBeLessThan(composer.indexOf('await afterFrame();'));
+    expect(src('state/actions.ts')).toContain('const choice = opts.choice ?? homeChoice();');
   });
 
   it('is asked at hello and on the correcting answer, from what the window knows by then', () => {

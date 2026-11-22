@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { access } from 'node:fs/promises';
 import path from 'node:path';
 import { trustedPathDirs } from './which';
 
@@ -14,17 +15,48 @@ const CLI: Record<string, { name: string; env: string }> = {
   opencode: { name: 'opencode', env: 'SABLE_OPENCODE_BIN' },
 };
 
-export function cliPresent(id: string, o: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; exists?: (file: string) => boolean } = {}): boolean {
-  const cli = CLI[id];
-  if (!cli) return true;
-  const env = o.env ?? process.env;
-  const platform = o.platform ?? process.platform;
-  const exists = o.exists ?? existsSync;
-  const own = env[cli.env];
-  if (own && exists(own)) return true;
+/** Every file that would be the agent's CLI: its override, then its name in each absolute PATH entry. */
+function candidates(cli: { name: string; env: string }, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
   const p = platform === 'win32' ? path.win32 : path.posix;
   const exts = platform === 'win32' ? ['.exe', '.cmd', '.bat', '.com'] : [''];
   const value = (platform === 'win32' ? (env.Path ?? env.PATH) : env.PATH) ?? '';
-  for (const dir of trustedPathDirs(value, platform)) for (const ext of exts) if (exists(p.join(dir, cli.name + ext))) return true;
-  return false;
+  const own = env[cli.env];
+  return [...(own ? [own] : []), ...trustedPathDirs(value, platform).flatMap((dir) => exts.map((ext) => p.join(dir, cli.name + ext)))];
+}
+
+export function cliPresent(id: string, o: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; exists?: (file: string) => boolean } = {}): boolean {
+  const cli = CLI[id];
+  if (!cli) return true;
+  const exists = o.exists ?? existsSync;
+  return candidates(cli, o.env ?? process.env, o.platform ?? process.platform).some((f) => exists(f));
+}
+
+/**
+ * The same look without holding the thread, for `app.hello`: a PATH entry on a drive that does not
+ * answer (a network drive that is gone) can take seconds per file, and the bridge has one thread
+ * for every window and phone. Undefined when it is not known within `ms`.
+ */
+export function cliPresentSoon(
+  id: string,
+  ms: number,
+  o: { env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; exists?: (file: string) => Promise<boolean> } = {},
+): Promise<boolean | undefined> {
+  const cli = CLI[id];
+  if (!cli) return Promise.resolve(true);
+  const exists = o.exists ?? ((f: string) => access(f).then(() => true, () => false));
+  const files = candidates(cli, o.env ?? process.env, o.platform ?? process.platform);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(undefined), ms);
+    t.unref?.();
+    let left = files.length;
+    if (!left) return void (clearTimeout(t), resolve(false));
+    for (const f of files) {
+      void exists(f).then((yes) => {
+        left--;
+        if (!yes && left) return;
+        clearTimeout(t);
+        resolve(yes);
+      });
+    }
+  });
 }

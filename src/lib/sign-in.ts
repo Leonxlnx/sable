@@ -7,6 +7,9 @@ import type { AuthState, ProviderId, ProviderInfo } from '@shared/protocol';
  */
 export const signedOut = (auth: AuthState | undefined): boolean => !!auth && !auth.loggedIn && !auth.checking;
 
+/** Whether the sign-in of any of these agents is not known yet: until it is, nothing asks to sign in or to connect an agent. */
+export const anyChecking = (providers: Partial<Record<ProviderId, ProviderInfo>>, ids: ProviderId[]): boolean => ids.some((id) => !!providers[id]?.auth.checking);
+
 /**
  * The agent home starts on: the one the person chose (`current` when `chosen`), else the one set in
  * settings, each only while it is installed; else the first real agent that is, else the Demo.

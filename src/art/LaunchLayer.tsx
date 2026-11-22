@@ -82,6 +82,8 @@ interface Run {
   typed: string;
   /** A hand-over of `typed` to the composer is waiting for a frame. */
   handing?: boolean;
+  /** Keys still kept after the piece ended, until the composer that takes them exists; takes the listener off. */
+  late?: (() => void) | null;
   ended: boolean;
   parts: HomeParts | null;
   /** Keeps the home mark out of sight until the launch mark has landed on it. */
@@ -478,20 +480,46 @@ function handOver(r: Run, tries = 0) {
   r.handing = true;
   requestAnimationFrame(() => {
     r.handing = false;
+    const over = () => {
+      r.late?.();
+      r.late = null;
+    };
     const field = document.querySelector<HTMLTextAreaElement>(COMPOSER_FIELD);
     if (!field) {
       if (tries < 90) handOver(r, tries + 1);
+      else over();
       return;
     }
     const active = document.activeElement;
     if (active !== field) {
-      if (active && active !== document.body) return;
+      if (active && active !== document.body) return over();
       field.focus();
     }
     const text = r.typed;
     r.typed = '';
     document.execCommand('insertText', false, text);
+    over();
   });
+}
+
+/**
+ * The piece has ended and words typed during it are not in a composer yet (the chat it opened onto
+ * is still loading its own): the keys that follow are kept too, in order, until the hand-over is
+ * done. Without this the first letter was kept and the rest went nowhere. Only while nothing has
+ * the keyboard: a field that took the focus meanwhile gets its own keys.
+ */
+function keepLateKeys(r: Run) {
+  if (r.late || !(r.typed || r.handing)) return;
+  const onKey = (e: KeyboardEvent) => {
+    const at = document.activeElement;
+    if (at && at !== document.body) return;
+    if (e.key.length !== 1 || e.ctrlKey || e.metaKey || e.altKey || r.typed.length >= 200) return;
+    e.preventDefault();
+    r.typed += e.key;
+    handOver(r);
+  };
+  window.addEventListener('keydown', onKey, true);
+  r.late = () => window.removeEventListener('keydown', onKey, true);
 }
 
 /** A key or a click: the piece gives way at once. */
@@ -535,6 +563,7 @@ function end(r: Run, silent = false) {
   for (const c of r.cues) window.clearTimeout(c.timer);
   r.cues.length = 0;
   for (const off of r.off) off();
+  if (!silent) keepLateKeys(r);
   r.hold?.cancel();
   r.hold = null;
   if (r.port) {
@@ -672,14 +701,15 @@ export function Launch({ ready, onDone }: { ready: boolean; onDone: () => void }
       bootMark('launch-hurry');
       r.port.post({ type: 'launch', id: r.port.id, op: 'hurry' } satisfies LaunchMessage);
     }
+    // The app is there. From here the window is its own: no longer a drag region (a click on a drag
+    // region never reaches the page, so it could not skip the wait below), and a click skips the piece.
+    r.root.dataset.ready = '';
     // A start into a chat opens onto the conversation, never onto an empty stage that fills.
     const wait = shortWait(whenViewShown, () => {
       r.readyNow = null;
       if (r.ended || r.ready) return;
       r.ready = true;
       bootMark('launch-ready');
-      // From here the window is the app's: no longer a drag region, and a click skips the piece.
-      r.root.dataset.ready = '';
       tryRelease(r);
       // The app is there: if the light cannot finish forming (a hidden window draws no frames), the ink goes anyway.
       if (!r.ended && !r.released) cue(r, 2600, () => !r.released && end(r));

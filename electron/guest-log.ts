@@ -45,8 +45,11 @@ export class GuestLog {
    * waiting for its document is dropped, since this one's document is another.
    */
   begin(id: number, requestId: number, main = false) {
+    // A redirect sends its next hop under the same request: the request keeps the document it
+    // first started on (another page may have committed between two hops).
+    const was = this.started.get(requestId);
     this.started.delete(requestId);
-    this.started.set(requestId, [id, this.doc(id), main]);
+    this.started.set(requestId, was && was[0] === id ? was : [id, this.doc(id), main]);
     while (this.started.size > this.limits.requests) this.started.delete(this.started.keys().next().value as number);
     if (main) this.ahead(id, () => {});
   }

@@ -80,7 +80,7 @@ import { Submissions, messagePrint } from './core/submissions';
 import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
-import { cliPresent } from './util/cli-present';
+import { cliPresentSoon } from './util/cli-present';
 
 /**
  * Who asks, beside the params: `allowed` (the phone endpoint's guard, services/phone.ts) says whether
@@ -915,15 +915,42 @@ export class App {
     void answered.then((info) => {
       if (late && !this.disposed) this.emit({ type: 'provider.updated', provider: info });
     });
+    const wait = this.delays.firstInfo ?? FIRST_INFO_WAIT_MS;
+    // Looked for beside the wait, off this thread (a PATH entry on a dead drive must not hold the bridge).
+    const present = cliPresentSoon(provider, wait + 150);
     return Promise.race([
       answered,
       new Promise<ProviderInfo>((resolve) => {
         const t = setTimeout(() => {
           late = true;
-          resolve(this.provisionalInfo(provider, cached));
-        }, this.delays.firstInfo ?? FIRST_INFO_WAIT_MS);
+          void present.then((installed) => resolve(this.provisionalInfo(provider, cached, installed)));
+        }, wait);
         t.unref?.();
         void answered.then(() => clearTimeout(t));
+      }),
+    ]);
+  }
+
+  /**
+   * The first word of an agent hello did not wait for, while it is still on its way (the first
+   * seconds of a first start). Hello alone goes ahead on a guess: whatever decides by an agent's
+   * sign-in or by its accounts' limits (where a chat starts or moves, who races, which agents a
+   * session may hand work to) waits here first. Nothing to wait for at any other time. `ms`: at
+   * most this long.
+   */
+  private firstWord(provider?: ProviderId, ms?: number): Promise<void> {
+    const waits = provider ? [this.asking.get(provider)] : [...this.asking.values()];
+    const all = Promise.all(waits.filter((w): w is Promise<ProviderInfo> => !!w)).then(
+      () => {},
+      () => {},
+    );
+    if (ms === undefined || !waits.some(Boolean)) return all;
+    return Promise.race([
+      all,
+      new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, ms);
+        t.unref?.();
+        void all.then(() => clearTimeout(t));
       }),
     ]);
   }
@@ -950,9 +977,10 @@ export class App {
   }
 
   /** What hello says of an agent before its CLI answered: nothing that needs the CLI. */
-  private provisionalInfo(provider: ProviderId, cached: ProviderInfo | undefined): ProviderInfo {
+  private provisionalInfo(provider: ProviderId, cached: ProviderInfo | undefined, present: boolean | undefined): ProviderInfo {
     const p = this.provider(provider);
-    const installed = cliPresent(provider);
+    // Not known in time (a slow drive in PATH): taken as there, its sign-in `checking`; the agent's own answer says.
+    const installed = present ?? true;
     const auth: AuthState = installed ? { loggedIn: false, checking: true } : { loggedIn: false };
     const defaultId = this.defaultAccountId(provider);
     const accounts = this.accountList(provider).map(
@@ -1572,6 +1600,9 @@ export class App {
 
   /** Limits known per account of `provider`: what the usage service remembers, then what came in this run. */
   private async knownLimits(provider: ProviderId): Promise<Map<string, { limits?: RateLimit[]; planLimits?: boolean }>> {
+    // An agent's first word names who is signed in: limits kept from another person's sign-in are
+    // forgotten with it (noteSignIns), so no decision is made on them a moment before.
+    await this.firstWord(provider);
     const out = new Map<string, { limits?: RateLimit[]; planLimits?: boolean }>();
     if (this.handlers.has('usage.limits')) {
       const reports = await this.call('usage.limits', {}).catch(() => []);
@@ -3172,6 +3203,8 @@ export class App {
    */
   private async raceContenders(cwd: string, hint?: ProviderId): Promise<Contender[] | { error: string }> {
     const settings = this.store.state.settings;
+    // Who is signed in is read from the agents' last answers: a first answer still on its way counts.
+    await this.firstWord();
     const signedIn = this.otherAgents();
     const pick: ProviderId[] = hint === 'demo' && this.providers.has('demo') ? ['demo'] : signedIn.length ? signedIn.slice(0, 2) : this.providers.has('demo') ? ['demo'] : [];
     if (!pick.length) return { error: 'Sign in to Claude Code or Codex to race.' };
@@ -3205,6 +3238,9 @@ export class App {
     const settings = this.store.state.settings;
     let accountId = p.accountId ?? this.defaultAccountId(p.provider);
     this.provider(p.provider, accountId);
+    // The agents a session may hand work to are read when it starts: a first answer still on its way
+    // counts (a few seconds at most: an agent that hangs is left out).
+    await this.firstWord(undefined, FIRST_WORD_WAIT_MS);
     // An account past its cap: the session starts on the next one under its own (a resumed
     // conversation stays where it lives).
     const capStart = p.resume ? undefined : await this.underCapStart(p.provider, accountId, p.model ?? settings.defaultModels[p.provider], p.cwd).catch(() => undefined);
@@ -4175,8 +4211,13 @@ const LOGIN_TIMEOUT_MS = 10 * 60_000;
 const INFO_REFRESH_DELAY_MS = 15_000;
 /** How long app.hello waits for an agent that has nothing cached before it answers without it. */
 const FIRST_INFO_WAIT_MS = 50;
-/** How long a hello that must not say `checking` (a phone's) waits for an agent's own answer: past the CLIs' own limits. */
-const SETTLED_INFO_WAIT_MS = 15_000;
+/**
+ * How long a hello that must not say `checking` (a phone's) waits for an agent's own answer: past
+ * the CLIs' own limits (Codex allows its account read 20 s) and inside the phone's 30 s for a request.
+ */
+const SETTLED_INFO_WAIT_MS = 24_000;
+/** How long a new session waits for the other agents' first word before it starts without them. */
+const FIRST_WORD_WAIT_MS = 3_000;
 /** How long after a cached capabilities answer the fresh one is fetched. */
 const CAPS_REFRESH_DELAY_MS = 2_500;
 

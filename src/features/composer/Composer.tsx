@@ -679,8 +679,11 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     // In a session the next placeholder is always the queueing one: the turn is running (or about to).
     // A queued message's words rise through the field into the tray: the placeholder waits for them.
     rollOut(text, variant === 'session' ? 'Queue a follow-up' : null, flew, !!sessionId && busy && !steering);
-    // From home: the composer starts its glide to the dock at once, before the session exists.
-    if (!sessionId && homeChoice()) beginHandoff(card.current);
+    // From home: the composer starts its glide to the dock at once, before the session exists. What
+    // home starts is read once, here: the message goes to the agent shown when Send was pressed,
+    // whatever an agent's late answer changes in the frame that follows.
+    const choice = sessionId ? null : homeChoice();
+    if (choice) beginHandoff(card.current);
     // The press itself only touches the page: the field empties on screen now, and the store, React
     // and the bridge follow once this frame is on the compositor. So the bubble, the key and the
     // glide are already moving there when the work they set off (the composer and the conversation
@@ -720,6 +723,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     }
     const res = await startFromHome(out.text, out.attachments, {
       submitId: pending.id,
+      choice,
       // The chat exists and is about to open: the drop in the air and what home holds now are its.
       onCreated: (id) => {
         flight?.scope(id);

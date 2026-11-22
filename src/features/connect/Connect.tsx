@@ -13,6 +13,7 @@ import { cancelLogin, login, logout, moveAccount, openSettings, refreshLimits, r
 import { useAccounts } from '@/state/hooks';
 import { accountKey, useStore, type AuthFlow } from '@/state/store';
 import { cx, IconButton, Menu, MenuContent, MenuItem, MenuSep, MenuTrigger, Spinner } from '@/ui';
+import { anyChecking } from '@/lib/sign-in';
 import { INSTALL, connectableAgents, isSignedIn, planLabel } from './plan';
 import './connect.css';
 
@@ -517,7 +518,9 @@ export function AutoHeight({ children, className }: { children: ReactNode; class
 export function ConnectBanner() {
   const ready = useStore((s) => s.ready);
   const signedIn = useStore((s) => connectableAgents(s.providers).some((id) => isSignedIn(s.providers[id])));
-  if (!ready || signedIn) return null;
+  // Not known yet (a first start, before the agents answered): no call to sign in that goes a moment later.
+  const checking = useStore((s) => anyChecking(s.providers, connectableAgents(s.providers)));
+  if (!ready || signedIn || checking) return null;
   return (
     <motion.div className="connect-banner" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.18, ease }}>
       <span className="cb-marks" aria-hidden>

@@ -7,6 +7,7 @@ import type { BridgeEvent, Capabilities, ProviderInfo } from '@shared/protocol';
 import { App } from '../server/app';
 import { DiskCache } from '../server/core/cache';
 import { DemoProvider } from '../server/providers/demo';
+import { cliPresentSoon } from '../server/util/cli-present';
 import type { Provider, ProviderContext } from '../server/providers/types';
 
 const homes: string[] = [];
@@ -200,6 +201,61 @@ describe('start-up cache', () => {
       const hello = await app.call('app.hello', {}, { settled: true });
       expect(performance.now() - t).toBeLessThan(1200);
       expect(hello.providers[0].auth.checking).toBe(true);
+    } finally {
+      if (was === undefined) delete process.env.SABLE_CLAUDE_BIN;
+      else process.env.SABLE_CLAUDE_BIN = was;
+    }
+  });
+
+  it('looks for a CLI without holding the thread, and says "not known" when a drive does not answer', async () => {
+    const env = { PATH: ['C:\\slow', 'C:\\tools'].join(';') };
+    const never = new Promise<boolean>(() => {});
+    // Found: at once, whatever the other entries do.
+    expect(await cliPresentSoon('claude', 500, { env, platform: 'win32', exists: (f) => (f === 'C:\\tools\\claude.cmd' ? Promise.resolve(true) : f.startsWith('C:\\slow') ? never : Promise.resolve(false)) })).toBe(true);
+    // Nowhere: known as soon as every entry answered.
+    expect(await cliPresentSoon('claude', 500, { env, platform: 'win32', exists: () => Promise.resolve(false) })).toBe(false);
+    // A drive that does not answer: not known, within the bound (never a wait for it).
+    const t = performance.now();
+    expect(await cliPresentSoon('claude', 60, { env, platform: 'win32', exists: (f) => (f.startsWith('C:\\slow') ? never : Promise.resolve(false)) })).toBeUndefined();
+    expect(performance.now() - t).toBeLessThan(400);
+    // Its override variable counts first; an agent without a CLI of its own is always there.
+    expect(await cliPresentSoon('codex', 500, { env: { PATH: '', SABLE_CODEX_BIN: 'D:\\x\\codex.exe' }, platform: 'win32', exists: (f) => Promise.resolve(f === 'D:\\x\\codex.exe') })).toBe(true);
+    expect(await cliPresentSoon('codex', 500, { env: { PATH: '' }, platform: 'win32', exists: () => Promise.resolve(true) })).toBe(false);
+    expect(await cliPresentSoon('demo', 500)).toBe(true);
+  });
+
+  it('decides nothing by an agent\'s sign-in or limits before its first word is in', async () => {
+    const { readFileSync } = await import('node:fs');
+    const app = readFileSync('server/app.ts', 'utf8').replace(/\r\n/g, '\n');
+    // Limits (where a chat starts or moves), the race's contenders, the agents a new session may hand work to.
+    const limits = app.slice(app.indexOf('private async knownLimits('), app.indexOf('private async knownLimits(') + 600);
+    expect(limits.indexOf('await this.firstWord(provider);')).toBeGreaterThan(-1);
+    expect(limits.indexOf('await this.firstWord(provider);')).toBeLessThan(limits.indexOf("this.call('usage.limits'"));
+    const race = app.slice(app.indexOf('private async raceContenders('), app.indexOf('private async raceContenders(') + 500);
+    expect(race.indexOf('await this.firstWord();')).toBeLessThan(race.indexOf('this.otherAgents()'));
+    expect(race.indexOf('await this.firstWord();')).toBeGreaterThan(-1);
+    const create = app.slice(app.indexOf('private async createSession('), app.indexOf('private async createSession(') + 900);
+    expect(create).toContain('await this.firstWord(undefined, FIRST_WORD_WAIT_MS);');
+    // A phone's hello waits past every CLI's own limit and inside the phone's own 30 s.
+    expect(app).toContain('const SETTLED_INFO_WAIT_MS = 24_000;');
+  });
+
+  it('a new chat in the first second of a first start waits for the agents\' first word, within a bound', async () => {
+    const home = tmp();
+    const bin = path.join(home, 'claude.exe');
+    writeFileSync(bin, '');
+    const was = process.env.SABLE_CLAUDE_BIN;
+    process.env.SABLE_CLAUDE_BIN = bin;
+    try {
+      const state = { infoCalls: 0, capsCalls: 0, models: ['opus'], delay: 300 };
+      const { app, events } = makeApp(home, [fakeClaude(state), (ctx) => new DemoProvider(ctx, { speed: 0 })]);
+      const hello = await app.call('app.hello', {});
+      expect(hello.providers.find((p) => p.id === 'claude')!.auth.checking).toBe(true);
+      // A Demo chat started right away: by the time it exists, Claude Code's answer is in and cached.
+      const snap = await app.call('session.create', { provider: 'demo', cwd: home });
+      expect(snap.session.provider).toBe('demo');
+      expect(app.cache.get<ProviderInfo>('info:claude')?.auth.loggedIn).toBe(true);
+      expect(events.some((e) => e.type === 'provider.updated' && e.provider.id === 'claude')).toBe(true);
     } finally {
       if (was === undefined) delete process.env.SABLE_CLAUDE_BIN;
       else process.env.SABLE_CLAUDE_BIN = was;

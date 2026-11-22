@@ -111,7 +111,8 @@ function SessionAccountMenu({ sessionId, provider, accountId, accounts, lim, row
           <RM.Label className="menu-label">Continue with</RM.Label>
           {accounts.map((a) => {
             const here = a.id === accountId;
-            const plan = a.auth.loggedIn ? planOf(a) : 'Signed out';
+            // (A sign-in not known yet says nothing: it is not signed out.)
+            const plan = a.auth.loggedIn ? planOf(a) : a.auth.checking ? '' : 'Signed out';
             return (
               <RM.Item
                 key={a.id}

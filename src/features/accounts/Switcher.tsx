@@ -155,7 +155,8 @@ export function AccountSwitcher() {
               inUse={{ provider: focus, accountId: current?.id }}
               onPeek={setPeek}
               onPick={(id, a) => {
-                if (!a.auth.loggedIn) return openSettings('accounts');
+                if (signedOut(a.auth)) return openSettings('accounts');
+                if (!a.auth.loggedIn) return;
                 void setDefaultAccount(id, a.id);
                 useStore.getState().setUi({ homeProvider: id });
                 setOpen(false);
@@ -172,7 +173,9 @@ export function AccountSwitcher() {
                 ends={ends}
                 onPeek={(accountId) => setPeek({ provider: id, accountId })}
                 onSelect={(a) => {
-                  if (!a.auth.loggedIn) return openSettings('accounts');
+                  if (signedOut(a.auth)) return openSettings('accounts');
+                  // Its sign-in is not known yet: nothing to choose, and nothing to sign in to.
+                  if (!a.auth.loggedIn) return;
                   void setDefaultAccount(id, a.id);
                   useStore.getState().setUi({ homeProvider: id });
                 }}
