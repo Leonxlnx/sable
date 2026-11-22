@@ -20,7 +20,7 @@ Sable is a desktop app for working with coding agents. It runs the Claude Code a
 
 **Your phone as a remote.** The Android app pairs with Sable by QR code and shows your chats, their live progress and everything that waits on you. Answer permissions and questions, send or steer messages, start new chats, and get a notification when a turn finishes or needs you. It talks to your computer directly over your home network (or [Tailscale](https://tailscale.com) when you are away); nothing goes through a server of ours.
 
-**Several accounts per agent, and their limits in view.** Add as many Claude Code or Codex accounts as you use and switch between them from the sidebar, which shows how much of each plan window is used. Set a cap per account ("use this one up to 90%"), and when a turn hits a cap or a plan limit, Sable continues the same conversation on the next account in your order. Spare quota that would expire unused can run queued work (`/spare`), and a chat stopped at a limit can continue by itself when the window resets.
+**Several accounts per agent, and their limits in view.** Add as many Claude Code or Codex accounts as you use and switch between them from the sidebar, which shows how much of each plan window is used. Accounts are listed in the order to use them: the one whose unused week ends soonest first, so the least quota expires unused (or your own order, if you prefer). Set a cap per account ("use this one up to 90%"), and when a turn hits a cap or a plan limit, Sable continues the same conversation on the next account. A big conversation is compacted on the account it leaves first, where that is cheaper, and the switch line says what the move did to its context. Spare quota that would expire unused can run queued work (`/spare`), and a chat stopped at a limit can continue by itself when the window resets. When Claude Code has a limit reset for you, Sable opens Claude Code's own reset dialog in a window of its own (on a Mac, it gives you the command), you confirm there, and Sable reads the limits again; it never touches your sign-in.
 
 ![The account switcher with one account's limits](docs/accounts.png)
 
@@ -35,7 +35,10 @@ Review comments on diffs: comment on lines in the Changes tab or an edit step, t
 ![Two review comments on a diff, and the review bar above the composer](docs/review.png)
 
 - Claude Code (through the Claude Agent SDK), Codex (through `codex app-server`) and, where it is installed, OpenCode (through `opencode acp`, on its free models or the providers you signed it in to) in one timeline: messages, thinking, commands, file edits with diffs, searches, sub-agents and workflows, MCP tools, plans and todos.
-- A map of long conversations along the right edge: a tick per message you sent, a preview on hover, Alt+Up/Down to step through them.
+- A navigator for long conversations along the right edge: your messages gathered into runs, and an index of every one of them (rest on the rail or Ctrl+G, type to filter). Alt+Up/Down steps through them.
+- A message sent while the agent works is answered first, in a sentence or two, before it goes on (Claude Code and Codex).
+- Sub-agents that keep working after a turn ends show in the sidebar and under the conversation, and the computer stays awake and updates wait until they finish.
+- Customize Sable: ask an agent (`/customize`, or Settings › Customize) to change how Sable looks. It writes your own stylesheet, applied live and kept across updates; a stylesheet that would load anything from the internet is not applied. Start with `--original` (or hold Shift) for Sable's own look.
 - Project scripts in the Terminal tab ("Run dev"), and a local address a dev server prints opens in the Browser tab with one click.
 - A triage deck (Ctrl+I) with every permission and question waiting across all chats, answered by keyboard.
 - `/until <check>`: the agent keeps going until your check passes (tests, a build, a linter), within a number of rounds and a usage budget.
@@ -45,14 +48,14 @@ Review comments on diffs: comment on lines in the Changes tab or an edit step, t
 - Permission cards with diff previews, question cards, queueing and steering, slash commands and skills (`/`), file mentions (`@`), shell commands (`!`), attachments and images.
 - Model, permission mode, thinking level and speed per session, including Ultracode for Claude and the ultra level for Codex.
 - Side panel: git changes, file tree, a browser with tabs next to the conversation, a terminal, tasks, context usage, the agents of the chat, and an Android device or emulator for app work.
-- Pull requests from the Changes tab: once the working tree is clean, "Create pull request" shows the branch, the remote and the base, then pushes and opens it with the GitHub CLI (`gh`). A commit message can be drafted from the changes by the chat's own agent and account (one small request, on your click).
+- Pull requests from the Changes tab: once the working tree is clean, "Create pull request" shows the branch, every address it is pushed to, the commits that go and the repository it opens in, then pushes exactly that and opens it with the GitHub CLI (`gh`). Git, `gh` and the terminal's shell are never run from inside the project folder. A commit message can be drafted from the changes by the chat's own agent and account (one small request, on your click).
 - A toast when an agent's plan window nears or reaches its limit, once no other account of that agent has room. Pictures in answers and messages open larger on click. On home, the branch chip switches between a repository's worktrees.
 - History: browse and resume the conversations your agents keep on disk. Rewind to an earlier message, optionally restoring files.
 - A profile of you (`~/.sable/profile.md`) that both agents read and can add short facts to.
 - Long chats stay fast: chats of hundreds of megabytes open in seconds and stream without slowing the app.
 - The computer does not go to sleep while an agent works, or while a paired phone may need it and it is plugged in.
 - Background tasks, agents and slash commands Claude Code writes into a chat show as quiet lines with their result, not as raw text.
-- Liquid glass on what floats (the composer, menus, dialogs) over a dithered backdrop that reacts when you send, when a turn ends and when something fails, and goes still when you stop. Presets, your own image and a live editor in Settings › Appearance.
+- Calm frosted glass on what floats (the composer, menus, dialogs) and flat controls, over a dithered backdrop that reacts when you send, when a turn ends and when something fails, and goes still when you stop. Presets, your own image and a live editor in Settings › Appearance.
 
 ![Settings, Appearance](docs/appearance.png)
 
@@ -126,8 +129,10 @@ Electron shell (electron/)        window, menus, updates, keep-awake
 Bridge (server/)                  sessions, accounts, limits, providers, services
    |  providers/   claude.ts (Claude Agent SDK), codex.ts (codex app-server),
    |               opencode.ts (opencode acp), demo.ts (scripted)
-   |  core/        runtime (timeline, prompts, queue), limit policy, lanes, race, check
-   |  services/    files, git, pull requests, terminal, usage, limits, phone, devices, updates
+   |  core/        runtime (timeline, prompts, queue, background work), limit policy,
+   |               account moves, reset dialog, lanes, race, check, commit draft
+   |  services/    files, git, pull requests, terminal, usage, limits, phone, devices,
+   |               updates, customize
         |  WebSocket /__sable, RPC methods defined in shared/protocol.ts
 Interface (src/)                  React 19 + TypeScript + zustand
    |  state/       store, actions (everything the UI may ask the bridge), hooks
@@ -143,9 +148,14 @@ Every agent is normalised into one timeline model (`TimelineItem`: user, text, t
 | Shared contract (RPC methods, types) | `shared/protocol.ts` |
 | Bridge, RPC handlers, sessions | `server/app.ts` |
 | Session timeline and queue | `server/core/runtime.ts` |
-| Limits and account switching | `server/core/limit-policy.ts`, `shared/use-first.ts` |
+| Limits and account switching | `server/core/limit-policy.ts`, `server/accounts/folders.ts` |
+| Account order (use first) | `shared/use-first.ts`, `src/features/accounts/order.ts` |
+| Moving a chat to another account | `server/core/move-context.ts`, `server/accounts/handover.ts` |
+| Limit reset in Claude Code's dialog | `server/core/reset-console.ts`, `server/util/console.ts` |
 | Claude Code, Codex, OpenCode, Demo | `server/providers/claude.ts`, `codex.ts`, `opencode.ts`, `demo.ts` |
-| Conversation view (turns, steps, live line) | `src/features/timeline/` |
+| Pull requests, commit draft | `server/services/pulls.ts`, `server/core/commit-draft.ts` |
+| Customize Sable | `server/services/custom.ts`, `src/features/customize/` |
+| Conversation view (turns, steps, live line, navigator) | `src/features/timeline/` |
 | Store and actions | `src/state/store.ts`, `src/state/actions.ts` |
 | Design tokens and primitives | `src/styles/tokens.css`, `src/styles/ui.css`, `src/ui/` |
 | Phone app | `mobile/src/` |
