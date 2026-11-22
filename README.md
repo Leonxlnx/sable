@@ -104,12 +104,14 @@ You need Node 22 or newer and pnpm.
 pnpm install
 pnpm dev                  # http://localhost:5173, with the bridge attached
 pnpm test                 # vitest
-pnpm typecheck
+pnpm typecheck            # everything, the tests too
 pnpm desktop:dist         # Windows installer in release/
 pnpm desktop:dist:mac     # on a Mac: disk image and zip for this Mac's chip
 ```
 
 The Mac app can only be built on a Mac. The "macOS build" workflow (`.github/workflows/mac.yml`) builds both chips on GitHub's Macs, checks the signature and the bundled agent, starts the app once, and can attach the files to a release.
+
+The tests also cover the phone app's code, so `pnpm test` and `pnpm typecheck` need its packages once: `npm install --prefix mobile`. Building the desktop app does not.
 
 `pnpm dev` runs on your real profile (`~/.sable`). For experiments, `node scripts/dev-test.mjs` starts the same server on a throwaway folder. `pnpm desktop:pack` builds `release/win-unpacked/Sable.exe` without an installer.
 
