@@ -66,6 +66,27 @@ interface Flight {
 
 let flight: Flight | null = null;
 let still = false;
+/**
+ * The chat the first send from home made, once it exists (`bindHandoff`): only its composer
+ * claims the flight, and only it takes over what was typed or attached on home meanwhile
+ * (`takeHomeDraft`), with or without the motion. Another chat opened meanwhile takes nothing.
+ */
+let bound: string | null = null;
+let carry: string | null = null;
+
+/** The first send from home made the chat `sessionId` (called before its view mounts). */
+export function bindHandoff(sessionId: string) {
+  bound = sessionId;
+  carry = sessionId;
+}
+
+/** True once, for the chat the home send made: home's draft (words and files typed since) is its now. */
+export function takeHomeDraft(sessionId: string | null): boolean {
+  if (!sessionId || carry !== sessionId) return false;
+  carry = null;
+  return true;
+}
+
 let phase: Phase = 'idle';
 const subs = new Set<() => void>();
 
@@ -222,6 +243,8 @@ function arrived(f: Flight) {
 /** Starts the flight from the home composer card. Safe to call when one is already running. */
 export function beginHandoff(card: HTMLElement | null) {
   if (!card || flight || phase === 'flying') return;
+  bound = null;
+  carry = null;
   if (reducedMotion()) {
     still = true;
     set('flying');
@@ -339,8 +362,9 @@ function fadeOut(f: Flight, duration: number) {
  * Called by the session composer when it mounts. When a flight is on its way, the card hides until
  * the ghost lands on it and the spring is re-aimed at its real place. Returns true when claimed.
  */
-export function claimHandoff(card: HTMLElement | null): boolean {
-  if (!card) return false;
+export function claimHandoff(card: HTMLElement | null, sessionId: string | null): boolean {
+  // Only the chat the send made (an existing chat opened meanwhile never claims it).
+  if (!card || !sessionId || bound !== sessionId) return false;
   if (still) {
     still = false;
     set('idle');

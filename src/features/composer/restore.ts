@@ -18,24 +18,38 @@ const idsOf = (list: readonly Attachment[]) => new Set(list.map((a) => a.id));
 
 /**
  * The field once `sent` has left it: words typed since stay (typing after a send replaces the
- * field's text, so text equal to the sent text is the sent text), and of the files only those that
- * went with it go; files added while it was on its way stay.
+ * field's text, so text equal to the sent text is the sent text, unless `typed` says the field was
+ * typed in since: then it is a new message, even with the same words), and of the files only those
+ * that went with it go; files added while it was on its way stay.
  */
-export function leaveField(now: FieldDraft | undefined, sent: FieldDraft): FieldDraft {
+export function leaveField(now: FieldDraft | undefined, sent: FieldDraft, typed?: boolean): FieldDraft {
   const text = now?.text ?? '';
   const gone = idsOf(sent.attachments);
-  return { text: text === sent.text ? '' : text, attachments: (now?.attachments ?? NONE).filter((a) => !gone.has(a.id)) };
+  return { text: text === sent.text && !typed ? '' : text, attachments: (now?.attachments ?? NONE).filter((a) => !gone.has(a.id)) };
 }
 
 /**
  * A refused message back in the field: its words first, then what was typed since on a line of
- * its own; its files first, then the files added since (never twice).
+ * its own (the same words typed again are another message: both stay); its files first, then the
+ * files added since (never twice). The composer's own sends go back through pending.ts `sendBack`,
+ * which also keeps several refused messages in the order they were sent.
  */
 export function putBack(now: FieldDraft | undefined, sent: FieldDraft): FieldDraft {
   const cur = now?.text ?? '';
-  const text = !cur.trim() || cur === sent.text ? sent.text : sent.text ? `${sent.text}\n${cur}` : cur;
+  const text = !cur.trim() ? sent.text : sent.text ? `${sent.text}\n${cur}` : cur;
   const back = idsOf(sent.attachments);
   return { text, attachments: [...sent.attachments, ...(now?.attachments ?? NONE).filter((a) => !back.has(a.id))] };
+}
+
+/**
+ * What was typed or attached on home while the first send made its chat, carried into that chat's
+ * field: after what the field holds (a refused first message put back there), files never twice.
+ */
+export function carryOver(now: FieldDraft | undefined, extra: FieldDraft): FieldDraft {
+  const cur = now?.text ?? '';
+  const text = !cur.trim() ? extra.text : extra.text.trim() ? `${cur}\n${extra.text}` : cur;
+  const have = idsOf(now?.attachments ?? NONE);
+  return { text, attachments: [...(now?.attachments ?? NONE), ...extra.attachments.filter((a) => !have.has(a.id))] };
 }
 
 /**

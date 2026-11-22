@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { DropdownMenu as RM } from 'radix-ui';
 import type { Attachment, QueuedMessage } from '@shared/protocol';
 import { stripWrappers, syntheticLine, syntheticOf } from '@shared/synthetic';
-import { beginHandoff, cancelHandoff, claimHandoff } from '@/features/home/handoff';
+import { beginHandoff, bindHandoff, cancelHandoff, claimHandoff, takeHomeDraft } from '@/features/home/handoff';
 import { Icon } from '@/icons';
 import { pathForFile } from '@/lib/desktop';
 import { isUltraEffort, toggledSpeed } from '@/lib/models';
@@ -22,7 +22,8 @@ import { useChoice } from './choice';
 import { paidAsk, paidConfirmed } from './paid-speed';
 import { APP_COMMANDS, appCommandsFor, commandRows, expandCommand, mentionRows, skillRows, type CommandCtx, type SuggestRow } from './commands';
 import { keepDrafts } from './drafts';
-import { leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
+import { carryOver, leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
+import { holdSend, sendBack, sendDone } from './pending';
 import { watchWidth } from './width-watch';
 import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut } from './Controls';
 import { CoveSkin } from './Cove';
@@ -370,18 +371,24 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   // ── the home-to-session hand-off lands on this card ──
 
   useLayoutEffect(() => {
-    if (variant !== 'session' || !claimHandoff(card.current)) return;
-    // Words typed on home during the glide (the home field kept the keyboard) come along, and the
-    // keyboard moves here now, so nothing typed right after the first send is lost.
-    const st = useStore.getState();
-    const carried = st.drafts.home?.text ?? '';
+    if (variant !== 'session') return;
+    const claimed = claimHandoff(card.current, sessionId);
+    // Words and files typed on home while this chat was being made (the home field kept the
+    // keyboard) are this chat's alone: they come along, with the glide or without it (reduced
+    // motion), and the keyboard moves here now, so nothing typed right after the first send is lost.
+    const carried = takeHomeDraft(sessionId);
     if (carried) {
-      const cur = st.drafts[key]?.text ?? '';
-      setText(cur + carried);
-      setDraft('home', { text: '' });
+      const st = useStore.getState();
+      const home = st.drafts.home;
+      if (home && (home.text || home.attachments.length)) {
+        const next = carryOver(st.drafts[key], home);
+        setDraft(key, { attachments: next.attachments });
+        setText(next.text);
+        setDraft('home', { text: '', attachments: [] });
+      }
     }
-    focus();
-  }, [variant]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (claimed || carried) focus();
+  }, [variant, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── focus ──
 
@@ -671,11 +678,15 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     if (ta) ta.value = '';
     sent.current = draft;
     await afterFrame();
+    // Typed in since (onChange let go of the hold): the field's words are a new message, whatever they say.
+    const typed = sent.current !== draft;
     if (sent.current === draft) sent.current = null;
     const now = useStore.getState().drafts[key];
-    // Words typed meanwhile stay (onChange let go of the hold), and files attached meanwhile; the
-    // sent words and their own files go (restore.ts).
-    const left = leaveField(now, draft);
+    // Words typed meanwhile stay, and files attached meanwhile; the sent words and their own files
+    // go (restore.ts). Until the bridge answers, the message is kept beside the field (pending.ts):
+    // a reload brings it back, a refusal puts it back in the order it was sent.
+    const left = leaveField(now, draft, typed);
+    const pending = holdSend(key, draft);
     setDraft(key, left);
     if (!left.text) pendingCaret.current = 0;
     setRecall(null);
@@ -686,17 +697,27 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       // The next placeholder may still be rising under the words.
       card.current?.querySelector('.cmp-roll')?.remove();
       card.current?.removeAttribute('data-rolling');
-      setDraft(key, putBack(useStore.getState().drafts[key], draft));
+      setDraft(key, sendBack(pending, useStore.getState().drafts[key]));
       pendingCaret.current = draft.text.length;
     };
     if (sessionId) {
-      const res = await sendMessage(sessionId, out.text, out.attachments, steer && busy ? { steer: true } : {});
-      if (res.ok) void flight?.settle(true);
-      else await giveBack();
+      const res = await sendMessage(sessionId, out.text, out.attachments, { submitId: pending.id, ...(steer && busy ? { steer: true } : {}) });
+      if (res.ok) {
+        sendDone(pending);
+        void flight?.settle(true);
+      } else await giveBack();
       return;
     }
-    const res = await startFromHome(out.text, out.attachments, { onCreated: (id) => flight?.scope(id) });
+    const res = await startFromHome(out.text, out.attachments, {
+      submitId: pending.id,
+      // The chat exists and is about to open: the drop in the air and what home holds now are its.
+      onCreated: (id) => {
+        flight?.scope(id);
+        bindHandoff(id);
+      },
+    });
     if (res.ok) {
+      sendDone(pending);
       void flight?.settle(true);
       return;
     }
@@ -709,7 +730,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     // go back into that chat's field (a retry sends them there), merged with what is there already.
     flight?.release();
     const st = useStore.getState();
-    st.setDraft(res.sessionId, putBack(st.drafts[res.sessionId], draft));
+    st.setDraft(res.sessionId, sendBack(pending, st.drafts[res.sessionId], res.sessionId));
   };
   const submitRef = useRef(submit);
   submitRef.current = submit;
@@ -731,7 +752,11 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       if (before.text.trim() || before.attachments.length) {
         const out = parcel(before.text.trim(), before.attachments);
         // The agent may have taken the message meanwhile: then nothing swaps and the draft stays.
-        if (!(await updateQueued(sessionId, q.id, out.text, out.attachments)).ok) return;
+        const res = await updateQueued(sessionId, q.id, out.text, out.attachments);
+        if (!res.ok) return;
+        // The message as the bridge had it when the draft took its place: another window may have
+        // edited it after this one showed it, and that edit is what comes into the field.
+        got = res.previous ?? q;
       } else got = await takeQueued(sessionId, q.id);
       if (!got) return;
       // What was typed or attached while the bridge answered stays, after the message.

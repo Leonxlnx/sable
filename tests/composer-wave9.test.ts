@@ -75,7 +75,7 @@ describe('Edit on a queued message (finding 3)', () => {
   it('the composer swaps only after the bridge said yes', () => {
     const src = read('src/features/composer/Composer.tsx');
     const edit = src.slice(src.indexOf('const editQueued'), src.indexOf('// ── ultracode'));
-    expect(edit).toMatch(/if \(!\(await updateQueued\([^)]*\)\)\.ok\) return;/);
+    expect(edit).toMatch(/const res = await updateQueued\([^)]*\);\s*if \(!res\.ok\) return;/);
     expect(edit.indexOf('updateQueued')).toBeLessThan(edit.indexOf('setDraft'));
     expect(edit).toContain('swapIn(useStore.getState().drafts[key], before');
   });
@@ -106,7 +106,7 @@ describe('bridge answers (findings 2, 3, 12)', () => {
     expect(bridgeCalls.map((c) => c.method)).toEqual(['session.create', 'session.send']);
     // The composer then puts the words and files back under that chat (merged with what is there).
     const src = read('src/features/composer/Composer.tsx');
-    expect(src).toContain('st.setDraft(res.sessionId, putBack(st.drafts[res.sessionId], draft));');
+    expect(src).toContain('st.setDraft(res.sessionId, sendBack(pending, st.drafts[res.sessionId], res.sessionId));');
   });
 
   it('a first send that is taken reports ok', async () => {

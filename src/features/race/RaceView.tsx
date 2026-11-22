@@ -15,12 +15,12 @@ import { modelName, modelNameById } from '@/lib/models';
 import { interrupt, openSession, sendMessage } from '@/state/actions';
 import { useStore, type Store } from '@/state/store';
 import { IconButton, PathLabel, Segmented, Spinner, Tip, cx } from '@/ui';
-import { compareRows, discardRace, keepRace, stepCount, totals, useRaceDiff, useRacePair } from './race';
+import { compareRows, discardRace, keepRace, raceDraftKey, raceTarget, retryTarget, setRaceTarget, stepCount, totals, useRaceDiff, useRacePair, type RaceTarget } from './race';
 import '@/features/composer/composer.css';
 import './race.css';
 
 type Side = 0 | 1;
-type Target = 'both' | '0' | '1';
+type Target = RaceTarget;
 
 /** How a side reads: its agent (or, when both sides are one agent, its model) and its mark. */
 function useSideNames(ids: [string, string]): { provider: ProviderId; label: string; model: string }[] {
@@ -54,12 +54,20 @@ function useSideNames(ids: [string, string]): { provider: ProviderId; label: str
 export function RaceView({ raceId }: { raceId: string }) {
   const pair = useRacePair(raceId);
   const [mode, setMode] = useState<'chats' | 'changes'>('chats');
-  const [target, setTarget] = useState<Target>('both');
+  // The target is kept with the race (a retry aimed at the lane that refused survives leaving the view).
+  const [target, setTargetState] = useState<Target>(() => raceTarget(raceId));
+  const setTarget = useCallback(
+    (t: Target) => {
+      setRaceTarget(raceId, t);
+      setTargetState(t);
+    },
+    [raceId],
+  );
   if (!pair) return null;
-  return <RaceBody key={raceId} pair={pair} mode={mode} setMode={setMode} target={target} setTarget={setTarget} />;
+  return <RaceBody key={raceId} raceId={raceId} pair={pair} mode={mode} setMode={setMode} target={target} setTarget={setTarget} />;
 }
 
-function RaceBody({ pair, mode, setMode, target, setTarget }: { pair: [string, string]; mode: 'chats' | 'changes'; setMode: (m: 'chats' | 'changes') => void; target: Target; setTarget: (t: Target) => void }) {
+function RaceBody({ raceId, pair, mode, setMode, target, setTarget }: { raceId: string; pair: [string, string]; mode: 'chats' | 'changes'; setMode: (m: 'chats' | 'changes') => void; target: Target; setTarget: (t: Target) => void }) {
   const names = useSideNames(pair);
   const outcomes = useStore((s) => pair.map((id) => s.sessions[id]?.race?.outcome ?? '').join('|'));
   const [a, b] = outcomes.split('|');
@@ -86,7 +94,7 @@ function RaceBody({ pair, mode, setMode, target, setTarget }: { pair: [string, s
           <RaceCompare pair={pair} names={names} />
         )}
       </div>
-      {!decided && <RaceDock pair={pair} names={names} target={target} setTarget={setTarget} field={field} />}
+      {!decided && <RaceDock raceId={raceId} pair={pair} names={names} target={target} setTarget={setTarget} field={field} />}
     </div>
   );
 }
@@ -495,12 +503,19 @@ function CmpCount({ f }: { f?: FileDiff }) {
 // ─────────────────────────────── the composer ───────────────────────────────
 
 /** A follow-up for both, or for one side: the same field and keys as the chat's composer, without its agent controls. */
-function RaceDock({ pair, names, target, setTarget, field }: { pair: [string, string]; names: { provider: ProviderId; label: string }[]; target: Target; setTarget: (t: Target) => void; field: RefObject<HTMLTextAreaElement | null> }) {
-  const [text, setText] = useState('');
+function RaceDock({ raceId, pair, names, target, setTarget, field }: { raceId: string; pair: [string, string]; names: { provider: ProviderId; label: string }[]; target: Target; setTarget: (t: Target) => void; field: RefObject<HTMLTextAreaElement | null> }) {
+  // The field's words are a draft of the race's own: leaving the view (or a refused lane's retry) keeps them.
+  const draftKey = raceDraftKey(raceId);
+  const text = useStore((s) => s.drafts[draftKey]?.text ?? '');
+  const setText = useCallback((next: string | ((cur: string) => string)) => {
+    const st = useStore.getState();
+    const cur = st.drafts[draftKey]?.text ?? '';
+    st.setDraft(draftKey, { text: typeof next === 'function' ? next(cur) : next });
+  }, [draftKey]);
   const sendWithEnter = useStore((s) => s.settings.sendWithEnter);
   const busy = useStore((s) => pair.some((id) => ['running', 'starting', 'awaiting'].includes(s.sessions[id]?.status ?? '')));
   const dock = useRef<HTMLDivElement>(null);
-  const to = target === 'both' ? pair : [pair[Number(target)]];
+  const sides: (0 | 1)[] = target === 'both' ? [0, 1] : [Number(target) as 0 | 1];
   const trimmed = text.trim();
 
   // The columns end a little above the dock, as a conversation ends above its composer.
@@ -524,11 +539,15 @@ function RaceDock({ pair, names, target, setTarget, field }: { pair: [string, st
   const send = async () => {
     if (!trimmed) return;
     setText('');
-    const results = await Promise.all(to.map((id) => sendMessage(id, trimmed)));
-    // Refused: the words come back, before anything typed since.
-    if (results.some((r) => !r.ok)) setText((cur) => putBack({ text: cur, attachments: [] }, { text: trimmed, attachments: [] }).text);
+    const results = await Promise.all(sides.map((i) => sendMessage(pair[i], trimmed)));
+    // Refused by a lane: the words come back, before anything typed since, aimed only at the lanes
+    // that refused (a lane that took it never gets it twice).
+    const retry = retryTarget(sides, results.map((r) => r.ok));
+    if (!retry) return;
+    setText((cur) => putBack({ text: cur, attachments: [] }, { text: trimmed, attachments: [] }).text);
+    setTarget(retry);
   };
-  const stop = () => to.forEach((id) => void interrupt(id));
+  const stop = () => sides.forEach((i) => void interrupt(pair[i]));
   const placeholder = target === 'both' ? (busy ? 'Queue a follow-up for both' : 'Message both') : `Message ${names[Number(target)].label}`;
 
   return (

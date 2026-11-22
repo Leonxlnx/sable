@@ -1583,6 +1583,47 @@ export interface GitPullRequestResult {
   stale?: boolean;
 }
 
+/** One check of a pull request: a check run or a commit status, in one shape. */
+export interface PullCheck {
+  name: string;
+  state: 'passed' | 'failed' | 'running' | 'skipped';
+  /** Its page on github.com (a workflow run's job, usually); any other address is left out. */
+  url?: string;
+}
+
+/** The pull request of a folder's checked-out branch, as `gh pr view` reads it. */
+export interface PullRequestInfo {
+  number: number;
+  title: string;
+  state: 'draft' | 'open' | 'merged' | 'closed';
+  /** Its address on github.com. */
+  url: string;
+  /** The review decision, when there is one. */
+  review?: 'approved' | 'changes';
+  /** The commit GitHub has as its head (in full): sent back with `pulls.failures`. */
+  head: string;
+  /** Its checks, the failed ones first, then those still running, then the rest (the first 100). */
+  checks: PullCheck[];
+  /** How many checks it has in each state: all of them, also beyond the 100 kept. */
+  counts: { passed: number; failed: number; running: number; skipped: number };
+}
+
+/** `pulls.status`: what the Changes tab shows of the branch's pull request. */
+export interface PullStatus {
+  /** The branch the answer is for (an answer for another branch than the one shown is dropped); absent on a detached HEAD and outside a repository. */
+  branch?: string;
+  /** Absent: nothing to show (no pull request, no gh or no sign-in, origin not on GitHub, a timeout). */
+  pull?: PullRequestInfo;
+}
+
+/** `pulls.failures`: the failed checks of a pull request as a message for the chat. */
+export interface PullFailures {
+  /** Which checks failed, and the end of their failed logs (bounded). Absent when `stale`. */
+  text?: string;
+  /** The pull request is not the one asked about any more (another head, nothing failed): read its status again. */
+  stale?: boolean;
+}
+
 export interface AppState {
   version: string;
   platform: string;
@@ -2350,7 +2391,8 @@ export interface RpcMethods {
    * `/model <name>` is never sent: it sets the session's model (`model`, its id), or switches the
    * chat to the agent that has that model (`switched`); `error` when no model has that name.
    */
-  'session.send': { params: { sessionId: string; text: string; attachments?: Attachment[]; steer?: boolean }; result: { ok: boolean; queued?: boolean; model?: string; switched?: ProviderId; error?: string } };
+  /** `submitId`: one submission (a retry of it keeps it); the bridge answers a second send with an id it took in the last minutes as accepted, without sending it again. */
+  'session.send': { params: { sessionId: string; text: string; attachments?: Attachment[]; steer?: boolean; submitId?: string }; result: { ok: boolean; queued?: boolean; model?: string; switched?: ProviderId; error?: string } };
   /**
    * Switches the chat to another agent in place (same chat, same conversation shown): the next
    * message goes to `provider`, which starts from a compact handover of the conversation, or, when
@@ -2431,7 +2473,8 @@ export interface RpcMethods {
    * Replaces a queued message's text, and its attachments when `attachments` is given (an empty
    * array clears them). A message left with no text and no attachments is removed.
    */
-  'queue.update': { params: { sessionId: string; id: string; text: string; attachments?: Attachment[] }; result: { ok: boolean } };
+  /** `previous`: the message as it was just before this edit replaced it (to the desktop only), so an edit made meanwhile elsewhere is never lost. */
+  'queue.update': { params: { sessionId: string; id: string; text: string; attachments?: Attachment[] }; result: { ok: boolean; previous?: QueuedMessage } };
   'queue.remove': { params: { sessionId: string; id: string }; result: { ok: boolean } };
   /**
    * Removes a queued message and returns it, atomically (for "edit": put it back in the composer).
@@ -2523,6 +2566,16 @@ export interface RpcMethods {
     params: { cwd: string; title: string; body: string; base: string; draft: boolean; branch?: string; head?: string; destination?: string; repo?: string };
     result: GitPullRequestResult;
   };
+  /**
+   * The checked-out branch's pull request on GitHub and its checks. Read-only: git says the branch
+   * and where origin pushes, and gh is started only when that is github.com. Never on a phone.
+   */
+  'pulls.status': { params: { cwd: string }; result: PullStatus };
+  /**
+   * On the person's click: the failed checks of pull request `number` and the end of their failed
+   * logs, as one bounded message for the chat. Nothing when its head is not `head` any more.
+   */
+  'pulls.failures': { params: { cwd: string; number: number; head: string }; result: PullFailures };
 
   /** The agent's own settings files (permission rules, hooks), read-only and without secrets. */
   'config.read': { params: { provider: ProviderId; cwd?: string }; result: AgentConfigFile[] };

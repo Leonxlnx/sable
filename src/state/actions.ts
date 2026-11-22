@@ -3,6 +3,7 @@ import { DEFAULT_BACKDROP, normalizeBackdrop } from '@shared/backdrop';
 import { bridge } from '@/lib/bridge';
 import { addComment, clearReview, editComment, removeComment, reviewMessage, type ReviewComment } from '@/features/review/model';
 import { applySnapshot, applyWholeItem, capsKey, loadSession, useStore, type RailTab, type SettingsSection, type Store } from './store';
+import type { PullFailures, PullStatus } from '@shared/protocol';
 
 /** Everything the UI can ask the bridge to do. Components call these, never bridge.call directly. */
 
@@ -111,19 +112,23 @@ export async function switchAgent(sessionId: string, provider: ProviderId, model
 }
 
 /** `/model <name>` in a chat: the bridge finds the model (this agent's, or another agent's, which switches the chat) and says when there is none. */
-export async function modelByName(sessionId: string, name: string) {
+export async function modelByName(sessionId: string, name: string): Promise<boolean> {
   try {
     const r = await bridge.call('session.send', { sessionId, text: `/model ${name}` });
     if (!r.ok && r.error) useStore.getState().toast(r.error);
+    return r.ok;
   } catch (err) {
     fail(err);
+    return false;
   }
 }
 
-export async function createSession(choice: NewSessionChoice): Promise<SessionMeta | null> {
+/** `made` runs once the session exists, before it opens (its view mounts only after). */
+export async function createSession(choice: NewSessionChoice, made?: (sessionId: string) => void): Promise<SessionMeta | null> {
   try {
     const snap = await bridge.call('session.create', choice);
     applySnapshot(snap);
+    made?.(snap.session.id);
     useStore.getState().setUi({ activeSessionId: snap.session.id, race: null });
     return snap.session;
   } catch (err) {
@@ -171,16 +176,17 @@ export const setHomeUltracode = (on: boolean) => useStore.getState().setUi({ hom
  * session exists, also when the message itself was then refused: the chat is open by then, so a
  * refused message goes back into that chat's field (and a retry sends it there).
  */
-export async function startFromHome(text: string, attachments: Attachment[] = [], opts: { onCreated?: (sessionId: string) => void } = {}): Promise<{ ok: boolean; sessionId?: string }> {
+export async function startFromHome(text: string, attachments: Attachment[] = [], opts: { onCreated?: (sessionId: string) => void; submitId?: string } = {}): Promise<{ ok: boolean; sessionId?: string }> {
   const choice = homeChoice();
   if (!choice) {
     useStore.getState().setUi({ projectPicker: true });
     return { ok: false };
   }
-  const session = await createSession(choice.chat ? { ...choice, chat: { text } } : choice);
+  // Told before the chat opens: what belongs to it (the drop in the air, words typed on home
+  // meanwhile) is bound to it before its view mounts.
+  const session = await createSession(choice.chat ? { ...choice, chat: { text } } : choice, opts.onCreated);
   if (!session) return { ok: false };
-  opts.onCreated?.(session.id);
-  const res = await sendMessage(session.id, text, attachments);
+  const res = await sendMessage(session.id, text, attachments, opts.submitId ? { submitId: opts.submitId } : {});
   return { ok: res.ok, sessionId: session.id };
 }
 
@@ -189,9 +195,9 @@ export async function startFromHome(text: string, attachments: Attachment[] = []
  * set: then the running agent takes it at its next step and it shows where it was sent
  * (`UserItem.steered`). Resolves `queued: true` when it went to the queue.
  */
-export async function sendMessage(sessionId: string, text: string, attachments: Attachment[] = [], opts: { steer?: boolean } = {}): Promise<{ ok: boolean; queued?: boolean }> {
+export async function sendMessage(sessionId: string, text: string, attachments: Attachment[] = [], opts: { steer?: boolean; submitId?: string } = {}): Promise<{ ok: boolean; queued?: boolean }> {
   try {
-    return await bridge.call('session.send', { sessionId, text, attachments, ...(opts.steer ? { steer: true } : {}) });
+    return await bridge.call('session.send', { sessionId, text, attachments, ...(opts.steer ? { steer: true } : {}), ...(opts.submitId ? { submitId: opts.submitId } : {}) });
   } catch (err) {
     fail(err);
     return { ok: false };
@@ -205,9 +211,10 @@ export const interrupt = (sessionId: string) => bridge.call('session.interrupt',
 /**
  * Replaces a queued message's text, and its attachments when given; left empty, it is removed.
  * `ok: false` when the message is no longer in the queue (the agent took it meanwhile) or the
- * bridge could not be reached.
+ * bridge could not be reached. `previous`: the message as the edit found it (another window may
+ * have changed it since this one showed it).
  */
-export const updateQueued = (sessionId: string, id: string, text: string, attachments?: Attachment[]): Promise<{ ok: boolean }> =>
+export const updateQueued = (sessionId: string, id: string, text: string, attachments?: Attachment[]): Promise<{ ok: boolean; previous?: QueuedMessage }> =>
   bridge.call('queue.update', { sessionId, id, text, ...(attachments ? { attachments } : {}) }).catch((err) => {
     fail(err);
     return { ok: false };
@@ -828,3 +835,12 @@ export async function resumeFromHistory(provider: ProviderId, providerSessionId:
   }
   return createSession({ provider, cwd, resume: providerSessionId, title, accountId });
 }
+
+// ── the branch's pull request and its checks (features/rail/pull-status.ts) ──
+
+/** The checked-out branch's pull request on GitHub and its checks, read-only. Null when the bridge could not be asked: the tab keeps what it had. */
+export const readPullStatus = (cwd: string): Promise<PullStatus | null> => bridge.call('pulls.status', { cwd }, 30_000).catch(() => null);
+
+/** On the person's click: the failed checks of that pull request and the end of their failed logs, as a message for the chat. Null when it could not be read. */
+export const readPullFailures = (cwd: string, number: number, head: string): Promise<PullFailures | null> =>
+  bridge.call('pulls.failures', { cwd, number, head }, 100_000).catch(() => null);

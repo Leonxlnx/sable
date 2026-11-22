@@ -62,6 +62,7 @@ import { windowForModel, windowModel } from '../shared/limit-windows';
 import { mergeWindows } from './services/limits';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
 import { ResetConsoles } from './core/reset-console';
+import { Submissions } from './core/submissions';
 import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
@@ -1765,6 +1766,8 @@ export class App {
 
   /** Messages a phone sent while its chat moved, queued: the guard of the pairing that sent each (by queue id). */
   private queueGuards = new Map<string, CallContext>();
+  /** `session.send` by submission id: a retry of a send that went out is answered, not sent again. */
+  private submissions = new Submissions<RpcMethods['session.send']['result']>();
   /** Chats switching agent right now (`switchAgent`): no account move meanwhile. */
   private switching = new Set<string>();
   /** Per chat, how often the person stopped it (Stop, close): work begun before a stop does not start a turn after it. */
@@ -2931,7 +2934,8 @@ export class App {
       return { item: { ...item } };
     });
 
-    this.register('session.send', async ({ sessionId, text, attachments, steer }, ctx) => {
+    // A retry of a submission the bridge already took (its window lost the answer) is answered, not sent again.
+    this.register('session.send', ({ sessionId, text, attachments, steer, submitId }, ctx) => this.submissions.run(sessionId, submitId, async () => {
       // A message is words (maybe empty, with pictures) before anything holds it: the queue, the timeline, the agent.
       validMessage(text, attachments);
       const rt = this.runtime(sessionId);
@@ -2950,16 +2954,21 @@ export class App {
       }
       await this.deliver(rt, text, attachments, undefined, ctx);
       return { ok: true };
-    });
+    }));
 
-    this.register('queue.update', ({ sessionId, id, text, attachments }) => {
+    this.register('queue.update', ({ sessionId, id, text, attachments }, ctx) => {
       // Omitted attachments keep the message's; an empty list removes them.
       validMessage(text, attachments);
       const rt = this.runtime(sessionId);
       this.hydrate(rt);
+      // The message as this edit finds it, in the same step: the desktop's swap takes it into its
+      // field, so an edit another window made just before is never lost (review wave 10, #8).
+      const found = rt.queue.find((q) => q.id === id);
+      const previous = found ? { ...found, ...(found.attachments ? { attachments: [...found.attachments] } : {}) } : undefined;
       const ok = rt.updateQueued(id, text, attachments ?? undefined);
       this.spare.queueChanged(rt);
-      return { ok };
+      // Only for an edit that kept the message (one that emptied it removed it), and never to a phone.
+      return ok && previous && !ctx.allowed && rt.queue.some((q) => q.id === id) ? { ok, previous } : { ok };
     });
     this.register('queue.take', ({ sessionId, id }) => {
       const rt = this.runtime(sessionId);

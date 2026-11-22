@@ -20,8 +20,8 @@ import { lastResponse } from '@/features/timeline/turns';
 export interface CommandCtx {
   sessionId: string | null;
   openModel: () => void;
-  /** `/model <name>`: picks that model at once (another agent's switches the chat), never sent. */
-  setModel?: (name: string) => void;
+  /** `/model <name>`: picks that model at once (another agent's switches the chat), never sent; false (or a promise of it) when there is none or the bridge refused. */
+  setModel?: (name: string) => unknown;
   openMode: () => void;
   openEffort: () => void;
   /** Switches between standard and the fastest speed the model offers; absent when it offers none. */
@@ -105,12 +105,13 @@ const BUILT_IN: AppCommand[] = [
     argumentHint: '<title>',
     session: true,
     run: ({ sessionId }, arg) => {
-      if (!sessionId) return;
+      if (!sessionId) return false;
       if (!arg) {
         useStore.getState().toast('Add a title after /rename');
-        return;
+        return false;
       }
-      void renameSession(sessionId, arg);
+      // Not reached: `/rename …` comes back into the field.
+      return renameSession(sessionId, arg).then((r) => !!r?.ok);
     },
   },
   {
@@ -118,13 +119,13 @@ const BUILT_IN: AppCommand[] = [
     description: 'Run a check after each turn and send failures back until it passes',
     argumentHint: '<check> [--rounds n]',
     session: true,
-    run: ({ sessionId }, arg) => sessionId && void untilCommand(sessionId, arg),
+    run: ({ sessionId }, arg) => (sessionId ? untilCommand(sessionId, arg) : false),
   },
   {
     name: 'spare',
     description: 'Send when an account has quota that would go unused',
     argumentHint: '<message>',
-    run: ({ sessionId }, arg) => void spareCommand(sessionId, arg),
+    run: ({ sessionId }, arg) => spareCommand(sessionId, arg),
   },
   {
     name: 'race',

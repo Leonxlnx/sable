@@ -571,7 +571,8 @@ describe('queueing', () => {
     await h.send('second');
     const [a, b] = h.rt.queue;
 
-    expect(await h.app.call('queue.update', { sessionId: h.id, id: a.id, text: 'hi there' })).toEqual({ ok: true });
+    // The answer carries the message as the edit found it (review wave 10, #8).
+    expect(await h.app.call('queue.update', { sessionId: h.id, id: a.id, text: 'hi there' })).toMatchObject({ ok: true, previous: { id: a.id, text: 'first' } });
     expect(h.rt.queue[0].text).toBe('hi there');
     expect(await h.app.call('queue.remove', { sessionId: h.id, id: b.id })).toEqual({ ok: true });
     expect(h.rt.queue.map((q) => q.id)).toEqual([a.id]);

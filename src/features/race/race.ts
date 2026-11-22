@@ -93,6 +93,26 @@ export async function raceCommand(sessionId: string | null, task: string): Promi
   return startRace(cwd, task, provider, modes);
 }
 
+/** Where the race's follow-up field sends: both lanes, or one side. */
+export type RaceTarget = 'both' | '0' | '1';
+
+/**
+ * After a follow-up went to `sides` (in that order, `ok` for each): where a retry goes, only the
+ * lanes that refused it, or null when every lane took it. A lane that took it never gets it twice.
+ */
+export function retryTarget(sides: readonly (0 | 1)[], ok: readonly boolean[]): RaceTarget | null {
+  const refused = sides.filter((_, i) => !ok[i]);
+  if (!refused.length) return null;
+  return refused.length > 1 ? 'both' : (String(refused[0]) as RaceTarget);
+}
+
+/** Each race's chosen target, kept with the race while the app runs (leaving the view keeps it; its words are a draft, `raceDraftKey`). */
+const targets = new Map<string, RaceTarget>();
+export const raceTarget = (raceId: string): RaceTarget => targets.get(raceId) ?? 'both';
+export const setRaceTarget = (raceId: string, t: RaceTarget) => void targets.set(raceId, t);
+/** The race's follow-up field, as a draft in the store (and kept across a restart as drafts are). */
+export const raceDraftKey = (raceId: string) => `race:${raceId}`;
+
 /** The lane ends with a land or a discard: the header's mark plays its last moment (see LaneMark). */
 const ending = (id: string, ended: 'landed' | 'discarded' | undefined) => useLanes.setState((s) => ({ byId: { ...s.byId, [id]: { loading: false, ...s.byId[id], ended } } }));
 

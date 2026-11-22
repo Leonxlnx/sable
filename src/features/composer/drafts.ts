@@ -1,9 +1,11 @@
 import { useStore, type Draft } from '@/state/store';
+import { draftsWithPending, onPending } from './pending';
 
 /**
  * What you typed stays: the store keeps a draft per session while the app runs (switching away
  * and back), and this keeps the text of each across a restart. Text only: attachments hold image
- * data and are not written to disk here.
+ * data and are not written to disk here. A message still on its way to the bridge is written as
+ * part of its draft (pending.ts), so a reload before the bridge took it brings its words back.
  */
 const KEY = 'sable.drafts';
 const MAX_DRAFTS = 40;
@@ -52,7 +54,7 @@ export function keepDrafts() {
   let timer = 0;
   const write = () => {
     timer = 0;
-    const next = JSON.stringify(packDrafts(useStore.getState().drafts));
+    const next = JSON.stringify(packDrafts(draftsWithPending(useStore.getState().drafts)));
     if (next === saved) return;
     saved = next;
     try {
@@ -61,10 +63,13 @@ export function keepDrafts() {
       /* full or private: the drafts stay in memory */
     }
   };
+  const soon = () => {
+    if (!timer) timer = window.setTimeout(write, 500);
+  };
   useStore.subscribe((s, p) => {
-    if (s.drafts === p.drafts || timer) return;
-    timer = window.setTimeout(write, 500);
+    if (s.drafts !== p.drafts) soon();
   });
+  onPending(soon);
   window.addEventListener('pagehide', write);
   window.addEventListener('beforeunload', write);
 }

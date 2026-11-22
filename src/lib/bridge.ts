@@ -5,13 +5,18 @@ export type ConnStatus = 'connecting' | 'open' | 'closed';
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: number };
 
-/** WebSocket RPC client for the Sable bridge. Reconnects on its own. */
-class Bridge {
+/**
+ * WebSocket RPC client for the Sable bridge. Reconnects on its own. A request asked while the
+ * socket is not open waits in the outbox, and only as long as its caller waits for it: once the
+ * request is rejected (its time ran out, or the connection it waited for failed) its frame is
+ * dropped, so a request the UI was told failed is never sent later.
+ */
+export class Bridge {
   status: ConnStatus = 'connecting';
   private ws?: WebSocket;
   private nextId = 1;
   private pending = new Map<number, Pending>();
-  private outbox: string[] = [];
+  private outbox: { id: number; frame: string }[] = [];
   private listeners = new Set<(e: BridgeEvent) => void>();
   private statusListeners = new Set<(s: ConnStatus) => void>();
   private retry = 0;
@@ -34,7 +39,7 @@ class Bridge {
     const opened = () => {
       this.retry = 0;
       this.setStatus('open');
-      for (const frame of this.outbox.splice(0)) ws.send(frame);
+      for (const { frame } of this.outbox.splice(0)) ws.send(frame);
     };
     const received = (data: string) => {
       let frame: ServerFrame;
@@ -58,6 +63,8 @@ class Bridge {
       if (this.ws !== ws) return;
       this.bootHello = undefined;
       this.setStatus('closed');
+      // Every request still waiting is told it failed: none of them may go out on the next socket.
+      this.outbox.length = 0;
       for (const [id, p] of this.pending) {
         clearTimeout(p.timer);
         p.reject(new Error('Connection to the bridge was lost'));
@@ -96,13 +103,20 @@ class Bridge {
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
         this.pending.delete(id);
+        this.unsent(id);
         reject(new Error(`${method} timed out`));
       }, timeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       if (early?.asked) return;
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(frame);
-      else this.outbox.push(frame);
+      else this.outbox.push({ id, frame });
     });
+  }
+
+  /** A request that was given up drops its frame if it has not gone out yet. */
+  private unsent(id: number) {
+    const at = this.outbox.findIndex((o) => o.id === id);
+    if (at >= 0) this.outbox.splice(at, 1);
   }
 
   on(listener: (e: BridgeEvent) => void) {
