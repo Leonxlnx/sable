@@ -329,6 +329,13 @@ function guardGuest(contents: WebContents) {
   };
   (contents as unknown as NodeJS.EventEmitter).on('unresponsive', hang(true));
   (contents as unknown as NodeJS.EventEmitter).on('responsive', hang(false));
+  // A navigation that ends on the engine's own error page commits no document: what waited for one
+  // (its own failed answer) is the current page's. -3 is a load another navigation replaced.
+  contents.on('did-fail-load', (_e, code, _text, _url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return;
+    guestLog.settle(contents.id);
+    outboxTimer ??= setTimeout(flushBrowserEvents, EVENT_BEAT);
+  });
   contents.once('destroyed', () => {
     guestLog.forget(contents.id);
     hidden.delete(contents.id);
@@ -527,7 +534,7 @@ function hardenBrowser() {
   const reportNet = (d: { id: number; webContentsId?: number; url: string; method: string; statusCode?: number; error?: string }) => {
     if (typeof d.webContentsId !== 'number') return;
     // The document the request started on, whatever its outcome (and the request is forgotten).
-    const doc = guestLog.end(d.id, d.webContentsId);
+    const doc = guestLog.end(d.id, d.webContentsId, d.error === undefined);
     if (!win || win.isDestroyed() || (d.statusCode !== undefined && d.statusCode < 400) || d.error === 'net::ERR_ABORTED') return;
     let url = d.url;
     try {
@@ -541,10 +548,10 @@ function hardenBrowser() {
   };
   // A request's start: it belongs to the guest's document current now. onSendHeaders is a plain
   // listener (onBeforeRequest has one slot, sign-in.ts's); a request that never got here reads as the
-  // document current when it ended. A main-frame request is never stamped at its start: it sends its
-  // headers before its own document commits, and its 404 or 500 is the new page's.
+  // document current when it ended. A navigation's own request is marked: its 404 or 500 is the page
+  // it brings, and that answer can end before its page commits (guest-log.ts holds it until then).
   ses.webRequest.onSendHeaders((d) => {
-    if (typeof d.webContentsId === 'number' && d.resourceType !== 'mainFrame') guestLog.begin(d.webContentsId, d.id);
+    if (typeof d.webContentsId === 'number') guestLog.begin(d.webContentsId, d.id, d.resourceType === 'mainFrame');
   });
   ses.webRequest.onCompleted((d) => {
     countRequest(d.webContentsId);

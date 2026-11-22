@@ -4,6 +4,14 @@
  * console line the document current when it was logged, a failed request the document current when the
  * request started (remembered per request id, bounded, forgotten when the request ends). A commit flushes
  * the outgoing document's tail first, as that document's, then says the new document, in that order.
+ *
+ * A navigation's own request is the exception: a page that is itself a 404 or a 500 belongs to the
+ * document that answer brings, the one after the document the request started on. The answer can end
+ * before its page commits (a small page from a near server always does), so such an entry is stamped
+ * with a document that is not there yet and held back until it is: sent earlier, the window would
+ * wipe it with the reset the commit brings, and the most useful failed request of all never reached
+ * the agent. A navigation that gets no answer (the address refused, no network) brings no document:
+ * its failure is the current page's.
  */
 
 export type GuestLine = { level: string; text: string; source?: string };
@@ -22,8 +30,8 @@ export class GuestLog {
   private docs = new Map<number, number>();
   /** Per guest, per document: what has not gone out yet. */
   private pending = new Map<number, Map<number, Bucket>>();
-  /** Request id to [guest, the document current when it started]; oldest out past `requests`. */
-  private started = new Map<number, [number, number]>();
+  /** Request id to [guest, the document current when it started, a navigation's own request]; oldest out past `requests`. */
+  private started = new Map<number, [number, number, boolean]>();
 
   constructor(private limits: GuestLogLimits = { lines: 60, net: 30, requests: 2000 }) {}
 
@@ -31,18 +39,56 @@ export class GuestLog {
     return this.docs.get(id) ?? 0;
   }
 
-  /** A request of a guest starts: it belongs to the document current now. */
-  begin(id: number, requestId: number) {
+  /**
+   * A request of a guest starts: it belongs to the document current now. A navigation's own request
+   * (`main`) belongs to the document it brings; what an earlier navigation that never committed left
+   * waiting for its document is dropped, since this one's document is another.
+   */
+  begin(id: number, requestId: number, main = false) {
     this.started.delete(requestId);
-    this.started.set(requestId, [id, this.doc(id)]);
+    this.started.set(requestId, [id, this.doc(id), main]);
     while (this.started.size > this.limits.requests) this.started.delete(this.started.keys().next().value as number);
+    if (main) this.ahead(id, () => {});
   }
 
-  /** A request ended (whatever its outcome): its document, if its start was seen, and it is forgotten. */
-  end(requestId: number, id: number): number {
+  /**
+   * A request ended (whatever its outcome) and is forgotten: the document its failure belongs to.
+   * A sub-resource: the document it started on. A navigation's own request that got an answer: the
+   * document after the one it started on, committed yet or not. One that got no answer
+   * (`answered` false), or a request whose start was not seen: the current document.
+   */
+  end(requestId: number, id: number, answered = true): number {
     const s = this.started.get(requestId);
     this.started.delete(requestId);
-    return s && s[0] === id ? s[1] : this.doc(id);
+    if (!s || s[0] !== id) return this.doc(id);
+    if (!s[2]) return s[1];
+    return answered ? s[1] + 1 : this.doc(id);
+  }
+
+  /** Takes out what waits for a document of `id` that has not committed, handing each bucket to `each`. */
+  private ahead(id: number, each: (b: Bucket) => void) {
+    const g = this.pending.get(id);
+    if (!g) return;
+    const now = this.doc(id);
+    for (const doc of [...g.keys()]) {
+      if (doc <= now) continue;
+      const b = g.get(doc)!;
+      g.delete(doc);
+      each(b);
+    }
+    if (!g.size) this.pending.delete(id);
+  }
+
+  /**
+   * A navigation ended without a document of its own (the engine shows its error page instead, which
+   * is no commit): what waited for that document is the current page's.
+   */
+  settle(id: number) {
+    const now = this.doc(id);
+    this.ahead(id, (b) => {
+      for (const e of b.net) this.net(id, now, e);
+      if (b.netDropped) this.bucket(id, now).netDropped += b.netDropped;
+    });
   }
 
   private bucket(id: number, doc: number): Bucket {
@@ -67,25 +113,30 @@ export class GuestLog {
     else b.net.push(ev);
   }
 
+  /** What can go out of a guest's entries: every document's up to the current one (one not committed yet waits). */
   private take(id: number, out: GuestEvent[]) {
     const g = this.pending.get(id);
     if (!g) return;
-    this.pending.delete(id);
+    const now = this.doc(id);
     for (const doc of [...g.keys()].sort((a, b) => a - b)) {
+      if (doc > now) continue;
       const b = g.get(doc)!;
+      g.delete(doc);
       if (b.lines.length || b.dropped) out.push({ type: 'console', id, doc, lines: b.lines, dropped: b.dropped });
       for (const e of b.net) out.push({ type: 'net', id, doc, ...e });
       if (b.netDropped) out.push({ type: 'net-dropped', id, doc, count: b.netDropped });
     }
+    if (!g.size) this.pending.delete(id);
   }
 
-  /** A new document committed: the outgoing one's tail first, then the new document. */
+  /** A new document committed: the outgoing one's tail first, then the new document, then what waited for it. */
   commit(id: number): GuestEvent[] {
     const out: GuestEvent[] = [];
     this.take(id, out);
     const doc = this.doc(id) + 1;
     this.docs.set(id, doc);
     out.push({ type: 'doc', id, doc });
+    this.take(id, out);
     return out;
   }
 

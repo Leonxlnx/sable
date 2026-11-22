@@ -21,10 +21,11 @@ describe('guest log: every entry carries its own document', () => {
     ]);
   });
 
-  it('the main-frame request of A -> B (never begun, as main.ts skips mainFrame) that answers 404 after B committed is B\'s; a sub-resource begun on A is still A\'s', () => {
+  it('the navigation A -> B that answers 404 after B committed is B\'s; a sub-resource begun on A is still A\'s', () => {
     const log = new GuestLog();
     log.commit(G); // A = 1
-    log.begin(G, 200); // a sub-resource of A; the main-frame request 201 is not begun
+    log.begin(G, 200); // a sub-resource of A
+    log.begin(G, 201, true); // the navigation's own request, begun while A is current
     log.commit(G); // B = 2
     log.net(G, log.end(201, G), { url: 'https://b.test/', method: 'GET', status: 404 });
     log.net(G, log.end(200, G), { url: 'https://a.test/img', method: 'GET', error: 'net::ERR_FAILED' });
@@ -32,6 +33,60 @@ describe('guest log: every entry carries its own document', () => {
       [1, 'https://a.test/img'],
       [2, 'https://b.test/'],
     ]);
+  });
+
+  it('a page that is itself a 404 and whose answer ends BEFORE it commits waits for its document, then goes out after it', () => {
+    // Seen in the packaged app: a small page from a near server ends its request first, then commits.
+    const log = new GuestLog();
+    log.commit(G); // A = 1
+    log.console(G, { level: 'error', text: 'a-last' });
+    log.begin(G, 300, true);
+    log.net(G, log.end(300, G), { url: 'https://b.test/gone', method: 'GET', status: 404 });
+    // A beat passes before the commit: A's line goes out, B's own 404 does not (the window would wipe it at the reset).
+    expect(log.flush().map((e) => [e.type, e.doc])).toEqual([['console', 1]]);
+    expect(log.flush()).toEqual([]);
+    // B commits: the new document, then its own failed request, as B's.
+    const out = log.commit(G);
+    expect(out.map((e) => [e.type, e.doc])).toEqual([
+      ['doc', 2],
+      ['net', 2],
+    ]);
+    expect((out[1] as { url: string; status?: number }).url).toBe('https://b.test/gone');
+    expect(log.flush()).toEqual([]);
+  });
+
+  it('a navigation that got no answer brings no document: its failure is the current page\'s, at once', () => {
+    const log = new GuestLog();
+    log.commit(G); // A = 1
+    log.begin(G, 400, true);
+    // The address refused: no answer, no commit.
+    log.net(G, log.end(400, G, false), { url: 'http://127.0.0.1:1/', method: 'GET', error: 'net::ERR_CONNECTION_REFUSED' });
+    expect(log.flush().map((e) => [e.type, e.doc])).toEqual([['net', 1]]);
+  });
+
+  it('an answer whose page never commits (the engine\'s own error page) settles on the current page; a new navigation drops what still waits', () => {
+    const log = new GuestLog();
+    log.commit(G); // A = 1
+    // A 404 with nothing in it: the engine shows its error page, which is no commit.
+    log.begin(G, 500, true);
+    log.net(G, log.end(500, G), { url: 'https://b.test/empty', method: 'GET', status: 404 });
+    expect(log.flush()).toEqual([]);
+    log.settle(G);
+    expect(log.flush().map((e) => [e.type, e.doc, (e as { url?: string }).url])).toEqual([['net', 1, 'https://b.test/empty']]);
+    // Nothing waits: settling again says nothing.
+    log.settle(G);
+    expect(log.flush()).toEqual([]);
+    // An answer left waiting when the next navigation starts is not that navigation's.
+    log.begin(G, 501, true);
+    log.net(G, log.end(501, G), { url: 'https://c.test/one', method: 'GET', status: 500 });
+    log.begin(G, 502, true);
+    const out = log.commit(G); // the second navigation's document = 2
+    expect(out.map((e) => e.type)).toEqual(['doc']);
+    expect(log.flush()).toEqual([]);
+    // Redirect hops begin the same request again: the last hop's document counts.
+    log.begin(G, 503, true);
+    log.begin(G, 503, true);
+    expect(log.end(503, G)).toBe(3);
   });
 
   it('a request whose start was not seen reads as the document current when it ended', () => {
