@@ -50,6 +50,30 @@ import type { App } from '../app';
  *   5. The dev frame's origin was compared by prefix. Now: origins are compared exactly (scheme, host
  *      in punycode, port; `sameOrigin`), the dev frame compares parsed origins, and the dev frame
  *      cannot fill at all (only the desktop's main process fills).
+ *
+ * The review of the rebuild (22 Nov 2026, scratch/reviews/out-day5b.md) said no again. Still to clear
+ * before the switch goes on; the numbers are that review's:
+ *   1. The ciphertext holds the password alone: the entry's origin and user name are plain JSON beside
+ *      it, so whoever can write the file can point a saved password at another origin. Encrypt the
+ *      origin and the user name with it and check them after decrypting.
+ *   2. A second `begin` on a guest that still shows a filled form: its reload is read as the first
+ *      fill's new document, which removes the new network guard and tells the window to stop
+ *      refusing. Refuse `begin` while a guest has a sign-in pending or filled; one id per hold.
+ *   4. The hold is the window's and has holes: `browser_read` (page text, console, failed requests),
+ *      the title and address, and a console batch of the old document arriving late still reach the
+ *      agent. Enforce the hold in main, on what is delivered as well as on what is asked.
+ *   6. The approval names an origin, not the login page or its form: a path change in the same
+ *      document, a same-origin redirect, `document.open()` or a form swapped after the stamp, or the
+ *      field moved into a frame during the user name's event, all pass. Pin the address and the form.
+ *   7. The network guard misses a form-encoded password (`!` and the like) and a `<base target>`;
+ *      the destination must hold for the request and each redirect whatever the body looks like.
+ *   8. A single saved entry is used after 2.6 s without the person choosing it. Always ask.
+ *   9. The tool's step is published before its input is cleaned.
+ * And two that no fix here removes; the person must be told before they save anything:
+ *   3. What is filled into a page can be read by that page's scripts (a third party's too), as with
+ *      any password manager's autofill.
+ *   5. Once signed in, the agent acts in that session, and the Browser tab's pages share one stored
+ *      profile: a site that keeps a token where scripts can read it gives it to the agent's eval.
  */
 
 /** Saved sign-ins ship at all. Tests of its code turn it on with `setSignInShips`. */
