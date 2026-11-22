@@ -109,7 +109,10 @@ export async function pullContext(cwd: string): Promise<GitPullContext | { error
 }
 
 /** Pushes the branch and opens its pull request. Never throws. */
-export async function createPull(cwd: string, opts: { title: string; body: string; base: string; draft: boolean }): Promise<GitPullRequestResult> {
+export async function createPull(
+  cwd: string,
+  opts: { title: string; body: string; base: string; draft: boolean; branch?: string; head?: string; destination?: string; repo?: string },
+): Promise<GitPullRequestResult> {
   try {
     return await bridge.call('pulls.create', { cwd, ...opts }, 180_000);
   } catch (err) {

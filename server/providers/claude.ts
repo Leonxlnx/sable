@@ -530,8 +530,13 @@ export class ClaudeProvider implements Provider {
         const any = m as Obj;
         if (m.type === 'assistant' && !any.parent_tool_use_id) {
           for (const b of (any.message?.content as Obj[] | undefined) ?? []) if (b.type === 'text' && b.text) text += String(b.text);
+          // Longer than any title or commit message: stop there (review wave 8, #24).
+          if (text.length > QUICK_MAX_CHARS) {
+            text = text.slice(0, QUICK_MAX_CHARS);
+            break;
+          }
         } else if (m.type === 'result') {
-          if (any.subtype === 'success' && typeof any.result === 'string' && any.result.trim()) text = any.result;
+          if (any.subtype === 'success' && typeof any.result === 'string' && any.result.trim()) text = any.result.slice(0, QUICK_MAX_CHARS);
           else if (any.subtype !== 'success') this.ctx.log('claude: no title:', any.subtype, (any.errors as string[] | undefined)?.join('; ') ?? '');
           break;
         }
@@ -905,6 +910,8 @@ export class ClaudeProvider implements Provider {
 }
 
 const WARM_TTL_MS = 3 * 60_000;
+/** The most of a quick answer (a title, a commit message) kept. */
+const QUICK_MAX_CHARS = 16_000;
 /** How long after the usage endpoint refused before Sable asks it again unasked. */
 const LIMITS_REFUSED_BACKOFF_MS = 10 * 60_000;
 /** Plan windows as `rate_limit_event` names them, with the rows the usage answer gives them. */
@@ -1264,7 +1271,9 @@ class ClaudeSession implements ProviderSession {
 
   private ensure(): Query {
     if (this.q) return this.q;
-    const meta = this.rt.meta;
+    // A process (re)started while a phone's switch is held runs under the mode the work had (`workMode`).
+    const rt = this.rt;
+    const meta = rt.workMode === rt.meta.mode ? rt.meta : { ...rt.meta, mode: rt.workMode };
     // A process started while the user was typing on the home screen, for exactly this choice.
     const warm = !meta.providerSessionId && !this.resumeAt ? this.provider.takeWarm(warmKey(meta, this.provider.concise(), this.provider.widgets(), this.provider.profileText())) : undefined;
     let q: Query;
@@ -2475,7 +2484,7 @@ class ClaudeSession implements ProviderSession {
     switch (m.subtype) {
       case 'init': {
         if (Array.isArray(m.skills)) this.skillNames = m.skills.map(String);
-        if (m.permissionMode && m.permissionMode !== rt.meta.mode) rt.update({ mode: m.permissionMode });
+        if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         if (rt.caps && this.skillNames.length) {
           const names = new Set(this.skillNames);
           const commands = rt.caps.commands.map((c) => (names.has(c.name) ? { ...c, kind: 'skill' as const } : c));
@@ -2490,7 +2499,7 @@ class ClaudeSession implements ProviderSession {
       }
       case 'status':
         if (m.status === 'compacting') rt.update({ activity: 'Compacting the conversation' });
-        if (m.permissionMode && m.permissionMode !== rt.meta.mode) rt.update({ mode: m.permissionMode });
+        if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         break;
       case 'compact_boundary': {
         const meta = m.compact_metadata ?? {};

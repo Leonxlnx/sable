@@ -233,6 +233,8 @@ export function titleThreadParams(prompt: TitlePrompt, model: string, plugins: r
 
 /** How long the title thread's own MCP listing may take (with no server it answers at once). */
 const TITLE_CHECK_MS = 10_000;
+/** The most of a quick answer (a title, a commit message) kept: past it the turn is stopped. */
+export const QUICK_MAX_CHARS = 16_000;
 
 /** The one turn of a title thread: the prompt as text, the lowest effort, no reasoning summary. */
 export function titleTurnParams(threadId: string, prompt: TitlePrompt, effort?: Effort): TurnStartParams & { summary: string } {
@@ -445,12 +447,21 @@ export class CodexProvider implements Provider {
     let text = '';
     let deltas = '';
     let turnId: string | undefined;
+    // An answer longer than any title or commit message can be stops the turn there (review wave 8, #24).
+    let overflow = false;
     let quit = () => {};
     const done = new Promise<void>((resolve, reject) => {
       quit = resolve;
       this.titleThreads.set(threadId, (method, p) => {
-        if (method === 'item/agentMessage/delta' && typeof p?.delta === 'string') deltas += p.delta;
-        else if (method === 'item/completed' && p?.item?.type === 'agentMessage' && typeof p.item.text === 'string') text = p.item.text;
+        if (method === 'item/agentMessage/delta' && typeof p?.delta === 'string') {
+          if (overflow) return;
+          deltas += p.delta;
+          if (deltas.length > QUICK_MAX_CHARS) {
+            deltas = deltas.slice(0, QUICK_MAX_CHARS);
+            overflow = true;
+            resolve();
+          }
+        } else if (method === 'item/completed' && p?.item?.type === 'agentMessage' && typeof p.item.text === 'string') text = p.item.text.slice(0, QUICK_MAX_CHARS);
         else if (method === 'turn/started' && p?.turn?.id) turnId ??= p.turn.id;
         else if (method === 'error' && !p?.willRetry) reject(new Error(p?.error?.message ?? 'Codex error'));
         else if (method === 'turn/completed') {
@@ -470,7 +481,7 @@ export class CodexProvider implements Provider {
     } finally {
       signal.removeEventListener('abort', stop);
       this.titleThreads.delete(threadId);
-      if (signal.aborted && turnId) void rpc.request('turn/interrupt', { threadId, turnId }, 10_000).catch(() => {});
+      if ((signal.aborted || overflow) && turnId) void rpc.request('turn/interrupt', { threadId, turnId }, 10_000).catch(() => {});
       void rpc.request('thread/unsubscribe', { threadId }, 10_000).catch(() => {});
     }
     if (signal.aborted) return null;
@@ -1217,7 +1228,8 @@ class CodexSession implements ProviderSession {
   private async resumeOrStart(threadId: string | undefined, epoch?: number): Promise<{ resp: ThreadStartResponse; resumed: boolean }> {
     const rt = this.rt;
     const rpc = await this.provider.client();
-    const p = preset(rt.meta.mode);
+    // A reload mid-turn keeps the mode the work runs under (a phone's switch is held: `workMode`).
+    const p = preset(rt.workMode);
     const rev = this.policyRev;
     const config = this.threadConfig();
     const developerInstructions = await this.provider.developerInstructions(rt.meta.cwd, rt.meta);
@@ -1445,7 +1457,7 @@ class CodexSession implements ProviderSession {
     if (tier !== undefined) params.serviceTier = tier;
     const rev = this.policyRev;
     if (this.policyDirty) {
-      const p = preset(rt.meta.mode);
+      const p = preset(rt.workMode);
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }

@@ -4,6 +4,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import type { InitializeParams, InitializeResponse, RequestId } from './codex-types';
 import { cliCommand } from '../util/proc';
+import { trustedPathDirs } from '../util/which';
 
 /**
  * JSON-RPC client for `codex app-server` (newline-delimited JSON over stdio, no
@@ -76,7 +77,7 @@ export function resolveCodexCommand(args: string[], extraEnv?: Record<string, st
   if (process.platform !== 'win32') return { file: 'codex', args, shell: false, env };
 
   const target = winTarget();
-  const dirs = (process.env.PATH ?? process.env.Path ?? '').split(path.delimiter).filter(Boolean);
+  const dirs = trustedPathDirs(process.env.PATH ?? process.env.Path ?? '', 'win32');
   for (const dir of dirs) {
     if (existsSync(path.join(dir, 'codex.cmd')) && target) {
       const pkgRoot = path.join(dir, 'node_modules', '@openai', 'codex');

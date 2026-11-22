@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { trustedPathDirs } from './which';
 
 const resolved = new Map<string, string | null>();
 
@@ -12,7 +13,8 @@ function whichWin(cmd: string, env: NodeJS.ProcessEnv = process.env): string | n
   if (path.isAbsolute(cmd) || cmd.includes('/') || cmd.includes('\\')) found = existsSync(cmd) ? cmd : null;
   else {
     const exts = (env.PATHEXT ?? process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
-    const dirs = (env.PATH ?? env.Path ?? process.env.PATH ?? process.env.Path ?? '').split(path.delimiter).filter(Boolean);
+    // Absolute entries only: a relative one ("." or "bin") would read against whatever folder the CLI starts in.
+    const dirs = trustedPathDirs(env.PATH ?? env.Path ?? process.env.PATH ?? process.env.Path ?? '', 'win32');
     outer: for (const dir of dirs)
       for (const ext of exts) {
         const p = path.join(dir, cmd + ext.toLowerCase());

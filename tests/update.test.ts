@@ -125,7 +125,7 @@ ${body}
       chmodSync(path.join(bin, name), 0o755);
     };
     // The script calls /usr/bin/ditto, /usr/bin/xattr and /usr/bin/open by absolute path: rewrite them to the stubs.
-    stub('ditto', 'mkdir -p "$4/Sable.app" && echo new > "$4/Sable.app/version"');
+    stub('ditto', 'mkdir -p "$4/Sable.app/Contents/MacOS" && touch "$4/Sable.app/Contents/Info.plist" && echo new > "$4/Sable.app/version"');
     stub('xattr', 'exit 0');
     stub('open', 'echo "$1" >> "$OPENED"');
     const script = MAC_INSTALL_SCRIPT.replace(/\/usr\/bin\/(ditto|xattr|open)/g, `${bin}/$1`);

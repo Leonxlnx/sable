@@ -6,6 +6,7 @@ import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus, Git
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
 import { folderNow, openContained, within as under, type FolderRoot } from '../core/contain';
 import type { App } from '../app';
+import { findProgram } from '../util/which';
 
 // ───────────────────────────── git runner ─────────────────────────────
 
@@ -52,9 +53,17 @@ export function runGit(
       });
     };
     let child: ReturnType<typeof spawn>;
+    const dir = path.resolve(cwd);
+    // git from PATH, never from the folder (server/util/which.ts), and started outside it: `-C`
+    // moves it into the repository, so nothing there is looked up as a program or a library.
+    const git = findProgram('git', { outside: [dir] });
+    if (!git) {
+      resolve({ code: null, stdout: '', stderr: '', missing: true, timedOut: false, truncated: false });
+      return;
+    }
     try {
-      child = spawn('git', ['-c', 'core.quotePath=false', '-c', 'color.ui=false', ...args], {
-        cwd,
+      child = spawn(git, ['-C', dir, '-c', 'core.quotePath=false', '-c', 'color.ui=false', ...args], {
+        cwd: path.dirname(git),
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_PAGER: 'cat', LC_ALL: 'C', ...opts.env },
@@ -658,7 +667,8 @@ export async function gitDraftInput(cwd: string): Promise<CommitDraftInput | { e
   if (head.code !== 0) return { files, patch: '', subjects: [] };
   const [diff, log] = await Promise.all([
     runGit(dir, ['diff', 'HEAD', '--no-color', '--no-ext-diff', '-M'], { timeoutMs: 20_000, maxBytes: 4_000_000 }),
-    runGit(dir, ['log', '-8', '--format=%s'], { timeoutMs: 5000 }),
+    // Eight subjects are a few hundred bytes; a repository with an endless one is cut here (commit-draft.ts budgets the rest).
+    runGit(dir, ['log', '-8', '--format=%s'], { timeoutMs: 5000, maxBytes: 64_000 }),
   ]);
   return {
     files,

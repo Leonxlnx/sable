@@ -1557,10 +1557,18 @@ export interface GitPullContext {
   base?: string;
   /** Whether a remote named origin exists. */
   remote: boolean;
-  /** Where origin points, without any user name or token in it. */
-  remoteUrl?: string;
-  /** Subjects of the commits the base does not have, oldest first. */
+  /** Every address `git push origin` sends to, as git resolves them, without any user name or token. */
+  pushUrls?: string[];
+  /** A fingerprint of those addresses, sent back with the click: the push goes there or not at all. */
+  destination?: string;
+  /** The commit the push sends (HEAD when the dialog opened, in full). */
+  head?: string;
+  /** The GitHub repository gh opens the pull request in (`owner/name`), when gh could say. */
+  repo?: string;
+  /** Subjects of the commits the base does not have, oldest first (the first 50). */
   commits: string[];
+  /** How many commits the push brings. */
+  commitCount?: number;
   title: string;
   body: string;
 }
@@ -1571,6 +1579,8 @@ export interface GitPullRequestResult {
   url?: string;
   number?: number;
   error?: string;
+  /** The branch, its commit or the push addresses changed since the dialog read them: nothing was pushed. */
+  stale?: boolean;
 }
 
 export interface AppState {
@@ -2509,7 +2519,10 @@ export interface RpcMethods {
   /** The branch, its base and a draft title and description for a pull request. Pushes nothing. */
   'pulls.context': { params: { cwd: string }; result: GitPullContext };
   /** Pushes the branch to origin, then opens a pull request for it with gh. */
-  'pulls.create': { params: { cwd: string; title: string; body: string; base: string; draft: boolean }; result: GitPullRequestResult };
+  'pulls.create': {
+    params: { cwd: string; title: string; body: string; base: string; draft: boolean; branch?: string; head?: string; destination?: string; repo?: string };
+    result: GitPullRequestResult;
+  };
 
   /** The agent's own settings files (permission rules, hooks), read-only and without secrets. */
   'config.read': { params: { provider: ProviderId; cwd?: string }; result: AgentConfigFile[] };

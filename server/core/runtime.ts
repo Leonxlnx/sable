@@ -67,6 +67,17 @@ export class SessionRuntime {
    * once only from the person's next message on (`App.applyDue` lifts it; review wave 7, #1).
    */
   dangerHeld = false;
+  /** The mode before the held switch: what the work in progress still runs under (`workMode`). */
+  heldMode?: string;
+  /**
+   * The mode the agent's work runs under now. `meta.mode` is the one chosen (shown, and taken with the
+   * next message); while a phone's switch to a mode that never asks is held it is the mode before it.
+   * Every place that decides what work may do reads this: a permission answered by the adapter, a
+   * thread or process (re)opened mid-turn, a sub-agent started by the running turn (review wave 8, #5).
+   */
+  get workMode(): string {
+    return this.dangerHeld && this.heldMode !== undefined ? this.heldMode : this.meta.mode;
+  }
   /** The mode answers asks at once now (`danger`: the mode is one that never asks). */
   answersAtOnce(danger: boolean): boolean {
     return danger && !this.dangerHeld;
