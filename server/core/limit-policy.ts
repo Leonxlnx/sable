@@ -108,6 +108,16 @@ export const RETURN_AT_START_MS = { first: 30_000, gap: 5_000 };
 export const returnAtStartMs = (nth: number, returnAt: number | undefined, now: number, ms = RETURN_AT_START_MS) =>
   Math.max((returnAt ?? 0) - now, ms.first + Math.max(0, nth) * ms.gap);
 
+/**
+ * When the returns still owed at a start are looked at, as waits from `now`, for chats given
+ * soonest due first: none in the first half minute, none before it is due, and never two within
+ * `gap` of each other, also when several are due at the same reset an hour away.
+ */
+export function returnsAtStart(dues: readonly (number | undefined)[], now: number, ms = RETURN_AT_START_MS): number[] {
+  let prev = -Infinity;
+  return dues.map((due, nth) => (prev = Math.max(returnAtStartMs(nth, due, now, ms), prev + ms.gap)));
+}
+
 /** The next try after an inconclusive reading (not fresh, failed, no room shown): 1, 2, 4… minutes, at most 30. */
 export const returnRetryMs = (tries: number) => Math.min(30 * 60_000, 60_000 * 2 ** Math.max(0, tries));
 

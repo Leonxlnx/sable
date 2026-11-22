@@ -49,7 +49,7 @@ import { cleanCommit, commitPrompt } from './core/commit-draft';
 import { SessionRuntime, autoTitle, pendingPrompts, type BackgroundLimit } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
-import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_RECHECK_MS, returnAtStartMs, returnRetryMs, returnTarget, runningOnCredits } from './core/limit-policy';
+import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_AT_START_MS, RETURN_RECHECK_MS, returnRetryMs, returnsAtStart, returnTarget, runningOnCredits } from './core/limit-policy';
 import { rankAccount } from '../shared/use-first';
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
 import { speedFor, startSpeedFor } from '../shared/speed';
@@ -205,6 +205,12 @@ export class App {
   private compacting = new Map<string, (error?: string) => void>();
   /** Chats moving to another account right now: a message sent meanwhile waits in the queue (`queuedWhileMoving`). */
   private moving = new Set<string>();
+  /** Where each of them is going (`accountKey`): that account is not removed while the move runs. */
+  private movingTo = new Map<string, string>();
+  /** Chats whose file is there but could not be read: their timeline is empty, so no move may start them over from it. */
+  private unreadable = new Set<string>();
+  /** Returns due at the same moment go this far apart (`RETURN_AT_START_MS.gap`; tests shorten it). */
+  private returnGapMs = RETURN_AT_START_MS.gap;
   private queuedWhileMoving = new Set<string>();
   /** Sign-ins given up after `loginTimeoutMs`; the rejection that follows is not an error. */
   private loginTimedOut = new Set<string>();
@@ -449,8 +455,11 @@ export class App {
     // Chats that waited when Sable closed go on waiting (a reset that passed meanwhile is due now).
     if (this.spare.hasWaits()) this.spare.poke(4000);
     // A chat a limit moved away still owes its return (its timer lived in the last run).
-    let owed = 0;
-    for (const rt of this.sessions.values()) if (rt.meta.movedFrom) this.armReturn(rt, returnAtStartMs(owed++, rt.meta.returnAt, Date.now(), opts.returnAtStartMs));
+    // Soonest due first, never two within the gap: chats that left one account are due at the same reset.
+    if (opts.returnAtStartMs) this.returnGapMs = opts.returnAtStartMs.gap;
+    const owing = [...this.sessions.values()].filter((rt) => rt.meta.movedFrom).sort((a, b) => (a.meta.returnAt ?? 0) - (b.meta.returnAt ?? 0));
+    const waits = returnsAtStart(owing.map((rt) => rt.meta.returnAt), Date.now(), opts.returnAtStartMs);
+    owing.forEach((rt, i) => this.armReturn(rt, waits[i]));
   }
 
   log = (...args: unknown[]) => {
@@ -1058,7 +1067,10 @@ export class App {
     // (stopped as read, so the count never shows them, also not on the way).
     rt.loadRestored(file.items, file.todos, file.queue ?? []);
     // A file that is there but cannot be read is left exactly as it is (nothing is written to it).
-    if (file.unreadable) rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Restart Sable to try again.');
+    if (file.unreadable) {
+      this.unreadable.add(rt.id);
+      rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Restart Sable to try again.');
+    }
     // What was in flight when Sable closed ended then, not now (the chat may be opened much later).
     rt.settle('cancelled', { endUnknown: true });
     // Messages still waiting for the agent when Sable closed (a steer not taken yet) would wait forever: back to the queue.
@@ -1858,16 +1870,27 @@ export class App {
     this.returnTimers.delete(rt.id);
     const at = inMs !== undefined ? Date.now() + inMs : rt.meta.returnAt;
     if (!rt.meta.movedFrom || !at || this.disposed || this.sessions.get(rt.id) !== rt) return;
+    // Chats that left one account are due at the same reset: one after another, never a burst of readings and moves.
+    const turn = inMs !== undefined ? 0 : this.returnTurn(rt) * this.returnGapMs;
     // Long waits are armed again in steps (a laptop may sleep through one).
     const timer = setTimeout(
       () => {
         this.returnTimers.delete(rt.id);
         void this.returnAfterLimit(rt, { retry: inMs !== undefined }).catch((err) => this.log('return after a limit failed', (err as Error).message));
       },
-      Math.min(Math.max(0, at - Date.now()) + (inMs !== undefined ? 0 : 1000), 6 * 3600_000),
+      Math.min(Math.max(0, at - Date.now()) + (inMs !== undefined ? 0 : 1000) + turn, 6 * 3600_000),
     );
     timer.unref?.();
     this.returnTimers.set(rt.id, timer);
+  }
+
+  /** This chat's place among the chats that owe the same return (the same account, due at the same moment), from 0. */
+  private returnTurn(rt: SessionRuntime): number {
+    const same = [...this.sessions.values()]
+      .filter((o) => o.meta.provider === rt.meta.provider && !!o.meta.movedFrom && o.meta.movedFrom === rt.meta.movedFrom && o.meta.returnAt === rt.meta.returnAt)
+      .map((o) => o.id)
+      .sort();
+    return Math.max(0, same.indexOf(rt.id));
   }
 
   /** A chat closed or let go: its limit decision and its return wait for nothing any more (review wave 16, #10). */
@@ -1973,6 +1996,10 @@ export class App {
     const to = returnTarget({ from, current, fromTakesWork: true });
     // A chat not read since the start (the timer after a restart): read beside the app, never in its way.
     if (to) await this.hydrateAsync(rt).catch(() => {});
+    // A chat that could not be read (its file locked or broken, or the read failed) is not moved: a
+    // move may have to start the conversation over from the timeline, and there is none. The return
+    // stays owed and is looked at again at the next start or the person's next message.
+    if (to && (this.lazy.has(rt.id) || this.unreadable.has(rt.id))) return;
     // Only at rest, looked at again after the wait (never mid-turn, never beside another transition).
     if (!to || !still() || !this.atRest(rt)) return;
     this.returned.add(key);
@@ -2320,12 +2347,14 @@ export class App {
     if (rt.items.some((i) => worksInBackground(i) && !left?.has(i.id))) throw new Error('Background work is still running in this chat. Move when it is done.');
     if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) return { ok: true, carried: 'none' };
     this.moving.add(rt.id);
+    this.movingTo.set(rt.id, accountKey(rt.meta.provider, accountId));
     let compacted = false;
     const stops = this.stopsOf(rt);
     try {
       return await this.moveAccount(rt, accountId, target, opts, ctx, () => (compacted = true));
     } finally {
       this.moving.delete(rt.id);
+      this.movingTo.delete(rt.id);
       // What was sent meanwhile (or waited behind the compaction) goes out on the new account; after a
       // Stop or a close meanwhile it waits for the person (review wave 8, #21).
       const waited = this.queuedWhileMoving.delete(rt.id);
@@ -2540,6 +2569,9 @@ export class App {
       live();
       if (adopted) carried = 'conversation';
       else {
+        // The conversation stays behind, and the timeline it would be told from could not be read: the
+        // chat keeps its account and its conversation rather than starting with nothing.
+        if (this.unreadable.has(rt.id)) throw new Error('This chat could not be read from disk, so it cannot start over on another account. Restart Sable and try again.');
         rt.update({ providerSessionId: undefined });
         // Kept with the chat (its switch line, below) and taken by the first message the agent accepts.
         if (handoverText(withoutChecks(rt.items), { skip: refused?.id })) {
@@ -3313,6 +3345,8 @@ export class App {
       const mine = [...this.sessions.values()].filter((rt) => rt.meta.provider === provider && rt.meta.accountId === accountId);
       const busy = mine.filter((rt) => rt.meta.status === 'running' || rt.meta.status === 'awaiting' || rt.meta.status === 'starting');
       if (busy.length) throw new Error(busy.length === 1 ? 'A session with this account is still working. Stop it first.' : `${busy.length} sessions with this account are still working. Stop them first.`);
+      // A chat on its way here (a big one compacts first, which takes a while) would arrive on an account that is gone.
+      if ([...this.movingTo.values()].includes(accountKey(provider, accountId))) throw new Error('A chat is moving to this account. Remove it when the move is done.');
       for (const rt of mine) {
         rt.cancelPrompts();
         await rt.handle?.close().catch(() => {});

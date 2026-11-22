@@ -18,7 +18,7 @@ import { DEFAULT_ACCOUNT, type NoticeItem, type SessionMeta, type TimelineItem, 
 import { parseSynthetic, RESUME_UNDER_ANOTHER, stripWrappers } from '@shared/synthetic';
 import { App } from '../server/app';
 import { SessionRuntime } from '../server/core/runtime';
-import { backgroundLimitDue, limitStoppedAgents, readingShowsRoom, returnAtStartMs, returnRetryMs, returnTarget } from '../server/core/limit-policy';
+import { backgroundLimitDue, limitStoppedAgents, readingShowsRoom, returnAtStartMs, returnRetryMs, returnsAtStart, returnTarget } from '../server/core/limit-policy';
 import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
@@ -366,6 +366,56 @@ describe('back to the account a limit moved the chat from', { timeout: 20_000 },
     expect(returnAtStartMs(0, now - 5, now)).toBe(30_000);
     expect(returnAtStartMs(2, undefined, now)).toBe(40_000);
     expect(returnAtStartMs(0, now + 3_600_000, now)).toBe(3_600_000);
+    // Several chats due at the same reset an hour away (they left one account): still a few seconds apart.
+    const hour = now + 3_600_000;
+    expect(returnsAtStart([hour, hour, hour], now)).toEqual([3_600_000, 3_605_000, 3_610_000]);
+    // Due already, then one later: the first ones by the start's own spacing, the late one at its time.
+    expect(returnsAtStart([undefined, now - 5, hour], now)).toEqual([30_000, 35_000, 3_600_000]);
+    expect(returnsAtStart([], now)).toEqual([]);
+  });
+
+  it('chats that owe the same return at the same moment go one after another', async () => {
+    const h = await moved();
+    const app = h.app as unknown as { returnTurn(rt: SessionRuntime): number; sessions: Map<string, SessionRuntime> };
+    expect(app.returnTurn(h.rt)).toBe(0);
+    // A second chat that left the same account, due at the same reset.
+    await h.app.call('session.create', { provider: 'demo', cwd: h.home });
+    const other = [...app.sessions.values()].find((r) => r !== h.rt)!;
+    h.rt.update({ returnAt: 5_000_000_000_000 });
+    other.update({ movedFrom: h.rt.meta.movedFrom, returnAt: 5_000_000_000_000 });
+    expect([app.returnTurn(h.rt), app.returnTurn(other)].sort()).toEqual([0, 1]);
+    // Due at another moment: each is first in its own.
+    other.update({ returnAt: 5_000_000_100_000 });
+    expect(app.returnTurn(other)).toBe(0);
+  });
+
+  it('a chat that could not be read after the restart is not moved: its return stays owed', async () => {
+    const h = await moved();
+    await setProfile(h.app, h.max3, 'Max3', 'light');
+    h.rt.update({ returnAt: Date.now() - 1 });
+    const id = h.rt.id;
+    const dir = (h.app as unknown as { store: { dir: string } }).store.dir;
+    await h.app.dispose();
+    // Its file is damaged meanwhile.
+    writeFileSync(path.join(dir, 'sessions', `${id}.json`), '{"items":[{"id":"x"');
+    const next = start({ home: h.home, returnAtStartMs: { first: 120, gap: 40 } });
+    const rt = next.app.runtime(id);
+    expect(rt.meta.movedFrom).toBe(h.max3.id);
+    await tick(1500);
+    expect(rt.meta.accountId).toBe(h.ultra3.id);
+    expect(rt.meta.movedFrom).toBe(h.max3.id);
+    expect(notices(rt.items).some((n) => /^Back on/.test(n.text))).toBe(false);
+    // A move by hand still works where the agent's own conversation goes along (nothing is told from the
+    // timeline then); where it cannot, the move is refused rather than starting the chat with nothing.
+    await expect(next.app.call('session.switchAccount', { sessionId: id, accountId: h.max3.id })).resolves.toMatchObject({ carried: 'conversation' });
+  });
+
+  it('an account a chat is moving to is not removed meanwhile', async () => {
+    const h = await moved();
+    const app = h.app as unknown as { movingTo: Map<string, string> };
+    app.movingTo.set(h.rt.id, `demo:${h.max3.id}`);
+    await expect(h.app.call('account.remove', { provider: 'demo', accountId: h.max3.id })).rejects.toThrow(/moving to this account/);
+    app.movingTo.delete(h.rt.id);
   });
 });
 
