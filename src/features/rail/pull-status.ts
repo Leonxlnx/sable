@@ -62,6 +62,8 @@ interface Entry {
   askedAt: number;
   /** A request that waits: for the branch the tab moved to, or because the pull request itself changed. */
   want: false | 'branch' | 'changed';
+  /** A plain ask was held back by the long quiet (no pull request, nothing known to have changed): asked once when it ends. */
+  quiet: boolean;
   /** Until when checks are expected to begin. */
   expectUntil: number;
   /** The row shows the dialog's own pull request, not yet GitHub's answer; and when it was put in. */
@@ -87,7 +89,7 @@ export function createPullWatch(deps: PullWatchDeps) {
     const k = gitKey(cwd);
     let e = entries.get(k);
     if (!e) {
-      e = { cwd, view: EMPTY, askedAt: -Infinity, want: false, expectUntil: 0, seeded: false, seededAt: -Infinity, watchers: 0 };
+      e = { cwd, view: EMPTY, askedAt: -Infinity, want: false, quiet: false, expectUntil: 0, seeded: false, seededAt: -Infinity, watchers: 0 };
       entries.set(k, e);
     }
     return e;
@@ -111,7 +113,7 @@ export function createPullWatch(deps: PullWatchDeps) {
     if (e.inflight || e.watchers === 0 || !deps.seen()) return;
     const t = now();
     const polls = current(e) && (checksRunning(e.view.status?.pull) || e.expectUntil > t);
-    const due = e.want ? e.askedAt + FLOOR_MS : polls ? e.askedAt + POLL_MS : null;
+    const due = e.want ? e.askedAt + FLOOR_MS : polls ? e.askedAt + POLL_MS : e.quiet ? e.askedAt + QUIET_MS : null;
     if (due === null) return;
     e.timer = setTimeout(() => {
       e.timer = undefined;
@@ -123,6 +125,7 @@ export function createPullWatch(deps: PullWatchDeps) {
     clearTimeout(e.timer);
     e.timer = undefined;
     e.want = false;
+    e.quiet = false;
     const began = now();
     e.askedAt = began;
     const run = deps
@@ -165,6 +168,9 @@ export function createPullWatch(deps: PullWatchDeps) {
     // Nothing new is known and the last answer was "none": the longer quiet applies.
     const floor = !wants && !e.view.status?.pull ? QUIET_MS : FLOOR_MS;
     if (o.force || now() - e.askedAt >= floor) return start(e);
+    // Held back by the long quiet: a pull request opened elsewhere meanwhile would never show while
+    // the tab simply stays in view, so the folder is asked once when the quiet ends.
+    if (floor === QUIET_MS) e.quiet = true;
     if (wants && e.want !== 'changed') e.want = wants;
     show(e);
     plan(e);
@@ -331,9 +337,15 @@ export function pullLabel(pull: PullRequestInfo): string {
  * them, so the whole draft is a plain message.
  */
 export function withFailures(typed: string, failures: string): string {
-  if (!failures.trim() || typed.includes(failures)) return typed;
+  if (!failures.trim()) return typed;
+  // Before anything else: a draft that begins with ! or / and already holds the report (the `!`
+  // typed in front of it later) gets the report moved to the front, once.
+  if (/^\s*[!/]/.test(typed)) {
+    const rest = typed.split(failures).join('').trim();
+    return rest ? `${failures}\n\n${rest}` : failures;
+  }
+  if (typed.includes(failures)) return typed;
   if (!typed.trim()) return failures;
-  if (/^\s*[!/]/.test(typed)) return `${failures}\n\n${typed.trim()}`;
   return `${typed.replace(/\s+$/, '')}\n\n${failures}`;
 }
 

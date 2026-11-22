@@ -280,7 +280,9 @@ function turnsToState(p: string, writing: boolean): boolean {
   if (!rest) return false;
   // "…, but checking the logs showed the backup failed": a clause that opens like an announcement
   // (an -ing word) and then says what happened is a statement.
-  const told = /^[a-z]+ing\b/i.test(rest) && (STATES.test(rest) || HAPPENED.test(rest));
+  // Only when that verb is the clause's own: "checking what the command returns first" still announces.
+  const said = [STATES.exec(rest), HAPPENED.exec(rest)].filter((m): m is RegExpExecArray => !!m).sort((a, b) => a.index - b.index)[0];
+  const told = /^[a-z]+ing\b/i.test(rest) && !!said && !/\b(?:what|whether|if|how|which|why|where|when|that|who)\b/i.test(rest.slice(0, said.index)) && !/\b(?:first|next)[.!]?$/i.test(rest);
   if (!told && (ANNOUNCE.test(rest) || FILLER.test(rest) || isMove(rest))) return false;
   if (writing && !told && mayStart(rest)) return false;
   return rest.split(/\s+/).length >= 3 || STATES.test(rest) || HAPPENED.test(rest) || REQUIRES.test(rest) || GERMAN_STATES.test(rest);

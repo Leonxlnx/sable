@@ -86,11 +86,10 @@ describe('#7: a submission id answers only the message it was given for', () => 
     const subs = new Submissions<{ ok: boolean; n?: number }>();
     let n = 0;
     const send = async () => ({ ok: true, n: ++n });
-    const a = messagePrint('one', [], false);
-    const b = messagePrint('two', [], false);
+    const a = messagePrint('one', []);
+    const b = messagePrint('two', []);
     expect(a).not.toBe(b);
-    expect(messagePrint('one', [{ id: 'f1' }], false)).not.toBe(a);
-    expect(messagePrint('one', [], true)).not.toBe(a);
+    expect(messagePrint('one', [{ id: 'f1' }])).not.toBe(a);
     expect(await subs.run('s', 'id-1', send, a)).toEqual({ ok: true, n: 1 });
     // A retry of the same message: answered, not sent.
     expect(await subs.run('s', 'id-1', send, a)).toEqual({ ok: true, n: 1 });
@@ -102,7 +101,7 @@ describe('#7: a submission id answers only the message it was given for', () => 
   it("a phone's send never carries one", () => {
     const phone = read('server/services/phone.ts');
     expect(phone).toMatch(/if \(method === 'session\.send'\) delete p\.submitId;/);
-    expect(read('server/app.ts')).toContain('}, messagePrint(text, attachments, steer)));');
+    expect(read('server/app.ts')).toContain('}, messagePrint(text, attachments)));');
   });
 });
 

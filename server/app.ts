@@ -2954,7 +2954,7 @@ export class App {
       }
       await this.deliver(rt, text, attachments, undefined, ctx);
       return { ok: true };
-    }, messagePrint(text, attachments, steer)));
+    }, messagePrint(text, attachments)));
 
     this.register('queue.update', ({ sessionId, id, text, attachments }, ctx) => {
       // Omitted attachments keep the message's; an empty list removes them.
