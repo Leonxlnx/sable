@@ -453,6 +453,23 @@ const AUTH_FAILURE = /^(?:Failed to authenticate\b|Failed to refresh OAuth token
 /** Whether a text is Claude Code's own words for a request refused for the sign-in (`AUTH_FAILURE_TEXT` and its kin). */
 export const isAuthFailure = (text: string | undefined | null): boolean => typeof text === 'string' && text.length < 1200 && AUTH_FAILURE.test(text.trim());
 
+/**
+ * A saved text that is only one of Claude Code's own sign-in failure lines, word for word at its
+ * start and a single short line: what chats saved before 0.2.20 hold as a text of the agent (since
+ * then the provider never stores it). Stricter than `isAuthFailure`, which is only asked about
+ * messages the CLI marks as its own: here nothing says who wrote the text, so an answer that begins
+ * "Not logged in…" or runs on for a paragraph stays the agent's.
+ */
+const AUTH_FAILURE_LINE = /^(?:Failed to authenticate: OAuth session expired and could not be refreshed|Failed to refresh OAuth token: |Failed to authenticate\. API Error: 401\b)/;
+export const isAuthFailureLine = (text: string | undefined | null): boolean => {
+  if (typeof text !== 'string') return false;
+  const t = text.trim();
+  return t.length < 400 && !t.includes('\n') && AUTH_FAILURE_LINE.test(t);
+};
+
+/** A text nobody wrote: Claude Code's stand-in answer or its own sign-in failure line. Never shown as the agent's words. */
+export const isNobodysWords = (text: string | undefined | null): boolean => isStandIn(text) || isAuthFailureLine(text);
+
 /** The handover's heads: after a move to another account, a switch of agent, a return to an agent. */
 export const HANDOVER_HEAD_ACCOUNT = 'This continues a conversation that started under another account. Here is what happened so far, oldest first:';
 export const handoverHeadAgent = (from: string) => `This continues a conversation the user had with ${from} in this folder. Here is what happened so far, oldest first:`;

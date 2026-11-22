@@ -8,6 +8,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import { DEFAULT_SETTINGS, type NoticeItem, type SessionMeta, type TimelineItem, type ToolItem, type UserItem } from '@shared/protocol';
 import {
   HANDOVER_JOIN,
+  isNobodysWords,
   isStandIn,
   parseSynthetic,
   partOfTurn,
@@ -58,6 +59,15 @@ describe('the stand-in answer', () => {
     expect(isStandIn(STAND_IN_ANSWER)).toBe(true);
     expect(isStandIn('  No response requested.\n')).toBe(true);
     expect(isStandIn('No response requested. Then I wrote the file.')).toBe(false);
+    // Claude Code's own sign-in failure line, as chats saved before 0.2.20 hold it: nobody's words either.
+    expect(isNobodysWords('Failed to authenticate: OAuth session expired and could not be refreshed')).toBe(true);
+    expect(isNobodysWords('Failed to refresh OAuth token: another Claude Code process is refreshing it. Try again.')).toBe(true);
+    expect(isNobodysWords('Failed to authenticate. API Error: 401 {"type":"error"}')).toBe(true);
+    expect(isNobodysWords(STAND_IN_ANSWER)).toBe(true);
+    // An answer that begins like it, or says more, stays the agent's.
+    expect(isNobodysWords('Not logged in: the test user has no session, so the route redirects.')).toBe(false);
+    expect(isNobodysWords('Failed to authenticate: OAuth session expired and could not be refreshed\n\nThat line comes from the CLI; here is why.')).toBe(false);
+    expect(isNobodysWords('Failed to authenticate against staging, so I mocked the client.')).toBe(false);
   });
 
   for (const phone of [false, true]) {

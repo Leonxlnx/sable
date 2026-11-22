@@ -97,6 +97,17 @@ export function readingShowsRoom(o: { fresh: boolean; limits: RateLimit[]; model
 /** How soon a chat that may return reads the account's limits again when the last reading showed it still held. */
 export const RETURN_RECHECK_MS = 5 * 60_000;
 
+/**
+ * After a start, the returns chats still owe are looked at again (their timers lived in the last
+ * run): never in the first `first` ms, when every account is being read anyway, and `gap` apart, so
+ * a start is not a burst of readings and moves.
+ */
+export const RETURN_AT_START_MS = { first: 30_000, gap: 5_000 };
+
+/** When the `nth` chat (from 0) that owes a return is looked at after a start; never before its own `returnAt`. */
+export const returnAtStartMs = (nth: number, returnAt: number | undefined, now: number, ms = RETURN_AT_START_MS) =>
+  Math.max((returnAt ?? 0) - now, ms.first + Math.max(0, nth) * ms.gap);
+
 /** The next try after an inconclusive reading (not fresh, failed, no room shown): 1, 2, 4… minutes, at most 30. */
 export const returnRetryMs = (tries: number) => Math.min(30 * 60_000, 60_000 * 2 ** Math.max(0, tries));
 

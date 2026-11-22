@@ -49,7 +49,7 @@ import { cleanCommit, commitPrompt } from './core/commit-draft';
 import { SessionRuntime, autoTitle, pendingPrompts, type BackgroundLimit } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
-import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_RECHECK_MS, returnRetryMs, returnTarget, runningOnCredits } from './core/limit-policy';
+import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_RECHECK_MS, returnAtStartMs, returnRetryMs, returnTarget, runningOnCredits } from './core/limit-policy';
 import { rankAccount } from '../shared/use-first';
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
 import { speedFor, startSpeedFor } from '../shared/speed';
@@ -128,6 +128,8 @@ export interface AppOptions {
   compactTimeoutMs?: number;
   /** How long a limit met by background work waits for the next refusal, and at most (`core/limit-policy.ts`; tests shorten them). */
   backgroundLimitMs?: { settle: number; max: number };
+  /** Tests: when the returns chats still owe are looked at after a start (`RETURN_AT_START_MS`). */
+  returnAtStartMs?: { first: number; gap: number };
 }
 
 export { VERSION };
@@ -446,6 +448,9 @@ export class App {
     this.registerCore();
     // Chats that waited when Sable closed go on waiting (a reset that passed meanwhile is due now).
     if (this.spare.hasWaits()) this.spare.poke(4000);
+    // A chat a limit moved away still owes its return (its timer lived in the last run).
+    let owed = 0;
+    for (const rt of this.sessions.values()) if (rt.meta.movedFrom) this.armReturn(rt, returnAtStartMs(owed++, rt.meta.returnAt, Date.now(), opts.returnAtStartMs));
   }
 
   log = (...args: unknown[]) => {
@@ -1966,6 +1971,8 @@ export class App {
     if (!readingShowsRoom({ fresh: reading.fresh, limits: reading.limits, model, now, full })) return inconclusive();
     this.returnTries.delete(rt.id);
     const to = returnTarget({ from, current, fromTakesWork: true });
+    // A chat not read since the start (the timer after a restart): read beside the app, never in its way.
+    if (to) await this.hydrateAsync(rt).catch(() => {});
     // Only at rest, looked at again after the wait (never mid-turn, never beside another transition).
     if (!to || !still() || !this.atRest(rt)) return;
     this.returned.add(key);

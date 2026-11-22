@@ -1,5 +1,5 @@
 import type { TimelineItem } from '@shared/protocol';
-import { isStandIn, syntheticOf } from '@shared/synthetic';
+import { isNobodysWords, syntheticOf } from '@shared/synthetic';
 import { changedSince, type ItemsRevision } from '@/state/revision';
 import { isLeadIn } from './lead-in';
 
@@ -172,8 +172,9 @@ export function shapeOf(item: TimelineItem | undefined): string {
       return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : syn.role === 'output' ? 'c' : 'n';
     }
     case 'text':
-      // Claude Code's stand-in where a cut turn has no answer ("No response requested."): nobody's words.
-      if (!item.streaming && (!item.text.trim() || isStandIn(item.text))) return '.';
+      // Claude Code's stand-in where a cut turn has no answer ("No response requested.") and its own
+      // sign-in failure line in a chat saved before 0.2.20: nobody's words.
+      if (!item.streaming && (!item.text.trim() || isNobodysWords(item.text))) return '.';
       return isLeadIn(item.text, !!item.streaming) ? 'l' : 't';
     case 'thinking':
       return 'h';
@@ -674,7 +675,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
   close(null, false, true);
 }
 
-const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' && !isStandIn(it.text) ? it.text.trim() : '');
+const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' && !isNobodysWords(it.text) ? it.text.trim() : '');
 
 /**
  * The words of what a turn can show as its answer (`ANSWER`): a text as written, a plan as its

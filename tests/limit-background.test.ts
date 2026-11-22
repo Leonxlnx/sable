@@ -18,7 +18,7 @@ import { DEFAULT_ACCOUNT, type NoticeItem, type SessionMeta, type TimelineItem, 
 import { parseSynthetic, RESUME_UNDER_ANOTHER, stripWrappers } from '@shared/synthetic';
 import { App } from '../server/app';
 import { SessionRuntime } from '../server/core/runtime';
-import { backgroundLimitDue, limitStoppedAgents, readingShowsRoom, returnRetryMs, returnTarget } from '../server/core/limit-policy';
+import { backgroundLimitDue, limitStoppedAgents, readingShowsRoom, returnAtStartMs, returnRetryMs, returnTarget } from '../server/core/limit-policy';
 import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
@@ -85,10 +85,10 @@ async function demoAccount(app: App, label: string, profile: Profile) {
   return account;
 }
 
-function start(opts: { capped?: boolean; ms?: { settle: number; max: number } } = {}) {
-  const home = temp('sable-limit-bg-');
+function start(opts: { capped?: boolean; ms?: { settle: number; max: number }; home?: string; returnAtStartMs?: { first: number; gap: number } } = {}) {
+  const home = opts.home ?? temp('sable-limit-bg-');
   const cwd = path.join(home, 'proj');
-  mkdirSync(cwd);
+  mkdirSync(cwd, { recursive: true });
   const sent: { text: string; account: string }[] = [];
   const app = new App({
     home,
@@ -96,9 +96,10 @@ function start(opts: { capped?: boolean; ms?: { settle: number; max: number } } 
     userHome: path.join(home, 'user'),
     providers: [(ctx) => (opts.capped ? new CappedDemo(ctx, sent) : new RecordingDemo(ctx, sent))],
     backgroundLimitMs: opts.ms ?? { settle: 60, max: 400 },
+    returnAtStartMs: opts.returnAtStartMs,
   });
   cleanups.push(() => app.dispose());
-  return { app, cwd, sent };
+  return { app, cwd, sent, home };
 }
 
 const agentStep = (i: number): ToolItem => ({
@@ -341,6 +342,30 @@ describe('back to the account a limit moved the chat from', { timeout: 20_000 },
     const h = await moved();
     await h.app.call('session.switchAccount', { sessionId: h.rt.id, accountId: DEFAULT_ACCOUNT });
     expect(h.rt.meta.movedFrom).toBeUndefined();
+  });
+
+  it('after Sable restarted the return is still owed: looked at again by itself, the chat read beside the app', async () => {
+    const h = await moved();
+    await setProfile(h.app, h.max3, 'Max3', 'light');
+    h.rt.update({ returnAt: Date.now() - 1 });
+    const id = h.rt.id;
+    await h.app.dispose();
+    // The next run: nothing is sent, nobody opens the chat.
+    const next = start({ home: h.home, returnAtStartMs: { first: 120, gap: 40 } });
+    const rt = next.app.runtime(id);
+    expect(rt.meta.movedFrom).toBe(h.max3.id);
+    expect(rt.meta.accountId).toBe(h.ultra3.id);
+    await until(() => (rt.meta.accountId ?? DEFAULT_ACCOUNT) === h.max3.id, 'the return after the restart', 6000);
+    expect(notices(rt.items).filter((n) => /^Back on Max3/.test(n.text))).toHaveLength(1);
+    expect(next.sent).toHaveLength(0);
+    expect(rt.meta.movedFrom).toBeUndefined();
+  });
+
+  it('a start is not a burst: never in the first half minute, a few seconds apart, never before its own time', () => {
+    const now = 1_000_000;
+    expect(returnAtStartMs(0, now - 5, now)).toBe(30_000);
+    expect(returnAtStartMs(2, undefined, now)).toBe(40_000);
+    expect(returnAtStartMs(0, now + 3_600_000, now)).toBe(3_600_000);
   });
 });
 
