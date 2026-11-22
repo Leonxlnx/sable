@@ -19,11 +19,11 @@ const RECENT = 5;
 const LONG_REPORT = 700;
 
 /**
- * An opened agent, in place: one quiet line of facts (its kind, when it started, its steps), why it
+ * An opened agent, in place: one quiet line of facts (its kind, when it started and finished, its steps), why it
  * stopped when it did, the task it was given, its latest steps and its report (or a workflow's
  * phases), and a way to it in the conversation.
  */
-export function AgentDetail({ sessionId, item, live }: { sessionId: string; item: ToolItem; live: boolean }) {
+export function AgentDetail({ sessionId, item, live, endedAt = 0 }: { sessionId: string; item: ToolItem; live: boolean; endedAt?: number }) {
   // A long report or result comes cut to the window: opened, it is asked for whole.
   const more = !!item.more;
   useEffect(() => {
@@ -32,7 +32,7 @@ export function AgentDetail({ sessionId, item, live }: { sessionId: string; item
 
   return (
     <div className="agx-detail">
-      {item.workflow ? <WorkflowDetail item={item} run={item.workflow} live={live} /> : <SubAgentDetail sessionId={sessionId} item={item} live={live} />}
+      {item.workflow ? <WorkflowDetail item={item} run={item.workflow} live={live} endedAt={endedAt} /> : <SubAgentDetail sessionId={sessionId} item={item} live={live} endedAt={endedAt} />}
       <button type="button" className="agx-goto" onClick={() => revealItem(sessionId, item.id)}>
         <Icon name="chat" size={13} />
         Show in conversation
@@ -41,7 +41,15 @@ export function AgentDetail({ sessionId, item, live }: { sessionId: string; item
   );
 }
 
-function SubAgentDetail({ sessionId, item, live }: { sessionId: string; item: ToolItem; live: boolean }) {
+/** "Started 14:32" while it works (or when its end is not known), "14:32 to 14:35" once it is; one time when both read the same. */
+function span(from: number, to: number): string {
+  const a = clock(from);
+  if (to <= from) return `Started ${a}`;
+  const b = clock(to);
+  return a === b ? a : `${a} to ${b}`;
+}
+
+function SubAgentDetail({ sessionId, item, live, endedAt }: { sessionId: string; item: ToolItem; live: boolean; endedAt: number }) {
   const recent = useShown((s) => latestSteps(s.data[sessionId]?.items, s.data[sessionId]?.children[item.id], RECENT));
   // Counted under it only when it gave no count of its own, and only again when a step joins.
   const counter = useMemo(() => {
@@ -68,7 +76,7 @@ function SubAgentDetail({ sessionId, item, live }: { sessionId: string; item: To
   const outcome = live ? null : outcomeOf(item);
   const f = figuresOf(item);
   const steps = f.steps ?? counted;
-  const facts = [agentType(item), `Started ${clock(item.ts)}`, !live && steps > 0 ? plural(steps, 'step') : ''].filter(Boolean);
+  const facts = [agentType(item), span(item.ts, live ? 0 : endedAt), !live && steps > 0 ? plural(steps, 'step') : ''].filter(Boolean);
   const failed = outcome === 'failed';
   const why = agentLimitText(item);
   const errorText = failed ? firstLines((item.result?.stderr || item.result?.text || '').trim(), 4) : '';
@@ -148,10 +156,10 @@ const StepRow = memo(function StepRow({ sessionId, id }: { sessionId: string; id
 
 // ── workflows ──
 
-function WorkflowDetail({ item, run, live }: { item: ToolItem; run: WorkflowRun; live: boolean }) {
+function WorkflowDetail({ item, run, live, endedAt }: { item: ToolItem; run: WorkflowRun; live: boolean; endedAt: number }) {
   const g = workflowGlance(run);
   const f = figuresOf(item);
-  const facts = [`Started ${clock(item.ts)}`, g.agents ? plural(g.agents, 'agent') : '', g.failed ? `${g.failed} failed` : '', !live && f.steps ? plural(f.steps, 'step') : ''].filter(Boolean);
+  const facts = [span(item.ts, live ? 0 : endedAt || (run.durationMs ? item.ts + run.durationMs : 0)), g.agents ? plural(g.agents, 'agent') : '', g.failed ? `${g.failed} failed` : '', !live && f.steps ? plural(f.steps, 'step') : ''].filter(Boolean);
   const count = Math.max(1, g.phases);
   return (
     <>

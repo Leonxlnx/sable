@@ -1,42 +1,167 @@
 /* ───────────── agents ─────────────
-   Two tiers, one set of columns. What works now sits on cards one step above the panel: one mark
-   (the ring, amber waiting on you, or the other agent's mark for a hand-over), the task, its live
-   time, and under it what it does now. What is done is a quiet list of one-line rows in the same
-   columns: the task and one figure, a mark only where it tells something (a failure, a hand-over,
-   a workflow). Everything else (steps, tokens, the report) is in the opened row. Monochrome: the
-   agents' marks keep their colour, amber is waiting on you, red a failure. */
+   Two tiers, one set of columns. What works now sits on cards one step above the panel, and stays
+   in view while the rest scrolls under it: one mark (the ring, amber waiting on you, or the other
+   agent's mark for a hand-over), the task, its live time, and under it what it does now and how
+   many steps it took. What is done is a quiet list of one-line rows in the same columns: the task
+   and one figure, a mark only where it tells something (a failure, a hand-over, a workflow),
+   gathered under one line per wave (the message that set it going). Everything else (steps,
+   tokens, the report) is in the opened row. Monochrome: the agents' marks keep their colour, amber
+   is waiting on you, red a failure.
+
+   The panel's grid: rows and cards stand 8 px in from the pane's edge, what they hold 16 px (the
+   bars' own left edge, 17 px from the panel's outer line). Rows are the panel's 30 px. */
 
 .agx-list {
   /* The mark's column and the gap after it: the sub-line and the opened detail start at the title. */
   --agx-mark: 16px;
   --agx-indent: calc(var(--agx-mark) + 10px);
-  /* The card's inset (its hairline and padding), shared by the rows so the columns line up. */
-  --agx-inset: 12px;
+  /* The card's inset (its padding inside its 1 px hairline); a row, which has no hairline until it is
+     opened, adds that pixel to its own padding, so the columns line up. */
+  --agx-inset: 7px;
   display: flex;
   flex-direction: column;
-  padding: 4px 10px 28px;
+  padding: 0 8px 28px;
 }
 
-/* ── headings: "Done" under the cards, or the message behind a group ── */
+/* The scroller is the measure of the working section's height (cqh below). */
+.agx-scroll {
+  container-type: size;
+}
 
-.agx-head {
+/* ── working now: one block that sticks to the top of the pane ── */
+
+.agx-working {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  /* Out to the pane's edges, so a row passing under it is covered whole. */
+  margin: 0 -8px;
+  padding: 0 8px 12px;
+  background-color: var(--sheet);
+}
+
+/* Many at once: the block takes at most a good half of the pane and scrolls by itself. */
+.agx-working[data-many] {
+  max-height: 58cqh;
+}
+
+/* Its lower edge: the card it cuts sinks into the sheet (an overlay in the surface colour, never a
+   mask). It lies in the block's own bottom padding, so scrolled to the end it covers nothing. */
+.agx-working[data-many]::after {
+  content: '';
+  position: sticky;
+  bottom: 0;
+  display: block;
+  height: 12px;
+  margin-bottom: -12px;
+  background: linear-gradient(to bottom, transparent, var(--sheet));
+  pointer-events: none;
+}
+
+.agx-cards {
   display: flex;
-  align-items: baseline;
-  gap: 12px;
-  min-width: 0;
-  /* In the titles' column: every line of text in the list starts at one edge, the marks hang left of it. */
-  padding: 22px calc(var(--agx-inset) + 1px) 8px calc(var(--agx-inset) + 1px + var(--agx-indent));
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* ── a group's line: a wave (the message that set its agents going) or the commands ── */
+
+.agx-wave {
+  margin-top: 6px;
+}
+
+.agx-wave:first-child,
+.agx-working + .agx-wave {
+  margin-top: 0;
+}
+
+.agx-wave-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: var(--rail-row-h);
+  padding: 0 calc(var(--agx-inset) + 1px);
+  border-radius: var(--r-md);
   font-size: var(--t-small);
+  text-align: left;
   color: var(--text-3);
+  transition:
+    background-color var(--d-1) var(--ease),
+    color var(--d-1) var(--ease);
 }
 
-.agx-head:first-child {
-  padding-top: 8px;
+.agx-wave-btn:hover {
+  background-color: var(--fill-2);
+  color: var(--text-2);
 }
 
-.agx-head-label {
+.agx-wave-btn:active {
+  background-color: var(--fill-3);
+}
+
+.agx-wave-btn:focus-visible {
+  outline-offset: var(--focus-inset);
+}
+
+.agx-caret {
+  transition: rotate var(--d-2) var(--ease-out);
+}
+
+.agx-wave[data-open] .agx-caret {
+  rotate: 90deg;
+}
+
+.agx-wave-time {
+  flex-shrink: 0;
+}
+
+.agx-wave-label {
   flex: 1;
   min-width: 0;
+  color: var(--text-2);
+}
+
+.agx-wave-btn:hover .agx-wave-label,
+.agx-wave[data-open] .agx-wave-label {
+  color: var(--text);
+}
+
+/* What failed in it: the one red figure, there whether the group is open or folded. */
+.agx-wave-failed,
+.agx-bar-failed {
+  flex-shrink: 0;
+  color: var(--red-text);
+}
+
+.agx-wave-count {
+  flex-shrink: 0;
+  min-width: 2ch;
+  text-align: right;
+}
+
+/* What an open group holds back: in the titles' column. */
+.agx-more-btn {
+  display: flex;
+  align-items: center;
+  height: var(--rail-row-h);
+  margin-left: calc(var(--agx-inset) + 1px + var(--agx-indent) - 8px);
+  padding: 0 8px;
+  border-radius: var(--r-ctl-sm);
+  font-size: var(--t-small);
+  color: var(--text-3);
+  transition:
+    background-color var(--d-1) var(--ease),
+    color var(--d-1) var(--ease);
+}
+
+.agx-more-btn:hover {
+  background-color: var(--fill-2);
+  color: var(--text);
+}
+
+.agx-more-btn:active {
+  background-color: var(--fill-3);
 }
 
 /* ── shared pieces of a line ── */
@@ -75,20 +200,12 @@
   background-color: var(--panel);
 }
 
-.agx-card + .agx-card {
-  margin-top: 8px;
-}
-
-.agx-card + .agx-row {
-  margin-top: 10px;
-}
-
 .agx-card-btn {
   display: flex;
   flex-direction: column;
   gap: 4px;
   width: 100%;
-  padding: 12px 14px 13px var(--agx-inset);
+  padding: 10px var(--agx-inset) 11px;
   border-radius: inherit;
   text-align: left;
   transition: background-color var(--d-1) var(--ease);
@@ -148,6 +265,13 @@
   align-items: baseline;
   flex: 1;
   min-width: 0;
+}
+
+/* How much it has done so far, at the line's end under its time. */
+.agx-steps-n {
+  flex-shrink: 0;
+  padding-left: 10px;
+  color: var(--text-4);
 }
 
 /* Each new title arrives with a short rise; the old one simply goes. A working one keeps its
@@ -226,15 +350,20 @@
 /* ── done: one line each ── */
 
 .agx-row {
-  border: 1px solid transparent;
   border-radius: var(--r-md);
   transition: background-color var(--d-2) var(--ease);
 }
 
+/* Opened, it is a card like the working ones: the hairline is drawn inside, so the row keeps its place. */
 .agx-row[data-open] {
   margin: 6px 0;
-  border-color: var(--line);
   background-color: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+.agx-row .agx-detail {
+  padding-right: calc(var(--agx-inset) + 1px);
+  padding-left: calc(var(--agx-inset) + 1px + var(--agx-indent));
 }
 
 /* The mark and the title stand in the cards' columns, the figure on the time's right edge, so
@@ -244,8 +373,8 @@
   align-items: center;
   gap: 10px;
   width: 100%;
-  height: 32px;
-  padding: 0 14px 0 var(--agx-inset);
+  height: var(--rail-row-h);
+  padding: 0 calc(var(--agx-inset) + 1px);
   border-radius: var(--r-md);
   font-size: var(--t-ui);
   text-align: left;
@@ -285,6 +414,15 @@
   color: var(--text-2);
 }
 
+/* A background command: its mark is the terminal's, quiet; a word and the time it was last heard of. */
+.agx-cmd .agx-meta {
+  gap: 8px;
+}
+
+.agx-cmd .agx-dur {
+  min-width: 0;
+}
+
 /* One figure: the time it took, or how it ended when that was not done. */
 .agx-meta {
   display: flex;
@@ -309,7 +447,7 @@
 }
 
 /* A row that joins the list on screen rises into place, once. */
-:is(.agx-row, .agx-card, .agx-head)[data-new] {
+:is(.agx-row, .agx-card, .agx-wave)[data-new] {
   animation: rise-in var(--d-3) var(--ease-out) backwards;
 }
 
@@ -320,7 +458,7 @@
   flex-direction: column;
   align-items: flex-start;
   gap: 12px;
-  padding: 2px 14px 14px calc(var(--agx-inset) + var(--agx-indent));
+  padding: 2px var(--agx-inset) 14px calc(var(--agx-inset) + var(--agx-indent));
   font-size: var(--t-small);
   color: var(--text-2);
 }
@@ -563,12 +701,13 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  :is(.agx-row, .agx-card, .agx-head)[data-new],
+  :is(.agx-row, .agx-card, .agx-wave)[data-new],
   .agx-now > span:last-child,
   .agx-now > .shimmer:last-child {
     animation: none;
   }
-  .agx-seg-fill {
+  .agx-seg-fill,
+  .agx-caret {
     transition: none;
   }
 }

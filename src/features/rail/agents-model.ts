@@ -1,5 +1,5 @@
 import type { TimelineItem, ToolItem, WorkflowRun } from '@shared/protocol';
-import { partOfTurn, syntheticOf } from '@shared/synthetic';
+import { syntheticOf, type TaskOutcome } from '@shared/synthetic';
 import { isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
 
 /**
@@ -82,15 +82,118 @@ export function agentIndex(): (t: Timeline | undefined) => readonly string[] {
   };
 }
 
-/** The ids of the person's messages, in order: the same array until one is added. */
+/**
+ * Whether a message is one the person sent (their words, or a command they ran): the only kind a
+ * wave of agents is named after. What the agent's harness wrote in their place (a notification that
+ * a background task finished, a command's output, a reminder) and Sable's own /until message never
+ * are: agents started in the turn such a message opened belong to the person's message before it.
+ */
+export function startsWave(it: TimelineItem | undefined): boolean {
+  if (it?.type !== 'user' || it.until) return false;
+  const s = syntheticOf(it);
+  return !s || s.role === 'command';
+}
+
+/** The ids of the person's own messages (`startsWave`), in order: the same array until one is added. */
 export function userIndex(): (t: Timeline | undefined) => readonly string[] {
   let scan: Scan<string> | undefined;
   return (t) => {
     if (!t) return NONE;
-    // A command's output or a reminder the harness wrote opens no turn: no heading of its own.
-    scan = grow(scan, t.roots, (id) => (t.items[id]?.type === 'user' && !partOfTurn(syntheticOf(t.items[id])) ? id : undefined));
+    scan = grow(scan, t.roots, (id) => (startsWave(t.items[id]) ? id : undefined));
     return scan.found;
   };
+}
+
+// ── what the harness said of background work ──
+
+/** The end of a background task as its notification told it. */
+export interface EndNote {
+  /** When the notification arrived: when the task ended, as near as is known. */
+  ts: number;
+  outcome: TaskOutcome;
+  exitCode?: number;
+}
+
+const NO_NOTES: ReadonlyMap<string, EndNote> = new Map();
+
+/**
+ * Every task notification of a session by the step it names (`tool-use-id`): how a background
+ * command ended (the bridge keeps that on no step) and when a background agent did. The same map
+ * until another notification arrives; a later word of the same step replaces the earlier one.
+ */
+export function noteIndex(): (t: Timeline | undefined) => ReadonlyMap<string, EndNote> {
+  let scan: Scan<[string, EndNote][]> | undefined;
+  let from: unknown = null;
+  let map = NO_NOTES;
+  return (t) => {
+    if (!t) return NO_NOTES;
+    scan = grow(scan, t.roots, (id) => {
+      const it = t.items[id];
+      const s = it?.type === 'user' ? syntheticOf(it) : null;
+      if (!it || !s || s.role !== 'notification') return undefined;
+      const out: [string, EndNote][] = [];
+      for (const p of s.parts) {
+        if (p.kind !== 'task' || !p.task.toolUseId || p.task.outcome === 'running') continue;
+        out.push([p.task.toolUseId, { ts: it.ts, outcome: p.task.outcome, ...(p.task.exitCode != null ? { exitCode: p.task.exitCode } : {}) }]);
+      }
+      return out.length ? out : undefined;
+    });
+    if (scan.found !== from) {
+      from = scan.found;
+      map = scan.found.length ? new Map(scan.found.flat()) : NO_NOTES;
+    }
+    return map;
+  };
+}
+
+// ── background commands ──
+
+/** A shell command the agent sent to the background (a build, a test run, a dev server). */
+export function isBackgroundCommand(it: TimelineItem | undefined): it is ToolItem {
+  if (it?.type !== 'tool' || it.kind !== 'bash') return false;
+  return !!it.detail.background || (it.input as { run_in_background?: unknown } | undefined)?.run_in_background === true;
+}
+
+/** The chat's own background commands, oldest first: the same array until one is started. */
+export function commandIndex(): (t: Timeline | undefined) => readonly string[] {
+  let scan: Scan<string> | undefined;
+  return (t) => {
+    if (!t) return NONE;
+    scan = grow(scan, t.roots, (id) => (isBackgroundCommand(t.items[id]) ? id : undefined));
+    return scan.found;
+  };
+}
+
+/**
+ * Where a background command stands. `unknown`: it was started and no word of its end came (it
+ * may still run, a dev server does for hours; it may have gone with its process). Never called
+ * running: nothing here knows that.
+ */
+export type CommandState = 'starting' | 'done' | 'failed' | 'stopped' | 'unknown';
+
+export function commandState(item: ToolItem, note: EndNote | undefined): CommandState {
+  if (item.status === 'error' || item.status === 'denied') return 'failed';
+  if (item.status === 'cancelled') return 'stopped';
+  if (note) return note.outcome === 'failed' ? 'failed' : note.outcome === 'stopped' ? 'stopped' : 'done';
+  if (item.status === 'running' || item.status === 'pending' || item.status === 'awaiting') return 'starting';
+  return 'unknown';
+}
+
+export interface Commands {
+  /** What failed first, then newest first. */
+  ids: string[];
+  failed: number;
+}
+
+export function commandRows(ids: readonly string[], items: Items, notes: ReadonlyMap<string, EndNote>): Commands {
+  const bad: string[] = [];
+  const rest: string[] = [];
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const it = items[ids[i]];
+    if (!isBackgroundCommand(it)) continue;
+    (commandState(it, notes.get(it.id)) === 'failed' ? bad : rest).push(it.id);
+  }
+  return { ids: bad.length ? [...bad, ...rest] : rest, failed: bad.length };
 }
 
 /** One character per agent, `1` while it works: the list's sections follow it, nothing else. */
@@ -309,4 +412,67 @@ export function groupDone(ids: readonly string[], items: Items, users: readonly 
 export function promptLine(text: string): string {
   const line = text.trim().split('\n')[0]?.trim() ?? '';
   return line.length > 90 ? line.slice(0, 89).trimEnd() + '…' : line || 'Message';
+}
+
+// ── the overview ──
+
+/** Finished agents of one wave: everything the person's message set going, across the turns that followed it. */
+export interface Wave {
+  /** The message that started it ('' before the first message). */
+  user: string;
+  /** What failed first, then newest first. */
+  ids: string[];
+  failed: number;
+}
+
+export interface Overview {
+  /** Working now, oldest first: the longest runner on top. */
+  working: string[];
+  /** Newest first. */
+  waves: Wave[];
+  done: number;
+  failed: number;
+}
+
+/**
+ * The tab's list at a glance: who works now, then what finished, by the message that set it going.
+ * `ids`, `users` oldest first (`agentIndex`, `userIndex`); `live` from `liveKey`.
+ */
+export function overview(ids: readonly string[], live: string, items: Items, users: readonly string[]): Overview {
+  const working: string[] = [];
+  const done: string[] = [];
+  ids.forEach((id, i) => (live[i] === '1' ? working : done).push(id));
+  let failed = 0;
+  const waves = groupDone(done, items, users).map((g): Wave => {
+    const bad: string[] = [];
+    const rest: string[] = [];
+    for (const id of g.ids) {
+      const it = items[id];
+      (it?.type === 'tool' && outcomeOf(it) === 'failed' ? bad : rest).push(id);
+    }
+    failed += bad.length;
+    return { user: g.user, ids: bad.length ? [...bad, ...rest] : g.ids, failed: bad.length };
+  });
+  return { working, waves, done: done.length, failed };
+}
+
+/** A wave shows this many rows until asked for all; a tab with no more finished agents than `OPEN_ALL` opens every wave. */
+export const WAVE_ROWS = 8;
+export const OPEN_ALL = 12;
+/** However many failed, a wave that holds rows back lists at most this many. */
+const WAVE_MOST = 24;
+
+/** Whether a wave stands open: as the person left it, else the newest one, or all of them while the list is short. */
+export function waveOpen(index: number, done: number, chosen: boolean | undefined): boolean {
+  return chosen ?? (index === 0 || done <= OPEN_ALL);
+}
+
+/**
+ * The rows an open wave shows and how many it holds back. Every failure shows (they come first);
+ * a wave only a row or two longer than the cut shows whole, so "Show 1 more" never stands there.
+ */
+export function waveRows(wave: Wave, all: boolean): { ids: readonly string[]; more: number } {
+  if (all || wave.ids.length <= WAVE_ROWS + 2) return { ids: wave.ids, more: 0 };
+  const n = Math.min(Math.max(WAVE_ROWS, wave.failed), WAVE_MOST);
+  return { ids: wave.ids.slice(0, n), more: wave.ids.length - n };
 }

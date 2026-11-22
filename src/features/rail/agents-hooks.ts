@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useTick } from '@/features/timeline/util';
 import { useStore } from '@/state/store';
-import { agentIndex, progressIndex, userIndex } from './agents-model';
+import { agentIndex, commandIndex, noteIndex, progressIndex, userIndex } from './agents-model';
 
 type Store = ReturnType<typeof useStore.getState>;
 
@@ -37,6 +37,8 @@ export function usePaneTick(): number {
 interface Indexes {
   agents: ReturnType<typeof agentIndex>;
   users: ReturnType<typeof userIndex>;
+  notes: ReturnType<typeof noteIndex>;
+  commands: ReturnType<typeof commandIndex>;
 }
 
 /** Per session, shared by the tab's count and the list: the second reader of a state pays nothing. */
@@ -45,7 +47,7 @@ const indexes = new Map<string, Indexes>();
 export function indexFor(sessionId: string): Indexes {
   let x = indexes.get(sessionId);
   if (!x) {
-    x = { agents: agentIndex(), users: userIndex() };
+    x = { agents: agentIndex(), users: userIndex(), notes: noteIndex(), commands: commandIndex() };
     indexes.set(sessionId, x);
     if (indexes.size > 12) indexes.delete(indexes.keys().next().value as string);
   }

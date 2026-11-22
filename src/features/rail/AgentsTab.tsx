@@ -1,4 +1,4 @@
-import { memo, useMemo, useRef, type CSSProperties, type ReactNode } from 'react';
+import { memo, useCallback, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type { ToolItem, WorkflowRun } from '@shared/protocol';
 import { userItemText } from '@shared/synthetic';
 import { worksInBackground } from '@shared/background';
@@ -6,14 +6,15 @@ import { ProviderMark, Ring } from '@/art/Logo';
 import { Collapse } from '@/components/Collapse';
 import { agentProvider, agentTask, isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
 import { TimelineCtx, type TimelineCtxValue } from '@/features/timeline/ctx';
-import { foldKey, useFold } from '@/features/timeline/fold';
+import { foldKey, getFold, setFold, useFold } from '@/features/timeline/fold';
+import { revealItem } from '@/features/timeline/reveal';
 import { shortDuration, useHeld } from '@/features/timeline/util';
 import { clock } from '@/features/usage/format';
 import { Icon } from '@/icons';
 import { useStore } from '@/state/store';
 import { AgentDetail } from './AgentDetail';
 import { ShownCtx, indexFor, usePaneTick, useProgress, useShown } from './agents-hooks';
-import { OUTCOME_WORD, figuresOf, groupDone, liveKey, outcomeOf, promptLine, readProgress, workflowNow, type Progress } from './agents-model';
+import { OUTCOME_WORD, commandRows, commandState, figuresOf, liveKey, outcomeOf, overview, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress } from './agents-model';
 import { LeaveList } from './leave';
 import './agents.css';
 
@@ -35,11 +36,25 @@ const SCOPE = 'agents-tab';
 /** The conversation's context, for the opened details (file links in a report). */
 const ON = { current: true };
 
+/** More working agents than this and their section scrolls by itself, so the finished ones stay in reach. */
+const MANY = 4;
+
+/** The fold of the background commands, among the waves' own. */
+const COMMANDS = '\u0000commands';
+
 /**
- * Every sub-agent and workflow of the session. What works now comes first, one card each, oldest
- * first: its time, what it does now, its steps and how far it is when it says (its task list, a
- * workflow's phases). What is done follows as one line each (outcome, time, tokens), newest
- * first, under the message that started it when there are several. A row opens in place.
+ * Every sub-agent and workflow of the session, as an overview.
+ *
+ * Who works now stands first and stays in view while the rest scrolls under it: a card each, the
+ * longest runner on top, with its time, what it does now and how far it is when it says (its task
+ * list, a workflow's phases). What finished follows as one line each (how it ended or how long it
+ * took), gathered into waves: everything one message of the person's set going, the newest wave
+ * first and open, older ones folded to a line once the list is long, what failed first in each. A
+ * notification the harness wrote ("Background task finished: …") never names a wave. The chat's
+ * background commands are a group of their own under the agents. A row opens in place.
+ *
+ * Long lists are cheap: a folded wave renders one line, an open one at most a few rows until asked
+ * for all, and the model behind it (`agents-model.ts`) scans only what joined since it last looked.
  *
  * `active`: the pane is on screen. Hidden (another tab, the panel closed) it holds still.
  */
@@ -52,37 +67,66 @@ export function AgentsTab({ sessionId, active = true }: { sessionId: string; act
 }
 
 function AgentsList({ sessionId }: { sessionId: string }) {
-  const { agents, users } = indexFor(sessionId);
+  const { agents, users, notes, commands } = indexFor(sessionId);
   const ids = useShown((s) => agents(s.data[sessionId]));
   const live = useShown((s) => liveKey(s.data[sessionId]?.items, agents(s.data[sessionId])));
   const asked = useShown((s) => users(s.data[sessionId]));
+  const started = useShown((s) => commands(s.data[sessionId]));
+  const ended = useShown((s) => notes(s.data[sessionId]));
   const cwd = useStore((s) => s.sessions[sessionId]?.cwd ?? '');
   const home = useStore((s) => s.home);
   const ctx = useMemo<TimelineCtxValue>(() => ({ sessionId, cwd, home, live: ON, stuck: ON }), [sessionId, cwd, home]);
 
-  const view = useMemo(() => {
-    const items = useStore.getState().data[sessionId]?.items ?? {};
-    const running: string[] = [];
-    const done: string[] = [];
-    ids.forEach((id, i) => (live[i] === '1' ? running : done).push(id));
-    return { running, done: done.length, groups: groupDone(done, items, asked) };
-  }, [ids, live, asked, sessionId]);
+  const view = useMemo(() => overview(ids, live, useStore.getState().data[sessionId]?.items ?? {}, asked), [ids, live, asked, sessionId]);
+  const cmds = useMemo(() => commandRows(started, useStore.getState().data[sessionId]?.items ?? {}, ended), [started, ended, sessionId]);
+
+  // What the person opened or closed (waves, the commands) and where they asked for every row.
+  // Remembered with the rows' own folds while the app is open.
+  const [, redraw] = useState(0);
+  const chosen = (key: string) => getFold(foldKey(sessionId, key, SCOPE));
+  const all = (key: string) => !!getFold(foldKey(sessionId, `${key}\u0000all`, SCOPE));
+  const flip = useCallback(
+    (key: string, to: boolean) => {
+      setFold(foldKey(sessionId, key, SCOPE), to);
+      redraw((n) => n + 1);
+    },
+    [sessionId],
+  );
 
   // `key` is the row's place in the list (what moves); `as` tells a card from a row for entrances.
   const rows: { key: string; as: string; node: (fresh: boolean) => ReactNode }[] = [];
-  for (const id of view.running) rows.push({ key: id, as: `L${id}`, node: (fresh) => <LiveCard key={id} sessionId={sessionId} id={id} fresh={fresh} /> });
-  // Headings only where they tell something: the message behind each group, when there are several
-  // and at least one of them started more than one agent (one heading per agent tells nothing).
-  const grouped = view.groups.length > 1 && view.groups.some((g) => g.ids.length > 1);
-  if (!grouped && view.running.length && view.done) rows.push({ key: 'h:done', as: 'h:done', node: (fresh) => <Heading key="h:done" label="Done" fresh={fresh} /> });
-  for (const g of view.groups) {
-    if (grouped) rows.push({ key: `h:${g.user}`, as: `h:${g.user}`, node: (fresh) => <GroupHeading key={`h:${g.user}`} sessionId={sessionId} user={g.user} fresh={fresh} /> });
-    for (const id of g.ids) rows.push({ key: id, as: `D${id}`, node: (fresh) => <DoneRow key={id} sessionId={sessionId} id={id} fresh={fresh} /> });
+  const working = view.working.join('|');
+  if (working) rows.push({ key: 'working', as: 'working', node: () => <Working key="working" sessionId={sessionId} order={working} /> });
+  // A wave gets its line when there is more than one, or commands beside it: one wave alone is simply the list.
+  const headed = view.waves.length > 1 || cmds.ids.length > 0;
+  view.waves.forEach((w, i) => {
+    const open = !headed || waveOpen(i, view.done, chosen(w.user));
+    if (headed) {
+      const hk = `h:${w.user}`;
+      rows.push({ key: hk, as: hk, node: (fresh) => <WaveHead key={hk} sessionId={sessionId} user={w.user} count={w.ids.length} failed={w.failed} open={open} onFlip={flip} fresh={fresh} /> });
+    }
+    if (!open) return;
+    const shown = waveRows(w, all(w.user));
+    for (const id of shown.ids) rows.push({ key: id, as: `D${id}`, node: (fresh) => <DoneRow key={id} sessionId={sessionId} id={id} fresh={fresh} /> });
+    if (shown.more) {
+      const mk = `m:${w.user}`;
+      rows.push({ key: mk, as: mk, node: () => <MoreRow key={mk} id={mk} group={w.user} count={shown.more} onFlip={flip} /> });
+    }
+  });
+  if (cmds.ids.length) {
+    // A few stand open; many fold to their line unless one failed.
+    const open = chosen(COMMANDS) ?? (cmds.ids.length <= 4 || cmds.failed > 0);
+    rows.push({ key: 'h:cmd', as: 'h:cmd', node: (fresh) => <GroupHead key="h:cmd" id="h:cmd" group={COMMANDS} label="Commands" count={cmds.ids.length} failed={cmds.failed} open={open} onFlip={flip} fresh={fresh} /> });
+    if (open) {
+      const shown = waveRows({ user: COMMANDS, ids: cmds.ids, failed: cmds.failed }, all(COMMANDS));
+      for (const id of shown.ids) rows.push({ key: `c:${id}`, as: `c:${id}`, node: (fresh) => <CommandRow key={`c:${id}`} sessionId={sessionId} id={id} fresh={fresh} /> });
+      if (shown.more) rows.push({ key: 'm:cmd', as: 'm:cmd', node: () => <MoreRow key="m:cmd" id="m:cmd" group={COMMANDS} count={shown.more} onFlip={flip} /> });
+    }
   }
   const keys = rows.map((r) => r.key);
   const arrived = useEntrances(rows.map((r) => r.as));
 
-  if (!ids.length) {
+  if (!ids.length && !cmds.ids.length) {
     return (
       <div className="rail-scroll scroll">
         <p className="rail-empty">No agents in this session yet.</p>
@@ -94,10 +138,13 @@ function AgentsList({ sessionId }: { sessionId: string }) {
     <div className="rail-col">
       <div className="rail-bar">
         <span className="rail-bar-title">Agents</span>
-        {/* One figure: how many work now, or once none does, how many there were. */}
-        <span className="rail-bar-meta num">{view.running.length ? `${view.running.length} running` : `${view.done} done`}</span>
+        {/* How many work now; once none does, how many there were. What failed is said beside it. */}
+        <span className="rail-bar-meta num">
+          {view.working.length ? `${view.working.length} working` : view.done ? `${view.done} done` : ''}
+          {view.failed > 0 && <span className="agx-bar-failed"> · {view.failed} failed</span>}
+        </span>
       </div>
-      <div className="rail-scroll scroll">
+      <div className="rail-scroll scroll agx-scroll">
         <TimelineCtx.Provider value={ctx}>
           <LeaveList className="agx-list" order={keys.join('|')}>
             {rows.map((r) => r.node(arrived.has(r.as)))}
@@ -109,9 +156,9 @@ function AgentsList({ sessionId }: { sessionId: string }) {
 }
 
 /**
- * Rows that joined the list on screen, which rise into place once. Not the first set, not a batch,
- * not a run of arrivals in quick succession (they simply appear), and not a finished agent whose
- * card it was (it glides from the cards to its row instead).
+ * Rows that joined a list on screen, which rise into place once (a card among the working, a row
+ * among the finished: an agent that ends leaves the one and rises into the other). Not the first
+ * set, not a batch, not a run of arrivals in quick succession: those simply appear.
  */
 function useEntrances(keys: readonly string[]): ReadonlySet<string> {
   const seen = useRef<Set<string> | null>(null);
@@ -125,35 +172,72 @@ function useEntrances(keys: readonly string[]): ReadonlySet<string> {
       const calm = news.length <= 6 && now - last.current > 400;
       last.current = now;
       for (const k of news) {
-        const wasCard = k[0] === 'D' && seen.current.has(`L${k.slice(1)}`);
         seen.current.add(k);
-        if (calm && !wasCard) fresh.current.add(k);
+        if (calm) fresh.current.add(k);
       }
     }
   }
   return fresh.current;
 }
 
-function Heading({ label, fresh }: { label: string; fresh: boolean }) {
+// ── a group's line ──
+
+/** One line over a group of finished rows: when it began, what it is, how many, and while folded what failed in it. It folds the group. */
+const GroupHead = memo(function GroupHead({ id, group, time, label, count, failed, open, onFlip, fresh, title }: { id: string; group: string; time?: string; label: string; count: number; failed: number; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; title?: string }) {
   return (
-    <div role="listitem" data-flip={`h:${label}`} className="agx-head" data-new={fresh || undefined}>
-      <span className="agx-head-label truncate">{label}</span>
+    <div role="listitem" data-flip={id} className="agx-wave" data-open={open || undefined} data-new={fresh || undefined}>
+      <button type="button" className="agx-wave-btn" aria-expanded={open} onClick={() => onFlip(group, !open)} title={title}>
+        <span className="agx-mark" aria-hidden>
+          <Icon name="caret-right" size={10} weight="bold" className="agx-caret" />
+        </span>
+        {time && <span className="agx-wave-time num">{time}</span>}
+        <span className="agx-wave-label truncate">{label}</span>
+        {/* Folded, the line says what failed inside; open, the failed rows stand first under it. */}
+        {failed > 0 && !open && <span className="agx-wave-failed num">{failed} failed</span>}
+        <span className="agx-wave-count num">{count}</span>
+      </button>
     </div>
   );
-}
+});
 
-/** The message whose turn started the agents under it: its first line (when it was sent shows on hover). */
-const GroupHeading = memo(function GroupHeading({ sessionId, user, fresh }: { sessionId: string; user: string; fresh: boolean }) {
+/** A wave's line: the first words of the message that set its agents going, under the time it was sent. */
+const WaveHead = memo(function WaveHead({ sessionId, user, count, failed, open, onFlip, fresh }: { sessionId: string; user: string; count: number; failed: number; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean }) {
   const item = useShown((s) => (user ? s.data[sessionId]?.items[user] : undefined));
   const text = item?.type === 'user' ? promptLine(userItemText(item)) : 'Earlier';
+  return <GroupHead id={`h:${user}`} group={user} time={item ? clock(item.ts) : undefined} label={text} title={text} count={count} failed={failed} open={open} onFlip={onFlip} fresh={fresh} />;
+});
+
+/** What an open group holds back. */
+const MoreRow = memo(function MoreRow({ id, group, count, onFlip }: { id: string; group: string; count: number; onFlip: (key: string, to: boolean) => void }) {
   return (
-    <div role="listitem" data-flip={`h:${user}`} className="agx-head" data-new={fresh || undefined} title={item ? `Sent ${clock(item.ts)}` : undefined}>
-      <span className="agx-head-label truncate">{text}</span>
+    <div role="listitem" data-flip={id} className="agx-more-row">
+      <button type="button" className="agx-more-btn num" onClick={() => onFlip(`${group}\u0000all`, true)}>
+        Show {count} more
+      </button>
     </div>
   );
 });
 
 // ── working now ──
+
+/**
+ * Who works now, as one block that stays at the top of the pane. `order`: their ids, joined: the
+ * block renders when that changes (one started, one ended), never when the finished list does.
+ */
+const Working = memo(function Working({ sessionId, order }: { sessionId: string; order: string }) {
+  const ids = useMemo(() => order.split('|'), [order]);
+  const arrived = useEntrances(ids);
+  const many = ids.length > MANY;
+  return (
+    <div role="listitem" data-flip="working" className={many ? 'agx-working scroll' : 'agx-working'} data-many={many || undefined} aria-label="Working now">
+      <LeaveList className="agx-cards" order={order}>
+        {ids.map((id) => (
+          <LiveCard key={id} sessionId={sessionId} id={id} fresh={arrived.has(id)} />
+        ))}
+      </LeaveList>
+    </div>
+  );
+});
 
 const LiveCard = memo(function LiveCard({ sessionId, id, fresh }: { sessionId: string; id: string; fresh: boolean }) {
   const item = useShown((s) => s.data[sessionId]?.items[id]) as ToolItem | undefined;
@@ -210,6 +294,8 @@ function AgentLive({ item, progress: p, awaiting }: { item: ToolItem; progress: 
             {doing}
           </span>
         </span>
+        {/* How much it has done: the one figure that tells a long runner that works from one that is stuck. */}
+        {p.steps > 0 && <span className="agx-steps-n num">{p.steps === 1 ? '1 step' : `${p.steps} steps`}</span>}
       </span>
       {p.todo && (
         <span className="agx-progress">
@@ -244,6 +330,11 @@ function WorkflowLive({ run }: { run: WorkflowRun }) {
             {now || 'Starting'}
           </span>
         </span>
+        {w.agents > 0 && (
+          <span className="agx-steps-n num">
+            {w.done} of {w.agents}
+          </span>
+        )}
       </span>
       <span className="agx-phases" role="img" aria-label={[w.phase || 'One phase', w.agents ? `${w.done} of ${w.agents} agents done` : ''].filter(Boolean).join(', ')}>
         {Array.from({ length: count }, (_, i) => {
@@ -268,10 +359,12 @@ function WorkflowLive({ run }: { run: WorkflowRun }) {
  * A finished agent: its task and one figure, in the cards' columns. A plain done row carries no
  * mark (being in this list says it); a failure has the red cross, a hand-over its agent's mark, a
  * workflow its tree. An outcome other than done is said in words where the time would stand; its
- * tokens and steps are in the opened row.
+ * tokens and steps, and when it finished, are in the opened row.
  */
 const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: string; id: string; fresh: boolean }) {
   const item = useShown((s) => s.data[sessionId]?.items[id]) as ToolItem | undefined;
+  // A background agent's call returned at once: its notification says when it ended.
+  const noted = useShown((s) => indexFor(sessionId).notes(s.data[sessionId]).get(id)?.ts ?? 0);
   const [open, setOpen] = useFold(foldKey(sessionId, id, SCOPE), false);
   if (!item) return null;
   const outcome = outcomeOf(item);
@@ -279,6 +372,8 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
   const provider = agentProvider(item) ?? item.check?.agent ?? null;
   const word = outcome === 'done' ? '' : OUTCOME_WORD[outcome];
   const mark = outcome === 'failed' ? <Icon name="x" size={11} weight="bold" /> : provider ? <ProviderMark provider={provider} size={12} /> : item.workflow ? <Icon name="tree" size={13} /> : null;
+  const launched = !!item.result?.agent?.background || !!item.detail.background;
+  const endedAt = noted || (launched ? 0 : (item.endedAt ?? 0));
   return (
     <div role="listitem" data-flip={id} className="agx-row" data-outcome={outcome} data-open={open || undefined} data-new={fresh || undefined}>
       <button type="button" className="agx-row-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -292,8 +387,40 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
         </span>
       </button>
       <Collapse open={open}>
-        <AgentDetail sessionId={sessionId} item={item} live={false} />
+        <AgentDetail sessionId={sessionId} item={item} live={false} endedAt={endedAt} />
       </Collapse>
+    </div>
+  );
+});
+
+// ── background commands ──
+
+const COMMAND_WORD: Record<CommandState, string> = { starting: 'Starting', done: '', failed: 'Failed', stopped: 'Stopped', unknown: 'Started' };
+
+/**
+ * A command the agent sent to the background: what it is and how it ended, when its notification
+ * said so. One that gave no word of its end is "Started" with the time: it may still run. The row
+ * goes to the step in the conversation, where its output is.
+ */
+const CommandRow = memo(function CommandRow({ sessionId, id, fresh }: { sessionId: string; id: string; fresh: boolean }) {
+  const item = useShown((s) => s.data[sessionId]?.items[id]) as ToolItem | undefined;
+  const note = useShown((s) => indexFor(sessionId).notes(s.data[sessionId]).get(id));
+  if (!item) return null;
+  const state = commandState(item, note);
+  const word = COMMAND_WORD[state];
+  const when = state === 'unknown' ? clock(item.ts) : note ? clock(note.ts) : '';
+  return (
+    <div role="listitem" data-flip={`c:${id}`} className="agx-row agx-cmd" data-outcome={state} data-new={fresh || undefined}>
+      <button type="button" className="agx-row-btn" title={item.detail.command} aria-label={`${item.detail.description || item.title}. Show in conversation`} onClick={() => revealItem(sessionId, id)}>
+        <span className="agx-mark" aria-hidden>
+          {state === 'failed' ? <Icon name="x" size={11} weight="bold" /> : state === 'starting' ? <Ring size={12} label={null} /> : <Icon name="terminal" size={13} />}
+        </span>
+        <span className="agx-title truncate">{item.detail.description || item.title}</span>
+        <span className="agx-meta num">
+          {word && <span className="agx-outcome">{word}</span>}
+          {when && <span className="agx-dur">{when}</span>}
+        </span>
+      </button>
     </div>
   );
 });

@@ -36,8 +36,10 @@ export function TasksTab({ sessionId }: { sessionId: string }) {
   return (
     <div className="rail-col">
       <div className="rail-bar">
-        <span className="rail-bar-title num">
-          {done} of {todos.length} done
+        {/* The bar as on every list pane: what it is, then its figure. */}
+        <span className="rail-bar-title">Tasks</span>
+        <span className="rail-bar-meta num">
+          {done} of {todos.length}
         </span>
         <span className="tk-progress meter" role="progressbar" aria-valuemin={0} aria-valuemax={todos.length} aria-valuenow={done} aria-label="Tasks done">
           <span className="meter-fill" style={{ '--p': done / todos.length } as CSSProperties} />

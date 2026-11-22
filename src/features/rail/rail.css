@@ -83,11 +83,12 @@
   border-bottom: 1px solid var(--line);
 }
 
-/* One quiet row: the most used tabs and More at the left, the panel's toggle at the right, where
-   the top bar's toggle stands while the panel is closed (in the desktop app, left of the window
-   controls and the hairline before them). The tabs read as one set with the top bar's icon
-   buttons: 28 px pills, 16 px line icons in --text-3, a fill step on hover, 2 px apart. The selected
-   tab is a dithered pill with its name (when there is room), the name opening on a spring. */
+/* One quiet row: the tabs and More at the left, the panel's toggle at the right, where the top bar's
+   toggle stands while the panel is closed (in the desktop app, left of the window controls and the
+   hairline before them). The tabs read as one set with the top bar's icon buttons: 28 px pills,
+   16 px line icons in --text-3, a fill step on hover, 2 px apart. The selected tab lies on a
+   dithered pill, with its name while the row has room for any tab's name. What stands in the row
+   at a width is decided in tab-row.ts: nothing here shrinks, wraps or is cut. */
 .rail-tabs {
   flex: 1;
   min-width: 0;
@@ -105,25 +106,10 @@
   flex-shrink: 0;
 }
 
-/* More: three dots, or the tab chosen from it with a small caret that says it is a menu. */
-.rail-more-caret {
-  margin-left: 3px;
-  margin-right: -1px;
-  color: var(--text-3);
-  transition: rotate var(--d-2) var(--ease-out);
-}
-
+/* More: three dots, always (a tab chosen from it takes the row's last seat while it is selected). */
 .rail-more[data-state='open'] {
   background-color: var(--fill-2);
   color: var(--text);
-}
-
-.rail-more[data-on][data-state='open'] {
-  background-color: transparent;
-}
-
-.rail-more[data-state='open'] .rail-more-caret {
-  rotate: 180deg;
 }
 
 /* The panel's toggle: the same glyph and state as the top bar's (a brighter glyph, no block of fill). */
@@ -188,27 +174,77 @@
   scale: none;
 }
 
-/* The selection: one pill for the whole row, moved by transform (and its width) on the name's spring. */
-.rail-tabs-pill {
+/* The selection: a pill inside the selected tab, so it has that tab's box at every width (a pill
+   placed by script once stayed as wide as a name that had since closed, over the next two tabs).
+   Its skin is two doors, as on the composer's chips: the same long pill drawn twice, the near end
+   behind a 12 px window, the rest behind a window that reaches past the tab. When the selection
+   moves, Rail.tsx slides the whole pill from the old tab and the far door's pill from the old
+   width: two transforms on one clock, the hairline whole in every frame, nothing scaled. */
+.rail-tab-pill {
   position: absolute;
-  top: calc(50% - 14px);
-  left: 0;
-  height: 28px;
-  border-radius: var(--r-ctl);
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
   pointer-events: none;
 }
 
-/* The name's box animates its width (motion); the text inside keeps its own size and never wraps. */
-.rail-tab-label {
-  display: block;
+.rail-tab-pill > i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
   overflow: hidden;
 }
 
-.rail-tab-label > span {
-  display: block;
-  /* Its own width whatever the box is at: the pill reads where the name will end. */
-  width: max-content;
+.rail-tab-pill > i > i {
+  position: absolute;
+  top: 0;
+  width: 480px;
+  height: 100%;
+  border-radius: var(--r-ctl);
+  background-color: var(--fill-3);
+  box-shadow: var(--press-up);
+}
+
+.rail-tab-pill-near {
+  left: 0;
+  width: 12px;
+}
+
+.rail-tab-pill-near > i {
+  left: 0;
+}
+
+.rail-tab-pill-far {
+  left: 12px;
+  right: -200px;
+}
+
+.rail-tab-pill-far > i {
+  right: 200px;
+}
+
+/* The dithered light off the pill's leading edge (as .dither-sel draws it). */
+.rail-tab-pill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--dither-fade) left top / var(--dither-fade-size) repeat-y;
+  image-rendering: pixelated;
+  opacity: 0.06;
+}
+
+/* The selected tab's name: in the flow at its own width. */
+.rail-tab-name {
+  flex-shrink: 0;
   padding: 0 2px 0 7px;
+}
+
+/* Where Rail.tsx measures the names and a figure in the row's own type: never seen, never in the flow. */
+.rail-tab-probe {
+  position: absolute;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 /* A count is a figure beside the icon, not a chip: small, tabular, one step dimmer than the name. */
@@ -1445,14 +1481,14 @@ textarea.field.ch-commit-field {
 .tk-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
 }
 
+/* One line is the panel's 30 px row; its mark stands on the bars' left edge. */
 .tk-item {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  padding: 5px 8px;
+  padding: 4px 7px;
   border: 1px solid transparent;
   border-radius: var(--r-sm);
   font-size: var(--t-ui);
