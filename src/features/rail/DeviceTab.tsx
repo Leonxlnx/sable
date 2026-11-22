@@ -106,7 +106,7 @@ export function DeviceTab({ active }: { active: boolean }) {
   };
 
   return (
-    <div className="rail-col dv">
+    <div className="rail-col dv-col">
       <div className="dv-bar">
         <Picker devices={devices} current={device} status={status} onPick={pick} onStart={(n) => void start(n)} onStop={(s) => void stop(s)} />
         <Tip label={logOpen ? 'Hide log' : 'Show log'}>
