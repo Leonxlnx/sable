@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -830,6 +830,83 @@ function customChat(app: App): SessionMeta | undefined {
     if (m.custom && customAgent(m.provider) && !m.archived && (!best || m.createdAt > best.createdAt)) best = m;
   }
   return best;
+}
+
+// ─────────────────────────────── what a phone may not do ───────────────────────────────
+
+/** A folder as the file system has it (links and junctions followed as far as it exists), compared case-blind where the disk is. */
+function canonical(p: string): string {
+  let at = path.resolve(p);
+  let rest = '';
+  for (;;) {
+    try {
+      at = path.join(realpathSync.native(at), rest);
+      break;
+    } catch {
+      const up = path.dirname(at);
+      if (up === at) break;
+      rest = path.join(path.basename(at), rest);
+      at = up;
+    }
+  }
+  return process.platform === 'win32' || process.platform === 'darwin' ? at.toLowerCase() : at;
+}
+
+/** `p` is `dir` or inside it. */
+export function within(p: string, dir: string): boolean {
+  const a = canonical(p);
+  const b = canonical(dir);
+  return a === b || a.startsWith(b.endsWith(path.sep) ? b : b + path.sep);
+}
+
+/**
+ * What a phone may still do with a chat that can write the person's stylesheet (the Customize chat, or
+ * any chat in `<data>/custom`): read it and stop it, never send, steer, answer or change how it works.
+ * Allowed by name, so a method added later is refused there until it is listed.
+ */
+const PHONE_CUSTOM_READS = new Set([
+  'session.snapshot',
+  'session.interrupt',
+  'session.update',
+  'phone.tail',
+  'phone.item',
+  'phone.queue',
+  'phone.prompts',
+  'phone.changes',
+  'phone.diff',
+  'phone.image',
+  'phone.thumb',
+  'phone.fileLink',
+  'phone.fileStart',
+  'phone.fileChunk',
+  'phone.fileEnd',
+  'turn.checkStop',
+]);
+
+export const PHONE_CUSTOM_REFUSED = 'The Customize chat is answered on the computer.';
+export const PHONE_DATA_REFUSED = "A chat from the phone cannot start in Sable's own folder.";
+
+/**
+ * Why a phone's request is refused because of Customize Sable, or undefined. The phone's allowlist keeps
+ * `custom.*` out; this keeps the stylesheet out of reach through a chat: a phone may not start a chat
+ * (or make a folder) anywhere in Sable's data folder, and may only read and stop a chat that can write
+ * `<data>/custom`.
+ */
+export function phoneRefusal(app: App, method: string, params: Record<string, unknown>): string | undefined {
+  const data = app.store.dir;
+  if (method === 'session.create') {
+    const chat = params.chat !== undefined && params.chat !== null;
+    const cwd = chat ? app.chatsRoot() : typeof params.cwd === 'string' ? params.cwd : '';
+    if (cwd && within(cwd, data)) return PHONE_DATA_REFUSED;
+    return undefined;
+  }
+  if (method === 'phone.mkdir') return typeof params.parent === 'string' && within(params.parent, data) ? PHONE_DATA_REFUSED : undefined;
+  const id = params.sessionId;
+  if (typeof id !== 'string' || PHONE_CUSTOM_READS.has(method)) return undefined;
+  const meta = app.sessions.get(id)?.meta;
+  if (!meta) return undefined;
+  if (meta.custom || within(meta.cwd, customOf(app).dir)) return PHONE_CUSTOM_REFUSED;
+  return undefined;
 }
 
 export function registerCustom(app: App) {

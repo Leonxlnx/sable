@@ -50,6 +50,7 @@ import { fileLine, saveLines, scopeLines } from '../core/permission-scope';
 import { cap, isSnapshot, lines } from '../core/trim';
 import { VERSION } from '../version';
 import { PhoneChangesReader, stepIds } from './phone-changes';
+import { phoneRefusal } from './custom';
 import { blockDigests, FILE_CHUNK, PhoneFiles, RetryLater } from './phone-files';
 import { FRAME_MAX, grantFor, openGrant, phoneAttachments, readHello, type FileGrant } from './phone-guard';
 import { qrMatrix, qrSvgPath } from './qr';
@@ -2018,6 +2019,9 @@ export class PhoneService {
       try {
         const raw = req.params && typeof req.params === 'object' ? (req.params as Record<string, unknown>) : {};
         const own = req.method as string;
+        // Never the person's stylesheet through a chat: no chat in Sable's own folder, the Customize chat read-only.
+        const refused = phoneRefusal(this.app, own, raw);
+        if (refused) throw new Error(refused);
         let result: unknown;
         if (own === 'phone.fileLink') {
           // Plain HTTP downloads only for a phone paired before the secure channel; a secure one gets its files over this connection.
