@@ -142,6 +142,13 @@ describe('Reset wording', () => {
     const week: RateLimit = { id: 'b', label: 'Weekly · all models', percent: 90, windowMins: 10_080 };
     expect(windowPhrase(week)).toBe('the weekly limit');
     expect(windowPhrase(five)).toBe('the 5-hour limit');
+    // A model's own window says whose: with only its week nearly used, "the weekly limit" would read as the plan's.
+    expect(windowPhrase({ id: 'model_Fable', label: 'Weekly · Fable', percent: 99, windowMins: 10_080 })).toBe('the weekly Fable limit');
+    expect(windowPhrase({ id: 'seven_day_opus', label: 'Weekly · Opus', percent: 99, windowMins: 10_080 })).toBe('the weekly Opus limit');
+    expect(windowPhrase({ id: 'five_hour_opus', label: '5-hour limit · Opus', percent: 99, windowMins: 300 })).toBe('the 5-hour Opus limit');
+    expect(windowPhrase({ id: 'spark:primary', label: 'GPT-5.3-Codex-Spark · 5-hour limit', percent: 99, windowMins: 300 })).toBe('the 5-hour GPT-5.3-Codex-Spark limit');
+    expect(windowPhrase({ id: 'codex:secondary', label: 'Weekly limit', percent: 99, windowMins: 10_080 })).toBe('the weekly limit');
+    expect(windowPhrase(undefined)).toBe('the limits');
     expect(resetTarget([five, week], ['a', 'b'])?.id).toBe('b');
     expect(resetTarget([five, week], ['a'])?.id).toBe('a');
   });

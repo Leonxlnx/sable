@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { DEFAULT_ACCOUNT, type LimitsMeta, type ProviderId, type RateLimit, type ResetOffer, type ResetOutcome } from '@shared/protocol';
+import { windowModel } from '@shared/limit-windows';
 import { useNow } from '@/lib/useNow';
 import { readLimitsNow, spendLimitReset } from '@/state/actions';
 import { accountName, useLimitsReport } from '@/state/hooks';
@@ -23,12 +24,21 @@ export function fullTarget(limits: RateLimit[] | undefined, now = Date.now()): R
   return full.find((l) => (l.windowMins ?? 0) >= 10_080) ?? full[0] ?? resetTarget(limits, undefined);
 }
 
-/** How a window is named inside a sentence: "the weekly limit", "the 5-hour limit". */
+/**
+ * How a window is named inside a sentence: "the weekly limit", "the 5-hour limit". A model's own
+ * window says whose ("the weekly Fable limit", "the 5-hour GPT-5.3-Codex-Spark limit"): with only
+ * that model's week nearly used, "the weekly limit" would read as the whole plan's.
+ */
 export function windowPhrase(l: RateLimit | undefined): string {
   if (!l) return 'the limits';
-  if ((l.windowMins ?? 0) >= 10_080) return 'the weekly limit';
-  const label = l.label.replace(/\s*·.*$/, '');
-  return `the ${label.charAt(0).toLowerCase()}${label.slice(1)}`;
+  const [head = '', tail = ''] = l.label.split(/\s*·\s*/);
+  // Claude Code labels a model's window "Weekly · Fable", Codex "GPT-5.3-Codex-Spark · 5-hour limit".
+  const scoped = !!windowModel(l);
+  const modelFirst = scoped && l.id.includes(':');
+  const model = scoped ? (modelFirst ? head : tail).trim() : '';
+  const window = ((modelFirst ? tail : head) || l.label).trim();
+  const kind = (l.windowMins ?? 0) >= 10_080 ? 'weekly' : `${window.charAt(0).toLowerCase()}${window.slice(1)}`.replace(/\s*limit$/i, '');
+  return `the ${[kind, model].filter(Boolean).join(' ')} limit`;
 }
 
 /** What came back, in one line, when it was not a reset. */
