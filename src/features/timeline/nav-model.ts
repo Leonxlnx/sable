@@ -1,14 +1,15 @@
 import type { TimelineItem, UserItem } from '@shared/protocol';
-import { changesOf } from './changes';
 import { shapeOf, type Group, type TurnGroup } from './turns';
 
 /**
- * The conversation's map (the navigator along its right edge): one mark per message the person
- * sent, placed where that message stands in the scroller's content. Pure: the view hands in what
- * it measured, so this never reads the page.
+ * The conversation's navigator (the rail at its right edge and the index it opens): one mark per
+ * message the person sent, the marks gathered into runs (messages sent close together), the rail
+ * that draws them (every run a stack, the one being read fanned out into its messages), and where
+ * each message stands in the scroller's content. Pure: the view hands in what it measured, so this
+ * never reads the page.
  *
- * Positions are content offsets (px from the top of the scroller's content), the same space as
- * `scrollTop`; the view scales them to its track (`k = track / scrollHeight`).
+ * Positions of messages are content offsets (px from the top of the scroller's content), the same
+ * space as `scrollTop`; positions on the rail are px from the top of the stack.
  */
 
 /** A rough height for an item that is not built yet (items.tsx `estimate`), handed in so this stays pure. */
@@ -70,8 +71,10 @@ export interface NavMark {
   group: number;
   /** Sent into a running turn: a later segment of its turn (or a turn it opened). */
   steered: boolean;
-  /** Files the turn changed (on the turn's first message only). */
-  files: number;
+  /** When it was sent (ms since epoch). */
+  ts: number;
+  /** Its turn ended in an error (on the turn's last message only). */
+  failed: boolean;
 }
 
 type TurnMarks = Omit<NavMark, 'group'>[];
@@ -91,13 +94,7 @@ const isMessage = (it: TimelineItem | undefined): it is UserItem => {
  * keeps the objects of turns that did not change, so a new step re-reads the running turn alone.
  * Returns `prev` itself when nothing changed, so a view can skip its work.
  */
-export function marksOf(
-  groups: readonly Group[],
-  items: Record<string, TimelineItem | undefined>,
-  children: Record<string, string[] | undefined>,
-  cache: WeakMap<TurnGroup, TurnMarks>,
-  prev?: NavMark[],
-): NavMark[] {
+export function marksOf(groups: readonly Group[], items: Record<string, TimelineItem | undefined>, cache: WeakMap<TurnGroup, TurnMarks>, prev?: NavMark[]): NavMark[] {
   const out: NavMark[] = [];
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
@@ -105,18 +102,17 @@ export function marksOf(
     let marks = cache.get(g);
     if (!marks) {
       marks = [];
-      const work: string[] = [];
-      for (const s of g.segments) for (const id of s.work) work.push(id);
-      const files = changesOf(items, children, work).files;
       for (const s of g.segments) {
-        if (!s.lead || !isMessage(items[s.lead])) continue;
-        marks.push({ id: s.lead, steered: s.steered, files: marks.length ? 0 : files });
+        const it = s.lead ? items[s.lead] : undefined;
+        if (!isMessage(it)) continue;
+        marks.push({ id: it.id, steered: s.steered, ts: it.ts, failed: false });
       }
+      if (g.state === 'failed' && marks.length) marks[marks.length - 1].failed = true;
       cache.set(g, marks);
     }
     for (const m of marks) out.push({ ...m, group: i });
   }
-  if (prev && prev.length === out.length && prev.every((m, i) => m.id === out[i].id && m.group === out[i].group && m.files === out[i].files && m.steered === out[i].steered)) return prev;
+  if (prev && prev.length === out.length && prev.every((m, i) => m.id === out[i].id && m.group === out[i].group && m.failed === out[i].failed && m.steered === out[i].steered && m.ts === out[i].ts)) return prev;
   return out;
 }
 
@@ -218,99 +214,232 @@ export function fractionIn(g: Group, id: string, items: Record<string, TimelineI
   return y / total;
 }
 
-export type TickKind = 'msg' | 'files' | 'wait';
-
-export interface Tick {
-  /** Px on the track. */
-  y: number;
-  kind: TickKind;
-  /** Every message in it was steered into a turn (drawn shorter). */
-  steered: boolean;
-}
-
-const RANK: Record<TickKind, number> = { msg: 0, files: 1, wait: 2 };
+/** A message that has been jumped to stands this close under the landing line (px). */
+const LANDED = 8;
 
 /**
- * Ticks to draw: marks closer than `gap` px on the track share one tick, which carries the
- * strongest kind among them (waiting, then files changed).
+ * The message the view is at: the first one standing in the upper part of the view, from the
+ * landing line (`top`, where a jump puts a message) down to the reading line (`line`); when none
+ * does, the last one above (the view is inside its turn). -1 above the first message.
  */
-export function ticksOf(ys: ArrayLike<number>, kindOf: (i: number) => TickKind, steeredOf: (i: number) => boolean, k: number, gap = 3): Tick[] {
-  const out: Tick[] = [];
-  for (let i = 0; i < ys.length; i++) {
-    const y = ys[i] * k;
-    const kind = kindOf(i);
-    const steered = steeredOf(i);
-    const last = out[out.length - 1];
-    if (last && y - last.y < gap) {
-      if (RANK[kind] > RANK[last.kind]) last.kind = kind;
-      last.steered &&= steered;
-      continue;
-    }
-    out.push({ y, kind, steered });
-  }
-  return out;
-}
-
-/** Plain ticks (find results): one per `gap` px. */
-export function rowsOf(ys: ArrayLike<number>, k: number, gap = 3): number[] {
-  const out: number[] = [];
-  for (let i = 0; i < ys.length; i++) {
-    const y = ys[i] * k;
-    if (out.length && y - out[out.length - 1] < gap) continue;
-    out.push(y);
-  }
-  return out;
-}
-
-/** The mark nearest to `y` (same units as `ys`, which are in order) within `radius`, or -1. */
-export function nearest(ys: ArrayLike<number>, y: number, radius: number): number {
+export function markAt(ys: ArrayLike<number>, line: number, top: number): number {
   let lo = 0;
   let hi = ys.length;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    if (ys[mid] < y) lo = mid + 1;
+    if (ys[mid] < top - LANDED) lo = mid + 1;
     else hi = mid;
   }
-  let best = -1;
-  let d = radius;
-  for (const i of [lo - 1, lo]) {
-    if (i < 0 || i >= ys.length) continue;
-    const e = Math.abs(ys[i] - y);
-    if (e <= d) {
-      d = e;
-      best = i;
-    }
-  }
-  return best;
+  return lo < ys.length && ys[lo] < line ? lo : lo - 1;
 }
 
 /**
- * The message to go to from the view (Alt+Up, Alt+Down): `line` is the reading line in content
- * offsets, `top` the view's top. Up from the middle of a long turn goes to the message that
- * started it first. Returns a mark index, or `marks.length` for the end of the conversation
- * (down from the last message), or -1 for nothing.
+ * The message to go to from the view (Alt+Up, Alt+Down), counted from the one the view is at
+ * (`markAt`), so short turns that share a view are stepped through one by one. Up from the middle
+ * of a long turn goes to the message that started it first. Returns a mark index, or
+ * `marks.length` for the end of the conversation (down from the last message), or -1 for nothing.
  */
 export function stepTarget(ys: ArrayLike<number>, line: number, top: number, dir: 1 | -1): number {
   const n = ys.length;
   if (!n) return dir === 1 ? 0 : -1;
-  // The message the view is at: the last one that starts above the reading line.
-  let at = -1;
-  for (let i = n - 1; i >= 0; i--) {
-    if (ys[i] < line) {
-      at = i;
-      break;
-    }
-  }
+  const at = markAt(ys, line, top);
   if (dir === -1) {
-    if (at >= 0 && ys[at] < top - 8) return at;
+    if (at >= 0 && ys[at] < top - LANDED) return at;
     return Math.max(0, at - 1);
   }
   return at + 1 >= n ? n : at + 1;
 }
 
-/** The first line of a message, for its preview. */
+// ── runs: messages sent close together ──
+
+/** A run of messages: marks `[from, to)`. */
+export interface NavRun {
+  from: number;
+  to: number;
+}
+
+/** A pause this long between two messages starts a new run (ms). */
+export const PAUSE = 60 * 60_000;
+/** The rail holds this many runs at most. */
+export const RUNS_MAX = 16;
+/** A run longer than one and a half of this is cut into pieces of it. */
+export const RUN_SIZE = 24;
+
+/** How many pieces a run of `n` is cut into: whole pieces of `size` from its start, the last up to one and a half. */
+const pieces = (n: number, size: number) => (n <= size * 1.5 ? 1 : Math.ceil((n - size * 1.5) / size) + 1);
+
+/**
+ * The runs of a conversation, from the times its messages were sent: a new run starts after a
+ * pause (a sitting of work is one run), a very long sitting is cut into pieces, and there are
+ * never more than `max`: only the longest pauses count then, and the pieces grow. Runs are cut
+ * from their start, so a conversation that grows keeps the runs it has.
+ */
+export function runsOf(ts: ArrayLike<number>, max = RUNS_MAX, size = RUN_SIZE, pause = PAUSE): NavRun[] {
+  const n = ts.length;
+  if (!n) return [];
+  let starts: number[] = [];
+  for (let i = 1; i < n; i++) if (ts[i] - ts[i - 1] >= pause) starts.push(i);
+  if (starts.length > max - 1) {
+    starts = starts
+      .sort((a, b) => ts[b] - ts[b - 1] - (ts[a] - ts[a - 1]) || a - b)
+      .slice(0, Math.max(0, max - 1))
+      .sort((a, b) => a - b);
+  }
+  const spans: NavRun[] = [];
+  let from = 0;
+  for (const s of starts) {
+    spans.push({ from, to: s });
+    from = s;
+  }
+  spans.push({ from, to: n });
+  let cut = Math.max(1, size);
+  const count = () => spans.reduce((c, r) => c + pieces(r.to - r.from, cut), 0);
+  while (count() > max && cut < n) cut = Math.ceil(cut * 1.25);
+  const out: NavRun[] = [];
+  for (const r of spans) {
+    let at = r.from;
+    for (let k = pieces(r.to - r.from, cut); k > 1; k--) {
+      out.push({ from: at, to: at + cut });
+      at += cut;
+    }
+    out.push({ from: at, to: r.to });
+  }
+  return out;
+}
+
+/** The run a mark is in (runs are in order and cover every mark), or -1. */
+export function runOf(runs: readonly NavRun[], mark: number): number {
+  let lo = 0;
+  let hi = runs.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (mark < runs[mid].from) hi = mid - 1;
+    else if (mark >= runs[mid].to) lo = mid + 1;
+    else return mid;
+  }
+  return -1;
+}
+
+// ── the rail ──
+
+/** Between two runs on the rail (px). */
+export const RAIL_GAP = 6;
+/** Between two messages of the open run (px), and the least when the rail runs out of track. */
+const PITCH = 5;
+const PITCH_MIN = 3;
+/** A run of one is the line of its message. */
+const LINE = 2;
+
+/** A closed run's height on the rail: a stack that grows slowly with what it holds. */
+export const stackHeight = (n: number) => (n < 2 ? LINE : Math.round(4 + 2 * Math.sqrt(n)));
+
+export interface Rail {
+  /** The whole stack's height. */
+  h: number;
+  /** Each run's top and height, from the top of the stack. */
+  top: number[];
+  height: number[];
+  /** The distance between two messages of the open run. */
+  pitch: number;
+}
+
+/**
+ * The rail: the runs under each other, each closed one a stack, the open one (`open`, -1 for
+ * none) fanned out into a line per message. When the track is too short for it, the open run's
+ * lines close up first, then the stacks and the gaps shrink.
+ */
+export function railOf(sizes: readonly number[], open: number, track: number): Rail {
+  const count = sizes.length;
+  const n = open >= 0 && open < count ? sizes[open] : 0;
+  let rest = Math.max(0, count - 1) * RAIL_GAP;
+  for (let i = 0; i < count; i++) if (i !== open) rest += stackHeight(sizes[i]);
+  let pitch = PITCH;
+  if (n > 1 && rest + n * pitch > track) pitch = Math.max(PITCH_MIN, Math.min(PITCH, Math.floor((track - rest) / n)));
+  const openH = n > 1 ? n * pitch : n === 1 ? LINE : 0;
+  const k = rest > 0 && rest + openH > track ? Math.max(0.4, (track - openH) / rest) : 1;
+  const top: number[] = [];
+  const height: number[] = [];
+  let y = 0;
+  for (let i = 0; i < count; i++) {
+    const h = i === open ? openH : Math.max(LINE, Math.round(stackHeight(sizes[i]) * k));
+    top.push(y);
+    height.push(h);
+    y += h + (i < count - 1 ? Math.max(2, Math.round(RAIL_GAP * k)) : 0);
+  }
+  return { h: y, top, height, pitch };
+}
+
+/** Where a message stands on the rail: its line in the open run, its share of a closed stack. */
+export function markY(rail: Rail, runs: readonly NavRun[], mark: number): number {
+  const r = runOf(runs, mark);
+  if (r < 0) return 0;
+  const { from, to } = runs[r];
+  return rail.top[r] + ((mark - from + 0.5) / (to - from)) * rail.height[r];
+}
+
+/**
+ * What a place on the rail (px from the top of the stack) points at: the nearest run, and the
+ * message there: in the open run the one whose line it is, in a closed run its first.
+ */
+export function railAt(rail: Rail, runs: readonly NavRun[], open: number, y: number): { run: number; mark: number } | null {
+  if (!runs.length) return null;
+  let run = 0;
+  for (let i = 1; i < runs.length; i++) {
+    // Half of the gap above a run belongs to it.
+    if (y < (rail.top[i - 1] + rail.height[i - 1] + rail.top[i]) / 2) break;
+    run = i;
+  }
+  const { from, to } = runs[run];
+  if (run !== open || to - from < 2) return { run, mark: from };
+  const at = Math.floor((y - rail.top[run]) / (rail.pitch || 1));
+  return { run, mark: from + Math.max(0, Math.min(to - from - 1, at)) };
+}
+
+// ── words ──
+
+/** The first line of a message, as its row in the index reads. */
 export function firstLine(text: string, max = 140): string {
   const line = text.split('\n').find((l) => l.trim()) ?? '';
   const t = line.trim();
   return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
+}
+
+/**
+ * A message against what was typed into the index: every word typed must be in it, case aside.
+ * Returns the line to show (the first line when a word is in it, otherwise the first line that
+ * has one, cut to start a little before the word when it stands far in) and which of its
+ * characters to mark; null when the message does not match.
+ */
+export function matchPrompt(text: string, query: string, max = 140): { line: string; indices: number[] } | null {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return { line: firstLine(text, max), indices: [] };
+  const lower = text.toLowerCase();
+  if (!words.every((w) => lower.includes(w))) return null;
+  const lines = text.split('\n').filter((l) => l.trim());
+  const has = (l: string) => {
+    const t = l.toLowerCase();
+    return words.some((w) => t.includes(w));
+  };
+  const full = ((lines.length && has(lines[0]) ? lines[0] : lines.find(has)) ?? lines[0] ?? '').trim();
+  const low = full.toLowerCase();
+  let first = -1;
+  for (const w of words) {
+    const at = low.indexOf(w);
+    if (at >= 0 && (first < 0 || at < first)) first = at;
+  }
+  // A word far into a long line: the line starts a few words before it.
+  let start = 0;
+  if (first > max - 24) {
+    start = Math.max(0, first - 18);
+    const space = full.indexOf(' ', start);
+    if (space >= 0 && space < first) start = space + 1;
+  }
+  const body = full.slice(start, start + max - 1).trimEnd();
+  const line = `${start > 0 ? '…' : ''}${body}${start + body.length < full.length ? '…' : ''}`;
+  const shown = line.toLowerCase();
+  const marked = new Set<number>();
+  for (const w of words) {
+    for (let at = shown.indexOf(w); at >= 0; at = shown.indexOf(w, at + w.length)) for (let i = 0; i < w.length; i++) marked.add(at + i);
+  }
+  return { line, indices: [...marked].sort((a, b) => a - b) };
 }

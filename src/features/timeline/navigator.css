@@ -1,13 +1,15 @@
 /*
- * The conversation's map (Navigator.tsx): a slim strip along the right edge of the conversation,
- * left of the scrollbar's gutter and clear of the reading column. A hairline per message the
- * person sent, find results as brighter ticks. Nearly invisible at rest; under the pointer the
- * hairlines reach out, the view shows as a soft band and the message under the pointer is named.
+ * The conversation's navigator (Navigator.tsx): a small rail at the right edge of the conversation,
+ * left of the scrollbar's gutter and clear of the reading column, and the index it opens.
  *
- * The band: `.nav-travel` is as tall as the band's travel (the track less the band); the script
- * moves it by transform when a scroll comes to rest, so the band's top is
- * scrollTop × track / scrollHeight, the scale of the ticks. While the view follows the end
- * (`data-end`) it rests there.
+ * The rail is a stack around the middle of its track, not a scale of the whole scroll: the
+ * messages the person sent, gathered into runs. A closed run is one short bar (a stack: taller the
+ * more it holds), a run of one is its line, and the run being read is fanned out into a line per
+ * message with the one in view lit. Every mark is placed by transform from the top of the track,
+ * so a run that opens or closes moves the others on the compositor.
+ *
+ * The index is a pane of glass beside the rail: the same runs, each under the time it began, a row
+ * per message with its first words.
  */
 
 .nav {
@@ -17,15 +19,15 @@
   top: 52px;
   /* Beside the scrollbar's gutter (10px) with a pixel over it, clear of its thumb (3 to 7px from the
      edge): at the narrowest gutter (24px, the side panel open) the track stands 9px from the
-     reading column. The ticks and hits (at most 14px from its right) fit its 16px. */
+     reading column. The marks (at most 14px from its right) fit its 16px. */
   right: 9px;
   /* Ends a little above the composer, which covers the conversation's last (dock - 30) px. */
   bottom: calc(var(--dock-h, 150px) - 14px);
   width: 16px;
   contain: strict;
-  touch-action: none;
   opacity: 0;
   visibility: hidden;
+  /* Only the stack answers the pointer (.nav-hot): above and below it the conversation does. */
   pointer-events: none;
   transition:
     opacity var(--d-3) var(--ease),
@@ -35,180 +37,379 @@
 .nav[data-show] {
   opacity: 1;
   visibility: visible;
-  pointer-events: auto;
   transition: opacity var(--d-3) var(--ease);
 }
 
-/* No transition: a glide would keep the main thread drawing frames for it (measured: reading back
-   a long chat about 10% busier). The band simply stands where the view has come to rest. */
-.nav-travel {
+/* How strong the marks are: quiet at rest, clearer under the pointer and while the index is open,
+   stepped back while find has results (the later rule: under the pointer too). */
+.nav {
+  --nav-stack: 0.22;
+  --nav-line: 0.34;
+}
+
+.nav[data-over],
+.nav[data-open] {
+  --nav-stack: 0.42;
+  --nav-line: 0.56;
+}
+
+.nav[data-find] {
+  --nav-stack: 0.14;
+  --nav-line: 0.14;
+}
+
+/* The stack's place on the track, with a little reach above and below: what takes the pointer and the focus. */
+.nav-hot {
   position: absolute;
-  inset: 0 0 auto;
+  left: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  pointer-events: auto;
+  cursor: pointer;
 }
 
-.nav[data-end] .nav-travel {
-  transform: translateY(100%);
+/* Inside the track's own box (contain: strict would cut a ring around it), clear of the longest mark. */
+.nav-hot:focus-visible {
+  outline-offset: var(--focus-inset);
 }
 
-/* The view: a soft band behind the ticks, only while the pointer is on the map (or holds it). At
-   rest the scrollbar already says where the view is; a second box beside it was noise. */
-.nav-band {
-  position: absolute;
-  inset: 0 0 auto;
-  border-radius: 4px;
-  background-color: var(--fill-2);
-  opacity: 0;
-  transition: opacity var(--d-2) var(--ease);
-}
-
-.nav:hover .nav-band,
-.nav[data-held] .nav-band {
-  opacity: 1;
-}
-
-/* Ticks: placed by transform from the top of the track, drawn centred on their place. */
-.nav-ticks,
-.nav-waits,
-.nav-hits {
+.nav-marks {
   position: absolute;
   inset: 0;
-  pointer-events: none;
+  transition: opacity var(--d-1) var(--ease);
 }
 
-/* At rest a column of hairlines one can just make out: the instrument is there, it does not ask
-   to be looked at. Under the pointer they reach out toward the reader and come up to reading
-   strength, as one layer (opacity and scale only). */
-.nav-ticks {
-  opacity: 0.2;
-  transform-origin: calc(100% - 3px) 50%;
-  transition:
-    opacity var(--d-2) var(--ease),
-    scale var(--d-3) var(--ease-out);
+.nav-hot:active ~ .nav-marks {
+  opacity: 0.7;
 }
 
-.nav:hover .nav-ticks,
-.nav[data-held] .nav-ticks {
-  opacity: 0.62;
-  scale: 1.7 1;
-}
-
-/* While find has results, the messages step back for them. */
-.nav[data-find] .nav-ticks {
-  opacity: 0.14;
-}
-
-.nav-tick,
-.nav-hit,
-.nav-lit {
+.nav-marks > i {
   position: absolute;
-  top: -0.5px;
+  top: 0;
   right: 3px;
-  width: 5px;
-  height: 1px;
   background-color: var(--text);
 }
 
-/* A message steered into a running turn: a shorter tick. */
-.nav-tick[data-steered] {
+/* A closed run: one bar, as tall as what it holds asks for. */
+.nav-stack {
   width: 3px;
+  border-radius: 1.5px;
+  opacity: var(--nav-stack);
+  transition:
+    transform var(--d-3) var(--ease-out),
+    opacity var(--d-2) var(--ease);
+  animation: nav-in var(--d-3) var(--ease) backwards;
 }
 
-/* A turn that changed files: a longer one. */
-.nav-tick[data-files] {
+/* The run being read shows its lines instead: its bar waits out of sight, where it will stand again. */
+.nav-marks > .nav-stack[data-open] {
+  opacity: 0;
+}
+
+/* A message of the open run (or a run of one): a line. It comes in from `--fan` away: the lines of
+   the run the view just came into fan out of where its bar stood, any other line simply appears
+   (--fan is 0). One animation for both, so a line never plays a second one when its run changes. */
+.nav-line {
   width: 7px;
+  height: 1px;
+  opacity: var(--nav-line);
+  transition:
+    transform var(--d-3) var(--ease-out),
+    opacity var(--d-2) var(--ease);
+  animation: nav-fan 260ms var(--ease-out) backwards;
 }
 
-/* Waiting on you: amber, at full strength. */
-.nav-waits .nav-tick {
-  top: -1px;
-  width: 8px;
-  height: 2px;
-  border-radius: 1px;
-  background-color: var(--amber);
+/* The lines of the run the view just left: closed up into its bar (their transform says where), fading as they go. */
+.nav-marks > .nav-line[data-out] {
+  opacity: 0;
+  transition:
+    transform var(--d-3) var(--ease-out),
+    opacity var(--d-3) var(--ease);
 }
 
-.nav-hit {
-  top: -1px;
-  width: 8px;
-  height: 2px;
-  border-radius: 1px;
-  opacity: 0.6;
-}
-
-.nav-hit[data-at] {
-  right: 2px;
-  width: 12px;
-  opacity: 1;
-}
-
-/* The tick under the pointer: full strength, the longest. */
-.nav-lit {
-  top: -1px;
-  right: 3px;
-  width: 12px;
-  height: 2px;
-  border-radius: 1px;
-  transition: transform 80ms var(--ease-out);
-}
-
-.nav-lit[data-steered] {
-  width: 8px;
-}
-
-/* ── the preview: left of the track, centred on the tick ── */
-
-.nav-peek {
-  position: absolute;
-  z-index: 3;
-  top: 52px;
-  /* 8px left of the track (right 9px, 16px wide). */
-  right: 33px;
-  width: max-content;
-  max-width: min(320px, calc(100% - 96px));
-  padding: 7px 12px 8px;
-  border-radius: var(--r-md);
-  translate: 0 -50%;
-  pointer-events: none;
-  transition: transform 120ms var(--ease-out);
-  animation: nav-peek-in 120ms var(--ease-out);
-}
-
-@keyframes nav-peek-in {
+@keyframes nav-in {
   from {
     opacity: 0;
-    scale: 0.98;
   }
 }
 
-.nav-peek-text {
+@keyframes nav-fan {
+  from {
+    opacity: 0;
+    translate: 0 var(--fan, 0px);
+  }
+}
+
+/* The message in view: the one full-strength mark, the longest. It slides between the lines of its run. */
+.nav-marks > .nav-here {
+  width: 10px;
+  height: 2px;
+  border-radius: 1px;
+  transition: transform var(--d-3) var(--ease-out);
+}
+
+/* What the pointer is on: the bar, or the line, at full strength. */
+.nav-marks > .nav-lit {
+  width: 3px;
+  border-radius: 1.5px;
+}
+
+.nav-marks > .nav-lit[data-line] {
+  width: 9px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+/* Marks on a message: a failed turn (red), the one waiting on the person (amber), find results. On a
+   closed run they cross its bar where the message is in it. */
+.nav-marks > .nav-flag {
+  width: 7px;
+  height: 2px;
+  border-radius: 1px;
+  transition: transform var(--d-3) var(--ease-out);
+}
+
+.nav-marks > .nav-flag[data-kind='fail'] {
+  background-color: var(--red);
+}
+
+.nav-marks > .nav-flag[data-kind='wait'] {
+  width: 10px;
+  background-color: var(--amber);
+}
+
+.nav-marks > .nav-flag[data-kind='hit'] {
+  opacity: 0.7;
+}
+
+.nav-marks > .nav-flag[data-kind='at'] {
+  width: 10px;
+}
+
+/* While find has results, the messages step back for them (--nav-* above), the one in view too. */
+.nav[data-find] .nav-here {
+  opacity: 0.3;
+}
+
+/* ── the index: left of the rail, around the same middle ── */
+
+.nav-pane {
+  position: absolute;
+  /* Its height is the list's measure (cqh below). */
+  container-type: size;
+  z-index: 4;
+  top: 52px;
+  /* 8px left of the rail (right 9px, 16px wide). */
+  right: 33px;
+  bottom: calc(var(--dock-h, 150px) - 14px);
+  left: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+
+.nav-index {
+  display: flex;
+  flex-direction: column;
+  /* On a narrow stage (the side panel open, a race's column) it leaves a good third of the conversation's width in view. */
+  width: min(320px, 64cqw);
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 14px;
+  pointer-events: auto;
+  transform-origin: 100% 50%;
+  animation: nav-index-in 160ms var(--ease-out) backwards;
+}
+
+@keyframes nav-index-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px) scale(0.985);
+  }
+}
+
+.nav-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  height: 38px;
+  padding: 0 10px 0 13px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  cursor: text;
+}
+
+.nav-field input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
   font-size: var(--t-ui);
-  line-height: 18px;
   color: var(--text);
 }
 
-.nav-peek-meta {
-  margin-top: 1px;
+.nav-field input::placeholder {
+  color: var(--text-3);
+}
+
+/* The key that opens it, as a quiet figure (as in a menu, not a row of boxes). */
+.nav-field .kbds {
+  gap: 0;
+}
+
+.nav-field .kbd {
+  min-width: 0;
+  height: auto;
+  padding: 0;
+  background: none;
+  box-shadow: none;
+  font-size: var(--t-small);
+  font-weight: var(--w-regular);
+  color: var(--text-3);
+}
+
+.nav-field .kbds:not([data-mac]) .kbd + .kbd::before {
+  content: '+';
+  padding: 0 1px;
+}
+
+.nav-field .kbds[data-mac] {
+  gap: 1px;
+}
+
+/* Fourteen rows at most (enough to read a run and its neighbours, never the whole height of the
+   conversation), and always a whole number of them: with the script keeping the scroll on the rows'
+   grid (28px), no row is cut at the list's edges. 47px: the field and the list's own padding. */
+.nav-list {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  max-height: calc(round(down, min(100cqh - 47px, 392px), 28px) + 8px);
+  padding: 4px;
+}
+
+/* When a run began: its head. The run under the pointer on the rail reads a step clearer. Heads
+   and rows are 28px, the list's grid, and their words start under the field's (35px from the pane's edge). */
+.nav-when {
+  padding: 9px 8px 3px 31px;
   font-size: var(--t-micro);
   line-height: 16px;
   color: var(--text-3);
   white-space: nowrap;
+  transition: color var(--d-1) var(--ease);
 }
 
-.nav-peek-wait {
-  color: var(--amber);
+.nav-when[data-aim] {
+  color: var(--text);
+}
+
+.nav-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 9px 0 31px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-ui);
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+  scroll-margin: 6px;
+  transition:
+    background-color 80ms var(--ease-out),
+    color 80ms var(--ease-out);
+}
+
+/* The lit row (the pointer, the arrows): one step lighter, as in a menu. */
+.nav-row[data-cur] {
+  background-color: var(--hl);
+  color: var(--text);
+}
+
+.nav-row:active {
+  background-color: var(--fill-3);
+}
+
+/* The message in view: the rail's lit line before its words, under the field's icon. */
+.nav-row[data-here] {
+  color: var(--text);
+}
+
+.nav-row[data-here]::before {
+  content: '';
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  width: 8px;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 1px;
+  background-color: var(--text);
+}
+
+.nav-words {
+  flex: 1;
+}
+
+/* What was typed, where it is in the line. */
+.nav-words mark {
+  background: none;
+  color: var(--text);
+  font-weight: var(--w-semi);
+}
+
+.nav-row:not([data-cur], [data-here]) .nav-words:has(mark) {
+  color: var(--text-3);
+}
+
+/* In a list of matches: when the message was sent. */
+.nav-time {
+  flex-shrink: 0;
+  font-size: var(--t-micro);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.nav-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.nav-dot[data-kind='wait'] {
+  background-color: var(--amber);
+}
+
+.nav-dot[data-kind='fail'] {
+  background-color: var(--red);
+}
+
+.nav-none {
+  margin: 0;
+  padding: 9px 8px 10px 31px;
+  font-size: var(--t-ui);
+  color: var(--text-3);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .nav-lit,
-  .nav-peek {
+  .nav-stack,
+  .nav-line,
+  .nav-marks > .nav-here,
+  .nav-marks > .nav-flag {
     transition: none;
     animation: none;
   }
-  .nav-ticks {
-    transition: opacity var(--d-2) var(--ease);
-  }
-  .nav:hover .nav-ticks,
-  .nav[data-held] .nav-ticks {
-    scale: none;
+  .nav-index {
+    animation-name: fade-in;
   }
 }

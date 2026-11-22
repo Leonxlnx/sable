@@ -1998,6 +1998,18 @@ button:hover > .row-caret {
   padding-top: 4px;
 }
 
+/* A nod after the answer ("Committed.", "Done.", TurnView `tail`): the agent's last words, under
+   what the person waits for, as a quiet last line close to it. */
+.fold-text.fold-tail > .collapse-inner > .tl-item[data-t='text'] {
+  padding-top: 2px;
+}
+
+.fold-text.fold-tail .md {
+  --md-fg: var(--text-2);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
 /* The work of a turn, opened: its checkpoints stand one level in from the line that holds them
    (and from the answer after them), each with its own line and note. */
 .tl-content {

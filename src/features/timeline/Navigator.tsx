@@ -1,13 +1,18 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type RefObject } from 'react';
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import type { TimelineItem } from '@shared/protocol';
+import { userItemText } from '@shared/synthetic';
 import { parseReview } from '@/features/review/model';
+import { Icon } from '@/icons';
 import { plural } from '@/lib/format';
+import { highlightRuns } from '@/lib/fuzzy';
 import { reducedMotion, uiZoom } from '@/lib/motion';
 import { useStore } from '@/state/store';
+import { Kbd } from '@/ui';
 import { useTimeline } from './ctx';
 import { estimate } from './items';
 import { findMarks, onFindMarks, takeSteps, type NavFeed, type NavLayout } from './nav-bus';
-import { firstLine, groupAt, groupBoxes, groupHeight, isBuilt, marksOf, nearest, placeMarks, rowsOf, stepTarget, ticksOf, type NavMark } from './nav-model';
+import { firstLine, groupAt, groupBoxes, groupHeight, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
 import { revealItem, rootOf } from './reveal';
 import type { Group, TurnGroup } from './turns';
 import { stampParts } from './util';
@@ -19,32 +24,44 @@ const LAND = 18;
 const FAR = 1.5;
 /** The glide at the end of a far jump (px). */
 const GLIDE = 220;
-/** The map shows once the conversation is this many views tall, and hides again below `HIDE`. */
+/** The rail shows once the conversation is this many views tall, and hides again below `HIDE`. */
 const SHOW = 2;
 const HIDE = 1.8;
-/** A tick answers the pointer within this distance (px on the track). */
-const HIT = 8;
 /** The reading line, as a share of the view's height from its top: the message above it is the one being read. */
 const READ = 0.42;
 /** Keys pressed while a jump is on its way step on from where it goes (ms). */
 const IN_FLIGHT = 650;
-/** The band moves once the scroll has been still this long (ms), and during a long scroll every `BAND_MS`. */
-const BAND_QUIET = 140;
-const BAND_MS = 500;
+/** Where the view is, is read once the scroll has been still this long (ms), and during a long scroll every `HERE_MS`. */
+const HERE_QUIET = 140;
+const HERE_MS = 500;
 /** Marks moved by heights changing above them are measured again this long after (ms), once for a burst. */
 const SETTLE_MS = 150;
-/** While only the end grows, the scale is followed once the farthest tick would move this far (px). */
-const DRIFT = 1.5;
+/** The pointer rests on the rail this long before the index opens (ms): crossing it on the way to the scrollbar opens nothing. */
+const INTENT = 110;
+/** The index stays this long after the pointer left it and the rail (ms): the way from one to the other. */
+const LINGER = 220;
+/** Above and below its stack the rail still answers the pointer (px). */
+const REACH = 14;
+/** From this many messages on the index has its field without being asked for. */
+const FIELD_FROM = 8;
+/** A row of the index and a run's head are this tall, and the list pads by `PAD` (navigator.css). */
+const ROW = 28;
+const PAD = 4;
+/** The index glides this many rows at most: a run further away is gone most of the way to at once. */
+const ROWS_GLIDE = 5;
 
 interface Geo {
   /** Content offset of each mark (px from the top of the scroller's content, as `scrollTop`). */
   ys: Float64Array;
   sH: number;
   cH: number;
+  /** The rail's track: how tall its stack may be. */
   track: number;
+  /** The stack's middle on the track: kept while only the composer grows, so the rail never moves as one types. */
+  mid: number;
 }
 
-const NO_GEO: Geo = { ys: new Float64Array(0), sH: 0, cH: 0, track: 0 };
+const NO_GEO: Geo = { ys: new Float64Array(0), sH: 0, cH: 0, track: 0, mid: 0 };
 
 const sameYs = (a: Float64Array, b: Float64Array) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < 0.5);
 
@@ -70,6 +87,15 @@ function landing(sc: HTMLElement, el: HTMLElement): number {
   return Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, y - LAND));
 }
 
+/** A key or click inside another surface (the side panel, a dialog, a menu) is not for the conversation. */
+const elsewhere = (t: EventTarget | null) => !!(t as HTMLElement | null)?.closest?.('.app-rail, [role="dialog"]:not(.nav-index), [role="menu"]');
+
+/** The rail under the pointer: the run, and the message a click goes to. */
+interface Aim {
+  run: number;
+  mark: number;
+}
+
 interface Props {
   sessionId: string;
   feed: NavFeed;
@@ -80,12 +106,21 @@ interface Props {
 }
 
 /**
- * The conversation's map, along its right edge: a short tick per message the person sent, where it
- * stands in the conversation, and the view as a quiet band. Hovering a tick previews the message,
- * a click jumps there, a drag scrubs; Alt+Up and Alt+Down step between messages (the find bar
- * hands the keys here). It never makes the timeline render: the turn list hands it its layout after
- * each commit (`feed`), it measures the built turns when the layout or a size changes (one read
- * when only the end grew), and the band moves by transform a few times a second while it scrolls.
+ * The conversation's navigator, at its right edge. At rest a small rail: the messages the person
+ * sent, gathered into runs (messages sent close together, a sitting of work), every run one short
+ * stack, and the run being read fanned out into a line per message with the one in view lit. So a
+ * chat of 300 messages is a dozen marks, and where one is stays plain.
+ *
+ * The pointer on the rail (or Ctrl+G) opens the index beside it: every message by its first words
+ * under the time its run began, the one in view marked; a click or Enter goes there, typing
+ * filters. A click on the rail itself goes to the run or the line under the pointer. Alt+Up and
+ * Alt+Down step between messages (the find bar hands the keys here).
+ *
+ * It never makes the timeline render: the turn list hands it its layout after each commit
+ * (`feed`), it measures the built turns when the layout or a size changes (one read when only the
+ * end grew), and where the view is, is read a few times a second while it scrolls: the lit mark
+ * then moves by one transform, and the rail is drawn again only when the view comes into another
+ * run. Nothing here runs for a streamed word.
  */
 export const Navigator = memo(function Navigator({ sessionId, feed, scroller, content, hold }: Props) {
   const layout = useSyncExternalStore(feed.subscribe, feed.get);
@@ -104,7 +139,7 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   const marks = useMemo(() => {
     if (!layout) return lastMarks.current;
     const d = useStore.getState().data[sessionId];
-    return (lastMarks.current = marksOf(layout.groups, d?.items ?? {}, d?.children ?? {}, turnCache, lastMarks.current));
+    return (lastMarks.current = marksOf(layout.groups, d?.items ?? {}, turnCache, lastMarks.current));
   }, [layout, sessionId, turnCache]);
 
   // Estimated heights and offsets inside groups, kept per group object (a settled group never changes).
@@ -131,7 +166,6 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   const marksRef = useRef(marks);
   marksRef.current = marks;
   const last = useRef<Measure>({ boxes: null, layout: null, sig: '', marks: null, anchor: null, anchorTop: 0 });
-  const shownRef = useRef(false);
   const settleTimer = useRef(0);
   useEffect(() => () => window.clearTimeout(settleTimer.current), []);
   const [boxesRev, setBoxesRev] = useState(0);
@@ -181,16 +215,19 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
     });
     last.current = { boxes, layout: L, sig: sigOf(L), marks: ms, anchor, anchorTop: anchor ? anchor.offsetTop : 0 };
     if (findMarks(sessionId)) setBoxesRev((r) => r + 1);
-    const next: Geo = { ys, sH: sc.scrollHeight, cH: sc.clientHeight, track: track.current?.clientHeight ?? 0 };
     const g = geoRef.current;
-    if (next.sH !== g.sH || next.cH !== g.cH || next.track !== g.track || !sameYs(next.ys, g.ys)) setGeo((geoRef.current = next));
+    const cH = sc.clientHeight;
+    const tr = track.current?.clientHeight ?? 0;
+    // The stack's middle follows the view's size, not the composer's: it stays put while a draft grows.
+    const next: Geo = { ys, sH: sc.scrollHeight, cH, track: tr, mid: cH !== g.cH || !g.mid ? tr / 2 : g.mid };
+    if (next.sH !== g.sH || next.cH !== g.cH || next.track !== g.track || next.mid !== g.mid || !sameYs(next.ys, g.ys)) setGeo((geoRef.current = next));
   }, [feed, scroller, content, shape, sessionId]);
 
   /**
    * After a commit or a size change: measure again only when the built ranges or the marks
-   * changed, something above the newest group moved (its top did), or the view or the track
-   * resized. When only the end grew (a streamed answer, a step in the running turn) the marks stay
-   * where they are: only the scale changes, and only once that moves a tick by `DRIFT`.
+   * changed, something above the newest group moved (its top did), or the view resized. When only
+   * the end grew (a streamed answer, a step in the running turn) nothing here changes at all,
+   * except once, when the conversation gets long enough for the rail.
    */
   const check = useCallback(() => {
     const sc = scroller.current;
@@ -199,8 +236,7 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
     const l = last.current;
     const g = geoRef.current;
     const cH = sc.clientHeight;
-    const tr = track.current?.clientHeight ?? 0;
-    if (l.sig !== sigOf(L) || l.marks !== marksRef.current || (l.anchor && !l.anchor.isConnected) || cH !== g.cH || tr !== g.track) return measure();
+    if (l.sig !== sigOf(L) || l.marks !== marksRef.current || (l.anchor && !l.anchor.isConnected) || cH !== g.cH) return measure();
     // Something above the newest group changed height (older turns drawn for the first time as
     // the reader scrolls through them, a fold opened): measured once that settles.
     if (l.anchor && l.anchor.offsetTop !== l.anchorTop) {
@@ -213,12 +249,11 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
     }
     // The groups changed objects only (a step joined the running turn): find results keep their groups' places.
     l.layout = L;
+    const tr = track.current?.clientHeight ?? 0;
     const sH = sc.scrollHeight;
-    if (sH === g.sH) return;
-    // Hidden, only the threshold matters; shown, the scale once the farthest tick would move by `DRIFT`.
+    // The track alone (the composer grew by a line): the rail keeps its middle and only learns its room.
     const crosses = sH > SHOW * cH !== g.sH > SHOW * cH || sH > HIDE * cH !== g.sH > HIDE * cH;
-    const far = Math.max(g.ys.length ? g.ys[g.ys.length - 1] : 0, g.cH);
-    if (crosses || (shownRef.current && Math.abs(far * tr * (1 / sH - 1 / g.sH)) >= DRIFT)) setGeo((geoRef.current = { ...g, sH }));
+    if (tr !== g.track || crosses) setGeo((geoRef.current = { ...g, track: tr, sH: crosses ? sH : g.sH }));
   }, [feed, scroller, measure]);
 
   // The turn list committed a new layout: look in the next frame, when the browser lays it out anyway.
@@ -255,7 +290,10 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   useEffect(() => {
     const sc = scroller.current;
     if (!sc) return;
-    const off = () => (pin.current = null);
+    const off = () => {
+      pin.current = null;
+      aimed.current = -1;
+    };
     const opts = { capture: true, passive: true } as const;
     for (const t of ['wheel', 'pointerdown', 'keydown', 'touchstart'] as const) sc.addEventListener(t, off, opts);
     return () => {
@@ -282,63 +320,104 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   // Shown only when the conversation is long enough to need it.
   const [shown, setShown] = useState(false);
   const tall = geo.cH > 0 && geo.sH > (shown ? HIDE : SHOW) * geo.cH;
-  const show = tall && (marks.length >= 2 || !!find?.ids.length);
-  useEffect(() => {
-    shownRef.current = show;
-    setShown(show);
-  }, [show]);
+  const show = tall && marks.length >= 2;
+  useEffect(() => setShown(show), [show]);
 
-  const k = geo.sH > 0 && geo.track > 0 ? geo.track / geo.sH : 0;
-  const px = useMemo(() => Array.from(geo.ys, (y) => y * k), [geo.ys, k]);
+  // ── where the view is ──
 
-  const lastMark = marks.length - 1;
-  const ticks = useMemo(
-    () =>
-      show
-        ? ticksOf(
-            geo.ys,
-            (i) => (waiting && i === lastMark ? 'wait' : marks[i]?.files ? 'files' : 'msg'),
-            (i) => !!marks[i]?.steered,
-            k,
-          )
-        : [],
-    [show, geo.ys, k, marks, waiting, lastMark],
-  );
-
-  // Find results: where each matching item stands (its group's box and its place inside it).
-  const hits = useMemo(() => {
-    const { boxes, layout: lay } = last.current;
-    if (!show || !find?.ids.length || !boxes || !lay) return null;
-    const items = (useStore.getState().data[sessionId]?.items ?? {}) as Record<string, TimelineItem | undefined>;
-    const groupOf = new Map<string, number>();
-    lay.groups.forEach((g, i) => {
-      if (g.kind === 'item') groupOf.set(g.id, i);
-      else {
-        for (const id of g.ids) groupOf.set(id, i);
-        for (const id of g.checks ?? []) groupOf.set(id, i);
+  /**
+   * The message in view (`markAt`); the last one while the view follows the end. Reading it costs
+   * the main thread a pass of the page's lifecycle when it changes something, so it is read when a
+   * scroll comes to rest (and every `HERE_MS` during a long one), never per frame, and not at all
+   * while a turn streams in front of the reader.
+   */
+  const hereRef = useRef(-1);
+  const hereEl = useRef<HTMLElement>(null);
+  /** What the rail shows right now (set where it is laid out, below), for handlers and for `moveHere`. */
+  const live = useRef<{ rail: Rail; runs: NavRun[]; open: number; offset: number } | null>(null);
+  const paneRef = useRef<null | 'peek' | 'open'>(null);
+  const [, redraw] = useState(0);
+  /**
+   * The message in view changed. Inside the run that is fanned out, with the index closed, the lit
+   * mark alone moves, by one write of its own (as the band did): scrolling never renders, so it
+   * never holds up the turns React is building ahead of the reader. Into another run, the rail is
+   * drawn again.
+   */
+  const moveHere = useCallback((i: number) => {
+    if (i === hereRef.current) return;
+    hereRef.current = i;
+    const l = live.current;
+    const el = hereEl.current;
+    if (l && el && !paneRef.current && l.open >= 0 && runOf(l.runs, i) === l.open) el.style.transform = `translateY(${l.offset + Math.floor(markY(l.rail, l.runs, i))}px)`;
+    else redraw((n) => n + 1);
+  }, []);
+  /** A jump on its way: where it goes, so keys pressed meanwhile step on from there, and the rail waits for it to land. */
+  const flight = useRef<{ index: number; at: number }>({ index: -1, at: 0 });
+  /**
+   * The message last jumped to, until the reader moves the view: while it stands in the view it is
+   * the one in view (near the end of the conversation a message cannot land at the top, and the
+   * ones above it would be taken for it).
+   */
+  const aimed = useRef(-1);
+  const jumped = useCallback(() => {
+    const sc = scroller.current;
+    const ys = geoRef.current.ys;
+    const i = aimed.current;
+    if (!sc || i < 0 || i >= ys.length) return -1;
+    const top = sc.scrollTop;
+    return ys[i] >= top - LAND && ys[i] < top + sc.clientHeight - LAND ? i : -1;
+  }, [scroller]);
+  const locate = useCallback(() => {
+    const sc = scroller.current;
+    const ys = geoRef.current.ys;
+    if (!sc || !ys.length) return;
+    let at = jumped();
+    if (at < 0) {
+      at = ys.length - 1;
+      if (!stuck.current) {
+        const top = sc.scrollTop;
+        at = Math.max(0, markAt(ys, top + sc.clientHeight * READ, top + LAND));
       }
-    });
-    const yOf = (id: string) => {
-      const root = rootOf(items, id);
-      const gi = groupOf.get(root);
-      if (gi === undefined) return undefined;
-      const s = shape(lay.groups[gi]);
-      const at = s.at.get(root) ?? 0;
-      return boxes.top[gi] + (s.h > 0 ? (at / s.h) * boxes.height[gi] : 0);
-    };
-    const ys: number[] = [];
-    for (const id of find.ids) {
-      const y = yOf(id);
-      if (y !== undefined) ys.push(y);
     }
-    const at = find.current ? yOf(find.current) : undefined;
-    return { rows: rowsOf(ys, k), at: at === undefined ? null : at * k };
-  }, [show, find, boxesRev, k, sessionId, shape]); // eslint-disable-line react-hooks/exhaustive-deps
+    moveHere(at);
+  }, [scroller, stuck, jumped, moveHere]);
+
+  useEffect(() => {
+    const sc = scroller.current;
+    if (!sc) return;
+    let timer = 0;
+    let raf = 0;
+    let read = performance.now();
+    const look = () => {
+      timer = 0;
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        read = performance.now();
+        locate();
+      });
+    };
+    const onScroll = () => {
+      // Following the end: the last message, known already.
+      if (stuck.current && hereRef.current === geoRef.current.ys.length - 1) return;
+      window.clearTimeout(timer);
+      // A jump on its way is read when it lands; a long scroll now and then; otherwise once it has been still a moment.
+      if (performance.now() - flight.current.at > IN_FLIGHT && performance.now() - read > HERE_MS) look();
+      else timer = window.setTimeout(look, HERE_QUIET);
+    };
+    sc.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      sc.removeEventListener('scroll', onScroll);
+      window.clearTimeout(timer);
+      cancelAnimationFrame(raf);
+    };
+  }, [scroller, stuck, locate]);
+  // The places changed (a message sent, older turns built, the view resized).
+  useEffect(() => {
+    if (performance.now() - flight.current.at > IN_FLIGHT) locate();
+  }, [geo.ys, geo.cH, locate]);
 
   // ── moving the view ──
-
-  /** A jump on its way: where it goes, so keys pressed meanwhile step on from there. */
-  const flight = useRef<{ index: number; at: number }>({ index: -1, at: 0 });
 
   /** Brings a row to the top of the view: straight there when near, most of the way at once and a short glide when far. */
   const land = useCallback(
@@ -380,6 +459,9 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
         (m.steered ? sc.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(m.id)}"]`) : content.current?.querySelector<HTMLElement>(`:scope > section[data-turn="${CSS.escape(m.id)}"]`)) ?? null;
       const el = rowOf();
       flight.current = { index, at: performance.now() };
+      aimed.current = index;
+      // The rail says where the view goes at once, not where it happens to pass.
+      moveHere(index);
       if (el) return land(el);
       hold();
       pin.current = null;
@@ -393,13 +475,14 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
       };
       requestAnimationFrame(look);
     },
-    [scroller, content, sessionId, land, hold],
+    [scroller, content, sessionId, land, hold, moveHere],
   );
 
   const toEnd = useCallback(() => {
     const sc = scroller.current;
     if (!sc) return;
     flight.current = { index: marksRef.current.length, at: performance.now() };
+    aimed.current = -1;
     pin.current = null;
     sc.scrollTo({ top: sc.scrollHeight, behavior: reducedMotion() ? 'instant' : 'smooth' });
   }, [scroller]);
@@ -413,7 +496,8 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
         if (!sc || !ms.length) return false;
         let to: number;
         const f = flight.current;
-        if (f.index >= 0 && performance.now() - f.at < IN_FLIGHT) to = Math.max(0, Math.min(ms.length, f.index + dir));
+        const from = f.index >= 0 && performance.now() - f.at < IN_FLIGHT ? f.index : jumped();
+        if (from >= 0) to = Math.max(0, Math.min(ms.length, from + dir));
         else {
           const top = sc.scrollTop;
           to = stepTarget(geoRef.current.ys, top + sc.clientHeight * READ, top + LAND, dir);
@@ -422,272 +506,623 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
         else if (to >= 0) jumpTo(to);
         return true;
       }),
-    [sessionId, scroller, jumpTo, toEnd],
+    [sessionId, scroller, jumpTo, toEnd, jumped],
   );
 
-  // ── the pointer ──
+  // ── the rail ──
 
-  const [hover, setHover] = useState(-1);
-  const [held, setHeld] = useState(false);
-  const press = useRef<{ id: number; y: number; scrub: boolean; raf: number; to: number } | null>(null);
-  /** Places the band (declared below with it), for scrubbing to move it with the pointer. */
-  const bandRef = useRef<((top?: number) => void) | null>(null);
-  const trackTop = useRef(0);
+  const runs = useMemo(() => runsOf(marks.map((m) => m.ts)), [marks]);
+  // Read where it is kept (`moveHere`): a render always draws the mark where it stands now.
+  const at = Math.min(hereRef.current < 0 ? marks.length - 1 : hereRef.current, marks.length - 1);
+  const open = runOf(runs, at);
+  const rail = useMemo(
+    () =>
+      railOf(
+        runs.map((r) => r.to - r.from),
+        open,
+        Math.max(0, geo.track - REACH * 2),
+      ),
+    [runs, open, geo.track],
+  );
+  // The stack stands around the track's middle, kept inside the track.
+  const offset = Math.round(Math.max(REACH, Math.min(geo.track - REACH - rail.h, geo.mid - rail.h / 2)));
+  live.current = { rail, runs, open, offset };
 
-  /** The pointer's place on the track (px), from a client y. */
-  const onTrack = (clientY: number) => (clientY - trackTop.current) / uiZoom();
-
-  /** Scrubbing: the view centred on the pointer's place, once a frame. */
-  const scrubTo = (y: number) => {
-    const sc = scroller.current;
-    const p = press.current;
-    if (!sc || !p) return;
-    p.to = y;
-    if (p.raf) return;
-    p.raf = requestAnimationFrame(() => {
-      p.raf = 0;
-      hold();
-      const top = (p.to / (geoRef.current.track || 1)) * sc.scrollHeight - sc.clientHeight / 2;
-      sc.scrollTop = top;
-      bandRef.current?.(top);
-    });
-  };
-
-  const onPointerEnter = (e: ReactPointerEvent<HTMLDivElement>) => {
-    trackTop.current = e.currentTarget.getBoundingClientRect().top;
-  };
-
-  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const y = onTrack(e.clientY);
-    const p = press.current;
-    if (p && p.id === e.pointerId) {
-      if (!p.scrub && Math.abs(y - p.y) > 3) p.scrub = true;
-      if (p.scrub) scrubTo(y);
-    }
-    const i = nearest(px, y, HIT);
-    if (i !== hover) setHover(i);
-  };
-
-  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    trackTop.current = e.currentTarget.getBoundingClientRect().top;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    press.current = { id: e.pointerId, y: onTrack(e.clientY), scrub: false, raf: 0, to: 0 };
-    setHeld(true);
-  };
-
-  const release = () => {
-    const p = press.current;
-    if (p?.raf) cancelAnimationFrame(p.raf);
-    press.current = null;
-    setHeld(false);
-    return p;
-  };
-
-  /**
-   * Whether the conversation is built at a content offset. A place that is not (behind a spacer)
-   * would show nothing: the view goes to the message there instead, which builds it.
-   */
-  const builtAt = (y: number) => {
+  // Find results: the message each one stands under, as brighter marks on the rail.
+  const hits = useMemo(() => {
     const { boxes, layout: lay } = last.current;
-    if (!boxes || !lay) return true;
-    const gi = groupAt(boxes.top, y);
-    return gi < 0 || isBuilt(lay.built, gi);
-  };
-
-  /** The message at a content offset: the last one that starts above it (or the first). */
-  const markAt = (y: number) => {
-    const ys = geoRef.current.ys;
-    let i = 0;
-    while (i + 1 < ys.length && ys[i + 1] <= y) i++;
-    return i;
-  };
-
-  const onPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (press.current?.id !== e.pointerId) return;
-    const p = release();
-    const sc = scroller.current;
-    if (!p || !sc || !geo.track) return;
-    if (p.scrub) {
-      // Let go over a part not built yet: the view settles on the message there.
-      const line = sc.scrollTop + sc.clientHeight * READ;
-      if (!builtAt(line)) jumpTo(markAt(line));
-      return;
+    if (!show || !find?.ids.length || !boxes || !lay) return null;
+    const items = (useStore.getState().data[sessionId]?.items ?? {}) as Record<string, TimelineItem | undefined>;
+    const groupOf = new Map<string, number>();
+    lay.groups.forEach((g, i) => {
+      if (g.kind === 'item') groupOf.set(g.id, i);
+      else {
+        for (const id of g.ids) groupOf.set(id, i);
+        for (const id of g.checks ?? []) groupOf.set(id, i);
+      }
+    });
+    const ys = geo.ys;
+    const markOf = (id: string) => {
+      const root = rootOf(items, id);
+      const gi = groupOf.get(root);
+      if (gi === undefined) return -1;
+      const s = shape(lay.groups[gi]);
+      const y = boxes.top[gi] + (s.h > 0 ? ((s.at.get(root) ?? 0) / s.h) * boxes.height[gi] : 0);
+      // The last message that stands at or above it.
+      return Math.max(0, groupAt(ys, y + 0.5));
+    };
+    const on = new Set<number>();
+    for (const id of find.ids) {
+      const m = markOf(id);
+      if (m >= 0 && m < ys.length) on.add(m);
     }
-    const y = onTrack(e.clientY);
-    const i = nearest(px, y, HIT);
-    if (i >= 0) return jumpTo(i);
-    // Between ticks: the view goes there, centred on the place.
-    const at = (y / geo.track) * sc.scrollHeight;
-    if (!builtAt(at)) return jumpTo(markAt(at));
-    hold();
-    flight.current = { index: -1, at: 0 };
-    pin.current = null;
-    sc.scrollTo({ top: at - sc.clientHeight / 2, behavior: reducedMotion() ? 'instant' : 'smooth' });
+    return { on, at: find.current ? markOf(find.current) : -1 };
+  }, [show, find, boxesRev, geo.ys, sessionId, shape]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── the index ──
+
+  /** Open by the pointer on the rail (`peek`: it leaves with the pointer) or asked for (`open`: by key, by its field). */
+  const [pane, setPane] = useState<null | 'peek' | 'open'>(null);
+  paneRef.current = pane;
+  const [aim, setAim] = useState<Aim | null>(null);
+  const back = useRef<HTMLElement | null>(null);
+  const intent = useRef(0);
+  const linger = useRef(0);
+  const trackTop = useRef(0);
+  const pointer = useRef('mouse');
+  useEffect(
+    () => () => {
+      window.clearTimeout(intent.current);
+      window.clearTimeout(linger.current);
+    },
+    [],
+  );
+
+  const closeIndex = useCallback((refocus = true) => {
+    window.clearTimeout(intent.current);
+    window.clearTimeout(linger.current);
+    if (!paneRef.current) return;
+    setPane((paneRef.current = null));
+    const el = back.current;
+    back.current = null;
+    if (refocus && el?.isConnected) el.focus({ preventScroll: true });
+  }, []);
+
+  const openIndex = useCallback(() => {
+    window.clearTimeout(intent.current);
+    window.clearTimeout(linger.current);
+    if (!marksRef.current.length) return;
+    if (!back.current && document.activeElement instanceof HTMLElement && !document.activeElement.closest('.nav-index')) back.current = document.activeElement;
+    setPane((paneRef.current = 'open'));
+  }, []);
+
+  /** The index's field took the focus (from `from`, which gets it back): it stays until closed. */
+  const pinIndex = useCallback((from: Element | null) => {
+    window.clearTimeout(linger.current);
+    if (!back.current && from instanceof HTMLElement && !from.closest('.nav-index, .nav')) back.current = from;
+    if (paneRef.current === 'peek') setPane((paneRef.current = 'open'));
+  }, []);
+
+  const stay = useCallback(() => window.clearTimeout(linger.current), []);
+  const leave = useCallback(() => {
+    window.clearTimeout(linger.current);
+    if (paneRef.current === 'peek') linger.current = window.setTimeout(() => paneRef.current === 'peek' && setPane((paneRef.current = null)), LINGER);
+  }, []);
+
+  const pick = useCallback(
+    (index: number) => {
+      closeIndex();
+      jumpTo(index);
+    },
+    [closeIndex, jumpTo],
+  );
+
+  // Ctrl+G opens the index (and closes it); Esc and a press elsewhere close it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'g') {
+        if (elsewhere(e.target) || !marksRef.current.length) return;
+        // Two conversations side by side (a race): the one the key was pressed in.
+        const own = track.current?.closest('.tl');
+        if (!own || (document.querySelectorAll('.tl').length > 1 && !own.contains(e.target as Node))) return;
+        e.preventDefault();
+        if (paneRef.current === 'open') closeIndex();
+        else openIndex();
+      } else if (e.key === 'Escape' && paneRef.current) {
+        e.preventDefault();
+        e.stopPropagation();
+        closeIndex();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [openIndex, closeIndex]);
+
+  useEffect(() => {
+    if (pane !== 'open') return;
+    const onDown = (e: PointerEvent) => {
+      if (!(e.target as HTMLElement | null)?.closest?.('.nav-index, .nav-hot')) closeIndex(false);
+    };
+    window.addEventListener('pointerdown', onDown, true);
+    return () => window.removeEventListener('pointerdown', onDown, true);
+  }, [pane, closeIndex]);
+
+  // ── the pointer on the rail ──
+
+  const aimAt = (clientY: number) => {
+    const l = live.current;
+    const hit = l ? railAt(l.rail, l.runs, l.open, (clientY - trackTop.current) / uiZoom() - l.offset) : null;
+    setAim((was) => (!hit ? null : was && was.run === hit.run && was.mark === hit.mark ? was : hit));
   };
 
-  // The wheel over the map scrolls the conversation, as it does beside it.
+  const onPointerEnter = (e: ReactPointerEvent<HTMLButtonElement>) => {
+    trackTop.current = track.current?.getBoundingClientRect().top ?? 0;
+    pointer.current = e.pointerType;
+    window.clearTimeout(linger.current);
+    aimAt(e.clientY);
+    if (!paneRef.current && e.pointerType === 'mouse' && e.buttons === 0) {
+      window.clearTimeout(intent.current);
+      intent.current = window.setTimeout(() => !paneRef.current && setPane((paneRef.current = 'peek')), INTENT);
+    }
+  };
+
+  const onPointerLeave = () => {
+    window.clearTimeout(intent.current);
+    setAim(null);
+    leave();
+  };
+
+  const onClick = (e: ReactMouseEvent<HTMLButtonElement>) => {
+    // By key (or a touch, which has no hover): the index. By the pointer: the run or the line under it.
+    if (e.detail === 0 || pointer.current !== 'mouse') return paneRef.current === 'open' ? closeIndex() : openIndex();
+    if (aim) pick(aim.mark);
+  };
+
+  // The wheel over the rail scrolls the conversation, as it does beside it.
+  const hot = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    const el = track.current;
+    const el = hot.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       const sc = scroller.current;
       if (!sc || e.ctrlKey) return;
       e.preventDefault();
+      // The reader moves the view: a jump lets go of its row.
+      pin.current = null;
+      aimed.current = -1;
       if (e.deltaY < 0) hold();
       sc.scrollBy({ top: e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY, behavior: 'instant' });
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [scroller, hold]);
-
-  // ── the band ──
-
-  /**
-   * The view's band. Every move of it costs the main thread a pass of the page's lifecycle, the
-   * intersection checks and layerization of the whole conversation (a scroll-linked animation pays
-   * that every frame: reading back a long chat was about 10% busier with one, measured). So it
-   * moves when a scroll comes to rest (and every `BAND_MS` during a long one), follows the pointer
-   * while scrubbing, and rests at the end while the view follows the end (a turn streaming in front
-   * of the reader). The scroll listener reads a ref and arms a timer; the one read of the scroll
-   * position happens in a frame.
-   */
-  const travel = useRef<HTMLDivElement>(null);
-  const placeBand = useCallback(
-    (top?: number) => {
-      const sc = scroller.current;
-      const el = travel.current;
-      if (!sc || !el) return;
-      const at = stuck.current && top === undefined;
-      if (el.parentElement && el.parentElement.hasAttribute('data-end') !== at) el.parentElement.toggleAttribute('data-end', at);
-      // The travel is the track less the band: the band's top is scrollTop × track / scrollHeight.
-      const max = sc.scrollHeight - sc.clientHeight;
-      const t = at || max <= 0 ? '' : `translateY(${((Math.max(0, Math.min(max, top ?? sc.scrollTop)) / max) * el.offsetHeight).toFixed(1)}px)`;
-      // Unchanged: no write, so nothing is laid out or layerized again.
-      if (el.style.transform !== t) el.style.transform = t;
-    },
-    [scroller, stuck],
-  );
-  bandRef.current = placeBand;
-  useEffect(() => {
-    const sc = scroller.current;
-    if (!sc || !show) return;
-    let timer = 0;
-    let raf = 0;
-    let placed = performance.now();
-    const place = () => {
-      timer = 0;
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        placed = performance.now();
-        placeBand();
-      });
-    };
-    const onScroll = () => {
-      // Following the end: it rests there (set once).
-      if (stuck.current && travel.current?.parentElement?.hasAttribute('data-end')) return;
-      window.clearTimeout(timer);
-      // A long scroll moves it now and then; otherwise once the scroll has been still a moment.
-      if (performance.now() - placed > BAND_MS) place();
-      else timer = window.setTimeout(place, BAND_QUIET);
-    };
-    place();
-    sc.addEventListener('scroll', onScroll, { passive: true });
-    return () => {
-      sc.removeEventListener('scroll', onScroll);
-      window.clearTimeout(timer);
-      cancelAnimationFrame(raf);
-    };
-  }, [scroller, show, stuck, placeBand]);
-  // The scale changed (the conversation grew, the view resized): the band takes its new place.
-  useEffect(() => {
-    if (show) placeBand();
-  }, [show, geo, placeBand]);
+  }, [scroller, hold, show]);
 
   // ── drawing ──
 
-  const bandH = Math.max(12, geo.cH * k);
-  const hovered = show && hover >= 0 && hover < px.length ? marks[hover] : undefined;
-  // The ticks as elements, made again only when they change: a new layout (a step in the running
-  // turn) re-renders the map without touching them.
-  const drawn = useMemo(
-    () => (
-      <>
-        <div className="nav-ticks">
-          {ticks.map((t, i) =>
-            t.kind === 'wait' ? null : <i key={i} className="nav-tick" data-files={t.kind === 'files' || undefined} data-steered={t.steered || undefined} style={{ transform: `translateY(${t.y}px)` }} />,
-          )}
-        </div>
-        {ticks.some((t) => t.kind === 'wait') && (
-          <div className="nav-waits">
-            {ticks.map((t, i) => (t.kind === 'wait' ? <i key={i} className="nav-tick" style={{ transform: `translateY(${t.y}px)` }} /> : null))}
-          </div>
-        )}
-      </>
-    ),
-    [ticks],
-  );
+  const lastMark = marks.length - 1;
+  /** A mark's place on the track, on whole pixels (a line is one pixel tall). */
+  const place = (v: number) => `translateY(${offset + Math.floor(v)}px)`;
+  // The run the view is in (by its first message) and the one it was in before. Coming into a run
+  // from another, its lines fan out of its bar while the other's close up into theirs: one motion.
+  // The rail's first appearance and a message that joins the open run later play nothing.
+  const openFrom = show && open >= 0 ? runs[open].from : -1;
+  const [opened, setOpened] = useState({ now: -1, was: -1 });
+  if (opened.now !== openFrom) setOpened({ now: openFrom, was: opened.now });
+  const fanned = useRef(-1);
+  const fan = opened.was >= 0 && fanned.current !== openFrom;
+  useEffect(() => {
+    fanned.current = openFrom;
+  }, [openFrom]);
+  const wasRun = opened.was >= 0 ? runOf(runs, opened.was) : -1;
+  const closing = wasRun >= 0 && wasRun !== open && runs[wasRun].from === opened.was ? wasRun : -1;
+  // The marks as elements, made again only when the rail changes: a new layout (a step in the
+  // running turn) re-renders the navigator without touching them.
+  const drawn = useMemo(() => {
+    if (!show) return null;
+    const out: ReactNode[] = [];
+    runs.forEach((r, i) => {
+      const n = r.to - r.from;
+      // A run of one is its message's line, open or not.
+      if (n === 1) return void out.push(<i key={`l${r.from}`} className="nav-line" style={{ transform: place(rail.top[i] + rail.height[i] / 2) }} />);
+      // Every other run has its bar, out of sight while the run is open.
+      const bar = i === open ? stackHeight(n) : rail.height[i];
+      out.push(<i key={`s${r.from}`} className="nav-stack" data-open={i === open || undefined} style={{ height: bar, transform: place(rail.top[i]) }} />);
+      if (i === open) {
+        // A line per message. `--fan` is how far the bar's middle is from the line's place: where it
+        // fans out from (navigator.css); nothing for a line that is simply there.
+        for (let j = 0; j < n; j++) {
+          const at = Math.floor((j + 0.5) * rail.pitch);
+          out.push(<i key={`t${r.from + j}`} className="nav-line" style={{ transform: place(rail.top[i] + at), '--fan': fan ? `${(bar / 2 - at).toFixed(1)}px` : '0px' } as CSSProperties} />);
+        }
+      } else if (i === closing) {
+        // The run the view just left: its lines (the same elements) close up into the bar's middle and stay out of sight.
+        const mid = place(rail.top[i] + bar / 2);
+        for (let j = 0; j < n; j++) out.push(<i key={`t${r.from + j}`} className="nav-line" data-out style={{ transform: mid }} />);
+      }
+    });
+    return out;
+  }, [show, runs, rail, open, closing, offset]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const flags = useMemo(() => {
+    if (!show) return null;
+    const out: ReactNode[] = [];
+    const y = (i: number) => place(markY(rail, runs, i));
+    if (hits) {
+      const seen = new Set<number>();
+      for (const i of hits.on) {
+        const row = Math.round(markY(rail, runs, i) / 2);
+        if (seen.has(row)) continue;
+        seen.add(row);
+        out.push(<i key={`h${i}`} className="nav-flag" data-kind="hit" style={{ transform: y(i) }} />);
+      }
+      if (hits.at >= 0 && hits.at < marks.length) out.push(<i key="at" className="nav-flag" data-kind="at" style={{ transform: y(hits.at) }} />);
+    }
+    marks.forEach((m, i) => {
+      if (m.failed) out.push(<i key={`f${i}`} className="nav-flag" data-kind="fail" style={{ transform: y(i) }} />);
+    });
+    if (waiting && lastMark >= 0) out.push(<i key="w" className="nav-flag" data-kind="wait" style={{ transform: y(lastMark) }} />);
+    return out;
+  }, [show, marks, runs, rail, offset, hits, waiting, lastMark]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The run or the line under the pointer, lit.
+  let lit: ReactNode = null;
+  if (show && aim && aim.run < runs.length) {
+    const r = runs[aim.run];
+    const line = aim.run === open || r.to - r.from === 1;
+    lit = line ? (
+      <i className="nav-lit" data-line style={{ transform: place(markY(rail, runs, aim.mark)) }} />
+    ) : (
+      <i className="nav-lit" style={{ height: rail.height[aim.run], transform: place(rail.top[aim.run]) }} />
+    );
+  }
 
   return (
     <>
-      <div
-        ref={track}
-        className="nav"
-        data-show={show || undefined}
-        data-held={held || undefined}
-        data-find={hits ? '' : undefined}
-        aria-hidden
-        onPointerEnter={onPointerEnter}
-        onPointerMove={onPointerMove}
-        onPointerLeave={() => !press.current && setHover(-1)}
-        onPointerDown={onPointerDown}
-        onPointerUp={onPointerUp}
-        onPointerCancel={release}
-        onLostPointerCapture={release}
-      >
+      <div ref={track} className="nav" data-show={show || undefined} data-find={hits ? '' : undefined} data-open={pane ? '' : undefined} data-over={aim ? '' : undefined}>
         {show && (
           <>
-            <div ref={travel} className="nav-travel" style={{ height: Math.max(0, geo.track - bandH) }}>
-              <i className="nav-band" style={{ height: bandH }} />
+            <button
+              ref={hot}
+              type="button"
+              className="nav-hot"
+              style={{ top: offset - REACH, height: rail.h + REACH * 2 }}
+              aria-label="Your messages"
+              aria-haspopup="dialog"
+              aria-expanded={!!pane}
+              onPointerEnter={onPointerEnter}
+              onPointerMove={(e) => aimAt(e.clientY)}
+              onPointerLeave={onPointerLeave}
+              onClick={onClick}
+            />
+            <div className="nav-marks" aria-hidden>
+              {drawn}
+              {at >= 0 && <i ref={hereEl} className="nav-here" style={{ transform: place(markY(rail, runs, at)) }} />}
+              {flags}
+              {lit}
             </div>
-            {drawn}
-            {hits && (
-              <div className="nav-hits">
-                {hits.rows.map((y, i) => (
-                  <i key={i} className="nav-hit" style={{ transform: `translateY(${y}px)` }} />
-                ))}
-                {hits.at !== null && <i className="nav-hit" data-at style={{ transform: `translateY(${hits.at}px)` }} />}
-              </div>
-            )}
-            {hovered && <i className="nav-lit" data-steered={hovered.steered || undefined} style={{ transform: `translateY(${px[hover]}px)` }} />}
           </>
         )}
       </div>
-      {hovered && <Peek sessionId={sessionId} mark={hovered} y={px[hover]} track={geo.track} waiting={waiting && hover === lastMark} />}
+      <div className="nav-pane">
+        <AnimatePresence>
+          {pane && marks.length > 0 && (
+            <Index
+              key="index"
+              sessionId={sessionId}
+              marks={marks}
+              runs={runs}
+              here={at}
+              waitAt={waiting ? lastMark : -1}
+              asked={pane === 'open'}
+              aim={aim}
+              onPick={pick}
+              onClose={closeIndex}
+              onPin={pinIndex}
+              onEnter={stay}
+              onLeave={leave}
+            />
+          )}
+        </AnimatePresence>
+      </div>
     </>
   );
 });
 
-/** The message under the pointer: its first line, when it was sent, what its turn changed. */
-function Peek({ sessionId, mark, y, track, waiting }: { sessionId: string; mark: NavMark; y: number; track: number; waiting: boolean }) {
-  const item = useStore.getState().data[sessionId]?.items[mark.id];
-  if (item?.type !== 'user') return null;
-  const words = parseReview(item.text)?.lead || item.text;
-  const line = firstLine(words) || (item.attachments?.length ? plural(item.attachments.length, 'attachment') : 'Message');
-  const { day, time } = stampParts(item.ts);
-  const when = day ? `${day}, ${time}` : time;
-  const meta = [mark.steered ? `Steered ${when}` : when];
-  if (mark.files) meta.push(`${plural(mark.files, 'file')} changed`);
-  // Kept beside the track, so a card at either end never leaves it.
-  const at = Math.max(16, Math.min(track - 16, y));
+// ── the index ──
+
+/** A message's words: the line its row shows and the text the field searches. Kept per item object (items never change in place). */
+const WORDS = new WeakMap<object, { line: string; text: string }>();
+function wordsOf(item: TimelineItem | undefined): { line: string; text: string } {
+  if (item?.type !== 'user') return { line: 'Message', text: '' };
+  let w = WORDS.get(item);
+  if (!w) {
+    const review = parseReview(item.text);
+    const text = review ? review.lead : userItemText(item);
+    w = { line: firstLine(text) || (review ? 'Review' : item.attachments?.length ? plural(item.attachments.length, 'attachment') : 'Message'), text };
+    WORDS.set(item, w);
+  }
+  return w;
+}
+
+/** When a run began: the time for today's, the date and the time for earlier ones. */
+function whenOf(ts: number): string {
+  const { day, time } = stampParts(ts);
+  return `${day || 'Today'}, ${time}`;
+}
+
+interface IndexProps {
+  sessionId: string;
+  marks: NavMark[];
+  runs: NavRun[];
+  /** The message in view. */
+  here: number;
+  /** The message that waits on the person, or -1. */
+  waitAt: number;
+  /** Asked for (a key, its field): the field has the focus and the index stays until closed. */
+  asked: boolean;
+  /** The rail under the pointer: the index brings that run beside it. */
+  aim: Aim | null;
+  onPick: (index: number) => void;
+  onClose: (refocus?: boolean) => void;
+  onPin: (from: Element | null) => void;
+  onEnter: () => void;
+  onLeave: () => void;
+}
+
+/**
+ * The index: every message by its first words, under the time its run began. The message in view
+ * is marked; the pointer or the arrows light a row, a click or Enter goes there. Typing into the
+ * field keeps the messages that have every word typed, anywhere in them.
+ */
+const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked, aim, onPick, onClose, onPin, onEnter, onLeave }: IndexProps) {
+  const uid = useId();
+  const rowId = (i: number) => `${uid}r${i}`;
+  const rows = useMemo(() => {
+    const items = useStore.getState().data[sessionId]?.items ?? {};
+    return marks.map((m) => wordsOf(items[m.id]));
+  }, [marks, sessionId]);
+
+  const [query, setQuery] = useState('');
+  const q = query.trim();
+  // With something typed: each message's line and marks, null for one that does not match.
+  const found = useMemo(() => (q ? rows.map((r) => matchPrompt(r.text, q)) : null), [rows, q]);
+  const order = useMemo(() => {
+    const out: number[] = [];
+    for (let i = 0; i < rows.length; i++) if (!found || found[i]) out.push(i);
+    return out;
+  }, [rows, found]);
+
+  const [cur, setCur] = useState(() => (asked || !aim ? here : aim.mark));
+  const list = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  /** The row was lit by a key: it is brought into view. */
+  const byKey = useRef(false);
+
+  const rowEl = (i: number) => list.current?.querySelector<HTMLElement>(`[data-i="${i}"]`) ?? null;
+
+  /** Moves the list (by a glide when asked for), always onto the rows' grid: no row is cut at its edges. */
+  const scrollList = (top: number, smooth = false) => {
+    const el = list.current;
+    if (!el) return;
+    const to = Math.max(0, Math.min(el.scrollHeight - el.clientHeight, Math.round(top / ROW) * ROW));
+    const d = to - el.scrollTop;
+    if (Math.abs(d) < 1) return;
+    if (!smooth || reducedMotion()) return void (el.scrollTop = to);
+    if (Math.abs(d) > ROWS_GLIDE * ROW) el.scrollTop = to - Math.sign(d) * ROWS_GLIDE * ROW;
+    el.scrollTo({ top: to, behavior: 'smooth' });
+  };
+
+  /** A run from its head at the top of the list: as much of it as fits is in view. */
+  const toRun = (r: number, smooth: boolean) => {
+    const head = list.current?.querySelector<HTMLElement>(`[data-run="${r}"]`);
+    if (head) scrollList(head.offsetTop - PAD, smooth);
+  };
+
+  /** A message's row in view, moving the list no further than that takes. */
+  const toRow = (i: number, smooth = false) => {
+    const el = list.current;
+    const row = rowEl(i);
+    if (!el || !row) return;
+    const top = row.offsetTop - PAD;
+    if (top < el.scrollTop) scrollList(top, smooth);
+    else if (top + ROW + PAD * 2 > el.scrollTop + el.clientHeight) scrollList(top + ROW + PAD * 2 - el.clientHeight, smooth);
+  };
+
+  /** A message's row in the middle of the list. */
+  const centre = (i: number) => {
+    const el = list.current;
+    const row = rowEl(i);
+    if (el && row) scrollList(row.offsetTop - PAD - Math.floor((el.clientHeight - PAD * 2) / ROW / 2) * ROW);
+  };
+
+  /** What the rail points at: a closed run from its head, a message of the run being read by its row. */
+  const follow = (a: Aim, smooth: boolean) => {
+    if (a.run === runOf(runs, here)) toRow(a.mark, smooth);
+    else toRun(a.run, smooth);
+  };
+
+  // Opened: the message in view in the middle, or what the pointer is on.
+  const first = useRef(true);
+  useLayoutEffect(() => {
+    centre(here);
+    if (aim && !asked) follow(aim, false);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The pointer moves along the rail: the index follows it, one glide per run.
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    if (!aim || q) return;
+    byKey.current = false;
+    setCur(aim.mark);
+    follow(aim, true);
+  }, [aim]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (asked) input.current?.focus({ preventScroll: true });
+  }, [asked]);
+
+  // Something typed: the first match is lit; cleared: the message in view again.
+  const typed = useRef(false);
+  useLayoutEffect(() => {
+    if (!typed.current) return;
+    typed.current = false;
+    if (q) {
+      setCur(order[0] ?? -1);
+      if (list.current) list.current.scrollTop = 0;
+    } else {
+      setCur(here);
+      centre(here);
+    }
+  }, [q]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useLayoutEffect(() => {
+    if (!byKey.current) return;
+    byKey.current = false;
+    toRow(cur);
+  }, [cur]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const move = (by: number) => {
+    if (!order.length) return;
+    const at = order.indexOf(cur);
+    const to = at < 0 ? (by > 0 ? 0 : order.length - 1) : Math.max(0, Math.min(order.length - 1, at + by));
+    byKey.current = true;
+    setCur(order[to]);
+  };
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') move(1);
+    else if (e.key === 'ArrowUp') move(-1);
+    else if (e.key === 'PageDown') move(8);
+    else if (e.key === 'PageUp') move(-8);
+    else if (e.key === 'Enter') {
+      if (cur >= 0 && order.includes(cur)) onPick(cur);
+    } else if (e.key === 'Tab') onClose();
+    else return;
+    e.preventDefault();
+  };
+
+  const point = useCallback((i: number) => {
+    byKey.current = false;
+    setCur(i);
+  }, []);
+
+  const field = asked || marks.length >= FIELD_FROM;
+  const flagOf = (i: number) => (i === waitAt ? 'wait' : marks[i].failed ? 'fail' : undefined);
+  const sections: ReactNode[] = [];
+  if (found) {
+    // What was typed: the messages that have it, one list, each with when it was sent.
+    for (const i of order) {
+      const hit = found[i];
+      if (hit) sections.push(<Row key={marks[i].id} i={i} id={rowId(i)} line={hit.line} marked={hit.indices} when={whenOf(marks[i].ts)} here={i === here} cur={i === cur} flag={flagOf(i)} onPick={onPick} onPoint={point} />);
+    }
+  } else {
+    runs.forEach((run, r) => {
+      const when = whenOf(marks[run.from].ts);
+      const body: ReactNode[] = [];
+      for (let i = run.from; i < run.to; i++) body.push(<Row key={marks[i].id} i={i} id={rowId(i)} line={rows[i].line} marked={NONE} here={i === here} cur={i === cur} flag={flagOf(i)} onPick={onPick} onPoint={point} />);
+      sections.push(
+        <div key={marks[run.from].id} className="nav-run" role="group" aria-label={when}>
+          <div className="nav-when num" data-run={r} data-aim={aim?.run === r || undefined} aria-hidden>
+            {when}
+          </div>
+          {body}
+        </div>,
+      );
+    });
+  }
+
   return (
-    <div className="nav-peek glass" style={{ transform: `translateY(${at}px)` }}>
-      <div className="nav-peek-text truncate">{line}</div>
-      <div className="nav-peek-meta num">
-        {meta.join(' · ')}
-        {waiting && <span className="nav-peek-wait"> · Waiting for you</span>}
+    <motion.div
+      className="nav-index glass"
+      role="dialog"
+      aria-label="Your messages"
+      data-field={field || undefined}
+      data-spot=""
+      onPointerEnter={onEnter}
+      onPointerLeave={onLeave}
+      // The entrance is a CSS animation (navigator.css): on the compositor from the first frame it is painted in.
+      initial={false}
+      exit={{ opacity: 0, transition: { duration: 0.09 } }}
+    >
+      {field && (
+        <label className="nav-field">
+          <Icon name="search" size={14} />
+          <input
+            ref={input}
+            role="combobox"
+            aria-label="Go to a message"
+            aria-expanded
+            aria-controls={`${uid}list`}
+            aria-activedescendant={cur >= 0 ? rowId(cur) : undefined}
+            aria-autocomplete="list"
+            value={query}
+            onChange={(e) => {
+              typed.current = true;
+              setQuery(e.target.value);
+            }}
+            onKeyDown={onKeyDown}
+            onFocus={(e) => onPin(e.relatedTarget)}
+            // The focus went to something else (the palette, the composer): the index is done. A press inside it keeps it.
+            onBlur={(e) => e.relatedTarget instanceof Element && !e.relatedTarget.closest('.nav-index') && onClose(false)}
+            placeholder="Go to a message"
+            spellCheck={false}
+            autoComplete="off"
+          />
+          {!asked && <Kbd combo="mod+g" />}
+        </label>
+      )}
+      <div ref={list} id={`${uid}list`} className="nav-list scroll" role="listbox" aria-label="Your messages" data-found={found ? '' : undefined}>
+        {sections}
+        {!sections.length && <p className="nav-none">No message matches “{q}”.</p>}
       </div>
+    </motion.div>
+  );
+});
+
+const NONE: number[] = [];
+
+interface RowProps {
+  i: number;
+  id: string;
+  line: string;
+  /** Characters of the line that match what was typed. */
+  marked: number[];
+  /** When it was sent: shown in a list of matches, which has no heads. */
+  when?: string;
+  here: boolean;
+  cur: boolean;
+  flag?: 'wait' | 'fail';
+  onPick: (i: number) => void;
+  onPoint: (i: number) => void;
+}
+
+const Row = memo(function Row({ i, id, line, marked, when, here, cur, flag, onPick, onPoint }: RowProps) {
+  return (
+    <div
+      id={id}
+      role="option"
+      aria-selected={cur}
+      aria-current={here || undefined}
+      className="nav-row"
+      data-i={i}
+      data-here={here || undefined}
+      data-cur={cur || undefined}
+      onPointerMove={() => onPoint(i)}
+      // The field keeps the focus (and the keys) when a row is pressed.
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={() => onPick(i)}
+    >
+      <span className="nav-words truncate">{marked.length ? highlightRuns(line, marked).map((r, k) => (r.hit ? <mark key={k}>{r.text}</mark> : <span key={k}>{r.text}</span>)) : line}</span>
+      {when && <span className="nav-time num">{when}</span>}
+      {flag && (
+        <i className="nav-dot" data-kind={flag}>
+          <span className="sr-only">{flag === 'wait' ? 'Waiting for you' : 'Failed'}</span>
+        </i>
+      )}
     </div>
   );
-}
+});
