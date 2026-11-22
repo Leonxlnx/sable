@@ -5,8 +5,9 @@
 }
 
 /*
- * The field darkens itself behind the centre column; this adds a last, very wide breath of
- * shade under the headline and composer, with no edge anywhere.
+ * The field darkens itself behind the centre column; this adds only a faint, very wide breath of
+ * shade under the headline, with no edge anywhere. It is kept light on purpose: together with the
+ * bar's own shadow a stronger one read as a dark halo that took the field's colour round the bar.
  */
 .home-veil {
   position: absolute;
@@ -14,7 +15,7 @@
   pointer-events: none;
   /* Radii in percent: a radial-gradient with min() radii is dropped as invalid (the veil never drew). */
   background:
-    radial-gradient(ellipse 62% 48% at 50% 44%, rgb(12 12 14 / 0.5) 0%, rgb(12 12 14 / 0.22) 55%, transparent 100%),
+    radial-gradient(ellipse 62% 48% at 50% 40%, rgb(12 12 14 / 0.26) 0%, rgb(12 12 14 / 0.1) 55%, transparent 100%),
     /* The top bar's controls lie over the field here: a short shade under them, eased out with no
        edge, so they keep their contrast on a bright backdrop (nothing to see on a quiet one). */
     linear-gradient(to bottom, rgb(12 12 14 / 0.72) 0, rgb(12 12 14 / 0.6) 24px, rgb(12 12 14 / 0.34) 52px, rgb(12 12 14 / 0.12) 78px, transparent 104px);

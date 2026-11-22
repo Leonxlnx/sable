@@ -25,7 +25,7 @@ import { keepDrafts } from './drafts';
 import { carryOver, leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
 import { holdSend, moveSend, sendBack, sendDone } from './pending';
 import { watchWidth } from './width-watch';
-import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut } from './Controls';
+import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut, usePanePlace } from './Controls';
 import { CoveSkin } from './Cove';
 import { PROVIDER_NAME } from '@/art/Logo';
 import { ModelEffort } from './Thinking';
@@ -167,17 +167,20 @@ const StageDrop = memo(function StageDrop({ host, images }: { host: HTMLElement 
 
 /** The attach button and its menu: memoized, so the composer's renders (each keystroke, a status change) skip it. */
 const AttachMenu = memo(function AttachMenu({ images, side, onAdd, onMention }: { images: boolean; side: 'top' | 'bottom'; onAdd: () => void; onMention: () => void }) {
+  const [open, setOpen] = useState(false);
+  const disc = useRef<HTMLButtonElement>(null);
+  const place = usePanePlace(disc, open, side, 'start', 2 * 28 + 8);
   return (
-    <RM.Root modal={false}>
+    <RM.Root open={open} onOpenChange={setOpen} modal={false}>
       <Tip label={images ? 'Attach files or images' : 'Attach files'} side="top">
         <RM.Trigger asChild>
-          <button type="button" className="cmp-attach" aria-label="Attach">
+          <button ref={disc} type="button" className="cmp-attach" aria-label="Attach">
             <PlusGlyph />
           </button>
         </RM.Trigger>
       </Tip>
       <RM.Portal>
-        <RM.Content className="pop cm-pop" data-spot side={side} align="start" sideOffset={8} collisionPadding={10} style={{ width: 220 }} onCloseAutoFocus={(e) => e.preventDefault()}>
+        <RM.Content className="pop cm-pop" data-spot side={place.side} align="start" sideOffset={place.sideOffset} alignOffset={place.alignOffset} avoidCollisions={place.avoid} collisionPadding={10} style={{ width: 208 }} onCloseAutoFocus={(e) => e.preventDefault()}>
           <RM.Item className="menu-item" onSelect={onAdd}>
             <Icon name={images ? 'image' : 'file-plus'} size={15} />
             <span className="grow">{images ? 'Add files or images' : 'Add files'}</span>
@@ -269,10 +272,17 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const ultraSeq = useRef(0);
   const searchSeq = useRef(0);
 
-  const opening = useStore((s) => variant === 'session' && !!sessionId && !s.data[sessionId]?.loaded);
-  // A chat with nothing said yet asks for the first task, as home does; later the field is a reply.
-  const fresh = useStore((s) => variant === 'session' && !!sessionId && !!s.data[sessionId]?.loaded && !s.data[sessionId]!.roots.length);
   const busy = status === 'running' || status === 'awaiting' || status === 'starting';
+  // A chat with nothing said yet asks for the first task, as home does; later the field is a reply.
+  // While its conversation still loads, the session itself says which: a chat that has had a turn
+  // (or runs one) is a reply. So the field never stands blank and then names itself a moment later.
+  const fresh = useStore((s) => {
+    if (variant !== 'session' || !sessionId) return false;
+    const d = s.data[sessionId];
+    if (d?.loaded) return !d.roots.length;
+    const st = s.sessions[sessionId]?.status;
+    return !(s.sessions[sessionId]?.usage?.turns ?? 0) && st !== 'running' && st !== 'awaiting' && st !== 'starting';
+  });
   const shell = variant === 'session' && text.startsWith('!');
   const trimmed = text.trim();
   const canSend = shell ? text.slice(1).trim().length > 0 : trimmed.length > 0 || attachments.length > 0;
@@ -904,10 +914,10 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   };
 
   const queueing = variant === 'session' && busy && !shell;
-  // A session switched to whose conversation is still loading: no placeholder and no agent
-  // controls yet, so the dock never shows a default ("Reply", skeleton chips) for a frame before
-  // the session's own state arrives.
-  const placeholder = opening ? '' : ghost || (shell && text === '!') ? '' : variant === 'home' ? (signedOut ? `Sign in to ${PROVIDER_NAME[homeAgent]} to start` : 'Describe a task or ask a question') : queueing ? 'Queue a follow-up' : fresh ? 'Describe a task or ask a question' : 'Reply';
+  // The bar stands complete in the first frame of a chat that opens: its placeholder from the
+  // session itself (above), its mode, model and effort from the session and the agent's last
+  // known answer (choice.ts, caps-seen.ts). Nothing waits for the conversation to load.
+  const placeholder = ghost || (shell && text === '!') ? '' : variant === 'home' ? (signedOut ? `Sign in to ${PROVIDER_NAME[homeAgent]} to start` : 'Describe a task or ask a question') : queueing ? 'Queue a follow-up' : fresh ? 'Describe a task or ask a question' : 'Reply';
 
   return (
     <div className="composer" data-variant={variant}>
@@ -942,7 +952,6 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
         data-ultra={ultraLook || undefined}
         data-shell={shell || undefined}
         data-empty={!text && !attachments.length ? '' : undefined}
-        data-opening={opening || undefined}
         onMouseDown={(e) => {
           const t = e.target as HTMLElement;
           if (t === e.currentTarget || t.classList.contains('cmp-bar') || t.classList.contains('cmp-side')) {
@@ -1019,9 +1028,6 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
           <div className="cmp-side cmp-right">
             <div className="cmp-agent" inert={shell || undefined}>
               <ModelPopover choice={choice} side={popSide} onClosed={focus} />
-              <span className="cmp-dot" aria-hidden>
-                ·
-              </span>
               <ModelEffort choice={choice} side={popSide} onClosed={focus} ultraOffered={ultraOffered} ultracode={ultra} onUltracode={toggleUltra} />
             </div>
           </div>

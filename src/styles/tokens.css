@@ -152,11 +152,22 @@
   /* What focus lays under the composer's content: a little more ink, so the words sit calmer.
      Never lighter. */
   --glass-pane-lift: rgb(9 9 11 / 0.14);
+  /* The pane without its blur (shed under load): the tone --glass-pane has over the bare stage
+     (--sheet), opaque. Never the lighter --glass-solid: the bar must not turn pale under load. */
+  --glass-pane-solid: rgb(14 14 16);
   --blur-pane: blur(22px) saturate(150%);
   /* Depth: a dark contact line that sharpens the rim evenly, a tight near shadow, a wide soft one. */
   --shadow-glass: 0 0 0 1px rgb(0 0 0 / 0.42), 0 2px 5px -1px rgb(0 0 0 / 0.38), 0 14px 34px -12px rgb(0 0 0 / 0.72), 0 34px 70px -34px rgb(0 0 0 / 0.6);
   /* What focus adds under the composer (its own layer, faded in; never an animated shadow). */
   --shadow-glass-lift: 0 22px 48px -16px rgb(0 0 0 / 0.78), 0 44px 90px -40px rgb(0 0 0 / 0.6);
+  /* The composer's own depth. It lies on the field, so it casts far less than a menu does: the
+     contact line, a short near shadow and one soft shadow that stays under the pane, so the
+     field keeps its colour round the bar. Focus adds nothing outside the pane (the composer does
+     not use --shadow-glass-lift). The layers one by one, for the cove's corner (composer.css). */
+  --pane-contact: 0 0 0 1px rgb(0 0 0 / 0.42);
+  --pane-near: 0 1px 3px -1px rgb(0 0 0 / 0.3);
+  --pane-far: 0 9px 20px -14px rgb(0 0 0 / 0.46);
+  --shadow-pane: var(--pane-contact), var(--pane-near), var(--pane-far);
   /* The reactive hairline on glass: the same rim, a little brighter near the pointer and fading
      out wide, so it never reads as a second line. */
   --spot-glass: rgb(255 255 255 / 0.12);

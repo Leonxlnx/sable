@@ -1,4 +1,4 @@
-import { GLASS, INK, SHADOW, frameBounds, lerp, type LiquidFrame, type Taper } from './liquid-shape';
+import { GLASS, INK, SHADOW, frameBounds, inkAt, lerp, type LiquidFrame, type Taper } from './liquid-shape';
 
 /**
  * Draws liquid frames (liquid-shape.ts) onto a canvas: in the worker (liquid.worker.ts) or, where
@@ -80,6 +80,7 @@ uniform float uJoin;
 uniform float uLens;
 uniform vec4 uInk;
 uniform vec4 uLook;
+uniform float uSettle;
 uniform sampler2D uBack;
 uniform vec4 uBackRect;
 uniform vec2 uBackLook;
@@ -233,12 +234,14 @@ void main() {
   float dome = glass * smoothstep(4.0, 9.0, uLens);
   if (uBackLook.x > 0.0 && dome > 0.0) through = field(p + n * s * s * uLens * ${GLASS.bend.toFixed(2)}) * uBackLook.x * dome * ${GLASS.pass.toFixed(2)} * (1.0 - mixed);
   float shapeA = body * a;
-  // One soft shadow, below: the ink's own (not the bar's), and none on the bar.
+  // One soft shadow, below: the ink's own (not the bar's), and none on the bar. It goes as the
+  // sheet settles: the card it becomes is a well and casts nothing (through its thin ink a
+  // shadow would show as a darker lower half).
   float sh = 0.0;
-  if (uLite < 0.5) {
+  if (uLite < 0.5 && uSettle < 1.0) {
     vec2 q = p - vec2(0.0, ${SHADOW.y.toFixed(1)});
     float ds = sdAir(q) + ${(SHADOW.blur * 0.25).toFixed(1)};
-    sh = (1.0 - smoothstep(-${(SHADOW.blur * 0.5).toFixed(1)}, ${(SHADOW.blur * 0.5).toFixed(1)}, ds)) * ${SHADOW.a.toFixed(2)} * (1.0 - ce);
+    sh = (1.0 - smoothstep(-${(SHADOW.blur * 0.5).toFixed(1)}, ${(SHADOW.blur * 0.5).toFixed(1)}, ds)) * ${SHADOW.a.toFixed(2)} * (1.0 - ce) * (1.0 - uSettle);
   }
   float outA = shapeA + sh * (1.0 - shapeA);
   outColor = vec4(min(col * shapeA + through * body, vec3(1.0)), outA) * uLook.w;
@@ -297,6 +300,7 @@ function glRenderer(canvas: AnyCanvas, scale: number): LiquidRenderer | null {
     lens: u('uLens'),
     ink: u('uInk'),
     look: u('uLook'),
+    settle: u('uSettle'),
     back: u('uBack'),
     backRect: u('uBackRect'),
     backLook: u('uBackLook'),
@@ -395,8 +399,9 @@ function glRenderer(canvas: AnyCanvas, scale: number): LiquidRenderer | null {
         gl.uniform4f(U.taper, tf[0], tf[1], tt[0], tt[1]);
         gl.uniform1f(U.join, f.join);
         gl.uniform1f(U.lens, f.lens);
-        const c = INK.fill.map((v, i) => lerp(v, INK.lift[i], f.light) / 255);
-        gl.uniform4f(U.ink, c[0], c[1], c[2], INK.a);
+        const c = inkAt(f.light, f.settle);
+        gl.uniform4f(U.ink, c[0] / 255, c[1] / 255, c[2] / 255, c[3]);
+        gl.uniform1f(U.settle, f.settle ?? 0);
         gl.uniform4f(U.look, f.light, INK.rim, INK.lit, f.alpha);
         const k = back && !lite ? backs.get(back) : undefined;
         gl.bindTexture(gl.TEXTURE_2D, k ? k.tex : none);
@@ -480,8 +485,8 @@ function canvas2d(canvas: AnyCanvas, scale: number): LiquidRenderer | null {
             ctx.clip();
           }
         }
-        const c = INK.fill.map((v, i) => Math.round(lerp(v, INK.lift[i], f.light)));
-        ctx.fillStyle = `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${INK.a})`;
+        const c = inkAt(f.light, f.settle);
+        ctx.fillStyle = `rgba(${Math.round(c[0])}, ${Math.round(c[1])}, ${Math.round(c[2])}, ${c[3].toFixed(3)})`;
         ctx.fill(p, 'nonzero');
         ctx.clip(p, 'nonzero');
         ctx.lineWidth = 2;

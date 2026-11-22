@@ -41,9 +41,11 @@ import { BORN, COLLAPSE, collapseAt, collapseEase, footAt, HAND, linearEasing, p
  * - A message queued while a turn runs hops into the queue tray's new row, melting into it.
  * - A queued message sent from its row gathers into a drop at the row's end and rises from there.
  * - When its row is late (a loaded machine, a slow bridge), the card waits where it landed and
- *   says so: it steps back to the waiting tone and a hairline fills slowly along its lower edge,
- *   on the compositor. It holds until the row is there (or the bridge refuses the message: then
- *   it goes back into the field with its words).
+ *   says so with one thing only: a hairline that fills slowly along its lower edge, on the
+ *   compositor. Its words keep their tone: a card that stepped back to a waiting tone and came
+ *   forward again when the row arrived a moment later blinked (every first message from home,
+ *   whose chat is still being made). It holds until the row is there (or the bridge refuses the
+ *   message: then it goes back into the field with its words).
  * Under reduced motion there is none of this: the items fade in as before.
  */
 
@@ -238,8 +240,6 @@ export const waitStart = (pathEnd: number) => Math.max(WAIT_MIN, pathEnd + WAIT_
 /** The waiting state starts this long after the message is complete, and never before `WAIT_MIN` after the key. */
 const WAIT_AFTER = 120;
 const WAIT_MIN = 380;
-/** The waiting tone (a queued or steered message's, timeline.css `.user[data-queued] .user-card`). */
-const WAIT_TONE = 0.6;
 /** The hairline's slow fill: quick at first, then ever slower, never quite to the end on its own. */
 const WAIT_FILL = 9000;
 const WAIT_REACH = 0.94;
@@ -257,7 +257,7 @@ const CORNER = 34;
 /** The words gather this far over the key's top: just inside the pane, past the channel. */
 const OVER_KEY = 8;
 /** A queue row (composer.css `.cq-list`, `.cq-row`): inset in the tray, its height, its corners, where its words start. */
-const ROW = { inset: 6, gap: 6, height: 28, radius: 9, text: 35 };
+const ROW = { inset: 6, gap: 6, height: 28, radius: 14, text: 35 };
 
 function columnToken(): number {
   return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--column')) || 760;
@@ -1053,7 +1053,7 @@ function releaseAhead(f: Flight) {
   if (Math.abs(y) > 0.5) play(a.content, [{ transform: `translateY(${y.toFixed(2)}px)` }, { transform: 'translateY(0px)' }], { duration: 260, easing: EASE_OUT });
 }
 
-/** The waiting state, from `at` ms after the key: the card at the waiting tone, a hairline filling along its lower edge. */
+/** The waiting state, from `at` ms after the key: a hairline filling along the card's lower edge (the card itself keeps its tone). */
 function waitFrom(f: Flight, at: number) {
   const inner = f.inner;
   const line = document.createElement('i');
@@ -1061,7 +1061,6 @@ function waitFrom(f: Flight, at: number) {
   line.setAttribute('aria-hidden', 'true');
   inner.appendChild(line);
   f.line = line;
-  const tone = fromKey(f, inner, [{ opacity: 1 }, { opacity: WAIT_TONE }], { duration: 260, delay: at, easing: 'cubic-bezier(0.3, 0, 0.2, 1)', fill: 'forwards' });
   const fill = fromKey(
     f,
     line,
@@ -1072,7 +1071,7 @@ function waitFrom(f: Flight, at: number) {
     ],
     { duration: WAIT_FILL, delay: at, easing: 'cubic-bezier(0.2, 0.7, 0.3, 1)', fill: 'forwards' },
   );
-  f.wait = [tone, fill].filter((a): a is Animation => !!a);
+  f.wait = fill ? [fill] : [];
 }
 
 /** Whether the waiting state has begun (its animations are past their delay). */
@@ -1084,13 +1083,11 @@ function endWait(f: Flight) {
 }
 
 /**
- * The swap after a wait: the row takes the card's tone and steps up to its own, and the hairline
- * runs to the end along the row's edge and fades, so the wait visibly completes as the message lands.
+ * The swap after a wait: the hairline goes on from where it stood on the row's own edge, runs to
+ * the end and fades, so the wait visibly completes as the message lands.
  */
 function finishWait(f: Flight, card: HTMLElement) {
-  const tone = parseFloat(getComputedStyle(f.inner).opacity) || WAIT_TONE;
   const scale = f.line ? new DOMMatrixReadOnly(getComputedStyle(f.line).transform).a : 0;
-  play(card, [{ opacity: tone }, { opacity: 1 }], { duration: 200, easing: EASE_OUT });
   const line = document.createElement('i');
   line.className = 'send-wait';
   line.setAttribute('aria-hidden', 'true');

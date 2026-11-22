@@ -1,197 +1,54 @@
-import { memo, useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from 'react';
-import { Popover as RP } from 'radix-ui';
+import { memo, useCallback, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { DropdownMenu as RM } from 'radix-ui';
 import { STANDARD_SPEED, type Effort, type SpeedInfo } from '@shared/protocol';
 import { effortName, isUltraEffort } from '@/lib/models';
-import { reducedMotion } from '@/lib/motion';
-import { Segmented, Switch, Tip } from '@/ui';
+import { reducedMotion, uiZoom } from '@/lib/motion';
+import { Tip } from '@/ui';
 import { Icon } from '@/icons';
 import { Chip, type ChipPart } from './Chip';
 import { type Choice } from './choice';
-import { ChipSkeleton, MENU_EVENT } from './Controls';
-import { headerLevel, step, stopAt, TRACK_KEYS, type TrackEvent, type TrackState } from './effort-track';
+import { ChipSkeleton, MENU_EVENT, MENU_PAD, ROW_H, usePanePlace } from './Controls';
+import { keyStop, land, lastStop, litLevels, positionOf, SCALE_KEYS, SCRUB_SLOP, scrubStop, type Scale, type Setting } from './effort-track';
 import { paidConfirmed, confirmPaid, takePaidAsk } from './paid-speed';
 import { Later } from './later';
 
-/** The landed bar's detent. */
-const SETTLE_MS = 220;
-/** How long the "ultra" moment plays when it turns on. */
-const BURST_MS = 900;
+/**
+ * The ladder's first focus: the stop in use. With none set (the agent decides the level) nothing is
+ * lit and focus rests on the menu itself, so Enter right after opening changes nothing: the row
+ * nearest the chip would be ultracode on home. The arrows start from there.
+ */
+// DropdownMenu.Content passes this through to the menu's focus scope; its types leave it out.
+const FOCUS_STOP = {
+  onOpenAutoFocus: (e: Event) => {
+    e.preventDefault();
+    const pop = e.currentTarget as HTMLElement;
+    requestAnimationFrame(() => {
+      const at = document.activeElement;
+      if (!pop.isConnected || pop.dataset.state === 'closed' || (at && at !== pop && pop.contains(at))) return;
+      (pop.querySelector<HTMLElement>('[data-current]') ?? pop).focus({ preventScroll: true });
+    });
+  },
+} as object;
+
+/** How long the scale's own part of ultracode's moment plays (composer.css `th-pip-wave`). */
+const BURST_MS = 700;
 
 /**
- * The "ultra" mark: two stacked heads, the second riding under the first. The same drawing the
- * send key gains, worn by ultracode (Claude Code) and by the Ultra level (Codex) alike.
+ * The scale as pips: one per level, lit up to where it stands. What lies past the plain levels (an
+ * Ultra level, ultracode) stands a step apart, outlined until it is reached. A change runs along
+ * the pips from where the scale stood (`from`), so it reads as a move and never as a swap.
  */
-export function UltraMark({ className }: { className?: string }) {
-  return (
-    <svg className={className ? `ux-mark ${className}` : 'ux-mark'} width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden>
-      <path className="ux-m1" d="M3.6 6.4 7 3l3.4 3.4" />
-      <path className="ux-m2" d="M3.6 10.6 7 7.2l3.4 3.4" />
-    </svg>
-  );
-}
-
-/** A level's name, with the ultra mark in front of an Ultra level. */
-function LevelName({ effort }: { effort: Effort | undefined }) {
-  return (
-    <>
-      {isUltraEffort(effort) && <UltraMark />}
-      {effort ? effortName(effort) : 'Default'}
-    </>
-  );
-}
-
-/** The level as a dial: the arc is the share of the way to the top level (none: the agent decides). */
-export function Dial({ level, of }: { level: number; of: number }) {
-  const round = 2 * Math.PI * 5;
-  const share = of > 0 ? Math.max(0, Math.min(1, level / of)) : 0;
-  return (
-    <svg className="th-dial" width="14" height="14" viewBox="0 0 14 14" aria-hidden>
-      <circle className="th-dial-track" cx="7" cy="7" r="5" />
-      <circle className="th-dial-arc" cx="7" cy="7" r="5" strokeDasharray={round} strokeDashoffset={round * (1 - share)} opacity={share ? 1 : 0} />
-    </svg>
-  );
-}
-
-interface TrackProps {
-  efforts: Effort[];
-  /** The confirmed level (or -1 when the agent decides). */
-  level: number;
-  /** While the pointer drags: the stop it stands on, so the chip names the same level as the track. */
-  onPreview: (i: number | null) => void;
-  /** A stop settled (release, click or key): save and send it. */
-  onCommit: (i: number) => void;
-  onDone: () => void;
-  trackRef: RefObject<HTMLDivElement | null>;
-  burst: boolean;
-}
-
-/**
- * The effort steps: one row of cells, one per level, lit up to the level (the current one ivory, an
- * Ultra level outlined until reached). Click a cell, drag across them, or use the arrows, Home, End and number keys: all
- * go through `step()` (effort-track.ts), so what the header names is what lands and is sent.
- */
-function Track({ efforts, level, onPreview, onCommit, onDone, trackRef, burst }: TrackProps) {
+export function Pips({ efforts, pos, ultra, from = pos }: { efforts: Effort[]; pos: number; ultra: boolean; from?: number }) {
   const n = efforts.length;
-  const [s, setS] = useState<TrackState>({ level, hover: null, dragging: false });
-  // The landing: the settled bar takes a short detent (one keyframe, restarted per landing).
-  const [settle, setSettle] = useState(false);
-  const settleTimer = useRef(0);
-  useEffect(() => () => window.clearTimeout(settleTimer.current), []);
-  const row = useRef<HTMLSpanElement>(null);
-  const sRef = useRef(s);
-  sRef.current = s;
-  // The level the track drew last, so the lighting runs outward from where it was.
-  const prev = useRef(s.level);
-  const from = prev.current;
-  useEffect(() => {
-    prev.current = s.level;
-  }, [s.level]);
-
-  // The confirmed value moved from outside: follow it (never mid-drag).
-  useEffect(() => {
-    if (level !== sRef.current.level) setS((cur) => step(cur, { type: 'sync', level }, n).state);
-  }, [level, n]);
-
-  const dispatch = (e: TrackEvent) => {
-    const out = step(sRef.current, e, n);
-    sRef.current = out.state;
-    setS(out.state);
-    if (e.type === 'down' || e.type === 'move') onPreview(out.state.dragging ? out.state.level : null);
-    if (out.commit !== undefined) {
-      onPreview(null);
-      onCommit(out.commit);
-      setSettle(false);
-      window.clearTimeout(settleTimer.current);
-      settleTimer.current = window.setTimeout(() => {
-        setSettle(true);
-        settleTimer.current = window.setTimeout(() => setSettle(false), SETTLE_MS);
-      }, 0);
-    }
-    if (out.done) onDone();
-  };
-
-  const at = (clientX: number) => {
-    const r = row.current?.getBoundingClientRect();
-    return r ? stopAt(clientX, r.left, r.width, n) : 0;
-  };
-
-  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
-    e.preventDefault();
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      /* a synthetic pointer */
-    }
-    e.currentTarget.focus({ preventScroll: true });
-    dispatch({ type: 'down', at: at(e.clientX) });
-  };
-  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const i = at(e.clientX);
-    const cur = sRef.current;
-    if (cur.dragging ? i !== cur.level : i !== cur.hover) dispatch({ type: 'move', at: i });
-  };
-  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (!TRACK_KEYS.test(e.key)) return;
-    e.preventDefault();
-    dispatch({ type: 'key', key: e.key });
-  };
-
-  const named = headerLevel(s);
-  const shown = efforts[named];
-  const still = reducedMotion();
-
+  const lit = litLevels(pos, { levels: n, ultra });
+  const order = (i: number) => ({ '--i': i, '--d': Math.max(0, Math.abs(i - from) - 1) }) as CSSProperties;
   return (
-    <div className="th-body">
-      <div className="th-head">
-        <span className="th-name" data-preview={named !== s.level || undefined} data-ultra={isUltraEffort(shown) || undefined} key={named}>
-          <LevelName effort={shown} />
-        </span>
-        <span className="th-title">Effort</span>
-      </div>
-      <div
-        ref={trackRef}
-        className="th-track"
-        role="slider"
-        tabIndex={0}
-        aria-label="Effort"
-        aria-valuemin={1}
-        aria-valuemax={n}
-        aria-valuenow={s.level + 1}
-        aria-valuetext={effortName(efforts[s.level]) ?? 'Default'}
-        data-pressed={s.dragging || undefined}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={() => dispatch({ type: 'up' })}
-        onPointerCancel={() => dispatch({ type: 'up' })}
-        onLostPointerCapture={() => sRef.current.dragging && dispatch({ type: 'up' })}
-        onPointerLeave={() => dispatch({ type: 'leave' })}
-        onKeyDown={onKeyDown}
-      >
-        <span ref={row} className="th-steps">
-          {efforts.map((e, i) => {
-            const on = i <= s.level;
-            const cur = i === s.level;
-            return (
-              <span
-                key={e}
-                className="th-col"
-                data-on={on || undefined}
-                data-cur={cur || undefined}
-                data-hover={(i === s.hover && !s.dragging) || undefined}
-                data-ultra={isUltraEffort(e) || undefined}
-                data-burst={(burst && isUltraEffort(e)) || undefined}
-              >
-                <i
-                  data-settle={(cur && settle && !still) || undefined}
-                  style={{ transitionDelay: still ? undefined : `${Math.max(0, Math.abs(i - from) - 1) * 24}ms` }}
-                />
-              </span>
-            );
-          })}
-        </span>
-      </div>
-    </div>
+    <span className="th-pips" aria-hidden>
+      {efforts.map((e, i) => (
+        <i key={e} data-on={i < lit || undefined} data-far={isUltraEffort(e) || undefined} style={order(i)} />
+      ))}
+      {ultra && <i data-far="" data-on={pos >= n || undefined} style={order(n)} />}
+    </span>
   );
 }
 
@@ -204,7 +61,7 @@ export interface ThinkingProps {
   ultraOffered: boolean;
   ultracode: boolean;
   onUltracode: (on: boolean) => void;
-  /** Speeds beyond standard the model offers; none hides the Speed row. */
+  /** Speeds beyond standard the model offers; none hides the speed rows. */
   speeds?: SpeedInfo[];
   speed?: string;
   onSpeed?: (id: string) => void;
@@ -212,91 +69,48 @@ export interface ThinkingProps {
   sessionId?: string | null;
   side: 'top' | 'bottom';
   onClosed: () => void;
+  /** The chip stood as a placeholder first: it comes in once (composer.css `data-late`). */
+  late?: boolean;
 }
 
 /**
- * Standard and the faster speeds, one segmented row. A speed included in the plan is a plain
- * choice (its cost note in the tooltip); a paid one (Claude's fast mode) names its cost in the row
- * and, the first time in a session, asks before it is turned on.
+ * Effort, set on the bar. At rest the chip is the scale itself: its pips and the level's name.
+ * - Drag it sideways and the level follows, stop by stop; the keyboard's left and right arrows do
+ *   the same while it has focus. Nothing opens, and the field keeps the caret.
+ * - Past the last level stands one more stop: ultracode. It keeps the level that was set under it.
+ * - A click opens the ladder: every stop by name, the highest on top, and under it the speeds the
+ *   model offers beyond standard.
+ * Every way in ends in `land()` (effort-track.ts), so what the chip names is what is sent.
  */
-function SpeedRow({ speeds, speed, onSpeed, sessionId, ask, onAsk }: { speeds: SpeedInfo[]; speed: string; onSpeed: (id: string) => void; sessionId: string | null; ask: string | null; onAsk: (id: string | null) => void }) {
-  const asking = ask ? speeds.find((s) => s.id === ask) : undefined;
-  const options = [{ id: STANDARD_SPEED, name: 'Standard' } as SpeedInfo, ...speeds].map((s) => ({
-    value: s.id,
-    label: s.paid ? (
-      <span className="th-paid">
-        {s.name}
-        <span className="th-cost">{s.note ?? 'Extra usage'}</span>
-      </span>
-    ) : s.note ? (
-      <Tip label={s.note} side="bottom">
-        <span>{s.name}</span>
-      </Tip>
-    ) : (
-      s.name
-    ),
-  }));
-  const pick = (id: string) => {
-    const s = speeds.find((x) => x.id === id);
-    if (s?.paid && sessionId && !paidConfirmed(sessionId)) return onAsk(id);
-    onAsk(null);
-    onSpeed(id);
-  };
-  return (
-    <div className="th-speed">
-      <div className="th-head">
-        <span className="th-title">Speed</span>
-      </div>
-      {asking ? (
-        <div className="th-ask" role="group" aria-label={`Turn on ${asking.name.toLowerCase()} mode`}>
-          <p className="th-ask-q">
-            {asking.name} mode is billed as extra usage, not from your plan.
-          </p>
-          <div className="th-ask-row">
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => onAsk(null)}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="btn btn-sm btn-primary"
-              autoFocus
-              onClick={() => {
-                if (sessionId) confirmPaid(sessionId);
-                onAsk(null);
-                onSpeed(asking.id);
-              }}
-            >
-              Turn on
-            </button>
-          </div>
-        </div>
-      ) : (
-        <Segmented id="th-speed" className="th-speed-seg" value={speed} onChange={pick} options={options} />
-      )}
-    </div>
-  );
-}
-
-/**
- * The thinking control: the level's name at rest; a small popover with the
- * stepped track and, where the agent has it, the ultracode switch. Choices apply live.
- */
-export const Thinking = memo(function Thinking({ efforts, value, onChange, ultraOffered, ultracode, onUltracode, speeds = NO_SPEEDS, speed = STANDARD_SPEED, onSpeed, sessionId = null, side, onClosed }: ThinkingProps) {
+export const Thinking = memo(function Thinking({ efforts, value, onChange, ultraOffered, ultracode, onUltracode, speeds = NO_SPEEDS, speed = STANDARD_SPEED, onSpeed, sessionId = null, side, onClosed, late }: ThinkingProps) {
   const [open, setOpen] = useState(false);
   // A level sent and not yet confirmed, so nothing waits on a round trip; and the stop a drag stands on.
   const [local, setLocal] = useState<Effort | undefined>();
   const [preview, setPreview] = useState<number | null>(null);
   const committed = local && efforts.includes(local) ? local : value;
-  const committedLevel = committed ? efforts.indexOf(committed) : -1;
-  // The chip names what the track stands for: the dragged stop while a drag runs.
-  const shown = preview !== null && efforts[preview] ? efforts[preview] : committed;
   const ucOn = ultraOffered && ultracode;
-  const look = ucOn || isUltraEffort(shown);
-  // A paid speed waiting on its question (from a click in the row or from `/fast`).
+  const scale: Scale = { levels: efforts.length, ultra: ultraOffered };
+  const now: Setting = { level: committed ? efforts.indexOf(committed) : -1, ultra: ucOn };
+  const at = positionOf(now, scale);
+  // The chip names what the scale stands on: the dragged stop while a drag runs.
+  const pos = preview ?? at;
+  const onUltra = ultraOffered && pos === efforts.length;
+  const shown = onUltra ? undefined : efforts[pos];
+  const look = onUltra || isUltraEffort(shown);
+  // A paid speed waiting on its question (from a click on its row or from `/fast`).
   const [ask, setAsk] = useState<string | null>(null);
 
-  const track = useRef<HTMLDivElement>(null);
+  const chip = useRef<HTMLButtonElement>(null);
+  // The ladder's height: its stops (the step of air before what lies past the levels), then the speeds or their question.
+  const need = (efforts.length + (ultraOffered ? 1 : 0)) * ROW_H + 4 + (speeds.length ? 9 + Math.max(speeds.length * ROW_H, ask ? 96 : 0) : 0) + MENU_PAD;
+  const place = usePanePlace(chip, open, side, 'end', need);
   const settleTimer = useRef(0);
+  // Where the scale stood when it last drew, so a change runs along the pips from there.
+  const drawn = useRef(pos);
+  const from = drawn.current;
+  useEffect(() => {
+    drawn.current = pos;
+  }, [pos]);
 
   useEffect(() => {
     const on = (e: Event) => {
@@ -331,56 +145,141 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
     [efforts, onChange],
   );
 
-  // The "ultra" moment: when it turns on by the user's hand, not when a view opens with it on.
+  /** Lands on a stop: sends what that changes, the level before ultracode. */
+  const go = (to: number, via: 'key' | 'drag' | 'pick') => {
+    const out = land(now, to, scale, via);
+    if (out.level !== undefined) commit(out.level);
+    if (out.ultra !== undefined) onUltracode(out.ultra);
+  };
+
+  // The "ultra" moment: when it turns on by the person's hand, not when a view opens with it on.
   const [burst, setBurst] = useState(false);
   const wasLook = useRef(look);
   useEffect(() => {
-    if (look === wasLook.current) return;
+    // While a drag still runs the stop is only passed over: the moment comes with the landing.
+    if (preview !== null || look === wasLook.current) return;
     wasLook.current = look;
     if (!look || reducedMotion()) return setBurst(false);
     setBurst(true);
     const t = window.setTimeout(() => setBurst(false), BURST_MS);
     return () => window.clearTimeout(t);
-  }, [look]);
+  }, [look, preview]);
+
+  // ── the chip: a click opens the ladder, a drag scrubs the scale ──
+
+  const drag = useRef<{ id: number; x: number; from: number; to: number; moved: boolean; wasOpen: boolean } | null>(null);
+  const [scrub, setScrub] = useState(false);
+
+  const onPointerDown = (e: ReactPointerEvent<HTMLButtonElement>) => {
+    if (e.button !== 0 || e.ctrlKey) return;
+    // Radix opens a menu on the press itself. This chip opens on a click and scrubs on a drag, so
+    // the press is ours; it also leaves focus where it is (the field keeps the caret).
+    e.preventDefault();
+    drag.current = { id: e.pointerId, x: e.clientX, from: at, to: at, moved: false, wasOpen: open };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* a synthetic pointer */
+    }
+  };
+  const onPointerMove = (e: ReactPointerEvent<HTMLButtonElement>) => {
+    const d = drag.current;
+    if (!d || d.id !== e.pointerId || lastStop(scale) < 0) return;
+    const dx = (e.clientX - d.x) / uiZoom();
+    if (!d.moved) {
+      if (Math.abs(dx) < SCRUB_SLOP) return;
+      d.moved = true;
+      setScrub(true);
+      if (open) setOpen(false);
+    }
+    const to = scrubStop(d.from, dx, scale);
+    if (to === d.to) return;
+    d.to = to;
+    setPreview(to);
+  };
+  const endDrag = (e: ReactPointerEvent<HTMLButtonElement>, landed: boolean) => {
+    const d = drag.current;
+    if (!d || d.id !== e.pointerId) return;
+    drag.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* already let go */
+    }
+    if (d.moved) {
+      setScrub(false);
+      setPreview(null);
+      if (landed && d.to !== d.from) go(d.to, 'drag');
+    } else if (landed) setOpen(!d.wasOpen);
+  };
+  const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
+    if (e.ctrlKey || e.metaKey || e.altKey || !SCALE_KEYS.test(e.key)) return;
+    const to = keyStop(at, e.key, scale);
+    e.preventDefault();
+    if (to !== null) go(to, 'key');
+  };
 
   const hasSpeed = speeds.length > 0 && !!onSpeed;
   if (!efforts.length && !ultraOffered && !hasSpeed) return null;
 
   const fast = hasSpeed && speed !== STANDARD_SPEED;
   const speedInfo = speeds.find((s) => s.id === speed);
-  const name = shown ? effortName(shown) : 'Default';
-  const aria = (efforts.length ? `Effort: ${name}${ucOn ? ', ultracode on' : ''}` : ultraOffered ? `Ultracode ${ucOn ? 'on' : 'off'}` : 'Speed') + (fast ? `, ${speedInfo?.name ?? 'fast'} speed${speedInfo?.paid ? ', billed as extra usage' : ''}` : '');
-  const tip = (efforts.length ? (ucOn ? `Effort and ultracode` : 'Effort') : ultraOffered ? 'Ultracode' : 'Speed') + (fast && speedInfo?.paid ? ` · ${speedInfo.name} on extra usage` : '');
-  // What the chip says, part by part (Chip.tsx): a part that stays keeps showing while the others
-  // come and go, so turning ultracode on only adds its mark and the word never blinks. The chip
-  // hugs its label and its right end (before the cove) holds, so the popover aligned to it stays put.
+  const asking = ask ? speeds.find((s) => s.id === ask) : undefined;
+  const levelName = shown ? effortName(shown) : 'Default';
+  const name = onUltra ? 'Ultracode' : levelName;
+  const hasScale = lastStop(scale) >= 0;
+  const aria = (hasScale ? (efforts.length ? `Effort: ${onUltra && committed ? `${effortName(committed)}, ultracode on` : name}` : `Ultracode ${ucOn ? 'on' : 'off'}`) : 'Speed') + (fast ? `, ${speedInfo?.name ?? 'fast'} speed${speedInfo?.paid ? ', billed as extra usage' : ''}` : '');
+  const tip = (efforts.length ? 'Effort' : ultraOffered ? 'Ultracode' : 'Speed') + (fast && speedInfo?.paid ? ` · ${speedInfo.name} on extra usage` : '');
+  // What the chip says, part by part (Chip.tsx): the pips stay while the word changes, so a new
+  // level is one glide of the chip's left end and the pips answer in the same frame. The chip
+  // hugs its label and its right end (before the cove) holds.
   const parts: ChipPart[] = [];
-  if (efforts.length > 0) {
-    if (fast) parts.push({ k: 'bolt', node: <Icon name="bolt" size={13} className="th-bolt" /> });
-    if (look) parts.push({ k: 'mark', node: <UltraMark /> });
-    parts.push({ k: 'dial', className: 'th-gauge', node: <Dial level={shown ? efforts.indexOf(shown) + 1 : 0} of={efforts.length} /> });
-    parts.push({ k: `word:${shown ?? ''}`, className: 'th-word', node: name });
-  } else parts.push(ultraOffered ? { k: 'uc', node: <UltraMark className="th-uc" /> } : { k: 'bolt', node: <Icon name="bolt" size={13} className="th-bolt" /> });
+  if (fast || !hasScale) parts.push({ k: 'bolt', node: <Icon name="bolt" size={13} className="th-bolt" /> });
+  if (hasScale) {
+    parts.push({ k: 'pips', node: <Pips efforts={efforts} pos={pos} ultra={ultraOffered} from={from} /> });
+    parts.push({ k: `word:${name}`, className: 'th-word', node: name });
+  }
+  const pickSpeed = (s: SpeedInfo, e: Event) => {
+    const next = speed === s.id ? STANDARD_SPEED : s.id;
+    if (next !== STANDARD_SPEED && s.paid && sessionId && !paidConfirmed(sessionId)) {
+      // Asked once per session, in place: the menu stays.
+      e.preventDefault();
+      setAsk(s.id);
+      return;
+    }
+    onSpeed?.(next);
+  };
   return (
-    <RP.Root open={open} onOpenChange={setOpen}>
+    <RM.Root open={open} onOpenChange={setOpen} modal={false}>
       <Tip label={tip} side="top">
-        <RP.Trigger asChild>
-          <Chip className="tb-chip th-chip" anchor="right" data-ultra={look || undefined} data-burst={burst || undefined} data-bare={!efforts.length || undefined} aria-label={aria} parts={parts} />
-        </RP.Trigger>
+        <RM.Trigger asChild onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={(e) => endDrag(e, true)} onPointerCancel={(e) => endDrag(e, false)} onKeyDown={onKeyDown}>
+          <Chip
+            ref={chip}
+            className="tb-chip th-chip"
+            anchor="right"
+            data-ultra={look || undefined}
+            data-burst={burst || undefined}
+            data-scrub={scrub || undefined}
+            data-bare={!hasScale || undefined}
+            data-late={late || undefined}
+            aria-label={aria}
+            aria-keyshortcuts={hasScale ? 'ArrowLeft ArrowRight' : undefined}
+            parts={parts}
+          />
+        </RM.Trigger>
       </Tip>
-      <RP.Portal>
-        <RP.Content
+      <RM.Portal>
+        <RM.Content
           className="pop cm-pop th-pop"
           data-spot
-          side={side}
+          side={place.side}
           align="end"
-          sideOffset={8}
+          sideOffset={place.sideOffset}
+          alignOffset={place.alignOffset}
+          avoidCollisions={place.avoid}
           collisionPadding={10}
           aria-label="Effort"
-          onOpenAutoFocus={(e) => {
-            e.preventDefault();
-            (track.current ?? (e.currentTarget as HTMLElement).querySelector<HTMLElement>('button'))?.focus({ preventScroll: true });
-          }}
+          {...FOCUS_STOP}
           onCloseAutoFocus={(e) => {
             e.preventDefault();
             onClosed();
@@ -389,27 +288,86 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
           <Later>
             {() => (
               <>
-                {efforts.length > 0 && <Track efforts={efforts} level={committedLevel} onPreview={setPreview} onCommit={commit} onDone={() => setOpen(false)} trackRef={track} burst={burst && isUltraEffort(shown)} />}
-                {efforts.length > 0 && ultraOffered && <div className="menu-sep th-sep" role="separator" />}
                 {ultraOffered && (
-                  <label className="th-uc-row" data-on={ucOn || undefined} data-burst={(burst && ucOn) || undefined}>
-                    <UltraMark className="th-uc-mark" />
+                  // Past the end of the scale. Picked again while it is on, it only switches off: the level kept under it stands (none, where the agent decides it).
+                  <RM.Item className="menu-item th-row th-row-far" data-current={ucOn || undefined} data-lit={ucOn || undefined} onSelect={() => (ucOn ? onUltracode(false) : go(efforts.length, 'pick'))}>
+                    <i className="th-seg" aria-hidden />
                     <span className="grow">Ultracode</span>
-                    <Switch checked={ucOn} onChange={onUltracode} label="Ultracode" />
-                  </label>
+                  </RM.Item>
                 )}
-                {hasSpeed && (efforts.length > 0 || ultraOffered) && <div className="menu-sep th-sep" role="separator" />}
-                {hasSpeed && <SpeedRow speeds={speeds} speed={speed} onSpeed={onSpeed!} sessionId={sessionId} ask={ask} onAsk={setAsk} />}
+                {efforts
+                  .map((e, i) => (
+                    <RM.Item
+                      key={e}
+                      className={isUltraEffort(e) ? 'menu-item th-row th-row-far' : 'menu-item th-row'}
+                      data-current={(!ucOn && i === now.level) || undefined}
+                      data-lit={ucOn || i <= now.level || undefined}
+                      onSelect={() => go(i, 'pick')}
+                    >
+                      <i className="th-seg" aria-hidden />
+                      <span className="grow">{effortName(e)}</span>
+                      {/* The level kept under ultracode: where the scale steps back to. */}
+                      {ucOn && i === now.level && <Icon name="check" size={13} className="th-kept" />}
+                    </RM.Item>
+                  ))
+                  .reverse()}
+                {hasSpeed && hasScale && <RM.Separator className="menu-sep th-sep" />}
+                {hasSpeed &&
+                  (asking ? (
+                    // Its own keys: Tab moves between the two buttons, and no letter reaches the menu's typeahead.
+                    <div className="th-ask" role="group" aria-label={`Turn on ${asking.name.toLowerCase()} mode`} onKeyDown={(e) => e.stopPropagation()}>
+                      <p className="th-ask-q">{asking.name} mode is billed as extra usage, not from your plan.</p>
+                      <div className="th-ask-row">
+                        <button type="button" className="btn btn-sm btn-ghost" onClick={() => setAsk(null)}>
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-primary"
+                          autoFocus
+                          onClick={() => {
+                            if (sessionId) confirmPaid(sessionId);
+                            setAsk(null);
+                            onSpeed?.(asking.id);
+                            setOpen(false);
+                          }}
+                        >
+                          Turn on
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    speeds.map((s) => {
+                      // A speed is on or off: picked again, it goes back to standard.
+                      const row = (
+                        <RM.CheckboxItem key={s.id} className="menu-item th-row th-speed" checked={speed === s.id} onSelect={(e) => pickSpeed(s, e)}>
+                          <Icon name="bolt" size={13} className="th-lead" />
+                          <span className="grow truncate">{s.name}</span>
+                          {/* A speed billed outside the plan names its cost on its row. */}
+                          {s.paid && speed !== s.id && <span className="th-cost">{s.note ?? 'Extra usage'}</span>}
+                          <span className="mm-check">{speed === s.id && <Icon name="check" size={14} />}</span>
+                        </RM.CheckboxItem>
+                      );
+                      // What a speed inside the plan costs (it uses the plan faster) is its tooltip, as before.
+                      return s.note && !s.paid ? (
+                        <Tip key={s.id} label={s.note} side="left">
+                          {row}
+                        </Tip>
+                      ) : (
+                        row
+                      );
+                    })
+                  ))}
               </>
             )}
           </Later>
-        </RP.Content>
-      </RP.Portal>
-    </RP.Root>
+        </RM.Content>
+      </RM.Portal>
+    </RM.Root>
   );
 });
 
-/** The thinking control for the composer's choice, or a placeholder while the caps are on their way. */
+/** The effort control for the composer's choice, or a quiet placeholder while nothing is known of the agent yet. */
 export const ModelEffort = memo(function ModelEffort({
   choice,
   side,
@@ -425,7 +383,9 @@ export const ModelEffort = memo(function ModelEffort({
   ultracode: boolean;
   onUltracode: (on: boolean) => void;
 }) {
-  if (!choice.caps) return choice.capsPending ? <ChipSkeleton w={74} /> : null;
+  const late = useRef(false);
+  if (!choice.caps) late.current = true;
+  if (!choice.caps) return choice.capsPending ? <ChipSkeleton w={78} /> : null;
   const efforts = choice.model?.efforts ?? NO_EFFORTS;
   return (
     <Thinking
@@ -441,6 +401,7 @@ export const ModelEffort = memo(function ModelEffort({
       sessionId={choice.sessionId}
       side={side}
       onClosed={onClosed}
+      late={late.current}
     />
   );
 });

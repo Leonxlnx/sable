@@ -1,88 +1,93 @@
-/** The effort track's snapping and state, and the rules for a speed billed outside the plan. */
+/** The effort scale's rules (a drag, the keys, a pick, ultracode past the end), and the rules for a speed billed outside the plan. */
 import { describe, expect, it } from 'vitest';
 import type { ModelInfo } from '@shared/protocol';
-import { headerLevel, step, stopAt, type TrackState } from '../src/features/composer/effort-track';
+import { clampStop, keyStop, land, lastStop, litLevels, positionOf, SCRUB_PX, scrubStop, ultraStop, type Scale, type Setting } from '../src/features/composer/effort-track';
 import { defaultableSpeeds, offeredSpeeds, startSpeedFor, toggledSpeed } from '../shared/speed';
 
-describe('effort snapping', () => {
-  it('picks the column under the pointer and clamps outside the row', () => {
-    // Six columns over 240px: 40px each.
-    expect(stopAt(0, 0, 240, 6)).toBe(0);
-    expect(stopAt(39.9, 0, 240, 6)).toBe(0);
-    expect(stopAt(40, 0, 240, 6)).toBe(1);
-    expect(stopAt(239, 0, 240, 6)).toBe(5);
-    expect(stopAt(-50, 0, 240, 6)).toBe(0);
-    expect(stopAt(900, 0, 240, 6)).toBe(5);
-    expect(stopAt(150, 100, 240, 6)).toBe(1);
-    expect(stopAt(10, 0, 0, 6)).toBe(0);
-    expect(stopAt(10, 0, 240, 1)).toBe(0);
-  });
-});
+describe('the effort scale', () => {
+  // Five levels and ultracode past the end: six stops, 0 to 5.
+  const claude: Scale = { levels: 5, ultra: true };
+  // Levels only (an agent without ultracode).
+  const plain: Scale = { levels: 3, ultra: false };
+  // Ultracode alone (a model whose level the agent decides).
+  const bare: Scale = { levels: 0, ultra: true };
+  const high: Setting = { level: 2, ultra: false };
 
-describe('effort track state', () => {
-  const n = 6;
-  const rest: TrackState = { level: 2, hover: null, dragging: false };
-  const run = (s: TrackState, events: Parameters<typeof step>[1][]) => {
-    const commits: number[] = [];
-    for (const e of events) {
-      const out = step(s, e, n);
-      s = out.state;
-      if (out.commit !== undefined) commits.push(out.commit);
-    }
-    return { s, commits };
-  };
-
-  it('a hover previews a name and clears on leave', () => {
-    const { s } = run(rest, [{ type: 'hover', at: 4 }]);
-    expect(headerLevel(s)).toBe(4);
-    expect(s.level).toBe(2);
-    expect(headerLevel(run(s, [{ type: 'leave' }]).s)).toBe(2);
+  it('has one stop per level and one more past the end where ultracode is offered', () => {
+    expect([lastStop(claude), ultraStop(claude)]).toEqual([5, 5]);
+    expect([lastStop(plain), ultraStop(plain)]).toEqual([2, -1]);
+    expect([lastStop(bare), ultraStop(bare)]).toEqual([0, 0]);
+    expect(lastStop({ levels: 0, ultra: false })).toBe(-1);
   });
 
-  it('a press clears the preview, so the header names the level the drag stands on', () => {
-    const { s } = run(rest, [{ type: 'hover', at: 1 }, { type: 'down', at: 3 }, { type: 'move', at: 5 }]);
-    expect(s.dragging).toBe(true);
-    expect(s.hover).toBeNull();
-    expect(headerLevel(s)).toBe(5);
-    expect(s.level).toBe(5);
+  it('stands on its level, and past the end while ultracode is on', () => {
+    expect(positionOf(high, claude)).toBe(2);
+    expect(positionOf({ level: 2, ultra: true }, claude)).toBe(5);
+    // Ultracode reported on by an agent that does not offer it here: the level's own stop.
+    expect(positionOf({ level: 2, ultra: true }, plain)).toBe(2);
+    expect(positionOf({ level: -1, ultra: false }, claude)).toBe(-1);
   });
 
-  it('a drag commits once, on release, the stop it ends on', () => {
-    const { s, commits } = run(rest, [{ type: 'down', at: 1 }, { type: 'move', at: 2 }, { type: 'move', at: 4 }, { type: 'move', at: 3 }, { type: 'up' }]);
-    expect(commits).toEqual([3]);
-    expect(s).toEqual({ level: 3, hover: null, dragging: false });
+  it('lights the pips up to the level, and all of them past the end', () => {
+    expect(litLevels(2, claude)).toBe(3);
+    expect(litLevels(-1, claude)).toBe(0);
+    expect(litLevels(5, claude)).toBe(5);
   });
 
-  it('a click is a press and release on one stop', () => {
-    expect(run(rest, [{ type: 'down', at: 0 }, { type: 'up' }]).commits).toEqual([0]);
+  it('a drag moves one stop per step of travel, from where it began, and stops at the ends', () => {
+    expect(scrubStop(2, 0, claude)).toBe(2);
+    // Less than a whole step in either direction stays.
+    expect(scrubStop(2, SCRUB_PX - 1, claude)).toBe(2);
+    expect(scrubStop(2, -(SCRUB_PX - 1), claude)).toBe(2);
+    expect(scrubStop(2, SCRUB_PX, claude)).toBe(3);
+    expect(scrubStop(2, -SCRUB_PX, claude)).toBe(1);
+    expect(scrubStop(2, SCRUB_PX * 3, claude)).toBe(5);
+    expect(scrubStop(2, 900, claude)).toBe(5);
+    expect(scrubStop(2, -900, claude)).toBe(0);
+    expect(scrubStop(1, 900, plain)).toBe(2);
+    // A scale that is ultracode alone: off is one step to the left.
+    expect(scrubStop(0, -SCRUB_PX, bare)).toBe(-1);
+    expect(scrubStop(-1, SCRUB_PX, bare)).toBe(0);
   });
 
-  it('a hover never moves the level, and a stray release commits nothing', () => {
-    const { s, commits } = run(rest, [{ type: 'move', at: 5 }, { type: 'up' }]);
-    expect(commits).toEqual([]);
-    expect(s.level).toBe(2);
+  it('the arrows step, Home and End jump, and the ends hold', () => {
+    expect(keyStop(2, 'ArrowRight', claude)).toBe(3);
+    expect(keyStop(2, 'ArrowLeft', claude)).toBe(1);
+    expect(keyStop(2, 'Home', claude)).toBe(0);
+    expect(keyStop(2, 'End', claude)).toBe(5);
+    expect(keyStop(5, 'ArrowRight', claude)).toBeNull();
+    expect(keyStop(0, 'ArrowLeft', claude)).toBeNull();
+    expect(keyStop(2, 'ArrowDown', claude)).toBeNull();
+    expect(keyStop(-1, 'ArrowRight', claude)).toBe(0);
+    expect(clampStop(9, plain)).toBe(2);
   });
 
-  it('keys step, jump and commit; out of range does nothing', () => {
-    expect(run(rest, [{ type: 'key', key: 'ArrowRight' }]).commits).toEqual([3]);
-    expect(run(rest, [{ type: 'key', key: 'ArrowDown' }]).commits).toEqual([1]);
-    expect(run(rest, [{ type: 'key', key: 'Home' }]).commits).toEqual([0]);
-    expect(run(rest, [{ type: 'key', key: 'End' }]).commits).toEqual([5]);
-    expect(run(rest, [{ type: 'key', key: '5' }]).commits).toEqual([4]);
-    expect(run(rest, [{ type: 'key', key: '9' }]).commits).toEqual([]);
-    expect(run({ ...rest, level: 5 }, [{ type: 'key', key: 'ArrowRight' }]).commits).toEqual([]);
-    expect(run(rest, [{ type: 'key', key: '3' }]).commits).toEqual([]);
-    expect(step(rest, { type: 'key', key: 'Enter' }, n).done).toBe(true);
+  it('landing on a level sends that level', () => {
+    expect(land(high, 4, claude, 'drag')).toEqual({ level: 4 });
+    expect(land(high, 0, claude, 'pick')).toEqual({ level: 0 });
+    expect(land(high, 2, claude, 'pick')).toEqual({});
   });
 
-  it('a key clears a hover preview', () => {
-    const { s } = run(rest, [{ type: 'hover', at: 5 }, { type: 'key', key: 'ArrowLeft' }]);
-    expect(headerLevel(s)).toBe(1);
+  it('landing past the end turns ultracode on and keeps the level under it', () => {
+    expect(land(high, 5, claude, 'key')).toEqual({ ultra: true });
+    expect(land(high, 5, claude, 'drag')).toEqual({ ultra: true });
+    expect(land({ level: 2, ultra: true }, 5, claude, 'pick')).toEqual({});
+    expect(land({ level: -1, ultra: false }, 0, bare, 'pick')).toEqual({ ultra: true });
   });
 
-  it('follows the confirmed value, but never mid-drag', () => {
-    expect(run(rest, [{ type: 'sync', level: 4 }]).s.level).toBe(4);
-    expect(run(rest, [{ type: 'down', at: 1 }, { type: 'sync', level: 4 }]).s.level).toBe(1);
+  it('one step down from ultracode by key only leaves it: back to the level that was kept', () => {
+    const on: Setting = { level: 2, ultra: true };
+    expect(land(on, keyStop(5, 'ArrowLeft', claude)!, claude, 'key')).toEqual({ ultra: false });
+    // A drag or a pick names a stop: that level is set.
+    expect(land(on, 4, claude, 'drag')).toEqual({ ultra: false, level: 4 });
+    expect(land(on, 4, claude, 'pick')).toEqual({ ultra: false, level: 4 });
+    // The kept level's own row, picked: ultracode off, the level as it was.
+    expect(land(on, 2, claude, 'pick')).toEqual({ ultra: false });
+    // Ultracode alone: off.
+    expect(land({ level: -1, ultra: true }, -1, bare, 'key')).toEqual({ ultra: false });
+    // No level set (the agent decides) under ultracode: the step down sets none, it only leaves.
+    expect(land({ level: -1, ultra: true }, keyStop(5, 'ArrowLeft', claude)!, claude, 'key')).toEqual({ ultra: false });
+    expect(positionOf({ level: -1, ultra: false }, claude)).toBe(-1);
   });
 });
 

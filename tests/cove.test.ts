@@ -47,13 +47,30 @@ describe('the cove', () => {
 
   it('ends its straight edges on whole pixels (the rim there is a ring on whole pixels)', () => {
     expect(Number.isInteger(cut)).toBe(true);
-    // A horn is rounder than a hook and smaller than the key: the cove still wraps the key.
-    expect(f).toBeGreaterThan(6);
-    expect(f).toBeLessThan(kr);
+    // One family of corners: a horn is the pane's own corner, so the straight edge ends a corner,
+    // the cove and a corner from the card's corner, and the cove is exactly a quarter circle.
+    expect(f).toBeCloseTo(kr, 6);
+    expect(cut).toBe(kr + C + kr);
+    expect(meet(C)).toEqual({ a: expect.closeTo(kr, 6), b: expect.closeTo(C + kr, 6) });
+  });
+
+  it('nests what stands on the last line in its corners: the same 6 as the channel', () => {
+    // The attach disc in the bottom-left corner and the last chip's round end in the base horn:
+    // discs of 14 (a 28 px line) whose centres are the corners' own, 6 in from the pane's edge.
+    const pad = /\.cmp-card \{[^}]*padding: 10px (\d+)px (\d+)px;/s.exec(css);
+    expect([Number(pad?.[1]), Number(pad?.[2])]).toEqual([gap, gap]);
+    const bar = /\.cmp-bar \{[^}]*height: (\d+)px;[^}]*padding-right: (\d+)px;/s.exec(css);
+    const line = Number(bar?.[1]);
+    expect(line / 2).toBe(kr - gap);
+    // The line's centre is the key's, and it ends where the cove begins plus the channel.
+    expect(gap + line / 2).toBe(kr);
+    expect(Number(bar?.[2])).toBe(kr + C);
+    // So the last chip's end is a disc about the base horn's centre (cut from the corner, kr up).
+    expect(gap + Number(bar?.[2]) + line / 2).toBe(cut);
   });
 
   it('draws the pane on the derived curve: horn, cove, horn, each tangent to the next', () => {
-    const [h1, cove, h2] = arcs(prop('cove-pane')).filter((a) => a.r !== kr || a.dir === 'ccw').slice(0, 3);
+    const [h1, cove, h2] = arcs(prop('cove-pane'));
     const p = meet(C);
     expect(h1.r).toBeCloseTo(f, 2);
     expect(h2.r).toBeCloseTo(f, 2);
@@ -80,7 +97,8 @@ describe('the cove', () => {
   });
 
   it('uses the same curve for what is not the pane, and the same cut for the straight parts', () => {
-    const pane = arcs(prop('cove-pane')).filter((a) => a.r !== kr || a.dir === 'ccw').slice(0, 3);
+    const pane = arcs(prop('cove-pane'));
+    expect(pane.length).toBe(3);
     expect(arcs(prop('cove-notch')).slice(0, 3)).toEqual(pane);
     expect(numbers(prop('cove-rest')).filter((n) => n === cut).length).toBe(4);
     // The shade's discs: the horns' as large as their rounding, standing where the edges end.

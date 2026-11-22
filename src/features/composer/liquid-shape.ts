@@ -448,6 +448,8 @@ export interface LiquidFrame {
   light: number;
   /** How deep the glass is rounded in from its rim, px: the drop's radius in the air, a hairline bevel on the card. */
   lens: number;
+  /** How far the sheet has settled into the card it lands as (0 until it lands, 1 at the handover): its ink thins to the card's (`inkAt`) and its shadow goes. */
+  settle?: number;
   alpha: number;
   done: boolean;
 }
@@ -531,6 +533,7 @@ export function liquidAt(plan: LiquidPlan, t: number): LiquidFrame {
   // The glass flattens as it spreads: a drop's dome at first, the card's bevel, then its hairline.
   const u = smooth(plan.land, plan.hand, t);
   f.light = 1 - u;
+  f.settle = u;
   f.lens = lerp(r, 1, smooth(0, 0.8, (t - plan.land) / (plan.hand - plan.land)));
   if (spec.kind === 'row') f.alpha = 1 - smooth(plan.hand, plan.hand + HAND * 1.5, t);
   else if (t > plan.hand) f.alpha = handAlpha((t - plan.hand) / HAND);
@@ -583,18 +586,31 @@ export function liquidBounds(plan: LiquidPlan, room = 90): { left: number; top: 
 }
 
 /**
- * The look of the liquid: the message card's fill (`.user-card::before`) and its inner hairline;
- * in the air a drop of dark glass (`GLASS`), and one soft shadow under it.
+ * The look of the liquid. It lands as the message card, a dark well (`.user-card::before`): `fill`
+ * and `a` are the card's fill, `rim` its inner hairline. In the air it is a drop of dark glass
+ * (`GLASS`) of the bar's own ink (`air`, `airA`), a step lighter while lit (`lift`), with one soft
+ * shadow under it; as the sheet settles its ink thins into the card's and the shadow goes, so the
+ * handover is the card exactly.
  */
 export const INK = {
-  fill: [26, 26, 30] as [number, number, number],
-  a: 0.72,
-  /** The drop's ink is a step lighter than the card's: it reads on the dark stage, and settles. */
+  fill: [0, 0, 0] as [number, number, number],
+  a: 0.34,
+  /** The liquid before it lands: the bar's ink, far denser than the well it becomes. */
+  air: [26, 26, 30] as [number, number, number],
+  airA: 0.72,
+  /** The drop's ink is a step lighter while lit: it reads on the dark stage, and settles. */
   lift: [32, 32, 37] as [number, number, number],
   /** The hairline: the card's, and its top while lit. */
-  rim: 0.09,
+  rim: 0.075,
   lit: 0.34,
 };
+
+/** The liquid's ink at a frame, as r, g, b (0..255) and alpha: the drop's in the air (lit as it lifts), the card's once it has settled. */
+export function inkAt(light: number, settle = 0): [number, number, number, number] {
+  const s = clamp(settle, 0, 1);
+  const c = INK.air.map((v, i) => lerp(lerp(v, INK.lift[i], light), INK.fill[i], s));
+  return [c[0], c[1], c[2], lerp(INK.airA, INK.a, s)];
+}
 
 /**
  * The glass: where its light comes from (the top and slightly left, as on the app's other glass,

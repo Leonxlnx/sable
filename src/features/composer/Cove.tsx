@@ -5,7 +5,8 @@ import { memo } from 'react';
  * and in that cove sits the send key, an object of its own (composer.css has the shape and its
  * numbers). The card itself stays a plain rectangle that everything measures; its paint is these
  * layers, all static:
- * - the shade under the pane: the glass's shadows, with what falls into the cove;
+ * - the shade under the pane: its contact line and one short soft shadow (tokens.css `--shadow-pane`),
+ *   with what falls into the cove; focus adds nothing to it;
  * - the glass: the frosted fill, clipped to the pane's outline, with the focus ink inside it;
  * - the rim, its focus step and the pointer's light, each a ring in two parts: the straight edges
  *   and the three plain corners (a masked ring, on whole pixels like every other pane's), and the
@@ -25,7 +26,6 @@ export const CoveSkin = memo(function CoveSkin() {
           <i className="sh-horn" data-at="base" />
         </span>
       </span>
-      <span className="cmp-shade-lift" aria-hidden />
       <span className="cmp-glass" aria-hidden>
         <i className="gl-glow" />
         <i className="gl-ink" />

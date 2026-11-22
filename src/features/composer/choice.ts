@@ -6,6 +6,7 @@ import { homeAccountId, setEffort as setSessionEffort, setMode as setSessionMode
 import { useShallow } from 'zustand/react/shallow';
 import { useCapsState } from '@/state/hooks';
 import { useStore } from '@/state/store';
+import { rememberCaps, seenCaps } from './caps-seen';
 
 // ── the effort last used with each model (per browser), so picking a model brings it back ──
 
@@ -111,7 +112,14 @@ export function useChoice(sessionId: string | null): Choice {
   // (the same models, modes and efforts) fills the controls. They never fall back to skeletons
   // under a card that showed them a moment ago on the home screen.
   const lentCaps = useStore((s) => (ownCaps ? undefined : capsFromAnywhere(s.providerCaps, provider, accountId)));
-  const caps = ownCaps ?? lentCaps;
+  const told = ownCaps ?? lentCaps;
+  // Before the agent has answered at all (a chat that opens right after start-up, home's first
+  // frame): what it said last time (caps-seen.ts). The last line then names the mode, the model
+  // and the effort at once; an agent never seen on this machine has nothing here yet.
+  const caps = told ?? seenCaps(provider, accountId);
+  useEffect(() => {
+    if (told) rememberCaps(provider, accountId, told);
+  }, [told, provider, accountId]);
   const capsPending = !caps && !capsFailed;
   const homeModel = useStore((s) => s.ui.homeModel[provider] ?? s.settings.defaultModels[provider]);
   const homeMode = useStore((s) => s.ui.homeMode[provider] ?? s.settings.defaultModes[provider]);

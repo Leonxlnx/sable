@@ -13,11 +13,11 @@ import { landInTimeline } from '@/features/composer/flight';
 import { parseReview } from '@/features/review/model';
 import { ReviewComments } from '@/features/review/ReviewMessage';
 import { afterSend, sendInAir } from '@/features/composer/settle';
-import { EASE_OUT, play, reducedMotion } from '@/lib/motion';
+import { EASE_OUT, play, reducedMotion, uiZoom } from '@/lib/motion';
 import { MessageAgain } from './Again';
 import { useTimeline } from './ctx';
 import { Stamp } from './Stamp';
-import { isLongMessage } from './user-card';
+import { isLongMessage, rowLeft, rowMoved } from './user-card';
 
 /** The steer key's arrow (composer/SendKey.tsx `steer`), drawn small: up and leaning into the turn. */
 function SteerMark() {
@@ -60,8 +60,35 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
 
   // The message sent from the composer (or a queue row) lands here: it flies in as this bubble and the two swap.
   const root = useRef<HTMLDivElement>(null);
+  const queuedNow = useRef(queued);
+  queuedNow.current = queued;
   useLayoutEffect(() => {
-    if (root.current && item.text) landInTimeline(root.current, item.text, { steer: item.steered, session: sessionId, ts: item.ts });
+    const el = root.current;
+    if (!el) return;
+    // A steered message the agent has just taken is put back where the agent took it (the bridge
+    // takes its row out and adds it again, user-card.ts): the same message moving, not a new one.
+    // It glides from where it stood and plays no entrance a second time (timeline.css
+    // `.user[data-moved]`); the take's own beat, which the row that left could not play, plays here.
+    const was = item.steered ? rowMoved(item.id, performance.now()) : null;
+    if (was) {
+      el.setAttribute('data-moved', '');
+      const card = el.querySelector<HTMLElement>('.user-card');
+      const now = card?.getBoundingClientRect();
+      const z = uiZoom();
+      const dx = now ? (was.left - now.left) / z : 0;
+      const dy = now ? (was.top - now.top) / z : 0;
+      // The whole row travels (its mark beside the card with it), from where the card stood.
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) play(el, [{ transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)` }, { transform: 'translate(0px, 0px)' }], { duration: 320, easing: EASE_OUT });
+      if (was.queued && !queued) fieldBeat('pulse', card, 0.6);
+    } else if (item.text) landInTimeline(el, item.text, { steer: item.steered, session: sessionId, ts: item.ts });
+    if (!item.steered) return;
+    // Only a steered message ever moves: where its card stands is read as its row leaves.
+    return () => {
+      const card = el.querySelector('.user-card');
+      if (!card) return;
+      const r = card.getBoundingClientRect();
+      if (r.width) rowLeft(item.id, { left: r.left, top: r.top, queued: queuedNow.current }, performance.now());
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A steer the agent has just taken: the card comes out of its waiting tone into the turn, and

@@ -21,18 +21,67 @@ import {
   Tip,
   TipProvider,
 } from '@/ui';
+import { ProviderMark } from '@/art/Logo';
 import { Chip, type ChipPart } from '@/features/composer/Chip';
 import { CoveSkin } from '@/features/composer/Cove';
 import { SendGlyphSvg } from '@/features/composer/SendKey';
-import { Dial, UltraMark } from '@/features/composer/Thinking';
+import { Pips } from '@/features/composer/Thinking';
 import { PullRow } from '@/features/rail/PullRequest';
-import type { PullCheck, PullRequestInfo } from '@shared/protocol';
+import { BrowserAgentStates } from '@/features/rail/BrowserAgentGallery';
+import { Notice, NoticeCard } from '@/features/timeline/Notice';
+import type { Effort, NoticeItem, PullCheck, PullRequestInfo } from '@shared/protocol';
 import '@/app/app.css';
 import '@/features/composer/composer.css';
 import '@/features/sidebar/sidebar.css';
 import '@/features/rail/rail.css';
 import '@/features/timeline/timeline.css';
 import './gallery.css';
+
+/**
+ * Notices as the conversation shows them (timeline/Notice.tsx): every level of the card, a long one
+ * with its rest on demand, an address as a link, the same notice counted, and the quiet divider.
+ */
+function NoticeStates() {
+  const n = (id: string, variant: NoticeItem['variant'], text: string, detail?: string): NoticeItem => ({ type: 'notice', id, ts: 0, variant, text, detail });
+  const moved =
+    "Claude can't use thinking from another organization, so the thinking from before the move was left out. See docs for more: https://platform.claude.com/docs/en/build-with-claude/preserved-thinking";
+  const states: { label: string; item: NoticeItem; count?: number; width?: number; open?: boolean }[] = [
+    { label: 'Informs: a long one, its first sentence', item: n('g1', 'error', moved) },
+    { label: 'Informs: opened, the address a link', item: n('g2', 'error', moved), open: true },
+    { label: 'Informs: short', item: { ...n('g3', 'error', 'Browser control starts after this turn'), level: 'info' } as NoticeItem },
+    { label: 'Warns', item: { ...n('g4', 'error', 'This model is retired on 1 March. Chats on it move to Opus 5.5.'), level: 'warn' } as NoticeItem },
+    { label: 'Error', item: n('g5', 'error', 'Could not send the message') },
+    { label: 'Error with what the service said', item: n('g6', 'error', 'Request failed after 3 attempts', 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}') },
+    { label: 'Error with a detail and an address', item: n('g7', 'error', 'Remote Control could not start', 'The relay refused the session (see https://status.claude.com/incidents/8813).') },
+    { label: 'The same notice seven times', item: n('g8', 'error', 'You have reached your usage limit.'), count: 7 },
+    { label: 'Narrow, 300px', item: n('g9', 'error', moved), width: 300, open: true },
+    { label: 'Narrow, 300px, counted', item: n('g10', 'error', 'You have reached your usage limit.'), count: 12, width: 300 },
+  ];
+  return (
+    <div className="gal-notices" style={{ display: 'flex', flexWrap: 'wrap', gap: '22px 28px', alignItems: 'flex-start' }}>
+      {states.map((s) => (
+        <div
+          key={s.label}
+          style={{ width: s.width ?? 520 }}
+          ref={(el) => {
+            // Shown open: the caret is pressed once, as a person would.
+            if (el && s.open && !el.dataset.opened) {
+              el.dataset.opened = '1';
+              el.querySelector<HTMLButtonElement>('.notice-more')?.click();
+            }
+          }}
+        >
+          <div className="gal-caption">{s.label}</div>
+          {s.count ? <NoticeCard item={s.item} count={s.count} /> : <Notice item={s.item} />}
+        </div>
+      ))}
+      <div style={{ width: 520 }}>
+        <div className="gal-caption">A divider (a model change), with a detail and an address</div>
+        <Notice item={n('g11', 'model', 'Switched to Opus 5.5', 'Rerouted from Sonnet 5, see https://docs.claude.com/en/docs/about-claude/models')} />
+      </div>
+    </div>
+  );
+}
 
 /**
  * Dev only (`?gallery`): every primitive in every state, for screenshots and design review.
@@ -186,10 +235,11 @@ const MODE: ChipPart[] = [
   { k: 'label', className: 'cm-mode-label', node: 'Ask first' },
 ];
 const MODEL: ChipPart[] = [{ k: 'name', className: 'chip-give', node: 'Opus 5.5' }];
+/** The effort chip as the composer builds it: the scale's pips (a level 1 to 5, ultracode past the end) and the stop's name. */
+const SCALE: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 const effortParts = (word: string, level: number, ultra = false): ChipPart[] => [
-  ...(ultra ? [{ k: 'mark', node: <UltraMark /> }] : []),
-  { k: 'dial', className: 'th-gauge', node: <Dial level={level} of={5} /> },
-  { k: `word:${word}`, className: 'th-word', node: word },
+  { k: 'pips', node: <Pips efforts={SCALE} pos={ultra ? SCALE.length : level - 1} ultra /> },
+  { k: `word:${ultra ? 'Ultracode' : word}`, className: 'th-word', node: ultra ? 'Ultracode' : word },
 ];
 
 /**
@@ -222,9 +272,6 @@ function GlassComposer({ focus, state = 'rest', width, ultra }: { focus?: boolea
         <div className="cmp-side cmp-right">
           <div className="cmp-agent">
             <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} />
-            <span className="cmp-dot" aria-hidden>
-              ·
-            </span>
             <Chip className="tb-chip th-chip" anchor="right" data-ultra={ultra || undefined} parts={effortParts('Extra high', 4, ultra)} />
           </div>
         </div>
@@ -254,10 +301,69 @@ function ChipChange() {
   return (
     <div className="cmp-agent" style={{ justifyContent: 'flex-end', width: 260 }}>
       <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} />
-      <span className="cmp-dot" aria-hidden>
-        ·
-      </span>
       <Chip className="tb-chip th-chip" anchor="right" data-ultra={s.ultra || undefined} aria-label="Next label" onClick={() => setI(i + 1)} parts={effortParts(s.word, s.level, s.ultra)} />
+    </div>
+  );
+}
+
+/**
+ * The ladder the effort chip opens (composer/Thinking.tsx, `.th-pop`), static: every stop by name,
+ * the highest on top, ultracode a step apart above them, then the speeds beyond standard.
+ * `at` is the level in use (from 0); `ultra`: ultracode is on and that level is kept under it.
+ */
+function Ladder({ at, ultra, highlight }: { at: number; ultra?: boolean; highlight?: number }) {
+  const names = ['Low', 'Medium', 'High', 'Extra high', 'Max'];
+  return (
+    <div className="pop cm-pop th-pop" data-static="" style={{ flex: 'none' }}>
+      <div className="menu-item th-row th-row-far" data-current={ultra ? '' : undefined} data-lit={ultra ? '' : undefined} role="menuitem">
+        <i className="th-seg" />
+        <span className="grow">Ultracode</span>
+      </div>
+      {names
+        .map((n, i) => (
+          <div key={n} className="menu-item th-row" data-current={!ultra && i === at ? '' : undefined} data-lit={ultra || i <= at ? '' : undefined} data-highlighted={i === highlight ? '' : undefined} role="menuitem">
+            <i className="th-seg" />
+            <span className="grow">{n}</span>
+            {ultra && i === at && <Icon name="check" size={13} className="th-kept" />}
+          </div>
+        ))
+        .reverse()}
+      <div className="menu-sep th-sep" />
+      <div className="menu-item th-row th-speed" data-state="unchecked" role="menuitemcheckbox">
+        <Icon name="bolt" size={13} className="th-lead" />
+        <span className="grow truncate">Fast</span>
+        <span className="th-cost">Extra usage</span>
+        <span className="mm-check" />
+      </div>
+    </div>
+  );
+}
+
+/** The model menu (composer/Controls.tsx, `.mm-pop`), static: the agents as marks on its first line, the listed agent's models under it. */
+function ModelMenu() {
+  const models = ['Opus 5.5', 'Fable 5.2', 'Sonnet 5.5', 'Haiku 5.5'];
+  return (
+    <div className="pop cm-pop mm-pop" data-static="" style={{ width: 232 }}>
+      <div className="mm-agents" role="tablist" aria-label="Agent">
+        <button type="button" role="tab" className="mm-agent" aria-selected="true">
+          <ProviderMark provider="claude" size={14} className="mm-mark" />
+          <span className="mm-agent-name">Claude Code</span>
+        </button>
+        <button type="button" role="tab" className="mm-agent" aria-selected="false" aria-label="Codex">
+          <ProviderMark provider="codex" size={14} className="mm-mark" />
+        </button>
+        <button type="button" role="tab" className="mm-agent" aria-selected="false" aria-label="OpenCode">
+          <ProviderMark provider="opencode" size={14} className="mm-mark" />
+        </button>
+      </div>
+      <div className="mm-list">
+        {models.map((n, i) => (
+          <div key={n} className="menu-item mm-row" data-current={i === 0 ? '' : undefined} data-highlighted={i === 1 ? '' : undefined} role="menuitem">
+            <span className="mm-name truncate">{n}</span>
+            <span className="mm-check">{i === 0 && <Icon name="check" size={14} />}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -509,6 +615,25 @@ export default function Gallery() {
           <States label="Model" render={(s) => <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} disabled={dis(s)} />} />
           <States label="Effort" render={(s) => <Chip className="tb-chip th-chip" anchor="right" parts={effortParts('High', 3)} disabled={dis(s)} />} />
           <States label="Effort, ultra" render={(s) => <Chip className="tb-chip th-chip" anchor="right" data-ultra="" parts={effortParts('High', 3, true)} disabled={dis(s)} />} />
+          <div className="gal-row">
+            <div className="gal-label">Effort, every stop of the scale</div>
+            <div className="gal-cell gal-wide" style={{ gap: 6, flexWrap: 'wrap' }}>
+              {['Low', 'Medium', 'High', 'Extra high', 'Max'].map((w, i) => (
+                <Chip key={w} className="tb-chip th-chip" anchor="right" parts={effortParts(w, i + 1)} />
+              ))}
+              <Chip className="tb-chip th-chip" anchor="right" data-ultra="" parts={effortParts('Max', 5, true)} />
+            </div>
+          </div>
+          <div className="gal-row">
+            <div className="gal-label">Effort while dragged; an agent not seen yet</div>
+            <div className="gal-cell gal-wide" style={{ gap: 16 }}>
+              <Chip className="tb-chip th-chip" anchor="right" data-scrub="" parts={effortParts('Extra high', 4)} />
+              <span className="cmp-agent">
+                <span className="chip-skel" style={{ width: 96 }} />
+                <span className="chip-skel" style={{ width: 78 }} />
+              </span>
+            </div>
+          </div>
           <States
             label="Key, to send"
             render={(s) => (
@@ -717,6 +842,17 @@ export default function Gallery() {
             <div className="gal-glass-col">
               <div className="gal-caption">Menu (.pop)</div>
               <MenuRows highlight={1} />
+              <div className="gal-caption" style={{ marginTop: 18 }}>
+                Effort's ladder: a level, and ultracode over it
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'flex-start' }}>
+                <Ladder at={2} highlight={3} />
+                <Ladder at={2} ultra />
+              </div>
+              <div className="gal-caption" style={{ marginTop: 18 }}>
+                Models: the agents as marks
+              </div>
+              <ModelMenu />
             </div>
             <div className="gal-glass-col">
               <div className="gal-caption">Frosted (.glass)</div>
@@ -947,6 +1083,14 @@ export default function Gallery() {
 
         <Section title="Pull request (the Changes tab's row)" id="pull-request">
           <PullRequestStates />
+        </Section>
+
+        <Section title="Notices (the conversation's cards and dividers)" id="notices">
+          <NoticeStates />
+        </Section>
+
+        <Section title="The agent on a page (the Browser tab)" id="browser-agent">
+          <BrowserAgentStates />
         </Section>
 
         <Section title="Live (real Radix parts)" id="live">
