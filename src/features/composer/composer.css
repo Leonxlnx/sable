@@ -1164,10 +1164,12 @@
   color: var(--text-2);
 }
 
+/* The level's name starts on the cells' left edge (14px from the pane), as "Effort" ends on their right one. */
 .th-body > .th-head {
   height: 34px;
   align-items: baseline;
   padding-top: 6px;
+  padding-left: 6px;
 }
 
 .th-body .th-title {
@@ -1329,7 +1331,8 @@
   align-items: center;
   gap: 9px;
   min-height: 34px;
-  padding: 0 8px 0 10px;
+  /* Mark and switch on the cells' two edges, 14px from the pane. */
+  padding: 0 10px;
   border-radius: 10px;
   color: var(--text-2);
   cursor: pointer;
@@ -2539,7 +2542,10 @@ button.hc:is(:active, [aria-expanded='true']) {
   border-radius: inherit;
 }
 
-.hc-group + .hc-group {
+/* An agent with accounts nested under it stands a little apart from its neighbours; agents with
+   one account each are plain rows, 28px apart as in the mode, model and folder menus. */
+.hc-group:has(.hc-acct) + .hc-group,
+.hc-group + .hc-group:has(.hc-acct) {
   margin-top: 2px;
 }
 

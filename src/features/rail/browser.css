@@ -473,6 +473,12 @@
   overflow: hidden;
 }
 
+/* The page ends in the panel's bottom corners: cut to the panel's inner curve there, or its square
+   corners (a white page's most of all) paint over the panel's hairline. Not with the log drawer under it. */
+.bw-view:last-child {
+  border-radius: 0 0 calc(var(--r-xl) - 1px) calc(var(--r-xl) - 1px);
+}
+
 .bw-host,
 .bw-webview,
 .bw-frame {

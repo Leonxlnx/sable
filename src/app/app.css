@@ -644,7 +644,7 @@ html[data-wc] .dialog {
 }
 
 html[data-wc] .dialog.settings-dialog {
-  height: min(640px, calc(100 * var(--vh) - var(--strip-h) - 32px));
+  height: min(656px, calc(100 * var(--vh) - var(--strip-h) - 32px));
 }
 
 html[data-wc] .palette {

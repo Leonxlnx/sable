@@ -196,6 +196,11 @@
   flex: 0 1 auto;
 }
 
+/* The row's title is the folder's name: its path beside it is one quiet tone (a path's own directory tone is brighter than this line). */
+.palette-sub .path-dir {
+  color: inherit;
+}
+
 .palette-row[data-active] .palette-sub {
   color: var(--text-3);
 }

@@ -1049,6 +1049,22 @@
   min-width: 0;
 }
 
+/* A row with no short window leaves that column empty: the name runs into it, so a narrow dialog
+   does not cut "Claude Code" beside free room. The same beside a row's one word ("Reading"),
+   which then stands in the week's column alone. */
+.ulo-who:has(+ span:empty),
+.ulo-who:has(+ .ulo-none) {
+  grid-column: 2 / 4;
+}
+
+.ulo-who + span:empty {
+  display: none;
+}
+
+.ulo-who + .ulo-none {
+  grid-column: 4;
+}
+
 .ulo-name {
   min-width: 0;
   font-size: var(--t-ui);

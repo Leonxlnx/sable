@@ -1,8 +1,9 @@
 /* ───────────── dialog frame ───────────── */
 
+/* Tall enough for every section of the nav (17 rows, 548px of list): at 640 the last one, About, was cut. */
 .dialog.settings-dialog {
   width: min(920px, calc(100 * var(--vw) - 48px));
-  height: min(640px, calc(100 * var(--vh) - 48px));
+  height: min(656px, calc(100 * var(--vh) - 48px));
   max-height: none;
   flex-direction: row;
   background-color: var(--panel);
@@ -300,9 +301,11 @@
   color: var(--text-3);
 }
 
+/* Keys in a help line sit on the sentence's baseline and do not push the line apart (ui.css `p .kbds`);
+   3px under it they hung below the words. */
 .set-row-help .kbds {
-  vertical-align: -3px;
-  margin: 0 1px;
+  vertical-align: baseline;
+  margin: -2px 1px;
 }
 
 .set-row-control {
@@ -380,6 +383,11 @@
   display: inline-flex;
   align-items: center;
   gap: 7px;
+}
+
+/* As a row's label it is the whole line: laid out as a block, or the line's strut lifts it 1.5px above the value beside it. */
+.set-row-label > .prov-label {
+  display: flex;
 }
 
 .set-foot-note {
