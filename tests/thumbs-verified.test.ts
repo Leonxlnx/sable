@@ -112,20 +112,22 @@ async function setup(opts: Parameters<typeof registerThumbs>[1]) {
   const phone = (itemId: string, index = 0) => pictureOf(app, { sessionId: id, itemId, index, size: 160 }, 'phone').then((r) => r.data);
   const desk = (itemId: string, index = 0) => app.call('file.thumb', { sessionId: id, itemId, index, size: 320 } as never).then((r) => (r as { data: string | null }).data);
   /** Another file of the same size and time takes the place of `f` (a build writes it aside and moves it over). */
-  const replace = (f: string, body: Buffer | string) => {
+  const replace = async (f: string, body: Buffer | string) => {
     const was = statSync(f);
     const next = `${f}.next`;
     writeFileSync(next, body);
     utimesSync(next, T, T);
     // Windows refuses the move while a reader still holds the file for a moment (under a full parallel
-    // run the copy for the renderer can take a while): try again briefly, as a build tool would.
+    // run the copy for the renderer can take a while): try again briefly, as a build tool would. The
+    // wait gives the event loop back: the reader is this very process (the app under test), and a
+    // wait that blocks it would hold the file for as long as it waits.
     for (let i = 0; ; i++) {
       try {
         renameSync(next, f);
         break;
       } catch (err) {
-        if (i >= 240 || (err as NodeJS.ErrnoException).code !== 'EPERM') throw err;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        if (i >= 400 || (err as NodeJS.ErrnoException).code !== 'EPERM') throw err;
+        await new Promise((r) => setTimeout(r, 50));
       }
     }
     expect(statSync(f).size).toBe(was.size);
@@ -156,7 +158,7 @@ describe('#3: a picture is made of the file that was checked', () => {
     const second = h.phone('s', 1);
     await new Promise((r) => setTimeout(r, 50));
     // While b waits for the renderer, another PDF of the same size and time takes its place.
-    h.replace(b, pdf(595, 842, 'secret'));
+    await h.replace(b, pdf(595, 842, 'secret'));
     g.open();
     await Promise.all([first, second]);
     expect(drawn).toEqual(['first', 'shared']);
@@ -180,7 +182,7 @@ describe('#3: a picture is made of the file that was checked', () => {
     await vi.waitFor(() => expect(seen).toHaveLength(1));
     const second = h.phone('s', 1);
     await new Promise((r) => setTimeout(r, 50));
-    h.replace(b, 'other one!');
+    await h.replace(b, 'other one!');
     g.open();
     await Promise.all([first, second]);
     expect(seen).toEqual(['video one!', 'video two!']);
@@ -192,7 +194,7 @@ describe('#3: a picture is made of the file that was checked', () => {
     h.share('s1', [f]);
     expect(await h.phone('s1')).toBe(url('image/png', png(4, 3, 10)));
     expect(await h.desk('s1')).toBe(url('image/png', png(4, 3, 10)));
-    h.replace(f, png(4, 3, 200));
+    await h.replace(f, png(4, 3, 200));
     // Shared again: the phone gets the new file's picture.
     h.share('s2', [f]);
     expect(await h.phone('s2')).toBe(url('image/png', png(4, 3, 200)));

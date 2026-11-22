@@ -6,6 +6,7 @@
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { NoticeItem, SessionMeta, UserItem } from '@shared/protocol';
@@ -502,8 +503,10 @@ describe('until green in the app (Demo agent, real check)', () => {
 
   it('a message sent while the check runs goes first; the check runs again after its turn', async () => {
     const { app: a, home } = await app();
-    // The check's process lets go of its folder a moment after it ends (Windows, a busy machine).
-    cleanups.push(() => rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
+    // The check's process lets go of its folder a moment after it ends (Windows, a busy machine: under a
+    // full parallel run two seconds were not enough). Waited for without blocking; a temporary folder
+    // that still cannot be removed is left to the system, it is not what this test is about.
+    cleanups.push(() => rm(home, { recursive: true, force: true, maxRetries: 60, retryDelay: 250 }).catch(() => {}));
     const cwd = path.join(home, 'proj');
     mkdirSync(cwd, { recursive: true });
     const snap = await a.call('session.create', { provider: 'demo', cwd, mode: 'bypassPermissions' });
