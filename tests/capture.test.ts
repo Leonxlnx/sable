@@ -240,22 +240,24 @@ describe('CaptureService', () => {
     expect(last().noBefore).toBeUndefined();
   });
 
-  it('has only an after when the page is named after the edit, and says so', async () => {
+  it('offers nothing when the page is named only after the edit: no before, so no picture at all', async () => {
     await turn({ say: `It is at ${PAGE}` });
-    expect(fake.shots).toHaveLength(1);
-    const c = last();
-    expect(c.state).toBe('ready');
-    expect(c.views[0].before).toBeUndefined();
-    expect(c.views[0].regions).toBeUndefined();
-    expect(c.noBefore).toMatch(/not known/);
+    expect(fake.shots).toHaveLength(0);
+    expect(captures()).toHaveLength(0);
+    expect(svc.list('s1')).toEqual([]);
+    // The page is known from here on: the next turn has its before and its after.
+    await turn();
+    expect(last()).toMatchObject({ state: 'ready' });
+    expect(last().views[0].before && last().views[0].after).toBeTruthy();
   });
 
-  it('drops a before that was taken after the first edit landed', async () => {
+  it('a before taken after the first edit landed is no before: nothing is offered', async () => {
     shown = PAGE;
     fake.lateBy = 60_000;
     await turn({ beforeEdit: () => {} });
-    expect(last().views[0].before).toBeUndefined();
-    expect(last().noBefore).toMatch(/landed before/);
+    // The late before was shot; no after is taken for it.
+    expect(fake.shots).toHaveLength(1);
+    expect(captures()).toHaveLength(0);
   });
 
   it('captures nothing for a turn that changed no files, but remembers its page for the next turn', async () => {
@@ -285,7 +287,7 @@ describe('CaptureService', () => {
     up = false;
     await turn({ say: `It is at ${PAGE}` });
     expect(fake.shots).toHaveLength(0);
-    expect(last()).toMatchObject({ state: 'failed', error: 'The page did not load' });
+    expect(captures()).toHaveLength(0);
   });
 
   it('captures the phone size too when the page is responsive', async () => {

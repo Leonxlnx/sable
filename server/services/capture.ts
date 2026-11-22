@@ -294,13 +294,6 @@ export class CaptureService {
   private async after(sessionId: string, turnId: string, url: string, t: Track) {
     const index = this.index(sessionId);
     index.lastUrl = url;
-    const entry: Entry = { capture: { turnId, url, state: 'capturing', views: [] }, bytes: 0 };
-    // A turn captured again (a retry under the same message) replaces its pictures.
-    const old = index.turns.findIndex((x) => x.capture.turnId === turnId);
-    if (old >= 0) this.dropImages(sessionId, index.turns.splice(old, 1)[0]);
-    index.turns.push(entry);
-    this.publish(sessionId, entry);
-
     const beforeP = t.befores.get([...t.befores.keys()].find((k) => samePage(k, url)) ?? url);
     await this.sleep(this.settleMs);
     let before = beforeP ? await beforeP : null;
@@ -314,11 +307,29 @@ export class CaptureService {
       before = valid.length && valid[0].view.kind === 'desktop' ? { ...before, pictures: valid } : null;
       if (!before) noBefore = NO_BEFORE.late;
     }
+    if (this.disposed) return;
+    // A turn captured again (a retry under the same message) replaces its pictures.
+    const old = index.turns.findIndex((x) => x.capture.turnId === turnId);
+    const had = old >= 0 ? index.turns.splice(old, 1)[0] : undefined;
+    if (had) this.dropImages(sessionId, had);
+    if (!before) {
+      // With no before there is nothing to compare: no picture is taken and the turn offers no
+      // "Before / after" (it used to offer one that said "After only"). What the turn showed
+      // before, under the same message, goes.
+      if (had) {
+        this.save(sessionId);
+        this.publish(sessionId, { capture: { turnId, url, state: 'failed', views: [], error: noBefore }, bytes: 0 });
+      }
+      return;
+    }
+    const entry: Entry = { capture: { turnId, url, state: 'capturing', views: [] }, bytes: 0 };
+    index.turns.push(entry);
+    this.publish(sessionId, entry);
 
     let after: Picture[] | null = null;
     let error: string | undefined;
     try {
-      after = await this.shoot(url, before?.pictures.some((p) => p.view.kind === 'phone') ? true : 'auto');
+      after = await this.shoot(url, before.pictures.some((p) => p.view.kind === 'phone') ? true : 'auto');
       if (!after) error = 'The page did not load';
     } catch (err) {
       error = (err as Error).message;
@@ -339,7 +350,7 @@ export class CaptureService {
       return { id, at: p.at };
     };
     const views: CaptureView[] = after.map((a) => {
-      const b = before?.pictures.find((p) => p.view.kind === a.view.kind);
+      const b = before.pictures.find((p) => p.view.kind === a.view.kind);
       const { kind, width, height, scale } = a.view;
       const view: CaptureView = { kind, width, height, scale, after: store(a) };
       if (b) {
@@ -350,7 +361,7 @@ export class CaptureService {
       }
       return view;
     });
-    entry.capture = { turnId, url, state: 'ready', views, ...(noBefore ? { noBefore } : {}) };
+    entry.capture = { turnId, url, state: 'ready', views };
     this.prune(sessionId);
     this.save(sessionId);
     this.publish(sessionId, entry);

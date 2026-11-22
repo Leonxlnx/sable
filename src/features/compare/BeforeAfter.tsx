@@ -17,7 +17,8 @@ function prefetch(sessionId: string, capture: TurnCapture) {
 
 /**
  * Under a turn that edited a local page: "Before / after" beside Preview. While the after is
- * being taken it waits quietly; with no before it says "After only". Opens the compare view.
+ * being taken it waits quietly. Only where there is a before: a capture with nothing to compare
+ * against (the bridge takes none any more; older chats still hold some) offers nothing.
  */
 export const BeforeAfter = memo(function BeforeAfter({ sessionId, turnId }: { sessionId: string; turnId: string }) {
   const capture = useTurnCapture(sessionId, turnId);
@@ -26,10 +27,11 @@ export const BeforeAfter = memo(function BeforeAfter({ sessionId, turnId }: { se
   const [opened, setOpened] = useState(false);
   if (!capture || capture.state === 'failed') return null;
   const capturing = capture.state === 'capturing';
-  const view = capture.views.find((v) => v.kind === 'desktop') ?? capture.views[0];
+  if (!capturing && !capture.views.some((v) => v.before)) return null;
+  const view = capture.views.find((v) => v.kind === 'desktop' && v.before) ?? capture.views.find((v) => v.before) ?? capture.views[0];
   const n = view?.regions?.length;
-  const meta = capturing ? undefined : !view?.before ? 'After only' : n === 0 ? 'No visible change' : n === 1 ? '1 change' : `${n} changes`;
-  const tip = capturing ? 'Capturing the page' : capture.noBefore;
+  const meta = capturing ? undefined : n === 0 ? 'No visible change' : n === 1 ? '1 change' : `${n} changes`;
+  const tip = capturing ? 'Capturing the page' : undefined;
   const button = (
     <button
       type="button"
