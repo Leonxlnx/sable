@@ -249,6 +249,40 @@ function states(p: string): boolean {
   return false;
 }
 
+/**
+ * A turn inside an announcement: what follows it says what is so ("I'll rerun CI, but the
+ * migration already failed.", "Ich prüfe die Logs, aber die Sicherung fehlt."). The contrast words
+ * may stand after a space; the weaker ones count only after a comma or a semicolon ("Let me check
+ * what changed since Monday" is still an announcement). A dash between two clauses turns too.
+ */
+const CONTRAST = ['but', 'however', 'although', 'because', 'aber', 'jedoch', 'allerdings', 'obwohl', 'weil'];
+const CONTRAST_AFTER_COMMA = ['though', 'since', 'whereas', 'doch', 'denn', 'sondern'];
+/** Each alternative is a fixed word or one run of dashes between required spaces: linear in the sentence's length. */
+const TURN = new RegExp(`(?:\\s[-–—]+\\s|[,;]\\s*(?:${[...CONTRAST, ...CONTRAST_AFTER_COMMA].join('|')})\\b|\\s(?:${CONTRAST.join('|')})\\b)`);
+/** What a German clause that states something reads like ("die Sicherung fehlt", "der Build ist rot"). */
+const GERMAN_STATES = /(?:^|\s)(?:ist|sind|war|waren|hat|haben|hatte|fehlt|fehlen|fehlte|schlägt|schlug|scheitert|gescheitert|fehlgeschlagen|kaputt|läuft|lief|geht|ging|klappt|bricht|brach|nicht|kein|keine|keinen|schon|bereits|noch)(?=[\s,.!:;]|$)/;
+
+/**
+ * Whether an announcement turns into a statement: after a contrast or a dash comes a clause that is
+ * not itself an announcement, a move or a nod, and that says something (a stating verb, or three
+ * words or more). `writing`: the sentence is still being written, and what follows the turn may
+ * still become an announcement ("…, but first let me").
+ */
+function turnsToState(p: string, writing: boolean): boolean {
+  const m = TURN.exec(p);
+  if (!m) return false;
+  const rest = p
+    .slice(m.index + m[0].length)
+    .replace(/^[\s,:]+/, '')
+    // German openers before a second announcement ("aber zuerst lass mich…").
+    .replace(/^(?:zuerst|erst|dann|jetzt|nun|vorher)[,]?\s+/, '')
+    .trim();
+  if (!rest) return false;
+  if (ANNOUNCE.test(rest) || FILLER.test(rest) || isMove(rest)) return false;
+  if (writing && mayStart(rest)) return false;
+  return rest.split(/\s+/).length >= 3 || STATES.test(rest) || HAPPENED.test(rest) || REQUIRES.test(rest) || GERMAN_STATES.test(rest);
+}
+
 /** Plain words: no code ticks, emphasis or link targets; curly apostrophes made straight. */
 function plain(text: string): string {
   return text
@@ -258,7 +292,8 @@ function plain(text: string): string {
     .trim();
 }
 
-const sentences = (s: string) => s.split(/(?<=[.!?:])\s+/).filter(Boolean);
+/** Sentences, and clauses after a semicolon ("I'll rerun CI; the migration failed." is two). */
+const sentences = (s: string) => s.split(/(?<=[.!?:;])\s+/).filter(Boolean);
 
 /** A sentence still being written that may yet turn out an announcement. */
 function mayStart(part: string): boolean {
@@ -293,6 +328,8 @@ export function isLeadIn(text: string, streaming: boolean): boolean {
     // so, told with a doing word in front. Also while it is still being written: once a verb says
     // so, it shows.
     if (states(p)) return false;
+    // "I'll rerun CI, but the migration already failed.": an announcement that turns into what is so.
+    if (ANNOUNCE.test(p) && turnsToState(p, streaming && i === parts.length - 1)) return false;
     if (ANNOUNCE.test(p) || FILLER.test(p) || isMove(p)) continue;
     // The sentence being written: it may still become one.
     if (streaming && i === parts.length - 1 && mayStart(p)) continue;

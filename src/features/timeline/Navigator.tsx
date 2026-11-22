@@ -11,7 +11,7 @@ import { useStore } from '@/state/store';
 import { Kbd } from '@/ui';
 import { useTimeline } from './ctx';
 import { estimate } from './items';
-import { findMarks, onFindMarks, takeSteps, type NavFeed, type NavLayout } from './nav-bus';
+import { findMarks, onFindMarks, takeConversation, takeSteps, type NavFeed, type NavLayout } from './nav-bus';
 import { firstLine, groupAt, groupBoxes, groupHeight, indexLines, indexWindow, isBuilt, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, rowsMoved, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
 import { revealItem, rootOf } from './reveal';
 import type { Group, TurnGroup } from './turns';
@@ -623,14 +623,16 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
     window.clearTimeout(intent.current);
     window.clearTimeout(linger.current);
     if (!marksRef.current.length) return;
-    if (!back.current && document.activeElement instanceof HTMLElement && !document.activeElement.closest('.nav-index')) back.current = document.activeElement;
+    // Never the body or a closing palette: focus would go back to nothing.
+    const was = document.activeElement;
+    if (!back.current && was instanceof HTMLElement && was !== document.body && !was.closest('.nav-index, .palette')) back.current = was;
     setPane((paneRef.current = 'open'));
   }, []);
 
   /** The index's field took the focus (from `from`, which gets it back): it stays until closed. */
   const pinIndex = useCallback((from: Element | null) => {
     window.clearTimeout(linger.current);
-    if (!back.current && from instanceof HTMLElement && !from.closest('.nav-index, .nav')) back.current = from;
+    if (!back.current && from instanceof HTMLElement && !from.closest('.nav-index, .nav, .palette')) back.current = from;
     if (paneRef.current === 'peek') setPane((paneRef.current = 'open'));
   }, []);
 
@@ -666,18 +668,25 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
         closeIndex();
       }
     };
-    // The palette's "Go to a message": the first conversation on screen answers (in a race, the left one).
-    const onAsk = () => {
-      if (!marksRef.current.length || document.querySelector('.tl') !== track.current?.closest('.tl')) return;
-      if (paneRef.current !== 'open') openIndex();
-    };
     window.addEventListener('keydown', onKey, true);
-    window.addEventListener('sable:go-to-message', onAsk);
-    return () => {
-      window.removeEventListener('keydown', onKey, true);
-      window.removeEventListener('sable:go-to-message', onAsk);
-    };
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [openIndex, closeIndex]);
+
+  // The palette's "Go to a message" (nav-bus picks the conversation: in a race the one last focused
+  // or pointed at). Focus goes back to where it was before the palette opened, not to the body.
+  useEffect(
+    () =>
+      takeConversation(sessionId, {
+        el: () => track.current?.closest('.tl') ?? null,
+        marks: () => marksRef.current.length,
+        open: (to) => {
+          if (!marksRef.current.length) return;
+          if (to && !to.closest('.nav-index, .nav')) back.current = to;
+          if (paneRef.current !== 'open') openIndex();
+        },
+      }),
+    [sessionId, openIndex],
+  );
 
   useEffect(() => {
     if (pane !== 'open') return;

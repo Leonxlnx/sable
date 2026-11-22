@@ -13,7 +13,8 @@ import { RAIL_TABS, railTabKeys } from '@/features/rail/tabs';
 import { getScripts, runScriptInPanel } from '@/features/rail/scripts-store';
 import { focusComposer } from '@/state/hooks';
 import { createLane } from '@/features/session/lane';
-import { openRace, raceFolder } from '@/features/race/race';
+import { openRace, raceFolder, raceKey } from '@/features/race/race';
+import { goToMessage, goToMessageTarget } from '@/features/timeline/nav-bus';
 import { useStore, type RailTab } from '@/state/store';
 
 export type PaletteGroup = 'Recent' | 'Sessions' | 'Projects' | 'Prompts' | 'Actions' | 'Commands' | 'Skills' | 'Messages';
@@ -107,6 +108,12 @@ export function buildItems(opts: {
     });
   }
 
+  /** The race view's two conversations, left then right, while it is in front. */
+  const raceOnScreen = () => {
+    const race = ui().race;
+    return race ? raceKey(useStore.getState(), race).split('|').filter(Boolean) : [];
+  };
+
   const act = (id: string, title: string, icon: IconName, run: () => void, extra: Partial<PaletteItem> = {}) =>
     items.push({ id: `action:${id}`, group: 'Actions', title, icon, run, ...extra });
 
@@ -128,10 +135,14 @@ export function buildItems(opts: {
     keywords: 'toggle sidebar',
   });
 
+  // The navigator's index of every prompt (timeline/nav-bus.ts): in the open chat, or in a race the
+  // conversation last focused or pointed at; left out when that one has no messages on its map. It
+  // opens once the palette has closed (its focus trap gone), and gives focus back to where it was before.
+  const nav = goToMessageTarget(opts.active ? [opts.active.id] : raceOnScreen());
+  if (nav) act('go-message', 'Go to a message', 'search', () => void setTimeout(() => goToMessage(nav), 90), { keys: 'mod+g', keywords: 'prompt navigator jump find index earlier' });
+
   if (opts.active) {
     const id = opts.active.id;
-    // The navigator's index of every prompt (timeline/Navigator.tsx listens): after the palette has closed and given focus back.
-    act('go-message', 'Go to a message', 'search', () => void setTimeout(() => window.dispatchEvent(new Event('sable:go-to-message')), 90), { keys: 'mod+g', keywords: 'prompt navigator jump find index earlier' });
     act('export', 'Export chat', 'export', () => void exportChat(id), { keywords: 'export save markdown file download conversation chat md' });
     act('copy-markdown', 'Copy as Markdown', 'copy', () => void copyChatMarkdown(id), { keywords: 'copy markdown clipboard export conversation chat md' });
     act('toggle-panel', ui().railOpen ? 'Hide panel' : 'Show panel', 'sidebar', () => setUi({ railOpen: !ui().railOpen }), { keys: 'mod+j', keywords: 'toggle panel rail' });

@@ -21,11 +21,13 @@ import { isLeadIn } from './lead-in';
  *      inside a running one a segment of its own, as a steered message does
  *   u  such a message with nothing to show (a reminder, a caveat): between turns it opens one, so
  *      the work after it folds as a turn's; a turn with nothing else in it is not shown
- *      (a slash command opens a turn as a message does, `U`; what it printed is a notice, `n`)
+ *      (a slash command opens a turn as a message does, `U`; what it printed is command output, `c`)
  *   l  a lead-in: a one-line announcement of the next step ("Let me run the tests."), or a text
  *      still being written that may turn out one (see `lead-in.ts`): folded with the steps it
  *      announces, said in view when no step follows it, and never the answer of a turn that said more
- *   c  command output (an answer candidate)     p  a plan (an answer candidate)
+ *   c  command output (an answer candidate): a command notice, or what a command printed written in
+ *      the person's place (`<local-command-stdout>` / `-stderr>`, `!` output)
+ *                                               p  a plan (an answer candidate)
  *   w  a step: a tool call                      n  any other notice (mode, model, compaction, retry): not a step
  *   h  thinking: part of the work, not counted as a step
  *   k  a task list update: kept in the work, not counted as a step (the dock shows the list)
@@ -138,7 +140,9 @@ export function shapeOf(item: TimelineItem | undefined): string {
       if (item.state === 'queued') return 'Q';
       const syn = syntheticOf(item);
       if (!syn) return 'U';
-      return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : 'n';
+      // What a command printed (`<local-command-stdout>`, `<local-command-stderr>`, a `!` command's
+      // output) is command output, as a command notice is: never folded. A compaction summary is a notice.
+      return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : syn.role === 'output' ? 'c' : 'n';
     }
     case 'text':
       if (!item.streaming && !item.text.trim()) return '.';
@@ -643,9 +647,37 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
 
 const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' ? it.text.trim() : '');
 
-/** What a copy of a turn's response holds: the answers of every segment, or failing that every text. */
+/**
+ * The words of what a turn can show as its answer (`ANSWER`): a text as written, a plan as its
+ * card shows it, command output as printed (a command notice's output, else its line; what a
+ * command printed in the person's place, every part of it). '' for anything else.
+ */
+export function answerText(it: TimelineItem | undefined): string {
+  if (!it) return '';
+  switch (it.type) {
+    case 'text':
+      return it.text.trim();
+    case 'tool':
+      if (it.kind !== 'plan') return '';
+      return (it.detail.plan ?? (typeof (it.input as { plan?: unknown } | undefined)?.plan === 'string' ? (it.input as { plan: string }).plan : '')).trim();
+    case 'notice':
+      return it.variant === 'command' ? (it.detail?.trim() || it.text.trim()) : '';
+    case 'user': {
+      const syn = syntheticOf(it);
+      if (syn?.role !== 'output') return '';
+      return syn.parts
+        .flatMap((p) => (p.kind === 'output' ? [p.text.trim()] : []))
+        .filter(Boolean)
+        .join('\n\n');
+    }
+    default:
+      return '';
+  }
+}
+
+/** What a copy of a turn's response holds: the answers of every segment (whatever kind each is), or failing that every text. */
 export function responseText(items: Record<string, TimelineItem | undefined>, turn: TurnGroup): string {
-  const answers = turn.segments.map((s) => textOf(s.answer ? items[s.answer] : undefined)).filter(Boolean);
+  const answers = turn.segments.map((s) => answerText(s.answer ? items[s.answer] : undefined)).filter(Boolean);
   if (answers.length) return answers.join('\n\n');
   return turn.ids
     .map((id) => textOf(items[id]))
@@ -654,17 +686,17 @@ export function responseText(items: Record<string, TimelineItem | undefined>, tu
 }
 
 /**
- * What `/copy` copies: the response of the newest settled turn with an answer, the same text as
- * that turn's "Copy response" (`responseText`), or null when there is none yet.
+ * What `/copy` copies: the response of the newest settled turn, the same text as that turn's
+ * "Copy response" (`responseText`), or null when it has none (or no turn has settled yet). It never
+ * reaches past that turn: an older turn's answer is not the last answer.
  */
 export function lastResponse(items: Record<string, TimelineItem | undefined>, roots: readonly string[], busy: boolean): string | null {
   const shape = roots.map((id) => shapeOf(items[id])).join('');
   const { groups } = groupTurns(roots, shape, busy);
   for (let i = groups.length - 1; i >= 0; i--) {
     const g = groups[i];
-    if (g.kind !== 'turn' || g.state === 'running' || !g.segments.some((s) => s.answer)) continue;
-    const text = responseText(items, g);
-    if (text) return text;
+    if (g.kind !== 'turn' || g.state === 'running') continue;
+    return responseText(items, g) || null;
   }
   return null;
 }

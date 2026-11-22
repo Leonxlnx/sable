@@ -387,3 +387,36 @@ describe('the navigator with long sittings and moving rows (review wave 9)', () 
     ]);
   });
 });
+
+describe('"Go to a message" from the palette (review wave 10)', () => {
+  it('goes to the open chat, or in a race to the side last focused or pointed at, else the left one', async () => {
+    const { pickConversation } = await import('@/features/timeline/nav-bus');
+    const marks = (n: Record<string, number>) => (id: string) => n[id] ?? 0;
+    expect(pickConversation(['a'], null, marks({ a: 3 }))).toBe('a');
+    expect(pickConversation(['l', 'r'], null, marks({ l: 2, r: 5 }))).toBe('l');
+    expect(pickConversation(['l', 'r'], 'r', marks({ l: 2, r: 5 }))).toBe('r');
+    // A conversation no longer on screen does not count.
+    expect(pickConversation(['l', 'r'], 'gone', marks({ l: 2, r: 5 }))).toBe('l');
+    // Left out when that conversation has no marks: never the other side instead.
+    expect(pickConversation(['l', 'r'], 'r', marks({ l: 2 }))).toBeNull();
+    expect(pickConversation(['a'], null, marks({}))).toBeNull();
+    expect(pickConversation([], null, marks({ a: 1 }))).toBeNull();
+  });
+
+  it('reaches the maps that are mounted, and opens the chosen one only', async () => {
+    const { takeConversation, goToMessage, goToMessageTarget } = await import('@/features/timeline/nav-bus');
+    const opened: string[] = [];
+    const conv = (id: string, n: number) => ({ el: () => null, marks: () => n, open: () => void opened.push(id) });
+    const offL = takeConversation('left', conv('left', 4));
+    const offR = takeConversation('right', conv('right', 2));
+    expect(goToMessageTarget(['left', 'right'])).toBe('left');
+    expect(goToMessage('right')).toBe(true);
+    expect(opened).toEqual(['right']);
+    offL();
+    // Its map is gone: nothing to offer, nothing opens.
+    expect(goToMessageTarget(['left', 'right'])).toBeNull();
+    expect(goToMessage('left')).toBe(false);
+    offR();
+    expect(goToMessageTarget(['right'])).toBeNull();
+  });
+});

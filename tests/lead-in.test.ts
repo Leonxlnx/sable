@@ -133,6 +133,54 @@ describe('isLeadIn: what must be read never folds (review wave 9)', () => {
   });
 });
 
+describe('isLeadIn: an announcement that turns into a result stays in view (review wave 10)', () => {
+  it('keeps a result or a contrast after an announcement in view', () => {
+    for (const t of [
+      "I'll rerun CI, but the migration already failed.",
+      'Ich prüfe die Logs, aber die Sicherung fehlt.',
+      'Let me rerun the suite, but two tests were already red on main.',
+      "I'll push the branch; the build on CI is broken though.",
+      'Let me retry the deploy because the first attempt timed out halfway.',
+      "Now I'll fix the import, although the real problem is in the bundler config.",
+      'Ich schaue mir die Tests an, weil der Build seit gestern rot ist.',
+      'Let me check the routes — the admin guard never runs.',
+      'Running the tests again, but the fixture file is missing.',
+    ])
+      expect(isLeadIn(t, false), t).toBe(false);
+  });
+
+  it('shows it while it is being written once the turn says something', () => {
+    expect(isLeadIn("I'll rerun CI, but the migration already", true)).toBe(false);
+    expect(isLeadIn('Ich prüfe die Logs, aber die Sicherung fehlt', true)).toBe(false);
+    // Until then, and when what follows is one more announcement, it is held.
+    expect(isLeadIn("I'll rerun CI, but", true)).toBe(true);
+    expect(isLeadIn("I'll rerun CI, but first let", true)).toBe(true);
+  });
+
+  it('keeps plain announcements folding, a turn into another announcement too', () => {
+    for (const t of [
+      "I'll rerun CI, but first let me check the logs.",
+      'Let me run the tests, but quickly.',
+      'Let me check what changed since the last release.',
+      'Now let me run the tests; then the build.',
+      "I'll update the docs, but let me finish the store first.",
+      'Ich prüfe die Logs, aber zuerst lass mich die Tests ausführen.',
+    ])
+      expect(isLeadIn(t, false), t).toBe(true);
+  });
+
+  it('stays linear with a long word after the turn', () => {
+    const id = 'a1b2c3d4e5'.repeat(18);
+    const started = performance.now();
+    for (const head of ["I'll rerun CI, but ", 'Let me check - ', 'Ich prüfe das, aber ', "I'll check; "]) {
+      isLeadIn(`${head}${id}`, true);
+      isLeadIn(`${head}${id}.`, false);
+      isLeadIn(`${head}${'- '.repeat(80)}`, true);
+    }
+    expect(performance.now() - started).toBeLessThan(200);
+  });
+});
+
 describe('leadTitle', () => {
   it('names what the step does, in the voice of a step title', () => {
     expect(leadTitle('Now let me run the tests.')).toBe('Run the tests');
