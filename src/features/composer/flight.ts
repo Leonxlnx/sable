@@ -7,20 +7,23 @@ import { BORN, COLLAPSE, collapseAt, collapseEase, footAt, HAND, linearEasing, p
 
 /**
  * A sent message leaves the composer as liquid (liquid-shape.ts has the beats and the geometry):
- * the words run into the bar's top-right corner as one piece while the field closes to one line
- * on the same curve; for a moment the bar is empty and at rest (it is live at once). Then the
- * liquid comes back out there: the edge swells, a drop of dark glass stands out of it and flies,
- * a thread still tying it to the bar until it thins and parts (both ends recoil, the edge bobs
- * once); the drop coasts to the bottom-right of where the message will sit, slowing, and spreads
- * there into the card's shape, revealing the words in place as it covers them; the conversation's
- * own card then takes over. One body, one path, one speed that never steps.
+ * the words run down into the pane's corner over the send key as one piece while the field closes
+ * to one line on the same curve; for a moment the pane is empty and at rest (it is live at once).
+ * Then the liquid comes back out of the key: the key gives, a drop of dark glass rises from
+ * behind its top and flies, a thread still tying it to the key until it thins and parts (both
+ * ends recoil, the key comes back up); the drop coasts straight up to the bottom-right of where
+ * the message will sit, slowing, and spreads there into the card's shape, revealing the words in
+ * place as it covers them; the conversation's own card then takes over. One body, one path, one
+ * speed that never steps.
  *
  * - Who draws what: the liquid is drawn by a worker on a canvas of its own (liquid.ts), the words
  *   are page layers animated on the compositor, both on the same clock with keyframes taken from
  *   the same geometry. Nothing runs per frame on the main thread, so a session mounting or a turn
  *   starting cannot make it stutter.
- * - The clock: time zero is the frame the gathering words first show in (`begin`), not the key:
- *   whatever the main thread took to get that frame out, the motion plays from its start.
+ * - The clock: time zero is one frame before the frame the gathering words first show in
+ *   (`begin`, `FIRST_FRAME`), not the key: that first frame already moves, and whatever the main thread
+ *   took to get it out, the motion plays from there. Everything of the message runs on that one
+ *   clock, the worker's drawing, the page's layers and the send key's part (launch.ts) alike.
  * - The key's handler (`launchFlight`) reads the page once and then only writes; what shows
  *   nothing yet waits for the frame after (`after`).
  * - The drop is glass: it bends a still of the backdrop's field (taken at the send, handed to the
@@ -214,8 +217,10 @@ const FIRST_TOP = 56;
 const LANDING_GAP = 26;
 /** The narrowest side padding of a conversation row (timeline.css `.tl-content --gutter`). */
 const MIN_GUTTER = 24;
-/** The bead forms this far in from the bar's right edge (clear of its corner's curve). */
+/** A bar without a key (nothing sends from one today): the bead forms this far in from its right edge. */
 const CORNER = 34;
+/** The words gather this far over the key's top: just inside the pane, past the channel. */
+const OVER_KEY = 8;
 /** A queue row (composer.css `.cq-list`, `.cq-row`): inset in the tray, its height, its corners, where its words start. */
 const ROW = { inset: 6, gap: 6, height: 28, radius: 9, text: 35 };
 
@@ -366,14 +371,24 @@ function fontOf(cs: CSSStyleDeclaration) {
 }
 
 /**
+ * The first frame a message shows in is already this far into its motion (ms): the frame after
+ * the key press moves (the words have begun to run, the key has begun to give), instead of
+ * standing for one frame exactly as the field stood. One frame's worth, whatever the first frame
+ * took to make: nothing more of the motion is ever skipped.
+ */
+const FIRST_FRAME = 16;
+
+/**
  * An animation timed from the message's start (`t0`, the page's clock), so it agrees with the
- * worker frame for frame. Before the start is known (the launch's first frame) it is left pending;
- * the start sets them all at once.
+ * worker frame for frame. Before the start is known (the launch's first frame) it is left pending,
+ * `FIRST_FRAME` in: it begins there in the first frame it shows in; the start then puts what shows
+ * nothing yet on the message's clock (`begin`).
  */
 function fromKey(f: Pick<Flight, 't0' | 'all' | 'started'>, el: Element, frames: Keyframe[], opts: KeyframeAnimationOptions): Animation | null {
   const a = play(el, frames, { easing: 'linear', fill: 'both', ...opts });
   if (!a) return null;
   if (f.started) a.startTime = f.t0;
+  else a.currentTime = FIRST_FRAME;
   if (frozenAt != null) {
     a.pause();
     a.currentTime = frozenAt;
@@ -558,21 +573,27 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   }
   const bar = source.oneLine ? null : source.el.closest<HTMLElement>('.cmp-card');
   const g = readGeometry(bar, column, stageEl);
+  // The key the drop leaves from: a disc in the bar's corner (composer.css `.cmp-keys`).
+  const keyR = bar?.querySelector('.cmp-keys')?.getBoundingClientRect();
   const rowEl = source.oneLine ? source.el.closest<HTMLElement>('[data-qrow]') : null;
   const rowBox = rowEl?.getBoundingClientRect();
   const cardR = g.card;
   // Fractional: a width rounded down would wrap the last word.
   const size = bubble ? made.el.getBoundingClientRect() : null;
-  // The field closes to one line with the words. A docked bar grows upward, so its top edge comes
-  // down by what the field loses; the home card's copy keeps its top (home/handoff.ts).
+  // The field closes to one line with the words. A docked bar grows upward, so its key stays
+  // where it is; the home card's copy keeps its top (home/handoff.ts), so its key comes up by
+  // what the field loses.
   const ta = bar && source.el instanceof HTMLTextAreaElement ? source.el : null;
   const oneLine = m.line + m.padY;
   const shrink = ta ? Math.max(0, m.box.bottom - m.box.top - oneLine) : 0;
-  const from: LiquidSpec['from'] = cardR
-    ? { x: cardR.right / z - CORNER, y: cardR.top / z + (first ? 0 : shrink), edge: true }
-    : rowBox
-      ? { x: rowBox.right / z - 44, y: (rowBox.top + rowBox.height / 2) / z, edge: false }
-      : { x: m.box.right - 30, y: (m.box.top + m.box.bottom) / 2, edge: false };
+  const from: LiquidSpec['from'] =
+    cardR && keyR?.width
+      ? { x: (keyR.left + keyR.width / 2) / z, y: keyR.top / z - (first ? shrink : 0), edge: true, r: keyR.width / 2 / z }
+      : cardR
+        ? { x: cardR.right / z - CORNER, y: cardR.top / z + (first ? 0 : shrink), edge: true }
+        : rowBox
+          ? { x: rowBox.right / z - 44, y: (rowBox.top + rowBox.height / 2) / z, edge: false }
+          : { x: m.box.right - 30, y: (m.box.top + m.box.bottom) / 2, edge: false };
 
   // Where it lands, and how far the conversation has to move up before that place is clear of its last lines.
   let box: Box;
@@ -632,9 +653,9 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   f.home = { left: m.left - CARD_PAD_X * s0, top: m.top - CARD_PAD_TOP * s0 + (m.line - CARD_LINE * s0) / 2, s0 };
   place(f);
   f.el.style.visibility = '';
-  // The words gather into the corner the drop will come out of (or the row's end), and the
-  // landing is revealed by the sheet.
-  f.pourEls = gatherWords(f, source, m, { x: from.x, y: from.y });
+  // The words gather into the pane's corner over the key the drop will come out of (or the row's
+  // end), and the landing is revealed by the sheet.
+  f.pourEls = gatherWords(f, source, m, { x: from.x, y: from.r ? from.y - OVER_KEY : from.y });
   // A queue row's words are gathering out of it: the row itself shows none (it leaves the tray
   // meanwhile; one that stays gets its words back).
   if (source.oneLine) {
@@ -707,14 +728,28 @@ function nextTask(fn: () => void) {
  * that moment. The compositor reports it (`lead.ready`), but only once the main thread is free
  * again, which after a send can be much later; so the worker is started right behind the frame
  * (the next task, ahead of the work the send set off) on that task's time, and put right when the
- * report comes in while nothing of the liquid shows yet. A hidden window shows no frame: a timer
- * starts the message instead. What the launch left for later follows at once.
+ * report comes in while nothing of the liquid shows yet. Everything of the message that shows
+ * later than its first frames runs on that same clock (`align`). A hidden window shows no frame: a
+ * timer starts the message instead. What the launch left for later follows at once.
  */
 function begin(f: Flight, g: Geometry, lead: Animation | null) {
+  // The layers that show nothing yet (the window the ink reveals the words through, the card's
+  // surface, the waiting state, a bar's glide that still holds) are put on the message's own
+  // clock, the one the worker draws by. Left to start by themselves they run from the moment the
+  // compositor first shows them, which on a loaded machine is some frames after the worker's
+  // zero; when the compositor's report of that moment then comes too late to move the worker
+  // (below), the two stay apart: the sheet let go on the worker's time and the surface formed on
+  // the compositor's, so for a few frames the card had neither (it blinked before the row took
+  // over). Only the gathering words, which show from the first frame, keep their own start.
+  const align = () => {
+    if (frozenAt != null) return;
+    for (const a of [...f.anims, ...f.wait, ...f.synced]) a.startTime = f.t0;
+  };
   const go = (at: number) => {
     if (f.started) return;
     f.t0 = at;
     f.started = true;
+    align();
     if (frozenAt != null)
       for (const a of [...f.all, ...f.synced]) {
         a.pause();
@@ -725,8 +760,9 @@ function begin(f: Flight, g: Geometry, lead: Animation | null) {
     armRest(f);
     after(f, g);
   };
-  requestAnimationFrame(() => nextTask(() => go(performance.now())));
-  window.setTimeout(() => go(performance.now()), 160);
+  // The first frame shows the message `FIRST_FRAME` in, so its zero lies that far before that frame.
+  requestAnimationFrame(() => nextTask(() => go(performance.now() - FIRST_FRAME)));
+  window.setTimeout(() => go(performance.now() - FIRST_FRAME), 160);
   const exact = () => {
     const at = lead?.startTime;
     if (typeof at !== 'number') return;
@@ -736,6 +772,7 @@ function begin(f: Flight, g: Geometry, lead: Animation | null) {
     if (Math.abs(at - f.t0) < 2 || t > f.plan.born || f.ending || frozenAt != null) return;
     f.t0 = at;
     f.liquid?.retime(at);
+    align();
     armRest(f);
   };
   lead?.ready.then(exact, () => {});
@@ -846,12 +883,29 @@ export function launchRead(bar: HTMLElement): { card: { left: number; top: numbe
 export function barLeaving(bar: HTMLElement, by: { dx: number; dy: number }): ((a: Animation) => void) | null {
   const f = leavingFlight(bar);
   if (!f) return null;
-  const flight = f;
-  flight.liquid?.leaving(by);
-  if (flight.liquid) flight.plan = flight.liquid.plan;
+  f.liquid?.leaving(by);
+  if (f.liquid) f.plan = f.liquid.plan;
+  return onFlightClock(bar);
+}
+
+/**
+ * How to put an animation on the clock of the message leaving `bar` in this same handler (its
+ * time zero is the message's first frame, the clock its drop is drawn by): the send key's part
+ * (launch.ts), the home bar's glide. Null when no message is leaving that bar.
+ */
+export function onFlightClock(bar: HTMLElement): ((a: Animation) => void) | null {
+  const flight = leavingFlight(bar);
+  if (!flight) return null;
   return (a) => {
     if (flight.started) a.startTime = flight.t0;
-    else flight.synced.push(a);
+    else {
+      flight.synced.push(a);
+      a.currentTime = FIRST_FRAME;
+    }
+    if (frozenAt != null) {
+      a.pause();
+      a.currentTime = frozenAt;
+    }
   };
 }
 
@@ -1443,7 +1497,7 @@ function devHook() {
       inAir: () => pending.length,
       easing: linearEasing(shiftEase),
       debug: () =>
-        pending.map((f) => ({ dest: f.dest, t: Math.round(performance.now() - f.t0), box: f.box, from: f.plan.spec.from, land: f.plan.land, hand: f.plan.hand, end: f.plan.end, shifts: f.plan.shifts, target: !!f.target, ending: f.ending, resting: f.resting, el: f.el.getBoundingClientRect().toJSON(), ahead: f.ahead?.by ?? null, slide: !!f.slide })),
+        pending.map((f) => ({ dest: f.dest, t: Math.round(performance.now() - f.t0), skew: f.anims.map((a) => (typeof a.startTime === 'number' ? Math.round((a.startTime - f.t0) * 10) / 10 : null)), box: f.box, from: f.plan.spec.from, land: f.plan.land, hand: f.plan.hand, end: f.plan.end, shifts: f.plan.shifts, target: !!f.target, ending: f.ending, resting: f.resting, el: f.el.getBoundingClientRect().toJSON(), ahead: f.ahead?.by ?? null, slide: !!f.slide })),
     };
 }
 

@@ -1,11 +1,20 @@
-/* The composer: the main pane of glass (styles/ui.css "material: glass"), the same on home and in
-   a session. One even frosted fill with a backdrop blur, thin enough for the field's colour to
-   come through; one even hairline rim all the way round (::before); a contact line and two
-   shadows for depth. No glint, no sheen, no thinner edges. Focus draws no ring and never lightens
-   the pane: one layer under the content fades in (a little more ink, so the words sit calmer, the
-   hairline a step clearer all the way round, a deeper shadow). Monochrome: the only colour is the
-   field's, through the glass. Everything here is static paint; only that layer's opacity and the
-   pointer's ring (ui/spot.ts) ever move. */
+/* The composer, "the cove": one pane of plain glass (styles/ui.css "material: glass") whose
+   bottom-right corner is not a corner. A concave arc carves it, and in that cove rests the send
+   key, an object of its own: the pane's corner, cut loose. The key has the pane's own corner
+   radius, so pane and key together still read as one calm rounded rectangle, with one even
+   channel between them. The same on home and in a session.
+
+   The card (`.cmp-card`) stays a plain rectangle that everything measures and lays out in; it
+   paints nothing itself. Its paint is the layers of Cove.tsx, all static:
+   - the glass (`.cmp-glass`): one even frosted fill with a backdrop blur, clipped to the pane's
+     outline; the pane's inner glow, the same all round (the cove's from a disc of its own);
+   - the rim (`.cmp-rim`): one even hairline along the whole outline, the cove included;
+   - the shade (`.cmp-shade`): the contact line and the shadows of glass, with what falls into the
+     channel.
+   No glint, no sheen, no thinner edges. Focus draws no ring and never lightens the pane: three
+   layers only fade in (a little more ink in the glass, the hairline a step clearer all the way
+   round, a deeper shadow). Monochrome: the only colour is the field's, through the glass and in
+   the channel. Only those opacities and the pointer's light (ui/spot.ts) ever move. */
 
 .composer {
   position: relative;
@@ -13,29 +22,149 @@
 }
 
 .cmp-card {
-  --cmp-fill: var(--glass-pane);
+  /* The cove, measured from the card's bottom-right corner. The key is a disc of the pane's own
+     corner radius (20) in the corner, so its centre K is 20 in; the channel is 6 wide, so the
+     cove is a circle of 26 about K. The two horns, where the pane's straight edges turn into the
+     cove, are rounded so that each straight edge ends a whole number of pixels from the corner
+     (the rim's straight part is a masked ring on whole pixels; only the curve is a shape). The
+     numbers between the two marks are derived from the key, the channel and that distance
+     (tests/cove.test.ts derives them again and compares). */
+  /* cove:begin */
+  --cove-key: 40px;
+  --cove-gap: 6px;
+  --cove-cut: 54px;
+  --cove-pane: shape(
+    from 20px 0,
+    hline to calc(100% - 20px),
+    arc to 100% 20px of 20px cw,
+    vline to calc(100% - 54px),
+    arc to calc(100% - 12.372px) calc(100% - 44.856px) of 9.565px cw,
+    arc to calc(100% - 44.856px) calc(100% - 12.372px) of 26px ccw,
+    arc to calc(100% - 54px) 100% of 9.565px cw,
+    hline to 20px,
+    arc to 0 calc(100% - 20px) of 20px cw,
+    vline to 20px,
+    arc to 20px 0 of 20px cw,
+    close
+  );
+  /* The rim along the cove: the band between that curve and the same curve one pixel in. */
+  --cove-band: shape(
+    from 100% calc(100% - 54px),
+    arc to calc(100% - 12.372px) calc(100% - 44.856px) of 9.565px cw,
+    arc to calc(100% - 44.856px) calc(100% - 12.372px) of 26px ccw,
+    arc to calc(100% - 54px) 100% of 9.565px cw,
+    vline to calc(100% - 1px),
+    arc to calc(100% - 45.812px) calc(100% - 12.078px) of 8.565px ccw,
+    arc to calc(100% - 12.078px) calc(100% - 45.812px) of 27px cw,
+    arc to calc(100% - 1px) calc(100% - 54px) of 8.565px ccw,
+    close
+  );
+  /* The corner's quarter of the plane without the pane: the channel, the key's place, and the
+     room beyond the corner where the shadows fall. */
+  --cove-notch: shape(
+    from 100% calc(100% - 54px),
+    arc to calc(100% - 12.372px) calc(100% - 44.856px) of 9.565px cw,
+    arc to calc(100% - 44.856px) calc(100% - 12.372px) of 26px ccw,
+    arc to calc(100% - 54px) 100% of 9.565px cw,
+    vline to calc(100% + 240px),
+    hline to calc(100% + 200px),
+    vline to calc(100% - 54px),
+    close
+  );
+  /* Everything but that quarter: the pane's straight edges and plain corners. */
+  --cove-rest: polygon(
+    -240px -240px,
+    calc(100% + 240px) -240px,
+    calc(100% + 240px) calc(100% - 54px),
+    calc(100% - 54px) calc(100% - 54px),
+    calc(100% - 54px) calc(100% + 240px),
+    -240px calc(100% + 240px)
+  );
+  /* The cove as a disc about the key's centre, and the stretch of it that is the pane's edge
+     (between the two points where the horns' roundings take over). */
+  --cove-disc: 52px;
+  --cove-disc-out: -6px;
+  --cove-arc: polygon(26px 26px, 41.257px -23.711px, -26px -26px, -23.711px 41.257px);
+  /* A horn's rounding as a disc, where it stands, and its stretch of the edge. */
+  --horn-disc: 19.13px;
+  --horn-at: 44.435px;
+  --horn-arc-side: polygon(9.565px 9.565px, 49.565px 9.565px, 49.565px 49.565px, -2.171px 47.805px);
+  --horn-arc-base: polygon(9.565px 9.565px, 47.805px -2.171px, 49.565px 49.565px, 9.565px 49.565px);
+  /* cove:end */
+  /* The glass's depth (tokens.css --shadow-glass, --rim-inner), layer by layer, for the corner's
+     quarter, where the pane's outline is not a box's: the contact line and the near shadow follow
+     the cove; the two wide shadows are the whole silhouette's (pane and key together are the
+     box); the channel keeps a shade of its own. Change them with those tokens. */
+  --cove-contact: 0 0 0 1px rgb(0 0 0 / 0.42);
+  --cove-near: 0 2px 5px -1px rgb(0 0 0 / 0.38);
+  --cove-far: 0 14px 34px -12px rgb(0 0 0 / 0.72), 0 34px 70px -34px rgb(0 0 0 / 0.6);
+  --cove-glow: 0 0 12px 0 rgb(255 255 255 / 0.02);
+  --cove-gap-shade: rgb(0 0 0 / 0.3);
   position: relative;
   z-index: 1;
   container: cmp / inline-size;
-  padding: 10px 11px 10px;
+  padding: 10px 6px 6px;
   border-radius: 20px;
+}
+
+/* ── the pane's paint (Cove.tsx) ── */
+
+.cmp-shade,
+.cmp-shade-lift,
+.cmp-glass,
+.cove-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.cmp-shade > *,
+.cmp-shade > .sh-q > *,
+.cmp-glass > *,
+.cove-ring > * {
+  position: absolute;
+}
+
+/* The glass: the fill and the blur, cut to the pane. */
+.cmp-glass {
+  --cmp-fill: var(--glass-pane);
+  z-index: -1;
   background-color: var(--cmp-fill);
   background-image: var(--grain);
   background-size: var(--grain-size);
   -webkit-backdrop-filter: var(--blur-pane);
   backdrop-filter: var(--blur-pane);
-  box-shadow: var(--rim-inner), var(--shadow-glass);
+  box-shadow: var(--rim-inner);
+  clip-path: var(--cove-pane);
 }
 
-/* The rim (the same even ring as .pop's). */
-.cmp-card::before {
-  content: '';
-  position: absolute;
+/* The inner glow along the cove: the light of a disc as large as the cove, falling outward into
+   the pane (the box's own inset glow never reaches this edge). */
+.gl-glow {
+  right: var(--cove-disc-out);
+  bottom: var(--cove-disc-out);
+  width: var(--cove-disc);
+  height: var(--cove-disc);
+  border-radius: 50%;
+  box-shadow: var(--cove-glow);
+}
+
+/* Focus, part one: a little more ink in the glass (the pane settles, it never goes lighter). */
+.gl-ink {
   inset: 0;
-  z-index: 1;
+  background-color: var(--glass-pane-lift);
+  opacity: 0;
+  transition: opacity 240ms var(--ease-out);
+}
+
+/* A ring along the outline, in two parts with the same origin: the straight edges and the three
+   plain corners as every pane's rim is drawn (a masked 1px ring, on whole pixels), cut off where
+   the cove begins; and the cove's own curve. */
+.cove-ring > .cr-edge {
+  inset: 0;
   padding: 1px;
   border-radius: inherit;
-  background: var(--rim-light);
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
@@ -43,56 +172,200 @@
   mask:
     linear-gradient(#000 0 0) content-box exclude,
     linear-gradient(#000 0 0);
-  pointer-events: none;
+  clip-path: var(--cove-rest);
+}
+
+.cove-ring > .cr-cove {
+  inset: 0;
+  clip-path: var(--cove-band);
+}
+
+/* The rim: one even hairline, the same along the cove as along the straight edges. */
+.cmp-rim {
+  z-index: 1;
+}
+
+.cmp-rim > i {
+  background: var(--rim-light);
+}
+
+/* Focus, part two: the hairline a step clearer, on the rim's own pixels, all the way round. */
+.cmp-rim-lift {
+  z-index: 1;
+  opacity: 0;
+  transition: opacity 240ms var(--ease-out);
+}
+
+.cmp-rim-lift > i {
+  background-color: rgb(255 255 255 / 0.03);
+}
+
+/* The shade, under the glass. Away from the cove it is the glass's own token on a box (cut off
+   where the cove begins). In the corner's quarter the outline is not a box's: the two wide
+   shadows are the box's (pane and key together), the contact line and the near shadow are drawn
+   by three discs, the cove's inward, the horns' outward, each kept to its own stretch of the
+   curve, and the channel has a soft shade of its own (a box's shadow is never drawn inside it). */
+.cmp-shade {
+  z-index: -2;
+}
+
+.sh-body {
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: var(--shadow-glass);
+  clip-path: var(--cove-rest);
+}
+
+.sh-q {
+  inset: 0;
+  border-radius: inherit;
+  clip-path: var(--cove-notch);
+}
+
+.sh-far {
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: var(--cove-far);
+}
+
+/* The channel is a narrow gap between two panes close over the ground: it keeps a soft shade of
+   its own, even along the channel and falling off where the channel opens to the outside. */
+.sh-gap {
+  right: calc(var(--cove-disc-out) - 10px);
+  bottom: calc(var(--cove-disc-out) - 10px);
+  width: calc(var(--cove-disc) + 20px);
+  height: calc(var(--cove-disc) + 20px);
+  border-radius: 50%;
+  background: radial-gradient(circle closest-side, var(--cove-gap-shade) 72%, transparent);
+}
+
+.sh-cove {
+  right: var(--cove-disc-out);
+  bottom: var(--cove-disc-out);
+  width: var(--cove-disc);
+  height: var(--cove-disc);
+  border-radius: 50%;
+  box-shadow:
+    inset var(--cove-contact),
+    inset var(--cove-near);
+  clip-path: var(--cove-arc);
+}
+
+.sh-horn {
+  width: var(--horn-disc);
+  height: var(--horn-disc);
+  border-radius: 50%;
+  box-shadow: var(--cove-contact), var(--cove-near);
+}
+
+.sh-horn[data-at='side'] {
+  right: 0;
+  bottom: var(--horn-at);
+  clip-path: var(--horn-arc-side);
+}
+
+.sh-horn[data-at='base'] {
+  right: var(--horn-at);
+  bottom: 0;
+  clip-path: var(--horn-arc-base);
+}
+
+/* Focus, part three: a deeper shadow, faded in as one layer. Its two wide shadows are the whole
+   silhouette's, so one plain box throws them. It is a layer of its own, the size of its shadows
+   (`will-change`, here for the layer's bounds, not for an animation): painted into the layer
+   under the composer, the widest of those shadows made that layer as large as the stage
+   (measured: 905 against 166 thousand px). And it is not drawn at all while it does not show
+   (`visibility`, switched before the fade in and after the fade out). */
+.cmp-shade-lift {
+  z-index: -2;
+  box-shadow: var(--shadow-glass-lift);
+  opacity: 0;
+  visibility: hidden;
+  will-change: opacity;
+  transition:
+    opacity 240ms var(--ease-out),
+    visibility 0s 240ms;
+}
+
+.cmp-card:has(> .cmp-field > textarea.cmp-input:focus) > :is(.cmp-shade-lift, .cmp-rim-lift),
+.cmp-card:has(> .cmp-field > textarea.cmp-input:focus) > .cmp-glass > .gl-ink {
+  opacity: 1;
+}
+
+.cmp-card:has(> .cmp-field > textarea.cmp-input:focus) > .cmp-shade-lift {
+  visibility: visible;
+  transition:
+    opacity 240ms var(--ease-out),
+    visibility 0s;
 }
 
 /* The pointer on the bar: the whole rim steps up a little, evenly (the ring's own fill, faded in
    with the ring), and a touch more near the pointer. The bar is wide and low, so the pointer is
    always close to its top and bottom edges: a light that only followed it would brighten those two
-   and leave the sides dark. */
+   and leave the sides dark. The ring is the composer's own (Cove.tsx), so it follows the cove:
+   ui/spot.ts moves one disc in each of its parts. */
 .cmp-card > .spot-ring {
   --spot: rgb(255 255 255 / 0.05);
   --spot-r: 280px;
+  padding: 0;
+  overflow: visible;
+  -webkit-mask: none;
+  mask: none;
+}
+
+.cmp-card > .spot-ring > .spot-part {
+  overflow: hidden;
   background-color: rgb(255 255 255 / 0.035);
 }
 
-/* Focus, all of it on one layer under the content that only fades in: a little more ink in the
-   fill (the pane settles, it never goes lighter), the hairline a step clearer on all four sides
-   (an even ring on the rim's own pixels) and a deeper shadow. The pane itself is never repainted
-   for it (no animated fill, no animated shadow). */
-.cmp-card::after {
-  content: '';
+.cmp-card > .spot-ring > .spot-part > i {
   position: absolute;
-  inset: 0;
-  z-index: -1;
-  border-radius: inherit;
-  background-color: var(--glass-pane-lift);
-  box-shadow:
-    inset 0 0 0 1px rgb(255 255 255 / 0.03),
-    var(--shadow-glass-lift);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 240ms var(--ease-out);
+  left: calc(var(--spot-r) * -1);
+  top: calc(var(--spot-r) * -1);
+  width: calc(var(--spot-r) * 2);
+  height: calc(var(--spot-r) * 2);
+  background: radial-gradient(circle closest-side, var(--spot), transparent);
+  transform: translate(-9999px, -9999px);
 }
 
-.cmp-card:has(> .cmp-field > textarea.cmp-input:focus)::after {
-  opacity: 1;
+.cmp-card[data-spot-on] > .spot-ring > .spot-part > i {
+  will-change: transform;
 }
 
 /* When the governor sheds effects, the glass goes opaque and stops blurring. */
-:root[data-quality] .cmp-card {
+:root[data-quality] .cmp-glass {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   --cmp-fill: var(--glass-solid);
+}
+
+/* Where a shape cannot be drawn the pane is a plain rounded box and the key lies on its corner. */
+@supports not (clip-path: shape(from 0 0, hline to 1px, close)) {
+  .cmp-glass {
+    clip-path: none;
+  }
+
+  .cove-ring > .cr-edge,
+  .sh-body {
+    clip-path: none;
+  }
+
+  .cove-ring > .cr-cove,
+  .sh-q,
+  .gl-glow {
+    display: none;
+  }
 }
 
 /* ── text ── */
 
 /* Long text scrolls inside the field and is cut at the field's own edges, top and bottom alike.
    Nothing is laid over the lower edge: a fade in "the card's colour" cannot match a translucent
-   pane (it showed as a pale band across the glass), and a mask on a scroller is not allowed. */
+   pane (it showed as a pale band across the glass), and a mask on a scroller is not allowed.
+   The words start 16 in from the pane's edge (the controls below nest 6 in, round in the corner). */
 .cmp-field {
   position: relative;
+  margin: 0 7px;
 }
 
 .cmp-input {
@@ -333,7 +606,9 @@
   pointer-events: none;
 }
 
-/* The send key's launch (Composer.launchKey): a copy of the disc over the real one for a moment. */
+/* The send key's launch (launch.ts): a copy of the disc in place of the real one for a moment,
+   with the key's own contact line and drop (the numbers of `--cove-contact` and tokens.css
+   `--key-up`: the copy lives outside the card). */
 .sk-launch {
   position: fixed;
   z-index: 61;
@@ -342,8 +617,16 @@
   border-radius: 50%;
   color: var(--text-inverse);
   background-color: var(--text);
+  box-shadow:
+    0 0 0 1px rgb(0 0 0 / 0.42),
+    var(--key-up);
+  /* The arrow leaves through the disc's edge and is cut there. */
   overflow: hidden;
   pointer-events: none;
+}
+
+.cmp-card[data-launching] > .cmp-keys {
+  opacity: 0;
 }
 
 .sk-launch .sk-glyph {
@@ -354,10 +637,10 @@
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 9px;
-  height: 9px;
-  margin: -4.5px 0 0 -4.5px;
-  border-radius: 2px;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border-radius: 3px;
   background-color: currentColor;
 }
 
@@ -373,14 +656,18 @@
   opacity: 0;
 }
 
-/* ── toolbar: every control 28 px, one centre line ── */
+/* ── the pane's last line: every control 28 px, on the key's centre line ──
+   The line sits 6 from the pane's edges, so the round attach button nests in the bottom-left
+   corner (a disc of 14 in a corner of 20) as the key nests in the cove, and its centre line is
+   the key's. It ends 6 before the cove, the width of the channel. */
 
 .cmp-bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 10px;
+  margin-top: 14px;
   height: 28px;
+  padding-right: 46px;
 }
 
 .cmp-side {
@@ -391,8 +678,11 @@
   height: 28px;
 }
 
+.cmp-side:first-child {
+  flex-shrink: 0;
+}
+
 .cmp-right {
-  gap: 2px;
   flex-shrink: 1;
   margin-left: auto;
 }
@@ -449,54 +739,51 @@
   transition: rotate var(--d-2) var(--ease-out);
 }
 
-/* Hover: the plus gathers and breathes out once (keyframes in icons/animated/animated.css). */
-.cmp-attach:is(:hover, :focus-visible):not([aria-expanded='true']) .cmp-plus {
-  animation: ai-plus-breathe 360ms var(--ease-out);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .cmp-attach .cmp-plus {
-    animation: none;
-  }
-}
-
+/* Pointed at, the plus moves with its key (icons/animated/, which knows `.cmp-plus`); open, it turns. */
 .cmp-attach[aria-expanded='true'] .cmp-plus {
   rotate: 45deg;
 }
 
-/* Text chips in the toolbar (mode, model). */
+/* ── chips: the words on the pane's last line (Chip.tsx) ──
+   Quiet text with even spacing. A chip has no edge of its own until it is pointed at, held, open
+   or on; the mode chip, which is always on, keeps one fill step. A chip's fill and hairline are
+   its skin (below), so that a label changing its width is one glide and never a layout per frame. */
+
 .tb-chip {
+  --chip-bg: transparent;
+  --chip-ring: none;
+  position: relative;
+  isolation: isolate;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   height: 28px;
   min-width: 0;
-  padding: 0 10px 0 9px;
+  padding: 0 10px;
   border-radius: var(--r-pill);
   font-size: var(--t-ui);
   white-space: nowrap;
   color: var(--text-2);
   transition:
-    background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
     scale var(--d-2) var(--spring);
 }
 
 .tb-chip:hover,
 .tb-chip[aria-expanded='true'] {
+  --chip-bg: var(--fill-2);
   color: var(--text);
-  background-color: var(--fill-2);
 }
 
 .tb-chip:active {
-  background-color: var(--fill-3);
+  --chip-bg: var(--fill-3);
   scale: var(--press);
-  transition-duration: var(--d-1), var(--d-1), 70ms;
+  transition-duration: var(--d-1), 70ms;
 }
 
-/* A bare chip has no edge until it is held or its menu is open: then its fill gets the even hairline. */
-.tb-chip:not(.th-chip):is(:active, [aria-expanded='true']) {
-  box-shadow: var(--press-down);
+/* Held or open, the fill gets the even hairline. */
+.tb-chip:is(:active, [aria-expanded='true']) {
+  --chip-ring: var(--press-down);
 }
 
 .tb-chip svg {
@@ -510,29 +797,118 @@
   color: var(--text-2);
 }
 
-.tb-chip[aria-expanded='true'] > :not(svg) {
-  opacity: 0.7;
+/* The skin of a chip: the same long pill drawn twice, each behind a window. The window at the
+   chip's fixed end shows 20px of the first, its cap. The window over the rest shows the second,
+   whose cap is the chip's moving end: Chip.tsx slides it when the label's width changes (a
+   transform, so the edge glides on the compositor). Each pill runs on far past the other's
+   window, so the two always meet on a straight part: together they are one pill in every frame,
+   hairline and all, and nothing is ever scaled. `--chip-room` is how far the moving window
+   reaches past the chip while a wider pill is on its way in. */
+[data-chip] > .chip-skin {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.chip-skin > i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  overflow: hidden;
+}
+
+.chip-skin > i > i {
+  position: absolute;
+  top: 0;
+  width: 640px;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background-color: var(--chip-bg);
+  box-shadow: var(--chip-ring);
+  transition: background-color var(--d-1) var(--ease);
+}
+
+[data-anchor='right'] > .chip-skin > .cs-fix {
+  right: 0;
+  width: 20px;
+}
+
+[data-anchor='right'] > .chip-skin > .cs-fix > i {
+  right: 0;
+}
+
+[data-anchor='right'] > .chip-skin > .cs-move {
+  left: calc(var(--chip-room, 0px) * -1);
+  right: 20px;
+}
+
+[data-anchor='right'] > .chip-skin > .cs-move > i {
+  left: var(--chip-room, 0px);
+}
+
+[data-anchor='left'] > .chip-skin > .cs-fix {
+  left: 0;
+  width: 20px;
+}
+
+[data-anchor='left'] > .chip-skin > .cs-fix > i {
+  left: 0;
+}
+
+[data-anchor='left'] > .chip-skin > .cs-move {
+  left: 20px;
+  right: calc(var(--chip-room, 0px) * -1);
+}
+
+[data-anchor='left'] > .chip-skin > .cs-move > i {
+  right: var(--chip-room, 0px);
+}
+
+/* What a chip says, part by part. */
+.chip-part {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+/* A part that left: where it stood, for the few frames it takes to go (Chip.tsx fades it). */
+.chip-part.chip-ghost {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: inline-flex;
+  overflow: visible;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chip-ghost {
+    display: none;
+  }
 }
 
 /* Mode: one fill step at rest, like a button. Every mode is neutral ivory except bypass, whose icon
    and label are red (it carries meaning: nothing asks first). The fill stays neutral. */
 .cm-mode {
+  --chip-bg: var(--fill-2);
+  --chip-ring: var(--press-up);
+  gap: 6px;
+  padding: 0 11px 0 9px;
+  flex-shrink: 0;
   color: var(--text);
   font-weight: var(--w-medium);
-  background-color: var(--fill-2);
-  box-shadow: var(--press-up);
 }
 
-.cm-mode:hover {
-  background-color: var(--fill-3);
-}
-
+.cm-mode:hover,
 .cm-mode[aria-expanded='true'] {
-  background-color: var(--fill-3);
+  --chip-bg: var(--fill-3);
 }
 
 .cm-mode:active {
-  background-color: var(--fill-4);
+  --chip-bg: var(--fill-4);
 }
 
 .cm-mode svg,
@@ -540,78 +916,36 @@
   color: var(--text-2);
 }
 
-.cm-mode[data-tone='danger'],
-.cm-mode[data-tone='danger'] svg {
+/* On the parts, not the chip: a red word that leaves stays red while it goes. */
+.cm-mode > .cm-danger,
+.cm-mode > .cm-danger svg {
   color: var(--red);
 }
 
-.cm-mode-label {
-  min-width: 0;
-}
-
+/* Model and effort read as one phrase at rest ("Opus 5.5 · Extra high"), each its own button: the
+   point between them steps back as soon as either shows its edge. */
 .cm-model {
-  gap: 5px;
+  flex-shrink: 1;
   padding: 0 8px 0 10px;
-}
-
-.cm-model-name {
-  min-width: 0;
   color: var(--text);
 }
 
-.cm-model .caret {
-  opacity: 0.7;
+.cmp-dot {
+  flex: none;
+  color: var(--text-4);
+  user-select: none;
+  transition: opacity var(--d-1) var(--ease);
 }
 
-/* Narrow composer (side panel open, larger Interface size): the mode label folds into its icon
-   first; past that the model name truncates. Nothing overlaps. */
-@container cmp (max-width: 470px) {
-  .cm-mode {
-    padding: 0;
-    width: 28px;
-    flex-shrink: 0;
-    justify-content: center;
-  }
-  .cm-mode .cm-mode-label {
-    display: none;
-  }
+.cmp-agent:has(> .tb-chip:is(:hover, :focus-visible, [aria-expanded='true'], [data-ultra])) > .cmp-dot {
+  opacity: 0;
 }
 
-/* ── a label whose content changes: fade, resize, fade ── */
-
-.morph {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  min-width: 0;
-}
-
-.morph-in {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  min-width: 0;
-  max-width: 100%;
-  overflow: hidden;
-  white-space: nowrap;
-}
-
-.morph-old {
-  position: absolute;
-  left: 0;
-  top: 50%;
-  translate: 0 -50%;
-  display: inline-flex;
-  gap: 5px;
-  white-space: nowrap;
-  pointer-events: none;
-  animation: morph-out 60ms linear forwards;
-}
-
-@keyframes morph-out {
-  to {
-    opacity: 0;
-  }
+/* No point without a word on each side of it (a model with nothing to set, chips still loading). */
+.cmp-dot:is(:first-child, :last-child),
+.chip-skel + .cmp-dot,
+.cmp-dot:has(+ .chip-skel) {
+  display: none;
 }
 
 .chip-skel {
@@ -625,7 +959,6 @@
 .cmp-agent {
   display: flex;
   align-items: center;
-  gap: 2px;
   min-width: 0;
   transition:
     opacity var(--d-1) var(--ease),
@@ -657,62 +990,16 @@
 
 /* ── thinking: the level at rest, the stepped track in a popover ── */
 
-/* At rest: the level's name and a step meter. The button hugs the current name, so the toolbar's
-   gaps stay equal; a new name eases the pill's width (its right edge, against the send key, holds). */
+/* At rest: the level's name. The chip hugs it, its right end (before the cove) holds, and a new
+   name is one glide of its left end with the model's name riding along (Chip.tsx). */
 .th-chip {
-  display: inline-grid;
-  justify-items: end;
   flex-shrink: 0;
-  padding: 0;
-  overflow: visible;
-  outline: none;
+  padding: 0 10px 0 8px;
+  color: var(--text);
+  outline-offset: 1px;
 }
 
-.tb-chip.th-chip:is(:hover, :active, [aria-expanded='true']) {
-  background-color: transparent;
-}
-
-.tb-chip.th-chip[aria-expanded='true'] > :not(svg) {
-  opacity: 1;
-}
-
-.th-pill {
-  grid-area: 1 / 1;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  height: 28px;
-  padding: 0 10px;
-  white-space: nowrap;
-}
-
-.th-pill {
-  border-radius: var(--r-pill);
-  overflow: hidden;
-  transition:
-    background-color var(--d-1) var(--ease),
-    opacity var(--d-1) var(--ease);
-}
-
-.th-chip:hover .th-pill {
-  background-color: var(--fill-2);
-}
-
-.th-chip:active .th-pill {
-  background-color: var(--fill-3);
-  box-shadow: var(--press-down);
-}
-
-.th-chip[aria-expanded='true'] .th-pill {
-  background-color: var(--fill-2);
-  box-shadow: var(--press-down);
-}
-
-.th-chip:focus-visible .th-pill {
-  box-shadow: 0 0 0 1.5px var(--focus);
-}
-
-.th-chip[data-bare] .th-pill {
+.th-chip[data-bare] {
   width: 28px;
   padding: 0;
   justify-content: center;
@@ -726,25 +1013,51 @@
   color: var(--text);
 }
 
-.th-nm {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--text);
-}
-
 /* "Ultra" at rest (ultracode on, or the Ultra level): one fill step, like an engaged control, and the mark. */
-.th-chip[data-ultra] .th-pill {
-  background-color: var(--fill-2);
-  box-shadow: var(--press-up);
+.th-chip[data-ultra] {
+  --chip-bg: var(--fill-2);
+  --chip-ring: var(--press-up);
 }
 
-.th-chip[data-ultra]:is(:active, [aria-expanded='true']) .th-pill {
-  box-shadow: var(--press-down);
+.th-chip[data-ultra]:is(:active, [aria-expanded='true']) {
+  --chip-ring: var(--press-down);
 }
 
-.th-chip[data-ultra]:is(:hover, [aria-expanded='true']) .th-pill {
-  background-color: var(--fill-3);
+.th-chip[data-ultra]:is(:hover, [aria-expanded='true']) {
+  --chip-bg: var(--fill-3);
+}
+
+/* The level as a small dial, for a pane too narrow for the word: the arc is the share of the way
+   to the top level. */
+.th-gauge {
+  display: none;
+}
+
+.th-dial {
+  display: block;
+  overflow: visible;
+}
+
+.th-dial circle {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
+
+.th-dial-track {
+  opacity: 0.26;
+}
+
+.th-dial-arc {
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: 7px 7px;
+  transition: stroke-dashoffset var(--d-3) var(--ease-out);
+}
+
+.tb-chip .th-dial,
+.tb-chip:hover .th-dial {
+  color: var(--text);
 }
 
 /* The mark. Its second head rides a step under the first. */
@@ -794,10 +1107,36 @@
   }
 }
 
-/* Narrow composer: the chip tightens; its name stays (the mode label folds first). */
-@container cmp (max-width: 470px) {
-  .th-pill {
-    padding: 0 9px;
+/* A narrow pane (the side panel open, a small window, a larger Interface size) sheds in this
+   order, and the cove and the key never change: the effort's word becomes its dial; the model's
+   name shortens (it is the one part of the line that gives); the mode chip becomes its icon. */
+@container cmp (max-width: 400px) {
+  .th-chip:not([data-bare]) {
+    padding: 0 7px;
+  }
+
+  .th-word {
+    display: none;
+  }
+
+  .th-gauge {
+    display: inline-flex;
+  }
+
+  .th-chip[data-ultra] .th-gauge {
+    display: none;
+  }
+}
+
+@container cmp (max-width: 330px) {
+  .cm-mode {
+    width: 28px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .cm-mode > .cm-mode-label {
+    display: none;
   }
 }
 
@@ -1029,7 +1368,9 @@
   }
 }
 
-/* ── the "ultra" edge: one lap of light when it turns on, then a still hairline ── */
+/* ── the "ultra" edge: the whole outline takes the light once when it turns on, then a still hairline ──
+   Two rings on the rim's own pixels (Cove.tsx `CoveRing`, so they follow the cove), opacity only.
+   Monochrome, and nothing turns: a hue or a loop here is decoration. */
 
 .uc {
   position: absolute;
@@ -1039,123 +1380,25 @@
   pointer-events: none;
 }
 
-.uc::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  box-shadow: inset 0 0 0 1px rgb(242 241 238 / 0.09);
+.uc-line > i {
+  background-color: rgb(242 241 238 / 0.09);
+}
+
+.uc-line {
   animation: fade-in 300ms var(--ease) backwards;
 }
 
-.uc[data-phase='drain']::after {
-  opacity: 0;
-  transition: opacity 360ms var(--ease);
-}
-
-/* The rainbow: a conic gradient whose angle turns, drawn only in a ring around the card (the
-   padding area, masked to it). Two rings: a crisp one at the edge and a wider, dimmer bloom.
-   Only the custom angle animates, so the rings repaint and nothing else does. */
-@property --uc-ang {
-  syntax: '<angle>';
-  inherits: false;
-  initial-value: 0deg;
-}
-
-@keyframes uc-spin {
-  to {
-    --uc-ang: 360deg;
-  }
-}
-
-@keyframes uc-ring-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 0.45;
-  }
-}
-
-@keyframes uc-bloom-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 0.14;
-  }
-}
-
-.uc-ring,
-.uc-bloom {
-  position: absolute;
-  pointer-events: none;
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask:
-    linear-gradient(#000 0 0) content-box exclude,
-    linear-gradient(#000 0 0);
-  animation: uc-spin 7s linear infinite;
-}
-
-/* One even spectrum around the whole edge, quiet and low in opacity, turning slowly. No bright
-   head and no gaps: the colour is the light, not a shape moving through it. */
-.uc-ring {
-  inset: -1px;
-  padding: 1px;
-  border-radius: 21px;
-  opacity: 0.45;
-  background: conic-gradient(
-    from var(--uc-ang),
-    rgb(255 120 130),
-    rgb(255 190 110),
-    rgb(210 230 130),
-    rgb(110 225 180),
-    rgb(100 200 255),
-    rgb(140 130 255),
-    rgb(220 130 255),
-    rgb(255 120 130)
-  );
-  animation:
-    uc-spin 14s linear infinite,
-    uc-ring-in 480ms var(--ease-out) backwards;
-}
-
-.uc-bloom {
-  inset: -4px;
-  padding: 4px;
-  border-radius: 24px;
-  opacity: 0.14;
-  background: conic-gradient(
-    from var(--uc-ang),
-    rgb(255 120 130),
-    rgb(255 190 110),
-    rgb(210 230 130),
-    rgb(110 225 180),
-    rgb(100 200 255),
-    rgb(140 130 255),
-    rgb(220 130 255),
-    rgb(255 120 130)
-  );
-  animation:
-    uc-spin 14s linear infinite,
-    uc-bloom-in 560ms var(--ease-out) backwards;
-}
-
-.uc[data-phase='drain'] > .uc-ring,
-.uc[data-phase='drain'] > .uc-bloom {
+.uc[data-phase='drain'] > .uc-line {
   opacity: 0;
   transition: opacity 360ms var(--ease);
 }
 
 /* The charge lands: the whole edge takes the light at once and settles into the hairline (opacity only). */
+.uc-flash > i {
+  background-color: rgb(242 241 238 / 0.42);
+}
+
 .uc-flash {
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  box-shadow: inset 0 0 0 1px rgb(242 241 238 / 0.42);
   opacity: 0;
   animation: uc-flash 320ms var(--ease-out) 190ms both;
 }
@@ -1176,61 +1419,68 @@
   .uc-flash {
     display: none;
   }
-
-  .uc-ring,
-  .uc-bloom {
-    animation: none;
-  }
-
-  .uc-bloom {
-    opacity: 0.14;
-  }
 }
 
-/* When the governor sheds effects, the rainbow stops turning and the bloom goes. */
-:root[data-quality] .uc-ring,
-:root[data-quality] .uc-bloom {
-  animation: none;
-}
+/* ── the key: send and stop share the cove ── */
 
-:root[data-quality] .uc-bloom {
-  display: none;
-}
-
-/* ── send and stop keys share one slot ── */
-
+/* The key rests in the cove: a disc of the pane's own corner radius, in the card's corner, the
+   channel between it and the pane the same 6 all the way round. It is no child of the glass, so
+   nothing clips it and it keeps its own material. */
 .cmp-keys {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 2;
   display: grid;
-  width: 28px;
-  height: 28px;
-  margin-left: 4px;
-  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
 }
 
 .cmp-keys > * {
   grid-area: 1 / 1;
 }
 
-/* Send: the one ivory key, with a dark glyph. A flat ivory face and a short soft drop that sets it
-   on the glass (styles/tokens.css --key-up): no gradient, no lips. Hover goes to white; held, it
-   dims a touch and the drop shortens in the same frame as the give in scale. With nothing to send
-   it is a dim glyph on one fill step, the same flat disc as the attach button at the other end. */
+/* With something to send it is the one ivory key: a flat ivory face with a dark glyph and a short
+   soft drop (styles/tokens.css --key-up), no gradient, no lips. Hover goes to white; held, it sinks
+   (the give in scale: the channel around it widens by as much), dims a touch and its drop shortens
+   in the same frame. With nothing to send it is a disc of the pane's own glass, one fill step up,
+   with the pane's rim and a dim arrow: the corner the pane let go of, waiting. */
 .cmp-send,
 .cmp-stop {
+  position: relative;
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
+  width: 40px;
+  height: 40px;
   padding: 0;
   border: 0;
   border-radius: 50%;
   color: var(--text-inverse);
   background-color: var(--text);
-  box-shadow: var(--key-up);
+  box-shadow: var(--cove-contact), var(--key-up);
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
     scale 80ms var(--ease-out);
+}
+
+/* The glass key's rim: the pane's hairline, the same all round (off on the ivory face). */
+.cmp-send::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  background: var(--rim-light);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box exclude,
+    linear-gradient(#000 0 0);
+  opacity: 0;
+  pointer-events: none;
 }
 
 .cmp-send:hover {
@@ -1240,7 +1490,7 @@
 .cmp-send:active,
 .cmp-stop:active {
   background-color: #e6e4df;
-  box-shadow: var(--key-down);
+  box-shadow: var(--cove-contact), var(--key-down);
 }
 
 .cmp-send:active {
@@ -1249,9 +1499,25 @@
 
 .cmp-send[data-on]:not([data-ready]) {
   color: var(--text-3);
-  background-color: var(--fill-2);
-  box-shadow: var(--press-up);
+  background-color: var(--glass-pane);
+  background-image: linear-gradient(var(--fill-2), var(--fill-2)), var(--grain);
+  background-size:
+    auto,
+    var(--grain-size);
+  -webkit-backdrop-filter: var(--blur-pane);
+  backdrop-filter: var(--blur-pane);
+  box-shadow: var(--rim-inner), var(--cove-contact), var(--cove-near);
   pointer-events: none;
+}
+
+.cmp-send[data-on]:not([data-ready])::before {
+  opacity: 1;
+}
+
+:root[data-quality] .cmp-send[data-on]:not([data-ready]) {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background-color: var(--glass-solid);
 }
 
 /* The two keys swap in one frame. The stop key never moves, pulses or changes on hover; held, it
@@ -1267,9 +1533,9 @@
 }
 
 .cmp-stop-sq {
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
   background-color: currentColor;
 }
 
@@ -1277,6 +1543,8 @@
    turn to steer. The lean is the only move between states: a short turn about the arrow's centre. */
 .sk-glyph {
   display: block;
+  width: 18px;
+  height: 18px;
   overflow: visible;
 }
 
@@ -1360,7 +1628,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  padding: 3px 3px 8px;
+  padding: 3px 10px 8px;
 }
 
 .att {
@@ -1685,9 +1953,11 @@
   flex-shrink: 0;
 }
 
+/* Where a section of models begins (an agent that lists them in sections): the menu's own quiet
+   label (ui.css `.menu-label`), nothing more. */
 .mm-group {
-  padding: 6px 8px 3px;
-  font-size: var(--t-small, 11.5px);
+  padding: 7px 8px 3px;
+  font-size: var(--t-micro);
   font-weight: var(--w-medium);
   color: var(--text-3);
   pointer-events: none;
@@ -1751,6 +2021,25 @@
   color: var(--text);
 }
 
+/* The check settles onto the row that was picked (the menu is on its way back into its chip by
+   then, and the chip already says the new value): one small move, once. */
+:is(.mm-check, .cm-check) > svg {
+  animation: check-settle 160ms var(--ease-out) backwards;
+}
+
+@keyframes check-settle {
+  from {
+    opacity: 0;
+    scale: 0.6;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :is(.mm-check, .cm-check) > svg {
+    animation: none;
+  }
+}
+
 .mm-search {
   display: flex;
   align-items: center;
@@ -1790,14 +2079,16 @@
   color: var(--text-3);
 }
 
-/* ── queued messages: a tray tucked behind the composer's top edge ── */
+/* ── queued messages: a tray tucked behind the composer's top edge ──
+   The last layer of the stack on the pane's top edge (until.css has the strips above it and the
+   stack's hairline): the pane's width and corners. */
 
 /* The clip is the tray's resting box: the tray unfolds up out of the card and folds back into it. */
 .cq-clip {
   position: relative;
   z-index: 0;
   margin-bottom: -20px;
-  border-radius: 18px 18px 0 0;
+  border-radius: 20px 20px 0 0;
   overflow: hidden;
 }
 
@@ -1806,8 +2097,9 @@
 }
 
 .cq {
+  position: relative;
   padding-bottom: 20px;
-  border-radius: 18px 18px 0 0;
+  border-radius: 20px 20px 0 0;
   background-color: var(--panel);
 }
 
@@ -2119,9 +2411,14 @@
   position: relative;
 }
 
-/* ── home: the next session's agent, folder and branch ── */
+/* ── home: the next session's agent, folder and working tree ──
+   Chips like the pane's own (Chip.tsx): a label that changes is one glide, and the chips after it
+   ride along. The row is as wide as the pane; where that is narrow the labels give in this order:
+   the working tree's name, the folder's, the account's; a very narrow row keeps the tree as its
+   mark alone. */
 
 .home-chips-row {
+  container: chips / inline-size;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -2131,6 +2428,10 @@
 }
 
 .hc {
+  --chip-bg: transparent;
+  --chip-ring: none;
+  position: relative;
+  isolation: isolate;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -2142,29 +2443,50 @@
   color: var(--text-2);
   white-space: nowrap;
   min-width: 0;
+  flex: 0 1 auto;
   transition:
-    background-color var(--d-1) var(--ease),
-    color var(--d-1) var(--ease);
+    color var(--d-1) var(--ease),
+    scale var(--d-2) var(--spring);
 }
 
 button.hc:hover,
 .hc[aria-expanded='true'] {
+  --chip-bg: var(--fill-2);
   color: var(--text);
-  background-color: var(--fill-2);
 }
 
 button.hc:active {
-  background-color: var(--fill-3);
+  --chip-bg: var(--fill-3);
+  scale: var(--press);
+  transition-duration: var(--d-1), 70ms;
+}
+
+button.hc:is(:active, [aria-expanded='true']) {
+  --chip-ring: var(--press-down);
+}
+
+/* A label that gives when the row is narrow: it shortens with an ellipsis, the rest keeps its size. */
+.chip-part.chip-give {
+  display: block;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .hc-icon {
   color: var(--text-3);
 }
 
+/* The caret turns over while the chip's menu is open (one small move, its own centre). */
 .hc-caret {
   color: var(--text-3);
   opacity: 0.7;
   margin-left: -1px;
+  transition: rotate var(--d-2) var(--ease-out);
+}
+
+.hc[aria-expanded='true'] .hc-caret {
+  rotate: 180deg;
 }
 
 .hc[data-missing] {
@@ -2177,14 +2499,29 @@ button.hc:active {
 }
 
 .hc-static {
-  max-width: 220px;
   color: var(--text-3);
+}
+
+/* The working tree is the first to give, down to its mark's width and its caret. */
+.hc-tree {
+  flex-shrink: 4;
+  max-width: 240px;
 }
 
 .hc-account {
   max-width: 180px;
   font-weight: var(--w-regular);
   color: var(--text-3);
+}
+
+@container chips (max-width: 380px) {
+  .hc-tree > .chip-give {
+    display: none;
+  }
+
+  .hc-tree {
+    flex-shrink: 0;
+  }
 }
 
 /* The agent menu: as tall as the window allows, its rows scrolling inside (as the model menu's do). */
@@ -2224,7 +2561,9 @@ button.hc:active {
 
 /* ── the home-to-session hand-off: the card copy that flies to the dock ── */
 
-.handoff-ghost .cmp-card::after {
+/* The copy never shows focus (its field is no field). */
+.handoff-ghost .cmp-card > :is(.cmp-shade-lift, .cmp-rim-lift),
+.handoff-ghost .cmp-card > .cmp-glass > .gl-ink {
   opacity: 0;
 }
 

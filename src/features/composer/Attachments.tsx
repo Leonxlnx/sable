@@ -21,6 +21,8 @@ export const AttachmentRow = memo(function AttachmentRow({ items, onRemove }: { 
             key={a.id}
             layout={reduced ? false : 'position'}
             className={a.kind === 'image' ? 'att att-img' : 'att att-file'}
+            // A file chip is no button: marked so its icon moves when the chip is pointed at (icons/animated/play.ts).
+            data-ai-host={a.kind === 'image' ? undefined : ''}
             initial={reduced ? { opacity: 0 } : { opacity: 0, scale: 0.94 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, transition: { duration: reduced ? 0.12 : 0 } }}

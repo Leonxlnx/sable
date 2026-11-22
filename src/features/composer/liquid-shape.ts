@@ -5,16 +5,16 @@
  * without talking.
  *
  * One body of liquid on one path, with one speed that never steps (ms after the key's first frame):
- * - collapse (0 to COLLAPSE): the words run into the bar's top-right corner as one piece (their
- *   width leading, so they draw into a stream there) and fade, while the field closes to one line.
- *   The bar is empty and at rest for a moment.
- * - swell (BORN on): the liquid that went in comes back out. The drop starts under the bar's top
- *   edge, at rest, and is pushed up through it: first the edge swells over it (a meniscus: the
- *   smooth union of the edge and the drop), then it stands out of it.
- * - thread (`launch` to `snap`): the drop is clear of the edge and already flying; a thread of
- *   liquid still ties it to the bar, thinning as it stretches, until surface tension parts it. What
- *   is left recoils both ways: the tail snaps up into the drop (which rings once, a little shorter
- *   then longer along its path), the foot falls back into the edge, which bobs once.
+ * - collapse (0 to COLLAPSE): the words run down into the pane's corner over the key as one piece
+ *   (their width leading, so they draw into a stream there) and fade, while the field closes to
+ *   one line. The pane is empty and at rest for a moment.
+ * - swell (BORN on): the liquid that went in comes back out of the key. The drop starts behind
+ *   the key's disc, at rest, and is pushed up over its top: first a collar of liquid swells there
+ *   (a meniscus: the smooth union of the disc and the drop), then the drop stands out of it.
+ * - thread (`launch` to `snap`): the drop is clear of the key and already flying; a thread of
+ *   liquid still ties it to the key's top, thinning as it stretches, until surface tension parts
+ *   it. What is left recoils both ways: the tail snaps up into the drop (which rings once, a
+ *   little shorter then longer along its path), the foot falls back into the key.
  * - flight (to `land`): the push is over; the drop coasts on, slowing, stretched along its speed.
  *   The whole way from under the edge to the landing is one path (a quadratic curve that leaves
  *   the bar straight up) run at one speed curve: a thrust that comes on smoothly, then drag.
@@ -27,7 +27,7 @@
  * A message into the queue row right above the bar is thrown up and falls into it (a hop). A drop
  * with no edge (words leaving a queue row) swells where the words gathered and leaves from there.
  * Under a first message the bar itself leaves for the dock while the thread still holds
- * (`spec.bar`): the edge, the meniscus and the thread's foot ride down with it.
+ * (`spec.bar`): the key, the meniscus and the thread's foot ride down with it.
  * Geometry is in the page's CSS px (viewport, already divided by the interface zoom).
  */
 
@@ -43,8 +43,12 @@ export interface Box {
 }
 
 export interface LiquidSpec {
-  /** Where the drop comes out: a point on the bar's top edge (`edge`), or a free point. */
-  from: { x: number; y: number; edge: boolean };
+  /**
+   * Where the drop comes out: the top of the send key (`edge`: the key is a disc of radius `r`
+   * hanging under that point, and the liquid shows only outside it), or a free point. An edge
+   * without `r` is a straight one (everything under `y`).
+   */
+  from: { x: number; y: number; edge: boolean; r?: number };
   /** The shape it ends as. */
   to: Box;
   /** A bubble becomes the message card; a row melts into a queue row. */
@@ -426,11 +430,12 @@ export interface Taper {
 /** What to draw at `t`. All of it is one liquid; `alpha` fades it as the card or row takes over. */
 export interface LiquidFrame {
   /**
-   * The bar's top edge while the drop is tied to it (and a moment after, while what is left on it
-   * falls back): only what stands above it is drawn, and the drop flows into it with a smooth
-   * union of radius `k`. `bob`: the edge's one small swell after the thread has parted (px).
+   * The key the drop is tied to (and a moment after, while what is left on it falls back): its
+   * top point and its radius `r` (0: a straight edge under `y`). Only what stands outside it is
+   * drawn, and the drop flows into it with a smooth union of radius `k`. `bob`: a straight edge's
+   * one small swell after the thread has parted (px; the key gives instead, launch.ts).
    */
-  edge?: { x: number; y: number; k: number; bob: number };
+  edge?: { x: number; y: number; k: number; bob: number; r: number };
   /** The drop: centre, radius, its stretch along `ang` (`sx`) and across it (`sy`). */
   drop?: { x: number; y: number; r: number; sx: number; sy: number; ang: number };
   /** The thread: its lower piece (out of the edge) and its upper piece (the drop's tail). */
@@ -461,9 +466,11 @@ export function liquidAt(plan: LiquidPlan, t: number): LiquidFrame {
     const since = t - plan.snap;
     // The meniscus is wide while the drop comes through the edge and lets go as it leaves; after
     // the thread has parted the edge bobs once, low and wide, and is the bar's alone again.
-    const k = r * lerp(0.3, 1.15, smooth(0, 26, ms)) * lerp(1, 0.45, smooth(plan.launch, plan.snap, t)) * (1 - smooth(0, 28, since));
+    const round = from.r ?? 0;
+    // On the key the collar stays close to the neck: the key is small and must stay a clean disc.
+    const k = r * lerp(0.3, round ? 0.8 : 1.15, smooth(0, 26, ms)) * lerp(1, 0.45, smooth(plan.launch, plan.snap, t)) * (1 - smooth(0, 28, since));
     const u = clamp((since - 16) / 72, 0, 1);
-    f.edge = { x: F.x, y: F.y, k, bob: since > 0 ? 2.2 * Math.sin(Math.PI * u) * (1 - u) : 0 };
+    f.edge = { x: F.x, y: F.y, k, bob: since > 0 && !round ? 2.2 * Math.sin(Math.PI * u) * (1 - u) : 0, r: round };
     if (t >= plan.launch) {
       if (since < 0) {
         // The thread, stretched between the edge and the drop: its waist thins as it lengthens.
@@ -570,7 +577,8 @@ export function liquidBounds(plan: LiquidPlan, room = 90): { left: number; top: 
   const q = Math.abs(den) > 1e-6 ? clamp((S.y - C.y) / den, 0, 1) : 1;
   const apex = Math.min(I.y, bez(S.y, C.y, I.y, q));
   const top = Math.min(to.top - 24, from.y - r * 2, apex - r * 2) - room;
-  const bottom = Math.max(from.y + 4, foot.y + 4, to.top + to.height + SHADOW.reach) + room;
+  const under = from.r ? from.r * 0.6 + 2 : 4;
+  const bottom = Math.max(from.y + under, foot.y + under, to.top + to.height + SHADOW.reach) + room;
   return { left: Math.floor(left), top: Math.floor(top), width: Math.ceil(right - left), height: Math.ceil(bottom - top) };
 }
 
@@ -631,7 +639,7 @@ export function frameBounds(f: LiquidFrame): { x0: number; y0: number; x1: numbe
   if (x0 === Infinity) return null;
   const pad = SHADOW.blur;
   const b = { x0: x0 - pad, y0: y0 - pad * 0.6, x1: x1 + pad, y1: y1 + SHADOW.reach };
-  // Nothing under a bar the drop is tied to.
-  if (f.edge) b.y1 = Math.min(b.y1, f.edge.y + 2);
+  // Nothing under a bar the drop is tied to; round a key only its shoulders (the collar).
+  if (f.edge) b.y1 = Math.min(b.y1, f.edge.y + (f.edge.r ? f.edge.r * 0.6 : 2));
   return b;
 }

@@ -1,6 +1,7 @@
 import { barLeaving, HOLD_MS, launchRead, RELEASE } from '@/features/composer/flight';
 import { BAR_LEAVES, COLLAPSE, collapseEase, GLIDE, linearEasing } from '@/features/composer/liquid-shape';
 import { holdSend } from '@/features/composer/settle';
+import { ARROW_OUT, ARROW_OUT_EASE, ARROW_OUT_MS, KEY_GIVE, KEY_GIVE_MS, SQUARE_IN, SQUARE_IN_AT, SQUARE_IN_EASE, SQUARE_IN_MS } from '@/features/composer/launch';
 import { reducedMotion, uiZoom } from '@/lib/motion';
 
 /**
@@ -269,15 +270,19 @@ export function beginHandoff(card: HTMLElement | null) {
   // the docked card of a running turn.
   const key = copy.querySelector<HTMLElement>('.cmp-send');
   const arrow = key?.querySelector('.sk-glyph');
+  // The key's part runs on the message's clock, like the glide (below).
+  const keyAnims: Animation[] = [];
   if (key && arrow) {
     key.style.overflow = 'hidden';
     key.style.position = 'relative';
     const sq = document.createElement('span');
     sq.className = 'sk-launch-sq';
     key.appendChild(sq);
-    arrow.animate([{ transform: 'translateY(0px)', opacity: 1 }, { transform: 'translateY(-20px)', opacity: 0 }], { duration: 180, delay: RELEASE, easing: 'cubic-bezier(0.55, 0, 0.8, 0.3)', fill: 'forwards' });
-    key.animate([{ scale: '1' }, { scale: '0.88', offset: 0.2 }, { scale: '1' }], { duration: 300, easing: 'cubic-bezier(0.3, 0, 0.2, 1)' });
-    sq.animate([{ transform: 'scale(0)', opacity: 0 }, { transform: 'scale(1)', opacity: 1 }], { duration: 190, delay: RELEASE + 110, easing: 'cubic-bezier(0.16, 1, 0.3, 1)', fill: 'both' });
+    keyAnims.push(
+      arrow.animate(ARROW_OUT, { duration: ARROW_OUT_MS, delay: RELEASE, easing: ARROW_OUT_EASE, fill: 'forwards' }),
+      key.animate(KEY_GIVE, { duration: KEY_GIVE_MS, easing: 'linear' }),
+      sq.animate(SQUARE_IN, { duration: SQUARE_IN_MS, delay: SQUARE_IN_AT, easing: SQUARE_IN_EASE, fill: 'both' }),
+    );
   }
   // The field settles to one line on the way down (the docked composer's resting height).
   requestAnimationFrame(() => field && (field.style.height = `${LINE}px`));
@@ -305,6 +310,7 @@ export function beginHandoff(card: HTMLElement | null) {
   run(f, glideFrom({ t: 0, x: 0, y: 0, w: start.width, vx: 0, vy: 0, vw: 0 }, target.left - start.left, target.top - start.top, target.width, hold), () => arrived(f));
   if (onClock && f.move) onClock(f.move);
   if (onClock && f.size) onClock(f.size);
+  if (onClock) for (const a of keyAnims) onClock(a);
   f.timer = window.setTimeout(() => flight === f && !f.dock && cancelHandoff(), GIVE_UP);
 }
 

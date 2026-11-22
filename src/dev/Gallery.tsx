@@ -21,6 +21,10 @@ import {
   Tip,
   TipProvider,
 } from '@/ui';
+import { Chip, type ChipPart } from '@/features/composer/Chip';
+import { CoveSkin } from '@/features/composer/Cove';
+import { SendGlyphSvg } from '@/features/composer/SendKey';
+import { Dial, UltraMark } from '@/features/composer/Thinking';
 import '@/app/app.css';
 import '@/features/composer/composer.css';
 import '@/features/sidebar/sidebar.css';
@@ -174,40 +178,84 @@ function MenuRows({ highlight }: { highlight?: number }) {
   );
 }
 
-/** The composer's surface with its toolbar, static: the glass, the chips and the keys together. */
-function GlassComposer({ focus }: { focus?: boolean }) {
+/** The chips of the composer's last line, as the composer builds them (Chip.tsx). */
+const MODE: ChipPart[] = [
+  { k: 'icon', node: <Icon name="hand" size={15} /> },
+  { k: 'label', className: 'cm-mode-label', node: 'Ask first' },
+];
+const MODEL: ChipPart[] = [{ k: 'name', className: 'chip-give', node: 'Opus 5.5' }];
+const effortParts = (word: string, level: number, ultra = false): ChipPart[] => [
+  ...(ultra ? [{ k: 'mark', node: <UltraMark /> }] : []),
+  { k: 'dial', className: 'th-gauge', node: <Dial level={level} of={5} /> },
+  { k: `word:${word}`, className: 'th-word', node: word },
+];
+
+/**
+ * The composer, static: the pane of glass with its cove, the chips on its last line and the key
+ * in the cove. `width` narrows it (the chips shed: the effort's word, the model's name, the mode's
+ * label).
+ */
+function GlassComposer({ focus, state = 'rest', width, ultra }: { focus?: boolean; state?: 'rest' | 'ready' | 'stop'; width?: number; ultra?: boolean }) {
   return (
-    <div className="cmp-card" data-spot="">
+    <div className="cmp-card" data-spot="" style={width ? { width } : undefined}>
+      <CoveSkin />
       <div className="cmp-field">
-        <textarea className="cmp-input" data-f={focus ? 'focus' : undefined} rows={2} readOnly placeholder="Describe a task or ask a question" defaultValue={focus ? 'Refactor the session module' : ''} />
+        <textarea
+          className="cmp-input"
+          data-f={focus ? 'focus' : undefined}
+          rows={1}
+          style={{ height: 32 }}
+          readOnly
+          placeholder={state === 'stop' ? 'Queue a follow-up' : 'Describe a task or ask a question'}
+          defaultValue={state === 'ready' ? 'Refactor the session module' : ''}
+        />
       </div>
       <div className="cmp-bar">
         <div className="cmp-side">
           <button className="cmp-attach" aria-label="Attach">
             <Icon name="plus" size={14} />
           </button>
-          <button className="tb-chip cm-mode">
-            <Icon name="hand" size={14} />
-            <span className="cm-mode-label">Ask first</span>
-          </button>
+          <Chip className="tb-chip cm-mode" anchor="left" parts={MODE} />
         </div>
         <div className="cmp-side cmp-right">
-          <button className="tb-chip cm-model">
-            <span className="cm-model-name">Opus 4.5</span>
-            <Icon name="caret-down" size={11} className="caret" />
-          </button>
-          <button className="tb-chip th-chip">
-            <span className="th-pill">
-              <span className="th-nm">High</span>
+          <div className="cmp-agent">
+            <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} />
+            <span className="cmp-dot" aria-hidden>
+              ·
             </span>
-          </button>
-          <div className="cmp-keys">
-            <button className="cmp-send" data-on="" data-ready={focus ? '' : undefined} aria-label="Send">
-              <Icon name="arrow-up" size={14} />
-            </button>
+            <Chip className="tb-chip th-chip" anchor="right" data-ultra={ultra || undefined} parts={effortParts('Extra high', 4, ultra)} />
           </div>
         </div>
       </div>
+      <div className="cmp-keys">
+        <button className="cmp-send" data-on={state === 'stop' ? undefined : ''} data-ready={state === 'ready' ? '' : undefined} aria-label="Send">
+          <SendGlyphSvg glyph="send" />
+        </button>
+        <button className="cmp-stop" data-on={state === 'stop' ? '' : undefined} aria-label="Stop">
+          <span className="cmp-stop-sq" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** A chip whose label changes on a click, to watch the change itself (Chip.tsx): the edge glides, the neighbour rides, no word leaves its chip. */
+function ChipChange() {
+  const steps: { word: string; level: number; ultra?: boolean }[] = [
+    { word: 'High', level: 3 },
+    { word: 'Extra high', level: 4 },
+    { word: 'Extra high', level: 4, ultra: true },
+    { word: 'Low', level: 1 },
+  ];
+  const [i, setI] = useState(0);
+  const s = steps[i % steps.length];
+  return (
+    <div className="cmp-agent" style={{ justifyContent: 'flex-end', width: 260 }}>
+      <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} />
+      <span className="cmp-dot" aria-hidden>
+        ·
+      </span>
+      <Chip className="tb-chip th-chip" anchor="right" data-ultra={s.ultra || undefined} aria-label="Next label" onClick={() => setI(i + 1)} parts={effortParts(s.word, s.level, s.ultra)} />
     </div>
   );
 }
@@ -350,56 +398,42 @@ export default function Gallery() {
               </button>
             )}
           />
+          <States label="Mode" render={(s) => <Chip className="tb-chip cm-mode" anchor="left" parts={MODE} disabled={dis(s)} />} />
+          <States label="Model" render={(s) => <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} disabled={dis(s)} />} />
+          <States label="Effort" render={(s) => <Chip className="tb-chip th-chip" anchor="right" parts={effortParts('High', 3)} disabled={dis(s)} />} />
+          <States label="Effort, ultra" render={(s) => <Chip className="tb-chip th-chip" anchor="right" data-ultra="" parts={effortParts('High', 3, true)} disabled={dis(s)} />} />
           <States
-            label="Mode"
-            render={(s) => (
-              <button className="tb-chip cm-mode" disabled={dis(s)}>
-                <Icon name="hand" size={14} />
-                <span className="cm-mode-label">Ask</span>
-              </button>
-            )}
-          />
-          <States
-            label="Model"
-            render={(s) => (
-              <button className="tb-chip cm-model" disabled={dis(s)}>
-                <span className="cm-model-name">Opus 4.5</span>
-                <Icon name="caret-down" size={11} className="caret" />
-              </button>
-            )}
-          />
-          <States
-            label="Send"
+            label="Key, to send"
             render={(s) => (
               <button className="cmp-send" data-on="" data-ready="" aria-label="Send" disabled={dis(s)}>
-                <Icon name="arrow-up" size={14} />
+                <SendGlyphSvg glyph="send" />
               </button>
             )}
           />
           <States
-            label="Send, empty"
+            label="Key, nothing to send"
+            only={['rest']}
             render={() => (
               <button className="cmp-send" data-on="" aria-label="Send">
-                <Icon name="arrow-up" size={14} />
+                <SendGlyphSvg glyph="send" />
               </button>
             )}
           />
           <States
-            label="Stop"
+            label="Key, steer"
+            only={['rest', 'hover']}
+            render={() => (
+              <button className="cmp-send" data-on="" data-ready="" aria-label="Steer">
+                <SendGlyphSvg glyph="steer" />
+              </button>
+            )}
+          />
+          <States
+            label="Key, stop"
             only={['rest', 'press', 'focus']}
             render={() => (
               <button className="cmp-stop" data-on="" aria-label="Stop">
                 <span className="cmp-stop-sq" />
-              </button>
-            )}
-          />
-          <States
-            label="Effort"
-            render={(s) => (
-              <button className="tb-chip th-chip" disabled={dis(s)}>
-                <span className="th-pill">
-                  <span className="th-nm">High</span>
-                </span>
               </button>
             )}
           />
@@ -409,19 +443,15 @@ export default function Gallery() {
               <button className="cmp-attach" aria-label="Attach" aria-expanded="true">
                 <Icon name="plus" size={14} />
               </button>
-              <button className="tb-chip cm-mode" aria-expanded="true">
-                <Icon name="hand" size={14} />
-                <span className="cm-mode-label">Ask</span>
-              </button>
-              <button className="tb-chip cm-model" aria-expanded="true">
-                <span className="cm-model-name">Opus 4.5</span>
-                <Icon name="caret-down" size={11} className="caret" />
-              </button>
-              <button className="tb-chip th-chip" aria-expanded="true">
-                <span className="th-pill">
-                  <span className="th-nm">High</span>
-                </span>
-              </button>
+              <Chip className="tb-chip cm-mode" anchor="left" aria-expanded="true" parts={MODE} />
+              <Chip className="tb-chip cm-model" anchor="right" aria-expanded="true" parts={MODEL} />
+              <Chip className="tb-chip th-chip" anchor="right" aria-expanded="true" parts={effortParts('High', 3)} />
+            </div>
+          </div>
+          <div className="gal-row">
+            <div className="gal-label">A label changes (click the effort)</div>
+            <div className="gal-cell gal-wide">
+              <ChipChange />
             </div>
           </div>
         </Section>
@@ -547,12 +577,23 @@ export default function Gallery() {
         <Section title="Material: glass and flat controls" id="material">
           <div className="gal-stage">
             <div className="gal-glass-col" style={{ flex: 1.6 }}>
-              <div className="gal-caption">Composer, rest</div>
+              <div className="gal-caption">Composer, rest: the pane, its cove, the key in it</div>
               <GlassComposer />
               <div className="gal-caption" style={{ marginTop: 18 }}>
-                Composer, focused
+                Focused, with something to send
               </div>
-              <GlassComposer focus />
+              <GlassComposer focus state="ready" />
+              <div className="gal-caption" style={{ marginTop: 18 }}>
+                A turn runs: the stop key, ultracode on
+              </div>
+              <GlassComposer state="stop" ultra />
+              <div className="gal-caption" style={{ marginTop: 18 }}>
+                Narrow: 420, 330
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <GlassComposer width={420} />
+                <GlassComposer width={330} />
+              </div>
               <div className="gal-caption" style={{ marginTop: 18 }}>
                 Message
               </div>
@@ -631,7 +672,7 @@ export default function Gallery() {
             only={['rest', 'hover', 'press', 'focus']}
             render={() => (
               <button className="cmp-send" data-on="" data-ready="" aria-label="Send">
-                <Icon name="arrow-up" size={14} />
+                <SendGlyphSvg glyph="send" />
               </button>
             )}
           />

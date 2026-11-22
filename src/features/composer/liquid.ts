@@ -181,7 +181,8 @@ export function placeFor(region: { left: number; top: number; width: number; hei
 function regionOf(plan: LiquidPlan) {
   const b = liquidBounds(plan, 0);
   const top = b.top - ROOM_ABOVE;
-  const bottom = Math.max(plan.spec.from.y, b.top + b.height) + ROOM_BELOW;
+  // Round a key the liquid's collar reaches a little below its top (liquid-shape.ts `frameBounds`).
+  const bottom = Math.max(plan.spec.from.y + (plan.spec.from.r ?? 0) * 0.6, b.top + b.height) + ROOM_BELOW;
   return { left: b.left, top, width: b.width, height: bottom - top };
 }
 

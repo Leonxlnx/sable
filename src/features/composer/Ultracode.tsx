@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, useState, type RefObject } from 'react';
 import { pulseFrom, reducedMotion } from '@/lib/motion';
+import { CoveRing } from './Cove';
 
 const CHARGE_MS = 520;
 /** When the charge lands on the top level (composer.css: the last bar's delay plus its rise). */
@@ -11,8 +12,9 @@ type Phase = 'charge' | 'on' | 'drain';
 /**
  * The composer's "ultra" edge (ultracode on, or an Ultra level). Turning it on is one beat: the
  * charge runs up the effort meter into its top level (composer.css `th-charge`), and as it lands
- * the card's whole edge takes the light at once and settles to a faint, still hairline, with one
- * pulse of the backdrop from it. Opacity only; nothing travels, nothing loops.
+ * the pane's whole edge takes the light at once and settles to a faint, still hairline, with one
+ * pulse of the backdrop from it. Both are rings on the rim's own pixels, so they follow the cove.
+ * Opacity only, monochrome; nothing travels, nothing loops.
  */
 export const UltraEdge = memo(function UltraEdge({ on, card }: { on: boolean; card: RefObject<HTMLElement | null> }) {
   const [phase, setPhase] = useState<Phase | null>(on ? 'on' : null);
@@ -44,9 +46,8 @@ export const UltraEdge = memo(function UltraEdge({ on, card }: { on: boolean; ca
   if (!phase) return null;
   return (
     <span className="uc" data-phase={phase} aria-hidden>
-      <span className="uc-ring" />
-      <span className="uc-bloom" />
-      {phase === 'charge' && <span className="uc-flash" />}
+      <CoveRing className="uc-line" />
+      {phase === 'charge' && <CoveRing className="uc-flash" />}
     </span>
   );
 });

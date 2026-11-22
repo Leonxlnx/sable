@@ -18,7 +18,7 @@ import { PathLabel, Tip } from '@/ui';
 import { planWord } from '@/features/accounts/model';
 import { LimitDot } from '@/features/usage';
 import { type Choice } from './choice';
-import { Morph } from './Morph';
+import { Chip, type ChipPart } from './Chip';
 import { Later } from './later';
 
 export const ChipSkeleton = ({ w }: { w: number }) => <span className="chip-skel skel" style={{ width: w }} aria-hidden />;
@@ -110,12 +110,16 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
     <RM.Root open={open} onOpenChange={setOpen} modal={false}>
       <Tip label="Mode" keys="shift+tab" side="top">
         <RM.Trigger asChild>
-          <button type="button" className="tb-chip cm-mode" data-tone={cur?.tone ?? 'ask'} aria-label={`Mode: ${cur?.name ?? 'default'}`}>
-            <Icon name={MODE_ICON[cur?.tone ?? 'ask']} size={15} />
-            <Morph k={cur?.id ?? ''} className="cm-mode-label">
-              {cur?.name ?? 'Mode'}
-            </Morph>
-          </button>
+          <Chip
+            className="tb-chip cm-mode"
+            anchor="left"
+            data-tone={cur?.tone ?? 'ask'}
+            aria-label={`Mode: ${cur?.name ?? 'default'}`}
+            parts={[
+              { k: `icon:${MODE_ICON[cur?.tone ?? 'ask']}`, className: cur?.tone === 'danger' ? 'cm-danger' : undefined, node: <Icon name={MODE_ICON[cur?.tone ?? 'ask']} size={15} /> },
+              { k: `label:${cur?.id ?? ''}`, className: cur?.tone === 'danger' ? 'cm-mode-label cm-danger' : 'cm-mode-label', node: cur?.name ?? 'Mode' },
+            ]}
+          />
         </RM.Trigger>
       </Tip>
       <RM.Portal>
@@ -251,14 +255,7 @@ export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed 
     <RM.Root open={open} onOpenChange={setOpen} modal={false}>
       <Tip label="Model" side="top">
         <RM.Trigger asChild>
-          <button type="button" className="tb-chip cm-model" aria-label={`Model: ${name}`}>
-            <Morph k={name} className="cm-model-name">
-              <span className="truncate" data-origin-anchor>
-                {name}
-              </span>
-            </Morph>
-            <Icon name="caret-down" size={11} className="caret" />
-          </button>
+          <Chip className="tb-chip cm-model" anchor="right" aria-label={`Model: ${name}`} parts={[{ k: name, className: 'chip-give', node: <span data-origin-anchor>{name}</span> }]} />
         </RM.Trigger>
       </Tip>
       <RM.Portal>
@@ -397,6 +394,10 @@ function useOtherAgentModels(choice: Choice, open: boolean) {
 
 // ───────────────────────── home chips ─────────────────────────
 
+/** The parts every home chip shares: the caret of a chip that opens a menu, the branch mark. */
+const CARET: ChipPart = { k: 'caret', node: <Icon name="caret-down" size={10} className="hc-caret" /> };
+const BRANCH: ChipPart = { k: 'branch', node: <Icon name="branch" size={15} className="hc-icon" /> };
+
 function AgentMenu({ onClosed }: { onClosed: () => void }) {
   const provider = useStore((s) => s.ui.homeProvider);
   const providers = useStore((s) => s.providers);
@@ -413,15 +414,18 @@ function AgentMenu({ onClosed }: { onClosed: () => void }) {
   return (
     <RM.Root modal={false}>
       <RM.Trigger asChild>
-        <button type="button" className="hc" aria-label={`Agent: ${PROVIDER_NAME[provider]}${chipAccount ? `, ${chipAccount}` : ''}`}>
-          <ProviderMark provider={provider} size={15} className="hc-mark" />
-          <Morph k={`${provider}:${chipAccount ?? ''}`}>
-            {PROVIDER_NAME[provider]}
-            {chipAccount && <span className="hc-account truncate">{chipAccount}</span>}
-          </Morph>
-          {chipPick && mine.length > 1 && <LimitDot provider={provider} accountId={chipPick.id} />}
-          <Icon name="caret-down" size={10} className="hc-caret" />
-        </button>
+        <Chip
+          className="hc"
+          anchor="left"
+          aria-label={`Agent: ${PROVIDER_NAME[provider]}${chipAccount ? `, ${chipAccount}` : ''}`}
+          parts={[
+            { k: `mark:${provider}`, node: <ProviderMark provider={provider} size={15} className="hc-mark" /> },
+            { k: `name:${provider}`, node: PROVIDER_NAME[provider] },
+            ...(chipAccount ? [{ k: `account:${chipAccount}`, className: 'hc-account chip-give', node: chipAccount }] : []),
+            ...(chipPick && mine.length > 1 ? [{ k: 'limit', node: <LimitDot provider={provider} accountId={chipPick.id} /> }] : []),
+            CARET,
+          ]}
+        />
       </RM.Trigger>
       <RM.Portal>
         <RM.Content
@@ -502,11 +506,17 @@ function FolderMenu({ onClosed }: { onClosed: () => void }) {
   return (
     <RM.Root modal={false}>
       <RM.Trigger asChild>
-        <button type="button" className="hc" data-missing={(!cwd && !chat) || undefined} aria-label={chat ? 'Folder: none, a new chat' : cwd ? `Folder: ${baseName(cwd)}` : 'Choose a folder'}>
-          <Icon name={chat ? 'chat' : cwd ? 'folder' : 'folder-plus'} size={15} className="hc-icon" />
-          <Morph k={chat ? ':chat' : (cwd ?? '')}>{label}</Morph>
-          <Icon name="caret-down" size={10} className="hc-caret" />
-        </button>
+        <Chip
+          className="hc"
+          anchor="left"
+          data-missing={(!cwd && !chat) || undefined}
+          aria-label={chat ? 'Folder: none, a new chat' : cwd ? `Folder: ${baseName(cwd)}` : 'Choose a folder'}
+          parts={[
+            { k: `icon:${chat ? 'chat' : cwd ? 'folder' : 'folder-plus'}`, node: <Icon name={chat ? 'chat' : cwd ? 'folder' : 'folder-plus'} size={15} className="hc-icon" /> },
+            { k: `label:${chat ? ':chat' : (cwd ?? '')}`, className: 'chip-give', node: label },
+            CARET,
+          ]}
+        />
       </RM.Trigger>
       <RM.Portal>
         <RM.Content
@@ -589,7 +599,7 @@ function useTrees(cwd: string | null): GitWorktree[] {
  * working trees (a folder per branch), the chip is a menu that switches between them, the main
  * checkout included.
  */
-function BranchChip() {
+function BranchChip({ onClosed }: { onClosed: () => void }) {
   const cwd = useStore((s) => (s.ui.homeChat ? null : s.ui.homeCwd));
   const setUi = useStore((s) => s.setUi);
   const list = useTrees(cwd);
@@ -599,40 +609,47 @@ function BranchChip() {
   if (list.length < 2) {
     return (
       <Tip label="Current branch" side="bottom">
-        <span className="hc hc-static" tabIndex={0} aria-label={`Branch: ${label}`}>
-          <Icon name="branch" size={15} className="hc-icon" />
-          <Morph k={label}>
-            <span className="truncate">{label}</span>
-          </Morph>
-        </span>
+        <Chip still className="hc hc-static hc-tree" anchor="left" tabIndex={0} aria-label={`Branch: ${label}`} parts={[BRANCH, { k: `label:${label}`, className: 'chip-give', node: label }]} />
       </Tip>
     );
   }
   return (
     <RM.Root modal={false}>
       <RM.Trigger asChild>
-        <button type="button" className="hc" aria-label={`Working tree: ${label}`}>
-          <Icon name="branch" size={15} className="hc-icon" />
-          <Morph k={label}>
-            <span className="truncate">{label}</span>
-          </Morph>
-          <Icon name="caret-down" size={10} className="hc-caret" />
-        </button>
+        <Chip className="hc hc-tree" anchor="left" aria-label={`Working tree: ${label}`} parts={[BRANCH, { k: `label:${label}`, className: 'chip-give', node: label }, CARET]} />
       </RM.Trigger>
       <RM.Portal>
-        <RM.Content className="pop cm-pop" data-spot side="bottom" align="start" sideOffset={8} collisionPadding={10} style={{ width: 240 }}>
-          {list.map((w) => {
-            const name = treeName(w);
-            const folder = baseName(w.path);
-            return (
-              <RM.Item key={w.path} className="menu-item cm-row" title={w.path} onSelect={() => setUi({ homeCwd: w.path, homeChat: false })}>
-                <Icon name="branch" size={15} className="hc-icon" />
-                <span className="cm-row-name grow truncate">{name}</span>
-                {folder !== name && <span className="cm-row-dim truncate">{folder}</span>}
-                <span className="cm-check">{pathKey(w.path) === pathKey(current.path) && <Icon name="check" size={14} />}</span>
-              </RM.Item>
-            );
-          })}
+        <RM.Content
+          className="pop cm-pop"
+          data-spot
+          side="bottom"
+          align="start"
+          sideOffset={8}
+          collisionPadding={10}
+          style={{ width: 240 }}
+          onCloseAutoFocus={(e) => {
+            e.preventDefault();
+            onClosed();
+          }}
+        >
+          <Later>
+            {() => (
+              <>
+                {list.map((w) => {
+                  const name = treeName(w);
+                  const folder = baseName(w.path);
+                  return (
+                    <RM.Item key={w.path} className="menu-item cm-row" title={w.path} onSelect={() => setUi({ homeCwd: w.path, homeChat: false })}>
+                      <Icon name="branch" size={15} className="hc-icon" />
+                      <span className="cm-row-name grow truncate">{name}</span>
+                      {folder !== name && <span className="cm-row-dim truncate">{folder}</span>}
+                      <span className="cm-check">{pathKey(w.path) === pathKey(current.path) && <Icon name="check" size={14} />}</span>
+                    </RM.Item>
+                  );
+                })}
+              </>
+            )}
+          </Later>
         </RM.Content>
       </RM.Portal>
     </RM.Root>
@@ -667,7 +684,7 @@ export const HomeChips = memo(function HomeChips({ onClosed }: { onClosed: () =>
       <AgentMenu onClosed={onClosed} />
       <SignInChip />
       <FolderMenu onClosed={onClosed} />
-      <BranchChip />
+      <BranchChip onClosed={onClosed} />
     </div>
   );
 });

@@ -23,6 +23,7 @@ import { paidAsk, paidConfirmed } from './paid-speed';
 import { APP_COMMANDS, appCommandsFor, commandRows, expandCommand, mentionRows, skillRows, type CommandCtx, type SuggestRow } from './commands';
 import { keepDrafts } from './drafts';
 import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut } from './Controls';
+import { CoveSkin } from './Cove';
 import { PROVIDER_NAME } from '@/art/Logo';
 import { ModelEffort } from './Thinking';
 import { Highlight } from './Highlight';
@@ -258,7 +259,9 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const [files, setFiles] = useState<FileHit[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [recall, setRecall] = useState<number | null>(null);
-  const [ultraLocal, setUltraLocal] = useState<boolean | null>(null);
+  // Ultracode as just switched here, over the value the session had then: it shows at once, and
+  // stops counting the moment the session says anything else (no effect, no second render).
+  const [ultraPick, setUltraPick] = useState<{ on: boolean; over: boolean } | null>(null);
   const searchSeq = useRef(0);
 
   const opening = useStore((s) => variant === 'session' && !!sessionId && !s.data[sessionId]?.loaded);
@@ -277,7 +280,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const popSide = variant === 'home' ? 'bottom' : 'top';
   const steerable = !!caps?.features.steer;
   const ultraOffered = !!caps?.features.ultracode;
-  const ultra = ultraOffered && (ultraLocal ?? storedUltra);
+  const ultra = ultraOffered && (ultraPick && ultraPick.over === storedUltra ? ultraPick.on : storedUltra);
   // "Ultra" is one look across agents: ultracode on (a mode), or an Ultra level (an effort).
   const ultraLook = ultra || isUltraEffort(choice.effort);
   const images = !!caps?.features.images;
@@ -285,7 +288,6 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const signedOut = useHomeSignedOut() && variant === 'home';
   const homeAgent = useStore((s) => s.ui.homeProvider);
 
-  useEffect(() => setUltraLocal(null), [storedUltra]);
 
   // ── text helpers ──
 
@@ -325,8 +327,6 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     const h = Math.min(max, Math.max(LINE * minLines + PAD_Y, content));
     ta.style.height = `${h}px`;
     ta.style.overflowY = content > max ? 'auto' : 'hidden';
-    // A field that scrolls fades out at its lower edge instead of cutting a line in half.
-    ta.parentElement?.toggleAttribute('data-scrolls', content > max);
   }, [measured, minLines]);
 
   // The pill layer scrolls (and reserves a scrollbar) exactly like the field above it.
@@ -724,7 +724,7 @@ ${cur}` : draft.text, attachments: draft.attachments });
 
   const toggleUltra = useCallback(
     (on: boolean) => {
-      setUltraLocal(on);
+      setUltraPick({ on, over: !on });
       if (sessionId) void setUltracode(sessionId, on);
       else setHomeUltracode(on);
     },
@@ -897,6 +897,7 @@ ${cur}` : draft.text, attachments: draft.attachments });
           }
         }}
       >
+        <CoveSkin />
         {attachments.length > 0 && <AttachmentRow items={attachments} onRemove={removeAttachment} />}
 
         <div className="cmp-field">
@@ -964,22 +965,26 @@ ${cur}` : draft.text, attachments: draft.attachments });
           <div className="cmp-side cmp-right">
             <div className="cmp-agent" inert={shell || undefined}>
               <ModelPopover choice={choice} side={popSide} onClosed={focus} />
+              <span className="cmp-dot" aria-hidden>
+                ·
+              </span>
               <ModelEffort choice={choice} side={popSide} onClosed={focus} ultraOffered={ultraOffered} ultracode={ultra} onUltracode={toggleUltra} />
             </div>
-            <SendKey
-              canSend={canSend}
-              busy={busy}
-              showStop={showStop}
-              steerable={steerable}
-              ultracode={ultraLook}
-              sendWithEnter={sendWithEnter}
-              shell={shell}
-              stoppable={variant === 'session' && !!sessionId}
-              onSend={onSend}
-              onStop={onStop}
-            />
           </div>
         </div>
+
+        {/* The key is no part of the pane: it rests in the cove the pane's corner makes for it. */}
+        <SendKey
+          canSend={canSend}
+          busy={busy}
+          showStop={showStop}
+          steerable={steerable}
+          sendWithEnter={sendWithEnter}
+          shell={shell}
+          stoppable={variant === 'session' && !!sessionId}
+          onSend={onSend}
+          onStop={onStop}
+        />
 
         <UltraEdge on={ultraLook} card={card} />
         <input

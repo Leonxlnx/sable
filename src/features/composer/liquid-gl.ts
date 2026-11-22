@@ -6,9 +6,9 @@ import { GLASS, INK, SHADOW, frameBounds, lerp, type LiquidFrame, type Taper } f
  *
  * WebGL: the liquid is a signed distance field evaluated per pixel. The drop, the two pieces of
  * its thread and the sheet are an ellipse, two tapers and a rounded box, united with each other
- * and with the bar's edge by smooth minimums, so the meniscus, the thread that thins and parts,
- * what falls back into the edge and the drop running into the sheet are one continuous skin,
- * crisp at any size.
+ * and with the send key's disc by smooth minimums, so the collar on the key, the thread that
+ * thins and parts, what falls back into the key and the drop running into the sheet are one
+ * continuous skin, crisp at any size.
  *
  * On it, the look. As the card: its ink (with a static grain like the page's), its inner hairline
  * and one soft shadow. In the air: glass. The skin is rounded in from its rim (`lens` px deep: a
@@ -130,9 +130,15 @@ float smin(float a, float b, float k) {
   return min(a, b) - h * h * k * 0.25;
 }
 
-// What stands on the bar: the edge itself, the thread's foot running out of it, its one small swell after.
+// What the drop is tied to: the key's disc (uEdgeX.y: its radius, hanging under its top point), or
+// a straight edge (radius 0: everything under the line).
+float sdKey(vec2 p) {
+  return uEdgeX.y > 0.0 ? length(p - vec2(uEdgeX.x, uEdge.x + uEdgeX.y)) - uEdgeX.y : uEdge.x - p.y;
+}
+
+// What stands on it: the key itself, the thread's foot running out of it, a straight edge's one small swell after.
 float sdEdge(vec2 p) {
-  float e = uEdge.x - p.y;
+  float e = sdKey(p);
   if (uTaper.x > 0.0) e = smin(e, sdTaper(p, vec2(uEdgeX.x, uEdge.x), uFoot.zw, uTaper.x, uTaper.y), 6.0);
   if (uEdge.w > 0.0) e = smin(e, length(p - vec2(uEdgeX.x, uEdge.x + 18.0 - uEdge.w)) - 18.0, 3.0);
   return e;
@@ -183,21 +189,22 @@ void main() {
   // Coverage of the ink and of its 1 px inner hairline, smoothed over one device pixel.
   float cov = clamp(0.5 - d * uScale, 0.0, 1.0);
   float inner = clamp(0.5 - (d + 1.0) * uScale, 0.0, 1.0);
-  // Tied to the bar: what is drawn is what the union adds to the bar's edge (the bar itself is
-  // the page's), so nothing lines its edge away from the drop; under the meniscus the ink runs on
-  // over the bar's own hairline, so the drop rises out of the bar, not onto it.
-  float de = uEdge.z > 0.5 ? uEdge.x - p.y : 1e5;
+  // Tied to the key: what is drawn is what the union adds to the key (the key itself is the
+  // page's, and stays a clean disc), so nothing lines its edge away from the drop. On a straight
+  // edge the ink runs on over the edge's own hairline under the meniscus, so the drop rises out
+  // of it, not onto it.
+  float de = uEdge.z > 0.5 ? sdKey(p) : 1e5;
   float ce = clamp(0.5 - de * uScale, 0.0, 1.0);
   float ie = clamp(0.5 - (de + 1.0) * uScale, 0.0, 1.0);
   float foot = 0.0;
-  if (uEdge.z > 0.5) {
+  if (uEdge.z > 0.5 && uEdgeX.y <= 0.0) {
     float band = clamp((uEdge.x + 1.5 - p.y) * uScale + 0.5, 0.0, 1.0) * ce;
     foot = clamp(0.5 - scene(vec2(p.x, uEdge.x - 0.75)) * uScale, 0.0, 1.0) * band;
   }
   float rim = max((cov - inner) - (ce - ie), 0.0);
-  // What still stands on the bar (the meniscus, the thread's foot, the bob) is the bar's own ink:
-  // the liquid turns to glass as it rises clear of the edge.
-  float glass = uLook.x * (uEdge.z > 0.5 ? smoothstep(1.0, 10.0, uEdge.x - p.y) : 1.0);
+  // What still clings to the key (the collar, the thread's foot) is plain ink: the liquid turns
+  // to glass as it rises clear of it.
+  float glass = uLook.x * (uEdge.z > 0.5 ? smoothstep(1.0, 10.0, de) : 1.0);
   // The card's hairline, a little brighter on top while it is still liquid.
   float up = clamp(0.5 - 0.5 * n.y, 0.0, 1.0);
   float rimA = mix(uLook.y, uLook.y + (uLook.z - uLook.y) * up * up, glass);
@@ -380,7 +387,7 @@ function glRenderer(canvas: AnyCanvas, scale: number): LiquidRenderer | null {
           gl.uniform4f(U.radii, s.radii[0], s.radii[1], s.radii[2], s.radii[3]);
         } else gl.uniform4f(U.sheet, 0, 0, 0, 0);
         gl.uniform4f(U.edge, f.edge?.y ?? 0, f.edge?.k ?? 0, f.edge ? 1 : 0, f.edge?.bob ?? 0);
-        gl.uniform2f(U.edgeX, f.edge?.x ?? 0, 0);
+        gl.uniform2f(U.edgeX, f.edge?.x ?? 0, f.edge?.r ?? 0);
         gl.uniform4f(U.foot, f.foot?.ax ?? 0, f.foot?.ay ?? 0, f.foot?.bx ?? 0, f.foot?.by ?? 0);
         gl.uniform4f(U.tail, f.tail?.ax ?? 0, f.tail?.ay ?? 0, f.tail?.bx ?? 0, f.tail?.by ?? 0);
         const tf = taper(f.edge ? f.foot : undefined);
@@ -406,7 +413,7 @@ function glRenderer(canvas: AnyCanvas, scale: number): LiquidRenderer | null {
   // not be a message's first frame.
   const one = { left: 0, top: 0, right: 4, bottom: 4, radii: [1, 1, 1, 1] as [number, number, number, number] };
   const t: Taper = { ax: 1, ay: 1, bx: 2, by: 3, ra: 1, rb: 0.5 };
-  renderer.draw([{ f: { edge: { x: 2, y: 3, k: 2, bob: 1 }, drop: { x: 2, y: 2, r: 2, sx: 1.1, sy: 0.9, ang: 0 }, foot: t, tail: t, sheet: one, join: 1, light: 1, lens: 2, alpha: 1, done: false } }], { x: 0, y: 0 });
+  renderer.draw([{ f: { edge: { x: 2, y: 3, k: 2, bob: 1, r: 2 }, drop: { x: 2, y: 2, r: 2, sx: 1.1, sy: 0.9, ang: 0 }, foot: t, tail: t, sheet: one, join: 1, light: 1, lens: 2, alpha: 1, done: false } }], { x: 0, y: 0 });
   gl.finish();
   clear();
   return renderer;
@@ -462,9 +469,16 @@ function canvas2d(canvas: AnyCanvas, scale: number): LiquidRenderer | null {
         ctx.save();
         ctx.globalAlpha = f.alpha;
         if (f.edge) {
+          // Only outside the key (or above a straight edge).
           ctx.beginPath();
-          ctx.rect(-1e5, -1e5, 2e5, 1e5 + f.edge.y);
-          ctx.clip();
+          if (f.edge.r) {
+            ctx.rect(-1e5, -1e5, 2e5, 2e5);
+            ctx.arc(f.edge.x, f.edge.y + f.edge.r, f.edge.r, 0, Math.PI * 2);
+            ctx.clip('evenodd');
+          } else {
+            ctx.rect(-1e5, -1e5, 2e5, 1e5 + f.edge.y);
+            ctx.clip();
+          }
         }
         const c = INK.fill.map((v, i) => Math.round(lerp(v, INK.lift[i], f.light)));
         ctx.fillStyle = `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${INK.a})`;

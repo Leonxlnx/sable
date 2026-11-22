@@ -10,12 +10,29 @@
  * ring's mask never changes). Nothing runs while the pointer
  * is still, and nothing at all for touch or when the user prefers reduced motion. Features only
  * add the attribute; they never listen themselves.
+ *
+ * A surface whose outline is not a rounded box (the composer and its cove) draws its own ring: a
+ * `.spot-ring` it renders itself, made of `.spot-part` children that share the surface's origin,
+ * each cut to its stretch of the outline. Every part gets a disc, and all of them move together.
  */
 
 let started = false;
 
-/** The surface's light (the disc inside its ring), created the first time it is needed. */
-function lightOf(el: HTMLElement): HTMLElement {
+/** The disc inside a ring (or inside one part of a ring), created the first time it is needed. */
+function discIn(host: HTMLElement): HTMLElement {
+  let light = host.firstElementChild as HTMLElement | null;
+  if (!light) {
+    light = document.createElement('i');
+    host.append(light);
+  }
+  return light;
+}
+
+/** A ring's discs, found once per ring (a re-render that drops the ring makes a new one). */
+const discs = new WeakMap<HTMLElement, HTMLElement[]>();
+
+/** The surface's lights: the disc inside its ring, or one per part of a ring the surface draws itself. */
+function lightsOf(el: HTMLElement): HTMLElement[] {
   const last = el.lastElementChild;
   let ring = last instanceof HTMLElement && last.classList.contains('spot-ring') ? last : el.querySelector<HTMLElement>(':scope > .spot-ring');
   if (!ring) {
@@ -24,12 +41,13 @@ function lightOf(el: HTMLElement): HTMLElement {
     ring.setAttribute('aria-hidden', 'true');
     el.append(ring);
   }
-  let light = ring.firstElementChild as HTMLElement | null;
-  if (!light) {
-    light = document.createElement('i');
-    ring.append(light);
+  let lights = discs.get(ring);
+  if (!lights || !lights.every((l) => l.isConnected)) {
+    const parts = ring.querySelectorAll<HTMLElement>(':scope > .spot-part');
+    lights = parts.length ? Array.from(parts, discIn) : [discIn(ring)];
+    discs.set(ring, lights);
   }
-  return light;
+  return lights;
 }
 
 export function startSpot() {
@@ -64,12 +82,13 @@ export function startSpot() {
     const k = r.width ? el.offsetWidth / r.width : 1;
     const mx = Math.round((x - r.left) * k);
     const my = Math.round((y - r.top) * k);
-    const light = lightOf(el);
+    const lights = lightsOf(el);
     set(el);
     if (mx === lastX && my === lastY) return;
     lastX = mx;
     lastY = my;
-    light.style.transform = `translate(${mx}px, ${my}px)`;
+    const at = `translate(${mx}px, ${my}px)`;
+    for (const light of lights) light.style.transform = at;
   };
 
   const schedule = () => {

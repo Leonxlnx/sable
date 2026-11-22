@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { DEFAULT_ACCOUNT, STANDARD_SPEED, type Capabilities, type Effort, type ModeInfo, type ModelInfo, type ProviderId, type SpeedInfo } from '@shared/protocol';
 import { defaultableSpeeds, isPaidSpeed, modelNameById, modelSpeeds, offeredSpeeds, speedFor, visibleModels } from '@/lib/models';
 import { useLimitsReport } from '@/state/hooks';
@@ -71,6 +71,13 @@ export interface Choice {
 
 const NO_MODELS: ModelInfo[] = [];
 
+/** A session's choices picked here and not yet confirmed by the bridge. */
+interface Picked {
+  model?: string;
+  effort?: Effort;
+  mode?: string;
+}
+
 /** What this agent offers under this account in some folder already asked about (the first found; undefined when none). */
 export function capsFromAnywhere(all: Record<string, Capabilities>, provider: ProviderId, accountId: string | undefined): Capabilities | undefined {
   const head = `${provider}:`;
@@ -113,14 +120,32 @@ export function useChoice(sessionId: string | null): Choice {
   // Home: the speed new sessions start with (the agent's default in settings).
   const homeSpeed = useStore((s) => s.settings.defaultSpeeds?.[provider]);
 
+  // What was just picked in a session and is still on its way to the bridge. The chips show it at
+  // once (a label never waits on a round trip, and Shift+Tab pressed twice moves two modes on); it
+  // is dropped when the session says the same, or after a few seconds when it never does.
+  const [picked, setPicked] = useState<Picked | null>(null);
+  useEffect(() => setPicked(null), [sessionId]);
+  useEffect(() => {
+    if (!picked) return;
+    if (!meta) return setPicked(null);
+    const left: Picked = {};
+    if (picked.model !== undefined && picked.model !== meta.model) left.model = picked.model;
+    if (picked.effort !== undefined && picked.effort !== meta.effort) left.effort = picked.effort;
+    if (picked.mode !== undefined && picked.mode !== meta.mode) left.mode = picked.mode;
+    const n = Object.keys(left).length;
+    if (n !== Object.keys(picked).length) return setPicked(n ? left : null);
+    const t = window.setTimeout(() => setPicked(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [picked, meta]);
+
   const all = caps?.models ?? NO_MODELS;
-  const modelId = meta ? meta.model : (homeModel ?? all.find((m) => m.isDefault)?.id ?? all[0]?.id);
+  const modelId = meta ? (picked?.model ?? meta.model) : (homeModel ?? all.find((m) => m.isDefault)?.id ?? all[0]?.id);
   const model = all.find((m) => m.id === modelId);
   const models = useMemo(() => visibleModels(provider, all, visibility, modelId), [provider, all, visibility, modelId]);
-  const modeId = meta ? meta.mode : (homeMode ?? caps?.modes[0]?.id);
+  const modeId = meta ? (picked?.mode ?? meta.mode) : (homeMode ?? caps?.modes[0]?.id);
   const mode = caps?.modes.find((m) => m.id === modeId);
   // No choice anywhere and no model default means the agent picks: show none rather than invent one.
-  let effort = meta ? meta.effort : homeEffort;
+  let effort = meta ? (picked?.effort ?? meta.effort) : homeEffort;
   const effortChosen = !!(effort && model?.efforts?.includes(effort));
   if (model?.efforts?.length && (!effort || !model.efforts.includes(effort))) effort = model.defaultEffort;
   if (model && !model.efforts?.length) effort = undefined;
@@ -128,6 +153,7 @@ export function useChoice(sessionId: string | null): Choice {
   const write = useCallback(
     (id: string | undefined, e: Effort | undefined) => {
       if (sessionId) {
+        if (id || e) setPicked((p) => ({ ...p, ...(id ? { model: id } : null), ...(e ? { effort: e } : null) }));
         if (id) void setSessionModel(sessionId, id).then(() => e && setSessionEffort(sessionId, e));
         else if (e) void setSessionEffort(sessionId, e);
         return;
@@ -162,8 +188,10 @@ export function useChoice(sessionId: string | null): Choice {
 
   const setMode = useCallback(
     (id: string) => {
-      if (sessionId) void setSessionMode(sessionId, id);
-      else {
+      if (sessionId) {
+        setPicked((p) => ({ ...p, mode: id }));
+        void setSessionMode(sessionId, id);
+      } else {
         const s = useStore.getState();
         s.setUi({ homeMode: { ...s.ui.homeMode, [provider]: id } });
       }

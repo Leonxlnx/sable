@@ -61,8 +61,6 @@ export interface SendKeyProps {
   showStop: boolean;
   /** The agent takes messages mid-turn. */
   steerable: boolean;
-  /** Shown by the effort chip; the key's arrow stays the same. */
-  ultracode?: boolean;
   sendWithEnter: boolean;
   shell: boolean;
   /** Only the session composer has a stop key. */
@@ -72,7 +70,8 @@ export interface SendKeyProps {
 }
 
 /**
- * The send and stop keys, sharing one 28 px slot.
+ * The send and stop keys, sharing the cove in the pane's corner (composer.css `.cmp-keys`): one
+ * 40 px disc, an object of its own beside the pane.
  * Send is a solid ivory disc with a dark glyph; stop an ivory disc with a dark square, static.
  */
 export const SendKey = memo(function SendKey({ canSend, busy, showStop, steerable, sendWithEnter, shell, stoppable, onSend, onStop }: SendKeyProps) {

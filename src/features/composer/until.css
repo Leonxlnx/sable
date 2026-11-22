@@ -1,22 +1,46 @@
-/* Until green: one quiet strip above the composer (UntilStrip.tsx). */
+/* The strips that belong to the composer (until green, spare, the review bar: UntilStrip.tsx,
+   SpareStrip.tsx, review/ReviewBar.tsx), and with them the queue tray (composer.css `.cq`): one
+   stack on the pane's top edge. Each is as wide as the pane, has the pane's corners and its
+   hairline, and is tucked 20px behind what comes after it (the next strip, or the pane), so a
+   strip rises out from behind the edge below it. Nothing of the stack reaches the cove. */
 
 .us-slot {
+  position: relative;
   width: 100%;
-  margin-bottom: 8px;
+  margin-bottom: -20px;
   transform-origin: 50% 100%;
 }
 
 .us {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 38px;
-  padding: 0 5px 0 12px;
-  border: 1px solid var(--line-2);
-  border-radius: var(--r-lg);
+  height: 58px;
+  padding: 0 7px 20px 14px;
+  border-radius: 20px 20px 0 0;
   background-color: var(--panel);
   font-size: var(--t-small);
   color: var(--text-2);
+}
+
+/* The stack's hairline: the pane's rim (its lower part lies behind the next layer). */
+.us::before,
+.cq::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1px 1px 0;
+  border-radius: inherit;
+  background: var(--rim-light);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box exclude,
+    linear-gradient(#000 0 0);
+  pointer-events: none;
 }
 
 .us-mark {

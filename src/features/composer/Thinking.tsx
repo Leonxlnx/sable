@@ -1,10 +1,11 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from 'react';
+import { memo, useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from 'react';
 import { Popover as RP } from 'radix-ui';
 import { STANDARD_SPEED, type Effort, type SpeedInfo } from '@shared/protocol';
 import { effortName, isUltraEffort } from '@/lib/models';
-import { EASE_OUT, play, reducedMotion } from '@/lib/motion';
+import { reducedMotion } from '@/lib/motion';
 import { Segmented, Switch, Tip } from '@/ui';
 import { Icon } from '@/icons';
+import { Chip, type ChipPart } from './Chip';
 import { type Choice } from './choice';
 import { ChipSkeleton, MENU_EVENT } from './Controls';
 import { headerLevel, step, stopAt, TRACK_KEYS, type TrackEvent, type TrackState } from './effort-track';
@@ -29,13 +30,25 @@ export function UltraMark({ className }: { className?: string }) {
   );
 }
 
-/** A level's name, with the ultra mark in front of an Ultra level (or of any level while ultracode is on). */
-function LevelName({ effort, mark }: { effort: Effort | undefined; mark?: boolean }) {
+/** A level's name, with the ultra mark in front of an Ultra level. */
+function LevelName({ effort }: { effort: Effort | undefined }) {
   return (
     <>
-      {(mark || isUltraEffort(effort)) && <UltraMark />}
+      {isUltraEffort(effort) && <UltraMark />}
       {effort ? effortName(effort) : 'Default'}
     </>
+  );
+}
+
+/** The level as a dial: the arc is the share of the way to the top level (none: the agent decides). */
+export function Dial({ level, of }: { level: number; of: number }) {
+  const round = 2 * Math.PI * 5;
+  const share = of > 0 ? Math.max(0, Math.min(1, level / of)) : 0;
+  return (
+    <svg className="th-dial" width="14" height="14" viewBox="0 0 14 14" aria-hidden>
+      <circle className="th-dial-track" cx="7" cy="7" r="5" />
+      <circle className="th-dial-arc" cx="7" cy="7" r="5" strokeDasharray={round} strokeDashoffset={round * (1 - share)} opacity={share ? 1 : 0} />
+    </svg>
   );
 }
 
@@ -282,7 +295,6 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
   // A paid speed waiting on its question (from a click in the row or from `/fast`).
   const [ask, setAsk] = useState<string | null>(null);
 
-  const chip = useRef<HTMLButtonElement>(null);
   const track = useRef<HTMLDivElement>(null);
   const settleTimer = useRef(0);
 
@@ -331,20 +343,6 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
     return () => window.clearTimeout(t);
   }, [look]);
 
-  // The chip hugs the current name, so the toolbar's gaps stay equal; a change of name eases the
-  // width (one short WAAPI resize, nothing re-renders). The chip's right edge sits against the send
-  // key and never moves, so the popover (aligned to it) stays put; only the model chip slides.
-  const pill = useRef<HTMLSpanElement>(null);
-  const lastPill = useRef(0);
-  useLayoutEffect(() => {
-    const el = pill.current;
-    if (!el) return;
-    const w = el.offsetWidth;
-    const was = lastPill.current;
-    lastPill.current = w;
-    if (was && Math.abs(w - was) > 1) play(el, [{ width: `${was}px` }, { width: `${w}px` }], { duration: 140, easing: EASE_OUT });
-  }, [shown, ucOn, efforts]);
-
   const hasSpeed = speeds.length > 0 && !!onSpeed;
   if (!efforts.length && !ultraOffered && !hasSpeed) return null;
 
@@ -353,26 +351,21 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
   const name = shown ? effortName(shown) : 'Default';
   const aria = (efforts.length ? `Effort: ${name}${ucOn ? ', ultracode on' : ''}` : ultraOffered ? `Ultracode ${ucOn ? 'on' : 'off'}` : 'Speed') + (fast ? `, ${speedInfo?.name ?? 'fast'} speed${speedInfo?.paid ? ', billed as extra usage' : ''}` : '');
   const tip = (efforts.length ? (ucOn ? `Effort and ultracode` : 'Effort') : ultraOffered ? 'Ultracode' : 'Speed') + (fast && speedInfo?.paid ? ` · ${speedInfo.name} on extra usage` : '');
+  // What the chip says, part by part (Chip.tsx): a part that stays keeps showing while the others
+  // come and go, so turning ultracode on only adds its mark and the word never blinks. The chip
+  // hugs its label and its right end (before the cove) holds, so the popover aligned to it stays put.
+  const parts: ChipPart[] = [];
+  if (efforts.length > 0) {
+    if (fast) parts.push({ k: 'bolt', node: <Icon name="bolt" size={13} className="th-bolt" /> });
+    if (look) parts.push({ k: 'mark', node: <UltraMark /> });
+    parts.push({ k: 'dial', className: 'th-gauge', node: <Dial level={shown ? efforts.indexOf(shown) + 1 : 0} of={efforts.length} /> });
+    parts.push({ k: `word:${shown ?? ''}`, className: 'th-word', node: name });
+  } else parts.push(ultraOffered ? { k: 'uc', node: <UltraMark className="th-uc" /> } : { k: 'bolt', node: <Icon name="bolt" size={13} className="th-bolt" /> });
   return (
     <RP.Root open={open} onOpenChange={setOpen}>
       <Tip label={tip} side="top">
         <RP.Trigger asChild>
-          <button ref={chip} type="button" className="tb-chip th-chip" data-ultra={look || undefined} data-burst={burst || undefined} data-bare={!efforts.length || undefined} aria-label={aria}>
-            {efforts.length > 0 ? (
-              <>
-                <span ref={pill} className="th-pill" aria-hidden>
-                  {fast && <Icon name="bolt" size={13} className="th-bolt" />}
-                  <span className="th-nm th-cur">
-                    <LevelName effort={shown} mark={ucOn} />
-                  </span>
-                </span>
-              </>
-            ) : (
-              <span ref={pill} className="th-pill" aria-hidden>
-                {ultraOffered ? <UltraMark className="th-uc" /> : <Icon name="bolt" size={13} className="th-bolt" />}
-              </span>
-            )}
-          </button>
+          <Chip className="tb-chip th-chip" anchor="right" data-ultra={look || undefined} data-burst={burst || undefined} data-bare={!efforts.length || undefined} aria-label={aria} parts={parts} />
         </RP.Trigger>
       </Tip>
       <RP.Portal>
