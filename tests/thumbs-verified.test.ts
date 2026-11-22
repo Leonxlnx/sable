@@ -124,7 +124,7 @@ async function setup(opts: Parameters<typeof registerThumbs>[1]) {
         renameSync(next, f);
         break;
       } catch (err) {
-        if (i >= 60 || (err as NodeJS.ErrnoException).code !== 'EPERM') throw err;
+        if (i >= 240 || (err as NodeJS.ErrnoException).code !== 'EPERM') throw err;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
       }
     }
