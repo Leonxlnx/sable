@@ -1,23 +1,212 @@
-import { useEffect, useState, type ReactNode } from 'react';
-import type { GitPullContext } from '@shared/protocol';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import type { GitPullContext, PullRequestInfo } from '@shared/protocol';
+import { Tiles } from '@/art/Logo';
+import { Collapse } from '@/components/Collapse';
 import { Icon } from '@/icons';
+import { readPullFailures } from '@/state/actions';
+import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
-import { Modal, Spinner, Switch } from '@/ui';
-import { createPull, pullContext } from './git-state';
+import { IconButton, Modal, Spinner, Switch, titleIfCut } from '@/ui';
+import { createPull, pullContext, useRepo } from './git-state';
+import { REVIEW_WORD, STATE_WORD, checksWords, createdPull, failedChecks, isLive, pullLabel, pulls, refreshPull, usePullRequest, usePullWatch, withFailures } from './pull-status';
 import './pull-request.css';
 
-/** The clean working tree's next step: a pull request for the branch, opened from here. */
+/** How long the Create button waits for GitHub's answer about the branch before it is offered anyway. */
+const OFFER_AFTER_MS = 4000;
+
+/**
+ * The clean working tree's next step: a pull request for the branch, opened from here. Offered for
+ * a branch with none to work on (none at all, or one already merged or closed), and only once that
+ * is known, so the button does not show just to make way for the pull request's row; an answer
+ * that takes longer than a few seconds is not waited for.
+ */
 export function PullRequestAction({ cwd }: { cwd: string }) {
   const [open, setOpen] = useState(false);
+  const status = useRepo(cwd)?.status;
+  const branch = status?.isRepo ? status.branch : undefined;
+  const { pull, known } = usePullRequest(cwd, branch);
+  const [waited, setWaited] = useState(false);
+  useEffect(() => {
+    setWaited(false);
+    const t = window.setTimeout(() => setWaited(true), OFFER_AFTER_MS);
+    return () => window.clearTimeout(t);
+  }, [cwd, branch]);
+  const offer = (known || waited) && !(pull && isLive(pull));
+  // It came after the tab did (GitHub was asked first): it fades in instead of popping.
+  const late = useRef(!offer).current;
+  if (!offer && !open) return null;
   return (
-    <div className="pr-action">
-      <button type="button" className="btn btn-sm pr-open" onClick={() => setOpen(true)}>
-        <Icon name="pull-request" size={14} />
-        Create pull request
-      </button>
+    <div className="pr-action" data-late={late || undefined}>
+      {offer && (
+        <button type="button" className="btn btn-sm pr-open" onClick={() => setOpen(true)}>
+          <Icon name="pull-request" size={14} />
+          Create pull request
+        </button>
+      )}
       {open && <PullRequestDialog cwd={cwd} onOpenChange={setOpen} />}
     </div>
   );
+}
+
+const Dot = () => (
+  <span className="pr-dot" aria-hidden>
+    ·
+  </span>
+);
+
+/**
+ * Pointer-enter on the row: the whole title as its tooltip, only when the row does not show it
+ * whole (cut with an ellipsis, or left out where the rail is narrow). Nothing measures at rest.
+ */
+function wholeTitleIfCut(e: { currentTarget: HTMLElement }) {
+  const row = e.currentTarget;
+  const title = row.querySelector<HTMLElement>('.pr-title');
+  const slot = title?.parentElement;
+  // Left out: it wrapped under the line the row shows.
+  const cut = !!title && !!slot && (title.scrollWidth > title.clientWidth + 1 || title.getBoundingClientRect().top >= slot.getBoundingClientRect().bottom - 1);
+  if (cut && title.textContent) row.title = title.textContent;
+  else row.removeAttribute('title');
+}
+
+/**
+ * The branch's pull request as one row: its number and title, then its state, its review and its
+ * checks in plain words; the whole row opens it on GitHub. Under it, only when checks failed, their
+ * names (each opens its run) and the hand-over to the chat. Drawn from what it is given: the
+ * gallery shows it from fixed data.
+ */
+export function PullRow({
+  pull,
+  loading,
+  sending,
+  onRefresh,
+  onSendFailures,
+}: {
+  pull: PullRequestInfo;
+  /** It is being read again. */
+  loading?: boolean;
+  /** The failed logs are being read. */
+  sending?: boolean;
+  onRefresh?: () => void;
+  onSendFailures?: () => void;
+}) {
+  const checks = checksWords(pull);
+  const review = isLive(pull) ? pull.review : undefined;
+  const { shown, more } = failedChecks(pull);
+  return (
+    <div className="pr-box">
+      <div className="pr-row rail-row-host">
+        <a className="pr-go" href={pull.url} target="_blank" rel="noreferrer" aria-label={pullLabel(pull)} onPointerEnter={wholeTitleIfCut}>
+          <span className="pr-mark">
+            <Icon name="pull-request" size={14} />
+          </span>
+          <span className="pr-text">
+            <span className="pr-num num">#{pull.number}</span>
+            <span className="pr-title-slot">
+              <span className="pr-title">{pull.title}</span>
+            </span>
+            {/* Written last to first: where the rail is narrow the words shed whole, the state first,
+                then the review; the checks stay (pull-request.css). Read as: state, review, checks. */}
+            <span className="pr-words">
+              {checks && (
+                <span className="pr-word">
+                  {checks.kind === 'failed' ? (
+                    <>
+                      <span className="pr-failed-n num">{checks.failed}</span> {checks.rest}
+                    </>
+                  ) : (
+                    <>
+                      {checks.kind === 'running' && <Tiles size={10} className="pr-tiles" />}
+                      {checks.text}
+                    </>
+                  )}
+                </span>
+              )}
+              {review && (
+                <span className="pr-word">
+                  {REVIEW_WORD[review]}
+                  {checks && <Dot />}
+                </span>
+              )}
+              {/* "Open" is not said beside a review decision, which says it: the title gets the room. */}
+              {!(pull.state === 'open' && review) && (
+                <span className="pr-word">
+                  {STATE_WORD[pull.state]}
+                  {(review || checks) && <Dot />}
+                </span>
+              )}
+            </span>
+          </span>
+          <Icon name="external" size={11} className="pr-out rail-row-deco" />
+        </a>
+        {onRefresh && (
+          <span className="rail-row-acts pr-row-acts">
+            <IconButton icon="refresh" label="Refresh pull request" size={14} className={loading ? 'is-spinning' : undefined} onClick={onRefresh} />
+          </span>
+        )}
+      </div>
+      <Collapse open={shown.length > 0}>
+        <div className="pr-fails">
+          <ul className="pr-fail-list">
+            {shown.map((c, i) => (
+              <li key={`${i}:${c.name}`}>
+                {c.url ? (
+                  <a className="pr-fail" href={c.url} target="_blank" rel="noreferrer" onPointerEnter={titleIfCut}>
+                    {c.name}
+                  </a>
+                ) : (
+                  <span className="pr-fail" onPointerEnter={titleIfCut}>
+                    {c.name}
+                  </span>
+                )}
+              </li>
+            ))}
+            {more > 0 && <li className="pr-fail-more">and {more} more</li>}
+          </ul>
+          {onSendFailures && (
+            <button type="button" className="btn btn-sm pr-send" disabled={sending} onClick={onSendFailures}>
+              {sending ? <Spinner size={12} /> : <Icon name="reply" size={13} />}
+              Send failures to chat
+            </button>
+          )}
+        </div>
+      </Collapse>
+    </div>
+  );
+}
+
+/**
+ * The pull request of the folder's branch at the head of the Changes tab: read while the tab shows
+ * (pull-status.ts says when), drawn once there is one, gone without a word when there is none.
+ */
+export function PullRequestRow({ sessionId, cwd }: { sessionId: string; cwd: string }) {
+  const status = useRepo(cwd)?.status;
+  usePullWatch(cwd, status);
+  const { pull, loading } = usePullRequest(cwd, status?.isRepo ? status.branch : undefined);
+  const toast = useStore((s) => s.toast);
+  const [sending, setSending] = useState(false);
+  // While the row folds away it still shows the pull request it had.
+  const last = useRef(pull);
+  if (pull) last.current = pull;
+  const drawn = pull ?? last.current;
+
+  const send = async () => {
+    if (!pull || sending) return;
+    setSending(true);
+    const res = await readPullFailures(cwd, pull.number, pull.head);
+    setSending(false);
+    if (!res?.text) {
+      // The pull request moved on meanwhile (another head, the checks ran again): the row reads it again.
+      void refreshPull(cwd);
+      toast(res?.stale ? 'The pull request changed. Its checks are read again.' : 'The failed checks could not be read.');
+      return;
+    }
+    // Into the chat's draft, after what is already typed there; the person reads it and sends.
+    const st = useStore.getState();
+    st.setDraft(sessionId, { text: withFailures(st.drafts[sessionId]?.text ?? '', res.text) });
+    focusComposer();
+  };
+
+  return <Collapse open={!!pull}>{drawn && <PullRow pull={drawn} loading={loading} sending={sending} onRefresh={() => void refreshPull(cwd)} onSendFailures={() => void send()} />}</Collapse>;
 }
 
 /** Why a pull request cannot be made from this branch yet, in a sentence; null when it can. */
@@ -114,10 +303,16 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
     if (res.ok) {
       setMade({ url: res.url, number: res.number });
       toast(res.number ? `Opened pull request #${res.number}` : 'Opened the pull request', 'success');
+      // The tab's row shows it at once from what the dialog knows, then reads GitHub for the rest.
+      const seed = createdPull({ branch: ctx.branch, head: ctx.head, number: res.number, url: res.url, title, draft });
+      if (seed) pulls.created(cwd, seed);
+      else void pulls.ask(cwd, { changed: true });
     } else {
       setError(res.error ?? 'The pull request could not be created.');
       setExisting(res.url ?? null);
       if (res.stale) setReads((n) => n + 1);
+      // gh named a pull request that already exists for the branch: the row reads it.
+      if (res.url) void pulls.ask(cwd, { changed: true });
     }
   };
 

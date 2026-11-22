@@ -11,6 +11,7 @@ import { STATUS_TONE, commitAll, draftCommitMessage, gitKey, isSmall, loadAllDif
 import { LeaveList } from './leave';
 import { LaneSection } from './LaneSection';
 import { PullRequestAction } from './PullRequest';
+import { PullRequestRow } from './PullRequest';
 import { useSessionLane } from '@/features/session/lane';
 import { useJumpOpen } from '@/features/review/jump';
 import { splitPath, useArrivals, useToolIds } from './util';
@@ -163,6 +164,8 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
         </span>
       </div>
       <div className="rail-scroll scroll">
+        {/* The branch's pull request and its checks, once it has one (read only while this tab shows). */}
+        <PullRequestRow sessionId={sessionId} cwd={cwd} />
         {status.files.length === 0 ? (
           <>
             <p className="rail-empty">The working tree is clean.</p>

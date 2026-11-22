@@ -1,10 +1,16 @@
-/* Create pull request: the button under a clean working tree, and its dialog. */
+/* Create pull request: the button under a clean working tree, and its dialog. Further down, the
+   row of the branch's pull request at the head of the Changes tab. */
 
 .pr-action {
   display: grid;
   justify-items: center;
   gap: 10px;
   padding: 4px 16px 16px;
+}
+
+/* GitHub was asked before the button could be offered: it arrives, it does not pop. */
+.pr-action[data-late] > .pr-open {
+  animation: fade-in var(--d-3) var(--ease-out) backwards;
 }
 
 .pr-open {
@@ -80,4 +86,199 @@
   gap: 12px;
   font-size: var(--t-ui);
   color: var(--text-2);
+}
+
+/* ── The branch's pull request ──
+   One row at the head of the Changes tab, a row of its list in every measure: 30 px, inset as the
+   files' rows are (8 px and their 1 px edge), its mark in the status letters' column, its title on
+   the paths' edge, its state and checks where the line counts stand, the way out where the carets
+   stand. Monochrome; the count of failed checks is the one red. */
+
+.pr-box {
+  padding: 0 9px 4px;
+}
+
+.pr-go {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: var(--rail-row-h, 30px);
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+}
+
+.pr-go:hover {
+  background-color: var(--fill-2);
+}
+
+.pr-go:active {
+  background-color: var(--fill-3);
+}
+
+.pr-go:focus-visible {
+  outline-offset: var(--focus-inset);
+}
+
+.pr-mark {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+/* Number, title and words share one baseline, whatever their sizes. */
+.pr-text {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  font-size: var(--t-ui);
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.pr-num {
+  flex: none;
+  color: var(--text-3);
+}
+
+/* The title takes what the number and the words leave, cut with an ellipsis. Left with less than
+   48 px it is not shown at all (a few letters of a title say nothing): the slot is one line of a
+   wrapping row, and a title that does not fit beside the slot's empty first item wraps out of
+   sight. The number names the pull request, the words are the news; the words shorten last. */
+.pr-title-slot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 20px;
+  overflow: hidden;
+}
+
+/* A zero-width character: the slot keeps a line of text's baseline when the title is out of it. */
+.pr-title-slot::before {
+  content: '\200b';
+}
+
+.pr-title {
+  flex: 1 1 48px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The words stand at the row's end and never break in the middle while they can shed whole: one
+   line of a wrapping row filled from the right, the checks first, then the review, then the state.
+   What does not fit wraps out of sight, so a narrow rail drops "Open", then the review, and keeps
+   the checks; only the checks alone, with no room left, end in an ellipsis. */
+.pr-words {
+  display: flex;
+  flex-direction: row-reverse;
+  flex-wrap: wrap;
+  align-items: baseline;
+  flex: 0 1 auto;
+  min-width: 0;
+  height: 20px;
+  margin-left: 6px;
+  overflow: hidden;
+  font-size: var(--t-small);
+  color: var(--text-2);
+}
+
+.pr-word {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The dot after a word belongs to it: it goes when the word does. */
+.pr-dot {
+  margin: 0 5px;
+  color: var(--text-4);
+}
+
+.pr-failed-n {
+  color: var(--red);
+}
+
+/* The working mark, on the words' middle. */
+.pr-tiles {
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+/* The way out, on the carets' column; 3 px more before it, so the words end clear of the tool that
+   takes its place. */
+.pr-out {
+  flex-shrink: 0;
+  margin-left: 3px;
+  color: var(--text-4);
+}
+
+.pr-go:hover .pr-out {
+  color: var(--text-2);
+}
+
+/* The row's one tool stands where its way out stood, 2 px inside the row on three sides. */
+.pr-row > .pr-row-acts {
+  right: 2px;
+}
+
+/* The failed checks, on the title's edge (8 + 18 + 9). */
+.pr-fails {
+  padding: 0 8px 8px 35px;
+}
+
+.pr-fail-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--t-small);
+  color: var(--text-2);
+}
+
+.pr-fail-list li {
+  display: flex;
+  min-width: 0;
+  line-height: 22px;
+}
+
+.pr-fail {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+a.pr-fail {
+  border-radius: 4px;
+  text-decoration: underline transparent;
+  text-underline-offset: 3px;
+}
+
+a.pr-fail:hover {
+  color: var(--text);
+  text-decoration-color: var(--line-3);
+}
+
+a.pr-fail:active {
+  color: var(--text);
+  text-decoration-color: var(--text-3);
+}
+
+a.pr-fail:focus-visible {
+  outline-offset: 0;
+}
+
+.pr-fail-more {
+  color: var(--text-3);
+}
+
+.pr-send {
+  margin-top: 6px;
 }

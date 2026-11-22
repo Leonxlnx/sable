@@ -25,6 +25,8 @@ import { Chip, type ChipPart } from '@/features/composer/Chip';
 import { CoveSkin } from '@/features/composer/Cove';
 import { SendGlyphSvg } from '@/features/composer/SendKey';
 import { Dial, UltraMark } from '@/features/composer/Thinking';
+import { PullRow } from '@/features/rail/PullRequest';
+import type { PullCheck, PullRequestInfo } from '@shared/protocol';
 import '@/app/app.css';
 import '@/features/composer/composer.css';
 import '@/features/sidebar/sidebar.css';
@@ -256,6 +258,111 @@ function ChipChange() {
         ·
       </span>
       <Chip className="tb-chip th-chip" anchor="right" data-ultra={s.ultra || undefined} aria-label="Next label" onClick={() => setI(i + 1)} parts={effortParts(s.word, s.level, s.ultra)} />
+    </div>
+  );
+}
+
+/**
+ * The branch's pull request in the Changes tab (features/rail/PullRequest.tsx), every state from
+ * fixed data: each in a piece of the tab (the branch bar above it, two changed files under it), so
+ * its edges, sizes and baselines can be judged against its neighbours without GitHub.
+ */
+function PullRequestStates() {
+  const base = { number: 128, title: 'Limit login attempts', url: 'https://github.com/acme/app/pull/128', head: 'a'.repeat(40), checks: [] as PullCheck[] };
+  const counts = (passed: number, failed: number, running: number) => ({ passed, failed, running, skipped: 0 });
+  const failed = (name: string, job: number): PullCheck => ({ name, state: 'failed', url: `https://github.com/acme/app/actions/runs/9412/job/${job}` });
+  const states: { label: string; pull: PullRequestInfo; width?: number; force?: string; sending?: boolean }[] = [
+    { label: 'Draft, checks running', pull: { ...base, state: 'draft', counts: counts(2, 0, 3) } },
+    { label: 'Open, 5 checks passed', pull: { ...base, state: 'open', counts: counts(5, 0, 0) } },
+    { label: 'Open, 2 of 5 failed', pull: { ...base, state: 'open', checks: [failed('test (ubuntu-latest, 22)', 1), failed('lint', 2)], counts: counts(3, 2, 0) } },
+    { label: 'Approved', pull: { ...base, state: 'open', review: 'approved', counts: counts(5, 0, 0) } },
+    { label: 'Changes requested', pull: { ...base, state: 'open', review: 'changes', counts: counts(5, 0, 0) } },
+    { label: 'Merged', pull: { ...base, state: 'merged', counts: counts(5, 0, 0) } },
+    { label: 'Closed', pull: { ...base, state: 'closed', counts: counts(3, 2, 0) } },
+    { label: 'No checks', pull: { ...base, state: 'open', counts: counts(0, 0, 0) } },
+    {
+      label: 'A very long title',
+      pull: { ...base, number: 1287, title: 'Limit login attempts to five per minute and per address, with a lockout that grows after every failed round', state: 'open', review: 'approved', counts: counts(12, 0, 0) },
+    },
+    {
+      label: 'Eight failed, one without a link, a long name',
+      pull: {
+        ...base,
+        state: 'open',
+        checks: [
+          failed('test (ubuntu-latest, 22)', 1),
+          failed('test (windows-latest, 22)', 2),
+          failed('build and package the desktop app for every platform and architecture we ship', 3),
+          { name: 'ci/external', state: 'failed' },
+          failed('lint', 5),
+          failed('types', 6),
+          failed('e2e', 7),
+          failed('docs', 8),
+        ],
+        counts: counts(4, 8, 0),
+      },
+    },
+    { label: 'Narrow rail, 280px', width: 280, pull: { ...base, state: 'open', checks: [failed('test (ubuntu-latest, 22)', 1), failed('lint', 2)], counts: counts(3, 2, 0) } },
+    { label: 'Narrow rail, 280px, approved', width: 280, pull: { ...base, state: 'open', review: 'approved', counts: counts(5, 0, 0) } },
+    { label: 'Hover (the refresh stands in for the way out)', force: 'hover', pull: { ...base, state: 'open', counts: counts(5, 0, 0) } },
+    { label: 'Focus', force: 'focus', pull: { ...base, state: 'open', counts: counts(5, 0, 0) } },
+    { label: 'Reading the failed logs', sending: true, pull: { ...base, state: 'open', checks: [failed('lint', 2)], counts: counts(4, 1, 0) } },
+  ];
+  const file = (dir: string, name: string, add: number, del: number) => (
+    <div className="ch-item">
+      <button type="button" className="ch-row" aria-expanded={false}>
+        <span className="st-letter" data-status="M">
+          M
+        </span>
+        <span className="ch-path">
+          <span className="ch-dir">{dir}</span>
+          <span className="ch-base">{name}</span>
+        </span>
+        <span className="ch-stat num">
+          <span className="dv-add">+{add}</span>
+          <span className="dv-del">−{del}</span>
+        </span>
+        <Icon name="caret-right" size={10} className="ch-caret" />
+      </button>
+    </div>
+  );
+  return (
+    <div className="gal-pulls" style={{ display: 'flex', flexWrap: 'wrap', gap: '18px 20px', alignItems: 'flex-start' }}>
+      {states.map((s) => (
+        <div key={s.label} style={{ width: s.width ?? 396 }}>
+          <div className="gal-caption">{s.label}</div>
+          <div
+            className="rail"
+            style={{ height: 'auto' }}
+            ref={(el) => {
+              // A forced state: the link itself, and for hover the row that hosts its tools.
+              if (!el || !s.force) return;
+              el.querySelector('.pr-go')?.setAttribute('data-f', s.force);
+              if (s.force === 'hover') el.querySelector('.pr-row')?.setAttribute('data-f', 'hover');
+            }}
+          >
+            <div className="rail-bar">
+              <span className="rail-bar-title ch-branch truncate">
+                <Icon name="branch" size={14} />
+                <span className="truncate">feature/login-rate-limit</span>
+              </span>
+              <span className="rail-bar-meta ch-totals num">
+                <span className="dv-add">+52</span>
+                <span className="dv-del">−5</span>
+                <span>in 2 files</span>
+              </span>
+              <span className="rail-bar-actions">
+                <IconButton icon="refresh" label="Refresh" size={14} />
+              </span>
+            </div>
+            <PullRow pull={s.pull} sending={s.sending} onRefresh={() => {}} onSendFailures={() => {}} />
+            <div className="ch-list">
+              {file('src/auth/', 'login.ts', 12, 3)}
+              {file('src/auth/', 'rate-limit.ts', 40, 2)}
+            </div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -836,6 +943,10 @@ export default function Gallery() {
               </button>
             )}
           />
+        </Section>
+
+        <Section title="Pull request (the Changes tab's row)" id="pull-request">
+          <PullRequestStates />
         </Section>
 
         <Section title="Live (real Radix parts)" id="live">

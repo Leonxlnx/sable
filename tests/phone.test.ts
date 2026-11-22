@@ -117,7 +117,7 @@ describe('phone endpoint', () => {
     const { c } = await pairPhone(app, port);
     const hello = await c.call('app.hello');
     expect(hello.ok).toBe(true);
-    for (const m of ['term.run', 'fs.read', 'memory.write', 'app.setSettings', 'phone.status', 'phone.pair', 'git.commit', 'auth.login', 'device.tap']) {
+    for (const m of ['term.run', 'fs.read', 'memory.write', 'app.setSettings', 'phone.status', 'phone.pair', 'git.commit', 'auth.login', 'device.tap', 'pulls.status', 'pulls.failures']) {
       const r = await c.call(m, {});
       expect(r.ok, m).toBe(false);
       expect(r.error).toMatch(/Not available from the phone/);
