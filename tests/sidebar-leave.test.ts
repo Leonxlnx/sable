@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { listShift } from '../src/features/sidebar/leave';
 
-const read = (p: string) => readFileSync(p, 'utf8');
+// Line ends as the tests write them: a checkout on Windows may have CRLF.
+const read = (p: string) => readFileSync(p, 'utf8').replace(/\r\n/g, '\n');
 
 describe('a row leaves the list in the frame of the click', () => {
   const leave = read('src/features/sidebar/leave.ts');
