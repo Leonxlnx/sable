@@ -40,6 +40,30 @@
 }
 
 .pr-route {
+  display: grid;
+  gap: 6px;
+  color: var(--text-3);
+}
+
+.pr-route p {
+  margin: 0;
+}
+
+.pr-urls,
+.pr-commits {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.pr-commits {
+  max-height: 96px;
+  overflow-y: auto;
+}
+
+.pr-more {
+  list-style: none;
   color: var(--text-3);
 }
 
@@ -47,4 +71,13 @@
   color: var(--text);
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+.pr-draft {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: var(--t-ui);
+  color: var(--text-2);
 }

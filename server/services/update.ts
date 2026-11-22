@@ -217,7 +217,13 @@ export class Updater {
       this.busyCheck = () => {
         if (this.opts.busy?.()) return;
         this.busyCheck = undefined;
-        this.go();
+        // Called from an event of the bridge: a start that fails (a Mac app that cannot replace
+        // itself) is said in the state, never thrown into the listener.
+        try {
+          this.go();
+        } catch (err) {
+          this.set({ pending: undefined, error: (err as Error).message });
+        }
       };
       this.set({ pending: true });
       return this.state;

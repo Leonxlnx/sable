@@ -722,8 +722,8 @@ describe('Spare in the App: nothing goes out without the planner or a click', ()
   });
 
   it('S2: a spare turn that meets a limit waits again instead of going on with another account', { timeout: 20_000 }, async () => {
-    // The built-in account has room (no spare): continuing at a limit would pick it.
-    const { app, rt } = await appWithSession([fiveIn(20), weekIn(96, 30)]);
+    // The built-in account has room (no spare; above the floor, so not counted spent): continuing at a limit would pick it.
+    const { app, rt } = await appWithSession([fiveIn(20), weekIn(92, 30)]);
     await app.call('app.setSettings', { patch: { continueAtLimit: true } });
     // Work reads as having spare, but its agent refuses the turn at a limit.
     const work = await demoAccount(app, 'Work', 'cap');

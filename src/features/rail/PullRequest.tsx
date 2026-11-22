@@ -26,8 +26,42 @@ function blockedBy(ctx: GitPullContext): string | null {
   if (!ctx.branch) return 'This folder is on a detached HEAD. Check out a branch first.';
   if (ctx.branch === ctx.base) return `This is ${ctx.base}. Make a branch for the pull request first.`;
   if (!ctx.remote) return 'This repository has no remote named origin.';
-  if (ctx.commits.length === 0) return `${ctx.branch} has no commits that ${ctx.base} does not have yet. Commit first.`;
+  if ((ctx.commitCount ?? ctx.commits.length) === 0) return `${ctx.branch} has no commits that ${ctx.base} does not have yet. Commit first.`;
   return null;
+}
+
+/** The push and the pull request in plain words, with the commits that go listed. */
+function Route({ ctx }: { ctx: GitPullContext }) {
+  const urls = ctx.pushUrls ?? [];
+  const count = ctx.commitCount ?? ctx.commits.length;
+  const more = count - ctx.commits.length;
+  const what = `${count} ${count === 1 ? 'commit' : 'commits'} on ${ctx.branch}${ctx.head ? ` (${ctx.head.slice(0, 7)})` : ''}`;
+  const into = `then opens a pull request into ${ctx.base}${ctx.repo ? ` on ${ctx.repo}` : ''}.`;
+  return (
+    <div className="pr-route">
+      {urls.length > 1 ? (
+        <>
+          <p>Pushes {what} to {urls.length} addresses:</p>
+          <ul className="pr-urls">
+            {urls.map((u) => (
+              <li key={u}>{u}</li>
+            ))}
+          </ul>
+          <p>{into.charAt(0).toUpperCase() + into.slice(1)}</p>
+        </>
+      ) : (
+        <p>
+          Pushes {what} to {urls[0] ?? 'origin'}, {into}
+        </p>
+      )}
+      <ol className="pr-commits scroll">
+        {ctx.commits.map((c, i) => (
+          <li key={i}>{c}</li>
+        ))}
+        {more > 0 && <li className="pr-more">and {more} more</li>}
+      </ol>
+    </div>
+  );
 }
 
 function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (open: boolean) => void }) {
@@ -43,6 +77,9 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
   const [existing, setExisting] = useState<string | null>(null);
   const [made, setMade] = useState<{ url?: string; number?: number } | null>(null);
 
+  // Read again when the branch, its commit or the push addresses changed under the dialog; what the
+  // person wrote stays.
+  const [reads, setReads] = useState(0);
   useEffect(() => {
     let live = true;
     void pullContext(cwd).then((res) => {
@@ -52,13 +89,15 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
         return;
       }
       setCtx(res);
-      setTitle(res.title);
-      setBody(res.body);
+      if (reads === 0) {
+        setTitle(res.title);
+        setBody(res.body);
+      }
     });
     return () => {
       live = false;
     };
-  }, [cwd]);
+  }, [cwd, reads]);
 
   const close = () => {
     if (!busy) onOpenChange(false);
@@ -69,7 +108,8 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
     setBusy(true);
     setError(null);
     setExisting(null);
-    const res = await createPull(cwd, { title, body, base: ctx.base, draft });
+    // The approval: exactly the branch, commit, addresses and repository shown.
+    const res = await createPull(cwd, { title, body, base: ctx.base, draft, branch: ctx.branch, head: ctx.head, destination: ctx.destination, repo: ctx.repo });
     setBusy(false);
     if (res.ok) {
       setMade({ url: res.url, number: res.number });
@@ -77,6 +117,7 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
     } else {
       setError(res.error ?? 'The pull request could not be created.');
       setExisting(res.url ?? null);
+      if (res.stale) setReads((n) => n + 1);
     }
   };
 
@@ -139,10 +180,12 @@ function PullRequestDialog({ cwd, onOpenChange }: { cwd: string; onOpenChange: (
             Description
             <textarea className="field pr-body scroll" rows={6} value={body} onChange={(e) => setBody(e.target.value)} disabled={busy} />
           </label>
-          <p className="pr-route">
-            {ctx.branch} into {ctx.base}
-          </p>
-          <Switch checked={draft} onChange={setDraft} label="Draft" disabled={busy} />
+          {/* What the click does, before it is done: the commits, every address they go to, and where the pull request opens. */}
+          <Route ctx={ctx} />
+          <label className="pr-draft">
+            <span>Open as a draft</span>
+            <Switch checked={draft} onChange={setDraft} label="Open as a draft" disabled={busy} />
+          </label>
           {error && (
             <p className="ch-commit-error" role="alert">
               <Icon name="warning" size={13} />

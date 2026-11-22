@@ -231,7 +231,7 @@ function findItem(rt: SessionRuntime, op: DeviceOp): ToolItem | undefined {
 
 /** An emulator is the agent's to work; a phone is the user's, so it asks first. */
 async function permit(rt: SessionRuntime, op: DeviceOp, d: DeviceInfo, item: ToolItem | undefined, input: Record<string, unknown>, signal?: AbortSignal): Promise<true | string> {
-  if (d.kind === 'emulator' || allowsEverything(rt.meta.mode)) return true;
+  if (d.kind === 'emulator' || rt.answersAtOnce(allowsEverything(rt.meta.mode))) return true;
   const act = DEVICE_ACTS.has(op);
   const key = `${act ? 'act' : 'look'} ${d.serial}`;
   const set = allowed.get(rt) ?? new Set<string>();

@@ -167,6 +167,20 @@ const claudeBinary = () => process.env.SABLE_CLAUDE_BIN || undefined;
 /** The user's own CLAUDE_CONFIG_DIR (usually unset): what the built-in default account uses. */
 const OWN_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
 
+/**
+ * The command a person runs in a terminal for this account's reset dialog, where Sable cannot open a
+ * console window: the resolved CLI and, for an account of its own, its config folder, each quoted for
+ * the shell (review wave 8, #19). Without either it is the plain `claude "/limit-reset"`.
+ */
+export function resetLine(bin: string, configDir: string | undefined, platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') {
+    const q = (s: string) => (/^[\w.:\\-]+$/.test(s) ? s : `"${s}"`);
+    return `${configDir ? `set "CLAUDE_CONFIG_DIR=${configDir}" && ` : ''}${q(bin)} "/limit-reset"`;
+  }
+  const q = (s: string) => (/^[\w./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+  return `${configDir ? `CLAUDE_CONFIG_DIR=${q(configDir)} ` : ''}${q(bin)} "/limit-reset"`;
+}
+
 /** Environment for a Claude Code process: the account's config folder, or the user's own setup. */
 function claudeEnv(configDir: string | undefined): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -235,6 +249,16 @@ export class ClaudeProvider implements Provider {
   /** Environment for every CLI call and agent process of this account. */
   env(): NodeJS.ProcessEnv {
     return claudeEnv(this.configDir);
+  }
+
+  /**
+   * Claude Code's own reset dialog: the binary the SDK runs (else `claude` on PATH) with the hidden
+   * `/limit-reset` command as its initial prompt, which an interactive session runs as if typed, and
+   * this account's config folder. Sable never runs it itself: only a console window the person sees.
+   */
+  limitResetCommand() {
+    const bin = claudeBinary() ?? 'claude';
+    return { bin, args: ['/limit-reset'], env: this.env(), line: resetLine(bin, this.configDir) };
   }
 
   /** Runs an SDK history read against this account's config folder. */
@@ -392,8 +416,19 @@ export class ClaudeProvider implements Provider {
    * generative UI on, one line that reminds the model the widget tool exists (a tool description
    * alone is rarely enough for a model to reach for an optional tool unprompted).
    */
-  appendix(meta?: Pick<SessionMeta, 'options'>): string {
-    return [this.concise() ? CONCISE_REPLIES_PROMPT : '', this.widgets() ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText()].filter(Boolean).join('\n\n');
+  appendix(meta?: Pick<SessionMeta, 'options' | 'custom'>): string {
+    return [this.concise() ? CONCISE_REPLIES_PROMPT : '', this.widgets() ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText(), this.customText(meta)].filter(Boolean).join('\n\n');
+  }
+
+  /** The Customize chat's brief: only for that chat (`SessionMeta.custom`). */
+  customText(meta?: Pick<SessionMeta, 'custom'>): string {
+    if (!meta?.custom) return '';
+    try {
+      return this.ctx.customBrief?.() ?? '';
+    } catch (err) {
+      this.ctx.log('claude: the Customize brief could not be made:', (err as Error).message);
+      return '';
+    }
   }
 
   /** Whether new agent processes get the user's profile and remember_about_user (Settings › Profile). */
@@ -411,7 +446,7 @@ export class ClaudeProvider implements Provider {
     }
   }
 
-  agentOptions(meta: Pick<SessionMeta, 'cwd' | 'model' | 'effort' | 'mode' | 'options' | 'providerSessionId' | 'ultracode'>, owner: WarmOwner, resumeAt?: string): Options {
+  agentOptions(meta: Pick<SessionMeta, 'cwd' | 'model' | 'effort' | 'mode' | 'options' | 'providerSessionId' | 'ultracode' | 'custom'>, owner: WarmOwner, resumeAt?: string): Options {
     const extraArgs: Record<string, string | null> = { 'replay-user-messages': null };
     // Claude in Chrome is a start-up flag; without it the CLI follows the machine's /chrome setting.
     if (meta.options?.browser) extraArgs.chrome = null;
@@ -495,8 +530,13 @@ export class ClaudeProvider implements Provider {
         const any = m as Obj;
         if (m.type === 'assistant' && !any.parent_tool_use_id) {
           for (const b of (any.message?.content as Obj[] | undefined) ?? []) if (b.type === 'text' && b.text) text += String(b.text);
+          // Longer than any title or commit message: stop there (review wave 8, #24).
+          if (text.length > QUICK_MAX_CHARS) {
+            text = text.slice(0, QUICK_MAX_CHARS);
+            break;
+          }
         } else if (m.type === 'result') {
-          if (any.subtype === 'success' && typeof any.result === 'string' && any.result.trim()) text = any.result;
+          if (any.subtype === 'success' && typeof any.result === 'string' && any.result.trim()) text = any.result.slice(0, QUICK_MAX_CHARS);
           else if (any.subtype !== 'success') this.ctx.log('claude: no title:', any.subtype, (any.errors as string[] | undefined)?.join('; ') ?? '');
           break;
         }
@@ -793,13 +833,21 @@ export class ClaudeProvider implements Provider {
    * `force` (the user asked) and none running, a short process starts just to read them: no
    * settings, plugins or MCP servers, no tokens, at most once a minute.
    */
-  async limits(force = false): Promise<RateLimit[]> {
+  async limits(force: boolean | 'fresh' = false): Promise<RateLimit[]> {
+    const fresh = force === 'fresh';
+    // A read already under way began before this call: a fresh one waits for it and asks again.
+    const read = async (q: Query) => {
+      if (fresh) while (this.limitsRun) await this.limitsRun.catch(() => undefined);
+      return this.readLimits(q, force ? 0 : 15_000);
+    };
     for (const s of this.sessions) {
       const q = s.liveQuery();
-      if (q) return this.readLimits(q, force ? 0 : 15_000);
+      if (q) return read(q);
     }
-    if (this.warm) return this.readLimits(this.warm.q, force ? 0 : 15_000);
-    if (!force || Date.now() - this.limitsProbeAt < 60_000) return this.limitsCache;
+    if (this.warm) return read(this.warm.q);
+    // The probe's once-a-minute throttle holds for clicks, not for a reset's reading after its
+    // dialog: that one must be taken after the dialog closed (review wave 8, #17).
+    if (!force || (!fresh && Date.now() - this.limitsProbeAt < 60_000)) return this.limitsCache;
     this.limitsProbeAt = Date.now();
     const input = new PushQueue<SDKUserMessage>();
     const q = query({ prompt: input, options: { ...this.baseOptions(homedir()), settingSources: [], strictMcpConfig: true, persistSession: false } });
@@ -862,6 +910,8 @@ export class ClaudeProvider implements Provider {
 }
 
 const WARM_TTL_MS = 3 * 60_000;
+/** The most of a quick answer (a title, a commit message) kept. */
+const QUICK_MAX_CHARS = 16_000;
 /** How long after the usage endpoint refused before Sable asks it again unasked. */
 const LIMITS_REFUSED_BACKOFF_MS = 10 * 60_000;
 /** Plan windows as `rate_limit_event` names them, with the rows the usage answer gives them. */
@@ -1068,9 +1118,10 @@ export function titleOptions(prompt: TitlePrompt, env: NodeJS.ProcessEnv, abortC
   };
 }
 
-function warmKey(c: { cwd: string; model?: string; mode?: string; effort?: Effort; options?: SessionOptions; ultracode?: boolean }, concise: boolean, widgets = true, profile = '') {
+function warmKey(c: { cwd: string; model?: string; mode?: string; effort?: Effort; options?: SessionOptions; ultracode?: boolean; custom?: boolean }, concise: boolean, widgets = true, profile = '') {
   const o = c.options ?? {};
-  return JSON.stringify([path.resolve(c.cwd).toLowerCase(), c.model && c.model !== 'default' ? c.model : '', c.mode || 'default', sdkEffort(c.effort) ?? '', o.browser ?? null, !!c.ultracode, concise, widgets, o.browserTab !== false, deviceEnabled(c), profile]);
+  // A process warmed for an ordinary chat never serves the Customize chat (its prompt carries the brief).
+  return JSON.stringify([path.resolve(c.cwd).toLowerCase(), c.model && c.model !== 'default' ? c.model : '', c.mode || 'default', sdkEffort(c.effort) ?? '', o.browser ?? null, !!c.ultracode, concise, widgets, o.browserTab !== false, deviceEnabled(c), profile, !!c.custom]);
 }
 
 /** Control requests the SDK does not wrap (remote_control, mcp_call): the CLI answers them on stdio. */
@@ -1152,6 +1203,12 @@ class ClaudeSession implements ProviderSession {
   private idleTimer?: NodeJS.Timeout;
   /** Background tasks (agents, shells, monitors) running in this process, by task id. */
   private liveTasks = new Set<string>();
+  /**
+   * The step each task of this process belongs to (task id to item id), from the task events that named
+   * it: a task's end that names no step still finds it, and the live task list settles a step whose task
+   * is gone (review wave 7, #8).
+   */
+  private taskItems = new Map<string, string>();
   private costBase = 0;
   private lastTotalCost = 0;
   private retryNotice?: string;
@@ -1214,7 +1271,9 @@ class ClaudeSession implements ProviderSession {
 
   private ensure(): Query {
     if (this.q) return this.q;
-    const meta = this.rt.meta;
+    // A process (re)started while a phone's switch is held runs under the mode the work had (`workMode`).
+    const rt = this.rt;
+    const meta = rt.workMode === rt.meta.mode ? rt.meta : { ...rt.meta, mode: rt.workMode };
     // A process started while the user was typing on the home screen, for exactly this choice.
     const warm = !meta.providerSessionId && !this.resumeAt ? this.provider.takeWarm(warmKey(meta, this.provider.concise(), this.provider.widgets(), this.provider.profileText())) : undefined;
     let q: Query;
@@ -1399,6 +1458,7 @@ class ClaudeSession implements ProviderSession {
     this.input = undefined;
     this.streams.clear();
     this.liveTasks.clear();
+    this.taskItems.clear();
     this.wakes = 0;
     this.cliState = undefined;
     this.owed = [];
@@ -1423,6 +1483,30 @@ class ClaudeSession implements ProviderSession {
       this.rt.notice('error', 'The agent process ended', text);
       this.awaiting.clear();
       this.rt.endTurn(text);
+    }
+  }
+
+  /** The step a task event belongs to: the one it names, or the one its task was seen with. */
+  private taskItem(m: Obj): ToolItem | undefined {
+    const id = m.tool_use_id ?? (m.task_id ? this.taskItems.get(String(m.task_id)) : undefined);
+    return id ? this.rt.get<ToolItem>(String(id)) : undefined;
+  }
+
+  /**
+   * The live task list is Claude Code's own word on what runs in the background: a step whose task is
+   * not on it, or any background step at all when nothing runs, has ended without its end reaching
+   * here (it is stopped). A step whose own call still runs is not background work yet.
+   */
+  private reconcileTasks() {
+    const called = (i: TimelineItem) => i.type === 'tool' && i.status !== 'running' && i.status !== 'pending' && i.status !== 'awaiting';
+    const gone = new Set<string>();
+    for (const [task, id] of this.taskItems) if (!this.liveTasks.has(task)) gone.add(id);
+    if (!this.liveTasks.size) this.rt.stopBackground(called);
+    else if (gone.size) this.rt.stopBackground((i) => gone.has(i.id) && called(i));
+    // A task off the list is forgotten once its step's call has returned (a running call's own end still comes).
+    for (const [task, id] of [...this.taskItems]) {
+      const item = this.rt.get(id);
+      if (!this.liveTasks.has(task) && (!item || called(item))) this.taskItems.delete(task);
     }
   }
 
@@ -1451,7 +1535,14 @@ class ClaudeSession implements ProviderSession {
     clearTimeout(this.idleTimer);
     dropRemote(this.remoteHolder);
     const q = this.q;
-    if (q) this.clearLiveState();
+    if (q) {
+      this.clearLiveState();
+      // Background sub-agents and workflows live in the process: they end with it (its pump, which
+      // settles them when the process ends by itself, skips a process let go here; review wave 7, #5).
+      this.liveTasks.clear();
+      this.taskItems.clear();
+      this.rt.stopBackground();
+    }
     this.q = undefined;
     this.cliState = undefined;
     this.input?.end();
@@ -1795,7 +1886,8 @@ class ClaudeSession implements ProviderSession {
     // Bypass runs everything without asking. Claude Code's own safety checks still send some calls
     // here in that mode (compound commands, deletes with a glob, protected paths): they run too. Only
     // real questions (AskUserQuestion, above) wait for the person.
-    if (bypassesAsking(rt.meta.mode)) {
+    // Bypass chosen from a phone while this work ran: its asks still wait (`SessionRuntime.dangerHeld`).
+    if (rt.answersAtOnce(bypassesAsking(rt.meta.mode))) {
       if (item && name === 'ExitPlanMode' && input.plan) rt.patch<ToolItem>(item.id, { input, detail: describeTool(name, input).detail });
       return { behavior: 'allow', updatedInput: input };
     }
@@ -2392,7 +2484,7 @@ class ClaudeSession implements ProviderSession {
     switch (m.subtype) {
       case 'init': {
         if (Array.isArray(m.skills)) this.skillNames = m.skills.map(String);
-        if (m.permissionMode && m.permissionMode !== rt.meta.mode) rt.update({ mode: m.permissionMode });
+        if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         if (rt.caps && this.skillNames.length) {
           const names = new Set(this.skillNames);
           const commands = rt.caps.commands.map((c) => (names.has(c.name) ? { ...c, kind: 'skill' as const } : c));
@@ -2407,7 +2499,7 @@ class ClaudeSession implements ProviderSession {
       }
       case 'status':
         if (m.status === 'compacting') rt.update({ activity: 'Compacting the conversation' });
-        if (m.permissionMode && m.permissionMode !== rt.meta.mode) rt.update({ mode: m.permissionMode });
+        if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         break;
       case 'compact_boundary': {
         const meta = m.compact_metadata ?? {};
@@ -2435,7 +2527,8 @@ class ClaudeSession implements ProviderSession {
         break;
       }
       case 'task_progress': {
-        const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
+        if (m.task_id && m.tool_use_id) this.taskItems.set(String(m.task_id), String(m.tool_use_id));
+        const item = this.taskItem(m);
         if (item?.workflow) {
           rt.patch<ToolItem>(item.id, { workflow: workflowProgress(item.workflow, m) });
           break;
@@ -2450,11 +2543,13 @@ class ClaudeSession implements ProviderSession {
       case 'background_tasks_changed':
         // Every live background task (replace, not merge): the process is kept open while any runs.
         this.liveTasks = new Set(((m.tasks as Obj[] | undefined) ?? []).map((t) => String(t.task_id)));
+        this.reconcileTasks();
         // The last one ended: messages held for this process's owed result can go to a new one.
         if (!this.liveTasks.size) this.release();
         break;
       case 'task_started': {
         if (m.task_id) this.liveTasks.add(String(m.task_id));
+        if (m.task_id && m.tool_use_id) this.taskItems.set(String(m.task_id), String(m.tool_use_id));
         const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
         if (item?.workflow && m.workflow_name && !item.workflow.name) rt.patch<ToolItem>(item.id, { workflow: { ...item.workflow, name: String(m.workflow_name) } });
         break;
@@ -2463,7 +2558,8 @@ class ClaudeSession implements ProviderSession {
         if (m.task_id) this.liveTasks.delete(String(m.task_id));
         if (!this.liveTasks.size) this.release();
         // How a sub-agent ended, with its own figures. For one started in the background this is the only word of it.
-        const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
+        const item = this.taskItem(m);
+        if (m.task_id) this.taskItems.delete(String(m.task_id));
         if (item?.workflow) {
           const run = workflowProgress(item.workflow, m);
           run.status = m.status === 'completed' ? 'done' : m.status === 'failed' ? 'failed' : 'stopped';

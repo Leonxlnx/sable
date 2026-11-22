@@ -125,7 +125,7 @@ ${body}
       chmodSync(path.join(bin, name), 0o755);
     };
     // The script calls /usr/bin/ditto, /usr/bin/xattr and /usr/bin/open by absolute path: rewrite them to the stubs.
-    stub('ditto', 'mkdir -p "$4/Sable.app" && echo new > "$4/Sable.app/version"');
+    stub('ditto', 'mkdir -p "$4/Sable.app/Contents/MacOS" && touch "$4/Sable.app/Contents/Info.plist" && echo new > "$4/Sable.app/version"');
     stub('xattr', 'exit 0');
     stub('open', 'echo "$1" >> "$OPENED"');
     const script = MAC_INSTALL_SCRIPT.replace(/\/usr\/bin\/(ditto|xattr|open)/g, `${bin}/$1`);
@@ -221,6 +221,23 @@ describe('the updater', () => {
     busy = false;
     second.u.workChanged();
     expect(second.ran).toHaveLength(0);
+  });
+
+  it('an installer that cannot start once the agents finish says so, and nothing quits', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'sable-update-test-'));
+    dirs.push(dir);
+    let busy = true;
+    const quit = vi.fn();
+    const gh = github(release('0.2.5'));
+    const u = new Updater(() => {}, { host: { quit }, dir, version: '0.2.4', platform: 'win32', fetch: gh.fetcher, run: () => { throw new Error('Sable cannot replace itself here.'); }, busy: () => busy, manual: true });
+    await u.check();
+    expect(u.install().pending).toBe(true);
+    busy = false;
+    expect(() => u.workChanged()).not.toThrow();
+    expect(u.state).toMatchObject({ status: 'ready', error: 'Sable cannot replace itself here.' });
+    expect(u.state.pending).toBeUndefined();
+    await new Promise((r) => setTimeout(r, 450));
+    expect(quit).not.toHaveBeenCalled();
   });
 
   it('does nothing where Sable cannot update itself', async () => {

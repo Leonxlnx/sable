@@ -19,6 +19,7 @@ import { matchSections, SECTIONS } from './sections';
 import { Shortcuts } from './Shortcuts';
 import { Skills } from './Skills';
 import { Usage } from '@/features/usage/Usage';
+import { Customize } from '@/features/customize/Customize';
 import { takeComposerFocus } from './UseList';
 import './settings.css';
 
@@ -30,6 +31,7 @@ const VIEWS: Record<SettingsSection, ComponentType> = {
   models: Models,
   permissions: Permissions,
   phone: Phone,
+  customize: Customize,
   mcp: Mcp,
   hooks: Hooks,
   skills: Skills,

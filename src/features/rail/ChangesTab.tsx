@@ -176,7 +176,7 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
           </LeaveList>
         )}
       </div>
-      {foot ?? (status.files.length > 0 && <CommitBox cwd={cwd} />)}
+      {foot ?? (status.files.length > 0 && <CommitBox sessionId={sessionId} cwd={cwd} />)}
     </div>
   );
 }
@@ -185,7 +185,7 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
 const commitDrafts = new Map<string, string>();
 const MAX_COMMIT_LINES = 3;
 
-function CommitBox({ cwd }: { cwd: string }) {
+function CommitBox({ sessionId, cwd }: { sessionId: string; cwd: string }) {
   const key = gitKey(cwd);
   const [message, setMessage] = useState(() => commitDrafts.get(key) ?? '');
   const [busy, setBusy] = useState(false);
@@ -212,12 +212,17 @@ function CommitBox({ cwd }: { cwd: string }) {
   };
 
   const [drafting, setDrafting] = useState(false);
+  const typed = useRef(message);
+  typed.current = message;
   const draft = async () => {
     if (drafting || busy) return;
     setDrafting(true);
     setError(null);
-    const res = await draftCommitMessage(cwd);
+    const before = typed.current;
+    const res = await draftCommitMessage(sessionId, cwd);
     setDrafting(false);
+    // What the person typed while the draft was written stays.
+    if (typed.current !== before) return;
     if (res.ok && res.message) {
       update(res.message);
       area.current?.focus();
@@ -271,8 +276,8 @@ function CommitBox({ cwd }: { cwd: string }) {
             }
           }}
         />
-        <Tip label="Write the message from the changes" side="top">
-          <button type="button" className="btn btn-sm ch-commit-draft" aria-label="Write the message from the changes" disabled={busy || drafting} onClick={() => void draft()}>
+        <Tip label="Draft the message: a small request on this chat's account" side="top">
+          <button type="button" className="btn btn-sm ch-commit-draft" aria-label="Draft the message: a small request on this chat's account" disabled={busy || drafting} onClick={() => void draft()}>
             {drafting ? <Spinner size={12} /> : <Icon name="sparkle" size={14} />}
           </button>
         </Tip>

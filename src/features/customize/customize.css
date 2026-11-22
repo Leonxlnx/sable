@@ -1,0 +1,42 @@
+/* Settings › Customize (Customize.tsx) and the strip above the Customize chat's composer (CustomStrip.tsx). */
+
+.cz-val,
+.cz-folder {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.cz-folder .code-chip {
+  min-width: 0;
+  max-width: 280px;
+}
+
+.cz-skel {
+  height: 64px;
+  border-radius: var(--r-lg);
+}
+
+.cz-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 auto 8px;
+  width: 100%;
+  max-width: var(--column);
+  padding: 6px 6px 6px 14px;
+  border-radius: var(--r-lg);
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font-size: var(--t-ui);
+  color: var(--text-2);
+}
+
+.cz-strip-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -782,8 +782,11 @@ export function registerUsage(app: App, opts: { home?: string; sources?: () => U
     for (const [key, list] of scanner.samples()) {
       const [provider, accountId] = key.split(':') as [ProviderId, string];
       if (provider !== 'codex') continue;
+      // Snapshots from before the account's sign-in changed are the previous person's (review wave 8, #26).
+      const since = app.limitsForgottenAt(provider, accountId);
       const byId = new Map<string, LimitSample[]>();
-      for (const s of list) byId.set(s.id, [...(byId.get(s.id) ?? []), s]);
+      for (const s of list) if (s.t > since) byId.set(s.id, [...(byId.get(s.id) ?? []), s]);
+      if (!byId.size) continue;
       for (const [id, samples] of byId) book.seed(provider, accountId, id, samples.map((s): [number, number] => [s.t, s.percent]));
       const latest = list[list.length - 1];
       const known = book.report(provider, accountId);
@@ -871,6 +874,12 @@ export function registerUsage(app: App, opts: { home?: string; sources?: () => U
   const unsubscribe = app.subscribe((e) => {
     if (e.type === 'limits.updated' && e.accountId && e.meta) record(e.provider, e.accountId, e.limits, e.meta);
     else if (e.type === 'item.added' && e.item.type === 'turn') afterTurn();
+  });
+
+  // An account signed in as someone else now (or with an API key in place of a plan): its old reading is not its own.
+  app.onLimitsForgotten((provider, accountId) => {
+    book.remove(provider, accountId);
+    app.emit({ type: 'limits.report', report: book.report(provider, accountId) });
   });
 
   app.register('usage.limits', () =>

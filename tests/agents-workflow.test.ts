@@ -118,9 +118,9 @@ describe('limits by model', () => {
 
   it('knows which model a window limits', () => {
     expect(windowModel(limits[0])).toBeUndefined();
-    expect(windowModel(limits[2])).toBe('Fable');
+    expect(windowModel(limits[2])).toBe('fable');
     expect(windowModel(limits[3])).toBe('opus');
-    expect(windowModel({ id: 'gpt-5.3-codex-spark:primary', label: 'GPT-5.3-Codex-Spark · 5-hour', percent: 0 })).toBe('GPT-5.3-Codex-Spark');
+    expect(windowModel({ id: 'gpt-5.3-codex-spark:primary', label: 'GPT-5.3-Codex-Spark · 5-hour', percent: 0 })).toBe('gpt-5.3-codex-spark');
     expect(appliesTo(limits[2], { id: 'claude-opus-5-5', name: 'Opus 5.5' })).toBe(false);
     expect(appliesTo(limits[3], { id: 'claude-opus-5-5', name: 'Opus 5.5' })).toBe(true);
   });

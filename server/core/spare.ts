@@ -175,10 +175,15 @@ export function spareRoom(a: SpareAccount, now: number, model?: string, floor = 
   return { ok: false, unused, score, ...(known ? { until: Math.max(...(holds as number[])) } : {}) };
 }
 
-/** The latest reset among the account's windows that are still full for `model` (unknown: any model); undefined when none is. */
+/**
+ * The latest reset among the account's windows that are still full for `model` (unknown: any model);
+ * undefined when none is. A full window whose reset is not known holds it too: `Infinity` (review
+ * wave 8, #18; it was left out, so the chat went on at a window still full).
+ */
 export function stillFull(limits: RateLimit[], now: number, model?: string): number | undefined {
-  const full = live(limits, now).filter((l) => l.percent >= 100 && forModel(l, model) && l.resetsAt);
-  return full.length ? Math.max(...full.map((l) => l.resetsAt!)) : undefined;
+  const full = live(limits, now).filter((l) => l.percent >= 100 && forModel(l, model));
+  if (!full.length) return undefined;
+  return full.some((l) => !l.resetsAt) ? Infinity : Math.max(...full.map((l) => l.resetsAt!));
 }
 
 export interface SpareItem {
@@ -248,6 +253,12 @@ export function planSpare(input: SpareInput): SparePlan {
     }
     const acc = input.accounts[it.provider]?.find((a) => a.id === accountId);
     const later = acc ? stillFull(acc.limits, now, it.model) : undefined;
+    if (later === Infinity) {
+      // Full with no reset known: it waits, and looks again in a while (a reading may tell).
+      out.waits[it.sessionId] = { accountId };
+      wake(now + SPARE_RECHECK_MS);
+      continue;
+    }
     if (later && later > now) {
       out.waits[it.sessionId] = { at: later, accountId };
       wake(later);
@@ -532,6 +543,31 @@ export class SpareWaits {
     if (this.hasWaits()) this.poke(1500);
   }
 
+  /**
+   * An account's full windows cleared before their time (a reset used in the agent's own dialog,
+   * confirmed by a fresh read): chats waiting for its reset are due now. The planner then starts
+   * them exactly as at a reset by time, checking the account's limits once more first.
+   */
+  resetCleared(provider: ProviderId, accountId: string, windows?: RateLimit[]) {
+    const now = this.now();
+    let due = false;
+    for (const rt of this.waiting()) {
+      const wait = rt.meta.spare;
+      if (wait?.reason !== 'reset' || rt.meta.provider !== provider || (wait.accountId ?? DEFAULT_ACCOUNT) !== accountId) continue;
+      // Only a chat that one of the cleared windows held (another model's week is not its wait); the
+      // planner then checks every window that holds it, against the fresh reading (review wave 8, #18).
+      const model = this.host.model(rt);
+      if (windows && !windows.some((l) => forModel(l, model))) continue;
+      if (wait.at !== undefined && wait.at > now) rt.update({ spare: { ...wait, at: now } });
+      due = true;
+    }
+    if (due) {
+      // The read that confirmed it is the fresh reading a start needs.
+      this.readAt.set(`${provider}:${accountId}`, now);
+      this.poke();
+    }
+  }
+
   /** Plans again after `delay` (coalesced: the earliest asked wins). */
   poke(delay = 0) {
     if (this.disposed) return;
@@ -602,7 +638,8 @@ export class SpareWaits {
       const cur = rt.meta.spare;
       if (!w || !cur) continue;
       if (cur.at === w.at && cur.accountId === w.accountId) continue;
-      if (cur.reason === 'reset' && !w.at) continue;
+      // A reset wait keeps its known time, unless that time passed (a window still full with no reset known).
+      if (cur.reason === 'reset' && !w.at && !(cur.at !== undefined && cur.at <= this.now())) continue;
       const next: SpareWait = { ...cur };
       if (w.at === undefined) delete next.at;
       else next.at = w.at;

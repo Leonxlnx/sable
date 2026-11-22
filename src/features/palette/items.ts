@@ -6,6 +6,7 @@ import type { IconName } from '@/icons';
 import { baseName, tildePath } from '@/lib/format';
 import { skillLabeller } from '@/lib/skills';
 import { SECTIONS as SETTINGS_SECTIONS } from '@/features/settings/sections';
+import { customized, getCustom, openCustomize, useOriginal } from '@/features/customize/custom-store';
 import { openImport } from '@/features/history/History';
 import { checkForUpdate, goHome, interrupt, openSession, openSettings, switchAgent } from '@/state/actions';
 import { RAIL_TABS, railTabKeys } from '@/features/rail/tabs';
@@ -119,6 +120,9 @@ export function buildItems(opts: {
     if (s.id === 'shortcuts') continue;
     act(`settings:${s.id}`, s.label, s.icon, () => openSettings(s.id), { sub: 'Settings', keywords: `settings preferences ${s.keywords}` });
   }
+  // Customize Sable: the Customize chat, and the way back while something of the person's is applied.
+  act('customize', 'Customize Sable', 'wand', () => void openCustomize(), { keywords: 'customize customise redesign restyle theme css styles look sidebar change sable agent' });
+  if (customized(getCustom())) act('customize:original', "Use Sable's own look", 'rewind', () => void useOriginal(), { keywords: 'original default reset styles theme customize off' });
   act('toggle-sidebar', ui().sidebarOpen ? 'Hide sidebar' : 'Show sidebar', 'sidebar', () => setUi({ sidebarOpen: !ui().sidebarOpen }), {
     keys: 'mod+b',
     keywords: 'toggle sidebar',

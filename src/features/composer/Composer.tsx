@@ -30,6 +30,7 @@ import { Highlight } from './Highlight';
 import { NO_QUEUE, QueueTray } from './QueueTray';
 import { UntilStrip } from './UntilStrip';
 import { SpareStrip } from './SpareStrip';
+import { CustomStrip } from '@/features/customize/CustomStrip';
 import { ReviewBar } from '@/features/review/ReviewBar';
 import { SendKey } from './SendKey';
 import { SuggestMenu } from './SuggestMenu';
@@ -878,6 +879,7 @@ ${cur}` : draft.text, attachments: draft.attachments });
 
       {variant === 'session' && sessionId && <UntilStrip sessionId={sessionId} />}
       {variant === 'session' && sessionId && <SpareStrip sessionId={sessionId} />}
+      {variant === 'session' && sessionId && <CustomStrip sessionId={sessionId} />}
       {variant === 'session' && sessionId && <ReviewBar sessionId={sessionId} />}
       {variant === 'session' && sessionId && <QueueTray sessionId={sessionId} queue={queue} running={busy} steerable={steerable} onEdit={editQueued} onFocusComposer={focus} />}
 

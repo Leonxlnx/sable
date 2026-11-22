@@ -440,7 +440,8 @@ describe('at a plan limit', () => {
     await app.call('session.send', { sessionId: rt.id, text: 'and now the tests' });
     await until(() => sent.length === 2, 'second send');
     expect(sent[1]).toContain('User: hi');
-    expect(sent[1].endsWith('and now the tests')).toBe(true);
+    // The person's words, then the note about the move (move-context.ts).
+    expect(sent[1]).toMatch(/\n\nand now the tests\n\n<system-reminder>\nThis conversation moved to another account/);
     // The timeline shows what the user typed, not the handover.
     expect((rt.items.filter((i) => i.type === 'user').pop() as UserItem).text).toBe('and now the tests');
     // Only once.

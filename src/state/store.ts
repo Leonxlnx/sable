@@ -17,6 +17,7 @@ import type {
   QuestionRequest,
   LimitsReport,
   RateLimit,
+  ResetRun,
   SessionMeta,
   SessionSnapshot,
   TimelineItem,
@@ -67,7 +68,7 @@ export interface SessionData {
 }
 
 export type RailTab = 'changes' | 'files' | 'browser' | 'device' | 'terminal' | 'tasks' | 'context' | 'agents';
-export type SettingsSection = 'general' | 'appearance' | 'accounts' | 'usage' | 'models' | 'permissions' | 'phone' | 'mcp' | 'hooks' | 'skills' | 'agents' | 'memory' | 'profile' | 'prompts' | 'shortcuts' | 'about';
+export type SettingsSection = 'general' | 'appearance' | 'accounts' | 'usage' | 'models' | 'permissions' | 'phone' | 'customize' | 'mcp' | 'hooks' | 'skills' | 'agents' | 'memory' | 'profile' | 'prompts' | 'shortcuts' | 'about';
 
 export interface AuthFlow {
   state: 'started' | 'url' | 'done' | 'error' | 'cancelled' | 'timeout';
@@ -155,6 +156,8 @@ export interface Store {
   limitReports: Partial<Record<string, LimitsReport>>;
   /** Sign-in flows per account, keyed by `accountKey(provider, accountId)`. */
   auth: Partial<Record<string, AuthFlow>>;
+  /** A limit reset used in the agent's own dialog (`limit.resetInAgent`), per account, keyed like `auth`. */
+  resetRuns: Partial<Record<string, ResetRun>>;
   toasts: Toast[];
   drafts: Record<string, Draft>;
   /** Review comments on diffs not sent yet, per session (features/review; actions `*ReviewComment`, `sendReview`). */
@@ -207,16 +210,6 @@ function touched(d: SessionData, ids: readonly string[], patch?: Partial<Session
 
 let toastId = 1;
 
-/** The release whose "New update available" toast this window already showed. */
-let announcedUpdate: string | undefined;
-
-/** Once per release and window: a downloaded update says so, whether the start check found it or a later one did. */
-function announceUpdate(u: UpdateState | undefined) {
-  if (!u || u.status !== 'ready' || !u.latest || announcedUpdate === u.latest) return;
-  announcedUpdate = u.latest;
-  useStore.getState().toast('New update available');
-}
-
 export const useStore = create<Store>((set, get) => ({
   conn: 'connecting',
   ready: false,
@@ -238,6 +231,7 @@ export const useStore = create<Store>((set, get) => ({
   limits: {},
   limitReports: {},
   auth: {},
+  resetRuns: {},
   toasts: [],
   drafts: {},
   reviews: {},
@@ -619,9 +613,18 @@ export function applyEvent(e: BridgeEvent) {
     case 'limit.reset':
       announceReset(e);
       return;
+    case 'limit.resetRun': {
+      const key = accountKey(e.provider, e.accountId);
+      useStore.setState((s) => {
+        const resetRuns = { ...s.resetRuns };
+        if (e.run) resetRuns[key] = e.run;
+        else delete resetRuns[key];
+        return { resetRuns };
+      });
+      return;
+    }
     case 'update.state':
       useStore.setState({ update: e.state });
-      announceUpdate(e.state);
       return;
     default:
       return;
@@ -675,7 +678,6 @@ async function hello() {
       ui: { ...s.ui, activeSessionId: active, homeProvider, homeAccount, homeCwd: s.ui.homeCwd ?? app.projects[0]?.path ?? null },
     };
   });
-  announceUpdate(app.update);
   const active = useStore.getState().ui.activeSessionId;
   if (active) void loadSession(active);
   // Limits remembered from earlier runs, so nothing waits for an agent to answer.

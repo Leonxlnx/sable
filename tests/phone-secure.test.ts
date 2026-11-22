@@ -19,7 +19,7 @@ import { deflateRawSync } from 'node:zlib';
 import { answerHello, fingerprintOf, loadIdentity, openFrame, readSecHello, sealFrame } from '../server/services/phone-secure';
 import { qrMatrix } from '../server/services/qr';
 import { b64u, IdentityError, MalformedError, pskOfKey, pskOfToken, startHandshake } from '../mobile/src/lib/secure';
-import { fetchSecure, fingerprintIn, handshake, helloPlain, helloSecure, keyOf, legacyPairing, pairSecure, wireClient, type Frame } from './phone-wire';
+import { beside, fetchSecure, fingerprintIn, handshake, helloPlain, helloSecure, keyOf, legacyPairing, pairSecure, wireClient, type Frame } from './phone-wire';
 import { CONTAIN } from '../server/core/contain';
 
 // These tests are about the secure channel, not containment. Where no handle names its file (Windows), the
@@ -81,7 +81,7 @@ describe('the secure channel', () => {
     // Nothing went plain after the handshake: every frame from the desktop was binary.
     const raw: Buffer[] = [];
     c.ws.on('message', (m, binary) => binary && raw.push(m as Buffer));
-    const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { ok: boolean; result: PhoneTail };
+    const created = (await c.call('session.create', { provider: 'demo', cwd: beside(home) })) as { ok: boolean; result: PhoneTail };
     expect(created.ok).toBe(true);
     expect(raw.length).toBeGreaterThan(0);
     for (const b of raw) expect(b.toString('utf8')).not.toContain(created.result.session.id);
@@ -93,7 +93,7 @@ describe('the secure channel', () => {
     const { c } = await pairSecure(app, port);
     const flags: number[] = [];
     c.ws.on('message', (m, binary) => binary && flags.push((m as Buffer)[0]));
-    const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
+    const created = (await c.call('session.create', { provider: 'demo', cwd: beside(home) })) as { result: PhoneTail };
     const id = created.result.session.id;
     app.sessions.get(id)!.add({ type: 'text', text: 'word '.repeat(4000), streaming: false });
     const tail = (await c.call('phone.tail', { sessionId: id })) as { ok: boolean; result: PhoneTail };
@@ -359,10 +359,10 @@ describe('downloads over the channel', () => {
   it("sends the file in chunks over the sealed connection, named by the share's SHA-256 and size", async () => {
     const { app, port, home } = await setup();
     const { c } = await pairSecure(app, port);
-    const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
+    const created = (await c.call('session.create', { provider: 'demo', cwd: beside(home) })) as { result: PhoneTail };
     const id = created.result.session.id;
     const body = Buffer.from(Array.from({ length: 5000 }, (_, i) => i % 251));
-    writeFileSync(path.join(home, 'app-release.apk'), body);
+    writeFileSync(path.join(beside(home), 'app-release.apk'), body);
     app.sessions.get(id)!.add({ id: 'share1', type: 'tool', name: 'share', kind: 'share', title: 'Share app-release.apk', status: 'done', detail: { files: [{ path: 'app-release.apk', name: 'app-release.apk', size: body.length }] } } as ToolItem);
     const got = await fetchSecure(c, { sessionId: id, itemId: 'share1', index: 0 }, 1024);
     expect(got.ok).toBe(true);

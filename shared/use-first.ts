@@ -30,7 +30,7 @@ export interface UseFirstRank {
   /**
    * `now`: has room and takes work now. `held`: has room this week, but a window holds it until
    * `until` (the 5-hour window, or the model's own week). `spent`: nothing left this week (back at
-   * `expiresAt`). `unknown`: its week was never read. `off`: signed out, or billed per token.
+   * `expiresAt`: the reset of the window that left too little, the model's own week when it was that). `unknown`: its week was never read. `off`: signed out, or billed per token.
    */
   state: 'now' | 'held' | 'spent' | 'unknown' | 'off';
   /** Points of the week still unused within the account's cap (for the model, when one is named). */
@@ -52,18 +52,32 @@ export function rankAccount(a: UseFirstAccount, now: number, model?: string): Us
   const live = (a.limits ?? []).filter((l) => !(l.resetsAt && l.resetsAt <= now));
   const week = live.find(isAllModelsWeekly);
   if (!week) return { id: a.id, state: 'unknown' };
-  let left = capPercent(a.cap?.weekly) - week.percent;
+  const shared = capPercent(a.cap?.weekly) - week.percent;
+  let left = shared;
   const holds: (number | undefined)[] = [];
+  // What each window leaves (the week of all models within the cap, the model's own week): the
+  // spent ones decide when the account is back (review wave 7, #14).
+  const room: { left: number; resetsAt?: number; hold?: boolean }[] = [{ left: shared, resetsAt: week.resetsAt }];
   // The model's own week bounds what the chat can use; a full one holds it until that week ends.
   if (model !== undefined)
     for (const l of live) {
       if (!modelWeek(l) || !windowForModel(l, model)) continue;
       left = Math.min(left, 100 - l.percent);
-      if (l.percent >= 100) holds.push(l.resetsAt);
+      const hold = l.percent >= 100;
+      room.push({ left: 100 - l.percent, resetsAt: l.resetsAt, hold });
+      if (hold) holds.push(l.resetsAt);
     }
   left = Math.max(0, Math.round(left * 10) / 10);
   const base = { id: a.id, left, ...(week.resetsAt ? { expiresAt: week.resetsAt } : {}) };
-  if (week.percent >= capPercent(a.cap?.weekly) || (left < USE_FIRST_FLOOR && !holds.length)) return { ...base, state: 'spent' };
+  // Spent while any window that is not a full model week (a hold, back at its reset) leaves less than
+  // the floor: a full model week ending soon never hides a shared week that stays short for days
+  // (review wave 8, #27).
+  if (week.percent >= capPercent(a.cap?.weekly) || room.some((r) => !r.hold && r.left < USE_FIRST_FLOOR)) {
+    // Back once every window below the floor has reset: the latest of them (the shared week's end when it is one).
+    const resets = room.filter((r) => r.left < USE_FIRST_FLOOR).map((r) => r.resetsAt);
+    const back = resets.every((t): t is number => t !== undefined) && resets.length ? Math.max(...resets) : week.resetsAt;
+    return { ...base, ...(back ? { expiresAt: back } : {}), state: 'spent' };
+  }
   const five = live.find(isSessionWindow);
   if (five && five !== week && five.percent >= Math.min(USE_FIRST_SESSION_CEILING, capPercent(a.cap?.session))) holds.push(five.resetsAt);
   if (!holds.length) return { ...base, state: 'now' };

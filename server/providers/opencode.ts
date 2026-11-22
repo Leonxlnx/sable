@@ -7,7 +7,6 @@
  * with no sign-in). Its plan limits are OpenCode Go's windows, read from the CLI (`limits()`). It
  * takes no message mid-turn: a message sent while it works waits in the queue.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -29,7 +28,7 @@ import type {
 import type { SessionRuntime } from '../core/runtime';
 import { runCli } from '../util/proc';
 import { openCodeConfig } from '../services/config';
-import { killTree } from './codex-rpc';
+import { openConsole, type ConsoleWindow } from '../util/console';
 import { AcpClient, AcpError, type AcpExit } from './opencode-acp';
 import {
   ALLOW_ALL_MODE,
@@ -42,13 +41,14 @@ import {
   locationPath,
   modelsOf,
   mapGoLimits,
+  permissionScope,
   parseAuthList,
   promptBlocks,
   resultOf,
   statusOf,
   todosOf,
 } from './opencode-map';
-import type { Provider, ProviderContext, ProviderSession } from './types';
+import type { Provider, ProviderContext, ProviderSession, SendOptions } from './types';
 import { VERSION } from '../version';
 
 /** How long a read of the plan limits is reused when nothing forces a new one. */
@@ -85,7 +85,7 @@ export class OpenCodeProvider implements Provider {
   private capsLoading?: Promise<CapsInfo>;
   /** Commands announced by a session the provider itself opened to read the capabilities. */
   private probeCommands = new Map<string, Capabilities['commands']>();
-  private login_?: { child: ChildProcess; cancelled: boolean };
+  private login_?: { window: ConsoleWindow; cancelled: boolean };
 
   constructor(readonly ctx: ProviderContext) {}
 
@@ -117,6 +117,16 @@ export class OpenCodeProvider implements Provider {
         });
     }
     return this.starting;
+  }
+
+  /** The process stopped answering (a stopped prompt that never ends): it is stopped; each chat opens again with its next message. */
+  abandon() {
+    const acp = this.acp;
+    if (!acp) return;
+    this.ctx.log('[opencode] giving up the process');
+    // The next message starts a new one at once, never this one while it closes.
+    this.acp = null;
+    void acp.close().catch(() => {});
   }
 
   private armIdle() {
@@ -191,13 +201,11 @@ export class OpenCodeProvider implements Provider {
     await this.cancelLogin();
     if (process.platform !== 'win32') throw new Error(`Run \`opencode auth ${command}\` in a terminal.`);
     if (command === 'login') this.ctx.emit({ type: 'auth.progress', provider: 'opencode', state: 'url', message: 'Finish signing in in the OpenCode window that opened.' });
-    const child = spawn('cmd.exe', ['/c', 'start', `"OpenCode ${command}"`, '/wait', 'opencode', 'auth', command], { windowsHide: false, stdio: 'ignore' });
-    const l = { child, cancelled: false };
+    // One verbatim command line (util/console.ts). `command` is one of two fixed words.
+    const window = openConsole({ title: `OpenCode ${command}`, bin: 'opencode', args: ['auth', command] });
+    const l = { window, cancelled: false };
     this.login_ = l;
-    await new Promise<void>((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', () => resolve());
-    }).finally(() => {
+    await window.closed.finally(() => {
       if (this.login_ === l) this.login_ = undefined;
       this.capsCache = undefined;
     });
@@ -211,7 +219,7 @@ export class OpenCodeProvider implements Provider {
     const l = this.login_;
     if (!l) return;
     l.cancelled = true;
-    killTree(l.child);
+    l.window.close();
   }
 
   async logout(): Promise<void> {
@@ -374,12 +382,42 @@ interface ToolState {
 
 interface Queued {
   item: UserItem;
+  /** Its sender's guard (`SendOptions.check`), asked again when it goes. */
+  check?: () => void;
+}
+
+/** A turn: `sent` once its prompt went to OpenCode, `done` once it ended. */
+interface Turn {
+  stop?: NodeJS.Timeout;
+  done: boolean;
+  sent?: boolean;
+  /** Its `session/prompt` request, settled when OpenCode answers it. */
+  prompt?: Promise<unknown>;
+}
+
+/** How long a stopped turn's prompt has to answer its cancel before the turn ends here anyway. */
+const STOP_GRACE_MS = 8_000;
+/** How long after that a prompt that still runs may hold the session before the process is given up. */
+const STOP_GIVE_UP_MS = 60_000;
+
+/** Whether a sender's guard (`SendOptions.check`) lets its message go now. */
+function passes(check: () => void): boolean {
+  try {
+    check();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 class OpenCodeSession implements ProviderSession {
   sessionId = '';
   private closed = false;
-  private turn?: { stop?: NodeJS.Timeout; done: boolean };
+  /** The process died under this handle: the next message revives it (`revive`). */
+  private dead = false;
+  /** A stopped turn's prompt that did not answer its cancel yet (`stopTimedOut`). */
+  private lingering?: Promise<void>;
+  private turn?: Turn;
   private queue: Queued[] = [];
   private tools = new Map<string, ToolState>();
   private text?: { id: string; messageId?: string };
@@ -453,16 +491,73 @@ class OpenCodeSession implements ProviderSession {
     this.applied = { model: get('model', 'model'), effort: get('effort', 'thought_level'), mode: get('mode', 'mode') };
   }
 
+  /**
+   * The process is gone. The handle stays the chat's (the bridge keeps it), but it is dead: its turn
+   * ends here, and the next message starts a process again and resumes the conversation there
+   * (`revive`) instead of failing as a closed session forever (review wave 8, #23).
+   */
   onServerDied(message: string, detail?: string) {
-    if (this.closed) return;
-    this.closed = true;
+    if (this.closed || this.dead) return;
+    this.dead = true;
     const rt = this.rt;
     this.prompts.abort();
+    const turn = this.turn;
+    if (turn) {
+      turn.done = true;
+      clearTimeout(turn.stop);
+      this.turn = undefined;
+    }
+    this.lingering = undefined;
+    this.closeText();
     if (rt.turnActive) {
       rt.settle('error');
       rt.notice('error', message, detail);
       rt.endTurn(message);
     }
+  }
+
+  /** A dead handle opens its conversation again on a new process (`session/resume`, or a new one with a notice). */
+  private async revive() {
+    this.dead = false;
+    this.prompts = new AbortController();
+    this.tools.clear();
+    await this.attach(false);
+  }
+
+  /**
+   * OpenCode did not answer a Stop within the grace: the turn ends here, but its prompt may still run
+   * in OpenCode. Until that prompt answers, the session is out of the provider's map (whatever it still
+   * streams or asks is dropped or refused) and nothing else goes to it: a message waits in the queue.
+   * A prompt that never answers gives the process up (`STOP_GIVE_UP_MS`); the next message revives it.
+   */
+  private stopTimedOut(turn: Turn) {
+    if (turn.done || this.turn !== turn) return;
+    const sid = this.sessionId;
+    if (this.provider.sessions.get(sid) === this) this.provider.sessions.delete(sid);
+    const giveUp = setTimeout(() => {
+      if (this.lingering !== lingering) return;
+      this.log('a stopped prompt never answered: stopping the process');
+      this.lingering = undefined;
+      this.dead = true;
+      this.provider.abandon();
+      this.drainQueue();
+    }, STOP_GIVE_UP_MS);
+    giveUp.unref?.();
+    const lingering: Promise<void> = (turn.prompt ?? Promise.resolve())
+      .then(
+        () => {},
+        () => {},
+      )
+      .finally(() => {
+        clearTimeout(giveUp);
+        if (this.lingering !== lingering) return;
+        this.lingering = undefined;
+        if (this.closed || this.dead) return;
+        this.provider.sessions.set(sid, this);
+        this.drainQueue();
+      });
+    this.lingering = lingering;
+    this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' });
   }
 
   // ── settings (applied right before the next message) ──
@@ -484,7 +579,9 @@ class OpenCodeSession implements ProviderSession {
   }
 
   private async applyChoices() {
-    const { model, effort, mode } = this.rt.meta;
+    const { model, effort } = this.rt.meta;
+    // A queued message drained inside the provider keeps the mode the work had while a switch is held.
+    const mode = this.rt.workMode;
     // The model first: the efforts a model offers come with it.
     if (model && model !== this.applied.model) await this.setOption('model', 'model', model).catch((err) => this.rt.notice('error', 'Could not switch the model', errMsg(err)));
     if (effort && effort !== this.applied.effort) await this.setOption('effort', 'thought_level', effort).catch((err) => this.log('effort', errMsg(err)));
@@ -494,41 +591,78 @@ class OpenCodeSession implements ProviderSession {
 
   // ── sending ──
 
-  async send(item: UserItem) {
+  async send(item: UserItem, opts?: SendOptions) {
     if (this.closed) throw new Error('Session is closed');
     if (!existsSync(this.rt.meta.cwd)) throw new Error(`The folder ${this.rt.meta.cwd} does not exist.`);
-    if (this.turn) {
-      // OpenCode takes one prompt at a time: the message waits for the turn to end.
-      this.queue.push({ item });
+    // The sender's guard: asked now, again right before the prompt goes, and when a waiting message goes later.
+    const check = opts?.check;
+    check?.();
+    // One prompt at a time: the message waits for the turn to end, or for a stopped prompt that has not answered yet.
+    if (this.turn || this.lingering) {
+      this.queue.push({ item, ...(check ? { check } : {}) });
       if (item.state !== 'queued') this.rt.patch<UserItem>(item.id, { state: 'queued' });
       return;
     }
-    await this.startTurn([item]);
+    await this.startTurn([{ item, ...(check ? { check } : {}) }], false);
   }
 
-  private async startTurn(items: UserItem[]) {
+  /**
+   * One prompt for `entries`. Each sender's guard is asked again after the setup (a process start, a
+   * resume, the choices), right before the prompt goes: a message sent directly throws (the bridge
+   * ends the turn it began); one from the queue whose sender may no longer act leaves the chat.
+   */
+  private async startTurn(entries: Queued[], fromQueue: boolean) {
     const rt = this.rt;
-    const turn: { stop?: NodeJS.Timeout; done: boolean } = { done: false };
+    const turn: Turn = { done: false };
     this.turn = turn;
     rt.beginTurn('Thinking');
-    for (const it of items) if (it.state === 'queued') rt.taken(it.id);
+    for (const { item } of entries) if (item.state === 'queued') rt.taken(item.id);
     this.text = this.thinking = undefined;
     const started = Date.now();
+    let acp: AcpClient;
     try {
+      if (this.dead) await this.revive();
       await this.applyChoices();
-      const blocks = items.length === 1 ? promptBlocks(items[0].text, items[0].attachments) : items.flatMap((it, i) => promptBlocks(i ? `\n\n${it.text}` : it.text, it.attachments));
-      const acp = await this.provider.client();
-      // One prompt runs for as long as the agent works: it is answered when the turn ends.
-      void acp
-        .request('session/prompt', { sessionId: this.sessionId, prompt: mergeText(blocks) }, 0)
-        .then((r) => this.completeTurn(turn, started, r, undefined, items))
-        .catch((err) => this.completeTurn(turn, started, undefined, errMsg(err), items));
+      acp = await this.provider.client();
     } catch (err) {
       this.completeTurn(turn, started, undefined, errMsg(err));
+      return;
     }
+    // Stopped, closed or replaced while the choices were applied: nothing goes (`interrupt` ended the turn).
+    if (turn.done || this.turn !== turn || this.closed || this.dead) return;
+    let live = entries;
+    if (!fromQueue) {
+      try {
+        entries[0]?.check?.();
+      } catch (err) {
+        // Its sender may no longer act: nothing went, and the bridge ends the turn it began.
+        turn.done = true;
+        this.turn = undefined;
+        throw err;
+      }
+    } else {
+      live = entries.filter((x) => {
+        if (!x.check || passes(x.check)) return true;
+        rt.remove(x.item.id);
+        rt.notice('info', 'A message from a removed phone was not sent');
+        return false;
+      });
+      if (!live.length) {
+        turn.done = true;
+        this.turn = undefined;
+        rt.endTurn();
+        return;
+      }
+    }
+    const items = live.map((x) => x.item);
+    const blocks = items.length === 1 ? promptBlocks(items[0].text, items[0].attachments) : items.flatMap((it, i) => promptBlocks(i ? `\n\n${it.text}` : it.text, it.attachments));
+    turn.sent = true;
+    // One prompt runs for as long as the agent works: it is answered when the turn ends.
+    turn.prompt = acp.request('session/prompt', { sessionId: this.sessionId, prompt: mergeText(blocks) }, 0);
+    void turn.prompt.then((r) => this.completeTurn(turn, started, r as Obj, undefined, items)).catch((err) => this.completeTurn(turn, started, undefined, errMsg(err), items));
   }
 
-  private completeTurn(turn: { stop?: NodeJS.Timeout; done: boolean }, started: number, result?: Obj, error?: string, items: UserItem[] = []) {
+  private completeTurn(turn: Turn, started: number, result?: Obj, error?: string, items: UserItem[] = []) {
     const rt = this.rt;
     if (turn.done || this.turn !== turn) return;
     turn.done = true;
@@ -559,21 +693,31 @@ class OpenCodeSession implements ProviderSession {
   }
 
   private drainQueue() {
-    if (!this.queue.length || this.turn || this.closed) return;
+    if (!this.queue.length || this.turn || this.lingering || this.closed) return;
     // Messages the bridge took back (the turn was stopped or failed before they were taken) go out from its queue, not twice.
-    const q = this.queue.splice(0).filter((x) => this.rt.get<UserItem>(x.item.id)?.state === 'queued');
+    // One whose sender may no longer act (a phone removed while it waited) never goes, and leaves the chat.
+    const q = this.queue.splice(0).filter((x) => {
+      if (this.rt.get<UserItem>(x.item.id)?.state !== 'queued') return false;
+      if (!x.check || passes(x.check)) return true;
+      this.rt.remove(x.item.id);
+      this.rt.notice('info', 'A message from a removed phone was not sent');
+      return false;
+    });
     if (!q.length) return;
-    void this.startTurn(q.map((x) => x.item)).catch((err) => this.rt.notice('error', 'Could not send the queued message', errMsg(err)));
+    void this.startTurn(q, true).catch((err) => this.rt.notice('error', 'Could not send the queued message', errMsg(err)));
   }
 
   async interrupt() {
     const turn = this.turn;
     if (!turn) return;
+    // Its prompt has not gone yet (the choices are still being applied): the turn ends here, and nothing goes.
+    if (!turn.sent) return this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' });
     const acp = await this.provider.client().catch(() => null);
     acp?.notify('session/cancel', { sessionId: this.sessionId });
-    // The prompt answers "cancelled" by itself; if it does not, the turn ends anyway.
+    // The prompt answers "cancelled" by itself; if it does not, the turn ends anyway, and the session
+    // takes nothing new until that prompt has answered (`stopTimedOut`).
     clearTimeout(turn.stop);
-    turn.stop = setTimeout(() => this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' }), 8_000);
+    turn.stop = setTimeout(() => this.stopTimedOut(turn), STOP_GRACE_MS);
     turn.stop.unref?.();
   }
 
@@ -646,7 +790,8 @@ class OpenCodeSession implements ProviderSession {
         return;
       }
       case 'current_mode_update':
-        if (typeof u.currentModeId === 'string' && agentModeFor(rt.meta.mode) !== u.currentModeId) rt.update({ mode: u.currentModeId });
+        // While a switch is held the agent reports the mode the work has; the one chosen for the next message stays.
+        if (typeof u.currentModeId === 'string' && !rt.dangerHeld && agentModeFor(rt.meta.mode) !== u.currentModeId) rt.update({ mode: u.currentModeId });
         return;
       case 'config_option_update':
         if (Array.isArray(u.configOptions)) {
@@ -719,8 +864,11 @@ class OpenCodeSession implements ProviderSession {
     const options = ((p.options as Obj[]) ?? []).filter((o) => typeof o?.optionId === 'string');
     const pickKind = (...kinds: string[]) => options.find((o) => kinds.includes(String(o.kind)))?.optionId as string | undefined;
     const selected = (optionId: string) => ({ outcome: { outcome: 'selected', optionId } });
-    if (rt.meta.mode === ALLOW_ALL_MODE) {
-      const yes = pickKind('allow_once', 'allow_always');
+    // "Allow all" answers at once only when it is the mode this work runs under (a phone's switch
+    // during the turn is held: `SessionRuntime.workMode`), and only ever with a one-time grant: an
+    // "always" would outlive the mode inside OpenCode (review wave 8, #5).
+    if (rt.answersAtOnce(rt.workMode === ALLOW_ALL_MODE)) {
+      const yes = pickKind('allow_once');
       if (yes) return selected(yes);
     }
     const call = (p.toolCall ?? {}) as Obj;
@@ -729,6 +877,8 @@ class OpenCodeSession implements ProviderSession {
     const input = inputOf(call, tool?.input);
     const view = describeCall(tool?.name ?? String(call.name ?? call.title ?? 'tool'), kind, input, typeof call.title === 'string' ? call.title : undefined);
     const result = resultOf(view.claudeName, view.kind, input, call, false);
+    // Where it reaches, in lines the phone shows whole (or it is the desktop's to answer).
+    const reach = permissionScope(kind, call, input, (result.diff ?? []).map((d) => d.path), options.some((o) => o.kind === 'allow_always'));
     if (tool) rt.patch<ToolItem>(tool.id, { status: 'awaiting' });
     const label: Record<string, { label: string; tone: 'allow' | 'always' | 'deny' }> = {
       allow_once: { label: 'Allow once', tone: 'allow' },
@@ -744,6 +894,8 @@ class OpenCodeSession implements ProviderSession {
         title: view.title,
         detail: view.detail,
         diff: result.diff,
+        ...(reach.lines.length ? { reason: reach.lines.join('\n') } : {}),
+        ...(reach.scope ? { scope: reach.scope } : {}),
         options: options.map((o) => ({ id: String(o.optionId), ...(label[String(o.kind)] ?? { label: String(o.name ?? 'Allow'), tone: /reject|deny/i.test(String(o.kind)) ? 'deny' : 'allow' }) })),
       },
       this.prompts.signal,
@@ -780,6 +932,7 @@ class OpenCodeSession implements ProviderSession {
     if (this.closed) return;
     if (this.turn) await this.interrupt().catch(() => {});
     this.closed = true;
+    this.lingering = undefined;
     this.prompts.abort();
     this.queue = [];
     if (this.provider.sessions.get(this.sessionId) === this) this.provider.sessions.delete(this.sessionId);

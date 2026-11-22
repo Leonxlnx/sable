@@ -6,9 +6,33 @@
 import type { CommitDraftInput } from '../services/git';
 import type { TitlePrompt } from './titles';
 
-/** The diff's start is what the model sees; the file list stays whole up to this many names. */
+/**
+ * Every field has a budget (review wave 8, #24): the diff's start is what the model sees; the file
+ * list stays whole up to this many names, each name and all of them bounded; the recent subjects are
+ * for style only, so a few short ones.
+ */
 const PATCH_CHARS = 12_000;
 const MAX_FILES = 200;
+const FILE_CHARS = 300;
+const FILES_CHARS = 12_000;
+const MAX_SUBJECTS = 8;
+const SUBJECT_CHARS = 120;
+
+/** `s` cut to `n` characters, marked when cut. */
+const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** As many of `lines` as fit in `budget` characters, each cut to `each`. */
+function fit(lines: string[], each: number, budget: number): string[] {
+  const out: string[] = [];
+  let used = 0;
+  for (const l of lines) {
+    const line = cut(l, each);
+    if (used + line.length > budget) break;
+    out.push(line);
+    used += line.length + 1;
+  }
+  return out;
+}
 /** A subject is one line; the body is a few sentences. */
 export const COMMIT_MAX_TOKENS = '600';
 
@@ -20,11 +44,12 @@ export const COMMIT_SYSTEM = [
 ].join(' ');
 
 export function commitPrompt(input: CommitDraftInput, cwd: string): TitlePrompt {
-  const files = input.files.slice(0, MAX_FILES);
+  const files = fit(input.files.slice(0, MAX_FILES), FILE_CHARS, FILES_CHARS);
   const more = input.files.length > files.length ? [`… and ${input.files.length - files.length} more`] : [];
   const patch = input.patch.length > PATCH_CHARS ? `${input.patch.slice(0, PATCH_CHARS)}\n… (cut)` : input.patch;
   const parts = ['Files changed:', ...files, ...more];
-  if (input.subjects.length) parts.push('', 'Recent commit subjects, for style:', ...input.subjects);
+  const subjects = fit(input.subjects.slice(0, MAX_SUBJECTS), SUBJECT_CHARS, MAX_SUBJECTS * (SUBJECT_CHARS + 2));
+  if (subjects.length) parts.push('', 'Recent commit subjects, for style:', ...subjects);
   parts.push('', 'Diff against HEAD (new files are only listed above):', '<diff>', patch || '(none)', '</diff>', '', 'The commit message:');
   return { system: COMMIT_SYSTEM, user: parts.join('\n'), cwd, maxTokens: COMMIT_MAX_TOKENS };
 }
@@ -47,5 +72,6 @@ export function cleanCommit(raw: string | null | undefined): string | null {
     .trim();
   if (!subject) return null;
   const body = lines.slice(1).join('\n').replace(/\s+$/, '');
-  return body.trim() ? `${subject}\n${body.replace(/^\n+/, '')}` : subject;
+  // A blank line between the subject and the body, as git wants it (without one the body joins the subject).
+  return body.trim() ? `${subject}\n\n${body.replace(/^\n+/, '')}` : subject;
 }

@@ -7,6 +7,7 @@ import { useStore } from '@/state/store';
 import { Spinner } from '@/ui';
 import { tildePath } from '@/lib/format';
 import { Card, CodeChip, Row } from './parts';
+import { customized, useCustom } from '@/features/customize/custom-store';
 
 const PLATFORM: Record<string, string> = { win32: 'Windows', darwin: 'macOS', linux: 'Linux' };
 
@@ -18,8 +19,9 @@ export function About() {
   const providers = useStore((s) => s.providers);
   const conn = useStore((s) => s.conn);
   const setUi = useStore((s) => s.setUi);
-  // Whatever agents the bridge reports, Claude Code and Codex first.
-  const agents: ProviderId[] = [...connectableAgents(providers), ...(Object.keys(providers) as ProviderId[]).filter((id) => !connectableAgents(providers).includes(id))];
+  const custom = customized(useCustom());
+  // Whatever agents the bridge reports, Claude Code and Codex first; any other (OpenCode) only where it is installed.
+  const agents: ProviderId[] = [...connectableAgents(providers), ...(Object.keys(providers) as ProviderId[]).filter((id) => !connectableAgents(providers).includes(id) && providers[id]?.installed)];
 
   return (
     <div className="set-stack">
@@ -30,7 +32,10 @@ export function About() {
         <div className="about-veil" />
         <LogoMark size={48} />
         <Wordmark className="about-word" />
-        <span className="about-ver num">Version {version || 'unknown'}</span>
+        <span className="about-ver num">
+          Version {version || 'unknown'}
+          {custom && ' · Customized'}
+        </span>
         <p className="about-line">Claude Code and Codex in one place: every session, step and change in one timeline.</p>
       </div>
 
@@ -90,23 +95,18 @@ export function About() {
   );
 }
 
-/** Updates of the desktop app: where it stands, and the one thing to do next. Where Sable cannot update itself (a dev or standalone run) it says so. */
+/** Updates of the desktop app: where it stands, and the one thing to do next. Hidden where Sable cannot update itself. */
 function Updates() {
   const u = useStore((s) => s.update);
-  if (!u) return null;
-  // A release newer than the running one: said in words, here as well as in the sidebar.
-  const news = u.latest && (u.status === 'downloading' || u.status === 'ready');
+  if (!u || u.status === 'unsupported') return null;
   const value =
-    u.status === 'unsupported' ? (
-      <span className="about-val">Only in the installed app</span>
-    ) : u.status === 'checking' ? (
+    u.status === 'checking' ? (
       <span className="about-val about-upd">
         <Spinner size={13} />
         Checking
       </span>
     ) : u.status === 'downloading' ? (
       <span className="about-val about-upd">
-        {news && <span className="about-upd-new">New update available</span>}
         <span className="num">Downloading {u.latest} · {Math.round((u.progress ?? 0) * 100)}%</span>
         <span className="meter about-upd-meter" aria-hidden>
           <span className="meter-fill" style={{ '--p': u.progress ?? 0 } as React.CSSProperties} />
@@ -114,17 +114,11 @@ function Updates() {
       </span>
     ) : u.status === 'ready' ? (
       u.pending ? (
-        <span className="about-val about-upd">
-          <span className="about-upd-new">New update available</span>
-          <span>Restarts when the agents finish</span>
-        </span>
+        <span className="about-val">Restarts when the agents finish</span>
       ) : (
-        <span className="about-val about-upd">
-          <span className="about-upd-new">New update available</span>
-          <button type="button" className="btn btn-sm btn-primary" onClick={() => void installUpdate()}>
-            Restart to update to {u.latest}
-          </button>
-        </span>
+        <button type="button" className="btn btn-sm btn-primary" onClick={() => void installUpdate()}>
+          Restart to update to {u.latest}
+        </button>
       )
     ) : (
       <span className="about-val about-upd">

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
 import { bootMark } from '../server/util/boot';
 import { fixPathFromLoginShell } from '../server/util/login-env';
+import { pageHeaders as csp } from './csp';
 import { pickFolder, type ShowFolderDialog } from './folder';
 import { windowsThumbs } from './thumbs';
 
@@ -58,6 +59,10 @@ const captureWait = Number(flag('wait') ?? (evalSnippet ? 3000 : 1200));
  * when covered, so frame timings are real even on a machine someone is using.
  */
 const perfRun = process.env.SABLE_PERF === '1';
+/** `--original`: nothing of the person's Customize Sable (their styles, their build) for this run. Shift held at start does the same. */
+const original = process.argv.includes('--original');
+/** How long after the window opens a held Shift still means "Sable's own look for this run". */
+const SHIFT_WINDOW_MS = 4000;
 
 // Everything Sable keeps lives under SABLE_HOME when it is set (verification runs use a temp folder).
 app.setName('Sable');
@@ -601,48 +606,8 @@ function harden() {
   windowCalls();
 }
 
-/**
- * The Content-Security-Policy of every page the app's server sends (passed to startServer, which adds
- * it to each response: set by the server itself, no response waits on this process for its headers).
- */
-function pageHeaders(pathname: string): Record<string, string> {
-  // The page only loads its own code; agent output may show images (data, blob, https) and nothing else.
-  const csp = [
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: https:",
-    "font-src 'self' data:",
-    "media-src 'self' data: blob:",
-    `connect-src 'self' ${appOrigin.replace(/^http/, 'ws')}`,
-    "worker-src 'self' blob:",
-    "object-src 'none'",
-    // The panel browser is a <webview>; its pages run in a separate guest and are not framed by the app.
-    // The only frame the app embeds is its own widget page (generative UI), sandboxed without same-origin.
-    "frame-src 'self'",
-    "base-uri 'none'",
-    "form-action 'none'",
-  ].join('; ');
-  // The widget page runs code an agent wrote: no network of any kind, inline code only, and it can
-  // frame nothing but its own srcdoc child, which inherits this policy.
-  const widgetCsp = [
-    "default-src 'none'",
-    "script-src 'unsafe-inline'",
-    "style-src 'unsafe-inline'",
-    "img-src data: blob:",
-    "font-src data:",
-    "media-src data: blob:",
-    "connect-src 'none'",
-    "frame-src 'none'",
-    "child-src 'none'",
-    "worker-src 'none'",
-    "object-src 'none'",
-    "form-action 'none'",
-    "base-uri 'none'",
-    "manifest-src 'none'",
-  ].join('; ');
-  return { 'content-security-policy': pathname === '/widget-frame.html' ? widgetCsp : csp };
-}
+/** The Content-Security-Policy of every page the app sends (`csp.ts`), for the origin it runs on now. */
+const pageHeaders = (pathname: string) => csp(appOrigin, pathname);
 
 /* ── menu and shortcuts ── */
 
@@ -926,6 +891,28 @@ function keepAwake(s: RunningServer) {
 }
 const PHONE_AWAKE_DELAY_MS = 4000;
 
+/**
+ * Customize Sable (server/services/custom.ts): the window reloads when what it is served changes (the
+ * person's build set aside because it did not start, or switched on or off). Shift held while the
+ * window opens leaves the person's styles and build out for this run, as `--original` does.
+ */
+function customize(s: RunningServer) {
+  s.watchCustom(() => {
+    if (win && !win.isDestroyed()) win.webContents.reload();
+  });
+  const w = win;
+  if (!w || original || screenshotFile) return;
+  const until = Date.now() + SHIFT_WINDOW_MS;
+  const onKey = (_e: Electron.Event, input: Electron.Input) => {
+    if (Date.now() > until) return void w.webContents.off('before-input-event', onKey);
+    if (input.type !== 'keyDown' || input.key !== 'Shift') return;
+    w.webContents.off('before-input-event', onKey);
+    if (s.ignoreCustom()) w.webContents.reload();
+  };
+  w.webContents.on('before-input-event', onKey);
+  setTimeout(() => w.isDestroyed() || w.webContents.off('before-input-event', onKey), SHIFT_WINDOW_MS + 100);
+}
+
 app.on('before-quit', (e) => {
   if (quitting || !server) return;
   e.preventDefault();
@@ -951,7 +938,9 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => app.quit
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_e, argv) => {
+    // Started again with `--original`: the running app leaves the person's changes out from now on.
+    if (argv.includes('--original') && server && server.ignoreCustom() && win && !win.isDestroyed()) win.webContents.reload();
     if (!win || win.isDestroyed()) {
       // A Mac keeps the app running without a window: opening it again brings one back.
       if (server && !quitting) win = createWindow(server.url);
@@ -991,6 +980,9 @@ if (!app.requestSingleInstanceLock()) {
   const serve = () =>
     startServer({
       root: path.join(app.getAppPath(), 'dist'),
+      original,
+      // The Customize chat's reference (CLAUDE.md and the app's CSS), staged by scripts/build-electron.mjs.
+      reference: app.isPackaged ? path.join(process.resourcesPath, 'reference') : path.join(app.getAppPath(), 'dist-resources', 'reference'),
       port: PREFERRED_PORT,
       fallbackToFreePort: true,
       // An installed build updates itself; a build run from a folder (or a test run) does not.
@@ -1023,6 +1015,7 @@ if (!app.requestSingleInstanceLock()) {
     bootMark('main:server');
     openWindow(server.url);
     keepAwake(server);
+    customize(server);
     bootMark('main:awake');
   });
 }

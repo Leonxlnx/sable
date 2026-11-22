@@ -14,7 +14,7 @@ import { DemoProvider } from '../server/providers/demo';
 import { registerFs } from '../server/services/fs';
 import { phoneQuestion, phoneWindow, PAGE_ITEMS, registerPhone, type PhoneService } from '../server/services/phone';
 import type { Link } from '../server/services/phone-secure';
-import { pairSecure } from './phone-wire';
+import { beside, pairSecure } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -72,8 +72,8 @@ describe('a page around a deep search hit (24)', () => {
     registerPhone(app, { port: 0, host: '127.0.0.1' });
     const { port } = await app.call('phone.setEnabled', { on: true });
     const { c } = await pairSecure(app, port);
-    mkdirSync(path.join(home, 'chat'));
-    const created = (await c.call('session.create', { provider: 'demo', cwd: path.join(home, 'chat') })) as { result: PhoneTail };
+
+    const created = (await c.call('session.create', { provider: 'demo', cwd: beside(home, 'chat') })) as { result: PhoneTail };
     const rt = app.sessions.get(created.result.session.id)!;
     rt.load(long(400), [], []);
     const r = (await c.call('phone.tail', { sessionId: rt.id, around: 'a10' })) as { ok: boolean; result: PhoneTail };
@@ -106,8 +106,8 @@ describe('a queued message taken back to the phone (W3-19)', () => {
     const phone = registerPhone(app, { port: 0, host: '127.0.0.1' });
     const { port } = await app.call('phone.setEnabled', { on: true });
     const paired = await pairSecure(app, port);
-    mkdirSync(path.join(home, 'chat'));
-    const created = (await paired.c.call('session.create', { provider: 'demo', cwd: path.join(home, 'chat') })) as { result: PhoneTail };
+
+    const created = (await paired.c.call('session.create', { provider: 'demo', cwd: beside(home, 'chat') })) as { result: PhoneTail };
     const rt = app.sessions.get(created.result.session.id)!;
     return { app, phone: phone as PhoneService, rt, ...paired };
   }

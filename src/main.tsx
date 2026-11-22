@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client';
 import './styles/base.css';
 import './styles/ui.css';
 import { App } from './app/App';
+import { openCustomize } from './features/customize/custom-store';
+import { startCustomLive } from './features/customize/live';
 import { bootMark } from './lib/boot';
 import { bridge } from './lib/bridge';
 import * as actions from './state/actions';
@@ -24,6 +26,8 @@ if (desktop?.platform === 'darwin' && desktop.window) {
 
 startBridge();
 startSpot();
+// The person's own stylesheet swapped live, and `custom.ready` (Customize Sable).
+startCustomLive();
 
 // A hidden document (minimised or fully covered) holds its looping CSS animations still
 // (base.css, :root[data-hidden]). Only hidden, never merely unfocused: a visible window that
@@ -52,6 +56,8 @@ if (import.meta.env.DEV || desktop?.debug) {
       if (session && prompt) await actions.sendMessage(session.id, prompt);
       return session?.id;
     },
+    /** Opens the Customize chat and sends `text` (`provider: 'demo'` for checks without quota). */
+    customize: (text?: string, provider?: 'demo' | 'claude' | 'codex') => openCustomize(text, provider),
   };
 }
 

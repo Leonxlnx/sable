@@ -17,7 +17,7 @@ import { DemoProvider } from '../server/providers/demo';
 import { registerFs } from '../server/services/fs';
 import { phonePermission, phoneQuestion, registerPhone } from '../server/services/phone';
 import { FRAME_MAX } from '../server/services/phone-guard';
-import { helloSecure, pairSecure, wireClient } from './phone-wire';
+import { beside, helloSecure, pairSecure, wireClient } from './phone-wire';
 
 const homes: string[] = [];
 const apps: App[] = [];
@@ -91,7 +91,7 @@ describe('an approval the phone gets shortened', () => {
   it('cannot be allowed from the phone; declined it can, and a whole one is allowed', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const rt = await chatIn(app, c, path.join(home, 'chat'));
+    const rt = await chatIn(app, c, beside(home, 'chat'));
     const asked = rt.requestPermission({ toolName: 'permissions', kind: 'other', title: 'Grant additional permissions?', description: `Write: ${manyFolders}`, detail: {}, options: grantOptions });
     const got = (await c.next((f) => eventOf(f)?.type === 'permission.added')) as { event: { request: PermissionRequest & { incomplete?: boolean } } };
     expect(got.event.request.incomplete).toBe(true);
@@ -157,7 +157,7 @@ describe('a new chat from the phone', () => {
       if (method === 'session.create') seen.push(params);
       return call(method as never, params);
     }) as typeof app.call;
-    const cwd = path.join(home, 'chat');
+    const cwd = beside(home, 'chat');
     mkdirSync(cwd, { recursive: true });
     const r = (await c.call('session.create', {
       provider: 'demo',
@@ -209,7 +209,7 @@ describe('questions on the phone', () => {
   it('are answered by id into the original keys; incomplete or lossy answers are refused', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const rt = await chatIn(app, c, path.join(home, 'chat'));
+    const rt = await chatIn(app, c, beside(home, 'chat'));
     const asked = rt.ask(questions());
     const got = (await c.next((f) => eventOf(f)?.type === 'question.added')) as { event: { request: ReturnType<typeof phoneQuestion> } };
     const req = got.event.request;
@@ -234,7 +234,7 @@ describe('questions on the phone', () => {
   it('the old shape still answers a question the phone got whole; skipping still works', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const rt = await chatIn(app, c, path.join(home, 'chat'));
+    const rt = await chatIn(app, c, beside(home, 'chat'));
     const asked = rt.ask([{ question: 'Ship it today?', options: [{ label: 'Yes' }, { label: 'No' }] }]);
     const got = (await c.next((f) => eventOf(f)?.type === 'question.added')) as { event: { request: { id: string } } };
     expect((await c.call('question.respond', { sessionId: rt.id, requestId: got.event.request.id, answers: { 'Something else?': ['Yes'] } })).ok).toBe(false);
@@ -250,7 +250,7 @@ describe('questions on the phone', () => {
   it('an incomplete questionnaire cannot be answered from the phone', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const rt = await chatIn(app, c, path.join(home, 'chat'));
+    const rt = await chatIn(app, c, beside(home, 'chat'));
     void rt.ask(Array.from({ length: 13 }, (_, i) => ({ question: `Question ${i}?`, options: [{ label: 'Yes' }] })));
     const got = (await c.next((f) => eventOf(f)?.type === 'question.added')) as { event: { request: ReturnType<typeof phoneQuestion> } };
     expect(got.event.request.incomplete).toBe(true);
@@ -282,7 +282,7 @@ describe('the frame budget', () => {
   it('an event too big for the phone becomes phone.stale for its chat, so the phone fetches it', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const rt = await chatIn(app, c, path.join(home, 'chat'));
+    const rt = await chatIn(app, c, beside(home, 'chat'));
     app.emit({ type: 'todos.updated', sessionId: rt.id, todos: [{ content: 'x'.repeat(FRAME_MAX.event + 100), status: 'pending' }] });
     const stale = await c.next((f) => eventOf(f)?.type === 'phone.stale');
     expect(eventOf(stale)).toEqual({ type: 'phone.stale', sessionId: rt.id, of: 'todos.updated' });
@@ -297,7 +297,7 @@ describe('the frame budget', () => {
   it('queue.take removes nothing when its reply cannot go to the phone', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
-    const rt = await chatIn(app, c, path.join(home, 'chat'));
+    const rt = await chatIn(app, c, beside(home, 'chat'));
     // Under the result budget in characters, over it in bytes.
     const q = rt.enqueue('漢'.repeat(Math.ceil(FRAME_MAX.result / 2.9)));
     const r = await c.call('queue.take', { sessionId: rt.id, id: q.id }, 15_000);

@@ -42,6 +42,12 @@ export interface ProviderInfo {
    * config.toml), each once. Shown as a quiet line in Settings › Agents, never in a conversation.
    */
   warnings?: { text: string; detail?: string }[];
+  /**
+   * Where a limit reset of this agent's own is used when Sable cannot spend it: `console`, Sable
+   * opens the agent in a console window straight into its reset dialog (`limit.resetInAgent`);
+   * `terminal`, the person runs `command` in a terminal. Absent: neither.
+   */
+  limitReset?: { via: 'console' | 'terminal'; command: string };
 }
 
 /** The id of the account every provider always has: the CLI's own config (~/.claude, ~/.codex). */
@@ -65,6 +71,8 @@ export interface AccountInfo {
   problem?: string;
   /** A folder the user already had ("Use an existing folder"): removing the account forgets it, never deletes it. */
   external?: boolean;
+  /** This account's own terminal command for the agent's reset dialog (`ProviderInfo.limitReset` via `terminal`). */
+  resetCommand?: string;
 }
 
 /** A config folder under the home folder that looks like an agent's own, offered by "Use an existing folder". */
@@ -443,6 +451,22 @@ export interface SessionMeta {
   agents?: AgentLeg[];
   /** The next message goes out with a handover of the conversation (after a switch of agent); null once sent. */
   agentHandover?: AgentHandover | null;
+  /**
+   * The chat moved to another account at `line` (its switch line): the next message the person sends
+   * carries a short note for the agent (`server/core/move-context.ts` `moveNote`); null once sent.
+   */
+  moveNote?: {
+    line: string;
+    /**
+     * The move could not carry the conversation: the next message also starts with a summary of the
+     * chat before this item (kept here, not in memory, so a restart or a send that never reached the
+     * agent does not lose it), leaving out `skip` (the refused message, which goes again itself).
+     */
+    summary?: string;
+    skip?: string;
+  } | null;
+  /** The Customize chat (`custom.open`): its agent gets the brief about changing Sable itself (`server/services/custom.ts`). */
+  custom?: boolean;
 }
 
 /**
@@ -1198,6 +1222,19 @@ export interface ResetOffer {
   paused?: boolean;
 }
 
+/**
+ * A reset used in the agent's own dialog (`limit.resetInAgent`), one per account at a time: `open`
+ * while its console window is open, `reading` while the limits are read again after it closed,
+ * then what that showed: `cleared` (the windows, by label, that were full and are not now),
+ * `unchanged` (nothing that was full has room), or `failed` (the window could not be opened).
+ */
+export interface ResetRun {
+  state: 'open' | 'reading' | 'cleared' | 'unchanged' | 'failed';
+  startedAt: number;
+  cleared?: string[];
+  message?: string;
+}
+
 /** What spending a reset credit did (Codex's `account/rateLimitResetCredit/consume` outcomes). */
 export type ResetOutcome = 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed';
 
@@ -1454,6 +1491,8 @@ export interface AppSettings {
    * session moves between turns to the next signed-in account of its agent that is under its own cap.
    */
   accountCaps?: Record<string, AccountCap>;
+  /** The person's own stylesheet (`<data>/custom/styles.css`) is applied over the app. Absent means on (when the file exists). */
+  customStyles?: boolean;
 }
 
 /** One permission rule set from an agent's settings file (read-only view). */
@@ -1518,8 +1557,18 @@ export interface GitPullContext {
   base?: string;
   /** Whether a remote named origin exists. */
   remote: boolean;
-  /** Subjects of the commits the base does not have, oldest first. */
+  /** Every address `git push origin` sends to, as git resolves them, without any user name or token. */
+  pushUrls?: string[];
+  /** A fingerprint of those addresses, sent back with the click: the push goes there or not at all. */
+  destination?: string;
+  /** The commit the push sends (HEAD when the dialog opened, in full). */
+  head?: string;
+  /** The GitHub repository gh opens the pull request in (`owner/name`), when gh could say. */
+  repo?: string;
+  /** Subjects of the commits the base does not have, oldest first (the first 50). */
   commits: string[];
+  /** How many commits the push brings. */
+  commitCount?: number;
   title: string;
   body: string;
 }
@@ -1530,6 +1579,8 @@ export interface GitPullRequestResult {
   url?: string;
   number?: number;
   error?: string;
+  /** The branch, its commit or the push addresses changed since the dialog read them: nothing was pushed. */
+  stale?: boolean;
 }
 
 export interface AppState {
@@ -1612,6 +1663,8 @@ export type BridgeEvent =
   /** A full window of an account reset (with `notifyLimitReset` on). */
   | { type: 'update.state'; state: UpdateState }
   | { type: 'limit.reset'; provider: ProviderId; accountId?: string; window: string; at: number }
+  /** A reset used in the agent's own dialog moved on (`ResetRun`); `run` null: nothing is under way or to show. */
+  | { type: 'limit.resetRun'; provider: ProviderId; accountId?: string; run: ResetRun | null }
   /** Local usage changed (a scan finished). */
   | { type: 'usage.updated'; report: UsageReport }
   /** Fresh capabilities for the home composer (after a cached answer was served first). */
@@ -1629,6 +1682,8 @@ export type BridgeEvent =
   | { type: 'profile.updated'; profile: UserProfile }
   /** The saved prompts changed (all of them, in order). */
   | { type: 'prompts.updated'; prompts: SavedPrompt[] }
+  /** Customize Sable changed: the person's styles (a new `styles.rev`: the page reloads the sheet), the build's state or work. */
+  | { type: 'custom.updated'; state: CustomState }
   /** A turn's before / after pictures of a local page were taken or changed state (server/services/capture.ts). */
   | { type: 'capture.updated'; sessionId: string; capture: TurnCapture };
 
@@ -2211,10 +2266,12 @@ export interface RpcMethods {
    * Moves an idle session to another account of its agent. The same conversation continues when the
    * agent's transcript can be carried over (`carried: 'conversation'`); otherwise a new one starts with a
    * short handover of this one (`'summary'`). `retry` sends the message a limit refused again.
+   * A big chat whose account can still run a turn compacts there first: then the answer comes as
+   * the compaction starts (`compacting`), and the move follows when it ends, said in the chat.
    */
   'session.switchAccount': {
     params: { sessionId: string; accountId: string; retry?: boolean };
-    result: { ok: boolean; carried: 'conversation' | 'summary' | 'none'; message?: string };
+    result: { ok: boolean; carried: 'conversation' | 'summary' | 'none'; message?: string; compacting?: boolean };
   };
 
   /** Models, modes, commands… for a provider before any session exists. */
@@ -2227,6 +2284,15 @@ export interface RpcMethods {
    * limits again. `key` identifies one attempt: the same key on a retry never spends a second one.
    */
   'provider.useReset': { params: { provider: ProviderId; accountId?: string; key: string }; result: { outcome: ResetOutcome } };
+  /**
+   * Opens the account's own agent in a console window, straight into its reset dialog, where the
+   * person reads what a reset clears and confirms (Sable types nothing there and spends nothing).
+   * When the window closes the limits are read again and chats waiting on a window that cleared go
+   * on. Progress comes as `limit.resetRun`. One at a time per account; refused while nothing is at a limit.
+   */
+  'limit.resetInAgent': { params: { provider: ProviderId; accountId?: string }; result: { ok: boolean; error?: string } };
+  /** Closes that console window (the limits are still read again, in case the reset went through). */
+  'limit.resetCancel': { params: { provider: ProviderId; accountId?: string }; result: { ok: boolean } };
   /**
    * Starts the agent process for the session about to be created from the home composer (no
    * prompt is sent). `session.create` with the same choice adopts it. At most one is kept.
@@ -2448,11 +2514,15 @@ export interface RpcMethods {
   /** Stages everything (`git add -A`) and commits it with `message`. */
   'git.commit': { params: { cwd: string; message: string }; result: GitCommitResult };
   /** A commit message written by a small model from the folder's changes. Stages and commits nothing. */
-  'git.draft': { params: { cwd: string }; result: { ok: boolean; message?: string; error?: string } };
+  /** On the person's click: one small request to the chat's own agent and account (as chat titles). */
+  'git.draft': { params: { sessionId: string; cwd: string }; result: { ok: boolean; message?: string; error?: string } };
   /** The branch, its base and a draft title and description for a pull request. Pushes nothing. */
   'pulls.context': { params: { cwd: string }; result: GitPullContext };
   /** Pushes the branch to origin, then opens a pull request for it with gh. */
-  'pulls.create': { params: { cwd: string; title: string; body: string; base: string; draft: boolean }; result: GitPullRequestResult };
+  'pulls.create': {
+    params: { cwd: string; title: string; body: string; base: string; draft: boolean; branch?: string; head?: string; destination?: string; repo?: string };
+    result: GitPullRequestResult;
+  };
 
   /** The agent's own settings files (permission rules, hooks), read-only and without secrets. */
   'config.read': { params: { provider: ProviderId; cwd?: string }; result: AgentConfigFile[] };
@@ -2524,6 +2594,83 @@ export interface RpcMethods {
   'prompts.remove': { params: { id: string }; result: { ok: boolean } };
   /** The prompts in this order (ids; any not named keep their place after them). */
   'prompts.reorder': { params: { ids: string[] }; result: SavedPrompt[] };
+  /** Customize Sable (`server/services/custom.ts`): the person's own styles and build, as they stand. Changes are pushed as `custom.updated`. */
+  'custom.state': { params: Record<string, never>; result: CustomState };
+  /**
+   * The Customize chat (one, kept, in `<data>/custom`), made with the person's default agent when there
+   * is none; `text`, when given, is sent to it. Answers its snapshot (open it like any chat).
+   */
+  'custom.open': { params: { text?: string; provider?: ProviderId }; result: SessionSnapshot };
+  /** "Use Sable's own look": the person's styles and build both off, at once. */
+  'custom.original': { params: Record<string, never>; result: CustomState };
+  /** The page served from a custom build started (it calls this within `CUSTOM_READY_MS` or the build is set aside). */
+  'custom.ready': { params: Record<string, never>; result: { ok: boolean } };
+  /**
+   * Your build, each a click of the person's (a phone or an agent never gets these): `setup` clones the
+   * public repository at the running version and installs; `build` builds the workspace and, with `use`,
+   * switches to it; `use` switches a finished build on or off; `bring` brings the changes to the running
+   * version (rebase, install, build, switch). Progress arrives as `custom.updated`. Not in this version:
+   * each answers that it is not available (`BUILD_SHIPS` in `server/services/custom.ts`).
+   */
+  'custom.setup': { params: Record<string, never>; result: CustomState };
+  'custom.build': { params: { use?: boolean }; result: CustomState };
+  'custom.use': { params: { on: boolean }; result: CustomState };
+  'custom.bring': { params: Record<string, never>; result: CustomState & { conflict?: string[] } };
+}
+
+/** How long a custom interface has to call `custom.ready` after its page was served. */
+export const CUSTOM_READY_MS = 15_000;
+
+/** The person's own stylesheet (`<data>/custom/styles.css`), as the bridge serves it at `/custom/styles.css`. */
+export interface CustomStyles {
+  exists: boolean;
+  /** `AppSettings.customStyles` (absent means on). */
+  on: boolean;
+  /** Changes with every change of the file that is served (the page reloads the sheet with it). */
+  rev: number;
+  size: number;
+  /** When the file last changed (ms). */
+  changedAt?: number;
+  /** The file asks for something from the internet (a remote `url()` or `@import`): it is not applied, and this says what. */
+  blocked?: string;
+}
+
+/** The person's own build of the interface (`<data>/custom/src`). */
+export interface CustomBuild {
+  /** This bridge can serve a custom interface (the desktop app; not the dev server). */
+  supported: boolean;
+  /** The workspace (a clone of the public repository on a branch `mine`) exists. */
+  workspace: boolean;
+  /** The person switched it on. */
+  active: boolean;
+  /** It is what windows get now (on, built for this version, not set aside, not ignored for this run). */
+  serving: boolean;
+  /** The version its last build was made for, and when. */
+  builtFor?: string;
+  builtAt?: number;
+  /** The last start of it failed and Sable's own interface took over. */
+  failed?: { at: number; reason: string };
+  /** Work under way. */
+  step?: 'checking' | 'cloning' | 'installing' | 'building' | 'rebasing';
+  /** The last step that went wrong, in one line. */
+  error?: string;
+  /** What the machine lacks to set up a build, with the command that installs it. */
+  missing?: string;
+  /** When the workspace's source last changed (an agent edited it): newer than `builtAt` means there is something to build. */
+  changedAt?: number;
+}
+
+export interface CustomState {
+  /** `<data>/custom`: the Customize chat's folder. */
+  dir: string;
+  /** The running version. */
+  version: string;
+  /** Started with `--original` (or Shift held): nothing of the person's is applied this run. */
+  ignored: boolean;
+  /** The Customize chat, when there is one. */
+  sessionId?: string;
+  styles: CustomStyles;
+  build: CustomBuild;
 }
 
 /** A prompt saved under a name: put into the composer from the palette or the `/` menu, never sent by itself. */

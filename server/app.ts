@@ -9,6 +9,7 @@ import {
   type AgentHandover,
   type UpdateState,
   type AccountInfo,
+  type AuthState,
   type AppState,
   type BridgeEvent,
   type Capabilities,
@@ -41,7 +42,8 @@ import { capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, ne
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
 import { speedFor, startSpeedFor } from '../shared/speed';
 import type { Provider, ProviderContext, ProviderSession } from './providers/types';
-import { findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
+import { atCap, findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
+import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, moveNote, type MoveOutcome } from './core/move-context';
 import { handoverText } from './accounts/handover';
 import { backgroundRunning, itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
 import { runSubAgent } from './core/sub-agent';
@@ -49,13 +51,18 @@ import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
 import { cutAt } from './core/fork';
 import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
-import { withBrowserLine } from './providers/browser-tool';
+import { allowsEverything, withBrowserLine } from './providers/browser-tool';
 import { profileOf } from './services/profile';
+import { CUSTOM_AGENT_ONLY, customAgent, customOf } from './services/custom';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
 import { Lanes, worktreesRoot } from './core/lanes';
 import { isAllModelsWeekly } from './core/limit-policy';
+import { windowForModel, windowModel } from '../shared/limit-windows';
+import { mergeWindows } from './services/limits';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
+import { ResetConsoles } from './core/reset-console';
+import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
 
@@ -98,9 +105,32 @@ export interface AppOptions {
   userHome?: string;
   /** How long a sign-in may wait for the browser before it is given up (tests shorten it). */
   loginTimeoutMs?: number;
+  /** Opens a console window (`limit.resetInAgent`); tests pass one that opens nothing. Default: a real window, Windows only. */
+  openConsole?: OpenConsole;
+  /** How long after a first read that showed no change a reset's limits are read once more (tests shorten it). */
+  resetSettleMs?: number;
+  /** How long a compaction before a move to another account may take (tests shorten it). */
+  compactTimeoutMs?: number;
 }
 
 export { VERSION };
+
+/** How long an agent asked to stop a compaction that took too long has to say it stopped. */
+const COMPACT_STOP_GRACE_MS = 5000;
+/** How long the agent of the account a chat leaves has to close before the move goes on without its transcript. */
+const MOVE_CLOSE_MS = 10_000;
+
+/** How a reset in the agent's own dialog is offered: a console window Sable opens, or a command for a terminal. */
+const limitResetVia = (consoles: boolean, p: Provider): NonNullable<ProviderInfo['limitReset']> | undefined => {
+  const line = p.limitResetCommand?.().line;
+  return line ? { via: consoles ? 'console' : 'terminal', command: line } : undefined;
+};
+
+/** An account's own terminal command for its reset dialog: its config folder in it, never another account's (review wave 8, #19). */
+const resetCommandOf = (p: Provider): { resetCommand?: string } => {
+  const line = p.limitResetCommand?.().line;
+  return line ? { resetCommand: line } : {};
+};
 
 /** The label of each provider's built-in account until the user renames it. */
 export const DEFAULT_ACCOUNT_LABEL = 'Main';
@@ -120,6 +150,10 @@ export class App {
   /** Last known sign-in per extra account (the default account asks its provider every time, as before). */
   private infoCache = new Map<string, Promise<ProviderInfo>>();
   private limitsCache = new Map<string, RateLimit[]>();
+  /** Accounts whose last limits event named only some windows (`LimitsMeta.partial`): their cache lays over what the usage service knows. */
+  private limitsPartial = new Set<string>();
+  /** Called when an account's old limits are no longer its own (its sign-in changed): the usage service forgets them. */
+  private limitsForgetters: ((provider: ProviderId, accountId: string) => void)[] = [];
   /** What each account's agent last said beside its windows (credits, extra usage), merged. */
   private limitsMeta = new Map<string, LimitsMeta>();
   /** Per agent: the limit handover moved sessions off the preferred account; new sessions use `to` until `until`. */
@@ -144,6 +178,12 @@ export class App {
   private hidden: SessionMeta[] = [];
   private userHome: string;
   private loginTimeoutMs: number;
+  private compactTimeoutMs: number;
+  /** Chats compacting on the account they leave, before a move: their compaction turn ends here, not in `afterTurn`. */
+  private compacting = new Map<string, (error?: string) => void>();
+  /** Chats moving to another account right now: a message sent meanwhile waits in the queue (`queuedWhileMoving`). */
+  private moving = new Set<string>();
+  private queuedWhileMoving = new Set<string>();
   /** Sign-ins given up after `loginTimeoutMs`; the rejection that follows is not an error. */
   private loginTimedOut = new Set<string>();
   /**
@@ -207,7 +247,7 @@ export class App {
       const accountId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
       const cap = this.capOf(rt.meta.provider, accountId);
       if (!cap) return undefined;
-      const reached = capReached((await this.knownLimits(rt.meta.provider)).get(accountId)?.limits, cap, rt.meta.model || undefined);
+      const reached = capReached((await this.knownLimits(rt.meta.provider)).get(accountId)?.limits, cap, this.chatModel(rt));
       return reached ? capReason(this.accountLabel(rt.meta.provider, accountId), reached) : undefined;
     },
     accountLabel: (rt) => this.accountLabel(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT),
@@ -222,7 +262,7 @@ export class App {
     sessions: () => this.sessions.values(),
     hydrate: (rt) => this.hydrate(rt),
     busy: (rt) => rt.turnActive || this.opening.has(rt.id) || this.delivering.has(rt.id),
-    model: (rt) => effectiveModel(rt.meta.model, (rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd)))?.models, this.store.state.settings.defaultModels[rt.meta.provider]),
+    model: (rt) => this.chatModel(rt),
     accounts: (provider) => this.spareAccounts(provider),
     refresh: async (provider, accountId) => {
       const key = accountKey(provider, accountId);
@@ -320,11 +360,38 @@ export class App {
     log: (...args) => this.log(...args),
   });
 
+  /** Limit resets used in the agent's own dialog, in a console window (server/core/reset-console.ts). */
+  private resets: ResetConsoles;
+  /** False where Sable cannot open a console window: the person runs the reset command in a terminal. */
+  private consoles: boolean;
+
   constructor(opts: AppOptions) {
+    this.consoles = !!opts.openConsole || process.platform === 'win32';
+    this.resets = new ResetConsoles({
+      open: opts.openConsole ?? realConsole,
+      command: (provider, accountId) => this.provider(provider, accountId).limitResetCommand?.(),
+      cwd: () => {
+        // A neutral folder of Sable's own, never a project.
+        const dir = path.join(this.store.dir, 'limit-reset');
+        mkdirSync(dir, { recursive: true });
+        return dir;
+      },
+      title: (provider, accountId) => {
+        const name = this.accountList(provider).length > 1 ? this.accountLabel(provider, accountId).replace(/["%^&|<>\r\n]/g, '').trim() : '';
+        return `${this.provider(provider, accountId).name} reset${name ? ` (${name})` : ''}`;
+      },
+      known: (provider, accountId) => ({ limits: this.limitsCache.get(accountKey(provider, accountId)), signIn: this.signInGen.get(accountKey(provider, accountId)) ?? 0 }),
+      read: (provider, accountId) => this.readLimits(provider, accountId, 'fresh'),
+      cleared: (provider, accountId, windows) => this.limitsCleared(provider, accountId, windows),
+      emit: (provider, accountId, run) => this.emit({ type: 'limit.resetRun', provider, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, run }),
+      log: (...args) => this.log(...args),
+      ...(opts.resetSettleMs !== undefined ? { settleMs: opts.resetSettleMs } : {}),
+    });
     this.quiet = !!opts.quiet;
     this.delays = opts.refreshDelays ?? {};
     this.userHome = opts.userHome ?? homedir();
     this.loginTimeoutMs = opts.loginTimeoutMs ?? LOGIN_TIMEOUT_MS;
+    this.compactTimeoutMs = opts.compactTimeoutMs ?? COMPACT_TIMEOUT_MS;
     this.store = new Store(opts.home);
     this.cache = new DiskCache(this.store.dir);
     bootMark('app:store');
@@ -344,6 +411,8 @@ export class App {
       // Remote links and live capability state belong to the agent process that is gone.
       meta.remote = meta.options?.remoteControl ? { status: 'Reconnects when the agent starts again', tone: 'waiting' } : undefined;
       meta.capState = undefined;
+      // Background work lived in the agent process that is gone (its steps are stopped as the chat is read: `loadRestored`).
+      meta.background = undefined;
       // An until loop does not outlive Sable: the session says so when it is opened.
       if (meta.until) this.untilLost.set(meta.id, meta.until), (meta.until = undefined);
       // A chat titled from a message the agent's harness wrote (`<task-notification>`): its plain words.
@@ -411,6 +480,7 @@ export class App {
       settings: () => this.store.state.settings,
       otherAgents: () => this.otherAgents(),
       profile: () => profileOf(this),
+      customBrief: () => customOf(this).brief(),
       runAgent: (rt, call, itemId, signal) => {
         if (this.sessions.get(rt.id) !== rt) return Promise.resolve({ ok: false, text: 'No session is attached yet.' });
         return runSubAgent(
@@ -454,23 +524,22 @@ export class App {
   }
 
   /**
-   * A commit message for a folder's changes, written by Claude Code's Haiku on the default account.
-   * Nothing is staged or committed: the person reads it and commits.
+   * A commit message for a chat's changes, written by its own agent's smallest model on the chat's
+   * own account, as chat titles are (`titleModel`: Claude Code's Haiku, Codex's smallest model; never
+   * another agent's or account's). Only on the person's click. Nothing is staged or committed: the
+   * person reads it and commits.
    */
-  private async draftCommit(cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+  private async draftCommit(sessionId: string, cwd: string): Promise<{ ok: boolean; message?: string; error?: string }> {
+    const rt = this.runtime(sessionId);
+    const owner = { provider: rt.meta.provider, accountId: rt.meta.accountId ?? DEFAULT_ACCOUNT };
+    const model = this.titleModel(owner);
+    if (!model) return { ok: false, error: `${this.agentName(owner.provider)} cannot write a commit message. Write one yourself.` };
     const input = await gitDraftInput(cwd);
     if ('error' in input) return { ok: false, error: input.error };
-    let model: Provider;
-    try {
-      model = this.provider('claude', this.defaultAccountId('claude'));
-    } catch {
-      return { ok: false, error: 'Claude Code is not set up, so no message can be written.' };
-    }
-    if (!model.quickTitle) return { ok: false, error: 'Claude Code is not set up, so no message can be written.' };
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 60_000);
     try {
-      const message = cleanCommit(await model.quickTitle(commitPrompt(input, path.resolve(cwd)), ctrl.signal));
+      const message = cleanCommit(await model(commitPrompt(input, path.resolve(cwd)), ctrl.signal));
       return message ? { ok: true, message } : { ok: false, error: 'The model gave no message. Write one yourself.' };
     } catch (err) {
       return { ok: false, error: (err as Error).message || 'The message could not be written.' };
@@ -493,6 +562,8 @@ export class App {
       case 'limits.updated': {
         const key = accountKey(e.provider, accountId);
         this.limitsCache.set(key, e.limits);
+        if (e.meta?.partial) this.limitsPartial.add(key);
+        else this.limitsPartial.delete(key);
         if (e.meta) this.limitsMeta.set(key, { ...this.limitsMeta.get(key), ...e.meta });
         this.limitsSeq.set(key, (this.limitsSeq.get(key) ?? 0) + 1);
         this.scheduleResetAlert();
@@ -576,6 +647,31 @@ export class App {
     this.resetTimer.unref?.();
   }
 
+  /**
+   * An account's full windows cleared before their time (a reset used in the agent's own dialog, as
+   * a fresh read showed): what waits for its reset goes on as at a reset by time: chats waiting to
+   * continue there, and new chats return to it when it is the preferred one.
+   */
+  private limitsCleared(provider: ProviderId, accountId: string, windows: RateLimit[]) {
+    // Chats that waited go on only where every window holding their model has room now (the planner
+    // checks the fresh reading); the windows that cleared say whose wait this was.
+    this.spare.resetCleared(provider, accountId, windows);
+    const fb = this.fallbacks.get(provider);
+    const now = Date.now();
+    if (fb && fb.from === accountId && fb.until && fb.until > now) {
+      // New chats return only once no window that holds the agent's default model stays full: a
+      // weekly window still full keeps them away until its own reset (review wave 8, #18).
+      const model = effectiveModel(undefined, this.cache.get<Capabilities>(capsCacheKey(provider, accountId))?.models, this.store.state.settings.defaultModels[provider]);
+      const still = (this.limitsCache.get(accountKey(provider, accountId)) ?? []).filter(
+        (l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now) && (!windowModel(l) || !model || windowForModel(l, model)),
+      );
+      if (!still.length) fb.until = now;
+      else if (still.every((l) => l.resetsAt)) fb.until = Math.max(...still.map((l) => l.resetsAt!));
+      void this.emitProvider(provider).catch(() => {});
+    }
+    this.scheduleResetAlert();
+  }
+
   private onResetDue() {
     const now = Date.now();
     const due = dueResets(this.capped(), this.resetCheckedAt, now);
@@ -601,25 +697,97 @@ export class App {
     const p = this.provider(provider);
     const base = await p.info(force === DEFAULT_ACCOUNT).catch(() => fallbackInfo(p));
     const defaultId = this.defaultAccountId(provider);
-    const accounts = await Promise.all(
-      this.accountList(provider).map(async (a): Promise<AccountInfo> => {
+    const signIns = await Promise.all(
+      this.accountList(provider).map(async (a) => {
         const own = a.id === DEFAULT_ACCOUNT;
         // A missing CLI has no accounts to ask about.
         const info = own ? base : base.installed ? await this.accountAuth(provider, a.id, force === a.id) : undefined;
-        return {
-          id: a.id,
-          provider,
-          label: a.label,
-          isDefault: a.id === defaultId,
-          auth: info?.auth ?? { loggedIn: false },
-          limits: this.limitsCache.get(accountKey(provider, a.id)),
-          dir: own ? undefined : this.accountDir(provider, a.id),
-          problem: own ? undefined : info?.problem,
-          ...(a.dir ? { external: true } : {}),
-        };
+        return { a, own, info, auth: info?.auth ?? { loggedIn: false } };
       }),
     );
-    return { ...base, accounts };
+    // The sign-ins first: one that changed forgets the old person's limits before any snapshot copies
+    // them (review wave 8, #26).
+    this.noteSignIns(
+      provider,
+      signIns.map((s) => ({ id: s.a.id, auth: s.auth })),
+    );
+    const accounts = signIns.map(
+      ({ a, own, info, auth }): AccountInfo => ({
+        id: a.id,
+        provider,
+        label: a.label,
+        isDefault: a.id === defaultId,
+        auth,
+        limits: this.limitsCache.get(accountKey(provider, a.id)),
+        dir: own ? undefined : this.accountDir(provider, a.id),
+        problem: own ? undefined : info?.problem,
+        ...(a.dir ? { external: true } : {}),
+        ...resetCommandOf(this.provider(provider, a.id)),
+      }),
+    );
+    const limitReset = limitResetVia(this.consoles, this.provider(provider));
+    return { ...base, accounts, ...(limitReset ? { limitReset } : {}) };
+  }
+
+  /**
+   * The sign-in each account's limits were read under. One that changed (another person, a
+   * subscription replaced by an API key) makes the old reading another account's: it is forgotten
+   * (review wave 7, #3).
+   */
+  private noteSignIns(provider: ProviderId, accounts: Pick<AccountInfo, 'id' | 'auth'>[]) {
+    for (const a of accounts) {
+      if (!a.auth.loggedIn) continue;
+      const now = signInOf(a.auth);
+      const key = `signin:${accountKey(provider, a.id)}`;
+      const was = this.cache.get<SignIn>(key);
+      if (was && was.apiKey === now.apiKey && (was.email ?? '') === (now.email ?? was.email ?? '')) continue;
+      // The same sign-in told with its address now: kept, nothing forgotten.
+      this.cache.set(key, { ...now, email: now.email ?? was?.email });
+      if (was && (was.apiKey !== now.apiKey || (!!was.email && !!now.email && was.email !== now.email))) this.forgetLimits(provider, a.id);
+    }
+  }
+
+  private forgetLimits(provider: ProviderId, accountId: string) {
+    const key = accountKey(provider, accountId);
+    this.limitsCache.delete(key);
+    this.limitsPartial.delete(key);
+    this.limitsMeta.delete(key);
+    // When: a reading older than this (a transcript's snapshot, a reset's "before") is the old person's.
+    this.cache.set(`limits-forgotten:${key}`, Date.now());
+    this.signInGen.set(key, (this.signInGen.get(key) ?? 0) + 1);
+    for (const fn of this.limitsForgetters) fn(provider, accountId);
+  }
+
+  /**
+   * Reads an account's limits from its agent. `fresh`: the agent itself announced a reading while
+   * this one ran (a throttled or refused read hands back the last known rows and says nothing).
+   * `force: 'fresh'` goes past the agent's own throttles (a reset's reading after its dialog).
+   */
+  private async readLimits(provider: ProviderId, accountId: string, force: boolean | 'fresh'): Promise<{ limits: RateLimit[]; fresh: boolean; signIn: number }> {
+    const key = accountKey(provider, accountId);
+    const seq = this.limitsSeq.get(key) ?? 0;
+    const signIn = this.signInGen.get(key) ?? 0;
+    const limits = await this.provider(provider, accountId).limits(force);
+    const fresh = (this.limitsSeq.get(key) ?? 0) > seq;
+    // A sign-in that changed meanwhile: this reading may be the previous person's; it is not kept.
+    if ((this.signInGen.get(key) ?? 0) !== signIn) return { limits: this.limitsCache.get(key) ?? [], fresh: false, signIn: this.signInGen.get(key) ?? 0 };
+    this.limitsCache.set(key, limits);
+    // A provider that read them announced it already (with what it knows about the read).
+    if (!fresh) this.emit({ type: 'limits.updated', provider, accountId, limits });
+    return { limits, fresh, signIn };
+  }
+
+  /** When an account's limits were last forgotten for a changed sign-in (0: never). */
+  limitsForgottenAt(provider: ProviderId, accountId: string): number {
+    return this.cache.get<number>(`limits-forgotten:${accountKey(provider, accountId)}`) ?? 0;
+  }
+
+  /** Counts the sign-in changes of each account in this run (a reset's reading before and after must share one). */
+  private signInGen = new Map<string, number>();
+
+  /** The usage service forgets an account's limits when they are no longer its own (`noteSignIns`). */
+  onLimitsForgotten(fn: (provider: ProviderId, accountId: string) => void) {
+    this.limitsForgetters.push(fn);
   }
 
   private async emitProvider(provider: ProviderId, force?: string) {
@@ -665,6 +833,7 @@ export class App {
         dir: a.id === DEFAULT_ACCOUNT ? undefined : this.accountDir(provider, a.id),
         problem: prev?.problem,
         ...(a.dir ? { external: true } : {}),
+        ...resetCommandOf(this.provider(provider, a.id)),
       };
     });
     // Setup warnings belong to the run that saw them: the fresh read brings this run's.
@@ -815,6 +984,8 @@ export class App {
       }, 0);
     };
     rt.onTurnStart = (r) => {
+      // A compaction before a move is no round of an until loop, nor a turn Spare started.
+      if (this.compacting.has(r.id)) return;
       this.until.turnStarted(r);
       this.spare.turnStarted(r);
     };
@@ -849,13 +1020,12 @@ export class App {
   }
 
   private loadInto(rt: SessionRuntime, file: ReturnType<Store['loadSession']>) {
-    rt.load(file.items, file.todos, file.queue ?? []);
-    rt.markSaved();
+    // No agent process carries anything from before: background sub-agents and workflows ended with it
+    // (stopped as read, so the count never shows them, also not on the way).
+    rt.loadRestored(file.items, file.todos, file.queue ?? []);
     // A file that is there but cannot be read is left exactly as it is (nothing is written to it).
     if (file.unreadable) rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Restart Sable to try again.');
     rt.settle('cancelled');
-    // No agent process carries anything from before: background sub-agents and workflows ended with it.
-    rt.stopBackground();
     // Messages still waiting for the agent when Sable closed (a steer not taken yet) would wait forever: back to the queue.
     rt.returnUntaken({ all: true, reason: 'closed' });
     const lost = this.untilLost.get(rt.id);
@@ -870,9 +1040,26 @@ export class App {
     // Past its account's cap, the session moves to the next account before the message goes out.
     // The first message names the session's lane, or moves it into one when its folder got busy.
     // A caller that may no longer act (a phone removed meanwhile) is asked again after every wait.
+    // Moving to another account (compacting first): the message waits in the queue and goes there.
+    if (this.moving.has(rt.id)) {
+      const q = rt.enqueue(text, attachments);
+      // Its sender's guard goes along: a phone removed meanwhile never has it sent (review wave 8, #21).
+      if (ctx?.allowed) this.queueGuards.set(q.id, ctx);
+      this.queuedWhileMoving.add(rt.id);
+      return;
+    }
     if (!extra?.until && !rt.items.some((i) => i.type === 'user')) await this.lanes.beforeFirstSend(rt, text);
     still(ctx);
-    if (!rt.turnActive && !this.opening.has(rt.id)) await this.checkCap(rt);
+    if (!rt.turnActive && !this.opening.has(rt.id)) {
+      const stops = this.stopsOf(rt);
+      await this.checkCap(rt);
+      // Stopped (or closed) while the cap check moved the chat (compacting first): the message starts
+      // no turn after the Stop; it waits in the queue for the person (review wave 8, #21).
+      if (this.stopsOf(rt) !== stops) {
+        if (this.sessions.get(rt.id) === rt) rt.enqueue(text, attachments);
+        return;
+      }
+    }
     still(ctx);
     const addUser = () => {
       if (rt.meta.titleSource === 'auto' && !rt.items.some((i) => i.type === 'user')) {
@@ -936,7 +1123,9 @@ export class App {
     try {
       // The guard goes along to the agent's own dispatch (review wave 6, #3): an adapter that waits
       // first (Codex loading its thread) asks it again right before the message goes.
-      await handle.send(this.withBrowserPage(rt, this.withHandover(rt, item)), { check: () => still(ctx) });
+      const out = this.withHandover(rt, item);
+      await handle.send(this.withBrowserPage(rt, out.item), { check: () => still(ctx) });
+      out.taken();
     } catch (err) {
       unhand();
       if (err instanceof CallerGone) {
@@ -973,14 +1162,38 @@ export class App {
    * The message as the agent gets it: after a move to another account without the conversation, the
    * summary goes first (once); after a switch of agent, the handover of what that agent has not seen.
    */
-  private withHandover(rt: SessionRuntime, item: UserItem): UserItem {
+  private withHandover(rt: SessionRuntime, item: UserItem): { item: UserItem; taken: () => void } {
+    // A slash command takes nothing before or after it (the agent would read it as its words): what
+    // is pending waits for the next message.
+    if (isSlashCommand(item.text)) return { item, taken: () => {} };
     const pending = rt.meta.agentHandover;
-    if (pending) rt.update({ agentHandover: null });
+    const kept = this.handovers.get(rt.id);
+    const moved = rt.meta.moveNote;
     // A summary of the whole conversation covers what a switch would hand over.
-    const summary = this.handovers.get(rt.id) ?? (pending ? this.agentHandoverText(rt, pending, item.id) : '');
-    this.handovers.delete(rt.id);
-    if (!summary) return item;
-    return { ...item, text: `${summary}\n\n---\n\n${item.text}` };
+    const summary = kept ?? ((moved?.summary ? this.moveSummaryText(rt, moved.summary, moved.skip) : '') || (pending ? this.agentHandoverText(rt, pending, item.id) : ''));
+    // After a move to another account: a short note after the person's words, once.
+    const note = moved ? this.moveNoteText(rt, moved.line, item.id) : '';
+    // All of it is let go only once the agent took the message (review wave 8, #22): a send that
+    // never went out (a phone removed meanwhile, the agent not starting) leaves it for the next one.
+    const taken = () => {
+      if (pending && rt.meta.agentHandover === pending) rt.update({ agentHandover: null });
+      if (kept !== undefined && this.handovers.get(rt.id) === kept) this.handovers.delete(rt.id);
+      if (moved && rt.meta.moveNote === moved) rt.update({ moveNote: null });
+    };
+    if (!summary && !note) return { item, taken };
+    return { item: { ...item, text: `${summary ? `${summary}\n\n---\n\n` : ''}${item.text}${note ? `\n\n${note}` : ''}` }, taken };
+  }
+
+  /** The summary a move without the conversation carries: the chat before its switch line, as it stood then. */
+  private moveSummaryText(rt: SessionRuntime, line: string, skip?: string): string {
+    const at = rt.items.findIndex((i) => i.id === line);
+    return handoverText(withoutChecks(at >= 0 ? rt.items.slice(0, at) : rt.items), { skip });
+  }
+
+  /** The note after a move: what the person waits on and the open todos, as the chat stood at its switch line. */
+  private moveNoteText(rt: SessionRuntime, line: string, skip: string): string {
+    const at = rt.items.findIndex((i) => i.id === line);
+    return moveNote(at >= 0 ? rt.items.slice(0, at) : rt.items, rt.todos, { skip });
   }
 
   /** What an agent the chat switched to has not seen: the whole chat, or what happened since it was left (`since`). */
@@ -988,7 +1201,9 @@ export class App {
     const range = withoutChecks(itemsSince(rt.items, pending.since)).filter((i) => i.id !== skip);
     const worked = workedIn(range, pending.from).filter((p) => p !== rt.meta.provider);
     const from = (worked.length ? worked : [pending.from]).map((p) => this.agentName(p)).join(' and ');
-    return handoverText(range, { from, since: !!pending.since, maxChars: SWITCH_HANDOVER_CHARS });
+    // Bounded whatever the chat holds: the newest exchanges within the budget, the person's last
+    // message always, the open todos and the files changed in the range.
+    return handoverText(range, { from, since: !!pending.since, maxChars: SWITCH_HANDOVER_CHARS, todos: rt.todos, files: changedFiles(range, rt.meta.cwd) });
   }
 
   /** An agent's name, also for one this build does not have. */
@@ -1000,6 +1215,8 @@ export class App {
 
   /** Sessions whose model changed while their agent was there: it takes the model right before the next message (`speed`: the speed fell back too). */
   private modelDue = new Map<string, { speed: boolean }>();
+  /** Sessions whose agent has not taken the mode a phone chose while work ran (`session.setMode`): it goes with the next message. */
+  private modeDue = new Set<string>();
 
   /**
    * Sets the session's model. Nothing goes to the agent now: a running agent takes it right
@@ -1018,8 +1235,17 @@ export class App {
     if (rt.handle || this.opening.has(rt.id)) this.modelDue.set(rt.id, { speed: speed || !!this.modelDue.get(rt.id)?.speed });
   }
 
+  /** A mode a phone chose during earlier work goes to the agent and answers at once from this message on (never inside a running turn). */
+  private async applyModeDue(rt: SessionRuntime, handle: ProviderSession) {
+    if (rt.turnActive || !(rt.dangerHeld || this.modeDue.has(rt.id))) return;
+    rt.dangerHeld = false;
+    rt.heldMode = undefined;
+    if (this.modeDue.delete(rt.id)) await handle.setMode(rt.meta.mode).catch((err: Error) => this.log('mode change failed', err.message));
+  }
+
   /** A model chosen since the agent started goes to it now (never into a running turn: a steer leaves it for the next message). */
   private async applyDue(rt: SessionRuntime, handle: ProviderSession) {
+    await this.applyModeDue(rt, handle);
     const due = this.modelDue.get(rt.id);
     if (!due || rt.turnActive) {
       // An effort the running agent did not take when it was chosen goes with this message (a change
@@ -1148,9 +1374,14 @@ export class App {
       const reports = await this.call('usage.limits', {}).catch(() => []);
       for (const r of reports) if (r.provider === provider) out.set(r.accountId, { limits: r.limits, planLimits: r.planLimits });
     }
+    // This run's last read: whole, it is the account's; partial (some windows only), it lays over the
+    // merged report by window, never a shorter list in its place (review wave 7, #9).
     for (const a of this.accountList(provider)) {
-      const l = this.limitsCache.get(accountKey(provider, a.id));
-      if (l?.length) out.set(a.id, { ...out.get(a.id), limits: l });
+      const key = accountKey(provider, a.id);
+      const l = this.limitsCache.get(key);
+      if (!l?.length) continue;
+      const known = out.get(a.id)?.limits;
+      out.set(a.id, { ...out.get(a.id), limits: this.limitsPartial.has(key) && known?.length ? mergeWindows(known, l) : l });
     }
     return out;
   }
@@ -1158,12 +1389,32 @@ export class App {
   /**
    * The signed-in account of `provider` to go on with, other than `current`: under its own cap, one
    * on the same plan first, then the most room (with `model`, other models' full windows do not
-   * count); with `byCap`, the next one in the person's order and never an API key. Undefined when
-   * none has room.
+   * count); with `byCap`, the next one in the person's order and never an API key; with the person's
+   * own order chosen (`accountsBy: 'manual'`), the first in it. Undefined when none has room.
+   * `rt`: the chat that moves: its effective model decides which windows count (the alias "default"
+   * is the model it names, as the Spare planner reads it), and an account whose known models leave out
+   * the chat's own is not taken. `except`: accounts that already refused this message.
    */
-  async nextAccount(provider: ProviderId, current: string, model?: string, byCap = false): Promise<string | undefined> {
-    const [info, known] = await Promise.all([this.providerInfo(provider), this.knownLimits(provider)]);
+  async nextAccount(provider: ProviderId, current: string, opts: { model?: string; cwd?: string; rt?: SessionRuntime; byCap?: boolean; except?: Iterable<string> } = {}): Promise<string | undefined> {
+    // The sign-ins first: one that changed forgets its old limits before they are read.
+    const info = await this.providerInfo(provider);
+    const known = await this.knownLimits(provider);
     const accounts = info.accounts ?? [];
+    const cwd = opts.rt?.meta.cwd ?? opts.cwd;
+    const capsOf = (accountId: string) => this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, accountId));
+    const chosen = opts.rt ? opts.rt.meta.model : opts.model;
+    const ownCaps = (opts.rt?.caps ?? capsOf(current))?.models;
+    const model = effectiveModel(chosen || undefined, ownCaps, this.store.state.settings.defaultModels[provider]);
+    // The chat's own model as its account lists it: another account whose known list leaves it out cannot take the chat (review wave 7, #12).
+    const named = chosen && chosen !== 'default' && ownCaps?.some((m) => m.id === chosen) ? chosen : undefined;
+    const offers = (accountId: string) => {
+      if (!named) return true;
+      const models = capsOf(accountId)?.models;
+      return !models?.length || models.some((m) => m.id === named);
+    };
+    const except = new Set(opts.except ?? []);
+    for (const a of accounts) if (a.id !== current && !offers(a.id)) except.add(a.id);
+    const manual = this.store.state.settings.accountsBy === 'manual';
     return pickNextAccount(
       current,
       accounts.map((a) => ({
@@ -1171,15 +1422,24 @@ export class App {
         signedIn: a.auth.loggedIn,
         isDefault: a.isDefault,
         limits: known.get(a.id)?.limits ?? a.limits,
-        // An API key bills per token: known as such from its sign-in even before its limits were read.
-        planLimits: known.get(a.id)?.planLimits ?? (/api/i.test(a.auth.method ?? '') || /^(api key|console)$/i.test(a.auth.plan ?? '') ? false : undefined),
+        // An API key bills per token: known as such from its sign-in now, whatever an older limits report said (review wave 7, #3).
+        planLimits: isApiKeyAuth(a.auth) ? false : known.get(a.id)?.planLimits,
         cap: this.capOf(provider, a.id),
         plan: a.auth.plan,
         weight: planWeight(provider, a.auth),
       })),
       Date.now(),
-      { model: model || undefined, plan: accounts.find((a) => a.id === current)?.auth.plan, byCap, useFirst: this.store.state.settings.accountsBy !== 'manual' },
+      { model, plan: accounts.find((a) => a.id === current)?.auth.plan, byCap: opts.byCap, useFirst: !manual, manual, except },
     );
+  }
+
+  /**
+   * The model a chat's turns run on, as per-model windows name it (the alias "default" resolved):
+   * one reading for ranking, moves, caps and reset notices (review wave 8, #27).
+   */
+  private chatModel(rt: SessionRuntime): string | undefined {
+    const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd));
+    return effectiveModel(rt.meta.model, caps?.models, this.store.state.settings.defaultModels[rt.meta.provider]);
   }
 
   // ── caps: "use up to" per account ──
@@ -1198,13 +1458,16 @@ export class App {
    * Where a new session starts when `accountId` is past its cap: the next account under its own
    * cap, with the line that says why. Undefined when it is under its cap, or no account is.
    */
-  private async underCapStart(provider: ProviderId, accountId: string, model: string | undefined): Promise<{ to: string; line: string } | undefined> {
+  private async underCapStart(provider: ProviderId, accountId: string, chosen: string | undefined, cwd?: string): Promise<{ to: string; line: string } | undefined> {
     const cap = this.capOf(provider, accountId);
     if (!cap) return undefined;
     const known = await this.knownLimits(provider);
-    const reached = capReached(known.get(accountId)?.limits, cap, model || undefined);
+    // The alias "default" resolved, as everywhere else that reads per-model windows (review wave 8, #27).
+    const caps = this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, accountId));
+    const model = effectiveModel(chosen || undefined, caps?.models, this.store.state.settings.defaultModels[provider]);
+    const reached = capReached(known.get(accountId)?.limits, cap, model);
     if (!reached) return undefined;
-    const next = await this.nextAccount(provider, accountId, model, true).catch(() => undefined);
+    const next = await this.nextAccount(provider, accountId, { model, byCap: true }).catch(() => undefined);
     if (!next) return undefined;
     return { to: next, line: `Started with ${this.accountLabel(provider, next)}: ${capReason(this.accountLabel(provider, accountId), reached)}` };
   }
@@ -1229,12 +1492,12 @@ export class App {
   private async moveOffCap(rt: SessionRuntime) {
     const provider = rt.meta.provider;
     const from = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-    const model = rt.meta.model || undefined;
+    const model = this.chatModel(rt);
     const known = await this.knownLimits(provider);
     const reached = capReached(known.get(from)?.limits, this.capOf(provider, from), model);
     if (!reached) return;
     // The next account in the person's order, never an API key (a cap does not start paying per token).
-    const next = await this.nextAccount(provider, from, model, true).catch(() => undefined);
+    const next = await this.nextAccount(provider, from, { rt, byCap: true }).catch(() => undefined);
     // Never mid-turn: a turn that started meanwhile runs on, and its end checks again.
     if (rt.turnActive || (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from || this.sessions.get(rt.id) !== rt) return;
     const name = this.accountLabel(provider, from);
@@ -1259,10 +1522,18 @@ export class App {
     const provider = rt.meta.provider;
     const accountId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
     const known = await this.knownLimits(provider);
-    const own = (known.get(accountId)?.limits ?? []).filter((l) => l.percent >= 100);
-    // Every window that is used up has to reset before the account can work again.
+    // Every window that is used up and holds this chat's model has to reset before the account can
+    // work again; another model's full week is not this chat's wait (review wave 8, #27).
+    const model = this.chatModel(rt);
+    const now = Date.now();
+    const own = (known.get(accountId)?.limits ?? []).filter((l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now) && (!windowModel(l) || !model || windowForModel(l, model)));
     const full = own.sort((a, b) => (b.resetsAt ?? 0) - (a.resetsAt ?? 0))[0];
-    const next = await this.nextAccount(provider, accountId, rt.meta.model).catch(() => undefined);
+    // The accounts that already refused this message are not tried again (review wave 7, #10).
+    const refused = this.refusedMessage(rt);
+    const done = this.autoContinued.get(rt.id) ?? new Set<string>();
+    const mark = `${refused?.id ?? ''}:`;
+    const tried = [...done].flatMap((k) => (k.startsWith(mark) ? [k.slice(mark.length)] : []));
+    const next = await this.nextAccount(provider, accountId, { rt, except: tried }).catch(() => undefined);
     const limit = { ...notice.limit, provider, accountId, resetsAt: notice.limit?.resetsAt ?? full?.resetsAt, window: notice.limit?.window ?? full?.label, ...(next ? { next } : {}) };
     rt.patch<NoticeItem>(notice.id, { limit });
     if (spare) return;
@@ -1272,11 +1543,11 @@ export class App {
     // No other account takes over: the chat waits for this account's reset and then carries on by itself.
     if (!moves && !rt.turnActive && settings.continueAtReset) this.spare.atReset(rt);
     if (!moves || rt.turnActive) return;
-    const refused = this.refusedMessage(rt);
-    const done = this.autoContinued.get(rt.id) ?? new Set<string>();
-    const key = `${refused?.id ?? ''}:${next}`;
+    const key = `${mark}${next}`;
     if (done.has(key)) return;
     done.add(key);
+    // This account refused it: a later limit of the same message does not come back here.
+    done.add(`${mark}${accountId}`);
     this.autoContinued.set(rt.id, done);
     this.movedByLimit(rt, accountId, next, full?.resetsAt ?? limit.resetsAt);
     await this.switchAccount(rt, next, { retry: true });
@@ -1303,13 +1574,15 @@ export class App {
     const meta = this.limitsMeta.get(accountKey(provider, accountId));
     if (!runningOnCredits(meta)) return;
     const settings = this.store.state.settings;
-    const next = settings.continueAtLimit ? await this.nextAccount(provider, accountId).catch(() => undefined) : undefined;
+    // The chat's model goes along: only its own windows and the shared ones count (review wave 7, #13).
+    const next = settings.continueAtLimit ? await this.nextAccount(provider, accountId, { rt }).catch(() => undefined) : undefined;
     const decision = decideAtLimit({ creditsAllowed: !!settings.creditsAtLimit?.[creditsKey(provider, accountId)], creditsAvailable: true, continueAtLimit: !!settings.continueAtLimit, next });
     if (decision === 'credits' || rt.turnActive) return;
     const until = meta?.extra?.resetsAt ?? meta?.credits?.resetsAt;
     if (decision === 'next' && next) {
       this.movedByLimit(rt, accountId, next, until);
-      await this.switchAccount(rt, next);
+      // Past its limit: a compaction there would be paid for with credits.
+      await this.switchAccount(rt, next, { compact: false });
       return;
     }
     const key = `${rt.id}:${accountId}:${until ?? ''}`;
@@ -1330,7 +1603,7 @@ export class App {
     if (!progressed) return refused;
     const text =
       carried === 'reset'
-        ? 'Usage has been restored. Continue the task from where it stopped. Do not repeat steps that are already done.'
+        ? 'The last turn was cut off by a usage limit, which has reset now. Carry on with the task from where it stopped. Do not repeat steps that are already done.'
         : carried === 'conversation'
           ? 'The last turn was cut off by a usage limit; the conversation now continues under another account. Carry on with the task from where it stopped. Do not repeat steps that are already done.'
           : `${refused.text}\n\n(Part of this was already done before a usage limit cut the turn off: the summary above shows how far it got. Carry on from there.)`;
@@ -1353,7 +1626,8 @@ export class App {
       return {
         id: a.id,
         signedIn: a.auth.loggedIn,
-        planLimits: r?.planLimits,
+        // An API key now bills per token, whatever a report from before said (review wave 8, #26).
+        planLimits: isApiKeyAuth(a.auth) ? false : r?.planLimits,
         limits: r?.limits.length ? r.limits : (this.limitsCache.get(key) ?? a.limits ?? []),
         pace: r?.pace,
         cap: this.capOf(provider, a.id),
@@ -1404,13 +1678,15 @@ export class App {
     rt.patch<NoticeItem>(open.id, { limit: { ...open.limit, continuedWith: accountId, ...(carried === 'reset' ? { atReset: true } : {}) } });
     const item: UserItem = refused
       ? this.resumeMessage(rt, refused, carried)
-      : { id: randomUUID(), ts: Date.now(), type: 'user', text: 'Usage has been restored. Continue the task from where it stopped.', state: 'sent' };
+      : { id: randomUUID(), ts: Date.now(), type: 'user', text: 'The usage limit has reset. Carry on with the task from where it stopped.', state: 'sent' };
     const handle = await this.ensureHandle(rt);
     await this.applyDue(rt, handle);
     // The turn carries on with the refused message: it is the one this turn answers.
     const unhand = refused ? this.handOver(rt, refused.id) : undefined;
     try {
-      await handle.send(this.withHandover(rt, item));
+      const out = this.withHandover(rt, item);
+      await handle.send(out.item);
+      out.taken();
     } catch (err) {
       unhand?.();
       rt.notice('error', 'Could not send the message', (err as Error).message);
@@ -1445,24 +1721,233 @@ export class App {
    * Moves an idle session to another account of its agent. The conversation is carried into that
    * account's folder so the same conversation resumes there; when that is not possible, a new one
    * starts and the next message carries a summary of this one.
+   *
+   * A big chat (`bigContext`) whose account can still run a turn compacts there first, where its
+   * cache is warm, and the compacted conversation is carried (`compact: false`: never, as at a limit,
+   * where that account cannot). `onCompacting`: called as the compaction starts. The switch line
+   * says what the move did to the context; the first message after it carries a short note.
    */
-  async switchAccount(rt: SessionRuntime, accountId: string, opts: { retry?: boolean; line?: string } = {}, ctx?: CallContext): Promise<RpcMethods['session.switchAccount']['result']> {
+  async switchAccount(
+    rt: SessionRuntime,
+    accountId: string,
+    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void } = {},
+    ctx?: CallContext,
+  ): Promise<RpcMethods['session.switchAccount']['result']> {
     this.hydrate(rt);
     if (rt.turnActive) throw new Error('The agent is still working. Stop it first.');
+    if (this.moving.has(rt.id)) throw new Error('This chat is moving to another account already.');
+    // One transition at a time (review wave 8, #10): never while its agent is still starting (its
+    // handle would come up on the account it leaves), while it switches agent, or while background
+    // work runs in the process the move would close.
+    if (this.opening.has(rt.id) || this.delivering.has(rt.id)) throw new Error('The agent is still starting. Move when it is ready.');
+    if (this.switching.has(rt.id)) throw new Error('This chat is switching agent. Move when it is done.');
+    if (backgroundRunning(rt.items)) throw new Error('Background work is still running in this chat. Move when it is done.');
+    const target = this.provider(rt.meta.provider, accountId);
+    if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) return { ok: true, carried: 'none' };
+    this.moving.add(rt.id);
+    let compacted = false;
+    const stops = this.stopsOf(rt);
+    try {
+      return await this.moveAccount(rt, accountId, target, opts, ctx, () => (compacted = true));
+    } finally {
+      this.moving.delete(rt.id);
+      // What was sent meanwhile (or waited behind the compaction) goes out on the new account; after a
+      // Stop or a close meanwhile it waits for the person (review wave 8, #21).
+      const waited = this.queuedWhileMoving.delete(rt.id);
+      if ((waited || compacted) && rt.queue.length) {
+        setTimeout(() => {
+          if (rt.turnActive || rt.stopRequested || this.stopsOf(rt) !== stops || this.moving.has(rt.id) || this.sessions.get(rt.id) !== rt) return;
+          this.sendNextQueued(rt);
+        }, 0);
+      }
+    }
+  }
+
+  /** Messages a phone sent while its chat moved, queued: the guard of the pairing that sent each (by queue id). */
+  private queueGuards = new Map<string, CallContext>();
+  /** Chats switching agent right now (`switchAgent`): no account move meanwhile. */
+  private switching = new Set<string>();
+  /** Per chat, how often the person stopped it (Stop, close): work begun before a stop does not start a turn after it. */
+  private stops = new Map<string, number>();
+  /** Per chat, how often it was closed or let go: a move begun before does not go on. */
+  private closes = new Map<string, number>();
+  private stopsOf(rt: SessionRuntime) {
+    return this.stops.get(rt.id) ?? 0;
+  }
+  private closesOf(rt: SessionRuntime) {
+    return this.closes.get(rt.id) ?? 0;
+  }
+  private stopped(rt: SessionRuntime) {
+    this.stops.set(rt.id, this.stopsOf(rt) + 1);
+  }
+  private closed(rt: SessionRuntime) {
+    this.stopped(rt);
+    this.closes.set(rt.id, this.closesOf(rt) + 1);
+  }
+
+  /**
+   * Whether the chat's account can run a turn now: still there, not at a plan limit that counts for
+   * the chat's model (another model's full weekly does not), not running on credits.
+   */
+  private async canRunTurn(rt: SessionRuntime, accountId: string): Promise<boolean> {
+    const provider = rt.meta.provider;
+    try {
+      this.provider(provider, accountId);
+    } catch {
+      return false;
+    }
+    const known = await this.knownLimits(provider).catch(() => new Map<string, { limits?: RateLimit[] }>());
+    const model = effectiveModel(rt.meta.model || undefined, rt.caps?.models, this.store.state.settings.defaultModels[provider]);
+    if (atCap(known.get(accountId)?.limits, Date.now(), model)) return false;
+    return !runningOnCredits(this.limitsMeta.get(accountKey(provider, accountId)));
+  }
+
+  /**
+   * Compacts the chat on the account it is on (the agent's own compaction: Claude Code's `/compact`,
+   * Codex's thread compaction, the Demo's), as a turn of its own that opens with a hidden line, so
+   * the chat shows it working. Never longer than `compactTimeoutMs`: then it is stopped. Says how it
+   * went; the context ring is right after it (the agent's own count, or unknown until the next turn).
+   */
+  private async compactBeforeMove(rt: SessionRuntime, label: string): Promise<MoveOutcome & { stable: boolean }> {
+    const before = rt.meta.usage.contextTokens ?? 0;
+    const opener = rt.add<UserItem>({ type: 'user', text: COMPACT_OPENER, state: 'sent' });
+    const status = rt.notice('info', `Compacting before the move to ${label}`);
+    let ended!: (error: string | undefined) => void;
+    const done = new Promise<{ error?: string }>((resolve) => (ended = (error) => resolve({ error })));
+    this.compacting.set(rt.id, (error) => ended(error));
+    // One deadline for all of it, from before the agent is opened (review wave 8, #11): a start, a
+    // send or a Stop that stalls never holds the move past it.
+    const deadline = Date.now() + this.compactTimeoutMs;
+    const TIMEOUT = Symbol('timeout');
+    const within = <T,>(p: Promise<T>, ms = Math.max(0, deadline - Date.now())): Promise<T | typeof TIMEOUT> => {
+      let timer: NodeJS.Timeout | undefined;
+      return Promise.race([p, new Promise<typeof TIMEOUT>((r) => (timer = setTimeout(() => r(TIMEOUT), ms)))]).finally(() => clearTimeout(timer));
+    };
+    let ok = false;
+    // The agent said the compaction turn ended (finished, failed or stopped): its transcript is whole.
+    let confirmed = false;
+    let handle: ProviderSession | undefined;
+    try {
+      const opened = await within(this.ensureHandle(rt));
+      if (opened === TIMEOUT) throw new Error('the agent did not start in time');
+      handle = opened;
+      const sent = await within(handle.send({ ...opener, text: '/compact' }).then(() => 'sent' as const));
+      const r = sent === TIMEOUT ? TIMEOUT : await within(done);
+      if (r === TIMEOUT) {
+        this.log('compaction before a move timed out');
+        // Asked to stop, and given a short while to say it did; past that, its transcript may still be written.
+        const h = handle;
+        const stoppedAt = await within(
+          h
+            .interrupt()
+            .catch(() => {})
+            .then(() => done),
+          Math.min(COMPACT_STOP_GRACE_MS, this.compactTimeoutMs),
+        );
+        confirmed = stoppedAt !== TIMEOUT;
+      } else {
+        confirmed = true;
+        ok = !r.error && !rt.stopRequested;
+      }
+    } catch (err) {
+      this.log('compaction before a move failed', (err as Error).message);
+      // Nothing was sent or the send failed at once: there is no turn whose writing could go on.
+      confirmed = !rt.turnActive;
+    } finally {
+      if (rt.turnActive) {
+        rt.settle('cancelled');
+        rt.endTurn();
+      }
+      this.compacting.delete(rt.id);
+      rt.remove(status.id);
+    }
+    const from = rt.items.findIndex((i) => i.id === opener.id);
+    const after = from >= 0 ? rt.items.slice(from + 1) : [];
+    // Nothing came of it (the send failed at once): the opener goes too.
+    if (!after.some((i) => !i.parentId && i.type !== 'turn')) rt.remove(opener.id);
+    if (!ok || !after.some((i) => i.type === 'notice' && i.variant === 'compact')) return { kind: 'notCompacted', tokens: before, stable: confirmed };
+    // The ring: the agent's own count after the compaction, asked for when its events did not say.
+    let now = rt.meta.usage.contextTokens;
+    if (!(now !== undefined && now < before) && handle?.context) {
+      const c = await within(handle.context().catch(() => null), Math.min(5000, Math.max(0, deadline - Date.now())));
+      if (c !== TIMEOUT && c?.totalTokens !== undefined && c.totalTokens < before) now = c.totalTokens;
+    }
+    if (now !== undefined && now < before) {
+      if (now !== rt.meta.usage.contextTokens) rt.update({ usage: { ...rt.meta.usage, contextTokens: now } });
+      return { kind: 'compacted', before, after: now, stable: true };
+    }
+    // Compacted, but no count came: unknown until the next turn rather than the old one.
+    rt.update({ usage: { ...rt.meta.usage, contextTokens: undefined } });
+    return { kind: 'compacted', before, stable: true };
+  }
+
+  private async moveAccount(
+    rt: SessionRuntime,
+    accountId: string,
+    target: Provider,
+    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void },
+    ctx: CallContext | undefined,
+    onCompacted: () => void,
+  ): Promise<RpcMethods['session.switchAccount']['result']> {
     const provider = rt.meta.provider;
     const fromId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-    const target = this.provider(provider, accountId);
     const label = this.findAccount(provider, accountId)?.label ?? 'another account';
-    if (fromId === accountId) return { ok: true, carried: 'none' };
     const refused = opts.retry ? this.refusedMessage(rt) : undefined;
+    // Closed or deleted meanwhile: the move goes no further (nothing copied, the runtime untouched);
+    // stopped meanwhile: it completes, but starts no turn (review wave 8, #21).
+    const closes = this.closesOf(rt);
+    const stops = this.stopsOf(rt);
+    const live = () => {
+      if (this.sessions.get(rt.id) !== rt || this.closesOf(rt) !== closes) throw new Error('The chat was closed during the move.');
+      still(ctx);
+    };
+    // Whether the old account's transcript is whole: false when its agent may still be writing it
+    // (a compaction that did not say it stopped, a close that failed or hung). Then it is not copied
+    // and the chat goes on from a summary instead (review wave 8, #11).
+    let stable = true;
+
+    // A big chat compacts first where it is, when that account can still run a turn (never to carry on a refused one).
+    const tokens = rt.meta.usage.contextTokens;
+    let outcome: MoveOutcome = { kind: 'plain' };
+    if (rt.meta.providerSessionId && target.adoptConversation && bigContext(tokens, rt.meta.usage.contextWindow)) {
+      const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId, rt.meta.cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId));
+      const can = opts.compact !== false && !opts.retry && caps?.features.compact !== false && (await this.canRunTurn(rt, fromId));
+      live();
+      if (can && !rt.turnActive) {
+        opts.onCompacting?.();
+        onCompacted();
+        const compacted = await this.compactBeforeMove(rt, label);
+        stable = compacted.stable;
+        const { stable: _s, ...rest } = compacted;
+        outcome = rest as MoveOutcome;
+        live();
+        if (rt.turnActive) throw new Error('The agent is still working. Stop it first.');
+      } else outcome = { kind: 'asIs', tokens: tokens! };
+    }
 
     rt.cancelPrompts();
-    await rt.handle?.close().catch(() => {});
+    // A start still under way is waited for (bounded) so its handle is closed here, not installed later.
+    const opening = this.opening.get(rt.id);
+    if (opening) await Promise.race([opening.catch(() => {}), new Promise((r) => setTimeout(r, MOVE_CLOSE_MS))]);
+    const old = rt.handle;
     rt.handle = undefined;
+    if (old) {
+      const closedOk = await Promise.race([
+        Promise.resolve()
+          .then(() => old.close())
+          .then(
+            () => true,
+            (err: Error) => (this.log('the agent did not close cleanly before a move', err.message), false),
+          ),
+        new Promise<false>((r) => setTimeout(() => r(false), MOVE_CLOSE_MS)),
+      ]);
+      if (!closedOk) stable = false;
+    }
     // A caller removed while the agent closed (a phone, review wave 6, #3): no conversation is copied, nothing moves.
-    still(ctx);
+    live();
 
     let carried: 'conversation' | 'summary' | 'none' = 'none';
+    let summaryAt = false;
     const id = rt.meta.providerSessionId;
     if (id) {
       let fromHome: string | undefined;
@@ -1471,35 +1956,68 @@ export class App {
       } catch {
         /* the old account was removed: nothing to copy from */
       }
-      const adopted = !!fromHome && !!target.adoptConversation && (await target.adoptConversation(fromHome, id).catch((err) => (this.log('could not carry the conversation over', (err as Error).message), false)));
-      still(ctx);
+      const adopted =
+        stable && !!fromHome && !!target.adoptConversation && (await target.adoptConversation(fromHome, id).catch((err) => (this.log('could not carry the conversation over', (err as Error).message), false)));
+      live();
       if (adopted) carried = 'conversation';
       else {
         rt.update({ providerSessionId: undefined });
-        const summary = handoverText(withoutChecks(rt.items), { skip: refused?.id });
-        if (summary) {
-          this.handovers.set(rt.id, summary);
+        // Kept with the chat (its switch line, below) and taken by the first message the agent accepts.
+        if (handoverText(withoutChecks(rt.items), { skip: refused?.id })) {
+          summaryAt = true;
           carried = 'summary';
         }
       }
     }
-    rt.update({ accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, status: 'idle', lastError: undefined });
+    // Anything that opened meanwhile on the old account goes (review wave 8, #10).
+    // (Read again: an await above may have installed one.)
+    const stray = rt.handle as ProviderSession | undefined;
+    if (stray) {
+      rt.handle = undefined;
+      await Promise.race([Promise.resolve().then(() => stray.close()).catch(() => {}), new Promise((r) => setTimeout(r, MOVE_CLOSE_MS))]);
+      live();
+    }
+    // A new conversation starts from the summary: the old count says nothing about it (the ring is
+    // empty until its first turn says). A carried one keeps its count, compacted or not.
+    const usage = carried === 'summary' ? { usage: { ...rt.meta.usage, contextTokens: undefined } } : {};
+    if (carried === 'summary' || carried === 'none') outcome = { kind: 'plain' };
+    rt.update({ accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, status: 'idle', lastError: undefined, ...usage });
     this.persistSessions();
 
-    // A move by a cap says why in its own line; a move at a limit closes the limit's notice.
+    // A move by a cap says why in its own line; a move at a limit closes the limit's notice. The
+    // line says what the move did to the context: compacted (before and after), or read again in full.
+    const clause = contextClause(outcome, !!refused);
+    const summaryLine = 'With a summary of the conversation so far';
     const open = opts.line ? undefined : rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId);
     if (open) rt.patch<NoticeItem>(open.id, { limit: { ...open.limit, continuedWith: accountId } });
-    if (opts.line) rt.notice('info', opts.line, carried === 'summary' ? 'With a summary of the conversation so far' : undefined);
+    let line: NoticeItem | undefined;
+    if (opts.line) line = rt.notice('info', `${opts.line}${clause.suffix ?? ''}`, carried === 'summary' ? summaryLine : clause.detail);
     else if (!open || carried === 'summary') {
-      rt.notice('info', carried === 'summary' ? `New conversation with ${label}` : `Continued with ${label}`, carried === 'summary' ? 'With a summary of the conversation so far' : undefined);
+      line = rt.notice('info', carried === 'summary' ? `New conversation with ${label}` : `Continued with ${label}${clause.suffix ?? ''}`, carried === 'summary' ? summaryLine : clause.detail);
+    } else if (clause.suffix || clause.detail) {
+      // The limit's notice says where it went; one quiet line says what that did to the context.
+      line = rt.notice('info', clause.suffix ? `Context${clause.suffix.replace(/^ · context/, '')}` : 'Carried as it is', clause.detail);
     }
-    if (refused) {
+    // The first message after the move tells the agent (moveNote): anchored at the line, so what the
+    // person waits on is read from before it, also after a restart.
+    const anchor = line?.id ?? open?.id ?? rt.items.findLast((i) => !i.parentId)?.id;
+    // The summary, when the conversation stayed behind, is the chat before the line; one from an
+    // earlier move that no message took yet stays (review wave 8, #22).
+    const prev = rt.meta.moveNote;
+    const summary = summaryAt && line ? { summary: line.id, ...(refused ? { skip: refused.id } : {}) } : prev?.summary ? { summary: prev.summary, ...(prev.skip ? { skip: prev.skip } : {}) } : {};
+    if (anchor) rt.update({ moveNote: { line: anchor, ...summary } });
+    // Stopped during the move: the refused turn does not start again by itself.
+    if (refused && this.stopsOf(rt) === stops) {
       const handle = await this.ensureHandle(rt);
       // Asked again once the new account's agent is there, and by the agent's own dispatch.
-      still(ctx);
+      live();
+      if (this.stopsOf(rt) !== stops) return { ok: true, carried };
+      await this.applyModeDue(rt, handle);
       const unhand = this.handOver(rt, refused.id);
       try {
-        await handle.send(this.withHandover(rt, this.resumeMessage(rt, refused, carried)), { check: () => still(ctx) });
+        const out = this.withHandover(rt, this.resumeMessage(rt, refused, carried));
+        await handle.send(out.item, { check: () => still(ctx) });
+        out.taken();
       } catch (err) {
         unhand();
         if (err instanceof CallerGone) {
@@ -1532,7 +2050,11 @@ export class App {
       return { ok: true };
     }
     if (!this.providers.has(provider)) throw new Error(`Provider not available: ${provider}`);
+    // The Customize chat only with an agent that gets its brief (`services/custom.ts`).
+    if (rt.meta.custom && !customAgent(provider)) throw new Error(CUSTOM_AGENT_ONLY);
     if (rt.turnActive || this.opening.has(rt.id) || this.delivering.has(rt.id) || this.capChecks.has(rt.id)) throw new Error('The agent is still working. Switch when it is done.');
+    // Never over a move of account, nor two switches at once (review wave 8, #10).
+    if (this.moving.has(rt.id) || this.switching.has(rt.id)) throw new Error('This chat is changing account or agent. Switch when it is done.');
     if (backgroundRunning(rt.items)) throw new Error('Background work is still running in this chat. Switch when it is done.');
     const cwd = rt.meta.cwd;
     if (provider !== 'demo' && !isDir(cwd)) throw new Error(`Folder not found: ${cwd}`);
@@ -1557,7 +2079,14 @@ export class App {
     const prev = legs.find((l) => l.provider === from);
 
     rt.cancelPrompts();
-    await rt.handle?.close().catch(() => {});
+    this.switching.add(rt.id);
+    try {
+      await rt.handle?.close().catch(() => {});
+    } finally {
+      this.switching.delete(rt.id);
+    }
+    // Closed or moved while the agent closed: nothing switches.
+    if (this.sessions.get(rt.id) !== rt) throw new Error('The chat was closed.');
     rt.handle = undefined;
     this.modelDue.delete(rt.id);
     this.handovers.delete(rt.id);
@@ -1599,6 +2128,8 @@ export class App {
       usage: { ...rt.meta.usage, contextTokens: keeps ? target!.context?.tokens : undefined, contextWindow: keeps ? target!.context?.window : undefined },
       agents: withLeg(legs, leaving),
       agentHandover: { from, ...(knows ? { since: knows } : {}) },
+      // The handover covers a move of account before it: no second note.
+      moveNote: undefined,
     };
     // Fields that end are dropped, not left undefined (patches travel as JSON; the meta goes whole below).
     for (const k of Object.keys(next) as (keyof SessionMeta)[]) if (next[k] === undefined) delete next[k];
@@ -1631,6 +2162,9 @@ export class App {
    * the agent could not say how the turn ended (`hold`).
    */
   private afterTurn(rt: SessionRuntime, error?: string, hold = false) {
+    // The compaction before a move ended: the move goes on (nothing is sent, nothing else follows).
+    const compacted = this.compacting.get(rt.id);
+    if (compacted) return compacted(error);
     // A spare turn's end frees its place; waiting chats are looked at again.
     const ran = this.spare.turnEnded(rt);
     const hit = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.provider && !i.parentId);
@@ -1672,14 +2206,23 @@ export class App {
   private drainWaiting = new Set<string>();
 
   /** After a turn: the next queued message goes out, or (nothing waits) an until loop runs its check. */
-  private sendNextQueued(rt: SessionRuntime) {
+  private sendNextQueued(rt: SessionRuntime): void {
+    // Moving to another account: the queue goes on there once the move is done.
+    if (this.moving.has(rt.id)) return void this.queuedWhileMoving.add(rt.id);
     // Messages held for Spare stay where they are: the chat starts them by itself.
     const held = this.spare.held(rt);
     const nextId = rt.queue.find((q) => !held.has(q.id))?.id;
     // A phone is taking it back right now: it neither goes nor is skipped; the queue goes on once that settles.
     if (rt.isReserved(nextId)) return void this.drainWaiting.add(rt.id);
     const next = nextId ? rt.takeQueued(nextId) : undefined;
-    if (next) void this.deliver(rt, next.text, next.attachments).catch((err) => this.log('queued send failed', (err as Error).message));
+    const guard = next ? this.queueGuards.get(next.id) : undefined;
+    if (next) this.queueGuards.delete(next.id);
+    // Queued during a move by a phone removed since: it never goes out; the next one may.
+    if (next && guard?.allowed && !guard.allowed()) {
+      rt.notice('info', 'A message from a removed phone was not sent');
+      return this.sendNextQueued(rt);
+    }
+    if (next) void this.deliver(rt, next.text, next.attachments, undefined, guard).catch((err) => this.log('queued send failed', (err as Error).message));
     // Nothing waits: an until loop runs its check (the user's messages always go first).
     else this.until.turnEnded(rt);
   }
@@ -1700,23 +2243,34 @@ export class App {
     if (rt.handle) return rt.handle;
     this.hydrate(rt);
     // One start per session: a second message sent while the agent starts waits for the same one.
-    const opened = this.provider(rt.meta.provider, rt.meta.accountId)
-      .open(rt, { loadTranscript: false })
-      .then((handle) => {
-        if (this.sessions.get(rt.id) !== rt) {
-          void Promise.resolve(handle.close()).catch(() => {});
-          throw new Error('The session was closed while the agent was starting.');
-        }
-        rt.handle = handle;
-        this.seedCaps(rt);
-      });
-    this.opening.set(rt.id, opened);
-    try {
-      await opened;
-    } finally {
-      if (this.opening.get(rt.id) === opened) this.opening.delete(rt.id);
+    // The handle is the agent and account it was opened for: one that comes up after the chat moved
+    // or switched agent is closed, never installed (review wave 8, #10), and the start is made again.
+    for (let tries = 0; ; tries++) {
+      const agent = rt.meta.provider;
+      const account = rt.meta.accountId ?? DEFAULT_ACCOUNT;
+      const opened = this.provider(agent, account)
+        .open(rt, { loadTranscript: false })
+        .then((handle) => {
+          if (this.sessions.get(rt.id) !== rt) {
+            void Promise.resolve(handle.close()).catch(() => {});
+            throw new Error('The session was closed while the agent was starting.');
+          }
+          if (rt.meta.provider !== agent || (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== account) {
+            void Promise.resolve(handle.close()).catch(() => {});
+            return;
+          }
+          rt.handle = handle;
+          this.seedCaps(rt);
+        });
+      this.opening.set(rt.id, opened);
+      try {
+        await opened;
+      } finally {
+        if (this.opening.get(rt.id) === opened) this.opening.delete(rt.id);
+      }
+      if (rt.handle) return rt.handle;
+      if (tries >= 2) throw new Error('The chat changed account or agent while its agent was starting.');
     }
-    return rt.handle!;
   }
 
   /** Shows what the agent offers right away from the cache; the adapter's own answer replaces it. */
@@ -1859,6 +2413,7 @@ export class App {
    * a message still waiting for the agent to start, an until loop, a turn check. The chat stays.
    */
   private async stopForGood(rt: SessionRuntime) {
+    this.closed(rt);
     this.until.closed(rt);
     await this.checks.closed(rt);
     rt.stopRequested = true;
@@ -1908,13 +2463,18 @@ export class App {
    * starts, whatever the folder's state (a race); when the lane cannot be made the session is removed
    * and this rejects.
    */
-  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string } } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
+  /** A new session with what `session.create` cannot ask for (the Customize chat, `services/custom.ts`). */
+  startSession(p: RpcMethods['session.create']['params'], extra: { custom?: boolean } = {}): Promise<SessionSnapshot> {
+    return this.createSession(p, extra);
+  }
+
+  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string }; custom?: boolean } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
     const settings = this.store.state.settings;
     let accountId = p.accountId ?? this.defaultAccountId(p.provider);
     this.provider(p.provider, accountId);
     // An account past its cap: the session starts on the next one under its own (a resumed
     // conversation stays where it lives).
-    const capStart = p.resume ? undefined : await this.underCapStart(p.provider, accountId, p.model ?? settings.defaultModels[p.provider]).catch(() => undefined);
+    const capStart = p.resume ? undefined : await this.underCapStart(p.provider, accountId, p.model ?? settings.defaultModels[p.provider], p.cwd).catch(() => undefined);
     // Its caller (a phone) removed while that was read: no chat, no folder.
     still(ctx);
     if (capStart) accountId = capStart.to;
@@ -1937,6 +2497,8 @@ export class App {
       ...(p.ultracode ? { ultracode: true } : {}),
       ...this.startSpeed(p.provider, accountId, cwd, p.model ?? settings.defaultModels[p.provider], p.speed ?? settings.defaultSpeeds?.[p.provider]),
       ...(p.chat ? { chat: true } : {}),
+      // The Customize chat lives in Sable's own folder, never one of the sidebar's folders.
+      ...(extra.custom ? { custom: true, chat: true } : {}),
       status: 'starting',
       createdAt: now,
       updatedAt: now,
@@ -2187,15 +2749,7 @@ export class App {
 
     this.register('provider.caps', ({ provider, cwd, accountId, refresh }) => this.capsFast(provider, cwd, accountId, refresh));
     this.register('provider.prewarm', (p) => this.prewarm(p));
-    this.register('provider.limits', async ({ provider, accountId = DEFAULT_ACCOUNT, force }) => {
-      const key = accountKey(provider, accountId);
-      const seq = this.limitsSeq.get(key) ?? 0;
-      const limits = await this.provider(provider, accountId).limits(!!force);
-      this.limitsCache.set(key, limits);
-      // A provider that read them announced it already (with what it knows about the read).
-      if ((this.limitsSeq.get(key) ?? 0) === seq) this.emit({ type: 'limits.updated', provider, accountId, limits });
-      return limits;
-    });
+    this.register('provider.limits', async ({ provider, accountId = DEFAULT_ACCOUNT, force }) => (await this.readLimits(provider, accountId, !!force)).limits);
     // Spends a reset credit: only the confirmed click in the UI calls this, never anything automatic.
     this.register('provider.useReset', async ({ provider, accountId = DEFAULT_ACCOUNT, key }) => {
       const p = this.provider(provider, accountId);
@@ -2203,6 +2757,15 @@ export class App {
       if (!key || typeof key !== 'string') throw new Error('Missing reset key');
       return { outcome: await p.useReset(key) };
     });
+
+    // A reset in the agent's own dialog: only the person's click opens it; the person confirms there.
+    this.register('limit.resetInAgent', async ({ provider, accountId = DEFAULT_ACCOUNT }) => {
+      const p = this.provider(provider, accountId);
+      if (!p.limitResetCommand) return { ok: false, error: 'This agent has no reset dialog' };
+      if (!this.consoles) return { ok: false, error: `Run ${p.limitResetCommand().line} in a terminal` };
+      return this.resets.start(provider, accountId);
+    });
+    this.register('limit.resetCancel', ({ provider, accountId = DEFAULT_ACCOUNT }) => ({ ok: this.resets.cancel(provider, accountId) }));
 
     // ── projects ──
     this.register('project.add', ({ path: dir }) => {
@@ -2379,7 +2942,10 @@ export class App {
       // While the agent works the bridge holds the message until the turn ends, unless it is
       // steered into the running turn (and the agent can take one).
       if (rt.turnActive && !(steer && rt.caps?.features.steer !== false)) {
-        rt.enqueue(text, attachments);
+        const q = rt.enqueue(text, attachments);
+        // A phone's message keeps its pairing's guard in the queue: once that phone is removed it
+        // never goes out by itself (review wave 8, #21; a move's compaction is such a turn).
+        if (ctx.allowed) this.queueGuards.set(q.id, ctx);
         return { ok: true, queued: true };
       }
       await this.deliver(rt, text, attachments, undefined, ctx);
@@ -2438,6 +3004,7 @@ export class App {
     this.register('session.interrupt', async ({ sessionId }) => {
       const rt = this.runtime(sessionId);
       if (rt.turnActive) rt.stopRequested = true;
+      this.stopped(rt);
       rt.cancelPrompts();
       // Stopped while the agent is still starting: what waits for it is not sent once it is there,
       // and the session is idle again (the message stays in the conversation, stopped, as after any stop).
@@ -2479,7 +3046,21 @@ export class App {
     });
     this.register('session.setMode', async ({ sessionId, mode, answerWaiting }) => {
       const rt = this.runtime(sessionId);
-      await rt.handle?.setMode(mode);
+      const danger = rt.caps?.modes.find((m) => m.id === mode)?.tone === 'danger' || allowsEverything(mode);
+      // A mode that never asks, chosen from a phone while work runs, answers that work's asks only from the
+      // next message on (review wave 7, #1): the phone could not be shown them. Claude Code's own mode
+      // waits for it too (in Bypass the CLI would stop asking at once); the switch goes with the next message.
+      if (answerWaiting === false && danger && (rt.turnActive || (rt.meta.background ?? 0) > 0)) {
+        // The work in progress keeps the mode it had (`workMode`), also over a second held switch.
+        if (!rt.dangerHeld) rt.heldMode = rt.meta.mode;
+        rt.dangerHeld = true;
+        this.modeDue.add(rt.id);
+      } else {
+        rt.dangerHeld = false;
+        rt.heldMode = undefined;
+        this.modeDue.delete(rt.id);
+        await rt.handle?.setMode(mode);
+      }
       rt.update({ mode });
       // The mode that never asks (Bypass, Full access) answers what already waits too; questions stay.
       // A phone answers only what it may itself (`answerWaiting: false`, phone.ts).
@@ -2557,7 +3138,7 @@ export class App {
 
     // Lanes (server/core/lanes.ts).
     this.register('git.worktrees', ({ cwd }) => gitWorktrees(cwd));
-    this.register('git.draft', ({ cwd }) => this.draftCommit(String(cwd ?? '')));
+    this.register('git.draft', ({ sessionId, cwd }) => this.draftCommit(String(sessionId ?? ''), String(cwd ?? '')));
     this.register('lane.forecast', ({ sessionId }) => this.lanes.forecast(this.runtime(sessionId)));
     this.register('lane.land', ({ sessionId, message }) => this.lanes.land(this.loaded(sessionId), typeof message === 'string' ? message : undefined));
     this.register('lane.discard', ({ sessionId }) => this.lanes.discard(this.loaded(sessionId)));
@@ -2583,6 +3164,7 @@ export class App {
 
     this.register('session.close', async ({ sessionId, remove }) => {
       const rt = this.runtime(sessionId);
+      this.closed(rt);
       this.until.closed(rt);
       await this.checks.closed(rt);
       rt.stopRequested = true;
@@ -2664,10 +3246,22 @@ export class App {
     this.register('session.switchAccount', async ({ sessionId, accountId, retry }, ctx) => {
       const rt = this.runtime(sessionId);
       const from = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-      const result = await this.switchAccount(rt, accountId, { retry }, ctx);
-      // Moved by hand: a wait for the old account's reset is over.
-      if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from) this.spare.movedByHand(rt);
-      return result;
+      // A big chat compacts first, which can take minutes: the answer comes as it starts, and the
+      // chat shows the compaction and then the switch line (a failure later is said there too).
+      let started!: () => void;
+      const compacting = new Promise<'compacting'>((resolve) => (started = () => resolve('compacting')));
+      const run = this.switchAccount(rt, accountId, { retry, onCompacting: () => started() }, ctx).then((result) => {
+        // Moved by hand: a wait for the old account's reset is over.
+        if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from) this.spare.movedByHand(rt);
+        return result;
+      });
+      const first = await Promise.race([run, compacting]);
+      if (first !== 'compacting') return first;
+      run.catch((err) => {
+        if (err instanceof CallerGone || this.sessions.get(rt.id) !== rt) return;
+        rt.notice('error', 'Could not move the chat to another account', (err as Error).message);
+      });
+      return { ok: true, carried: 'conversation', compacting: true };
     });
     this.register('session.context', async ({ sessionId }) => (await this.runtime(sessionId).handle?.context?.()) ?? null);
     this.register('session.setOptions', async ({ sessionId, options }, ctx) => {
@@ -2753,6 +3347,7 @@ export class App {
     this.updates?.dispose();
     this.until.dispose();
     this.spare.dispose();
+    this.resets.dispose();
     this.titles.dispose();
     await this.checks.dispose();
     for (const fn of this.disposers.splice(0)) await Promise.resolve(fn()).catch(() => {});
@@ -2828,4 +3423,20 @@ function capsCacheKey(provider: ProviderId, accountId: string, cwd?: string) {
 
 function fallbackInfo(p: Provider) {
   return { id: p.id, name: p.name, installed: false, auth: { loggedIn: false }, problem: 'Could not query the CLI' };
+}
+
+/** A sign-in that bills per token (an API key, the Console): never a plan with a week to use up. */
+export function isApiKeyAuth(auth: AuthState): boolean {
+  return /api/i.test(auth.method ?? '') || /^(api key|console)$/i.test(auth.plan ?? '');
+}
+
+/** Who an account is signed in as, for telling a changed sign-in (another person, a key in place of a plan). */
+interface SignIn {
+  apiKey: boolean;
+  email?: string;
+}
+
+function signInOf(auth: AuthState): SignIn {
+  const email = auth.email?.trim().toLowerCase();
+  return { apiKey: isApiKeyAuth(auth), ...(email ? { email } : {}) };
 }

@@ -28,7 +28,7 @@ import { qrMatrix } from '../server/services/qr';
 import { registerThumbs } from '../server/services/thumbs';
 import { mergeHosts } from '../mobile/src/lib/hosts';
 import { pskOfKey } from '../mobile/src/lib/secure';
-import { fetchSecure, fingerprintIn, handshake, helloSecure, keyOf, pairSecure, wireClient } from './phone-wire';
+import { beside, fetchSecure, fingerprintIn, handshake, helloSecure, keyOf, pairSecure, wireClient } from './phone-wire';
 import { CONTAIN } from '../server/core/contain';
 
 // These tests are about the phone's endpoint, not containment. Where no handle names its file (Windows), the
@@ -354,9 +354,10 @@ describe('files the agent hands over', () => {
     const { app, port, home } = await setup();
     const { c } = await pairPhone(app, port);
     // The chat's own folder: a file outside it goes to a phone only when the person allowed the share (tests/share-handed.test.ts).
-    const created = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: PhoneTail };
+    const work = beside(home);
+    const created = (await c.call('session.create', { provider: 'demo', cwd: work })) as { result: PhoneTail };
     const id = created.result.session.id;
-    const file = path.join(home, 'build.apk');
+    const file = path.join(work, 'build.apk');
     writeFileSync(file, 'apk bytes');
     const rt = app.sessions.get(id)!;
     rt.add({ id: 'share1', type: 'tool', name: 'SendUserFile', kind: 'share', title: 'build.apk', status: 'done', detail: { files: [{ path: file, name: 'build.apk', size: 9 }] } } as never);
@@ -645,7 +646,7 @@ describe("a chat's changes from the phone", () => {
 
   /** A repository with every kind of change: modified, deleted, untracked, a long one, a binary one; and a file beside it. */
   function repoIn(home: string) {
-    const repo = path.join(home, 'repo');
+    const repo = beside(home, 'repo');
     mkdirSync(path.join(repo, 'src'), { recursive: true });
     git(repo, 'init', '-q', '-b', 'main');
     git(repo, 'config', 'user.name', 'Test');
@@ -722,8 +723,7 @@ describe("a chat's changes from the phone", () => {
 
   it('outside a repository: the chat’s own edits; with steps named, only theirs (sub-agents included)', async () => {
     const { app, port, home } = await setup();
-    const plain = path.join(home, 'plain');
-    mkdirSync(plain);
+    const plain = beside(home, 'plain');
     const { c } = await pairPhone(app, port);
     const created = (await c.call('session.create', { provider: 'demo', cwd: plain })) as { result: PhoneTail };
     const id = created.result.session.id;
@@ -777,7 +777,7 @@ describe('switching agents from the phone', () => {
   it("learns the other agent's models, switches the chat in place and back, and answers /model without sending it", async () => {
     const { app, port, home } = await setup({ codex: true });
     const { c } = await pairPhone(app, port);
-    const snap = (await c.call('session.create', { provider: 'demo', cwd: home })) as { result: { session: { id: string } } };
+    const snap = (await c.call('session.create', { provider: 'demo', cwd: beside(home) })) as { result: { session: { id: string } } };
     const id = snap.result.session.id;
     await c.call('phone.tail', { sessionId: id });
     // The other agent's models, for the setup sheet (an existing phone method).

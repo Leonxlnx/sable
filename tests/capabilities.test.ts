@@ -95,21 +95,23 @@ describe('start-up cache', () => {
     expect(caps1.models.map((m) => m.id)).toEqual(['opus', 'haiku']);
     await first.app.dispose();
 
-    // Second start: instant answers from disk, even though the agent is slow.
+    // Second start: answers from disk without waiting for the agent, which is slow (far slower here
+    // than the bound, so a busy machine cannot make an answer from disk look like a wait).
     state.models = ['opus', 'sonnet', 'haiku'];
+    state.delay = 1500;
     const second = makeApp(home, [fakeClaude(state)]);
     let t = performance.now();
     const hello2 = await second.app.call('app.hello', {});
-    expect(performance.now() - t).toBeLessThan(100);
+    expect(performance.now() - t).toBeLessThan(700);
     expect(hello2.providers[0].version).toBe('2.1');
     expect(hello2.providers[0].accounts?.[0].auth.email).toBe('a@example.com');
     t = performance.now();
     const caps2 = await second.app.call('provider.caps', { provider: 'claude', cwd: home });
-    expect(performance.now() - t).toBeLessThan(100);
+    expect(performance.now() - t).toBeLessThan(700);
     expect(caps2.models.map((m) => m.id)).toEqual(['opus', 'haiku']);
 
     // The background refresh finds the changed model list and the new version, and says so.
-    await wait(600);
+    for (let i = 0; i < 100 && !(second.events.some((e) => e.type === 'caps.updated') && second.events.some((e) => e.type === 'provider.updated')); i++) await wait(100);
     const capsEvent = second.events.find((e) => e.type === 'caps.updated');
     expect(capsEvent && capsEvent.type === 'caps.updated' && capsEvent.caps.models.map((m) => m.id)).toEqual(['opus', 'sonnet', 'haiku']);
     expect(capsEvent && capsEvent.type === 'caps.updated' && capsEvent.cwd).toBe(home);
