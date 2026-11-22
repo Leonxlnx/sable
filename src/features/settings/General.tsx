@@ -119,7 +119,7 @@ function FolderSettingRow({ label, chosen, fallback, onSet }: { label: string; c
         />
       ) : (
         <div className="set-chats">
-          {current && <PathLabel path={tildePath(current, home)} title={current} className="set-chats-path" />}
+          {current && <PathLabel fit path={tildePath(current, home)} title={current} className="set-chats-path" />}
           {chosen && (
             <button type="button" className="btn btn-sm btn-ghost" onClick={() => void onSet('')}>
               Default

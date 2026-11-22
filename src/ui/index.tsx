@@ -8,6 +8,7 @@ import { play, spring } from '@/lib/motion';
 import { useStore } from '@/state/store';
 import './grow';
 import { movedByKeys } from './glide';
+import { fitDir, watchDir } from './path-fit';
 
 /** React wrappers around the primitives in styles/ui.css. Keep this file small and boring. */
 
@@ -580,17 +581,38 @@ export function Toasts() {
  * A path, folder or file shown as a label: the UI font, the directory dim and the name regular.
  * The directory gives way first (its start is elided), the name stays whole. Pass a path that is
  * already shortened for display (relPath / tildePath). Never monospace: that is for code only.
+ * `fit` cuts the directory by whole folders ("…/Local/Temp/", starting on the label's own left
+ * edge) instead of mid-name: for menus, settings and dialogs (ui/path-fit.ts says why and at what
+ * cost); rows that mount by the hundred keep the plain cut.
  */
-export function PathLabel({ path, className, title }: { path: string; className?: string; title?: string }) {
+export function PathLabel({ path, className, title, fit }: { path: string; className?: string; title?: string; fit?: boolean }) {
   const norm = path.replace(/\\/g, '/').replace(/\/+$/, '');
   const i = norm.lastIndexOf('/');
   const dir = i >= 0 ? norm.slice(0, i + 1) : '';
   const name = i >= 0 ? norm.slice(i + 1) : norm;
+  const dirBox = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    const el = dirBox.current;
+    if (!fit || !el) return;
+    fitDir(el);
+    return watchDir(el);
+  }, [fit, dir]);
   // The full path shows as a tooltip only when part of it was cut (or when a different title was asked for).
   return (
     <span className={cx('path', className)} title={title && title !== path ? title : undefined} data-title={path} onPointerEnter={title && title !== path ? undefined : titleIfCut}>
       {/* Left-to-right marks hold the slashes in place inside the right-to-left box that cuts from the start. */}
-      {dir && <span className="path-dir">{`\u200E${dir}\u200E`}</span>}
+      {dir &&
+        (fit ? (
+          // The whole directory unseen in the flow (it gives the box its width); what fits is written over it.
+          <span className="path-dir" data-fit="" data-dir={dir} ref={dirBox}>
+            <span className="path-dir-full" aria-hidden>
+              {dir}
+            </span>
+            <span className="path-dir-shown" />
+          </span>
+        ) : (
+          <span className="path-dir">{`\u200E${dir}\u200E`}</span>
+        ))}
       <span className="path-name">{name || norm}</span>
     </span>
   );

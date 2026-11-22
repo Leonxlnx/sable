@@ -549,7 +549,7 @@ function FolderMenu({ onClosed }: { onClosed: () => void }) {
                 {recent.map((p) => (
                   <RM.Item key={p.path} className="menu-item cm-row" onSelect={() => setUi({ homeCwd: p.path, homeChat: false })}>
                     <Icon name={p.pinned ? 'pin' : 'folder'} size={15} className="hc-icon" />
-                    <PathLabel path={tildePath(p.path, home)} title={p.path} className="cm-row-path grow" />
+                    <PathLabel fit path={tildePath(p.path, home)} title={p.path} className="cm-row-path grow" />
                     <span className="cm-check">{!chat && p.path === cwd && <Icon name="check" size={14} />}</span>
                   </RM.Item>
                 ))}

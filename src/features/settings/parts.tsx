@@ -58,7 +58,7 @@ export function CodeChip({ text, shown = text, copy = true, label }: { text: str
   const path = looksLikePath(text);
   return (
     <span className="code-chip" data-path={path || undefined}>
-      {path ? <PathLabel path={shown} title={shown !== text ? text : undefined} className="code-chip-path" /> : <code className="truncate">{shown}</code>}
+      {path ? <PathLabel fit path={shown} title={shown !== text ? text : undefined} className="code-chip-path" /> : <code className="truncate">{shown}</code>}
       {copy && <CopyButton text={text} label={label ?? `Copy ${text}`} size={13} className="code-chip-copy" />}
     </span>
   );

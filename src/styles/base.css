@@ -195,6 +195,25 @@ kbd {
 }
 
 
+/* Cut by whole folders (PathLabel `fit`, ui/path-fit.ts): the full directory stays in the flow
+   unseen and gives the box its width; what fits is written over it from the box's left edge. */
+.path-dir[data-fit] {
+  position: relative;
+  direction: ltr;
+  text-overflow: clip;
+}
+
+.path-dir-full {
+  visibility: hidden;
+}
+
+.path-dir-shown {
+  position: absolute;
+  left: 0;
+  top: 0;
+  white-space: nowrap;
+}
+
 .path-name {
   flex-shrink: 0;
   max-width: 100%;

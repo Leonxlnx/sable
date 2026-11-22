@@ -248,7 +248,7 @@ function Ready({ provider, accountId, onSignIn, onDone }: { provider: ProviderId
         {account.auth.loggedIn ? <Icon name="check-circle" size={16} className="aa-ready-icon" /> : <Icon name="circle-dashed" size={16} className="aa-ready-icon" />}
         <span className="aa-ready-state">{account.auth.loggedIn ? 'Signed in' : 'Not signed in'}</span>
         {plan && account.auth.loggedIn && <span className="aa-ready-plan">{plan} plan</span>}
-        {account.external && <PathLabel path={tildePath(account.dir ?? '', home)} className="aa-ready-dir" />}
+        {account.external && <PathLabel fit path={tildePath(account.dir ?? '', home)} className="aa-ready-dir" />}
       </div>
       <label className="aa-field">
         <span className="aa-field-label">Name</span>
@@ -332,7 +332,7 @@ function ExistingFolder({ provider, onBack, onAdded }: { provider: ProviderId; o
               <Icon name="folder" size={17} className="aa-option-icon" />
               <span className="aa-folder grow">
                 <span className="aa-folder-name">{f.name}</span>
-                <PathLabel path={tildePath(f.dir, home)} className="aa-folder-path" />
+                <PathLabel fit path={tildePath(f.dir, home)} className="aa-folder-path" />
               </span>
               {busy === f.dir ? <Spinner size={13} /> : <Icon name="plus" size={13} className="aa-option-caret" />}
             </button>

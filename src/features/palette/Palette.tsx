@@ -395,7 +395,7 @@ function PaletteRowView({
             {item.hit?.role === 'user' && <span className="palette-you">You: </span>}
             <Highlight text={item.title} indices={row.indices} />
           </span>
-          {item.sub && (item.group === 'Projects' ? <PathLabel path={item.sub} className="palette-sub" /> : <span className="palette-sub truncate">{item.sub}</span>)}
+          {item.sub && (item.group === 'Projects' ? <PathLabel fit path={item.sub} className="palette-sub" /> : <span className="palette-sub truncate">{item.sub}</span>)}
         </span>
         <span className="palette-end">{item.hit ? <HitEnd hit={item.hit} /> : item.session ? <SessionEnd session={item.session} /> : item.keys ? <Kbd combo={item.keys} /> : null}</span>
       </div>
