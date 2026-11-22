@@ -252,7 +252,12 @@ describe('the shade: the bar casts little, and focus darkens nothing round it', 
     // is the composer (the chips under the home composer open menus too), or a card on its own.
     const held = ":is(.composer, .cmp-card):is(:focus-within, :has([aria-expanded='true']))";
     expect(css).toContain(`${held} .cmp-rim-lift,\n${held} .cmp-glass > .gl-ink {\n  opacity: 1;`);
-    expect(css).toContain(`${held} .cmp-input::placeholder {`);
+    // The placeholder reads the state from a property on the holder: a `:has()` selector that ends in a
+    // pseudo-element makes every insertion anywhere restyle the whole document.
+    expect(css).toContain(`${held} {
+  --cmp-ph:`);
+    expect(css).toContain('color: var(--cmp-ph, var(--text-3));');
+    expect(css).not.toMatch(/:has\([^{]*::placeholder\s*\{/);
     // The copy that flies to the dock never shows it: its rule comes later, with as much weight.
     expect(css.indexOf('.handoff-ghost .cmp-card > .cmp-rim-lift')).toBeGreaterThan(css.indexOf(`${held} .cmp-rim-lift`));
     expect(css).not.toContain('textarea.cmp-input:focus)');

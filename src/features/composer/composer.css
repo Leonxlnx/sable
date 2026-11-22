@@ -380,15 +380,18 @@
 }
 
 .cmp-input::placeholder {
-  color: var(--text-3);
+  color: var(--cmp-ph, var(--text-3));
   opacity: 1;
   transition: color 360ms var(--ease-out);
 }
 
 /* With focus the placeholder steps back, so the caret leads; it stays back while the pane is held
-   (a menu of the bar is open), so nothing on the pane comes forward under a menu. */
-:is(.composer, .cmp-card):is(:focus-within, :has([aria-expanded='true'])) .cmp-input::placeholder {
-  color: rgb(122 121 117 / 0.72);
+   (a menu of the bar is open), so nothing on the pane comes forward under a menu. The state sets a
+   property on the holder and the placeholder reads it: written as one selector that ends in the
+   pseudo-element (`…:has(…) .cmp-input::placeholder`), Chrome restyled every element of the document
+   on every insertion anywhere (a streamed item, a menu, a toast: 40 to 60 ms each with a chat open). */
+:is(.composer, .cmp-card):is(:focus-within, :has([aria-expanded='true'])) {
+  --cmp-ph: rgb(122 121 117 / 0.72);
 }
 
 .cmp-input:focus,
