@@ -23,7 +23,13 @@
  *   Enter or a click into it does nothing, and what is typed meanwhile goes to the field that takes
  *   focus once the menu is gone. What the eye sees (the hold, the fold) does not change.
  *
- * Positions are read (two rects, converted to the pop's CSS pixels) before anything is written,
+ * - The pill's place is its row's place in the layout (`layoutBox`: offsets, never a drawn
+ *   rectangle), so the first frame it shows in is where it rests. A row still arriving behind the
+ *   pane (grow.ts) is drawn a few pixels short of its place for a moment: a pill put where the row
+ *   was drawn then rested between two rows until the next move. And a pill never shows before its
+ *   row: under a row that is still arriving it fades in on that row's own clock.
+ *
+ * Positions are read (layout offsets, in the pop's own CSS pixels) before anything is written,
  * inside the menu only: a move restyles one element and repaints nothing outside the menu.
  * Nothing here knows about a specific menu; a popover without menu rows never gets a glide.
  */
@@ -93,10 +99,123 @@ function glideOf(pop: HTMLElement): HTMLElement {
   return g;
 }
 
-const boxKey = (b: { x: number; y: number; w: number; h: number }) => `${b.x},${b.y},${b.w},${b.h}`;
+export interface Box {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
-/** The row's box in the pop's own coordinates, scroll offsets of anything between taken off. */
-function boxIn(row: HTMLElement, pop: HTMLElement) {
+const boxKey = (b: Box) => `${b.x},${b.y},${b.w},${b.h}`;
+
+/** What `layoutBox` reads of an element: its place in the layout, never where it is drawn. */
+export interface LayoutNode {
+  offsetLeft: number;
+  offsetTop: number;
+  offsetWidth: number;
+  offsetHeight: number;
+  clientLeft: number;
+  clientTop: number;
+  scrollLeft: number;
+  scrollTop: number;
+  offsetParent: unknown;
+  parentElement: unknown;
+}
+
+/**
+ * The row's box in the pop's own pixels (the pill's `top: 0; left: 0` is the pop's padding edge),
+ * from the layout alone: offsets up the positioned ancestors to the pop, the scroll of every
+ * scroller between taken off. A transform on the row or on the pane (a row arriving, a pane that
+ * unfolds or is zoomed) changes nothing here, so the box is the row's resting place in whatever
+ * frame it is read. Null when the offsets do not lead to the pop (it is not positioned).
+ */
+export function layoutBox(row: LayoutNode, pop: LayoutNode): Box | null {
+  let x = 0;
+  let y = 0;
+  let el: LayoutNode | null = row;
+  for (let i = 0; el && el !== pop; i++) {
+    if (i > 24) return null;
+    x += el.offsetLeft;
+    y += el.offsetTop;
+    const parent = el.offsetParent as LayoutNode | null;
+    // An offset is measured from the padding edge of the offset parent: its border comes on top.
+    if (parent && parent !== pop) {
+      x += parent.clientLeft;
+      y += parent.clientTop;
+    }
+    el = parent;
+  }
+  if (el !== pop) return null;
+  for (let s = row.parentElement as LayoutNode | null; s && s !== pop; s = s.parentElement as LayoutNode | null) {
+    x -= s.scrollLeft;
+    y -= s.scrollTop;
+  }
+  return { x: Math.round(x), y: Math.round(y), w: Math.round(row.offsetWidth), h: Math.round(row.offsetHeight) };
+}
+
+// ── a pill never shows before its row ──
+
+/** The id grow.ts gives a row's arrival, so the pill under that row can keep its time. */
+export const ARRIVE = 'menu-arrive';
+
+/** The pill's copy of its row's arrival, ended when the pill moves on or lets go. */
+const rides = new WeakMap<HTMLElement, Animation>();
+
+function endRide(g: HTMLElement | null) {
+  if (!g) return;
+  rides.get(g)?.cancel();
+  rides.delete(g);
+}
+
+/** One frame of an arrival as the pill takes it over: the row's opacity and its timing, never its offset. */
+export const rideFrame = (k: { computedOffset?: number; offset?: number | null; easing?: string; opacity?: unknown }): Keyframe => ({
+  offset: k.computedOffset ?? k.offset ?? undefined,
+  easing: k.easing,
+  opacity: Number(k.opacity ?? 1),
+});
+
+/**
+ * The row under the pill is still arriving behind the pane (grow.ts): the pill fades in on the
+ * row's own clock (the same frames, the same curve), already in its final place. Nothing when the
+ * row has arrived, or under reduced motion (no row arrives then).
+ */
+function rideWith(g: HTMLElement, row: HTMLElement) {
+  endRide(g);
+  if (typeof row.getAnimations !== 'function' || typeof KeyframeEffect !== 'function') return;
+  const a = row.getAnimations().find((x) => x.id === ARRIVE);
+  const fx = a?.effect;
+  if (!a || !(fx instanceof KeyframeEffect) || a.playState === 'finished' || a.playState === 'idle') return;
+  try {
+    const mine = g.animate(fx.getKeyframes().map(rideFrame), fx.getTiming());
+    rides.set(g, mine);
+    // The same clock. A row whose arrival has not been given its start yet (the page was busy while
+    // the menu opened) may get one earlier than a copy made now would: the pill takes the row's own
+    // start the moment it is known.
+    const sync = () => {
+      if (rides.get(g) === mine && a.startTime !== null) mine.startTime = a.startTime;
+    };
+    if (a.startTime !== null) sync();
+    else {
+      mine.currentTime = a.currentTime;
+      a.ready.then(sync, () => {});
+    }
+  } catch {
+    /* an arrival the pill cannot copy: it shows at once, in its place */
+  }
+}
+
+/** A pane's rows began to arrive (grow.ts) with the pill already on one of them: it takes that row's clock. */
+export function arriving(pop: HTMLElement) {
+  const s = state.get(pop);
+  const g = pop.querySelector<HTMLElement>(':scope > .menu-glide');
+  if (g && s?.row && !s.hide && g.dataset.on !== undefined) rideWith(g, s.row);
+}
+
+/** The row's box in the pop's own coordinates: its place in the layout, wherever it is drawn right now. */
+function boxIn(row: HTMLElement, pop: HTMLElement): Box {
+  const laid = layoutBox(row, pop);
+  if (laid) return laid;
+  // A pop that is not positioned (none is today): the drawn rectangles, as before.
   const P = pop.getBoundingClientRect();
   const R = row.getBoundingClientRect();
   // Client pixels to the pop's own CSS pixels (Interface size zooms floating layers).
@@ -125,6 +244,7 @@ function place(pop: HTMLElement, row: HTMLElement, travel: boolean) {
   g.dataset.tone = row.dataset.tone ?? '';
   g.dataset.on = '';
   s.box = boxKey(b);
+  rideWith(g, row);
   // The row under the pill says so: a row with a fill of its own (one whose submenu is open)
   // steps it aside while the pill is there, so the two never add up (ui.css).
   if (s.row !== row) {
@@ -149,6 +269,7 @@ function hide(pop: HTMLElement) {
     s.hidAt = performance.now();
     const g = pop.querySelector<HTMLElement>(':scope > .menu-glide');
     if (g) delete g.dataset.on;
+    endRide(g);
   });
 }
 
@@ -162,6 +283,7 @@ function drop(pop: HTMLElement) {
   s.hidAt = -1e9;
   const g = pop.querySelector<HTMLElement>(':scope > .menu-glide');
   if (g) delete g.dataset.on;
+  endRide(g);
 }
 
 // ── a pick is taken once ──

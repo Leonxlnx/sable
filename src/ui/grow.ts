@@ -1,4 +1,5 @@
 import { EASE_OUT, play, uiZoom } from '@/lib/motion';
+import { ARRIVE, arriving } from './glide';
 
 /**
  * Popovers grow out of where they came from and shrink back into it.
@@ -21,6 +22,10 @@ import { EASE_OUT, play, uiZoom } from '@/lib/motion';
  * only, once, and only the rows in view; a popover without rows brings its children in by a fade
  * alone, in the same order. `data-arrive="none"` on a popover keeps its content still, and
  * `data-arrive-row` makes any element inside one a row.
+ *
+ * A row is drawn short of its place while it arrives, so nothing may be placed by where a row is
+ * drawn then: the menu's highlight takes the row's place in the layout and the row's own clock
+ * (each arrival carries the id `ARRIVE`; glide.ts).
  */
 
 const PAD = 10;
@@ -145,16 +150,26 @@ function arrive(pop: HTMLElement, originY: number | null) {
     seen.push({ el, d: ((R.top + R.bottom) / 2 - P.top) * k - from });
   }
   seen.sort((a, b) => Math.abs(a.d) - Math.abs(b.d));
+  // The last row of a list that scrolls only fades when the rows are drawn below their place: its
+  // offset would lengthen what the list can scroll while it arrives, and a list scrolled to its end
+  // in those frames (to its current row) is pulled back, rows and highlight, when the row lands.
+  const lastIn = new Set<HTMLElement>();
+  if (!plain)
+    for (const scroller of pop.querySelectorAll<HTMLElement>('.scroll')) {
+      let last: HTMLElement | undefined;
+      for (const el of rows) if (scroller.contains(el)) last = el;
+      if (last) lastIn.add(last);
+    }
   // A row that is dim by itself (disabled) arrives dim, never lit first: its own opacity is read.
   const own = seen.map(({ el }) => (plain || el.matches(DIM) ? Number(getComputedStyle(el).opacity) || 1 : 1));
   seen.forEach(({ el, d }, i) => {
     const start = (FIRST + Math.min(i, BEATS) * BEAT) / TOTAL;
     const end = Math.min(1, start + RISE / TOTAL);
     // A row on the origin itself (the current row of a select-like menu) only fades.
-    const dy = Math.abs(d) < 14 ? 0 : d > 0 ? -5 : 5;
+    const dy = Math.abs(d) < 14 ? 0 : d > 0 ? -5 : lastIn.has(el) ? 0 : 5;
     const at = plain ? {} : { transform: `translateY(${dy}px)` };
     const home = plain ? {} : { transform: 'translateY(0px)' };
-    play(
+    const a = play(
       el,
       [
         { opacity: 0, ...at, offset: 0 },
@@ -163,7 +178,10 @@ function arrive(pop: HTMLElement, originY: number | null) {
       ],
       { duration: TOTAL },
     );
+    if (a) a.id = ARRIVE;
   });
+  // A highlight that took a row before the rows set off (the keys opened the menu) arrives with it.
+  arriving(pop);
 }
 
 const placed = new WeakSet<HTMLElement>();

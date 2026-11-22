@@ -414,25 +414,25 @@
 
 /* ───────────── glance (the switcher's popover, the side panel) ───────────── */
 
+/* Beside the switcher's menu it is that menu's second pane and keeps the menu's measures: its
+   content on the menu's inset (the pane's 4px and a row's 8px), its head a row of a menu row's
+   height with the mark on the rows' mark column and the name on the names', its last row a menu
+   row on the line of the menu's own last row. */
 .ul-glance {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
   width: 100%;
   min-width: 248px;
-  padding: 10px 10px 4px;
-}
-
-.ul-glance > :not(.ul-glance-open) {
-  padding: 0 2px;
+  padding: 0 8px;
 }
 
 .ul-glance-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   min-width: 0;
-  min-height: 20px;
+  min-height: 28px;
 }
 
 .ul-glance-mark {
@@ -475,37 +475,64 @@
   font-size: var(--t-ui);
 }
 
+/* The pane ends as a menu ends: the menu's hairline, then one row with a menu row's measures
+   (28px, the icon and the word on the rows' columns, the pane's radius less its 4px inset) and a
+   menu row's light: the next fill under the pointer, one more while held. Backed out of the
+   glance's padding to the pane's own 4px, where the menu's rows stand. */
+.ul-glance-foot {
+  margin: 0 -8px;
+}
+
+.ul-glance-foot::before {
+  content: '';
+  display: block;
+  height: 1px;
+  margin: 0 2px 4px;
+  background: var(--line);
+}
+
 .ul-glance-open {
   display: flex;
   align-items: center;
   gap: 9px;
-  height: 30px;
-  margin: 0 -6px;
-  padding: 0 8px;
-  border-top: 1px solid var(--line);
-  border-radius: 0 0 var(--r-sm) var(--r-sm);
+  width: 100%;
+  min-height: 28px;
+  padding: 3px 8px;
+  border-radius: var(--r-lg);
   font-size: var(--t-ui);
+  text-align: left;
   color: var(--text-2);
-  transition: background-color var(--d-1) var(--ease), color var(--d-1) var(--ease);
+  cursor: default;
+  transition: color 70ms linear;
 }
 
+/* A 15px icon centred on the 14px column of the marks, so the word stands on the names' column. */
+.ul-glance-open svg {
+  flex-shrink: 0;
+  margin: 0 -0.5px;
+  color: var(--text-3);
+  transition: color 70ms linear;
+}
+
+/* Lit in the frame the pointer reaches it, as a menu's row is. */
 .ul-glance-open:hover {
-  background-color: var(--fill-2);
+  background-color: var(--hl);
   color: var(--text);
+  transition-duration: 0s;
+}
+
+.ul-glance-open:hover svg {
+  color: var(--text);
+  transition-duration: 0s;
 }
 
 .ul-glance-open:active {
-  background-color: var(--fill-3);
+  background-color: var(--fill-4);
 }
 
 .ul-glance-open:focus-visible {
   outline: var(--focus-w) solid var(--focus);
   outline-offset: var(--focus-inset);
-}
-
-.ul-glance-caret {
-  margin-left: auto;
-  color: var(--text-4);
 }
 
 /* The side panel's Plan limits: the glance in a card, on the card's own padding. */
@@ -514,12 +541,14 @@
 }
 
 .ul-rail .ul-glance {
+  gap: 12px;
   min-width: 0;
   padding: 0;
 }
 
-.ul-rail .ul-glance > :not(.ul-glance-open) {
-  padding: 0;
+.ul-rail .ul-glance-head {
+  gap: 8px;
+  min-height: 20px;
 }
 
 /* ───────────── activity ───────────── */

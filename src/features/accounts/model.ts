@@ -23,6 +23,34 @@ export function accountAgents(providers: Partial<Record<ProviderId, ProviderInfo
   return connectableAgents(providers).filter((id) => providers[id]?.installed && (id !== 'opencode' || limited(id)));
 }
 
+// ── what the switcher says about an account ──
+
+/**
+ * The account in use, which the footer names: the open chat's own account while a chat of this
+ * agent is open (on home, the account chosen for the next chat), else the agent's default.
+ */
+export function accountInUse<A extends Pick<AccountInfo, 'id' | 'isDefault'>>(list: A[], focused: string | undefined): A | undefined {
+  return (focused !== undefined ? list.find((a) => a.id === focused) : undefined) ?? list.find((a) => a.isDefault) ?? list[0];
+}
+
+/**
+ * What a row of the switcher's menu says about its account. `here`: the account in use (the open
+ * chat runs on it; with no chat open, the next chat starts on it), which gets the check: the menu
+ * has one check, on the account the footer names. `next`: where new chats with this agent start,
+ * when that is another account: a quiet dot, never a second check. (The check used to mark the
+ * default for new chats: inside a chat it read as "this chat runs on it", on an account the chat
+ * was not on.) `inUse` is the id of the account in use when the row's agent is the one in focus.
+ */
+export type AccountMark = 'here' | 'next' | undefined;
+
+export function accountMark(account: Pick<AccountInfo, 'id' | 'isDefault'>, inUse: string | undefined): AccountMark {
+  if (inUse !== undefined && account.id === inUse) return 'here';
+  return account.isDefault ? 'next' : undefined;
+}
+
+/** The mark in words, for the row's accessible name. */
+export const markWords = (mark: AccountMark) => (mark === 'here' ? ', in use' : mark === 'next' ? ', new chats start here' : '');
+
 // ── the Add account dialog, opened from anywhere ──
 
 interface AddState {

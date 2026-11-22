@@ -935,7 +935,8 @@ textarea.field {
   gap: 9px;
   min-height: 26px;
   padding: 3px 8px;
-  border-radius: 10px;
+  /* The pane's radius less the pane's padding (16 - 4): a row's corner runs parallel to the pane's. */
+  border-radius: var(--r-lg);
   font-size: var(--t-ui);
   color: var(--text-2);
   cursor: default;
@@ -1021,7 +1022,8 @@ textarea.field {
   top: 0;
   left: 0;
   z-index: 0;
-  border-radius: 10px;
+  /* As the rows: the pane's radius less its padding. */
+  border-radius: var(--r-lg);
   background-color: var(--hl);
   opacity: 0;
   pointer-events: none;

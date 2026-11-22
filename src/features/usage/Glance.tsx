@@ -21,7 +21,7 @@ import { useLimitsTicker } from './ticker';
  *
  * `read` keeps the figures current while it is shown (a cheap read when it mounts and on the
  * limits ticker); leave it off where the host reads them already. `onOpenUsage` adds a last row
- * that opens Settings › Usage.
+ * that opens Settings › Usage: a menu's last row (hairline, icon, word), not a control of its own.
  */
 export function LimitsGlance({ provider, accountId = DEFAULT_ACCOUNT, read = true, onOpenUsage }: { provider: ProviderId; accountId?: string; read?: boolean; onOpenUsage?: () => void }) {
   const info = useStore((s) => s.providers[provider]);
@@ -69,19 +69,21 @@ export function LimitsGlance({ provider, accountId = DEFAULT_ACCOUNT, read = tru
           <AsOf report={report} now={now} pending={pending} />
         </div>
       )}
+      {/* The pane's last row, as a menu ends ("Manage accounts" beside it): a hairline, an icon, a word. */}
       {onOpenUsage && (
-        <button
-          type="button"
-          className="ul-glance-open"
-          onClick={() => {
-            onOpenUsage();
-            openUsage();
-          }}
-        >
-          <Icon name="gauge" size={15} />
-          <span>Usage</span>
-          <Icon name="caret-right" size={12} className="ul-glance-caret" />
-        </button>
+        <div className="ul-glance-foot">
+          <button
+            type="button"
+            className="ul-glance-open"
+            onClick={() => {
+              onOpenUsage();
+              openUsage();
+            }}
+          >
+            <Icon name="gauge" size={15} />
+            <span>Usage</span>
+          </button>
+        </div>
       )}
     </div>
   );

@@ -10,7 +10,7 @@ import { useNow } from '@/lib/useNow';
 import { accountName } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { Tip } from '@/ui';
-import { accountsOf, planWord } from './model';
+import { accountMark, accountsOf, markWords, planWord, type AccountMark } from './model';
 import { rankWords, shortUntil, useFirstRanks } from './order';
 import type { UseFirstRank } from '@shared/use-first';
 import { appliesTo } from '@/features/usage/scope';
@@ -170,7 +170,8 @@ export function ManyAccounts({
 
   return (
     <div className="acs-many" onKeyDown={onListKey}>
-      <label className="acs-filter">
+      {/* The menu's first row: it arrives with the rows, and the menu's own hairline closes it. */}
+      <label className="acs-filter" data-arrive-row>
         <Icon name="search" size={14} />
         <input
           ref={input}
@@ -185,6 +186,7 @@ export function ManyAccounts({
           autoComplete="off"
         />
       </label>
+      <RM.Separator className="menu-sep" />
       <div className="acs-list scroll" ref={list}>
         {shown.length === 0 && <p className="acs-empty">No account matches</p>}
         {shown.map((g) => {
@@ -233,28 +235,54 @@ function ManyRow({ row, now, rank, inUse, single, onPeek, onSelect }: { row: Roo
   const plan = planOf(account);
   const used = row.tight ? Math.round(livePercent(row.tight, now)) : undefined;
   const words = rankWords(rank, now);
+  const mark = accountMark(account, inUse ? account.id : undefined);
   return (
     <RM.Item
       className="menu-item acs-row acs-row-in"
-      data-current={account.isDefault || undefined}
+      data-current={mark === 'here' || undefined}
       data-in-use={inUse || undefined}
+      data-out={!account.auth.loggedIn || undefined}
       onFocus={onPeek}
       onSelect={onSelect}
-      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${used}% used` : ''}${words ? `, ${words.toLowerCase()}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${account.isDefault ? ', default' : ''}`}
+      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${used}% used` : ''}${words ? `, ${words.toLowerCase()}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${markWords(mark)}`}
     >
       {single ? (
         <ProviderMark provider={provider} size={14} className="acs-mark" />
       ) : (
         <span className="acs-check-col" aria-hidden>
-          {account.isDefault && <Icon name="check" size={13} className="acs-check" />}
+          <MarkCell mark={mark} />
         </span>
       )}
       <span className="acs-name truncate">{single ? PROVIDER_NAME[provider] : row.input.name}</span>
-      <span className="acs-plan">{account.auth.loggedIn ? plan : 'Sign in'}</span>
-      <UsedCell limit={account.auth.loggedIn ? row.tight : undefined} now={now} />
-      <EndsCell rank={rank} now={now} />
+      {account.auth.loggedIn ? (
+        <>
+          <span className="acs-plan">{plan}</span>
+          <UsedCell limit={row.tight} now={now} />
+          <EndsCell rank={rank} now={now} />
+        </>
+      ) : (
+        <SignIn />
+      )}
     </RM.Item>
   );
+}
+
+/**
+ * A row's mark, in the check's column: the check on the account in use, a quiet dot where new
+ * chats with the agent start when that is another account (`accountMark`).
+ */
+export function MarkCell({ mark }: { mark: AccountMark }) {
+  if (mark === 'here') return <Icon name="check" size={14} className="acs-check" />;
+  if (mark === 'next') return <span className="acs-next" title="New chats start here" />;
+  return null;
+}
+
+/**
+ * A signed-out account has no plan, no figures and no week: its row ends in what picking it does,
+ * on the right edge the figures of the other rows end on.
+ */
+export function SignIn() {
+  return <span className="acs-signin">Sign in</span>;
 }
 
 /**

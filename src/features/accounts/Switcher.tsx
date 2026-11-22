@@ -13,11 +13,39 @@ import { Icon } from '@/icons';
 import { openSettings, refreshLimits, setDefaultAccount } from '@/state/actions';
 import { accountName, useFocusAccount } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
-import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, planOf, usePool } from './ManyAccounts';
+import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, MarkCell, planOf, SignIn, usePool } from './ManyAccounts';
 import { useAccountOrder } from './order';
 import type { UseFirstRank } from '@shared/use-first';
 import { poolLeftPercent } from '@/features/usage/plans';
-import { accountAgents, accountsOf, openAddAccount, planWord } from './model';
+import { accountAgents, accountInUse, accountMark, accountsOf, markWords, openAddAccount, planWord } from './model';
+
+/** How long a menu takes to unfold (`--d-open` in ui.css). */
+export const OPEN_MS = 130;
+
+/**
+ * As the menu opens, the account in use takes the focus, pointer or keys alike, so the highlight
+ * lands on it once and its limits show beside the menu at once. It is the menu's first focus: Radix's
+ * own (the menu itself, then its first row when the keys opened it) is skipped, or the highlight
+ * would show on the first row for two frames and travel on. The list is scrolled to the row before
+ * it takes focus, at the start of the next frame (a focus move forces a style pass, and the menu's
+ * styles were just invalidated). DropdownMenu.Content hands this to its focus scope; its types
+ * leave it out.
+ */
+const FOCUS_IN_USE = {
+  onOpenAutoFocus: (e: Event) => {
+    e.preventDefault();
+    const pop = e.currentTarget as HTMLElement;
+    requestAnimationFrame(() => {
+      const at = document.activeElement;
+      if (!pop.isConnected || pop.dataset.state === 'closed' || (at && at !== pop && pop.contains(at))) return;
+      const row = pop.querySelector<HTMLElement>('.acs-row[data-in-use]') ?? pop.querySelector<HTMLElement>('.acs-row');
+      // In a long list the account in use may sit below the fold of the list's own scroller.
+      const scroller = row?.closest<HTMLElement>('.acs-list');
+      if (row && scroller) scroller.scrollTop = Math.max(0, row.offsetTop - (scroller.clientHeight - row.offsetHeight) / 2);
+      (row ?? pop).focus({ preventScroll: true });
+    });
+  },
+} as object;
 
 /**
  * The sidebar footer's account switcher. The row is one line that fits the narrowest sidebar: the
@@ -25,7 +53,9 @@ import { accountAgents, accountsOf, openAddAccount, planWord } from './model';
  * how much of its most used window is used as a small ring and figure, the same figure its row in
  * the menu shows. The tooltip says it in full (plan, every window, resets, what is left across the
  * agent's accounts). It opens every agent's
- * accounts as rows with the plan and how full each is, the default checked. Pointing at a row (or
+ * It opens every agent's
+ * accounts as rows with the plan and how full each is, the account in use checked (the open chat's
+ * own; `accountMark` in model.ts). Pointing at a row (or
  * moving to it with the keys) shows that account's limits beside the menu. Picking one makes it the
  * account new sessions use.
  */
@@ -36,6 +66,8 @@ export function AccountSwitcher() {
   const [peek, setPeek] = useState<{ provider: ProviderId; accountId: string } | null>(null);
   const reduce = useReducedMotion();
   const contentRef = useRef<HTMLDivElement>(null);
+  /** When the menu was opened: the pane beside it comes out once the menu has unfolded. */
+  const openedAt = useRef(0);
 
   // OpenCode is listed once its plan limits are known: one read when it is installed and not read yet.
   const openCodeReady = !!providers.opencode?.installed;
@@ -44,34 +76,22 @@ export function AccountSwitcher() {
     if (openCodeReady && !openCodeRead) void refreshLimits('opencode');
   }, [openCodeReady, openCodeRead]);
 
-  // As the menu opens, the account in use takes the focus (pointer or keys alike), so its limits
-  // show beside the menu at once. After Radix's own focus on open, at the start of a frame (a focus
-  // move forces a style pass, and the menu's styles were just invalidated).
-  useEffect(() => {
-    if (!open) return;
-    let r = requestAnimationFrame(() => {
-      r = requestAnimationFrame(() => {
-        const pop = contentRef.current;
-        if (!pop || pop.dataset.state === 'closed' || document.activeElement?.matches('.acs-row[data-in-use]')) return;
-        const row = pop.querySelector<HTMLElement>('.acs-row[data-in-use]') ?? pop.querySelector<HTMLElement>('.acs-row');
-        row?.focus({ preventScroll: true });
-        // In a long list the account in use may sit below the fold of the list's own scroller.
-        const scroller = row?.closest<HTMLElement>('.acs-list');
-        if (row && scroller) scroller.scrollTop = Math.max(0, row.offsetTop - scroller.clientHeight / 2);
-      });
-    });
-    return () => cancelAnimationFrame(r);
-  }, [open]);
-
   const reports = useStore((s) => s.limitReports);
   const agents = accountAgents(providers, (id) => reports[accountKey(id, DEFAULT_ACCOUNT)]?.planLimits === true);
   const signedIn = agents.filter((id) => accountsOf(providers[id]).some((a) => a.auth.loggedIn));
   const focus: ProviderId = signedIn.includes(active) || agents.includes(active) ? active : (signedIn[0] ?? agents[0] ?? active);
   const list = accountsOf(providers[focus]);
-  const current = (focus === active ? list.find((a) => a.id === accountId) : undefined) ?? list.find((a) => a.isDefault) ?? list[0];
+  // The account in use: the open chat's own (on home, the one the next chat starts on). The row names it and the menu checks it.
+  const current = accountInUse(list, focus === active ? accountId : undefined);
   const plan = planWord(current);
   const several = list.length > 1;
   const many = agents.reduce((n, id) => n + accountsOf(providers[id]).length, 0) >= MANY_ACCOUNTS;
+  // One set of columns down the short list: once any agent has several accounts, every row keeps
+  // the column of the week's end (empty for an agent's only account), so the figures line up.
+  const ends = agents.some((id) => accountsOf(providers[id]).length > 1);
+  // The menu unfolds by a clip, which would cut the pane beside it: that pane comes out of the
+  // menu's edge when the unfold is done (at once when the menu is already open).
+  const peekDelay = reduce ? 0 : Math.max(0, OPEN_MS - (performance.now() - openedAt.current)) / 1000;
 
   const pool = usePool(focus, providers[focus]);
   const on = !!current?.auth.loggedIn;
@@ -94,6 +114,7 @@ export function AccountSwitcher() {
     <RM.Root
       open={open}
       onOpenChange={(o) => {
+        if (o) openedAt.current = performance.now();
         setOpen(o);
         if (!o) setPeek(null);
       }}
@@ -122,8 +143,9 @@ export function AccountSwitcher() {
           align="start"
           sideOffset={8}
           collisionPadding={10}
-          style={{ width: many ? 292 : 268 }}
+          style={{ width: many || ends ? 292 : 268 }}
           loop
+          {...FOCUS_IN_USE}
         >
           {many && (
             <ManyAccounts
@@ -146,6 +168,7 @@ export function AccountSwitcher() {
                 provider={id}
                 info={providers[id]}
                 inUse={id === focus ? current?.id : undefined}
+                ends={ends}
                 onPeek={(accountId) => setPeek({ provider: id, accountId })}
                 onSelect={(a) => {
                   if (!a.auth.loggedIn) return openSettings('accounts');
@@ -177,7 +200,7 @@ export function AccountSwitcher() {
                 initial={reduce ? { opacity: 0 } : { opacity: 0, x: -6 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, transition: { duration: 0.08 } }}
-                transition={{ duration: 0.14, ease: [0.16, 1, 0.3, 1] }}
+                transition={{ duration: 0.14, ease: [0.16, 1, 0.3, 1], delay: peekDelay }}
               >
                 <Peek key={`${peek.provider}:${peek.accountId}`} provider={peek.provider} accountId={peek.accountId} onOpenUsage={() => setOpen(false)} />
               </motion.div>
@@ -190,38 +213,47 @@ export function AccountSwitcher() {
 }
 
 /** One agent's accounts in the short list, in the order every list uses (`useAccountOrder`). */
-function Rows({ provider, info, inUse, onPeek, onSelect }: { provider: ProviderId; info: ProviderInfo | undefined; inUse: string | undefined; onPeek: (accountId: string) => void; onSelect: (a: AccountInfo) => void }) {
+function Rows({ provider, info, inUse, ends, onPeek, onSelect }: { provider: ProviderId; info: ProviderInfo | undefined; inUse: string | undefined; ends: boolean; onPeek: (accountId: string) => void; onSelect: (a: AccountInfo) => void }) {
   const accounts = useMemo(() => accountsOf(info), [info]);
   const { list, rank } = useAccountOrder(provider, accounts);
   const now = useNow();
   return (
     <>
       {list.map((a) => (
-        <Row key={a.id} provider={provider} account={a} single={list.length === 1} inUse={a.id === inUse} rank={list.length > 1 ? rank.get(a.id) : undefined} now={now} onPeek={() => onPeek(a.id)} onSelect={() => onSelect(a)} />
+        <Row key={a.id} provider={provider} account={a} single={list.length === 1} inUse={a.id === inUse} ends={ends} rank={list.length > 1 ? rank.get(a.id) : undefined} now={now} onPeek={() => onPeek(a.id)} onSelect={() => onSelect(a)} />
       ))}
     </>
   );
 }
 
-function Row({ provider, account, single, inUse, rank, now, onPeek, onSelect }: { provider: ProviderId; account: AccountInfo; single: boolean; inUse: boolean; rank?: UseFirstRank; now: number; onPeek: () => void; onSelect: () => void }) {
+function Row({ provider, account, single, inUse, ends, rank, now, onPeek, onSelect }: { provider: ProviderId; account: AccountInfo; single: boolean; inUse: boolean; ends: boolean; rank?: UseFirstRank; now: number; onPeek: () => void; onSelect: () => void }) {
   const plan = planOf(account);
   // An agent's only account goes by the agent's name, and there is no choice to check.
   const label = single ? PROVIDER_NAME[provider] : accountName(account);
+  const mark = accountMark(account, inUse ? account.id : undefined);
   return (
     <RM.Item
       className="menu-item acs-row"
-      data-current={account.isDefault || undefined}
+      data-current={mark === 'here' || undefined}
       data-in-use={inUse || undefined}
+      data-out={!account.auth.loggedIn || undefined}
       onFocus={onPeek}
       onSelect={onSelect}
-      aria-label={`${PROVIDER_NAME[provider]}, ${label}${plan ? `, ${plan}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${account.isDefault ? ', default' : ''}`}
+      aria-label={`${PROVIDER_NAME[provider]}, ${label}${plan ? `, ${plan}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${markWords(mark)}`}
     >
       <ProviderMark provider={provider} size={14} className="acs-mark" />
       <span className="acs-name truncate">{label}</span>
-      <span className="acs-plan">{account.auth.loggedIn ? plan : 'Sign in'}</span>
-      {account.auth.loggedIn ? <AccountUsed provider={provider} accountId={account.id} /> : <span className="acs-used" aria-hidden />}
-      {rank && <EndsCell rank={rank} now={now} />}
-      <span className="acs-end">{account.isDefault && !single && <Icon name="check" size={14} className="acs-check" />}</span>
+      {account.auth.loggedIn ? (
+        <>
+          <span className="acs-plan">{plan}</span>
+          <AccountUsed provider={provider} accountId={account.id} />
+          {ends && <EndsCell rank={rank} now={now} />}
+        </>
+      ) : (
+        <SignIn />
+      )}
+      {/* The check's column exists only where there is a choice to check (some agent has several accounts). */}
+      {ends && <span className="acs-end">{!single && <MarkCell mark={mark} />}</span>}
     </RM.Item>
   );
 }
