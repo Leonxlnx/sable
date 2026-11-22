@@ -504,8 +504,14 @@ async function ask(rt: SessionRuntime, req: Omit<BrowserRequest, 'id' | 'session
  * that look like references are kept, before the step is first published (the providers call this
  * where they make the item); every other tool's input is as given.
  */
+/**
+ * Whether a name is Sable's own browser_sign_in, exactly: the bare name (Codex's dynamic tool, the Demo) or
+ * the name under Sable's own MCP server (Claude Code). Another server's tool that ends the same is not it.
+ */
+export const isSignInTool = (name: string | undefined) => name === BROWSER_TOOLS.sign_in || name === `mcp__${WIDGET_SERVER}__${BROWSER_TOOLS.sign_in}`;
+
 export function cleanToolInput(name: string | undefined, input: unknown): unknown {
-  if (browserOp(name) !== 'sign_in') return input;
+  if (!isSignInTool(name)) return input;
   const o = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
   const out: Record<string, string> = {};
   for (const k of SIGN_IN_KEYS) if (typeof o[k] === 'string' && /^e\d{1,6}$/.test(o[k] as string)) out[k] = o[k] as string;
@@ -513,7 +519,7 @@ export function cleanToolInput(name: string | undefined, input: unknown): unknow
 }
 
 /** Whether a tool's input may stream into the timeline as it is written (never browser_sign_in's). */
-export const streamsInput = (name: string | undefined) => browserOp(name) !== 'sign_in';
+export const streamsInput = (name: string | undefined) => !isSignInTool(name);
 
 /** Runs one browser tool for a session: the same path for Claude, Codex and the Demo. */
 export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: unknown, signal?: AbortSignal): Promise<BrowserToolResult> {

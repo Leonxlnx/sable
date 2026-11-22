@@ -392,8 +392,7 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         if (!e.url) return;
         // What the old document reported last lands before the new one starts.
         flushSoon();
-        // A new document: the agent's view of its console and failed requests starts empty.
-        resetLog(tid);
+        // The log starts empty once, on the shell's own `doc` event, in order with the batches.
         // A reload of the same address keeps its title and icon: the engine reports them again only when they change.
         const same = getPage(tid).url === e.url;
         setPage(tid, { url: e.url, ...(same ? {} : { title: '', favicon: undefined }), phase: 2 });

@@ -4,6 +4,7 @@ import nodeModule from 'node:module';
 import path from 'node:path';
 import { startServer, type RunningServer } from '../server/serve';
 import { installSignIn, signInHeld } from './sign-in';
+import { GuestLog } from './guest-log';
 import { bootMark } from '../server/util/boot';
 import { fixPathFromLoginShell } from '../server/util/login-env';
 import { pageHeaders as csp } from './csp';
@@ -255,21 +256,12 @@ const EVENT_NET = 30;
 type BrowserEvent = { type: string; id?: number; [k: string]: unknown };
 const outbox: BrowserEvent[] = [];
 let outboxTimer: ReturnType<typeof setTimeout> | undefined;
-const consoleBuf = new Map<number, { lines: { level: string; text: string; source?: string }[]; dropped: number }>();
-const netBuf = new Map<number, { list: BrowserEvent[]; dropped: number }>();
-/** Each guest's committed documents: batches carry the one they came from, so a late one of an old document is dropped. */
-const guestDoc = new Map<number, number>();
+/** Each entry carries its own document from the moment it is recorded (guest-log.ts), so a late one of an old document is dropped. */
+const guestLog = new GuestLog({ lines: EVENT_LINES, net: EVENT_NET, requests: 4_000 });
 
 function flushBrowserEvents() {
   outboxTimer = undefined;
-  for (const [id, b] of consoleBuf) outbox.push({ type: 'console', id, doc: guestDoc.get(id) ?? 0, lines: b.lines, dropped: b.dropped });
-  consoleBuf.clear();
-  for (const [id, b] of netBuf) {
-    const doc = guestDoc.get(id) ?? 0;
-    outbox.push(...b.list.map((e) => ({ ...e, doc })));
-    if (b.dropped) outbox.push({ type: 'net-dropped', id, doc, count: b.dropped });
-  }
-  netBuf.clear();
+  outbox.push(...guestLog.flush());
   const batch = outbox.splice(0);
   if (batch.length && win && !win.isDestroyed()) win.webContents.send('sable:browser-event', batch);
 }
@@ -283,19 +275,14 @@ function toApp(ev: BrowserEvent) {
 function queueConsole(id: number, line: { level: string; text: string; source?: string }) {
   // A page held for a sign-in says nothing to the app (so nothing of it can reach the agent).
   if (signInHeld(id)) return;
-  let b = consoleBuf.get(id);
-  if (!b) consoleBuf.set(id, (b = { lines: [], dropped: 0 }));
-  if (b.lines.length >= EVENT_LINES) b.dropped++;
-  else b.lines.push(line);
+  guestLog.console(id, line);
   outboxTimer ??= setTimeout(flushBrowserEvents, EVENT_BEAT);
 }
 
-function queueNet(ev: BrowserEvent & { id: number }) {
-  if (signInHeld(ev.id)) return;
-  let b = netBuf.get(ev.id);
-  if (!b) netBuf.set(ev.id, (b = { list: [], dropped: 0 }));
-  if (b.list.length >= EVENT_NET) b.dropped++;
-  else b.list.push(ev);
+/** A failed request, as the document it started on (`doc`). */
+function queueNet(id: number, doc: number, ev: { url: string; method: string; status?: number; error?: string }) {
+  if (signInHeld(id)) return;
+  guestLog.net(id, doc, ev);
   outboxTimer ??= setTimeout(flushBrowserEvents, EVENT_BEAT);
 }
 
@@ -315,15 +302,14 @@ function guardGuest(contents: WebContents) {
   contents.on('will-navigate', guard);
   contents.on('will-redirect', guard);
   contents.on('will-attach-webview', (e) => e.preventDefault());
-  // What the old document logged and has not gone out yet is dropped when the next one commits, so a
-  // late batch is never read as the new page's (the window starts the new page's log at this moment).
+  // A new document commits: what the old one logged and has not gone out yet goes first, as the old
+  // document's, then the new document (the window starts the new page's log at that moment, once).
   contents.on('did-navigate', () => {
-    consoleBuf.delete(contents.id);
-    netBuf.delete(contents.id);
-    const doc = (guestDoc.get(contents.id) ?? 0) + 1;
-    guestDoc.set(contents.id, doc);
-    // On the same channel as the batches, after every batch of the old document that already went out.
-    toApp({ type: 'doc', id: contents.id, doc });
+    // On the same channel as the batches, after every batch of the old document, and at once: the
+    // window must not read the old page's log under the new address while a beat waits.
+    outbox.push(...guestLog.commit(contents.id));
+    if (outboxTimer) clearTimeout(outboxTimer);
+    flushBrowserEvents();
   });
   const ours = () => {
     const host = contents.hostWebContents;
@@ -343,9 +329,7 @@ function guardGuest(contents: WebContents) {
   (contents as unknown as NodeJS.EventEmitter).on('unresponsive', hang(true));
   (contents as unknown as NodeJS.EventEmitter).on('responsive', hang(false));
   contents.once('destroyed', () => {
-    consoleBuf.delete(contents.id);
-    netBuf.delete(contents.id);
-    guestDoc.delete(contents.id);
+    guestLog.forget(contents.id);
     hidden.delete(contents.id);
   });
   contents.setWindowOpenHandler(({ url }) => {
@@ -539,8 +523,11 @@ function hardenBrowser() {
 
   // Failed requests of panel pages, for the agent's browser_read: the address without its query, the
   // method, and the status or the network error. Never headers or bodies.
-  const reportNet = (d: { webContentsId?: number; url: string; method: string; statusCode?: number; error?: string }) => {
-    if (!win || win.isDestroyed() || typeof d.webContentsId !== 'number') return;
+  const reportNet = (d: { id: number; webContentsId?: number; url: string; method: string; statusCode?: number; error?: string }) => {
+    if (typeof d.webContentsId !== 'number') return;
+    // The document the request started on, whatever its outcome (and the request is forgotten).
+    const doc = guestLog.end(d.id, d.webContentsId);
+    if (!win || win.isDestroyed() || (d.statusCode !== undefined && d.statusCode < 400) || d.error === 'net::ERR_ABORTED') return;
     let url = d.url;
     try {
       const u = new URL(d.url);
@@ -549,17 +536,23 @@ function hardenBrowser() {
     } catch {
       return;
     }
-    queueNet({ type: 'net', id: d.webContentsId, url: url.slice(0, 300), method: d.method, status: d.statusCode, error: d.error?.slice(0, 80) });
+    queueNet(d.webContentsId, doc, { url: url.slice(0, 300), method: d.method, status: d.statusCode, error: d.error?.slice(0, 80) });
   };
+  // A request's start: it belongs to the guest's document current now. onSendHeaders is a plain
+  // listener (onBeforeRequest has one slot, sign-in.ts's); a request that never got here reads as the
+  // document current when it ended. A main-frame request is never stamped at its start: it sends its
+  // headers before its own document commits, and its 404 or 500 is the new page's.
+  ses.webRequest.onSendHeaders((d) => {
+    if (typeof d.webContentsId === 'number' && d.resourceType !== 'mainFrame') guestLog.begin(d.webContentsId, d.id);
+  });
   ses.webRequest.onCompleted((d) => {
     countRequest(d.webContentsId);
-    if (d.statusCode >= 400) reportNet({ webContentsId: d.webContentsId, url: d.url, method: d.method, statusCode: d.statusCode });
+    reportNet({ id: d.id, webContentsId: d.webContentsId, url: d.url, method: d.method, statusCode: d.statusCode });
   });
   ses.webRequest.onErrorOccurred((d) => {
     countRequest(d.webContentsId);
-    // An aborted request (a navigation away, a cancelled fetch) is not a failure worth reporting.
-    if (d.error === 'net::ERR_ABORTED') return;
-    reportNet({ webContentsId: d.webContentsId, url: d.url, method: d.method, error: d.error });
+    // An aborted request (a navigation away, a cancelled fetch) is not a failure worth reporting (reportNet forgets it).
+    reportNet({ id: d.id, webContentsId: d.webContentsId, url: d.url, method: d.method, error: d.error });
   });
   // The Browser tab says which of its pages is in front; the others are muted and slowed down.
   ipcMain.on('sable:browser-shown', (e, id: unknown, shown: unknown) => {

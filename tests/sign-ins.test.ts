@@ -282,4 +282,14 @@ describe('finding 9: a sign-in step is clean in the first event that publishes i
     const other = { ref: 'e1', text: 'hello' };
     expect(cleanToolInput('mcp__sable__browser_type', other)).toBe(other);
   });
+
+  it("another MCP server's tool whose name ends in browser_sign_in keeps its input and streams", () => {
+    const input = { username: 'alice', note: 'kept' };
+    for (const name of ['mcp__other__browser_sign_in', 'mcp__sablex__browser_sign_in', 'other.browser_sign_in']) {
+      expect(streamsInput(name)).toBe(true);
+      expect(cleanToolInput(name, input)).toBe(input);
+    }
+    expect(streamsInput('browser_sign_in')).toBe(false);
+    expect(cleanToolInput('browser_sign_in', { password: PASSWORD, username_ref: 'e1' })).toEqual({ username_ref: 'e1' });
+  });
 });
