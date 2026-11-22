@@ -140,8 +140,6 @@
   --rim-light: linear-gradient(180deg, rgb(255 255 255 / 0.1), rgb(255 255 255 / 0.088));
   /* The pane's thickness: a faint glow just inside the rim, the same all the way round. */
   --rim-inner: inset 0 0 12px 0 rgb(255 255 255 / 0.02);
-  /* Retired (the band of light under the top edge). Surfaces that still name it get nothing. */
-  --glass-sheen: none;
   /* The composer's pane over the field: one even frosted fill, thin enough for the field's colour. */
   --glass-pane: rgb(15 15 18 / 0.6);
   /* What focus lays under the composer's content: a little more ink, so the words sit calmer.
