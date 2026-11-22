@@ -29,7 +29,8 @@ function serve(html: (path: string) => string): Promise<{ url: string; close: ()
   });
 }
 
-describe.skipIf(!EDGE)('a sign-in filled into a real page', () => {
+// A real browser, a new page per case: under a full parallel run each case takes seconds.
+describe.skipIf(!EDGE)('a sign-in filled into a real page', { timeout: 40_000 }, () => {
   let browser: Browser;
   let a: { url: string; close: () => void };
   let b: { url: string; close: () => void };
