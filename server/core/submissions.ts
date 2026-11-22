@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /**
  * Sends by submission id (`session.send`'s `submitId`, review wave 10, finding 1): a window whose
  * connection died after its message went out cannot know whether the bridge took it, so it puts
@@ -6,7 +8,7 @@
  * A refusal (an error, or `ok: false`) is forgotten, so its retry runs. Bounded in time and count.
  */
 export class Submissions<R extends { ok: boolean }> {
-  private seen = new Map<string, { at: number; done: Promise<R> }>();
+  private seen = new Map<string, { at: number; print: string; done: Promise<R> }>();
 
   constructor(
     private readonly ttlMs = 5 * 60_000,
@@ -14,8 +16,12 @@ export class Submissions<R extends { ok: boolean }> {
     private readonly now: () => number = Date.now,
   ) {}
 
-  /** Runs `send` once per `sessionId` + `id` (no id, or one that is not a short string: always). */
-  run(sessionId: string, id: unknown, send: () => Promise<R>): Promise<R> {
+  /**
+   * Runs `send` once per `sessionId` + `id` (no id, or one that is not a short string: always).
+   * `print`: what the message is (its words and files); an id that comes again with another
+   * message is not a retry and is sent.
+   */
+  run(sessionId: string, id: unknown, send: () => Promise<R>, print = ''): Promise<R> {
     if (typeof id !== 'string' || !id || id.length > 128) return send();
     const t = this.now();
     for (const [k, v] of this.seen) {
@@ -24,7 +30,7 @@ export class Submissions<R extends { ok: boolean }> {
     }
     const key = `${sessionId}\u0000${id}`;
     const had = this.seen.get(key);
-    if (had) return had.done;
+    if (had && had.print === print) return had.done;
     const forget = () => {
       if (this.seen.get(key)?.done === done) this.seen.delete(key);
     };
@@ -38,7 +44,14 @@ export class Submissions<R extends { ok: boolean }> {
         throw err;
       },
     );
-    this.seen.set(key, { at: t, done });
+    this.seen.delete(key);
+    this.seen.set(key, { at: t, print, done });
     return done;
   }
+}
+
+/** What a message is, for telling a retry from another message under the same id: its words, its files, whether it steers. */
+export function messagePrint(text: unknown, attachments: unknown, steer: unknown): string {
+  const files = Array.isArray(attachments) ? attachments.map((a) => (a && typeof a === 'object' ? [(a as { id?: unknown }).id, (a as { name?: unknown }).name, (a as { path?: unknown }).path] : a)) : [];
+  return createHash('sha256').update(JSON.stringify([typeof text === 'string' ? text : null, files, steer === true])).digest('hex');
 }

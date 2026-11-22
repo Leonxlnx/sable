@@ -66,6 +66,19 @@ function drop(p: PendingSend) {
   else out.delete(p.key);
 }
 
+/**
+ * The chat a first send from home made exists now: the message on its way is that chat's (a
+ * reload brings its words back there, where the conversation shows whether it went, not to home,
+ * where a retry would make a second chat).
+ */
+export function moveSend(p: PendingSend, key: string) {
+  if (p.key === key) return;
+  drop(p);
+  p.key = key;
+  out.set(key, [...(out.get(key) ?? []), p]);
+  changed();
+}
+
 /** The bridge took it. */
 export function sendDone(p: PendingSend) {
   drop(p);

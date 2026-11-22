@@ -500,7 +500,13 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
               onClick={() => {
                 haptic('send');
                 sentHere(sid);
-                void conn.call('queue.sendNow', { sessionId: sid, id: q.id }).catch(() => notSentHere(sid));
+                // Refused (the desktop took the entry meanwhile) or failed: no message of this phone's is coming.
+                void conn.call('queue.sendNow', { sessionId: sid, id: q.id }).then(
+                  (r) => {
+                    if (!(r as { ok?: boolean } | undefined)?.ok) notSentHere(sid);
+                  },
+                  () => notSentHere(sid),
+                );
               }}
             >
               <Icon name="steer" size={18} />

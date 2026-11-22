@@ -11,6 +11,7 @@ import { dissolve } from '@/lib/dissolve';
 import { useLaggedStore } from '@/lib/lagged';
 import { afterSend } from '@/features/composer/settle';
 import { reducedMotion } from '@/lib/motion';
+import { isNarrow } from '@/lib/narrow';
 import { baseName } from '@/lib/format';
 import { addFolders, addToGroup, arrangeSidebar, closeSession, createGroup, goHome, goHomeChat, openSettings, pinProject, removeFromGroup, removeGroup, removeProject, renameGroup, renameProject } from '@/state/actions';
 import { useStore } from '@/state/store';
@@ -1189,6 +1190,9 @@ function useStageFreeze() {
       const inner = side?.firstElementChild as HTMLElement | null;
       release(body);
       if (!body || !side || !inner || reducedMotion()) return;
+      // Stepped aside for the side panel in a narrow window: the column is away and stays away,
+      // whatever the preference becomes. Nothing moves, so nothing is frozen and no mark flies.
+      if (isNarrow() && s.ui.railOpen && !!s.ui.activeSessionId && !!s.sessions[s.ui.activeSessionId]) return;
       const cs = getComputedStyle(side);
       const ms = parseFloat(cs.transitionDuration) * (cs.transitionDuration.trim().endsWith('ms') ? 1 : 1000);
       if (!(ms > 20)) return;

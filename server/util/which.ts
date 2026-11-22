@@ -1,4 +1,5 @@
-import { accessSync, constants, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 /**
@@ -67,6 +68,48 @@ export function trustedPathDirs(value: string, platform: NodeJS.Platform = proce
     out.push(dir);
   }
   return out;
+}
+
+const tops = new Map<string, { at: number; top: string | null }>();
+
+/**
+ * The top of the checkout `dir` belongs to: the nearest folder from it upward that holds `.git`. A
+ * chat can work in a subfolder of a repository, and a program anywhere in that repository is the
+ * project's own, never a tool to run (review wave 11, #1). Null when there is none, and for a home
+ * folder or a drive that is itself a repository (dotfiles): tools installed under it are the
+ * person's own. Remembered for a few seconds.
+ */
+export function checkoutTop(dir: string, o: { exists?: (p: string) => boolean; home?: string; now?: number } = {}): string | null {
+  const start = path.resolve(dir);
+  const plain = !o.exists && !o.home;
+  const now = o.now ?? Date.now();
+  const known = plain ? tops.get(start) : undefined;
+  if (known && now - known.at < 5000) return known.top;
+  const exists = o.exists ?? existsSync;
+  const home = path.resolve(o.home ?? os.homedir());
+  let top: string | null = null;
+  let at = start;
+  for (let i = 0; i < 64; i++) {
+    const up = path.dirname(at);
+    if (exists(path.join(at, '.git'))) {
+      top = up === at || inside(at, home) ? null : at;
+      break;
+    }
+    if (up === at) break;
+    at = up;
+  }
+  if (plain) {
+    if (tops.size >= 128) tops.clear();
+    tops.set(start, { at: now, top });
+  }
+  return top;
+}
+
+/** The folders a tool that works in `dir` must not come from: the folder and the checkout it belongs to. */
+export function projectFolders(dir: string): string[] {
+  const start = path.resolve(dir);
+  const top = checkoutTop(start);
+  return top && top !== start ? [start, top] : [start];
 }
 
 const cache = new Map<string, string>();

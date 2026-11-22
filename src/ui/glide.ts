@@ -225,6 +225,14 @@ function seal() {
   holdUntil = performance.now() + HOLD;
 }
 
+/**
+ * A pick made from a control that is not a row (Enter in a menu's search field): the same hand-off
+ * as a row's pick, once the menu has begun to leave.
+ */
+export function pickedByKey() {
+  window.setTimeout(seal, 0);
+}
+
 /** The field that took focus after a pick gets what was typed meanwhile, at its caret. */
 function deliver(el: HTMLElement, text: string) {
   const field = el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && /^(text|search|url|email|tel|password)$/.test(el.type));

@@ -38,6 +38,12 @@ export function Palette() {
   useEffect(() => {
     if (open) setSession((n) => n + 1);
   }, [open]);
+  // One action per opening: the guard is let go when the palette opens. (Radix's open auto-focus
+  // callback does not run when focus is already inside, as the search field's own autoFocus makes it:
+  // the guard stayed taken and the palette ran nothing after its first pick.)
+  useLayoutEffect(() => {
+    if (open) ran.current = false;
+  }, [open]);
 
   return (
     <RD.Root open={open} onOpenChange={(o) => setUi({ paletteOpen: o })}>
@@ -47,9 +53,6 @@ export function Palette() {
           className="palette glass-rim"
           data-spot=""
           aria-describedby={undefined}
-          onOpenAutoFocus={() => {
-            ran.current = false;
-          }}
           onCloseAutoFocus={(e) => {
             // When an item ran, it decides where focus goes (composer, another dialog).
             if (ran.current) e.preventDefault();

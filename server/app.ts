@@ -62,7 +62,7 @@ import { windowForModel, windowModel } from '../shared/limit-windows';
 import { mergeWindows } from './services/limits';
 import { effectiveModel, planWeight, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
 import { ResetConsoles } from './core/reset-console';
-import { Submissions } from './core/submissions';
+import { Submissions, messagePrint } from './core/submissions';
 import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
@@ -2954,7 +2954,7 @@ export class App {
       }
       await this.deliver(rt, text, attachments, undefined, ctx);
       return { ok: true };
-    }));
+    }, messagePrint(text, attachments, steer)));
 
     this.register('queue.update', ({ sessionId, id, text, attachments }, ctx) => {
       // Omitted attachments keep the message's; an empty list removes them.

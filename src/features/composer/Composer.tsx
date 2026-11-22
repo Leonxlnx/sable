@@ -23,7 +23,7 @@ import { paidAsk, paidConfirmed } from './paid-speed';
 import { APP_COMMANDS, appCommandsFor, commandRows, expandCommand, mentionRows, skillRows, type CommandCtx, type SuggestRow } from './commands';
 import { keepDrafts } from './drafts';
 import { carryOver, leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
-import { holdSend, sendBack, sendDone } from './pending';
+import { holdSend, moveSend, sendBack, sendDone } from './pending';
 import { watchWidth } from './width-watch';
 import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut } from './Controls';
 import { CoveSkin } from './Cove';
@@ -714,6 +714,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       onCreated: (id) => {
         flight?.scope(id);
         bindHandoff(id);
+        moveSend(pending, id);
       },
     });
     if (res.ok) {

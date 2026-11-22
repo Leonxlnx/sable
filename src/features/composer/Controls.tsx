@@ -1,3 +1,4 @@
+import { pickedByKey } from '@/ui/glide';
 import { Fragment, memo, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { useShallow } from 'zustand/react/shallow';
@@ -305,9 +306,12 @@ export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed 
                         } else if (e.key === 'Enter' && rows[0]) {
                           e.preventDefault();
                           pick(rows[0].m.id);
+                          // What is typed while the menu leaves goes to the composer, as after a row's pick.
+                          pickedByKey();
                         } else if (e.key === 'Enter' && away[0]) {
                           e.preventDefault();
                           goAway(away[0].provider, away[0].m.id);
+                          pickedByKey();
                         }
                       }}
                     />

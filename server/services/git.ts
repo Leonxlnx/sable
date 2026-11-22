@@ -6,7 +6,7 @@ import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus, Git
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
 import { folderNow, openContained, within as under, type FolderRoot } from '../core/contain';
 import type { App } from '../app';
-import { findProgram } from '../util/which';
+import { findProgram, projectFolders } from '../util/which';
 
 // ───────────────────────────── git runner ─────────────────────────────
 
@@ -56,7 +56,7 @@ export function runGit(
     const dir = path.resolve(cwd);
     // git from PATH, never from the folder (server/util/which.ts), and started outside it: `-C`
     // moves it into the repository, so nothing there is looked up as a program or a library.
-    const git = findProgram('git', { outside: [dir] });
+    const git = findProgram('git', { outside: projectFolders(dir) });
     if (!git) {
       resolve({ code: null, stdout: '', stderr: '', missing: true, timedOut: false, truncated: false });
       return;

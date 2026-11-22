@@ -278,8 +278,11 @@ function turnsToState(p: string, writing: boolean): boolean {
     .replace(/^(?:zuerst|erst|dann|jetzt|nun|vorher)[,]?\s+/, '')
     .trim();
   if (!rest) return false;
-  if (ANNOUNCE.test(rest) || FILLER.test(rest) || isMove(rest)) return false;
-  if (writing && mayStart(rest)) return false;
+  // "…, but checking the logs showed the backup failed": a clause that opens like an announcement
+  // (an -ing word) and then says what happened is a statement.
+  const told = /^[a-z]+ing\b/i.test(rest) && (STATES.test(rest) || HAPPENED.test(rest));
+  if (!told && (ANNOUNCE.test(rest) || FILLER.test(rest) || isMove(rest))) return false;
+  if (writing && !told && mayStart(rest)) return false;
   return rest.split(/\s+/).length >= 3 || STATES.test(rest) || HAPPENED.test(rest) || REQUIRES.test(rest) || GERMAN_STATES.test(rest);
 }
 

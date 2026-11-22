@@ -24,6 +24,7 @@ import { ChatMenu } from '@/features/export/ChatMenu';
 import { shallow } from 'zustand/shallow';
 import { useLaggedStore } from '@/lib/lagged';
 import { railTabAt } from '@/features/rail/tabs';
+import { isNarrow } from '@/lib/narrow';
 import { useStore } from '@/state/store';
 import { IconButton, Tip, TipProvider, Toasts } from '@/ui';
 import { CapabilitiesButton } from './Capabilities';
@@ -113,9 +114,6 @@ const Onboarding = lazy(() => import('@/features/onboarding/Onboarding').then((m
  * the sidebar steps aside without forgetting that it was open, and comes back when the panel closes.
  * Showing it again from the top bar closes the panel instead.
  */
-const NARROW_PX = 1060;
-/** Narrower than three columns need, in CSS pixels (the Interface size zooms the page). */
-const isNarrow = () => window.innerWidth / (useStore.getState().settings.fontScale || 1) < NARROW_PX;
 function useNarrow(): boolean {
   const zoom = useStore((s) => s.settings.fontScale);
   const [narrow, setNarrow] = useState(isNarrow);

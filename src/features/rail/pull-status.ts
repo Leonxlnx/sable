@@ -325,11 +325,16 @@ export function pullLabel(pull: PullRequestInfo): string {
 
 /**
  * The composer's text with the failures added: what the person typed stays first, the failures
- * after a blank line. The same failures are never added twice.
+ * after a blank line. The same failures are never added twice. A draft that begins as a shell line
+ * (`!`) or a command (`/`) is read by its first character, and text from GitHub must never ride
+ * behind that into a shell or a command: there the failures go first and the typed words after
+ * them, so the whole draft is a plain message.
  */
 export function withFailures(typed: string, failures: string): string {
   if (!failures.trim() || typed.includes(failures)) return typed;
-  return typed.trim() ? `${typed.replace(/\s+$/, '')}\n\n${failures}` : failures;
+  if (!typed.trim()) return failures;
+  if (/^\s*[!/]/.test(typed)) return `${failures}\n\n${typed.trim()}`;
+  return `${typed.replace(/\s+$/, '')}\n\n${failures}`;
 }
 
 /** The pull request the dialog just opened, as the row shows it until GitHub is read: no checks yet. Null for an address that is not on github.com. */

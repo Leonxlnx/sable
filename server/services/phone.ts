@@ -1041,6 +1041,9 @@ export function phoneCreate(p: Record<string, unknown>): Record<string, unknown>
 function narrow(method: string, params: Record<string, unknown>, queued?: (sessionId: string, id: string) => Attachment[] | undefined): Record<string, unknown> {
   const p = { ...params };
   // Pictures as data, never a path on the computer: a message from the phone carries nothing of the desktop's.
+  // A submission id is the desktop window's own (it retries a message it put back): a phone's send
+  // never carries one, so it cannot be answered with another message's result.
+  if (method === 'session.send') delete p.submitId;
   if (method === 'session.send' || method === 'queue.update') {
     // Words first: nothing is queued, edited or sent for a message without them.
     if (typeof p.text !== 'string') throw new Error('A message needs its words.');

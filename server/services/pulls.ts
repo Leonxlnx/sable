@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { GitPullContext, GitPullRequestResult, PullCheck, PullFailures, PullRequestInfo, PullStatus } from '../../shared/protocol';
 import type { App } from '../app';
-import { findProgram } from '../util/which';
+import { findProgram, projectFolders } from '../util/which';
 import { gitError, repoRoot, runGit } from './git';
 
 /**
@@ -102,7 +102,7 @@ export function runGh(cwd: string, args: string[], input = '', timeoutMs = 60_00
     let child: ReturnType<typeof spawn>;
     // gh from PATH, never a gh.exe the repository brings (server/util/which.ts). It works in the
     // folder (it reads the remotes there) and finds git itself without looking in it.
-    const gh = findProgram('gh', { outside: [path.resolve(cwd)] });
+    const gh = findProgram('gh', { outside: projectFolders(cwd) });
     if (!gh) {
       resolve({ code: null, stdout: '', stderr: '', missing: true, timedOut: false });
       return;
@@ -626,10 +626,13 @@ export async function pullFailures(cwd: string, asked: { number: number; head: s
   if (!pull || pull.number !== asked.number || pull.head !== asked.head) return { stale: true };
   const failed = pull.checks.filter((c) => c.state === 'failed');
   if (failed.length === 0) return { stale: true };
+  // Only runs in the pull request's own repository: a check can link to a run anywhere the person
+  // can read, and another repository's log is not this pull request's failure (it stays a name).
+  const own = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\//.exec(pull.url)?.[1]?.toLowerCase();
   const runs = new Map<string, { repo: string; id: string; checks: string[] }>();
   for (const c of failed) {
     const run = runOf(c.url);
-    if (!run) continue;
+    if (!run || !own || run.repo.toLowerCase() !== own) continue;
     const key = `${run.repo}/${run.id}`;
     const known = runs.get(key);
     if (known) known.checks.push(c.name);

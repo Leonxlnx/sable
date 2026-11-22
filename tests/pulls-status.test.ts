@@ -614,6 +614,32 @@ describe('pulls.failures', () => {
     expect(res.text!.split('The end of the failed log of ')).toHaveLength(4);
   });
 
+  it("reads only runs of the pull request's own repository (review wave 11, #2)", async () => {
+    const gh = fakeGh((c) =>
+      c.args[0] === 'pr'
+        ? {
+            stdout: view({
+              statusCheckRollup: [
+                // A check can link to a run in any repository the person can read.
+                run('other repo', 'FAILURE', { detailsUrl: 'https://github.com/acme/secrets/actions/runs/901/job/1' }),
+                { __typename: 'StatusContext', context: 'ci/elsewhere', state: 'FAILURE', targetUrl: 'https://github.com/someone/else/actions/runs/902' },
+                run('own', 'FAILURE', { detailsUrl: jobUrl(301) }),
+                // The same repository in another case is still this one.
+                run('own, other case', 'FAILURE', { detailsUrl: 'https://github.com/Acme/App/actions/runs/302/job/1' }),
+              ],
+            }),
+          }
+        : { stdout: 'the log\n' },
+    );
+    const res = await pullFailures(hub, { number: 128, head: HEAD }, gh.run);
+    const logs = gh.calls.filter((c) => c.args[0] === 'run');
+    expect(logs.map((c) => c.args[2])).toEqual(['301', '302']);
+    expect(gh.calls.flatMap((c) => c.args).join(' ')).not.toMatch(/901|902|secrets|someone/);
+    // The checks are still named; only their logs are left out.
+    expect(res.text).toContain('- other repo');
+    expect(res.text).toContain('- ci/elsewhere');
+  });
+
   it('still names the failed checks when a log cannot be read', async () => {
     const gh = fakeGh((c) => (c.args[0] === 'pr' ? { stdout: failing() } : c.args[2] === '101' ? { code: 1, stderr: 'log not found' } : { code: null, timedOut: true, stdout: 'half a log' }));
     const res = await pullFailures(hub, { number: 128, head: HEAD }, gh.run);
