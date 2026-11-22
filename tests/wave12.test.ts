@@ -257,3 +257,62 @@ describe('wave 14 #4, #5: a fitted path is measured in layout pixels and refitte
     expect(src).toContain("window.addEventListener('resize', refitAll)");
   });
 });
+
+// ── review wave 15 ──
+
+describe('wave 15: a read that failed owes the next ask, whatever was read before', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const rig = (branch: { now: string }) => {
+    const waiting: ((v: PullStatus | null) => void)[] = [];
+    const read = vi.fn(() => new Promise<PullStatus | null>((res) => waiting.push(res)));
+    const w = createPullWatch({ read, branchOf: () => branch.now, seen: () => true });
+    const answer = async (v: PullStatus | null) => {
+      waiting.shift()!(v);
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    return { w, read, answer };
+  };
+
+  it('#1: an ask inside the 20 s after a failed read is made when they are over', async () => {
+    const { w, read, answer } = rig({ now: 'feature/a' });
+    w.watch('/repo');
+    await answer(null);
+    await vi.advanceTimersByTimeAsync(5_000);
+    void w.ask('/repo');
+    expect(read).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(read).toHaveBeenCalledTimes(2);
+    await answer({ branch: 'feature/a' });
+    // Answered now: nothing more is owed.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("#2: another branch's \"none\" does not hold back the retry for five minutes", async () => {
+    const branch = { now: 'main' };
+    const { w, read, answer } = rig(branch);
+    w.watch('/repo');
+    await answer({ branch: 'main' });
+    // Another branch, whose read fails.
+    branch.now = 'feature/a';
+    await vi.advanceTimersByTimeAsync(25_000);
+    void w.ask('/repo');
+    expect(read).toHaveBeenCalledTimes(2);
+    await answer(null);
+    // 25 s later the window comes back: asked again, not after the long quiet.
+    await vi.advanceTimersByTimeAsync(25_000);
+    void w.ask('/repo');
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  it('#3: a moved report takes Windows line breaks with it too', () => {
+    const R = '2 of 5 checks failed on pull request #128\n- lint';
+    expect(withFailures(`/review\n\n${R}\r\n\r\n    code`, R)).toBe(`${R}\n\n/review\n\n    code`);
+  });
+});

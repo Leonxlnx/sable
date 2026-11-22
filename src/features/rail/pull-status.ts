@@ -64,6 +64,8 @@ interface Entry {
   want: false | 'branch' | 'changed';
   /** A plain ask was held back by the long quiet (no pull request, nothing known to have changed): asked once when it ends. */
   quiet: boolean;
+  /** The latest read brought no answer (the bridge could not be asked): what the row holds is not this read's, and the next ask is owed. */
+  failed: boolean;
   /** Until when checks are expected to begin. */
   expectUntil: number;
   /** The row shows the dialog's own pull request, not yet GitHub's answer; and when it was put in. */
@@ -89,7 +91,7 @@ export function createPullWatch(deps: PullWatchDeps) {
     const k = gitKey(cwd);
     let e = entries.get(k);
     if (!e) {
-      e = { cwd, view: EMPTY, askedAt: -Infinity, want: false, quiet: false, expectUntil: 0, seeded: false, seededAt: -Infinity, watchers: 0 };
+      e = { cwd, view: EMPTY, askedAt: -Infinity, want: false, quiet: false, failed: false, expectUntil: 0, seeded: false, seededAt: -Infinity, watchers: 0 };
       entries.set(k, e);
     }
     return e;
@@ -140,6 +142,7 @@ export function createPullWatch(deps: PullWatchDeps) {
         // on its way, or one from the first moments in which GitHub does not list it yet, is not news.
         const older = e.seeded && (began < e.seededAt || (!answer?.pull && now() < e.expectUntil));
         if (answer?.pull) e.seeded = false;
+        e.failed = !answer;
         if (answer && !older) show(e, { status: answer, branch: answer.branch ?? shown, loading: false, settled: true });
         // Not asked (the bridge is away): the tab keeps what it had, and this branch counts as asked.
         else show(e, { loading: false, settled: true, ...(older ? {} : { branch: shown }) });
@@ -158,7 +161,9 @@ export function createPullWatch(deps: PullWatchDeps) {
   const ask = (cwd: string, o: { force?: boolean; changed?: boolean } = {}): Promise<void> => {
     if (!cwd) return Promise.resolve();
     const e = entry(cwd);
-    const wants = o.changed ? 'changed' : current(e) ? false : 'branch';
+    // After a read that failed the answer in hand is not for this ask (it may even be another
+    // branch's): the ask is owed like one for a branch moved to, and made when the 20 s allow.
+    const wants = o.changed ? 'changed' : current(e) && !e.failed ? false : 'branch';
     if (e.inflight) {
       // The answer on its way may be for the branch before, or from before the change.
       if (wants && e.want !== 'changed') e.want = wants;
@@ -362,7 +367,7 @@ function withoutBlock(text: string, block: string): string | null {
   for (let at = text.lastIndexOf(block); at >= 0; at = at === 0 ? -1 : text.lastIndexOf(block, at - 1)) {
     const before = text.slice(0, at);
     const after = text.slice(at + block.length);
-    if ((before === '' || /\n\s*$/.test(before)) && (after === '' || /^\s*(?:\n|$)/.test(after))) return `${before.replace(/\s+$/, '')}${before.trim() && after.trim() ? '\n\n' : ''}${after.replace(/^(?:[ \t]*\n)+/, '')}`;
+    if ((before === '' || /\n\s*$/.test(before)) && (after === '' || /^\s*(?:\n|$)/.test(after))) return `${before.replace(/\s+$/, '')}${before.trim() && after.trim() ? '\n\n' : ''}${after.replace(/^(?:[ \t]*\r?\n)+/, '')}`;
   }
   return null;
 }
