@@ -1235,3 +1235,11 @@
     animation: none;
   }
 }
+
+/* What the person reads before saving a sign-in (BrowserAgentUi.tsx SIGN_IN_RISK). */
+.bw-signin-risk {
+  margin: -4px 0 0;
+  font-size: var(--t-small);
+  line-height: 1.45;
+  color: var(--text-3);
+}

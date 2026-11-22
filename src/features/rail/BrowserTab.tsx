@@ -78,6 +78,10 @@ interface BrowserEvent {
   on?: boolean;
   count?: number;
   lines?: { level: string; text: string; source?: string }[];
+  /** The page's document a batch came from; 'doc' says a new one committed. */
+  doc?: number;
+  /** 'signin-released': which hold ended. */
+  hold?: string;
 }
 
 interface DesktopApi {
@@ -127,6 +131,8 @@ interface View {
   shown?: boolean;
   /** Reload after a hang: the old process's crash report that follows must not show. */
   restarting?: boolean;
+  /** The shell's count of the page's documents: batches of an older one are dropped. */
+  doc?: number;
   navTimer?: ReturnType<typeof setTimeout>;
   visitTimer?: ReturnType<typeof setTimeout>;
   unregister: () => void;
@@ -510,7 +516,12 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
       }
       const v = byWc(e.id);
       if (!v) return;
-      if (e.type === 'find') guestKey.current('f');
+      // A batch of a document that is no longer the page's is dropped (it would read as the new page's).
+      if ((e.type === 'console' || e.type === 'net' || e.type === 'net-dropped') && typeof e.doc === 'number' && e.doc < (v.doc ?? 0)) return;
+      if (e.type === 'doc' && typeof e.doc === 'number') {
+        v.doc = e.doc;
+        resetLog(v.tabId);
+      } else if (e.type === 'find') guestKey.current('f');
       else if (e.type === 'key' && e.key && v.tabId === activeTab(sessionId)) guestKey.current(e.key);
       // A request of this page failed (the shell sends the address without its query, and the status or error).
       else if (e.type === 'net' && e.url) logFailed(v.tabId, { url: e.url, method: e.method, status: e.status, error: e.error });
@@ -521,7 +532,7 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         logDropped(v.tabId, e.count ?? 0);
       } else if (e.type === 'hang') setPage(v.tabId, { hung: e.on ? true : undefined });
       // Electron main ended a sign-in's hold (a new document replaced the filled one, or nothing was filled).
-      else if (e.type === 'signin-released') setPage(v.tabId, { filled: undefined, signing: undefined });
+      else if (e.type === 'signin-released' && e.hold && getPage(v.tabId).hold === e.hold) setPage(v.tabId, { filled: undefined, signing: undefined, hold: undefined });
       else if (e.type === 'flood') setPage(v.tabId, { flooded: true });
     });
     const all = views.current;

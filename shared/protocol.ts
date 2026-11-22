@@ -371,6 +371,8 @@ export interface BrowserAnswer {
   /** signIn: whether the page was signed in, and as whom (the user name only, never the password). */
   signedIn?: boolean;
   user?: string;
+  /** The desktop's page view the answer is of (its webContents id): the bridge holds back a page held for a sign-in. */
+  guestId?: number;
 }
 
 /** A saved sign-in as the windows see it: never the password (`server/services/sign-ins.ts`). */

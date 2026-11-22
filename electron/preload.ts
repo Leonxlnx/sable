@@ -21,6 +21,10 @@ interface BrowserEvent {
   on?: boolean;
   count?: number;
   lines?: { level: string; text: string; source?: string }[];
+  /** The document of the page a console or failed-request batch came from ('doc': the page's new document). */
+  doc?: number;
+  /** 'signin-released': which hold ended. */
+  hold?: string;
 }
 
 interface WindowState {
@@ -105,6 +109,8 @@ contextBridge.exposeInMainWorld('sableDesktop', {
           on: typeof msg?.on === 'boolean' ? msg.on : undefined,
           count: typeof msg?.count === 'number' ? msg.count : typeof msg?.dropped === 'number' ? msg.dropped : undefined,
           lines: lines(msg?.lines),
+          doc: typeof msg?.doc === 'number' ? msg.doc : undefined,
+          hold: str(msg?.hold),
         });
       const listener = (_e: unknown, msg: unknown) => {
         if (Array.isArray(msg)) for (const m of msg) one(m);

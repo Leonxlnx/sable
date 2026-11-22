@@ -1,6 +1,6 @@
 import type { BrowserAnswer, BrowserRequest, PermissionOption, SessionMeta, ToolDetail, ToolItem } from '../../shared/protocol';
 import type { SessionRuntime } from '../core/runtime';
-import { onSignInShips, signInOrigin, signInShips } from '../services/sign-ins';
+import { anyPageHeld, deliveryHeld, onSignInShips, signInOrigin, signInShips } from '../services/sign-ins';
 import { WIDGET_SERVER } from './widget-tool';
 
 /**
@@ -485,6 +485,36 @@ export function formatWork(op: BrowserOp, o: Record<string, unknown>, a: Browser
 
 const KEY_RE =/^(?:(?:Control|Ctrl|Shift|Alt|Meta|Cmd)\+){0,3}(?:[A-Za-z][A-Za-z0-9]{1,14}|[\x21-\x7e])$/;
 
+/** What every tool answers while the page is held for a sign-in. */
+export const BROWSER_HELD = 'The page in the Browser tab is held for a sign-in: nothing of it reaches you until it loads another page.';
+
+/**
+ * Asks the window, and holds the answer back at delivery when it is of a page Electron main holds
+ * for a sign-in (services/sign-ins.ts `deliveryHeld`): an answer that was already on its way when the
+ * hold began is held back too. Only the sign-in's own answer passes (it carries the user name alone).
+ */
+async function ask(rt: SessionRuntime, req: Omit<BrowserRequest, 'id' | 'sessionId'>, timeout: number, signal?: AbortSignal): Promise<BrowserAnswer> {
+  const a = await rt.browserRequest(req, timeout, signal);
+  if (req.op !== 'signIn' && deliveryHeld(a.guestId)) return { ok: false, error: BROWSER_HELD };
+  return a;
+}
+
+/**
+ * The input of a browser step as it may stand in the timeline. For browser_sign_in only references
+ * that look like references are kept, before the step is first published (the providers call this
+ * where they make the item); every other tool's input is as given.
+ */
+export function cleanToolInput(name: string | undefined, input: unknown): unknown {
+  if (browserOp(name) !== 'sign_in') return input;
+  const o = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+  const out: Record<string, string> = {};
+  for (const k of SIGN_IN_KEYS) if (typeof o[k] === 'string' && /^e\d{1,6}$/.test(o[k] as string)) out[k] = o[k] as string;
+  return out;
+}
+
+/** Whether a tool's input may stream into the timeline as it is written (never browser_sign_in's). */
+export const streamsInput = (name: string | undefined) => browserOp(name) !== 'sign_in';
+
 /** Runs one browser tool for a session: the same path for Claude, Codex and the Demo. */
 export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: unknown, signal?: AbortSignal): Promise<BrowserToolResult> {
   if (op === 'sign_in' && !signInShips()) return fail('browser_sign_in is not available in this version of Sable.');
@@ -503,13 +533,13 @@ export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: u
     show(url);
     const ok = await permit(rt, op, url, item, signal);
     if (ok !== true) return fail(ok as string);
-    const a = await rt.browserRequest({ op: 'open', url, ...(o.new_tab === true ? { newTab: true } : {}) }, BROWSER_OPEN_TIMEOUT, signal);
+    const a = await ask(rt, { op: 'open', url, ...(o.new_tab === true ? { newTab: true } : {}) }, BROWSER_OPEN_TIMEOUT, signal);
     if (!a.ok) return fail(a.error ?? 'The page did not open.');
     if (a.url) show(a.url);
     return { ok: true, text: `Opened ${a.url ?? url} in the Browser tab. Title: ${clipLine(a.title ?? '', 200) || '(none)'}${a.title ? ' (from the page: untrusted)' : ''}. Use browser_read or browser_screenshot to look at it.` };
   }
 
-  const state = await rt.browserRequest({ op: 'state' }, 10_000, signal);
+  const state = await ask(rt, { op: 'state' }, 10_000, signal);
   if (!state.ok) return fail(state.error ?? 'The Browser tab did not answer.');
   const url = state.url ?? '';
   if (!url) return fail('No page is open in the Browser tab. Use browser_open to open one.');
@@ -585,7 +615,7 @@ export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: u
   if (ok !== true) return fail(ok as string);
 
   if (req) {
-    const a = await rt.browserRequest({ ...req, expectOrigin: originOf(url) }, timeout, signal);
+    const a = await ask(rt, { ...req, expectOrigin: originOf(url) }, timeout, signal);
     const now = a.url && isHttpUrl(a.url) ? a.url : url;
     if (item && rt.get(item.id) && (a.target || now !== url)) rt.patch<ToolItem>(item.id, { title: browserTitle(op, op === 'navigate' ? now : url, o, a.target) });
     if (!a.ok) return fail(a.error ?? 'The Browser tab could not do that.');
@@ -594,12 +624,12 @@ export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: u
 
   if (op === 'read') {
     const selector = typeof o.selector === 'string' && o.selector.trim() ? o.selector.trim().slice(0, 500) : undefined;
-    const a = await rt.browserRequest({ op: 'read', selector, expectOrigin: originOf(url) }, 15_000, signal);
+    const a = await ask(rt, { op: 'read', selector, expectOrigin: originOf(url) }, 15_000, signal);
     if (!a.ok) return fail(a.error ?? 'Could not read the page.');
     return { ok: true, text: formatRead(a, selector) };
   }
 
-  const a = await rt.browserRequest({ op: 'screenshot', expectOrigin: originOf(url) }, 20_000, signal);
+  const a = await ask(rt, { op: 'screenshot', expectOrigin: originOf(url) }, 20_000, signal);
   if (!a.ok || !a.image) return fail(a.error ?? 'Could not capture the page.');
   if (a.image.length > BROWSER_IMAGE_MAX) return fail('The picture was too large to pass on.');
   const m = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(a.image);
@@ -620,7 +650,8 @@ export async function runBrowserTool(rt: SessionRuntime, op: BrowserOp, input: u
  */
 async function signIn(rt: SessionRuntime, o: Record<string, unknown>, url: string, item: ToolItem | undefined, signal?: AbortSignal): Promise<BrowserToolResult> {
   const refs = { username_ref: str(o.username_ref, 20), password_ref: str(o.password_ref, 20), submit_ref: str(o.submit_ref, 20) };
-  if (item && rt.get(item.id)) rt.patch<ToolItem>(item.id, { input: Object.fromEntries(Object.entries(refs).filter(([, v]) => v)) });
+  // Again here, for a provider that made the step without cleanToolInput: only valid references stay.
+  if (item && rt.get(item.id)) rt.patch<ToolItem>(item.id, { input: cleanToolInput(BROWSER_TOOLS.sign_in, o) as Record<string, unknown>, inputText: undefined });
   const extra = Object.keys(o).filter((k) => !SIGN_IN_KEYS.has(k));
   if (extra.length) return fail('browser_sign_in takes only the references of the fields. Sable fills the user name and the password itself: never pass them, and never ask the user for a password in the chat.');
   for (const [k, v] of Object.entries(refs)) {
@@ -659,6 +690,8 @@ export async function browserDynamicAnswer(rt: SessionRuntime, op: BrowserOp, in
  */
 export function browserContextLine(rt: SessionRuntime): string | undefined {
   if (!browserTabEnabled(rt.meta)) return undefined;
+  // A page held for a sign-in: not even its address and title (the line goes once the hold ends).
+  if (anyPageHeld()) return undefined;
   const page = rt.browserPage;
   const key = page ? `${page.url}\n${page.title}` : '';
   if (key === (rt.browserTold ?? '')) return undefined;

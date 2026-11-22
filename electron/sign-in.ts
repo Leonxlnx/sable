@@ -1,5 +1,5 @@
 import { app, ipcMain, safeStorage, session, webContents, type BrowserWindow, type IpcMainInvokeEvent, type WebContents } from 'electron';
-import { SIGN_IN_OFF, SignInStore, signInShips } from '../server/services/sign-ins';
+import { setSignInHolds, SIGN_IN_OFF, SignInStore, signInShips } from '../server/services/sign-ins';
 import { SignInGate, SIGN_IN_WORLD, type Credential, type GuestPage } from './sign-in-core';
 
 /**
@@ -23,7 +23,7 @@ function guestPage(wc: WebContents): GuestPage {
     hostId: wc.hostWebContents?.id ?? -1,
     destroyed: () => wc.isDestroyed(),
     url: () => (wc.isDestroyed() ? '' : wc.getURL()),
-    loadFresh: () =>
+    loadFresh: (url) =>
       new Promise<void>((resolve, reject) => {
         let committed = false;
         const onNav = () => (committed = true);
@@ -50,7 +50,7 @@ function guestPage(wc: WebContents): GuestPage {
         wc.on('did-navigate', onNav);
         wc.on('did-finish-load', onLoad);
         wc.on('did-fail-load', onFail);
-        wc.loadURL(wc.getURL()).catch(() => {});
+        wc.loadURL(url).catch(() => {});
       }),
     isolated: (code) => wc.executeJavaScriptInIsolatedWorld(SIGN_IN_WORLD, [{ code }]),
   };
@@ -83,12 +83,18 @@ export function installSignIn(opts: { partition: string; home: string; window: (
     canSave: canEncrypt,
     encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
     decrypt: (cipher) => safeStorage.decryptString(Buffer.from(cipher, 'base64')),
-    cipherOf: (id, origin) => store.cipherOf(id, origin),
+    entryOf: (id, origin) => store.entryOf(id, origin),
     save: (origin, username, cipher) => store.put(origin, username, cipher),
     used: (id) => void store.used(id),
-    released: (id) => tell({ type: 'signin-released', id }),
+    // Only the hold's id goes to the window, which ends the refusal of exactly that hold.
+    released: (id, hold) => tell({ type: 'signin-released', id, hold }),
   });
   const g = gate;
+  // The bridge asks these at delivery: while a guest is held, nothing of its page reaches the agent.
+  setSignInHolds({ held: (id) => g.held(id), anyHeld: () => g.anyHeld() });
+
+  /** The last redirect each guest's network saw (its status), for the navigation's own redirect check. */
+  const lastRedirect = new Map<number, { status: number; to: string }>();
 
   // Every committed main-frame document (a navigation, a reload, a crash) moves a guest's count on.
   app.on('web-contents-created', (_e, wc) => {
@@ -96,13 +102,26 @@ export function installSignIn(opts: { partition: string; home: string; window: (
     const id = wc.id;
     wc.on('did-navigate', () => g.committed(id));
     wc.on('render-process-gone', () => g.committed(id));
-    wc.once('destroyed', () => g.gone(id));
+    // A 307 or 308 of the form's POST to another origin, while the password is in play, does not happen.
+    wc.on('will-redirect', (e) => {
+      const r = lastRedirect.get(id);
+      if (r && r.to === e.url && g.redirect(id, r.status, e.url) === 'cancel') e.preventDefault();
+    });
+    wc.once('destroyed', () => {
+      lastRedirect.delete(id);
+      g.gone(id);
+    });
   });
 
-  // While a password is in play: a request that carries it goes only as a POST to the exact origin.
-  session.fromPartition(opts.partition).webRequest.onBeforeRequest((d, cb) => {
-    const body = d.uploadData?.map((u) => u.bytes).filter((b): b is Buffer => !!b);
+  // While a password is in play: a request with a body goes only as a POST to the exact origin, and a
+  // request whose address holds the password does not go at all.
+  const ses = session.fromPartition(opts.partition);
+  ses.webRequest.onBeforeRequest((d, cb) => {
+    const body = d.uploadData ? d.uploadData.map((u) => u.bytes ?? new Uint8Array()) : undefined;
     cb({ cancel: g.verdict(d.webContentsId, { url: d.url, method: d.method, body }) === 'cancel' });
+  });
+  ses.webRequest.onBeforeRedirect((d) => {
+    if (typeof d.webContentsId === 'number') lastRedirect.set(d.webContentsId, { status: d.statusCode, to: d.redirectURL });
   });
 
   /** The guest, only when the asking window hosts it. */

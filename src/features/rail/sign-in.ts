@@ -11,24 +11,19 @@ import type { SignInInfo } from '@shared/protocol';
 export type SignInChoice =
   | { kind: 'cancel' }
   | { kind: 'saved'; id: string; username: string }
-  | { kind: 'typed'; username: string; password: string; save: boolean }
-  /** "Not this time" on the line of a saved sign-in: the card asks instead. */
-  | { kind: 'notNow' };
+  | { kind: 'typed'; username: string; password: string; save: boolean };
 
 export interface SignInAsk {
   tabId: string;
   /** Scheme, host and port as the browser has them: what the card shows, large. */
   origin: string;
-  /** 'card': the person signs in (or picks one of several saved); 'auto': one saved sign-in is used unless they say not this time. */
-  mode: 'card' | 'auto';
+  /** Saved for exactly this origin: each one is offered on the card, and the person picks (nothing picks one by itself). */
   saved: SignInInfo[];
   /** This computer can save a sign-in (the desktop's safeStorage); else the card says it is used once. */
   canSave: boolean;
   answer(choice: SignInChoice): void;
 }
 
-/** How long the line of a saved sign-in waits for "Not this time". */
-export const AUTO_WAIT_MS = 2600;
 /** How long "Signed in as name" stays. */
 export const SIGNED_LINE_MS = 3200;
 
@@ -50,7 +45,7 @@ export function useSignInAsk(tabId: string): SignInAsk | undefined {
   );
 }
 
-/** Shows the card (or the line) on a tab and waits for the person; another ask on the tab cancels the old one. */
+/** Shows the card on a tab and waits for the person; another ask on the tab cancels the old one. */
 export function askSignIn(a: Omit<SignInAsk, 'answer'>, signal?: { cancelled(): boolean }): Promise<SignInChoice> {
   asks.get(a.tabId)?.answer({ kind: 'cancel' });
   return new Promise((resolve) => {
@@ -67,11 +62,7 @@ export function askSignIn(a: Omit<SignInAsk, 'answer'>, signal?: { cancelled(): 
     };
     asks.set(a.tabId, ask);
     emit();
-    if (a.mode === 'auto' && a.saved[0]) {
-      const pick = a.saved[0];
-      setTimeout(() => ask.answer({ kind: 'saved', id: pick.id, username: pick.username }), AUTO_WAIT_MS);
-    }
-    // The tab closed, the session went away: the ask ends as a cancel.
+    // The tab closed or left the screen, the session went away: the ask ends as a cancel.
     if (signal) {
       const poll = setInterval(() => {
         if (done) return clearInterval(poll);

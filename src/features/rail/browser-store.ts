@@ -52,6 +52,8 @@ export interface PageState {
   filled?: boolean;
   /** A sign-in is under way on this page: every agent tool but the sign-in itself is refused. */
   signing?: boolean;
+  /** The id of the sign-in hold Electron main armed for this page; only its own release ends it. */
+  hold?: string;
   /** One line after a sign-in ("Signed in as name"), for a few seconds. */
   signedInAs?: string;
 }

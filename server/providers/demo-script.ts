@@ -28,7 +28,7 @@ import type {
 } from '../../shared/protocol';
 import { makeFileDiff } from '../../shared/diff';
 import { WIDGET_SERVER, WIDGET_SHOWN, WIDGET_TOOL_ID } from './widget-tool';
-import { BROWSER_TOOLS, describeBrowser, runBrowserTool, type BrowserOp, type BrowserToolResult } from './browser-tool';
+import { BROWSER_TOOLS, cleanToolInput, describeBrowser, runBrowserTool, type BrowserOp, type BrowserToolResult } from './browser-tool';
 
 // ───────────────────────────── control-flow signals ─────────────────────────────
 
@@ -482,7 +482,7 @@ export class Script {
     const name = `mcp__${WIDGET_SERVER}__${BROWSER_TOOLS[op]}`;
     const view = describeBrowser(name, input);
     if (!opts.parentId) this.activity(opts.activity ?? BROWSER_ACTIVITY[op] ?? 'Looking at the page');
-    const id = await this.tool({ name, ...view, input, parentId: opts.parentId });
+    const id = await this.tool({ name, ...view, input: cleanToolInput(name, input) as Record<string, unknown>, parentId: opts.parentId });
     this.start(id);
     const r = await runBrowserTool(this.rt, op, input, this.env.signal);
     this.check();

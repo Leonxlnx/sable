@@ -4,6 +4,7 @@ import { listSignIns, removeSignIn } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton } from '@/ui';
 import { Card, Empty } from '../settings/parts';
+import { SIGN_IN_RISK } from './BrowserAgentUi';
 import { originParts } from './sign-in';
 import './saved-sign-ins.css';
 
@@ -33,26 +34,29 @@ export function SavedSignIns() {
 
   if (!list) return null;
   return (
-    <Card title="Saved sign-ins">
-      {!list.length ? (
-        <Empty>No saved sign-ins.</Empty>
-      ) : (
-        <ul className="si-list" aria-label="Saved sign-ins">
-          {list.map((s) => {
-            const { scheme, host } = originParts(s.origin);
-            return (
-              <li key={s.id} className="si-row">
-                <span className="si-site truncate" title={s.origin}>
-                  <span className="si-scheme">{scheme}</span>
-                  {host}
-                </span>
-                <span className="si-user truncate">{s.username}</span>
-                <IconButton icon="trash" label={`Remove the sign-in for ${host}`} size={14} onClick={() => void remove(s)} />
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </Card>
+    <>
+      <Card title="Saved sign-ins">
+        {!list.length ? (
+          <Empty>No saved sign-ins.</Empty>
+        ) : (
+          <ul className="si-list" aria-label="Saved sign-ins">
+            {list.map((s) => {
+              const { scheme, host } = originParts(s.origin);
+              return (
+                <li key={s.id} className="si-row">
+                  <span className="si-site truncate" title={s.origin}>
+                    <span className="si-scheme">{scheme}</span>
+                    {host}
+                  </span>
+                  <span className="si-user truncate">{s.username}</span>
+                  <IconButton icon="trash" label={`Remove the sign-in for ${host}`} size={14} onClick={() => void remove(s)} />
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </Card>
+      <p className="set-foot-note">{SIGN_IN_RISK}</p>
+    </>
   );
 }

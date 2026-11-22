@@ -60,7 +60,7 @@ import { carryClaudeConversation } from '../accounts/handover';
 import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import { isAuthFailure, isStandIn, parseSynthetic, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
-import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled } from './browser-tool';
+import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled, cleanToolInput, streamsInput } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
 import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from './widget-tool';
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
@@ -2090,7 +2090,8 @@ class ClaudeSession implements ProviderSession {
         else if (d.type === 'thinking_delta') rt.delta(blk.itemId, 'text', d.thinking ?? '');
         else if (d.type === 'input_json_delta') {
           blk.json += d.partial_json ?? '';
-          rt.delta(blk.itemId, 'inputText', d.partial_json ?? '');
+          // browser_sign_in's input never streams into the timeline: it is published once cleaned (toolReady).
+          if (streamsInput(blk.name)) rt.delta(blk.itemId, 'inputText', d.partial_json ?? '');
           // A widget's title is all there is to peek at; its code can be long, so stop looking once found.
           if (blk.peeked && blk.name === WIDGET_TOOL_ID) break;
           // Surface the file / command as soon as it has streamed in.
@@ -2132,7 +2133,7 @@ class ClaudeSession implements ProviderSession {
     const item = rt.get<ToolItem>(id);
     if (!item) return;
     const view = describeTool(name, input);
-    const patch: Partial<ToolItem> = { input, title: view.title, detail: view.detail, kind: view.kind, inputText: undefined };
+    const patch: Partial<ToolItem> = { input: cleanToolInput(name, input) as Obj, title: view.title, detail: view.detail, kind: view.kind, inputText: undefined };
     if (item.status === 'pending') patch.status = 'running';
     if ((name === 'Edit' || name === 'Write') && !item.result) patch.result = { diff: previewDiff(name, input) };
     if (name === 'Workflow' && !item.workflow) patch.workflow = workflowStart(input);

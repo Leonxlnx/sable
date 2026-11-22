@@ -8,7 +8,7 @@ import './browser.css';
 /** The gallery's states of the agent on a page: its line, its pointer, the sign-in card (`?gallery#browser-agent`). */
 
 const saved = (n: number): SignInInfo[] => ['student.one', 'teacher.two', 'parent.three'].slice(0, n).map((u, i) => ({ id: `0000000${i}`, origin: 'https://portal.example.test', username: u, createdAt: 0 }));
-const ask = (p: Partial<SignInAsk>): SignInAsk => ({ tabId: 'gallery', origin: 'https://portal.example.test', mode: 'card', saved: [], canSave: true, answer: () => {}, ...p });
+const ask = (p: Partial<SignInAsk>): SignInAsk => ({ tabId: 'gallery', origin: 'https://portal.example.test', saved: [], canSave: true, answer: () => {}, ...p });
 
 function Frame({ label, children, h = 220 }: { label: string; children: React.ReactNode; h?: number }) {
   return (
@@ -73,7 +73,6 @@ export function BrowserAgentStates() {
         <AgentLineView line={{ kind: 'driving' }} provider="claude" />
         <AgentLineView line={{ kind: 'driving' }} provider="codex" />
         <AgentLineView line={{ kind: 'driving', yielding: true }} provider="claude" />
-        <AgentLineView line={{ kind: 'auto', user: 'student.one' }} provider="claude" />
         <AgentLineView line={{ kind: 'signed', user: 'student.one' }} provider="claude" />
       </div>
       <div className="row" style={{ gap: 18, flexWrap: 'wrap', alignItems: 'start' }}>
@@ -93,6 +92,9 @@ export function BrowserAgentStates() {
         </Frame>
         <Frame label="Not saved on this computer" h={300}>
           <SignInCardView ask={ask({ canSave: false, origin: 'http://127.0.0.1:4100' })} />
+        </Frame>
+        <Frame label="One saved" h={300}>
+          <SignInCardView ask={ask({ saved: saved(1) })} />
         </Frame>
         <Frame label="Several saved" h={340}>
           <SignInCardView ask={ask({ saved: saved(3) })} />

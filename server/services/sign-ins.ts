@@ -12,7 +12,7 @@ import type { App } from '../app';
  * the user name, dates and the password as ciphertext from Electron's `safeStorage`. Encrypting,
  * decrypting, filling and guarding the submission happen only in Electron's main process
  * (`electron/sign-in-core.ts` `SignInGate`, wired in `electron/sign-in.ts`), which reads the
- * ciphertext through `cipherOf` in-process. Over the bridge there is only `signIn.list` (names, never
+ * ciphertext through `entryOf` in-process. Over the bridge there is only `signIn.list` (names, never
  * a secret) and `signIn.remove`. None of it is on the phone's allowlist.
  *
  * NOT IN THIS VERSION (`SIGN_IN_SHIPS` is false): `browser_sign_in` is offered to no agent and answers
@@ -51,27 +51,54 @@ import type { App } from '../app';
  *      in punycode, port; `sameOrigin`), the dev frame compares parsed origins, and the dev frame
  *      cannot fill at all (only the desktop's main process fills).
  *
- * The review of the rebuild (22 Nov 2026, scratch/reviews/out-day5b.md) said no again. Still to clear
- * before the switch goes on; the numbers are that review's:
- *   1. The ciphertext holds the password alone: the entry's origin and user name are plain JSON beside
- *      it, so whoever can write the file can point a saved password at another origin. Encrypt the
- *      origin and the user name with it and check them after decrypting.
- *   2. A second `begin` on a guest that still shows a filled form: its reload is read as the first
- *      fill's new document, which removes the new network guard and tells the window to stop
- *      refusing. Refuse `begin` while a guest has a sign-in pending or filled; one id per hold.
- *   4. The hold is the window's and has holes: `browser_read` (page text, console, failed requests),
- *      the title and address, and a console batch of the old document arriving late still reach the
- *      agent. Enforce the hold in main, on what is delivered as well as on what is asked.
- *   6. The approval names an origin, not the login page or its form: a path change in the same
- *      document, a same-origin redirect, `document.open()` or a form swapped after the stamp, or the
- *      field moved into a frame during the user name's event, all pass. Pin the address and the form.
- *   7. The network guard misses a form-encoded password (`!` and the like) and a `<base target>`;
- *      the destination must hold for the request and each redirect whatever the body looks like.
- *   8. A single saved entry is used after 2.6 s without the person choosing it. Always ask.
- *   9. The tool's step is published before its input is cleaned.
- * And two that no fix here removes; the person must be told before they save anything:
- *   3. What is filled into a page can be read by that page's scripts (a third party's too), as with
- *      any password manager's autofill.
+ * The review of the rebuild (22 Nov 2026, scratch/reviews/out-day5b.md) said no again; its numbers.
+ * Second rebuild, still off: what answers each finding now, and what is still open.
+ *   1. The ciphertext held the password alone. Now: what is encrypted is the password with the
+ *      canonical origin and the user name (`sealPlain` in electron/sign-in-core.ts); main checks both
+ *      against the entry after decrypting (`openPlain`, `SignInGate.fill`), and an entry relabelled in
+ *      this file is refused as damaged, never filled. Open: any desktop bridge client can still read
+ *      and delete the file through the bridge's general file and terminal methods (`fs.*`, `term.*`),
+ *      and list and remove entries once this is on; safeStorage on Windows is no boundary against code
+ *      running as the same user. Restricting those methods to the app's own window is the lead's call.
+ *   2. A second sign-in undid the first's guard. Now: `begin` is refused while the guest has a sign-in
+ *      under way or a filled document still shown; each hold has an id, a release names it, and the
+ *      window ends only the hold whose id it was given (`PageState.hold`).
+ *   4. The hold had holes. Now: main holds back everything of a held guest at the point of delivery.
+ *      Every answer the window sends carries its page's webContents id (`BrowserAnswer.guestId`); the
+ *      bridge asks main's holds when an answer arrives (`deliveryHeld`, `setSignInHolds`;
+ *      browser-tool.ts `ask`), for every tool, `state` and `open` included, and an answer that does not
+ *      say its page is held back while any page is held; the line with the page's address and title is
+ *      left out while a page is held. Main passes no console line or failed request of a held guest to
+ *      the window, drops what an old document left in its buffers when the next one commits, and marks
+ *      each batch with its document (`doc`, the window drops a batch of an older one). Main refuses the
+ *      agent's screenshot of a held guest. Open: the window's own copy of an older log (read before the
+ *      hold) is held back only through the delivery check.
+ *   6. The approval named an origin only. Now: `begin` pins the address (origin and path) and the form
+ *      (its action and its two fields' names, read in an isolated world: `describeScript`); the fresh
+ *      load goes to the pinned address and must land there; the stamp finds the pinned form again and
+ *      keeps the document's root, the form, its fields and the submitter as references in its world; the
+ *      fill sets both values before any event, then checks the fields, the form and where it sends again,
+ *      and only then submits (`stampScript`, `fillScript`). A same-document change of the address, a
+ *      redirect to another path, `document.open()`, a replaced form or a field moved into a frame void it.
+ *      Open: the page's own listeners still run on the two events (finding 3).
+ *   7. The network rule leaned on recognising the password. Now: while the password is in play every
+ *      request of that guest with a body is a POST to the exact origin or is cancelled, whatever the body
+ *      holds; an address holding the password in any form the URL standard's form encoding writes
+ *      (`formEncode`, tested against the browser's own serialization of a password with `!` and a space)
+ *      is cancelled; a 307 or 308 to another origin is cancelled (`redirectVerdict`, from
+ *      `onBeforeRedirect` and `will-redirect`); `<base target>` counts as the form's target. Open: the
+ *      redirect path is not verified in the pinned Electron binary; a WebSocket frame, a worker's request
+ *      without a guest id and DNS lookups are outside an HTTP rule (finding 3).
+ *   8. One saved entry was used after a timer. Now: no timer; every saved entry is offered on the card
+ *      and the person picks every time; the card opens only while this window is focused and the
+ *      session's Browser tab is on screen, and it closes if the tab leaves the screen.
+ *   9. The step was published before its input was cleaned. Now: `cleanToolInput` keeps only valid
+ *      references where the providers make the step (claude.ts `toolReady`, codex-map.ts, the Demo), and
+ *      Claude's input of browser_sign_in never streams into the timeline (`streamsInput`).
+ * Not removable here, so the person is told before saving (`SIGN_IN_RISK`, on the card's Save choice
+ * and under Settings › Permissions' list):
+ *   3. What is filled into a page can be read by that page's scripts (a third party's too), and a
+ *      page may carry it off by means no HTTP rule sees (a WebSocket, storage kept for later).
  *   5. Once signed in, the agent acts in that session, and the Browser tab's pages share one stored
  *      profile: a site that keeps a token where scripts can read it gives it to the agent's eval.
  */
@@ -97,6 +124,31 @@ export function onSignInShips(l: () => void) {
 }
 
 export const SIGN_IN_OFF = 'SIGN_IN_OFF: sign-ins are not available in this version of Sable.';
+
+/**
+ * The holds Electron main keeps (electron/sign-in.ts): while a guest is held, nothing of its page goes
+ * to the agent. The bridge asks at delivery, when the window's answer arrives (browser-tool.ts).
+ * Absent (no desktop shell, or sign-ins off): nothing is held.
+ */
+export interface SignInHolds {
+  held(guestId: number): boolean;
+  anyHeld(): boolean;
+}
+
+let holds: SignInHolds | undefined;
+
+export function setSignInHolds(h: SignInHolds | undefined) {
+  holds = h;
+}
+
+/** An answer from that guest (or, when it does not say which, from any guest while one is held) must not reach the agent. */
+export function deliveryHeld(guestId: number | undefined): boolean {
+  if (!holds) return false;
+  return typeof guestId === 'number' && guestId > 0 ? holds.held(guestId) : holds.anyHeld();
+}
+
+/** Some page is held: the line about the Browser tab's page (address and title) is left out. */
+export const anyPageHeld = () => !!holds?.anyHeld();
 
 export const SIGN_INS_FILE = 'sign-ins.json';
 /** How many sign-ins are kept (the oldest used go first). */
@@ -201,11 +253,16 @@ export class SignInStore {
     return [...list].sort((a, b) => (b.usedAt ?? b.createdAt) - (a.usedAt ?? a.createdAt)).map(info);
   }
 
-  /** The ciphertext of one sign-in, for exactly the origin it was saved for. Electron main only (never an RPC). */
-  cipherOf(id: string, origin: string): string | undefined {
+  /**
+   * One sign-in's ciphertext and user name, for exactly the origin it was saved for. Electron main only
+   * (never an RPC). What is encrypted holds the origin and the user name too (`sealPlain` in
+   * electron/sign-in-core.ts): main checks them after decrypting, so an entry relabelled in this file
+   * is refused, never filled.
+   */
+  entryOf(id: string, origin: string): { cipher: string; username: string } | undefined {
     const o = signInOrigin(origin);
     const e = this.load().find((x) => x.id === id);
-    return o && e && e.origin === o ? e.secret : undefined;
+    return o && e && e.origin === o ? { cipher: e.secret, username: e.username } : undefined;
   }
 
   /** Saves (or replaces) the ciphertext for this origin and user name. */

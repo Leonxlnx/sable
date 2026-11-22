@@ -257,14 +257,17 @@ const outbox: BrowserEvent[] = [];
 let outboxTimer: ReturnType<typeof setTimeout> | undefined;
 const consoleBuf = new Map<number, { lines: { level: string; text: string; source?: string }[]; dropped: number }>();
 const netBuf = new Map<number, { list: BrowserEvent[]; dropped: number }>();
+/** Each guest's committed documents: batches carry the one they came from, so a late one of an old document is dropped. */
+const guestDoc = new Map<number, number>();
 
 function flushBrowserEvents() {
   outboxTimer = undefined;
-  for (const [id, b] of consoleBuf) outbox.push({ type: 'console', id, lines: b.lines, dropped: b.dropped });
+  for (const [id, b] of consoleBuf) outbox.push({ type: 'console', id, doc: guestDoc.get(id) ?? 0, lines: b.lines, dropped: b.dropped });
   consoleBuf.clear();
   for (const [id, b] of netBuf) {
-    outbox.push(...b.list);
-    if (b.dropped) outbox.push({ type: 'net-dropped', id, count: b.dropped });
+    const doc = guestDoc.get(id) ?? 0;
+    outbox.push(...b.list.map((e) => ({ ...e, doc })));
+    if (b.dropped) outbox.push({ type: 'net-dropped', id, doc, count: b.dropped });
   }
   netBuf.clear();
   const batch = outbox.splice(0);
@@ -278,6 +281,8 @@ function toApp(ev: BrowserEvent) {
 }
 
 function queueConsole(id: number, line: { level: string; text: string; source?: string }) {
+  // A page held for a sign-in says nothing to the app (so nothing of it can reach the agent).
+  if (signInHeld(id)) return;
   let b = consoleBuf.get(id);
   if (!b) consoleBuf.set(id, (b = { lines: [], dropped: 0 }));
   if (b.lines.length >= EVENT_LINES) b.dropped++;
@@ -286,6 +291,7 @@ function queueConsole(id: number, line: { level: string; text: string; source?: 
 }
 
 function queueNet(ev: BrowserEvent & { id: number }) {
+  if (signInHeld(ev.id)) return;
   let b = netBuf.get(ev.id);
   if (!b) netBuf.set(ev.id, (b = { list: [], dropped: 0 }));
   if (b.list.length >= EVENT_NET) b.dropped++;
@@ -309,6 +315,16 @@ function guardGuest(contents: WebContents) {
   contents.on('will-navigate', guard);
   contents.on('will-redirect', guard);
   contents.on('will-attach-webview', (e) => e.preventDefault());
+  // What the old document logged and has not gone out yet is dropped when the next one commits, so a
+  // late batch is never read as the new page's (the window starts the new page's log at this moment).
+  contents.on('did-navigate', () => {
+    consoleBuf.delete(contents.id);
+    netBuf.delete(contents.id);
+    const doc = (guestDoc.get(contents.id) ?? 0) + 1;
+    guestDoc.set(contents.id, doc);
+    // On the same channel as the batches, after every batch of the old document that already went out.
+    toApp({ type: 'doc', id: contents.id, doc });
+  });
   const ours = () => {
     const host = contents.hostWebContents;
     return !!host && host === win?.webContents;
@@ -329,6 +345,7 @@ function guardGuest(contents: WebContents) {
   contents.once('destroyed', () => {
     consoleBuf.delete(contents.id);
     netBuf.delete(contents.id);
+    guestDoc.delete(contents.id);
     hidden.delete(contents.id);
   });
   contents.setWindowOpenHandler(({ url }) => {

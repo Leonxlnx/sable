@@ -203,6 +203,9 @@ export async function handleBrowserRequest(req: BrowserRequest) {
   } catch (err) {
     answer = { ok: false, error: (err as Error)?.message || 'The Browser tab could not do that.' };
   }
+  // Which page view the answer is of: the bridge holds back everything of a page Electron main holds for a sign-in.
+  const guestId = controllers.get(activeTab(req.sessionId))?.guestId?.();
+  if (guestId) answer = { ...answer, guestId };
   void respondBrowser(req.sessionId, req.id, answer);
 }
 
@@ -451,7 +454,7 @@ export function signInAllowed(url: string): string | undefined {
 
 /** The desktop shell's sign-in calls (electron/preload.ts): main fills, the window never holds a saved password. */
 type SignInShell = {
-  begin(webContentsId: number, origin: string): Promise<{ ticket: string; canSave: boolean }>;
+  begin(webContentsId: number, origin: string): Promise<{ ticket: string; hold: string; canSave: boolean }>;
   fill(webContentsId: number, ticket: string, cred: { kind: 'typed'; username: string; password: string; save: boolean } | { kind: 'saved'; id: string; username: string }): Promise<{ ok: boolean; signedIn?: boolean; user?: string; error?: string }>;
   cancel(ticket: string): Promise<void>;
 };
@@ -476,13 +479,19 @@ async function signIn(req: BrowserRequest, c: PageController, url: string): Prom
   if (!/^e\d{1,6}$/.test(refs.userRef) || !/^e\d{1,6}$/.test(refs.passRef)) return { ok: false, url, error: 'Name the fields by their references from browser_snapshot.' };
 
   // The ticket arms the hold (in main and here) before anything else: no tool of the agent reaches this page from now on.
-  let begun: { ticket: string; canSave: boolean };
+  // The card is only for a person who is looking: this window focused and its Browser tab on screen.
+  useStore.getState().setUi({ railOpen: true, railTab: 'browser' });
+  const looking = () => document.visibilityState === 'visible' && document.hasFocus() && activeTab(c.sessionId) === tab && useStore.getState().ui.activeSessionId === c.sessionId;
+  if (!looking()) return { ok: false, url, error: 'the person is not looking at the Browser tab. Ask them to open it, then try again.' };
+  let begun: { ticket: string; hold: string; canSave: boolean };
   try {
     begun = await sh.begin(wc, origin);
-  } catch {
-    return { ok: false, url, error: 'sign-ins are not available here.' };
+  } catch (err) {
+    // Main's words (a form it will not fill, a sign-in already under way): plain, never a value.
+    const said = String((err as Error)?.message ?? '').replace(/^.*Error: /, '');
+    return { ok: false, url, error: (said || 'sign-ins are not available here.').slice(0, 200) };
   }
-  setPage(tab, { filled: true, signing: true });
+  setPage(tab, { filled: true, signing: true, hold: begun.hold });
   let filling = false;
   try {
     // Where the fields stand, for the pointer only (no value is read or written here).
@@ -492,12 +501,10 @@ async function signIn(req: BrowserRequest, c: PageController, url: string): Prom
 
     const saved = await listSignIns(origin).catch(() => []);
     const here = () => signInAllowed(c.url() || getPage(tab).url) === origin && controllers.get(tab) === c;
-    const alive = { cancelled: () => !here() };
-    // The card and the line are the Browser tab's: it comes to the front for them.
-    useStore.getState().setUi({ railOpen: true, railTab: 'browser' });
-    let choice: SignInChoice = saved.length === 1 ? await askSignIn({ tabId: tab, origin, mode: 'auto', saved, canSave: begun.canSave }, alive) : { kind: 'notNow' };
-    if (choice.kind === 'notNow') choice = await askSignIn({ tabId: tab, origin, mode: 'card', saved: saved.length > 1 ? saved : [], canSave: begun.canSave }, alive);
-    if (choice.kind === 'cancel' || choice.kind === 'notNow') return { ok: false, url, error: here() ? 'the user cancelled the sign-in.' : 'the page moved on before the sign-in.' };
+    const alive = { cancelled: () => !here() || document.visibilityState !== 'visible' || activeTab(c.sessionId) !== tab };
+    // Always asked: the person chooses on the visible card every time, a saved sign-in too (nothing picks one by itself).
+    const choice: SignInChoice = await askSignIn({ tabId: tab, origin, saved, canSave: begun.canSave }, alive);
+    if (choice.kind === 'cancel') return { ok: false, url, error: here() ? 'the user cancelled the sign-in.' : 'the page moved on before the sign-in.' };
 
     // Watch it: the pointer goes to each field and the submit control; main then fills and sends.
     if (c.point && probe.vw) {

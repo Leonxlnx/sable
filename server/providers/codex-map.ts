@@ -23,7 +23,7 @@ import type {
 } from '../../shared/protocol';
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
 import { WIDGET_TOOL, describeWidget, isWidgetTool } from './widget-tool';
-import { browserOp, describeBrowser } from './browser-tool';
+import { browserOp, cleanToolInput, describeBrowser } from './browser-tool';
 import { describeDevice, deviceOp } from './device-tool';
 import { agentOfTool, describeAgentCall } from './agent-tool';
 import { describeProfileCall, isProfileTool } from './profile-tool';
@@ -667,7 +667,7 @@ export function draftItem(item: ThreadItem, opts: { streaming?: boolean } = {}):
           name: item.tool,
           ...describeBrowser(item.tool, item.arguments, plain),
           status,
-          input: item.arguments,
+          input: cleanToolInput(item.tool, item.arguments),
           ...(status !== 'running' ? { result: { text: plain, isError: status === 'error' || undefined, ...(images.length ? { images } : {}) }, endedAt: done(status) } : {}),
         });
       }

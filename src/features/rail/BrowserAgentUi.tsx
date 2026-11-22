@@ -8,41 +8,29 @@ import { originParts, useSignInAsk, type SignInAsk } from './sign-in';
 
 /**
  * What the Browser tab shows of the agent's own use of the page: one line under the toolbar (who is
- * driving, with Stop; a saved sign-in about to be used, with Not this time; who it signed in as) and
+ * driving, with Stop; who it signed in as) and
  * the sign-in card over the page. All of it is the app's own, drawn by the tab, never in the page.
  */
 
-/** What the line says: a saved sign-in about to be used, who it signed in as, or who is driving. */
-export type LineKind = { kind: 'auto'; user: string } | { kind: 'signed'; user: string } | { kind: 'driving'; yielding?: boolean };
+/** What the line says: who it signed in as, or who is driving. */
+export type LineKind = { kind: 'signed'; user: string } | { kind: 'driving'; yielding?: boolean };
+
+/**
+ * What the person reads before saving a sign-in (the card's Save choice, Settings › Permissions): the
+ * two things no fix removes. A page's own scripts can read what is filled into it, and once signed in
+ * the agent works in that page, with that session.
+ */
+export const SIGN_IN_RISK = 'The page can read what is filled into it, and the agent then works in the signed-in page.';
 
 /** The line under the toolbar: at most one thing at a time, the most pressing first. */
 export function AgentLine({ tabId, provider, running, onStop }: { tabId: string; provider: ProviderId; running: boolean; onStop: () => void }) {
   const page = usePage(tabId);
-  const ask = useSignInAsk(tabId);
-  const line: LineKind | null =
-    ask?.mode === 'auto' && ask.saved[0]
-      ? { kind: 'auto', user: ask.saved[0].username }
-      : page.signedInAs
-        ? { kind: 'signed', user: page.signedInAs }
-        : page.driving && running
-          ? { kind: 'driving', yielding: page.yielding }
-          : null;
+  const line: LineKind | null = page.signedInAs ? { kind: 'signed', user: page.signedInAs } : page.driving && running ? { kind: 'driving', yielding: page.yielding } : null;
   if (!line) return null;
-  return <AgentLineView line={line} provider={provider} onStop={onStop} onNotNow={() => ask?.answer({ kind: 'notNow' })} />;
+  return <AgentLineView line={line} provider={provider} onStop={onStop} />;
 }
 
-export function AgentLineView({ line, provider, onStop, onNotNow }: { line: LineKind; provider: ProviderId; onStop?: () => void; onNotNow?: () => void }) {
-  if (line.kind === 'auto') {
-    return (
-      <div className="bw-line" role="status" data-kind="auto">
-        <Icon name="key" size={14} className="bw-line-icon" />
-        <span className="bw-line-text truncate">Signing in as {line.user}</span>
-        <button type="button" className="btn btn-sm btn-ghost" onClick={onNotNow}>
-          Not this time
-        </button>
-      </div>
-    );
-  }
+export function AgentLineView({ line, provider, onStop }: { line: LineKind; provider: ProviderId; onStop?: () => void }) {
   if (line.kind === 'signed') {
     return (
       <div className="bw-line" role="status" data-kind="signed">
@@ -66,13 +54,13 @@ export function AgentLineView({ line, provider, onStop, onNotNow }: { line: Line
 
 /**
  * The sign-in card over the page: the site's origin as the browser has it (never a name the page or
- * the agent gave), large; a choice when several sign-ins are saved for it; the person's user name and
- * password; Save for this site (where this computer can keep it); Sign in and Cancel. Enter signs in,
+ * the agent gave), large; the sign-ins saved for it, one of which the person picks (always: nothing
+ * picks one by itself), or another account with a user name and password; Save for this site (where this computer can keep it); Sign in and Cancel. Enter signs in,
  * Escape cancels. The password stays in this component's field until it goes into the answer.
  */
 export function SignInCard({ tabId }: { tabId: string }) {
   const ask = useSignInAsk(tabId);
-  if (!ask || ask.mode !== 'card') return null;
+  if (!ask) return null;
   // A new ask is a new card: nothing typed for another one carries over.
   return <SignInCardView key={`${ask.origin}:${ask.saved.length}`} ask={ask} />;
 }
@@ -130,7 +118,7 @@ export function SignInCardView({ ask }: { ask: SignInAsk }) {
           <span className="bw-signin-host">{host}</span>
         </p>
 
-        {ask.saved.length > 1 && (
+        {ask.saved.length > 0 && (
           <div className="bw-signin-picks" role="radiogroup" aria-label="Saved sign-ins">
             {ask.saved.map((s) => (
               <button key={s.id} type="button" role="radio" aria-checked={pick === s.id} className="bw-signin-pick" data-on={pick === s.id || undefined} onClick={() => setPick(s.id)}>
@@ -164,6 +152,8 @@ export function SignInCardView({ ask }: { ask: SignInAsk }) {
             <input ref={passRef} className="field" type="password" placeholder="Password" aria-label="Password" autoComplete="off" maxLength={1000} onChange={(e) => setEmpty(!e.target.value)} />
           </div>
         )}
+
+        {typing && ask.canSave && save && <p className="bw-signin-risk">{SIGN_IN_RISK}</p>}
 
         <div className="bw-signin-foot">
           {typing &&

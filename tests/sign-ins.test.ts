@@ -1,15 +1,16 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { PHONE_METHODS, type BridgeEvent, type BrowserAnswer, type BrowserRequest, type SessionMeta, type ToolItem } from '@shared/protocol';
 import { SessionRuntime } from '../server/core/runtime';
 import { App } from '../server/app';
 import { ClaudeProvider } from '../server/providers/claude';
 import { CodexProvider } from '../server/providers/codex';
-import { BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOL_IDS, BROWSER_TOOLS, runBrowserTool, SIGN_IN_KEYS } from '../server/providers/browser-tool';
+import { BROWSER_DESCRIPTIONS, BROWSER_HELD, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOL_IDS, BROWSER_TOOLS, browserContextLine, cleanToolInput, runBrowserTool, SIGN_IN_KEYS, streamsInput } from '../server/providers/browser-tool';
+import { draftItem } from '../server/providers/codex-map';
 import { DemoProvider } from '../server/providers/demo';
-import { MAX_SIGN_INS, SIGN_IN_SHIPS, setSignInShips, SignInStore, signInOrigin } from '../server/services/sign-ins';
+import { MAX_SIGN_INS, SIGN_IN_SHIPS, setSignInHolds, setSignInShips, SignInStore, signInOrigin } from '../server/services/sign-ins';
 import { DEFAULT_SETTINGS } from '@shared/protocol';
 import { signInProbeScript, snapshotScript } from '../src/features/rail/browser-scripts';
 
@@ -47,6 +48,8 @@ describe('not in this version: the switch is off', () => {
   it('every signIn method answers off and reads or writes nothing; none of them carries a secret', async () => {
     const home = temp();
     const app = new App({ home, providers: [(c) => new DemoProvider(c, { speed: 0 })], quiet: true });
+    // A read leaves no trace in the folder: the store's own reading is watched instead.
+    const load = vi.spyOn(SignInStore.prototype as unknown as { load(): unknown }, 'load');
     try {
       const before = readdirSync(home).sort();
       const calls: [string, Record<string, unknown>][] = [
@@ -59,7 +62,9 @@ describe('not in this version: the switch is off', () => {
       expect(readdirSync(home).sort()).toEqual(before);
       // Finding 1: no method of the bridge reveals or takes a password, switched on or off.
       for (const m of ['signIn.reveal', 'signIn.save', 'signIn.state', 'signIn.used']) await expect(app.call(m as never, {} as never)).rejects.toThrow(/Unknown method/);
+      expect(load).not.toHaveBeenCalled();
     } finally {
+      load.mockRestore();
       await app.dispose();
     }
   });
@@ -75,9 +80,9 @@ describe('the saved sign-ins (server/services/sign-ins.ts)', () => {
     const [one] = s.all('https://portal.example.test');
     expect(one).toMatchObject({ origin: 'https://portal.example.test', username: 'student.one' });
     expect(Object.keys(one)).not.toContain('secret');
-    expect(s.cipherOf(one.id, 'https://portal.example.test')).toBe('CIPHER-made-up');
+    expect(s.entryOf(one.id, 'https://portal.example.test')?.cipher).toBe('CIPHER-made-up');
     // Never a look-alike, a subdomain, another port or the plain-http twin.
-    for (const o of ['https://portal.example.test.evil.test', 'https://login.portal.example.test', 'https://portal.example.test:8443', 'http://portal.example.test', 'https://portal-example.test']) expect(s.cipherOf(one.id, o)).toBeUndefined();
+    for (const o of ['https://portal.example.test.evil.test', 'https://login.portal.example.test', 'https://portal.example.test:8443', 'http://portal.example.test', 'https://portal-example.test']) expect(s.entryOf(one.id, o)?.cipher).toBeUndefined();
     // Written atomically: no temporary file is left beside it.
     expect(readdirSync(dir)).toEqual(['sign-ins.json']);
     // Read on every use: a second store on the same folder (Electron main's) sees the same list.
@@ -97,7 +102,7 @@ describe('the saved sign-ins (server/services/sign-ins.ts)', () => {
     s.put('https://a.example.test', 'one', 'c1');
     s.put('https://a.example.test', 'one', 'c2');
     expect(s.all()).toHaveLength(1);
-    expect(s.cipherOf(s.all()[0].id, 'https://a.example.test')).toBe('c2');
+    expect(s.entryOf(s.all()[0].id, 'https://a.example.test')?.cipher).toBe('c2');
     for (let i = 0; i < MAX_SIGN_INS + 5; i++) s.put(`https://s${i}.example.test`, 'u', 'c');
     expect(s.all()).toHaveLength(MAX_SIGN_INS);
     const id = s.all()[0].id;
@@ -202,5 +207,79 @@ describe('the outline script of a sign-in (browser-scripts.ts)', () => {
     expect(probe).toContain('window.top !== window');
     expect(probe).toContain('ownerDocument !== document');
     expect(probe).not.toMatch(/\.value\s*=|requestSubmit|\.click\(/);
+  });
+});
+
+describe('finding 4 (second review): nothing of a held page reaches the agent, checked at delivery', () => {
+  afterEach(() => setSignInHolds(undefined));
+  const answerOf = (guestId: number | undefined) => (r: BrowserRequest): BrowserAnswer => {
+    const base = { url: 'http://localhost:3000/home', title: 'Welcome, student.one', ...(guestId ? { guestId } : {}) };
+    if (r.op === 'state') return { ok: true, ...base };
+    if (r.op === 'read') return { ok: true, ...base, text: 'secret page text', console: [{ level: 'warning', text: 'filled made-up-pass-7351' }] };
+    return { ok: true, ...base, text: 'x' };
+  };
+
+  it('page text, title, address and console of a held guest are held back, for every tool', async () => {
+    setSignInHolds({ held: (id) => id === 5, anyHeld: () => true });
+    for (const [op, input] of [['read', {}], ['snapshot', {}], ['eval', { script: 'return 1' }], ['logs', { kind: 'console' }], ['open', { url: 'http://localhost:3000/' }]] as const) {
+      const t = makeRt();
+      t.serve(answerOf(5));
+      const r = await runBrowserTool(t.rt, op, input);
+      expect(r, op).toEqual({ ok: false, text: BROWSER_HELD });
+      expect(r.text).not.toMatch(/Welcome|secret|made-up/);
+    }
+  });
+
+  it('an answer that does not say its page is held back while any page is held; another, unheld page passes', async () => {
+    setSignInHolds({ held: (id) => id === 5, anyHeld: () => true });
+    const unknown = makeRt();
+    unknown.serve(answerOf(undefined));
+    expect((await runBrowserTool(unknown.rt, 'read', {})).text).toBe(BROWSER_HELD);
+    const other = makeRt();
+    other.serve(answerOf(6));
+    expect((await runBrowserTool(other.rt, 'read', {})).ok).toBe(true);
+  });
+
+  it('an answer already on its way when the hold began is held back too (the check is at delivery)', async () => {
+    let held = false;
+    setSignInHolds({ held: (id) => held && id === 5, anyHeld: () => held });
+    const t = makeRt();
+    t.serve((r) => {
+      // The window answers, and the hold begins before the answer is delivered.
+      held = r.op === 'read';
+      return answerOf(5)(r);
+    });
+    expect((await runBrowserTool(t.rt, 'read', {})).text).toBe(BROWSER_HELD);
+  });
+
+  it('the line about the Browser tab (address and title) waits while a page is held', () => {
+    const t = makeRt();
+    t.rt.browserPage = { url: 'https://portal.example.test/home', title: 'Welcome, student.one' };
+    setSignInHolds({ held: () => true, anyHeld: () => true });
+    expect(browserContextLine(t.rt)).toBeUndefined();
+    setSignInHolds(undefined);
+    expect(browserContextLine(t.rt)).toMatch(/portal\.example\.test/);
+  });
+});
+
+describe('finding 9: a sign-in step is clean in the first event that publishes it', () => {
+  it('Codex: the step as it is first added carries only valid references', () => {
+    const events: BridgeEvent[] = [];
+    const m: SessionMeta = { id: 's9', provider: 'codex', cwd: '/x', title: 't', titleSource: 'auto', model: '', mode: 'default', status: 'idle', createdAt: 0, updatedAt: 0, usage: { inputTokens: 0, outputTokens: 0, turns: 0 } };
+    const rt = new SessionRuntime(m, (e) => events.push(e), () => {});
+    const d = draftItem({ type: 'dynamicToolCall', id: 'c1', namespace: null, tool: 'browser_sign_in', arguments: { username_ref: 'e1', password_ref: PASSWORD, submit_ref: 'e3', password: PASSWORD }, status: 'inProgress', contentItems: null, success: null } as never) as ToolItem;
+    rt.add(d);
+    expect(events.length).toBeGreaterThan(0);
+    expect(JSON.stringify(events)).not.toContain(PASSWORD);
+    expect(JSON.stringify(events)).toContain('"input":{"username_ref":"e1","submit_ref":"e3"}');
+  });
+
+  it('Claude: the input never streams; once complete it is cleaned before it is set', () => {
+    expect(streamsInput('mcp__sable__browser_sign_in')).toBe(false);
+    expect(streamsInput('mcp__sable__browser_click')).toBe(true);
+    expect(cleanToolInput('mcp__sable__browser_sign_in', { username_ref: 'e1', password_ref: 'e2', password: PASSWORD })).toEqual({ username_ref: 'e1', password_ref: 'e2' });
+    expect(cleanToolInput('mcp__sable__browser_sign_in', { username_ref: PASSWORD, password_ref: 'e2' })).toEqual({ password_ref: 'e2' });
+    const other = { ref: 'e1', text: 'hello' };
+    expect(cleanToolInput('mcp__sable__browser_type', other)).toBe(other);
   });
 });
