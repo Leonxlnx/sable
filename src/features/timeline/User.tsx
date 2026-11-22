@@ -17,7 +17,7 @@ import { EASE_OUT, play, reducedMotion, uiZoom } from '@/lib/motion';
 import { MessageAgain } from './Again';
 import { useTimeline } from './ctx';
 import { Stamp } from './Stamp';
-import { isLongMessage, rowLeft, rowMoved } from './user-card';
+import { MOVE_GLIDE_MS, isLongMessage, rowLeft, rowMoved, willMove } from './user-card';
 
 /** The steer key's arrow (composer/SendKey.tsx `steer`), drawn small: up and leaning into the turn. */
 function SteerMark() {
@@ -78,7 +78,7 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
       const dx = now ? (was.left - now.left) / z : 0;
       const dy = now ? (was.top - now.top) / z : 0;
       // The whole row travels (its mark beside the card with it), from where the card stood.
-      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) play(el, [{ transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)` }, { transform: 'translate(0px, 0px)' }], { duration: 320, easing: EASE_OUT });
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) play(el, [{ transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)` }, { transform: 'translate(0px, 0px)' }], { duration: MOVE_GLIDE_MS, easing: EASE_OUT });
       if (was.queued && !queued) fieldBeat('pulse', card, 0.6);
     } else if (item.text) landInTimeline(el, item.text, { steer: item.steered, session: sessionId, ts: item.ts });
     if (!item.steered) return;
@@ -90,6 +90,34 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
       if (r.width) rowLeft(item.id, { left: r.left, top: r.top, queued: queuedNow.current }, performance.now());
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The agent takes a waiting steer: the bridge moves it to where it was taken, and the window makes
+  // that one update (store.ts, `moved`). The row stays this element, so nothing is entered twice, but
+  // its card would stand in its new place within a frame. Where it stands is read the moment the store
+  // says so, before the list is laid out again, and the row glides from there.
+  const stoodAt = useRef<{ left: number; top: number } | null>(null);
+  useEffect(() => {
+    if (!item.steered || !queued) return;
+    return useStore.subscribe((s, prev) => {
+      const roots = s.data[sessionId]?.roots;
+      const before = prev.data[sessionId]?.roots;
+      if (!willMove(item.id, before, roots)) return;
+      const r = root.current?.querySelector('.user-card')?.getBoundingClientRect();
+      if (r?.width) stoodAt.current = { left: r.left, top: r.top };
+    });
+  }, [queued, item.steered, item.id, sessionId]);
+  useLayoutEffect(() => {
+    const was = stoodAt.current;
+    const el = root.current;
+    if (!was || !el) return;
+    stoodAt.current = null;
+    const now = el.querySelector('.user-card')?.getBoundingClientRect();
+    if (!now) return;
+    const z = uiZoom();
+    const dx = (was.left - now.left) / z;
+    const dy = (was.top - now.top) / z;
+    if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) play(el, [{ transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)` }, { transform: 'translate(0px, 0px)' }], { duration: MOVE_GLIDE_MS, easing: EASE_OUT });
+  });
 
   // A steer the agent has just taken: the card comes out of its waiting tone into the turn, and
   // the light answers once from it.

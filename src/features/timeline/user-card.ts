@@ -18,11 +18,29 @@ export const isLongMessage = (text: string) => text.length > LONG_CHARS || text.
 
 /**
  * A steered message moves once: when the agent takes it, the bridge takes its row out and puts it
- * back where the agent took it (`SessionRuntime.taken`: `item.removed`, then `item.added` with the
- * same id). In the window that is a row unmounting and one mounting. It is the same message
- * moving, not a new one arriving: the row that mounts asks here where the one that just left
- * stood, glides from there and plays no entrance a second time (User.tsx).
+ * back where the agent took it (`SessionRuntime.taken`: `item.removed` marked `moving`, then
+ * `item.added` marked `moved`, with the same id). The window makes that one update (store.ts): the
+ * message goes to the end of the roots and its row stays the same element, which reads where its
+ * card stood as the store changes (`willMove`) and glides from there (User.tsx).
+ *
+ * A reader of the two events without the marks sees a row unmounting and one mounting (and so does
+ * the window when the layout around the row changes at the same moment). That is the same message
+ * moving too, not a new one arriving: the row that mounts asks here where the one that just left
+ * stood (`rowLeft`, `rowMoved`), glides from there and plays no entrance a second time.
  */
+
+/** How long the row takes from where it stood to where the agent took it. */
+export const MOVE_GLIDE_MS = 320;
+
+/**
+ * Whether this change of a chat's roots is the bridge's move of `id`: it stood somewhere in the
+ * list and now stands at its end, with the same messages round it (nothing added or removed).
+ */
+export function willMove(id: string, before: readonly string[] | undefined, after: readonly string[] | undefined): boolean {
+  if (!before || !after || before === after || before.length !== after.length) return false;
+  return after[after.length - 1] === id && before[before.length - 1] !== id && before.includes(id);
+}
+
 export interface LeftRow {
   /** Where its card stood, in the window's pixels. */
   left: number;
