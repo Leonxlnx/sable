@@ -464,7 +464,19 @@ export function applyEvent(e: BridgeEvent) {
         return it ? putItems(d, [{ ...it, ...e.patch } as TimelineItem]) : {};
       });
     case 'item.removed':
-      return patchData(e.sessionId, (d) => removeTree(d, e.id));
+      return patchData(e.sessionId, (d) => {
+        const out: Partial<SessionData> = removeTree(d, e.id);
+        // Held for when the pages here reach the newest: gone from there too (a message the agent took
+        // comes again right behind, and must not stand twice).
+        if (d.late?.includes(e.id)) out.late = d.late.filter((x) => x !== e.id);
+        // The page after the ones here started at this root, and it is no longer there (removed, or a
+        // waiting message the agent took, which now stands at the end): read on from the last root
+        // here instead (a page that starts at a root the phone has adds only what follows it), or
+        // everything between would be skipped.
+        const last = (out.roots ?? d.roots).at(-1);
+        if (d.next === e.id && last) out.next = last;
+        return out;
+      });
     case 'timeline.reset': {
       const s = state.sessions[e.sessionId];
       const d = state.data[e.sessionId];

@@ -109,6 +109,55 @@ const whole = (sid: string) => {
   expect(roots).toEqual(all.slice(all.indexOf(roots[0])));
 };
 
+describe('a message the agent takes while the phone reads far back', () => {
+  /** The desktop moves a root to the end (`SessionRuntime.taken`), and the phone hears the pair of events. */
+  const take = (sid: string, id: string) => {
+    const roots = desk.get(sid)!;
+    const at = roots.findIndex((r) => r.id === id);
+    const [it] = roots.splice(at, 1);
+    roots.push(it);
+    store.applyEvent({ type: 'item.removed', sessionId: sid, id, moving: true });
+    store.applyEvent({ type: 'item.added', sessionId: sid, item: it, moved: true });
+  };
+
+  it('the root the next page started at moves to the end: reading on skips nothing', async () => {
+    const roots = chat('steer', 200);
+    await store.openAt('steer', roots[100].id);
+    const next = store.getState().data.steer.next!;
+    expect(next).toBeTruthy();
+    for (let k = 0; k < 5; k++) arrive('steer');
+    take('steer', next);
+    // The page after here no longer starts at the moved root.
+    expect(store.getState().data.steer.next).toBe(store.getState().data.steer.roots.at(-1));
+    await readOn('steer');
+    whole('steer');
+    expect(store.getState().data.steer.roots.at(-1)).toBe(next);
+  });
+
+  it('a root held for later that moves stands once, at the end', async () => {
+    const roots = chat('held', 200);
+    await store.openAt('held', roots[100].id);
+    const sent = arrive('held');
+    for (let k = 0; k < 4; k++) arrive('held');
+    take('held', sent.id);
+    await readOn('held');
+    whole('held');
+    const mine = store.getState().data.held.roots.filter((r) => r === sent.id);
+    expect(mine).toHaveLength(1);
+    expect(store.getState().data.held.roots.at(-1)).toBe(sent.id);
+  });
+
+  it('at the newest the message simply moves to the end', async () => {
+    const roots = chat('live', 30);
+    await store.openAt('live', roots[20].id);
+    await readOn('live');
+    const sent = arrive('live');
+    arrive('live');
+    take('live', sent.id);
+    whole('live');
+  });
+});
+
 describe('reading a chat far back while it runs (23)', () => {
   it('keeps a bounded live buffer, and reading on brings every root that came meanwhile', async () => {
     const roots = chat('long', 2000);
