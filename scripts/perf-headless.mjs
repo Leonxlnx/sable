@@ -42,14 +42,16 @@ const throttle = Number(opt('throttle', '1'));
 
 async function findServer() {
   if (process.env.SABLE_URL) return process.env.SABLE_URL;
-  for (const port of [5173, 5174]) {
-    try {
-      const res = await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(1500) });
-      if (res.ok && (await res.text()).includes('<title>Sable</title>')) return `http://localhost:${port}/`;
-    } catch {
-      /* not this one */
+  // 127.0.0.1 first, as shot.mjs: the test server (scripts/dev-test.mjs, a throwaway profile) listens there only.
+  for (const host of ['127.0.0.1', 'localhost'])
+    for (const port of [5173, 5174]) {
+      try {
+        const res = await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(1500) });
+        if (res.ok && (await res.text()).includes('<title>Sable</title>')) return `http://${host}:${port}/`;
+      } catch {
+        /* not this one */
+      }
     }
-  }
   throw new Error('No Sable dev server on 5173/5174.');
 }
 
