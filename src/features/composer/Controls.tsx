@@ -97,7 +97,7 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
   const [anchor, setAnchor] = useState(cur?.id);
   useEffect(() => {
     if (open) return;
-    const t = window.setTimeout(() => setAnchor(cur?.id), 140);
+    const t = window.setTimeout(() => setAnchor(cur?.id), 180);
     return () => window.clearTimeout(t);
   }, [open, cur?.id]);
   if (!choice.caps) return choice.capsPending ? <ChipSkeleton w={84} /> : null;

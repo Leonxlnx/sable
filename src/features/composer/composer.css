@@ -699,7 +699,7 @@
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 /* A flat disc (ui.css "material: flat controls"): one fill step and an even hairline. Hover is the
@@ -766,7 +766,7 @@
   color: var(--text-2);
   transition:
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .tb-chip:hover,
@@ -2447,7 +2447,7 @@
   flex: 0 1 auto;
   transition:
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 button.hc:hover,

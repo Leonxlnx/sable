@@ -16,7 +16,7 @@
   text-align: left;
   transition:
     background-color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .acs-trigger:hover,
@@ -258,7 +258,7 @@
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .sa-trigger:hover,

@@ -424,7 +424,7 @@ button:hover > .row-caret {
     opacity var(--d-1) var(--ease),
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .dev-chip.tool-server:hover {
@@ -2498,7 +2498,7 @@ button:hover > .row-caret {
   background-color: var(--fill-1);
   transition:
     background-color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .preview-btn:hover {

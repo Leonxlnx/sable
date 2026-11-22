@@ -419,7 +419,7 @@
   transition:
     color var(--d-1) var(--ease),
     background-color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .acc-add:hover {

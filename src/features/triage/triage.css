@@ -199,7 +199,7 @@
   transition:
     background-color var(--d-1) var(--ease),
     color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .tri-from-link:hover {
@@ -347,7 +347,7 @@
   box-shadow: inset 0 0 0 1px var(--line);
   transition:
     background-color var(--d-1) var(--ease),
-    scale var(--d-2) var(--spring);
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .tri-opt:hover {
