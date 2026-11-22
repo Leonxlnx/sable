@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import type { Question, QuestionRequest } from '@shared/protocol';
 import { Icon } from '@/icons';
 import { respondQuestion } from '@/state/actions';
+import { leaveCard } from './leave';
 import { focusComposer } from '@/state/hooks';
 import { EASE_OUT, play } from '@/lib/motion';
 import { DOCK_GLIDE_MS } from '@/features/session/dock-glide';
@@ -231,6 +232,7 @@ export function QuestionPage({ x, onFieldEscape }: { x: QuestionAnswers; onField
 /** Structured questions from the agent: pick options, or write your own answer. */
 export function QuestionCard({ sessionId, req, more }: { sessionId: string; req: QuestionRequest; more: number }) {
   const x = useQuestionAnswers(req, (answers) => {
+    leaveCard(req.id);
     void respondQuestion(sessionId, req.id, answers);
     focusComposer();
   });

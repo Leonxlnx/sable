@@ -9,8 +9,10 @@ import { timeAgo } from '@/lib/format';
 import { interrupt, openSession, prefetchSession, renameSession, updateSession } from '@/state/actions';
 import { accountName } from '@/state/hooks';
 import { useStore } from '@/state/store';
+import { cueOpen } from '@/app/open-cue';
 import { cx } from '@/ui';
 import type { Mix } from './groups';
+import { leaveRow, liftRow } from './leave';
 import { NameField } from './NameField';
 import { holdFocus, onCloseAutoFocus } from './rename';
 
@@ -250,8 +252,24 @@ interface MenuAction {
   sepBefore?: boolean;
 }
 
-const togglePin = (s: SessionMeta) => void updateSession(s.id, { pinned: !s.pinned });
-const toggleArchive = (s: SessionMeta) => void updateSession(s.id, { archived: !s.archived, ...(s.archived ? {} : { pinned: false }) });
+/** Pinned or let go: the row lifts out of its place (or sinks from Pinned) in the frame of the click (`leave.ts`). */
+function togglePin(s: SessionMeta) {
+  const row = document.querySelector<HTMLElement>(`.side-list .srow[data-row="${CSS.escape(s.id)}"]`);
+  const back = row ? liftRow(row, s.pinned ? 'down' : 'up') : undefined;
+  const was = !!s.pinned;
+  // Shown again only when the bridge refused (the list may render the change a moment after its answer).
+  void updateSession(s.id, { pinned: !s.pinned }).then(() => back && window.setTimeout(() => !!useStore.getState().sessions[s.id]?.pinned === was && back(), 500));
+}
+/**
+ * Archived from the list: the row is put away in the frame of the click (`leave.ts`). Brought back
+ * from the archive it lifts out of the archived rows, as a pinned row does. Back if the bridge refuses.
+ */
+function toggleArchive(s: SessionMeta) {
+  const row = document.querySelector<HTMLElement>(`.side-list .srow[data-row="${CSS.escape(s.id)}"]`);
+  const back = !row ? undefined : s.archived ? liftRow(row, 'up') : leaveRow(row, 'archive');
+  const was = !!s.archived;
+  void updateSession(s.id, { archived: !s.archived, ...(s.archived ? {} : { pinned: false }) }).then(() => back && window.setTimeout(() => !!useStore.getState().sessions[s.id]?.archived === was && back(), 500));
+}
 
 function rowActions(s: SessionMeta, ctx: RowCtx): MenuAction[] {
   const running = s.status === 'running' || s.status === 'starting' || s.status === 'awaiting';
@@ -443,7 +461,11 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
             data-id={session.id}
             aria-current={active ? 'page' : undefined}
             title={[label, who].filter(Boolean).join(' · ') || undefined}
-            onClick={() => openSession(session.id)}
+            onClick={() => {
+              // The stage answers in this frame, also when the chat has to be fetched first.
+              cueOpen(session.id);
+              openSession(session.id);
+            }}
             onDoubleClick={() => ctx.setRenaming(session.id)}
             onKeyDown={onKeyDown}
           >

@@ -1,8 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ComponentType, type ReactNode, type RefObject } from 'react';
-import { AnimatePresence, cancelFrame, frame, motion, MotionConfig, type Variants } from 'motion/react';
+import { AnimatePresence, cancelFrame, frame, motion, MotionConfig, usePresence, type Variants } from 'motion/react';
 import { Launch, launchPlays } from '@/art/LaunchLayer';
 import { LogoMark, ProviderMark } from '@/art/Logo';
-import { veil, VEIL_SWAP, VEIL_SWAP_AT } from '@/art/veil';
+import { veil, veilCover, veilHeld, veilReveal, type VeilRun } from '@/art/veil';
 import { reducedMotion, uiZoom } from '@/lib/motion';
 import { Home } from '@/features/home/Home';
 import { handoffActive, handoffPhase, subscribeHandoff } from '@/features/home/handoff';
@@ -28,6 +28,7 @@ import { isNarrow } from '@/lib/narrow';
 import { useStore } from '@/state/store';
 import { IconButton, Tip, TipProvider, Toasts } from '@/ui';
 import { CapabilitiesButton } from './Capabilities';
+import { onOpenCue } from './open-cue';
 import { loadSessionView, sessionViewNow } from './views';
 import { WindowControls } from './WindowControls';
 import './app.css';
@@ -145,7 +146,9 @@ function Deferred({ when, children }: { when: boolean; children: ReactNode }) {
  * How the stage changes views:
  * - `swap` (session to session, session to home, home to a session from the list): the old view
  *   dissolves into the ground through the dither veil, the new one resolves out of it and rises a
- *   few pixels. The views only change opacity and transform: nothing is laid out again meanwhile.
+ *   few pixels. The veil starts covering in the frame of the input, before the new view is built
+ *   (`useShownView`); the views switch when it is solid, by animations on the veil's own clock
+ *   (`veilReveal`), never by this file's script: nothing here animates them in a swap.
  * - `handoff` (the first message sent from home): the composer flies to the dock (handoff.ts), the
  *   conversation fades in around it, and the home field lingers just long enough for the send's
  *   wave to cross it.
@@ -154,15 +157,14 @@ function Deferred({ when, children }: { when: boolean; children: ReactNode }) {
  */
 type ViewMode = 'swap' | 'handoff' | 'enter' | 'fade';
 const EASE = [0.16, 1, 0.3, 1] as const;
-/** When the veil is solid: the old view goes and the new one appears under it, in one frame. */
-const SWAP_AT = (VEIL_SWAP / 1000) * VEIL_SWAP_AT;
+const STILL = { opacity: 1, y: 0, transition: { duration: 0 } } as const;
 const VIEW: Variants = {
-  initial: (m: ViewMode) => (m === 'swap' ? { opacity: 0, y: 8 } : m === 'handoff' || m === 'fade' ? { opacity: 0 } : { opacity: 1 }),
+  initial: (m: ViewMode) => (m === 'handoff' || m === 'fade' ? { opacity: 0 } : { opacity: 1 }),
   animate: (m: ViewMode) =>
     m === 'fade'
       ? { opacity: 1, y: 0, transition: { duration: 0.14 } }
       : m === 'swap'
-      ? { opacity: 1, y: 0, transition: { opacity: { duration: 0.001, delay: SWAP_AT }, y: { duration: 0.36, delay: SWAP_AT, ease: EASE } } }
+      ? STILL
       : m === 'handoff'
         ? { opacity: 1, y: 0, transition: { duration: 0.32, delay: 0.08, ease: EASE } }
         : { opacity: 1, y: 0, transition: { duration: 0 } },
@@ -170,7 +172,8 @@ const VIEW: Variants = {
     m === 'fade'
       ? { opacity: 0, transition: { duration: 0.14 } }
       : m === 'swap'
-      ? { opacity: 0, transition: { duration: 0.001, delay: SWAP_AT } }
+      ? // Kept in the page by `HoldForVeil` until the veil is solid; the veil's clock hides it.
+        STILL
       : m === 'handoff'
         ? // Holds while the wave from the send key crosses the field, then lets go: long enough
           // that its last light is still going down as the session's horizon starts to come up
@@ -201,27 +204,158 @@ function useBuilt(): boolean {
   return built;
 }
 
-/** Which kind of change the stage is making (read while rendering the change, see ViewMode). */
-function useViewMode(key: string | null, body: RefObject<HTMLElement | null>): ViewMode {
-  const last = useRef(key);
+/** What the stage shows: a chat, a race or home (no key before the app is there). */
+interface StageView {
+  key: string | null;
+  sessionId: string | null;
+  raceId: string | null;
+}
+
+/** The veil's run for the change of view under way: what leaves stays in the page until it is solid. */
+let swapRun: VeilRun | null = null;
+
+/**
+ * What stands on the solid veil when a chat takes long to be there (a long one read from disk, a
+ * first open while the view's code loads): the shape of a conversation in the column's own
+ * measures, quiet, never a spinner. Unseen for the first 150 ms after the veil is solid (veil.ts).
+ */
+function waitingChat(): HTMLElement {
+  const el = document.createElement('div');
+  el.className = 'stage-wait';
+  // A message, an answer of a few lines, a message, an answer.
+  const lines = (widths: number[]) => `<div class="stage-wait-text">${widths.map((w) => `<i class="skel" style="width:${w}%"></i>`).join('')}</div>`;
+  el.innerHTML = `<div class="stage-wait-col"><i class="skel stage-wait-card"></i>${lines([92, 86, 64])}<i class="skel stage-wait-card" data-short></i>${lines([88, 94, 79, 46])}</div>`;
+  return el;
+}
+
+/** The veil has gone and no other is on its way: the dock is no longer held above it. */
+function settle(el: HTMLElement) {
+  if (!veilHeld(el)) el.removeAttribute('data-session-swap');
+}
+
+/** A cover that has nothing to switch (the change it began for never came) opens again. */
+function lift(el: HTMLElement | null) {
+  if (el) void veilReveal(el).done.then(() => settle(el));
+}
+
+/**
+ * Inside a stage view: once it is on its way out, keeps it in the page until the veil of the change
+ * that sends it away is solid (the veil's own clock has hidden it by then). In the other modes it
+ * holds nothing: the view's own exit decides.
+ */
+function HoldForVeil() {
+  const [present, safeToRemove] = usePresence();
+  useEffect(() => {
+    if (present) return;
+    let live = true;
+    void (swapRun?.solid ?? Promise.resolve()).then(() => live && safeToRemove?.());
+    return () => {
+      live = false;
+    };
+  }, [present, safeToRemove]);
+  return null;
+}
+
+/**
+ * The view the stage shows, which in a swap is one frame behind the view that was asked for.
+ *
+ * Building a conversation takes the page a while (tens of ms at best, some hundred for a long one),
+ * and a veil started with it only begins once that work is over: the click had no answer until then,
+ * and the views (switched by a script clock that had been running meanwhile) showed under the cover
+ * while it was still closing. So a swap is two commits: the first changes nothing on the stage and
+ * starts the cover, which is on screen in the next frame; the new view is built in a task after that
+ * frame, under the cover, and the reveal follows on the cover's own clock (`veilReveal`).
+ * Every other change (the first view, a send from home, reduced motion, a chat that is gone) is
+ * shown in the render that asks for it, as before.
+ */
+function useShownView(live: StageView, body: RefObject<HTMLElement | null>): { shown: StageView; mode: ViewMode } {
+  const [shown, setShown] = useState(live);
   const mode = useRef<ViewMode>('enter');
-  if (last.current !== key) mode.current = last.current == null ? 'enter' : handoffActive() ? 'handoff' : reducedMotion() ? 'fade' : 'swap';
-  // Before paint: the veil's first frame lands in the same frame as the new view.
+  // The chat on the stage was removed (from another window, the phone): nothing to dissolve from.
+  const gone = useStore((s) => !!shown.sessionId && !s.sessions[shown.sessionId]);
+  if (live.key !== shown.key && (shown.key == null || live.key == null || gone || handoffActive() || reducedMotion())) {
+    mode.current = shown.key == null ? 'enter' : handoffActive() ? 'handoff' : 'fade';
+    setShown(live);
+  } else if (live.key === shown.key && (live.sessionId !== shown.sessionId || live.raceId !== shown.raceId)) {
+    // The same view under another name of its parts (before the app is there): no change of view.
+    setShown(live);
+  }
+
+  // The new view is in the page: the veil uncovers it, and switches the views when it is solid.
+  const last = useRef(shown);
   useLayoutEffect(() => {
-    if (last.current === key) return;
     const was = last.current;
-    last.current = key;
-    if (was != null && key != null && mode.current === 'swap') {
-      // Session to session: the dock stays above the veil, so only the conversation dissolves.
-      const el = body.current;
-      if (el && was !== 'home' && key !== 'home') {
-        el.setAttribute('data-session-swap', '');
-        window.setTimeout(() => el.removeAttribute('data-session-swap'), VEIL_SWAP + 40);
-      }
-      void veil(el, 'swap');
+    last.current = shown;
+    if (was.key === shown.key) return;
+    const el = body.current;
+    if (mode.current !== 'swap' || !el) {
+      swapRun = null;
+      // A cover a row's press had started, and the view changed another way (its chat was removed): it lifts.
+      if (veilHeld(el)) lift(el);
+      return;
     }
-  }, [key, body]);
-  return mode.current;
+    // The dock and the band of light outlive a change between chats: they come and go with home only.
+    const chat = (v: StageView) => !!v.sessionId;
+    const parts = [...el.querySelectorAll<HTMLElement>(':scope > [data-view]')];
+    const side = (v: HTMLElement) => v.dataset.view === 'dock' || v.dataset.view === 'light';
+    const show = parts.filter((v) => (side(v) ? !chat(was) && chat(shown) : v.dataset.view === shown.key));
+    const hide = parts.filter((v) => (side(v) ? chat(was) && !chat(shown) : v.dataset.view !== shown.key));
+    const run = veilReveal(el, { hide, show, rise: 8 });
+    swapRun = run;
+    void run.done.then(() => swapRun === run && settle(el));
+  }, [shown, body]);
+
+  // Another view was asked for: the cover starts now, the view is built after the frame that shows it.
+  useLayoutEffect(() => {
+    const el = body.current;
+    if (live.key === shown.key) {
+      // Asked for and taken back before it was built: the cover lifts off what is still there.
+      if (veilHeld(el)) lift(el);
+      return;
+    }
+    if (shown.key == null || live.key == null) return;
+    mode.current = 'swap';
+    // Session to session: the dock stays above the veil, so only the conversation dissolves.
+    el?.toggleAttribute('data-session-swap', shown.key !== 'home' && live.key !== 'home');
+    // (Already on when the row's press started it, open-cue below.)
+    if (!veilHeld(el)) veilCover(el, { waiting: live.sessionId ? waitingChat : undefined });
+    let t = 0;
+    const raf = requestAnimationFrame(() => {
+      t = window.setTimeout(() => setShown(live), 0);
+    });
+    // A window that draws no frame (hidden, minimised) changes its view all the same.
+    const cap = window.setTimeout(() => setShown(live), 150);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(t);
+      window.clearTimeout(cap);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live.key, shown.key, body]);
+  // A chat's row was pressed: the cover starts in that frame, whatever the chat needs before the
+  // view can change (open-cue.ts). Should the view never change, the cover lifts again.
+  const state = useRef({ live, shown });
+  state.current = { live, shown };
+  useEffect(() => {
+    let timer = 0;
+    const off = onOpenCue((id) => {
+      const el = body.current;
+      const now = state.current;
+      if (!el || now.shown.key == null || now.live.key !== now.shown.key || id === now.shown.sessionId || reducedMotion() || handoffActive()) return;
+      el.toggleAttribute('data-session-swap', now.shown.key !== 'home');
+      veilCover(el, { waiting: waitingChat });
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        const s = state.current;
+        if (s.live.key === s.shown.key && veilHeld(el)) lift(el);
+      }, 700);
+    });
+    return () => {
+      off();
+      window.clearTimeout(timer);
+    };
+  }, [body]);
+  return { shown, mode: mode.current };
 }
 
 export function App() {
@@ -233,7 +367,7 @@ export function App() {
   const fontScale = useStore((s) => s.settings.fontScale);
   const setUi = useStore((s) => s.setUi);
   // The open session's id and title only: the shell must not re-render on every usage tick.
-  const sessionId = useStore((s) => (activeId && s.sessions[activeId] ? activeId : null));
+  const liveSession = useStore((s) => (activeId && s.sessions[activeId] ? activeId : null));
   const title = useStore((s) => (activeId ? s.sessions[activeId]?.title : undefined));
   const provider = useActiveProvider();
   // The launch (art/LaunchLayer.tsx) plays over the app from the window's first frame. The app itself
@@ -247,9 +381,11 @@ export function App() {
   const onboarding = useOnboarding(!booting);
   const stageBody = useRef<HTMLDivElement>(null);
   // The race view (features/race): both chats of a race side by side, while no session is open.
-  const raceId = useOpenRace(sessionId);
-  const viewKey = booting || onboarding || !built ? null : (sessionId ?? (raceId ? `race:${raceId}` : 'home'));
-  const viewMode = useViewMode(viewKey, stageBody);
+  const liveRace = useOpenRace(liveSession);
+  const liveKey = booting || onboarding || !built ? null : (liveSession ?? (liveRace ? `race:${liveRace}` : 'home'));
+  // What the stage shows: in a swap the view asked for is built one frame later, under the veil (useShownView).
+  const { shown, mode: viewMode } = useShownView({ key: liveKey, sessionId: liveSession, raceId: liveRace }, stageBody);
+  const { key: viewKey, sessionId, raceId } = shown;
   // The panel waits while the first message's composer glides to the dock: the session mounts
   // first, the panel opens once the card has landed (only read while the panel is meant to be open).
   const handingOff = useSyncExternalStore(subscribeHandoff, () => railOpen && handoffPhase() === 'flying');
@@ -343,7 +479,8 @@ export function App() {
                   changes its colour and pace, it is never built again. Under the conversation. */}
               <AnimatePresence initial={false} custom={viewMode}>
                 {viewKey != null && sessionId && (
-                  <motion.div key="light" className="stage-view stage-light" custom={viewMode} variants={VIEW} initial="initial" animate="animate" exit="exit">
+                  <motion.div key="light" className="stage-view stage-light" data-view="light" custom={viewMode} variants={VIEW} initial="initial" animate="animate" exit="exit">
+                    <HoldForVeil />
                     <SessionPart part="SessionLight" sessionId={sessionId} />
                   </motion.div>
                 )}
@@ -351,7 +488,8 @@ export function App() {
               {/* After a send from home the conversation fades in around the docked composer, which must not move. */}
               <AnimatePresence mode="popLayout" initial={false} custom={viewMode}>
                 {viewKey == null ? null : (
-                  <motion.div key={viewKey} className="stage-view" custom={viewMode} variants={VIEW} initial="initial" animate="animate" exit="exit">
+                  <motion.div key={viewKey} className="stage-view" data-view={viewKey} custom={viewMode} variants={VIEW} initial="initial" animate="animate" exit="exit">
+                    <HoldForVeil />
                     {sessionId ? (
                       <SessionPart part="SessionView" sessionId={sessionId} />
                     ) : raceId ? (
@@ -368,7 +506,8 @@ export function App() {
                   Coming from or going to home it arrives and leaves with the view. */}
               <AnimatePresence initial={false} custom={viewMode}>
                 {viewKey != null && sessionId && (
-                  <motion.div key="dock" className="stage-dock" custom={viewMode} variants={VIEW} initial="initial" animate="animate" exit="exit">
+                  <motion.div key="dock" className="stage-dock" data-view="dock" custom={viewMode} variants={VIEW} initial="initial" animate="animate" exit="exit">
+                    <HoldForVeil />
                     <SessionPart part="SessionDock" sessionId={sessionId} />
                   </motion.div>
                 )}

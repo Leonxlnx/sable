@@ -6,6 +6,7 @@ import { Markdown } from '@/components/Markdown';
 import { Glyph, Icon, TOOL_ICON } from '@/icons';
 import { langFromPath, relPath } from '@/lib/format';
 import { respondPermission } from '@/state/actions';
+import { leaveCard } from './leave';
 import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { PathLabel } from '@/ui';
@@ -205,6 +206,7 @@ export function PermissionCard({ sessionId, req, more }: { sessionId: string; re
   const respond = (o: PermissionOption, msg?: string) => {
     if (sent) return;
     setSent(true);
+    leaveCard(req.id);
     void respondPermission(sessionId, req.id, o.id, msg);
     focusComposer();
   };

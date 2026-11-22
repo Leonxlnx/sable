@@ -72,7 +72,7 @@ export function PromptDock({ sessionId }: { sessionId: string }) {
       </AnimatePresence>
       <AnimatePresence initial={false} mode="wait">
         {head && (
-          <motion.div key={head.req.id} className="pd-slot" {...rise}>
+          <motion.div key={head.req.id} className="pd-slot" data-req={head.req.id} {...rise}>
             {head.kind === 'permission' ? (
               <PermissionCard sessionId={sessionId} req={head.req} more={more} />
             ) : (

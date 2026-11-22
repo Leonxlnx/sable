@@ -7,7 +7,6 @@ import { LogoMark, PROVIDER_NAME, ProviderMark, StatusGlyph, Wordmark } from '@/
 import { Icon } from '@/icons';
 import { QuickSwitch } from '@/features/session/QuickSwitch';
 import { pathForFile } from '@/lib/desktop';
-import { dissolve } from '@/lib/dissolve';
 import { useLaggedStore } from '@/lib/lagged';
 import { afterSend } from '@/features/composer/settle';
 import { reducedMotion } from '@/lib/motion';
@@ -19,6 +18,7 @@ import { IconButton, Modal, Tip } from '@/ui';
 import { flyBrand } from './brand-flight';
 import { Flip } from './flip';
 import { nudgeFolder, pressFolder, releaseFolderDrag, type FolderDrop } from './folder-drag';
+import { holdListEnd, leaveRow } from './leave';
 import { SideResize } from './Resize';
 import { createGroupsSelector, idsOf, loadCollapsed, pathKey, saveCollapsed, toggleCollapsed, unfoldKeys, type ChatsGroup, type Mix, type ProjectGroup, type SetGroup, type TopEntry } from './groups';
 import { NameField } from './NameField';
@@ -249,8 +249,12 @@ function SkeletonRows() {
 }
 
 function DeleteDialog({ id, onClose }: { id: string | null; onClose: () => void }) {
-  const title = useStore((s) => (id ? s.sessions[id]?.title : undefined));
-  const provider = useStore((s) => (id ? s.sessions[id]?.provider : undefined));
+  const now = useStore((s) => (id ? s.sessions[id] : undefined));
+  // While the dialog leaves (and once the chat is gone) it keeps the words it was read with.
+  const [shown, setShown] = useState(now);
+  if (now && now !== shown && (now.id !== shown?.id || now.title !== shown.title)) setShown(now);
+  const title = (now ?? shown)?.title;
+  const provider = (now ?? shown)?.provider;
   return (
     <Modal
       open={!!id}
@@ -287,19 +291,20 @@ function DeleteDialog({ id, onClose }: { id: string | null; onClose: () => void 
   );
 }
 
-/** The row breaks into dither cells where it stood; its neighbours close the gap as it goes. */
+/**
+ * The row breaks into the ground's dither where it stood while the rows below close the gap, and the
+ * open chat gives way to home through the veil: all from the click, none of it waiting for the bridge
+ * (`leave.ts`).
+ */
 function removeRow(id: string) {
   const row = document.querySelector<HTMLElement>(`.srow[data-row="${CSS.escape(id)}"]`);
   // The next row takes the keyboard focus the deleted one had.
   const focusNext = row?.contains(document.activeElement) || document.activeElement === document.body;
   const next = row && (row.nextElementSibling ?? row.previousElementSibling)?.querySelector<HTMLElement>('.srow-main');
-  dissolve(row);
-  if (row) {
-    row.style.visibility = 'hidden';
-    // Should the bridge refuse, the row comes back.
-    window.setTimeout(() => row.isConnected && (row.style.visibility = ''), 2500);
-  }
-  void closeSession(id, true);
+  if (useStore.getState().ui.activeSessionId === id) goHome();
+  const back = row ? leaveRow(row, 'delete') : undefined;
+  // Should the bridge refuse, the row comes back.
+  void closeSession(id, true).then(() => window.setTimeout(() => useStore.getState().sessions[id] && back?.(), 500));
   if (focusNext && next) requestAnimationFrame(() => next.focus());
 }
 
@@ -336,7 +341,12 @@ const SessionList = memo(function SessionList({ ids, mix }: { ids: string; mix: 
   // Rows that arrive after the first paint animate in; the first paint does not (nor the rows it left for a moment later).
   const [drawnAt] = useState(() => performance.now());
   const all = ids ? ids.split(' ') : [];
-  const [shown, setShown] = useState(() => rowsNow(all.length));
+  // A list shown whole stays whole: counted in rows, a list that then grew by one dropped its last
+  // row for a task (it came back as a new row, fading in), and what stood below jumped a row.
+  const [shown, setShown] = useState(() => {
+    const n = rowsNow(all.length);
+    return n >= all.length ? Infinity : n;
+  });
   // The rows left for a moment later belong to the first paint: they never animate in.
   const [held] = useState(() => (shown < all.length ? new Set(all.slice(shown)) : null));
   const later = shown < all.length;
@@ -380,6 +390,8 @@ const FOLD_OPEN = { height: 'auto', opacity: 1, transitionEnd: { overflow: 'visi
 /** A section's rows and its archived ones, folding open and shut. */
 function GroupBody({ open, sessions, archived, mix, children }: { open: boolean; sessions: SessionMeta[]; archived: SessionMeta[]; mix: Mix; children?: ReactNode }) {
   const [showArchived, setShowArchived] = useState(false);
+  // The "Archived" line of a folder that had none when it was drawn arrives (sidebar.css).
+  const [hadArchived] = useState(archived.length > 0);
   const fold = useFold();
   return (
     <AnimatePresence initial={false}>
@@ -389,7 +401,7 @@ function GroupBody({ open, sessions, archived, mix, children }: { open: boolean;
           {sessions.length > 0 && <SessionList ids={idsOf(sessions)} mix={mix} />}
           {archived.length > 0 && (
             <>
-              <button type="button" className="sarchived" data-nav tabIndex={-1} aria-expanded={showArchived} onClick={() => setShowArchived((v) => !v)}>
+              <button type="button" className="sarchived" data-nav tabIndex={-1} data-enter={!hadArchived || undefined} aria-expanded={showArchived} onClick={() => setShowArchived((v) => !v)}>
                 <span className="srow-mark">
                   <Icon name="archive" size={14} />
                 </span>
@@ -630,13 +642,15 @@ function FolderRename({ group, onDone }: { group: ProjectGroup; onDone: () => vo
   );
 }
 
-/** The folder dissolves where it stood, then leaves the list with its sessions. */
+/**
+ * The folder leaves the list in the frame of the click, as a row does (`leave.ts`): its header breaks
+ * into the dither, its rows fade, what is below closes the gap. Back if the bridge refuses.
+ */
 function removeFolder(key: string, path: string) {
   const el = document.querySelector<HTMLElement>(`section.sgroup[data-folder="${CSS.escape(key)}"]`);
-  const head = el?.querySelector<HTMLElement>('.sgroup-head');
-  if (head) dissolve(head);
-  if (el) el.style.visibility = 'hidden';
-  void removeProject(path).finally(() => el?.isConnected && (el.style.visibility = ''));
+  const back = el ? leaveRow(el, 'folder') : undefined;
+  // Still in the list well after the bridge answered: it was refused.
+  void removeProject(path).finally(() => window.setTimeout(() => back?.(), 1500));
 }
 
 // ── projects: several folders under one name ──
@@ -1043,30 +1057,6 @@ function onListScroll(e: { currentTarget: HTMLElement; timeStamp: number }) {
     scrollIdle = 0;
     delete list.dataset.scrolling;
   }, 140);
-}
-
-/**
- * A folder folding shut near the end of a scrolled list would bring the list's end up: everything
- * slides down, the header under the pointer with it, and the next quick click lands on the folder
- * above. While the pointer stays in the list its rows keep the height they had (empty ground at the
- * end, if it is scrolled to); they let go when the pointer leaves the list.
- */
-function holdListEnd(from: Element) {
-  const rows = from.closest<HTMLElement>('.side-rows');
-  const list = rows?.closest<HTMLElement>('.side-list');
-  if (!rows || !list || list.scrollHeight <= list.clientHeight || !list.matches(':hover')) return;
-  const h = rows.offsetHeight;
-  if ((parseFloat(rows.style.minHeight) || 0) < h) rows.style.minHeight = `${h}px`;
-  if (list.dataset.holdEnd !== undefined) return;
-  list.dataset.holdEnd = '';
-  list.addEventListener(
-    'pointerleave',
-    () => {
-      rows.style.minHeight = '';
-      delete list.dataset.holdEnd;
-    },
-    { once: true },
-  );
 }
 
 // ── keyboard: one tab stop for the whole list, arrows inside it ──

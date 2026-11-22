@@ -96,6 +96,44 @@
   flex-direction: column;
 }
 
+/* What stands on the solid veil while a chat takes long to be there (App.tsx `waitingChat`,
+   veil.ts): the shape of a conversation in the column's own measures. Opacity only, by the veil. */
+.stage-wait {
+  position: absolute;
+  inset: 0;
+  padding: 30px 0 0;
+  will-change: opacity;
+}
+
+.stage-wait-col {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  width: min(var(--column), 100% - 48px);
+  margin: 0 auto;
+}
+
+.stage-wait-card {
+  align-self: flex-end;
+  width: 46%;
+  height: 40px;
+  border-radius: var(--r-xl);
+}
+
+.stage-wait-card[data-short] {
+  width: 28%;
+}
+
+.stage-wait-text {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.stage-wait-text > .skel {
+  height: 9px;
+}
+
 .app-rail {
   flex-shrink: 0;
   overflow: hidden;

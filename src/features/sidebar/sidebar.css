@@ -829,6 +829,25 @@
   color: var(--text-4);
 }
 
+/* A folder's first archived chat: the line comes in once the row put away into it has gone (the row
+   was the folder's last when the line takes its very place), so no two words ever cross. */
+.sarchived[data-enter] {
+  animation: sarchived-in var(--d-3) var(--ease-out) 130ms backwards;
+}
+
+@keyframes sarchived-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sarchived[data-enter] {
+    animation: none;
+  }
+}
+
 .sarchived:hover {
   background-color: var(--fill-1);
   color: var(--text-2);
