@@ -1234,6 +1234,8 @@ const Notice = memo(function Notice({ sid, id }: { sid: string; id: string }) {
       <span className="notice-body">
         {it.text}
         {it.detail && <span className="notice-detail"> · {it.detail}</span>}
+        {/* The sign-in itself happens in the agent's own window on the computer: the phone says where. */}
+        {!it.detail && it.auth?.state === 'signedOut' && <span className="notice-detail"> · Sign in on your computer</span>}
         {next && (
           <button
             type="button"
