@@ -4,9 +4,19 @@
    first lines where it is text, a table for CSV, the drawing for an SVG, a picture of it for
    pictures, documents and videos, a cover with its kind otherwise), and under it the name, the size
    and where it lies. The whole card opens the file;
-   under the pointer the sheet rises a little out of the well and Show in folder and Copy path come
-   forward on it. Flat ink like everything in flow: its depth is the well and the sheet, both
-   static paint; only the sheet's transform and the card's fill ever change. */
+   under the pointer the sheet rises a little out of the well (its folded corner turns a little
+   further) and Show in folder and Copy path come forward on it. Flat ink like everything in flow:
+   its depth is the well and the sheet, both static paint.
+
+   Motion (all transform, opacity and stroke dashes, each one-shot, nothing at rest):
+   - arriving (`[data-arrive]` on the row, set by FileCard.tsx only for a share that happens on
+     screen while you watch): the sheet rises into the well and settles, its corner turns down, and
+     what is on it draws in: the lines of a page one after another, a cover's drawing stroke by
+     stroke, a picture as it develops; cards of one share a beat apart;
+   - pointed at: the lift above, and the cover's drawing gives its kind's one small motion (the icon
+     engine plays it like an icon: `data-ai` on the svg, settled, never cut, when the pointer leaves);
+   - opened (`[data-beat]`): the sheet is drawn out a little further and let go.
+   A card still arriving ("Sharing files") keeps its skeleton and none of this. */
 
 .tl-item[data-k='share'] {
   padding-top: 10px;
@@ -98,12 +108,13 @@
     inset 0 1px 0 rgb(255 255 255 / 0.08),
     0 10px 22px -8px rgb(0 0 0 / 0.75),
     0 1px 2px rgb(0 0 0 / 0.4);
-  transition: transform 180ms var(--ease-out);
+  /* It rises a hair past its place and settles (the app's spring), and goes back the same way. */
+  transition: transform 260ms var(--spring);
 }
 
 .fcard:not(.fcard-wait):hover .fcard-sheet,
 .fcard:has(.fcard-open:focus-visible) .fcard-sheet {
-  transform: translateY(-7px);
+  transform: translateY(-6px);
 }
 
 /* The folded corner: the sheet's own corner painted away in the well's colour, the flap one step
@@ -117,9 +128,20 @@
   border-bottom-left-radius: 3px;
   background: linear-gradient(to bottom left, var(--fc-well) 50%, var(--panel-4) 50%);
   box-shadow: -2px 2px 3px -1px rgb(0 0 0 / 0.4);
+  /* It turns from the sheet's own corner: under the pointer a little further down, a beat after the sheet lifts. */
+  transform-origin: 100% 0;
+  transition: transform 220ms var(--ease-out);
 }
 
-/* A cover: the file's kind in the corner, its extension set large, and a few ruled lines. */
+.fcard:not(.fcard-wait):hover .fcard-fold,
+.fcard:has(.fcard-open:focus-visible) .fcard-fold {
+  transform: scale(1.26);
+  transition-delay: 60ms;
+}
+
+/* A cover: the file's extension set large, and under it a drawing of its kind in a few hairlines
+   (FileCard.tsx `COVERS`, on a 124 by 52 grid): a paragraph, a table, a picture, a zip, a frame of
+   film, a wave, indented code, or three plain rules. */
 .fcard-cover {
   position: absolute;
   inset: 0;
@@ -139,21 +161,128 @@
   color: var(--text-2);
 }
 
-.fcard-rule {
-  align-self: stretch;
-  height: 2px;
-  margin-top: 7px;
-  border-radius: 1px;
-  background-color: var(--fill-2);
-}
-
-.fcard-ext + .fcard-rule {
+.fcover {
+  display: block;
+  flex-shrink: 0;
   margin-top: 13px;
+  overflow: visible;
+  color: var(--line-3);
 }
 
-.fcard-rule:last-of-type {
-  width: 58%;
-  align-self: flex-start;
+/* The parts that say the most are one step stronger: a table's header rule, the sun, the play mark, the zip's pull, the caret. */
+.fcover :is(.hd, .sun, .tri, .pull, .caret) {
+  color: var(--text-4);
+}
+
+.fcover .hd {
+  stroke-width: 2.5;
+}
+
+.fcover .sun {
+  transform-origin: 97.5px 14px;
+}
+
+.fcover .tri {
+  transform-origin: 61px 24px;
+}
+
+.fcover .bar {
+  transform-origin: 62px 24px;
+}
+
+/* ── a cover pointed at: its kind's one small motion ──
+   Played by the icon engine with the card's button (icons/animated/play.ts: `data-ai` on the svg),
+   on the hover layer (`--ai-h`) of the icon set and in its curves; its keyframes carry that layer's
+   `ai-` prefix, which is how the engine knows them. Opening gives the sheet's beat, not one of the
+   drawing's own. */
+.fcard svg.fcover:is([data-ap], [data-ai-in]) {
+  --ai-p: none;
+  --ai-n: none;
+}
+
+svg.fcover[data-ai] {
+  /* a document: its lines are written again, top to bottom */
+  &:is([data-icon='cover-doc'], [data-icon='cover-file']) {
+    & .r1 { --ai-h: ai-redraw 460ms var(--ai-io); }
+    & .r2 { --ai-h: ai-redraw 460ms 70ms var(--ai-io); }
+    & .r3 { --ai-h: ai-redraw 460ms 140ms var(--ai-io); }
+    & .r4 { --ai-h: ai-redraw 460ms 210ms var(--ai-io); }
+  }
+
+  /* a table: a cell is picked, and the pick steps on through two more */
+  &[data-icon='cover-table'] .cell { --ai-h: ai-fc-cell 840ms var(--ai-io); }
+
+  /* a picture: the sun sets behind the hills and rises a hair past its place */
+  &[data-icon='cover-picture'] .sun { --ai-h: ai-fc-sun 840ms var(--ai-in); }
+
+  /* an archive: the zip is opened half way and closed again */
+  &[data-icon='cover-archive'] {
+    & .pull { --ai-h: ai-fc-pull 840ms var(--ai-io); }
+    & .teeth { --ai-h: ai-fc-teeth 840ms var(--ai-io); }
+  }
+
+  /* a video: the film runs on by two perforations, the play mark answers */
+  &[data-icon='cover-video'] {
+    & .perf { --ai-h: ai-fc-film 720ms var(--ai-io); }
+    & .tri { --ai-h: ai-node-answer 520ms 140ms var(--ai-out); }
+  }
+
+  /* sound: a wave runs through the bars */
+  &[data-icon='cover-audio'] .bar { --ai-h: ai-fc-bar 440ms calc(var(--b) * 24ms) var(--ai-out); }
+
+  /* code: the last line is typed again, the caret blinks twice */
+  &[data-icon='cover-code'] {
+    & .r4 { --ai-h: ai-redraw 520ms var(--ai-io); }
+    & .caret { --ai-h: ai-blink-2 680ms step-end; }
+  }
+}
+
+@keyframes ai-fc-cell {
+  0% { opacity: 0; transform: translate(0, 0); animation-timing-function: var(--ai-out); }
+  12% { opacity: 0.9; transform: translate(0, 0); }
+  26% { opacity: 0.9; transform: translate(0, 0); }
+  40% { opacity: 0.9; transform: translate(41px, 12px); }
+  54% { opacity: 0.9; transform: translate(41px, 12px); }
+  68% { opacity: 0.9; transform: translate(-41px, 24px); }
+  82% { opacity: 0.9; transform: translate(-41px, 24px); }
+  100% { opacity: 0; transform: translate(-41px, 24px); }
+}
+
+@keyframes ai-fc-sun {
+  0% { opacity: 1; transform: translateY(0); }
+  26% { opacity: 0; transform: translateY(18px); }
+  38% { opacity: 0; transform: translateY(18px); animation-timing-function: var(--ai-spring); }
+  58% { opacity: 1; }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* (the teeth are one stroke from the left edge to the pull, 95 long: what shows of it follows the pull) */
+@keyframes ai-fc-pull {
+  0% { animation-timing-function: var(--ai-out); }
+  10% { transform: translateX(2px); }
+  44% { transform: translateX(-46px); }
+  56% { transform: translateX(-46px); }
+  86% { transform: translateX(0); animation-timing-function: var(--ai-out); }
+  92% { transform: translateX(2px); animation-timing-function: var(--ai-io); }
+  100% { transform: translateX(0); }
+}
+
+@keyframes ai-fc-teeth {
+  0%, 10% { stroke-dasharray: 1 2; stroke-dashoffset: 0; }
+  44% { stroke-dasharray: 1 2; stroke-dashoffset: 0.484; }
+  56% { stroke-dasharray: 1 2; stroke-dashoffset: 0.484; }
+  86%, 100% { stroke-dasharray: 1 2; stroke-dashoffset: 0; }
+}
+
+/* (two periods of the dashes: the last frame is the first) */
+@keyframes ai-fc-film {
+  to { stroke-dashoffset: -24; }
+}
+
+@keyframes ai-fc-bar {
+  0% { animation-timing-function: var(--ai-out); }
+  34% { transform: scaleY(1.5); animation-timing-function: var(--ai-spring-2); }
+  100% { transform: scaleY(1); }
 }
 
 /* A page of the file itself, set at a readable size and shown at half of it: the lines are real,
@@ -167,6 +296,12 @@
   transform: scale(0.5);
   transform-origin: 0 0;
   animation: fade-in 220ms var(--ease) backwards;
+}
+
+/* Lines and rows are their own boxes, so each can come in on its own when the card arrives. */
+.fcard-line,
+.fcard-tr {
+  transform-origin: 0 50%;
 }
 
 .fcard-lines {
@@ -346,10 +481,6 @@ button.fcard-open::after {
   color: var(--text-2);
 }
 
-.fcard:hover .fcard-kind[data-icon] {
-  animation: icon-nudge var(--ai-d1) var(--ai-out);
-}
-
 .fcard-name {
   min-width: 0;
 }
@@ -440,17 +571,169 @@ button.fcard-open::after {
   padding-top: 12px;
 }
 
+/* ── arriving ──
+   Only while the row carries `data-arrive` (FileCard.tsx `useArrival`: a share that happens on
+   screen while you watch; "wait" holds every part at its first frame until the row's first look at
+   the screen, then "go" runs it and the mark is taken away). Cards of one share come a beat apart
+   (`--i`, the sixth and later together); what is on a page comes line by line (`--l`).
+   A rule here only ever adds to an element's animations and keeps the ones it has at rest (a page's
+   and a picture's own short fade), so taking the mark away starts nothing again. */
+
+.fshare-list[data-arrive] .fcard {
+  --fc-at: calc(min(var(--i, 0), 5) * 80ms);
+}
+
+/* the sheet rises into the well, a hair past its place, and settles */
+.fshare-list[data-arrive] .fcard-sheet {
+  animation: var(--fc-in, fc-sheet-in) 560ms var(--fc-at) var(--ease-out) backwards;
+}
+
+/* the first card takes over from the one that waited: its sheet is already there and only settles */
+.fshare-list[data-arrive][data-waited] .fcard:first-child {
+  --fc-in: fc-sheet-settle;
+}
+
+@keyframes fc-sheet-in {
+  0% { opacity: 0; transform: translateY(34px) rotate(2.4deg); }
+  30% { opacity: 1; }
+  62% { transform: translateY(-3px) rotate(-0.3deg); animation-timing-function: cubic-bezier(0.4, 0, 0.3, 1); }
+  100% { opacity: 1; transform: translateY(0) rotate(0deg); }
+}
+
+@keyframes fc-sheet-settle {
+  0% { transform: translateY(9px) rotate(1deg); }
+  62% { transform: translateY(-2px) rotate(-0.2deg); animation-timing-function: cubic-bezier(0.4, 0, 0.3, 1); }
+  100% { transform: translateY(0) rotate(0deg); }
+}
+
+/* its corner turns down once it stands */
+.fshare-list[data-arrive] .fcard-fold {
+  animation: fc-fold-in 420ms calc(var(--fc-at) + 260ms) var(--ai-back) backwards;
+}
+
+@keyframes fc-fold-in {
+  from { transform: scale(0); }
+}
+
+/* a page: its lines and rows come in one after another */
+.fshare-list[data-arrive] :is(.fcard-line, .fcard-tr) {
+  animation: fc-line-in 320ms calc(var(--fc-at) + 120ms + min(var(--l, 0), 12) * 28ms) var(--ease-out) backwards;
+}
+
+@keyframes fc-line-in {
+  from { opacity: 0; transform: translateX(-14px); }
+}
+
+/* a picture develops: it comes up out of the dark, a little close, and settles back */
+.fshare-list[data-arrive] :is(.fcard-pic-img, .fcard-img) {
+  animation:
+    fade-in 220ms var(--ease) backwards,
+    fc-develop 620ms calc(var(--fc-at) + 120ms) var(--ease-out) backwards;
+}
+
+@keyframes fc-develop {
+  from { opacity: 0; scale: 1.08; }
+}
+
+.fshare-list[data-arrive] .fcard-play {
+  animation: fc-pop 420ms calc(var(--fc-at) + 420ms) var(--ai-back) backwards;
+}
+
+@keyframes fc-pop {
+  from { opacity: 0; scale: 0.5; }
+}
+
+/* a cover: its word comes up, its drawing is drawn stroke by stroke */
+.fshare-list[data-arrive] .fcard-ext {
+  animation: fc-line-in 320ms calc(var(--fc-at) + 140ms) var(--ease-out) backwards;
+}
+
+.fshare-list[data-arrive] .fcover :is(.r, .hd, .col, .fr, .hill) {
+  animation: an-draw 460ms calc(var(--fc-at) + 220ms + var(--n, 0) * 60ms) var(--ease-out) backwards;
+}
+
+.fcover :is(.r1, .c1) { --n: 1; }
+.fcover :is(.r2, .c2, .hill) { --n: 2; }
+.fcover .r3 { --n: 3; }
+.fcover .r4 { --n: 4; }
+
+.fshare-list[data-arrive] .fcover :is(.sun, .tri, .caret, .perf) {
+  animation: fc-pop 420ms calc(var(--fc-at) + 520ms) var(--ai-back) backwards;
+}
+
+/* the zip is closed from the left: the pull runs to its place, the teeth close behind it */
+.fshare-list[data-arrive] .fcover .pull {
+  animation: fc-pull-in 620ms calc(var(--fc-at) + 220ms) var(--ai-io) backwards;
+}
+
+.fshare-list[data-arrive] .fcover .teeth {
+  animation: an-draw 620ms calc(var(--fc-at) + 220ms) var(--ai-io) backwards;
+}
+
+@keyframes fc-pull-in {
+  from { transform: translateX(-96px); }
+}
+
+/* the bars of a sound stand up one after another */
+.fshare-list[data-arrive] .fcover .bar {
+  animation: fc-bar-in 380ms calc(var(--fc-at) + 220ms + var(--b) * 22ms) var(--ai-back) backwards;
+}
+
+@keyframes fc-bar-in {
+  from { transform: scaleY(0.05); }
+}
+
+/* waiting for its first look at the screen: held at the first frame */
+.fshare-list[data-arrive='wait'] .fcard * {
+  animation-play-state: paused !important;
+}
+
+/* ── opened: the sheet is drawn out of the well a little and let go; its corner flicks ──
+   On the individual properties, so it plays over the lift (a transform) without taking it away. */
+.fcard[data-beat] .fcard-sheet {
+  animation: fc-open 380ms var(--ease-out);
+}
+
+.fcard[data-beat] .fcard-fold {
+  animation: fc-fold-flick 380ms var(--ease-out);
+}
+
+/* opened while it still arrives: the beat joins the arrival, which runs on (and is not begun again when the beat is over) */
+.fshare-list[data-arrive] .fcard[data-beat] .fcard-sheet {
+  animation:
+    var(--fc-in, fc-sheet-in) 560ms var(--fc-at) var(--ease-out) backwards,
+    fc-open 380ms var(--ease-out);
+}
+
+.fshare-list[data-arrive] .fcard[data-beat] .fcard-fold {
+  animation:
+    fc-fold-in 420ms calc(var(--fc-at) + 260ms) var(--ai-back) backwards,
+    fc-fold-flick 380ms var(--ease-out);
+}
+
+@keyframes fc-open {
+  30% { translate: 0 -9px; scale: 1.035; animation-timing-function: var(--ai-spring); }
+}
+
+@keyframes fc-fold-flick {
+  30% { scale: 1.5; animation-timing-function: var(--ai-spring-2); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .fcard,
-  .fcard-sheet {
+  .fcard-sheet,
+  .fcard-fold {
     transition-property: background-color;
   }
   .fcard:hover .fcard-sheet,
-  .fcard:has(.fcard-open:focus-visible) .fcard-sheet {
+  .fcard:has(.fcard-open:focus-visible) .fcard-sheet,
+  .fcard:hover .fcard-fold,
+  .fcard:has(.fcard-open:focus-visible) .fcard-fold {
     transform: none;
   }
+  .fcard *,
   .fcard-page,
   .fcard-pic-img {
-    animation: none;
+    animation: none !important;
   }
 }

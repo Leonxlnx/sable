@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type { SharedFile, ToolItem } from '@shared/protocol';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/components/Markdown';
@@ -6,10 +6,11 @@ import { fileIcon } from '@/features/composer/file-icon';
 import { Icon } from '@/icons';
 import { bridge } from '@/lib/bridge';
 import { formatBytes, relPath } from '@/lib/format';
+import { reducedMotion } from '@/lib/motion';
 import { useStore } from '@/state/store';
 import { IconButton } from '@/ui';
-import { useTimeline } from './ctx';
-import { coverWord, pictureFit, pictureKind, sheetOf, wantsText, type Sheet } from './file-sheet';
+import { useFresh, useTimeline } from './ctx';
+import { coverKind, coverWord, pictureFit, pictureKind, sheetOf, wantsText, type CoverKind, type Sheet } from './file-sheet';
 import { isActive } from './util';
 import './files.css';
 
@@ -45,6 +46,52 @@ export const shareReadable = (item: Pick<ToolItem, 'status'>) => item.status ===
  */
 export const sheetKey = (itemId: string, index: number, path: string, size?: number) => `${itemId}\n${index}\n${path}\n${size ?? ''}`;
 
+// ── arriving ──
+
+/** How long the arrival of a row of cards may take, with its staggers: after it the cards are at rest and only answer the pointer. */
+const ARRIVE_MS = 1700;
+
+/**
+ * The arrival of a row of cards (files.css, `[data-arrive]`): only for a share that happens while you
+ * watch (`fresh`), and only if the row is on screen when its files are named. Before the row's first
+ * paint it is marked waiting (`data-arrive="wait"`: every part held at its first frame), and its
+ * first look at the screen decides, once: in view, the motion runs (`go`) and the mark is taken away
+ * when it is over; out of view, the mark goes at once and the cards simply stand there. Nothing
+ * ever moves off screen, and nothing is left running. (The mark is written here, never rendered, so
+ * a later render of the row does not bring it back.)
+ */
+function useArrival(fresh: boolean, named: boolean) {
+  const row = useRef<HTMLDivElement>(null);
+  const decided = useRef(false);
+  useLayoutEffect(() => {
+    const el = row.current;
+    if (!el || !fresh || !named || decided.current) return;
+    if (reducedMotion() || typeof IntersectionObserver === 'undefined') {
+      decided.current = true;
+      return;
+    }
+    el.dataset.arrive = 'wait';
+    let timer = 0;
+    const io = new IntersectionObserver((entries) => {
+      io.disconnect();
+      decided.current = true;
+      if (!entries.some((e) => e.isIntersecting)) {
+        delete el.dataset.arrive;
+        return;
+      }
+      el.dataset.arrive = 'go';
+      timer = window.setTimeout(() => delete el.dataset.arrive, ARRIVE_MS);
+    });
+    io.observe(el);
+    return () => {
+      io.disconnect();
+      window.clearTimeout(timer);
+      delete el.dataset.arrive;
+    };
+  }, [fresh, named]);
+  return row;
+}
+
 /**
  * Files the agent hands over (Claude Code's SendUserFile), always in view like a widget: its caption
  * as a quiet line, then one card per file, side by side.
@@ -55,9 +102,17 @@ export const FileShare = memo(function FileShare({ item }: { item: ToolItem }) {
   const failed = item.status === 'error';
   // A page of the file only once the share went through (never for one waiting, denied or stopped).
   const readable = shareReadable(item);
+  const active = isActive(item);
+  // Shared while you watch: the cards arrive. History being laid out simply stands there.
+  const fresh = useFresh(item.endedAt ?? item.ts);
+  // The first card takes the place of the one that waited ("Sharing files"): its sheet is already in the well.
+  const waited = useRef(false);
+  const row = useArrival(fresh, files.length > 0);
   if (!files.length) {
+    if (!active) return null;
+    waited.current = true;
     // The call is still arriving: one card's room, so nothing jumps when the files are named.
-    return isActive(item) ? (
+    return (
       <div className="fshare">
         <div className="fshare-list">
           <div className="fcard fcard-wait" aria-busy>
@@ -80,14 +135,20 @@ export const FileShare = memo(function FileShare({ item }: { item: ToolItem }) {
           </div>
         </div>
       </div>
-    ) : null;
+    );
   }
   return (
     <div className="fshare">
       {caption && <Markdown text={caption} className="fshare-caption" />}
-      <div className="fshare-list" role="list" aria-label={files.length === 1 ? 'Shared file' : 'Shared files'}>
+      <div
+        className="fshare-list"
+        role="list"
+        aria-label={files.length === 1 ? 'Shared file' : 'Shared files'}
+        ref={row}
+        data-waited={waited.current || undefined}
+      >
         {files.map((f, i) => (
-          <FileCard key={`${i}:${f.path}`} file={f} failed={failed} readable={readable} itemId={item.id} index={i} sheet={sheetKey(item.id, i, f.path, f.size)} />
+          <FileCard key={`${i}:${f.path}`} file={f} failed={failed} readable={readable} active={active} itemId={item.id} index={i} sheet={sheetKey(item.id, i, f.path, f.size)} />
         ))}
       </div>
     </div>
@@ -99,14 +160,18 @@ export const FileShare = memo(function FileShare({ item }: { item: ToolItem }) {
 /** Sheets read so far, by share step and file (`sheetKey`). */
 const sheets = new Map<string, Sheet>();
 const SHEETS_MAX = 120;
+/** A file that could not be read gets its cover. */
+const COVER: Sheet = { kind: 'cover' };
 
 /**
  * The page a card shows: for a text file its real first lines (read once, a couple of kilobytes),
  * a table for CSV, the drawing itself for an SVG; for anything else a cover with its kind.
- * The cover shows at once and the page fades in over it, so the card never changes size.
+ * While the share is still under way (`waiting`) and until a text file has been read, its sheet is
+ * bare (`pending`), so a cover never flashes before its page; the page then draws in over it and
+ * the card never changes size.
  * `key` (`sheetKey`): a new key never shows the page read for another.
  */
-function useSheet(file: SharedFile, at: string, key: string, skip: boolean): Sheet | null {
+function useSheet(file: SharedFile, at: string, key: string, skip: boolean, waiting: boolean): { sheet: Sheet | null; pending: boolean } {
   const want = !skip && wantsText(file.name, file.size);
   const [read, setRead] = useState<{ key: string; sheet: Sheet } | null>(null);
   useEffect(() => {
@@ -120,13 +185,15 @@ function useSheet(file: SharedFile, at: string, key: string, skip: boolean): She
         sheets.set(key, s);
         if (live) setRead({ key, sheet: s });
       })
-      .catch(() => {});
+      // Gone or not readable: its cover (asked again when the card is next laid out).
+      .catch(() => live && setRead({ key, sheet: COVER }));
     return () => {
       live = false;
     };
   }, [key, want]); // eslint-disable-line react-hooks/exhaustive-deps
-  if (!want) return null;
-  return sheets.get(key) ?? (read?.key === key ? read.sheet : null);
+  if (!want) return { sheet: null, pending: waiting && wantsText(file.name, file.size) > 0 };
+  const sheet = sheets.get(key) ?? (read?.key === key ? read.sheet : null);
+  return { sheet, pending: !sheet };
 }
 
 // ── the picture: what the bridge can show of a picture, a PDF or a video ──
@@ -183,28 +250,15 @@ function usePicture(file: SharedFile, itemId: string, index: number, key: string
   return pictures.get(key) ?? (got?.key === key ? got.pic : null);
 }
 
-const PictureSheet = memo(function PictureSheet({ pic, kind }: { pic: Picture; kind: 'image' | 'page' | 'video' }) {
-  const fit = pictureFit(kind, pic.w, pic.h, SHEET_W);
-  return (
-    <span className="fcard-sheet fcard-pic" data-pic={kind} data-small={fit.small || undefined} style={{ height: fit.height }}>
-      <img className="fcard-pic-img" src={pic.src} alt="" draggable={false} decoding="async" />
-      {kind === 'video' && (
-        <span className="fcard-play">
-          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden>
-            <path d="M5 3.4v9.2a.6.6 0 0 0 .9.5l7.2-4.6a.6.6 0 0 0 0-1L5.9 2.9a.6.6 0 0 0-.9.5Z" fill="currentColor" />
-          </svg>
-        </span>
-      )}
-    </span>
-  );
-});
+/** A line's or a row's place on its page, for the stagger of its arrival (files.css `--l`). */
+const nth = (i: number) => ({ '--l': i }) as CSSProperties;
 
 const Page = memo(function Page({ sheet }: { sheet: Sheet }) {
   if (sheet.kind === 'table') {
     return (
       <span className="fcard-page fcard-table">
         {sheet.rows.map((row, r) => (
-          <span key={r} className="fcard-tr">
+          <span key={r} className="fcard-tr" style={nth(r)}>
             {row.map((cell, c) => (
               <span key={c} className="fcard-td">
                 {cell}
@@ -220,8 +274,8 @@ const Page = memo(function Page({ sheet }: { sheet: Sheet }) {
     return (
       <span className="fcard-page fcard-lines">
         {sheet.lines.map((l, i) => (
-          <span key={i} className="fcard-line" data-head={l.head || undefined}>
-            {l.text || ' '}
+          <span key={i} className="fcard-line" data-head={l.head || undefined} style={nth(i)}>
+            {l.text || ' '}
           </span>
         ))}
       </span>
@@ -230,13 +284,154 @@ const Page = memo(function Page({ sheet }: { sheet: Sheet }) {
   return null;
 });
 
+// ── the cover: what kind of file it is, in a few hairlines ──
+
+/** A stroke that can draw itself (normalised length, as in the icon set). */
+const L = ({ c, d }: { c: string; d: string }) => <path className={c} d={d} pathLength={1} />;
+
+/** The bars of a sound, by height (centred on the cover's middle line). */
+const BARS = [8, 16, 26, 12, 34, 20, 40, 28, 36, 16, 30, 22, 12, 18, 8];
+/** The teeth of a zip, one zigzag from the left edge to where the pull sits. */
+const TEETH = `M1,24${Array.from({ length: 19 }, (_, i) => `L${6 + i * 5},${i % 2 ? 30 : 18}`).join('')}`;
+
+/**
+ * The drawings, on a 124 by 52 grid under the cover's word. Static at rest; files.css draws them in
+ * when the card arrives and gives each kind one small motion when the card is pointed at (the icon
+ * engine marks the svg, as it does an icon: `data-ai`).
+ */
+const COVERS: Record<CoverKind, ReactNode> = {
+  // a document: a paragraph, its last line short
+  doc: (
+    <>
+      <L c="r r1" d="M1,3H123" />
+      <L c="r r2" d="M1,15H123" />
+      <L c="r r3" d="M1,27H99" />
+      <L c="r r4" d="M1,39H61" />
+    </>
+  ),
+  // a table: a header rule, three rows, two columns, and the cell that is picked while it moves
+  table: (
+    <>
+      <rect className="cell" x="44" y="17" width="37" height="8" rx="1.5" fill="currentColor" stroke="none" opacity={0} />
+      <L c="hd" d="M1,3H123" />
+      <L c="r r1" d="M1,15H123" />
+      <L c="r r2" d="M1,27H123" />
+      <L c="r r3" d="M1,39H123" />
+      <L c="col c1" d="M42,3V46" />
+      <L c="col c2" d="M83,3V46" />
+    </>
+  ),
+  // a picture: a frame, two hills, a sun
+  picture: (
+    <>
+      <L c="fr" d="M4,1H120a3,3,0,0,1,3,3V44a3,3,0,0,1-3,3H4a3,3,0,0,1-3-3V4A3,3,0,0,1,4,1Z" />
+      <path className="sun" d="M92,14a5.5,5.5,0,1,0,11,0a5.5,5.5,0,1,0-11,0Z" />
+      <L c="hill" d="M2,41L33,22L55,35L77,17L122,44" />
+    </>
+  ),
+  // an archive: a zip closed to its pull
+  archive: (
+    <>
+      <L c="teeth" d={TEETH} />
+      <g className="pull">
+        <path d="M100,16h8a3,3,0,0,1,3,3v10a3,3,0,0,1-3,3h-8a3,3,0,0,1-3-3V19A3,3,0,0,1,100,16Z" />
+        <path d="M111,24h6" />
+        <path d="M117,24a2.5,2.5,0,1,0,5,0a2.5,2.5,0,1,0-5,0Z" />
+      </g>
+    </>
+  ),
+  // a video: a frame of film with its perforations, and a play mark
+  video: (
+    <>
+      <L c="fr" d="M4,1H120a3,3,0,0,1,3,3V44a3,3,0,0,1-3,3H4a3,3,0,0,1-3-3V4A3,3,0,0,1,4,1Z" />
+      <path className="perf" d="M9,9H117" strokeDasharray="4 8" />
+      <path className="perf" d="M9,39H117" strokeDasharray="4 8" />
+      <path className="tri" d="M57,18v12l10-6Z" fill="currentColor" />
+    </>
+  ),
+  // sound: its wave as bars
+  audio: (
+    <>
+      {BARS.map((h, i) => (
+        <path key={i} className="bar" d={`M${6 + i * 8},${24 - h / 2}V${24 + h / 2}`} style={{ '--b': i } as CSSProperties} />
+      ))}
+    </>
+  ),
+  // code: indented lines, a caret after the last
+  code: (
+    <>
+      <L c="r r1" d="M1,3H55" />
+      <L c="r r2" d="M15,15H103" />
+      <L c="r r3" d="M15,27H79" />
+      <L c="r r4" d="M29,39H67" />
+      <path className="caret" d="M75,34.5v9" />
+    </>
+  ),
+  // any other file: three plain rules
+  file: (
+    <>
+      <L c="r r1" d="M1,3H123" />
+      <L c="r r2" d="M1,15H123" />
+      <L c="r r3" d="M1,27H73" />
+    </>
+  ),
+};
+
+const Cover = memo(function Cover({ name }: { name: string }) {
+  const kind = coverKind(name);
+  return (
+    <span className="fcard-cover">
+      <span className="fcard-ext">{coverWord(name)}</span>
+      {/* `data-icon`: the icon engine plays it with the card's button; `data-anim`: it brings its own motion. */}
+      <svg className="fcover" data-icon={`cover-${kind}`} data-anim="" viewBox="0 0 124 52" width="124" height="52" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        {COVERS[kind]}
+      </svg>
+    </span>
+  );
+});
+
+/** Opening gives a beat: the sheet is drawn out of the well a little and let go (files.css `[data-beat]`), once per press. */
+function beat(card: HTMLElement | null) {
+  if (!card || reducedMotion()) return;
+  card.removeAttribute('data-beat');
+  // Read once, so a second press in a row starts the beat again.
+  void card.offsetWidth;
+  card.setAttribute('data-beat', '');
+  const sheet = card.querySelector('.fcard-sheet');
+  const done = (e: Event) => {
+    if (e.target !== sheet) return;
+    card.removeEventListener('animationend', done);
+    card.removeEventListener('animationcancel', done);
+    card.removeAttribute('data-beat');
+  };
+  card.addEventListener('animationend', done);
+  card.addEventListener('animationcancel', done);
+}
+
 /**
  * One file as a card: a sheet of it in a small well (its first lines where it is text, a picture of
  * it for pictures, documents and videos, a cover with its kind otherwise), its name, its size and
  * where it lies. The whole card opens the file
  * with its app; Show in folder and Copy path come forward on hover or focus.
  */
-const FileCard = memo(function FileCard({ file, failed, readable, itemId, index, sheet: key }: { file: SharedFile; failed: boolean; readable: boolean; itemId: string; index: number; sheet: string }) {
+const FileCard = memo(function FileCard({
+  file,
+  failed,
+  readable,
+  active,
+  itemId,
+  index,
+  sheet: key,
+}: {
+  file: SharedFile;
+  failed: boolean;
+  readable: boolean;
+  /** The share is still under way: a text file's sheet stays bare until its page can be read. */
+  active: boolean;
+  itemId: string;
+  index: number;
+  sheet: string;
+}) {
   const { cwd, home } = useTimeline();
   // Where it is on the computer: a name relative to the chat's folder lies in it.
   const at = sharedPath(file.path, cwd);
@@ -244,34 +439,48 @@ const FileCard = memo(function FileCard({ file, failed, readable, itemId, index,
   // The folder by its own name (the whole path is the card's tooltip, and Show in folder goes there).
   const folder = where.slice(where.replace(/\/+$/, '').lastIndexOf('/') + 1);
   const size = formatBytes(file.size);
-  const sheet = useSheet(file, at, key, failed || !readable);
+  const { sheet, pending } = useSheet(file, at, key, failed || !readable, active && !failed);
   const page = sheet && sheet.kind !== 'cover' ? sheet : null;
   const pic = usePicture(file, itemId, index, key, failed || !readable);
   const picKind = pictureKind(file.name);
+  // A picture stands on the same sheet as the cover it takes over from (one element: it never arrives twice).
+  const fit = pic && picKind ? pictureFit(picKind, pic.w, pic.h, SHEET_W) : null;
   return (
-    <div className="fcard" role="listitem" data-spot data-failed={failed || undefined}>
+    <div className="fcard" role="listitem" data-spot data-failed={failed || undefined} style={{ '--i': index } as CSSProperties}>
       <span className="fcard-stage" aria-hidden>
-        {pic && picKind ? (
-          <PictureSheet pic={pic} kind={picKind} />
-        ) : (
-          <span className="fcard-sheet">
-            {page ? (
-              <Page sheet={page} />
-            ) : (
-              <span className="fcard-cover">
-                <span className="fcard-ext">{coverWord(file.name)}</span>
-                <span className="fcard-rule" />
-                <span className="fcard-rule" />
-                <span className="fcard-rule" />
-              </span>
-            )}
-            <i className="fcard-fold" />
-          </span>
-        )}
+        <span className={fit ? 'fcard-sheet fcard-pic' : 'fcard-sheet'} data-pic={fit ? picKind : undefined} data-small={fit?.small || undefined} style={fit ? { height: fit.height } : undefined}>
+          {pic && fit ? (
+            <>
+              <img className="fcard-pic-img" src={pic.src} alt="" draggable={false} decoding="async" />
+              {picKind === 'video' && (
+                <span className="fcard-play">
+                  <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden>
+                    <path d="M5 3.4v9.2a.6.6 0 0 0 .9.5l7.2-4.6a.6.6 0 0 0 0-1L5.9 2.9a.6.6 0 0 0-.9.5Z" fill="currentColor" />
+                  </svg>
+                </span>
+              )}
+            </>
+          ) : (
+            <>
+              {page ? <Page sheet={page} /> : pending ? null : <Cover name={file.name} />}
+              <i className="fcard-fold" />
+            </>
+          )}
+        </span>
       </span>
       <span className="fcard-foot">
-        {/* The one button that opens the file: it covers the card, so a click anywhere on it opens. */}
-        <button type="button" className="fcard-open" onClick={() => openFile(at)} aria-label={`Open ${file.name}`} title={at}>
+        {/* The one button that opens the file: it covers the card, so a click anywhere on it opens; the cover's drawing answers it too. */}
+        <button
+          type="button"
+          className="fcard-open"
+          data-ai-scope=".fcard"
+          onClick={(e) => {
+            beat(e.currentTarget.closest<HTMLElement>('.fcard'));
+            openFile(at);
+          }}
+          aria-label={`Open ${file.name}`}
+          title={at}
+        >
           <Icon name={fileIcon(file.name)} size={15} className="fcard-kind" />
           <span className="fcard-name truncate">{file.name}</span>
         </button>

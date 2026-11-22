@@ -5,7 +5,8 @@
  * - text and code: the first lines as they are (a Markdown heading set a little stronger);
  * - CSV and TSV: the first rows as a small table;
  * - SVG: the drawing itself (as an image: nothing in it runs);
- * - anything else, or a file that could not be read: a cover with its kind.
+ * - anything else, or a file that could not be read: a cover with its kind (`coverKind`: a document,
+ *   a table, a picture, an archive, a video, sound, code, or a plain file).
  */
 
 export type Sheet =
@@ -58,6 +59,28 @@ export function pictureFit(kind: 'image' | 'page' | 'video', w: number, h: numbe
   if (kind === 'page' || !(w > 0 && h > 0)) return { height: sheetH, small: false };
   if (kind === 'image' && w < sheetW * 0.75 && h < sheetH * 0.6) return { height: sheetH, small: true };
   return { height: Math.round(Math.min(sheetH, Math.max(72, (sheetW * h) / w))), small: false };
+}
+
+/** What a cover draws under the file's extension (FileCard.tsx `Cover`): each kind has its own few hairlines and its own small motion. */
+export type CoverKind = 'doc' | 'table' | 'picture' | 'archive' | 'video' | 'audio' | 'code' | 'file';
+
+const COVER_KINDS: [CoverKind, RegExp][] = [
+  ['picture', /\.(png|jpe?g|jfif|gif|webp|bmp|tiff?|heic|heif|avif|ico|svg|psd|ai|fig|sketch|xcf|raw)$/i],
+  ['video', /\.(mp4|m4v|mov|webm|mkv|avi|wmv|mpe?g|3gp)$/i],
+  ['audio', /\.(mp3|wav|flac|ogg|oga|m4a|aac|opus|aiff?|midi?)$/i],
+  ['archive', /\.(zip|tar|gz|tgz|bz2|xz|zst|7z|rar|jar|war|apk|ipa|dmg|iso|deb|rpm|msi|cab)$/i],
+  ['table', /\.(xlsx?|xlsm|ods|numbers|csv|tsv|parquet)$/i],
+  ['doc', /\.(pdf|docx?|odt|rtf|pages|txt|md|mdx|markdown|rst|epub|pptx?|key|odp|log)$/i],
+  [
+    'code',
+    /\.(json|jsonc|json5|ya?ml|toml|ini|cfg|conf|env|ts|mts|cts|tsx|js|mjs|cjs|jsx|css|scss|sass|less|html?|xml|py|rs|go|java|kt|swift|rb|php|sh|bash|ps1|sql|c|h|cpp|cc|hpp|cs|lua|vue|svelte|astro|diff|patch|wasm|exe|dll|so|dylib|bin|class|lock)$/i,
+  ],
+];
+
+/** The kind of cover a file gets, from its name alone. */
+export function coverKind(name: string): CoverKind {
+  for (const [kind, re] of COVER_KINDS) if (re.test(name)) return kind;
+  return 'file';
 }
 
 /** The kind as the cover writes it: the extension as typed, in lower case (".pdf"); "file" when there is none. */

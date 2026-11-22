@@ -194,8 +194,14 @@ export const ANIMATED: Record<string, AnimatedDef> = {
     w: 24,
     parts: (
       <>
-        <line className="shaft" x1="40" y1="128" x2="216" y2="128" />
-        <polyline className="head" points="144 56 216 128 144 200" />
+        <g className="a">
+          <line x1="40" y1="128" x2="216" y2="128" />
+          <polyline points="144 56 216 128 144 200" />
+        </g>
+        <g className="b" opacity={0}>
+          <line x1="40" y1="128" x2="216" y2="128" />
+          <polyline points="144 56 216 128 144 200" />
+        </g>
       </>
     ),
   },
@@ -203,8 +209,14 @@ export const ANIMATED: Record<string, AnimatedDef> = {
     w: 24,
     parts: (
       <>
-        <line className="shaft" x1="216" y1="128" x2="40" y2="128" />
-        <polyline className="head" points="112 56 40 128 112 200" />
+        <g className="a">
+          <line x1="216" y1="128" x2="40" y2="128" />
+          <polyline points="112 56 40 128 112 200" />
+        </g>
+        <g className="b" opacity={0}>
+          <line x1="216" y1="128" x2="40" y2="128" />
+          <polyline points="112 56 40 128 112 200" />
+        </g>
       </>
     ),
   },
@@ -212,8 +224,14 @@ export const ANIMATED: Record<string, AnimatedDef> = {
     w: 24,
     parts: (
       <>
-        <line className="shaft" x1="128" y1="216" x2="128" y2="40" />
-        <polyline className="head" points="56 112 128 40 200 112" />
+        <g className="a">
+          <line x1="128" y1="216" x2="128" y2="40" />
+          <polyline points="56 112 128 40 200 112" />
+        </g>
+        <g className="b" opacity={0}>
+          <line x1="128" y1="216" x2="128" y2="40" />
+          <polyline points="56 112 128 40 200 112" />
+        </g>
       </>
     ),
   },
@@ -221,8 +239,14 @@ export const ANIMATED: Record<string, AnimatedDef> = {
     w: 24,
     parts: (
       <>
-        <line className="shaft" x1="128" y1="40" x2="128" y2="216" />
-        <polyline className="head" points="56 144 128 216 200 144" />
+        <g className="a">
+          <line x1="128" y1="40" x2="128" y2="216" />
+          <polyline points="56 144 128 216 200 144" />
+        </g>
+        <g className="b" opacity={0}>
+          <line x1="128" y1="40" x2="128" y2="216" />
+          <polyline points="56 144 128 216 200 144" />
+        </g>
       </>
     ),
   },
@@ -309,10 +333,11 @@ export const ANIMATED: Record<string, AnimatedDef> = {
         <line x1="37.46" y1="96" x2="218.54" y2="96" />
         <line x1="37.46" y1="160" x2="218.54" y2="160" />
         {/* Three front meridians as half ellipses (signed width, so one can pass through the centre):
-            at rest a and b make Phosphor's ellipse; turning, a rolls to the rim, b to a's place, c in from the far rim. */}
+            at rest a and b make Phosphor's ellipse; turning, each rolls on toward the right rim and c, then d, come in from the left one. */}
         <path className="ma" d="M128,34.61C150.09,34.61,168,76.42,168,128S150.09,221.39,128,221.39" />
         <path className="mb" d="M128,34.61C105.91,34.61,88,76.42,88,128S105.91,221.39,128,221.39" />
         <path className="mc" d="M128,34.61C76.08,34.61,34,76.42,34,128S76.08,221.39,128,221.39" opacity={0} />
+        <path className="md" d="M128,34.61C76.08,34.61,34,76.42,34,128S76.08,221.39,128,221.39" opacity={0} />
       </>
     ),
   },
@@ -499,6 +524,8 @@ export const ANIMATED: Record<string, AnimatedDef> = {
       <>
         <path className="lp" d="M24,200H96a32,32,0,0,1,32,32V88A32,32,0,0,0,96,56H24Z" />
         <path className="rp" d="M128,88a32,32,0,0,1,32-32h72V200H160a32,32,0,0,0-32,32" />
+        {/* The page that turns: a copy of the right page, shown only while it moves. */}
+        <path className="turn" d="M128,88a32,32,0,0,1,32-32h72V200H160a32,32,0,0,0-32,32" opacity={0} />
       </>
     ),
   },
@@ -571,10 +598,10 @@ export const ANIMATED: Record<string, AnimatedDef> = {
   },
   robot: {
     parts: (
-      <>
+      <g className="all">
         <F c="bot" d="M200,48H136V16a8,8,0,0,0-16,0V48H56A32,32,0,0,0,24,80V192a32,32,0,0,0,32,32H200a32,32,0,0,0,32-32V80A32,32,0,0,0,200,48Zm16,144a16,16,0,0,1-16,16H56a16,16,0,0,1-16-16V80A16,16,0,0,1,56,64H200a16,16,0,0,1,16,16Zm-52-56H92a28,28,0,0,0,0,56h72a28,28,0,0,0,0-56Zm-24,16v24H116V152ZM80,164a12,12,0,0,1,12-12h8v24H92A12,12,0,0,1,80,164Zm84,12h-8V152h8a12,12,0,0,1,0,24Z" />
         <F c="eye" d="M72,108a12,12,0,1,1,12,12A12,12,0,0,1,72,108Zm88,0a12,12,0,1,1,12,12A12,12,0,0,1,160,108Z" />
-      </>
+      </g>
     ),
   },
   queue: {
@@ -607,7 +634,8 @@ export const ANIMATED: Record<string, AnimatedDef> = {
     parts: (
       <>
         <F c="tray" d="M224,144v64a8,8,0,0,1-8,8H40a8,8,0,0,1-8-8V144a8,8,0,0,1,16,0v56H208V144a8,8,0,0,1,16,0Z" />
-        <F c="arrow" d="M122.34,149.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z" />
+        <F c="a" d="M122.34,149.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z" />
+        <path className="b" d="M122.34,149.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z" fill="currentColor" stroke="none" opacity={0} />
       </>
     ),
   },
@@ -631,7 +659,8 @@ export const ANIMATED: Record<string, AnimatedDef> = {
     parts: (
       <>
         <F c="box" d="M184,128a8,8,0,0,0-8,8v72H48V80h72a8,8,0,0,0,0-16H48A16,16,0,0,0,32,80V208a16,16,0,0,0,16,16H176a16,16,0,0,0,16-16V136A8,8,0,0,0,184,128Z" />
-        <F c="arrow" d="M224,104a8,8,0,0,1-16,0V59.32l-66.33,66.34a8,8,0,0,1-11.32-11.32L196.68,48H152a8,8,0,0,1,0-16h64a8,8,0,0,1,8,8Z" />
+        <F c="a" d="M224,104a8,8,0,0,1-16,0V59.32l-66.33,66.34a8,8,0,0,1-11.32-11.32L196.68,48H152a8,8,0,0,1,0-16h64a8,8,0,0,1,8,8Z" />
+        <path className="b" d="M224,104a8,8,0,0,1-16,0V59.32l-66.33,66.34a8,8,0,0,1-11.32-11.32L196.68,48H152a8,8,0,0,1,0-16h64a8,8,0,0,1,8,8Z" fill="currentColor" stroke="none" opacity={0} />
       </>
     ),
   },
@@ -648,6 +677,456 @@ export const ANIMATED: Record<string, AnimatedDef> = {
       <>
         <path className="clap" d="M96,192a32,32,0,0,0,64,0" />
         <path className="shell" d="M56,104a72,72,0,0,1,144,0c0,35.82,8.3,64.6,14.9,76A8,8,0,0,1,208,192H48a8,8,0,0,1-6.88-12C47.71,168.6,56,139.81,56,104Z" />
+      </>
+    ),
+  },
+
+  // ── third tier: the rest of what sits on a control people use daily, drawn from Phosphor's own strokes ──
+
+  // sidebar
+  stack: {
+    parts: (
+      <>
+        <path className="bot" d="M32,176L128,232L224,176" />
+        <path className="mid" d="M32,128L128,184L224,128" />
+        <path className="top" d="M32,80L128,136L224,80L128,24Z" />
+      </>
+    ),
+  },
+  'pin-off': {
+    parts: (
+      <>
+        <g className="pin">
+          <line x1="96.29" y1="159.71" x2="48" y2="208" />
+          <path d="M185,143.14l44.65-44.8a8,8,0,0,0,0-11.31L169,26.34a8,8,0,0,0-11.31,0L116.43,67.7" />
+          <path d="M84.32,80C73.54,79.16,58.53,81.32,43,93.85a8,8,0,0,0-.65,11.91l107.9,107.89a8,8,0,0,0,12-.83c5.21-6.93,12.27-18.39,14.12-31.58" />
+        </g>
+        <D c="slash" d="M48,40L208,216" />
+      </>
+    ),
+  },
+  'folder-open': {
+    parts: (
+      <>
+        {/* A sheet between the back and the leaf, shown only while the leaf is down. */}
+        <path className="sheet" d="M92,112V84h80v28" opacity={0} />
+        <path className="back" d="M32,208V64a8,8,0,0,1,8-8H93.33a8,8,0,0,1,4.8,1.6L128,80h72a8,8,0,0,1,8,8v24" />
+        <path className="leaf" d="M32,208l30.18-90.53A8,8,0,0,1,69.77,112H232a8,8,0,0,1,7.59,10.53L211.09,208Z" />
+      </>
+    ),
+  },
+  chat: {
+    parts: (
+      <>
+        <path className="bubble" d="M79.93,211.11a96,96,0,1,0-35-35h0L32.42,213.46a8,8,0,0,0,10.12,10.12l37.39-12.47Z" />
+        {/* Three dots of someone typing, shown only while the icon moves. */}
+        <path className="dt d1" d={circ(92, 128, 11)} fill="currentColor" stroke="none" opacity={0} />
+        <path className="dt d2" d={circ(128, 128, 11)} fill="currentColor" stroke="none" opacity={0} />
+        <path className="dt d3" d={circ(164, 128, 11)} fill="currentColor" stroke="none" opacity={0} />
+      </>
+    ),
+  },
+  chats: {
+    parts: (
+      <>
+        <path className="b1" d="M32.5,138A72,72,0,1,1,62,167.5l-27.76,8.16a8,8,0,0,1-9.93-9.93Z" />
+        <path className="b2" d="M163.94,80.11A72,72,0,0,1,223.5,186l8.16,27.76a8,8,0,0,1-9.93,9.93L194,215.5A72.05,72.05,0,0,1,92.06,175.89" />
+      </>
+    ),
+  },
+  home: {
+    parts: (
+      <g className="all">
+        <path className="house" d="M152,216h64V120a8,8,0,0,0-2.34-5.66l-80-80a8,8,0,0,0-11.32,0l-80,80A8,8,0,0,0,40,120v96h64" />
+        <D c="door" d="M104,216V152h48v64" />
+      </g>
+    ),
+  },
+
+  // top bar
+  devices: {
+    parts: (
+      <>
+        <g className="scr">
+          <path d="M160,176H40a16,16,0,0,1-16-16V64A16,16,0,0,1,40,48H184a16,16,0,0,1,16,16V80" />
+          <line x1="128" y1="208" x2="88" y2="208" />
+        </g>
+        <g className="ph">
+          <path d={rrect(160, 80, 80, 128, 16)} />
+          <line x1="192" y1="112" x2="208" y2="112" />
+        </g>
+      </>
+    ),
+  },
+  browser: {
+    parts: (
+      <>
+        <path d={rrect(32, 48, 192, 160, 8)} />
+        <D c="bar" d="M32,96H224" />
+        {/* Two lines of the page, shown only while it loads. */}
+        <path className="ln l1" d="M64,136H160" pathLength={1} strokeWidth={14} opacity={0} />
+        <path className="ln l2" d="M64,168H128" pathLength={1} strokeWidth={14} opacity={0} />
+      </>
+    ),
+  },
+
+  // composer
+  bolt: {
+    parts: (
+      <g className="bolt">
+        <path className="glow" d="M160,16L144,96L208,120L96,240L112,160L48,136Z" fill="currentColor" stroke="none" opacity={0} />
+        <path d="M160,16L144,96L208,120L96,240L112,160L48,136Z" />
+      </g>
+    ),
+  },
+  file: {
+    parts: (
+      <g className="all">
+        <path d="M200,224H56a8,8,0,0,1-8-8V40a8,8,0,0,1,8-8h96l56,56V216A8,8,0,0,1,200,224Z" />
+        <D c="fold" d="M152,32V88h56" />
+      </g>
+    ),
+  },
+  'file-plus': {
+    parts: (
+      <>
+        <path d="M200,224H56a8,8,0,0,1-8-8V40a8,8,0,0,1,8-8h96l56,56V216A8,8,0,0,1,200,224Z" />
+        <D c="fold" d="M152,32V88h56" />
+        <g className="plus">
+          <line x1="104" y1="152" x2="152" y2="152" />
+          <line x1="128" y1="128" x2="128" y2="176" />
+        </g>
+      </>
+    ),
+  },
+  'file-code': {
+    parts: (
+      <>
+        <path d="M200,224a8,8,0,0,0,8-8V88L152,32H56a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8Z" />
+        <path d="M152,32V88h56" />
+        <path className="cr" d="M152,128L176,152L152,176" />
+        <path className="cl" d="M104,128L80,152L104,176" />
+      </>
+    ),
+  },
+  'file-search': {
+    parts: (
+      <>
+        <path d="M200,224H56a8,8,0,0,1-8-8V40a8,8,0,0,1,8-8h96l56,56V216A8,8,0,0,1,200,224Z" />
+        <path d="M152,32V88h56" />
+        <g className="lens">
+          <path d={circ(124, 148, 28)} />
+          <line x1="143.8" y1="167.8" x2="160" y2="184" />
+        </g>
+      </>
+    ),
+  },
+  prompt: {
+    parts: (
+      <>
+        <path className="chev" d="M40,64L112,128L40,192" />
+        <line className="cursor" x1="120" y1="192" x2="216" y2="192" />
+      </>
+    ),
+  },
+  attach: {
+    parts: <D c="clip" d="M160,80,76.69,164.69a16,16,0,0,0,22.63,22.62L198.63,86.63a32,32,0,0,0-45.26-45.26L54.06,142.06a48,48,0,0,0,67.88,67.88L204,128" />,
+  },
+  at: {
+    parts: (
+      <>
+        <path className="a" d={circ(128, 128, 40)} />
+        <D c="tail" d="M184,208c-15.21,10.11-36.37,16-56,16a96,96,0,1,1,96-96c0,22.09-8,40-28,40s-28-17.91-28-40V88" />
+      </>
+    ),
+  },
+  key: {
+    parts: (
+      <g className="key">
+        <path d="M93.17,122.83A71.68,71.68,0,0,1,88,95.91c0-38.58,31.08-70.64,69.64-71.87A72,72,0,0,1,232,98.36C230.73,136.92,198.67,168,160.09,168a71.68,71.68,0,0,1-26.92-5.17h0L120,176H96v24H72v24H40a8,8,0,0,1-8-8V187.31a8,8,0,0,1,2.34-5.65l58.83-58.83Z" />
+        <path d={circ(180, 76, 12)} fill="currentColor" stroke="none" />
+      </g>
+    ),
+  },
+
+  // session header and menus
+  export: {
+    parts: (
+      <>
+        <path className="box" d="M176,104h24a8,8,0,0,1,8,8v96a8,8,0,0,1-8,8H56a8,8,0,0,1-8-8V112a8,8,0,0,1,8-8H80" />
+        <g className="a">
+          <path d="M88,64L128,24L168,64" />
+          <line x1="128" y1="24" x2="128" y2="136" />
+        </g>
+        <g className="b" opacity={0}>
+          <path d="M88,64L128,24L168,64" />
+          <line x1="128" y1="24" x2="128" y2="136" />
+        </g>
+      </>
+    ),
+  },
+  'sign-out': {
+    parts: (
+      <>
+        <path d="M112,40H48V216H112" />
+        <g className="a">
+          <line x1="112" y1="128" x2="224" y2="128" />
+          <path d="M184,88L224,128L184,168" />
+        </g>
+        <g className="b" opacity={0}>
+          <line x1="112" y1="128" x2="224" y2="128" />
+          <path d="M184,88L224,128L184,168" />
+        </g>
+      </>
+    ),
+  },
+  'sign-in': {
+    parts: (
+      <>
+        <g className="a">
+          <line x1="24" y1="128" x2="136" y2="128" />
+          <path d="M96,88L136,128L96,168" />
+        </g>
+        <g className="b" opacity={0}>
+          <line x1="24" y1="128" x2="136" y2="128" />
+          <path d="M96,88L136,128L96,168" />
+        </g>
+        <path d="M136,40H200V216H136" />
+      </>
+    ),
+  },
+  reply: {
+    parts: (
+      <g className="arrow">
+        <path className="head" d="M80,152L32,104L80,56" />
+        <D c="curve" d="M224,200a96,96,0,0,0-96-96H32" />
+      </g>
+    ),
+  },
+  fork: {
+    parts: (
+      <>
+        <D c="stem" d="M128,168V128" />
+        <D c="bl" d="M128,128H80a16,16,0,0,1-16-16V88" />
+        <D c="br" d="M128,128h48a16,16,0,0,0,16-16V88" />
+        <path className="n1" d={circ(64, 64, 24)} />
+        <path className="n0" d={circ(128, 192, 24)} />
+        <path className="n2" d={circ(192, 64, 24)} />
+      </>
+    ),
+  },
+  'pull-request': {
+    parts: (
+      <>
+        <path className="n1" d={circ(72, 192, 24)} />
+        <path className="n2" d={circ(72, 64, 24)} />
+        <line x1="72" y1="88" x2="72" y2="168" />
+        <path className="n3" d={circ(200, 192, 24)} />
+        <D c="l" d="M200,168V110.63a16,16,0,0,0-4.69-11.32L144,48" />
+        <path className="h" d="M144,96V48H192" />
+      </>
+    ),
+  },
+  comment: {
+    parts: (
+      <g className="all">
+        <path d="M132,216H48a8,8,0,0,1-8-8V124a92,92,0,0,1,92-92h0a92,92,0,0,1,92,92h0A92,92,0,0,1,132,216Z" />
+        <D c="l1" d="M96,112H164" />
+        <D c="l2" d="M96,144H164" />
+      </g>
+    ),
+  },
+  hourglass: {
+    parts: (
+      <g className="all">
+        <path d="M128,128,67.2,82.4A8,8,0,0,1,64,76V40a8,8,0,0,1,8-8H184a8,8,0,0,1,8,8V75.64A8,8,0,0,1,188.82,82L128,128h0" />
+        <path d="M128,128,67.2,173.6A8,8,0,0,0,64,180v36a8,8,0,0,0,8,8H184a8,8,0,0,0,8-8V180.36a8,8,0,0,0-3.18-6.38L128,128h0" />
+      </g>
+    ),
+  },
+
+  // panel bars
+  play: {
+    parts: <F c="tri" d="M240,128a15.74,15.74,0,0,1-7.6,13.51L88.32,229.65a16,16,0,0,1-16.2.3A15.86,15.86,0,0,1,64,216.13V39.87a15.86,15.86,0,0,1,8.12-13.82,16,16,0,0,1,16.2.3L232.4,114.49A15.74,15.74,0,0,1,240,128Z" />,
+  },
+  square: { parts: <path className="sq" d={rrect(40, 40, 176, 176, 8)} /> },
+  minus: { w: 24, parts: <D c="bar" d="M40,128H216" /> },
+  'zoom-in': {
+    parts: (
+      <>
+        <g className="ring">
+          <path d={circ(112, 112, 80)} />
+          <line x1="80" y1="112" x2="144" y2="112" />
+          <line className="pv" x1="112" y1="80" x2="112" y2="144" />
+        </g>
+        <line className="handle" x1="168.57" y1="168.57" x2="224" y2="224" />
+      </>
+    ),
+  },
+  'zoom-out': {
+    parts: (
+      <>
+        <g className="ring">
+          <path d={circ(112, 112, 80)} />
+          <line x1="80" y1="112" x2="144" y2="112" />
+        </g>
+        <line className="handle" x1="168.57" y1="168.57" x2="224" y2="224" />
+      </>
+    ),
+  },
+  code: {
+    parts: (
+      <>
+        <path className="cl" d="M64,88L16,128L64,168" />
+        <path className="cr" d="M192,88L240,128L192,168" />
+        <line className="slash" x1="160" y1="40" x2="96" y2="216" />
+      </>
+    ),
+  },
+  tree: {
+    parts: (
+      <>
+        <path className="root" d={rrect(16, 104, 48, 48, 8)} />
+        <D c="stem" d="M64,128H112" />
+        <D c="up" d="M112,128V88a16,16,0,0,1,16-16h24" />
+        <D c="dn" d="M112,128v40a16,16,0,0,0,16,16h24" />
+        <path className="c1" d={rrect(152, 40, 64, 64, 8)} />
+        <path className="c2" d={rrect(152, 152, 64, 64, 8)} />
+      </>
+    ),
+  },
+  sparkle: {
+    parts: (
+      <>
+        <path className="star" d="M84.27,171.73l-55.09-20.3a7.92,7.92,0,0,1,0-14.86l55.09-20.3,20.3-55.09a7.92,7.92,0,0,1,14.86,0l20.3,55.09,55.09,20.3a7.92,7.92,0,0,1,0,14.86l-55.09,20.3-20.3,55.09a7.92,7.92,0,0,1-14.86,0Z" />
+        <g className="p1">
+          <line x1="176" y1="16" x2="176" y2="64" />
+          <line x1="152" y1="40" x2="200" y2="40" />
+        </g>
+        <g className="p2">
+          <line x1="224" y1="72" x2="224" y2="104" />
+          <line x1="208" y1="88" x2="240" y2="88" />
+        </g>
+      </>
+    ),
+  },
+  filter: {
+    parts: (
+      <>
+        <D c="l1" d="M24,88H232" />
+        <D c="l2" d="M64,136H192" />
+        <D c="l3" d="M104,184H152" />
+      </>
+    ),
+  },
+  lock: {
+    parts: (
+      <>
+        <path className="shackle" d="M88,88V56a40,40,0,0,1,80,0V88" />
+        <g className="body">
+          <path d={rrect(40, 88, 176, 128, 8)} />
+          <path className="hole" d={circ(128, 152, 12)} fill="currentColor" stroke="none" />
+        </g>
+      </>
+    ),
+  },
+  unlock: {
+    parts: (
+      <>
+        <path className="shackle" d="M88,88V56a40,40,0,0,1,40-40c19.35,0,36.29,13.74,40,32" />
+        <g className="body">
+          <path d={rrect(40, 88, 176, 128, 8)} />
+          <path className="hole" d={circ(128, 152, 12)} fill="currentColor" stroke="none" />
+        </g>
+      </>
+    ),
+  },
+  phone: {
+    parts: (
+      <g className="body">
+        <path d={rrect(64, 24, 128, 208, 16)} />
+        <line x1="64" y1="56" x2="192" y2="56" />
+        <line x1="64" y1="200" x2="192" y2="200" />
+      </g>
+    ),
+  },
+  tablet: {
+    parts: (
+      <g className="body">
+        <path d={rrect(48, 32, 160, 192, 16)} />
+        <line x1="48" y1="64" x2="208" y2="64" />
+        <line x1="48" y1="192" x2="208" y2="192" />
+      </g>
+    ),
+  },
+  monitor: {
+    parts: (
+      <>
+        <path className="scr" d={rrect(32, 48, 192, 144, 16)} />
+        <D c="stand" d="M96,224H160" />
+      </>
+    ),
+  },
+  laptop: {
+    parts: (
+      <>
+        <g className="lid">
+          <path d="M40,176V72A16,16,0,0,1,56,56H200a16,16,0,0,1,16,16V176" />
+          <line x1="144" y1="88" x2="112" y2="88" />
+        </g>
+        <path d="M24,176H232v16a16,16,0,0,1-16,16H40a16,16,0,0,1-16-16Z" />
+      </>
+    ),
+  },
+
+  // settings and lists
+  text: {
+    parts: (
+      <>
+        <D c="l1" d="M40,64H216" />
+        <D c="l2" d="M40,104H168" />
+        <D c="l3" d="M40,144H216" />
+        <D c="l4" d="M40,184H168" />
+      </>
+    ),
+  },
+  profile: {
+    parts: (
+      <>
+        <path d={rrect(32, 48, 192, 160, 8)} />
+        <path className="head" d={circ(96, 120, 24)} />
+        <path className="sh" d="M64,168c3.55-13.8,17.09-24,32-24s28.46,10.19,32,24" />
+        <D c="l1" d="M152,112H192" />
+        <D c="l2" d="M152,144H192" />
+      </>
+    ),
+  },
+  star: {
+    parts: (
+      <path
+        className="star"
+        d="M128,189.09l54.72,33.65a8.4,8.4,0,0,0,12.52-9.17l-14.88-62.79,48.7-42A8.46,8.46,0,0,0,224.27,94L160.36,88.8,135.74,29.2a8.36,8.36,0,0,0-15.48,0L95.64,88.8,31.73,94a8.46,8.46,0,0,0-4.79,14.83l48.7,42L60.76,213.57a8.4,8.4,0,0,0,12.52,9.17Z"
+      />
+    ),
+  },
+  wrench: {
+    parts: <path className="tool" d="M104,126.94a64,64,0,0,1,80-90.29L144,80l5.66,26.34L176,112l43.35-40a64,64,0,0,1-90.29,80L73,217A24,24,0,0,1,39,183Z" />,
+  },
+  enter: {
+    w: 24,
+    parts: (
+      <>
+        <path className="elbow" d="M192,32V176H48" />
+        <path className="head" d="M96,128L48,176L96,224" />
+      </>
+    ),
+  },
+  'caret-updown': {
+    w: 24,
+    parts: (
+      <>
+        <path className="dn" d="M80,176L128,224L176,176" />
+        <path className="up" d="M80,80L128,32L176,80" />
       </>
     ),
   },

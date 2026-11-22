@@ -188,6 +188,44 @@ html[data-gallery] body {
   color: var(--text);
 }
 
+.isheet-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 10px;
+}
+
+.isheet-note {
+  margin-left: 6px;
+  color: var(--text-3);
+  font-size: var(--t-small);
+}
+
+/* The icons without a drawn version, under the sheet. */
+.isheet-others {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 18px;
+}
+
+.isheet-others .isheet-note {
+  margin-left: 0;
+}
+
+.isheet-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  max-width: 1000px;
+}
+
+/* File cards, one of each cover (FileCovers.tsx), above the sheet. */
+.fcovers {
+  max-width: 1000px;
+  padding-bottom: 28px;
+}
+
 .isheet-row {
   display: grid;
   grid-template-columns: 150px repeat(3, max-content);
@@ -219,7 +257,17 @@ html[data-gallery] body {
 }
 
 .isheet-head .isheet-size {
-  width: calc(9 * 30px + 16px);
+  width: calc(3 * 30px + 10px);
+}
+
+/* the first size carries the frames */
+.isheet-head .isheet-size:nth-child(2) {
+  width: calc(13 * 30px + 30px);
+}
+
+/* the press beat's frames stand a little apart */
+.isheet-cell[data-scrub='p'] {
+  background-color: var(--fill-1);
 }
 
 .isheet-cell {
@@ -255,7 +303,7 @@ html[data-gallery] body {
   color: #fff;
 }
 
-/* The director's sheet (`?gallery&strip`): eight frames at 16 px, then the same eight at 4x. */
+/* The director's sheet (`?gallery&strip`): the rest copy, then nine frames of the motion and three of the press beat at 3.5x. */
 .isheet-strip .isheet-row {
   grid-template-columns: 96px max-content max-content;
   gap: 14px;
@@ -278,9 +326,10 @@ html[data-gallery] body {
 }
 
 .isheet-big {
-  width: 76px;
-  height: 76px;
+  width: 68px;
+  height: 68px;
 }
+
 
 /* Material: glass over a sample of the field (dev only: the dither stands in for the backdrop). */
 .gal-stage {

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Capabilities } from '@shared/protocol';
 import { capsFromAnywhere } from '@/features/composer/choice';
 import { folderOf, shareReadable, sharedPath, sheetKey } from '@/features/timeline/FileCard';
-import { coverWord, sheetOf, wantsText } from '@/features/timeline/file-sheet';
+import { coverKind, coverWord, sheetOf, wantsText } from '@/features/timeline/file-sheet';
 
 describe('folderOf', () => {
   it('names where a shared file lies, relative to the session folder or home', () => {
@@ -95,5 +95,28 @@ describe('capsFromAnywhere', () => {
     expect(capsFromAnywhere(all, 'claude', 'work')).toBe(all['claude:D:/b@work']);
     expect(capsFromAnywhere(all, 'claude', 'other')).toBeUndefined();
     expect(capsFromAnywhere(all, 'demo', undefined)).toBeUndefined();
+  });
+});
+
+describe('the cover of a file that has no page', () => {
+  it('draws what kind of file it is, from its name', () => {
+    expect(coverKind('auth-audit.pdf')).toBe('doc');
+    expect(coverKind('Notes.DOCX')).toBe('doc');
+    expect(coverKind('figures.xlsx')).toBe('table');
+    expect(coverKind('latency.csv')).toBe('table');
+    expect(coverKind('shot.PNG')).toBe('picture');
+    expect(coverKind('logo.svg')).toBe('picture');
+    expect(coverKind('build.tar.gz')).toBe('archive');
+    expect(coverKind('release.zip')).toBe('archive');
+    expect(coverKind('demo.mp4')).toBe('video');
+    expect(coverKind('voice.m4a')).toBe('audio');
+    expect(coverKind('session.ts')).toBe('code');
+    expect(coverKind('app.wasm')).toBe('code');
+  });
+
+  it('is a plain file when the name says nothing', () => {
+    expect(coverKind('LICENSE')).toBe('file');
+    expect(coverKind('data.xyz')).toBe('file');
+    expect(coverKind('')).toBe('file');
   });
 });

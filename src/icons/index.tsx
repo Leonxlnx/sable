@@ -184,6 +184,12 @@ import { ArrowClockwiseIcon } from '@phosphor-icons/react/dist/csr/ArrowClockwis
 import './icons.css';
 import { ANIMATED } from './animated/parts';
 import './animated/animated.css';
+import { startIconMotion } from './animated/play';
+
+export { playIcons } from './animated/play';
+
+// The icons answer the control they sit in: one set of listeners for the app (animated/play.ts).
+startIconMotion();
 
 /** One icon vocabulary for the whole app. Names describe meaning, not the glyph. */
 const ICONS = {
@@ -447,6 +453,8 @@ export function IconOriginal({ name, size = 16 }: { name: IconName; size?: numbe
 
 /** The names that have an animated drawing. */
 export const ANIMATED_NAMES = Object.keys(ANIMATED).filter((n): n is IconName => n in ICONS);
+/** Every icon name (for the dev gallery's sheet). */
+export const ICON_NAMES = Object.keys(ICONS) as IconName[];
 
 /**
  * Maps a tool kind to its icon. The interface is monochrome: every tone is the same neutral
