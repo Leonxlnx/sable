@@ -17,6 +17,7 @@ import { readReview, type PhoneReview } from '@m/lib/review';
 import { applyChildren, applyFull, fetchItem, getState, sessionData, setState, useStore, type State } from '@m/lib/store';
 import { claimFlight } from '@m/lib/flight';
 import { checkOpener, foldTarget, showKind, turnChanges } from '@m/lib/chat-rules';
+import { foldKey, keepOpen, wasOpen } from '@m/lib/folds';
 import { useChanges } from '@m/lib/changes';
 import type { Segment, StepsChunk, TurnGroup } from '@m/lib/turns';
 import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
@@ -95,7 +96,10 @@ function useSecond(active: boolean): number {
  */
 export const TurnView = memo(function TurnView({ sid, turn, newest, reveal }: { sid: string; turn: TurnGroup; newest?: boolean; reveal?: string }) {
   const running = turn.state === 'running';
-  const [open, setOpen] = useState(false);
+  // What was opened is remembered per turn and per checkpoint (lib/folds.ts).
+  const turnFold = foldKey(sid, turn.key);
+  const [open, setOpen] = useState(() => wasOpen(turnFold));
+  useEffect(() => keepOpen(turnFold, open), [turnFold, open]);
   // Asked to show an item it holds (a search hit): the folds around it open, the line and its checkpoint.
   const target = useMemo(() => (reveal ? foldTarget(turn, reveal) : null), [turn, reveal]);
   useLayoutEffect(() => {
@@ -158,7 +162,7 @@ export const TurnView = memo(function TurnView({ sid, turn, newest, reveal }: { 
             ) : p.k === 'total' ? (
               <WorkHead sid={sid} mode="total" run={null} from={null} until={null} turn={turn} open={open} onToggle={toggle} />
             ) : (
-              <RunPiece sid={sid} p={p} settled={!laidLive} open={shownOpen} multi={multi} nest={nest} turn={p.head ? turn : undefined} onToggle={toggle} reveal={!!target?.run && target.run === p.run?.key} />
+              <RunPiece sid={sid} p={p} fold={foldKey(sid, turn.key, p.key)} settled={!laidLive} open={shownOpen} multi={multi} nest={nest} turn={p.head ? turn : undefined} onToggle={toggle} reveal={!!target?.run && target.run === p.run?.key} />
             )}
           </div>
         );
@@ -353,8 +357,10 @@ function hold(el: Element | null) {
  * ("Run the tests · 12s · 2 steps") through the closed checkpoint ("Worked 45s · 5 steps") to its
  * place in the finished turn's fold; on the turn's first run the line then reads the whole turn.
  */
-const RunPiece = memo(function RunPiece({ sid, p, settled, open, multi, nest, turn, onToggle, reveal }: { sid: string; p: RunP; settled: boolean; open: boolean; multi: boolean; nest: boolean; turn?: TurnGroup; onToggle: () => void; reveal?: boolean }) {
-  const [runOpen, setRunOpen] = useState(false);
+const RunPiece = memo(function RunPiece({ sid, p, fold, settled, open, multi, nest, turn, onToggle, reveal }: { sid: string; p: RunP; fold: string; settled: boolean; open: boolean; multi: boolean; nest: boolean; turn?: TurnGroup; onToggle: () => void; reveal?: boolean }) {
+  // Its steps as the reader left them: this element is gone while its turn is folded, the choice is not.
+  const [runOpen, setRunOpen] = useState(() => wasOpen(fold));
+  useEffect(() => keepOpen(fold, runOpen), [fold, runOpen]);
   const ref = useRef<HTMLDivElement>(null);
   // Holds the item looked for: its steps open.
   useLayoutEffect(() => {
