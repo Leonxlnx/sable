@@ -209,6 +209,25 @@ describe('turns and prompts', () => {
     expect(rt.get<ToolItem>(done.id)!.endedAt).toBeUndefined();
   });
 
+  it('settle stamps only the turn it settles, at the time it is given and never before a step began', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000);
+      const { rt } = make();
+      // Left running by work before this turn (its process went away unnoticed).
+      const straggler = rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'running', detail: {} });
+      vi.setSystemTime(6 * 3600_000);
+      rt.beginTurn();
+      const late = rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'running', detail: {} });
+      rt.settle('cancelled', { at: 5 * 3600_000 });
+      expect(rt.get<ToolItem>(straggler.id)!.status).toBe('cancelled');
+      expect(rt.get<ToolItem>(straggler.id)!.endedAt).toBeUndefined();
+      expect(rt.get<ToolItem>(late.id)!.endedAt).toBe(6 * 3600_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a step does not count the time spent waiting for approval as its own', async () => {
     vi.useFakeTimers();
     try {

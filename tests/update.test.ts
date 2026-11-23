@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { UpdateState } from '../shared/protocol';
-import { newer, pickRelease, RELEASES_URL, Updater } from '../server/services/update';
+import { COMMAND_UPDATE_WAIT_MS, newer, pickRelease, RELEASES_URL, Updater, updateWaits, type UpdateSession } from '../server/services/update';
 import { appBundleOf, MAC_INSTALL_SCRIPT } from '../server/services/update-mac';
 
 const dirs: string[] = [];
@@ -53,14 +53,14 @@ function github(json: unknown, bytes: Buffer = BYTES) {
   return { fetcher, calls };
 }
 
-function updater(json: unknown, opts: { busy?: () => boolean; bytes?: Buffer } = {}) {
+function updater(json: unknown, opts: { busy?: () => boolean; recheckAt?: () => number | undefined; bytes?: Buffer } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'sable-update-test-'));
   dirs.push(dir);
   const states: UpdateState[] = [];
   const ran: string[] = [];
   const quit = vi.fn();
   const gh = github(json, opts.bytes);
-  const u = new Updater((s) => states.push(s), { host: { quit }, dir, version: '0.2.4', platform: 'win32', fetch: gh.fetcher, run: (f) => ran.push(f), busy: opts.busy, manual: true });
+  const u = new Updater((s) => states.push(s), { host: { quit }, dir, version: '0.2.4', platform: 'win32', fetch: gh.fetcher, run: (f) => ran.push(f), busy: opts.busy, recheckAt: opts.recheckAt, manual: true });
   return { u, states, ran, quit, dir, gh };
 }
 
@@ -262,6 +262,40 @@ describe('the updater', () => {
     busy = false;
     second.u.workChanged();
     expect(second.ran).toHaveLength(0);
+  });
+
+  it('waits for a young background command, and goes by itself once it is old enough', async () => {
+    const t0 = Date.now();
+    const chat: UpdateSession = { meta: { status: 'idle', commands: 1 }, turnActive: false, newestCommandAt: t0 };
+    const { u, ran } = updater(release('0.2.5'), { busy: () => updateWaits([chat]).busy, recheckAt: () => updateWaits([chat]).recheckAt });
+    await u.check();
+    vi.useFakeTimers({ now: t0 + 60_000 });
+    try {
+      expect(u.install().pending).toBe(true);
+      vi.advanceTimersByTime(COMMAND_UPDATE_WAIT_MS - 2 * 60_000);
+      expect(ran).toHaveLength(0);
+      // Nothing the bridge says changes when the command turns 30 minutes old: the updater looks again by itself.
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(ran).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('what the restart waits for', () => {
+    const now = 10 * COMMAND_UPDATE_WAIT_MS;
+    const idle = (extra: Partial<UpdateSession> = {}): UpdateSession => ({ meta: { status: 'idle' }, turnActive: false, ...extra });
+    expect(updateWaits([idle()], now)).toEqual({ busy: false });
+    expect(updateWaits([idle({ turnActive: true })], now)).toEqual({ busy: true });
+    expect(updateWaits([idle({ meta: { status: 'idle', background: 1 } })], now)).toEqual({ busy: true });
+    // A dev server running for hours does not hold the update.
+    expect(updateWaits([idle({ meta: { status: 'idle', commands: 1 }, newestCommandAt: now - COMMAND_UPDATE_WAIT_MS })], now)).toEqual({ busy: false });
+    expect(updateWaits([idle({ meta: { status: 'idle', commands: 1 }, newestCommandAt: now - 60_000 }), idle({ meta: { status: 'idle', commands: 2 }, newestCommandAt: now - 120_000 })], now)).toEqual({
+      busy: true,
+      recheckAt: now - 60_000 + COMMAND_UPDATE_WAIT_MS,
+    });
+    // A count of none: a time left over says nothing.
+    expect(updateWaits([idle({ meta: { status: 'idle', commands: 0 }, newestCommandAt: now })], now)).toEqual({ busy: false });
   });
 
   it('an installer that cannot start once the agents finish says so, and nothing quits', async () => {

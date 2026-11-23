@@ -414,6 +414,12 @@ export interface SessionUsage {
   cacheReadTokens?: number;
   costUsd?: number;
   turns: number;
+  /**
+   * The agent's own running total for a conversation (Claude Code's `total_cost_usd`), as last seen,
+   * and the conversation it counts for. A new process that resumes the conversation starts from this
+   * total, so its first result is not booked with the whole chat's cost.
+   */
+  cliCost?: { session: string; total: number };
 }
 
 export interface SessionMeta {
@@ -457,6 +463,15 @@ export interface SessionMeta {
    * ended (`status` idle): lists and the conversation say that it still works.
    */
   background?: number;
+  /**
+   * Background commands and monitors still running in the agent's process after the step that
+   * started them returned (`ToolItem.task` with state `running`; counted by `SessionRuntime`). Apart
+   * from `background`, which stays the count of sub-agents and workflows: phones already installed
+   * read that one as "sub-agents working". Above 0 the chat is not at rest either.
+   */
+  commands?: number;
+  /** The chat is moving to another account right now (set and cleared by `session.switchAccount`). */
+  moving?: boolean;
   /** The account the session runs under; absent means `default`. */
   accountId?: string;
   /** Capabilities switched on for this session (browser, computer use, remote control). */
@@ -1014,6 +1029,11 @@ export interface ToolItem extends BaseItem {
   /** A `share` step that went through: each listed file as it was then (null: it could not be read), by its place in `detail.files`. */
   handed?: (HandedFile | null)[];
   /**
+   * The step started work that goes on after the step itself returned: a background command or a
+   * monitor in the agent's process. The bridge owns its state, from the agent's own task events.
+   */
+  task?: TaskMark;
+  /**
    * Set by the bridge only, on a finished step in a whole timeline sent to a window (a snapshot,
    * `timeline.reset`): its long output or result was cut (the start and end of long texts kept,
    * pictures left out). `session.item` returns it whole. Never on disk.
@@ -1053,6 +1073,13 @@ export interface NoticeItem extends BaseItem {
   agentSwitch?: AgentSwitchMark;
   /** A request was refused for the sign-in (server/core/auth-gate.ts; shown by `features/accounts`' AuthNotice). */
   auth?: AuthHit;
+  /**
+   * The turn above was cut before the agent finished, and the bridge knows it: `died` the agent's
+   * process ended by itself, `closed` Sable had to close it mid-work, `restart` Sable itself closed
+   * or crashed while the turn ran. Shown as the "Ended early" line with Continue. Nothing else says
+   * a turn ended early: a turn with no record of its end says nothing about how it ended.
+   */
+  early?: 'died' | 'closed' | 'restart';
 }
 
 /**
@@ -1066,6 +1093,22 @@ export interface AuthHit {
   accountId?: string;
   /** The account's name when the agent has several ("Ultra1"). */
   label?: string;
+}
+
+/** Work a step left running in the agent's process (`ToolItem.task`). */
+export interface TaskMark {
+  /** The agent's own id for the task. */
+  id: string;
+  kind: 'command' | 'monitor';
+  /**
+   * `lost`: the process that held it went away while it ran, and no word of its end ever came. It
+   * usually ended with the process, but a child process can outlive it: never say "ended".
+   */
+  state: 'running' | 'done' | 'failed' | 'stopped' | 'lost';
+  since: number;
+  endedAt?: number;
+  /** Why it is `stopped` or `lost`: the process ended or was let go, Sable restarted, the chat moved, a limit, the person. */
+  why?: 'process' | 'restart' | 'move' | 'limit' | 'you';
 }
 
 /** Closes a turn: duration, cost, token counts. */

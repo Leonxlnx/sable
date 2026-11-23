@@ -4,6 +4,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  lostTasksNote,
+  RESUME_AFTER_RESET,
   parseSynthetic,
   partLine,
   readableTitle,
@@ -283,5 +285,39 @@ describe('titles and items', () => {
   it('says each part as one line', () => {
     expect(partLine({ kind: 'bash', command: 'git status' })).toBe('! git status');
     expect(partLine({ kind: 'message', from: '', text: '\n\nhello\nthere' })).toBe('Message from another session: hello');
+  });
+});
+
+describe('the note of tasks lost with their process', () => {
+  const note = lostTasksNote([`"Run app tests" (command, task b1x2)`, `"Watch logs" (monitor, task m1)`]);
+
+  it('names every task and never says they ended', () => {
+    expect(note).toContain('"Run app tests" (command, task b1x2); "Watch logs" (monitor, task m1)');
+    expect(note).toContain('may still be running');
+    expect(note).toContain('no notification will come for them');
+    expect(lostTasksNote([])).toBe('');
+  });
+
+  it("is never shown as the person's words: after their message, before a wrapper or the Browser tab's line", () => {
+    expect(userText(`Continue${note}`)).toBe('Continue');
+    expect(stripWrappers(`Continue${note}`)).toBe('Continue');
+    expect(userText(`Fix the login page${note}
+
+<system-reminder>Answer this message first.</system-reminder>`)).toBe('Fix the login page');
+    expect(userText(`Fix it${note}
+
+[Sable: the user's Browser tab shows http://localhost:5173/. browser_read reads it.]`)).toBe('Fix it');
+    expect(parseSynthetic(`Continue${note}`)).toBeNull();
+  });
+
+  it("a carry-on with the note is all Sable's", () => {
+    expect(parseSynthetic(`${RESUME_AFTER_RESET}${note}`)).toMatchObject({ role: 'hidden' });
+  });
+
+  it('the same words inside what the person wrote stay theirs', () => {
+    const pasted = `Why did Sable say this?${note}
+
+It keeps happening.`;
+    expect(userText(pasted)).toBe(pasted);
   });
 });

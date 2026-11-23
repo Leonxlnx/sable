@@ -62,6 +62,8 @@ export class Store {
   private sessionFiles = new SessionFiles((id) => this.sessionPath(id));
   private sessionTimers = new Map<string, NodeJS.Timeout>();
   private sessionPending = new Map<string, () => SessionSave>();
+  /** Sable is going down: nothing more is written (`seal`). */
+  private sealed = false;
 
   constructor(dir?: string) {
     this.dir = dir ?? process.env.SABLE_HOME ?? path.join(homedir(), '.sable');
@@ -117,6 +119,7 @@ export class Store {
   }
 
   private schedule(file: string, data: () => unknown, delay: number) {
+    if (this.sealed) return;
     this.pending.set(file, data);
     if (this.timers.has(file)) return;
     this.timers.set(
@@ -156,6 +159,7 @@ export class Store {
 
   /** `data` is read when the write happens; its `dirty` names the items changed since the last save. */
   saveSession(id: string, data: () => SessionSave) {
+    if (this.sealed) return;
     this.sessionPending.set(id, data);
     if (this.sessionTimers.has(id)) return;
     this.sessionTimers.set(
@@ -193,5 +197,14 @@ export class Store {
     }
     await Promise.all([...[...this.pending.keys()].map((f) => this.flushFile(f)), ...[...this.sessionPending.keys()].map((id) => this.flushSession(id))]);
     await this.sessionFiles.idle();
+  }
+
+  /**
+   * Writes nothing from here on (after a last `flush`): Sable is going down, and every chat stays on
+   * disk as it stood then. What closing the agents changes in them afterwards is said when each chat
+   * is read again, as after a crash (app.ts `dispose`).
+   */
+  seal() {
+    this.sealed = true;
   }
 }

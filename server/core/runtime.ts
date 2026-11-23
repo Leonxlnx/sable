@@ -19,7 +19,7 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { userText } from '../../shared/synthetic';
-import { worksInBackground } from '../../shared/background';
+import { runsTask, worksInBackground } from '../../shared/background';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
 
 export type Emit = (event: BridgeEvent) => void;
@@ -49,7 +49,39 @@ export interface BackgroundLimit {
 type NewItem<T extends TimelineItem> = T extends TimelineItem ? Omit<T, 'id' | 'ts'> & { id?: string; ts?: number } : never;
 
 
-export { worksInBackground };
+export { runsTask, worksInBackground };
+
+/** Why a background command was lost: its process ended or was let go, Sable restarted, the chat moved, a limit. */
+export type LostWhy = 'process' | 'restart' | 'move' | 'limit';
+
+/** How a cut turn is said under its "Ended early" line (`cutTurn`), by what cut it. */
+const CUT_DETAIL: Record<'died' | 'closed' | 'restart', string> = {
+  died: "The agent's process ended by itself while it worked.",
+  closed: "Sable closed the agent's process while it worked.",
+  restart: 'Sable closed while the agent worked.',
+};
+
+/**
+ * The line that tells the person, at rest, that background commands were lost with their process
+ * (`SessionRuntime.tasksLost` gives the names for its detail). Never "ended": a child of the agent's
+ * shell can outlive it.
+ */
+export function lostLine(count: number, why: LostWhy): string {
+  const what = count === 1 ? '1 background command was' : `${count} background commands were`;
+  return why === 'move' ? `${what} lost when the chat moved` : why === 'restart' ? `${what} lost when Sable closed` : `${what} lost with the agent's process`;
+}
+
+/** At most this many lost tasks are named to the agent at once, each cut to `TASK_NAME_MAX` characters. */
+const LOST_NAMES_MAX = 12;
+const TASK_NAME_MAX = 90;
+/** Lost tasks kept for the agent's next message: a chat that loses more before it is told keeps the newest. */
+const LOST_KEPT = 64;
+
+/** A task step's name as the person knows it: what the agent said it does, else the step's label. */
+function taskName(i: ToolItem): string {
+  const name = (i.detail?.description || i.title || i.name || 'Background command').replace(/\s+/g, ' ').trim();
+  return name.length > TASK_NAME_MAX ? `${name.slice(0, TASK_NAME_MAX - 1).trimEnd()}…` : name;
+}
 
 /** The step with its sub-agent or workflow marked stopped (their process is gone), or the step itself when nothing of it runs. */
 export function stoppedBackground(i: TimelineItem): TimelineItem {
@@ -170,18 +202,30 @@ export class SessionRuntime {
   /**
    * As `load`, for a chat read from disk after a restart: no agent process carries anything from before,
    * so sub-agents and workflows still marked running are stopped first and the count starts at 0, with
-   * nothing announced on the way (review wave 7, #4). The steps it changed go with the next save.
+   * nothing announced on the way (review wave 7, #4). A background command still marked running was
+   * lost with that process (`lost`, why `restart`): the agent is told with its next message
+   * (`takeLost`), and their names as the person knows them are returned, for the line that tells
+   * them (`lostLine`, the caller's to write). The steps it changed go with the next save.
    */
-  loadRestored(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]) {
+  loadRestored(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]): string[] {
     const changed: string[] = [];
+    const lost: string[] = [];
+    const names: string[] = [];
     const out = items.map((i) => {
-      const s = stoppedBackground(i);
+      let s = stoppedBackground(i);
+      if (runsTask(s)) {
+        names.push(taskName(s));
+        s = { ...s, task: { ...s.task, state: 'lost', why: 'restart' } };
+        lost.push(i.id);
+      }
       if (s !== i) changed.push(i.id);
       return s;
     });
     this.load(out, todos, queue);
     this.markSaved();
     for (const id of changed) this.markDirty(id);
+    for (const id of lost) this.keepLost(id);
+    return names;
   }
 
   load(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]) {
@@ -191,24 +235,150 @@ export class SessionRuntime {
     if (queue) this.queue = queue;
     this.index = new Map(items.map((i) => [i.id, i]));
     this.working.clear();
-    for (const i of items) if (worksInBackground(i)) this.working.add(i.id);
+    this.running.clear();
+    this.taskSteps.clear();
+    for (const i of items) {
+      if (worksInBackground(i)) this.working.add(i.id);
+      if (i.type === 'tool' && i.task) this.taskSteps.set(i.task.id, i.id);
+      if (runsTask(i)) this.running.add(i.id);
+    }
     // As read: whoever loads gets the whole chat next (a snapshot), so nothing is announced here.
     this.meta.background = this.working.size;
+    this.meta.commands = this.running.size;
   }
 
   // ── background work ──
 
   /** Steps whose sub-agent or workflow still works in the background (`SessionMeta.background` is their count). */
   private working = new Set<string>();
+  /** Steps whose background command or monitor still runs (`SessionMeta.commands` is their count). */
+  private running = new Set<string>();
+  /** The step of each task the chat has seen, by the agent's own task id. */
+  private taskSteps = new Map<string, string>();
 
-  /** A step was added or changed: the chat's count of background work follows it. */
+  /**
+   * A step was added or changed: the chat's counts of background work follow it. At rest (`onRest`)
+   * when the last sub-agent or workflow ends, as before, or the last command when no sub-agent works
+   * either, with no turn running; a command still running then is the bridge's to weigh (a move waits
+   * only for a young one).
+   */
   private trackBackground(item: TimelineItem) {
-    const now = worksInBackground(item);
-    if (now === this.working.has(item.id)) return;
-    if (now) this.working.add(item.id);
-    else this.working.delete(item.id);
-    this.update({ background: this.working.size });
-    if (!this.working.size && !this.turnActive) this.onRest?.(this);
+    if (item.type === 'tool' && item.task) this.taskSteps.set(item.task.id, item.id);
+    const works = worksInBackground(item);
+    const runs = runsTask(item);
+    const patch: Partial<SessionMeta> = {};
+    let agentsDone = false;
+    let commandsDone = false;
+    if (works !== this.working.has(item.id)) {
+      if (works) this.working.add(item.id);
+      else {
+        this.working.delete(item.id);
+        agentsDone = !this.working.size;
+      }
+      patch.background = this.working.size;
+    }
+    if (runs !== this.running.has(item.id)) {
+      if (runs) this.running.add(item.id);
+      else {
+        this.running.delete(item.id);
+        commandsDone = !this.running.size;
+      }
+      patch.commands = this.running.size;
+    }
+    if (!('background' in patch) && !('commands' in patch)) return;
+    this.update(patch);
+    if (!this.turnActive && !this.working.size && (agentsDone || commandsDone)) this.onRest?.(this);
+  }
+
+  /** When the youngest background command or monitor still running began; undefined when none runs. */
+  get newestCommandAt(): number | undefined {
+    let at: number | undefined;
+    for (const id of this.running) {
+      const i = this.index.get(id);
+      if (runsTask(i)) at = Math.max(at ?? 0, i.task.since);
+    }
+    return at;
+  }
+
+  /**
+   * A step left work running in the agent's process (a background command, a monitor). Sets `task`
+   * (state running, since now) and counts it. Said again for the same task, or after its end came
+   * first, it changes nothing.
+   */
+  taskStarted(itemId: string, mark: { id: string; kind: 'command' | 'monitor' }) {
+    const item = this.index.get(itemId);
+    if (item?.type !== 'tool' || item.task?.id === mark.id) return;
+    // A task already known by another step stays with it (the first word of it named its step).
+    const known = this.taskSteps.get(mark.id);
+    if (known && known !== itemId && this.index.has(known)) return;
+    if (item.task && this.taskSteps.get(item.task.id) === itemId) this.taskSteps.delete(item.task.id);
+    this.taskSteps.set(mark.id, itemId);
+    this.patch<ToolItem>(itemId, { task: { id: mark.id, kind: mark.kind, state: 'running', since: Date.now() } });
+  }
+
+  /**
+   * Word of a task's end, by the agent's task id. Unknown ids are ignored, and so is a second end. A
+   * task already marked `lost` takes its real end when word of it comes after all (a resumed process
+   * may report what its predecessor left), and is no longer named to the agent as lost.
+   */
+  taskEnded(taskId: string, state: 'done' | 'failed' | 'stopped', at?: number) {
+    const id = this.taskSteps.get(taskId);
+    const item = id ? this.index.get(id) : undefined;
+    if (item?.type !== 'tool' || item.task?.id !== taskId) return;
+    const t = item.task;
+    if (t.state !== 'running' && t.state !== 'lost') return;
+    this.lost.delete(item.id);
+    this.patch<ToolItem>(item.id, { task: { id: t.id, kind: t.kind, state, since: t.since, endedAt: Math.max(at ?? Date.now(), t.since) } });
+  }
+
+  /** Task steps lost since the agent was last told (`takeLost`), oldest first. */
+  private lost = new Set<string>();
+
+  private keepLost(id: string) {
+    this.lost.delete(id);
+    this.lost.add(id);
+    if (this.lost.size > LOST_KEPT) this.lost.delete(this.lost.values().next().value as string);
+  }
+
+  /**
+   * The process is gone: every running task becomes `lost` (with `why`, and no end: when or whether it
+   * ended is not known). Returns their names as the person knows them, for the notice that tells
+   * them (`lostLine`), and keeps them for `takeLost`.
+   */
+  tasksLost(why: LostWhy): string[] {
+    const names: string[] = [];
+    const ids = this.items.filter((i) => this.running.has(i.id)).map((i) => i.id);
+    for (const id of ids) {
+      const item = this.index.get(id);
+      if (!runsTask(item)) continue;
+      names.push(taskName(item));
+      this.keepLost(id);
+      this.patch<ToolItem>(id, { task: { ...item.task, state: 'lost', why } });
+    }
+    return names;
+  }
+
+  /**
+   * The tasks lost since the last call, as the agent knows them (`"Run app tests" (command, task
+   * b1x2)`; at most 12, then "N more"), for the hidden note its next message carries
+   * (shared/synthetic.ts `lostTasksNote`). Empties the list; a task whose end was heard since is left
+   * out. Take it only with a message the agent accepted.
+   */
+  takeLost(): string[] {
+    const out: string[] = [];
+    let more = 0;
+    for (const id of this.lost) {
+      const item = this.index.get(id);
+      if (item?.type !== 'tool' || item.task?.state !== 'lost') continue;
+      if (out.length >= LOST_NAMES_MAX) {
+        more++;
+        continue;
+      }
+      out.push(`"${taskName(item).replace(/"/g, "'")}" (${item.task.kind}, task ${item.task.id})`);
+    }
+    if (more) out.push(`${more} more`);
+    this.lost.clear();
+    return out;
   }
 
   /**
@@ -590,20 +760,32 @@ export class SessionRuntime {
     this.emit({ type: 'item.removed', sessionId: this.id, id });
     this.onDirty(this, 'items');
     let had = false;
-    for (const g of gone) had = this.working.delete(g) || had;
-    if (had) this.update({ background: this.working.size });
+    let ran = false;
+    for (const g of gone) {
+      had = this.working.delete(g) || had;
+      ran = this.running.delete(g) || ran;
+      this.lost.delete(g);
+    }
+    for (const [task, step] of [...this.taskSteps]) if (gone.has(step)) this.taskSteps.delete(task);
+    if (had || ran) this.update({ ...(had ? { background: this.working.size } : {}), ...(ran ? { commands: this.running.size } : {}) });
   }
 
   reset(items: TimelineItem[]) {
     const before = this.meta.background ?? 0;
+    const commands = this.meta.commands ?? 0;
     this.load(items, this.todos);
     this.emit({ type: 'timeline.reset', sessionId: this.id, items: items.map((i) => ({ ...i })) });
     this.onDirty(this, 'items');
-    // `load` set the count silently: a reset happens under clients that are listening.
+    // `load` set the counts silently: a reset happens under clients that are listening.
     if (before !== this.working.size) {
       this.meta.background = before;
       this.update({ background: this.working.size });
     }
+    if (commands !== this.running.size) {
+      this.meta.commands = commands;
+      this.update({ commands: this.running.size });
+    }
+    for (const id of [...this.lost]) if (!this.index.has(id)) this.lost.delete(id);
   }
 
   notice(variant: NoticeItem['variant'], text: string, detail?: string, parentId?: string) {
@@ -843,7 +1025,6 @@ export class SessionRuntime {
     return out;
   }
 
-  /** Settles anything left "in flight" (after an interrupt, crash or restart). */
   /**
    * Sub-agents and workflows still marked as running in the background whose agent process is gone
    * (it ended, or Sable restarted): they died with it and their end will never be reported.
@@ -858,19 +1039,78 @@ export class SessionRuntime {
     }
   }
 
-  settle(reason: 'cancelled' | 'error' = 'cancelled', opts: { endUnknown?: boolean } = {}) {
-    const keep = this.apart.size ? this.subtree(this.apart) : undefined;
-    // `endUnknown`: read from disk after a restart, when these ended is not known (now is when the chat
-    // was opened, maybe long after): they get no end, so no time of theirs counts as work.
-    const end = opts.endUnknown ? {} : { endedAt: Date.now() };
+  /**
+   * Settles anything left "in flight" (after an interrupt, crash or restart). Only steps of the turn
+   * being settled (begun at or after its start; with no turn since the chat was read, after the last
+   * record of a turn's end) get an end, at `at` (default now): a step left running by older work got
+   * its status long ago in truth, and is given it with no end time, so the hours between never count
+   * as its work. The subtree of a step that still works in the background (a sub-agent, a workflow)
+   * and a step whose background command runs are left alone: their process still runs them.
+   * `endUnknown`: read from disk after a restart, when these ended is not known (now is when the chat
+   * was opened, maybe long after): none gets an end.
+   */
+  settle(reason: 'cancelled' | 'error' = 'cancelled', opts: { endUnknown?: boolean; at?: number } = {}) {
+    this.settleSteps(reason, opts, true);
+  }
+
+  /** `settle`; `live`: what still works in the background is left alone (false: its process is gone too). */
+  private settleSteps(reason: 'cancelled' | 'error', opts: { endUnknown?: boolean; at?: number }, live: boolean) {
+    const roots = [...this.apart];
+    if (live) for (const i of this.items) if (worksInBackground(i) || runsTask(i)) roots.push(i.id);
+    const keep = roots.length ? this.subtree(roots) : undefined;
+    const from = this.turnStartedAt || this.lastTurnStart();
+    const at = opts.at ?? Date.now();
     for (const item of this.items) {
       if (keep?.has(item.id)) continue;
+      const end = opts.endUnknown || item.ts < from ? {} : { endedAt: Math.max(at, item.ts) };
       if ((item.type === 'text' || item.type === 'thinking') && item.streaming) {
         this.patch(item.id, { streaming: false, ...(item.type === 'thinking' ? end : {}) } as Partial<TimelineItem>);
       } else if (item.type === 'tool' && (item.status === 'running' || item.status === 'pending' || item.status === 'awaiting')) {
         this.patch(item.id, { status: reason, ...end } as Partial<TimelineItem>);
       }
     }
+  }
+
+  /** Whether a root item records the end of a turn: its result, an interrupt, a cut. */
+  private static endsTurn(i: TimelineItem): boolean {
+    return !i.parentId && (i.type === 'turn' || (i.type === 'notice' && (i.variant === 'interrupted' || !!i.early)));
+  }
+
+  /** When the last turn began, read from the items (a chat read from disk has no turn of this run): the first root after the last record of an end. */
+  private lastTurnStart(): number {
+    // Nothing after the last end: no turn is open, and whatever still runs is older than any.
+    let start = Infinity;
+    for (let k = this.items.length - 1; k >= 0; k--) {
+      const i = this.items[k];
+      if (i.parentId) continue;
+      if (SessionRuntime.endsTurn(i)) break;
+      start = i.ts;
+    }
+    return start;
+  }
+
+  /**
+   * The bridge knows the open turn was cut before the agent finished: `died` its process ended by
+   * itself, `closed` Sable had to close it mid-work, `restart` Sable itself went down while it ran
+   * (said when the chat is read again, with `at` the time of the turn's last item, never now). The
+   * process is gone, so its running steps are settled at `at` (default now), background work's too;
+   * then one notice says so ("Ended early", `early`; `detail`: the agent's own words, after the
+   * reason) and the turn ends with the queue held. No turn open: what was left running in the process
+   * is settled and nothing is written, except for `restart`, which the load path asks for with no turn
+   * open (once: a chat whose last word is already such a notice gets no second).
+   * Mark what ran in the background first (`stopBackground`, `tasksLost`): this settles steps only.
+   */
+  cutTurn(reason: 'died' | 'closed' | 'restart', opts: { at?: number; detail?: string } = {}) {
+    const at = opts.at ?? Date.now();
+    const open = this.turnActive;
+    this.settleSteps('cancelled', { at }, false);
+    if (!open && reason !== 'restart') return;
+    const last = this.items.findLast((i) => !i.parentId);
+    if (open || !(last?.type === 'notice' && last.early)) {
+      const detail = opts.detail?.trim() ? `${CUT_DETAIL[reason]}\n\n${opts.detail.trim()}` : CUT_DETAIL[reason];
+      this.add<NoticeItem>({ type: 'notice', variant: 'info', text: 'Ended early', detail, early: reason, ts: at });
+    }
+    if (open) this.endTurn(undefined, { hold: true });
   }
 
   /** The prompts open now, oldest first (as the snapshot lists them). */

@@ -83,6 +83,11 @@ interface UpdaterOptions {
   run?: (file: string) => void;
   /** Whether agents are at work anywhere now, and a way to hear when that may have changed. */
   busy?: () => boolean;
+  /**
+   * While `busy` holds only for a while (a young background command, `updateWaits`): when to look
+   * again by itself, as nothing the bridge says changes when that while is over.
+   */
+  recheckAt?: () => number | undefined;
   /** No timers (tests call check() themselves). */
   manual?: boolean;
 }
@@ -92,6 +97,7 @@ export class Updater {
   private release?: Release;
   private file?: string;
   private busyCheck?: () => void;
+  private recheck?: NodeJS.Timeout;
   private timers: NodeJS.Timeout[] = [];
   private checking?: Promise<UpdateState>;
   private readonly dir: string;
@@ -249,14 +255,16 @@ export class Updater {
   install(cancel = false): UpdateState {
     if (cancel) {
       this.busyCheck = undefined;
+      this.armRecheck();
       this.set({ pending: undefined });
       return this.state;
     }
     if (this.state.status !== 'ready' || !this.file || !this.opts.host) throw new Error('No update is ready to install.');
     if (this.opts.busy?.()) {
       this.busyCheck = () => {
-        if (this.opts.busy?.()) return;
+        if (this.opts.busy?.()) return this.armRecheck();
         this.busyCheck = undefined;
+        this.armRecheck();
         // Called from an event of the bridge: a start that fails (a Mac app that cannot replace
         // itself) is said in the state, never thrown into the listener.
         try {
@@ -266,10 +274,21 @@ export class Updater {
         }
       };
       this.set({ pending: true });
+      this.armRecheck();
       return this.state;
     }
     this.go();
     return this.state;
+  }
+
+  /** While a restart waits: a look again when the work that holds it stops holding it by its age alone. */
+  private armRecheck() {
+    clearTimeout(this.recheck);
+    this.recheck = undefined;
+    const at = this.busyCheck ? this.opts.recheckAt?.() : undefined;
+    if (at === undefined) return;
+    this.recheck = setTimeout(() => this.workChanged(), Math.max(1000, at - Date.now() + 50));
+    this.recheck.unref?.();
   }
 
   /** Called when work may have ended somewhere (a pending restart goes once nothing runs). */
@@ -297,12 +316,41 @@ export class Updater {
   }
 }
 
+/**
+ * How long a background command holds a restart for an update: a test run the agent waits on does,
+ * a dev server that runs all day does not hold the update for ever.
+ */
+export const COMMAND_UPDATE_WAIT_MS = 30 * 60_000;
+
+/** A session as the update's wait reads it: `newestCommandAt`, when its youngest background command still running began. */
+export type UpdateSession = { meta: { status: string; background?: number; commands?: number }; turnActive: boolean; readonly newestCommandAt?: number };
+
+/**
+ * Whether an update's restart waits for work now: a turn, a session starting, sub-agents still
+ * working in the background (an update would end them), a background command younger than
+ * `COMMAND_UPDATE_WAIT_MS`. `recheckAt`: when the youngest such command stops holding it, if only
+ * commands do.
+ */
+export function updateWaits(sessions: Iterable<UpdateSession>, now = Date.now()): { busy: boolean; recheckAt?: number } {
+  let busy = false;
+  let recheckAt: number | undefined;
+  for (const rt of sessions) {
+    if (rt.turnActive || rt.meta.status === 'running' || rt.meta.status === 'starting' || (rt.meta.background ?? 0) > 0) return { busy: true };
+    const at = (rt.meta.commands ?? 0) > 0 ? rt.newestCommandAt : undefined;
+    if (at !== undefined && now - at < COMMAND_UPDATE_WAIT_MS) {
+      busy = true;
+      recheckAt = Math.max(recheckAt ?? 0, at + COMMAND_UPDATE_WAIT_MS);
+    }
+  }
+  return busy ? { busy, recheckAt } : { busy };
+}
+
 /** Updates through the desktop shell: `update.check`, `update.install`, and the state in `app.hello`. */
 export function registerUpdates(app: App, host?: UpdateHost) {
   const updater = new Updater((state) => app.emit({ type: 'update.state', state }), {
     host: process.platform === 'win32' || process.platform === 'darwin' ? host : undefined,
-    // Sub-agents still working in the background count: an update would end them.
-    busy: () => [...app.sessions.values()].some((rt) => rt.turnActive || rt.meta.status === 'running' || rt.meta.status === 'starting' || (rt.meta.background ?? 0) > 0),
+    busy: () => updateWaits(app.sessions.values()).busy,
+    recheckAt: () => updateWaits(app.sessions.values()).recheckAt,
   });
   app.updates = updater;
   app.subscribe((e) => {

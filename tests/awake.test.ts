@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AppSettings, BridgeEvent, PhoneStatus, SessionMeta } from '../shared/protocol';
-import { phoneWantsAwake, watchAwake, watchPhoneAwake } from '../server/core/awake';
+import { COMMAND_AWAKE_MS, phoneWantsAwake, watchAwake, watchPhoneAwake } from '../server/core/awake';
 
-type S = { meta: SessionMeta; turnActive: boolean };
+type S = { meta: SessionMeta; turnActive: boolean; newestCommandAt?: number };
 
 function source() {
   const sessions: S[] = [];
@@ -62,6 +62,47 @@ describe('keep awake', () => {
     stop();
     expect(calls).toEqual([true, false]);
     expect(listeners.size).toBe(0);
+  });
+});
+
+describe('keep awake for background commands', () => {
+  it('a command the agent waits on keeps the computer up, until it is two hours old', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const { src, add, set } = source();
+    const a = add('idle');
+    const calls: boolean[] = [];
+    const stop = watchAwake(src, (b) => calls.push(b));
+    a.newestCommandAt = Date.now();
+    set(a, { commands: 1 });
+    expect(calls).toEqual([true]);
+    vi.advanceTimersByTime(COMMAND_AWAKE_MS - 60_000);
+    expect(calls).toEqual([true]);
+    // Two hours on, a dev server is no reason to keep the laptop up all night: the minute's grace, then off.
+    vi.advanceTimersByTime(60_000 + 60_000 + 1000);
+    expect(calls).toEqual([true, false]);
+    stop();
+  });
+
+  it('a command that ends lets go after the grace; an old one never takes the block', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10 * COMMAND_AWAKE_MS);
+    const { src, add, set } = source();
+    const a = add('idle');
+    const old = add('idle');
+    const calls: boolean[] = [];
+    const stop = watchAwake(src, (b) => calls.push(b));
+    old.newestCommandAt = Date.now() - COMMAND_AWAKE_MS - 1;
+    set(old, { commands: 1 });
+    expect(calls).toEqual([]);
+    a.newestCommandAt = Date.now();
+    set(a, { commands: 1 });
+    expect(calls).toEqual([true]);
+    a.newestCommandAt = undefined;
+    set(a, { commands: 0 });
+    vi.advanceTimersByTime(60_000);
+    expect(calls).toEqual([true, false]);
+    stop();
   });
 });
 
