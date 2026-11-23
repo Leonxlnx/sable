@@ -27,6 +27,8 @@ import {
   type SessionOptions,
   type SessionSnapshot,
   type SpareWait,
+  type TimelineItem,
+  type ToolItem,
   type UserItem,
 } from '../shared/protocol';
 import { authGate, SignInChecks, takeAuthFailure } from './core/auth-gate';
@@ -39,14 +41,14 @@ interface RefusalMark {
   stops: number;
   closes: number;
 }
-import { RESUME_AFTER_SIGN_IN, signInBackgroundNote } from '../shared/synthetic';
+import { lostTasksNote, RESUME_AFTER_SIGN_IN, signInBackgroundNote } from '../shared/synthetic';
 import { normalizeBackdrop } from '../shared/backdrop';
 import { HANDOVER_JOIN, readableTitle, RESUME_AFTER_RESET, RESUME_LIMIT_RESET, RESUME_SUMMARY_TRAILER, RESUME_UNDER_ANOTHER, resumeBackgroundNote } from '../shared/synthetic';
 import { Races, type Contender } from './core/race';
 import { laneSlug } from './services/git-lanes';
 import { gitDraftInput, gitWorktrees } from './services/git';
 import { cleanCommit, commitPrompt } from './core/commit-draft';
-import { SessionRuntime, autoTitle, pendingPrompts, type BackgroundLimit } from './core/runtime';
+import { SessionRuntime, autoTitle, lostLine, pendingPrompts, type BackgroundLimit } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
 import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_AT_START_MS, RETURN_RECHECK_MS, returnRetryMs, returnsAtStart, returnTarget, runningOnCredits } from './core/limit-policy';
@@ -55,9 +57,9 @@ import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/
 import { speedFor, startSpeedFor } from '../shared/speed';
 import type { Provider, ProviderContext, ProviderSession } from './providers/types';
 import { atCap, findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
-import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, moveNote, type MoveOutcome } from './core/move-context';
+import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, lostClause, moveNote, type MoveOutcome } from './core/move-context';
 import { handoverText } from './accounts/handover';
-import { backgroundRunning, itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
+import { itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
 import { worksInBackground } from '../shared/background';
 import { runSubAgent } from './core/sub-agent';
 import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
@@ -65,6 +67,7 @@ import { cutAt } from './core/fork';
 import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
 import { allowsEverything, withBrowserLine } from './providers/browser-tool';
+import { ownReplays } from './providers/claude-tools';
 import { profileOf } from './services/profile';
 import { anyPageHeld, registerSignIns } from './services/sign-ins';
 import { CUSTOM_AGENT_ONLY, customAgent, customOf } from './services/custom';
@@ -107,6 +110,45 @@ const still = (ctx?: CallContext) => {
   if (ctx?.allowed && !ctx.allowed()) throw new CallerGone();
 };
 
+/**
+ * A move or a switch refused for now because the chat is busy: a turn runs (one the agent began by
+ * itself too), work goes on in the background, a message is on its way to the agent, another
+ * transition runs. Nothing went wrong and nothing changed: the next moment of rest decides again. A
+ * move Sable makes by itself passes over it quietly; one the person asked for says it as any refusal.
+ */
+export class NotNow extends Error {}
+
+/** When the last thing in a timeline happened: the latest start or end of any of its items (undefined when empty). */
+function lastAct(items: readonly TimelineItem[]): number | undefined {
+  let at: number | undefined;
+  for (const i of items) {
+    const end = (i.type === 'tool' || i.type === 'thinking') && i.endedAt ? i.endedAt : 0;
+    at = Math.max(at ?? 0, i.ts, end);
+  }
+  return at;
+}
+
+/** `p`, or `fallback` once `ms` passed (the timer cleared either way). */
+function boundedBy<T, F>(p: Promise<T>, ms: number, fallback: F): Promise<T | F> {
+  let timer: NodeJS.Timeout | undefined;
+  return Promise.race([p, new Promise<F>((r) => (timer = setTimeout(() => r(fallback), ms)))]).finally(() => clearTimeout(timer));
+}
+
+/** What still runs in the agent's process, as the agent says it (`ProviderSession.liveWork`). */
+type LiveWork = ReturnType<NonNullable<ProviderSession['liveWork']>>;
+
+/** The work a chat holds now (`App.workOf`): one reading for every move, the agent switch and `atRest`. */
+interface ChatWork {
+  /** A turn runs: one Sable began, or one the agent runs by itself and says so. */
+  turn: boolean;
+  /** Sub-agents and workflows working in the background. */
+  agents: number;
+  /** Background commands and monitors running. */
+  commands: number;
+  /** Until when what runs holds a move Sable can postpone (a young command, a wake-up due soon); undefined when nothing that ages does. */
+  holds?: number;
+}
+
 /** A message's words and pictures as a send or a queue edit takes them: words a string, pictures a list or nothing. */
 function validMessage(text: unknown, attachments: unknown) {
   if (typeof text !== 'string') throw new Error('A message needs its words.');
@@ -146,6 +188,27 @@ const COMPACT_STOP_GRACE_MS = 5000;
 const RETURN_SEND_WAIT_MS = 15_000;
 /** How long the agent of the account a chat leaves has to close before the move goes on without its transcript. */
 const MOVE_CLOSE_MS = 10_000;
+/**
+ * How long a background command holds a move Sable decides by itself and can postpone (the return to
+ * the account a limit left, a cap or credits move): a test run the agent waits on does; a server that
+ * has run for half an hour does not, or it would hold the move for good.
+ */
+const COMMAND_HOLDS_MS = 30 * 60_000;
+/** How far ahead a wake-up the agent scheduled holds such a move (its timer lives in the process a move closes). */
+const WAKE_HOLDS_MS = 60 * 60_000;
+/** How soon a move held by a turn the agent says it runs, where Sable runs none, is looked at again. */
+const LIVE_TURN_RECHECK_MS = 5_000;
+/** How long a move gives the agent's word of a turn's end to follow its result (`settleLiveTurn`). */
+const LIVE_TURN_SETTLE_MS = 2_000;
+/** How long a move waits for a message already on its way to the agent before it looks again (`untilDispatched`). */
+const DISPATCH_WAIT_MS = 15_000;
+/** Between two chats whose Remote Control process opens again after a move: a reset returns many chats at once. */
+const REMOTE_REOPEN_GAP_MS = 3_000;
+/**
+ * How long the silent second send after a refused sign-in waits while the agent still works: a process
+ * that still holds the refused message runs it by itself once its sign-in is renewed (C5).
+ */
+const SIGN_IN_HOLD_MS = 10_000;
 
 /** How a reset in the agent's own dialog is offered: a console window Sable opens, or a command for a terminal. */
 const limitResetVia = (consoles: boolean, p: Provider): NonNullable<ProviderInfo['limitReset']> | undefined => {
@@ -217,6 +280,8 @@ export class App {
   private removingAccounts = new Set<string>();
   /** Chats whose file is there but could not be read: their timeline is empty, so no move may start them over from it. */
   private unreadable = new Set<string>();
+  /** Chats whose turn ran when Sable closed (their saved status): cut where it stopped once they are read (`loadInto`). */
+  private cutAtRestart = new Set<string>();
   /** Returns due at the same moment go this far apart (`RETURN_AT_START_MS.gap`; tests shorten it). */
   private returnGapMs = RETURN_AT_START_MS.gap;
   private queuedWhileMoving = new Set<string>();
@@ -442,14 +507,19 @@ export class App {
         this.hidden.push(meta);
         continue;
       }
-      // Nothing survives a restart mid-turn.
+      // Nothing survives a restart mid-turn: a chat that worked when Sable closed says so where its turn
+      // was cut, once it is read (`loadInto`).
+      if (meta.status === 'running' || meta.status === 'awaiting') this.cutAtRestart.add(meta.id);
       meta.status = 'idle';
       meta.activity = undefined;
       // Remote links and live capability state belong to the agent process that is gone.
       meta.remote = meta.options?.remoteControl ? { status: 'Reconnects when the agent starts again', tone: 'waiting' } : undefined;
       meta.capState = undefined;
-      // Background work lived in the agent process that is gone (its steps are stopped as the chat is read: `loadRestored`).
+      // Background work lived in the agent process that is gone (its steps are stopped, its commands
+      // lost, as the chat is read: `loadRestored`); so did a move that was under way.
       meta.background = undefined;
+      meta.commands = undefined;
+      meta.moving = undefined;
       // An until loop does not outlive Sable: the session says so when it is opened.
       if (meta.until) this.untilLost.set(meta.id, meta.until), (meta.until = undefined);
       // A chat titled from a message the agent's harness wrote (`<task-notification>`): its plain words.
@@ -1136,8 +1206,8 @@ export class App {
     rt.onTurnEnd = (r, error, opts) => this.afterTurn(r, error, opts?.hold);
     // Background work met a plan limit with no turn running: the chat's limit, decided once (limit-policy.ts).
     rt.onBackgroundLimit = (r, hit) => this.limitInBackground(r, hit);
-    // At rest: a chat a limit moved away goes back once that account takes work again.
-    rt.onRest = (r) => void setTimeout(() => void this.returnAfterLimit(r).catch((err) => this.log('return after a limit failed', (err as Error).message)), 0);
+    // At rest (the last background work ended): the moves that waited for it are looked at again.
+    rt.onRest = (r) => void setTimeout(() => this.restMoves(r), 0);
     // A queued message a phone was taking back is released: the queue goes on if it waited for it.
     rt.onQueueReleased = (r) => {
       if (!this.drainWaiting.delete(r.id)) return;
@@ -1185,12 +1255,22 @@ export class App {
   private loadInto(rt: SessionRuntime, file: ReturnType<Store['loadSession']>) {
     // No agent process carries anything from before: background sub-agents and workflows ended with it
     // (stopped as read, so the count never shows them, also not on the way).
-    rt.loadRestored(file.items, file.todos, file.queue ?? []);
+    const lostNames = rt.loadRestored(file.items, file.todos, file.queue ?? []);
+    // A message Sable sent that came back as one "From the Claude app" (D-own): merged into its own card,
+    // only where the agent's own id for it proves they are one message.
+    for (const id of ownReplays(rt.items)) rt.remove(id);
     // A file that is there but cannot be read is left exactly as it is (nothing is written to it).
     if (file.unreadable) {
       this.unreadable.add(rt.id);
       rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Restart Sable to try again.');
     }
+    // Its turn ran when Sable closed: the bridge knows it was cut, and says so once ("Ended early"),
+    // at the time of the turn's last item, never now (the chat may be read hours later).
+    const cutAt = this.cutAtRestart.delete(rt.id) && !file.unreadable ? lastAct(rt.items) : undefined;
+    if (cutAt !== undefined) rt.cutTurn('restart', { at: cutAt });
+    // Background commands still running when Sable closed were lost with it (D-lost): said once, where the
+    // chat stopped, their names on demand (the agent hears it with its next message, `takeLost`).
+    if (lostNames.length && !file.unreadable) rt.add<NoticeItem>({ type: 'notice', variant: 'info', text: lostLine(lostNames.length, 'restart'), detail: lostNames.join('\n'), ts: lastAct(rt.items) });
     // What was in flight when Sable closed ended then, not now (the chat may be opened much later).
     rt.settle('cancelled', { endUnknown: true });
     // Messages still waiting for the agent when Sable closed (a steer not taken yet) would wait forever: back to the queue.
@@ -1268,6 +1348,18 @@ export class App {
       }
     }
     still(ctx);
+    // From here to the agent's own dispatch the message is on its way: no move or agent switch begins
+    // under it (D6). One asked for meanwhile waits for it, and then finds the chat working.
+    const sent = this.beginDispatch(rt);
+    try {
+      await this.dispatchNow(rt, text, attachments, extra, ctx);
+    } finally {
+      sent();
+    }
+  }
+
+  /** The message goes to the agent: shown in the timeline (steered into a running turn) and sent. */
+  private async dispatchNow(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: Pick<UserItem, 'until'>, ctx?: CallContext) {
     const addUser = () => {
       if (rt.meta.titleSource === 'auto' && !rt.items.some((i) => i.type === 'user')) {
         rt.update({ title: extra?.until?.check ? autoTitle(`Until ${extra.until.check.command} passes`) : autoTitle(text) });
@@ -1348,6 +1440,25 @@ export class App {
       return;
     }
     gone();
+    // The chat began moving to another account after all (a move whose wait for this message ran
+    // out), a limit's transition began while the message got ready, or its agent was replaced
+    // or let go meanwhile (a close, a lane's release: a Claude session let go refuses every message):
+    // the message never goes to an account it is leaving or a process that was let go (D6). It waits
+    // in the queue and goes where the chat is then.
+    const holding = this.sendHolds.has(rt.id) && !rt.turnActive;
+    if (this.moving.has(rt.id) || holding || rt.handle !== handle) {
+      if (early) rt.remove(early.id);
+      if (early && !rt.turnActive && rt.meta.status === 'starting') rt.update({ status: 'idle' });
+      if (holding && !this.moving.has(rt.id)) return void this.queueBehindHold(rt, text, attachments, ctx);
+      const q = rt.enqueue(text, attachments);
+      if (ctx?.allowed) this.queueGuards.set(q.id, ctx);
+      if (this.moving.has(rt.id)) this.queuedWhileMoving.add(rt.id);
+      else
+        setTimeout(() => {
+          if (!rt.turnActive && !rt.stopRequested && !this.moving.has(rt.id) && this.sessions.get(rt.id) === rt) this.sendNextQueued(rt);
+        }, 0);
+      return;
+    }
     const item = early ?? addUser();
     const runningSince = item.steered ? rt.turnStartedAt : undefined;
     const unhand = this.handOver(rt, item.id);
@@ -1392,6 +1503,8 @@ export class App {
   /**
    * The message as the agent gets it: after a move to another account without the conversation, the
    * summary goes first (once); after a switch of agent, the handover of what that agent has not seen.
+   * Background commands lost with a process since the agent was last told are named right after the
+   * person's words (shared/synthetic.ts `lostTasksNote`), before any note.
    */
   private withHandover(rt: SessionRuntime, item: UserItem): { item: UserItem; taken: () => void } {
     // A slash command takes nothing before or after it (the agent would read it as its words): what
@@ -1400,19 +1513,38 @@ export class App {
     const pending = rt.meta.agentHandover;
     const kept = this.handovers.get(rt.id);
     const moved = rt.meta.moveNote;
+    const lost = this.lostToTell(rt);
     // A summary of the whole conversation covers what a switch would hand over.
     const summary = kept ?? ((moved?.summary ? this.moveSummaryText(rt, moved.summary, moved.skip) : '') || (pending ? this.agentHandoverText(rt, pending, item.id) : ''));
     // After a move to another account: a short note after the person's words, once.
-    const note = moved ? this.moveNoteText(rt, moved.line, item.id) : '';
+    const note = moved ? this.moveNoteText(rt, moved.line, item.id, lost.length > 0) : '';
     // All of it is let go only once the agent took the message (review wave 8, #22): a send that
     // never went out (a phone removed meanwhile, the agent not starting) leaves it for the next one.
     const taken = () => {
       if (pending && rt.meta.agentHandover === pending) rt.update({ agentHandover: null });
       if (kept !== undefined && this.handovers.get(rt.id) === kept) this.handovers.delete(rt.id);
       if (moved && rt.meta.moveNote === moved) rt.update({ moveNote: null });
+      if (lost.length && this.untold.get(rt.id) === lost) this.untold.delete(rt.id);
     };
-    if (!summary && !note) return { item, taken };
-    return { item: { ...item, text: `${summary ? `${summary}${HANDOVER_JOIN}` : ''}${item.text}${note ? `\n\n${note}` : ''}` }, taken };
+    if (!summary && !note && !lost.length) return { item, taken };
+    return { item: { ...item, text: `${summary ? `${summary}${HANDOVER_JOIN}` : ''}${item.text}${lostTasksNote(lost)}${note ? `\n\n${note}` : ''}` }, taken };
+  }
+
+  /**
+   * Per chat, lost background tasks taken from the runtime for a message the agent has not accepted
+   * yet: named again with the next one until one goes through (`withHandover`'s `taken`).
+   */
+  private untold = new Map<string, string[]>();
+
+  /** The lost tasks to name with the message going out now: those not told yet, then any lost since. */
+  private lostToTell(rt: SessionRuntime): string[] {
+    const fresh = rt.takeLost();
+    const kept = this.untold.get(rt.id);
+    if (!fresh.length) return kept ?? [];
+    // Bounded as the runtime bounds one list (its own "N more" included).
+    const all = [...(kept ?? []), ...fresh].slice(-26);
+    this.untold.set(rt.id, all);
+    return all;
   }
 
   /** The summary a move without the conversation carries: the chat before its switch line, as it stood then. */
@@ -1421,10 +1553,14 @@ export class App {
     return handoverText(withoutChecks(at >= 0 ? rt.items.slice(0, at) : rt.items), { skip });
   }
 
-  /** The note after a move: what the person waits on and the open todos, as the chat stood at its switch line. */
-  private moveNoteText(rt: SessionRuntime, line: string, skip: string): string {
+  /**
+   * The note after a move: what the person waits on and the open todos, as the chat stood at its
+   * switch line. `lost`: the same message names background tasks lost on the way (nothing else
+   * changed would be untrue).
+   */
+  private moveNoteText(rt: SessionRuntime, line: string, skip: string, lost = false): string {
     const at = rt.items.findIndex((i) => i.id === line);
-    return moveNote(at >= 0 ? rt.items.slice(0, at) : rt.items, rt.todos, { skip });
+    return moveNote(at >= 0 ? rt.items.slice(0, at) : rt.items, rt.todos, { skip, lost });
   }
 
   /** What an agent the chat switched to has not seen: the whole chat, or what happened since it was left (`since`). */
@@ -1742,8 +1878,32 @@ export class App {
       rt.notice('info', capReason(name, reached), 'No other account is under its cap, so this chat stays here');
       return;
     }
-    this.movedByLimit(rt, from, next, reached.resetsAt);
-    await this.switchAccount(rt, next, { line: `Moved to ${this.accountLabel(provider, next)}: ${capReason(name, reached)}` });
+    // Sable's own move, which can wait: never under work that still runs in the process it would
+    // close (a sub-agent, a young command); the end of that work looks again (`restMoves`).
+    if (this.holdsMove(this.workOf(rt))) return this.recheckWhenFree(rt);
+    const label = this.accountLabel(provider, next);
+    try {
+      // What the move leaves behind (where it goes back, where new chats start) only once it happened.
+      await this.switchAccount(rt, next, { line: `Moved to ${label}: ${capReason(name, reached)}`, waits: true, onMoved: () => this.movedByLimit(rt, from, next, reached.resetsAt) });
+    } catch (err) {
+      this.autoMoveFailed(rt, err, `Could not move to ${label}`);
+    }
+  }
+
+  /**
+   * A move Sable made by itself did not happen. Refused for now (the chat works: `NotNow`), it is
+   * looked at again at the next rest; a removed phone or a closed chat needs nothing. Anything else is
+   * said in the chat, once, with why (`text`: what did not happen).
+   */
+  private autoMoveFailed(rt: SessionRuntime, err: unknown, text: string) {
+    if (err instanceof CallerGone || this.sessions.get(rt.id) !== rt) return;
+    if (err instanceof NotNow) {
+      this.log('a move waits:', (err as Error).message);
+      this.recheckWhenFree(rt);
+      return;
+    }
+    this.log(`${text}:`, (err as Error).message);
+    rt.add<NoticeItem>({ type: 'notice', variant: 'error', level: 'warn', text, detail: (err as Error).message });
   }
 
   /**
@@ -1753,6 +1913,18 @@ export class App {
    * Spare started (`spare`) never moves: it waits again instead (`SpareWaits.limitHit`).
    */
   private async onLimitHit(rt: SessionRuntime, notice: NoticeItem, spare = false, settleMs = this.backgroundLimitMs?.settle ?? BACKGROUND_LIMIT_SETTLE_MS) {
+    try {
+      await this.decideLimit(rt, notice, spare, settleMs);
+    } finally {
+      // Decided: a later refusal (a turn the agent wakes for) is not folded into this card unseen, where
+      // nothing would decide it again; it gets a card of its own (D4). While background work still runs
+      // on the account, its refusals still belong to this one.
+      const card = rt.get<NoticeItem>(notice.id);
+      if (!spare && rt.limitCard === notice.id && card?.limit?.provider && !card.limit.moving && !(rt.meta.background ?? 0)) rt.limitCard = undefined;
+    }
+  }
+
+  private async decideLimit(rt: SessionRuntime, notice: NoticeItem, spare: boolean, settleMs: number) {
     const provider = rt.meta.provider;
     const accountId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
     // Still the same chat, open and on this account after every wait below (review wave 16, #10).
@@ -1807,8 +1979,13 @@ export class App {
           // gets a short while to end by itself, then what is left stops at the limit (limit-policy.ts).
           await this.settleBackground(rt, limit, settleMs);
           if (rt.turnActive || this.moving.has(rt.id) || rt.get<NoticeItem>(notice.id)?.limit?.continuedWith || !open()) return;
-          this.movedByLimit(rt, accountId, next, full?.resetsAt ?? limit.resetsAt);
-          await this.switchAccount(rt, next, { retry: true });
+          try {
+            // Where it goes back and where new chats start meanwhile: written only for a move that
+            // happens, before the refused message goes out again there (D5).
+            await this.switchAccount(rt, next, { retry: true, onMoved: () => this.movedByLimit(rt, accountId, next, full?.resetsAt ?? limit.resetsAt) });
+          } catch (err) {
+            this.autoMoveFailed(rt, err, `Could not continue with ${this.accountLabel(provider, next)}`);
+          }
         })(),
       );
     } finally {
@@ -1820,6 +1997,8 @@ export class App {
 
   /** Per chat, a limit met by its background work and not decided yet (`limitInBackground`). */
   private bgLimits = new Map<string, { first: number; last: number; timer?: NodeJS.Timeout; card: string }>();
+  /** Limit cards written for background work, not for a turn of the person's (`resumeMessage`: nothing of theirs to send again). */
+  private bgCards = new Set<string>();
 
   /**
    * Background work met a plan limit while the chat's own turn is over (limit-policy.ts has the
@@ -1843,6 +2022,7 @@ export class App {
     if (!open) {
       open = rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'You have reached your usage limit.', ...(hit.detail ? { detail: hit.detail } : {}), limit: { resetsAt: hit.resetsAt, window: hit.window } });
       rt.limitCard = open.id;
+      this.bgCards.add(open.id);
     } else if (open.limit && (!open.limit.resetsAt || !open.limit.window) && (hit.resetsAt || hit.window)) {
       rt.patch<NoticeItem>(open.id, { limit: { ...open.limit, resetsAt: open.limit.resetsAt ?? hit.resetsAt, window: open.limit.window ?? hit.window } });
     }
@@ -1902,6 +2082,9 @@ export class App {
           .then(() => true),
       );
     }
+    // A turn began while they were being stopped (a notification woke the agent; Claude Code then
+    // stops nothing): none of them is taken for unstoppable, and a move waits for that turn (D2).
+    if (result === false && rt.turnActive) return;
     const failed = new Set(result === true ? [] : result === false ? running : result.failed.filter((id) => running.includes(id)));
     const done = new Set(running.filter((id) => !failed.has(id)));
     if (done.size) rt.stopAtLimit((i) => done.has(i.id), limit);
@@ -1909,11 +2092,43 @@ export class App {
     this.log('background work at a limit: its stop was not confirmed for', failed.size);
     this.unstoppable.set(rt.id, new Set([...(this.unstoppable.get(rt.id) ?? []), ...failed]));
     const n = failed.size;
-    rt.notice('info', `${n === 1 ? 'A sub-agent' : `${n} sub-agents`} could not be stopped`, `${n === 1 ? 'It' : 'They'} may still be working on ${this.accountLabel(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT)}.`);
+    const note = rt.notice('info', `${n === 1 ? 'A sub-agent' : `${n} sub-agents`} could not be stopped`, `${n === 1 ? 'It' : 'They'} may still be working on ${this.accountLabel(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT)}.`);
+    this.unstoppableNotes.set(rt.id, [...(this.unstoppableNotes.get(rt.id) ?? []), { notice: note.id, steps: [...failed] }]);
   }
 
   /** Per chat, background steps whose stop at a limit was not confirmed: a move goes ahead beside them. */
   private unstoppable = new Map<string, Set<string>>();
+  /** Per chat, the lines that said such steps may still be working, with the steps each names. */
+  private unstoppableNotes = new Map<string, { notice: string; steps: string[] }[]>();
+
+  /**
+   * Sub-agents a limit could not stop that the move's close ended after all (their process went with
+   * it, moves-M2): at the limit they read as stopped by it and are named to the agent with the
+   * carry-on, and a line that said they may still be working says what became of them.
+   */
+  private endedByMove(rt: SessionRuntime, ended: string[], limit: { window?: string; resetsAt?: number } | undefined, label: string) {
+    if (!ended.length) return;
+    const gone = new Set(ended);
+    if (limit) {
+      for (const id of ended) {
+        const i = rt.get<ToolItem>(id);
+        if (!i || i.result?.agent?.limit) continue;
+        const agent = { ...i.result?.agent, limit: { window: limit.window ?? 'Plan limit', ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}) } };
+        rt.patch<ToolItem>(id, { result: { ...i.result, agent } });
+      }
+    }
+    const left = this.unstoppable.get(rt.id);
+    if (left) for (const id of ended) left.delete(id);
+    const notes = this.unstoppableNotes.get(rt.id) ?? [];
+    const keep = notes.filter((n) => {
+      if (!n.steps.every((id) => gone.has(id) || !worksInBackground(rt.get(id)))) return true;
+      const note = rt.get<NoticeItem>(n.notice);
+      if (note) rt.patch<NoticeItem>(n.notice, { detail: `${n.steps.length === 1 ? 'It' : 'They'} stopped when the chat moved to ${label}.` });
+      return false;
+    });
+    if (keep.length) this.unstoppableNotes.set(rt.id, keep);
+    else this.unstoppableNotes.delete(rt.id);
+  }
 
   /** Remembers a limit handover: the session's preferred account, and where new sessions go meanwhile. */
   private movedByLimit(rt: SessionRuntime, from: string, to: string, until?: number) {
@@ -2023,18 +2238,110 @@ export class App {
     this.bgLimits.delete(rt.id);
     clearTimeout(this.returnTimers.get(rt.id));
     this.returnTimers.delete(rt.id);
+    clearTimeout(this.workTimers.get(rt.id));
+    this.workTimers.delete(rt.id);
+  }
+
+  /**
+   * The work a chat holds now: one reading for every move, the agent switch and `atRest`. Its turn
+   * (one Sable began, or one the agent runs by itself and says so), sub-agents and workflows working
+   * in the background, background commands and monitors (the larger of the chat's own count and the
+   * agent's word), and until when that work holds a move Sable can postpone (`holds`): a command
+   * younger than 30 minutes, a wake-up the agent scheduled within the hour. An older command (a
+   * server) holds nothing, or it would hold the move for good.
+   */
+  private workOf(rt: SessionRuntime, now = Date.now()): ChatWork {
+    let live: LiveWork | undefined;
+    try {
+      live = rt.handle?.liveWork?.();
+    } catch {
+      live = undefined;
+    }
+    let holds: number | undefined;
+    const newest = rt.newestCommandAt;
+    if (newest !== undefined) holds = newest + COMMAND_HOLDS_MS;
+    // The agent names only when its oldest command began: when even that one is young, all are.
+    if (live?.commands && live.oldestCommandAt !== undefined) holds = Math.max(holds ?? 0, live.oldestCommandAt + COMMAND_HOLDS_MS);
+    if (live?.wakeAt !== undefined && live.wakeAt > now && live.wakeAt - now <= WAKE_HOLDS_MS) holds = Math.max(holds ?? 0, live.wakeAt);
+    return {
+      turn: rt.turnActive || !!live?.turn,
+      agents: Math.max(rt.meta.background ?? 0, live?.agents ?? 0),
+      commands: Math.max(rt.meta.commands ?? 0, live?.commands ?? 0),
+      ...(holds !== undefined && holds > now ? { holds } : {}),
+    };
+  }
+
+  /**
+   * The agent says it runs a turn where Sable runs none: most often its word of the end is a moment
+   * behind the turn's result (a compaction just ended). Given that moment (bounded) before a move
+   * reads it as work; a turn that really runs is still there after it.
+   */
+  private async settleLiveTurn(rt: SessionRuntime) {
+    const end = Date.now() + LIVE_TURN_SETTLE_MS;
+    while (!rt.turnActive && this.workOf(rt).turn && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
+  }
+
+  /** Whether the agent of `handle` says it runs a turn now (one Sable knows or not); an agent that cannot say is taken at its word for none. */
+  private agentWorks(handle: ProviderSession): boolean {
+    try {
+      return !!handle.liveWork?.().turn;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether the chat's work holds a move Sable decides by itself and can postpone (a return, a cap or credits move). */
+  private holdsMove(w: ChatWork): boolean {
+    return w.turn || w.agents > 0 || w.holds !== undefined;
+  }
+
+  /** Per chat, the timer that looks at the moves that wait again once what held them ages out of it (`recheckWhenFree`). */
+  private workTimers = new Map<string, NodeJS.Timeout>();
+
+  /**
+   * A move that can wait was held. A turn's end or the last background work's end looks again by
+   * itself (`afterTurn`, `restMoves`); what holds it only by its age (a young command still running,
+   * a wake-up due) is looked at again once it no longer does, and a turn only the agent knows of
+   * shortly.
+   */
+  private recheckWhenFree(rt: SessionRuntime) {
+    if (this.disposed || this.sessions.get(rt.id) !== rt) return;
+    const w = this.workOf(rt);
+    // The agent says it works where Sable runs no turn (its word of the end is on its way, or a turn of
+    // its own is about to begin, which then ends by itself): looked at again shortly.
+    const at = w.turn ? (rt.turnActive ? undefined : Date.now() + LIVE_TURN_RECHECK_MS) : w.agents > 0 ? undefined : w.holds;
+    if (at === undefined) return;
+    clearTimeout(this.workTimers.get(rt.id));
+    const timer = setTimeout(
+      () => {
+        this.workTimers.delete(rt.id);
+        this.restMoves(rt);
+      },
+      Math.min(Math.max(0, at - Date.now()) + (w.turn ? 0 : 1000), 6 * 3600_000),
+    );
+    timer.unref?.();
+    this.workTimers.set(rt.id, timer);
+  }
+
+  /** At rest (the last background work ended, or what held a move aged out of it): the moves that waited are looked at again. */
+  private restMoves(rt: SessionRuntime) {
+    if (this.disposed || this.sessions.get(rt.id) !== rt) return;
+    void this.checkCap(rt)
+      .then(() => this.returnAfterLimit(rt))
+      .catch((err) => this.log('return after a limit failed', (err as Error).message));
   }
 
   /** The chat is at rest and no transition or send of it runs: nothing visible is in the way of a move. */
   private atRest(rt: SessionRuntime): boolean {
     return (
       this.sessions.get(rt.id) === rt &&
-      !rt.turnActive &&
-      !(rt.meta.background ?? 0) &&
+      // No turn, no sub-agent, no young command or wake-up due (an older command does not hold it).
+      !this.holdsMove(this.workOf(rt)) &&
       !this.moving.has(rt.id) &&
       !this.switching.has(rt.id) &&
       !this.opening.has(rt.id) &&
       !this.delivering.has(rt.id) &&
+      !this.dispatching.has(rt.id) &&
       !this.compacting.has(rt.id) &&
       (!(this.sending.get(rt.id) ?? 0) || this.sendWaits.has(rt.id)) &&
       // Closed or stopped by the person: nothing moves it until they send again.
@@ -2072,7 +2379,8 @@ export class App {
     };
     // Back on it already, or the account is gone: nothing is owed any more.
     if (from === current || !this.findAccount(provider, from)) return forget();
-    if (!this.atRest(rt)) return;
+    // Held by work in the process the move would close: the end of that work looks again.
+    if (!this.atRest(rt)) return this.recheckWhenFree(rt);
     const at = rt.meta.returnAt;
     if (at && Date.now() < at) return this.armReturn(rt);
     const key = `${rt.id}:${from}:${at ?? ''}`;
@@ -2124,13 +2432,17 @@ export class App {
     // stays owed and is looked at again at the next start or the person's next message.
     if (to && (this.lazy.has(rt.id) || this.unreadable.has(rt.id))) return;
     // Only at rest, looked at again after the wait (never mid-turn, never beside another transition).
-    if (!to || !still() || !this.atRest(rt)) return;
+    if (!to || !still()) return;
+    if (!this.atRest(rt)) return this.recheckWhenFree(rt);
     this.returned.add(key);
     try {
-      await this.switchAccount(rt, to, { line: `Back on ${this.accountLabel(provider, to)}` });
+      // Sable's own move, which can wait for work in the background (`waits`), and never compacts by
+      // itself (moves-M1): the person did not ask for it, and every bounce would cost working detail.
+      await this.switchAccount(rt, to, { line: `Back on ${this.accountLabel(provider, to)}`, compact: false, waits: true });
     } catch (err) {
-      // Not moved: the chat still owes its return, tried again later.
+      // Not moved: the chat still owes its return, tried again later (by the work's end when it was busy).
       this.returned.delete(key);
+      if (err instanceof NotNow) return this.recheckWhenFree(rt);
       if (still()) inconclusive();
       throw err;
     }
@@ -2154,9 +2466,16 @@ export class App {
     if (decision === 'credits' || rt.turnActive) return;
     const until = meta?.extra?.resetsAt ?? meta?.credits?.resetsAt;
     if (decision === 'next' && next) {
-      this.movedByLimit(rt, accountId, next, until);
-      // Past its limit: a compaction there would be paid for with credits.
-      await this.switchAccount(rt, next, { compact: false });
+      // Sable's own move, which can wait for work in the background: the next turn's end looks again
+      // (the turn that work's end wakes, or the person's next).
+      if (this.holdsMove(this.workOf(rt))) return;
+      try {
+        // Past its limit: a compaction there would be paid for with credits. What the move leaves
+        // behind only once it happened (D5).
+        await this.switchAccount(rt, next, { compact: false, waits: true, onMoved: () => this.movedByLimit(rt, accountId, next, until) });
+      } catch (err) {
+        this.autoMoveFailed(rt, err, `Could not move to ${this.accountLabel(provider, next)}`);
+      }
       return;
     }
     const key = `${rt.id}:${accountId}:${until ?? ''}`;
@@ -2197,12 +2516,12 @@ export class App {
    * of starting the task over (the conversation came along, or the summary shows what was done),
    * and nothing new appears in the conversation.
    */
-  private resumeMessage(rt: SessionRuntime, refused: UserItem, carried: 'conversation' | 'summary' | 'none' | 'reset'): UserItem {
+  private resumeMessage(rt: SessionRuntime, refused: UserItem, carried: 'conversation' | 'summary' | 'none' | 'reset', ended: readonly string[] = []): UserItem {
     const from = rt.items.findIndex((i) => i.id === refused.id);
     const progressed = from >= 0 && rt.items.slice(from + 1).some((i) => (i.type === 'text' && i.text.trim()) || i.type === 'tool');
     // The limit met the chat's background work (its own turn had ended): nothing of the person's to send again.
     const card = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.parentId);
-    const background = !!card && card.id === rt.limitCard;
+    const background = !!card && (card.id === rt.limitCard || this.bgCards.has(card.id));
     if (!progressed && !background) return refused;
     const text =
       carried === 'reset'
@@ -2210,8 +2529,9 @@ export class App {
         : carried === 'conversation' || background
           ? RESUME_UNDER_ANOTHER
           : `${refused.text}${RESUME_SUMMARY_TRAILER}`;
-    // Background agents the same limit stopped: named, so the agent can start again what is still needed.
-    const stopped = resumeBackgroundNote(limitStoppedAgents(rt.items, rt.takeLimitStopped()));
+    // Background agents the same limit stopped (`ended`: those the move's close ended after all):
+    // named, so the agent can start again what is still needed.
+    const stopped = resumeBackgroundNote(limitStoppedAgents(rt.items, new Set([...rt.takeLimitStopped(), ...ended])));
     return { id: randomUUID(), ts: Date.now(), type: 'user', text: `${text}${stopped}`, state: 'sent' };
   }
 
@@ -2394,6 +2714,13 @@ export class App {
     this.hydrate(rt);
     const handle = await this.ensureHandle(rt);
     await this.applyDue(rt, handle);
+    // The agent's process may still hold the refused message (a request of other work was refused,
+    // and the message waits behind it): it runs it by itself once its sign-in is renewed, and a second
+    // send would make it run twice (C5). So the message goes again only once the agent says it is not
+    // working (bounded); a turn that begins meanwhile is the agent taking it, and nothing is sent.
+    const end = Date.now() + SIGN_IN_HOLD_MS;
+    while (this.agentWorks(handle) && Date.now() < end && this.sameRefusal(rt, mark) && rt.handle === handle) await new Promise((r) => setTimeout(r, 100));
+    if (this.agentWorks(handle) || rt.handle !== handle) return;
     // Checked again right before it goes: what was refused is still the chat's last word (#8).
     if (!this.sameRefusal(rt, mark) || mark.refusedId !== refused.id) return;
     const at = rt.items.findIndex((i) => i.id === refused.id);
@@ -2449,17 +2776,19 @@ export class App {
   async switchAccount(
     rt: SessionRuntime,
     accountId: string,
-    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void } = {},
+    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void; waits?: boolean; onMoved?: () => void } = {},
     ctx?: CallContext,
   ): Promise<RpcMethods['session.switchAccount']['result']> {
     this.hydrate(rt);
-    if (rt.turnActive) throw new Error('The agent is still working. Stop it first.');
-    if (this.moving.has(rt.id)) throw new Error('This chat is moving to another account already.');
-    // One transition at a time (review wave 8, #10): never while its agent is still starting (its
-    // handle would come up on the account it leaves), while it switches agent, or while background
-    // work runs in the process the move would close.
-    if (this.opening.has(rt.id) || this.delivering.has(rt.id)) throw new Error('The agent is still starting. Move when it is ready.');
-    if (this.switching.has(rt.id)) throw new Error('This chat is switching agent. Move when it is done.');
+    // One transition at a time, never under work (review wave 8, #10; D-moves).
+    await this.settleLiveTurn(rt);
+    this.refuseBusy(rt, opts.waits);
+    // A message already on its way to the agent goes first (D6): the move never closes the process it
+    // is being handed to. Then everything is looked at again (it has usually begun a turn).
+    if (this.dispatching.has(rt.id)) {
+      await this.untilDispatched(rt);
+      this.refuseBusy(rt, opts.waits, true);
+    }
     // At a limit (the notice's move, by itself or by the click): what still runs works on the account
     // at its limit and is refused with its next request, so it stops at the limit and the chat moves.
     const atLimit = opts.retry ? rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId) : undefined;
@@ -2472,28 +2801,123 @@ export class App {
     let moving = false;
     let compacted = false;
     const stops = this.stopsOf(rt);
+    const closes = this.closesOf(rt);
     try {
-      if (atLimit?.limit && rt.items.some((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)) && (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId && !this.moving.has(rt.id)) await this.stopLiveBackground(rt, atLimit.limit);
+      if (atLimit?.limit && rt.items.some((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)) && (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId && !this.moving.has(rt.id)) {
+        await this.stopLiveBackground(rt, atLimit.limit);
+        // A turn began while they were stopped (a notification woke the agent): the move waits for
+        // that turn's end, which is refused at the limit too and decides again (D2).
+        if (this.workOf(rt).turn) throw new NotNow('The agent is still working. Stop it first.');
+      }
       // Work a limit's stop could not end does not hold the move (it stays on the account it ran on).
       const left = this.unstoppable.get(rt.id);
-      if (rt.items.some((i) => worksInBackground(i) && !left?.has(i.id))) throw new Error('Background work is still running in this chat. Move when it is done.');
+      if (rt.items.some((i) => worksInBackground(i) && !left?.has(i.id))) throw new NotNow('Background work is still running in this chat. Move when it is done.');
       if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) return { ok: true, carried: 'none' };
-      // Another move of this chat began while the background work was stopped: one at a time.
-      if (this.moving.has(rt.id)) throw new Error('This chat is moving to another account already.');
+      // Anything that began while the background work was stopped (another move, a message): one at a time.
+      this.refuseBusy(rt, opts.waits, true);
       this.moving.add(rt.id);
+      // The header's account menu shows the move for as long as it runs (D8).
+      rt.update({ moving: true });
       moving = true;
       return await this.moveAccount(rt, accountId, target, opts, ctx, () => (compacted = true));
     } finally {
       const holds = (this.movingTo.get(to) ?? 1) - 1;
       if (holds > 0) this.movingTo.set(to, holds);
       else this.movingTo.delete(to);
-      if (moving) this.moved(rt, stops, compacted);
+      const remote = this.remoteBack.delete(rt.id);
+      if (moving) {
+        this.moved(rt, stops, compacted);
+        if (remote && (rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId) this.reopenRemote(rt, { stops, closes, accountId });
+      }
     }
+  }
+
+  /**
+   * Refuses a move for now (`NotNow`) while the chat is busy (D-moves): a turn runs (one the agent
+   * began by itself too), another move or a switch of agent runs, its agent is still starting (its
+   * handle would come up on the account it leaves), and (`sent`, once a wait for it is over) a message
+   * is on its way to the agent. A move Sable decides by itself and that can wait (`waits`) is also
+   * held while sub-agents work or a young background command runs; one the person asks for, or one at
+   * a limit, goes ahead beside commands, which are lost with the process (the switch line names them).
+   */
+  private refuseBusy(rt: SessionRuntime, waits = false, sent = false) {
+    const w = this.workOf(rt);
+    if (w.turn) throw new NotNow('The agent is still working. Stop it first.');
+    if (this.moving.has(rt.id)) throw new NotNow('This chat is moving to another account already.');
+    if (this.opening.has(rt.id) || this.delivering.has(rt.id)) throw new NotNow('The agent is still starting. Move when it is ready.');
+    if (this.switching.has(rt.id)) throw new NotNow('This chat is switching agent. Move when it is done.');
+    if (sent && this.dispatching.has(rt.id)) throw new NotNow('A message is on its way to the agent. Move once it is sent.');
+    if (waits && this.holdsMove(w)) throw new NotNow(w.agents ? 'Background work is still running in this chat. It moves once that is done.' : 'A background command is still running in this chat. It moves once that is done.');
+  }
+
+  /** Per chat, sends past their own checks and on their way to the agent (`deliverNow`): no move or agent switch begins under one. */
+  private dispatching = new Map<string, Set<Promise<void>>>();
+
+  /** A send of the chat is on its way to its agent until the returned function is called. */
+  private beginDispatch(rt: SessionRuntime): () => void {
+    let done!: () => void;
+    const p = new Promise<void>((r) => (done = r));
+    let set = this.dispatching.get(rt.id);
+    if (!set) this.dispatching.set(rt.id, (set = new Set()));
+    const own = set;
+    own.add(p);
+    return () => {
+      own.delete(p);
+      if (!own.size && this.dispatching.get(rt.id) === own) this.dispatching.delete(rt.id);
+      done();
+    };
+  }
+
+  /** Waits until no message of the chat is on its way to its agent (bounded: `DISPATCH_WAIT_MS`). */
+  private async untilDispatched(rt: SessionRuntime) {
+    const end = Date.now() + DISPATCH_WAIT_MS;
+    for (let set = this.dispatching.get(rt.id); set?.size && Date.now() < end; set = this.dispatching.get(rt.id)) {
+      await boundedBy(Promise.all([...set]), Math.max(0, end - Date.now()), undefined);
+    }
+  }
+
+  /** Chats whose move closed a process that held a live Remote Control link: it is opened again on the new account (`reopenRemote`). */
+  private remoteBack = new Set<string>();
+  /** Remote Control processes opened again after moves, one after another. */
+  private remoteReopens: Promise<void> = Promise.resolve();
+
+  /**
+   * After a move, a chat whose Remote Control was live gets its agent process back on the new account
+   * (D3), so the Claude app reaches it again without a message from the desktop first. Paced: one at
+   * a time and a few seconds apart (a reset returns many chats at once, and each start goes through its
+   * account's sign-in gate). Never for a chat closed, stopped, moved or switched meanwhile, one whose
+   * Remote Control was turned off, or one whose agent is already there (a carry-on opened it).
+   */
+  private reopenRemote(rt: SessionRuntime, mark: { stops: number; closes: number; accountId: string }) {
+    const due = () =>
+      !this.disposed &&
+      this.sessions.get(rt.id) === rt &&
+      !!rt.meta.options?.remoteControl &&
+      !rt.handle &&
+      !this.opening.has(rt.id) &&
+      !this.moving.has(rt.id) &&
+      !this.switching.has(rt.id) &&
+      this.stopsOf(rt) === mark.stops &&
+      this.closesOf(rt) === mark.closes &&
+      (rt.meta.accountId ?? DEFAULT_ACCOUNT) === mark.accountId;
+    if (!due()) return;
+    this.remoteReopens = this.remoteReopens.then(async () => {
+      if (!due()) return;
+      try {
+        const handle = await this.ensureHandle(rt);
+        // Claude Code starts Remote Control when asked, as a new chat's start asks it.
+        if (rt.meta.provider === 'claude' && rt.handle === handle && rt.meta.options) await handle.setOptions?.(rt.meta.options);
+      } catch (err) {
+        this.log('Remote Control did not start again after a move', (err as Error).message);
+      }
+      await new Promise<void>((r) => void setTimeout(r, REMOTE_REOPEN_GAP_MS).unref?.());
+    });
   }
 
   /** A move ended, however: what was sent meanwhile goes out. */
   private moved(rt: SessionRuntime, stops: number, compacted: boolean) {
     this.moving.delete(rt.id);
+    if (rt.meta.moving) rt.update({ moving: false });
     // What was sent meanwhile (or waited behind the compaction) goes out on the new account; after a
     // Stop or a close meanwhile it waits for the person (review wave 8, #21).
     const waited = this.queuedWhileMoving.delete(rt.id);
@@ -2631,7 +3055,7 @@ export class App {
     rt: SessionRuntime,
     accountId: string,
     target: Provider,
-    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void },
+    opts: { retry?: boolean; line?: string; compact?: boolean; onCompacting?: () => void; onMoved?: () => void },
     ctx: CallContext | undefined,
     onCompacted: () => void,
   ): Promise<RpcMethods['session.switchAccount']['result']> {
@@ -2639,6 +3063,7 @@ export class App {
     const fromId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
     const label = this.findAccount(provider, accountId)?.label ?? 'another account';
     const refused = opts.retry ? this.refusedMessage(rt) : undefined;
+    const atLimit = opts.retry ? rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId)?.limit : undefined;
     // Closed or deleted meanwhile: the move goes no further (nothing copied, the runtime untouched);
     // stopped meanwhile: it completes, but starts no turn (review wave 8, #21).
     const closes = this.closesOf(rt);
@@ -2646,6 +3071,16 @@ export class App {
     const live = () => {
       if (this.sessions.get(rt.id) !== rt || this.closesOf(rt) !== closes) throw new Error('The chat was closed during the move.');
       still(ctx);
+    };
+    // Up to the close, after every wait: a turn that began meanwhile (a notification woke the agent, a
+    // message came by Remote Control) is never closed under; the move backs out with nothing changed (D2).
+    const check = () => {
+      live();
+      if (this.workOf(rt).turn) throw new NotNow('The agent is still working. Stop it first.');
+    };
+    const ready = async () => {
+      await this.settleLiveTurn(rt);
+      check();
     };
     // Whether the old account's transcript is whole: false when its agent may still be writing it
     // (a compaction that did not say it stopped, a close that failed or hung). Then it is not copied
@@ -2658,39 +3093,67 @@ export class App {
     if (rt.meta.providerSessionId && target.adoptConversation && bigContext(tokens, rt.meta.usage.contextWindow)) {
       const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId, rt.meta.cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId));
       const can = opts.compact !== false && !opts.retry && caps?.features.compact !== false && (await this.canRunTurn(rt, fromId));
-      live();
-      if (can && !rt.turnActive) {
+      await ready();
+      if (can) {
         opts.onCompacting?.();
         onCompacted();
         const compacted = await this.compactBeforeMove(rt, label);
         stable = compacted.stable;
         const { stable: _s, ...rest } = compacted;
         outcome = rest as MoveOutcome;
-        live();
-        if (rt.turnActive) throw new Error('The agent is still working. Stop it first.');
+        await ready();
       } else outcome = { kind: 'asIs', tokens: tokens! };
     }
 
-    rt.cancelPrompts();
     // A start still under way is waited for (bounded) so its handle is closed here, not installed later.
     const opening = this.opening.get(rt.id);
-    if (opening) await Promise.race([opening.catch(() => {}), new Promise((r) => setTimeout(r, MOVE_CLOSE_MS))]);
+    if (opening) await boundedBy(opening.catch(() => {}), MOVE_CLOSE_MS, undefined);
+    await this.settleLiveTurn(rt);
+    // The last look, with nothing awaited between it and the close: from here the move happens.
+    check();
+    // Background commands and monitors live in the process the move closes: they are lost with it
+    // (D-lost: the switch line names them, the agent is told with its next message). Sub-agents still
+    // working are only those a limit could not stop; the close may end them after all (moves-M2).
+    rt.cancelPrompts();
+    const working = rt.items.filter((i) => worksInBackground(i)).map((i) => i.id);
+    const lost = rt.tasksLost('move');
     const old = rt.handle;
     rt.handle = undefined;
+    // Its Remote Control was live: the new account's process takes it over once the move is done (D3).
+    if (old && rt.meta.options?.remoteControl && (!!rt.meta.remote?.url || rt.meta.remote?.tone === 'ok')) this.remoteBack.add(rt.id);
     if (old) {
-      const closedOk = await Promise.race([
+      const closedOk = await boundedBy(
         Promise.resolve()
           .then(() => old.close())
           .then(
             () => true,
             (err: Error) => (this.log('the agent did not close cleanly before a move', err.message), false),
           ),
-        new Promise<false>((r) => setTimeout(() => r(false), MOVE_CLOSE_MS)),
-      ]);
+        MOVE_CLOSE_MS,
+        false,
+      );
       if (!closedOk) stable = false;
+      // The transcript is copied only once the agent's process is gone (moves-M3): one still writing it
+      // (a last result, a compaction that did not stop when asked) would leave a cut copy. An agent that
+      // says when it exited lets a move whose compaction overran carry the whole conversation after all
+      // (D7); one that cannot say keeps the rule above.
+      else if (old.exited) {
+        const exited = await boundedBy(
+          old.exited().then(
+            () => true,
+            () => false,
+          ),
+          MOVE_CLOSE_MS,
+          false,
+        );
+        if (!exited) this.log('the agent did not exit in time before a move; its transcript stays behind');
+        stable = exited;
+      }
     }
     // A caller removed while the agent closed (a phone, review wave 6, #3): no conversation is copied, nothing moves.
     live();
+    const ended = working.filter((wid) => !worksInBackground(rt.get(wid)));
+    this.endedByMove(rt, ended, atLimit, label);
 
     let carried: 'conversation' | 'summary' | 'none' = 'none';
     let summaryAt = false;
@@ -2736,17 +3199,26 @@ export class App {
     // A move by a cap says why in its own line; a move at a limit closes the limit's notice. The
     // line says what the move did to the context: compacted (before and after), or read again in full.
     const clause = contextClause(outcome, !!refused);
+    // Background commands the close lost: said on the same line, named in its detail.
+    const gone = lostClause(lost);
+    const detailOf = (d: string | undefined) => [d, gone.detail].filter(Boolean).join('\n\n') || undefined;
     const summaryLine = 'With a summary of the conversation so far';
     const open = opts.line ? undefined : rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId);
     if (open) rt.patch<NoticeItem>(open.id, { limit: { ...open.limit, continuedWith: accountId } });
     let line: NoticeItem | undefined;
-    if (opts.line) line = rt.notice('info', `${opts.line}${clause.suffix ?? ''}`, carried === 'summary' ? summaryLine : clause.detail);
+    if (opts.line) line = rt.notice('info', `${opts.line}${clause.suffix ?? ''}${gone.suffix ?? ''}`, detailOf(carried === 'summary' ? summaryLine : clause.detail));
     else if (!open || carried === 'summary') {
-      line = rt.notice('info', carried === 'summary' ? `New conversation with ${label}` : `Continued with ${label}${clause.suffix ?? ''}`, carried === 'summary' ? summaryLine : clause.detail);
+      line = rt.notice('info', carried === 'summary' ? `New conversation with ${label}${gone.suffix ?? ''}` : `Continued with ${label}${clause.suffix ?? ''}${gone.suffix ?? ''}`, detailOf(carried === 'summary' ? summaryLine : clause.detail));
     } else if (clause.suffix || clause.detail) {
       // The limit's notice says where it went; one quiet line says what that did to the context.
-      line = rt.notice('info', clause.suffix ? `Context${clause.suffix.replace(/^ · context/, '')}` : 'Carried as it is', clause.detail);
+      line = rt.notice('info', `${clause.suffix ? `Context${clause.suffix.replace(/^ · context/, '')}` : 'Carried as it is'}${gone.suffix ?? ''}`, detailOf(clause.detail));
+    } else if (lost.length) {
+      // The limit's notice says where it went; one quiet line says what the move lost.
+      line = rt.notice('info', lostLine(lost.length, 'move'), gone.names);
     }
+    // What a move Sable made by itself leaves behind (where the chat goes back, where new chats start
+    // meanwhile) is written now that it happened, and before a refused message goes out again here (D5).
+    opts.onMoved?.();
     // The first message after the move tells the agent (moveNote): anchored at the line, so what the
     // person waits on is read from before it, also after a restart.
     const anchor = line?.id ?? open?.id ?? rt.items.findLast((i) => !i.parentId)?.id;
@@ -2766,7 +3238,7 @@ export class App {
       await this.applyModeDue(rt, handle);
       const unhand = this.handOver(rt, refused.id);
       try {
-        const out = this.withHandover(rt, this.resumeMessage(rt, refused, carried));
+        const out = this.withHandover(rt, this.resumeMessage(rt, refused, carried, ended));
         await handle.send(out.item, { check: () => (still(ctx), still(this.refusedGuards.get(refused.id))) });
         this.refusedGuards.delete(refused.id);
         out.taken();
@@ -2804,10 +3276,14 @@ export class App {
     if (!this.providers.has(provider)) throw new Error(`Provider not available: ${provider}`);
     // The Customize chat only with an agent that gets its brief (`services/custom.ts`).
     if (rt.meta.custom && !customAgent(provider)) throw new Error(CUSTOM_AGENT_ONLY);
-    if (rt.turnActive || this.opening.has(rt.id) || this.delivering.has(rt.id) || this.capChecks.has(rt.id)) throw new Error('The agent is still working. Switch when it is done.');
+    // The same reading of the chat's work as every move: a turn (one the agent began by itself too), a
+    // message on its way to the agent, sub-agents working in the background. Background commands do not
+    // hold a switch the person asks for: they are lost with the process it closes, and said so.
+    const work = this.workOf(rt);
+    if (work.turn || this.opening.has(rt.id) || this.delivering.has(rt.id) || this.dispatching.has(rt.id) || this.capChecks.has(rt.id)) throw new NotNow('The agent is still working. Switch when it is done.');
     // Never over a move of account, nor two switches at once (review wave 8, #10).
-    if (this.moving.has(rt.id) || this.switching.has(rt.id)) throw new Error('This chat is changing account or agent. Switch when it is done.');
-    if (backgroundRunning(rt.items)) throw new Error('Background work is still running in this chat. Switch when it is done.');
+    if (this.moving.has(rt.id) || this.switching.has(rt.id)) throw new NotNow('This chat is changing account or agent. Switch when it is done.');
+    if (work.agents > 0 || rt.items.some(worksInBackground)) throw new NotNow('Background work is still running in this chat. Switch when it is done.');
     const cwd = rt.meta.cwd;
     if (provider !== 'demo' && !isDir(cwd)) throw new Error(`Folder not found: ${cwd}`);
     const settings = this.store.state.settings;
@@ -2831,6 +3307,8 @@ export class App {
     const prev = legs.find((l) => l.provider === from);
 
     rt.cancelPrompts();
+    // Commands still running live in the process the switch closes (D-lost): marked before it goes.
+    const lost = rt.tasksLost('process');
     this.switching.add(rt.id);
     try {
       await rt.handle?.close().catch(() => {});
@@ -2854,6 +3332,9 @@ export class App {
       if (prior?.agentSwitch && !prior.agentSwitch.past) rt.patch<NoticeItem>(prior.id, { agentSwitch: { ...prior.agentSwitch, past: true } });
       line = rt.add<NoticeItem>({ type: 'notice', variant: 'info', text: `${target ? 'Switched back to' : 'Switched to'} ${this.agentName(provider)}`, agentSwitch: { from, to: provider, ...(target ? { back: true } : {}) } });
     }
+    // The commands the closed process ran are lost with it: said once, their names on demand (the
+    // agent the chat goes on with hears it with its next message).
+    if (lost.length) rt.notice('info', lostLine(lost.length, 'process'), lost.join('\n'));
     // The agent left behind covers the chat up to this line, unless its handover never went out.
     const leaving = legOf(rt.meta, rt.meta.agentHandover ? prev?.knows : (line?.id ?? rt.items.findLast((i) => !i.parentId)?.id));
     const knows = keeps ? target!.knows : undefined;
@@ -2917,6 +3398,9 @@ export class App {
     // The compaction before a move ended: the move goes on (nothing is sent, nothing else follows).
     const compacted = this.compacting.get(rt.id);
     if (compacted) return compacted(error);
+    // Sable is going down (a close at quit cuts the turn it ran): nothing follows, no move, no check,
+    // no queued message, nothing that would start an agent again.
+    if (this.disposed) return;
     // Refused for the sign-in: asked again before it is believed (server/core/auth-gate.ts).
     const signIn = takeAuthFailure(rt.id);
     // What was refused is taken now, before anything is awaited (review wave 16, #8). Only a turn that
@@ -3966,6 +4450,8 @@ export class App {
         this.sessions.delete(sessionId);
         this.handed.delete(sessionId);
         this.pinned.delete(sessionId);
+        this.untold.delete(sessionId);
+        this.unstoppableNotes.delete(sessionId);
         this.store.deleteSession(sessionId);
         this.emit({ type: 'session.removed', id: sessionId });
         // A deleted chat takes its folder along when nothing was ever put in it.
@@ -4037,19 +4523,21 @@ export class App {
       // chat shows the compaction and then the switch line (a failure later is said there too).
       let started!: () => void;
       const compacting = new Promise<'compacting'>((resolve) => (started = () => resolve('compacting')));
-      const run = this.switchAccount(rt, accountId, { retry, onCompacting: () => started() }, ctx).then((result) => {
-        // Moved by hand: a wait for the old account's reset is over.
-        if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from) {
-          this.spare.movedByHand(rt);
-          // Carried on at a limit ("Continue with"): it goes back once that account takes work again.
-          // Any other move is the person's choice: nothing to go back to.
-          const card = retry ? rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && i.limit?.continuedWith === accountId && !i.parentId) : undefined;
-          if (card) this.movedByLimit(rt, from, accountId, card.limit?.resetsAt);
-          else {
-            rt.update({ movedFrom: undefined, returnAt: undefined });
-            this.armReturn(rt);
-          }
+      // Written as the move happens, before a refused message goes out again on the new account (a
+      // limit met again in that first turn reads where the chat came from).
+      const onMoved = () => {
+        // Carried on at a limit ("Continue with"): it goes back once that account takes work again.
+        // Any other move is the person's choice: nothing to go back to.
+        const card = retry ? rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && i.limit?.continuedWith === accountId && !i.parentId) : undefined;
+        if (card) this.movedByLimit(rt, from, accountId, card.limit?.resetsAt);
+        else {
+          rt.update({ movedFrom: undefined, returnAt: undefined });
+          this.armReturn(rt);
         }
+      };
+      const run = this.switchAccount(rt, accountId, { retry, onCompacting: () => started(), onMoved }, ctx).then((result) => {
+        // Moved by hand: a wait for the old account's reset is over.
+        if ((rt.meta.accountId ?? DEFAULT_ACCOUNT) !== from) this.spare.movedByHand(rt);
         return result;
       });
       const first = await Promise.race([run, compacting]);
@@ -4151,13 +4639,23 @@ export class App {
     this.titles.dispose();
     await this.checks.dispose();
     for (const fn of this.disposers.splice(0)) await Promise.resolve(fn()).catch(() => {});
-    for (const rt of this.sessions.values()) {
-      rt.cancelPrompts();
-      await rt.handle?.close().catch(() => {});
-    }
+    // Sable going down is said when each chat is read again, as after a crash: a turn that ran is cut
+    // as `restart` at its last item (`loadInto`), its commands are lost when Sable closed and named to
+    // the agent with its next message (`loadRestored`). So the chats are written as they stand now, and
+    // what closing their agents changes in them (a turn cut as `closed`, commands lost with the process,
+    // which no later start could tell the agent) is not. Written first, too: the desktop shell waits
+    // only a few seconds for all of this.
+    await this.store.flush();
+    this.store.seal();
+    // Every agent is let go together: a close waits for its process to end (bounded by its provider).
+    await Promise.all(
+      [...this.sessions.values()].map((rt) => {
+        rt.cancelPrompts();
+        return rt.handle?.close().catch(() => {});
+      }),
+    );
     await Promise.all([...this.providers.values(), ...this.instances.values()].map((p) => p.dispose().catch(() => {})));
     this.instances.clear();
-    await this.store.flush();
     await this.cache.flush();
   }
 }

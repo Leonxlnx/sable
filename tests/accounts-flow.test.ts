@@ -476,6 +476,22 @@ describe('at a plan limit', () => {
     expect(rt.items.filter((i) => i.type === 'user')).toHaveLength(users);
   });
 
+  it('"Continue with" at a limit writes where to go back before the refused message goes out there (day 6, D5)', async () => {
+    const seen: { text: string; movedFrom?: string; account?: string }[] = [];
+    const { app, home } = start({ make: (ctx) => new WatchingDemo(ctx, seen) });
+    const capped = await demoAccount(app, 'Studio', 'cap');
+    const roomy = await demoAccount(app, 'Work', 'light');
+    const snap = await app.call('session.create', { provider: 'demo', cwd: path.join(home, 'p'), accountId: capped.id });
+    const rt = app.runtime(snap.session.id);
+    await app.call('session.send', { sessionId: rt.id, text: 'hi' });
+    await until(() => notices(rt.items).some((n) => n.limit?.provider), 'limit notice');
+    seen.length = 0;
+    await app.call('session.switchAccount', { sessionId: rt.id, accountId: roomy.id, retry: true });
+    await until(() => seen.length === 1, 'the refused message again');
+    // A limit met again in this very turn reads where the chat came from.
+    expect(seen[0]).toMatchObject({ text: expect.stringMatching(/^hi\b/), movedFrom: capped.id, account: roomy.id });
+  });
+
   it('refuses to move a working session, and to an account that is gone', async () => {
     const { app, home } = start();
     const other = await demoAccount(app, 'Work', 'light');
@@ -517,6 +533,25 @@ class RecordingDemo extends DemoProvider {
     const send = s.send.bind(s);
     s.send = (item) => {
       this.sent.push(item.text);
+      return send(item);
+    };
+    return s;
+  }
+}
+
+/** The demo agent recording, with each send, where the chat would go back to and the account it is on. */
+class WatchingDemo extends DemoProvider {
+  constructor(
+    ctx: ProviderContext,
+    private seen: { text: string; movedFrom?: string; account?: string }[],
+  ) {
+    super(ctx, { speed: 0 });
+  }
+  override async open(rt: SessionRuntime, opts: { loadTranscript?: boolean }): Promise<ProviderSession> {
+    const s = await super.open(rt, opts);
+    const send = s.send.bind(s);
+    s.send = (item) => {
+      this.seen.push({ text: item.text, movedFrom: rt.meta.movedFrom, account: rt.meta.accountId });
       return send(item);
     };
     return s;

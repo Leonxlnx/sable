@@ -24,7 +24,11 @@ export function SessionAccount({ sessionId }: { sessionId: string }) {
   const provider = useStore((s) => s.sessions[sessionId]?.provider);
   const accountId = useStore((s) => s.sessions[sessionId]?.accountId ?? DEFAULT_ACCOUNT);
   const accounts = useStore((s) => (provider ? s.providers[provider]?.accounts : undefined));
-  const [moving, setMoving] = useState<string | null>(null);
+  const [picked, setMoving] = useState<string | null>(null);
+  // The bridge says the chat moves for as long as it does (a compaction first can take minutes, long
+  // after the pick was answered); the pick itself shows until that word comes.
+  const movingNow = useStore((s) => !!s.sessions[sessionId]?.moving);
+  const moving = picked ?? (movingNow ? accountId : null);
   const lim = useSessionLimits(sessionId);
   if (!provider || !accounts || accounts.length < 2) return null;
   const current = accounts.find((a) => a.id === accountId);
@@ -77,9 +81,11 @@ type MenuProps = {
  * here for the same reason.
  */
 function SessionAccountMenu({ sessionId, provider, accountId, accounts, lim, rows, goesOn, name, moving, setMoving }: MenuProps) {
+  // A move is refused while the agent works, also by sub-agents in the background: nothing offers it then.
   const busy = useStore((s) => {
-    const st = s.sessions[sessionId]?.status;
-    return st === 'running' || st === 'awaiting' || st === 'starting';
+    const m = s.sessions[sessionId];
+    const st = m?.status;
+    return st === 'running' || st === 'awaiting' || st === 'starting' || (m?.background ?? 0) > 0;
   });
   return (
     <>

@@ -706,6 +706,72 @@ describe('review wave 17', { timeout: 25_000 }, () => {
   });
 });
 
+describe('moves at a limit are stable (day 6)', { timeout: 25_000 }, () => {
+  /** A Bash step that left a command running in the agent's process (as Claude Code's task events say). */
+  const command = (rt: SessionRuntime, name: string, task: string) => {
+    const step = rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: name, status: 'done', detail: { command: 'pnpm test', description: name, background: true } } as Omit<ToolItem, 'id' | 'ts'>);
+    rt.taskStarted(step.id, { id: task, kind: 'command' });
+    return step;
+  };
+
+  it('D1 a move at a limit goes ahead beside a command: it is lost with the process, said so, and named in the carry-on', async () => {
+    const h = await crewOnMax3();
+    const step = command(h.rt, 'Run app tests', 'b1');
+    for (let i = 1; i <= 7; i++) h.rt.limitInBackground(hit(i));
+    await until(() => h.rt.meta.accountId === h.ultra3.id && h.sent.length > 0, 'the move');
+    expect(h.rt.get<ToolItem>(step.id)!.task).toMatchObject({ state: 'lost', why: 'move' });
+    expect(notices(h.rt.items).some((n) => n.text === '1 background command was lost when the chat moved' && n.detail === 'Run app tests')).toBe(true);
+    // The carry-on names it after the stopped agents; all of it reads back as Sable's own.
+    expect(h.sent[0].text.startsWith(RESUME_UNDER_ANOTHER)).toBe(true);
+    expect(h.sent[0].text).toContain('"Run app tests" (command, task b1)');
+    expect(parseSynthetic(h.sent[0].text)?.role).toBe('hidden');
+  });
+
+  it('D2 a "Continue with" while the stop at the limit wakes the agent is refused: nothing is taken for unstoppable, nothing closed', async () => {
+    const h = await crewOnMax3();
+    h.rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'You have reached your usage limit.', limit: { window: '5-hour limit' } });
+    const handle = h.rt.handle!;
+    // Claude Code stops nothing when a turn began meanwhile (a notification woke the agent).
+    (handle as unknown as { stopBackgroundWork: () => Promise<boolean> }).stopBackgroundWork = async () => (h.rt.beginTurn('Thinking', { keepHold: true }), false);
+    await expect(h.app.call('session.switchAccount', { sessionId: h.rt.id, accountId: h.ultra3.id, retry: true })).rejects.toThrow(/still working/);
+    expect(h.rt.meta.accountId).toBe(h.max3.id);
+    expect(h.rt.handle).toBe(handle);
+    expect(h.rt.turnActive).toBe(true);
+    expect((h.app as unknown as { unstoppable: Map<string, Set<string>> }).unstoppable.get(h.rt.id)?.size ?? 0).toBe(0);
+    expect(notices(h.rt.items).some((n) => /could not be stopped/.test(n.text))).toBe(false);
+  });
+
+  it('M2 a sub-agent the limit could not stop that the move\'s close ended is named after all, and its line says so', async () => {
+    const h = await crewOnMax3();
+    const handle = h.rt.handle!;
+    (handle as unknown as { stopBackgroundWork: () => Promise<{ failed: string[] }> }).stopBackgroundWork = async () => ({ failed: ['toolu_7'] });
+    // As Claude Code's: what ran in the process ends with it.
+    const close = handle.close.bind(handle);
+    handle.close = async () => (h.rt.stopBackground(), close());
+    for (let i = 1; i <= 5; i++) h.rt.limitInBackground(hit(i));
+    await until(() => h.rt.meta.accountId === h.ultra3.id && h.sent.length > 0, 'the move');
+    expect(h.rt.get<ToolItem>('toolu_7')!.result!.agent).toMatchObject({ background: 'stopped', limit: { window: '5-hour limit' } });
+    expect(h.sent[0].text).toContain('call toolu_7');
+    expect(notices(h.rt.items).find((n) => n.text === 'A sub-agent could not be stopped')).toMatchObject({ detail: 'It stopped when the chat moved to Ultra3.' });
+  });
+
+  it('D4 a decided limit card is not reused unseen: a turn the agent wakes for that is refused gets a card of its own and is decided', async () => {
+    const h = await crewOnMax3({ capped: true, ultra: false });
+    for (let i = 1; i <= 7; i++) h.rt.limitInBackground(hit(i));
+    await until(() => !!cards(h.rt.items)[0]?.limit?.provider && h.rt.meta.background === 0, 'the decision');
+    // No account to go on with: decided, and no longer the card a provider folds a new refusal into.
+    expect(h.rt.limitCard).toBeUndefined();
+    // A notification wakes the agent and that turn is refused at the limit (the provider's rule:
+    // reuse the chat's open card, else write one).
+    h.rt.beginTurn('Thinking', { keepHold: true });
+    const reused = h.rt.limitCard && h.rt.get(h.rt.limitCard);
+    if (!reused) h.rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'You have reached your usage limit.', limit: { window: '5-hour limit' } });
+    h.rt.endTurn();
+    await until(() => cards(h.rt.items).length === 2 && !!cards(h.rt.items)[1].limit?.provider, 'the second decision');
+    expect(cards(h.rt.items)[1].limit).toMatchObject({ provider: 'demo', accountId: h.max3.id });
+  });
+});
+
 describe('the rules, pure', () => {
   it('decides after the refusals stop, within a bound, or at once when nothing runs', () => {
     expect(backgroundLimitDue({ first: 0, last: 0, now: 0, running: 3 })).toBe(3000);

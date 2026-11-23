@@ -77,6 +77,21 @@ export function contextClause(o: MoveOutcome, retry = false): { suffix?: string;
   }
 }
 
+/** At most this many lost commands are named on a switch line; the rest are counted. */
+const LOST_NAMED = 8;
+
+/**
+ * What a move did to the background commands and monitors that ran in the process it closed
+ * (`SessionRuntime.tasksLost`): a clause for the switch line (" · 1 background command lost") and
+ * the detail that names them. Lost, never ended: a child of the agent's shell can outlive it.
+ */
+export function lostClause(names: readonly string[]): { suffix?: string; detail?: string; names?: string } {
+  const n = names.length;
+  if (!n) return {};
+  const shown = `${names.slice(0, LOST_NAMED).join('; ')}${n > LOST_NAMED ? ` and ${n - LOST_NAMED} more` : ''}`;
+  return { suffix: ` · ${n === 1 ? '1 background command' : `${n} background commands`} lost`, detail: `Lost when the chat moved: ${shown}`, names: shown };
+}
+
 // ── the note after a move ──
 
 const clip = (s: string, n: number) => {
@@ -111,9 +126,15 @@ const NOTE_TODO = 90;
  * The note the agent gets with the first message after a move to another account, after the
  * person's words (hidden in the conversation like any `<system-reminder>`). Bounded: at most about
  * 1,600 characters, whatever the chat holds. `skip`: the message about to go out (never quoted back).
+ * `lost`: the same message names background tasks the move lost (shared/synthetic.ts
+ * `lostTasksNote`), so the note does not say that nothing else changed.
  */
-export function moveNote(items: readonly TimelineItem[], todos: readonly Todo[], opts: { skip?: string } = {}): string {
-  const lines = ['This conversation moved to another account of the same person. Nothing else changed: the same folder, the same files.'];
+export function moveNote(items: readonly TimelineItem[], todos: readonly Todo[], opts: { skip?: string; lost?: boolean } = {}): string {
+  const lines = [
+    opts.lost
+      ? 'This conversation moved to another account of the same person, in the same folder with the same files.'
+      : 'This conversation moved to another account of the same person. Nothing else changed: the same folder, the same files.',
+  ];
   const waiting = lastUnanswered(items.filter((i) => i.id !== opts.skip));
   if (waiting) lines.push(`Their last message before the move has no answer yet: "${clip(personWords(waiting), NOTE_QUOTE)}"`);
   const open = todos.filter((t) => t.status !== 'completed');
