@@ -1,6 +1,7 @@
 import { statSync } from 'node:fs';
-import type { AgentStats, FileDiff, Question, SharedFile, Todo, ToolDetail, ToolKind, ToolResult, WorkflowAgent, WorkflowRun } from '../../shared/protocol';
+import type { AgentStats, Attachment, FileDiff, Question, SharedFile, TimelineItem, Todo, ToolDetail, ToolKind, ToolResult, WorkflowAgent, WorkflowRun } from '../../shared/protocol';
 import { countChanges, makeFileDiff } from '../../shared/diff';
+import { stripWrappers } from '../../shared/synthetic';
 import { WIDGET_SERVER, WIDGET_TOOL_ID, describeWidget } from './widget-tool';
 import { browserOp, describeBrowser } from './browser-tool';
 import { describeDevice, deviceOp } from './device-tool';
@@ -464,6 +465,111 @@ export function resetFromText(text: string, now = Date.now()): number | undefine
     else at.setDate(at.getDate() + 1);
   }
   return at.getTime();
+}
+
+// ── background tasks and wake-ups ──
+
+/** What a task of Claude Code's is: a sub-agent or workflow, a background command, a monitor, or anything else. */
+export type TaskKind = 'agent' | 'command' | 'monitor' | 'other';
+
+/** A task's kind, from its own `task_type` when that says it, else from the call that started it. */
+export function taskKindOf(taskType?: unknown, toolName?: string): TaskKind {
+  const t = typeof taskType === 'string' ? taskType.toLowerCase() : '';
+  if (/agent|workflow/.test(t)) return 'agent';
+  if (/monitor/.test(t)) return 'monitor';
+  if (/bash|shell/.test(t)) return 'command';
+  if (toolName === 'Agent' || toolName === 'Task' || toolName === 'Workflow') return 'agent';
+  if (toolName === 'Monitor') return 'monitor';
+  if (toolName === 'Bash' || toolName === 'PowerShell') return 'command';
+  return 'other';
+}
+
+/**
+ * The background task a call left running, read from the call's own result (the tie between task and
+ * step that needs no task event): a command's `backgroundTaskId` (run in the background, backgrounded
+ * by the person, or by Claude Code at its timeout), a monitor's `taskId`.
+ */
+export function backgroundTaskOf(name: string, structured: unknown): { id: string; kind: 'command' | 'monitor' } | undefined {
+  const r = structured && typeof structured === 'object' ? (structured as Obj) : {};
+  if ((name === 'Bash' || name === 'PowerShell') && typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) return { id: r.backgroundTaskId, kind: 'command' };
+  if (name === 'Monitor' && typeof r.taskId === 'string' && r.taskId) return { id: r.taskId, kind: 'monitor' };
+  return undefined;
+}
+
+/**
+ * A wake-up the agent scheduled or cancelled, read only from the call's own result, never guessed
+ * from its input: `loop` the next dynamic wake-up (`ScheduleWakeup`'s `scheduledFor`; null when it
+ * stopped the loop), `cron` a scheduled task's next fire (`CronCreate`'s `nextFireAt`; null when it was
+ * deleted, or no time was given).
+ */
+export function wakeOf(name: string, input: Obj, structured: unknown): { loop?: number | null; cron?: { id: string; at: number | null } } | undefined {
+  const r = structured && typeof structured === 'object' ? (structured as Obj) : {};
+  const time = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
+  if (name === 'ScheduleWakeup') {
+    if (r.stopped === true) return { loop: null };
+    const at = time(r.scheduledFor);
+    return at ? { loop: at } : undefined;
+  }
+  if (name === 'CronCreate' && typeof r.id === 'string' && r.id) return { cron: { id: r.id, at: time(r.nextFireAt) } };
+  if (name === 'CronDelete') {
+    const id = typeof r.id === 'string' && r.id ? r.id : typeof input.id === 'string' ? input.id : '';
+    if (id) return { cron: { id, at: null }, ...(r.endedLoopWakeup === true ? { loop: null } : {}) };
+  }
+  return undefined;
+}
+
+// ── whose message it is ──
+
+/**
+ * A message's words as they are compared with a replay's: without the wrappers the harness adds, the
+ * note that asks a steer to be answered first, and the words Sable adds (a handover, the Browser tab's
+ * line), with runs of white space as one space.
+ */
+export function plainWords(text: string): string {
+  return stripWrappers(text).replace(/\s+/g, ' ').trim();
+}
+
+/** The pictures a message from the app may carry, and how their data must read. */
+const PICTURE_KINDS = /^image\/(png|jpeg|gif|webp)$/;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * The pictures of a message from the Claude app (its base64 image blocks) as attachments, within
+ * bounds: at most `count`, none bigger than `each` as a data URL, all of them no more than `total`
+ * (review of 23 Nov, C4). What is past a bound, or not a picture in plain base64, is left out.
+ */
+export function appPictures(content: unknown, limits: { count: number; each: number; total: number }): Attachment[] | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const out: Attachment[] = [];
+  let total = 0;
+  for (const b of content as Obj[]) {
+    if (out.length >= limits.count) break;
+    const src = b?.type === 'image' ? (b.source as Obj | undefined) : undefined;
+    if (src?.type !== 'base64' || typeof src.data !== 'string' || typeof src.media_type !== 'string' || !PICTURE_KINDS.test(src.media_type)) continue;
+    const dataUrl = `data:${src.media_type};base64,${src.data}`;
+    if (dataUrl.length > limits.each || total + dataUrl.length > limits.total || !BASE64.test(src.data)) continue;
+    total += dataUrl.length;
+    const pad = src.data.endsWith('==') ? 2 : src.data.endsWith('=') ? 1 : 0;
+    out.push({ id: `app-${out.length + 1}-${src.data.length.toString(36)}`, kind: 'image', name: `Picture ${out.length + 1}`, dataUrl, mime: src.media_type, size: Math.max(0, Math.floor((src.data.length * 3) / 4) - pad) });
+  }
+  return out.length ? out : undefined;
+}
+
+/**
+ * Cards a chat saved twice for one message of Sable's own (review of 23 Nov, D-own; DIAG messages-M3),
+ * for the bridge to drop when it reads the chat: a card from the Claude app (`remote`) whose provider
+ * id is that of a card Sable sent before it is that message's replay, shown again by a fault since
+ * fixed. Only with that proof: the same words alone never merge a message from the app into Sable's.
+ */
+export function ownReplays(items: readonly TimelineItem[]): string[] {
+  const own = new Set<string>();
+  const out: string[] = [];
+  for (const i of items) {
+    if (i.type !== 'user' || i.parentId || !i.providerId) continue;
+    if (!i.remote) own.add(i.providerId);
+    else if (own.has(i.providerId)) out.push(i.id);
+  }
+  return out;
 }
 
 // ── workflows ──

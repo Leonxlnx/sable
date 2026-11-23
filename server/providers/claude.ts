@@ -18,6 +18,7 @@ import {
   type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import type {
+  Attachment,
   Capabilities,
   CapabilityState,
   SessionMeta,
@@ -48,17 +49,17 @@ import type {
   TurnItem,
   UserItem,
 } from '../../shared/protocol';
-import type { MessageOutcome, SessionRuntime } from '../core/runtime';
+import { lostLine, type LostWhy, type MessageOutcome, type SessionRuntime } from '../core/runtime';
 import type { TitlePrompt } from '../core/titles';
-import { dropRemote, holdRemote, type RemoteHolder } from '../core/remote-keep';
+import { dropRemote, holdRemote, idleSince, type RemoteHolder } from '../core/remote-keep';
 import { claudeForkPoint, cutAt } from '../core/fork';
 import { killTree, runCli, spawnCli } from '../util/proc';
-import { agentLimitOf, baseName, describeTool, flattenContent, mapResult, mergeWorkflow, normalizeTodos, peekPartialInput, previewDiff, workflowStart } from './claude-tools';
+import { agentLimitOf, appPictures, backgroundTaskOf, baseName, describeTool, flattenContent, mapResult, mergeWorkflow, normalizeTodos, peekPartialInput, plainWords, previewDiff, taskKindOf, wakeOf, workflowStart, type TaskKind } from './claude-tools';
 import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoice } from './types';
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
-import { isAuthFailure, isStandIn, parseSynthetic, syntheticLine } from '../../shared/synthetic';
+import { isAuthFailure, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled, cleanToolInput, streamsInput } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
@@ -79,8 +80,43 @@ type Obj = Record<string, any>;
 const query: typeof sdkQuery = (p) => sdkQuery({ ...p, options: { ...p.options, spawnClaudeCodeProcess: p.options?.spawnClaudeCodeProcess ?? authGate.spawner(p.options?.stderr) } });
 
 const IDLE_CLOSE_MS = 8 * 60_000;
+/**
+ * A turn Claude Code began by itself is over once it has gone this quiet: no frame of its own work, no
+ * step of it running, nothing of anyone's waiting. The bound for a CLI that never says it is idle, so
+ * no such turn reads "Thinking" for ever.
+ */
+const WAKE_QUIET_MS = 90_000;
+/** How long the CLI's own word that it works (`running`) is believed while nothing at all is heard from it. */
+const CLI_TRUST_MS = 10 * 60_000;
+/** A wake-up the agent scheduled holds its process when it is due within this (never longer: a guess must not keep a process for ever). */
+const WAKE_HOLD_MS = 60 * 60_000;
+/** A wake-up past its time is looked for this long, then taken as gone. */
+const WAKE_GRACE_MS = 2 * 60_000;
+/** How long `close()` waits for the process it let go to end. */
+const EXIT_WAIT_MS = 3_000;
+/** A background command gone from the CLI's live list with no word of its end is taken as stopped after this (its word comes first as a rule). */
+const LIST_GRACE_MS = 3_000;
+/** Frames about tasks and the CLI's state: no sign of the agent's own work at the root. */
+const TASK_FRAMES = new Set(['task_started', 'task_progress', 'task_updated', 'task_notification', 'background_tasks_changed', 'session_state_changed']);
 /** The live line of a turn whose messages wait for a stopped turn's result (`held`). */
 const HELD_LINE = 'Waiting for the stopped turn to end';
+/** Said by a session the bridge let go when it is asked to start its process again. */
+const RETIRED = 'The agent was closed before the message reached it.';
+/** How many of the messages it sent a session remembers as its own (`own`): far more than a turn's bookkeeping ever lets go of unread. */
+const OWN_MAX = 500;
+/**
+ * A message of Sable's own that Claude Code takes after its turn's bookkeeping let it go begins a turn
+ * of its own when it was sent this recently to the same process; older, it is only marked as Sable's
+ * (a repeat, never new work).
+ */
+const OWN_LATE_MS = 30 * 60_000;
+/**
+ * A message of Sable's own that Claude Code has not read keeps its turn, but not for ever: once the
+ * process has said nothing for this long and works on nothing, the message is not coming.
+ */
+const UNREAD_QUIET_MS = 60_000;
+/** Pictures a message from the Claude app keeps: how many, the biggest one and all of them together (data URL lengths). */
+const APP_PICTURES = { count: 4, each: 4 * 1024 * 1024, total: 8 * 1024 * 1024 };
 
 const MODES: ModeInfo[] = [
   { id: 'default', name: 'Ask first', description: 'Asks before editing files or running commands', tone: 'ask' },
@@ -250,6 +286,12 @@ export class ClaudeProvider implements Provider {
   private limitsRefusedUntil = 0;
   private limitsRefusedLogged = false;
   readonly sessions = new Set<ClaudeSession>();
+  /**
+   * What this provider's CLI was seen to do in any session: name the messages a result answers. Every
+   * session runs the same binary, so a chat's first result after Sable started is read with what the
+   * others already showed (review of 23 Nov, D-own).
+   */
+  readonly seen = { names: false };
   /** The account's own config folder; undefined for the built-in default account. */
   private readonly configDir?: string;
 
@@ -1163,12 +1205,40 @@ interface StreamState {
   blocks: Map<number, { itemId: string; type: 'text' | 'thinking' | 'tool'; name?: string; json: string; peeked?: string }>;
 }
 
+/** A message a session sent, as it remembers it (`ClaudeSession.own`). */
+interface OwnSend {
+  /** Its card (none in the timeline for a message Sable sends unseen, a carry-on). */
+  itemId: string;
+  /** The card's words, and what went (with what Sable added), each as `plainWords`. */
+  words: string;
+  sent: string;
+  /** When it went, and to which process. */
+  at: number;
+  q?: object;
+  /** Claude Code took it (replayed, stamped on a reply, or found by its words); and replayed it under its own uuid. */
+  read: boolean;
+  replayed: boolean;
+  /** A replay under another uuid taken for it by its words: the app's own message after all if this one comes back under its own (`unalias`). */
+  alias?: { uuid: string; text: string; attachments?: Attachment[]; at: number };
+}
+
 class ClaudeSession implements ProviderSession {
   private q?: Query;
   private input?: PushQueue<SDKUserMessage>;
   private streams = new Map<string, StreamState>();
   private streamedMessages = new Set<string>();
   private pendingUsers = new Map<string, string>(); // sdk uuid → UserItem id
+  /**
+   * Every message this session sent, by the uuid it went with (review of 23 Nov, D-own): its card, its
+   * words as the card shows them and as they went (wrappers and Sable's additions aside), when and to
+   * which process it went, and whether Claude Code took it (`read`: replayed, stamped on a reply, or
+   * found by its words) or replayed it under its own uuid. Turn bookkeeping never forgets one, so a
+   * replay of a message of Sable's own is never a message from the Claude app, whatever a result or a
+   * turn's end did meanwhile. Bounded (`OWN_MAX`); a close forgets them all.
+   */
+  private own = new Map<string, OwnSend>();
+  /** The bound on a turn kept open by a message of ours Claude Code has not read (`UNREAD_QUIET_MS`). */
+  private unreadNet?: NodeJS.Timeout;
   /**
    * Messages from people (ours, or from the Claude app) whose turn has not ended yet, by their uuid,
    * and whether Claude Code has read them (replayed them): a result can only answer a message it read.
@@ -1190,9 +1260,9 @@ class ClaudeSession implements ProviderSession {
    * Steers Claude Code had not read when the person stopped: they went back to the queue (sdk uuid →
    * the UserItem's id and the words and pictures as they went to Claude Code). One it reads after all
    * is shown as it went, and its copy in the queue is taken out (never sent twice) unless the person
-   * changed it there since.
+   * changed it there since; sent again from the queue meanwhile, the card that went is this one too.
    */
-  private withdrawn = new Map<string, { itemId: string; text: string; attachments?: UserItem['attachments'] }>();
+  private withdrawn = new Map<string, { itemId: string; text: string; attachments?: UserItem['attachments']; at: number }>();
   /** The CLI's own state (session_state_changed), as last reported. */
   private cliState?: 'idle' | 'running' | 'requires_action';
   private interrupted = false;
@@ -1217,16 +1287,60 @@ class ClaudeSession implements ProviderSession {
   /** A new agent process has not said hello yet (system/init): the live line says "Starting", not "Thinking". */
   private booting = false;
   private idleTimer?: NodeJS.Timeout;
-  /** Background tasks (agents, shells, monitors) running in this process, by task id. */
+  /**
+   * Live tasks of this process (agents, shells, monitors), by task id, from three kinds of word
+   * (review of 23 Nov, A4). `liveTasks`: those known from their own events (started, moved to the
+   * background) until their end is heard; a background one also leaves when the CLI's next list is in,
+   * as that list covers it. `foreground`: those of them a call blocks on, which no list holds; one also
+   * ends with its call's result. `level`: the CLI's own list of every live background task (replaced
+   * by each `background_tasks_changed`; none until the first). Ambient tasks (watchers, housekeeping)
+   * are nobody's work and never count (`ambient`).
+   */
   private liveTasks = new Set<string>();
+  private foreground = new Set<string>();
+  private level?: Set<string>;
+  private ambient = new Set<string>();
+  /** What each task of this process is, and when it was first seen. */
+  private taskInfo = new Map<string, { kind: TaskKind; since: number }>();
+  /** Tasks whose end was heard: a start that comes after its end never marks one running again. */
+  private endedTasks = new Set<string>();
+  private listTimer?: NodeJS.Timeout;
   /**
    * The step each task of this process belongs to (task id to item id), from the task events that named
    * it: a task's end that names no step still finds it, and the live task list settles a step whose task
    * is gone (review wave 7, #8).
    */
   private taskItems = new Map<string, string>();
-  private costBase = 0;
-  private lastTotalCost = 0;
+  /** Wake-ups the agent scheduled, read from its calls' results: the dynamic loop's next one, and each scheduled task's next fire. */
+  private loopWakeAt?: number;
+  private cronWakes = new Map<string, number>();
+  /** When this process last said anything at all, and anything of the agent's own work at the root (`WAKE_QUIET_MS`). */
+  private heardAt = 0;
+  private rootHeardAt = 0;
+  /**
+   * The turn this session's process runs (its `rt.turnStartedAt`), and the one Claude Code began by
+   * itself: a close ends only a turn of its own process (`ownsTurn`), and only the agent's own turn
+   * ends by going quiet (`wakeNet`).
+   */
+  private turnAt = -1;
+  private agentTurnAt = -1;
+  private wakeNet?: NodeJS.Timeout;
+  /** Messages held back while the CLI says it works: looked at again once that word is too old to believe. */
+  private releaseTimer?: NodeJS.Timeout;
+  /** Let go by the bridge (`close`): it never starts a process again, so a message meant for it never reaches the account the chat left. */
+  private retired = false;
+  /** The end of each process's stream (`pump`), and of the one let go last (`exited`). */
+  private exits = new WeakMap<object, Promise<void>>();
+  private leaving?: Promise<void>;
+  /**
+   * The CLI's running total (`total_cost_usd`) as last seen in this process, which each result's cost
+   * is counted from (review of 23 Nov, D-cost). A process that resumes a conversation starts from the
+   * total this chat last saw for it (`SessionUsage.cliCost`); undefined when that is not known (a chat
+   * from before, a fork): its first result then carries the conversation's past, and books nothing.
+   */
+  private lastTotalCost: number | undefined = 0;
+  /** No result with a total has come from this process yet: one below where it started is a resume from an earlier point. */
+  private costFresh = false;
   private retryNotice?: string;
   private tasks = new Map<string, Todo>();
   private chain: string[] = [];
@@ -1239,8 +1353,13 @@ class ClaudeSession implements ProviderSession {
   private compacted = false;
   /** The options the running process was started with. */
   private applied?: SessionOptions;
-  /** A start-up option changed mid-turn: restart once the turn ends. */
-  private restartPending = false;
+  /**
+   * A start-up option changed while the process held work: restart once it holds none
+   * (`restartWhenFree`). What the notice says starts or stops ("Browser control starts"), and whether
+   * it has said that it waits for background work.
+   */
+  private restartPending?: string;
+  private restartTold = false;
   /** The running process has reported its own capabilities (better than the probe's). */
   liveCaps = false;
   /** This turn was refused at a plan limit: the window that refused it, and the notice that says so. */
@@ -1256,18 +1375,145 @@ class ClaudeSession implements ProviderSession {
     private rt: SessionRuntime,
     private provider: ClaudeProvider,
   ) {
-    this.costBase = rt.meta.usage.costUsd ?? 0;
+    // What the CLI was seen to do in another chat holds for this one (the same binary).
+    this.namesMessages = provider.seen.names;
     this.remoteHolder = {
       id: rt.id,
       lastActive: () => this.lastActive,
-      busy: () => this.rt.turnActive || this.liveTasks.size > 0,
+      // A process that holds work (a turn, also one the agent began by itself, its own word that it
+      // works, a background task, a wake-up due soon) is never let go, and counts toward the max.
+      busy: () => this.holdsWork(),
       release: () => {
-        if (this.rt.turnActive || this.liveTasks.size) return;
+        // Work began while the release waited: declined, and the keeper holds it again.
+        if (this.holdsWork()) return false;
         this.log('claude: Remote Control process released (not used recently)');
         // As the idle close: the remote status says it reconnects when the chat is used again.
-        this.shutdown();
+        this.tellLost(this.shutdown(), 'process');
       },
     };
+  }
+
+  // ── what the process holds ──
+
+  /**
+   * Whether the process holds work (review of 23 Nov, D-hold): a turn (Sable's or one Claude Code began
+   * by itself), a question or permission open, the CLI's own word that it works, a task that is not
+   * ambient (foreground or background: a sub-agent, a workflow, a command, a monitor), or a wake-up it
+   * scheduled that is due within the hour. Housekeeping (the idle close, the Remote Control keeper, a
+   * restart for a changed option) never lets go of a process that holds work.
+   */
+  holdsWork(): boolean {
+    if (this.rt.turnActive) return true;
+    if (!this.q) return false;
+    return this.worksNow() || this.wakeDue();
+  }
+
+  /** Work running in the process now, a turn aside: a prompt open, the CLI's own word that it works, a live task. */
+  private worksNow(): boolean {
+    return this.promptsOpen() || this.cliBusy() || this.liveIds().size > 0;
+  }
+
+  private promptsOpen(): boolean {
+    const p = this.rt.prompts();
+    return p.permissions.length + p.questions.length > 0;
+  }
+
+  /**
+   * The CLI says it works (`running`, or waiting on a prompt). Believed while it is heard from: a
+   * missed idle never keeps a process for ever (`CLI_TRUST_MS`).
+   */
+  private cliBusy(): boolean {
+    return (this.cliState === 'running' || this.cliState === 'requires_action') && Date.now() - this.heardAt < CLI_TRUST_MS;
+  }
+
+  /** Every live task of this process that is somebody's work. */
+  private liveIds(): Set<string> {
+    const out = new Set<string>(this.liveTasks);
+    for (const id of this.level ?? []) out.add(id);
+    for (const id of this.ambient) out.delete(id);
+    return out;
+  }
+
+  /** The next wake-up the agent scheduled in this process that is not yet past its grace. */
+  private wakeAt(now = Date.now()): number | undefined {
+    let at: number | undefined;
+    for (const t of [this.loopWakeAt, ...this.cronWakes.values()]) if (t !== undefined && t > now - WAKE_GRACE_MS) at = Math.min(at ?? t, t);
+    return at;
+  }
+
+  private wakeDue(now = Date.now()): boolean {
+    const at = this.wakeAt(now);
+    return at !== undefined && at - now <= WAKE_HOLD_MS;
+  }
+
+  /**
+   * What still runs in the agent's process, as Claude Code says it: its turn, background sub-agents
+   * and workflows, background commands and monitors (and any other task that is not ambient), when the
+   * oldest of those commands began, and its next scheduled wake-up. Nothing without a process.
+   */
+  liveWork(): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; wakeAt?: number } {
+    if (!this.q) return { turn: false, agents: 0, commands: 0 };
+    let agents = 0;
+    let commands = 0;
+    let oldest: number | undefined;
+    for (const id of this.liveIds()) {
+      // A task a call blocks on is that call's, and so the turn's.
+      if (this.foreground.has(id)) continue;
+      const info = this.taskInfo.get(id);
+      if (info?.kind === 'agent') agents++;
+      else {
+        commands++;
+        if (info) oldest = Math.min(oldest ?? info.since, info.since);
+      }
+    }
+    const wakeAt = this.wakeAt();
+    // The CLI says it runs for as long as its background agents run (its idle comes once they are
+    // done, sdk.d.ts): that is their work, counted as agents, not a turn. Read as a turn it would hold
+    // a move at a limit off the very agents that move stops, and a send after a sign-in for minutes.
+    const turn = this.rt.turnActive || (this.cliBusy() && !agents);
+    return { turn, agents, commands, ...(oldest !== undefined ? { oldestCommandAt: oldest } : {}), ...(wakeAt !== undefined ? { wakeAt } : {}) };
+  }
+
+  /** Whether the open turn runs in this session's process: a close ends no turn of another's (review of 23 Nov, D2). */
+  private ownsTurn(): boolean {
+    return !!this.q && this.rt.turnActive && this.turnAt === this.rt.turnStartedAt;
+  }
+
+  /**
+   * Resolves once the process let go last has really ended (its stream is over); rejects when it has
+   * not after `EXIT_WAIT_MS`, so a move never copies a transcript its process may still be writing
+   * (app.ts `moveAccount`).
+   */
+  exited(): Promise<void> {
+    const p = this.leaving;
+    if (!p) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('The agent process has not ended yet.')), EXIT_WAIT_MS);
+      void p.then(() => {
+        clearTimeout(t);
+        resolve();
+      });
+    });
+  }
+
+  /** The person is told, once, which background commands went with a process (`tasksLost` gave their names). */
+  private tellLost(names: string[], why: LostWhy) {
+    if (names.length) this.rt.notice('info', lostLine(names.length, why), names.join('\n'));
+  }
+
+  /** A process's tasks and wake-ups are its own: a new or ended one has none. */
+  private forgetTasks() {
+    this.liveTasks.clear();
+    this.foreground.clear();
+    this.level = undefined;
+    this.ambient.clear();
+    this.taskInfo.clear();
+    this.endedTasks.clear();
+    this.taskItems.clear();
+    this.loopWakeAt = undefined;
+    this.cronWakes.clear();
+    clearTimeout(this.listTimer);
+    clearTimeout(this.releaseTimer);
   }
 
   liveQuery() {
@@ -1287,6 +1533,7 @@ class ClaudeSession implements ProviderSession {
 
   private ensure(): Query {
     if (this.q) return this.q;
+    if (this.retired) throw new Error(RETIRED);
     // A process (re)started while a phone's switch is held runs under the mode the work had (`workMode`).
     const rt = this.rt;
     const meta = rt.workMode === rt.meta.mode ? rt.meta : { ...rt.meta, mode: rt.workMode };
@@ -1310,11 +1557,20 @@ class ClaudeSession implements ProviderSession {
     this.lastActive = Date.now();
     if (meta.options?.remoteControl) holdRemote(this.remoteHolder);
     this.applied = { ...meta.options };
-    this.lastTotalCost = 0;
+    // Its running total starts where the conversation it resumes left it (D-cost): what this chat last
+    // saw for that conversation; not known for one it never counted. A new conversation starts at 0.
+    const counted = meta.usage.cliCost;
+    this.lastTotalCost = !meta.providerSessionId ? 0 : counted?.session === meta.providerSessionId ? counted.total : undefined;
+    this.costFresh = true;
     this.liveCaps = false;
-    // A new process owes no result of the last one's turns.
+    // A new process owes no result of the last one's turns, and runs none of its tasks.
     this.owed = [];
-    void this.pump(q);
+    this.forgetTasks();
+    this.heardAt = Date.now();
+    this.exits.set(
+      q,
+      this.pump(q).catch((err) => this.log('claude: reading the agent process failed:', (err as Error).message)),
+    );
     void q
       .initializationResult()
       .then(async (init) => {
@@ -1398,6 +1654,8 @@ class ClaudeSession implements ProviderSession {
   }
 
   async setOptions(options: SessionOptions) {
+    // Let go by the bridge: a process started here now would be one nobody owns.
+    if (this.retired) return;
     const q = this.q;
     const before = this.applied ?? {};
     if (!q) {
@@ -1413,18 +1671,12 @@ class ClaudeSession implements ProviderSession {
     }
     if (!!options.browser !== !!before.browser) {
       // A CLI flag: only a new process has it.
-      if (this.rt.turnActive) {
-        this.restartPending = true;
-        this.rt.notice('info', options.browser ? 'Browser control starts after this turn' : 'Browser control stops after this turn');
-      } else this.restart();
+      this.restartFor(options.browser ? 'Browser control starts' : 'Browser control stops');
       return;
     }
     if ((options.browserTab !== false) !== (before.browserTab !== false) || deviceEnabled({ options }) !== deviceEnabled({ options: before })) {
       // The Browser tab tools live in the process's own MCP server: only a new process changes them.
-      if (this.rt.turnActive) {
-        this.restartPending = true;
-        this.rt.notice('info', options.browserTab !== false ? 'The Browser tab tools start after this turn' : 'The Browser tab tools stop after this turn');
-      } else this.restart();
+      this.restartFor(options.browserTab !== false ? 'The Browser tab tools start' : 'The Browser tab tools stop');
       return;
     }
     if (!!options.remoteControl !== !!before.remoteControl) {
@@ -1445,11 +1697,56 @@ class ClaudeSession implements ProviderSession {
     }
   }
 
+  /**
+   * A start-up option changed (`subject`: what starts or stops): a new process takes it. Never one
+   * that holds work: after the turn, or once its background work is over (a restart would end a test
+   * run the agent waits for; review of 23 Nov, visible-M1), and the chat says which.
+   */
+  private restartFor(subject: string) {
+    if (this.rt.turnActive) {
+      this.restartPending = subject;
+      this.restartTold = false;
+      this.rt.notice('info', `${subject} after this turn`);
+    } else if (this.holdsWork()) {
+      this.restartPending = subject;
+      this.restartTold = true;
+      this.rt.notice('info', `${subject} ${this.whenFree()}`);
+    } else this.restart();
+  }
+
+  /** The restart a changed option waits for, once the turn is over and nothing else holds the process; said once when background work still does. */
+  private restartWhenFree() {
+    if (!this.restartPending || this.retired || this.rt.turnActive) return;
+    if (this.holdsWork()) {
+      if (!this.restartTold) {
+        this.restartTold = true;
+        this.rt.notice('info', `${this.restartPending} ${this.whenFree()}`);
+      }
+      return;
+    }
+    this.restart();
+  }
+
+  /** Looks at a waiting restart once the event at hand is handled. */
+  private freeLater() {
+    if (this.restartPending) setTimeout(() => this.restartWhenFree(), 0);
+  }
+
+  /** When a waiting restart can happen, as the person reads it. */
+  private whenFree(): string {
+    const w = this.liveWork();
+    if (w.commands && !w.agents) return w.commands === 1 ? 'when the background command finishes' : 'when the background commands finish';
+    if (w.agents || w.commands) return 'when the background work finishes';
+    if (this.wakeDue()) return 'after the scheduled wake-up';
+    return 'when the agent is done';
+  }
+
   /** Replaces the idle agent process so new start-up options take effect (the conversation resumes). */
   private restart() {
-    this.restartPending = false;
+    this.restartPending = undefined;
+    this.restartTold = false;
     const keepRunning = !!this.rt.meta.options?.remoteControl;
-    this.shutdown();
+    this.tellLost(this.shutdown(), 'process');
     this.rt.update({ remote: undefined, capState: undefined });
     if (keepRunning) this.ensure();
   }
@@ -1458,8 +1755,9 @@ class ClaudeSession implements ProviderSession {
     let failure: string | undefined;
     try {
       for await (const m of q) {
-        // A process let go (closed, restarted, set aside after a stop): what it still writes is no turn's here.
-        if (this.q !== q) break;
+        // A process let go (closed, restarted, set aside after a stop): what it still writes is no turn's
+        // here. It is read on to its end all the same: that end is when the process is gone (`exited`).
+        if (this.q !== q) continue;
         try {
           this.onMessage(m);
         } catch (err) {
@@ -1469,37 +1767,46 @@ class ClaudeSession implements ProviderSession {
     } catch (err) {
       failure = (err as Error).message || String(err);
     }
+    // Let go by Sable: what it held was settled then (`shutdown`).
     if (this.q !== q) return;
+    // The process ended by itself.
     this.q = undefined;
     this.input = undefined;
     this.streams.clear();
-    this.liveTasks.clear();
-    this.taskItems.clear();
+    this.forgetTasks();
     this.wakes = 0;
     this.cliState = undefined;
     this.owed = [];
+    clearTimeout(this.wakeNet);
+    clearTimeout(this.idleTimer);
+    dropRemote(this.remoteHolder);
     // What the process had not read went with it.
     this.withdrawn.clear();
+    this.clearLiveState();
+    // What ran in it went with it (review of 23 Nov, A3): background sub-agents and workflows ended;
+    // its commands and monitors are lost (a child of its shell may outlive it unseen, so never "ended").
+    this.rt.stopBackground();
+    const lost = this.rt.tasksLost('process');
     if (this.held && this.rt.turnActive && !this.closed) {
       // Messages held back from it never reached it (they are all the running turn has): they go to a new one.
-      this.clearLiveState();
-      this.rt.stopBackground();
+      this.tellLost(lost, 'process');
       return this.release();
     }
     this.held = undefined;
     this.retire(this.sentItems.keys(), 'failed');
-    this.clearLiveState();
-    // Background sub-agents and workflows lived in this process: they ended with it.
-    this.rt.stopBackground();
     if (this.rt.turnActive && !this.closed) {
+      // Its turn was cut, and the bridge knows it: it ended early (D-early), with the process's own words.
       this.turnSeq++;
       clearTimeout(this.interruptTimer);
-      this.rt.settle(failure ? 'error' : 'cancelled');
-      const text = failure ?? 'Claude Code stopped unexpectedly';
-      this.rt.notice('error', 'The agent process ended', text);
+      this.interrupted = false;
       this.awaiting.clear();
-      this.rt.endTurn(text);
+      this.rt.cutTurn('died', { detail: failure });
+    } else if (!this.rt.turnActive) {
+      // No turn open: the steps it left running end with it, at this moment, and nothing is said of them.
+      this.rt.cutTurn('died');
     }
+    // Said once, after the turn's own line: the agent is told with its next message (`takeLost`).
+    this.tellLost(lost, 'process');
   }
 
   /** The step a task event belongs to: the one it names, or the one its task was seen with. */
@@ -1508,37 +1815,86 @@ class ClaudeSession implements ProviderSession {
     return id ? this.rt.get<ToolItem>(String(id)) : undefined;
   }
 
+  /** What a task is and when it was first seen, kept from the first word of it that says. */
+  private noteTask(id: string, taskType?: unknown, toolName?: string) {
+    const known = this.taskInfo.get(id);
+    const kind = taskKindOf(taskType, toolName);
+    if (!known) this.taskInfo.set(id, { kind, since: Date.now() });
+    else if (known.kind === 'other' && kind !== 'other') known.kind = kind;
+  }
+
+  /**
+   * A task of this process runs in the background now (its start, or its call moved to the
+   * background): a command or monitor marks its step (`ToolItem.task`), so the bridge counts it.
+   */
+  private backgrounded(id: string, item: ToolItem | undefined) {
+    if (!item || this.endedTasks.has(id) || this.ambient.has(id)) return;
+    const kind = this.taskInfo.get(id)?.kind;
+    if (kind === 'command' || kind === 'monitor') this.rt.taskStarted(item.id, { id, kind });
+  }
+
+  /** Word of a task's end (its notification, or its state): it no longer holds the process, and a command's step says how it ended. */
+  private taskOver(id: string, state: 'done' | 'failed' | 'stopped', at?: number) {
+    this.liveTasks.delete(id);
+    this.foreground.delete(id);
+    this.level?.delete(id);
+    this.endedTasks.add(id);
+    if (this.endedTasks.size > 500) this.endedTasks.delete(this.endedTasks.values().next().value as string);
+    this.rt.taskEnded(id, state, at);
+    // The last one ended: messages held for this process's owed result can go, and a waiting restart too.
+    this.release();
+    this.freeLater();
+  }
+
   /**
    * The live task list is Claude Code's own word on what runs in the background: a step whose task is
    * not on it, or any background step at all when nothing runs, has ended without its end reaching
-   * here (it is stopped). A step whose own call still runs is not background work yet.
+   * here (it is stopped). A step whose own call still runs is not background work yet. A command or
+   * monitor off the list whose end was not heard is taken as stopped after a short grace (its word
+   * comes first as a rule): a stale "running" never stays.
    */
   private reconcileTasks() {
+    const live = new Set([...(this.level ?? []), ...this.foreground]);
     const called = (i: TimelineItem) => i.type === 'tool' && i.status !== 'running' && i.status !== 'pending' && i.status !== 'awaiting';
     const gone = new Set<string>();
-    for (const [task, id] of this.taskItems) if (!this.liveTasks.has(task)) gone.add(id);
-    if (!this.liveTasks.size) this.rt.stopBackground(called);
+    for (const [task, id] of this.taskItems) if (!live.has(task)) gone.add(id);
+    if (!live.size) this.rt.stopBackground(called);
     else if (gone.size) this.rt.stopBackground((i) => gone.has(i.id) && called(i));
+    const off: string[] = [];
+    for (const [task, info] of this.taskInfo) {
+      if ((info.kind !== 'command' && info.kind !== 'monitor') || live.has(task) || this.liveTasks.has(task) || this.endedTasks.has(task)) continue;
+      const step = this.taskItems.get(task);
+      if (step && this.rt.get<ToolItem>(step)?.task?.state === 'running') off.push(task);
+    }
     // A task off the list is forgotten once its step's call has returned (a running call's own end still comes).
     for (const [task, id] of [...this.taskItems]) {
       const item = this.rt.get(id);
-      if (!this.liveTasks.has(task) && (!item || called(item))) this.taskItems.delete(task);
+      if (!live.has(task) && !off.includes(task) && (!item || called(item))) this.taskItems.delete(task);
     }
+    clearTimeout(this.listTimer);
+    if (!off.length) return;
+    this.listTimer = setTimeout(() => {
+      for (const task of off) if (this.level && !this.level.has(task) && !this.liveTasks.has(task) && !this.endedTasks.has(task)) this.taskOver(task, 'stopped');
+    }, LIST_GRACE_MS);
+    this.listTimer.unref?.();
   }
 
   /**
    * At a plan limit: every background task of this process is stopped for real, so nothing goes on
-   * on the account at its limit. False while a turn runs (that turn's end decides).
+   * on the account at its limit. False while a turn runs (that turn's end decides), also one the agent
+   * began by itself. The tasks it stops are its point, so they never hold it, nor does the CLI's own
+   * "running", which lasts while its background agents run (review of 23 Nov, A1).
    */
   async stopBackgroundWork(): Promise<boolean> {
     const q = this.q as (Query & { stopTask?: (taskId: string) => Promise<void> }) | undefined;
     if (!q || this.rt.turnActive) return !q;
     // Each task asked to stop first; then the process goes, and whatever it ran (also a task whose
     // start never reached here) ends with it. The next message resumes the conversation in a new one.
-    if (typeof q.stopTask === 'function') await Promise.all([...this.liveTasks].map((task) => withTimeout(Promise.resolve(q.stopTask!(task)), 5_000, 'stopTask').catch(() => {})));
+    if (typeof q.stopTask === 'function') await Promise.all([...this.liveIds()].map((task) => withTimeout(Promise.resolve(q.stopTask!(task)), 5_000, 'stopTask').catch(() => {})));
     // Never the process a turn now uses (one the agent began meanwhile): then nothing is confirmed (review wave 17, #5).
     if (this.rt.turnActive) return false;
-    if (this.q === q) this.shutdown();
+    // A command whose stop was not heard before the process went is lost at the limit, and said so.
+    if (this.q === q) this.tellLost(this.shutdown('limit'), 'limit');
     return true;
   }
 
@@ -1547,16 +1903,32 @@ class ClaudeSession implements ProviderSession {
     this.lastActive = Date.now();
     // Remote Control lives in this process: the keeper (server/core/remote-keep.ts) decides when it closes.
     if (this.q && this.rt.meta.options?.remoteControl) holdRemote(this.remoteHolder);
-    const due = Date.now() + IDLE_CLOSE_MS;
+    this.armIdleClose(IDLE_CLOSE_MS);
+  }
+
+  /**
+   * The idle close (Remote Control off): the process goes once it has held no work (`holdsWork`) for
+   * `IDLE_CLOSE_MS`, counted from the later of its last use and the last wake from sleep (a laptop
+   * that slept was not idle; work the sleep suspended goes on when it wakes). While it holds work the
+   * clock starts again.
+   */
+  private armIdleClose(ms: number) {
+    clearTimeout(this.idleTimer);
+    const expected = Date.now() + ms;
     this.idleTimer = setTimeout(() => {
-      if (this.rt.turnActive || this.rt.meta.options?.remoteControl) return;
-      // Background agents and shells live in this process too, and wake the agent when they end:
-      // it stays while any runs, and the idle clock starts again once the last one is done.
-      if (this.liveTasks.size) return this.scheduleIdleClose();
+      if (!this.q || this.rt.meta.options?.remoteControl) return;
+      // A timer that fired far too late slept with the laptop: noted, so the sleep counts as no idleness.
+      authGate.noteTimer(expected);
+      if (this.holdsWork()) return this.scheduleIdleClose();
+      const left = idleSince(this.lastActive) + IDLE_CLOSE_MS - Date.now();
+      if (left > 1_000) return this.armIdleClose(left);
       // After a sleep every chat's close falls due at once, while each process renews its sign-in:
-      // spread out (server/core/auth-gate.ts), and only when the chat is still idle then.
-      authGate.afterWake(() => !this.rt.turnActive && !this.liveTasks.size && this.shutdown(), due);
-    }, IDLE_CLOSE_MS);
+      // spread out (server/core/auth-gate.ts), and only when the chat still holds no work then.
+      authGate.afterWake(() => {
+        if (this.q && !this.rt.meta.options?.remoteControl && !this.holdsWork()) this.tellLost(this.shutdown(), 'process');
+      });
+    }, ms);
+    this.idleTimer.unref?.();
   }
 
   /** The process is gone: its remote link and Chrome connection went with it. */
@@ -1566,36 +1938,71 @@ class ClaudeSession implements ProviderSession {
     if (meta.capState) this.rt.update({ capState: undefined });
   }
 
-  private shutdown() {
+  /**
+   * Lets the process go: it is closed, and nothing it writes after this reaches a turn here (`pump`).
+   * What ran in it went with it: background sub-agents and workflows are stopped, its commands and
+   * monitors lost (`why`), and the steps it left running with no turn open settle now, at the moment
+   * of the cut (an open turn is its caller's to end). Returns the names of the commands lost, for the
+   * caller to tell (`tellLost`).
+   */
+  private shutdown(why: LostWhy = 'process'): string[] {
     clearTimeout(this.idleTimer);
+    clearTimeout(this.wakeNet);
     dropRemote(this.remoteHolder);
     const q = this.q;
+    let lost: string[] = [];
     if (q) {
       this.clearLiveState();
-      // Background sub-agents and workflows live in the process: they end with it (its pump, which
-      // settles them when the process ends by itself, skips a process let go here; review wave 7, #5).
-      this.liveTasks.clear();
-      this.taskItems.clear();
+      // Its pump, which settles all this when the process ends by itself, skips a process let go here (review wave 7, #5).
+      this.forgetTasks();
       this.rt.stopBackground();
+      lost = this.rt.tasksLost(why);
+      if (!this.rt.turnActive) this.rt.cutTurn('closed');
+      this.leaving = this.exits.get(q);
     }
     this.q = undefined;
     this.cliState = undefined;
     this.input?.end();
     this.input = undefined;
-    this.costBase = this.rt.meta.usage.costUsd ?? this.costBase;
     try {
       q?.close();
     } catch {
       /* already closed */
     }
+    return lost;
   }
 
+  /**
+   * Let go by the bridge (a move, the chat closed, a switch of agent, Sable quitting). The session is
+   * retired: it never starts a process again, so a message sent to it late throws instead of reaching
+   * the account the chat left (review of 23 Nov, D6). A turn its own process still ran was cut by
+   * Sable and says so ("Ended early"); a turn it does not run is left to whoever does. Resolves once
+   * the process has really ended, or after `EXIT_WAIT_MS` (a move copies a transcript only once
+   * `exited` says it ended).
+   */
   async close() {
+    this.retired = true;
     this.closed = true;
     this.held = undefined;
     clearTimeout(this.interruptTimer);
-    this.shutdown();
+    clearTimeout(this.releaseTimer);
+    clearTimeout(this.unreadNet);
+    // Nothing of its process reaches it any more: what it sent is no longer looked for.
+    this.own.clear();
+    const owned = this.ownsTurn();
+    const lost = this.shutdown();
+    if (owned) {
+      this.turnSeq++;
+      this.interrupted = false;
+      this.awaiting.clear();
+      this.wakes = 0;
+      this.retire(this.sentItems.keys(), 'stopped');
+      this.rt.cutTurn('closed');
+    }
+    this.tellLost(lost, 'process');
     this.provider.sessions.delete(this);
+    // Bounded: a process that does not end in time is not waited for here (`exited` says so to a move).
+    await this.exited().catch(() => {});
   }
 
   /**
@@ -1605,7 +2012,7 @@ class ClaudeSession implements ProviderSession {
    */
   private setAside() {
     this.log('claude: a stopped turn never sent its result; the next message goes to a new agent process');
-    this.shutdown();
+    this.tellLost(this.shutdown(), 'process');
     this.owed = [];
     this.streams.clear();
     this.wakes = 0;
@@ -1617,18 +2024,23 @@ class ClaudeSession implements ProviderSession {
   async send(item: UserItem, opts?: SendOptions) {
     // The sender's guard (review wave 6, #3): everything from here to the push into the stream runs at once.
     opts?.check?.();
+    // Let go by the bridge (the chat moved, or closed): never a process on the account it left (review of 23 Nov, D6).
+    if (this.retired) throw new Error(RETIRED);
     // Otherwise the SDK reports a missing cwd as a binary that "failed to launch".
     if (!existsSync(this.rt.meta.cwd)) throw new Error(`The folder ${this.rt.meta.cwd} does not exist.`);
     this.closed = false;
     this.lastActive = Date.now();
     // A stopped turn still owes its result on a stream that has not shown it names what a result
     // answers: a result naming nothing could then be either turn's. The next turn goes to a new process
-    // (the conversation resumes there), whose results are all its own. With background tasks running in
-    // it, letting it go would end them: the message waits instead (`held`) until that result is told
-    // apart (`release`).
+    // (the conversation resumes there), whose results are all its own. With work running in it (a
+    // background task, the CLI's own word that it works), letting it go would end that: the message
+    // waits instead (`held`) until that result is told apart (`release`). A wake-up it scheduled does
+    // not hold the person's message: it goes, and the wake-up with the process.
     if (this.q && !this.rt.turnActive && this.owed.length && !this.namesMessages) {
-      if (this.liveTasks.size) this.held ??= [];
-      else this.setAside();
+      if (this.worksNow()) {
+        this.held ??= [];
+        this.recheckHeld();
+      } else this.setAside();
     }
     this.ensure();
     clearTimeout(this.idleTimer);
@@ -1655,14 +2067,23 @@ class ClaudeSession implements ProviderSession {
         : text;
     this.awaiting.set(uuid, { read: false });
     this.sentItems.set(uuid, item.id);
+    // Sable's own for good (D-own): its card's words, and what went (Sable may have added a summary, a line, files).
+    const card = this.rt.get<UserItem>(item.id);
+    this.own.set(uuid, { itemId: item.id, words: plainWords(card?.type === 'user' ? card.text : item.text), sent: plainWords(text), at: Date.now(), q: this.q, read: false, replayed: false });
+    while (this.own.size > OWN_MAX) this.own.delete(this.own.keys().next().value!);
     // Its result says what it came to (`retire`): until then it went ok for nobody (the bridge names a chat only from one that did).
     this.rt.expectOutcome(item.id);
     this.interrupted = false;
     // Local commands (/cost, /context) can take a while and never "think".
     const command = /^\/[\w:-]+/.exec(item.text.trim())?.[0];
-    if (!this.rt.turnActive) this.rt.beginTurn(command ? `Running ${command}` : this.booting ? 'Starting' : 'Thinking');
+    if (!this.rt.turnActive) {
+      this.rt.beginTurn(command ? `Running ${command}` : this.booting ? 'Starting' : 'Thinking');
+      this.agentTurnAt = -1;
+    }
     // Steered into a turn the agent began by itself after a stop: the person lifts the stop's hold.
     else this.rt.personSent();
+    // The turn runs in this process (`ownsTurn`).
+    this.turnAt = this.rt.turnStartedAt;
     const msg = {
       type: 'user',
       uuid,
@@ -1690,13 +2111,30 @@ class ClaudeSession implements ProviderSession {
     const held = this.held;
     if (!held) return;
     if (this.q && this.owed.length && !this.namesMessages) {
-      if (this.liveTasks.size) return;
+      if (this.worksNow()) return this.recheckHeld();
       this.setAside();
     }
+    clearTimeout(this.releaseTimer);
     this.held = undefined;
     this.ensure();
-    for (const m of held) this.input!.push(m);
+    for (const m of held) {
+      // It goes to this process now (a late take is looked for only from the process a message went to).
+      const o = this.own.get((m as { uuid?: string }).uuid ?? '');
+      if (o) o.q = this.q;
+      this.input!.push(m);
+    }
     if (this.rt.turnActive && this.rt.meta.activity === HELD_LINE) this.rt.update({ activity: this.booting ? 'Starting' : 'Thinking' });
+  }
+
+  /**
+   * Messages held while the CLI's own word that it works is what holds them: looked at again once that
+   * word is too old to believe (`CLI_TRUST_MS`), so a missed idle never holds them for ever.
+   */
+  private recheckHeld() {
+    clearTimeout(this.releaseTimer);
+    if (!this.cliBusy()) return;
+    this.releaseTimer = setTimeout(() => this.release(), Math.max(1_000, this.heardAt + CLI_TRUST_MS - Date.now() + 50));
+    this.releaseTimer.unref?.();
   }
 
   async interrupt() {
@@ -1741,16 +2179,15 @@ class ClaudeSession implements ProviderSession {
    */
   private terminate() {
     this.log('claude: the stop was not confirmed; the agent process is closed');
-    this.shutdown();
+    // Its background sub-agents and workflows end with it, its commands are lost (`shutdown`).
+    const lost = this.shutdown();
     this.owed = [];
     this.streams.clear();
-    this.liveTasks.clear();
     this.wakes = 0;
-    // Background sub-agents and workflows lived in that process.
-    this.rt.stopBackground();
     this.finishTurn(undefined, true);
     // What it had not read went back to the queue (finishTurn); no process is left to read it.
     this.withdrawn.clear();
+    this.tellLost(lost, 'process');
   }
 
   /** The running turn is settled without its result: the result it still owes is told apart when it comes (`late`). */
@@ -1786,7 +2223,7 @@ class ClaudeSession implements ProviderSession {
   private late(m: Obj): boolean {
     if (!this.owed.length) return false;
     const named = resultUuids(m);
-    if (named.length) this.namesMessages = true;
+    if (named.length) this.learnNames();
     const at = named.length ? this.owed.findIndex((s) => named.every((u) => s.has(u))) : this.owed.findIndex((s) => !this.namesMessages || !s.size);
     if (at < 0) {
       this.owed = [];
@@ -1862,14 +2299,17 @@ class ClaudeSession implements ProviderSession {
         note = (err as Error).message;
       }
     }
+    // The agent may have begun a turn by itself meanwhile: a rewind never cuts one (what the files came to is still said).
+    if (this.rt.turnActive) return { ok: false, message: note ? `${note} The conversation was not rewound: the agent began working meanwhile.` : 'Stop the current turn first.' };
     const at = item.providerId ? this.chain.indexOf(item.providerId) : -1;
-    this.shutdown();
+    const lost = this.shutdown();
     if (at > 0) this.resumeAt = this.chain[at - 1];
     else this.rt.update({ providerSessionId: undefined });
     this.chain = at > 0 ? this.chain.slice(0, at) : [];
     const idx = this.rt.items.findIndex((i) => i.id === itemId);
     if (idx >= 0) this.rt.reset(this.rt.items.slice(0, idx));
     this.rt.notice('rewind', 'Rewound the conversation', note || undefined);
+    this.tellLost(lost, 'process');
     return { ok: true, message: note || undefined };
   }
 
@@ -2015,7 +2455,83 @@ class ClaudeSession implements ProviderSession {
     return s;
   }
 
+  /**
+   * Every frame of the process. Around it: when the process was last heard (its own root work apart,
+   * `WAKE_QUIET_MS`), and whose the open turn is. A turn open while a frame of this process is handled
+   * runs in it (`ownsTurn`); one that began with the frame is Claude Code's own, not the person's
+   * (a notification, a message withdrawn at a stop read after all, a wake), and it ends when it goes
+   * quiet if nothing else ends it (`wakeNet`).
+   */
   private onMessage(m: SDKMessage) {
+    const any = m as Obj;
+    const now = Date.now();
+    this.heardAt = now;
+    if (!any.parent_tool_use_id && !(m.type === 'system' && TASK_FRAMES.has(any.subtype)) && m.type !== 'rate_limit_event' && m.type !== 'prompt_suggestion') this.rootHeardAt = now;
+    const rt = this.rt;
+    const before = rt.turnActive ? rt.turnStartedAt : -1;
+    const seq = this.turnSeq;
+    this.handleMessage(m);
+    if (!rt.turnActive) return;
+    if (rt.turnStartedAt !== before || this.turnSeq !== seq) {
+      // Begun by Claude Code with this frame: the chat was just used (the Remote Control keeper, the idle close).
+      this.agentTurnAt = rt.turnStartedAt;
+      this.lastActive = now;
+      this.armWakeNet();
+    }
+    this.turnAt = rt.turnStartedAt;
+  }
+
+  /**
+   * Claude Code works at the root while no turn is open here (review of 23 Nov, D-turn): work it took up
+   * after a result, a wake-up with no message to replay, a new process taking up work. It begins a turn
+   * of its own, not the person's (`keepHold`: a stop's hold on the queue stays through it), which its
+   * result, the CLI's idle or the quiet bound ends. None for a process let go, and none while a turn a
+   * stop's safety net settled still owes its result: what comes before that result is that turn's.
+   */
+  private wake() {
+    const rt = this.rt;
+    if (rt.turnActive || !this.q || this.closed || this.owed.length) return;
+    this.wakes++;
+    rt.beginTurn('Thinking', { keepHold: true });
+  }
+
+  /** The bound on a turn Claude Code began by itself (`WAKE_QUIET_MS`), looked at again until that turn ends. */
+  private armWakeNet(ms = WAKE_QUIET_MS) {
+    clearTimeout(this.wakeNet);
+    const at = this.agentTurnAt;
+    this.wakeNet = setTimeout(() => this.wakeNetDue(at), ms);
+    this.wakeNet.unref?.();
+  }
+
+  /**
+   * A turn Claude Code began by itself has gone quiet: no frame of its own root work for
+   * `WAKE_QUIET_MS`, no step of it running, no prompt open, nothing of anyone's waiting for its answer,
+   * nothing held, no stop under way, and the CLI not saying it works. It is over: a CLI that never says
+   * it is idle never leaves the chat "Thinking". Should the agent go on after all, its next output begins
+   * a turn again.
+   */
+  private wakeNetDue(at: number) {
+    const rt = this.rt;
+    if (!rt.turnActive || rt.turnStartedAt !== at || this.agentTurnAt !== at || !this.q) return;
+    const quiet = Date.now() - Math.max(this.rootHeardAt, at);
+    const busy = this.awaiting.size > 0 || !!this.held || this.interrupted || this.promptsOpen() || this.cliBusy() || this.rootStepRunning();
+    if (busy || quiet < WAKE_QUIET_MS) return this.armWakeNet(busy ? WAKE_QUIET_MS : WAKE_QUIET_MS - quiet + 50);
+    this.log('claude: a turn the agent began went quiet with no end; it is over');
+    this.finishTurn(undefined, false);
+  }
+
+  /** Whether a root step of the open turn still runs (a call the agent waits on). */
+  private rootStepRunning(): boolean {
+    const from = this.rt.turnStartedAt;
+    const items = this.rt.items;
+    for (let k = items.length - 1, n = 0; k >= 0 && n < 5_000; k--, n++) {
+      const i = items[k];
+      if (!i.parentId && i.type === 'tool' && i.ts >= from && (i.status === 'running' || i.status === 'pending' || i.status === 'awaiting')) return true;
+    }
+    return false;
+  }
+
+  private handleMessage(m: SDKMessage) {
     const any = m as Obj;
     if (any.session_id && any.session_id !== this.rt.meta.providerSessionId) this.rt.update({ providerSessionId: any.session_id });
     if (this.booting) {
@@ -2023,6 +2539,8 @@ class ClaudeSession implements ProviderSession {
       this.booting = false;
       if (this.rt.turnActive && this.rt.meta.activity === 'Starting') this.rt.update({ activity: 'Thinking' });
     }
+    // A reply stamped with the messages its turn took: one of Sable's is taken there, before the reply shows.
+    if ((m.type === 'assistant' || m.type === 'stream_event') && !any.parent_tool_use_id) this.stamped(any);
     switch (m.type) {
       case 'stream_event':
         return this.onStreamEvent(any.event, any.parent_tool_use_id ?? null);
@@ -2064,6 +2582,9 @@ class ClaudeSession implements ProviderSession {
         break;
       case 'content_block_start': {
         const b = ev.content_block ?? {};
+        // The model writes at the root while no turn is open: Claude Code's own work, in a turn of its own
+        // (begun before the first thing it writes is shown).
+        if (!parent && (b.type === 'text' || b.type === 'thinking' || b.type === 'tool_use' || b.type === 'server_tool_use')) this.wake();
         if (b.type === 'text') {
           const item = rt.add<TextItem>({ type: 'text', text: b.text ?? '', streaming: true, parentId });
           s.blocks.set(ev.index, { itemId: item.id, type: 'text', json: '' });
@@ -2170,6 +2691,10 @@ class ClaudeSession implements ProviderSession {
     // when a cut conversation is taken up again, and as a refused request's words) is nobody's words.
     const standIn = synthetic && texts.length > 0 && texts.every(isStandIn);
     const failedWords = (!!m.error || texts.some(isAuthFailure)) && synthetic;
+    // The agent's own output at the root while no turn is open begins one (`wake`), after the refusal
+    // above is read: a refusal at a limit outside the person's turn stays the background's to decide
+    // (`limitInBackground`). A frame Claude Code wrote itself (a stand-in, a refusal, an error) is no work.
+    if (!parentId && !synthetic && ((msg.content as Obj[] | undefined) ?? []).some((b) => (b.type === 'text' && b.text) || (b.type === 'thinking' && b.thinking) || b.type === 'tool_use' || b.type === 'server_tool_use')) this.wake();
     if (synthetic) for (const t of texts) this.syntheticTexts.add(t);
     for (const b of (msg.content as Obj[] | undefined) ?? []) {
       if (b.type === 'tool_use' || b.type === 'server_tool_use') {
@@ -2196,8 +2721,9 @@ class ClaudeSession implements ProviderSession {
         ...(words && !isStandIn(words) ? { detail: words } : {}),
       });
     } else if (atLimit) {
-      // One notice for the chat: one written while its background work met the limit is this turn's too.
-      if (!this.limitNoticeId && rt.limitCard && rt.get(rt.limitCard)) this.limitNoticeId = rt.limitCard;
+      // One notice for the chat: one written while its background work met the limit is this turn's too
+      // (while nothing is decided on it yet).
+      this.limitNoticeId ??= this.openLimitCard();
       if (!this.limitNoticeId) {
         const said = texts.join(' ');
         // Older CLIs say "Claude AI usage limit reached|<reset time in epoch seconds>".
@@ -2233,15 +2759,8 @@ class ClaudeSession implements ProviderSession {
   private onUser(m: Obj) {
     const rt = this.rt;
     if (m.isReplay) {
-      const itemId = m.uuid ? this.pendingUsers.get(m.uuid) : undefined;
-      if (itemId) {
-        this.pendingUsers.delete(m.uuid);
-        this.markRead(m.uuid);
-        this.chain.push(m.uuid);
-        // Replayed when the agent takes it: from here on what it writes was written knowing the message.
-        rt.taken(itemId, { providerId: m.uuid });
-        return;
-      }
+      // One of Sable's own on its way: replayed when the agent takes it.
+      if (m.uuid && this.pendingUsers.has(m.uuid)) return void this.takeOwn(m.uuid, 'replay');
       const back = m.uuid ? this.withdrawn.get(m.uuid) : undefined;
       if (back && !m.parent_tool_use_id) {
         // A steer withdrawn at a stop that Claude Code read after all: it is this turn's, shown as it
@@ -2250,14 +2769,24 @@ class ClaudeSession implements ProviderSession {
         this.withdrawn.delete(m.uuid);
         this.chain.push(m.uuid);
         this.awaiting.set(m.uuid, { read: true });
+        const o = this.own.get(m.uuid);
+        if (o) o.read = o.replayed = true;
         let id = back.itemId;
         if (rt.get<UserItem>(id)?.type === 'user') rt.taken(id, { providerId: m.uuid });
         else {
           const copy = rt.queue.find((q) => q.id === id);
           const same = (a?: UserItem['attachments'], b?: UserItem['attachments']) => (a ?? []).map((x) => x.id).join('\n') === (b ?? []).map((x) => x.id).join('\n');
-          if (copy && copy.text === back.text && same(copy.attachments, back.attachments)) rt.takeQueued(id);
-          else if (copy) id = randomUUID();
-          rt.add<UserItem>({ id, type: 'user', text: back.text || replayText(m.message?.content) || '', attachments: back.attachments, state: 'sent', providerId: m.uuid });
+          // Sent again from the queue meanwhile (C5): the card that went is this message too. Claude Code
+          // has it twice now; the conversation shows it once.
+          const again = copy ? undefined : this.sentAgain(back);
+          if (again) {
+            id = again;
+            rt.taken(id, { providerId: m.uuid });
+          } else {
+            if (copy && copy.text === back.text && same(copy.attachments, back.attachments)) rt.takeQueued(id);
+            else if (copy) id = randomUUID();
+            rt.add<UserItem>({ id, type: 'user', text: back.text || replayText(m.message?.content) || '', attachments: back.attachments, state: 'sent', providerId: m.uuid });
+          }
         }
         this.sentItems.set(m.uuid, id);
         this.rt.expectOutcome(id);
@@ -2269,35 +2798,53 @@ class ClaudeSession implements ProviderSession {
         return;
       }
       if (m.parent_tool_use_id) return;
+      // One of Sable's own whose turn's bookkeeping let it go before Claude Code took it (a result named
+      // it, or its turn ended, first): still the person's message, never one from the Claude app.
+      if (m.uuid && this.takeOwn(m.uuid, 'replay')) return;
       // The same message replayed again (a reconnect, a repeat) is already in the conversation.
       if (m.uuid && (this.chain.includes(m.uuid) || rt.items.some((i) => i.type === 'user' && i.providerId === m.uuid))) return;
-      const text = replayText(m.message?.content);
-      if (!text) return;
+      const content = m.message?.content;
+      const text = replayText(content);
       // Written by Claude Code in the person's place (a task finished, a command and its output):
       // shown as a line (shared/synthetic.ts), never as a message from the Claude app.
-      const syn = parseSynthetic(text);
+      const syn = text ? parseSynthetic(text) : null;
       // A slash command Sable sent comes back in the CLI's own tags (`<command-name>/compact</command-name>…`).
       const echo = syn?.role === 'command' ? syntheticLine(syn) : '';
-      // One of ours under another uuid (a steer the CLI folded in): the same words, still waiting.
-      for (const [uuid, id] of this.pendingUsers) {
-        const mine = rt.get<UserItem>(id);
-        // Sable may have sent more than the words (a summary before them, a line on the Browser tab, pictures).
-        const words = mine?.text.trim() ?? '';
-        if (mine && (words === text.trim() || (words.length >= 12 && text.includes(words)) || (!!echo && words === echo))) {
-          this.pendingUsers.delete(uuid);
-          this.markRead(uuid);
+      // One of ours under another uuid (a steer the CLI folded in): only one it has not read yet, and only
+      // by its very words. A message from the app that merely holds them stays the app's; one with the
+      // same words is the app's again once ours comes back under its own uuid (`unalias`).
+      const mine = this.ownByWords(text, echo);
+      if (mine) {
+        const [uuid, o] = mine;
+        this.pendingUsers.delete(uuid);
+        this.markRead(uuid);
+        o.read = true;
+        if (m.uuid && m.uuid !== uuid) {
           // A result may name it by either uuid.
-          if (m.uuid && m.uuid !== uuid) this.aliases.set(m.uuid, uuid);
-          if (m.uuid) this.chain.push(m.uuid);
-          rt.taken(id, { providerId: m.uuid });
-          return;
+          this.aliases.set(m.uuid, uuid);
+          o.alias = { uuid: m.uuid, text, attachments: appPictures(content, APP_PICTURES), at: Date.now() };
         }
+        if (m.uuid) this.chain.push(m.uuid);
+        rt.taken(o.itemId, { providerId: m.uuid });
+        return;
       }
+      const synthetic = !!syn || m.isSynthetic === true;
+      const pictures = synthetic ? undefined : appPictures(content, APP_PICTURES);
+      if (!text && !pictures) return;
       if (m.uuid) this.chain.push(m.uuid);
       // Claude Code's own (a background task ended, a teammate wrote): it wakes the model with a turn of
       // its own, whose result names no message, or is folded into the running turn and has none.
-      if (syn || m.isSynthetic === true) {
-        rt.add<UserItem>({ type: 'user', text, state: 'sent', providerId: m.uuid, ...(syn ? {} : { remote: true }) });
+      if (synthetic) {
+        if (syn) rt.add<UserItem>({ type: 'user', text, state: 'sent', providerId: m.uuid });
+        // Marked as Claude Code's with no wrapper Sable knows (C4): its line, never the person's words
+        // nor a message from the app.
+        else {
+          const plain = stripWrappers(text).trim() || text.trim();
+          const nl = plain.indexOf('\n');
+          const head = (nl < 0 ? plain : plain.slice(0, nl)).trim();
+          const rest = nl < 0 ? '' : plain.slice(nl + 1).trim();
+          rt.notice('info', head.length > 160 ? `${head.slice(0, 159)}…` : head, rest ? (rest.length > 2000 ? `${rest.slice(0, 1999)}…` : rest) : undefined);
+        }
         // Output, summaries and wrappers belong to the turn they came in; a notification or a command opens one.
         if (syn?.role === 'output' || syn?.role === 'summary' || syn?.role === 'hidden') return;
         this.wakes++;
@@ -2306,8 +2853,8 @@ class ClaudeSession implements ProviderSession {
         return;
       }
       // A message sent from elsewhere (Remote Control in the Claude app or on claude.ai): it belongs
-      // in this conversation, and the turn it starts runs here too.
-      rt.add<UserItem>({ type: 'user', text, state: 'sent', providerId: m.uuid, remote: true });
+      // in this conversation, with its pictures (bounded), and the turn it starts runs here too.
+      rt.add<UserItem>({ type: 'user', text, ...(pictures ? { attachments: pictures } : {}), state: 'sent', providerId: m.uuid, remote: true });
       // It gets a result of its own (or is folded into the running turn's): either way the turn waits for it.
       this.awaiting.set(m.uuid || `remote-${randomUUID()}`, { read: true });
       if (!rt.turnActive) rt.beginTurn('Thinking');
@@ -2317,6 +2864,8 @@ class ClaudeSession implements ProviderSession {
     if (m.uuid && !m.parent_tool_use_id) this.chain.push(m.uuid);
     const content = m.message?.content;
     if (!Array.isArray(content)) return;
+    // A call's result at the root while no turn is open: Claude Code works on, in a turn of its own.
+    if (!m.parent_tool_use_id && (content as Obj[]).some((b) => b?.type === 'tool_result')) this.wake();
     for (const b of content as Obj[]) {
       if (b.type !== 'tool_result') continue;
       const item = rt.get<ToolItem>(b.tool_use_id);
@@ -2331,10 +2880,38 @@ class ClaudeSession implements ProviderSession {
         const resetsAt = this.provider.windowReset(limit.window) ?? (this.limitHit?.window === limit.window ? this.limitHit.resetsAt : undefined);
         if (resetsAt) merged.agent = { ...merged.agent, limit: { ...limit, resetsAt } };
       }
-      rt.patch<ToolItem>(item.id, { status, result: merged, endedAt: Date.now() });
+      // A step already settled (cancelled when its turn was cut or settled, or denied) keeps the end it
+      // got then: a result that comes hours later is no measure of its work.
+      rt.patch<ToolItem>(item.id, { status, result: merged, ...(item.status === 'cancelled' || item.status === 'denied' ? {} : { endedAt: Date.now() }) });
       this.trackTasks(item, m.tool_use_result);
+      this.trackLive(item, (item.input as Obj) ?? {}, m.tool_use_result);
     }
     if (!m.parent_tool_use_id && rt.turnActive) rt.update({ activity: 'Thinking' });
+  }
+
+  /**
+   * What a call's result says of work left in the process: the background task it started (a command's
+   * `backgroundTaskId`, a monitor's `taskId`; the tie needs no task event), a foreground task it waited
+   * on, which ends with this result, and a wake-up it scheduled or cancelled.
+   */
+  private trackLive(item: ToolItem, input: Obj, structured: unknown) {
+    const bg = backgroundTaskOf(item.name, structured);
+    for (const [task, step] of [...this.taskItems]) if (step === item.id && this.foreground.has(task) && task !== bg?.id) this.taskOver(task, 'done');
+    if (bg && !this.endedTasks.has(bg.id) && !this.ambient.has(bg.id)) {
+      // Its call returned with the task still running (moved to the background at its timeout, or by the person): it goes on.
+      if (this.foreground.delete(bg.id)) this.liveTasks.add(bg.id);
+      this.taskItems.set(bg.id, item.id);
+      this.noteTask(bg.id, undefined, item.name);
+      this.backgrounded(bg.id, this.rt.get<ToolItem>(item.id));
+    }
+    const wake = wakeOf(item.name, input, structured);
+    if (wake?.loop !== undefined) this.loopWakeAt = wake.loop ?? undefined;
+    if (wake?.cron) {
+      if (wake.cron.at) this.cronWakes.set(wake.cron.id, wake.cron.at);
+      else this.cronWakes.delete(wake.cron.id);
+      // A chat that schedules many keeps the newest few.
+      while (this.cronWakes.size > 32) this.cronWakes.delete(this.cronWakes.keys().next().value as string);
+    }
   }
 
   /** TaskCreate / TaskUpdate (the newer task tools) → the pinned task list. */
@@ -2357,13 +2934,18 @@ class ClaudeSession implements ProviderSession {
     this.rt.setTodos([...this.tasks.values()]);
   }
 
-  /** Messages the CLI has answered for (`uuids`, or all sent so far): taken, even when no replay said so. */
+  /**
+   * Messages the CLI has answered for (`uuids`, or all sent so far): taken, even when no replay said so.
+   * Each card gets the uuid it went with (D-own): a replay of it that comes after all is a repeat of a
+   * message of Sable's own, also once the chat is read again.
+   */
   private takeUsers(uuids?: readonly unknown[]) {
     for (const uuid of uuids ?? [...this.pendingUsers.keys()]) {
       const itemId = typeof uuid === 'string' ? this.pendingUsers.get(uuid) : undefined;
       if (!itemId) continue;
       this.pendingUsers.delete(uuid as string);
-      if (this.rt.get<UserItem>(itemId)?.state === 'queued') this.rt.taken(itemId);
+      const card = this.rt.get<UserItem>(itemId);
+      if (card?.type === 'user' && (card.state === 'queued' || !card.providerId)) this.rt.taken(itemId, { providerId: uuid as string });
     }
   }
 
@@ -2379,16 +2961,157 @@ class ClaudeSession implements ProviderSession {
     return false;
   }
 
+  /** The cards of Sable's own messages still on their way to Claude Code (sent, not read), oldest first. */
+  private unreadOwn(): string[] {
+    const out: string[] = [];
+    for (const [uuid, a] of this.awaiting) {
+      const o = a.read ? undefined : this.own.get(uuid);
+      if (o) out.push(o.itemId);
+    }
+    return out;
+  }
+
+  /** The CLI names the messages a result answers: every session of this provider reads its results so from now on. */
+  private learnNames() {
+    this.namesMessages = true;
+    this.provider.seen.names = true;
+  }
+
+  /**
+   * Claude Code took message `uuid` of Sable's own: its replay (`replay`), or a reply frame stamped with
+   * it (`stamp`). False when the uuid is not one Sable sent. On its way, it is taken where the agent
+   * took it. Let go by its turn's bookkeeping first (a result named it, or its turn ended, before
+   * Claude Code read it): still the person's message, never one from the Claude app; it stands where
+   * the agent took it, and the work it begins is its turn, whose own result ends it (review of 23 Nov,
+   * D-own). A repeat changes nothing.
+   */
+  private takeOwn(uuid: string, via: 'replay' | 'stamp'): boolean {
+    const o = this.own.get(uuid);
+    if (!o) return false;
+    const rt = this.rt;
+    if (via === 'replay') {
+      if (o.replayed) return true;
+      o.replayed = true;
+      if (!this.chain.includes(uuid)) this.chain.push(uuid);
+      // Back under its own uuid: the message taken for it by its words was the app's after all.
+      if (o.alias) this.unalias(o, uuid);
+    }
+    const itemId = this.pendingUsers.get(uuid);
+    if (itemId) {
+      // From here on what the agent writes was written knowing the message.
+      this.pendingUsers.delete(uuid);
+      this.markRead(uuid);
+      o.read = true;
+      rt.taken(itemId, { providerId: uuid });
+      return true;
+    }
+    if (o.read) return true;
+    o.read = true;
+    const card = rt.get<UserItem>(o.itemId);
+    // Only from the process it went to, and soon after: anything else is a repeat of what was settled.
+    if (o.q !== this.q || !this.q || Date.now() - o.at > OWN_LATE_MS) {
+      if (card?.type === 'user' && !card.providerId) rt.patch<UserItem>(card.id, { providerId: uuid });
+      return true;
+    }
+    if (card?.type === 'user') rt.move(card.id, { state: 'sent', providerId: uuid } as Partial<TimelineItem>, true);
+    else {
+      // Taken back to the queue meanwhile (a stop, a failure): out of it again, never sent twice. A
+      // message Sable sent with no card of its own (a carry-on) stays unseen.
+      const copy = rt.queue.find((q) => q.id === o.itemId);
+      if (copy && rt.takeQueued(copy.id)) rt.add<UserItem>({ id: copy.id, type: 'user', text: copy.text, attachments: copy.attachments, state: 'sent', providerId: uuid });
+    }
+    this.awaiting.set(uuid, { read: true });
+    this.sentItems.set(uuid, o.itemId);
+    rt.expectOutcome(o.itemId);
+    // Its result answers it in the turn it begins now, never as a settled turn's debt (`owe`).
+    this.forgive(uuid);
+    // Begun by Claude Code, not by a send: a stop's hold on the queue stays through it.
+    if (!rt.turnActive) rt.beginTurn('Thinking', { keepHold: true });
+    return true;
+  }
+
+  /**
+   * A message from the Claude app was taken for Sable's own `o` by its words, and `o` came back under
+   * its own uuid: the app's message was the app's. It gets its own card (with its pictures), at the
+   * time it came; `o`'s card keeps its own uuid. What the app's message's result says, it says for it.
+   */
+  private unalias(o: OwnSend, uuid: string) {
+    const a = o.alias!;
+    o.alias = undefined;
+    o.read = false;
+    this.aliases.delete(a.uuid);
+    const rt = this.rt;
+    if (rt.get<UserItem>(o.itemId)?.type === 'user') rt.patch<UserItem>(o.itemId, { providerId: uuid });
+    rt.add<UserItem>({ ts: a.at, type: 'user', text: a.text, ...(a.attachments ? { attachments: a.attachments } : {}), state: 'sent', providerId: a.uuid, remote: true });
+  }
+
+  /**
+   * A message of Sable's own that Claude Code has not read yet whose very words a replay under another
+   * uuid has (wrappers, the steer note and Sable's additions aside): the oldest. Never by a part of the
+   * words, never one already read.
+   */
+  private ownByWords(text: string, echo: string): [string, OwnSend] | undefined {
+    const said = text ? plainWords(text) : '';
+    const command = echo ? plainWords(echo) : '';
+    if (!said && !command) return undefined;
+    for (const uuid of this.pendingUsers.keys()) {
+      const o = this.own.get(uuid);
+      if (!o || o.read) continue;
+      if ((!!said && (said === o.sent || said === o.words)) || (!!command && command === o.words)) return [uuid, o];
+    }
+    return undefined;
+  }
+
+  /**
+   * A steer withdrawn at a stop that the person sent again from the queue (its words, after the stop):
+   * the card that went then, if it is still there.
+   */
+  private sentAgain(back: { text: string; at: number }): string | undefined {
+    const words = plainWords(back.text);
+    if (!words) return undefined;
+    for (const o of this.own.values()) {
+      if (o.at < back.at || o.words !== words) continue;
+      if (this.rt.get<UserItem>(o.itemId)?.type === 'user') return o.itemId;
+    }
+    return undefined;
+  }
+
+  /**
+   * A reply frame stamped with the messages its turn took (`user_message_uuids`): this CLI names them,
+   * and each of Sable's own is taken there, also one Claude Code folded in and never replays.
+   */
+  private stamped(m: Obj) {
+    const named = resultUuids(m);
+    if (!named.length) return;
+    this.learnNames();
+    for (const u of named) this.takeOwn(u, 'stamp');
+  }
+
+  /**
+   * The chat's limit card its background work wrote, while nothing is decided on it yet: a turn refused
+   * at the same limit is said by it. A decided one (moved on, or waiting for its reset) is history,
+   * and a new refusal gets a card of its own, which the bridge decides again (review of 23 Nov, D4).
+   */
+  private openLimitCard(): string | undefined {
+    const id = this.rt.limitCard;
+    const card = id ? this.rt.get<NoticeItem>(id) : undefined;
+    return card?.type === 'notice' && card.limit && !card.limit.provider && !card.limit.continuedWith ? card.id : undefined;
+  }
+
   /**
    * The messages a result answers, by identity. Named (`user_message_uuids`, or `user_message_uuid`):
-   * those. Named none: in a CLI that names what its turns answer, a turn Claude Code started on its own
-   * (a wake); in an older one, one message, the oldest it has read. A message it has not read yet (a
-   * steer still on its way) is never answered by a result that does not name it.
+   * those. Named none: in a CLI that names what its turns answer, none (a turn Claude Code began by
+   * itself), unless it failed (a zeroed result: what it read last); in an older one, one message, the
+   * oldest it has read. A message Claude Code has not read yet is never answered by a result that does
+   * not name it once the CLI is known to name what its results answer (by any session of this
+   * provider), nor while it says sends still wait (`queued_turn_count`); only a CLI never seen to name
+   * one answers its messages in order (review of 23 Nov, D-own; a message that never comes back is
+   * bounded by `armUnreadNet`).
    */
   private answer(m: Obj): string[] {
     const named = resultUuids(m);
     if (named.length) {
-      this.namesMessages = true;
+      this.learnNames();
       const ids = named.map((u) => this.aliases.get(u) ?? u);
       // The messages this result answers for (a steer folded into the turn is one of them).
       this.takeUsers(ids);
@@ -2396,15 +3119,15 @@ class ClaudeSession implements ProviderSession {
       for (const u of named) this.aliases.delete(u);
       return ids;
     }
-    if (this.wakes > 0 && this.namesMessages) return [];
+    const failed = m.subtype !== 'success' || !!m.is_error;
+    if (this.namesMessages && (!failed || this.wakes > 0)) return [];
     for (const [id, a] of this.awaiting) {
       if (!a.read) continue;
       this.awaiting.delete(id);
       return [id];
     }
-    // A wake's result never answers a message Claude Code has not read (a steer still on its way).
-    if (this.wakes > 0) return [];
-    // None read (a CLI that does not replay, a replay missed): the oldest, as each result answers one.
+    if (this.wakes > 0 || this.namesMessages || Number(m.queued_turn_count) > 0) return [];
+    // A CLI never seen to name what its results answer (an older one): each result answers one, the oldest.
     const oldest = this.awaiting.keys().next().value;
     if (oldest === undefined) return [];
     this.awaiting.delete(oldest);
@@ -2440,7 +3163,7 @@ class ClaudeSession implements ProviderSession {
       this.pendingUsers.delete(uuid);
       this.sentItems.delete(uuid);
       const row = itemId ? this.rt.get<UserItem>(itemId) : undefined;
-      if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined });
+      if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined, at: Date.now() });
     }
     while (this.withdrawn.size > 50) this.withdrawn.delete(this.withdrawn.keys().next().value!);
   }
@@ -2457,10 +3180,12 @@ class ClaudeSession implements ProviderSession {
     if (!late) this.wakes = 0;
     const total = Number(m.total_cost_usd ?? 0);
     const usage: SessionUsage = { ...rt.meta.usage };
-    // total_cost_usd counts from the start of this CLI process (reset in ensure()).
-    const turnCost = Math.max(0, total - this.lastTotalCost);
+    // total_cost_usd is the CLI's running total for the conversation: this result costs what it added.
+    const turnCost = this.costOf(total);
     usage.costUsd = (usage.costUsd ?? 0) + turnCost;
-    this.lastTotalCost = total;
+    // Kept per conversation: a process that resumes it starts from here (`ensure`).
+    const conversation = typeof m.session_id === 'string' && m.session_id ? m.session_id : rt.meta.providerSessionId;
+    if (total > 0 && conversation) usage.cliCost = { session: conversation, total };
     usage.turns += 1;
     usage.inputTokens += Number(m.usage?.input_tokens ?? 0) + Number(m.usage?.cache_creation_input_tokens ?? 0);
     usage.outputTokens += Number(m.usage?.output_tokens ?? 0);
@@ -2491,7 +3216,7 @@ class ClaudeSession implements ProviderSession {
     // it at the turn's end), never as "The turn ended with an error" with "Try again".
     const cutAtLimit = !!error && !signIn && (m.error === 'rate_limit' || Number(m.api_error_status) === 429 || !!agentLimitOf(error) || /usage limit reached/i.test(error));
     if (cutAtLimit && error) {
-      if (!this.limitNoticeId && rt.limitCard && rt.get(rt.limitCard)) this.limitNoticeId = rt.limitCard;
+      this.limitNoticeId ??= this.openLimitCard();
       if (!this.limitNoticeId) {
         const named = agentLimitOf(error);
         const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(error)?.[1]));
@@ -2509,9 +3234,19 @@ class ClaudeSession implements ProviderSession {
         if (n?.limit && named && (!n.limit.resetsAt || !n.limit.window)) rt.patch<NoticeItem>(n.id, { limit: { ...n.limit, resetsAt: n.limit.resetsAt ?? named.resetsAt, window: n.limit.window ?? named.window } });
       }
     }
+    const inputTokens = Number(m.usage?.input_tokens ?? 0) + Number(m.usage?.cache_read_input_tokens ?? 0) + Number(m.usage?.cache_creation_input_tokens ?? 0);
+    const outputTokens = Number(m.usage?.output_tokens ?? 0);
+    const shownError = signIn || cutAtLimit ? undefined : error;
+    // A message of ours still on its way to Claude Code is no part of what this result closes: a result
+    // that answers none of ours then belongs to earlier work (a turn it took up by itself, a start that
+    // failed, a resumed process's first word) and never ends the person's turn. Its line stands above
+    // the message, which begins what comes next (review of 23 Nov, D-own); one that shows nothing (no
+    // tokens, no cost, no error) is not written at all, so nothing stands between message and answer.
+    const ahead = wasInterrupted ? [] : this.unreadOwn();
+    const blank = !answered.length && ahead.length > 0 && !inputTokens && !outputTokens && !turnCost && !shownError;
     // What the messages this result answers came to, whatever the turn does next, and the result's
     // line in the timeline that closes their answer.
-    const resultId = wasInterrupted ? undefined : randomUUID();
+    const resultId = wasInterrupted || blank ? undefined : randomUUID();
     this.retire(answered, wasInterrupted ? 'stopped' : failed ? 'failed' : 'ok', resultId);
     if (resultId) {
       rt.add<TurnItem>({
@@ -2519,17 +3254,20 @@ class ClaudeSession implements ProviderSession {
         type: 'turn',
         durationMs: Number(m.duration_ms ?? Date.now() - rt.turnStartedAt),
         costUsd: turnCost || undefined,
-        inputTokens: Number(m.usage?.input_tokens ?? 0) + Number(m.usage?.cache_read_input_tokens ?? 0) + Number(m.usage?.cache_creation_input_tokens ?? 0),
-        outputTokens: Number(m.usage?.output_tokens ?? 0),
+        inputTokens,
+        outputTokens,
         stopReason: m.stop_reason ?? undefined,
-        error: signIn || cutAtLimit ? undefined : error,
+        error: shownError,
       });
+      for (const id of ahead) if (rt.get<UserItem>(id)?.state === 'sent') rt.move(id, {}, true);
     }
     // Fresh plan limits after every turn (shared with any read in the last few seconds).
     if (this.q) void this.provider.readLimits(this.q);
     if (this.awaiting.size > 0 && !wasInterrupted) {
-      // Messages it has not answered yet are still coming (a steer it has not read): their turn starts right away.
+      // Messages it has not answered yet are still coming (a steer it has not read): their turn starts
+      // right away. One that never comes back does not keep it for ever (`armUnreadNet`).
       rt.update({ activity: 'Thinking' });
+      if (this.unread()) this.armUnreadNet();
       return;
     }
     // A stop holds through the turn's end: steers it has not read go back to the queue (finishTurn), and
@@ -2546,9 +3284,11 @@ class ClaudeSession implements ProviderSession {
   private finishTurn(error: string | undefined, interrupted: boolean) {
     const rt = this.rt;
     if (!rt.turnActive) return;
-    // This turn is settled: its stop's safety net goes with it.
+    // This turn is settled: its stop's safety net and its quiet bounds go with it.
     this.turnSeq++;
     clearTimeout(this.interruptTimer);
+    clearTimeout(this.wakeNet);
+    clearTimeout(this.unreadNet);
     if (interrupted) this.withdrawUnread();
     // Messages no result named on its own (an older CLI, a steer folded in, one the turn went idle
     // without answering) come to the turn's stop or failure. Otherwise what they came to is not known:
@@ -2568,8 +3308,55 @@ class ClaudeSession implements ProviderSession {
     else this.takeUsers();
     rt.endTurn(error);
     this.scheduleIdleClose();
-    if (this.restartPending) setTimeout(() => !this.rt.turnActive && this.restartPending && this.restart(), 0);
+    // A changed option restarts the process once nothing holds it any more (`restartWhenFree`).
+    if (this.restartPending) this.freeLater();
     else if (this.q && rt.meta.options?.browser) void this.checkBrowser(this.q);
+  }
+
+  /**
+   * A message of ours Claude Code has not read keeps the turn: its own turn is still to come. Not for
+   * ever (a delivery that failed, a zeroed result that named nothing): once the process has said
+   * nothing for `UNREAD_QUIET_MS` since then, and works on nothing (no word that it runs, no step of
+   * the turn running, no prompt open, nothing held, no stop under way), the message is not coming and
+   * the turn ends. Should Claude Code take it after all, it is still Sable's (`takeOwn`), and its
+   * turn begins then.
+   */
+  private armUnreadNet(ms = UNREAD_QUIET_MS) {
+    clearTimeout(this.unreadNet);
+    const at = this.rt.turnStartedAt;
+    this.unreadNet = setTimeout(() => this.unreadNetDue(at), ms);
+    this.unreadNet.unref?.();
+  }
+
+  private unreadNetDue(at: number) {
+    const rt = this.rt;
+    if (!rt.turnActive || rt.turnStartedAt !== at || !this.q || !this.unread()) return;
+    let since = this.heardAt;
+    for (const [uuid, a] of this.awaiting) if (!a.read) since = Math.max(since, this.own.get(uuid)?.at ?? 0);
+    const quiet = Date.now() - since;
+    const busy = !!this.held || this.interrupted || this.promptsOpen() || this.cliBusy() || this.rootStepRunning();
+    if (busy || quiet < UNREAD_QUIET_MS) return this.armUnreadNet(busy ? UNREAD_QUIET_MS : UNREAD_QUIET_MS - quiet + 50);
+    this.log('claude: a message never came back from the agent; its turn ends without it');
+    this.finishTurn(undefined, false);
+  }
+
+  /**
+   * What a result cost, from the CLI's running total for the conversation (review of 23 Nov, D-cost):
+   * what it added since the last total seen. A zeroed total (a crash, a refused start) says nothing and
+   * costs nothing. Where this process started is not known (a resumed conversation this chat never
+   * counted): its first total carries the conversation's past, so nothing is booked rather than all of
+   * it. A total below the last one restarted the count: within a process (a /clear) it all counts; as
+   * the process's first (a resume from an earlier point, a transcript that saved less) nothing does.
+   */
+  private costOf(total: number): number {
+    if (!(total > 0)) return 0;
+    const base = this.lastTotalCost;
+    const first = this.costFresh;
+    this.costFresh = false;
+    this.lastTotalCost = total;
+    if (base === undefined) return 0;
+    if (total >= base) return total - base;
+    return first ? 0 : total;
   }
 
   private onSystem(m: Obj) {
@@ -2635,23 +3422,66 @@ class ClaudeSession implements ProviderSession {
         }
         break;
       }
-      case 'background_tasks_changed':
-        // Every live background task (replace, not merge): the process is kept open while any runs.
-        this.liveTasks = new Set(((m.tasks as Obj[] | undefined) ?? []).map((t) => String(t.task_id)));
+      case 'background_tasks_changed': {
+        // Every live background task (replace, never merge: a missed start or end leaves nothing stale).
+        // Ambient ones (watchers, housekeeping) are nobody's work and never hold the process.
+        const level = new Set<string>();
+        for (const t of (m.tasks as Obj[] | undefined) ?? []) {
+          if (!t?.task_id) continue;
+          const id = String(t.task_id);
+          if (t.ambient === true) {
+            this.ambient.add(id);
+            continue;
+          }
+          this.ambient.delete(id);
+          level.add(id);
+          this.noteTask(id, t.task_type);
+        }
+        this.level = level;
+        // The list covers every background task started before it (they join it before their start is said).
+        for (const id of [...this.liveTasks]) if (!this.foreground.has(id)) this.liveTasks.delete(id);
         this.reconcileTasks();
-        // The last one ended: messages held for this process's owed result can go to a new one.
-        if (!this.liveTasks.size) this.release();
+        // The last one ended: messages held for this process's owed result can go to a new one, and a waiting restart.
+        this.release();
+        this.freeLater();
         break;
+      }
       case 'task_started': {
-        if (m.task_id) this.liveTasks.add(String(m.task_id));
         if (m.task_id && m.tool_use_id) this.taskItems.set(String(m.task_id), String(m.tool_use_id));
         const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
         if (item?.workflow && m.workflow_name && !item.workflow.name) rt.patch<ToolItem>(item.id, { workflow: { ...item.workflow, name: String(m.workflow_name) } });
+        if (!m.task_id) break;
+        const id = String(m.task_id);
+        // Housekeeping (a watcher, a task that writes no transcript): nobody's work.
+        if (m.ambient === true || m.skip_transcript === true) {
+          this.ambient.add(id);
+          break;
+        }
+        if (this.endedTasks.has(id)) break;
+        this.noteTask(id, m.task_type, item?.name);
+        this.liveTasks.add(id);
+        // A call that blocks on it (a sub-agent run in the foreground, a command waited for): it ends with that call.
+        if (m.is_backgrounded === false) this.foreground.add(id);
+        else this.backgrounded(id, item);
+        break;
+      }
+      case 'task_updated': {
+        const id = m.task_id ? String(m.task_id) : '';
+        const p = (m.patch ?? {}) as Obj;
+        if (!id) break;
+        // Moved to the background (at its timeout, or by the person): its call returns, the task goes on.
+        if (p.is_backgrounded === true && !this.endedTasks.has(id) && !this.ambient.has(id)) {
+          this.foreground.delete(id);
+          this.liveTasks.add(id);
+          this.backgrounded(id, this.taskItem({ task_id: id }));
+        }
+        const end = p.status === 'completed' ? 'done' : p.status === 'failed' ? 'failed' : p.status === 'killed' ? 'stopped' : undefined;
+        if (end) this.taskOver(id, end, typeof p.end_time === 'number' && p.end_time > 1e12 ? p.end_time : undefined);
         break;
       }
       case 'task_notification': {
-        if (m.task_id) this.liveTasks.delete(String(m.task_id));
-        if (!this.liveTasks.size) this.release();
+        // Its end: it holds the process no more, and a background command's step says how it ended.
+        if (m.task_id) this.taskOver(String(m.task_id), m.status === 'completed' ? 'done' : m.status === 'failed' ? 'failed' : 'stopped');
         // How a sub-agent ended, with its own figures. For one started in the background this is the only word of it.
         const item = this.taskItem(m);
         if (m.task_id) this.taskItems.delete(String(m.task_id));
@@ -2688,21 +3518,25 @@ class ClaudeSession implements ProviderSession {
         if (m.state === 'idle') {
           this.owed = [];
           this.release();
+          this.freeLater();
         }
         // Idle with nothing of Sable's still on its way: whatever no result closed (a message from the Claude
         // app folded into the turn, a background task's notification that woke no model turn) is over.
-        // A message of ours it has not read yet keeps the turn: its own turn is still to come.
-        // After a stop, idle is the end whatever it has not read (that goes back to the queue).
+        // A message of ours it has not read yet keeps the turn: its own turn is still to come (bounded,
+        // `armUnreadNet`). After a stop, idle is the end whatever it has not read (that goes back to the queue).
         if (m.state === 'idle' && rt.turnActive && (this.interrupted || !this.unread())) this.finishTurn(undefined, this.interrupted);
-        // Work it started on its own, with no message to replay (a scheduled wake-up): a turn like any other,
-        // which its result or the next idle ends. Only from idle: after a prompt it is the same work going on.
-        // Not the person's: a stop's hold on the queue stays through it, as through any turn the agent begins.
-        else if (m.state === 'running' && prev === 'idle' && !rt.turnActive && this.q && !this.closed) {
-          this.wakes++;
-          rt.beginTurn('Thinking', { keepHold: true });
-        }
+        else if (m.state === 'idle' && rt.turnActive) this.armUnreadNet();
+        // Work it started on its own, with no message to replay (a scheduled wake-up): a turn like any other
+        // (`wake`), which its result or the next idle ends. From idle, or as the first word of a new process
+        // (a process taking up work by itself); after a prompt it is the same work going on (a sub-agent's
+        // permission answered), and root work then begins its turn with its first output.
+        else if (m.state === 'running' && (prev === 'idle' || prev === undefined)) this.wake();
         break;
       }
+      case 'worker_shutting_down':
+        // Also read back from a transcript on a resume: never more than a line in the log.
+        this.log('claude: the agent process says it is shutting down');
+        break;
       default:
         break;
     }
