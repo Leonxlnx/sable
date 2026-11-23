@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { TimelineItem, ToolItem, UserItem } from '../shared/protocol';
+import type { TaskMark, TimelineItem, ToolItem, UserItem } from '../shared/protocol';
 import {
   OPEN_ALL,
   WAVE_ROWS,
@@ -11,6 +11,7 @@ import {
   liveKey,
   noteIndex,
   overview,
+  ownerAgent,
   startsWave,
   userIndex,
   waveOpen,
@@ -28,6 +29,8 @@ class Tl implements Timeline {
   items: Record<string, TimelineItem> = {};
   roots: string[] = [];
   children: Record<string, string[]> = {};
+  rev?: number;
+  changed?: { since: number; ids: readonly string[] };
   add(item: TimelineItem) {
     this.items = { ...this.items, [item.id]: item };
     if (item.parentId) this.children = { ...this.children, [item.parentId]: [...(this.children[item.parentId] ?? []), item.id] };
@@ -203,8 +206,51 @@ describe('background commands', () => {
     expect(commandState(t.items.serve as ToolItem, notes.get('serve'))).toBe('unknown');
     expect(commandState(bash('x', { status: 'running' }), undefined)).toBe('starting');
     expect(commandState(bash('x', { status: 'error' }), undefined)).toBe('failed');
-    // What failed first, then newest first.
-    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'serve', 'build'], failed: 1 });
+    // What failed first, then newest first (nothing here says one runs).
+    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'serve', 'build'], running: 0, failed: 1 });
+  });
+
+  it("read the bridge's own word first: running first with its time, then what failed, then the newest", () => {
+    const task = (state: TaskMark['state'], since: number, extra: Partial<TaskMark> = {}): TaskMark => ({ id: `task-${since}`, kind: 'command', state, since, ...extra });
+    const t = new Tl()
+      .add(user('u1', 1))
+      .add(bash('old', { ts: 2 }))
+      .add(bash('server', { ts: 3, task: task('running', 3) }))
+      .add(bash('lint', { ts: 4, task: task('failed', 4, { endedAt: 9 }) }))
+      .add(bash('tests', { ts: 5, task: task('running', 5) }))
+      .add(bash('gone', { ts: 6, task: task('lost', 6, { why: 'move' }) }))
+      .add(bash('build', { ts: 7, task: task('done', 7, { endedAt: 8 }) }));
+    const notes = noteIndex()(t);
+    expect(commandState(t.items.server as ToolItem, undefined)).toBe('running');
+    expect(commandState(t.items.gone as ToolItem, undefined)).toBe('lost');
+    // A note that says otherwise does not outrank the bridge.
+    expect(commandState(t.items.build as ToolItem, { ts: 9, outcome: 'failed' })).toBe('done');
+    // A chat saved before the bridge kept it: started, never running.
+    expect(commandState(t.items.old as ToolItem, undefined)).toBe('unknown');
+    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['server', 'tests', 'lint', 'build', 'gone', 'old'], running: 2, failed: 1 });
+  });
+
+  it('lists a command the bridge marked on a step that was not sent to the background, and one a sub-agent started', () => {
+    const index = commandIndex();
+    const t = new Tl().add(user('u1', 1)).add(tool('fg', { kind: 'bash', ts: 2, status: 'running', detail: { command: 'npm test' } })).add(agent('a', { ts: 3, status: 'running' }));
+    t.rev = 1;
+    expect(index(t)).toEqual([]);
+    // It ran into its timeout and the agent sent it to the background: done as a step, with a task.
+    t.items.fg = { ...(t.items.fg as ToolItem), status: 'done' };
+    t.rev = 2;
+    t.changed = { since: 1, ids: ['fg'] };
+    expect(index(t)).toEqual([]);
+    t.items.fg = { ...(t.items.fg as ToolItem), task: { id: 'b1', kind: 'command', state: 'running', since: 2 } };
+    t.rev = 3;
+    t.changed = { since: 2, ids: ['fg'] };
+    expect(index(t)).toEqual(['fg']);
+    // A monitor is listed too.
+    expect(isBackgroundCommand(tool('m', { name: 'Monitor', kind: 'other' as ToolItem['kind'], task: { id: 'm1', kind: 'monitor', state: 'running', since: 1 } }))).toBe(true);
+    // The sub-agent's own command, nested under its step, in the order they were started.
+    t.add(bash('inner', { ts: 4, parentId: 'a' })).add(bash('mine', { ts: 5 }));
+    expect(index(t)).toEqual(['fg', 'inner', 'mine']);
+    expect(ownerAgent(t.items, t.items.inner!)?.id).toBe('a');
+    expect(ownerAgent(t.items, t.items.mine!)).toBeUndefined();
   });
 
   it('keeps the same map until another notification arrives', () => {

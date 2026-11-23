@@ -38,6 +38,8 @@ import { isLeadIn } from './lead-in';
  *   f  files the agent hands over (SendUserFile): their cards, never folded, shown in their place
  *   Z  an until loop's end line, a switch of agent, a rewind's result: closes a turn left open (an
  *      interrupted one, the kept part of a rewound one), stands on its own
+ *   E  the bridge's word that the turn above was cut (`NoticeItem.early`): closes it, and is that
+ *      turn's "Ended early" line
  *   x  a check of a turn by the other agent: never part of a turn, shown under the turn it checks
  *   .  nothing to show (an empty, finished text)
  */
@@ -118,32 +120,13 @@ export interface TurnGroup {
   /** Checks of this turn by the other agent ("Check with Codex"), shown under it, oldest first. */
   checks?: string[];
   /**
-   * The turn ended before the agent finished (`endedEarly`): no record of its end came, and its last
-   * act was work (a step, thinking, a task update) with nothing said after it. Only a settled turn.
+   * The bridge's notice that this turn was cut before the agent finished (`NoticeItem.early`: the
+   * process ended, Sable closed it, Sable itself went down). Only the bridge knows that: a turn with
+   * no record of its end says nothing about how it ended, whatever its last act was.
    */
-  early?: true;
-}
-
-/** What may stand after a turn's last act without saying anything: empty texts, notices, a warning's card. */
-const AFTER_LAST = new Set(['.', 'n', 'a']);
-/** Acts that leave something to say: a turn whose last act was one of these had more to do. */
-const UNFINISHED = new Set(['w', 'h', 'k']);
-
-/**
- * Whether a settled turn ended before the agent finished, from what its provider wrote: no turn
- * record closed it (Claude Code writes one for every turn it finishes, Codex one for every turn it
- * ends, also an interrupted or failed one), it was not stopped and did not fail (those say so
- * themselves), and its last act was work with nothing said after it (cut after a step, or while
- * thinking). `closedBy`: what closed it, when not the next message or the end of the timeline.
- */
-export function endedEarly(state: TurnState, end: string | null, lastChars: readonly string[], closedBy?: 'line'): boolean {
-  if (state !== 'done' || end || closedBy) return false;
-  for (let i = lastChars.length - 1; i >= 0; i--) {
-    const ch = lastChars[i];
-    if (AFTER_LAST.has(ch)) continue;
-    return UNFINISHED.has(ch);
-  }
-  return false;
+  early?: string;
+  /** The first root after the turn, when there is one: no time of the turn's reaches past it. */
+  next?: string;
 }
 
 export interface ItemGroup {
@@ -183,6 +166,8 @@ export function shapeOf(item: TimelineItem | undefined): string {
       if (item.check) return 'x';
       return item.kind === 'plan' ? 'p' : item.kind === 'widget' ? 'g' : item.kind === 'share' ? 'f' : item.kind === 'todo' ? 'k' : 'w';
     case 'notice':
+      // The bridge knows the turn was cut: whatever its variant, it is that turn's last line.
+      if (item.early) return 'E';
       // An until loop's end, a switch of agent, a rewind: a line of its own that closes a turn left
       // open (a rewind to a steered message keeps a turn with no end; its result must not fold into it).
       if (item.until || item.agentSwitch || item.variant === 'rewind') return 'Z';
@@ -522,6 +507,31 @@ function foldNotes(segments: Segment[]) {
 }
 
 /**
+ * The notices that stand after the last act of a turn's last segment, taken out of it (empty texts
+ * among them stay). Only when something came before them: notices that are all a segment holds (a
+ * /compact, a model change on its own) are what it shows.
+ */
+function trailingNotices(o: Open): string[] {
+  const seg = o.segs[o.segs.length - 1];
+  let k = seg.chars.length;
+  while (k > 0 && (seg.chars[k - 1] === 'n' || seg.chars[k - 1] === '.')) k--;
+  if (k === 0 || k === seg.chars.length) return [];
+  const out: string[] = [];
+  const ids = seg.ids.slice(0, k);
+  const chars = seg.chars.slice(0, k);
+  for (let i = k; i < seg.chars.length; i++) {
+    if (seg.chars[i] === 'n') out.push(seg.ids[i]);
+    else {
+      ids.push(seg.ids[i]);
+      chars.push(seg.chars[i]);
+    }
+  }
+  seg.ids = ids;
+  seg.chars = chars;
+  return out;
+}
+
+/**
  * Groups root items into turns. A turn runs from a sent message to its closing turn item; when
  * there is none (an interrupted turn, history from a provider that keeps no turn records), the
  * next sent message closes it. Messages steered into a turn split it into segments, each with
@@ -561,7 +571,11 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
   const { groups, queued, checks } = g;
   let open: Open | null = null;
 
-  const close = (end: string | null, failedEnd: boolean, atEnd: boolean, closedBy?: 'line') => {
+  /**
+   * Closes the open turn. `end`: its record; `early`: the bridge's notice that it was cut (it is in
+   * the turn's ids, in no segment: the turn's own line says it); `next`: the root that closed it.
+   */
+  const close = (end: string | null, failedEnd: boolean, atEnd: boolean, opts: { early?: string; next?: string } = {}) => {
     if (!open) return;
     const o = open;
     open = null;
@@ -570,6 +584,16 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
     const state: TurnState = atEnd && !end && busy && !o.interrupted ? 'running' : failed ? 'failed' : o.interrupted ? 'interrupted' : 'done';
     // A reminder or a caveat with nothing after it (a caveat before a command): nothing to show.
     if (o.quiet && state !== 'running' && o.segs.length === 1 && o.segs[0].chars.every((c) => c === '.')) return;
+    // A settled turn with no record of its end: notices after its last act (an account move's line,
+    // a mode change) came after the turn, not in it. They stand on their own after it, so the move
+    // line is in view and the turn's time is not drawn out to theirs.
+    const loose = !end && !opts.early && state !== 'running' ? trailingNotices(o) : [];
+    let next = opts.next;
+    if (loose.length) {
+      const out = new Set(loose);
+      o.ids = o.ids.filter((id) => !out.has(id));
+      next = loose[0];
+    }
     const key = o.ids[0];
     const last = o.segs.length - 1;
     const segments = o.segs.map((s, i) => buildSegment(s, i, key, failed && i === last, state === 'running' && i === last, i < last));
@@ -585,8 +609,8 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
       }
     }
     foldNotes(segments);
-    const early = endedEarly(state, end, o.segs[last].chars, closedBy);
-    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(early ? { early } : {}) });
+    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(opts.early ? { early: opts.early } : {}), ...(next ? { next } : {}) });
+    for (const id of loose) groups.push({ kind: 'item', key: id, id });
   };
 
   const start = (id: string, steered: boolean, quiet = false) => {
@@ -618,7 +642,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
         o.segs.push({ lead: id, steered: false, ids: [], chars: [] });
         continue;
       }
-      close(null, false, false);
+      close(null, false, false, { next: id });
       start(id, false);
       continue;
     }
@@ -628,7 +652,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
       continue;
     }
     if (ch === 'U' || (ch === 'S' && !open)) {
-      close(null, false, false);
+      close(null, false, false, { next: id });
       // Nothing is open here and nothing after this point reaches back before it (an "Interrupted"
       // only joins a turn closed right before it, and this message opens one).
       if (ch === 'U') cuts?.push({ at: i, groups: groups.length, queued: queued.length, checks: checks.length });
@@ -636,8 +660,17 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
       continue;
     }
     if (ch === 'Z') {
-      close(null, false, false, 'line');
+      close(null, false, false, { next: id });
       groups.push({ kind: 'item', key: id, id });
+      continue;
+    }
+    // The bridge knows the turn above was cut: its notice closes it and is its last line. With no
+    // turn open (nothing of it reached this timeline) the notice stands on its own.
+    if (ch === 'E') {
+      if (open) {
+        (open as Open).ids.push(id);
+        close(null, false, false, { early: id });
+      } else groups.push({ kind: 'item', key: id, id });
       continue;
     }
     if (ch === 'T' || ch === 'F') {
@@ -665,7 +698,7 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
     // An interrupted turn has ended even without its record: a notice after it (a lane landed, a
     // model changed) stands on its own instead of folding into that turn's work and its time.
     if (ch === 'n' && (open as Open).interrupted) {
-      close(null, false, false);
+      close(null, false, false, { next: id });
       groups.push({ kind: 'item', key: id, id });
       continue;
     }
@@ -687,6 +720,88 @@ function groupFrom(g: Grouping, ids: readonly string[], shape: string, busy: boo
 }
 
 const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' && !isNobodysWords(it.text) ? it.text.trim() : '');
+
+// ── how long it took ──
+
+type ItemMap = Record<string, TimelineItem | undefined>;
+
+/**
+ * Where one item's own time ends, for a turn's or a checkpoint's span, or null when it is no act of
+ * the turn: its work and words count (steps, thinking, texts, things shown) and the notices that say
+ * how it ended (Interrupted, an error, the bridge's word that it was cut); other notices came beside
+ * it (an account move, a mode change) and never draw it out. A cancelled step's end is left out: a
+ * settle stamped it with the moment it ran, which in a chat saved before 0.2.23 may be hours after
+ * the step (the next turn's end), so its own start is all that is known of it.
+ */
+function actEnd(it: TimelineItem | undefined): number | null {
+  if (!it) return null;
+  switch (it.type) {
+    case 'tool':
+      if (it.check) return null;
+      return it.status === 'cancelled' ? it.ts : Math.max(it.ts, it.endedAt ?? 0);
+    case 'thinking':
+    case 'text':
+      return Math.max(it.ts, ('endedAt' in it && typeof it.endedAt === 'number' && it.endedAt) || 0);
+    case 'notice':
+      return it.early || it.variant === 'interrupted' || (it.variant === 'error' && noticeLevel(it) === 'error') ? it.ts : null;
+    default:
+      return null;
+  }
+}
+
+/** The latest end among `ids` (`actEnd`), never past `cap`'s time; `from` when none is later. */
+function lastAct(items: ItemMap, ids: readonly string[], from: number, cap?: string | null): number {
+  let last = from;
+  for (const id of ids) {
+    const at = actEnd(items[id]);
+    if (at !== null && at > last) last = at;
+  }
+  const bound = cap ? items[cap]?.ts : undefined;
+  return bound !== undefined && last > bound ? Math.max(from, bound) : last;
+}
+
+/**
+ * How long a finished turn took, in ms; null when there is nothing to measure. With the agent's
+ * record of its end: the time the live lines counted (a fresh agent's start-up included, which the
+ * agent's own figure leaves out), so the number does not drop when the turn settles, and the agent's
+ * figure where the items' times say less (a conversation loaded from history). Without one: from
+ * its message (or its first act) to the end of its last act (`actEnd`), never past the next root.
+ */
+export function turnSpan(items: ItemMap, turn: TurnGroup): number | null {
+  const lead = turn.segments[0]?.lead;
+  const leadTs = lead ? items[lead]?.ts : undefined;
+  const end = turn.end ? items[turn.end] : undefined;
+  if (end?.type === 'turn') {
+    const start = leadTs ?? items[turn.ids[0]]?.ts;
+    if (!start) return null;
+    const wall = end.ts - start;
+    return end.durationMs > wall ? end.durationMs : wall;
+  }
+  let start = leadTs;
+  if (!start) {
+    for (const id of turn.ids) {
+      if (actEnd(items[id]) === null) continue;
+      start = items[id]!.ts;
+      break;
+    }
+  }
+  if (!start) return null;
+  return lastAct(items, turn.ids, start, turn.next) - start;
+}
+
+/**
+ * How long one checkpoint's work took, in ms: from the item whose time opens it (`from`: the
+ * segment's message for its first run, else the run's first item) to what closed it (`until`: the
+ * note, the next message, the turn's end), or to the end of its last act when nothing did, never
+ * past `cap` (the root after the turn).
+ */
+export function runSpan(items: ItemMap, run: { ids: readonly string[] }, from: string, until: string | null, cap?: string | null): number | null {
+  const start = items[from]?.ts ?? items[run.ids[0]]?.ts;
+  if (!start) return null;
+  const closer = until ? items[until] : undefined;
+  if (closer) return closer.ts - start;
+  return lastAct(items, run.ids, start, cap) - start;
+}
 
 /**
  * The words of what a turn can show as its answer (`ANSWER`): a text as written, a plan as its

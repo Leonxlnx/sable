@@ -1,6 +1,7 @@
-import type { TimelineItem, ToolItem, WorkflowRun } from '@shared/protocol';
+import type { TaskMark, TimelineItem, ToolItem, WorkflowRun } from '@shared/protocol';
 import { syntheticOf, type TaskOutcome } from '@shared/synthetic';
 import { isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
+import { changedSince } from '@/state/revision';
 
 /**
  * What the Agents tab reads from a session, worked out so that a streamed step costs next to
@@ -14,6 +15,9 @@ export interface Timeline {
   items: Items;
   roots: readonly string[];
   children: Record<string, readonly string[] | undefined>;
+  /** The items' revision, as the store keeps it (`SessionData.rev`, `changed`): what changed since a reader last looked. */
+  rev?: number;
+  changed?: { since: number; ids: readonly string[] };
 }
 
 const NONE: readonly string[] = [];
@@ -148,55 +152,104 @@ export function noteIndex(): (t: Timeline | undefined) => ReadonlyMap<string, En
 
 // ── background commands ──
 
-/** A shell command the agent sent to the background (a build, a test run, a dev server). */
+/**
+ * A command the agent left running after its step returned (a build, a test run, a dev server, a
+ * monitor): the bridge marks it (`ToolItem.task`), and a chat saved before it did says so on the
+ * shell step alone (`run_in_background`).
+ */
 export function isBackgroundCommand(it: TimelineItem | undefined): it is ToolItem {
-  if (it?.type !== 'tool' || it.kind !== 'bash') return false;
+  if (it?.type !== 'tool' || it.check) return false;
+  if (it.task) return true;
+  if (it.kind !== 'bash') return false;
   return !!it.detail.background || (it.input as { run_in_background?: unknown } | undefined)?.run_in_background === true;
 }
 
 /** A shell step still being written or running: it may yet turn out to be sent to the background. */
 const isOpenCommand = (it: TimelineItem | undefined) => it?.type === 'tool' && it.kind === 'bash' && (it.status === 'pending' || it.status === 'running' || it.status === 'awaiting');
 
-/** The chat's own background commands, oldest first: the same array until one is started. */
+/**
+ * The chat's background commands, its own and those its sub-agents started (nested under their
+ * agent's step), oldest first: the same array until one is started.
+ */
 export function commandIndex(): (t: Timeline | undefined) => readonly string[] {
-  let scan: Scan<string> | undefined;
+  const scans = new Map<string, Scan<string>>();
   // Shell steps seen while still open and not (yet) in the background. A streamed call arrives with
   // empty input and gets its `run_in_background` in a later patch, which changes no list: these few
-  // are looked at again each time, and one that turned reads the roots afresh (to keep their order).
-  let open: string[] = [];
+  // are looked at again each time, and one that turned reads the lists afresh (to keep their order).
+  let open = new Set<string>();
+  let roots: unknown = null;
+  let children: unknown = null;
+  let rev = -1;
+  let known = new Set<string>();
+  let out: readonly string[] = NONE;
   return (t) => {
     if (!t) return NONE;
-    if (open.length) {
-      const still: string[] = [];
-      let turned = false;
-      for (const id of open) {
-        const it = t.items[id];
-        if (isBackgroundCommand(it)) turned = true;
-        else if (isOpenCommand(it)) still.push(id);
-      }
-      open = still;
-      if (turned) scan = undefined;
-    }
-    const fresh = !scan;
-    if (fresh) open = [];
-    scan = grow(scan, t.roots, (id) => {
+    let turned = false;
+    for (const id of open) {
       const it = t.items[id];
-      if (isBackgroundCommand(it)) return id;
-      if (isOpenCommand(it)) open.push(id);
+      if (isBackgroundCommand(it)) turned = true;
+      else if (!isOpenCommand(it)) open.delete(id);
+    }
+    // A step the bridge marks afterwards (`task`: a command sent to the background by its timeout,
+    // or by the person in the agent's own terminal) changes no list either: the write that marked it says.
+    if (t.rev !== undefined && t.rev !== rev) {
+      const changed = changedSince({ items: t.items, rev: t.rev, changed: t.changed }, rev);
+      // Not known which (writes it did not see while the pane was hidden, a new timeline): all again.
+      if (!changed) turned = rev >= 0;
+      else for (const id of changed) if (!known.has(id) && isBackgroundCommand(t.items[id])) turned = true;
+      rev = t.rev;
+    }
+    if (!turned && t.roots === roots && t.children === children) return out;
+    roots = t.roots;
+    children = t.children;
+    if (turned) {
+      scans.clear();
+      open = new Set();
+    }
+    const ids: string[] = [];
+    let nested = false;
+    const pick = (id: string) => {
+      const it = t.items[id];
+      if (isBackgroundCommand(it) || isAgentItem(it)) return id;
+      if (isOpenCommand(it)) open.add(id);
       return undefined;
-    });
-    return scan.found;
+    };
+    const visit = (key: string, arr: readonly string[] | undefined, depth: number) => {
+      if (!arr?.length || depth > 8) return;
+      const scan = grow(scans.get(key), arr, pick);
+      scans.set(key, scan);
+      for (const id of scan.found) {
+        const it = t.items[id];
+        if (isBackgroundCommand(it)) {
+          ids.push(id);
+          if (depth) nested = true;
+        }
+        if (isAgentItem(it)) visit(id, t.children[id], depth + 1);
+      }
+    };
+    visit('', t.roots, 0);
+    // Commands of sub-agents stand where they were started among the chat's own.
+    if (nested) ids.sort((a, b) => (t.items[a]?.ts ?? 0) - (t.items[b]?.ts ?? 0));
+    known = new Set(ids);
+    if (ids.length === out.length && ids.every((id, i) => id === out[i])) return out;
+    out = ids.length ? ids : NONE;
+    return out;
   };
 }
 
 /**
- * Where a background command stands. `unknown`: it was started and no word of its end came (it
- * may still run, a dev server does for hours; it may have gone with its process). Never called
- * running: nothing here knows that.
+ * Where a background command stands. The bridge's own word comes first (`ToolItem.task`): running,
+ * how it ended, or `lost` with the process that held it. Without it (a chat saved before the bridge
+ * kept it, a provider that does not say) only a notification tells its end, and `unknown` is a
+ * command that gave no word of its end since it was started: it may have gone with its process long
+ * ago, so it is never called running.
  */
-export type CommandState = 'starting' | 'done' | 'failed' | 'stopped' | 'unknown';
+export type CommandState = 'starting' | 'running' | 'done' | 'failed' | 'stopped' | 'lost' | 'unknown';
+
+const TASK_STATE: Record<TaskMark['state'], CommandState> = { running: 'running', done: 'done', failed: 'failed', stopped: 'stopped', lost: 'lost' };
 
 export function commandState(item: ToolItem, note: EndNote | undefined): CommandState {
+  if (item.task) return TASK_STATE[item.task.state] ?? 'unknown';
   if (item.status === 'error' || item.status === 'denied') return 'failed';
   if (item.status === 'cancelled') return 'stopped';
   if (note) return note.outcome === 'failed' ? 'failed' : note.outcome === 'stopped' ? 'stopped' : 'done';
@@ -205,20 +258,35 @@ export function commandState(item: ToolItem, note: EndNote | undefined): Command
 }
 
 export interface Commands {
-  /** What failed first, then newest first. */
+  /** Running first (the longest runner on top), then what failed, then the rest, newest first. */
   ids: string[];
+  running: number;
   failed: number;
 }
 
 export function commandRows(ids: readonly string[], items: Items, notes: ReadonlyMap<string, EndNote>): Commands {
+  const live: string[] = [];
   const bad: string[] = [];
   const rest: string[] = [];
   for (let i = ids.length - 1; i >= 0; i--) {
     const it = items[ids[i]];
     if (!isBackgroundCommand(it)) continue;
-    (commandState(it, notes.get(it.id)) === 'failed' ? bad : rest).push(it.id);
+    const state = commandState(it, notes.get(it.id));
+    (state === 'running' ? live : state === 'failed' ? bad : rest).push(it.id);
   }
-  return { ids: bad.length ? [...bad, ...rest] : rest, failed: bad.length };
+  // The oldest running first, as the working agents stand.
+  if (live.length > 1) live.sort((a, b) => ((items[a] as ToolItem).task?.since ?? 0) - ((items[b] as ToolItem).task?.since ?? 0));
+  return { ids: live.length || bad.length ? [...live, ...bad, ...rest] : rest, running: live.length, failed: bad.length };
+}
+
+/** The sub-agent whose work a nested step is (the nearest agent above it); undefined for the chat's own. */
+export function ownerAgent(items: Items, item: TimelineItem): ToolItem | undefined {
+  let up = item.parentId ? items[item.parentId] : undefined;
+  for (let n = 0; up && n < 64; n++) {
+    if (isAgentItem(up)) return up;
+    up = up.parentId ? items[up.parentId] : undefined;
+  }
+  return undefined;
 }
 
 /** One character per agent, `1` while it works: the list's sections follow it, nothing else. */

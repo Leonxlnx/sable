@@ -1,5 +1,6 @@
 import { memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import type { ThinkingItem, TimelineItem, ToolItem } from '@shared/protocol';
+import type { NoticeItem, ThinkingItem, TimelineItem, ToolItem } from '@shared/protocol';
+import { hasWork } from '@shared/work-label';
 import { Tiles } from '@/art/Logo';
 import { Collapse } from '@/components/Collapse';
 import { Icon } from '@/icons';
@@ -14,7 +15,7 @@ import { REVEAL_EVENT, rootOf, type RevealDetail } from './reveal';
 import { changesOf } from './changes';
 import { Tail } from './Tail';
 import { TurnFoot } from './Turn';
-import { shapeIndex, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
+import { runSpan, shapeIndex, turnSpan, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
 import { stallAt } from './stall';
@@ -93,7 +94,7 @@ function stabilize(layout: TurnLayout, cache: Map<string, unknown>, kept: WeakMa
       put(k, seg);
       return seg;
     });
-    const k = `t|${g.state}|${g.end}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${segments.map(segSig).join(';')}`;
+    const k = `t|${g.state}|${g.end}|${g.early ?? ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${segments.map(segSig).join(';')}`;
     const prev = (next.get(k) ?? cache.get(k)) as TurnGroup | undefined;
     const turn = prev ?? { ...g, segments };
     put(k, turn);
@@ -382,7 +383,9 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
           seg={seg}
           // The turn itself only where its line stands: a segment a steer cut skips rendering when a step joins the turn.
           turn={i === headSeg ? turn : undefined}
-          after={turn.segments[i + 1]?.lead ?? turn.end}
+          // The last run ends at the turn's record, or at the bridge's word that it was cut.
+          after={turn.segments[i + 1]?.lead ?? turn.end ?? turn.early}
+          cap={i === last ? turn.next : undefined}
           index={i}
           place={headSeg < 0 || i < headSeg ? -1 : i === headSeg ? 0 : 1}
           running={running}
@@ -402,19 +405,41 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
   );
 });
 
+/** Why the bridge says a turn was cut (`NoticeItem.early`), after "Ended early". */
+const EARLY_WHY: Record<NonNullable<NoticeItem['early']>, string> = {
+  died: "the agent's process ended",
+  closed: "Sable closed the agent's process",
+  restart: 'Sable closed while it worked',
+};
+
 /**
- * A turn that ended before the agent finished (`TurnGroup.early`: cut after a step, the process
- * gone, a conversation taken up again): one quiet line in the turn's own style, so it never reads as
- * a finished turn, and while it is the conversation's last and nothing runs, one way to carry on.
+ * Whether the line of a cut turn may offer Continue: the chat is at rest (no turn, no sub-agent, no
+ * background command still at work) and the turn is its newest (nothing but notices after its line).
+ */
+export function mayContinue(s: Store, sessionId: string, line: string): boolean {
+  const meta = s.sessions[sessionId];
+  const roots = s.data[sessionId]?.roots;
+  if (!meta || !roots) return false;
+  if (meta.status === 'running' || meta.status === 'awaiting' || meta.status === 'starting' || hasWork(meta)) return false;
+  for (let i = roots.length - 1, n = 0; i >= 0 && n < 40; i--, n++) {
+    if (roots[i] === line) return true;
+    if (s.data[sessionId]!.items[roots[i]]?.type !== 'notice') return false;
+  }
+  return false;
+}
+
+/**
+ * A turn the bridge knows was cut before the agent finished (`TurnGroup.early`: its process ended,
+ * Sable had to close it, Sable itself went down): one quiet line in the turn's own style with the
+ * reason, so it never reads as a finished turn, and while it is the conversation's newest and the
+ * chat is at rest, one way to carry on.
  */
 const EndedEarly = memo(function EndedEarly({ turn }: { turn: TurnGroup }) {
   const { sessionId } = useTimeline();
-  const last = turn.ids[turn.ids.length - 1];
-  const canContinue = useStore((s) => {
-    const roots = s.data[sessionId]?.roots;
-    const status = s.sessions[sessionId]?.status;
-    return !!roots && roots[roots.length - 1] === last && status !== 'running' && status !== 'awaiting' && status !== 'starting';
-  });
+  const line = turn.early ?? '';
+  const note = useItem<NoticeItem>(line);
+  const why = note?.type === 'notice' && note.early ? EARLY_WHY[note.early] : '';
+  const canContinue = useStore((s) => mayContinue(s, sessionId, line));
   const [sent, setSent] = useState(false);
   const carryOn = () => {
     if (sent) return;
@@ -422,11 +447,12 @@ const EndedEarly = memo(function EndedEarly({ turn }: { turn: TurnGroup }) {
     void sendMessage(sessionId, 'Continue').then((r) => !r.ok && setSent(false));
   };
   return (
-    <div className="tl-item turn" data-state="early">
+    <div className="tl-item turn" data-state="early" data-item-id={line || undefined}>
       <div className="turn-line">
         <span className="turn-note">
           <Icon name="circle-dashed" size={12} />
           Ended early
+          {why && <span className="work-time">{why}</span>}
         </span>
         {canContinue && (
           <button type="button" className="btn btn-sm" onClick={carryOn} disabled={sent}>
@@ -438,53 +464,14 @@ const EndedEarly = memo(function EndedEarly({ turn }: { turn: TurnGroup }) {
   );
 });
 
-/** How long a finished turn took, in ms; null when there is nothing to measure. */
-function turnSpan(items: Record<string, TimelineItem>, turn: TurnGroup): number | null {
-  const lead = turn.segments[0]?.lead;
-  const start = (lead ? items[lead]?.ts : undefined) ?? items[turn.ids[0]]?.ts;
-  if (!start) return null;
-  const end = turn.end ? items[turn.end] : undefined;
-  if (end?.type === 'turn') {
-    // The time the live lines counted (a fresh agent's start-up included, which the agent's own
-    // figure leaves out), so the number does not drop when the turn settles. The agent's figure
-    // only where the items' times say less (a conversation loaded from history).
-    const wall = end.ts - start;
-    return end.durationMs > wall ? end.durationMs : wall;
-  }
-  let last = start;
-  for (const id of turn.ids) {
-    const it = items[id];
-    if (!it) continue;
-    last = Math.max(last, it.ts, ('endedAt' in it && it.endedAt) || 0);
-  }
-  return last - start;
-}
-
-/**
- * How long one checkpoint's work took, in ms: from the item whose time opens it (`from`: the
- * segment's message for its first run, else the run's first item) to what closed it (`until`: the
- * note, the next message, the turn's end), or to the last thing in it when nothing did.
- */
-function runSpan(items: Record<string, TimelineItem>, run: StepsChunk, from: string, until: string | null): number | null {
-  const start = items[from]?.ts ?? items[run.ids[0]]?.ts;
-  if (!start) return null;
-  const closer = until ? items[until] : undefined;
-  if (closer) return closer.ts - start;
-  let last = start;
-  for (const id of run.ids) {
-    const it = items[id];
-    if (!it) continue;
-    last = Math.max(last, it.ts, ('endedAt' in it && it.endedAt) || 0);
-  }
-  return last - start;
-}
-
 interface SegmentProps {
   seg: Segment;
   /** The turn, for the segment its line stands in. */
   turn?: TurnGroup;
   /** What follows the segment: the next segment's message, else the turn's end (it closes the last run). */
   after: string | null | undefined;
+  /** The root after the turn, for its last segment: the last run's time never reaches past it. */
+  cap?: string;
   index: number;
   /** Where the segment stands to the turn's line: before it (-1), holding it (0), after it (1). */
   place: -1 | 0 | 1;
@@ -503,7 +490,7 @@ interface SegmentProps {
  * each. A steered message and the reply to it stand as a pair and never fold; a notification the
  * agent took up mid-turn is part of the work and folds with it.
  */
-const SegmentView = memo(function SegmentView({ seg, turn, after, index, place, running, live, open, nest, multi, onToggle }: SegmentProps) {
+const SegmentView = memo(function SegmentView({ seg, turn, after, cap, index, place, running, live, open, nest, multi, onToggle }: SegmentProps) {
   const settled = !running;
   const shown = running || open;
   const flow = seg.flow;
@@ -537,6 +524,7 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, index, place, 
         run={c}
         from={i === 0 && seg.lead ? seg.lead : c.ids[0]}
         until={(next ? (next.kind === 'steps' ? next.ids[0] : next.id) : after) ?? null}
+        cap={next ? undefined : cap}
         head={head}
         live={isLive}
         first={i === 0}
@@ -598,6 +586,8 @@ interface RunProps {
   from: string | null;
   /** What closed it (see `runSpan`). */
   until: string | null;
+  /** The root after the turn, when nothing closed the run (see `runSpan`). */
+  cap?: string;
   /** The turn's own line stands on this run: once the turn has ended it reads the whole turn and opens the fold. */
   head: boolean;
   live: boolean;
@@ -621,7 +611,7 @@ interface RunProps {
  * ("Run the tests · 12s · 2 steps") through the closed checkpoint ("Worked 45s · 5 steps") to its
  * place in the finished turn's fold; on the turn's first run the line then reads the whole turn.
  */
-const RunPiece = memo(function RunPiece({ run, from, until, head, live, first, settled, open, multi, nest, seg, turn, onToggle }: RunProps) {
+const RunPiece = memo(function RunPiece({ run, from, until, cap, head, live, first, settled, open, multi, nest, seg, turn, onToggle }: RunProps) {
   const { sessionId } = useTimeline();
   const [runOpen, setRunOpen] = useFold(foldKey(sessionId, run?.key ?? '', 'run'), false);
   const toggleRun = useCallback(() => setRunOpen(!runOpen), [setRunOpen, runOpen]);
@@ -635,11 +625,11 @@ const RunPiece = memo(function RunPiece({ run, from, until, head, live, first, s
     <Collapse open={head || !settled || open} className={`tl-fold fold-run${inside && !head ? ' nest' : ''}`}>
       <div className="seg-work">
         {!(bare && nest && !head) && (
-          <WorkHead mode={mode} run={run} from={from} until={until} first={first} seg={seg} turn={turn} open={total ? open : stepsOpen} onToggle={total ? onToggle : run ? toggleRun : undefined} />
+          <WorkHead mode={mode} run={run} from={from} until={until} cap={cap} first={first} seg={seg} turn={turn} open={total ? open : stepsOpen} onToggle={total ? onToggle : run ? toggleRun : undefined} />
         )}
         {head && run && (
           <Collapse open={open && multi} className="tl-fold fold-run nest">
-            <WorkHead mode="run" run={run} from={from} until={until} first={false} open={stepsOpen} onToggle={toggleRun} />
+            <WorkHead mode="run" run={run} from={from} until={until} cap={cap} first={false} open={stepsOpen} onToggle={toggleRun} />
           </Collapse>
         )}
         {run && <Steps ids={run.ids} open={stepsOpen} nest={inside} />}
@@ -667,6 +657,7 @@ interface HeadProps {
   run: StepsChunk | null;
   from: string | null;
   until: string | null;
+  cap?: string;
   first: boolean;
   seg?: Segment;
   turn?: TurnGroup;
@@ -675,7 +666,7 @@ interface HeadProps {
 }
 
 /** A work line in its place: live while its checkpoint runs, its summary once closed, the turn's once the turn has ended. */
-function WorkHead({ mode, run, from, until, first, seg, turn, open, onToggle }: HeadProps) {
+function WorkHead({ mode, run, from, until, cap, first, seg, turn, open, onToggle }: HeadProps) {
   // A line that starts live in front of the reader: the first of a segment arrives with the sent
   // message, a later one simply fades in under the note before it.
   const fresh = useFresh() && mode === 'live';
@@ -699,7 +690,7 @@ function WorkHead({ mode, run, from, until, first, seg, turn, open, onToggle }: 
   let line: ReactNode = null;
   if (mode === 'live' && seg) line = <LiveLine seg={seg} run={run} from={from} open={open} onToggle={run ? onToggle : undefined} />;
   else if (mode === 'total' && turn) line = <TotalLine turn={turn} open={open} onToggle={onToggle} landed={landed} />;
-  else if (run) line = <RunLine run={run} from={from} until={until} open={open} onToggle={onToggle} landed={landed} />;
+  else if (run) line = <RunLine run={run} from={from} until={until} cap={cap} open={open} onToggle={onToggle} landed={landed} />;
   if (!line) return null;
   return (
     <div ref={el} className="tl-item tl-work" data-live={mode === 'live' || undefined} data-enter={(fresh && first) || undefined} data-next={(fresh && !first) || undefined} data-open={open || undefined}>
@@ -709,16 +700,16 @@ function WorkHead({ mode, run, from, until, first, seg, turn, open, onToggle }: 
 }
 
 /** "Worked 45s · 5 steps": one closed checkpoint, opening to its steps. */
-function RunLine({ run, from, until, open, onToggle, landed }: { run: StepsChunk; from: string | null; until: string | null; open: boolean; onToggle?: () => void; landed: boolean }) {
+function RunLine({ run, from, until, cap, open, onToggle, landed }: { run: StepsChunk; from: string | null; until: string | null; cap?: string; open: boolean; onToggle?: () => void; landed: boolean }) {
   const { sessionId } = useTimeline();
   const { span, thought } = useMemo(() => {
     const items = useStore.getState().data[sessionId]?.items ?? {};
     return {
-      span: runSpan(items, run, from ?? run.ids[0], until),
+      span: runSpan(items, run, from ?? run.ids[0], until, cap),
       // Work that was only thinking says so ("Thought for 6s"), with no count of steps.
       thought: !run.count && run.ids.some((id) => items[id]?.type === 'thinking'),
     };
-  }, [sessionId, run, from, until]);
+  }, [sessionId, run, from, until, cap]);
   const took = span && span >= 1000 ? shortDuration(span) : '';
   return (
     <div className="work-head" data-landed={landed || undefined}>

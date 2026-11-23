@@ -27,6 +27,11 @@ describe('sidebar groups', () => {
     expect(g.projects[0].attention).toBe('awaiting');
   });
 
+  it('a folder whose chat has only a background command running is working, as the row says (day 6)', () => {
+    const g = buildGroups(map(s('a', { status: 'error', commands: 1 }), s('b', { unread: true })), []);
+    expect(g.projects[0].attention).toBe('working');
+  });
+
   it('keeps folders in their manual order while chats inside go newest first', () => {
     const sessions = map(s('a', { updatedAt: 9 }), s('b', { updatedAt: 3 }), s('c', { cwd: 'D:/code/other', updatedAt: 1 }));
     const projects = [

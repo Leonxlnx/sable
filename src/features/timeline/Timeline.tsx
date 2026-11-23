@@ -12,6 +12,7 @@ import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
 import { DOCK_GLIDE_MS } from '@/features/session/dock-glide';
+import { glideFrame } from './follow';
 import { useStaged } from '@/features/session/staged';
 import './timeline.css';
 
@@ -63,7 +64,8 @@ export function Timeline({ sessionId }: { sessionId: string }) {
   const feed = useMemo(() => navFeed(), [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
   const ctx = useMemo<TimelineCtxValue>(() => ({ sessionId, cwd, home, live, stuck, scrolled, nav: feed }), [sessionId, cwd, home, feed]);
 
-  const glide = useRef({ raf: 0, pos: 0, v: 0, last: 0 });
+  /** The follower's state; `wrote` is the scroll position it set last, to notice a move made by anyone else. */
+  const glide = useRef({ raf: 0, pos: 0, v: 0, last: 0, wrote: 0 });
 
   const pin = useCallback(() => {
     const el = scroller.current;
@@ -71,13 +73,14 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     el.scrollTop = el.scrollHeight;
     lastTop.current = el.scrollTop;
     glide.current.pos = el.scrollTop;
+    glide.current.wrote = el.scrollTop;
     glide.current.v = 0;
   }, []);
 
   /**
-   * Follows the end with a critically damped motion: content that grows (streamed lines, a new
-   * row, a sent message) is scrolled to smoothly instead of in steps. The target is read every
-   * frame, so it tracks whatever arrives meanwhile; it stops the moment the reader lets go.
+   * Travels to the end with a critically damped motion: a sent message is scrolled to smoothly
+   * instead of in one step. The target is read every frame, so it tracks whatever arrives
+   * meanwhile; it stops the moment the reader lets go.
    */
   const follow = useCallback(() => {
     const el = scroller.current;
@@ -91,6 +94,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     }
     if (g.raf || gap < 0.5) return;
     g.pos = el.scrollTop;
+    g.wrote = el.scrollTop;
     g.last = performance.now();
     const tick = (now: number) => {
       g.raf = 0;
@@ -98,24 +102,29 @@ export function Timeline({ sessionId }: { sessionId: string }) {
         g.v = 0;
         return;
       }
-      const target = el.scrollHeight - el.clientHeight;
       const dt = Math.min(0.034, Math.max(0.001, (now - g.last) / 1000));
       g.last = now;
-      const x = g.pos - target;
-      g.v += (-FOLLOW_W * FOLLOW_W * x - 2 * FOLLOW_W * g.v) * dt;
-      g.pos += g.v * dt;
-      if (g.pos >= target - 0.4) {
-        g.pos = target;
-        g.v = 0;
-        el.scrollTop = target;
-        lastTop.current = el.scrollTop;
-        return;
-      }
-      el.scrollTop = g.pos;
-      lastTop.current = el.scrollTop;
-      g.raf = requestAnimationFrame(tick);
+      // Exact for a long frame, and it goes on from a move anyone else made meanwhile (follow.ts).
+      const step = glideFrame(g, el.scrollTop, el.scrollHeight - el.clientHeight, FOLLOW_W, dt);
+      el.scrollTop = step.top;
+      lastTop.current = g.wrote = el.scrollTop;
+      if (!step.done) g.raf = requestAnimationFrame(tick);
     };
     g.raf = requestAnimationFrame(tick);
+  }, [pin]);
+
+  /**
+   * The content grew or shrank while the view is at the end: the end is kept in the same frame (a
+   * ResizeObserver runs after layout and before paint), so the newest line stays on its baseline
+   * and the live line where it stands. Gliding after it instead drew every new line, note or
+   * closed checkpoint one frame lower first and then slid it back up: the newest words and the
+   * live line bobbed up and down by a line (23px) to a checkpoint (65px) all through a turn, and
+   * every time a chat with a running turn was opened. Only a travel already under way (a sent
+   * message) keeps gliding; it reads the end every frame.
+   */
+  const keepEnd = useCallback(() => {
+    if (glide.current.raf) return;
+    pin();
   }, [pin]);
 
   useEffect(() => () => cancelAnimationFrame(glide.current.raf), []);
@@ -223,6 +232,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       // there, stays put until its own place reaches it.
       const padNow = parseFloat(getComputedStyle(inner).paddingBottom) || 0;
       const less = pad - padNow;
+      const taller = pad >= 0 && less < -0.5;
       const fell = lastTop.current - el.scrollTop;
       if (pad >= 0 && less > 24 && fell > 8 && stuck.current && live.current) {
         const d = Math.min(less, fell);
@@ -248,14 +258,17 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       if (restoreTo.current !== null && restore()) return;
       if (stuck.current) {
         if (rewrapped) pin();
-        else follow();
+        // The dock got taller (a permission card, a question, the queue tray came): the conversation
+        // travels up with it instead of stepping by the card's height.
+        else if (taller) follow();
+        else keepEnd();
       } else setAway(el.scrollHeight - el.scrollTop - el.clientHeight > AWAY);
     });
     // Border box: the end padding follows the dock's height and must re-pin too.
     ro.observe(inner, { box: 'border-box' });
     ro.observe(el);
     return () => ro.disconnect();
-  }, [follow, glideTail, pin, restore]);
+  }, [follow, keepEnd, glideTail, pin, restore]);
 
   // Only the reader lets go of the end. Layout moving the scroll position (rows above built
   // or settling to their real height, scroll anchoring, the dock resizing) never does.

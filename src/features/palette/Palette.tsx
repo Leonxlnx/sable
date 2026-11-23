@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { Dialog as RD } from 'radix-ui';
 import { DEFAULT_ACCOUNT, type MessageHit, type ProviderId, type SessionMeta } from '@shared/protocol';
+import { hasWork } from '@shared/work-label';
 import { ProviderMark } from '@/art/Logo';
 import { accountName as nameOfAccount, focusComposer } from '@/state/hooks';
 import { StatusMark, statusLabel, statusTone } from '@/features/sidebar/SessionRow';
@@ -424,8 +425,8 @@ function HitEnd({ hit }: { hit: MessageHit }) {
 function SessionEnd({ session }: { session: SessionMeta }) {
   const now = useNow();
   const label = statusLabel(session);
-  // Its sub-agents still work: working, as the sidebar says (the label names them).
-  if (session.status === 'running' || session.status === 'starting' || (session.status !== 'awaiting' && (session.background ?? 0) > 0))
+  // Its sub-agents or background commands still work: working, as the sidebar says (the label names them).
+  if (session.status === 'running' || session.status === 'starting' || (session.status !== 'awaiting' && hasWork(session)))
     return (
       <span className="palette-status">
         <span className="truncate shimmer">{label}</span>

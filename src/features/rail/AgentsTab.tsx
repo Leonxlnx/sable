@@ -1,5 +1,5 @@
 import { memo, useCallback, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
-import type { ToolItem, WorkflowRun } from '@shared/protocol';
+import type { TaskMark, ToolItem, WorkflowRun } from '@shared/protocol';
 import { userItemText } from '@shared/synthetic';
 import { worksInBackground } from '@shared/background';
 import { ProviderMark, Ring } from '@/art/Logo';
@@ -14,7 +14,7 @@ import { Icon } from '@/icons';
 import { useStore } from '@/state/store';
 import { AgentDetail } from './AgentDetail';
 import { ShownCtx, indexFor, usePaneTick, useProgress, useShown } from './agents-hooks';
-import { OUTCOME_WORD, commandRows, commandState, figuresOf, liveKey, outcomeOf, overview, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress } from './agents-model';
+import { OUTCOME_WORD, commandRows, commandState, figuresOf, liveKey, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress } from './agents-model';
 import { LeaveList } from './leave';
 import './agents.css';
 
@@ -117,11 +117,12 @@ function AgentsList({ sessionId }: { sessionId: string }) {
     }
   });
   if (cmds.ids.length) {
-    // A few stand open; many fold to their line unless one failed.
-    const open = chosen(COMMANDS) ?? (cmds.ids.length <= 4 || cmds.failed > 0);
-    rows.push({ key: 'h:cmd', as: 'h:cmd', node: (fresh) => <GroupHead key="h:cmd" id="h:cmd" group={COMMANDS} label="Commands" count={cmds.ids.length} failed={cmds.failed} open={open} onFlip={flip} fresh={fresh} /> });
+    // A few stand open; many fold to their line unless one runs or failed.
+    const open = chosen(COMMANDS) ?? (cmds.ids.length <= 4 || cmds.running > 0 || cmds.failed > 0);
+    rows.push({ key: 'h:cmd', as: 'h:cmd', node: (fresh) => <GroupHead key="h:cmd" id="h:cmd" group={COMMANDS} label="Commands" count={cmds.ids.length} running={cmds.running} failed={cmds.failed} always open={open} onFlip={flip} fresh={fresh} /> });
     if (open) {
-      const shown = waveRows({ user: COMMANDS, ids: cmds.ids, failed: cmds.failed }, all(COMMANDS));
+      // Everything running shows, as every failure does (`waveRows` lists those first).
+      const shown = waveRows({ user: COMMANDS, ids: cmds.ids, failed: cmds.running + cmds.failed }, all(COMMANDS));
       for (const id of shown.ids) rows.push({ key: `c:${id}`, as: `c:${id}`, node: (fresh) => <CommandRow key={`c:${id}`} sessionId={sessionId} id={id} fresh={fresh} /> });
       if (shown.more) rows.push({ key: 'm:cmd', as: 'm:cmd', node: () => <MoreRow key="m:cmd" id="m:cmd" group={COMMANDS} count={shown.more} onFlip={flip} /> });
     }
@@ -141,9 +142,9 @@ function AgentsList({ sessionId }: { sessionId: string }) {
     <div className="rail-col">
       <div className="rail-bar">
         <span className="rail-bar-title">Agents</span>
-        {/* How many work now; once none does, how many there were. What failed is said beside it. */}
+        {/* How many work now (and which commands run); once none does, how many there were. What failed is said beside it. */}
         <span className="rail-bar-meta num">
-          {view.working.length ? `${view.working.length} working` : view.done ? `${view.done} done` : ''}
+          {[cmds.running ? `${cmds.running} ${cmds.running === 1 ? 'command' : 'commands'} running` : '', view.working.length ? `${view.working.length} working` : view.done ? `${view.done} done` : ''].filter(Boolean).join(' · ')}
           {view.failed > 0 && <span className="agx-bar-failed"> · {view.failed} failed</span>}
         </span>
       </div>
@@ -185,8 +186,12 @@ function useEntrances(keys: readonly string[]): ReadonlySet<string> {
 
 // ── a group's line ──
 
-/** One line over a group of finished rows: when it began, what it is, how many, and while folded what failed in it. It folds the group. */
-const GroupHead = memo(function GroupHead({ id, group, time, label, count, failed, open, onFlip, fresh, title }: { id: string; group: string; time?: string; label: string; count: number; failed: number; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; title?: string }) {
+/**
+ * One line over a group of rows: when it began, what it is, how many, and while folded what failed
+ * in it (`always`: also open, with what runs in it, as the commands' line says "1 running 4 failed").
+ * It folds the group.
+ */
+const GroupHead = memo(function GroupHead({ id, group, time, label, count, running = 0, failed, always, open, onFlip, fresh, title }: { id: string; group: string; time?: string; label: string; count: number; running?: number; failed: number; always?: boolean; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; title?: string }) {
   return (
     <div role="listitem" data-flip={id} className="agx-wave" data-open={open || undefined} data-new={fresh || undefined}>
       <button type="button" className="agx-wave-btn" aria-expanded={open} onClick={() => onFlip(group, !open)} title={title}>
@@ -195,8 +200,9 @@ const GroupHead = memo(function GroupHead({ id, group, time, label, count, faile
         </span>
         {time && <span className="agx-wave-time num">{time}</span>}
         <span className="agx-wave-label truncate">{label}</span>
+        {running > 0 && <span className="agx-wave-count num">{running} running</span>}
         {/* Folded, the line says what failed inside; open, the failed rows stand first under it. */}
-        {failed > 0 && !open && <span className="agx-wave-failed num">{failed} failed</span>}
+        {failed > 0 && (always || !open) && <span className="agx-wave-failed num">{failed} failed</span>}
         <span className="agx-wave-count num">{count}</span>
       </button>
     </div>
@@ -398,29 +404,71 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
 
 // ── background commands ──
 
-const COMMAND_WORD: Record<CommandState, string> = { starting: 'Starting', done: '', failed: 'Failed', stopped: 'Stopped', unknown: 'Started' };
+/** What a command's row says of where it stands; a running one adds how long it has run, an unknown one when it started. */
+const COMMAND_WORD: Record<CommandState, string> = {
+  starting: 'Starting',
+  running: 'Running',
+  done: '',
+  failed: 'Failed',
+  stopped: 'Stopped',
+  lost: "Lost with the agent's process",
+  unknown: 'Started',
+};
+
+/** Why a command was lost (`TaskMark.why`), where it was not simply its process that went. */
+const LOST_WORD: Partial<Record<NonNullable<TaskMark['why']>, string>> = {
+  move: 'Lost when the chat moved',
+  restart: 'Lost when Sable closed',
+  limit: 'Lost at the plan limit',
+};
 
 /**
- * A command the agent sent to the background: what it is and how it ended, when its notification
- * said so. One that gave no word of its end is "Started" with the time: it may still run. The row
- * goes to the step in the conversation, where its output is.
+ * A command the agent left running in the background: what it is and where it stands, as the
+ * bridge says (`ToolItem.task`: running with its time so far, how it ended, lost with the process
+ * that held it), or for a chat saved before the bridge kept that, as its notification said. One
+ * that gave no word of its end is "Started" with the time: it is never called running without word
+ * of it. A command a sub-agent started says whose it is. The row goes to the step in the
+ * conversation, where its output is.
  */
 const CommandRow = memo(function CommandRow({ sessionId, id, fresh }: { sessionId: string; id: string; fresh: boolean }) {
   const item = useShown((s) => s.data[sessionId]?.items[id]) as ToolItem | undefined;
   const note = useShown((s) => indexFor(sessionId).notes(s.data[sessionId]).get(id));
+  // The sub-agent that started it, by its task: a string, so the row does not render when that agent streams.
+  const owner = useShown((s) => {
+    const d = s.data[sessionId];
+    const it = d?.items[id];
+    const agent = it?.parentId && d ? ownerAgent(d.items, it) : undefined;
+    return agent ? agentTask(agent) : '';
+  });
   if (!item) return null;
   const state = commandState(item, note);
-  const word = COMMAND_WORD[state];
-  const when = state === 'unknown' ? clock(item.ts) : note ? clock(note.ts) : '';
+  const word = state === 'lost' ? ((item.task?.why && LOST_WORD[item.task.why]) ?? COMMAND_WORD.lost) : COMMAND_WORD[state];
+  const ended = item.task?.endedAt ?? note?.ts;
+  const when = state === 'unknown' ? clock(item.ts) : state === 'done' || state === 'failed' || state === 'stopped' ? (ended ? clock(ended) : '') : '';
+  const name = item.detail.description || item.title;
   return (
     <div role="listitem" data-flip={`c:${id}`} className="agx-row agx-cmd" data-outcome={state} data-new={fresh || undefined}>
-      <button type="button" className="agx-row-btn" title={item.detail.command} aria-label={`${item.detail.description || item.title}. Show in conversation`} onClick={() => revealItem(sessionId, id)}>
+      <button
+        type="button"
+        className="agx-row-btn"
+        title={item.detail.command}
+        aria-label={`${name}${owner ? `, started by ${owner}` : ''}. ${word || 'Done'}. Show in conversation`}
+        onClick={() => revealItem(sessionId, id)}
+      >
         <span className="agx-mark" aria-hidden>
-          {state === 'failed' ? <Icon name="x" size={11} weight="bold" /> : state === 'starting' ? <Ring size={12} label={null} /> : <Icon name="terminal" size={13} />}
+          {state === 'failed' ? <Icon name="x" size={11} weight="bold" /> : state === 'starting' || state === 'running' ? <Ring size={12} label={null} /> : <Icon name="terminal" size={13} />}
         </span>
-        <span className="agx-title truncate">{item.detail.description || item.title}</span>
+        <span className="agx-title truncate">
+          {name}
+          {owner && <span className="agx-outcome"> · {owner}</span>}
+        </span>
         <span className="agx-meta num">
           {word && <span className="agx-outcome">{word}</span>}
+          {state === 'running' && item.task && (
+            <span className="agx-dur">
+              <Since ts={item.task.since} />
+            </span>
+          )}
           {when && <span className="agx-dur">{when}</span>}
         </span>
       </button>

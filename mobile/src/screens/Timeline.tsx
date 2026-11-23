@@ -20,7 +20,8 @@ import { claimFlight } from '@m/lib/flight';
 import { checkOpener, foldTarget, showKind, turnChanges } from '@m/lib/chat-rules';
 import { foldKey, keepDetail, keepOpen, keptDetail, stepKey, wasOpen } from '@m/lib/folds';
 import { useChanges } from '@m/lib/changes';
-import type { Segment, StepsChunk, TurnGroup } from '@m/lib/turns';
+import { runSpan, turnSpan, type Segment, type StepsChunk, type TurnGroup } from '@m/lib/turns';
+import { hasWork } from '@shared/work-label';
 import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
 import { FileGlyph, kindName } from '@m/ui/FileGlyph';
 import { PROVIDER_NAME, ProviderMark, Ring, StatusMark, Tiles } from '@m/ui/marks';
@@ -221,7 +222,7 @@ export class TurnGuard extends Component<{ id: string; turn: unknown; children: 
 /** How long the pieces that fold take to fade before the turn gathers (ms). */
 const LEAVE_MS = 170;
 
-type RunP = { k: 'run'; key: string; run: StepsChunk | null; from: string | null; until: string | null; head: boolean; live: boolean; seg?: Segment };
+type RunP = { k: 'run'; key: string; run: StepsChunk | null; from: string | null; until: string | null; cap?: string; head: boolean; live: boolean; seg?: Segment };
 type Piece =
   | { k: 'lead'; key: string; id: string; steered: boolean; fold: boolean }
   | { k: 'text'; key: string; id: string; note: boolean; answer: boolean; tail: boolean }
@@ -252,7 +253,8 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
   for (let si = 0; si <= last; si++) {
     const seg = segs[si];
     const place = headSeg < 0 || si < headSeg ? -1 : si === headSeg ? 0 : 1;
-    const after = segs[si + 1]?.lead ?? turn.end;
+    // The last run ends at the turn's record, or at the bridge's word that it was cut.
+    const after = segs[si + 1]?.lead ?? turn.end ?? turn.early;
     // A notification taken up mid-turn is part of the work: it folds with it.
     if (seg.lead) out.push({ k: 'lead', key: seg.lead, id: seg.lead, steered: seg.steered, fold: si > 0 && !seg.steered && place === 1 });
     const flow = seg.flow;
@@ -277,6 +279,7 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
         run: c,
         from: i === 0 && seg.lead ? seg.lead : c.ids[0],
         until: (next ? (next.kind === 'steps' ? next.ids[0] : next.id) : after) ?? null,
+        ...(!next && si === last && turn.next ? { cap: turn.next } : {}),
         head: i === headAt,
         live,
         ...(live ? { seg } : {}),
@@ -365,21 +368,38 @@ function TurnFoot({ sid, turn }: { sid: string; turn: TurnGroup }) {
   return null;
 }
 
+/** Why the bridge says a turn was cut (`NoticeItem.early`), after "Ended early", as the desktop says it. */
+const EARLY_WHY: Record<NonNullable<NoticeItem['early']>, string> = {
+  died: "the agent's process ended",
+  closed: "Sable closed the agent's process",
+  restart: 'Sable closed while it worked',
+};
+
 /**
- * A turn that ended before the agent finished (`TurnGroup.early`, the desktop's rule): one quiet line,
- * and while it is the chat's last and nothing runs, one way to carry on.
+ * A turn the bridge knows was cut before the agent finished (`TurnGroup.early`, the desktop's rule):
+ * one quiet line with the reason, and while it is the chat's newest (nothing but notices after its
+ * line) and the chat is at rest (no turn, no sub-agent or background command at work), one way to
+ * carry on.
  */
 function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
-  const last = turn.ids[turn.ids.length - 1];
+  const line = turn.early ?? '';
+  const note = useItem<NoticeItem>(sid, line);
+  const why = note?.type === 'notice' && note.early ? EARLY_WHY[note.early] : '';
   const canContinue = useStore((s) => {
-    const roots = sessionData(s, sid).roots;
-    const status = s.sessions[sid]?.status;
-    return roots[roots.length - 1] === last && status !== 'running' && status !== 'awaiting' && status !== 'starting';
+    const meta = s.sessions[sid];
+    if (!meta || meta.status === 'running' || meta.status === 'awaiting' || meta.status === 'starting' || hasWork(meta)) return false;
+    const d = sessionData(s, sid);
+    for (let i = d.roots.length - 1, n = 0; i >= 0 && n < 40; i--, n++) {
+      if (d.roots[i] === line) return true;
+      if (d.items[d.roots[i]]?.type !== 'notice') return false;
+    }
+    return false;
   });
   const [sent, setSent] = useState(false);
   return (
     <div className="turn-note">
       <Icon name="warning" size={14} /> Ended early
+      {why && <span className="work-meta">{why}</span>}
       {canContinue && (
         <button
           type="button"
@@ -433,10 +453,10 @@ const RunPiece = memo(function RunPiece({ sid, p, fold, settled, open, multi, ne
   const mode: LineMode = p.live && !settled ? 'live' : total ? 'total' : 'run';
   return (
     <div className="seg-work" ref={ref}>
-      {!(bare && nest) && <WorkHead sid={sid} mode={mode} run={p.run} from={p.from} until={p.until} seg={p.seg} turn={turn} open={total ? open : stepsOpen} onToggle={total ? toggleTurn : p.run ? toggleRun : undefined} />}
+      {!(bare && nest) && <WorkHead sid={sid} mode={mode} run={p.run} from={p.from} until={p.until} cap={p.cap} seg={p.seg} turn={turn} open={total ? open : stepsOpen} onToggle={total ? toggleTurn : p.run ? toggleRun : undefined} />}
       {total && p.run && open && multi && (
         <div className="tp-in" data-nest>
-          <WorkHead sid={sid} mode="run" run={p.run} from={p.from} until={p.until} open={stepsOpen} onToggle={toggleRun} />
+          <WorkHead sid={sid} mode="run" run={p.run} from={p.from} until={p.until} cap={p.cap} open={stepsOpen} onToggle={toggleRun} />
         </div>
       )}
       {p.run && <Run sid={sid} ids={p.run.ids} open={stepsOpen} />}
@@ -544,7 +564,7 @@ function PlanBlock({ sid, it }: { sid: string; it: ToolItem }) {
 type LineMode = 'live' | 'run' | 'total';
 
 /** A work line in its place: live while its checkpoint runs, its summary once closed, the turn's once the turn has ended. */
-function WorkHead({ sid, mode, run, from, until, seg, turn, open, onToggle }: { sid: string; mode: LineMode; run: StepsChunk | null; from: string | null; until: string | null; seg?: Segment; turn?: TurnGroup; open: boolean; onToggle?: () => void }) {
+function WorkHead({ sid, mode, run, from, until, cap, seg, turn, open, onToggle }: { sid: string; mode: LineMode; run: StepsChunk | null; from: string | null; until: string | null; cap?: string; seg?: Segment; turn?: TurnGroup; open: boolean; onToggle?: () => void }) {
   // A checkpoint closing, and the turn ending: the line hands over to its summary, once.
   const was = useRef(mode);
   const [landed, setLanded] = useState(false);
@@ -558,50 +578,18 @@ function WorkHead({ sid, mode, run, from, until, seg, turn, open, onToggle }: { 
   }, [mode]);
   if (mode === 'live' && seg) return <LiveLine sid={sid} seg={seg} run={run} from={from} open={open} onToggle={run ? onToggle : undefined} />;
   if (mode === 'total' && turn) return <TotalLine sid={sid} turn={turn} open={open} onToggle={onToggle} landed={landed} />;
-  if (run) return <RunLine sid={sid} run={run} from={from} until={until} open={open} onToggle={onToggle} landed={landed} />;
+  if (run) return <RunLine sid={sid} run={run} from={from} until={until} cap={cap} open={open} onToggle={onToggle} landed={landed} />;
   return null;
-}
-
-/** How long one checkpoint's work took (ms): from what opened it to what closed it, or to the last thing in it. */
-function runSpan(items: Record<string, TimelineItem>, run: StepsChunk, from: string, until: string | null): number | null {
-  const start = items[from]?.ts ?? items[run.ids[0]]?.ts;
-  if (!start) return null;
-  const closer = until ? items[until] : undefined;
-  if (closer) return closer.ts - start;
-  let last = start;
-  for (const id of run.ids) {
-    const it = items[id];
-    if (it) last = Math.max(last, it.ts, ('endedAt' in it && it.endedAt) || 0);
-  }
-  return last - start;
-}
-
-/** How long a finished turn took (ms), as the live lines counted it; the agent's own figure where the items' times say less. */
-function turnSpan(items: Record<string, TimelineItem>, turn: TurnGroup): number | null {
-  const lead = turn.segments[0]?.lead;
-  const start = (lead ? items[lead]?.ts : undefined) ?? items[turn.ids[0]]?.ts;
-  if (!start) return null;
-  const end = turn.end ? items[turn.end] : undefined;
-  if (end?.type === 'turn') {
-    const wall = end.ts - start;
-    return end.durationMs > wall ? end.durationMs : wall;
-  }
-  let last = start;
-  for (const id of turn.ids) {
-    const it = items[id];
-    if (it) last = Math.max(last, it.ts, ('endedAt' in it && it.endedAt) || 0);
-  }
-  return last - start;
 }
 
 const workedLabel = (thought: boolean, took: string) => (thought ? (took ? `Thought for ${took}` : 'Thought') : took ? `Worked ${took}` : 'Worked');
 
 /** "Worked 45s · 5 steps": one closed checkpoint, opening to its steps. */
-function RunLine({ sid, run, from, until, open, onToggle, landed }: { sid: string; run: StepsChunk; from: string | null; until: string | null; open: boolean; onToggle?: () => void; landed: boolean }) {
+function RunLine({ sid, run, from, until, cap, open, onToggle, landed }: { sid: string; run: StepsChunk; from: string | null; until: string | null; cap?: string; open: boolean; onToggle?: () => void; landed: boolean }) {
   const { span, thought } = useMemo(() => {
     const items = sessionData(getState(), sid).items;
-    return { span: runSpan(items, run, from ?? run.ids[0], until), thought: !run.count && run.ids.some((id) => items[id]?.type === 'thinking') };
-  }, [sid, run, from, until]);
+    return { span: runSpan(items, run, from ?? run.ids[0], until, cap), thought: !run.count && run.ids.some((id) => items[id]?.type === 'thinking') };
+  }, [sid, run, from, until, cap]);
   const took = span && span >= 1000 ? shortDuration(span) : '';
   return (
     <div className="work" data-landed={landed || undefined} data-open={open || undefined}>

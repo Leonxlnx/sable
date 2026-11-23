@@ -2164,6 +2164,14 @@ button:hover > .row-caret {
   z-index: 1;
 }
 
+/* The live line of the running turn is the conversation's last line, and the turn's footer (`.turn`:
+   4 + 26 + 8) takes its place when it ends: the same height (2 + 28 + 8), so the answer above does
+   not move when the one goes and the other comes. Shorter, the conversation's end rose 6px in the
+   frame the turn ended. */
+.tg[data-state='running'] .seg-work > .tl-work[data-live]:last-child {
+  padding-bottom: 8px;
+}
+
 .work-head {
   position: relative;
   display: flex;
@@ -2721,8 +2729,11 @@ button:hover > .row-caret {
 }
 
 /* The live line of a later checkpoint (TurnView marks it `data-next`): it starts under the note
-   that closed the one before, with no travel. */
-.tl-work[data-next][data-live] > .work-head {
+   that closed the one before, with no travel. At the end of the conversation it stands where the
+   line before it stood (the view keeps the end), so the working tiles stay on and only the words
+   fade in, as a new title does: the whole line fading in from nothing blinked the indicator out
+   at every checkpoint. */
+.tl-work[data-next][data-live] > .work-head :is(.work-label, .work-time) {
   animation: fade-in 200ms var(--ease) backwards;
 }
 
@@ -2737,7 +2748,7 @@ button:hover > .row-caret {
     animation: fade-in var(--d-3) var(--ease);
   }
   .tail .tail-label,
-  .tl-work[data-next][data-live] > .work-head,
+  .tl-work[data-next][data-live] > .work-head :is(.work-label, .work-time),
   .tl-work[data-enter][data-live] > .work-head :is(.work-label, .work-time) {
     animation: none;
   }

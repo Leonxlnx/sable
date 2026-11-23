@@ -1,4 +1,5 @@
 import type { FolderGroup, FolderOrder, Project, ProviderId, SessionMeta } from '@shared/protocol';
+import { hasWork } from '@shared/work-label';
 import { baseName } from '@/lib/format';
 
 /** Case- and slash-insensitive key for a folder path. */
@@ -89,8 +90,9 @@ function attentionOf(list: SessionMeta[]): Attention {
   for (const s of list) {
     const a: Attention =
       // A chat waiting for a reset (Spare) after a limit is not an error to look at.
-      // A chat whose sub-agents still work is working, whatever its own last turn did (as its row says).
-      s.status === 'awaiting' ? 'awaiting' : (s.background ?? 0) > 0 ? 'working' : s.status === 'error' && !s.spare ? 'error' : s.status === 'running' || s.status === 'starting' ? 'working' : s.unread ? 'unread' : undefined;
+      // A chat whose sub-agents or background commands still work is working, whatever its own last turn
+      // did (as its row says, `statusTone`).
+      s.status === 'awaiting' ? 'awaiting' : hasWork(s) ? 'working' : s.status === 'error' && !s.spare ? 'error' : s.status === 'running' || s.status === 'starting' ? 'working' : s.unread ? 'unread' : undefined;
     if (a && (!best || RANK[a] > RANK[best])) best = a;
   }
   return best;

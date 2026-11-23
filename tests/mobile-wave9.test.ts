@@ -211,4 +211,10 @@ describe('wave 9 #22: a chat whose sub-agents still work is working', () => {
     expect(rules.worksNow({ status: 'error', background: 1 })).toBe(true);
     expect(rules.worksNow({ status: 'error', background: 0 })).toBe(false);
   });
+
+  it('a background command left running is work too, as the row says it (day 6)', () => {
+    expect(rules.worksNow({ status: 'idle', commands: 1 })).toBe(true);
+    expect(rules.worksNow({ status: 'idle', commands: 0, background: 0 })).toBe(false);
+    expect(rules.worksNow({ status: 'awaiting', commands: 1 })).toBe(false);
+  });
 });

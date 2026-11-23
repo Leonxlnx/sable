@@ -10,7 +10,7 @@ import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
 import { homeFolder, openRace } from '@m/lib/race';
-import { backgroundLabel } from '@m/lib/turns';
+import { hasWork, workLabel } from '@shared/work-label';
 import { worksNow } from '@m/lib/chat-rules';
 import { getState, refresh, setState, useStore, type State } from '@m/lib/store';
 import { useNow } from '@m/lib/useNow';
@@ -37,8 +37,8 @@ export const toneOf = (s: SessionMeta): Tone =>
     ? 'working'
     : s.status === 'awaiting'
       ? 'awaiting'
-      : // Its own turn ended (also with an error), but sub-agents it sent to the background still work: the chat is not at rest.
-        (s.background ?? 0) > 0
+      : // Its own turn ended (also with an error), but sub-agents or background commands it started still work: the chat is not at rest.
+        hasWork(s)
         ? 'working'
         : s.status === 'error'
           ? 'error'
@@ -588,9 +588,9 @@ const LiveRow = memo(function LiveRow({ id, done, now }: { id: string; done: boo
   if (s && !done) began.current = s.updatedAt;
   if (!s) return null;
   const failed = done && s.status === 'error';
-  // Its own turn over, sub-agents it sent to the background still at work: they are what it does now.
-  const background = s.status !== 'running' && s.status !== 'starting' && (s.background ?? 0) > 0;
-  const line = done ? (failed ? (s.lastError ?? 'Stopped with an error') : 'Done') : s.status === 'starting' ? 'Starting' : background ? backgroundLabel(s.background!) : s.activity || 'Working';
+  // Its own turn over, sub-agents or background commands it started still at work: they are what it does now.
+  const background = s.status !== 'running' && s.status !== 'starting' ? workLabel(s) : null;
+  const line = done ? (failed ? (s.lastError ?? 'Stopped with an error') : 'Done') : s.status === 'starting' ? 'Starting' : background || s.activity || 'Working';
   return (
     <motion.li layout="position" className="rrow" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0, transition: { duration: 0.22 } }} transition={SNAP}>
       <button
@@ -995,7 +995,7 @@ export const Row = memo(function Row({ id, onMenu, swipe = true, search }: { id:
         <span className="row-main">
           <span className="row-title">{s.title}</span>
           <span className="row-sub">
-            {tone === 'awaiting' ? <span className="row-wait">Waiting for you</span> : (s.background ?? 0) > 0 && tone === 'working' ? <span className="row-folder">{backgroundLabel(s.background!)}</span> : <span className="row-folder">{folder}</span>}
+            {tone === 'awaiting' ? <span className="row-wait">Waiting for you</span> : hasWork(s) && tone === 'working' ? <span className="row-folder">{workLabel(s)}</span> : <span className="row-folder">{folder}</span>}
           </span>
         </span>
         <span className="row-end">

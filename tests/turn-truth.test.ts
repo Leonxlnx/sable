@@ -20,7 +20,7 @@ import {
   stripWrappers,
   userText,
 } from '@shared/synthetic';
-import { groupTurns, lastResponse, shapeOf, endedEarly, type TurnGroup } from '@/features/timeline/turns';
+import { groupTurns, lastResponse, runSpan, shapeOf, turnSpan, type TurnGroup } from '@/features/timeline/turns';
 import { handoverText } from '../server/accounts/handover';
 import { moveNote } from '../server/core/move-context';
 import { failureMessage } from '../server/core/until';
@@ -35,8 +35,10 @@ vi.mock('@desk/features/review/model', async () => await import('../src/features
 vi.mock('@desk/lib/word-diff', async () => await import('../src/lib/word-diff'));
 const MOBILE = '../mobile/src/lib/turns';
 const mobile = (await import(/* @vite-ignore */ MOBILE)) as {
-  groupTurns: (ids: readonly string[], shape: string, busy: boolean) => { groups: (TurnGroup | { kind: 'item' })[] };
+  groupTurns: (ids: readonly string[], shape: string, busy: boolean) => { groups: (TurnGroup | { kind: 'item'; id: string })[] };
   shapeOf: (item: TimelineItem) => string;
+  turnSpan: typeof turnSpan;
+  runSpan: typeof runSpan;
 };
 
 let n = 0;
@@ -94,41 +96,112 @@ describe('the stand-in answer', () => {
   }
 });
 
-describe('a turn that ended before the agent finished', () => {
+describe('how a turn ended: only the bridge says it was cut', () => {
+  const early = (why: 'died' | 'closed' | 'restart', variant = 'info') => mk({ type: 'notice', variant, text: 'The turn was cut', early: why });
+  const items = (list: TimelineItem[]) => Object.fromEntries(list.map((i) => [i.id, i])) as Record<string, TimelineItem>;
+
   for (const phone of [false, true]) {
     const tag = phone ? 'phone' : 'desktop';
-    it(`cut after a step, with no record of its end, reads as ended early (${tag})`, () => {
+    const groups = (list: TimelineItem[], busy = false) => {
+      const ids = list.map((i) => i.id);
+      const shape = list.map((i) => (phone ? mobile.shapeOf(i) : shapeOf(i))).join('');
+      return (phone ? mobile.groupTurns(ids, shape, busy) : groupTurns(ids, shape, busy)).groups;
+    };
+    const span = phone ? mobile.turnSpan : turnSpan;
+    const run = phone ? mobile.runSpan : runSpan;
+
+    it(`a turn with no record of its end says nothing about it (${tag})`, () => {
       // The reported case, as a transcript read back shows it: a read-only check, the stand-in, then the next message.
       const turns = layout([user('look at the jobs'), text('Let me check the queue.'), step(), text(STAND_IN_ANSWER), user('what happened?'), text('Nothing ran.')], false, phone);
-      expect(turns[0].early).toBe(true);
+      expect(turns[0].early).toBeUndefined();
       expect(turns[0].state).toBe('done');
-      expect(turns[1].early).toBeUndefined();
+      // Work the agent began by itself, settled with no record (the chat at rest): nothing either.
+      expect(layout([user('a'), step(), end(), step(), step()], false, phone)[1].early).toBeUndefined();
+      expect(layout([user('a'), step()], false, phone)[0].early).toBeUndefined();
+      expect(layout([user('a'), mk({ type: 'thinking', text: 'Hm', streaming: false })], false, phone)[0].early).toBeUndefined();
     });
 
-    it(`a finished, stopped, failed or running turn does not (${tag})`, () => {
-      expect(layout([user('a'), step(), end()], false, phone)[0].early).toBeUndefined();
-      expect(layout([user('a'), step(), notice('interrupted')], false, phone)[0].early).toBeUndefined();
-      expect(layout([user('a'), step(), notice('error')], false, phone)[0].early).toBeUndefined();
-      expect(layout([user('a'), step(), end('Boom')], false, phone)[0].early).toBeUndefined();
-      expect(layout([user('a'), step()], true, phone)[0].early).toBeUndefined();
-      // History with no turn records: a turn that ends with words is finished.
-      expect(layout([user('a'), step(), text('Done: the queue is empty.'), user('b')], false, phone)[0].early).toBeUndefined();
-      // Closed by a line of its own (a switch of agent, a rewind): not the agent's doing.
-      expect(layout([user('a'), step(), mk({ type: 'notice', variant: 'info', text: 'Switched', agentSwitch: { from: 'claude', to: 'codex' } })], false, phone)[0].early).toBeUndefined();
+    it(`a wake turn with its record is a turn of its own, finished (${tag})`, () => {
+      const list = [user('run the tests in the background'), step(), text('Started.'), end(), step(), text('The tests passed.'), end()];
+      const turns = layout(list, false, phone);
+      expect(turns).toHaveLength(2);
+      expect(turns[1].segments[0].lead).toBeNull();
+      expect(turns[1].end).toBe(list[6].id);
+      expect(turns[1].state).toBe('done');
+      expect(turns[1].early).toBeUndefined();
+      // While it runs, it is the running turn.
+      expect(layout(list.slice(0, 5), true, phone)[1].state).toBe('running');
+    });
+
+    it(`an early notice closes the turn above it and is that turn's line (${tag})`, () => {
+      for (const variant of ['info', 'error', 'interrupted']) {
+        const cut = early('died', variant);
+        const list = [user('fix it'), step(), cut, user('go on'), text('Done.')];
+        const gs = groups(list);
+        const turn = gs[0] as TurnGroup;
+        expect(turn.kind).toBe('turn');
+        expect(turn.early).toBe(cut.id);
+        expect(turn.state).toBe('done');
+        expect(turn.ids).toContain(cut.id);
+        // It is the turn's own line, not a piece of it.
+        expect(turn.segments.some((sg) => sg.flow.some((c) => (c.kind === 'steps' ? c.ids.includes(cut.id) : c.id === cut.id)))).toBe(false);
+        expect((gs[1] as TurnGroup).early).toBeUndefined();
+      }
+      // With nothing open (nothing of the turn in this timeline), it stands on its own.
+      const lone = early('restart');
+      expect(groups([lone])).toEqual([{ kind: 'item', key: lone.id, id: lone.id }]);
+    });
+
+    it(`a notice after the last act of a turn with no record stands on its own (${tag})`, () => {
+      const t0 = 1_000_000;
+      const u = mk({ type: 'user', text: 'a', state: 'sent', ts: t0 });
+      const w = mk({ type: 'tool', name: 'Read', kind: 'read', title: 'Read a.ts', status: 'done', detail: {}, ts: t0 + 1000, endedAt: t0 + 4000 });
+      const say = mk({ type: 'text', text: 'Read it: the queue is empty.', streaming: false, ts: t0 + 5000 });
+      // An account move six hours later.
+      const moved = mk({ type: 'notice', variant: 'info', text: 'Continued with Work', ts: t0 + 6 * 3_600_000 });
+      const next = mk({ type: 'user', text: 'b', state: 'sent', ts: t0 + 6 * 3_600_000 + 60_000 });
+      const gs = groups([u, w, say, moved, next]);
+      const turn = gs[0] as TurnGroup;
+      expect(turn.ids).not.toContain(moved.id);
+      expect(gs[1]).toEqual({ kind: 'item', key: moved.id, id: moved.id });
+      expect(turn.next).toBe(moved.id);
+      expect(span(items([u, w, say, moved, next]), turn)).toBe(5000);
+      // At the end of a chat at rest too.
+      const end2 = groups([u, w, say, moved]);
+      expect(end2[1]).toEqual({ kind: 'item', key: moved.id, id: moved.id });
+      // In a running turn it is part of the work (more may come after it).
+      expect((groups([u, w, moved], true)[0] as TurnGroup).ids).toContain(moved.id);
+      // A notice that is all a turn holds (a /compact) is that turn.
+      expect((groups([u, moved])[0] as TurnGroup).ids).toContain(moved.id);
+    });
+
+    it(`the time of a turn with no record: its work, not a settle six hours late (${tag})`, () => {
+      const t0 = 2_000_000;
+      const u = mk({ type: 'user', text: 'ship it', state: 'sent', ts: t0 });
+      const a = mk({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Run tests', status: 'done', detail: {}, ts: t0 + 60_000, endedAt: t0 + 120_000 });
+      // Still running when its process went away; the next turn's settle stamped it 6h 11m later.
+      const b = mk({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Wait for CI', status: 'cancelled', detail: {}, ts: t0 + 487_000, endedAt: t0 + 22_260_000 });
+      const later = mk({ type: 'user', text: 'and now?', state: 'sent', ts: t0 + 22_200_000 });
+      const list = [u, a, b, later];
+      const turn = groups(list)[0] as TurnGroup;
+      expect(span(items(list), turn)).toBe(487_000);
+      const r = turn.segments[0].flow.find((c) => c.kind === 'steps')!;
+      expect(run(items(list), r as { ids: string[] }, u.id, null, turn.next)).toBe(487_000);
+      // A step whose end came after the next message never reaches past it.
+      const c = mk({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Serve', status: 'done', detail: {}, ts: t0 + 1000, endedAt: t0 + 900_000 });
+      const soon = mk({ type: 'user', text: 'b', state: 'sent', ts: t0 + 300_000 });
+      const t2 = groups([u, c, soon])[0] as TurnGroup;
+      expect(span(items([u, c, soon]), t2)).toBe(300_000);
+      // The bridge's line says when it was cut: the turn ran to it.
+      const cut = mk({ type: 'notice', variant: 'info', text: 'cut', early: 'closed', ts: t0 + 600_000 });
+      const t3 = groups([u, a, b, cut])[0] as TurnGroup;
+      expect(span(items([u, a, b, cut]), t3)).toBe(600_000);
+      // With the agent's record, as before: the wall time, or the agent's own figure where that is more.
+      const rec = mk({ type: 'turn', durationMs: 90_000, ts: t0 + 125_000 });
+      const t4 = groups([u, a, rec])[0] as TurnGroup;
+      expect(span(items([u, a, rec]), t4)).toBe(125_000);
     });
   }
-
-  it('the rule reads the provider events only', () => {
-    expect(endedEarly('done', null, ['l', 'w', '.'])).toBe(true);
-    expect(endedEarly('done', null, ['w', 'h'])).toBe(true);
-    expect(endedEarly('done', null, ['w', 't', 'n'])).toBe(false);
-    // A warning after the last act says nothing about how the turn ended: the act before it decides.
-    expect(endedEarly('done', null, ['w', 'a'])).toBe(true);
-    expect(endedEarly('done', null, ['w', 't', 'a'])).toBe(false);
-    expect(endedEarly('done', 'end', ['w'])).toBe(false);
-    expect(endedEarly('done', null, ['w'], 'line')).toBe(false);
-    expect(endedEarly('interrupted', null, ['w'])).toBe(false);
-  });
 });
 
 describe('a step shows only its own time', () => {
@@ -142,9 +215,10 @@ describe('a step shows only its own time', () => {
     rt.settle('cancelled', { endUnknown: true });
     expect(rt.get<ToolItem>('w')).toMatchObject({ status: 'cancelled' });
     expect(rt.get<ToolItem>('w')!.endedAt).toBeUndefined();
-    // And the turn reads as ended early, not as 41 minutes of work.
+    // And the turn says nothing of how it ended (only the bridge's notice does), and not 41 minutes of work.
     const turn = groupTurns(['u', 'w'], rt.items.map((i) => shapeOf(i)).join(''), false).groups[0] as TurnGroup;
-    expect(turn.early).toBe(true);
+    expect(turn.early).toBeUndefined();
+    expect(turnSpan(Object.fromEntries(rt.items.map((i) => [i.id, i])), turn)).toBe(92_000);
     // A stop while it runs still ends it now.
     const live = new SessionRuntime({ ...meta, id: 's2' }, () => {}, () => {});
     live.add<ToolItem>({ ...write, status: 'running', id: 'w2', ts: now - 1000 });

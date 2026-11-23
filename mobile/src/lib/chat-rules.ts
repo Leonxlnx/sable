@@ -1,5 +1,6 @@
 import type { SessionMeta, TimelineItem } from '@shared/protocol';
 import { syntheticOf } from '@shared/synthetic';
+import { hasWork } from '@shared/work-label';
 
 /**
  * The parts of a turn (lib/turns.ts `TurnGroup`) these rules read, written out here so the rules load
@@ -51,12 +52,13 @@ export function showKind(it: TimelineItem | undefined): ShowKind | null {
 // ───────────────────────── a chat at work ─────────────────────────
 
 /**
- * The chat works now: its own turn runs, or its turn has ended while sub-agents it sent to the
- * background still work (`SessionMeta.background`). One predicate for home's row, its count of
- * chats at work and the moment a chat is done.
+ * The chat works now: its own turn runs, or its turn has ended while sub-agents or background
+ * commands it started still work (`SessionMeta.background`, `commands`; shared/work-label.ts, as the
+ * row's tone reads it). One predicate for home's row, its count of chats at work and the moment a
+ * chat is done.
  */
-export const worksNow = (s: Pick<SessionMeta, 'status' | 'background'>): boolean =>
-  s.status === 'running' || s.status === 'starting' || (s.status !== 'awaiting' && (s.background ?? 0) > 0);
+export const worksNow = (s: Pick<SessionMeta, 'status' | 'background' | 'commands'>): boolean =>
+  s.status === 'running' || s.status === 'starting' || (s.status !== 'awaiting' && hasWork(s));
 
 /** The chat's turn can be stopped (`session.interrupt`): it runs, starts, or waits on a prompt. */
 export const canStop = (status: SessionMeta['status'] | undefined): boolean => status === 'running' || status === 'starting' || status === 'awaiting';

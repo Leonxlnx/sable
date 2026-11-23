@@ -13,7 +13,8 @@ import { around, growDown, growUp, MOUNT_MAX, rangeOf, SpacerSums, trimTop, type
 import { matchRanges, searchWords } from '@m/lib/find';
 import { canStop, followSent, newestSent, wholeForFind } from '@m/lib/chat-rules';
 import { takeSentHere } from '@m/lib/follow';
-import { backgroundLabel, groupTurns, stabilize } from '@m/lib/turns';
+import { groupTurns, stabilize } from '@m/lib/turns';
+import { workLabel } from '@shared/work-label';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles } from '@m/ui/marks';
@@ -671,16 +672,16 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   );
 }
 
-/** Under the conversation once the chat's own turn has ended while sub-agents it sent to the background still work. */
+/** Under the conversation once the chat's own turn has ended while sub-agents or background commands it started still work. */
 function BackgroundLine({ id }: { id: string }) {
-  const n = useStore((st) => st.sessions[id]?.background ?? 0);
-  if (!n) return null;
+  const label = useStore((st) => (st.sessions[id] ? workLabel(st.sessions[id]) : null));
+  if (!label) return null;
   return (
     <div className="bg-line" role="status">
       <span className="work-ind">
         <Tiles size={13} />
       </span>
-      <span className="bg-line-text">{backgroundLabel(n)}</span>
+      <span className="bg-line-text">{label}</span>
     </div>
   );
 }
