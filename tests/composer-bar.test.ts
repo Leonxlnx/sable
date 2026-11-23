@@ -6,73 +6,63 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Capabilities } from '@shared/protocol';
 import { rememberCaps, resetSeenCaps, seenCaps } from '../src/features/composer/caps-seen';
-import { FAR, GAP, NEAR, panePlace, placeMenu, roomBeyond } from '../src/features/composer/menu-place';
+import { GAP, placeMenu, roomBeside } from '../src/features/composer/menu-place';
 import { rimRun } from '../src/features/composer/ultra-run';
 import { INK, inkAt } from '../src/features/composer/liquid-shape';
 
 const read = (file: string) => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 
-describe('a menu the bar opens stands clear of the pane', () => {
-  // A docked bar, 760 by 90: its last line is 28 tall, 6 from the bottom and the sides.
-  const pane = { left: 400, top: 700, right: 1160, bottom: 790 };
+// 23 Nov: the menus open at their chip again. 0.2.21 stood them clear of the pane, flush with its
+// side (`panePlace`, tested here until then); with a draft of a few lines and an attachment the
+// model menu opened about 150 px above the chip that was clicked, and the owner called it worse.
+describe('a menu the bar opens stands by its own chip', () => {
+  // A docked bar with a draft of three lines and an attachment, 760 by 186: its last line is 28
+  // tall, 6 from the bottom and the sides.
   const mode = { left: 440, top: 756, right: 520, bottom: 784 };
   const effort = { left: 1000, top: 756, right: 1108, bottom: 784 };
 
-  it('8 px beyond the pane’s edge and flush with its side', () => {
-    // Above the pane in a chat: from the chip's top to the pane's top, and the gap.
-    expect(panePlace(mode, pane, 'top', 'start')).toEqual({ sideOffset: 56 + GAP, alignOffset: -40 });
-    expect(panePlace(effort, pane, 'top', 'end')).toEqual({ sideOffset: 56 + GAP, alignOffset: -52 });
-    // Below it on home.
-    expect(panePlace(effort, pane, 'bottom', 'end')).toEqual({ sideOffset: 6 + GAP, alignOffset: -52 });
+  it('8 px off the chip, on the chip’s own edge, however tall the draft', () => {
+    expect(placeMenu(mode, 'top', 4 * 28 + 8, 800)).toEqual({ side: 'top', sideOffset: GAP, alignOffset: 0 });
+    expect(placeMenu(effort, 'top', 400, 800)).toEqual({ side: 'top', sideOffset: GAP, alignOffset: 0 });
+    // Nothing about the pane goes in: the place is the chip's alone.
+    expect(placeMenu.length).toBe(4);
+  });
+
+  it('opens on the side it is wanted on when the window has the room, else on the side with more, decided before it is drawn', () => {
+    // Home, a window 800 tall: the pane in its middle, the chip on its last line.
+    const chip = { left: 1000, top: 438, right: 1108, bottom: 466 };
+    // 800 - 466 - 8 - 10 = 316 below, 438 - 8 - 10 = 420 above.
+    expect([roomBeside(chip, 'bottom', 800), roomBeside(chip, 'top', 800)]).toEqual([316, 420]);
+    expect(placeMenu(chip, 'bottom', 5 * 28 + 8, 800)).toEqual({ side: 'bottom', sideOffset: GAP, alignOffset: 0 });
+    // One that does not fit below goes above, by the same chip.
+    expect(placeMenu(chip, 'bottom', 330, 800)).toEqual({ side: 'top', sideOffset: GAP, alignOffset: 0 });
+    // Where neither side has the room it takes the side with more (a list that scrolls is held to it).
+    expect(placeMenu(chip, 'bottom', 500, 800).side).toBe('top');
+    expect(placeMenu({ ...chip, top: 300, bottom: 328 }, 'bottom', 500, 800).side).toBe('bottom');
   });
 
   it('measures in the interface’s own pixels', () => {
     const z = 1.25;
-    const scaled = (b: typeof pane) => ({ left: b.left * z, top: b.top * z, right: b.right * z, bottom: b.bottom * z });
-    expect(panePlace(scaled(mode), scaled(pane), 'top', 'start', z)).toEqual({ sideOffset: 64, alignOffset: -40 });
-  });
-
-  it('stays by its chip over a tall draft, and where there is no pane round the chip', () => {
-    const tall = { ...pane, top: pane.bottom - 34 - FAR - 1 };
-    expect(panePlace(mode, tall, 'top', 'start')).toEqual(NEAR);
-    expect(panePlace({ left: 0, top: 0, right: 10, bottom: 10 }, pane, 'top', 'start')).toEqual(NEAR);
-  });
-
-  it('opens on the side it is wanted on when the window has the room, else on the other, decided before it is drawn', () => {
-    // Home, a window 800 tall: the pane in its middle, the last line 6 from its bottom.
-    const home = { left: 400, top: 360, right: 1160, bottom: 472 };
-    const chip = { left: 1000, top: 438, right: 1108, bottom: 466 };
-    // 800 - 472 - 8 - 10 = 310 below, 360 - 8 - 10 = 342 above.
-    expect([roomBeyond(home, 'bottom', 800), roomBeyond(home, 'top', 800)]).toEqual([310, 342]);
-    // A menu that fits below (five rows of 28 and its padding) opens below, off the pane's bottom edge.
-    expect(placeMenu(chip, home, 'bottom', 'end', 5 * 28 + 8, 800)).toEqual({ side: 'bottom', avoid: false, sideOffset: 6 + GAP, alignOffset: -52 });
-    // One that does not goes above, with the offsets of that side (never across the pane).
-    expect(placeMenu(chip, home, 'bottom', 'end', 330, 800)).toEqual({ side: 'top', avoid: false, sideOffset: 78 + GAP, alignOffset: -52 });
-    // A long list that scrolls inside the menu needs only a few rows: it stays below.
-    expect(placeMenu(chip, home, 'bottom', 'end', 240, 800).side).toBe('bottom');
-    // In a chat the pane is docked at the bottom: above, always.
-    expect(placeMenu(mode, pane, 'top', 'start', 400, 800)).toEqual({ side: 'top', avoid: false, sideOffset: 56 + GAP, alignOffset: -40 });
-  });
-
-  it('hangs by its chip and keeps itself in the window where neither side of the pane has the room', () => {
-    const home = { left: 400, top: 200, right: 1160, bottom: 312 };
-    const chip = { left: 1000, top: 278, right: 1108, bottom: 306 };
-    expect(placeMenu(chip, home, 'bottom', 'end', 300, 520)).toEqual({ side: 'bottom', avoid: true, ...NEAR });
-    // Over a tall draft the wanted side is by the chip too (the pane's far edge is too far away).
-    const tall = { ...pane, top: pane.bottom - 34 - FAR - 1 };
-    expect(placeMenu(mode, tall, 'top', 'start', 100, 900)).toEqual({ side: 'top', avoid: true, ...NEAR });
+    const chip = { left: 1250, top: 547.5, right: 1385, bottom: 582.5 };
+    // 438 and 466 at a zoom of 1.25 in a window 1000 device px tall: the same room as above.
+    expect([roomBeside(chip, 'bottom', 1000, z), roomBeside(chip, 'top', 1000, z)]).toEqual([316, 420]);
   });
 
   it('is what every menu of the bar uses, and their rows nest in the menu’s corner', () => {
     const controls = read('src/features/composer/Controls.tsx');
     expect(controls.match(/sideOffset=\{place\.sideOffset\}/g)?.length).toBe(2);
-    // The side and whether it may move itself come from the placement, on all four menus.
+    expect(controls).not.toMatch(/panePlace|usePanePlace|closest<HTMLElement>\('\.cmp-card'\)/);
+    // The side comes from the placement on all four menus, and Radix never flips it (a flipped mode
+    // menu kept the row order of the side it left).
     for (const file of ['Controls.tsx', 'Thinking.tsx', 'Composer.tsx']) {
       const src = read(`src/features/composer/${file}`);
       expect(src).toContain('side={place.side}');
-      expect(src).toContain('avoidCollisions={place.avoid}');
-      expect(src).not.toContain('avoidCollisions={false}');
+      expect(src).toContain('useMenuPlace(');
+      expect(src).toContain('avoidCollisions={false}');
+      expect(src).not.toContain('avoidCollisions={place.avoid}');
     }
+    // The home chips' menus (agent, folder, working tree) hang below their chips by the same gap.
+    expect(controls.match(/side="bottom"\s+align="start"\s+sideOffset=\{GAP\}/g)?.length).toBe(3);
     expect(read('src/features/composer/Thinking.tsx')).toMatch(/sideOffset=\{place\.sideOffset\}\s*alignOffset=\{place\.alignOffset\}/);
     expect(read('src/features/composer/Composer.tsx')).toMatch(/sideOffset=\{place\.sideOffset\} alignOffset=\{place\.alignOffset\}/);
     // A menu's corner is 16 and its rows stand 4 in: 12, for the row and the highlight under it.

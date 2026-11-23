@@ -25,7 +25,7 @@ import { keepDrafts } from './drafts';
 import { carryOver, leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
 import { holdSend, moveSend, sendBack, sendDone } from './pending';
 import { watchWidth } from './width-watch';
-import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut, usePanePlace } from './Controls';
+import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut, useMenuPlace } from './Controls';
 import { CoveSkin } from './Cove';
 import { PROVIDER_NAME } from '@/art/Logo';
 import { ModelEffort } from './Thinking';
@@ -169,7 +169,7 @@ const StageDrop = memo(function StageDrop({ host, images }: { host: HTMLElement 
 const AttachMenu = memo(function AttachMenu({ images, side, onAdd, onMention }: { images: boolean; side: 'top' | 'bottom'; onAdd: () => void; onMention: () => void }) {
   const [open, setOpen] = useState(false);
   const disc = useRef<HTMLButtonElement>(null);
-  const place = usePanePlace(disc, open, side, 'start', 2 * 28 + 8);
+  const place = useMenuPlace(disc, open, side, 2 * 28 + 8);
   return (
     <RM.Root open={open} onOpenChange={setOpen} modal={false}>
       <Tip label={images ? 'Attach files or images' : 'Attach files'} side="top">
@@ -180,7 +180,7 @@ const AttachMenu = memo(function AttachMenu({ images, side, onAdd, onMention }: 
         </RM.Trigger>
       </Tip>
       <RM.Portal>
-        <RM.Content className="pop cm-pop" data-spot side={place.side} align="start" sideOffset={place.sideOffset} alignOffset={place.alignOffset} avoidCollisions={place.avoid} collisionPadding={10} style={{ width: 208 }} onCloseAutoFocus={(e) => e.preventDefault()}>
+        <RM.Content className="pop cm-pop" data-spot side={place.side} align="start" sideOffset={place.sideOffset} alignOffset={place.alignOffset} avoidCollisions={false} collisionPadding={10} style={{ width: 208 }} onCloseAutoFocus={(e) => e.preventDefault()}>
           <RM.Item className="menu-item" onSelect={onAdd}>
             <Icon name={images ? 'image' : 'file-plus'} size={15} />
             <span className="grow">{images ? 'Add files or images' : 'Add files'}</span>

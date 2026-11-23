@@ -53,16 +53,42 @@
     arc to 20px 0 of 20px cw,
     close
   );
-  /* The rim along the cove: the band between that curve and the same curve one pixel in. */
+  /* The rim along the cove: the band between that curve and the same curve the rim's width in
+     (tokens.css --rim-w: 1px, or two device pixels where 1px is less). The inner curve is the
+     outer one offset: the horns' radii less the width, the cove's more, and they still meet on
+     the line between their centres, the width further from the corner. */
   --cove-band: shape(
     from 100% calc(100% - 66px),
     arc to calc(100% - 20px) calc(100% - 46px) of 20px cw,
     arc to calc(100% - 46px) calc(100% - 20px) of 26px ccw,
     arc to calc(100% - 66px) 100% of 20px cw,
-    vline to calc(100% - 1px),
-    arc to calc(100% - 47px) calc(100% - 20px) of 19px ccw,
-    arc to calc(100% - 20px) calc(100% - 47px) of 27px cw,
-    arc to calc(100% - 1px) calc(100% - 66px) of 19px ccw,
+    vline to calc(100% - var(--rim-w)),
+    arc to calc(100% - 46px - var(--rim-w)) calc(100% - 20px) of calc(20px - var(--rim-w)) ccw,
+    arc to calc(100% - 20px) calc(100% - 46px - var(--rim-w)) of calc(26px + var(--rim-w)) cw,
+    arc to calc(100% - var(--rim-w)) calc(100% - 66px) of calc(20px - var(--rim-w)) ccw,
+    close
+  );
+  /* The rest of the rim: the band along the straight edges and the three plain corners, from the
+     outline to the same outline the rim's width in, cut where the cove's band begins. A path, as
+     the cove's band is: every part of the ring is anti-aliased the same way (a masked box had
+     its straight edges snapped to whole device pixels and only its corners anti-aliased). */
+  --rim-rest: shape(
+    from 100% calc(100% - 66px),
+    vline to 20px,
+    arc to calc(100% - 20px) 0 of 20px ccw,
+    hline to 20px,
+    arc to 0 20px of 20px ccw,
+    vline to calc(100% - 20px),
+    arc to 20px 100% of 20px ccw,
+    hline to calc(100% - 66px),
+    vline to calc(100% - var(--rim-w)),
+    hline to 20px,
+    arc to var(--rim-w) calc(100% - 20px) of calc(20px - var(--rim-w)) cw,
+    vline to 20px,
+    arc to 20px var(--rim-w) of calc(20px - var(--rim-w)) cw,
+    hline to calc(100% - 20px),
+    arc to calc(100% - var(--rim-w)) 20px of calc(20px - var(--rim-w)) cw,
+    vline to calc(100% - 66px),
     close
   );
   /* The corner's quarter of the plane without the pane: the channel, the key's place, and the
@@ -107,6 +133,11 @@
   --cove-far: var(--pane-far);
   --cove-glow: 0 0 12px 0 rgb(255 255 255 / 0.02);
   --cove-gap-shade: rgb(0 0 0 / 0.22);
+  /* The hairlines of the controls on the pane (the attach disc, the chips): the flat controls' own
+     (tokens.css --press-up, --press-down) at the rim's width and with its thinned light, so a
+     round control reads as even round its curve as the pane's rim does. */
+  --press-up: inset 0 0 0 var(--rim-w) rgb(255 255 255 / calc(0.06 * var(--rim-k)));
+  --press-down: inset 0 0 0 var(--rim-w) rgb(255 255 255 / calc(0.1 * var(--rim-k)));
   position: relative;
   z-index: 1;
   container: cmp / inline-size;
@@ -165,20 +196,15 @@
 }
 
 /* A ring along the outline, in two parts with the same origin: the straight edges and the three
-   plain corners as every pane's rim is drawn (a masked 1px ring, on whole pixels), cut off where
-   the cove begins; and the cove's own curve. */
+   plain corners, cut off where the cove begins; and the cove's own curve. Both are paths of the
+   same kind, so the ring is anti-aliased the same way all round, and both are the rim's width
+   (tokens.css --rim-w: two device pixels where 1px is less, which always holds one whole pixel
+   at any angle). Every fill laid on them is thinned by the same factor (--rim-k), so the ring
+   holds the light of a 1px hairline at every display scale, the same along the edges as round
+   the corners. */
 .cove-ring > .cr-edge {
   inset: 0;
-  padding: 1px;
-  border-radius: inherit;
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask:
-    linear-gradient(#000 0 0) content-box exclude,
-    linear-gradient(#000 0 0);
-  clip-path: var(--cove-rest);
+  clip-path: var(--rim-rest);
 }
 
 .cove-ring > .cr-cove {
@@ -192,7 +218,7 @@
 }
 
 .cmp-rim > i {
-  background: var(--rim-light);
+  background: var(--rim-hair);
 }
 
 /* Focus, part two: the hairline a step clearer, on the rim's own pixels, all the way round. */
@@ -203,7 +229,7 @@
 }
 
 .cmp-rim-lift > i {
-  background-color: rgb(255 255 255 / 0.03);
+  background-color: rgb(255 255 255 / calc(0.03 * var(--rim-k)));
 }
 
 /* The shade, under the glass. Away from the cove it is the pane's own token on a box (cut off
@@ -294,7 +320,7 @@
    and leave the sides dark. The ring is the composer's own (Cove.tsx), so it follows the cove:
    ui/spot.ts moves one disc in each of its parts. */
 .cmp-card > .spot-ring {
-  --spot: rgb(255 255 255 / 0.05);
+  --spot: rgb(255 255 255 / calc(0.05 * var(--rim-k)));
   --spot-r: 280px;
   padding: 0;
   overflow: visible;
@@ -304,7 +330,7 @@
 
 .cmp-card > .spot-ring > .spot-part {
   overflow: hidden;
-  background-color: rgb(255 255 255 / 0.035);
+  background-color: rgb(255 255 255 / calc(0.035 * var(--rim-k)));
 }
 
 .cmp-card > .spot-ring > .spot-part > i {
@@ -336,9 +362,22 @@
     clip-path: none;
   }
 
-  .cove-ring > .cr-edge,
   .sh-body {
     clip-path: none;
+  }
+
+  /* The rim as every other pane's: a masked ring round the box. */
+  .cove-ring > .cr-edge {
+    padding: var(--rim-w);
+    border-radius: inherit;
+    clip-path: none;
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+      linear-gradient(#000 0 0) content-box exclude,
+      linear-gradient(#000 0 0);
   }
 
   .cove-ring > .cr-cove,
@@ -1267,7 +1306,7 @@
 }
 
 .uc-line > i {
-  background-color: rgb(242 241 238 / 0.09);
+  background-color: rgb(242 241 238 / calc(0.09 * var(--rim-k)));
 }
 
 /* The hairline comes up behind the lights and is whole as they meet. */
@@ -1336,14 +1375,15 @@
     scale 80ms var(--ease-out);
 }
 
-/* The glass key's rim: the pane's hairline, the same all round (off on the ivory face). */
+/* The glass key's rim: the pane's hairline, the same all round (off on the ivory face), at the
+   pane's width and light (tokens.css --rim-w). */
 .cmp-send::before {
   content: '';
   position: absolute;
   inset: 0;
-  padding: 1px;
+  padding: var(--rim-w);
   border-radius: inherit;
-  background: var(--rim-light);
+  background: var(--rim-hair);
   -webkit-mask:
     linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);

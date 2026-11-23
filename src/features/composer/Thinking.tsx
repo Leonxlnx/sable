@@ -7,7 +7,7 @@ import { Tip } from '@/ui';
 import { Icon } from '@/icons';
 import { Chip, type ChipPart } from './Chip';
 import { type Choice } from './choice';
-import { ChipSkeleton, MENU_EVENT, MENU_PAD, ROW_H, usePanePlace } from './Controls';
+import { ChipSkeleton, MENU_EVENT, MENU_PAD, ROW_H, useMenuPlace } from './Controls';
 import { keyStop, land, lastStop, litLevels, positionOf, SCALE_KEYS, SCRUB_SLOP, scrubStop, type Scale, type Setting } from './effort-track';
 import { paidConfirmed, confirmPaid, takePaidAsk } from './paid-speed';
 import { Later } from './later';
@@ -103,7 +103,7 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
   const chip = useRef<HTMLButtonElement>(null);
   // The ladder's height: its stops (the step of air before what lies past the levels), then the speeds or their question.
   const need = (efforts.length + (ultraOffered ? 1 : 0)) * ROW_H + 4 + (speeds.length ? 9 + Math.max(speeds.length * ROW_H, ask ? 96 : 0) : 0) + MENU_PAD;
-  const place = usePanePlace(chip, open, side, 'end', need);
+  const place = useMenuPlace(chip, open, side, need);
   const settleTimer = useRef(0);
   // Where the scale stood when it last drew, so a change runs along the pips from there.
   const drawn = useRef(pos);
@@ -297,7 +297,7 @@ export const Thinking = memo(function Thinking({ efforts, value, onChange, ultra
           align="end"
           sideOffset={place.sideOffset}
           alignOffset={place.alignOffset}
-          avoidCollisions={place.avoid}
+          avoidCollisions={false}
           collisionPadding={10}
           aria-label="Effort"
           {...FOCUS_STOP}

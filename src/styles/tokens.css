@@ -152,9 +152,22 @@
      1px rim that reads the same on all four sides and round every corner, and depth from the
      shadow alone. No glint, no bright corner, no sheen under the top edge. All static paint;
      nothing here animates. Monochrome: the only colour is what shows through from the field. */
-  /* The rim's fill: one even hairline. The top is a breath lighter than the bottom (the light is
-     above), far too little to read as a gradient. */
-  --rim-light: linear-gradient(180deg, rgb(255 255 255 / 0.1), rgb(255 255 255 / 0.088));
+  /* The rim's fill: one even hairline, one tone all the way round. (It was a breath lighter at the
+     top; measured at 1.25 that read as a top edge 10 to 15% brighter than the bottom.) */
+  --rim-light: rgb(255 255 255 / 0.094);
+  /* The composer's rim, the same strength all the way round at any display scale. A ring 1 CSS px
+     wide is 1.25 device px at 125%: Chromium snaps its straight edges to one whole, crisp device
+     pixel, while round its corners the same ring is anti-aliased and its light falls across two
+     pixels, often half and half where the curve runs nearly level, so no pixel there is as bright
+     as the edge's and the corners read thinner. Two device pixels always hold one whole pixel at
+     any angle and any offset. So where one CSS px is less than two device px the ring is two
+     device px wide (--rim-w) and its fill is thinned by the same factor (--rim-k, 1px over the
+     width): it holds the light of a 1px hairline, evenly. Below 2 device px only; at 2x and above
+     1px is already two. (Settings' interface size zooms the root: there the ring is a little wider
+     than two device px, which keeps it even.) */
+  --rim-w: 1px;
+  --rim-k: 1;
+  --rim-hair: rgb(255 255 255 / calc(0.094 * var(--rim-k)));
   /* The pane's thickness: a faint glow just inside the rim, the same all the way round. */
   --rim-inner: inset 0 0 12px 0 rgb(255 255 255 / 0.02);
   /* The composer's pane over the field: one even frosted fill, thin enough for the field's colour. */
@@ -248,6 +261,32 @@
 [data-tone='danger'] {
   --tone: var(--red);
   --tone-dim: var(--red-dim);
+}
+
+/* The rim's width in whole device pixels (two) at the display scales Windows offers below 200%. */
+@media (min-resolution: 1.05dppx) and (max-resolution: 1.15dppx) {
+  :root {
+    --rim-w: 1.8182px;
+    --rim-k: 0.55;
+  }
+}
+@media (min-resolution: 1.2dppx) and (max-resolution: 1.3dppx) {
+  :root {
+    --rim-w: 1.6px;
+    --rim-k: 0.625;
+  }
+}
+@media (min-resolution: 1.45dppx) and (max-resolution: 1.55dppx) {
+  :root {
+    --rim-w: 1.3333px;
+    --rim-k: 0.75;
+  }
+}
+@media (min-resolution: 1.7dppx) and (max-resolution: 1.8dppx) {
+  :root {
+    --rim-w: 1.1429px;
+    --rim-k: 0.875;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

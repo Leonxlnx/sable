@@ -22,7 +22,7 @@ import { LimitDot } from '@/features/usage';
 import { type Choice } from './choice';
 import { Chip, type ChipPart } from './Chip';
 import { Later } from './later';
-import { NEAR, placeMenu, type Placed } from './menu-place';
+import { GAP, placeMenu, type Placed } from './menu-place';
 import { signedOut } from '@/lib/sign-in';
 
 /**
@@ -89,19 +89,18 @@ const FOCUS_CURRENT = {
 } as object;
 
 /**
- * Where a menu of the bar stands (menu-place.ts): clear of the pane and flush with its side, on
- * the side it is wanted on when it has the room it needs there (`need`, px), else on the other.
- * Measured once, in the render that opens it, so the menu's first frame is already in its place;
- * a menu placed here never flips by itself (`avoidCollisions={place.avoid}` on its content: only a
- * menu that hangs by its chip keeps itself in the window).
+ * Where a menu of the bar stands (menu-place.ts): by its chip, 8 px off it and on its edge, on the
+ * side it is wanted on when the window has the room it needs there (`need`, px), else on the side
+ * with more room. Measured once, in the render that opens it, so the menu's first frame is already
+ * in its place and the mode menu's rows are already turned the right way; the menus take that side
+ * as it is (`avoidCollisions={false}`), and one whose list scrolls is held to the room there.
  */
-export function usePanePlace(chip: RefObject<HTMLElement | null>, open: boolean, side: 'top' | 'bottom', align: 'start' | 'end', need: number): Placed {
-  const place = useRef<Placed>({ side, avoid: true, ...NEAR });
+export function useMenuPlace(chip: RefObject<HTMLElement | null>, open: boolean, side: 'top' | 'bottom', need: number): Placed {
+  const place = useRef<Placed>({ side, sideOffset: GAP, alignOffset: 0 });
   const was = useRef(false);
   if (open && !was.current) {
     const el = chip.current;
-    const pane = el?.closest<HTMLElement>('.cmp-card');
-    place.current = el && pane ? placeMenu(el.getBoundingClientRect(), pane.getBoundingClientRect(), side, align, need, window.innerHeight, uiZoom()) : { side, avoid: true, ...NEAR };
+    place.current = el ? placeMenu(el.getBoundingClientRect(), side, need, window.innerHeight, uiZoom()) : { side, sideOffset: GAP, alignOffset: 0 };
   } else if (!open && !was.current) place.current = { ...place.current, side };
   was.current = open;
   return place.current;
@@ -125,7 +124,7 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
   const chip = useRef<HTMLButtonElement>(null);
   const late = useRef(false);
   const modes = choice.caps?.modes ?? [];
-  const place = usePanePlace(chip, open, side, 'start', modes.length * ROW_H + MENU_PAD);
+  const place = useMenuPlace(chip, open, side, modes.length * ROW_H + MENU_PAD);
   const cur = choice.mode;
   // The order holds while the menu is open and while it shrinks away; it turns once it is gone.
   const [anchor, setAnchor] = useState(cur?.id);
@@ -168,7 +167,7 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
           align="start"
           sideOffset={place.sideOffset}
           alignOffset={place.alignOffset}
-          avoidCollisions={place.avoid}
+          avoidCollisions={false}
           collisionPadding={10}
           style={{ width: MENU_W - 24 }}
           {...FOCUS_CURRENT}
@@ -239,7 +238,7 @@ export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed 
   const chip = useRef<HTMLButtonElement>(null);
   const late = useRef(false);
   // Its list scrolls: a few rows are room enough to stay on its side.
-  const place = usePanePlace(chip, open, side, 'end', Math.min(240, choice.models.length * ROW_H + 68));
+  const place = useMenuPlace(chip, open, side, Math.min(240, choice.models.length * ROW_H + 68));
   // An hour-old list is asked for again while the menu is open (new models appear without a restart).
   useEffect(() => {
     if (!open) return;
@@ -360,7 +359,7 @@ export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed 
           align="end"
           sideOffset={place.sideOffset}
           alignOffset={place.alignOffset}
-          avoidCollisions={place.avoid}
+          avoidCollisions={false}
           collisionPadding={10}
           loop
           style={{ width: MENU_W }}
@@ -532,7 +531,7 @@ function AgentMenu({ onClosed }: { onClosed: () => void }) {
           data-spot
           side="bottom"
           align="start"
-          sideOffset={8}
+          sideOffset={GAP}
           collisionPadding={10}
           style={{ width: 248 }}
           onCloseAutoFocus={(e) => {
@@ -623,7 +622,7 @@ function FolderMenu({ onClosed }: { onClosed: () => void }) {
           data-spot
           side="bottom"
           align="start"
-          sideOffset={8}
+          sideOffset={GAP}
           collisionPadding={10}
           style={{ width: 300 }}
           onCloseAutoFocus={(e) => {
@@ -760,7 +759,7 @@ function BranchChip({ onClosed }: { onClosed: () => void }) {
           data-spot
           side="bottom"
           align="start"
-          sideOffset={8}
+          sideOffset={GAP}
           collisionPadding={10}
           style={{ width: 240 }}
           onCloseAutoFocus={(e) => {

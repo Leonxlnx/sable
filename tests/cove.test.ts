@@ -34,6 +34,79 @@ const ux = (kr - f) / (C + f);
 const uy = T / (C + f);
 const meet = (c: number) => ({ a: kr - c * ux, b: kr + c * uy });
 
+/** One length of a shape (`100%`, `Npx`, `var(--rim-w)`, a `calc()` of them) on a box `size` long. */
+function length(e: string, size: number, w: number): number {
+  const flat = e.replace(/var\(--rim-w\)/g, `${w}px`).replace(/100%/g, `${size}px`).replace(/calc\(|\)/g, '');
+  const parts = flat.trim().split(/\s+/);
+  let v = parseFloat(parts[0]);
+  for (let i = 1; i < parts.length; i += 2) v += (parts[i] === '-' ? -1 : 1) * parseFloat(parts[i + 1]);
+  return v;
+}
+
+/** Splits at top-level separators (outside parentheses). */
+function split(s: string, sep: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of s) {
+    if (ch === '(') depth++;
+    if (ch === ')') depth--;
+    if (ch === sep && depth === 0) {
+      if (cur.trim()) out.push(cur.trim());
+      cur = '';
+    } else cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+interface Arc {
+  x0: number;
+  y0: number;
+  cx: number;
+  cy: number;
+  r: number;
+}
+
+/**
+ * Walks a `shape()` on a box W by H with the rim `w` wide: every point it reaches, its straight
+ * lines (where they run) and its arcs with their centres (y down; a clockwise arc turns right, so
+ * its centre lies to the right of the chord).
+ */
+function walk(shape: string, W: number, H: number, w: number) {
+  const body = shape.slice(shape.indexOf('(') + 1, shape.lastIndexOf(')'));
+  let p = { x: 0, y: 0 };
+  let start = p;
+  const points: { x: number; y: number }[] = [];
+  const lines: { kind: 'h' | 'v'; at: number }[] = [];
+  const arcList: Arc[] = [];
+  for (const cmd of split(body, ',')) {
+    const t = split(cmd, ' ');
+    if (t[0] === 'from') {
+      p = start = { x: length(t[1], W, w), y: length(t[2], H, w) };
+    } else if (t[0] === 'hline') {
+      lines.push({ kind: 'h', at: p.y });
+      p = { x: length(t[2], W, w), y: p.y };
+    } else if (t[0] === 'vline') {
+      lines.push({ kind: 'v', at: p.x });
+      p = { x: p.x, y: length(t[2], H, w) };
+    } else if (t[0] === 'arc') {
+      const b = { x: length(t[2], W, w), y: length(t[3], H, w) };
+      const r = length(t[5], W, w);
+      const dx = b.x - p.x;
+      const dy = b.y - p.y;
+      const d = Math.hypot(dx, dy);
+      const h = Math.sqrt(Math.max(0, r * r - (d * d) / 4));
+      const side = t[6] === 'cw' ? 1 : -1;
+      arcList.push({ x0: p.x, y0: p.y, cx: (p.x + b.x) / 2 + (side * h * -dy) / d, cy: (p.y + b.y) / 2 + (side * h * dx) / d, r });
+      p = b;
+    } else if (t[0] === 'close') continue;
+    else throw new Error(`unknown command ${cmd}`);
+    points.push(p);
+  }
+  return { start, end: p, points, lines, arcs: arcList };
+}
+
 describe('the cove', () => {
   it('holds a key of the pane’s own corner radius, in the card’s corner', () => {
     const card = /\.cmp-card \{[^}]*border-radius: (\d+)px;/s.exec(css);
@@ -85,15 +158,57 @@ describe('the cove', () => {
     expect(Math.hypot(kr - f, T)).toBeCloseTo(C + f, 6);
   });
 
-  it('draws the rim’s band between that curve and the same curve one pixel inside the pane', () => {
-    const all = arcs(prop('cove-band'));
-    const outer = all.slice(0, 3);
-    const inner = all.slice(3);
-    expect(outer.map((a) => a.r)).toEqual([expect.closeTo(f, 2), expect.closeTo(C, 3), expect.closeTo(f, 2)]);
-    expect(inner.map((a) => a.r)).toEqual([expect.closeTo(f - 1, 2), expect.closeTo(C + 1, 3), expect.closeTo(f - 1, 2)]);
-    const q = meet(C + 1);
-    expect([inner[1].x, inner[1].y]).toEqual([expect.closeTo(q.a, 2), expect.closeTo(q.b, 2)]);
-    expect(Math.hypot(inner[1].x - kr, inner[1].y - kr)).toBeCloseTo(C + 1, 2);
+  // The rim is a band between the outline and the same outline the rim's width in (tokens.css
+  // --rim-w: 1px, or two device pixels where 1px is less: 1.6px at 125%, 1.3333px at 150%).
+  // Walked as real paths on a one-line docked pane, at each of those widths.
+  const W = 760;
+  const H = 90;
+  const widths = [1, 1.6, 1.3333, 1.8182, 1.1429];
+
+  it('draws the cove’s rim between that curve and the same curve the rim’s width inside the pane', () => {
+    for (const w of widths) {
+      const band = walk(prop('cove-band'), W, H, w);
+      const outer = band.arcs.slice(0, 3);
+      const inner = band.arcs.slice(3);
+      expect(outer.map((a) => a.r)).toEqual([expect.closeTo(f, 2), expect.closeTo(C, 3), expect.closeTo(f, 2)]);
+      // The inner curve is the outer one offset: the same centres, taken in the other direction,
+      // the horns' radii less the width and the cove's more.
+      expect(inner.map((a) => a.r)).toEqual([expect.closeTo(f - w, 3), expect.closeTo(C + w, 3), expect.closeTo(f - w, 3)]);
+      inner.forEach((a, i) => expect([a.cx, a.cy]).toEqual([expect.closeTo(outer[2 - i].cx, 2), expect.closeTo(outer[2 - i].cy, 2)]));
+      // The cove's centre is the key's.
+      expect([outer[1].cx, outer[1].cy]).toEqual([expect.closeTo(W - kr, 3), expect.closeTo(H - kr, 3)]);
+      // Inner horn and inner cove still meet on the line between their centres, the width further out.
+      const q = meet(C + w);
+      expect([W - inner[1].x0, H - inner[1].y0]).toEqual([expect.closeTo(q.b, 2), expect.closeTo(q.a, 2)]);
+    }
+  });
+
+  it('draws the rest of the rim as a path of the same kind, meeting the cove’s band where it begins', () => {
+    for (const w of widths) {
+      const rest = walk(prop('rim-rest'), W, H, w);
+      const outer = rest.arcs.slice(0, 3);
+      const inner = rest.arcs.slice(3);
+      // The three plain corners: the pane's own radius, about the pane's own corner centres.
+      expect(outer.map((a) => [a.cx, a.cy, a.r])).toEqual([
+        [expect.closeTo(W - kr, 3), expect.closeTo(kr, 3), expect.closeTo(kr, 3)],
+        [expect.closeTo(kr, 3), expect.closeTo(kr, 3), expect.closeTo(kr, 3)],
+        [expect.closeTo(kr, 3), expect.closeTo(H - kr, 3), expect.closeTo(kr, 3)],
+      ]);
+      inner.forEach((a, i) => {
+        expect([a.cx, a.cy]).toEqual([expect.closeTo(outer[2 - i].cx, 2), expect.closeTo(outer[2 - i].cy, 2)]);
+        expect(a.r).toBeCloseTo(kr - w, 3);
+      });
+      // Its straight edges are the width wide: every inner line stands w in from the outer one.
+      expect(rest.lines.filter((l) => l.kind === 'h').map((l) => l.at)).toEqual([0, H, H - w, w].map((v) => expect.closeTo(v, 3)));
+      expect(rest.lines.filter((l) => l.kind === 'v').map((l) => l.at)).toEqual([W, 0, W - cut, w, W - w].map((v) => expect.closeTo(v, 3)));
+      // The two bands share their ends: the cut on the right edge and on the bottom edge, outside and inside.
+      const band = walk(prop('cove-band'), W, H, w);
+      const ends = (p: { x: number; y: number }[]) => p.map((q) => [Math.round(q.x * 1000) / 1000, Math.round(q.y * 1000) / 1000].join());
+      expect(ends([rest.start, rest.points.find((p) => p.y === H && p.x === W - cut)!, rest.points.find((p) => p.y === H - w && p.x === W - cut)!, rest.end])).toEqual(
+        ends([band.start, band.points.find((p) => p.y === H && p.x === W - cut)!, band.points.find((p) => p.y === H - w && p.x === W - cut)!, band.end]),
+      );
+      expect(rest.end).toEqual({ x: expect.closeTo(W - w, 3), y: expect.closeTo(H - cut, 3) });
+    }
   });
 
   it('uses the same curve for what is not the pane, and the same cut for the straight parts', () => {
