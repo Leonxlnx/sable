@@ -1048,13 +1048,13 @@ function Peek({ peek, onClose }: { peek: { id: string; rect: DOMRect } | null; o
           <motion.div className="peek-scrim" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.18 }} onClick={onClose} />
           <motion.div
             className="peek-row"
-            style={{ top: r.top, left: r.left, width: r.width, height: r.height }}
+            style={{ top: r.top, left: 16, right: 16, height: r.height }}
             initial={{ scale: 1 }}
             animate={{ scale: 1.035 }}
             exit={{ scale: 1, opacity: 0, transition: { duration: 0.14 } }}
             transition={SNAP}
           >
-            <ProviderMark provider={s!.provider} size={18} />
+            <ProviderMark provider={s!.provider} size={15} />
             <span className="row-title">{s!.title}</span>
           </motion.div>
           <motion.div

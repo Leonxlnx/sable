@@ -41,16 +41,16 @@
 
   --font: 'Inter Variable', 'Inter', system-ui, sans-serif;
   --mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace, monospace;
-  --t-xs: 12.5px;
-  --t-sm: 13.5px;
-  --t-md: 14.5px;
-  --t-ui: 15px;
+  /* one type scale, six steps (2.16): a caption (times, counts, small labels), small (secondary lines,
+     chips, a row's folder), body (what is read, a row's title, fields, keys), lead (a question, a large
+     key), title (a sheet's or a card's name), display (home's computer, the pairing screen). Weight, not
+     size, tells a row's title from its body. Nothing in between. */
+  --t-caption: 12.5px;
+  --t-small: 14px;
   --t-body: 16px;
-  --t-lead: 17px;
-  --t-h3: 19px;
-  --t-h2: 21px;
-  --t-h1: 28px;
-  --t-display: 34px;
+  --t-lead: 18px;
+  --t-title: 22px;
+  --t-display: 30px;
   /* three weights and one for display: body, a label or a row's name, a heading or a key, the large titles */
   --w-medium: 510;
   --w-strong: 590;
@@ -175,7 +175,7 @@ body,
   background: var(--void);
   color: var(--text);
   font-family: var(--font);
-  font-size: var(--t-ui);
+  font-size: var(--t-body);
   font-feature-settings: 'cv11', 'ss01';
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
@@ -352,7 +352,7 @@ p {
   border-radius: var(--r-md);
   background: var(--fill-3);
   box-shadow: inset 0 0 0 1px var(--line);
-  font-size: var(--t-ui);
+  font-size: var(--t-body);
   font-weight: var(--w-strong);
   color: var(--text);
   white-space: nowrap;
@@ -372,7 +372,7 @@ p {
   height: 38px;
   padding: 0 14px;
   border-radius: var(--r-sm);
-  font-size: var(--t-sm);
+  font-size: var(--t-small);
 }
 
 .btn-lg {
@@ -457,7 +457,7 @@ p {
   height: 44px;
   padding: 0 12px;
   color: var(--text-2);
-  font-size: var(--t-ui);
+  font-size: var(--t-body);
   font-weight: var(--w-medium);
   white-space: nowrap;
   transition: color 100ms, opacity 100ms;
@@ -668,7 +668,7 @@ p {
   margin: 56px 28px;
   text-align: center;
   color: var(--text-3);
-  font-size: var(--t-ui);
+  font-size: var(--t-small);
   line-height: 1.5;
 }
 
@@ -683,7 +683,7 @@ p {
 .diffstat {
   display: inline-flex;
   gap: 6px;
-  font-size: var(--t-xs);
+  font-size: var(--t-caption);
   flex-shrink: 0;
 }
 
@@ -744,7 +744,7 @@ p {
   isolation: isolate;
   background: rgb(31 31 35);
   box-shadow: var(--rim-ring), var(--rim-inner), var(--shadow-glass);
-  font-size: var(--t-md);
+  font-size: var(--t-small);
   font-weight: var(--w-medium);
   line-height: 1.4;
 }
@@ -778,7 +778,7 @@ p {
   gap: 12px;
   padding: 10px 10px 10px 18px;
   border-radius: var(--r-lg);
-  font-size: var(--t-sm);
+  font-size: var(--t-small);
 }
 
 .banner span {
@@ -810,7 +810,7 @@ p {
 }
 
 .attn-title {
-  font-size: var(--t-ui);
+  font-size: var(--t-body);
   font-weight: var(--w-strong);
   color: var(--text);
   white-space: nowrap;
@@ -822,7 +822,7 @@ p {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: var(--t-xs);
+  font-size: var(--t-caption);
   color: var(--amber);
 }
 
@@ -834,7 +834,7 @@ p {
   padding: 0 16px;
   border-radius: var(--r-pill);
   background: var(--fill-3);
-  font-size: var(--t-sm);
+  font-size: var(--t-small);
   font-weight: var(--w-strong);
   color: var(--text);
   flex-shrink: 0;

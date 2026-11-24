@@ -357,6 +357,22 @@ function reach(hosts: string[], port: number, auth: (ws: WebSocket) => Promise<W
   });
 }
 
+/**
+ * What an attempt that ended (well or not) is now (2.16): `mine` while it is still the attempt in use
+ * (the same number, credential generation and pairing): it reports for itself. `superseded` once a
+ * newer attempt began: that one reports. `stale` when the credential generation moved on under it
+ * with no newer attempt (whoever moved it, a pairing kept or forgotten, decides what connects next):
+ * it only lets go of "connecting". `orphaned` when, in the same generation, the pairing object was
+ * replaced under it (the saved pairing read a second time): nobody else reports for it, so it lets go
+ * and connects again with the pairing now in use. Before, both stayed "connecting", and every later
+ * attempt returned at once: the phone said "Connecting" until it was closed.
+ */
+export function attemptEnd(a: { attempt: number; attemptId: number; sameGen: boolean; samePairing: boolean }): 'mine' | 'superseded' | 'stale' | 'orphaned' {
+  if (a.attempt !== a.attemptId) return 'superseded';
+  if (!a.sameGen) return 'stale';
+  return a.samePairing ? 'mine' : 'orphaned';
+}
+
 /** The phone's connection to its desktop: pairing, the token hello, RPC and events, reconnecting on its own. */
 class Conn {
   state: ConnState = 'unpaired';
@@ -444,7 +460,14 @@ class Conn {
   /** Pairing writes, one at a time in the order made (a late write of an older pairing never lands over a newer one). */
   private writes: Promise<unknown> = Promise.resolve();
 
-  async init() {
+  private started?: Promise<void>;
+
+  /** Looks up the saved pairing and connects with it, once (a second call, as React's development double effect makes, waits for the first). */
+  init(): Promise<void> {
+    return (this.started ??= this.start());
+  }
+
+  private async start() {
     // A network that comes back (Wi-Fi again after mobile data) reconnects at once.
     window.addEventListener('online', () => this.wake());
     let got: [EraseMark | null, Pairing | null] | undefined;
@@ -588,7 +611,16 @@ class Conn {
     if (this.state === 'open' && this.live() && away < 15_000) {
       const w = this.wire;
       void this.call('usage.limits', {}, 3000).catch(() => {
-        if (this.wire === w) w?.close();
+        if (this.wire !== w) return;
+        // A socket that died while the app was frozen may never say so (its close waits on a network
+        // that is gone): it is let go now and a fresh connection starts, not after its close event.
+        this.dropWire();
+        if (this.state === 'denied' || this.holdOld) return;
+        this.setState('offline', 'Reconnecting');
+        this.cancelAttempt();
+        clearTimeout(this.retryTimer);
+        this.retry = 0;
+        void this.connect();
       });
       return;
     }
@@ -722,9 +754,16 @@ class Conn {
         this.scheduleRetry();
       }
     } finally {
-      if (current()) {
+      const end = attemptEnd({ attempt, attemptId: this.attemptId, sameGen: gen === this.gen, samePairing: this.pairing === p });
+      if (end !== 'superseded') {
         this.connecting = false;
         this.abortAttempt = undefined;
+      }
+      // Nobody else reports for this attempt: the pairing in use now connects (or waits, when there is none).
+      if (end === 'orphaned' && this.pairing && !this.holdOld && this.state !== 'denied' && !this.live()) {
+        clearTimeout(this.retryTimer);
+        this.retry = 0;
+        queueMicrotask(() => void this.connect());
       }
     }
   }
