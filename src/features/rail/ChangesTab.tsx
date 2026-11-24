@@ -1,12 +1,12 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import type { FileDiff, GitFileStatus, ToolItem } from '@shared/protocol';
+import type { FileDiff, GitFileStatus, SeenFile, ToolItem } from '@shared/protocol';
 import { Collapse } from '@/components/Collapse';
 import { DiffView } from '@/components/DiffView';
 import { Icon } from '@/icons';
 import { plural, relPath } from '@/lib/format';
 import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
-import { IconButton, Spinner, Tip } from '@/ui';
+import { IconButton, Segmented, Spinner, Tip } from '@/ui';
 import { STATUS_TONE, commitAll, draftCommitMessage, gitKey, isSmall, loadAllDiffs, loadDiff, refreshGit, useRepo, type DiffEntry } from './git-state';
 import { LeaveList } from './leave';
 import { LaneSection } from './LaneSection';
@@ -15,6 +15,7 @@ import { PullRequestRow } from './PullRequest';
 import { useSessionLane } from '@/features/session/lane';
 import { useJumpOpen } from '@/features/review/jump';
 import { splitPath, useArrivals, useToolIds } from './util';
+import { READ_MS, UNDO_MS, loadSince, markSeen, undoSeen, unmarkSeen, useSeenRefresh, useSeenView, useTurnPaths, type SinceEntry } from './changes-seen';
 
 /** How many files the Changes tab lists (working tree, or this session's edits outside a repo). */
 export function useChangeCount(sessionId: string, cwd: string): number {
@@ -93,19 +94,71 @@ const withPath = (path: string) => (o: ReadonlySet<string>) => (o.has(path) ? o 
 
 // ───────────────────────────── repository ─────────────────────────────
 
+/** What the list shows: what is new since the person last looked, what the last turn edited, or everything. */
+type Scope = 'new' | 'turn' | 'all';
+
+/** The scope picked per chat while the window is open (a chat opened again opens on what is new when anything is). */
+const picked = new Map<string, Scope>();
+
+const posix = (p: string) => p.replace(/\\/g, '/');
+
 /** `foot`: what takes the commit box's place (a lane's section, which lands instead). */
 function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string; foot?: ReactNode }) {
   const repo = useRepo(cwd)!;
   const status = repo.status!;
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
-  // The review bar's list jumps to a comment on one of these files: its row opens.
+  // The review bar's list jumps to a comment on one of these files: its row opens (in the list that holds it).
+  const [scope, setScope] = useState<Scope | null>(() => picked.get(sessionId) ?? null);
   useJumpOpen(
     (r) => r.sessionId === sessionId && r.scope.startsWith('git:'),
-    (r) => setOpen(withPath(r.scope.slice(4))),
+    (r) => {
+      setOpen(withPath(r.scope.slice(4)));
+      setScope('all');
+    },
   );
+  useSeenRefresh(sessionId, cwd);
+  const seen = useSeenView(sessionId);
+  const turn = useTurnPaths(sessionId, cwd);
   const small = isSmall(status);
-  const allOpen = status.files.length > 0 && status.files.every((f) => open.has(f.path));
   const arrived = useArrivals(status.files.map((f) => f.path));
+
+  // Seen states known for this tree: every row can say whether it was looked at.
+  const known = !!seen?.repo;
+  const stateOf = (p: string): SeenFile | undefined => (known ? seen!.files[p] : undefined);
+  const unseen = known ? status.files.filter((f) => stateOf(f.path)?.state !== 'seen') : [];
+  const seenFiles = known ? status.files.filter((f) => stateOf(f.path)?.state === 'seen') : [];
+  const inTurn = status.files.filter((f) => turn.has(posix(f.path)));
+  // Opens on what is new when anything is; a scope with nothing in it falls back to the whole list.
+  let shown: Scope = scope ?? (unseen.length ? 'new' : 'all');
+  if (!known || (shown === 'turn' && !inTurn.length)) shown = 'all';
+  const pick = (v: Scope) => {
+    picked.set(sessionId, v);
+    setScope(v);
+  };
+  // The scope it opened on stays while the tab is open: marking the last new file seen leaves the
+  // list on "Nothing new since you last looked", not on another list.
+  useEffect(() => {
+    if (known && scope === null) setScope(shown);
+  }, [known, scope, shown]);
+  const [seenOpen, setSeenOpen] = useState(false);
+  const rows = shown === 'new' ? unseen : shown === 'turn' ? inTurn : status.files;
+  const folded = shown === 'new' ? seenFiles : [];
+  const visible = seenOpen ? [...rows, ...folded] : rows;
+  const toMark = rows.filter((f) => stateOf(f.path)?.state !== 'seen');
+  const allOpen = visible.length > 0 && visible.every((f) => open.has(f.path));
+
+  // Mark all seen offers its undo in its own place for a few seconds.
+  const [undo, setUndo] = useState<{ id: string; n: number } | null>(null);
+  useEffect(() => {
+    if (!undo) return;
+    const t = window.setTimeout(() => setUndo(null), UNDO_MS);
+    return () => window.clearTimeout(t);
+  }, [undo]);
+  const markAll = async () => {
+    const list = toMark.map((f) => stateOf(f.path)).filter((f): f is SeenFile => !!f);
+    const id = await markSeen(sessionId, cwd, list);
+    if (id) setUndo({ id, n: list.length });
+  };
 
   // Drop open entries for files that left the tree.
   useEffect(() => {
@@ -133,18 +186,62 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
     for (const p of open) if (needs(repo.diffs[p])) loadDiff(cwd, p);
   }, [small, open, repo.diffs, repo.rev, status, cwd]);
 
+  // Open rows whose file changed since it was seen get the diff of what is new since.
+  useEffect(() => {
+    if (!seen) return;
+    for (const p of open) if (seen.files[p]?.since) loadSince(sessionId, cwd, p);
+  }, [open, seen, sessionId, cwd]);
+
+  // When each row was opened: a diff closed after it stood open long enough to be read counts as looked at.
+  const openedAt = useRef(new Map<string, number>());
+  const seenRef = useRef(seen);
+  seenRef.current = seen;
+  const openRef = useRef(open);
+  openRef.current = open;
   // Stable, so a refresh re-renders only the rows whose file changed (FileRow is memoised).
   const toggle = useCallback(
-    (p: string) =>
-      setOpen((o) => {
-        const n = new Set(o);
-        if (n.has(p)) n.delete(p);
-        else n.add(p);
-        return n;
-      }),
-    [],
+    (p: string) => {
+      const n = new Set(openRef.current);
+      if (n.has(p)) {
+        n.delete(p);
+        const at = openedAt.current.get(p);
+        openedAt.current.delete(p);
+        const f = seenRef.current?.files[p];
+        if (at !== undefined && performance.now() - at >= READ_MS && f && f.state !== 'seen') void markSeen(sessionId, cwd, [f]);
+      } else {
+        n.add(p);
+        if (document.visibilityState === 'visible') openedAt.current.set(p, performance.now());
+      }
+      openRef.current = n;
+      setOpen(n);
+    },
+    [sessionId, cwd],
   );
-  const shown = useRowLimit(status.files.length);
+  const flip = useCallback(
+    (p: string) => {
+      const f = seenRef.current?.files[p];
+      if (!f) return;
+      if (f.state === 'seen') void unmarkSeen(sessionId, cwd, p);
+      else void markSeen(sessionId, cwd, [f]);
+    },
+    [sessionId, cwd],
+  );
+  const limit = useRowLimit(visible.length);
+  const row = (f: GitFileStatus) => (
+    <FileRow
+      key={f.path}
+      sessionId={sessionId}
+      cwd={cwd}
+      file={f}
+      fresh={arrived.has(f.path)}
+      open={open.has(f.path)}
+      entry={repo.diffs[f.path]}
+      seen={stateOf(f.path)}
+      since={seen?.since[f.path]}
+      onToggle={toggle}
+      onSeen={flip}
+    />
+  );
 
   return (
     <div className="rail-col">
@@ -179,17 +276,48 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
           )}
         </span>
         <span className="rail-bar-actions">
-          {status.files.length > 0 && (
+          {visible.length > 0 && (
             <IconButton
               icon={allOpen ? 'collapse' : 'expand'}
               label={allOpen ? 'Collapse all' : 'Expand all'}
               size={14}
-              onClick={() => setOpen(allOpen ? new Set() : new Set(status.files.map((f) => f.path)))}
+              onClick={() => setOpen(allOpen ? new Set() : new Set(visible.map((f) => f.path)))}
             />
           )}
           <IconButton icon="refresh" label="Refresh" size={14} className={repo.loading ? 'is-spinning' : undefined} onClick={() => void refreshGit(cwd)} />
         </span>
       </div>
+      {known && status.files.length > 0 && (
+        <div className="ch-scope">
+          <Segmented
+            id={`ch-scope-${sessionId}`}
+            className="ch-seg"
+            value={shown}
+            onChange={pick}
+            options={[
+              { value: 'new' as const, label: <ScopeLabel name="New" n={unseen.length} /> },
+              ...(inTurn.length ? [{ value: 'turn' as const, label: <ScopeLabel name="This turn" n={inTurn.length} /> }] : []),
+              { value: 'all' as const, label: <ScopeLabel name="All" n={status.files.length} /> },
+            ]}
+          />
+          {undo ? (
+            <button type="button" className="btn btn-sm btn-ghost ch-mark-all" onClick={() => {
+              void undoSeen(sessionId, cwd, undo.id);
+              setUndo(null);
+            }}>
+              <Icon name="rewind" size={13} />
+              Undo
+            </button>
+          ) : toMark.length > 0 ? (
+            <Tip label={toMark.length === 1 ? 'Mark this file seen' : `Mark these ${toMark.length} files seen`}>
+              <button type="button" className="btn btn-sm btn-ghost ch-mark-all" onClick={() => void markAll()}>
+                <Icon name="checks" size={14} />
+                Mark all seen
+              </button>
+            </Tip>
+          ) : null}
+        </div>
+      )}
       <div className="rail-scroll scroll">
         {/* The branch's pull request and its checks, once it has one (read only while this tab shows). */}
         <PullRequestRow sessionId={sessionId} cwd={cwd} />
@@ -198,16 +326,43 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
             <p className="rail-empty">The working tree is clean.</p>
             <PullRequestAction cwd={cwd} />
           </>
-        ) : (
-          <LeaveList className="ch-list" order={status.files.map((f) => f.path).join('|')}>
-            {(shown < status.files.length ? status.files.slice(0, shown) : status.files).map((f) => (
-              <FileRow key={f.path} sessionId={sessionId} cwd={cwd} file={f} fresh={arrived.has(f.path)} open={open.has(f.path)} entry={repo.diffs[f.path]} onToggle={toggle} />
-            ))}
-          </LeaveList>
+        ) : !seen ? null : (
+          <>
+            {rows.length === 0 && shown === 'new' && <p className="rail-empty ch-none">Nothing new since you last looked.</p>}
+            {rows.length > 0 && (
+              <LeaveList className="ch-list" order={`${shown}|${rows.map((f) => f.path).join('|')}`}>
+                {(limit < rows.length ? rows.slice(0, limit) : rows).map(row)}
+              </LeaveList>
+            )}
+            {folded.length > 0 && (
+              <div className="ch-fold" data-open={seenOpen || undefined}>
+                <button type="button" className="ch-fold-head" aria-expanded={seenOpen} onClick={() => setSeenOpen((v) => !v)}>
+                  <Icon name="caret-right" size={10} className="ch-caret" />
+                  <span>Seen</span>
+                  <span className="ch-fold-n num">{folded.length}</span>
+                </button>
+                <Collapse open={seenOpen}>
+                  <LeaveList className="ch-list ch-list-seen" order={folded.map((f) => f.path).join('|')}>
+                    {folded.map(row)}
+                  </LeaveList>
+                </Collapse>
+              </div>
+            )}
+          </>
         )}
       </div>
       {foot ?? (status.files.length > 0 && <CommitBox sessionId={sessionId} cwd={cwd} />)}
     </div>
+  );
+}
+
+/** A scope's name and how many files it holds, the figure a step quieter. */
+function ScopeLabel({ name, n }: { name: string; n: number }) {
+  return (
+    <>
+      {name}
+      <span className="ch-seg-n num">{n}</span>
+    </>
   );
 }
 
@@ -356,6 +511,13 @@ function useRowLimit(total: number): number {
 
 /** A refresh brings new objects for unchanged files: a row draws again only when what it shows changed. */
 const sameFile = (a: GitFileStatus, b: GitFileStatus) => a === b || (a.path === b.path && a.status === b.status && a.additions === b.additions && a.deletions === b.deletions);
+const sameSeen = (a: SeenFile | undefined, b: SeenFile | undefined) => a === b || (!!a && !!b && a.state === b.state && a.hash === b.hash && a.since === b.since);
+
+/**
+ * What kind of change a file has, as a word, where it is not plain editing: an "M" before every
+ * row said nothing a list of changes does not already say (audit §3).
+ */
+const KIND: Record<string, string> = { A: 'Added', '?': 'Added', D: 'Deleted', R: 'Renamed', U: 'Conflict' };
 
 const FileRow = memo(
   function FileRow({
@@ -365,7 +527,10 @@ const FileRow = memo(
     fresh,
     open,
     entry,
+    seen,
+    since,
     onToggle,
+    onSeen,
   }: {
     sessionId: string;
     cwd: string;
@@ -374,33 +539,97 @@ const FileRow = memo(
     fresh?: boolean;
     open: boolean;
     entry: DiffEntry | undefined;
+    /** What the person has seen of it (absent until the seen states are known). */
+    seen?: SeenFile;
+    /** The diff of what is new since it was seen, when it has one. */
+    since?: SinceEntry;
     onToggle: (p: string) => void;
+    /** Marks it seen, or new again when it is seen. */
+    onSeen: (p: string) => void;
   }) {
     const [dir, base] = splitPath(file.path);
-    const diff = entry?.state === 'ok' ? entry.diff : entry?.state === 'loading' ? entry.prev : undefined;
+    const full = entry?.state === 'ok' ? entry.diff : entry?.state === 'loading' ? entry.prev : undefined;
+    // Changed again since it was seen: what is new since, unless the person asked for the whole diff.
+    const [whole, setWhole] = useState(false);
+    const again = seen?.state === 'again';
+    const deltaReady = again && !!seen.since && !whole && since?.state === 'ok' && since.hash === seen.hash;
+    const waitDelta = again && !!seen.since && !whole && !deltaReady && since?.state !== 'error';
     // The row's actions are built the first time it is hovered or focused, not with the list.
     const [hot, setHot] = useState(false);
     const wake = hot ? undefined : () => setHot(true);
+    // The same target in both views: a comment written on what is new since stays on its lines in the whole diff.
     const review = useMemo(() => ({ sessionId, scope: `git:${file.path}`, path: file.path }), [sessionId, file.path]);
+    const kind = KIND[file.status];
+    const isSeen = seen?.state === 'seen';
     return (
-      <div role="listitem" data-flip={file.path} className="ch-item rail-row-host" data-open={open || undefined} data-new={fresh || undefined} onPointerEnter={wake} onFocus={wake}>
-        <button type="button" className="ch-row" aria-expanded={open} onClick={() => onToggle(file.path)}>
-          <StatusLetter status={file.status} />
+      <div
+        role="listitem"
+        data-flip={file.path}
+        className="ch-item rail-row-host"
+        data-open={open || undefined}
+        data-new={fresh || undefined}
+        data-seen={isSeen || undefined}
+        onPointerEnter={wake}
+        onFocus={wake}
+      >
+        <button
+          type="button"
+          className="ch-row"
+          aria-expanded={open}
+          aria-keyshortcuts={seen ? 'M' : undefined}
+          onClick={() => onToggle(file.path)}
+          onKeyDown={(e) => {
+            if (seen && (e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+              e.preventDefault();
+              onSeen(file.path);
+            }
+          }}
+        >
+          <span className="ch-mark" aria-hidden>
+            {seen && !isSeen && <span className="ch-dot" />}
+          </span>
           <span className="ch-path">
             {dir && <span className="ch-dir">{dir}</span>}
             <span className="ch-base">{base}</span>
           </span>
+          {seen && <span className="sr-only">{isSeen ? ', seen' : again ? ', changed since you looked' : ', not seen yet'}</span>}
           <span className="ch-stat num rail-row-deco">
+            {kind && <span className="ch-kind" data-kind={file.status}>{kind}</span>}
             {!!file.additions && <span className="dv-add">+{file.additions}</span>}
             {!!file.deletions && <span className="dv-del">−{file.deletions}</span>}
           </span>
           <Icon name="caret-right" size={10} className="ch-caret" />
         </button>
-        {hot && <RowActions path={file.path} deleted={file.status === 'D'} />}
+        {hot && <RowActions path={file.path} deleted={file.status === 'D'} seen={seen} onSeen={onSeen} />}
         <Collapse open={open}>
           <div className="ch-diff">
-            {diff ? (
-              <DiffView diff={diff} showHeader={false} maxLines={240} review={review} />
+            {again && (
+              <p className="ch-since">
+                {seen.since ? (
+                  <>
+                    <span>{whole ? 'The whole diff' : 'What changed since you looked'}</span>
+                    <button type="button" className="rail-link" onClick={() => setWhole((v) => !v)}>
+                      {whole ? 'Show only what is new' : 'Show the whole diff'}
+                    </button>
+                  </>
+                ) : (
+                  <span>Changed since you looked. The version you saw was too large to keep, so this is the whole diff.</span>
+                )}
+              </p>
+            )}
+            {deltaReady ? (
+              since.diff ? (
+                <DiffView diff={since.diff} showHeader={false} maxLines={240} review={review} />
+              ) : (
+                <p className="ch-note">No textual changes since you looked</p>
+              )
+            ) : waitDelta ? (
+              <div className="ch-note">
+                <Spinner size={12} />
+                Loading diff
+              </div>
+            ) : full ? (
+              <DiffView diff={full} showHeader={false} maxLines={240} review={review} />
             ) : entry?.state === 'error' ? (
               <p className="ch-note">
                 Could not load this diff. <button type="button" className="rail-link" onClick={() => loadDiff(cwd, file.path)}>Try again</button>
@@ -418,17 +647,36 @@ const FileRow = memo(
       </div>
     );
   },
-  (a, b) => a.sessionId === b.sessionId && a.cwd === b.cwd && a.fresh === b.fresh && a.open === b.open && a.entry === b.entry && a.onToggle === b.onToggle && sameFile(a.file, b.file),
+  (a, b) =>
+    a.sessionId === b.sessionId &&
+    a.cwd === b.cwd &&
+    a.fresh === b.fresh &&
+    a.open === b.open &&
+    a.entry === b.entry &&
+    a.since === b.since &&
+    a.onToggle === b.onToggle &&
+    a.onSeen === b.onSeen &&
+    sameSeen(a.seen, b.seen) &&
+    sameFile(a.file, b.file),
 );
 
 /**
  * A changed file's secondary actions: they take the place of its line counts while the row is
  * hovered or focused (the panel's one pattern for secondary actions, see .rail-row-acts).
  */
-function RowActions({ path, deleted }: { path: string; deleted?: boolean }) {
+function RowActions({ path, deleted, seen, onSeen }: { path: string; deleted?: boolean; seen?: SeenFile; onSeen?: (p: string) => void }) {
   const setUi = useStore((s) => s.setUi);
   return (
     <span className="rail-row-acts ch-acts">
+      {seen && onSeen && (
+        <IconButton
+          icon={seen.state === 'seen' ? 'circle' : 'check'}
+          label={seen.state === 'seen' ? 'Mark as not seen' : 'Mark seen'}
+          keys="m"
+          size={14}
+          onClick={() => onSeen(path)}
+        />
+      )}
       <IconButton icon="at" label="Mention in chat" size={14} onClick={() => focusComposer('@' + path + ' ', { append: true })} />
       {!deleted && <IconButton icon="file-text" label="Open file" size={14} onClick={() => setUi({ railFile: path })} />}
     </span>
@@ -536,12 +784,12 @@ function SessionEdits({ sessionId, cwd }: { sessionId: string; cwd: string }) {
                 return (
                   <li key={f.path} className="ch-item rail-row-host" data-open={isOpen || undefined} data-new={arrived.has(f.path) || undefined}>
                     <button type="button" className="ch-row" aria-expanded={isOpen} onClick={() => toggle(f.path)}>
-                      <StatusLetter status={f.status === 'added' ? 'A' : f.status === 'deleted' ? 'D' : f.status === 'renamed' ? 'R' : 'M'} />
                       <span className="ch-path">
                         {dir && <span className="ch-dir">{dir}</span>}
                         <span className="ch-base">{base}</span>
                       </span>
                       <span className="ch-stat num rail-row-deco">
+                        {f.status !== 'modified' && <span className="ch-kind" data-kind={f.status === 'added' ? 'A' : f.status === 'deleted' ? 'D' : 'R'}>{f.status === 'added' ? 'Added' : f.status === 'deleted' ? 'Deleted' : 'Renamed'}</span>}
                         {f.edits > 1 && <span className="ch-edits">{f.edits} edits</span>}
                         {!!f.additions && <span className="dv-add">+{f.additions}</span>}
                         {!!f.deletions && <span className="dv-del">−{f.deletions}</span>}

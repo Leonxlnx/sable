@@ -257,8 +257,8 @@ export function FilesTab({ sessionId, cwd }: { sessionId: string; cwd: string })
                 <input
                   value={filter}
                   onChange={(e) => setFilter(e.target.value)}
-                  placeholder="Filter loaded files"
-                  aria-label="Filter loaded files"
+                  placeholder="Filter files"
+                  aria-label="Filter files"
                   spellCheck={false}
                   onKeyDown={(e) => {
                     if (e.key === 'ArrowDown') {
@@ -302,7 +302,7 @@ export function FilesTab({ sessionId, cwd }: { sessionId: string; cwd: string })
               ) : root.error ? (
                 <p className="rail-empty">{root.error}</p>
               ) : rows.length === 0 ? (
-                <p className="rail-empty">{q ? 'Nothing loaded matches this filter.' : 'This folder is empty.'}</p>
+                <p className="rail-empty">{q ? 'Nothing matches this filter.' : 'This folder is empty.'}</p>
               ) : (
                 <div className="fl-tree" role="tree" aria-label="Files" ref={tree} onKeyDown={onTreeKey}>
                   {rows.map((r, i) =>
@@ -374,7 +374,7 @@ const TreeRow = memo(function TreeRow({
       <span className="fl-caret" aria-hidden>
         {entry.dir && <Icon name="caret-right" size={10} className={open ? 'is-open' : undefined} />}
       </span>
-      <Icon name={entry.dir ? (open ? 'folder-open' : 'folder') : fileIcon(entry.name)} size={15} className="fl-icon" />
+      <Icon name={entry.dir ? (open ? 'folder-open' : 'folder') : fileIcon(entry.name)} size={14} className="fl-icon" />
       <span className="fl-name truncate">{highlight(entry.name, query)}</span>
       <span className="rail-row-deco fl-deco">
         {status && <StatusLetter status={status} small />}

@@ -7,6 +7,7 @@ import { fadeShown, play, reducedMotion, slideLeft, spring, uiZoom } from '@/lib
 import { useStore } from '@/state/store';
 import './grow';
 import { movedByKeys } from './glide';
+import { quietFocus } from '@/lib/quiet-focus';
 import { fitDir, watchDir } from './path-fit';
 
 /** React wrappers around the primitives in styles/ui.css. Keep this file small and boring. */
@@ -336,6 +337,21 @@ export function PopoverContent({
 
 // ── dialog ──
 
+const TABBABLE = 'button:not([disabled]), [href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * A dialog's first focus, as Radix would give it (the first control that can take it), but quiet:
+ * no ring and no lit field until the person moves focus (`quietFocus`). A dialog that focused one of
+ * its own controls as it mounted never gets here.
+ */
+function quietFirstFocus(e: Event) {
+  const root = e.currentTarget as HTMLElement | null;
+  const first = [...(root?.querySelectorAll<HTMLElement>(TABBABLE) ?? [])].find((el) => el.checkVisibility?.() ?? el.offsetParent !== null);
+  if (!first) return;
+  e.preventDefault();
+  quietFocus(first);
+}
+
 export function Modal({
   open,
   onOpenChange,
@@ -371,6 +387,7 @@ export function Modal({
           style={width ? { width } : undefined}
 
           aria-describedby={undefined}
+          onOpenAutoFocus={quietFirstFocus}
           onCloseAutoFocus={onCloseAutoFocus}
           onEscapeKeyDown={keepForInnerScope}
         >

@@ -365,9 +365,8 @@ function WorkflowLive({ run }: { run: WorkflowRun }) {
 // ── done ──
 
 /**
- * A finished agent: its task and one figure, in the cards' columns. A plain done row carries no
- * mark (being in this list says it); a failure has the red cross, a hand-over its agent's mark, a
- * workflow its tree. An outcome other than done is said in words where the time would stand; its
+ * A finished agent: its task and one figure, in the cards' columns. A plain done row carries a
+ * quiet check; a failure has the red cross, a hand-over its agent's mark, a workflow its tree. An outcome other than done is said in words where the time would stand; its
  * tokens and steps, and when it finished, are in the opened row.
  */
 const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: string; id: string; fresh: boolean }) {
@@ -380,7 +379,8 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
   const f = figuresOf(item);
   const provider = agentProvider(item) ?? item.check?.agent ?? null;
   const word = outcome === 'done' ? '' : OUTCOME_WORD[outcome];
-  const mark = outcome === 'failed' ? <Icon name="x" size={11} weight="bold" /> : provider ? <ProviderMark provider={provider} size={12} /> : item.workflow ? <Icon name="tree" size={13} /> : null;
+  // A plain done row is checked: the column every row leads with is never empty (an empty one read as a misindent).
+  const mark = outcome === 'failed' ? <Icon name="x" size={11} weight="bold" /> : provider ? <ProviderMark provider={provider} size={12} /> : item.workflow ? <Icon name="tree" size={13} /> : outcome === 'done' ? <Icon name="check" size={12} /> : null;
   const launched = !!item.result?.agent?.background || !!item.detail.background;
   const endedAt = noted || (launched ? 0 : (item.endedAt ?? 0));
   return (

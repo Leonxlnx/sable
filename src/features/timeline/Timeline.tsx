@@ -11,6 +11,7 @@ import { Navigator } from './Navigator';
 import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
+import { keptAt } from './build-window';
 import { DOCK_GLIDE_MS } from '@/features/session/dock-glide';
 import { glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
 import { useStaged } from '@/features/session/staged';
@@ -24,13 +25,6 @@ const AWAY = 160;
 const FOLLOW_W = 24;
 /** Dev only: `?nonav` leaves the conversation's map out, to measure what it costs (scripts/perf-headless.mjs with SABLE_URL). */
 const NO_NAV = import.meta.env.DEV && typeof location !== 'undefined' && new URLSearchParams(location.search).has('nonav');
-
-/**
- * Where the reader left each conversation they had scrolled away from the end of, as the distance
- * from the end (the end is always built, older turns wait behind a spacer of estimated height), so
- * switching back lands where they were reading. For the window's life only.
- */
-const keptAt = new Map<string, number>();
 
 /**
  * The conversation. A scroller that stays with the newest content until the reader

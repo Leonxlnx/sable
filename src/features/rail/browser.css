@@ -103,7 +103,8 @@
   gap: 1px;
   flex-shrink: 0;
   height: var(--rail-bar-h);
-  padding: 0 7px;
+  /* Back's glyph on the pane's 16 px text edge (its 26 px button holds a 14 px glyph). */
+  padding: 0 7px 0 10px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -203,7 +204,7 @@
   height: 28px;
   margin: 0 3px 0 5px;
   padding: 0 3px 0 8px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background-color: var(--well);
   cursor: text;
@@ -211,7 +212,7 @@
 }
 
 .bw-addr:hover {
-  border-color: var(--line-3);
+  border-color: var(--line-2);
 }
 
 .bw-addr[data-focused] {
@@ -691,7 +692,7 @@
   align-items: center;
   gap: 10px;
   width: 100%;
-  height: 32px;
+  height: var(--rail-row-h);
   padding: 0 10px 0 8px;
   border-radius: var(--r-sm);
   text-align: left;
@@ -770,7 +771,7 @@
 }
 
 .bw-list .rail-row-acts {
-  top: 3px;
+  top: 1px;
   right: 4px;
 }
 

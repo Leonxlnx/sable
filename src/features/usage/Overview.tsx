@@ -117,9 +117,8 @@ export function LimitsOverview({ refs, pending }: { refs: AccountRef[]; pending:
         </span>
         <Segmented id="ulo-sort" className="ulo-sort" value={sort} onChange={pick} options={SORTS} />
       </div>
+      {/* Only the one column that needs a word: the 5h and 7d tags name the meters, the rows name themselves. */}
       <div className="ulo-cols" aria-hidden>
-        <span>Account</span>
-        <span>Used</span>
         <span>Resets in</span>
       </div>
       <div className="ulo-list" role="list">
@@ -156,11 +155,6 @@ const OverviewRow = memo(function OverviewRow({ row, now, best, open, pending, o
         <span className="ulo-who">
           <span className="ulo-name truncate">{input.name}</span>
           {plan && <span className="ulo-plan truncate">{plan}</span>}
-          {best && (
-            <Tip label="Least used right now">
-              <span className="ulo-best" aria-hidden />
-            </Tip>
-          )}
         </span>
         {state === 'off' ? (
           <span className="ulo-none">{ref.info?.installed ? 'Not signed in' : 'Not installed'}</span>
@@ -248,11 +242,8 @@ function TotalRow({ total: t }: { total: PoolTotal }) {
       <ProviderMark provider={t.provider} size={14} className="ulo-mark" />
       <span className="ult-who">
         <span className="ulo-name truncate">{PROVIDER_NAME[t.provider]}</span>
-        <Tip label={mix}>
-          <span className="ult-left num truncate" tabIndex={0}>
-            <span className="ult-figure">{units(poolWeeksUsed(t))}</span> of {units(t.week.size)} {t.unit} weeks used
-          </span>
-        </Tip>
+        {/* Its plans in words ("1 Max, 2 Pro"); how much of them is used is the meters' to say. */}
+        <span className="ult-left num truncate">{mix}</span>
       </span>
       {t.short ? <Meter tag="5h" pct={used(t.short)} label={`5-hour limits of ${t.accounts} accounts`} /> : <span />}
       <Meter tag="7d" pct={used(t.week)} label={`Weekly limits of ${t.accounts} accounts`} />

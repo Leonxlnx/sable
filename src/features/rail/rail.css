@@ -331,9 +331,12 @@
    A pane is: an optional bar (40 px, the pane's subject on the left in --text, a dim figure after it,
    26 px icon actions at the right), then its content, lists in 30 px rows inset 8 px, or a single
    calm sentence when there is nothing to show. Secondary row actions take the place of the row's
-   end decorations (counts, status) while it is hovered or holds focus. */
+   end decorations (counts, status) while it is hovered or holds focus.
+   One inset for every pane: a well, a field or a row's pill stands 8 px in from the panel's edge,
+   the first glyph or word in it 16 px, the bar's own text edge. One row rhythm: 28 px, a menu row's
+   height, in every list of the panel. */
 .rail {
-  --rail-row-h: 30px;
+  --rail-row-h: 28px;
   --rail-bar-h: 40px;
 }
 
@@ -398,7 +401,8 @@
    1 ms fade so both run on the compositor's clock). */
 .rail-row-acts {
   position: absolute;
-  top: 2px;
+  /* A 26 px button centred in the 28 px row. */
+  top: 1px;
   right: 6px;
   display: flex;
   gap: 1px;
@@ -408,8 +412,8 @@
 
 .rail-row-acts .icon-btn {
   color: var(--text-2);
-  /* 2px in from the row's top and bottom: its corner less that. */
-  border-radius: calc(var(--r-sm) - 2px);
+  /* 1px in from the row's top and bottom: its corner less that. */
+  border-radius: calc(var(--r-sm) - 1px);
 }
 
 /* They take the pointer in the frame they begin to show (pointer-events steps with the opacity's
@@ -459,7 +463,7 @@
   min-height: 24px;
   margin: 0 2px 8px;
   font-size: var(--t-ui);
-  font-weight: var(--w-semi);
+  font-weight: var(--w-medium);
   letter-spacing: -0.006em;
   color: var(--text);
 }
@@ -576,6 +580,164 @@
 /* The secondary actions sit where the line counts are, just before the caret. */
 .ch-acts {
   right: 26px;
+}
+
+/* The scope: a quiet switch under the bar, on the panel's 8 px inset, with Mark all seen at its end. */
+.ch-scope {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 8px;
+  flex-shrink: 0;
+}
+
+.ch-seg {
+  min-width: 0;
+}
+
+.ch-seg .seg-item {
+  font-weight: var(--w-regular);
+  white-space: nowrap;
+}
+
+.ch-seg .seg-item[data-active='true'] {
+  font-weight: var(--w-medium);
+}
+
+/* A scope's figure: one step quieter than its name. */
+.ch-seg-n {
+  margin-left: 5px;
+  color: var(--text-3);
+  font-weight: var(--w-regular);
+}
+
+.ch-mark-all {
+  margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* A narrow panel keeps the switch whole: Mark all seen gives up its word, its icon stays. */
+@container rail (max-width: 330px) {
+  .ch-mark-all {
+    width: var(--ctl-h-sm);
+    padding: 0;
+    justify-content: center;
+    font-size: 0;
+    gap: 0;
+  }
+}
+
+/* What has not been looked at: the sidebar's own mark for it, a small ivory dot in a column of its
+   own, the first glyph on the panel's 16 px text edge. Seen rows keep the column empty. */
+.ch-mark {
+  display: grid;
+  place-items: center;
+  width: 10px;
+  flex-shrink: 0;
+}
+
+.ch-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--text);
+}
+
+/* Seen: the same row a step quieter. */
+.ch-item[data-seen] :is(.ch-base, .ch-stat) {
+  color: var(--text-3);
+}
+
+.ch-item[data-seen] .ch-dir {
+  color: var(--text-4);
+}
+
+.ch-item[data-seen] .ch-stat > * {
+  opacity: 0.72;
+}
+
+.ch-item[data-seen] .ch-row:hover .ch-base {
+  color: var(--text-2);
+}
+
+/* A change that is not plain editing says what it is in a word, in the counts' quiet tone. */
+.ch-kind {
+  font-weight: var(--w-regular);
+  color: var(--text-3);
+}
+
+.ch-kind[data-kind='U'] {
+  color: var(--red);
+}
+
+/* "Seen 3": the files of the New scope that are as last seen, folded under one quiet row. */
+.ch-fold {
+  padding: 0 8px 16px;
+}
+
+.ch-list + .ch-fold {
+  margin-top: -12px;
+}
+
+.ch-fold-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  height: var(--rail-row-h);
+  padding: 0 8px;
+  border-radius: calc(var(--r-md) - 1px);
+  font-size: 12.5px;
+  color: var(--text-3);
+  text-align: left;
+}
+
+.ch-fold-head .ch-caret {
+  width: 10px;
+}
+
+.ch-fold-head:hover {
+  background-color: var(--fill-2);
+  color: var(--text-2);
+}
+
+.ch-fold-head:active {
+  background-color: var(--fill-3);
+}
+
+.ch-fold-head:focus-visible {
+  outline-offset: var(--focus-inset);
+}
+
+.ch-fold-n {
+  color: var(--text-4);
+}
+
+.ch-list-seen {
+  padding: 0;
+}
+
+/* The empty New scope: one calm sentence, the Seen fold under it. */
+.ch-none {
+  padding-bottom: 24px;
+}
+
+/* Above a diff of what is new since: what it shows, and the way to the whole diff. */
+.ch-since {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 4px 8px;
+  font-size: var(--t-small);
+  line-height: 1.45;
+  color: var(--text-3);
+}
+
+.ch-since .rail-link {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: var(--t-small);
 }
 
 /* Commit box: pinned under the list, a hairline above. */
@@ -796,8 +958,9 @@ textarea.field.ch-commit-field {
   min-width: 0;
   height: 28px;
   margin-right: 4px;
-  padding: 0 6px 0 9px;
-  border: 1px solid var(--line-2);
+  /* The glyph on the pane's 16 px text edge (8 px out, the hairline, 7 px in). */
+  padding: 0 6px 0 7px;
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background-color: var(--well);
   color: var(--text-3);
@@ -805,7 +968,7 @@ textarea.field.ch-commit-field {
 }
 
 .fl-filter:hover {
-  border-color: var(--line-3);
+  border-color: var(--line-2);
 }
 
 .fl-filter:focus-within {
@@ -872,7 +1035,8 @@ textarea.field.ch-commit-field {
   align-items: center;
   gap: 6px;
   height: var(--rail-row-h);
-  padding: 0 8px 0 calc(4px + var(--indent));
+  /* The caret's glyph on the pane's 16 px text edge, under the filter's glass. */
+  padding: 0 8px 0 calc(6px + var(--indent));
   border-radius: var(--r-sm);
   font-size: var(--t-ui);
   color: var(--text-2);
@@ -886,7 +1050,7 @@ textarea.field.ch-commit-field {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 11px;
+  left: 13px;
   width: var(--indent);
   background: repeating-linear-gradient(90deg, var(--line) 0 1px, transparent 1px 14px);
   pointer-events: none;
@@ -909,6 +1073,10 @@ textarea.field.ch-commit-field {
 
 .fl-row[data-ignored] {
   color: var(--text-4);
+}
+
+.fl-row[data-ignored]:hover {
+  color: var(--text-2);
 }
 
 .fl-row[data-ignored] .fl-icon {
@@ -969,8 +1137,8 @@ textarea.field.ch-commit-field {
 }
 
 .fl-note {
-  height: 26px;
-  padding-left: calc(28px + var(--depth) * 14px);
+  height: var(--rail-row-h);
+  padding-left: calc(26px + var(--depth) * 14px);
   display: flex;
   align-items: center;
   font-size: var(--t-small);
@@ -1093,12 +1261,12 @@ textarea.field.ch-commit-field {
 /* ───────────── terminal ───────────── */
 
 .tm-scroll {
-  padding: 0 12px 8px;
+  padding: 0 8px 8px;
 }
 
 /* The empty sentence lines up with every other pane's: the scroller's side padding is the row inset. */
 .tm-scroll > .rail-empty {
-  margin: 0 -12px;
+  margin: 0 -8px;
 }
 
 .tm-scroll:focus-visible {
@@ -1151,7 +1319,8 @@ textarea.field.ch-commit-field {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 8px 8px 0 11px;
+  /* The prompt mark on the pane's 16 px text edge (8 px out, the hairline, 7 px in). */
+  padding: 8px 8px 0 7px;
   min-height: 32px;
 }
 
@@ -1329,14 +1498,15 @@ textarea.field.ch-commit-field {
 }
 
 .tm-trim {
-  margin: 6px 11px 0;
+  margin: 6px 7px 0;
   font-size: var(--t-micro);
   color: var(--text-3);
 }
 
 .tm-out {
   margin: 0;
-  padding: 4px 11px 2px 30px;
+  /* Under the command's first letter: 7 px, the prompt mark's 7.5 px advance, the 8 px gap. */
+  padding: 4px 7px 2px 22.5px;
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 18.5px;
@@ -1353,7 +1523,7 @@ textarea.field.ch-commit-field {
 }
 
 .tm-error {
-  margin: 4px 11px 0 30px;
+  margin: 4px 7px 0 22.5px;
   font-size: var(--t-small);
   line-height: 1.5;
   color: var(--text-2);
@@ -1363,7 +1533,7 @@ textarea.field.ch-commit-field {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 6px 11px 8px 30px;
+  padding: 6px 7px 8px 22.5px;
   font-size: var(--t-micro);
   color: var(--text-3);
 }
@@ -1415,23 +1585,25 @@ textarea.field.ch-commit-field {
 
 .tm-input-wrap {
   flex-shrink: 0;
-  padding: 6px 12px 12px;
+  padding: 6px 8px 8px;
 }
 
+/* A field like the filter's: 8 px in from the panel's edge, its mark on the 16 px text edge; in the
+   panel's bottom corner, so its corner is the panel's less those 8 px. */
 .tm-input {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 38px;
-  padding: 0 8px 0 12px;
-  border: 1px solid var(--line-2);
-  border-radius: var(--r-md);
+  height: 36px;
+  padding: 0 8px 0 7px;
+  border: 1px solid var(--line);
+  border-radius: calc(var(--r-xl) - 8px);
   background-color: var(--well);
   cursor: text;
 }
 
 .tm-input:hover {
-  border-color: var(--line-3);
+  border-color: var(--line-2);
 }
 
 .tm-input:focus-within {
@@ -1699,8 +1871,9 @@ textarea.field.ch-commit-field {
 }
 
 .cx-tokens {
+  /* The weight budget: figures in a column are regular; the full ink against the quiet rows' dim one says it. */
   color: var(--text);
-  font-weight: var(--w-medium);
+  font-weight: var(--w-regular);
 }
 
 .cx-row-quiet .cx-tokens {

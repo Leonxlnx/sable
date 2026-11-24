@@ -714,6 +714,14 @@
   color: var(--text-3);
 }
 
+/* Files to review (seen states): the Changes tab's mark and a figure where the time stands, neutral. */
+.srow-review {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-3);
+}
+
 /* A ring while it works, a dot when it wants you: their right edge on the times' right edge. */
 .srow-state {
   display: grid;
@@ -721,6 +729,16 @@
   width: 12px;
   height: 12px;
   margin-right: 8px;
+}
+
+/* A dot is drawn in the middle of its 12 px slot: set over by what it leaves of the slot, so its ink
+   ends on the times' right edge as the ring's does (the unread dot stood 3 px short of it). */
+.srow-state > .status-glyph[data-tone='unread'] {
+  translate: 3px 0;
+}
+
+.srow-state > .status-glyph[data-tone='error'] {
+  translate: 2.5px 0;
 }
 
 /* A quieter ring on rows you are not looking at. */

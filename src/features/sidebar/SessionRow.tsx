@@ -6,7 +6,7 @@ import { PROVIDER_NAME, ProviderMark, StatusGlyph } from '@/art/Logo';
 import { fieldBeat } from '@/art/events';
 import { SpareClock, spareLine } from '@/features/composer/SpareStrip';
 import { Icon, type IconName } from '@/icons';
-import { timeAgo } from '@/lib/format';
+import { plural, timeAgo } from '@/lib/format';
 import { interrupt, openSession, prefetchSession, renameSession, updateSession } from '@/state/actions';
 import { accountName } from '@/state/hooks';
 import { useStore } from '@/state/store';
@@ -260,7 +260,7 @@ function rowActions(s: SessionMeta, ctx: RowCtx): MenuAction[] {
     { icon: 'pencil', label: 'Rename', run: () => ctx.setRenaming(s.id) },
     { icon: s.pinned ? 'pin-off' : 'pin', label: s.pinned ? 'Unpin' : 'Pin', run: () => togglePin(s) },
   ];
-  if (!s.unread) list.push({ icon: 'circle', label: 'Mark unread', run: () => void updateSession(s.id, { unread: true }) });
+  if (!s.unread) list.push({ icon: 'dot', label: 'Mark unread', run: () => void updateSession(s.id, { unread: true }) });
   list.push({ icon: 'archive', label: s.archived ? 'Unarchive' : 'Archive', run: () => toggleArchive(s) });
   if (running) list.push({ icon: 'stop', label: 'Stop', run: () => void interrupt(s.id), sepBefore: true });
   list.push({ icon: 'trash', label: 'Delete', tone: 'danger', run: () => ctx.askDelete(s.id), sepBefore: !running });
@@ -454,7 +454,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
             tabIndex={-1}
             data-id={session.id}
             aria-current={active ? 'page' : undefined}
-            title={[label, who].filter(Boolean).join(' · ') || undefined}
+            title={[label, who, session.review ? `${plural(session.review, 'file')} to review` : ''].filter(Boolean).join(' · ') || undefined}
             onClick={() => {
               // The stage answers in this frame, also when the chat has to be fetched first.
               cueOpen(session.id);
@@ -464,7 +464,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
             onKeyDown={onKeyDown}
           >
             <span className="srow-title truncate">{title}</span>
-            <span className="sr-only">{[who ?? PROVIDER_NAME[session.provider], label].filter(Boolean).join(', ')}</span>
+            <span className="sr-only">{[who ?? PROVIDER_NAME[session.provider], label, session.review ? `${plural(session.review, 'file')} to review` : ''].filter(Boolean).join(', ')}</span>
           </button>
         )}
         {/* Kept while the title is edited, only hidden: the menu Rename came from closes as any menu does. */}
@@ -472,6 +472,12 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
           {waits ? (
             <span className="srow-state" data-tone="spare">
               <SpareClock size={12} />
+            </span>
+          ) : tone === 'idle' && session.review ? (
+            // Changed files not looked at since they changed: the Changes tab's mark and their count, where the time stands.
+            <span className="srow-time srow-review num">
+              <Icon name="diff" size={11} />
+              {session.review}
             </span>
           ) : tone === 'idle' ? (
             <RowTime ts={session.updatedAt} />

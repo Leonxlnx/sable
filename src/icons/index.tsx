@@ -147,6 +147,7 @@ import { FireIcon } from '@phosphor-icons/react/dist/csr/Fire';
 import { CheckCircleIcon } from '@phosphor-icons/react/dist/csr/CheckCircle';
 import { XCircleIcon } from '@phosphor-icons/react/dist/csr/XCircle';
 import { CircleIcon } from '@phosphor-icons/react/dist/csr/Circle';
+import { DotOutlineIcon } from '@phosphor-icons/react/dist/csr/DotOutline';
 import { CircleDashedIcon } from '@phosphor-icons/react/dist/csr/CircleDashed';
 import { ProhibitIcon } from '@phosphor-icons/react/dist/csr/Prohibit';
 import { LightbulbIcon } from '@phosphor-icons/react/dist/csr/Lightbulb';
@@ -347,6 +348,8 @@ const ICONS = {
   'check-circle': CheckCircleIcon,
   'x-circle': XCircleIcon,
   circle: CircleIcon,
+  /** A filled dot: the unread mark's own shape ("Mark unread"). */
+  dot: DotOutlineIcon,
   'circle-dashed': CircleDashedIcon,
   prohibit: ProhibitIcon,
   lightbulb: LightbulbIcon,
@@ -417,6 +420,7 @@ const THIN: Partial<Record<IconName, IconWeight>> = {
   enter: 'bold',
   stop: 'fill',
   play: 'fill',
+  dot: 'fill',
 };
 
 export function Icon({ name, size = 16, weight, className, style }: IconProps) {

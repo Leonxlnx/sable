@@ -438,8 +438,13 @@ p .kbds,
   border-color: var(--line-2);
 }
 
-/* Focus: the hairline turns soft ivory at once; the well deepens behind it. */
-.field:focus,
+/* Focus: the hairline turns soft ivory at once; the well deepens behind it. Only a focus the person
+   gave (a click or a key: a text field always shows that one): a field a dialog focuses as it opens
+   (`quietFocus`, the Modal's own first focus) keeps its quiet rest until the person moves focus. */
+.field:focus {
+  outline: none;
+}
+
 .field:focus-visible {
   outline: none;
   border-color: var(--focus-field);
@@ -494,7 +499,7 @@ textarea.field {
   border-color: var(--line-2);
 }
 
-.field-wrap:focus-within {
+.field-wrap:has(:focus-visible) {
   border-color: var(--focus-field);
   background-color: var(--well-strong);
   transition-duration: var(--d-2);
@@ -505,7 +510,7 @@ textarea.field {
   transition: color var(--d-1) var(--ease);
 }
 
-.field-wrap:focus-within > svg {
+.field-wrap:has(:focus-visible) > svg {
   color: var(--text-2);
 }
 
@@ -955,6 +960,12 @@ textarea.field {
   flex-shrink: 0;
   color: var(--text-3);
   transition: color 70ms linear;
+}
+
+/* The filled dot ("Mark unread") is Phosphor's 3 px point at 14 px: drawn at the sidebar's unread
+   dot's 6 px, in the same glyph box, so the row's words keep their column. */
+svg[data-icon='dot'] {
+  scale: 1.9;
 }
 
 /* The highlighted row is one step lighter than the menu: light, not a press. */

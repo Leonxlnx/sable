@@ -18,11 +18,11 @@ import { TurnFoot } from './Turn';
 import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnSpan, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
+import { keptAt, rememberTurnSize, tailStart, TAIL, turnSizes, VIEWS } from './build-window';
 import { stallAt } from './stall';
 import { shortDuration, thinkingHeadline, useHeld, useTick } from './util';
 
-/** Groups built when a transcript opens, and how many more each step up builds. */
-const TAIL = 8;
+/** How many more groups each step up builds (what an open builds: `build-window.ts`). */
 const CHUNK = 8;
 /**
  * Older groups built ahead of the reader in idle moments, a few at a time, up to this many beyond
@@ -46,7 +46,7 @@ const REACH = 16;
 const MARGIN = 1500;
 
 interface BuiltState {
-  /** Groups before this one are not built (null: not decided yet, the last `TAIL` are). */
+  /** Groups before this one are not built (null: not decided yet, the newest that fill a few views are: `build-window.ts`). */
   hidden: number | null;
   /** A run built on its own around a message far up: groups [from, to), short of `hidden`. */
   win: { from: number; to: number } | null;
@@ -122,7 +122,7 @@ function spanHeight(groups: readonly Group[], from: number, to: number, sessionI
   if (from >= to) return 0;
   const items = useStore.getState().data[sessionId]?.items ?? {};
   let h = 0;
-  for (let i = from; i < to; i++) h += groupHeight(groups[i], items, estimate);
+  for (let i = from; i < to; i++) h += turnSizes.get(`${sessionId}|${groups[i].key}`) ?? groupHeight(groups[i], items, estimate);
   return h;
 }
 
@@ -160,8 +160,18 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
   const [built, setBuilt] = useState<BuiltState>({ hidden: null, win: null });
   const size = useRef(groups.length);
   size.current = groups.length;
+  // Until it is decided (the first commit with groups), the newest groups that fill a few views by
+  // their estimated height, and reach a kept reading place (build-window.ts).
+  const first = useRef(0);
+  if (built.hidden === null) {
+    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const view = typeof window === 'undefined' ? 900 : window.innerHeight;
+    const from = Math.max(0, groups.length - TAIL);
+    const heights = groups.slice(from).map((g) => turnSizes.get(`${sessionId}|${g.key}`) ?? groupHeight(g, items, estimate));
+    first.current = from + tailStart(heights, VIEWS * view, (keptAt.get(sessionId) ?? 0) + view);
+  }
   /** A state's first built group of the newest turns: decided, and within the groups there are. */
-  const hiddenOf = (b: BuiltState) => Math.min(size.current, b.hidden ?? Math.max(0, size.current - TAIL));
+  const hiddenOf = (b: BuiltState) => Math.min(size.current, b.hidden ?? first.current);
   const hidden = hiddenOf(built);
   const win = built.win && built.win.from < built.win.to ? built.win : null;
   // Groups before `lead` wait behind the first spacer, groups [gapFrom, hidden) behind the second
@@ -410,8 +420,27 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
   if (liveAfterCards) {
     rows.push(<RunPiece key="live" run={null} from={current.flow.length ? null : current.lead} until={null} head={false} live first={!current.flow.length} settled={false} open={false} multi={runs > 1} nest={false} seg={current} onToggle={toggle} />);
   }
+  // A settled turn skips layout while it is far from view (timeline.css), and stands in for its own
+  // height until it is laid out (`auto` keeps the real one after that): the height it had when its
+  // view last went (`turnSizes`), else its estimate. With one 360 px stand-in for every turn, a chat
+  // of a few turns fit within Chrome's reach of the view on its first frame, so every turn was laid
+  // out on open: a 4,000-line answer far above the end cost 220 ms and more under the veil on every
+  // switch to the chat (scratch/day7/open). The height it had keeps a reading place restored in it
+  // exact: with the estimate the place was counted from the end over the estimate, and landed
+  // thousands of lines off once the turn was laid out.
+  const sizeKey = `${sessionId}|${turn.key}`;
+  const standIn = useMemo(
+    () => (running ? undefined : (turnSizes.get(sizeKey) ?? Math.max(34, Math.round(groupHeight(turn, useStore.getState().data[sessionId]?.items ?? {}, estimate))))),
+    [running, turn, sessionId, sizeKey],
+  );
+  const box = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const el = box.current;
+    // Read as the view goes, while it is still in the page (its layout is settled by then).
+    return () => rememberTurnSize(sizeKey, el?.offsetHeight ?? 0);
+  }, [sizeKey]);
   return (
-    <section className="tg" data-state={turn.state} data-turn={turn.key}>
+    <section ref={box} className="tg" data-state={turn.state} data-turn={turn.key} style={standIn ? { containIntrinsicSize: `auto ${standIn}px` } : undefined}>
       {rows}
       {turn.early && <EndedEarly turn={turn} />}
       <TurnFoot turn={turn} />
