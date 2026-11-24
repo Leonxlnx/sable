@@ -30,7 +30,7 @@ import { HomeChips, ModeMenu, openComposerMenu, useHomeSignedOut, useMenuPlace }
 import { CoveSkin } from './Cove';
 import { PROVIDER_NAME } from '@/art/Logo';
 import { ModelEffort, type PhraseHandle } from './Phrase';
-import { levelChord, opensPanel, ultraChord } from './effort-track';
+import { altGraph, levelChord, opensPanel, ultraChord } from './effort-track';
 import { Highlight } from './Highlight';
 import { NO_QUEUE, QueueTray } from './QueueTray';
 import { UntilStrip } from './UntilStrip';
@@ -601,8 +601,8 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
    * the next placeholder rises from 8px below (100 ms, two frames later). The backdrop gets a pulse.
    */
   const rollOut = (sent: string, next: string | null, flew: boolean, queued = false) => {
-    // The backdrop's wave: a message that leaves as liquid sends its own, from where its drop
-    // parts from the bar (flight.ts); any other leaves the key with one.
+    // The backdrop's wave: a message that leaves as signal sends its own, from where its line
+    // leaves the key (flight.ts); any other leaves the key with one.
     if (!flew) fieldBeat('send', card.current?.querySelector('.cmp-send') ?? card.current, 1);
     const field = ref.current?.parentElement;
     if (!field || !sent) return;
@@ -835,20 +835,21 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    if (e.defaultPrevented || altGraph(e) || e.nativeEvent.isComposing || e.keyCode === 229) return;
     const mod = MAC ? e.metaKey : e.ctrlKey;
     const ta = e.currentTarget;
 
     // One level up or down from the field: nothing opens and the caret stays where it was.
     const lvl = shell ? null : levelChord(e, MAC);
-    if (lvl) {
+    if (lvl && phrase.current) {
       e.preventDefault();
-      phrase.current?.step(lvl);
+      phrase.current.step(lvl);
       return;
     }
 
+    if (e.altKey) return;
     if (menuOpen) {
-      if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && rows.length) {
+      if (!mod && !e.shiftKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp') && rows.length) {
         e.preventDefault();
         setActive((a) => (e.key === 'ArrowDown' ? (a + 1) % rows.length : (a - 1 + rows.length) % rows.length));
         return;
@@ -856,7 +857,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       const row = rows[active];
       // A command or skill typed out in full sends on Enter (Tab still completes it).
       const typedOut = e.key === 'Enter' && sendWithEnter && !!row && row.kind !== 'app' && trigger?.kind !== 'mention' && trigger?.query === row.name;
-      if (((e.key === 'Enter' && !e.shiftKey && !mod) || (e.key === 'Tab' && !e.shiftKey)) && row && !typedOut) {
+      if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey && !mod && row && !typedOut) {
         e.preventDefault();
         accept(row);
         return;
@@ -947,7 +948,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       className="composer"
       data-variant={variant}
       onKeyDown={(e) => {
-        if (shell) return;
+        if (shell || e.defaultPrevented || e.nativeEvent.isComposing || e.keyCode === 229) return;
         // Alt+U anywhere in the composer switches ultracode, at whatever level; a held key switches once.
         if (ultraOffered && ultraChord(e, MAC)) {
           e.preventDefault();
@@ -955,9 +956,9 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
           return;
         }
         // Ctrl+. anywhere in the composer (the field, a chip, the panel) opens the model and effort panel, or closes it.
-        if (!opensPanel(e, MAC)) return;
+        if (!opensPanel(e, MAC) || !phrase.current) return;
         e.preventDefault();
-        phrase.current?.toggle();
+        phrase.current.toggle();
       }}
     >
       {menuOpen && (

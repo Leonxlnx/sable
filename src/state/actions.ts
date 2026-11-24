@@ -2,7 +2,8 @@ import { DEFAULT_ACCOUNT, type AccountCap, type AccountInfo, type Attachment, ty
 import { DEFAULT_BACKDROP, normalizeBackdrop } from '@shared/backdrop';
 import { bridge } from '@/lib/bridge';
 import { addComment, clearReview, editComment, removeComment, reviewMessage, type ReviewComment } from '@/features/review/model';
-import { applySnapshot, applyWholeItem, capsKey, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
+import { accountLiveCaps, applySnapshot, applyWholeItem, capsKey, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
+import { seenCaps } from '@/features/composer/caps-seen';
 import type { PullFailures, PullStatus } from '@shared/protocol';
 
 /** Everything the UI can ask the bridge to do. Components call these, never bridge.call directly. */
@@ -205,7 +206,8 @@ export function homeChoice(): NewSessionChoice | null {
   const model = ui.homeModel[provider] ?? settings.defaultModels[provider] ?? caps?.models.find((m) => m.isDefault)?.id ?? caps?.models[0]?.id;
   const mode = ui.homeMode[provider] ?? settings.defaultModes[provider] ?? caps?.modes[0]?.id;
   const effort = ui.homeEffort[provider] ?? settings.defaultEfforts[provider];
-  const ultracode = ui.homeUltracode && caps?.features.ultracode ? true : undefined;
+  const offered = accountLiveCaps(providerCaps, provider, ui.homeCwd, accountId) ?? seenCaps(provider, accountId);
+  const ultracode = ui.homeUltracode && offered?.features.ultracode ? true : undefined;
   return { provider, cwd: ui.homeCwd, model, mode, effort, accountId, ...(ultracode ? { ultracode } : {}), ...(ui.homeChat ? { chat: {} } : {}) };
 }
 

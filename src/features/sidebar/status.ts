@@ -14,8 +14,7 @@ import type { StatusTone } from '@/art/Logo';
  */
 export function statusTone(s: SessionMeta): StatusTone {
   if (s.status === 'awaiting') return 'awaiting';
-  // Between an /until loop's turns Sable runs the check: the chat is still at work.
-  if (s.status === 'running' || s.status === 'starting' || (s.status === 'idle' && s.until?.phase === 'checking')) return 'working';
+  if (s.status === 'running' || s.status === 'starting') return 'working';
   // Its own turn ended (also with an error), but sub-agents or background commands it started still
   // work: the chat is not at rest.
   if (hasWork(s)) return 'working';
@@ -38,7 +37,6 @@ export function statusLabel(s: SessionMeta): string | null {
     const own = s.activity || 'Working';
     return work && hasWork(s) ? `${own} · ${work.replace(/ (working|running)$/, '')}` : own;
   }
-  if (s.status === 'idle' && s.until?.phase === 'checking') return 'Running the check';
   if (s.status === 'awaiting') return 'Waiting for you';
   // "2 sub-agents working", "1 command running" (shared/work-label.ts, the phone says the same).
   if (work) return work;

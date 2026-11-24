@@ -13,11 +13,12 @@ import { pathKey } from '@/features/sidebar/groups';
 import type { GitWorktree } from '@shared/protocol';
 import { goHomeChat, homeAccountId, openSettings, setHomeAccount } from '@/state/actions';
 import { accountName } from '@/state/hooks';
-import { capsKey, ensureProviderCaps, useStore } from '@/state/store';
+import { accountLiveCaps, ensureProviderCaps, useStore } from '@/state/store';
 import { PathLabel, Tip } from '@/ui';
 import { planWord } from '@/features/accounts/model';
 import { LimitDot } from '@/features/usage';
-import { type Choice } from './choice';
+import { switchModelAccount, type Choice } from './choice';
+import { seenCaps } from './caps-seen';
 import { Chip, type ChipPart } from './Chip';
 import { Later } from './later';
 import { GAP, placeMenu, type Placed } from './menu-place';
@@ -226,13 +227,14 @@ const AGENTS: ProviderId[] = ['claude', 'codex', 'opencode'];
 export function useOtherAgentModels(choice: Choice, open: boolean) {
   const sessionId = choice.sessionId;
   const cwd = useStore((s) => (sessionId ? (s.sessions[sessionId]?.cwd ?? null) : null));
-  const signedIn = useStore(useShallow((s) => AGENTS.filter((p) => p !== choice.provider && isSignedIn(s.providers[p]))));
+  const signedIn = useStore(useShallow((s) => sessionId ? AGENTS.filter((p) => p !== choice.provider && isSignedIn(s.providers[p])) : []));
   const visibility = useStore((s) => s.settings.modelVisibility);
-  const caps = useStore(useShallow((s) => signedIn.map((p) => s.providerCaps[capsKey(p, cwd, homeAccountId(p, s))] ?? s.providerCaps[capsKey(p, cwd)])));
+  const accounts = useStore(useShallow((s) => signedIn.map((p) => switchModelAccount(s.sessions[sessionId ?? ''], p, s))));
+  const caps = useStore(useShallow((s) => signedIn.map((p, i) => accountLiveCaps(s.providerCaps, p, cwd, accounts[i]) ?? seenCaps(p, accounts[i]))));
   useEffect(() => {
     if (!open || !sessionId || !cwd) return;
-    for (const p of signedIn) ensureProviderCaps(p, cwd, homeAccountId(p));
-  }, [open, sessionId, cwd, signedIn]);
+    signedIn.forEach((p, i) => ensureProviderCaps(p, cwd, accounts[i]));
+  }, [open, sessionId, cwd, signedIn, accounts]);
   return useMemo(() => {
     if (!sessionId || !cwd) return NO_OTHERS;
     return signedIn.flatMap((p, i) => (caps[i] ? visibleModels(p, caps[i]!.models, visibility).map((m) => ({ provider: p, m })) : []));

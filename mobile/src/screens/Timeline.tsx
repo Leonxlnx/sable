@@ -17,7 +17,7 @@ import { putDraft } from '@m/lib/put-draft';
 import { readReview, type PhoneReview } from '@m/lib/review';
 import { applyChildren, applyFull, fetchItem, getState, sessionData, setState, useStore, type State } from '@m/lib/store';
 import { claimFlight } from '@m/lib/flight';
-import { checkOpener, foldTarget, limitAction, showKind, turnChanges } from '@m/lib/chat-rules';
+import { checkOpener, foldTarget, limitAction, limitProvider, showKind, turnChanges } from '@m/lib/chat-rules';
 import { foldKey, keepDetail, keepOpen, keptDetail, stepKey, wasOpen } from '@m/lib/folds';
 import { useChanges } from '@m/lib/changes';
 import { runSpan, turnSpan, type Segment, type StepsChunk, type TurnGroup } from '@m/lib/turns';
@@ -1228,7 +1228,7 @@ const statusWord = (s: string) => (s === 'running' ? 'Running' : s === 'done' ? 
 
 const Notice = memo(function Notice({ sid, id }: { sid: string; id: string }) {
   const it = useItem<NoticeItem>(sid, id);
-  const provider = useStore((s) => s.sessions[sid]?.provider);
+  const provider = useStore((s) => limitProvider(it?.limit, s.sessions[sid]?.provider));
   const accounts = useStore((s) => (provider ? s.providers[provider]?.accounts : undefined));
   if (!it) return null;
   // What a command printed, standing for its turn: a line under the command's (Synthetic.tsx).

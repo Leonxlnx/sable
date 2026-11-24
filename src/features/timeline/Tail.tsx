@@ -1,6 +1,6 @@
 import { memo, useState } from 'react';
 import { worksInBackground } from '@shared/background';
-import { tailLabel, workCounts } from '@shared/work-label';
+import { tailLabel, workCounts, workLabel } from '@shared/work-label';
 import { Tiles } from '@/art/Logo';
 import { Icon } from '@/icons';
 import { showRailTab } from '@/state/actions';
@@ -125,12 +125,16 @@ export const Tail = memo(function Tail() {
   const { sessionId } = useTimeline();
   const status = useStore((s) => s.sessions[sessionId]?.status);
   const activity = useStore((s) => s.sessions[sessionId]?.activity);
+  const check = useStore((s) => {
+    const until = s.sessions[sessionId]?.until;
+    return until?.phase === 'checking' ? until : undefined;
+  });
   const info = useStore((s) => tailInfo(s.data[sessionId]));
   const agents = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).agents);
   const commands = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).commands);
   const [read] = useState(workSince);
   const work = useStore((s) => (agents || commands ? read(s.data[sessionId]) : NO_WORK));
-  const working = status === 'running' || status === 'starting';
+  const working = status === 'running' || status === 'starting' || !!check;
   const background = !working && status !== 'awaiting' && (agents > 0 || commands > 0);
   const now = useTick(working || (background && work.since > 0));
   // Laid out with the chat (history): it simply stands. Only work that begins while the person
@@ -160,7 +164,7 @@ export const Tail = memo(function Tail() {
   }
 
   const [startRaw, quietRaw] = info.split('|');
-  const start = Number(startRaw);
+  const start = check ? check.since : Number(startRaw);
   const elapsed = start ? now - start : 0;
 
   if (status === 'awaiting') {
@@ -175,11 +179,11 @@ export const Tail = memo(function Tail() {
   }
 
   return (
-    <div className="tail" data-status={status} data-enter={fresh || undefined} data-quiet={quietRaw === '1' || undefined} role="status" aria-live="off">
+    <div className="tail" data-status={status} data-enter={fresh || undefined} data-quiet={(!check && quietRaw === '1') || undefined} role="status" aria-live="off">
       <span className="row-slot">
         <Tiles size={14} />
       </span>
-      <span className="tail-label shimmer truncate">{status === 'starting' ? 'Starting' : activity || 'Working'}</span>
+      <span className="tail-label shimmer truncate">{check ? workLabel({ until: check }) : status === 'starting' ? 'Starting' : activity || 'Working'}</span>
       {elapsed >= 1000 && <span className="tail-time num">{shortDuration(elapsed)}</span>}
     </div>
   );

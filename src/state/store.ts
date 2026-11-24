@@ -1003,7 +1003,19 @@ function withAccountLimits(limits: Store['limits'], providers: ProviderInfo[]): 
 
 /** Capabilities differ per account (plan models, skills, MCP servers): extra accounts get their own cache entry. */
 export const capsKey = (provider: ProviderId, cwd: string | null, accountId?: string | null) =>
-  `${provider}:${cwd ?? ''}${accountId && accountId !== DEFAULT_ACCOUNT ? `@${accountId}` : ''}`;
+  `${provider}:${(cwd ?? '').replaceAll('%', '%25').replaceAll('@', '%40')}${accountId && accountId !== DEFAULT_ACCOUNT ? `@${accountId}` : ''}`;
+
+/** A live answer for the same account from another folder. A literal @ in a folder is escaped by capsKey. */
+export function capsFromAnywhere(all: Record<string, Capabilities>, provider: ProviderId, accountId?: string): Capabilities | undefined {
+  const suffix = accountId && accountId !== DEFAULT_ACCOUNT ? `@${accountId}` : '';
+  for (const key in all) {
+    if (key.startsWith(`${provider}:`) && (suffix ? key.endsWith(suffix) : !key.includes('@'))) return all[key];
+  }
+}
+
+export function accountLiveCaps(all: Record<string, Capabilities>, provider: ProviderId, cwd: string | null, accountId?: string): Capabilities | undefined {
+  return all[capsKey(provider, cwd, accountId)] ?? all[capsKey(provider, null, accountId)] ?? capsFromAnywhere(all, provider, accountId);
+}
 
 const normPath = (p?: string | null) => (p ? p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() : null);
 /** A capsKey with its folder normalized (see `caps.updated`). */

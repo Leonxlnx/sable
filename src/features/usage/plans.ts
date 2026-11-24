@@ -109,12 +109,9 @@ export function poolTotals(inputs: PoolInput[], now: number): PoolTotal[] {
       return { size: size / top.weight, left: left / top.weight, used: size ? Math.round((1 - left / size) * 1000) / 10 : 0 };
     };
     const week = part(counted.map(({ i, size }) => ({ w: size.weight, used: livePercent(poolWindow(i.limits, 'week')!, now) })));
-    // A 5-hour window is no use while the week it belongs to is used up.
     const shortRows = counted.flatMap(({ i, size }) => {
       const s = poolWindow(i.limits, 'short');
-      if (!s) return [];
-      const weekFull = livePercent(poolWindow(i.limits, 'week')!, now) >= 100;
-      return [{ w: size.weight, used: weekFull ? 100 : livePercent(s, now) }];
+      return s ? [{ w: size.weight, used: livePercent(s, now) }] : [];
     });
     const plans = new Map<string, { name: string; count: number; weight: number }>();
     for (const { size } of counted) {

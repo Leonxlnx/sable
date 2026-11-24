@@ -10,9 +10,6 @@ import { useStore } from '@/state/store';
 import { Spinner, Tip } from '@/ui';
 import { AccountUsed, planOf } from './ManyAccounts';
 
-/** "used up", "82% used": the share used, as everywhere (`usage/words.ts`). */
-const stateOf = (l: RateLimit) => windowState(l, Date.now());
-
 /**
  * The account a session runs under, quietly in the session's header, only when its agent has more
  * than one. It opens the other accounts: picking one continues this conversation there.
@@ -38,7 +35,7 @@ export function SessionAccount({ sessionId }: { sessionId: string }) {
   const level = lim?.level === 'cap' ? 'red' : lim?.level === 'near' ? 'amber' : lim?.otherCap ? 'other' : undefined;
   const rows = lim ? [...lim.own, ...lim.other] : [];
   const goesOn = !!lim?.model && lim.level !== 'cap' && lim.other.some((l) => l.percent >= 100);
-  const said = rows.map((l) => `${limitTitle(l.label)} ${stateOf(l)}`).join(', ');
+  const said = rows.map((l) => `${limitTitle(l.label)} ${windowState(l, lim!.now)}`).join(', ');
   const tip = said ? `${name}: ${said}${goesOn ? `. ${lim!.model} is not limited` : ''}` : name;
   const menu = { sessionId, provider, accountId, accounts, lim, rows, goesOn, name, moving, setMoving };
 
@@ -96,13 +93,14 @@ function SessionAccountMenu({ sessionId, provider, accountId, accounts, lim, row
                 {rows.map((l) => {
                   const mine = lim!.own.includes(l);
                   const tone = mine ? (l.percent >= 100 ? 'red' : 'amber') : 'other';
+                  const reset = resetsText(l.resetsAt, lim!.now);
                   return (
                     <div key={l.id} className="sa-limit">
                       <span className="limit-dot" data-level={tone} aria-hidden />
                       <span className="sa-limit-text">
-                        {limitTitle(l.label)} {stateOf(l)}
+                        {limitTitle(l.label)} {windowState(l, lim!.now)}
                       </span>
-                      {resetsText(l.resetsAt, Date.now()) && <span className="sa-limit-reset num">{resetsText(l.resetsAt, Date.now())}</span>}
+                      {reset && <span className="sa-limit-reset num">{reset}</span>}
                     </div>
                   );
                 })}

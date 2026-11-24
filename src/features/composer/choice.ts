@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { DEFAULT_ACCOUNT, STANDARD_SPEED, type Capabilities, type Effort, type ModeInfo, type ModelInfo, type ProviderId, type SpeedInfo } from '@shared/protocol';
+import { DEFAULT_ACCOUNT, STANDARD_SPEED, type Capabilities, type Effort, type ModeInfo, type ModelInfo, type ProviderId, type SessionMeta, type SpeedInfo } from '@shared/protocol';
 import { defaultableSpeeds, isPaidSpeed, modelNameById, modelSpeeds, offeredSpeeds, speedFor, visibleModels } from '@/lib/models';
 import { useLimitsReport } from '@/state/hooks';
 import { homeAccountId, setEffort as setSessionEffort, setMode as setSessionMode, setModel as setSessionModel, setSettings, setSpeed as setSessionSpeed } from '@/state/actions';
 import { useShallow } from 'zustand/react/shallow';
 import { useCapsState } from '@/state/hooks';
-import { useStore } from '@/state/store';
+import { accountLiveCaps, useStore, type Store } from '@/state/store';
+import { pathKey } from '@/features/sidebar/groups';
 import { rememberCaps, seenCaps } from './caps-seen';
 
 // ── the effort last used with each model (per browser), so picking a model brings it back ──
@@ -80,16 +81,16 @@ interface Picked {
   mode?: string;
 }
 
-/** What this agent offers under this account in some folder already asked about (the first found; undefined when none). */
-export function capsFromAnywhere(all: Record<string, Capabilities>, provider: ProviderId, accountId: string | undefined): Capabilities | undefined {
-  const head = `${provider}:`;
-  const extra = accountId && accountId !== DEFAULT_ACCOUNT ? `@${accountId}` : '';
-  for (const key in all) {
-    if (!key.startsWith(head)) continue;
-    // Keys read `provider:folder` or `provider:folder@account` (state/store.ts `capsKey`).
-    if (extra ? key.endsWith(extra) : !/@[\w-]+$/.test(key)) return all[key];
+export { capsFromAnywhere } from '@/state/store';
+
+/** The account session.switchAgent will resume, or the Home choice if the leg can no longer resume. */
+export function switchModelAccount(session: SessionMeta | undefined, provider: ProviderId, state: Pick<Store, 'providers' | 'ui'>): string {
+  const leg = session?.agents?.find((l) => l.provider === provider);
+  if (session && leg && !(provider === 'claude' && leg.cwd && pathKey(leg.cwd) !== pathKey(session.cwd))) {
+    const id = leg.accountId ?? DEFAULT_ACCOUNT;
+    if (id === DEFAULT_ACCOUNT || state.providers[provider]?.accounts?.some((a) => a.id === id)) return id;
   }
-  return undefined;
+  return homeAccountId(provider, state);
 }
 
 /**
@@ -112,7 +113,7 @@ export function useChoice(sessionId: string | null): Choice {
   // agent start: until that answers, the same agent and account's answer from any other folder
   // (the same models, modes and efforts) fills the controls. They never fall back to skeletons
   // under a card that showed them a moment ago on the home screen.
-  const lentCaps = useStore((s) => (ownCaps ? undefined : capsFromAnywhere(s.providerCaps, provider, accountId)));
+  const lentCaps = useStore((s) => ownCaps ? undefined : accountLiveCaps(s.providerCaps, provider, sessionId ? s.sessions[sessionId]?.cwd ?? null : s.ui.homeCwd, accountId));
   const told = ownCaps ?? lentCaps;
   // Before the agent has answered at all (a chat that opens right after start-up, home's first
   // frame): what it said last time (caps-seen.ts). The last line then names the mode, the model

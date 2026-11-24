@@ -178,12 +178,12 @@ export function watchLive(send: (spec: LiveSpec | null, stop: boolean) => void) 
   const sync = (before?: State) => {
     const { sessions, data, fresh, notify, conn } = state;
     if (before && before.sessions === sessions && before.fresh === fresh && before.notify === notify && before.conn === conn && before.listAt === state.listAt) {
-      if (before.data === data || !previous.some(({ id }) => before.data[id]?.roots !== data[id]?.roots)) return;
+      if (before.data === data || !previous.some(({ id }) => before.data[id]?.roots !== data[id]?.roots || before.data[id]?.shape !== data[id]?.shape)) return;
     }
     const enabled = liveEnabled(state);
     const live = liveOf(enabled ? Object.values(sessions) : [], previous, Date.now(), (id) => {
       const d = data[id];
-      return d && !d.cached && !d.next ? turnSteps(d.roots.slice(-400).map((r) => d.items[r])) : undefined;
+      return d && !d.cached && !d.next ? turnSteps(d) : undefined;
     });
     previous = live.chats;
     send(livePayload(state, live), !enabled);

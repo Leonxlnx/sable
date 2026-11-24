@@ -12,13 +12,13 @@ import { refreshStaleCaps, useStore } from '@/state/store';
 import { movedByKeys, pickedByKey } from '@/ui/glide';
 import { Tip } from '@/ui';
 import { aimsAt, AIM_WAIT_MS, type Pt } from './aim';
-import { Chip, type ChipPart } from './Chip';
+import { Chip, type ChipPart, type ChipProps } from './Chip';
 import { remember, rememberedEffort, type Choice } from './choice';
 import { ChipSkeleton, Hits, MENU_PAD, ROW_H, useMenuPlace, useOtherAgentModels, useReleaseGuard } from './Controls';
-import { chordKeys, landLevel, landUltra, stepStop, type Setting } from './effort-track';
+import { altGraph, chordKeys, landLevel, landUltra, stepStop, type Setting } from './effort-track';
 import { Later } from './later';
 import { askLine, confirmPaid, paidConfirmed, takePaidAsk } from './paid-speed';
-import { digitLevel, navigate, panelRows, returnsToTrigger, type Col, type Shape } from './panel-nav';
+import { digitLevel, filterTextKey, navigate, panelRows, returnsToTrigger, triggerKey, type Col, type Shape } from './panel-nav';
 
 /**
  * Model and effort: one phrase on the bar, one panel at the phrase.
@@ -79,6 +79,14 @@ const NO_EFFORTS: Effort[] = [];
 /** The panel's width: its two columns, the gap between them and its padding (composer.css `.mx`, 152 + 4 + 124 + 8). */
 export const PANEL_W = 288;
 const keyOf = (p: ProviderId, id: string) => `${p}\u0001${id}`;
+
+// RM.Trigger composes our handler with its own ArrowDown/Enter/Space handler. Gate that whole
+// handler at the button so modified keys still bubble to their owner with their default intact.
+const PhraseTrigger = forwardRef<HTMLButtonElement, ChipProps>(function PhraseTrigger({ onKeyDown, ...props }, ref) {
+  return <Chip {...props} ref={ref} onKeyDown={(e) => {
+    if (!e.defaultPrevented && !e.nativeEvent.isComposing && e.keyCode !== 229 && triggerKey(e)) onKeyDown?.(e);
+  }} />;
+});
 
 /** The phrase, or a quiet placeholder while nothing is known of the agent yet. */
 export const ModelEffort = memo(
@@ -165,10 +173,14 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
     go(to);
   };
 
-  // How the panel was opened and how it closed: Escape after the keys opened it on the phrase
-  // gives the keyboard back to the phrase; any other way it goes on to the field.
+  // Escape can return to the phrase. A pick hands focus to the composer before its exit animation.
   const openedBy = useRef<'keys' | 'pointer' | 'field'>('pointer');
   const escaped = useRef(false);
+  const close = () => {
+    setOpen(false);
+    if (returnsToTrigger(openedBy.current, escaped.current)) chip.current?.focus({ preventScroll: true });
+    else onClosed();
+  };
 
   const openOn = (on: 'model' | 'level' | 'speed') => {
     if (on === 'speed') setAsk(takePaidAsk(choice.sessionId) ?? null);
@@ -177,7 +189,7 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
     openedBy.current = 'field';
     setOpen(true);
   };
-  const toggle = () => (open ? setOpen(false) : openOn('model'));
+  const toggle = () => (open ? close() : openOn('model'));
   const latest = useRef({ step, openOn, toggle });
   latest.current = { step, openOn, toggle };
   useImperativeHandle(ref, () => ({ step: (d) => latest.current.step(d), open: (w) => latest.current.openOn(w), toggle: () => latest.current.toggle() }), []);
@@ -268,7 +280,6 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
 
   const setOwnerIf = (k: { p: ProviderId; id: string }) => setOwner((o) => (o && o.p === k.p && o.id === k.id ? o : k));
 
-  const close = () => setOpen(false);
   const pickModelRow = (p: ProviderId, m: ModelInfo) => {
     if (p === choice.provider) return choice.pickModel(m.id);
     // Another agent's model switches the chat to that agent, in place (never while a turn runs).
@@ -368,7 +379,12 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
 
   /** The panel's own keys, before Radix's single list (panel-nav.ts). */
   const onKeyCapture = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (e.ctrlKey || e.metaKey || e.altKey || e.nativeEvent.isComposing) return;
+    if (e.defaultPrevented) return;
+    if (altGraph(e) || e.nativeEvent.isComposing || e.keyCode === 229 || (e.target === field.current && filterTextKey(e))) {
+      e.stopPropagation();
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     const pop = content.current;
     const t = e.target as HTMLElement;
     if (!pop) return;
@@ -387,8 +403,7 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
         consume();
         pickModelRow(first.provider, first.m);
         close();
-        // What is typed while the panel leaves goes to the composer, as after a row's pick.
-        pickedByKey();
+        pickedByKey(); // Seal the departing search menu just as Radix seals a picked row.
       }
       return;
     }
@@ -459,7 +474,6 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
   const aria = `Model and effort: ${name}${word ? `, ${word}` : ''}${fast ? `, ${speedInfo?.name ?? 'fast'} speed${speedInfo?.paid ? ', billed as extra usage' : ''}` : ''}`;
 
   const onTriggerKey = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
-    if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
       // Radix opens on ArrowDown: here the arrows step the level, and nothing opens.
       e.preventDefault();
@@ -625,7 +639,7 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
           {place.side !== 'top' && agentRowsView}
         </div>
       </RM.RadioGroup>
-      <RM.RadioGroup ref={scaleCol} className="mx-scale" value={isCurrent && committed ? committed : ''} aria-label={`Effort for ${ownerName}`}>
+      <RM.RadioGroup ref={scaleCol} className="mx-scale" onPointerEnter={() => window.clearTimeout(aimTimer.current)} value={isCurrent && committed ? committed : ''} aria-label={`Effort for ${ownerName}`}>
         {levels.length ? (
           [...levels].reverse().map((e, j) => {
             const i = levels.length - 1 - j;
@@ -650,7 +664,7 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
   );
 
   return (
-    <RM.Root open={open} onOpenChange={setOpen} modal={false}>
+    <RM.Root open={open} onOpenChange={(next) => next ? setOpen(true) : close()} modal={false}>
       <span className="ph-slot" data-chip-slot="">
         <Tip label={tip} keys={chordKeys(isMac)} side="top">
           <RM.Trigger
@@ -662,7 +676,7 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
             onKeyDown={onTriggerKey}
           >
             {/* The right end holds: the phrase ends the same distance from the key whatever it says. */}
-            <Chip
+            <PhraseTrigger
               ref={chip}
               className="tb-chip ph"
               anchor="right"
@@ -703,13 +717,26 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
               setQuery('');
             } else escaped.current = true;
           }}
-          onCloseAutoFocus={(e) => {
-            // Opened by the keys on the phrase and left with Escape: the keyboard stays where it
-            // was, on the phrase (Radix gives the trigger the focus). Any other way on to the field.
-            if (returnsToTrigger(openedBy.current, escaped.current)) return;
+          onPointerDownOutside={(e) => {
             e.preventDefault();
-            onClosed();
+            const pointer = e.detail.originalEvent;
+            const target = pointer.target as Element | null;
+            const hit = target?.closest<HTMLElement>('input, textarea, select, button, a[href], label, [tabindex], [contenteditable]:not([contenteditable="false"])');
+            const control = hit?.tagName === 'LABEL' ? (hit as HTMLLabelElement).control : hit;
+            // Give a clicked field the keyboard now. Its native pointer action still places the caret.
+            control?.focus({ preventScroll: true });
+            if (control && document.activeElement === control) setOpen(false);
+            else {
+              // A click on the background would move focus to body after this handler returns.
+              pointer.preventDefault();
+              close();
+            }
           }}
+          onFocusOutside={(e) => {
+            e.preventDefault();
+            setOpen(false);
+          }}
+          onCloseAutoFocus={(e) => e.preventDefault()}
         >
           <Later>
             {() => (

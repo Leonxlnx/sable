@@ -1,7 +1,6 @@
 import { animate } from 'motion';
 import { AnimatePresence, motion, usePresence } from 'motion/react';
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { hasWork } from '@shared/work-label';
 import { goBack, pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
 import { clearNotification, forgetNotificationLines, haptic, inForeground, isNative, loadPref, notify, onAppState, onBackButton, onNoteAction, onPairLink, setLive, setShortcuts } from '@m/lib/native';
@@ -110,7 +109,7 @@ function watchTurns() {
       else
         void doneText(id).then((text) => {
           const cur = getState().sessions[id];
-          if (!cur || cur.status !== 'idle' || hasWork(cur) || !canNotify()) return;
+          if (!cur || cur.status !== 'idle' || !workEnded(prior, cur) || !canNotify()) return;
           void notify(cur.title, text ?? 'Done', id, 'done');
         });
     }

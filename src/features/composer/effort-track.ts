@@ -63,10 +63,14 @@ export interface KeyLike {
   metaKey: boolean;
   altKey: boolean;
   shiftKey: boolean;
+  getModifierState?(key: string): boolean;
 }
 
+/** Windows also reports AltGr as Ctrl+Alt on layouts without an AltGraph flag. */
+export const altGraph = (e: KeyLike) => !!e.getModifierState?.('AltGraph') || (e.ctrlKey && e.altKey);
+
 /** The effort keys' modifier: Alt alone (Command+Option on a Mac, where Option with a key types). */
-const effortMod = (e: KeyLike, mac: boolean) => !e.shiftKey && (mac ? e.metaKey && e.altKey && !e.ctrlKey : e.altKey && !e.ctrlKey && !e.metaKey);
+const effortMod = (e: KeyLike, mac: boolean) => !altGraph(e) && !e.shiftKey && (mac ? e.metaKey && e.altKey && !e.ctrlKey : e.altKey && !e.ctrlKey && !e.metaKey);
 
 /**
  * The chord that steps the level from the field, with nothing opening and the caret where it
@@ -101,5 +105,5 @@ export const ultraKeys = (mac: boolean) => (mac ? 'mod+alt+u' : 'alt+u');
 /** Ctrl+. (Command+. on a Mac) opens the model and effort panel from anywhere in the composer. */
 export function opensPanel(e: KeyLike, mac: boolean): boolean {
   const mod = mac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
-  return mod && !e.altKey && !e.shiftKey && (e.key === '.' || e.code === 'Period');
+  return mod && !altGraph(e) && !e.altKey && !e.shiftKey && (e.key === '.' || e.code === 'Period');
 }

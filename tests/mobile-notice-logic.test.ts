@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NoticeItem, PermissionRequest, SessionMeta } from '@shared/protocol';
-import { limitAction } from '../mobile/src/lib/chat-rules';
+import { limitAction, limitProvider } from '../mobile/src/lib/chat-rules';
 import { liveOf, livePayload, noteAnswer, noteAsk, workEnded, type NoteAction } from '../mobile/src/lib/notes';
 
 const meta = (id: string, fields: Partial<SessionMeta> = {}) => ({ id, title: id, status: 'idle', ...fields }) as SessionMeta;
@@ -63,13 +63,24 @@ describe('an answer from the shade', () => {
   });
 });
 
+it('looks up both account IDs under the refusal provider after an agent switch', () => {
+  for (const limit of [{ next: 'default' }, { continuedWith: 'default' }]) {
+    expect(limitProvider({ ...limit, provider: 'claude' }, 'codex')).toBe('claude');
+    expect(limitProvider(limit, 'codex')).toBe('codex');
+    expect(limitProvider({ ...limit, provider: 'claude' })).toBe('claude');
+  }
+});
+
 it('builds each limit action from the clicked notice, including the earlier of two refusals', () => {
   const card = (id: string) => ({ type: 'notice', id, limit: { resetsAt: 200 } }) as NoticeItem;
   for (const id of ['older', 'newer']) {
     expect(limitAction('s', card(id), { id: 'other', label: 'Other' }, false, 100)).toEqual({ method: 'session.switchAccount', label: 'Continue with Other', params: { sessionId: 's', accountId: 'other', retry: true, refusalId: id } });
     expect(limitAction('s', card(id), undefined, false, 100)).toEqual({ method: 'spare.atReset', label: 'Continue at reset', params: { sessionId: 's', refusalId: id } });
   }
-  expect(limitAction('s', card('old'), undefined, false, 200)).toBeNull();
+  for (const now of [200, 201]) {
+    expect(limitAction('s', card('old'), undefined, false, now)).toEqual({ method: 'spare.atReset', label: 'Continue now', params: { sessionId: 's', refusalId: 'old' } });
+    expect(limitAction('s', card('old'), undefined, true, now)).toBeNull();
+  }
   expect(limitAction('s', card('old'), undefined, true, 100)).toBeNull();
 });
 

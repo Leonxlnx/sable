@@ -59,9 +59,10 @@ final class PageInsets {
         ViewCompat.setOnApplyWindowInsetsListener(decor, (v, insets) -> {
             if (v.getPaddingLeft() != 0 || v.getPaddingTop() != 0 || v.getPaddingRight() != 0 || v.getPaddingBottom() != 0) v.setPadding(0, 0, 0, 0);
             Insets bars = insets.getInsets(BARS);
-            // The gesture pill's own strip, where a swipe goes home: never under a control.
-            Insets gestures = insets.getInsets(GESTURES);
-            int bottom = Math.max(bars.bottom, gestures.bottom);
+            // On API 24–28 mandatory gestures are emulated with the system-window inset, which
+            // includes the IME. Keep the navigation-bar/cutout edge there and count the IME as lift.
+            // API 29+ reports the mandatory gesture strip separately; keep controls above it too.
+            int bottom = Build.VERSION.SDK_INT >= 29 ? Math.max(bars.bottom, insets.getInsets(GESTURES).bottom) : bars.bottom;
             int ime = insets.isVisible(IME) ? insets.getInsets(IME).bottom : 0;
             st.top = bars.top;
             st.right = bars.right;

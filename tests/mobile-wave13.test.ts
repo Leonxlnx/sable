@@ -122,6 +122,17 @@ describe('the live notification', () => {
     expect(turnSteps([user('u1'), tool('a'), tool('b'), user('u2'), tool('c'), text('t', 'x'), tool('d')])).toBe(2);
     expect(turnSteps([])).toBe(0);
   });
+  it('keeps earlier steps through queued and taken steers until an actual turn boundary', () => {
+    const start = user('prompt');
+    const roots = [start, tool('a'), tool('b')];
+    for (const mark of [{ state: 'queued' }, { state: 'queued', steered: true }, { state: 'sent', steered: true }] as const) {
+      const steer = { ...user('follow-up'), ...mark } as TimelineItem;
+      expect(turnSteps([...roots, steer])).toBe(2);
+      expect(turnSteps([...roots, steer, tool('c')])).toBe(3);
+    }
+    const end = { type: 'turn', id: 'end', ts: 2 } as TimelineItem;
+    expect(turnSteps([...roots, end, tool('next')])).toBe(1);
+  });
 });
 
 describe('the summary of the chats with a notification up', () => {

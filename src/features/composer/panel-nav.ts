@@ -12,6 +12,15 @@
  * Digits pick a level in the scale: 1 is the lowest.
  */
 
+import { altGraph, type KeyLike } from './effort-track';
+
+/** Only these keys go through the trigger's composed (phrase + Radix) handler. */
+export const triggerKey = (e: KeyLike) => !altGraph(e) && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey
+  && ['ArrowUp', 'ArrowDown', 'Enter', ' '].includes(e.key);
+
+/** Native text edits in the search field must bypass the menu's typeahead. */
+export const filterTextKey = (e: KeyLike) => !e.ctrlKey && !e.altKey && !e.metaKey && [...e.key].length === 1;
+
 export type Col = 'models' | 'scale' | 'toggles';
 
 export interface Where {
@@ -69,9 +78,8 @@ export function navigate(at: Where, key: string, shift: boolean, s: Shape): Wher
 }
 
 /**
- * Where the keyboard goes when the panel closes. Opened by the keys on the phrase and left with
- * Escape, it stays where it was: on the phrase. Any other way (a pick, a click outside, opened by
- * a click, by Ctrl+. or a command from the field) it goes on to the field.
+ * Escape returns to a keyboard-opened phrase. A pick goes to the composer. An outside
+ * interaction with its own focus destination is handled directly by the panel.
  */
 export const returnsToTrigger = (openedBy: 'keys' | 'pointer' | 'field', escaped: boolean): boolean => openedBy === 'keys' && escaped;
 

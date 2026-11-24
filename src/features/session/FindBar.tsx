@@ -201,7 +201,7 @@ export function ConversationFind({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.isComposing) return;
+      if (e.defaultPrevented || e.isComposing || e.getModifierState?.('AltGraph')) return;
       const mod = e.ctrlKey || e.metaKey;
       if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'f') {
         if (inOtherSurface(e.target)) return;

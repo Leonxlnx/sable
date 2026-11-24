@@ -53,6 +53,11 @@ describe('the whole plan window of an account', () => {
 });
 
 describe('left across accounts', () => {
+  it('shows zero five-hour usage when both short windows are empty and one week is full', () => {
+    const [pool] = poolTotals([0, 100].map((used) => acct('claude', claude('Pro'), [five(0), week(used)])), NOW);
+    expect(pool.week.used).toBe(50);
+    expect(pool.short?.used).toBe(0);
+  });
   it('one Pro and one Ultra hold 1.1 Ultra', () => {
     const [t] = poolTotals([acct('claude', claude('Ultra', 'max'), [week(0)]), acct('claude', claude('Pro', 'pro'), [week(0)])], NOW);
     expect(t.unit).toBe('Ultra');
@@ -78,8 +83,8 @@ describe('left across accounts', () => {
     expect(t.week.size).toBeCloseTo(4.875);
     expect(t.week.left).toBeCloseTo(2.75);
     expect(t.week.used).toBeCloseTo(43.6, 1);
-    // The used-up week makes its 5-hour window count as used up too.
-    expect(t.short!.left).toBeCloseTo(0.8 + 1 + 0 + 0.625 * (0.9 + 0.5 + 1));
+    // The third Ultra reports 40% five-hour usage even when its week is full.
+    expect(t.short!.left).toBeCloseTo(0.8 + 1 + 0.6 + 0.625 * (0.9 + 0.5 + 1));
     expect(units(t.week.left)).toBe('2.8');
     expect(units(t.week.size)).toBe('4.9');
     // The sidebar's one figure is the used share the Usage page draws: usage is always said as used.

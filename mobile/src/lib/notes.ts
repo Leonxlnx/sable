@@ -1,5 +1,6 @@
 import type { PermissionRequest, QuestionRequest, SessionMeta, TimelineItem } from '@shared/protocol';
 import { hasWork, workLabel } from '@shared/work-label';
+import { syntheticOf } from '@shared/synthetic';
 import { permissionKeys, scopeOf } from './asks';
 
 /**
@@ -168,17 +169,29 @@ export interface Live {
   waiting: number;
 }
 
-/** Steps of the newest turn in a conversation's roots: tool steps after the last message the person sent. */
-export function turnSteps(roots: readonly (TimelineItem | undefined)[]): number {
+type StepPage = { roots: readonly string[]; items: Readonly<Record<string, TimelineItem>>; cursor?: string };
+
+/** Scan back to the turn's start or the previous footer. A steer or queue entry belongs to this turn. */
+export function turnSteps(roots: readonly (TimelineItem | undefined)[]): number;
+export function turnSteps(page: StepPage): number | undefined;
+export function turnSteps(data: readonly (TimelineItem | undefined)[] | StepPage): number | undefined {
   let n = 0;
-  for (let i = roots.length - 1; i >= 0; i--) {
-    const it = roots[i];
+  const length = 'roots' in data ? data.roots.length : data.length;
+  for (let i = length - 1; i >= 0; i--) {
+    const it = 'roots' in data ? data.items[data.roots[i]] : data[i];
     if (!it) continue;
-    if (it.type === 'user') break;
+    if (it.type === 'turn') return n;
+    if (it.type === 'user' && it.state !== 'queued' && !it.steered) {
+      const syn = syntheticOf(it);
+      if (!syn || syn.role === 'command' || it.until) return n;
+    }
     if (it.type === 'tool') n++;
   }
-  return n;
+  return 'roots' in data && data.cursor ? undefined : n;
 }
+
+// The bridge reports idle first, then patches the loop to checking, paused or cleared.
+const betweenLoopTurns = (s: SessionMeta) => s.status === 'idle' && s.until?.phase === 'working';
 
 /**
  * The live state from the chats' list: every chat at work (its own turn or its sub-agents and
@@ -197,9 +210,10 @@ export function liveOf(
     if (s.archived) continue;
     if (s.status === 'awaiting') waiting++;
     const own = s.status === 'running' || s.status === 'starting';
-    if (!own && !hasWork(s)) continue;
+    const between = seen.has(s.id) && betweenLoopTurns(s);
+    if (!own && !hasWork(s) && !between) continue;
     const work = workLabel(s);
-    const line = own ? (s.activity?.trim() ? cutClean(plainLine(s.activity), 80) : s.status === 'starting' ? 'Starting' : 'Working') : (work ?? 'Working');
+    const line = own ? (s.activity?.trim() ? cutClean(plainLine(s.activity), 80) : s.status === 'starting' ? 'Starting' : 'Working') : (work ?? 'Between turns');
     const n = own ? steps(s.id) : undefined;
     chats.push({ id: s.id, title: s.title?.trim() || 'Chat', line, since: seen.get(s.id) ?? now, ...(n ? { steps: n } : {}) });
   }
@@ -248,6 +262,6 @@ export function livePayload(settings: LiveSettings, live: Live): LiveSpec | null
 
 /** Done only when the turn and the work it left running have both ended. */
 export function workEnded(previous: SessionMeta, current: SessionMeta): boolean {
-  return (previous.status === 'running' || previous.status === 'starting' || previous.status === 'awaiting' || hasWork(previous))
-    && (current.status === 'idle' || current.status === 'error') && !hasWork(current);
+  return (previous.status === 'running' || previous.status === 'starting' || previous.status === 'awaiting' || hasWork(previous) || betweenLoopTurns(previous))
+    && (current.status === 'idle' || current.status === 'error') && !hasWork(current) && !betweenLoopTurns(current);
 }

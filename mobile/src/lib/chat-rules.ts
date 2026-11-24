@@ -1,6 +1,11 @@
-import type { NoticeItem, SessionMeta, TimelineItem } from '@shared/protocol';
+import type { NoticeItem, ProviderId, SessionMeta, TimelineItem } from '@shared/protocol';
 import { syntheticOf } from '@shared/synthetic';
 import { hasWork } from '@shared/work-label';
+
+/** The account IDs on a refusal belong to the agent that issued it. */
+export function limitProvider(limit: NoticeItem['limit'], sessionProvider?: ProviderId) {
+  return limit?.provider ?? sessionProvider;
+}
 
 /** The action offered by this particular limit card. The desktop rechecks it when the call arrives. */
 export function limitAction(sessionId: string, notice: NoticeItem, next: { id: string; label: string } | undefined, waiting: boolean, now: number) {
@@ -8,7 +13,7 @@ export function limitAction(sessionId: string, notice: NoticeItem, next: { id: s
   if (!limit || limit.continuedWith || limit.moving) return null;
   const params = { sessionId, refusalId: notice.id };
   if (next) return { label: `Continue with ${next.label}`, method: 'session.switchAccount', params: { ...params, retry: true, accountId: next.id } } as const;
-  if (!waiting && limit.resetsAt && limit.resetsAt > now) return { label: 'Continue at reset', method: 'spare.atReset', params } as const;
+  if (!waiting && limit.resetsAt) return { label: limit.resetsAt > now ? 'Continue at reset' : 'Continue now', method: 'spare.atReset', params } as const;
   return null;
 }
 
@@ -63,11 +68,11 @@ export function showKind(it: TimelineItem | undefined): ShowKind | null {
 
 /**
  * The chat works now: its own turn runs, or its turn has ended while sub-agents or background
- * commands it started still work (`SessionMeta.background`, `commands`; shared/work-label.ts, as the
+ * commands it started still work or an /until check runs (shared/work-label.ts, as the
  * row's tone reads it). One predicate for home's row, its count of chats at work and the moment a
  * chat is done.
  */
-export const worksNow = (s: Pick<SessionMeta, 'status' | 'background' | 'commands'>): boolean =>
+export const worksNow = (s: Pick<SessionMeta, 'status' | 'background' | 'commands' | 'until'>): boolean =>
   s.status === 'running' || s.status === 'starting' || (s.status !== 'awaiting' && hasWork(s));
 
 /** The chat's turn can be stopped (`session.interrupt`): it runs, starts, or waits on a prompt. */

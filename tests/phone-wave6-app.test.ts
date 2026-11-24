@@ -115,6 +115,48 @@ describe('phone session updates', () => {
       stop();
     }
   });
+
+  it('counts a long live turn through a waiting steer and observes an in-place turn boundary', async () => {
+    const s = await load();
+    const before = s.getState();
+    const row = (id: string, type: string, fields = {}) => ({ id, type, ts: 1, ...fields });
+    const items = [row('u', 'user', { text: 'go' }), ...Array.from({ length: 405 }, (_, i) => row(String(i), 'tool')),
+      row('q', 'user', { text: 'more', state: 'queued', steered: true })];
+    const data = { items: Object.fromEntries(items.map((it) => [it.id, it])), roots: items.map((it) => it.id), shape: 'U' + 'w'.repeat(405) + 's' };
+    s.setState({ conn: 'open', fresh: true, listAt: 1, notify: true, sessions: { a: { ...meta('a'), status: 'running' } }, data: { a: data } });
+    const send = vi.fn();
+    const stop = s.watchLive(send);
+    try {
+      expect(send.mock.lastCall?.[0]?.sub).toBe('405 steps');
+      s.applyEventSoon({ type: 'item.patch', sessionId: 'a', id: 'q', patch: { state: 'sent', steered: false } });
+      expect(send.mock.lastCall?.[0]?.sub).toBeUndefined();
+    } finally {
+      stop();
+      s.setState(before);
+    }
+  });
+
+  it('keeps the ongoing notification across the separate idle and checking patches', async () => {
+    const s = await load();
+    const before = s.getState();
+    s.setState({ conn: 'open', fresh: true, listAt: 1, notify: true,
+      sessions: { a: { ...meta('a'), status: 'running', until: { phase: 'working' } } } });
+    const send = vi.fn();
+    const stop = s.watchLive(send);
+    const since = send.mock.lastCall?.[0]?.since;
+    const patch = (fields: object) => s.applyEventSoon({ type: 'session.updated', id: 'a', patch: fields });
+    try {
+      patch({ status: 'idle' });
+      expect(send.mock.lastCall?.[0]).toMatchObject({ chats: 1, since });
+      patch({ until: { phase: 'checking' } });
+      expect(send.mock.lastCall?.[0]).toMatchObject({ text: 'Running the check', since });
+      patch({ until: null });
+      expect(send.mock.lastCall).toEqual([null, false]);
+    } finally {
+      stop();
+      s.setState(before);
+    }
+  });
 });
 
 it('keeps Open on a closed socket or refused answer and clears only the old post when the desktop answered first', async () => {

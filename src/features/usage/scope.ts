@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { DEFAULT_ACCOUNT, type ProviderId, type RateLimit } from '@shared/protocol';
 import { windowForModel } from '@shared/limit-windows';
 import { modelNameById } from '@/lib/models';
+import { useNow } from '@/lib/useNow';
 import type { LimitLevel } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { resetsText, windowState } from './words';
@@ -68,7 +69,8 @@ export function limitLine(l: Pick<RateLimit, 'id' | 'label' | 'percent' | 'reset
 const NO_LIMITS: RateLimit[] = [];
 
 /** One session's account and model with the limits that matter to it. Re-renders only when they change. */
-export function useSessionLimits(sessionId: string | undefined): (ModelLimits & { provider?: ProviderId; accountId: string; model?: string; modelId?: string }) | undefined {
+export function useSessionLimits(sessionId: string | undefined): (ModelLimits & { provider?: ProviderId; accountId: string; model?: string; modelId?: string; now: number }) | undefined {
+  const now = useNow();
   const provider = useStore((s) => (sessionId ? s.sessions[sessionId]?.provider : undefined));
   const accountId = useStore((s) => (sessionId ? s.sessions[sessionId]?.accountId : undefined)) ?? DEFAULT_ACCOUNT;
   const modelId = useStore((s) => (sessionId ? s.sessions[sessionId]?.model : undefined));
@@ -82,6 +84,6 @@ export function useSessionLimits(sessionId: string | undefined): (ModelLimits & 
   return useMemo(() => {
     if (!provider) return undefined;
     const name = modelNameById(modelId, models);
-    return { ...modelLimits(limits, { id: modelId, name }), provider, accountId, model: name, modelId };
-  }, [provider, accountId, modelId, models, limits]);
+    return { ...modelLimits(limits, { id: modelId, name }, now), provider, accountId, model: name, modelId, now };
+  }, [provider, accountId, modelId, models, limits, now]);
 }
