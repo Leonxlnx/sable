@@ -16,7 +16,7 @@ import { cutItems, isLight, LIGHT, resultForWindow } from '../server/core/trim';
 import { DemoProvider } from '../server/providers/demo';
 import { namedInTurn } from '../server/services/capture';
 import { registerExport } from '../server/services/export';
-import { phoneDetail, registerPhone } from '../server/services/phone';
+import { phoneDetail, phoneItem, registerPhone } from '../server/services/phone';
 import { beside, pairSecure } from './phone-wire';
 
 const workerFault = vi.hoisted(() => ({ enabled: false }));
@@ -48,15 +48,16 @@ function fixture(padding = 0) {
   const meta: SessionMeta = { id: 'src', title: 'Long chat', provider: 'demo', model: 'm', status: 'idle',
     cwd: beside(home), titleSource: 'user', mode: 'default', createdAt: 1, updatedAt: 2, usage: { inputTokens: 0, outputTokens: 0, turns: 0 } };
   const picture = 'data:image/png;base64,' + 'A'.repeat(8000);
-  const output = 'before\n'.repeat(700) + 'http://localhost:8234/preview\n' + 'after ✓\n'.repeat(700);
   const items: TimelineItem[] = [];
   for (let n = 0; n < 6; n++) {
-    items.push({ type: 'user', id: 'u' + n, ts: n, text: 'Part ' + n });
+    const output = 'before\n'.repeat(700) + (n === 0 ? 'http://localhost:8234/preview\n' : '') + 'after ✓\n'.repeat(700);
+    items.push({ type: 'user', id: 'u' + n, ts: n, text: 'Part ' + n, ...(n === 0 ? { attachments: [{ id: 'picture', name: 'fixture.png', kind: 'image' as const, dataUrl: picture }] } : {}) });
     items.push({ type: 'tool', id: 's' + n, ts: n, kind: 'bash', name: 'Bash', title: 'Run ✓', status: 'done',
-      detail: { command: 'test' }, result: { images: [picture], text: output, stderr: output, exitCode: 0,
+      ...(n === 0 ? { input: { run_in_background: true } } : {}),
+      detail: { command: 'test ' + 'arg '.repeat(150) + '\nsecond command' }, result: { images: [picture], text: output, stderr: output, exitCode: 0,
         file: { path: 'f', content: output }, files: Array.from({ length: 214 }, (_, i) => '/dir/file' + i) }, output });
     if (n === 0 && padding) items.push({ type: 'tool', id: 'padding', ts: 0, kind: 'read', name: 'Read', title: 'Output', status: 'done', detail: {}, result: { text: 'a'.repeat(padding) } });
-    items.push({ type: 'text', id: 'a' + n, ts: n, text: 'Done ' + n, streaming: false });
+    items.push(n === 1 ? { type: 'thinking', id: 'a1', ts: n, text: 'Consider this. '.repeat(400), streaming: false } : { type: 'text', id: 'a' + n, ts: n, text: 'Done ' + n, streaming: false });
     items.push({ type: 'turn', id: 't' + n, ts: n, durationMs: 1234 });
   }
   writeFileSync(file('src'), '{"gen":42,"items":[\n' + items.map(i => JSON.stringify(i)).join(',\n') + '\n],"todos":[]}');
@@ -105,13 +106,19 @@ it('sends identical window snapshots and serves the whole step over session.item
     expect(rt.get('s5')).toEqual(items.find(i => i.id === 's5'));
     expect(snap).toEqual(expected);
     expect(snap.items).toEqual(cutItems(items));
-    expect((await call<{ item: ToolItem }>('session.item', { sessionId: 'src', itemId: 's0' })).item).toEqual(items[1]);
+    for (const itemId of ['s0', 'u0', 'a1']) {
+      expect(isLight(rt.get(itemId)!)).toBe(true);
+      expect(snap.items.find(i => i.id === itemId)).toHaveProperty('more', true);
+      expect((await call<{ item: TimelineItem }>('session.item', { sessionId: 'src', itemId })).item).toEqual(items.find(i => i.id === itemId));
+    }
     expect(isLight(rt.get('s0')!)).toBe(true);
     const old = rt.get<ToolItem>('s1')!;
     rt.patch<ToolItem>('s1', { result: { ...old.result, exitCode: 3 } });
     expect(rt.get('s1')).toEqual({ ...items[5], result: { ...(items[5] as ToolItem).result, exitCode: 3 } });
     rt.delta('s2', 'output', 'late');
     expect(rt.get<ToolItem>('s2')!.output).toBe((items[9] as ToolItem).output + 'late');
+    rt.delta('a1', 'text', 'late');
+    expect(rt.get('a1')).toEqual({ ...items[6], text: 'Consider this. '.repeat(400) + 'late' });
     // After a rewind the same step needs its recent preview and is live in the runtime again.
     rt.reset(rt.items.slice(0, 4));
     expect(rt.get('s0')).toEqual(items[1]);
@@ -138,7 +145,7 @@ it('shares old-turn eligibility and uses the matching tail to find recent steps'
   const files = new SessionFiles(file);
   const loaded = await files.loadAsync('src');
   expect(loaded.items.slice(0, alwaysWhole.length)).toEqual(alwaysWhole);
-  expect(loaded.items.filter(isLight).map(i => i.id)).toEqual(['s0', 's1', 's2']);
+  expect(loaded.items.filter(isLight).map(i => i.id)).toEqual(['u0', 's0', 's1', 'a1', 's2']);
   // A final tail truncates the base after the first turn. s0 is now recent.
   writeFileSync(file('src.tail'), JSON.stringify({ baseGen: 42, from: alwaysWhole.length + 4, items: [] }));
   expect((await files.loadAsync('src')).items).toEqual(baseItems.slice(0, alwaysWhole.length + 4));
@@ -198,6 +205,48 @@ it('rewrites identical bytes on a clean save, a late patch, a folded tail and a 
   expect(disk.items[2]).toEqual(items[2]);
 });
 
+it('sends the original attachment when the bridge retries an indexed message', async () => {
+  const { home, items } = fixture();
+  const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
+  try {
+    await app.call('session.snapshot', { sessionId: 'src' });
+    const rt = app.runtime('src');
+    const item = rt.get('u0')!;
+    if (item.type !== 'user' || !isLight(item)) throw new Error('Expected indexed message');
+    const handle = rt.handle = await app.provider('demo').open(rt, { loadTranscript: false });
+    const send = vi.spyOn(handle, 'send').mockResolvedValue();
+    await app['sendWithHandover'](rt, handle, item);
+    expect(send.mock.calls[0][0]).toEqual(items[0]);
+    expect(isLight(rt.get('u0')!)).toBe(true);
+  } finally { await app.dispose(); }
+});
+
+it('preserves hidden image data and edit hunks when a late patch reorders and updates their rows', async () => {
+  const { home, file, items, picture } = fixture();
+  const user = items[0];
+  if (user.type !== 'user') throw new Error('Missing message');
+  user.attachments = ['one', 'two'].map(id => ({ id, name: id, kind: 'image', dataUrl: picture + id }));
+  const edit = items[1] as ToolItem;
+  const diff = ['a', 'a', 'b'].map((path, i) => ({ path, status: 'modified' as const, additions: 1, deletions: 0,
+    hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+' + path + i] }] }));
+  edit.kind = 'edit';
+  edit.result = { diff };
+  writeFileSync(file('src'), '{"gen":42,"items":[\n' + items.map(i => JSON.stringify(i)).join(',\n') + '\n],"todos":[]}');
+  const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
+  try {
+    await app.call('session.snapshot', { sessionId: 'src' });
+    const rt = app.sessions.get('src')!;
+    const message = rt.get<typeof user>('u0')!;
+    const step = rt.get<ToolItem>('s0')!;
+    expect(isLight(message) && isLight(step)).toBe(true);
+    rt.patch<typeof user>('u0', { attachments: message.attachments!.slice().reverse().map(a => ({ ...a, name: a.name + '.png' })) });
+    const order = [2, 0, 1];
+    rt.patch<ToolItem>('s0', { result: { diff: order.map(i => ({ ...step.result!.diff![i], additions: 2 })) } });
+    expect(rt.get<typeof user>('u0')!.attachments).toEqual(user.attachments.slice().reverse().map(a => ({ ...a, name: a.name + '.png' })));
+    expect(rt.get<ToolItem>('s0')!.result?.diff).toEqual(order.map(i => ({ ...diff[i], additions: 2 })));
+  } finally { await app.dispose(); }
+});
+
 it('keeps markdown, exported bytes, phone pictures, phone detail and capture URLs identical', async () => {
   const { home, items, picture } = fixture();
   const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
@@ -206,12 +255,13 @@ it('keeps markdown, exported bytes, phone pictures, phone detail and capture URL
   registerPhone(app, { host: '127.0.0.1', port: 0 });
   try {
     const snap = await app.call('session.snapshot', { sessionId: 'src' });
+    expect(snap.items.map(i => phoneItem(i))).toEqual(items.map(i => phoneItem(i)));
     const markdown = chatMarkdown(snap.session, items);
     const fetch = vi.spyOn(app.store, 'wholeItem');
     expect((await app.call('session.markdown', { sessionId: 'src' })).markdown).toBe(markdown);
     await app.call('session.export', { sessionId: 'src' });
     expect(readFileSync(target, 'utf8')).toBe(markdown);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fetch.mock.calls.map(([, item]) => item.id)).toEqual(['u0', 's0', 's1', 'a1', 's2', 'u0', 's0', 's1', 'a1', 's2']);
     const turn = snap.items.slice(0, 4);
     expect(namedInTurn(turn, 'u0', i => app.store.wholeItem('src', i))).toEqual(['http://localhost:8234/preview']);
     const status = await app.call('phone.setEnabled', { on: true });
@@ -221,6 +271,7 @@ it('keeps markdown, exported bytes, phone pictures, phone detail and capture URL
       expect(page.result).toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ id: 's0', pics: 1 })]) });
       const full = await c.call('phone.item', { sessionId: 'src', itemId: 's0' });
       expect(full.result).toEqual(phoneDetail(items, 's0'));
+      for (const itemId of ['u0', 'a1']) expect((await c.call('phone.item', { sessionId: 'src', itemId })).result).toEqual(phoneDetail(items, itemId));
       expect(await c.call('phone.image', { sessionId: 'src', itemId: 's0', index: 0 })).toMatchObject({ result: { data: picture } });
       expect(JSON.stringify(c.frames)).not.toContain(marker);
     } finally { c.ws.close(); }
@@ -239,6 +290,29 @@ it('forks a whole independent base before the source is deleted', async () => {
     expect((await app.call('session.item', { sessionId: id, itemId: 's0' })).item).toEqual(items[1]);
     await app.store.flush();
     expect(readFileSync(file(id), 'utf8')).not.toContain(marker);
+  } finally { await app.dispose(); }
+});
+
+it('reads old edit hunks for a phone diff and the turn check brief', async () => {
+  const { home, file, items } = fixture();
+  const edit: ToolItem = { type: 'tool', kind: 'edit', id: 'edit', ts: 1, name: 'Edit', title: 'Edit a.ts', status: 'done',
+    detail: { path: 'a.ts' }, result: { diff: [{ path: 'a.ts', status: 'modified', additions: 1, deletions: 1,
+      hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-previous', '+new line for review'] }] }] } };
+  items.splice(2, 0, edit);
+  writeFileSync(file('src'), '{"gen":42,"items":[\n' + items.map(i => JSON.stringify(i)).join(',\n') + '\n],"todos":[]}');
+  const app = new App({ home, providers: [ctx => new DemoProvider(ctx, { speed: 0 })], quiet: true });
+  registerPhone(app, { host: '127.0.0.1', port: 0 });
+  try {
+    const status = await app.call('phone.setEnabled', { on: true });
+    const { c } = await pairSecure(app, status.port);
+    try {
+      const data = { sessionId: 'src', path: 'a.ts', items: [edit.id] };
+      expect((await c.call('phone.diff', data)).result).toMatchObject({ diff: { hunks: edit.result!.diff![0].hunks } });
+    } finally { c.ws.close(); }
+    const rt = app.runtime('src');
+    expect(isLight(rt.get(edit.id)!)).toBe(true);
+    const check = await app.call('turn.check', { sessionId: 'src', turnId: 'u0' });
+    expect(rt.get<ToolItem>(check.itemId!)?.detail.prompt).toContain('+new line for review');
   } finally { await app.dispose(); }
 });
 

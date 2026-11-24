@@ -15,7 +15,7 @@
  * The adapter is driven with fake SDK messages (no real agent turns): a stand-in process that records
  * what is pushed, or (where its own start and reading loop matter) a fake SDK `query`.
  */
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -23,6 +23,8 @@ import { DEFAULT_SETTINGS, STEER_FIRST_BLOCK, type NoticeItem, type SessionMeta,
 import { HANDOVER_HEAD_ACCOUNT, HANDOVER_JOIN, HANDOVER_TAIL, lostTasksNote, stripWrappers } from '@shared/synthetic';
 import { App } from '../server/app';
 import { SessionRuntime } from '../server/core/runtime';
+import { READ } from '../server/core/session-file';
+import { isLight, resultForWindow } from '../server/core/trim';
 import { ClaudeProvider } from '../server/providers/claude';
 import { DemoProvider } from '../server/providers/demo';
 import { appPictures, ownReplays, plainWords } from '../server/providers/claude-tools';
@@ -153,6 +155,39 @@ async function claude(opts: { live?: boolean; meta?: Partial<SessionMeta>; runti
   return { p, rt, session, pushed, proc, message, send, replay, text, state, q: () => session.q as object | undefined };
 }
 
+it('uses the original input to map a late Write result on a restored row', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-late-input-'));
+  cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+  const meta: SessionMeta = { id: 's', provider: 'demo', cwd: home, title: 'Late result', titleSource: 'user',
+    model: 'm', mode: 'default', status: 'idle', createdAt: 1, updatedAt: 1, usage: { inputTokens: 0, outputTokens: 0, turns: 0 } };
+  const input = { file_path: 'record.txt', content: 'the original Write input' };
+  const write: ToolItem = { id: 'write', type: 'tool', ts: 1, status: 'done', kind: 'write', name: 'Write', title: 'Write', detail: {}, input };
+  const items: TimelineItem[] = [write, ...Array.from({ length: 4 }, (_, ts) => ({ type: 'turn' as const, id: 't' + ts, ts, durationMs: 1 }))];
+  mkdirSync(path.join(home, 'sessions'));
+  writeFileSync(path.join(home, 'sessions', 's.json'), '{"gen":1,"items":[\n' + items.map(i => JSON.stringify(i)).join(',\n') + '\n],"todos":[]}');
+  writeFileSync(path.join(home, 'state.json'), JSON.stringify({ sessions: [meta], projects: [], accounts: [] }));
+  const threshold = READ.inWorkerAbove;
+  READ.inWorkerAbove = 1;
+  cleanups.push(() => { READ.inWorkerAbove = threshold; });
+  const app = new App({ home, quiet: true, providers: [ctx => new DemoProvider(ctx)] });
+  cleanups.push(() => app.dispose());
+  const snap = await app.call('session.snapshot', { sessionId: meta.id });
+  const rt = app.runtime(meta.id);
+  const row = rt.get<ToolItem>(write.id)!;
+  expect(isLight(row)).toBe(true);
+  const reads = vi.spyOn(app.store, 'wholeItem');
+  expect(JSON.stringify(resultForWindow(snap))).not.toContain(input.content);
+  expect(reads).not.toHaveBeenCalled();
+  expect(row.input).toEqual(input);
+  expect(isLight(row)).toBe(true);
+  const h = await claude({ runtime: rt });
+  await h.message({ type: 'user', parent_tool_use_id: 'agent', message: { content: [{ type: 'tool_result', tool_use_id: write.id, content: 'ok' }] } });
+  expect(row.result?.diff?.[0]).toMatchObject({ path: input.file_path, additions: 1, hunks: [{ lines: ['+' + input.content] }] });
+  expect(row.input).toEqual(input);
+  expect(isLight(row)).toBe(false);
+  expect(row).not.toHaveProperty('inputText');
+});
+
 // ───────────────────────────── D-own: a message Sable sent is Sable's ─────────────────────────────
 
 describe("whose message it is (S3)", () => {
@@ -193,6 +228,33 @@ describe("whose message it is (S3)", () => {
     expect(lines[1].costUsd).toBeCloseTo(3.94);
     expect(h.rt.meta.usage.costUsd).toBeCloseTo(8.24);
     expect(h.rt.meta.usage.cliCost).toEqual({ session: 'cc1', total: 208.24 });
+  });
+
+  it("a resumed process's first result that books only a cost, with the person's message still on its way: no line, the turn stays open", async () => {
+    const h = await claude({ live: true, meta: { providerSessionId: 'cc1', usage: { inputTokens: 0, outputTokens: 0, turns: 0, cliCost: { session: 'cc1', total: 200 } } } });
+    const a = await h.send('run the tests');
+    await h.replay(a.uuid, 'run the tests');
+    await h.text('All green.');
+    await h.message(result([a.uuid], { total_cost_usd: 204.3, usage: { input_tokens: 900, output_tokens: 40 } }));
+    h.proc().end();
+    await tick(10);
+    // Sable was restarted; the person writes; a new process resumes the conversation.
+    const b = await h.send('continue now');
+    expect(sdk.procs).toHaveLength(2);
+    // Its first word names nothing and has no tokens, but its total has grown by what ran unseen
+    // (sub-agents' last requests): as built this stood as a bare "$0.10" under the message, the turn closed.
+    await h.message(result(undefined, { total_cost_usd: 204.4 }));
+    expect(h.rt.turnActive).toBe(true);
+    expect(turns(h.rt)).toHaveLength(1);
+    expect(h.rt.items.at(-1)).toMatchObject({ id: b.item.id, type: 'user' });
+    // The chat's own total has it all the same.
+    expect(h.rt.meta.usage.costUsd).toBeCloseTo(4.4);
+    await h.replay(b.uuid, 'continue now');
+    await h.text('On it.');
+    await h.message(result([b.uuid], { total_cost_usd: 205, usage: { input_tokens: 1000, output_tokens: 20 } }));
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.rt.items.map((i) => i.type)).toEqual(['user', 'text', 'turn', 'user', 'text', 'turn']);
+    expect(turns(h.rt)[1].costUsd).toBeCloseTo(0.6);
   });
 
   it('a result naming the rewritten UUID binds when the matching replay arrives', async () => {

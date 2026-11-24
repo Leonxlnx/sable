@@ -805,6 +805,8 @@ interface BaseItem {
 
 export interface UserItem extends BaseItem {
   type: 'user';
+  /** Attachment data is available through session.item. */
+  more?: boolean;
   text: string;
   attachments?: Attachment[];
   /**
@@ -830,6 +832,8 @@ export interface TextItem extends BaseItem {
 
 export interface ThinkingItem extends BaseItem {
   type: 'thinking';
+  /** The full reasoning text is available through session.item. */
+  more?: boolean;
   text: string;
   streaming: boolean;
   endedAt?: number;

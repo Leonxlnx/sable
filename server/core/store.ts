@@ -5,7 +5,7 @@ import path from 'node:path';
 import { isBackdropImageId, migrateBackdrop, migrateQuietDefault, normalizeBackdrop } from '../../shared/backdrop';
 import { isLight, LIGHT } from './trim';
 import { SessionFiles, type SessionData, type SessionSave } from './session-file';
-import { DEFAULT_SETTINGS, type AppSettings, type FolderGroup, type Project, type ProviderId, type QueuedMessage, type SessionMeta, type TimelineItem, type Todo } from '../../shared/protocol';
+import { DEFAULT_SETTINGS, type AppSettings, type FolderGroup, type Project, type ProviderId, type QueuedMessage, type SessionMeta, type TimelineItem, type Todo, type ToolItem } from '../../shared/protocol';
 
 /** An account in the registry. The built-in `default` account of each provider is stored too (for its label). */
 export interface StoredAccount {
@@ -199,10 +199,31 @@ export class Store {
     return this.sessionFiles.wholeItem(id, item);
   }
 
+  /** Providers read tool.input while interpreting a late result, before they emit a patch.
+   * Only an explicit property read does I/O. Row spreads, JSON and the frozen writer view
+   * omit this accessor. A provider replacing the input gets an ordinary writable field. */
+  bindProviderInputs(id: string, items: TimelineItem[]) {
+    const store = this;
+    const input: PropertyDescriptor = {
+      configurable: true,
+      get(this: ToolItem) { return (store.wholeItem(id, this) as ToolItem).input; },
+      set(this: ToolItem, value: unknown) {
+        Object.defineProperty(this, 'input', { value, enumerable: true, writable: true, configurable: true });
+      },
+    };
+    for (const item of items) {
+      if (isLight(item) && item[LIGHT].input && !Object.hasOwn(item, 'input')) Object.defineProperty(item, 'input', input);
+    }
+  }
+
   /** Keep runtime references valid when a rewind or a late event makes an old step live again. */
   promote(id: string, item: TimelineItem) {
     if (isLight(item)) {
       const whole = this.wholeItem(id, item);
+      if (item.type === 'tool') {
+        delete item.input;
+        delete item.inputText;
+      }
       Reflect.deleteProperty(item, LIGHT);
       delete item.more;
       Object.assign(item, whole);

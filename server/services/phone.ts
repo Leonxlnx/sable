@@ -49,7 +49,7 @@ import type { App } from '../app';
 import { fileLine, saveLines, scopeLines } from '../core/permission-scope';
 import { cap, isLight, LIGHT, isSnapshot, lines, sessionPatchForJson } from '../core/trim';
 import { VERSION } from '../version';
-import { PhoneChangesReader, stepIds } from './phone-changes';
+import { PhoneChangesReader, relTo, stepIds } from './phone-changes';
 import { phoneRefusal } from './custom';
 import { blockDigests, FILE_CHUNK, PhoneFiles, RetryLater } from './phone-files';
 import { FRAME_MAX, grantFor, openGrant, phoneAttachments, readHello, type FileGrant } from './phone-guard';
@@ -223,7 +223,7 @@ export function widgetPics(input: unknown): string[] {
 
 /** How many pictures a phone may ask for: a result's (a screenshot), then a widget's own. */
 function picCount(it: Partial<ToolItem>, kind: string | undefined = it.kind): number {
-  const n = (it.result?.images?.length ?? (isLight(it) ? it[LIGHT] : 0)) + (kind === 'widget' ? widgetPics(it.input).length : 0);
+  const n = (it.result?.images?.length ?? (isLight(it) ? it[LIGHT].pictures : 0)) + (kind === 'widget' ? widgetPics(it.input).length : 0);
   return Math.min(n, MAX_PICS);
 }
 
@@ -305,19 +305,27 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
   const until = (it.type === 'user' || it.type === 'notice') && it.until?.check?.output ? { until: { ...it.until, check: { ...it.until.check, output: cap(it.until.check.output, full ? FULL.field : 3000) } } } : {};
   switch (it.type) {
     case 'user': {
-      const { attachments, ...rest } = it;
+      const { attachments, more: _more, ...rest } = it;
+      Reflect.deleteProperty(rest, LIGHT);
       return { ...rest, ...textCap(it.text, full ? FULL.text : it.until ? LIMITS.step : LIMITS.answer), ...(attachments ? { attachments: trimAttachments(attachments) } : {}), ...until };
     }
     case 'text':
       return { ...it, ...textCap(it.text, full ? FULL.text : opts.role === 'step' ? LIMITS.step : LIMITS.answer) };
-    case 'thinking':
-      return { ...it, ...textCap(it.text, full ? FULL.thinking : LIMITS.thinking) };
+    case 'thinking': {
+      const { more, ...rest } = it;
+      Reflect.deleteProperty(rest, LIGHT);
+      return { ...rest, ...textCap(it.text, full ? FULL.thinking : LIMITS.thinking), ...(more ? { cut: true } : {}) };
+    }
     case 'notice':
       return { ...it, text: cap(it.text, full ? FULL.field : LIMITS.notice), ...(it.detail ? { detail: cap(it.detail, full ? FULL.field : LIMITS.notice) } : {}), ...until };
     case 'turn':
       return it.error ? { ...it, error: cap(it.error, LIMITS.notice) } : it;
     case 'tool': {
       const n = full ? FULL.field : LIMITS.field;
+      const detail = trimDetail(it.detail, n, full);
+      // The desktop infers a background job from legacy shell input. A phone row
+      // historically carries this flag only when the provider set it in detail.
+      if (isLight(it) && it[LIGHT].legacyBackground) delete detail.background;
       const out: PhoneItem = {
         id: it.id,
         ts: it.ts,
@@ -327,7 +335,7 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
         kind: it.kind,
         title: cap(it.title, 300),
         status: it.status,
-        detail: trimDetail(it.detail, n, full),
+        detail,
         ...(it.endedAt ? { endedAt: it.endedAt } : {}),
         ...(it.waitedMs ? { waitedMs: it.waitedMs } : {}),
         ...(it.result ? { result: trimResult(it.result, full) } : {}),
@@ -335,7 +343,7 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
         // A check of a turn by the other agent: which turn and who, and its findings (they are its answer).
         ...(it.check ? { check: it.check } : {}),
         ...(opts.kids ? { kids: opts.kids } : {}),
-        ...(!full && hasMore(it) ? { more: true } : {}),
+        ...(!full && (hasMore(it) || isLight(it) && it[LIGHT].hunks) ? { more: true } : {}),
         // Pictures (a screenshot, a widget's own) stay on the desktop: their count, and `phone.image` for each.
         ...(picCount(it) ? { pics: picCount(it) } : {}),
       };
@@ -2091,7 +2099,26 @@ export class PhoneService {
         } else if (own === 'phone.changes') {
           result = await this.changes.changes(String(raw.sessionId ?? ''), stepIds(raw.items));
         } else if (own === 'phone.diff') {
-          result = await this.changes.diff(String(raw.sessionId ?? ''), typeof raw.path === 'string' ? raw.path : '', stepIds(raw.items));
+          const file = typeof raw.path === 'string' ? raw.path.replace(/\\/g, '/') : '';
+          // Only this request's matching file needs its stored hunks. Keep that view local to
+          // the request, so two phones can inspect different files in the same chat.
+          const reader = new PhoneChangesReader(async sessionId => {
+            const snap = await this.app.call('session.snapshot', { sessionId });
+            const items = snap.items.map(it => {
+              if (!isLight(it) || it.type !== 'tool' || !it.result?.diff?.some(d => relTo(d.path, snap.session.cwd) === file)) return it;
+              const files = it.result.diff.map((d, index) => {
+                if (relTo(d.path, snap.session.cwd) !== file) return d;
+                // editsOf reads hunks only after selecting this turn's edits. A working-tree
+                // request goes straight to git and never opens a stored line.
+                const read = () => (this.app.store.wholeItem(sessionId, it) as ToolItem).result?.diff?.[index]?.hunks ?? [];
+                let hunks: FileDiff['hunks'] | undefined;
+                return { ...d, get hunks() { return hunks ??= read(); } };
+              });
+              return { ...it, result: { ...it.result, diff: files } };
+            });
+            return { ...snap, items };
+          });
+          result = await reader.diff(String(raw.sessionId ?? ''), file, stepIds(raw.items));
         } else if (own === 'phone.search') {
           // Each phone its own search: one phone's query never goes on with, or stops, another's.
           result = await this.finder.search(typeof raw.query === 'string' ? raw.query : '', { scope: `phone:${device.id}`, cursor: typeof raw.cursor === 'string' ? raw.cursor : undefined });

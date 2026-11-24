@@ -126,9 +126,13 @@ function readIndexed(io: typeof fs, file: string, tailFile: string | undefined, 
         if (typeof item.id !== 'string' || index.has(item.id) || Object.hasOwn(item, options.mark)) throw new Error('Invalid session item');
         const range: Line = { offset, length, chars: json.length };
         const view = tailFile ? cut(item, options.old) : item;
-        if (view !== item && item.type === 'tool') {
+        if (view !== item) {
           // Round-trip the preview: a V8 substring can otherwise pin the entire output it came from.
-          range.preview = JSON.parse(JSON.stringify({ ...view, [options.mark]: item.result?.images?.length ?? 0 })) as TimelineItem;
+          const result = item.type === 'tool' ? item.result : undefined;
+          const mark = { pictures: result?.images?.length ?? 0, hunks: !!result?.diff?.some(f => f.hunks.length),
+            ...(item.type === 'tool' && item.input !== undefined ? { input: true } : {}),
+            ...(item.type === 'tool' && view.type === 'tool' && view.detail.background && !item.detail.background ? { legacyBackground: true } : {}) };
+          range.preview = JSON.parse(JSON.stringify({ ...view, [options.mark]: mark })) as TimelineItem;
           items.push(structuredClone(range.preview));
         } else items.push(item);
         index.set(items[items.length - 1].id, range);
@@ -583,6 +587,26 @@ async function renameRetry(from: string, to: string, commit: () => void) {
  * original preview stands for the intact disk value. Start with disk order for byte-stable saves. */
 function overlay(disk: unknown, before: unknown, now: unknown): unknown {
   if (isDeepStrictEqual(before, now)) return disk;
+  if (Array.isArray(disk) && Array.isArray(before) && Array.isArray(now)) {
+    // An attachment rename or an updated file count must retain that entry's hidden bytes.
+    // IDs and diff paths also survive a reorder. Other arrays are replaced as a field.
+    const key = (v: unknown) => v && typeof v === 'object' ? ('id' in v ? v.id : 'path' in v ? v.path : undefined) : undefined;
+    if (before.every(v => typeof key(v) === 'string')) {
+      // Some providers emit several patches for one path. Consume those entries in
+      // their original order so two patches never inherit the same hidden hunks.
+      const indexes = new Map<unknown, number[]>();
+      for (let i = before.length - 1; i >= 0; i--) {
+        const k = key(before[i]);
+        const group = indexes.get(k);
+        if (group) group.push(i);
+        else indexes.set(k, [i]);
+      }
+      return now.map(v => {
+        const at = indexes.get(key(v))?.pop();
+        return at === undefined ? v : overlay(disk[at], before[at], v);
+      });
+    }
+  }
   const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
   if (!record(disk) || !record(before) || !record(now)) return now;
   const out = { ...disk };

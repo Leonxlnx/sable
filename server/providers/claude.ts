@@ -3698,9 +3698,12 @@ class ClaudeSession implements ProviderSession {
     // that answers none of ours then belongs to earlier work (a turn it took up by itself, a start that
     // failed, a resumed process's first word) and never ends the person's turn. Its line stands above
     // the message, which begins what comes next (review of 23 Nov, D-own); one that shows nothing (no
-    // tokens, no cost, no error) is not written at all, so nothing stands between message and answer.
+    // tokens, no error) is not written at all, so nothing stands between message and answer. A cost
+    // alone is nothing to show: a resumed process's first result may book what ran unseen since the
+    // chat last heard a total (its sub-agents' last requests), and that stood as a bare "$0.10" under
+    // the person's message with no working line (the chat's own total above already has it).
     const ahead = wasInterrupted ? [] : this.unreadOwn();
-    const blank = !answered.length && ahead.length > 0 && !inputTokens && !outputTokens && !turnCost && !shownError;
+    const blank = !answered.length && ahead.length > 0 && !inputTokens && !outputTokens && !shownError;
     // What the messages this result answers came to, whatever the turn does next, and the result's
     // line in the timeline that closes their answer.
     const resultId = wasInterrupted || blank ? undefined : randomUUID();

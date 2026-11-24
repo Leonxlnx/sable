@@ -14,6 +14,7 @@ import type {
 import { App } from '../server/app';
 import type { SessionRuntime } from '../server/core/runtime';
 import { DemoProvider } from '../server/providers/demo';
+import { expectSameRows } from './trim-model';
 
 // ─────────────────────────────────── harness ────────────────────────────────────
 
@@ -188,6 +189,27 @@ describe('DemoProvider catalog', () => {
 // ─────────────────────────────────── flagship ───────────────────────────────────
 
 describe('flagship scenario', () => {
+  it('keeps the folded step and Worked models across Demo runtime scenarios and every tool kind', async () => {
+    const h = await setup();
+    h.autoApprove();
+    for (const prompt of [REFACTOR, 'agents', 'search', 'plan', 'questions', 'mcp', 'chart', 'errors', 'workflow']) {
+      await h.send(prompt);
+      await h.idle();
+    }
+    // Complete provider-specific kinds absent from these scenarios through the same runtime.
+    const kinds = ['bash', 'read', 'edit', 'write', 'search', 'glob', 'fetch', 'websearch', 'agent', 'todo', 'mcp', 'question', 'plan', 'skill', 'widget', 'browser', 'device', 'share', 'other'] as const;
+    const seen = new Set(h.tools().map(t => t.kind));
+    expect(seen.size).toBeGreaterThan(10);
+    for (const kind of kinds) if (!seen.has(kind)) h.rt.add<ToolItem>({
+      type: 'tool', kind, name: kind, title: kind, status: 'done', detail: {}, input: { arg: 'x'.repeat(9000) },
+    });
+    h.rt.add<ToolItem>({ type: 'tool', kind: 'bash', name: 'Bash', title: 'Watch', status: 'done',
+      detail: { command: 'pnpm dev' }, input: { run_in_background: true }, output: 'logs\n'.repeat(100) + 'Local: http://localhost:8080/test\n' + 'done\n'.repeat(100) });
+    const opaque = { type: 'tool', kind: 'other', name: 'Custom', title: 'Custom', status: 'done' } as const;
+    h.rt.add<ToolItem>({ ...opaque, detail: {}, input: { opaque: 'x'.repeat(1500) } });
+    h.rt.add<ToolItem>({ ...opaque, detail: { content: 'x'.repeat(1500) }, inputText: '{', output: 'log\n'.repeat(100) });
+    expectSameRows(h.items());
+  }, 30_000);
   it('streams thinking, tools, text and a turn in a sane order', async () => {
     const h = await setup();
     await h.send(REFACTOR);

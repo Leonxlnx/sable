@@ -51,7 +51,7 @@ import { cleanCommit, commitPrompt } from './core/commit-draft';
 import { SessionRuntime, autoTitle, lostLine, pendingPrompts, type BackgroundLimit, type LossTrigger } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
-import { isLight, recentStart, RECENT_TURNS, settled, sessionPatchForJson } from './core/trim';
+import { isLight, recentStart, RECENT_TURNS, sessionPatchForJson } from './core/trim';
 import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_AT_START_MS, RETURN_RECHECK_MS, returnRetryMs, returnsAtStart, returnTarget, runningOnCredits } from './core/limit-policy';
 import { rankAccount } from '../shared/use-first';
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
@@ -63,7 +63,7 @@ import { handoverText } from './accounts/handover';
 import { itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
 import { runsTask, worksInBackground } from '../shared/background';
 import { runSubAgent } from './core/sub-agent';
-import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
+import { editsOf, readOnlyMode, turnSlice, TurnChecks, withoutChecks } from './core/check';
 import { cutAt } from './core/fork';
 import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
@@ -570,6 +570,7 @@ export class App {
     // restart one. Restore that item in place before subscribers or the provider use it again.
     if (event.type === 'timeline.reset') {
       const rt = this.sessions.get(event.sessionId);
+      if (rt) this.store.bindProviderInputs(rt.id, rt.items);
       for (let i = recentStart(event.items, RECENT_TURNS); rt && i < event.items.length; i++) {
         if (isLight(event.items[i])) event.items[i] = { ...this.store.promote(rt.id, rt.items[i]) };
       }
@@ -578,14 +579,19 @@ export class App {
     } else if (event.type === 'item.patch' || event.type === 'item.delta') {
       const item = this.sessions.get(event.sessionId)?.get(event.id);
       if (item && isLight(item)) {
-        if (event.type === 'item.delta' && event.field === 'output') {
-          // The runtime already appended to the preview.
-          item.output = item.output?.slice(0, -event.delta.length);
+        if (event.type === 'item.delta') {
+          // Undo the runtime's append to the preview, then append to the original.
+          const field = event.field;
+          const values = item as Partial<Record<typeof field, string>>;
+          const prefix = (values[field] ?? '').slice(0, -event.delta.length);
+          if (prefix || field === 'text') values[field] = prefix;
+          else delete values[field];
           this.store.promote(event.sessionId, item);
-          item.output = (item.output ?? '') + event.delta;
-        } else if (!settled(item) || (event.type === 'item.patch' && ('result' in event.patch || 'output' in event.patch))) {
+          values[field] = (values[field] ?? '') + event.delta;
+          event = { type: 'item.patch', sessionId: event.sessionId, id: item.id, patch: { ...item, more: false } };
+        } else {
           this.store.promote(event.sessionId, item);
-          if (event.type === 'item.patch' && 'result' in event.patch) event = { ...event, patch: { ...event.patch, result: item.result } as Partial<ToolItem> };
+          event = { ...event, patch: { ...item, more: false } };
         }
       }
     }
@@ -1350,6 +1356,7 @@ export class App {
     const users = new Set(file.items.filter(i => i.type === 'user').map(i => i.id));
     const queue = file.queue?.filter(q => !users.has(q.id));
     const lostNames = rt.loadRestored(file.items, file.todos, queue ?? []);
+    this.store.bindProviderInputs(rt.id, rt.items);
     // A message Sable sent that came back as one "From the Claude app" (D-own): merged into its own card,
     // only where the agent's own id for it proves they are one message.
     for (const id of ownReplays(rt.items)) rt.remove(id);
@@ -1800,7 +1807,8 @@ export class App {
     if (rt.meta.lane) await this.lanes.ready(rt);
     if (this.beforeFirstInput) await this.beforeFirstInput(rt.id);
     maySend();
-    const out = this.withHandover(rt, item);
+    // A refused message retried after a restore can have disk-backed attachments.
+    const out = this.withHandover(rt, this.store.wholeItem(rt.id, item) as UserItem);
     const wake = !rt.get(item.id) && out.count ? this.pendingLossWake.get(rt) : undefined;
     if (item.text === RESUME_LOST && !rt.get(item.id) && !wake) { out.release?.(); return; }
     const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex' || (rt.meta.provider === 'opencode' && !!out.count);
@@ -4553,6 +4561,7 @@ export class App {
       try {
         const file = await this.store.copySession(extra.fork.source, rt.id, extra.fork.items);
         rt.loadRestored(file.items, file.todos);
+        this.store.bindProviderInputs(rt.id, rt.items);
       } catch (err) {
         this.store.deleteSession(rt.id);
         throw err;
@@ -5165,6 +5174,9 @@ export class App {
     this.register('turn.check', ({ sessionId, turnId }) => {
       const rt = this.runtime(sessionId);
       this.hydrate(rt);
+      // The check builds its brief synchronously from the requested turn, including child edits.
+      const slice = turnSlice(rt.items, turnId);
+      if (slice) for (const edit of editsOf(rt.items, slice.roots)) if (isLight(edit)) this.store.promote(sessionId, edit);
       return this.checks.start(rt, String(turnId ?? ''));
     });
     this.register('turn.checkStop', ({ sessionId, itemId }) => ({ ok: this.checks.stop(this.runtime(sessionId), String(itemId ?? '')) }));

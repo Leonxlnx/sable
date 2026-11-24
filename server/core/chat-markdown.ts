@@ -12,6 +12,8 @@ import { noticeLevel } from '../../shared/notice';
  */
 
 export interface ChatMarkdownOptions {
+  /** Resolve one disk-backed item while formatting it. The tree holds only resident rows. */
+  whole?: (item: TimelineItem) => TimelineItem;
   /** The agent's name as people know it. */
   agentName?: (provider: ProviderId) => string;
   /** Dates in the header (tests pin it). */
@@ -146,7 +148,7 @@ function userWords(it: UserItem): { text: string; command?: boolean } | null {
   return text || it.attachments?.length ? { text } : null;
 }
 
-/** Format each step from the fields kept by the old-turn cut. Long output and picture data stay on disk. */
+/** Format disk-backed content in display order, releasing each whole item before reading the next. */
 export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd' | 'chat' | 'createdAt'>, items: TimelineItem[], opts: ChatMarkdownOptions = {}): string {
   const agentName = opts.agentName ?? ((p: ProviderId) => AGENT[p] ?? p);
   const cwd = meta.cwd ?? '';
@@ -177,11 +179,14 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
   };
 
   /** One step into the turn's list (sub-agents' own edits count as the turn's changes). */
-  const step = (t: ToolItem, depth = 0) => {
+  const step = (t: ToolItem, depth: number, fetched: boolean) => {
+    // A short command/path sliced out of a parsed JSON line can keep that entire line
+    // alive. Only the formatted words and map keys live beyond this iteration.
+    const keep = (s: string) => fetched ? Buffer.from(s, 'utf16le').toString('utf16le') : s;
     if (depth === 0) turn.steps++;
     switch (t.kind) {
       case 'bash':
-        if (depth === 0) turn.lines.push(`- Ran ${inlineCode(commandLine(t.detail.command ?? t.title))}: ${outcome(t)}`);
+        if (depth === 0) turn.lines.push(keep(`- Ran ${inlineCode(commandLine(t.detail.command ?? t.title))}: ${outcome(t)}`));
         return;
       case 'edit':
       case 'write': {
@@ -197,7 +202,7 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
           f.add += d.additions;
           f.del += d.deletions;
           f.deleted = d.status === 'deleted';
-          turn.files.set(d.path, f);
+          turn.files.set(keep(d.path), f);
         }
         return;
       }
@@ -206,13 +211,12 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
         if (depth === 0) {
           const what = t.detail.description || t.title;
           const n = t.result?.agent?.steps ?? kids.length;
-          turn.lines.push(`- Agent: ${what.replace(/\s+/g, ' ').trim()}${n ? ` (${plural(n, 'step')})` : ''}`);
+          turn.lines.push(keep(`- Agent: ${what.replace(/\s+/g, ' ').trim()}${n ? ` (${plural(n, 'step')})` : ''}`));
         }
-        if (depth < 4) for (const k of kids) step(k, depth + 1);
         return;
       }
       case 'skill':
-        if (depth === 0) turn.lines.push(`- Skill: ${t.detail.skill ?? t.title}`);
+        if (depth === 0) turn.lines.push(keep(`- Skill: ${t.detail.skill ?? t.title}`));
         return;
       default:
         if (depth > 0) return;
@@ -225,7 +229,20 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
     }
   };
 
-  for (const it of roots) {
+  function* inOrder(rows: TimelineItem[], depth = 0): Generator<[TimelineItem, number]> {
+    for (const row of rows) {
+      yield [row, depth];
+      if (row.type === 'tool' && row.kind === 'agent' && (depth || !row.check) && depth < 4) {
+        yield* inOrder(children.get(row.id) ?? [], depth + 1);
+      }
+    }
+  }
+  for (const [row, depth] of inOrder(roots)) {
+    const it = ('more' in row && row.more && opts.whole) ? opts.whole(row) : row;
+    if (depth) {
+      if (it.type === 'tool') step(it, depth, it !== row);
+      continue;
+    }
     if (it.type === 'user') {
       if (it.state === 'queued' || it.until?.check) continue;
       const said = userWords(it);
@@ -259,7 +276,7 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
           const a = answers[q.question];
           blocks.push(`> ${q.question.trim()}${a?.length ? `\n>\n> Answer: ${a.join(', ')}` : ''}`);
         }
-      } else if (it.kind !== 'todo') step(it);
+      } else if (it.kind !== 'todo') step(it, 0, it !== row);
     } else if (it.type === 'notice') {
       if (it.agentSwitch) {
         agent = it.agentSwitch.to;

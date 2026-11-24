@@ -3,12 +3,9 @@ import { runsTask } from '../../shared/background';
 
 // ── what a window gets of an existing conversation ──
 //
-// Real conversations reach hundreds of MB, nearly all of it finished steps' output and results
-// (command output, file reads, search results, screenshots), which the window shows only when a
-// step is opened. Whole timelines (snapshots, `timeline.reset`) reach a window with those fields
-// cut and the step marked (`ToolItem.more`); `session.item` returns one whole. Live items (running
-// steps, deltas, `item.added`, patches) are never cut. The bridge applies this at its socket
-// (server/bridge.ts), and the disk reader uses the same rule for settled steps in old turns.
+// Snapshots and resets keep what the timeline rows show. The socket and indexed disk reader
+// share the old-turn rule for steps, thoughts and message attachments. A cut row carries
+// `more`, and `session.item` reads the original when needed. Live work stays whole.
 // The phone cuts further on its own (services/phone.ts).
 
 /**
@@ -26,9 +23,9 @@ export const KEEP = { head: 3_000, tail: 3_000 };
  * they keep only a short start and end, so a chat of hundreds of megabytes reaches the window in a
  * few. The last `RECENT_TURNS` turns keep `KEEP`.
  */
-export const OLD = { at: 1_200, head: 600, tail: 300 };
+export const OLD = { row: true, at: 96, head: 48, tail: 24 };
 export const RECENT_TURNS = 3;
-type Cut = { at: number; head: number; tail: number };
+type Cut = { row?: boolean; at: number; head: number; tail: number };
 const RECENT: Cut = { at: CUT_AT, head: KEEP.head, tail: KEEP.tail };
 /** A cut file list keeps this many paths. */
 const KEEP_FILES = 200;
@@ -75,7 +72,10 @@ export function timelineCut(recent: Cut, keepFiles: number, taskRunning: typeof 
    * still at work in the background, stays whole. A turn check stays whole: its findings show without
    * opening it and go to the composer as they are.
    */
-  function settled(t: ToolItem): boolean {
+  function settled(t: TimelineItem): boolean {
+    if (t.type === 'thinking') return !t.streaming;
+    if (t.type === 'user') return t.state !== 'queued';
+    if (t.type !== 'tool') return false;
     return SETTLED.has(t.status) && !WHOLE.has(t.kind) && !t.check && !taskRunning(t) && t.result?.agent?.background !== 'running' && t.workflow?.status !== 'running';
   }
 
@@ -101,9 +101,105 @@ export function timelineCut(recent: Cut, keepFiles: number, taskRunning: typeof 
     return out ?? r;
   }
 
-  /** An item as a window gets it in a whole timeline: a settled step with long output or result cut and marked `more`; anything else as it is. */
+  // The folded command chip and turn footer scan local URLs. Keep the announcement lines,
+  // including ANSI and error context. At >48k the chip uses character offsets into the
+  // original; retain that exceptional field if shortening it would change its scan window.
+  function localLines(s: string): string | undefined {
+    if (!s.includes('://') || !/localhost|127\.\d|0\.0\.0\.0|\[::/i.test(s)) return;
+    const announcements = (part: string) => part.split('\n').filter(line => line.includes('://') && /localhost|127\.\d|0\.0\.0\.0|\[::/i.test(line)).join('\n');
+    if (s.length > 48_000) {
+      const head = Math.max(0, s.lastIndexOf('\n', 32_000));
+      const end = s.indexOf('\n', s.length - 16_000);
+      // A URL in this middle is eligible for the footer but outside the chip's scan.
+      const middle = s.slice(head, end < 0 ? undefined : end);
+      if (middle.includes('://') && /localhost|127\.\d|0\.0\.0\.0|\[::/i.test(middle)) {
+        // Keep the chip's two scan windows at their original offsets from either end.
+        // Of the intervening complete lines, only those naming a page reach the footer.
+        const left = s.indexOf('\n', 32_001);
+        const right = s.lastIndexOf('\n', s.length - 16_001);
+        if (left < 0 || right <= left) return s;
+        return s.slice(0, left + 1) + announcements(s.slice(left + 1, right)) + s.slice(right);
+      }
+    }
+    return announcements(s) || undefined;
+  }
+
+  function oldTool(it: ToolItem, c: Cut): ToolItem {
+    const out = { ...it };
+    let changed = false;
+    const d = it.detail;
+    const legacyBackground = it.kind === 'bash' && (it.input as { run_in_background?: unknown } | undefined)?.run_in_background === true;
+    if (legacyBackground && !d.background) {
+      out.detail = { ...d, background: true };
+      changed = true;
+    }
+    // A generic tool with only raw input had a disclosure caret. A one-character
+    // input preview preserves it without making a detail-only or output-only row openable.
+    const inputOnly = (it.input !== undefined || it.more && it.inputText === '…') && !it.result && !d.pattern && !d.query && !d.url;
+    if (it.input !== undefined) { delete out.input; changed = true; }
+    if (inputOnly && it.inputText !== '…') { out.inputText = '…'; changed = true; }
+    else if (!inputOnly && it.inputText) { delete out.inputText; changed = true; }
+    const hasUrl = it.kind === 'bash' && (d.command?.length ?? 0) > 400 && [it.output, it.result?.text].some(s => s && s.includes('://') && /localhost|127\.\d|0\.0\.0\.0|\[::/i.test(s));
+    for (const k of ['command', 'oldText', 'newText', 'content', 'prompt'] as const) {
+      const value = d[k];
+      // Command tooltips on background rows show the full command. A command can also
+      // decide whether its output is a server announcement or an HTTP client response.
+      if (k === 'command' && (legacyBackground || d.background || it.task || hasUrl)) continue;
+      const max = k === 'command' ? 400 : c.head;
+      if (value && value.length > max) {
+        if (out.detail === d) out.detail = { ...d };
+        out.detail[k] = value.slice(0, max);
+        changed = true;
+      }
+    }
+    const preview = (s: string) => (it.kind === 'bash' ? localLines(s) : undefined) ?? headTail(s, c.head, c.tail);
+    if (it.output && it.output.length > c.at) {
+      out.output = preview(it.output);
+      changed ||= out.output !== it.output;
+    }
+    const r = it.result;
+    if (r) {
+      const part = { ...r };
+      for (const k of ['text', 'stderr'] as const) {
+        const s = r[k];
+        if (!s || s.length <= c.at) continue;
+        // A failed step shows the first three lines under its folded row.
+        if (it.status === 'error' && it.kind !== 'bash' && (k === 'stderr' || !r.stderr)) {
+          const lines = s.trim().split('\n', 4);
+          part[k] = lines.length > 3 ? lines.slice(0, 3).join('\n') + '\n…' : s;
+        } else part[k] = k === 'text' ? preview(s) : headTail(s, c.head, c.tail);
+      }
+      if (r.file?.content && r.file.content.length > c.at) part.file = { ...r.file, content: r.file.content.slice(0, c.head) };
+      if (r.images?.length && size(r.images) > c.at) delete part.images;
+      if (r.files && r.files.length > 1) part.files = r.files.slice(0, 1);
+      if (r.diff?.some(f => f.hunks.length)) part.diff = r.diff.map(f => f.hunks.length ? { ...f, hunks: [] } : f);
+      if (Object.keys(r).some(k => r[k as keyof ToolResult] !== part[k as keyof ToolResult])) { out.result = part; changed = true; }
+    }
+    if (!changed) return it;
+    out.more = true;
+    return out;
+  }
+
   function cutItem(it: TimelineItem, c: Cut = recent): TimelineItem {
-    if (it.type !== 'tool' || !settled(it)) return it;
+    if (!settled(it)) return it;
+    if (c.row && it.type === 'thinking' && it.text.length > 320) {
+      let text = it.text.slice(0, 320);
+      // The caret depends on whether the thought contains any non-space character.
+      if (!text.trim() && it.text.trim()) text += it.text.trimStart()[0];
+      return { ...it, text, more: true };
+    }
+    if (c.row && it.type === 'user' && it.attachments?.some(a => (a.dataUrl?.length ?? 0) > 1024 || (a.text?.length ?? 0) > 1024)) {
+      return { ...it, more: true, attachments: it.attachments.map(a => {
+        const attachment = { ...a };
+        // Empty dataUrl reserves the original thumbnail; a path-only image remains a file chip.
+        if (a.dataUrl && a.dataUrl.length > 1024) attachment.dataUrl = '';
+        else if (a.dataUrl === '') delete attachment.dataUrl;
+        if (a.text && a.text.length > 1024) delete attachment.text;
+        return attachment;
+      }) };
+    }
+    if (it.type !== 'tool') return it;
+    if (c.row) return oldTool(it, c);
     let out: ToolItem | undefined;
     if (it.output && it.output.length > c.at) (out ??= { ...it }).output = headTail(it.output, c.head, c.tail);
     if (it.result) {
@@ -118,10 +214,10 @@ export function timelineCut(recent: Cut, keepFiles: number, taskRunning: typeof 
 }
 export const { cutItem, settled, headTail, headOnly } = timelineCut(RECENT, KEEP_FILES, runsTask);
 
-/** Private ToolItem field. Its value is the original picture count. */
+/** Private indexed-row metadata for phone summaries and provider input lookups. */
 export const LIGHT = '\0sable.baseStep';
-export type LightStep = ToolItem & { [LIGHT]: number };
-export function isLight(item: Partial<TimelineItem>): item is LightStep {
+type LightItem = Extract<TimelineItem, { type: 'tool' | 'thinking' | 'user' }> & { [LIGHT]: { pictures: number; hunks: boolean; input?: true; legacyBackground?: true } };
+export function isLight(item: Partial<TimelineItem>): item is LightItem {
   return Object.hasOwn(item, LIGHT);
 }
 

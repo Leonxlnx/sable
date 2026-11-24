@@ -16,6 +16,7 @@ import {
   placeMarks,
   railAt,
   railOf,
+  railShown,
   runOf,
   runsOf,
   stackHeight,
@@ -202,6 +203,22 @@ describe('runs', () => {
       { from: 4, to: 9 },
     ];
     expect([0, 2, 3, 4, 8, 9].map((i) => runOf(runs, i))).toEqual([0, 0, 1, 2, 2, -1]);
+  });
+});
+
+describe('when the rail shows', () => {
+  it('says nothing with one or two messages, however long the conversation', () => {
+    expect(railShown(10_000, 800, 1, false)).toBe(false);
+    expect(railShown(10_000, 800, 2, false)).toBe(false);
+    expect(railShown(10_000, 800, 2, true)).toBe(false);
+  });
+
+  it('shows from three messages once the conversation is two views tall, and hides a little lower', () => {
+    expect(railShown(1_500, 800, 3, false)).toBe(false);
+    expect(railShown(1_700, 800, 3, false)).toBe(true);
+    expect(railShown(1_500, 800, 3, true)).toBe(true);
+    expect(railShown(1_400, 800, 3, true)).toBe(false);
+    expect(railShown(5_000, 0, 9, false)).toBe(false);
   });
 });
 
