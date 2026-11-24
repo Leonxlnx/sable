@@ -368,6 +368,7 @@ export function mapResult(name: string, input: Obj, structured: unknown, content
       // The text the model reads ends with the agent's id and a usage block: figures, not part of the report.
       const tail = splitAgentUsage(flat.text);
       const agent: AgentStats = { ...tail.stats };
+      if (typeof r.agentId === 'string') agent.taskId = r.agentId;
       if (num(r.totalTokens) !== undefined) agent.tokens = num(r.totalTokens);
       if (num(r.totalToolUseCount) !== undefined) agent.steps = num(r.totalToolUseCount);
       if (num(r.totalDurationMs) !== undefined) agent.durationMs = num(r.totalDurationMs);
@@ -503,8 +504,10 @@ export function taskKindOf(taskType?: unknown, toolName?: string): TaskKind {
  * step that needs no task event): a command's `backgroundTaskId` (run in the background, backgrounded
  * by the person, or by Claude Code at its timeout), a monitor's `taskId`.
  */
-export function backgroundTaskOf(name: string, structured: unknown): { id: string; kind: 'command' | 'monitor' } | undefined {
+export function backgroundTaskOf(name: string, structured: unknown): { id: string; kind: 'command' | 'monitor' | 'agent' } | undefined {
   const r = structured && typeof structured === 'object' ? (structured as Obj) : {};
+  if ((name === 'Agent' || name === 'Task') && r.status === 'async_launched' && typeof r.agentId === 'string' && r.agentId) return { id: r.agentId, kind: 'agent' };
+  if (name === 'SendMessage' && r.success === true && typeof r.resumedAgentId === 'string' && r.resumedAgentId) return { id: r.resumedAgentId, kind: 'agent' };
   if ((name === 'Bash' || name === 'PowerShell') && typeof r.backgroundTaskId === 'string' && r.backgroundTaskId) return { id: r.backgroundTaskId, kind: 'command' };
   if (name === 'Monitor' && typeof r.taskId === 'string' && r.taskId) return { id: r.taskId, kind: 'monitor' };
   return undefined;

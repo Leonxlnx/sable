@@ -185,6 +185,19 @@ describe('background commands', () => {
 });
 
 describe('a chat read after a restart', () => {
+  it('omits only the old Claude command output directly following its compaction notice', () => {
+    const { rt } = make();
+    rt.notice('compact', 'Conversation compacted', '466k → 24.0k tokens');
+    rt.add({ type: 'user', text: '<local-command-stdout>Compacted</local-command-stdout>', state: 'sent' });
+    rt.add({ type: 'text', text: 'Compacted', streaming: false });
+    rt.notice('command', 'Command output', 'Compacted (ctrl+o to see full summary)');
+    rt.add({ type: 'text', text: 'Compacted the logs.', streaming: false });
+    rt.add({ type: 'text', text: 'Compacted', streaming: false });
+    rt.notice('compact', 'Conversation compacted');
+    rt.add({ type: 'user', text: '<local-command-stdout>Total cost: $0.25</local-command-stdout>', state: 'sent' });
+    rt.loadRestored(structuredClone(rt.items));
+    expect(rt.snapshot().items.map(i => 'text' in i && i.text)).toEqual(['Conversation compacted', 'Compacted the logs.', 'Compacted', 'Conversation compacted', '<local-command-stdout>Total cost: $0.25</local-command-stdout>']);
+  });
   it('recovers a saved move loss without repeating the notice to the person', () => {
     const { rt } = make();
     rt.taskStarted(rt.add<ToolItem>(bash()).id, { id: 'b1', kind: 'command' });

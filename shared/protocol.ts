@@ -446,6 +446,10 @@ export interface SessionMeta {
   speed?: string;
   /** Sable restarted mid-turn. Kept until the recovered timeline records how the turn ended. */
   pendingRestart?: boolean;
+  /** Background agents and SDK-list-only tasks lost with a process, awaiting delivery to the agent. */
+  lostReports?: { key: string; name: string }[];
+  /** Recent automatic lost-work sends and the permanent hold after a recovery process died promptly. */
+  lossWake?: { attempts: number[]; blocked?: true };
   /** The limit handover moved this session here from this account (its preferred one). */
   movedFrom?: string;
   /** When `movedFrom` is expected to take work again (the reset of the window that moved the chat): the chat returns then, at rest or before the next message (`App.returnAfterLimit`). */
@@ -969,6 +973,8 @@ export interface ToolResult {
 }
 
 export interface AgentStats {
+  /** Claude's stable task id, also used when SendMessage resumes this agent in a later process. */
+  taskId?: string;
   tokens?: number;
   steps?: number;
   durationMs?: number;

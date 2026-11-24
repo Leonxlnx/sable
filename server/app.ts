@@ -41,14 +41,14 @@ interface RefusalMark {
   stops: number;
   closes: number;
 }
-import { lostTasksNote, RESUME_AFTER_SIGN_IN, signInBackgroundNote } from '../shared/synthetic';
+import { lostTasksNote, RESUME_AFTER_SIGN_IN, RESUME_LOST, signInBackgroundNote } from '../shared/synthetic';
 import { normalizeBackdrop } from '../shared/backdrop';
 import { HANDOVER_JOIN, readableTitle, RESUME_AFTER_RESET, RESUME_LIMIT_RESET, RESUME_SUMMARY_TRAILER, RESUME_UNDER_ANOTHER, resumeBackgroundNote } from '../shared/synthetic';
 import { Races, type Contender } from './core/race';
 import { laneSlug } from './services/git-lanes';
 import { gitDraftInput, gitWorktrees } from './services/git';
 import { cleanCommit, commitPrompt } from './core/commit-draft';
-import { SessionRuntime, autoTitle, lostLine, pendingPrompts, type BackgroundLimit } from './core/runtime';
+import { SessionRuntime, autoTitle, lostLine, pendingPrompts, type BackgroundLimit, type LossTrigger } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
 import { sessionPatchForJson } from './core/trim';
@@ -75,7 +75,7 @@ import { CUSTOM_AGENT_ONLY, customAgent, customOf } from './services/custom';
 import { parseUntil, runCheck, UntilLoops } from './core/until';
 import { ChatTitles, type TitleModel, type TitleOwner, type TitlePrompt } from './core/titles';
 import { Lanes, LaneUnavailable, worktreesRoot } from './core/lanes';
-import { isAllModelsWeekly } from './core/limit-policy';
+import { backgroundAgentName, isAllModelsWeekly } from './core/limit-policy';
 import { matchesWindowModel, windowForModel, windowModel } from '../shared/limit-windows';
 import { mergeWindows } from './services/limits';
 import { workOf, WAKE_DELIVERY_GRACE_MS, type ChatWork } from './core/work';
@@ -230,6 +230,9 @@ const resetCommandOf = (p: Provider): { resetCommand?: string } => {
 export const DEFAULT_ACCOUNT_LABEL = 'Main';
 
 const WAKE_LOST = 'The scheduled wake-up ended with the old process. Schedule it again if still needed.';
+const LOSS_WAKE_WINDOW_MS = 10 * 60_000;
+const LOSS_WAKE_CRASH_MS = 2 * 60_000;
+const recentLossWakes = (rt: SessionRuntime, now = Date.now()) => (rt.meta.lossWake?.attempts ?? []).filter(at => now - at < LOSS_WAKE_WINDOW_MS);
 const accountKey = (provider: ProviderId, accountId: string) => `${provider}:${accountId}`;
 
 /** The bridge application: owns providers, sessions and persistence. Transport-agnostic. */
@@ -1269,7 +1272,8 @@ export class App {
     rt.onBackgroundLimit = (r, hit) => this.limitInBackground(r, hit);
     rt.onStoppedLimit = (r, notice) => { void this.onLimitHit(r, notice, false, 0, true).catch(err => this.log('stopped limit failed', (err as Error).message)); };
     // At rest (the last background work ended): the moves that waited for it are looked at again.
-    rt.onRest = (r) => void setTimeout(() => this.restMoves(r), 0);
+    rt.onRest = (r) => { setTimeout(() => this.restMoves(r), 0); this.scheduleLossWake(r); };
+    rt.onWorkLost = (r, cause, count) => this.workLost(r, cause, count);
     // A queued message a phone was taking back is released: the queue goes on if it waited for it.
     rt.onQueueReleased = (r) => {
       if (!this.drainWaiting.delete(r.id)) return;
@@ -1375,6 +1379,7 @@ export class App {
       if (n > 0) this.sending.set(rt.id, n);
       else {
         this.sending.delete(rt.id);
+        this.scheduleLossWake(rt);
         this.lanes.sent(rt);
       }
     }
@@ -1598,14 +1603,16 @@ export class App {
    * Background commands lost with a process since the agent was last told are named right after the
    * person's words (shared/synthetic.ts `lostTasksNote`), before any note.
    */
-  private withHandover(rt: SessionRuntime, item: UserItem): { item: UserItem; taken?: () => void; release?: () => void } {
+  private withHandover(rt: SessionRuntime, item: UserItem): { item: UserItem; count?: number; taken?: () => void; release?: () => void } {
     // A slash command takes nothing before or after it (the agent would read it as its words): what
     // is pending waits for the next message.
     if (isSlashCommand(item.text)) return { item };
     const pending = rt.meta.agentHandover;
     const kept = this.handovers.get(rt.id);
     const moved = rt.meta.moveNote;
-    const { names: lost, taken: toldLost, release } = rt.meta.provider === 'claude' ? rt.reserveLost() : rt.pendingLost();
+    const { names: lost, count, taken: toldLost, release } = rt.meta.provider === 'claude' ? rt.reserveLost() : rt.pendingLost();
+    const wake = this.pendingLossWake.get(rt);
+    const lossNotice = rt.lossNotice;
     if (!pending && !moved && kept === undefined && !lost.length) return { item };
     // A summary of the whole conversation covers what a switch would hand over.
     const summary = kept ?? ((moved?.summary ? this.moveSummaryText(rt, moved.summary, moved.skip) : '') || (pending ? this.agentHandoverText(rt, pending, item.id) : ''));
@@ -1613,14 +1620,113 @@ export class App {
     const note = moved ? this.moveNoteText(rt, moved.line, item.id, lost.length > 0) : '';
     // All of it is let go only once the agent took the message (review wave 8, #22): a send that
     // never went out (a phone removed meanwhile, the agent not starting) leaves it for the next one.
+    let acknowledged = false;
     const taken = () => {
+      if (acknowledged) return;
+      acknowledged = true;
       if (pending && rt.meta.agentHandover === pending) rt.update({ agentHandover: null });
       if (kept !== undefined && this.handovers.get(rt.id) === kept) this.handovers.delete(rt.id);
       if (moved && rt.meta.moveNote === moved) rt.update({ moveNote: null });
       toldLost();
+      if (count && wake) {
+        if (this.pendingLossWake.get(rt) === wake && !rt.pendingLost().count) this.pendingLossWake.delete(rt);
+        if (!rt.get(item.id) && this.stopsOf(rt) === wake.stops) {
+          const changedAccount = (wake.cause === 'move' || wake.cause === 'limit') && rt.meta.accountId !== wake.account;
+          const when = changedAccount ? 'when the chat moved' : wake.cause === 'limit' ? 'at the plan limit' :
+            wake.cause === 'capability' ? 'when the agent restarted' : "with the agent's process";
+          const line = `${count === 1 ? '1 background task was' : `${count} background tasks were`} lost ${when}. The agent was told and carries on.`;
+          const noticeId = wake.notice ?? lossNotice;
+          const old = noticeId && rt.get<NoticeItem>(noticeId);
+          if (old) rt.patch<NoticeItem>(old.id, { text: line, detail: lost.join('\n') });
+          else rt.notice('info', line, lost.join('\n'));
+        }
+      }
     };
     if (!summary && !note && !lost.length) return { item, taken };
-    return { item: { ...item, text: `${summary ? `${summary}${HANDOVER_JOIN}` : ''}${item.text}${lostTasksNote(lost)}${note ? `\n\n${note}` : ''}` }, taken, release };
+    return { item: { ...item, text: `${summary ? `${summary}${HANDOVER_JOIN}` : ''}${item.text}${lostTasksNote(lost)}${note ? `\n\n${note}` : ''}` }, count, taken, release };
+  }
+
+  private pendingLossWake = new WeakMap<SessionRuntime, { cause: LossTrigger; stops: number; account?: string; notice?: string }>();
+  /** Includes the checks before a move can publish its moving flag. */
+  private moveAttempts = new WeakMap<SessionRuntime, number>();
+  private lossWakeTimers = new Map<SessionRuntime, NodeJS.Timeout>();
+  private wakeProcesses = new WeakMap<SessionRuntime, { handle: ProviderSession; generation: number; at: number }>();
+
+  private workLost(rt: SessionRuntime, cause: LossTrigger, count: number) {
+    const last = this.wakeProcesses.get(rt);
+    if (this.disposed) return;
+    if (cause === 'death' && last && last.handle === rt.handle && last.generation === rt.processGeneration && Date.now() - last.at < LOSS_WAKE_CRASH_MS) {
+      rt.update({ lossWake: { attempts: rt.meta.lossWake?.attempts ?? [], blocked: true } });
+    }
+    if (!count || rt.stopRequested || rt.meta.lossWake?.blocked) return;
+    this.pendingLossWake.set(rt, { cause, stops: this.stopsOf(rt), account: rt.meta.accountId });
+    this.scheduleLossWake(rt);
+  }
+
+  /** Give a pending personal send or limit carry-on first claim on the batch. */
+  private scheduleLossWake(rt: SessionRuntime, delay = 0) {
+    if (this.disposed || !this.pendingLossWake.has(rt) || this.lossWakeTimers.has(rt)) return;
+    const timer = setTimeout(() => {
+      this.lossWakeTimers.delete(rt);
+      void this.wakeAfterLoss(rt).catch(err => this.log('lost-work wake failed', (err as Error).message));
+    }, delay);
+    timer.unref?.();
+    this.lossWakeTimers.set(rt, timer);
+  }
+
+  private async wakeAfterLoss(rt: SessionRuntime) {
+    const batch = this.pendingLossWake.get(rt);
+    if (!batch || !rt.pendingLost().count || rt.meta.lossWake?.blocked) return;
+    const account = rt.meta.accountId;
+    const ready = (dispatches: number, ownTurn = false) => {
+      const w = this.workOf(rt);
+      return !this.disposed && !this.updates?.installing && this.sessions.get(rt.id) === rt && rt.meta.accountId === account &&
+        this.pendingLossWake.get(rt) === batch && this.stopsOf(rt) === batch.stops && !rt.stopRequested && !rt.meta.lossWake?.blocked &&
+        !rt.dangerHeld && !rt.queue.length && !rt.meta.spare && (!w.turn || ownTurn) && !w.agents && !w.commands &&
+        !this.limitPending(rt) && !this.refusalQueues.has(rt) && !this.openLimit(rt) && !this.sendHolds.has(rt.id) &&
+        !this.moveAttempts.has(rt) && !this.moving.has(rt.id) && !this.switching.has(rt.id) && !this.sending.has(rt.id) && !this.delivering.has(rt.id) &&
+        !this.opening.has(rt.id) && !this.capChecks.has(rt.id) && !this.returnRuns.has(rt.id) && (this.dispatching.get(rt.id)?.size ?? 0) === dispatches;
+    };
+    if (!ready(0)) return;
+    const now = Date.now();
+    const attempts = recentLossWakes(rt, now);
+    if (attempts.length >= 2) return this.scheduleLossWake(rt, attempts[0] + LOSS_WAKE_WINDOW_MS - now);
+    const release = this.beginDispatch(rt, false);
+    const lossNotice = rt.lossNotice;
+    const names = rt.pendingLost().names;
+    let reported = false;
+    const missed = () => {
+      if (reported || this.disposed || this.stopsOf(rt) !== batch.stops || this.sessions.get(rt.id) !== rt) return;
+      reported = true;
+      const note = "Background work was lost. The agent hasn't confirmed the message.";
+      if (lossNotice && rt.get(lossNotice)) rt.patch<NoticeItem>(lossNotice, { text: note });
+      else batch.notice = rt.notice('info', note, names.join('\n')).id;
+    };
+    try {
+      const handle = await this.ensureHandle(rt);
+      if (!ready(1) || await this.heldForCredits(rt) || !ready(1)) return;
+      await this.applyDue(rt, handle);
+      if (!ready(1)) return;
+      // Codex takes its turn synchronously and checks the sender again just before its RPC.
+      // Its own generation check rejects a turn replaced in between.
+      let admitted = false;
+      const check = () => {
+        if (!ready(1, admitted && rt.meta.provider === 'codex')) throw new NotNow('The chat changed before the agent could carry on.');
+        admitted = true;
+      };
+      await this.sendWithHandover(rt, handle, { type: 'user', id: randomUUID(), ts: now, state: 'sent', text: RESUME_LOST }, check, false, read => {
+        if (read) reported = true;
+        else missed();
+      }, missed);
+    } catch (err) {
+      if (!(err instanceof NotNow)) {
+        if (this.pendingLossWake.get(rt) === batch) this.pendingLossWake.delete(rt);
+        missed();
+        throw err;
+      }
+    } finally {
+      release();
+    }
   }
 
   /** A destination that has not acknowledged its first input still owes the source a rollback. */
@@ -1658,15 +1764,24 @@ export class App {
     if (rt.meta.lane) await this.lanes.ready(rt);
     maySend();
     const out = this.withHandover(rt, item);
+    const wake = !rt.get(item.id) && out.count ? this.pendingLossWake.get(rt) : undefined;
+    if (item.text === RESUME_LOST && !rt.get(item.id) && !wake) { out.release?.(); return; }
     const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex';
     const taken = receipt ? () => { out.taken?.(); receipt(true); } : out.taken;
     const release = receipt ? () => { out.release?.(); receipt(false); } : out.release;
     try {
+      if (wake) {
+        const at = Date.now();
+        this.wakeProcesses.set(rt, { handle, generation: rt.processGeneration, at });
+        rt.update({ lossWake: { attempts: [...recentLossWakes(rt, at), at] } });
+      }
       await handle.send(browser ? this.withBrowserPage(rt, out.item) : out.item, { check: maySend, taken: confirms ? taken : undefined, release, uncertain });
       if (!confirms) taken?.();
     } catch (err) {
       release?.();
       throw err;
+    } finally {
+      if (item.text === RESUME_LOST && wake && this.pendingLossWake.get(rt) === wake) this.pendingLossWake.delete(rt);
     }
   }
 
@@ -1986,7 +2101,7 @@ export class App {
     if (rt.turnActive || !this.capOf(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT)) return Promise.resolve();
     const run = this.moveOffCap(rt)
       .catch((err) => this.log('cap check failed', (err as Error).message))
-      .finally(() => this.capChecks.delete(rt.id));
+      .finally(() => { this.capChecks.delete(rt.id); this.scheduleLossWake(rt); });
     this.capChecks.set(rt.id, run);
     return run;
   }
@@ -2071,6 +2186,7 @@ export class App {
     } finally {
       active.delete(notice.id);
       if (!active.size) this.limitDecisions.delete(rt.id);
+      this.scheduleLossWake(rt);
       // Decided: a later refusal (a turn the agent wakes for) is not folded into this card unseen, where
       // nothing would decide it again; it gets a card of its own (D4). While background work still runs
       // on the account, its refusals still belong to this one.
@@ -2276,15 +2392,15 @@ export class App {
    * stop was confirmed (review wave 17, #6); one that could not be stopped keeps running in the
    * Agents tab, the chat says so plainly, and a move still goes ahead (`unstoppable`).
    */
-  private async stopLiveBackground(rt: SessionRuntime, limit: { window?: string; resetsAt?: number }) {
+  private async stopLiveBackground(rt: SessionRuntime, limit: { window?: string; resetsAt?: number }, automatic = true) {
     // Work already found unstoppable is not asked again.
     const running = rt.items.filter((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)).map((i) => i.id);
     if (!running.length) return;
     type Stop = boolean | { failed: string[] };
-    const h = rt.handle as (ProviderSession & { stopBackgroundWork?: () => Promise<Stop> }) | undefined;
+    const h = rt.handle as (ProviderSession & { stopBackgroundWork?: (automatic: boolean) => Promise<Stop> }) | undefined;
     const bounded = (p: Promise<Stop>) => Promise.race([p.catch((): Stop => false), new Promise<Stop>((r) => setTimeout(() => r(false), MOVE_CLOSE_MS))]);
     let result: Stop = true;
-    if (h?.stopBackgroundWork) result = await bounded(h.stopBackgroundWork());
+    if (h?.stopBackgroundWork) result = await bounded(h.stopBackgroundWork(automatic));
     else if (h) {
       rt.handle = undefined;
       result = await this.closeWriter(rt, rt.meta.accountId ?? DEFAULT_ACCOUNT, h).then(() => true, () => false);
@@ -2294,7 +2410,11 @@ export class App {
     if (result === false && rt.turnActive) return;
     const failed = new Set(result === true ? [] : result === false ? running : result.failed.filter((id) => running.includes(id)));
     const done = new Set(running.filter((id) => !failed.has(id)));
-    if (done.size) rt.stopAtLimit((i) => done.has(i.id), limit);
+    if (done.size) {
+      rt.stopAtLimit((i) => done.has(i.id), limit);
+      this.markLimitStops(rt, [...done], limit);
+      if (automatic) this.recordStoppedAgents(rt, done, 'limit');
+    }
     if (!failed.size) return;
     this.log('background work at a limit: its stop was not confirmed for', failed.size);
     this.unstoppable.set(rt.id, new Set([...(this.unstoppable.get(rt.id) ?? []), ...failed]));
@@ -2307,6 +2427,15 @@ export class App {
   private unstoppable = new Map<string, Set<string>>();
   /** Per chat, the lines that said such steps may still be working, with the steps each names. */
   private unstoppableNotes = new Map<string, { notice: string; steps: string[] }[]>();
+
+  private recordStoppedAgents(rt: SessionRuntime, ids: Iterable<string>, cause: 'limit' | 'move') {
+    const names: string[] = [];
+    for (const id of ids) {
+      const item = rt.get<ToolItem>(id);
+      if (item && (item.result?.agent?.background === 'stopped' || item.workflow?.status === 'stopped')) names.push(backgroundAgentName(item));
+    }
+    if (names.length) rt.reportLoss(cause, names);
+  }
 
   /**
    * Sub-agents a limit could not stop that the move's close ended after all (their process went with
@@ -2541,6 +2670,7 @@ export class App {
     if (running) return running;
     const run: Promise<void> = this.tryReturn(rt, opts).finally(() => {
       if (this.returnRuns.get(rt.id) === run) this.returnRuns.delete(rt.id);
+      this.scheduleLossWake(rt);
     });
     this.returnRuns.set(rt.id, run);
     return run;
@@ -2721,7 +2851,8 @@ export class App {
           : `${refused.text}${RESUME_SUMMARY_TRAILER}`;
     // Background agents the same limit stopped (`ended`: those the move's close ended after all):
     // named, so the agent can start again what is still needed.
-    const stopped = resumeBackgroundNote(limitStoppedAgents(rt.items, new Set([...rt.takeLimitStopped(), ...ended])));
+    const lost = new Set(rt.pendingLost().names);
+    const stopped = resumeBackgroundNote(limitStoppedAgents(rt.items, new Set([...rt.takeLimitStopped(), ...ended])).filter(name => !lost.has(name)));
     return { id: randomUUID(), ts: Date.now(), type: 'user', text: `${text}${stopped}`, state: 'sent' };
   }
 
@@ -3010,12 +3141,18 @@ export class App {
   ): Promise<RpcMethods['session.switchAccount']['result']> {
     const stops = this.stopsOf(rt);
     const closes = this.closesOf(rt);
+    this.moveAttempts.set(rt, (this.moveAttempts.get(rt) ?? 0) + 1);
     try {
       return await this.switchIdleAccount(rt, accountId, opts, ctx, stops, closes);
     } catch (err) {
       // Even a refusal before the destination was reserved confirms the source for every window.
       if (this.sessions.get(rt.id) === rt) this.emit({ type: 'session.updated', id: rt.id, patch: { accountId: rt.meta.accountId ?? DEFAULT_ACCOUNT, movedFrom: rt.meta.movedFrom, returnAt: rt.meta.returnAt } });
       throw err;
+    } finally {
+      const remaining = this.moveAttempts.get(rt)! - 1;
+      if (remaining) this.moveAttempts.set(rt, remaining);
+      else this.moveAttempts.delete(rt);
+      this.scheduleLossWake(rt);
     }
   }
 
@@ -3071,7 +3208,7 @@ export class App {
     const attempt: MoveAttempt = { stops, live, compacted: false, remote: false, sourceClosed: false, lostSteps: [] };
     try {
       if (atLimit?.limit && rt.items.some((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)) && (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== accountId && !this.moving.has(rt.id)) {
-        await this.stopLiveBackground(rt, atLimit.limit);
+        await this.stopLiveBackground(rt, atLimit.limit, !!opts.automatic);
         live();
         // A turn began while they were stopped (a notification woke the agent): the move waits for
         // that turn's end, which is refused at the limit too and decides again (D2).
@@ -3153,7 +3290,7 @@ export class App {
   private dispatching = new Map<string, Set<Promise<void>>>();
 
   /** A send of the chat is on its way to its agent until the returned function is called. */
-  private beginDispatch(rt: SessionRuntime): () => void {
+  private beginDispatch(rt: SessionRuntime, checkLossAfter = true): () => void {
     let done!: () => void;
     const p = new Promise<void>((r) => (done = r));
     let set = this.dispatching.get(rt.id);
@@ -3163,6 +3300,7 @@ export class App {
     return () => {
       own.delete(p);
       if (!own.size && this.dispatching.get(rt.id) === own) this.dispatching.delete(rt.id);
+      if (checkLossAfter) this.scheduleLossWake(rt);
       done();
     };
   }
@@ -3219,6 +3357,7 @@ export class App {
   /** A move ended, however: what was sent meanwhile goes out. */
   private moved(rt: SessionRuntime, stops: number, compacted: boolean) {
     this.moving.delete(rt.id);
+    this.scheduleLossWake(rt);
     if (rt.meta.moving) rt.update({ moving: false });
     // What was sent meanwhile (or waited behind the compaction) goes out on the new account; after a
     // Stop or a close meanwhile it waits for the person (review wave 8, #21).
@@ -3248,10 +3387,14 @@ export class App {
     return this.closes.get(rt.id) ?? 0;
   }
   private stopped(rt: SessionRuntime) {
+    this.pendingLossWake.delete(rt);
+    clearTimeout(this.lossWakeTimers.get(rt));
+    this.lossWakeTimers.delete(rt);
     this.stops.set(rt.id, this.stopsOf(rt) + 1);
     this.firstInputs.get(rt.id)?.missed();
   }
   private closed(rt: SessionRuntime) {
+    rt.stopRequested = true;
     this.stopped(rt);
     this.closes.set(rt.id, this.closesOf(rt) + 1);
     // A limit decision or a return armed before never starts it again (review wave 16, #10).
@@ -3489,7 +3632,7 @@ export class App {
     rt.cancelPrompts();
     const working = rt.items.filter((i) => worksInBackground(i)).map((i) => i.id);
     if (rt.meta.commands) attempt.lostSteps = rt.items.filter(runsTask).map((i) => i.id);
-    const lost = rt.tasksLost('move');
+    const lost = rt.tasksLost('move', auto ? 'move' : undefined);
     const old = rt.handle;
     rt.handle = undefined;
     // Its Remote Control was live: the new account's process takes it over once the move is done (D3).
@@ -3498,6 +3641,7 @@ export class App {
       try {
         await this.closeWriter(rt, fromId, old);
         attempt.sourceClosed = true;
+        rt.setReportedTasks([]);
         if (old.exited) stable = true;
       } catch {
         stable = false;
@@ -3508,6 +3652,7 @@ export class App {
     if (auto && !stable) throw new Error('The old process did not confirm its exit, so the conversation could not be copied.');
     const ended = working.filter((wid) => !worksInBackground(rt.get(wid)));
     this.markLimitStops(rt, ended, atLimit);
+    if (auto) this.recordStoppedAgents(rt, ended, 'move');
 
     let carried: 'conversation' | 'summary' | 'none' = 'none';
     let summaryAt = false;
@@ -3676,14 +3821,18 @@ export class App {
       live();
       if (!handle) throw new NotNow('The destination process was released during the move.');
       // Its sender (a phone) removed meanwhile: the refused message never goes (review wave 17, #3).
-      if (!this.refusedAllowed(rt, refused.id)) return;
+      if (!this.refusedAllowed(rt, refused.id)) {
+        this.pendingLossWake.delete(rt);
+        return;
+      }
+      const retry = this.resumeMessage(rt, refused, carried, limitCard!, ended);
+      if (auto && !rt.get(retry.id) && rt.pendingLost().count && (rt.dangerHeld || rt.meta.lossWake?.blocked || recentLossWakes(rt).length >= 2)) return;
       await this.applyModeDue(rt, handle);
       live();
       if (this.stopsOf(rt) !== stops) return;
       const stopped = new NotNow('The chat was stopped during the move.');
       const unhand = this.handOver(rt, refused.id);
       try {
-        const retry = this.resumeMessage(rt, refused, carried, limitCard!, ended);
         if (person && retry.id === person.id) this.retryOwners.set(rt, person.id);
         const checkDelivery = () => {
           live();
@@ -3863,6 +4012,7 @@ export class App {
    * the agent could not say how the turn ended (`hold`).
    */
   private afterTurn(rt: SessionRuntime, error?: string, hold = false, backgroundLimit = false) {
+    this.scheduleLossWake(rt);
     // The compaction before a move ended: the move goes on (nothing is sent, nothing else follows).
     const compacted = this.compacting.get(rt.id);
     if (compacted) return compacted(error);
@@ -5208,6 +5358,8 @@ export class App {
 
   async dispose(saved?: () => void) {
     this.disposed = true;
+    for (const timer of this.lossWakeTimers.values()) clearTimeout(timer);
+    this.lossWakeTimers.clear();
     clearTimeout(this.registryRetry);
     for (const pending of this.firstInputs.values()) {
       pending.missed();

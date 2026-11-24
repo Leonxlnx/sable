@@ -806,6 +806,18 @@ describe('review wave 17', { timeout: 25_000 }, () => {
     expect(rt.get<ToolItem>(step.id)?.task?.lossTold).toBe(true);
   });
 
+  it('checks a hidden loss wake through Codex turn/start and confirms it on the RPC receipt', async () => {
+    const { rt, asked } = await codexChat();
+    const step = rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Read the report', status: 'done', detail: {} });
+    rt.taskStarted(step.id, { id: 'report', kind: 'command' });
+    rt.tasksLost('process', 'death');
+    await until(() => !!rt.get<ToolItem>(step.id)?.task?.lossTold, 'the RPC receipt');
+    const starts = asked.filter(a => a.method === 'turn/start');
+    expect(starts).toHaveLength(1);
+    expect(JSON.stringify(starts[0].params.input)).toContain('task report');
+    expect(notices(rt.items).filter(n => n.text.includes('The agent was told and carries on.'))).toHaveLength(1);
+  });
+
   it("#6 Codex: a sub-agent whose turn started before its spawn registered it is still interrupted", async () => {
     const { app, rt, asked, notify, provider } = await codexChat();
     await app.call('session.send', { sessionId: rt.id, text: 'split the work' });

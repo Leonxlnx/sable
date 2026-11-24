@@ -21,7 +21,8 @@ describe('a sub-agent result keeps its figures', () => {
 
   it('a background launch is marked as still working and shows no placeholder text', () => {
     const r = mapResult('Agent', { run_in_background: true }, { status: 'async_launched', agentId: 'x', description: 'd' }, 'Async agent launched successfully.', false);
-    expect(r).toEqual({ agent: { background: 'running' } });
+    // The agent's own id is kept with the step, so a later resume of the same agent (SendMessage) finds its row.
+    expect(r).toEqual({ agent: { taskId: 'x', background: 'running' } });
   });
 
   it('task events give only the figures they carry', () => {

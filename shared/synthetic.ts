@@ -173,6 +173,14 @@ function lastClose(text: string, end: string, from: number): number {
 
 const clean = (s: string) => s.replace(/\r\n?/g, '\n').replace(ANSI, '');
 
+/** Claude's local /compact stdout, when a compact boundary already represents it. */
+export function isCompactOutput(text: string, bare = false): boolean {
+  const trimmed = clean(text).trim();
+  const stdout = /^<local-command-stdout>([^<>]*)<\/local-command-stdout>$/.exec(trimmed);
+  const value = stdout ? stdout[1].trim() : bare ? trimmed : '';
+  return /^Compacted(?:\s*\([\w+ -]+ to see full summary\))?(?:\s+Tip: [^\n<>]+)?$/.test(value);
+}
+
 /** A child element's text (`<status>completed</status>`): to its closing tag, or to the end when it is cut. */
 function child(body: string, name: string, last = false): string | undefined {
   const open = new RegExp(`<${name}(?:\\s[^<>]*)?>`, 'i');
@@ -487,6 +495,8 @@ export const HANDOVER_JOIN = '\n\n---\n\n';
 export const RESUME_AFTER_RESET = 'The last turn was cut off by a usage limit, which has reset now. Carry on with the task from where it stopped. Do not repeat steps that are already done.';
 export const RESUME_UNDER_ANOTHER = 'The last turn was cut off by a usage limit; the conversation now continues under another account. Carry on with the task from where it stopped. Do not repeat steps that are already done.';
 export const RESUME_LIMIT_RESET = 'The usage limit has reset. Carry on with the task from where it stopped.';
+/** Sable opens a turn with this line and the reserved lostTasksNote. It has no user card. */
+export const RESUME_LOST = 'Check what the lost background work finished, then carry on with the task.';
 /** After the person's words, when the turn carries on from a summary. */
 export const RESUME_SUMMARY_TRAILER = '\n\n(Part of this was already done before a usage limit cut the turn off: the summary above shows how far it got. Carry on from there.)';
 /** After a carry-on (`RESUME_*`, or the summary trailer) when the same limit stopped background agents: which ones (`resumeBackgroundNote`). */
@@ -514,7 +524,7 @@ const LOST_TASKS_TAIL = '. They may have ended with it or may still be running, 
 const LOST_TASKS = /(?:^|\n\n)Sable lost track of these background tasks when the agent process that ran them went away: [^\n]{1,4000}\. They may have ended with it or may still be running, and no notification will come for them\. Check what they left \(their output, ports, files\) before you start any of them again\.\s*(?=$|\n\n(?:@\S|\[Attached file: |<attachment[\s>]))/;
 export const lostTasksNote = (names: string[]) => (names.length ? `${LOST_TASKS_HEAD}${names.join('; ')}${LOST_TASKS_TAIL}` : '');
 
-const SABLE_OPENERS = ['This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, 'The check `'];
+const SABLE_OPENERS = ['This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, RESUME_LOST, 'The check `'];
 const HANDOVER_HEAD = /^(?:This continues a conversation (?:that started under another account|the user had with [^\n]{1,200} in this folder)|Since your last reply here, the user went on with [^\n]{1,200} in this conversation)\. Here is what happened (?:so far|since), oldest first:\n/;
 /** The whole of an `/until` round's failure (server/core/until.ts `failureMessage`): its head, then the output fenced or "It printed nothing.", and nothing after: the output ends at the first line that is the closing fence, so words and a fenced block of the person's own after a pasted failure stay theirs. */
 const UNTIL_FAILURE = /^The check `[^`\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n(?:(?!\1[ \t]*(?:\n|$))[^\n]*\n)*\1)$/;
@@ -527,7 +537,7 @@ function sableMessage(lead: string): string {
   let bare = lead;
   for (const tag of STRIP_TAGS) bare = bare.replace(new RegExp(`\\s*<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?(?:</${tag}>|$)`, 'g'), '');
   const t = bare.replace(BROWSER_LINE, '').trimEnd().replace(LOST_TASKS, '').replace(RESUME_BACKGROUND, '').replace(SIGN_IN_BACKGROUND, '').trim();
-  if (t === RESUME_AFTER_RESET || t === RESUME_UNDER_ANOTHER || t === RESUME_LIMIT_RESET || t === RESUME_AFTER_SIGN_IN) return t;
+  if (t === RESUME_AFTER_RESET || t === RESUME_UNDER_ANOTHER || t === RESUME_LIMIT_RESET || t === RESUME_AFTER_SIGN_IN || t === RESUME_LOST) return t;
   if (UNTIL_FAILURE.test(t)) return t;
   // A handover with nothing of the person's after it.
   const words = withoutHandover(t);

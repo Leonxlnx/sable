@@ -250,6 +250,8 @@
             if (final) {
               finalDone = true;
               runScripts();
+              /* The app waits for a height measured after this render: send one even when it did not change. */
+              lastH = -1;
             }
             schedule();
             send({ type: 'rendered', final: !!final });

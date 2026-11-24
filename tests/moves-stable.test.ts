@@ -62,6 +62,8 @@ interface Ctl {
   stopsBackground?: boolean;
   /** A close cuts the turn its process ran and loses its commands, said once (as Claude Code's does). */
   closeCuts?: boolean;
+  /** A continued turn whose SDK events are driven by the test. */
+  carryOn?: (rt: SessionRuntime) => void;
 }
 
 /** The Demo, recording what each process was given and when it opened and closed. */
@@ -82,6 +84,7 @@ class MoveDemo extends DemoProvider {
     let held = false;
     s.send = async (item, o) => {
       this.ctl.sent.push({ text: item.text, home, chat: rt.id, account: rt.meta.accountId ?? DEFAULT_ACCOUNT });
+      if (this.ctl.carryOn && item.text.startsWith(RESUME_UNDER_ANOTHER)) return this.ctl.carryOn(rt);
       if (item.text === '/compact' && this.ctl.compact === 'stall') {
         rt.beginTurn('Running /compact');
         held = true;
@@ -905,7 +908,7 @@ describe('move and quit races', { timeout: 20000 }, () => {
 
   it('retains a lost-task note until Claude confirms the exact send', async () => {
     const home = temp('sable-confirm-');
-    const calls: { text: string; taken?: () => void; release?: () => void }[] = [];
+    const calls: { text: string; taken?: () => void; release?: () => void; uncertain?: () => void }[] = [];
     const app = new App({ home, userHome: home, quiet: true, providers: [ctx => {
       const p = new DemoProvider(ctx, { speed: 0 });
       const open = p.open.bind(p);
@@ -937,6 +940,19 @@ describe('move and quit races', { timeout: 20000 }, () => {
     expect(rt.get<ToolItem>(step.id)?.task?.lossTold).toBe(true);
     await app.call('session.send', { sessionId: rt.id, text: 'after confirmation' });
     expect(calls[3].text).not.toContain('task ci');
+    const another = command(rt, 'Review follow-up', 'review');
+    rt.tasksLost('process', 'death');
+    await until(() => calls.length === 5, 'the standalone recovery input');
+    expect(parseSynthetic(calls[4].text)?.role).toBe('hidden');
+    expect(rt.get<ToolItem>(another.id)?.task?.lossTold).toBeFalsy();
+    expect(notices(rt.items).filter(i => i.text.includes('The agent was told'))).toHaveLength(0);
+    calls[4].uncertain!();
+    const waiting = notices(rt.items).find(i => i.text.includes("hasn't confirmed"));
+    expect(waiting).toBeDefined();
+    calls[4].taken!();
+    calls[4].taken!();
+    expect(rt.get<ToolItem>(another.id)?.task?.lossTold).toBe(true);
+    expect(notices(rt.items).filter(i => i.text.includes('The agent was told'))).toEqual([expect.objectContaining({ id: waiting!.id })]);
   });
   it('a reset armed for an older refusal leaves its replacement alone', async () => {
     const h = start();
@@ -1414,6 +1430,174 @@ describe('the account that refused Fable', () => {
 });
 
 describe('a move Sable makes by itself waits for work in the background (D1, E3)', { timeout: 20_000 }, () => {
+  it.each(['return', 'cap'])('the night run holds a %s on B through both the fresh and resumed agent', async reason => {
+    const h = start();
+    const { studio: a, work: b } = await twoAccounts(h);
+    const rt = await chat(h, a.id, { tokens: 453000 });
+    await h.app.call('app.setSettings', { patch: { continueAtLimit: true } });
+    const reset = Date.now() + 3600000;
+    const card = rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: '5-hour limit reached', limit: { origin: 'background', window: '5-hour', resetsAt: reset } });
+    h.ctl.carryOn = r => {
+      r.beginTurn();
+      r.add<ToolItem>({ id: 'fresh-call', type: 'tool', name: 'Agent', kind: 'agent', title: 'Fresh', status: 'done', detail: {}, result: { agent: { background: 'running' } } });
+      r.setReportedTasks([{ id: 'fresh', itemId: 'fresh-call', agent: true }, { id: 'resumed', agent: true }]);
+    };
+    await h.app.switchAccount(rt, b.id, { automatic: true, retry: true, limitReturn: { at: reset } });
+    expect(rt.get<NoticeItem>(card.id)?.limit?.continuedWith).toBe(b.id);
+    expect(h.ctl.sent.map(s => s.account)).toEqual([b.id]);
+    expect(notices(rt.items).some(i => i.text === 'Carried as it is' && i.detail?.includes('453k'))).toBe(true);
+    rt.update({ returnAt: reason === 'return' ? Date.now() - 1 : reset, usage: { ...rt.meta.usage, contextTokens: 462000 } });
+    if (reason === 'cap') await h.app.call('app.setSettings', { patch: { accountCaps: { [`demo:${b.id}`]: { weekly: 1 } } } });
+    rt.endTurn();
+    const check = () => reason === 'return' ? h.app.returnAfterLimit(rt) : internals(h.app).checkCap(rt);
+    await check();
+    expect(rt.meta.background).toBe(2);
+    rt.stopBackground(i => i.id === 'fresh-call');
+    rt.setReportedTasks([{ id: 'resumed', agent: true }]);
+    await check();
+    expect(rt.meta.accountId).toBe(b.id);
+    expect(h.ctl.closed.filter(s => s.home === b.dir)).toEqual([]);
+    expect(h.ctl.sent.map(s => s.text)).not.toContain('/compact');
+    rt.setReportedTasks([]);
+    await until(() => !rt.meta.moving && rt.meta.accountId !== b.id, 'the deferred move');
+    if (reason === 'return') {
+      expect(rt.meta.accountId).toBe(a.id);
+      expect(h.ctl.sent.map(s => s.text)).not.toContain('/compact');
+    }
+  });
+
+  it.each(['return', 'cap'])('wakes exactly once on the destination after a %s loses an old command', async reason => {
+    const h = start();
+    const { studio, work } = await twoAccounts(h, 'near');
+    const rt = await chat(h, studio.id);
+    command(rt, 'Serve reports', 'old-server', 31 * 60_000);
+    if (reason === 'return') {
+      rt.update({ movedFrom: work.id, returnAt: Date.now() - 1 });
+      await h.app.returnAfterLimit(rt);
+    } else {
+      await h.app.call('app.setSettings', { patch: { accountCaps: { [`demo:${studio.id}`]: { weekly: 70 } } } });
+      await internals(h.app).checkCap(rt);
+    }
+    await until(() => h.ctl.sent.length > 0, 'the lost-work wake', 800);
+    expect(h.ctl.sent.map(s => s.account)).toEqual([work.id]);
+    expect(h.ctl.sent[0].text).toContain('Serve reports');
+    expect(h.ctl.sent[0].text).toContain('no notification will come');
+    expect(parseSynthetic(h.ctl.sent[0].text)?.role).toBe('hidden');
+    expect(notices(rt.items).filter(n => n.text.includes('The agent was told and carries on.'))).toHaveLength(1);
+    expect(rt.pendingLost().names).toEqual([]);
+  });
+
+  it.each(['death', 'capability'] as const)('wakes at rest after process %s with the command and the SDK-list-only agent in one message', async cause => {
+    const h = start(), rt = await chat(h, DEFAULT_ACCOUNT);
+    command(rt, 'Collect reports', 'report');
+    rt.setReportedTasks([{ id: 'reviewer', agent: true }]);
+    rt.tasksLost('process', cause);
+    rt.setReportedTasks([]);
+    await until(() => h.ctl.sent.length > 0, 'a hidden wake', 800);
+    expect(h.ctl.sent).toHaveLength(1);
+    expect(h.ctl.sent[0].text).toContain('Collect reports');
+    expect(h.ctl.sent[0].text).toContain('reviewer');
+    expect(parseSynthetic(h.ctl.sent[0].text)?.role).toBe('hidden');
+    expect(notices(rt.items).filter(n => n.text.startsWith('2 background tasks were lost'))).toHaveLength(1);
+    await until(() => !rt.turnActive, 'the wake answer');
+    expect(h.ctl.sent).toHaveLength(1);
+  });
+
+  it.each(['Stop', 'close', 'manual move', 'held phone mode'])('leaves lost work for a personal message after %s', async action => {
+    const h = start({ closeCuts: true }), { studio, work } = await twoAccounts(h);
+    const rt = await chat(h, studio.id);
+    command(rt, 'Waiting for CI', 'ci');
+    if (action === 'manual move') await h.app.call('session.switchAccount', { sessionId: rt.id, accountId: work.id });
+    else if (action === 'close') await h.app.call('session.close', { sessionId: rt.id });
+    else {
+      if (action === 'held phone mode') {
+        rt.beginTurn();
+        await h.app.call('session.setMode', { sessionId: rt.id, mode: 'bypassPermissions', answerWaiting: false });
+        rt.endTurn();
+      }
+      rt.tasksLost('process', 'death');
+      if (action === 'Stop') await h.app.call('session.interrupt', { sessionId: rt.id });
+    }
+    await tick(80);
+    expect(h.ctl.sent).toHaveLength(0);
+    expect(rt.pendingLost().names.join()).toContain('Waiting for CI');
+    if (action === 'held phone mode') expect(rt.dangerHeld).toBe(true);
+  });
+
+  it('a personal send in flight receives the loss instead of a second send', async () => {
+    const h = start(), rt = await chat(h, DEFAULT_ACCOUNT);
+    const inLane = gate(), go = gate();
+    const lanes = (h.app as unknown as { lanes: { ready(rt: SessionRuntime): Promise<void> } }).lanes;
+    vi.spyOn(lanes, 'ready').mockImplementationOnce(async () => { inLane.release(); await go.wait; });
+    const personal = h.app.call('session.send', { sessionId: rt.id, text: 'Show me the results' });
+    await inLane.wait;
+    try {
+      command(rt, 'Collect results', 'ci');
+      rt.tasksLost('process', 'death');
+      await tick(60);
+      expect(h.ctl.sent).toHaveLength(0);
+    } finally { go.release(); await personal; }
+    await until(() => !rt.turnActive, 'the answer');
+    expect(h.ctl.sent).toHaveLength(1);
+    expect(stripWrappers(h.ctl.sent[0].text)).toBe('Show me the results');
+    expect(h.ctl.sent[0].text).toContain('Collect results');
+  });
+
+  it('a loss waits for the limit decision and move, then rides the one carry-on', async () => {
+    const h = start(), { studio, work } = await twoAccounts(h);
+    const rt = await chat(h, studio.id);
+    await h.app.call('app.setSettings', { patch: { continueAtLimit: true } });
+    const deciding = gate(), decide = gate(), copying = gate(), copy = gate();
+    vi.spyOn(h.app, 'nextAccount').mockImplementationOnce(async () => { deciding.release(); await decide.wait; return work.id; });
+    vi.spyOn(h.app.provider('demo', work.id), 'adoptConversation').mockImplementationOnce(async () => { copying.release(); await copy.wait; return true; });
+    rt.limitInBackground({ window: '5-hour', resetsAt: Date.now() + 3600000 });
+    await deciding.wait;
+    try {
+      command(rt, 'Review output', 'r');
+      rt.tasksLost('process', 'death');
+      await tick(60);
+      expect(h.ctl.sent).toHaveLength(0);
+      decide.release();
+      await copying.wait;
+      await tick(60);
+      expect(h.ctl.sent).toHaveLength(0);
+    } finally { decide.release(); copy.release(); }
+    await until(() => h.ctl.sent.length > 0 && !rt.turnActive && !rt.meta.moving, 'the limit carry-on');
+    expect(h.ctl.sent.map(s => s.account)).toEqual([work.id]);
+    expect(h.ctl.sent[0].text).toContain('Review output');
+    expect(parseSynthetic(h.ctl.sent[0].text)?.role).toBe('hidden');
+    expect(notices(rt.items).filter(n => n.text.includes('The agent was told and carries on.'))).toHaveLength(1);
+  });
+
+  it.each(['rate limit', 'early death', 'later death', 'another process'])('bounds automatic recovery across a %s', async guard => {
+    const h = start(), rt = await chat(h, DEFAULT_ACCOUNT);
+    await tick();
+    vi.useFakeTimers();
+    try {
+      const lose = async (id: string, cause: 'death' | 'capability') => {
+        command(rt, id, id);
+        rt.tasksLost('process', cause);
+        await vi.advanceTimersByTimeAsync(1000);
+      };
+      await lose('first', 'capability');
+      expect(h.ctl.sent).toHaveLength(1);
+      if (guard === 'another process') rt.processGeneration++;
+      if (guard === 'later death') await vi.advanceTimersByTimeAsync(120000);
+      if (guard === 'rate limit') {
+        await lose('second', 'capability');
+        await lose('third', 'capability');
+        expect(h.ctl.sent).toHaveLength(2);
+        await vi.advanceTimersByTimeAsync(600000);
+        expect(h.ctl.sent).toHaveLength(3);
+      } else {
+        // A process that crashes without any new tasks must still trip the guard.
+        rt.tasksLost('process', 'death');
+        await vi.advanceTimersByTimeAsync(600000);
+        await lose('second', 'capability');
+        expect(h.ctl.sent).toHaveLength(guard === 'early death' ? 1 : 2);
+      }
+    } finally { vi.useRealTimers(); }
+  });
   it('the return to the account a limit left waits for a young background command, and goes once it ended', async () => {
     const h = start();
     const { rt, studio, work } = await owingReturn(h);

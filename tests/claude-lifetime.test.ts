@@ -21,6 +21,8 @@ import { SessionRuntime, type BackgroundLimit } from '../server/core/runtime';
 import { remoteToRelease, resetRemoteKeeper, type RemoteHolder } from '../server/core/remote-keep';
 import { ClaudeProvider } from '../server/providers/claude';
 import { backgroundTaskOf, taskKindOf, wakeOf } from '../server/providers/claude-tools';
+import { agentIndex, liveKey, overview } from '../src/features/rail/agents-model';
+import { hasWork } from '@shared/work-label';
 import type { ProviderSession } from '../server/providers/types';
 
 /** A fake SDK `query`: a stream a test writes to (`out`) and ends (`end`), ended too by `close()` (or later, `closeLag`). */
@@ -83,10 +85,10 @@ const sdk = vi.hoisted(() => {
     procs.push(proc);
     return proc.q;
   }
-  return { procs, fakeQuery, child };
+  return { procs, fakeQuery, child, history: vi.fn() };
 });
 
-vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => ({ ...(await importOriginal<object>()), query: (p: { prompt: AsyncIterable<unknown> }) => sdk.fakeQuery(p) }));
+vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => ({ ...(await importOriginal<object>()), getSessionMessages: sdk.history, query: (p: { prompt: AsyncIterable<unknown> }) => sdk.fakeQuery(p) }));
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -718,6 +720,17 @@ describe('what the process holds', () => {
     expect(h.notices().at(-1)).toMatchObject({ text: '1 background command was lost at the plan limit', detail: 'Run app tests 1' });
   });
 
+  it('a person moving at a limit leaves the loss for their next input', async () => {
+    const h = await atRest();
+    await h.background(1);
+    await h.message(result([h.first.uuid]));
+    const wake = vi.fn();
+    h.rt.onWorkLost = wake;
+    expect(await (h.session.stopBackgroundWork as (automatic: boolean) => Promise<boolean>)(false)).toBe(true);
+    expect(h.rt.pendingLost().count).toBe(1);
+    expect(wake).not.toHaveBeenCalled();
+  });
+
   it("the CLI's own running while its background agents work is theirs, not a turn: a move at a limit and a send after a sign-in are not held by it", async () => {
     const h = await atRest();
     await h.call('toolu_ag', 'Agent', { description: 'Review the diff', prompt: 'review', run_in_background: true });
@@ -741,6 +754,113 @@ describe('what the process holds', () => {
 // ─────────────────────────────── D-tasks: background commands ───────────────────────────────
 
 describe('background commands', () => {
+  it.each(['idle close', 'Remote Control keeper'])('keeps a SendMessage resume working through the %s until its own run ends', async (keeper) => {
+    vi.useFakeTimers();
+    const h = await atRest({ options: { remoteControl: keeper === 'Remote Control keeper' } });
+    const task = { task_id: 'reviewer', task_type: 'local_agent', description: 'Review the change' };
+    await h.call('original', 'Agent', { prompt: 'Review', description: task.description, run_in_background: true });
+    await h.system({ ...task, subtype: 'task_started', tool_use_id: 'original', run_id: '01', is_backgrounded: true });
+    await h.done('original', { status: 'async_launched', agentId: task.task_id });
+    const terminal = (run_id: string) => h.system({ subtype: 'task_notification', task_id: task.task_id, run_id, status: 'completed', output_file: 'review.txt', summary: 'Reviewed' });
+    await terminal('01');
+    await h.message(result([h.first.uuid]));
+    await h.system({ subtype: 'background_tasks_changed', tasks: [] });
+    const again = await h.send('Check again');
+    await h.replay(again.uuid, 'Check again');
+    await h.call('message', 'SendMessage', { to: task.task_id, message: 'Review the follow-up', summary: 'Check follow-up' });
+    const active = { ...task, run_id: '02' };
+    await h.system({ subtype: 'background_tasks_changed', tasks: [active] });
+    await h.system({ ...active, subtype: 'task_started', ...(keeper === 'idle close' ? { tool_use_id: 'message' } : {}), is_backgrounded: true });
+    const delivery = { success: true, message: 'Resuming agent reviewer', resumedAgentId: 'reviewer', revivedAgentId: 'reviewer' };
+    await h.done('message', delivery, null, delivery.message);
+    await h.system({ subtype: 'task_progress', task_id: task.task_id, run_id: '02', tool_use_id: 'message', description: task.description, summary: 'Checking changes', usage: { total_tokens: 100, tool_uses: 2, duration_ms: 50 } });
+    await h.system({ subtype: 'task_updated', task_id: task.task_id, run_id: '02', patch: { status: 'running' } });
+    await h.message(result([again.uuid]));
+    await terminal('01');
+    const working = () => {
+      const items = Object.fromEntries(h.rt.items.map(i => [i.id, i]));
+      const roots = h.rt.items.filter(i => !i.parentId).map(i => i.id);
+      const ids = agentIndex()({ items, roots, children: {} });
+      return overview(ids, liveKey(items, ids), items, [], roots).working;
+    };
+    expect(h.session.liveWork()).toMatchObject({ turn: false, agents: 1 });
+    expect(h.rt.meta.background).toBe(1);
+    expect(hasWork(h.rt.snapshot().session)).toBe(true);
+    await vi.advanceTimersByTimeAsync(46 * 60_000);
+    expect(h.session.holdsWork()).toBe(true);
+    if (keeper === 'Remote Control keeper') {
+      expect(remoteToRelease([h.holder()], Date.now())).toEqual([]);
+      expect(h.holder().release()).toBe(false);
+    }
+    expect(h.closes()).toBe(0);
+    expect(working()).toEqual(['original']);
+    await h.system({ subtype: 'task_updated', task_id: task.task_id, run_id: '02', patch: { status: 'completed' } });
+    expect(working()).toEqual([]);
+    await terminal('02');
+    await h.system({ subtype: 'background_tasks_changed', tasks: [] });
+    await vi.advanceTimersByTimeAsync(3001);
+    expect(h.session.holdsWork()).toBe(false);
+    expect(h.rt.meta.background).toBe(0);
+    if (keeper === 'Remote Control keeper') {
+      expect(remoteToRelease([h.holder()], Date.now() + 46 * 60_000)).toEqual([h.holder()]);
+      h.holder().release();
+    } else await vi.advanceTimersByTimeAsync(8 * 60_000 + 1);
+    expect(h.closes()).toBe(1);
+  });
+
+  it.each([true, false])('shows a resumed task on a new account when its original call was carried (%s)', async carried => {
+    const h = await atRest();
+    if (carried) h.rt.add<ToolItem>({ type: 'tool', id: 'old-call', name: 'Agent', kind: 'agent', status: 'done', title: 'Inspect build', detail: {},
+      result: { agent: { taskId: 'inspect', background: 'done' } } });
+    await h.call('msg', 'SendMessage', { to: 'inspect', message: 'Finish the checks', summary: 'Finish checks' });
+    const task = { task_id: 'inspect', task_type: 'local_agent', description: 'Inspect build', run_id: '02' };
+    await h.system({ subtype: 'background_tasks_changed', tasks: [task] });
+    await h.system({ ...task, subtype: 'task_started', is_backgrounded: true, tool_use_id: 'msg' });
+    await h.done('msg', { success: true, resumedAgentId: 'inspect', revivedAgentId: 'inspect' });
+    await h.message(result([h.first.uuid]));
+    const rows = h.rt.items.filter((i): i is ToolItem => i.type === 'tool' && i.kind === 'agent');
+    expect(rows.map(i => i.name)).toEqual([carried ? 'Agent' : 'local_agent']);
+    expect(rows[0].result?.agent).toMatchObject({ taskId: 'inspect', background: 'running' });
+    expect(h.rt.meta.background).toBe(1);
+    await h.system({ ...task, subtype: 'task_notification', status: 'completed' });
+    expect(step(h.rt, rows[0].id).result?.agent?.background).toBe('done');
+    expect(h.rt.meta.background).toBe(0);
+  });
+
+  it('shows the compaction boundary once across the three local-output frames', async () => {
+    const h = await atRest();
+    await h.system({ subtype: 'compact_boundary', compact_metadata: { pre_tokens: 466000, post_tokens: 24000 } });
+    const stdout = '<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>';
+    await h.text(stdout, { message: { model: '<synthetic>', content: [{ type: 'text', text: stdout }] } });
+    await h.replay('output', stdout, { isSynthetic: true });
+    await h.system({ subtype: 'local_command_output', content: stdout });
+    expect(h.rt.items.filter(i => 'text' in i && i.text?.includes('Compacted'))).toEqual([]);
+    expect(h.notices().map(n => n.variant)).toEqual(['compact']);
+    for (const output of ['Context usage: 24k', 'Total cost: $0.25']) await h.system({ subtype: 'local_command_output', content: output });
+    expect(h.notices().map(n => n.detail)).toEqual(['466k → 24.0k tokens', 'Context usage: 24k', 'Total cost: $0.25']);
+    await h.text('Compacted');
+    expect(h.rt.items.at(-1)).toMatchObject({ type: 'text', text: 'Compacted' });
+  });
+
+  it('reads SDK history with a compact boundary, both stdout spellings and a later ordinary reply', async () => {
+    const h = await claude();
+    h.rt.update({ providerSessionId: 'imported' });
+    const output = '<local-command-stdout>Compacted</local-command-stdout>';
+    sdk.history.mockResolvedValueOnce([
+      { type: 'system', message: { subtype: 'compact_boundary', compact_metadata: { pre_tokens: 466000, post_tokens: 24000 } } },
+      { type: 'user', isCompactSummary: true, message: { content: 'Private compact summary' } },
+      { type: 'assistant', message: { model: '<synthetic>', content: [{ type: 'text', text: 'Compacted' }] } },
+      { type: 'user', uuid: 'out', message: { content: output } },
+      { type: 'system', message: { subtype: 'local_command_output', content: 'Compacted' } },
+      { type: 'user', uuid: 'cost', message: { content: [{ type: 'text', text: '<local-command-stdout>Total cost: $0.25</local-command-stdout>' }] } },
+      { type: 'system', message: { subtype: 'local_command_output', content: 'Context usage: 24k' } },
+      { type: 'assistant', message: { model: 'opus', content: [{ type: 'text', text: 'Compacted' }] } },
+    ]);
+    await (h.session.loadTranscript as () => Promise<void>)();
+    expect(sdk.history).toHaveBeenCalledWith('imported', { dir: h.rt.meta.cwd, includeSystemMessages: true });
+    expect(h.rt.items.map(i => 'text' in i && i.text)).toEqual(['Conversation compacted', '<local-command-stdout>Total cost: $0.25</local-command-stdout>', 'Command output', 'Compacted']);
+    expect(h.notices().at(-1)?.detail).toBe('Context usage: 24k');
+  });
   it('publishes SDK-list-only work to the chat, counts a linked step once and clears on exit', async () => {
     const h = await atRest();
     await h.message(result([h.first.uuid]));
@@ -910,6 +1030,25 @@ describe('background commands', () => {
 // ─────────────────────────── D-lost: a process that goes away ───────────────────────────
 
 describe('a process that goes away', () => {
+  it.each(['death', 'capability'] as const)('reports an actual %s before discarding the process task identities', async cause => {
+    const h = await atRest({ live: true });
+    await h.message(result([h.first.uuid]));
+    const heard = vi.fn();
+    h.rt.onWorkLost = heard;
+    if (cause === 'death') {
+      await h.system({ subtype: 'background_tasks_changed', tasks: [{ task_id: 'revived', task_type: 'local_agent', description: 'Review reports' }] });
+      h.proc().end();
+    } else {
+      await h.system({ subtype: 'background_tasks_changed', tasks: [{ task_id: 'review', task_type: 'local_bash', description: 'Review reports' }] });
+      expect(h.session.holdsWork()).toBe(true);
+      // Exercise the recovery fallback if a capability restart is ever admitted despite a live task.
+      vi.spyOn(h.session, 'holdsWork').mockReturnValueOnce(false);
+      await h.session.setOptions!({ browser: true });
+    }
+    await until(() => !h.q(), 'the old process to end');
+    expect(heard).toHaveBeenCalledWith(h.rt, cause, 1);
+    expect(h.rt.pendingLost().names.join()).toContain('Review reports');
+  });
   it('ends by itself at rest with a command running: the command is lost, one notice names it, the agent is told with its next message (A3)', async () => {
     const h = await atRest({ live: true });
     await h.background(1, 'Run app tests');

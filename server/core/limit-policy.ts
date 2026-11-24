@@ -1,4 +1,4 @@
-import type { AccountCap, LimitsMeta, ProviderId, RateLimit, TimelineItem } from '../../shared/protocol';
+import type { AccountCap, LimitsMeta, ProviderId, RateLimit, TimelineItem, ToolItem } from '../../shared/protocol';
 import { capPercent, isAllModelsWeekly, isSessionWindow, windowForModel, windowModel } from '../../shared/limit-windows';
 
 // The window helpers live in shared/ (the UI and the phone order accounts by them too).
@@ -43,6 +43,15 @@ export function backgroundLimitDue(o: { first: number; last: number; now: number
 const NAMES_MAX = 12;
 const NAME_MAX = 90;
 
+export function backgroundAgentName(i: ToolItem): string {
+  const task = (i.detail.description || i.title || i.name).replace(/\s+/g, ' ').trim();
+  const cut = task.length > NAME_MAX ? `${task.slice(0, NAME_MAX - 1).trimEnd()}…` : task;
+  const kind = i.detail.subagent?.replace(/\s+/g, ' ').trim().slice(0, 40);
+  const sdkId = i.name === 'local_agent' && i.result?.agent?.taskId;
+  const reference = sdkId ? `task ${sdkId.slice(0, NAME_MAX)}` : `${i.workflow ? 'workflow' : 'call'} ${i.id.slice(0, NAME_MAX)}`;
+  return `"${cut.replace(/"/g, "'")}" (${kind ? `${kind}, ` : ''}${reference})`;
+}
+
 /**
  * Background agents a plan limit stopped (`AgentStats.limit` on a stopped or failed background
  * step; `only`: these steps), as the agent knows them: the task it gave, the kind, and its own call
@@ -60,10 +69,7 @@ export function limitStoppedAgents(items: readonly TimelineItem[], only?: Readon
       more++;
       continue;
     }
-    const task = (i.detail.description || i.title || i.name).replace(/\s+/g, ' ').trim();
-    const cut = task.length > NAME_MAX ? `${task.slice(0, NAME_MAX - 1).trimEnd()}…` : task;
-    const kind = i.detail.subagent?.replace(/\s+/g, ' ').trim().slice(0, 40);
-    out.push(`"${cut.replace(/"/g, "'")}" (${kind ? `${kind}, ` : ''}${i.workflow ? 'workflow' : 'call'} ${i.id})`);
+    out.push(backgroundAgentName(i));
   }
   if (more) out.push(`${more} more`);
   return out;

@@ -18,9 +18,10 @@ import type {
   UserItem,
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
-import { userText } from '../../shared/synthetic';
+import { isCompactOutput, userText } from '../../shared/synthetic';
 import { runsTask, worksInBackground } from '../../shared/background';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
+import { backgroundAgentName } from './limit-policy';
 
 export type Emit = (event: BridgeEvent) => void;
 
@@ -53,6 +54,7 @@ export { runsTask, worksInBackground };
 
 /** Why a background command was lost: its process ended or was let go, Sable restarted, the chat moved, a limit. */
 export type LostWhy = 'process' | 'restart' | 'move' | 'limit';
+export type LossTrigger = 'death' | 'capability' | 'move' | 'limit';
 
 /** How a cut turn is said under its "Ended early" line (`cutTurn`), by what cut it. */
 const CUT_DETAIL: Record<'died' | 'closed' | 'restart', string> = {
@@ -99,6 +101,7 @@ export interface ReportedTask {
   id: string;
   itemId?: string;
   agent: boolean;
+  description?: string;
   since?: number;
 }
 
@@ -165,6 +168,12 @@ export class SessionRuntime {
   onStoppedLimit?: (rt: SessionRuntime, notice: NoticeItem) => void;
   /** The last background work ended with no turn running: the chat is at rest. */
   onRest?: (rt: SessionRuntime) => void;
+  /** Sable took work away, or the process died (also reported with zero losses for crash protection). */
+  onWorkLost?: (rt: SessionRuntime, trigger: LossTrigger, count: number) => void;
+  /** Changes whenever Claude retires a process on this handle. */
+  processGeneration = 0;
+  /** The existing line for this loss can be updated when the agent confirms the wake. */
+  lossNotice?: string;
   /** The limit notice the bridge wrote when work outside a turn met a limit: a turn refused at it says it there (one notice). */
   limitCard?: string;
 
@@ -231,7 +240,16 @@ export class SessionRuntime {
       if (s !== i) changed.push(i.id);
       return s;
     });
-    this.load(out, todos, queue);
+    let afterCompact = false;
+    this.load(this.meta.provider === 'claude' ? out.filter(item => {
+      if (afterCompact && !item.parentId && (
+        (item.type === 'text' && isCompactOutput(item.text, true)) ||
+        (item.type === 'user' && isCompactOutput(item.text)) ||
+        (item.type === 'notice' && item.variant === 'command' && item.detail && isCompactOutput(item.detail, true))
+      )) return false;
+      afterCompact = !item.parentId && item.type === 'notice' && item.variant === 'compact';
+      return true;
+    }) : out, todos, queue);
     this.markSaved();
     for (const id of changed) this.markDirty(id);
     return names;
@@ -366,8 +384,20 @@ export class SessionRuntime {
    * ended is not known). Returns their names as the person knows them, for the notice that tells
    * them (`lostLine`), and keeps them for `takeLost`.
    */
-  tasksLost(why: LostWhy): string[] {
+  tasksLost(why: LostWhy, trigger?: LossTrigger): string[] {
     const names: string[] = [];
+    const reports: string[] = [];
+    if (trigger) {
+      for (const t of this.reportedTasks) {
+        if (this.running.has(this.taskSteps.get(t.id) ?? '') || (t.itemId && this.working.has(t.itemId))) continue;
+        reports.push(`"${(t.description || t.id).replace(/\s+/g, ' ').slice(0, TASK_NAME_MAX)}" (${t.agent ? 'agent' : 'task'}, task ${t.id.slice(0, TASK_NAME_MAX)})`);
+      }
+      // A provider's confirmed process exit ends its agents too. A move may leave an
+      // unstoppable remote agent alive, so the move records only confirmed stops.
+      if (trigger === 'death' || trigger === 'capability') {
+        for (const id of this.working) reports.push(backgroundAgentName(this.get<ToolItem>(id)!));
+      }
+    }
     const ids = this.items.filter((i) => this.running.has(i.id)).map((i) => i.id);
     for (const id of ids) {
       const item = this.index.get(id);
@@ -375,7 +405,15 @@ export class SessionRuntime {
       names.push(taskName(item));
       this.patch<ToolItem>(id, { task: { ...item.task, state: 'lost', why } });
     }
+    if (trigger) this.reportLoss(trigger, reports, names.length);
     return names;
+  }
+
+  /** Reports without a command mark still share the same delivery reservation and receipt. */
+  reportLoss(trigger: LossTrigger, reports: string[], marked = 0) {
+    if (reports.length) this.update({ lostReports: [...(this.meta.lostReports ?? []), ...reports.map(name => ({ key: randomUUID(), name }))] });
+    if (reports.length || marked) this.lossNotice = undefined;
+    this.onWorkLost?.(this, trigger, reports.length + marked);
   }
 
   /**
@@ -390,6 +428,8 @@ export class SessionRuntime {
   reserveLost() {
     return this.lostBatch(Symbol());
   }
+
+  private reportReservations = new Map<string, symbol>();
 
   private lostBatch(token?: symbol) {
     const names: string[] = [];
@@ -407,14 +447,26 @@ export class SessionRuntime {
         names.push(`"${taskName(item).replace(/"/g, "'")}" (${item.task.kind}, task ${item.task.id})`);
       }
     }
-    if (batch.size > names.length) names.push(`${batch.size - names.length} more`);
+    const reports = (this.meta.lostReports ?? []).filter(r => !token || !this.reportReservations.has(r.key));
+    const keys = new Set(reports.map(r => r.key));
+    for (const r of reports) {
+      if (token) this.reportReservations.set(r.key, token);
+      if (names.length < LOST_NAMES_MAX) names.push(r.name);
+    }
+    const count = batch.size + reports.length;
+    if (count > names.length) names.push(`${count - names.length} more`);
     const release = () => {
+      if (token) for (const key of keys) if (this.reportReservations.get(key) === token) this.reportReservations.delete(key);
       if (token) for (const id of batch.keys()) {
         if (this.lossReservations.get(id)?.token === token) this.lossReservations.delete(id);
       }
     };
     const taken = () => {
       release();
+      if (keys.size && this.meta.lostReports?.some(r => keys.has(r.key))) {
+        const rest = this.meta.lostReports.filter(r => !keys.has(r.key));
+        this.update({ lostReports: rest.length ? rest : undefined });
+      }
       for (const [id, sent] of batch) {
         const task = this.get<ToolItem>(id)?.task;
         if (task?.state === 'lost' && !task.lossTold && task.id === sent.id && task.since === sent.since) {
@@ -422,7 +474,7 @@ export class SessionRuntime {
         }
       }
     };
-    return { names, taken, release };
+    return { names, count, taken, release };
   }
 
   /** Takes and acknowledges the current list together, for an already accepted message. */

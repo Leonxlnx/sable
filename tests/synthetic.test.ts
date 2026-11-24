@@ -5,6 +5,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   lostTasksNote,
+  RESUME_LOST,
+  isCompactOutput,
   RESUME_AFTER_RESET,
   parseSynthetic,
   partLine,
@@ -18,6 +20,24 @@ import {
   type SyntheticPart,
   type TaskNote,
 } from '@shared/synthetic';
+
+it('reads the lost-work wake as Sable’s message, including its names and move reminder', () => {
+  const note = lostTasksNote(['"Review reports" (agent, task review)']);
+  const text = RESUME_LOST + note + '\n\n<system-reminder>Account moved</system-reminder>';
+  expect(parseSynthetic(text)?.role).toBe('hidden');
+  expect(userText(text)).toBe('');
+  expect(parseSynthetic(RESUME_LOST + ' I will check separately.')).toBeNull();
+  expect(stripWrappers('Show my report' + note)).toBe('Show my report');
+});
+
+it('recognises compact stdout and its tip without swallowing other command output', () => {
+  const stdout = (s: string) => `<local-command-stdout>${s}</local-command-stdout>`;
+  expect(isCompactOutput(stdout('\x1b[2mCompacted\x1b[0m'))).toBe(true);
+  expect(isCompactOutput(stdout('Compacted (ctrl+o to see full summary)\nTip: Run /context to inspect usage.'))).toBe(true);
+  for (const s of [stdout('Compacted the database'), stdout('Total cost: $0.42'), stdout('Context usage'), '<bash-stdout>Compacted</bash-stdout>', 'Compacted']) {
+    expect(isCompactOutput(s)).toBe(false);
+  }
+});
 
 const BUILD = `<task-notification>
 <task-id>b296xlpn0</task-id>

@@ -50,7 +50,7 @@ import type {
   TurnItem,
   UserItem,
 } from '../../shared/protocol';
-import { lostLine, type BackgroundLimit, type LostWhy, type MessageOutcome, type SessionRuntime } from '../core/runtime';
+import { lostLine, type BackgroundLimit, type LossTrigger, type LostWhy, type MessageOutcome, type SessionRuntime } from '../core/runtime';
 import type { TitlePrompt } from '../core/titles';
 import { dropRemote, holdRemote, idleSince, type RemoteHolder } from '../core/remote-keep';
 import { claudeForkPoint, cutAt } from '../core/fork';
@@ -60,7 +60,7 @@ import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoic
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
-import { HANDOVER_JOIN, isAuthFailure, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
+import { HANDOVER_JOIN, isAuthFailure, isCompactOutput, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled, cleanToolInput, streamsInput } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
@@ -1348,7 +1348,7 @@ class ClaudeSession implements ProviderSession {
   private level?: Set<string>;
   private ambient = new Set<string>();
   /** What each task of this process is, and when it was first seen. */
-  private taskInfo = new Map<string, { kind: TaskKind; since: number }>();
+  private taskInfo = new Map<string, { kind: TaskKind; since: number; description?: string; reportedRow?: string }>();
   /** Tasks whose end was heard: a start that comes after its end never marks one running again. */
   private endedTasks = new Set<string>();
 
@@ -1533,7 +1533,7 @@ class ClaudeSession implements ProviderSession {
     for (const id of this.liveIds()) {
       if (this.foreground.has(id)) continue;
       const info = this.taskInfo.get(id);
-      yield { id, itemId: this.taskItems.get(id), agent: info?.kind === 'agent', since: info?.since };
+      yield { id, itemId: this.taskItems.get(id), agent: info?.kind === 'agent', since: info?.since, description: info?.description };
     }
   }
 
@@ -1603,7 +1603,7 @@ class ClaudeSession implements ProviderSession {
 
   /** The person is told, once, which background commands went with a process (`tasksLost` gave their names). */
   private tellLost(names: string[], why: LostWhy) {
-    if (names.length) this.rt.notice('info', lostLine(names.length, why), names.join('\n'));
+    if (names.length) this.rt.lossNotice = this.rt.notice('info', lostLine(names.length, why), names.join('\n')).id;
   }
 
   /** Tasks, wakes, pending option changes and unmatched frames belong to one query. */
@@ -1881,7 +1881,7 @@ class ClaudeSession implements ProviderSession {
     this.restartPending = undefined;
     this.restartTold = false;
     const keepRunning = !!this.rt.meta.options?.remoteControl;
-    this.tellLost(this.shutdown(), 'process');
+    this.tellLost(this.shutdown('process', 'capability'), 'process');
     this.rt.update({ remote: undefined, capState: undefined });
     if (keepRunning) this.ensure();
   }
@@ -1907,6 +1907,8 @@ class ClaudeSession implements ProviderSession {
     // The process ended by itself.
     const wakeLimit = this.takeWakeLimit();
     this.releaseQueryReceipts(q);
+    const lost = this.rt.tasksLost('process', 'death');
+    this.rt.processGeneration++;
     this.q = undefined;
     this.input = undefined;
     this.resetProcessState();
@@ -1923,7 +1925,6 @@ class ClaudeSession implements ProviderSession {
     // What ran in it went with it (review of 23 Nov, A3): background sub-agents and workflows ended;
     // its commands and monitors are lost (a child of its shell may outlive it unseen, so never "ended").
     this.rt.stopBackground();
-    const lost = this.rt.tasksLost('process');
     if (!wakeLimit && this.held && this.rt.turnActive && !this.closed) {
       // Messages held back from it never reached it (they are all the running turn has): they go to a new one.
       this.tellLost(lost, 'process');
@@ -1950,15 +1951,48 @@ class ClaudeSession implements ProviderSession {
 
   /** The step a task event belongs to: the one it names, or the one its task was seen with. */
   private taskItem(m: Obj): ToolItem | undefined {
-    const id = m.tool_use_id ?? (m.task_id ? this.taskItems.get(String(m.task_id)) : undefined);
-    return id ? this.rt.get<ToolItem>(String(id)) : undefined;
+    const named = m.tool_use_id && this.rt.get<ToolItem>(String(m.tool_use_id));
+    if (named && named.name !== 'SendMessage') return named;
+    const id = this.taskItems.get(String(m.task_id));
+    return id ? this.rt.get<ToolItem>(id) : undefined;
+  }
+
+  /** A message can start another run of the same agent without another Agent tool call. */
+  private linkAgentRun(m: Obj) {
+    const id = String(m.task_id);
+    const info = this.taskInfo.get(id);
+    if (info?.kind !== 'agent' || this.endedTasks.has(id)) return;
+    let item = this.taskItem(m);
+    if (item?.kind !== 'agent') {
+      item = this.rt.items.findLast((i): i is ToolItem => i.type === 'tool' && i.result?.agent?.taskId === id);
+    }
+    // A level can precede the start or be the only frame. Replace its row if the actual call arrives.
+    if (!item && m.task_type === 'local_agent') {
+      item = this.rt.add<ToolItem>({
+        type: 'tool', name: 'local_agent', kind: 'agent', status: 'done', title: m.description || 'Background agent',
+        detail: { description: m.description, subagent: m.subagent_type, background: true },
+      });
+      info.reportedRow = item.id;
+    }
+    if (!item || item.workflow) return;
+    if (info.reportedRow && item.id !== info.reportedRow) {
+      this.rt.remove(info.reportedRow);
+      delete info.reportedRow;
+    }
+    this.taskItems.set(id, item.id);
+    const agent = item.result?.agent;
+    if (agent?.taskId === id && agent.background === 'running') return;
+    this.rt.patch<ToolItem>(item.id, {
+      status: ['cancelled', 'denied', 'error'].includes(item.status) ? 'done' : item.status,
+      result: { ...item.result, agent: { taskId: id, background: 'running' } },
+    });
   }
 
   /** What a task is and when it was first seen, kept from the first word of it that says. */
-  private noteTask(id: string, taskType?: unknown, toolName?: string) {
+  private noteTask(id: string, taskType?: unknown, toolName?: string, description?: string) {
     const known = this.taskInfo.get(id);
     const kind = taskKindOf(taskType, toolName);
-    if (!known) this.taskInfo.set(id, { kind, since: Date.now() });
+    if (!known) this.taskInfo.set(id, { kind, since: Date.now(), description });
     else if (known.kind === 'other' && kind !== 'other') known.kind = kind;
   }
 
@@ -2027,7 +2061,7 @@ class ClaudeSession implements ProviderSession {
    * began by itself. The tasks it stops are its point, so they never hold it, nor does the CLI's own
    * "running", which lasts while its background agents run (review of 23 Nov, A1).
    */
-  async stopBackgroundWork(): Promise<boolean> {
+  async stopBackgroundWork(automatic = true): Promise<boolean> {
     const q = this.q as (Query & { stopTask?: (taskId: string) => Promise<void> }) | undefined;
     if (!q || this.rt.turnActive) return !q;
     // Each task asked to stop first; then the process goes, and whatever it ran (also a task whose
@@ -2036,7 +2070,7 @@ class ClaudeSession implements ProviderSession {
     // Never the process a turn now uses (one the agent began meanwhile): then nothing is confirmed (review wave 17, #5).
     if (this.rt.turnActive) return false;
     // A command whose stop was not heard before the process went is lost at the limit, and said so.
-    if (this.q === q) this.tellLost(this.shutdown('limit'), 'limit');
+    if (this.q === q) this.tellLost(this.shutdown('limit', automatic ? 'limit' : undefined), 'limit');
     return true;
   }
 
@@ -2087,7 +2121,7 @@ class ClaudeSession implements ProviderSession {
    * of the cut (an open turn is its caller's to end). Returns the names of the commands lost, for the
    * caller to tell (`tellLost`).
    */
-  private shutdown(why: LostWhy = 'process'): string[] {
+  private shutdown(why: LostWhy = 'process', trigger?: LossTrigger): string[] {
     clearTimeout(this.idleTimer);
     clearTimeout(this.wakeNet);
     clearTimeout(this.unreadNet);
@@ -2098,9 +2132,10 @@ class ClaudeSession implements ProviderSession {
       this.releaseQueryReceipts(q);
       this.clearLiveState();
       // Its pump, which settles all this when the process ends by itself, skips a process let go here (review wave 7, #5).
+      lost = this.rt.tasksLost(why, trigger);
+      this.rt.processGeneration++;
       this.resetProcessState();
       this.rt.stopBackground();
-      lost = this.rt.tasksLost(why);
       if (!this.rt.turnActive) this.rt.cutTurn('closed');
     }
     this.q = undefined;
@@ -2911,6 +2946,7 @@ class ClaudeSession implements ProviderSession {
         }
         this.toolReady(b.id, b.name, b.input ?? {});
       } else if (!refusedAtLimit && !standIn && !failedWords && b.type === 'text' && b.text && !this.confirmStreamed(parentId, msg.id, 'text', b.text)) {
+        if (synthetic && !parentId && this.compacted && isCompactOutput(b.text, true)) continue;
         rt.add<TextItem>({ type: 'text', text: b.text, streaming: false, parentId });
       } else if (b.type === 'thinking' && b.thinking && !this.confirmStreamed(parentId, msg.id, 'thinking', b.thinking)) {
         rt.add<ThinkingItem>({ type: 'thinking', text: b.thinking, streaming: false, endedAt: Date.now(), parentId });
@@ -2965,6 +3001,7 @@ class ClaudeSession implements ProviderSession {
       if (m.uuid && (this.chain.includes(m.uuid) || rt.items.some((i) => i.type === 'user' && i.providerId === m.uuid))) return;
       const content = m.message?.content;
       const text = replayText(content);
+      if (this.compacted && isCompactOutput(text)) return;
       // Written by Claude Code in the person's place (a task finished, a command and its output):
       // shown as a line (shared/synthetic.ts), never as a message from the Claude app.
       const syn = text ? parseSynthetic(text) : null;
@@ -3041,6 +3078,11 @@ class ClaudeSession implements ProviderSession {
       const status = item.status === 'denied' || item.status === 'cancelled' ? item.status : b.is_error ? 'error' : 'done';
       // Keep answers / preview diff when the result itself carries less.
       const merged = { ...item.result, ...result, diff: result.diff ?? item.result?.diff, answers: result.answers ?? item.result?.answers };
+      if (item.result?.agent?.taskId && result.agent) {
+        const previous = item.result.agent;
+        merged.agent = { ...previous, ...result.agent };
+        if (this.endedTasks.has(item.result.agent.taskId) && previous.background) merged.agent.background = previous.background;
+      }
       if (status === 'denied') merged.diff = item.result?.diff;
       const limit = merged.agent?.limit;
       if (limit && !limit.resetsAt) {
@@ -3068,8 +3110,9 @@ class ClaudeSession implements ProviderSession {
       // Its call returned with the task still running (moved to the background at its timeout, or by the person): it goes on.
       this.foreground.delete(bg.id);
       this.liveTasks.add(bg.id);
-      this.taskItems.set(bg.id, item.id);
-      this.noteTask(bg.id, undefined, item.name);
+      if (item.name !== 'SendMessage') this.taskItems.set(bg.id, item.id);
+      this.noteTask(bg.id, bg.kind, item.name);
+      if (bg.kind === 'agent') this.linkAgentRun({ task_id: bg.id, task_type: 'local_agent', tool_use_id: item.id, description: input.summary ?? input.description });
       this.backgrounded(bg.id, this.rt.get<ToolItem>(item.id));
       this.rt.setReportedTasks([...this.backgroundTasks()]);
     }
@@ -3874,7 +3917,7 @@ class ClaudeSession implements ProviderSession {
         break;
       }
       case 'local_command_output':
-        if (m.content) rt.notice('command', 'Command output', String(m.content));
+        if (m.content && !(this.compacted && isCompactOutput(String(m.content), true))) rt.notice('command', 'Command output', String(m.content));
         break;
       case 'informational':
         // A warning stands as a card (variant `error`, for every reader) and says its own level: it is no failure.
@@ -3887,7 +3930,7 @@ class ClaudeSession implements ProviderSession {
         break;
       }
       case 'task_progress': {
-        if (m.task_id && m.tool_use_id) this.taskItems.set(String(m.task_id), String(m.tool_use_id));
+        if (m.task_id && m.tool_use_id && rt.get<ToolItem>(m.tool_use_id)?.name !== 'SendMessage') this.taskItems.set(String(m.task_id), String(m.tool_use_id));
         const item = this.taskItem(m);
         if (item?.workflow) {
           rt.patch<ToolItem>(item.id, { workflow: workflowProgress(item.workflow, m) });
@@ -3916,9 +3959,11 @@ class ClaudeSession implements ProviderSession {
             this.ambient.add(id);
             continue;
           }
+          if (this.endedTasks.has(id)) continue;
           this.ambient.delete(id);
           level.add(id);
-          this.noteTask(id, t.task_type);
+          this.noteTask(id, t.task_type, undefined, t.description);
+          this.linkAgentRun(t);
         }
         this.level = level;
         // The list covers every background task started before it (they join it before their start is said).
@@ -3931,8 +3976,8 @@ class ClaudeSession implements ProviderSession {
         break;
       }
       case 'task_started': {
-        if (m.task_id && m.tool_use_id) this.taskItems.set(String(m.task_id), String(m.tool_use_id));
         const item = m.tool_use_id ? rt.get<ToolItem>(m.tool_use_id) : undefined;
+        if (m.task_id && m.tool_use_id && item?.name !== 'SendMessage') this.taskItems.set(String(m.task_id), String(m.tool_use_id));
         if (item?.workflow && m.workflow_name && !item.workflow.name) rt.patch<ToolItem>(item.id, { workflow: { ...item.workflow, name: String(m.workflow_name) } });
         if (!m.task_id) break;
         const id = String(m.task_id);
@@ -3942,11 +3987,14 @@ class ClaudeSession implements ProviderSession {
           break;
         }
         if (this.endedTasks.has(id)) break;
-        this.noteTask(id, m.task_type, item?.name);
+        this.noteTask(id, m.task_type, item?.name, m.description);
         this.liveTasks.add(id);
         // A call that blocks on it (a sub-agent run in the foreground, a command waited for): it ends with that call.
         if (m.is_backgrounded === false) this.foreground.add(id);
-        else this.backgrounded(id, item);
+        else {
+          this.linkAgentRun(m);
+          this.backgrounded(id, item);
+        }
         break;
       }
       case 'task_updated': {
@@ -3960,7 +4008,13 @@ class ClaudeSession implements ProviderSession {
           this.backgrounded(id, this.taskItem({ task_id: id }));
         }
         const end = p.status === 'completed' ? 'done' : p.status === 'failed' ? 'failed' : p.status === 'killed' ? 'stopped' : undefined;
-        if (end) this.taskOver(id, end, typeof p.end_time === 'number' && p.end_time > 1e12 ? p.end_time : undefined);
+        if (end) {
+          this.taskOver(id, end, typeof p.end_time === 'number' && p.end_time > 1e12 ? p.end_time : undefined);
+          const item = this.taskItem(m);
+          if (item?.result?.agent?.background === 'running' && !item.workflow) {
+            rt.patch<ToolItem>(item.id, { result: { ...item.result, agent: { ...item.result.agent, background: end } } });
+          }
+        }
         break;
       }
       case 'task_notification': {
@@ -3978,7 +4032,7 @@ class ClaudeSession implements ProviderSession {
         }
         if (item?.kind !== 'agent' || !item.result) break;
         const agent = { ...item.result.agent, ...taskFigures(m.usage) };
-        const wasRunning = agent.background === 'running';
+        const wasRunning = !!agent.background && !agent.limit;
         if (agent.background) agent.background = m.status === 'completed' ? 'done' : m.status === 'failed' ? 'failed' : 'stopped';
         // Ended by a plan limit: stopped at the limit, said once by the chat (never a notice of its own).
         const limit = m.status !== 'completed' && !agent.limit ? agentLimitOf(String(m.summary ?? '')) : undefined;
@@ -4032,7 +4086,7 @@ class ClaudeSession implements ProviderSession {
     const rt = this.rt;
     const id = rt.meta.providerSessionId;
     if (!id) return;
-    const messages = (await this.provider.withHistory(() => getSessionMessages(id, { dir: rt.meta.cwd }))) as Obj[];
+    const messages = (await this.provider.withHistory(() => getSessionMessages(id, { dir: rt.meta.cwd, includeSystemMessages: true }))) as Obj[];
     const items: TimelineItem[] = [];
     const tools = new Map<string, ToolItem>();
     const unstamped = new Set<string>();
@@ -4049,17 +4103,43 @@ class ClaudeSession implements ProviderSession {
     };
     let firstPrompt: string | undefined;
     let planDraft: string | undefined;
+    const afterCompact = () => {
+      const last = items.at(-1);
+      return last?.type === 'notice' && last.variant === 'compact';
+    };
+    const readUserText = (text: string, uuid: string) => {
+      const role = parseSynthetic(text)?.role;
+      if (role === 'output') {
+        if (afterCompact() && isCompactOutput(text)) return;
+      } else {
+        if (role === 'hidden' || !isHumanText(text)) return;
+        firstPrompt ??= text;
+      }
+      push({ type: 'user', text, state: 'sent', providerId: uuid });
+    };
     for (const m of messages) {
       const parentId: string | undefined = m.parent_tool_use_id ?? undefined;
       const msg = (m.message ?? {}) as Obj;
       const content = msg.content;
       const stamp = Date.parse(String(m.timestamp ?? ''));
       real = Number.isFinite(stamp) ? stamp : undefined;
-      if (m.type === 'assistant' && Array.isArray(content)) {
+      if (m.type === 'system' && (m.subtype ?? msg.subtype) === 'compact_boundary') {
+        const meta = m.compact_metadata ?? msg.compact_metadata ?? {};
+        push({ type: 'notice', variant: 'compact', text: 'Conversation compacted', detail: meta.post_tokens ? `${fmtTokens(meta.pre_tokens)} → ${fmtTokens(meta.post_tokens)} tokens` : undefined });
+      } else if (m.type === 'system' && (m.subtype ?? msg.subtype) === 'local_command_output') {
+        const detail = m.content ?? content;
+        if (typeof detail === 'string' && detail && !(afterCompact() && isCompactOutput(detail, true))) {
+          push({ type: 'notice', variant: 'command', text: 'Command output', detail });
+        }
+      } else if (m.type === 'user' && m.isCompactSummary && !parentId) {
+        // Some saved histories expose only the SDK's summary marker for this boundary.
+        if (!afterCompact()) push({ type: 'notice', variant: 'compact', text: 'Conversation compacted' });
+      } else if (m.type === 'assistant' && Array.isArray(content)) {
         if (!parentId) this.chain.push(m.uuid);
         for (const b of content as Obj[]) {
           // Claude Code's stand-in where a cut turn has no answer: nobody's words.
           if (b.type === 'text' && b.text && msg.model === '<synthetic>' && (isStandIn(String(b.text)) || isAuthFailure(String(b.text)))) continue;
+          if (!parentId && b.type === 'text' && afterCompact() && isCompactOutput(String(b.text), msg.model === '<synthetic>')) continue;
           if (b.type === 'text' && b.text) push({ type: 'text', text: b.text, streaming: false, parentId });
           else if (b.type === 'thinking' && b.thinking) push({ type: 'thinking', text: b.thinking, streaming: false, endedAt: real, parentId });
           else if (b.type === 'tool_use') {
@@ -4082,10 +4162,7 @@ class ClaudeSession implements ProviderSession {
       } else if (m.type === 'user') {
         if (!parentId) this.chain.push(m.uuid);
         if (typeof content === 'string') {
-          if (isHumanText(content) && !parentId) {
-            firstPrompt ??= content;
-            push({ type: 'user', text: content, state: 'sent', providerId: m.uuid });
-          }
+          if (!parentId) readUserText(content, m.uuid);
         } else if (Array.isArray(content)) {
           const text = flattenContent(content.filter((b: Obj) => b.type === 'text')).text;
           for (const b of content as Obj[]) {
@@ -4098,10 +4175,7 @@ class ClaudeSession implements ProviderSession {
             // A step's time runs from its own start to its result: with either not known it shows none.
             if (real && !unstamped.has(t.id)) t.endedAt = real;
           }
-          if (text && isHumanText(text) && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) {
-            firstPrompt ??= text;
-            push({ type: 'user', text, state: 'sent', providerId: m.uuid });
-          }
+          if (text && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) readUserText(text, m.uuid);
         }
       }
     }
