@@ -68,11 +68,10 @@ describe('a menu the bar opens stands by its own chip', () => {
     // (tests/composer-effort.test.ts has the rule).
     const phrase = read('src/features/composer/Phrase.tsx');
     expect(phrase).toMatch(/align="end"\s*sideOffset=\{place\.sideOffset\}\s*alignOffset=\{0\}/);
-    // Its width is its two columns, the gap between them and its padding.
-    const w = /--mx-col-m: (\d+)px;\n  --mx-col-s: (\d+)px;\n  --mx-gap: (\d+)px;/.exec(read('src/features/composer/composer.css'));
-    expect(Number(w?.[1]) + Number(w?.[2]) + Number(w?.[3]) + 8).toBe(Number(/export const PANEL_W = (\d+);/.exec(phrase)?.[1]));
-    // The scale's column starts on the 4 px grid its edges are laid out on.
-    expect((4 + Number(w?.[1]) + Number(w?.[3])) % 4).toBe(0);
+    // One column: its width in the CSS is the one Phrase.tsx names, on the 4 px grid.
+    const w = /\n\.mx \{\n  width: (\d+)px;/.exec(read('src/features/composer/composer.css'));
+    expect(Number(w?.[1])).toBe(Number(/export const PANEL_W = (\d+);/.exec(phrase)?.[1]));
+    expect(Number(w?.[1]) % 4).toBe(0);
     expect(read('src/features/composer/Composer.tsx')).toMatch(/sideOffset=\{place\.sideOffset\} alignOffset=\{place\.alignOffset\}/);
     // A menu's corner is 16 and its rows stand 4 in: 12, for the row and the highlight under it.
     const css = read('src/features/composer/composer.css');

@@ -1,24 +1,23 @@
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type FocusEvent as ReactFocusEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type FocusEvent as ReactFocusEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { STANDARD_SPEED, type Effort, type ModelInfo, type ProviderId, type SpeedInfo } from '@shared/protocol';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { Icon } from '@/icons';
-import { fuzzy } from '@/lib/fuzzy';
+import { fuzzy, type FuzzyMatch } from '@/lib/fuzzy';
 import { isMac } from '@/lib/format';
 import { effortName, modelName } from '@/lib/models';
 import { EASE_OUT, play } from '@/lib/motion';
 import { setEffort as setSessionEffort, switchAgent } from '@/state/actions';
 import { refreshStaleCaps, useStore } from '@/state/store';
-import { movedByKeys, pickedByKey } from '@/ui/glide';
-import { Tip } from '@/ui';
-import { aimsAt, AIM_WAIT_MS, type Pt } from './aim';
+import { pickedByKey } from '@/ui/glide';
+import { Slider, Tip, useSlidePill } from '@/ui';
 import { Chip, type ChipPart, type ChipProps } from './Chip';
-import { remember, rememberedEffort, type Choice } from './choice';
-import { ChipSkeleton, Hits, MENU_PAD, ROW_H, useMenuPlace, useOtherAgentModels, useReleaseGuard } from './Controls';
-import { altGraph, chordKeys, landLevel, landUltra, stepStop, type Setting } from './effort-track';
+import { rememberedEffort, type Choice } from './choice';
+import { ChipSkeleton, Hits, useMenuPlace, useOtherAgentModels, useReleaseGuard } from './Controls';
+import { altGraph, chordKeys, landLevel, stepStop, type Setting } from './effort-track';
 import { Later } from './later';
 import { askLine, confirmPaid, paidConfirmed, takePaidAsk } from './paid-speed';
-import { digitLevel, filterTextKey, navigate, panelRows, returnsToTrigger, triggerKey, type Col, type Shape } from './panel-nav';
+import { digitLevel, filterTextKey, listRows, modelDue, navigate, panelReach, panelRows, returnsToTrigger, scaleKey, triggerKey, type Col, type Shape } from './panel-nav';
 
 /**
  * Model and effort: one phrase on the bar, one panel at the phrase.
@@ -32,22 +31,24 @@ import { digitLevel, filterTextKey, navigate, panelRows, returnsToTrigger, trigg
  * - One level up or down opens nothing: Up and Down on the focused phrase, Alt+Right and Alt+Left
  *   from the field (Composer.tsx, `levelChord`). The scale ends at its top level and stays there:
  *   the ends hold and the word nudges.
- * - Ultracode is no level. It is a switch of its own beside the phrase (Ultracode.tsx `UltraChip`)
- *   and a switch row in the panel: on or off at any level, and the phrase goes on naming the model
- *   and the level whatever it does (effort-track.ts).
+ * - Ultracode is no level and has no row here: its own chip beside the phrase is its control
+ *   (Ultracode.tsx `UltraChip`, Alt+U), on or off at any level (effort-track.ts).
  * - A click (or Enter, or Ctrl+.) opens the panel 8 px off the phrase and flush with its right end
- *   in every frame (it hangs from that end, which a level pointed at never moves): the models on the
- *   left, the levels on the right as a scale (the highest on top), both standing on the line
- *   nearest the phrase, and the switches (ultracode, the speeds) across the whole width at the far
- *   end. The left column drives the right one: resting on a model makes the scale show that
- *   model's own levels and the level it would come back at (an outlined thumb, nothing picked
- *   yet), so a click on the model picks it at the level shown and a click on a level picks that
- *   model at that level. Pointing at a level of the model in use shows its name on the bar a step
- *   dimmer before the click.
- * - The panel keeps the size it opened with (panel-nav.ts `panelRows`): turning to another agent or
- *   resting on another model never moves a row, and a shorter column stands on the same line.
- * - The row in use reads the same in every menu of the bar: ivory, with the check at its end (the
- *   level in use has the scale's thumb for its mark).
+ *   in every frame (it hangs from that end). It is one column of 28 px rows. Nearest the phrase the
+ *   effort slider, then the speeds, a hairline, and the models: every row led by its agent's mark,
+ *   the names on one edge, the check at the end of the model in use; with other agents listed
+ *   (switching agent in place), each agent's models stand under its name, the chat's own first.
+ *   The effort is one slider of the model's levels (ui/index.tsx `Slider` with `stops`: dragged 1:1, the
+ *   level's word over the thumb, the bar naming the level under the thumb a step dimmer and rolling
+ *   in step; let go, the thumb settles on its stop and the level is sent); for a model with one
+ *   level or none its row stays as a quiet disabled track. The speeds are one row of choices.
+ * - A model of the chat's own agent with a scale keeps the panel open (the scale takes its levels in
+ *   place); the model in use again, a model with no scale, or another agent's model closes it.
+ *   Another agent's model while the chat works says "After this turn" at its row and stays.
+ * - The list is as long as it is now (panel-nav.ts `panelRows`, scrolling past twelve rows); the
+ *   slider's row never goes, so a pick never moves a row under the pointer.
+ * - A model picked while a turn runs is applied with the next message: the bar names it in the
+ *   waiting tone with the tooltip "From your next message" (panel-nav.ts `modelDue`).
  */
 
 export interface PhraseHandle {
@@ -63,22 +64,33 @@ interface Props {
   choice: Choice;
   side: 'top' | 'bottom';
   onClosed: () => void;
+  /** Ultracode is offered: the phrase stands even with no model to name (its chip is beside it). */
   ultraOffered: boolean;
-  ultracode: boolean;
-  onUltracode: (on: boolean) => void;
 }
 
-/** A switch's look, for a row that is the switch (the whole row is the target). */
-const SwitchLook = ({ on }: { on: boolean }) => (
-  <span className="switch mx-switch" data-state={on ? 'checked' : 'unchecked'} aria-hidden>
-    <span className="switch-thumb" />
-  </span>
-);
-
 const NO_EFFORTS: Effort[] = [];
-/** The panel's width: its two columns, the gap between them and its padding (composer.css `.mx`, 152 + 4 + 124 + 8). */
-export const PANEL_W = 288;
+/** The disabled track of a model with one level or none: two stops with no names. */
+const NO_STOPS = ['', ''] as const;
+/** The panel's width (composer.css `.mx`): one column of models, the scale and the speeds across it. */
+export const PANEL_W = 256;
+/** The speed row's pill: the pane's corner (16) less its 4 px inset and the track's 3 px to the pill. */
+const SPEED_PILL_R = 9;
 const keyOf = (p: ProviderId, id: string) => `${p}\u0001${id}`;
+
+/** A model's row in the panel. */
+interface Row {
+  provider: ProviderId;
+  m: ModelInfo;
+  name: string;
+  hit?: FuzzyMatch | null;
+}
+
+/**
+ * The model each chat's running turn started on (the bridge applies a model picked meanwhile
+ * right before the next message, `applyDue`, but already names it in the session): kept while
+ * the chat works, forgotten when it rests.
+ */
+const ranWith = new Map<string, string | undefined>();
 
 // RM.Trigger composes our handler with its own ArrowDown/Enter/Space handler. Gate that whole
 // handler at the button so modified keys still bubble to their owner with their default intact.
@@ -100,7 +112,7 @@ export const ModelEffort = memo(
   }),
 );
 
-const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phrase({ choice, side, onClosed, ultraOffered, ultracode, onUltracode, late }, ref) {
+const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phrase({ choice, side, onClosed, late }, ref) {
   const [open, setOpen] = useState(false);
   // What the panel opens on: the level in use for a click, the model in use for the keys.
   const want = useRef<'model' | 'level'>('level');
@@ -114,16 +126,27 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
   const chip = useRef<HTMLButtonElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const field = useRef<HTMLInputElement>(null);
-  const scaleCol = useRef<HTMLDivElement>(null);
   const guard = useReleaseGuard(open);
+  // The chat works: another agent's model waits for the turn's end, and a model picked now runs from the next message.
+  const busy = useStore((s) => {
+    const st = choice.sessionId ? s.sessions[choice.sessionId]?.status : undefined;
+    return st === 'running' || st === 'starting' || st === 'awaiting';
+  });
+  const sid = choice.sessionId;
+  useEffect(() => {
+    if (!sid) return;
+    if (!busy) ranWith.delete(sid);
+    else if (!ranWith.has(sid)) ranWith.set(sid, choice.modelId);
+  }, [busy, sid]); // eslint-disable-line react-hooks/exhaustive-deps
+  // A model picked while the turn runs: the bar names it in the waiting tone until the next message.
+  const due = modelDue(busy, !!sid && ranWith.has(sid), sid ? ranWith.get(sid) : undefined, choice.modelId);
 
   // Only while the panel is open: a closing panel still under the pointer can take focus once more.
   const preview = open ? pointed : null;
   const efforts = choice.model?.efforts ?? NO_EFFORTS;
   const committed = local && efforts.includes(local) ? local : choice.effort;
-  // Ultracode is a switch of its own: it never changes what the phrase names.
-  const ucOn = ultraOffered && ultracode;
-  const now: Setting = { level: committed ? efforts.indexOf(committed) : -1, ultra: ucOn };
+  // Ultracode is a switch of its own (its chip): it never changes what the phrase names or a level.
+  const now: Setting = { level: committed ? efforts.indexOf(committed) : -1, ultra: false };
   const shownLevel = preview ?? committed;
   // A model with levels and none set (the agent decides): "Default", as the agent's own picker says.
   const word = shownLevel ? effortName(shownLevel) : efforts.length ? 'Default' : undefined;
@@ -197,46 +220,33 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
   // ── the panel ──
 
   const others = useOtherAgentModels(choice, open);
-  const agents = useMemo(() => [choice.provider, ...others.map((o) => o.provider).filter((p, i, all) => all.indexOf(p) === i)], [choice.provider, others]);
   const speeds = choice.speeds;
-  const toggles = (ultraOffered ? 1 : 0) + speeds.length;
-  // Fixed when it opens (panel-nav.ts): the longest column of any agent listed, or the longest scale.
-  const rowsNow = panelRows(
-    agents.map((p) => ({ models: p === choice.provider ? choice.models.length : others.filter((o) => o.provider === p).length })),
-    [...choice.models, ...others.map((o) => o.m)].map((m) => m.efforts?.length ?? 0),
-  );
-  const frozen = useRef(rowsNow);
+  // The other agents with models to offer, in the order they come.
+  const otherAgents = useMemo(() => others.map((o) => o.provider).filter((p, i, all) => all.indexOf(p) === i), [others]);
+  // The effort scale stands for the model in use only when it has more than one level.
+  const scaleShown = efforts.length > 1;
+  // Which side it opens on is decided once, for the tallest it can come to (panel-nav.ts
+  // `panelReach`): every model listed now, and a scale if any of the chat's own models has one.
+  const reach = panelReach({
+    list: listRows(choice.models.length, otherAgents.map((p) => others.filter((o) => o.provider === p).length)),
+    scale: true,
+    speeds: speeds.length > 0,
+  });
   const wasOpen = useRef(false);
   // The panel hangs from the phrase's right end (Radix `align="end"`), which holds whatever the
-  // phrase says: a level pointed at changes the phrase's width at its left, never where the panel
-  // stands, so no row ever moves under the pointer.
-  if (open && !wasOpen.current) {
-    frozen.current = rowsNow;
-    escaped.current = false;
-  }
+  // phrase says: a level dragged to changes the phrase's width at its left, never where the panel
+  // stands.
+  if (open && !wasOpen.current) escaped.current = false;
   wasOpen.current = open;
-  const rows = open ? frozen.current : rowsNow;
-  const need = MENU_PAD + rows * ROW_H + (toggles ? 8 + toggles * ROW_H : 0);
-  const place = useMenuPlace(chip, open, side, need);
+  const place = useMenuPlace(chip, open, side, reach);
 
-  const [tab, setTab] = useState<ProviderId>(choice.provider);
   const [query, setQuery] = useState('');
-  // The model whose levels the scale shows (null: the model in use), and the column focus is in.
-  const [owner, setOwner] = useState<{ p: ProviderId; id: string } | null>(null);
-  const [focusCol, setFocusCol] = useState<Col | null>(null);
-  const aimTimer = useRef(0);
-  const last = useRef<Pt | null>(null);
   useEffect(() => {
     if (open) return;
-    window.clearTimeout(aimTimer.current);
     setQuery('');
-    setTab(choice.provider);
-    setOwner(null);
-    setFocusCol(null);
     setPreview(null);
     setAsk(null);
   }, [open, choice.provider]);
-  useEffect(() => () => window.clearTimeout(aimTimer.current), []);
 
   // An hour-old list is asked for again while the panel is open (new models appear without a restart).
   useEffect(() => {
@@ -245,68 +255,103 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
     const meta = choice.provider === s.ui.homeProvider && !s.ui.activeSessionId ? undefined : s.sessions[s.ui.activeSessionId ?? ''];
     refreshStaleCaps(choice.provider, meta ? meta.cwd : s.ui.homeCwd, choice.accountId);
   }, [open, choice.provider, choice.accountId]);
-  // The chat switches agents only between turns.
-  const busy = useStore((s) => {
-    const st = choice.sessionId ? s.sessions[choice.sessionId]?.status : undefined;
-    return st === 'running' || st === 'starting' || st === 'awaiting';
-  });
 
-  const shown = agents.includes(tab) ? tab : choice.provider;
   const q = query.trim();
-  const own = choice.models.map((m) => {
+  const own: Row[] = choice.models.map((m) => {
     const n = modelName(m) ?? m.id;
     return { provider: choice.provider, m, name: n, hit: q ? fuzzy(q, n) : undefined };
   });
-  const away = others.map((o) => {
+  const away: Row[] = others.map((o) => {
     const n = modelName(o.m) ?? o.m.id;
-    return { ...o, name: n, hit: q ? fuzzy(q, n) : undefined };
+    return { provider: o.provider, m: o.m, name: n, hit: q ? fuzzy(q, n) : undefined };
   });
-  // A filter looks through every agent's models, the chat's own first; else one agent's list.
-  const list = q ? [...own, ...away].filter((r) => r.hit) : shown === choice.provider ? own : away.filter((r) => r.provider === shown);
-  const agentRows = !q && agents.length > 1 ? agents.filter((p) => p !== shown) : [];
+  // The groups: the chat's own models, then each other agent's under its name. A filter looks
+  // through every agent's models as one list, the chat's own first.
+  const groups: { p: ProviderId; rows: Row[] }[] = q
+    ? [{ p: choice.provider, rows: [...own, ...away].filter((r) => r.hit) }]
+    : [{ p: choice.provider, rows: own }, ...otherAgents.map((p) => ({ p, rows: away.filter((r) => r.provider === p) }))];
+  const headed = !q && groups.length > 1;
+  // Nearest the phrase stand the chat's own models. Above it (a chat) the list is laid out from its
+  // end (composer.css: `column-reverse`), so it opens on them and models that arrive later (another
+  // agent's list, asked for as the panel opens) come in above, never pushing them away.
+  const listCount = groups.reduce((n, g) => n + g.rows.length, 0) + (headed ? groups.length : 0);
+  // As tall as its list is now; while a filter is typed, as tall as it was before it.
+  const plainRows = useRef(listCount);
+  if (!q) plainRows.current = listCount;
+  const rows = panelRows(q ? plainRows.current : listCount);
 
-  const ownerKey = owner ?? { p: choice.provider, id: choice.modelId ?? '' };
-  const ownerModel: ModelInfo | undefined = ownerKey.p === choice.provider ? (choice.models.find((m) => m.id === ownerKey.id) ?? choice.model) : others.find((o) => o.provider === ownerKey.p && o.m.id === ownerKey.id)?.m;
-  const isCurrent = ownerKey.p === choice.provider && ownerKey.id === choice.modelId;
-  const levels = ownerModel?.efforts ?? NO_EFFORTS;
+  // Above the phrase the list scrolls from its end: the chat's own models, nearest the phrase, show first.
+  // Once per opening, when the list is first there (it comes a frame after the panel, `Later`, in
+  // a render of its own, so this is the list's own ref and not an effect of the phrase).
+  const listEl = useCallback((l: HTMLDivElement | null) => {
+    if (!l) return;
+    const cur = l.querySelector<HTMLElement>('[data-current]');
+    if (!cur) return;
+    const r = cur.getBoundingClientRect();
+    const box = l.getBoundingClientRect();
+    if (r.top < box.top) l.scrollTop -= box.top - r.top;
+    else if (r.bottom > box.bottom) l.scrollTop += r.bottom - box.bottom;
+  }, []);
+
   /** The level a model comes back at: the one last used with it, else the one in use where it fits, else its default (choice.ts `pickModel`). */
   const levelFor = (p: ProviderId, m: ModelInfo): Effort | undefined => {
     const fits = (e: Effort | undefined) => (e && m.efforts?.includes(e) ? e : undefined);
     return rememberedEffort(p, m) ?? (p === choice.provider ? fits(choice.effort) : undefined) ?? m.defaultEffort;
   };
-  // The thumb: the level in use, solid; for any other model the level it would come back at, outlined.
-  const thumbAt = isCurrent ? committed : ownerModel ? levelFor(ownerKey.p, ownerModel) : undefined;
-  const thumbIdx = thumbAt ? levels.indexOf(thumbAt) : -1;
 
-  const setOwnerIf = (k: { p: ProviderId; id: string }) => setOwner((o) => (o && o.p === k.p && o.id === k.id ? o : k));
-
-  const pickModelRow = (p: ProviderId, m: ModelInfo) => {
-    if (p === choice.provider) return choice.pickModel(m.id);
-    // Another agent's model switches the chat to that agent, in place (never while a turn runs).
+  /** A row's pick: the panel stays open for a model of this agent whose scale is to follow, and for a refusal. */
+  const pickModelRow = (p: ProviderId, m: ModelInfo, ev?: Event) => {
+    if (p === choice.provider) {
+      choice.pickModel(m.id);
+      // Another model with a scale: the scale takes its levels in place and the panel stays, so
+      // the person may go on to its level. The model in use again, or one with no scale: done.
+      if (m.id !== choice.modelId && (m.efforts?.length ?? 0) > 1) ev?.preventDefault();
+      return;
+    }
+    // Another agent's model switches the chat to that agent, in place (never while a turn runs:
+    // the row says so and stays).
     const sid = choice.sessionId;
-    if (busy || !sid) return;
+    if (busy || !sid) {
+      ev?.preventDefault();
+      const row = ev?.target instanceof Element ? ev.target.closest('.mx-row') : null;
+      play(row?.querySelector('.mx-why'), [{ transform: 'translateX(0px)' }, { transform: 'translateX(-3px)', offset: 0.3 }, { transform: 'translateX(0px)' }], { duration: 260, easing: EASE_OUT });
+      return;
+    }
     const e = levelFor(p, m);
     void switchAgent(sid, p, m.id).then((ok) => {
       if (ok && e) void setSessionEffort(sid, e);
     });
   };
-  const pickLevel = (e: Effort) => {
-    if (isCurrent) return go(efforts.indexOf(e));
-    // That model at that level. Ultracode stays as it is: it belongs to no level.
-    if (ownerKey.p === choice.provider) return choice.pickModel(ownerKey.id, e);
-    const sid = choice.sessionId;
-    if (busy || !sid) return;
-    remember(ownerKey.p, ownerKey.id, e);
-    void switchAgent(sid, ownerKey.p, ownerKey.id).then((ok) => {
-      if (ok) void setSessionEffort(sid, e);
-    });
+
+  // ── the effort scale ──
+
+  const stopNames = useMemo(() => efforts.map((e) => effortName(e)), [efforts]);
+  // The thumb: the level in use, else the model's own default (the bar says "Default").
+  const scaleAt = committed ? efforts.indexOf(committed) : choice.model?.defaultEffort ? efforts.indexOf(choice.model.defaultEffort) : -1;
+  const shownIdx = shownLevel ? efforts.indexOf(shownLevel) : scaleAt;
+  /** Dragged to a stop: the bar names it, a step dimmer, rolling the way it went. */
+  const slide = (i: number) => {
+    const e = efforts[i];
+    if (!e) return;
+    stepped.current = i > shownIdx ? 1 : i < shownIdx ? -1 : 0;
+    setPreview(e !== committed ? e : null);
   };
-  const pickSpeed = (s: SpeedInfo, ev: Event) => {
-    // A switch: the panel stays.
+  /** Landed on a stop (released, a key, a click on the track): that level, sent when it is another one. */
+  const land = (i: number) => {
+    stepped.current = i > shownIdx ? 1 : i < shownIdx ? -1 : 0;
+    setPreview(null);
+    go(i);
+  };
+
+  const speedNow = speeds.some((s) => s.id === choice.speed) ? (choice.speed as string) : STANDARD_SPEED;
+  const speedPill = useSlidePill(speedNow, SPEED_PILL_R);
+  const pickSpeed = (s: SpeedInfo | undefined, ev: Event) => {
+    // One of them: the panel stays, and picking the one in use changes nothing.
     ev.preventDefault();
-    const next = choice.speed === s.id ? STANDARD_SPEED : s.id;
-    // A speed billed outside the plan is asked for once per session, in its own row.
-    if (next !== STANDARD_SPEED && s.paid && choice.sessionId && !paidConfirmed(choice.sessionId)) return setAsk(s.id);
+    const next = s?.id ?? STANDARD_SPEED;
+    if (next === speedNow) return;
+    // A speed billed outside the plan is asked for once per session, in the row's place.
+    if (s && s.paid && choice.sessionId && !paidConfirmed(choice.sessionId)) return setAsk(s.id);
     choice.setSpeed(next);
   };
   const confirmAsk = (id: string) => {
@@ -327,8 +372,8 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
     requestAnimationFrame(() => content.current?.querySelector<HTMLElement>(`[data-speed="${id}"]`)?.focus({ preventScroll: true }));
   };
 
-  // The rows changed under the keyboard (another agent's list, a filter cleared): the model in use,
-  // or the first row, takes focus, so the keys go on working.
+  // The rows changed under the keyboard (a filter cleared, a model's scale came or went): the model
+  // in use, or the first row, takes focus, so the keys go on working.
   const wasOpenL = useRef(false);
   useLayoutEffect(() => {
     const was = wasOpenL.current;
@@ -339,7 +384,7 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
     const a = document.activeElement;
     if (a && a !== pop && pop.contains(a)) return;
     (pop.querySelector<HTMLElement>('[data-col="models"][data-current]') ?? pop.querySelector<HTMLElement>('[data-col="models"]:not([data-disabled])'))?.focus({ preventScroll: true });
-  }, [open, shown, q === '']); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, q === '', scaleShown]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A filter typed with focus on a row: the field appears and takes the keyboard from there.
   useLayoutEffect(() => {
@@ -349,32 +394,11 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
     f.setSelectionRange(f.value.length, f.value.length);
   }, [open, q]);
 
-  /** Focus landed somewhere in the panel: the column it is in, the scale's owner, the bar's preview. */
+  /** Focus landed somewhere in the panel: the bar's preview goes unless it is the scale's. */
   const onFocusIn = (e: ReactFocusEvent<HTMLDivElement>) => {
     if (!open) return;
-    const row = (e.target as HTMLElement).closest<HTMLElement>('[data-col]');
-    const col = (row?.dataset.col as Col | undefined) ?? null;
-    setFocusCol(col);
-    if (col === 'models' && row?.dataset.model && movedByKeys()) {
-      const [p, id] = row.dataset.model.split('\u0001') as [ProviderId, string];
-      window.clearTimeout(aimTimer.current);
-      setOwnerIf({ p, id });
-    }
-    const lv = col === 'scale' ? (row?.dataset.level as Effort | undefined) : undefined;
-    setPreview(lv && isCurrent && lv !== committed ? lv : null);
-  };
-
-  /** The pointer on a model: the scale becomes its, unless the pointer is on its way into the scale (aim.ts). */
-  const onModelPointer = (p: ProviderId, id: string) => (e: ReactPointerEvent<HTMLElement>) => {
-    const pt = { x: e.clientX, y: e.clientY };
-    const from = last.current;
-    window.clearTimeout(aimTimer.current);
-    const r = scaleCol.current?.getBoundingClientRect();
-    if (from && r && aimsAt(from, pt, { x: r.left, top: r.top, bottom: r.bottom })) {
-      aimTimer.current = window.setTimeout(() => setOwnerIf({ p, id }), AIM_WAIT_MS);
-      return;
-    }
-    setOwnerIf({ p, id });
+    const col = (e.target as HTMLElement).closest<HTMLElement>('[data-col]')?.dataset.col;
+    if (col !== 'scale') setPreview(null);
   };
 
   /** The panel's own keys, before Radix's single list (panel-nav.ts). */
@@ -398,7 +422,7 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
         consume();
         firstModel()?.focus();
       } else if (e.key === 'Enter') {
-        const first = list.find((r) => r.provider === choice.provider || !busy);
+        const first = groups[0]?.rows.find((r) => r.provider === choice.provider || !busy);
         if (!first) return;
         consume();
         pickModelRow(first.provider, first.m);
@@ -420,10 +444,18 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
     if (!row) return;
     const col = row.dataset.col as Col;
     if (col === 'scale') {
-      const d = digitLevel(e.key, levels.length);
+      const d = digitLevel(e.key, efforts.length);
       if (d !== null) {
         consume();
-        pop.querySelector<HTMLElement>(`[data-col="scale"][data-level="${levels[d]}"]`)?.click();
+        land(d);
+        return;
+      }
+      // Left, Right, Home, End and the page keys are the scale's own (ui/stops.ts `stopKey`).
+      if (scaleKey(e.key)) return;
+      // Enter on the scale: the level stands (it was sent as it landed), the panel goes.
+      if (e.key === 'Enter') {
+        consume();
+        close();
         return;
       }
     }
@@ -439,18 +471,21 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
       return;
     }
     const lists: Record<Col, HTMLElement[]> = {
-      models: [...pop.querySelectorAll<HTMLElement>('[data-col="models"]:not([data-disabled])')],
-      scale: [...pop.querySelectorAll<HTMLElement>('[data-col="scale"]:not([data-disabled])')],
-      toggles: [...pop.querySelectorAll<HTMLElement>('[data-col="toggles"]:not([data-ask])')],
+      // In the order they stand on screen (above the phrase the groups are laid out from the end).
+      models: [...pop.querySelectorAll<HTMLElement>('[data-col="models"]:not([data-disabled])')].sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top),
+      scale: [...pop.querySelectorAll<HTMLElement>('[data-col="scale"] [role="slider"]:not([aria-disabled])')],
+      speeds: [...pop.querySelectorAll<HTMLElement>('[data-col="speeds"]:not([data-ask])')],
     };
     const shape: Shape = {
+      side: place.side,
       models: lists.models.length,
       scale: lists.scale.length,
-      toggles: lists.toggles.length,
-      owner: Math.max(0, lists.models.findIndex((el) => el.dataset.owns !== undefined)),
-      level: Math.max(0, lists.scale.findIndex((el) => el.dataset.thumb !== undefined)),
+      speeds: lists.speeds.length,
+      current: Math.max(0, lists.models.findIndex((el) => el.dataset.current !== undefined)),
+      speed: Math.max(0, lists.speeds.findIndex((el) => el.dataset.state === 'checked')),
     };
-    const to = navigate({ col, i: lists[col].indexOf(row) }, e.key, e.shiftKey, shape);
+    const at = col === 'scale' ? 0 : lists[col].indexOf(row);
+    const to = navigate({ col, i: at }, e.key, e.shiftKey, shape);
     if (to) {
       consume();
       lists[to.col][to.i]?.focus();
@@ -464,13 +499,13 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
   const fast = hasSpeed && choice.speed !== STANDARD_SPEED;
   const parts: ChipPart[] = [];
   if (fast) parts.push({ k: 'bolt', className: 'ph-bolt', node: <Icon name="bolt" size={13} /> });
-  parts.push({ k: `model:${name}`, className: 'ph-model', node: <span className="ph-name">{name}</span> });
+  parts.push({ k: `model:${name}`, className: 'ph-model', node: <span className="ph-name" data-due={due ? '' : undefined}>{name}</span> });
   if (word) {
     // The dot is one gap each side: it stays when the word changes and rides with the name.
     parts.push({ k: 'dot', className: 'ph-dot', node: '·' });
     parts.push({ k: `word:${word}`, className: 'ph-word', node: <span data-preview={preview ? '' : undefined}>{word}</span> });
   }
-  const tip = 'Model and effort' + (fast && speedInfo?.paid ? ` · ${speedInfo.name} on extra usage` : '');
+  const tip = due ? 'From your next message' : 'Model and effort' + (fast && speedInfo?.paid ? ` · ${speedInfo.name} on extra usage` : '');
   const aria = `Model and effort: ${name}${word ? `, ${word}` : ''}${fast ? `, ${speedInfo?.name ?? 'fast'} speed${speedInfo?.paid ? ', billed as extra usage' : ''}` : ''}`;
 
   const onTriggerKey = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
@@ -485,8 +520,8 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
   };
 
   // The panel's first focus, a frame after it opens (Radix's own focus first would be a second
-  // move): the model in use for the keys, the level in use for a click. A field or button that
-  // already took focus keeps it.
+  // move): the model in use for the keys, the scale for a click. A field or button that already
+  // took focus keeps it.
   const firstFocus = {
     onOpenAutoFocus: (e: Event) => {
       e.preventDefault();
@@ -494,172 +529,132 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
       requestAnimationFrame(() => {
         const a = document.activeElement;
         if (!pop.isConnected || pop.dataset.state === 'closed' || (a && a !== pop && pop.contains(a))) return;
-        const target = want.current === 'model' ? pop.querySelector<HTMLElement>('[data-col="models"][data-current]') : pop.querySelector<HTMLElement>('[data-col="scale"][data-current]');
+        const target = want.current === 'model' ? pop.querySelector<HTMLElement>('[data-col="models"][data-current]') : pop.querySelector<HTMLElement>('[data-col="scale"] [role="slider"]:not([aria-disabled])');
+        // Opened by a click: the scale takes focus without the ring (it shows with the first key).
+        if (want.current !== 'model') target?.setAttribute('data-pointer', '');
         (target ?? pop.querySelector<HTMLElement>('[data-col="models"][data-current]') ?? pop.querySelector<HTMLElement>('[data-col]') ?? pop).focus({ preventScroll: true });
       });
     },
   } as object;
 
-  const ownerName = ownerModel ? (modelName(ownerModel) ?? ownerModel.id) : name;
-  const togglesView = toggles > 0 && (
-    <div className="mx-togs" role="group" aria-label="Switches">
-      {ultraOffered && (
-        <RM.CheckboxItem
-          className="menu-item mx-tog"
-          data-col="toggles"
-          data-uc=""
-          checked={ucOn}
-          onSelect={(e) => {
-            // A switch: the panel stays, and the level stays (ultracode is no level).
-            e.preventDefault();
-            const out = landUltra(now, !ucOn, ultraOffered);
-            if (out.ultra !== undefined) onUltracode(out.ultra);
-          }}
-        >
-          <Icon name="ultracode" size={14} />
-          <span className="grow">Ultracode</span>
-          <SwitchLook on={ucOn} />
-        </RM.CheckboxItem>
-      )}
-      {speeds.map((s) => {
-        const sOn = choice.speed === s.id;
-        if (ask === s.id)
+  // The speeds: one row of choices, one of them in use, as Settings › Models shows them.
+  const asking = ask ? speeds.find((s) => s.id === ask) : undefined;
+  const speedsView =
+    speeds.length === 0 ? null : asking ? (
+      // The question holds the focus itself (Enter turns it on, Escape leaves it off), so its
+      // button stays a plain primary and wears the focus ring only when Tab reaches it.
+      <div className="mx-tog mx-ask" data-col="speeds" data-ask="" tabIndex={-1} role="group" aria-label={`Turn on ${asking.name.toLowerCase()} mode, billed as extra usage`}>
+        <Icon name="bolt" size={14} />
+        {/* The speed keeps its name while it asks: the row says what is billed. */}
+        <span className="grow truncate mx-ask-q">{askLine(asking.name)}</span>
+        <button type="button" className="btn btn-primary mx-ask-on" onClick={() => confirmAsk(asking.id)}>
+          Turn on
+        </button>
+      </div>
+    ) : (
+      <RM.RadioGroup className="seg mx-speeds" value={speedNow} aria-label="Speed">
+        {[undefined, ...speeds].map((s) => {
+          const id = s?.id ?? STANDARD_SPEED;
+          const label = s?.name ?? 'Standard';
           return (
-            // The question holds the focus itself (Enter turns it on, Escape leaves it off), so its
-            // button stays a plain primary and wears the focus ring only when Tab reaches it.
-            <div key={s.id} className="mx-tog mx-ask" data-col="toggles" data-ask="" tabIndex={-1} role="group" aria-label={`Turn on ${s.name.toLowerCase()} mode, billed as extra usage`}>
-              <Icon name="bolt" size={14} />
-              {/* The speed keeps its name while it asks: the row says what is billed. */}
-              <span className="grow truncate mx-ask-q">{askLine(s.name)}</span>
-              <button type="button" className="btn btn-primary mx-ask-on" onClick={() => confirmAsk(s.id)}>
-                Turn on
-              </button>
-            </div>
+            <RM.RadioItem key={id} value={id} className="seg-item mx-speed" data-col="speeds" data-speed={id} data-active={id === speedNow} aria-label={s?.paid ? `${label}, billed as extra usage` : undefined} onSelect={(e) => pickSpeed(s, e)}>
+              {id === speedNow && <span ref={speedPill} className="seg-pill" />}
+              {/* What a speed inside the plan costs (it uses the plan faster) is its tooltip. */}
+              {s?.note && !s.paid ? (
+                <Tip label={s.note} side="top">
+                  <span>{label}</span>
+                </Tip>
+              ) : (
+                label
+              )}
+            </RM.RadioItem>
           );
-        const row = (
-          <RM.CheckboxItem key={s.id} className="menu-item mx-tog" data-col="toggles" data-speed={s.id} checked={sOn} aria-label={s.paid ? `${s.name}, billed as extra usage` : undefined} onSelect={(e) => pickSpeed(s, e)}>
-            <Icon name="bolt" size={14} />
-            <span className="grow truncate">{s.name}</span>
-            <SwitchLook on={sOn} />
-          </RM.CheckboxItem>
-        );
-        // What a speed inside the plan costs (it uses the plan faster) is its tooltip.
-        return s.note && !s.paid ? (
-          <Tip key={s.id} label={s.note} side="left">
-            {row}
-          </Tip>
-        ) : (
-          row
-        );
-      })}
+        })}
+      </RM.RadioGroup>
+    );
+
+  // The effort: one slider of the model's levels, its word over the thumb (ui/index.tsx `Slider`
+  // with `stops`), nearest the phrase. Dragged, the bar names the level under the thumb a step
+  // dimmer; let go, it is sent. Its row is always there: for a model with one level or none it is
+  // the quiet disabled track (no word, no thumb), so a pick never changes the panel's height.
+  const scaleView = (
+    <div className="mx-effort" data-col="scale" data-none={scaleShown ? undefined : ''}>
+      {scaleShown ? (
+        <Slider stops={stopNames} value={scaleAt} onChange={slide} onCommit={land} label={`Effort for ${name}`} className="mx-slider" />
+      ) : (
+        <Slider stops={NO_STOPS} value={0} onChange={() => {}} label={`${name} has no effort levels`} className="mx-slider" disabled />
+      )}
     </div>
   );
 
-  // A column for the agents' marks stands at the rows' start only where a row has one: the other
-  // agents under the models, or a filter that looks through every agent's models.
-  const marks = agentRows.length > 0 || (!!q && agents.length > 1);
-  const agentRowsView = agentRows.map((p) => (
-    // Another agent: its models take the column's place, one step away (the panel keeps its size).
-    <RM.Item
-      key={p}
-      className="menu-item mx-agent"
-      data-col="models"
-      aria-label={`${PROVIDER_NAME[p]} models`}
-      onSelect={(e) => {
-        e.preventDefault();
-        setTab(p);
-      }}
-    >
-      <span className="mx-lead">
-        <ProviderMark provider={p} size={14} className="mm-mark" />
-      </span>
-      <span className="grow truncate">{PROVIDER_NAME[p]}</span>
-      <span className="mx-end">
-        <Icon name="caret-right" size={12} className="mx-caret" />
-      </span>
-    </RM.Item>
-  ));
+  const rowView = ({ provider, m, name: n, hit }: Row) => {
+    const home = provider === choice.provider;
+    const k = keyOf(provider, m.id);
+    const current = home && m.id === choice.modelId;
+    // Another agent's model while the chat works: it says why it waits, at the row.
+    const held = !home && (busy || !choice.sessionId);
+    const body = (
+      <>
+        <ProviderMark provider={provider} size={14} className="mm-mark" />
+        <span className="mm-name truncate">
+          <Hits text={n} indices={hit?.indices} />
+        </span>
+        {held ? <span className="mx-why">After this turn</span> : <span className="mm-check">{current && <Icon name="check" size={14} />}</span>}
+      </>
+    );
+    const attrs = {
+      'data-col': 'models',
+      'data-model': k,
+      'data-current': current || undefined,
+      'data-held': held || undefined,
+      onSelect: (ev: Event) => pickModelRow(provider, m, ev),
+      ...guard,
+    };
+    return home ? (
+      <RM.RadioItem key={k} value={k} className="menu-item mm-row mx-row" {...attrs}>
+        {body}
+      </RM.RadioItem>
+    ) : (
+      <RM.Item key={k} className="menu-item mm-row mx-row" aria-label={`Switch to ${PROVIDER_NAME[provider]} with ${n}`} aria-disabled={held || undefined} {...attrs}>
+        {body}
+      </RM.Item>
+    );
+  };
 
-  const columns = (
-    <div className="mx-cols">
-      <RM.RadioGroup className="mx-models" data-filter={q ? '' : undefined} value={keyOf(choice.provider, choice.modelId ?? '')} aria-label="Model">
-        {q && (
-          <div className="mm-search mx-search">
-            <Icon name="search" size={14} />
-            <input
-              ref={field}
-              className="mm-field"
-              value={query}
-              aria-label="Search models"
-              spellCheck={false}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-          </div>
-        )}
-        <div className="mx-list scroll">
-          {/* The models stand nearest the phrase: above it, the other agents come first. */}
-          {place.side === 'top' && agentRowsView}
-          {list.map(({ provider, m, name: n, hit }) => {
-            const home = provider === choice.provider;
-            const k = keyOf(provider, m.id);
-            const current = home && m.id === choice.modelId;
-            const owns = ownerKey.p === provider && ownerKey.id === m.id;
-            const body = (
-              <>
-                {marks && <span className="mx-lead">{q && !home && <ProviderMark provider={provider} size={14} className="mm-mark" />}</span>}
-                <span className="mm-name truncate">
-                  <Hits text={n} indices={hit?.indices} />
-                </span>
-                {/* The row's end: the check of the model in use, as every menu of the bar marks its row; or the arrow of a model that carries the chat over to another agent. */}
-                <span className="mx-end">{current ? <Icon name="check" size={14} className="mx-check" /> : !home ? <Icon name="arrow-right" size={13} className="mx-away" /> : null}</span>
-              </>
-            );
-            const attrs = {
-              'data-col': 'models',
-              'data-model': k,
-              'data-current': current || undefined,
-              'data-owns': owns || undefined,
-              // Lit a step below the highlight only once the person rested on it and went on into its scale.
-              'data-owner': (owns && owner !== null && focusCol === 'scale') || undefined,
-              onPointerMove: onModelPointer(provider, m.id),
-              onSelect: () => pickModelRow(provider, m),
-              ...guard,
-            };
-            return home ? (
-              <RM.RadioItem key={k} value={k} className="menu-item mx-row" {...attrs}>
-                {body}
-              </RM.RadioItem>
-            ) : (
-              <RM.Item key={k} className="menu-item mx-row" disabled={busy} aria-label={`Switch to ${PROVIDER_NAME[provider]} with ${n}`} {...attrs}>
-                {body}
-              </RM.Item>
-            );
-          })}
-          {!list.length && <div className="mm-empty">{q ? `No model matches “${q}”.` : 'This agent lists no models.'}</div>}
-          {place.side !== 'top' && agentRowsView}
+  const listView = (
+    <RM.RadioGroup className="mx-models" data-filter={q ? '' : undefined} value={keyOf(choice.provider, choice.modelId ?? '')} aria-label="Model">
+      {q && (
+        <div className="mm-search mx-search">
+          <Icon name="search" size={14} />
+          <input
+            ref={field}
+            className="mm-field"
+            value={query}
+            aria-label="Search models"
+            spellCheck={false}
+            onChange={(e) => setQuery(e.target.value)}
+          />
         </div>
-      </RM.RadioGroup>
-      <RM.RadioGroup ref={scaleCol} className="mx-scale" onPointerEnter={() => window.clearTimeout(aimTimer.current)} value={isCurrent && committed ? committed : ''} aria-label={`Effort for ${ownerName}`}>
-        {levels.length ? (
-          [...levels].reverse().map((e, j) => {
-            const i = levels.length - 1 - j;
-            const end = levels.length === 1 ? 'only' : i === levels.length - 1 ? 'top' : i === 0 ? 'bottom' : undefined;
-            const lit = isCurrent && thumbIdx >= 0 ? (i < thumbIdx ? 'all' : i === thumbIdx ? 'half' : undefined) : undefined;
-            const thumb = i === thumbIdx ? (isCurrent ? 'set' : 'shows') : undefined;
-            return (
-              // Another agent's model at a level switches the chat to it: never while a turn runs.
-              <RM.RadioItem key={e} value={e} className="menu-item mx-rung" data-col="scale" data-level={e} data-current={(isCurrent && e === committed) || undefined} data-thumb={thumb} disabled={ownerKey.p !== choice.provider && busy} onSelect={() => pickLevel(e)} {...guard}>
-                <i className="mx-stop" data-end={end} data-lit={lit} data-hole={thumb === 'shows' || undefined} aria-hidden>
-                  {thumb && <b data-k={thumb} />}
-                </i>
-                <span className="truncate">{effortName(e)}</span>
-              </RM.RadioItem>
-            );
-          })
-        ) : (
-          <div className="mx-none">No effort levels.</div>
-        )}
-      </RM.RadioGroup>
+      )}
+      <div ref={listEl} className="mx-list scroll">
+        {groups.map((g) => (
+          <div key={g.p} className="mx-group" role="group" aria-label={headed ? PROVIDER_NAME[g.p] : undefined}>
+            {/* Every agent's models under its name, once more than one agent is listed. */}
+            {headed && <div className="mx-head">{PROVIDER_NAME[g.p]}</div>}
+            {g.rows.map(rowView)}
+          </div>
+        ))}
+        {!listCount && <div className="mm-empty">{q ? `No model matches “${q}”.` : 'This agent lists no models.'}</div>}
+      </div>
+    </RM.RadioGroup>
+  );
+
+  // Nearest the phrase what is set for the model: its effort, then the speeds; beyond a hairline
+  // the models. The slider's row never goes, so no pick moves a row under the pointer.
+  const settings = (
+    <div className="mx-set">
+      {place.side === 'top' ? speedsView : scaleView}
+      {place.side === 'top' ? scaleView : speedsView}
     </div>
   );
 
@@ -707,7 +702,6 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
           {...firstFocus}
           onKeyDownCapture={onKeyCapture}
           onFocus={onFocusIn}
-          onPointerMove={(e) => (last.current = { x: e.clientX, y: e.clientY })}
           onEscapeKeyDown={(e) => {
             if (ask) {
               e.preventDefault();
@@ -740,13 +734,12 @@ const Phrase = forwardRef<PhraseHandle, Props & { late: boolean }>(function Phra
         >
           <Later>
             {() => (
-              // The switches stand at the far end from the phrase, so the models and the levels are nearest it.
               <>
-                {place.side === 'top' && togglesView}
-                {place.side === 'top' && togglesView && <div className="mx-sep" role="separator" />}
-                {columns}
-                {place.side !== 'top' && togglesView && <div className="mx-sep" role="separator" />}
-                {place.side !== 'top' && togglesView}
+                {place.side !== 'top' && settings}
+                {place.side !== 'top' && <div className="mx-sep" role="separator" />}
+                {listView}
+                {place.side === 'top' && <div className="mx-sep" role="separator" />}
+                {place.side === 'top' && settings}
               </>
             )}
           </Later>

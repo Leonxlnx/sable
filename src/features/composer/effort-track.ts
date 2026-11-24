@@ -107,3 +107,14 @@ export function opensPanel(e: KeyLike, mac: boolean): boolean {
   const mod = mac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
   return mod && !altGraph(e) && !e.altKey && !e.shiftKey && (e.key === '.' || e.code === 'Period');
 }
+
+/**
+ * Whether ultracode is offered here: it is Claude Code's (the Demo plays it), and only where this
+ * account's agent says so for the chat (`Capabilities.features.ultracode`, narrowed to the CLIs
+ * that have its Workflow tool). Never Codex's or OpenCode's, also not for a moment after a switch
+ * of agent in place while caps of the agent it left are still around. The one place the provider id
+ * decides it; the chip, Alt+U and what the composer remembers of a switch all follow it.
+ */
+export function ultraOffered(provider: string | undefined, caps: { features: { ultracode?: boolean } } | undefined): boolean {
+  return (provider === 'claude' || provider === 'demo') && !!caps?.features.ultracode;
+}

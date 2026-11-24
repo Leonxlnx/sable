@@ -33,12 +33,16 @@ export const ChipSkeleton = ({ w }: { w: number }) => <span className="chip-skel
 /** The mode menu's width. */
 const MENU_W = 208;
 
-/** `/mode` opens the mode menu through this event (`/model` and `/effort` open the panel, Phrase.tsx). */
+/**
+ * `/mode` opens the mode menu through this event (`/model` and `/effort` open the panel, Phrase.tsx);
+ * a first send from home with no folder opens the folder menu (Composer.tsx `submit`).
+ */
 export const MENU_EVENT = 'sable:composer-menu';
-export const openComposerMenu = (which: 'mode') => window.dispatchEvent(new CustomEvent(MENU_EVENT, { detail: which }));
+type MenuName = 'mode' | 'folder';
+export const openComposerMenu = (which: MenuName) => window.dispatchEvent(new CustomEvent(MENU_EVENT, { detail: which }));
 
 /** Open state kept inside the control, so opening a menu re-renders the menu and nothing else. */
-function useMenuOpen(which: 'mode') {
+function useMenuOpen(which: MenuName) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     const on = (e: Event) => (e as CustomEvent<string>).detail === which && setOpen(true);
@@ -352,13 +356,21 @@ function FolderMenu({ onClosed }: { onClosed: () => void }) {
     // Seven, with "No folder" above them: the menu still opens below the chip on a 900px tall window at 110%.
     .slice(0, 7);
   const label = chat ? 'No folder' : cwd ? baseName(cwd) : 'Choose a folder';
+  // A send refused for want of a folder opens this menu at its chip (Composer.tsx): the chip says
+  // in amber that it waits on the person, until a folder (or "No folder") is chosen. At rest it is
+  // a plain chip like the others.
+  const [open, setOpen] = useMenuOpen('folder');
+  const [asked, setAsked] = useState(false);
+  if (open && !asked && !cwd && !chat) setAsked(true);
+  if (asked && (cwd || chat)) setAsked(false);
   return (
-    <RM.Root modal={false}>
+    <RM.Root modal={false} open={open} onOpenChange={setOpen}>
       <RM.Trigger asChild>
         <Chip
           className="hc"
           anchor="left"
           data-missing={(!cwd && !chat) || undefined}
+          data-asked={asked || undefined}
           aria-label={chat ? 'Folder: none, a new chat' : cwd ? `Folder: ${baseName(cwd)}` : 'Choose a folder'}
           parts={[
             { k: `icon:${chat ? 'chat' : cwd ? 'folder' : 'folder-plus'}`, node: <Icon name={chat ? 'chat' : cwd ? 'folder' : 'folder-plus'} size={15} className="hc-icon" /> },

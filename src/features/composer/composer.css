@@ -466,8 +466,6 @@
   color: var(--text);
   caret-color: var(--text);
   overflow-y: hidden;
-  scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar) transparent;
 }
 
 .cmp-input[data-ready] {
@@ -578,13 +576,14 @@
 
 /* ── a sent message as signal (flight.ts, signal.ts, signal-shape.ts, signal-draw.ts) ──
    Three layers over everything, opacity only: the field's words going in dither order (four
-   layers, each a quarter of the 4x4 ordered dither under a static mask), the card or row the
-   message lands as (its well's and words' quarters, then the whole card), and over both the line
-   (a canvas a worker draws: the trace from the key and the outline that closes round the card). */
+   layers, each a quarter of the 4x4 ordered dither under a static mask), the line (a canvas a
+   worker draws: the hairline from the key and the card opening out of where it arrives), and over
+   it the card or row the message lands as (its words, its well taking over from the canvas's, then
+   the whole card): the words are never under the canvas's well. */
 
 .send-signal {
   position: fixed;
-  z-index: 62;
+  z-index: 60;
   pointer-events: none;
 }
 
@@ -644,12 +643,12 @@
   opacity: 0;
 }
 
-/* The words' quarters carry the words only: the well comes by its own quarters. */
+/* The words' layer carries the words only: the well comes by its own layer. */
 .send-words .user-card::before {
   display: none;
 }
 
-/* The card's surface (timeline.css `.user-card::before`, the same numbers), one quarter per layer. */
+/* The card's surface (timeline.css `.user-card::before`, the same numbers). */
 .send-surface {
   position: absolute;
   inset: 0;
@@ -1164,9 +1163,15 @@
   color: var(--text);
 }
 
-/* A level pointed at in the panel, before the click: in the word's own place, a step dimmer. */
+/* A level dragged to in the panel, before it lands: in the word's own place, a step dimmer. */
 .ph-word > [data-preview] {
   color: var(--text-3);
+}
+
+/* A model picked while the turn runs: it runs from the next message (the tooltip says so), so it
+   stands in the waiting tone, as a message that waits in the queue. */
+.ph-name[data-due] {
+  opacity: 0.6;
 }
 
 /* ── ultracode: a switch of its own beside the phrase (Ultracode.tsx) ──
@@ -1281,78 +1286,59 @@
   --chip-ring: inset 0 0 0 var(--focus-w) var(--focus);
 }
 
-/* ── the panel at the phrase (Phrase.tsx): the models and their scale side by side, the switches
-   across the whole width at the far end from the phrase ──
-   Every row of both columns is one pitch of 28, so the panel reads as one grid. Both columns are
-   as tall as the panel opened with (`--mx-rows`) and both stand on the line nearest the phrase:
-   above it (a chat) on the bottom line, the other agents over the models; below it (home) they
-   hang from the top line. A shorter column's spare rows are then one band at the far side, never
-   a hole in two corners. The columns stand 4 apart, so a lit model and a lit level on one line
-   are two pills. Every edge of the scale lies on a whole device pixel at 100, 125, 150, 175 and
-   200%: the columns start on a multiple of 4 px (the pane's padding, the models' width, the gap),
-   the axis is 14 in, the thumb 12 on a 4 px grid, and the track's width is a whole number of
-   device pixels centred on the axis (`--mx-track`). */
+/* ── the panel at the phrase (Phrase.tsx): one column, 8 px off the phrase and flush with its right
+   end. Nearest the phrase the models, every row led by its agent's mark (the only colour) with the
+   names on one edge and the check at the end of the model in use, as in every menu of the bar;
+   with other agents listed, each agent's models stand under its name, the chat's own nearest the
+   phrase. Nearest the phrase what is set for the model: its effort as one slider (ui.css `.sls`),
+   the level's word riding over the thumb, then the speeds as one row of choices, a hairline, and
+   the models (the chat's own first). The slider's row is always there (a model with one level or
+   none shows the quiet disabled track), so a pick never moves a row under the pointer. The list is as long as it is now (`--mx-rows`,
+   panel-nav.ts `panelRows`), scrolling past twelve rows. ── */
 .mx {
-  --mx-col-m: 152px;
-  --mx-col-s: 124px;
-  --mx-gap: 4px;
-  --mx-track: 2px;
-  width: calc(var(--mx-col-m) + var(--mx-gap) + var(--mx-col-s) + 8px);
+  width: 256px;
   min-width: 0;
 }
 
-@media (min-resolution: 1.2dppx) and (max-resolution: 1.3dppx) {
-  .mx {
-    --mx-track: 2.4px;
-  }
-}
-
-@media (min-resolution: 1.45dppx) and (max-resolution: 1.55dppx) {
-  .mx {
-    --mx-track: 2.6667px;
-  }
-}
-
-@media (min-resolution: 1.7dppx) and (max-resolution: 1.8dppx) {
-  .mx {
-    --mx-track: 1.7143px;
-  }
-}
-
-.mx-cols {
-  display: grid;
-  grid-template-columns: var(--mx-col-m) var(--mx-col-s);
-  column-gap: var(--mx-gap);
-}
-
-.mx-models,
-.mx-scale {
+.mx-models {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  height: calc(var(--mx-rows, 5) * 28px);
 }
 
 .mx-list {
   display: flex;
   flex-direction: column;
-  flex: 1 1 auto;
+  max-height: calc(var(--mx-rows, 5) * 28px);
   min-height: 0;
+  overflow-y: auto;
 }
 
-.mx-list > * {
+.mx-list > *,
+.mx-group > * {
   flex-shrink: 0;
 }
 
-/* Above the phrase both columns stand on the bottom line. The models by a margin, not by the
-   column's own alignment: a list longer than the column must still scroll from its first row.
-   A filter's results hang under its field. */
-.mx[data-side='top'] .mx-scale {
-  justify-content: flex-end;
+/* Above the phrase the list is laid out from its end: it opens scrolled to the chat's own models
+   (the last group, nearest the phrase) and what arrives later comes in above them. */
+.mx[data-side='top'] .mx-list {
+  flex-direction: column-reverse;
 }
 
-.mx[data-side='top'] .mx-models:not([data-filter]) > .mx-list > :first-child {
-  margin-top: auto;
+.mx-group {
+  display: flex;
+  flex-direction: column;
+}
+
+/* An agent's name over its models: quiet, on the names' edge (8 px of the row and the 14 px mark
+   with its 9 px gap), and no row of its own to stop on. */
+.mx-head {
+  display: flex;
+  align-items: flex-end;
+  height: 28px;
+  padding: 0 8px 6px 31px;
+  font-size: var(--t-small);
+  color: var(--text-3);
 }
 
 .mx .menu-item {
@@ -1361,54 +1347,32 @@
   padding: 0 8px;
 }
 
-.mx-row,
-.mx-agent,
-.mx-tog {
-  gap: 8px;
-}
-
-/* The row in use reads the same in every menu of the bar (the mode menu, the home chips' menus,
-   here): ivory, with the check at the row's end. So a model's row ends in a seat of 14 for it; a
-   model of another agent has its arrow there, an agent's row its caret. What leads a row is an
-   agent's mark, and the seat for it stands only where some row has one (Phrase.tsx `marks`). */
-.mx-lead,
-.mx-end {
-  display: grid;
-  place-items: center;
+/* The mark leads every row at full colour on the model in use and the row pointed at, a step
+   quieter on the rest (`.mm-mark`), so the list reads as names first. */
+.mx-row .mm-mark {
   flex: none;
-  width: 14px;
 }
 
-.mx-row[data-current] {
-  color: var(--text);
-}
-
-.menu-item.mx-row .mx-check {
-  color: var(--text);
-}
-
-/* Another agent's model: the arrow says it carries the conversation over, quiet until pointed at. */
-.menu-item .mx-away {
-  color: var(--text-4);
-}
-
-.menu-item.mx-row:is([data-highlighted], :hover) .mx-away {
-  color: var(--text-2);
-}
-
-.menu-item:is(.mx-row, .mx-agent):is([data-highlighted], [data-current]) .mm-mark {
-  opacity: 1;
-}
-
-.menu-item .mx-caret {
+/* Another agent's model while the chat works: it waits for the turn's end, and says so at the row
+   when pointed at (a pick there plays the word, and the panel stays). The word takes its room only
+   on that row, so the other rows keep their whole names. */
+.mx-why {
+  display: none;
+  flex: none;
+  font-size: var(--t-small);
   color: var(--text-3);
 }
 
-/* The model whose scale stands beside it, while the pointer or the keys work in the scale: lit one
-   step below the highlight, as a row whose submenu is open. */
-.mx-row[data-owner] {
+.menu-item.mx-row[data-held] {
+  color: var(--text-3);
+}
+
+.menu-item.mx-row[data-held]:is([data-highlighted], :hover) .mx-why {
+  display: block;
+}
+
+.mx > .menu-glide {
   background-color: var(--fill-1);
-  color: var(--text);
 }
 
 .mx .mm-search {
@@ -1416,125 +1380,68 @@
   margin: 0;
 }
 
-.mx .mx-rung {
-  padding-left: 30px;
+/* What is set for the model, at the far end: the speeds and the scale, 4 apart. */
+.mx-set {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
-/* The level in use: ivory as every row in use; its mark is the scale's thumb. */
-.mx-rung[data-current] {
-  color: var(--text);
+/* The effort: the slider across the panel on the rows' inset (8 px), its word over the thumb; the
+   row is the same 50 px at every model that has a scale (panel-nav.ts `SCALE_PX`). */
+.mx-effort {
+  display: flex;
+  align-items: flex-end;
+  height: 50px;
+  padding: 0 8px 4px;
 }
 
-.mx-none {
-  padding: 0 8px;
-  line-height: 28px;
-  font-size: var(--t-ui);
-  color: var(--text-3);
-  animation: var(--empty-in);
+.mx-slider {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
-/* The scale: the house slider stood on end, the names beside it its stops. Each rung draws its own
-   piece of the axis (a track in --fill-4, lit below the level in use), so nothing is measured;
-   the ends stop 2 px past the first and last stop. The level in use is the ivory thumb; the level
-   another model would come back at is the same thumb outlined: nothing is picked yet. */
-.mx-stop {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 14px;
-  width: 0;
-  pointer-events: none;
+/* A model with one level or none: the track alone, quiet, in the same row (no word, no thumb). */
+.mx-effort[data-none] :is(.sls-thumb, .sls-tick, .sls-word) {
+  visibility: hidden;
 }
 
-.mx-stop::before,
-.mx-stop::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: calc(var(--mx-track) / -2);
-  width: var(--mx-track);
-  background-color: var(--fill-4);
-}
-
-.mx-stop::after {
-  display: none;
-  background-color: var(--text-3);
-}
-
-.mx-stop[data-lit]::after {
-  display: block;
-}
-
-.mx-stop[data-end='top']::before,
-.mx-stop[data-lit='half']::after {
-  top: 12px;
-}
-
-.mx-stop[data-end='top']::before {
-  border-radius: 1px 1px 0 0;
-}
-
-.mx-stop[data-end='bottom']::before,
-.mx-stop[data-end='bottom']::after {
-  bottom: 12px;
-  border-radius: 0 0 1px 1px;
-}
-
-.mx-stop[data-end='only']::before {
-  display: none;
-}
-
-.mx-stop > b {
-  position: absolute;
-  z-index: 1;
-  top: 8px;
-  left: -6px;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background-color: var(--text);
-  box-shadow: var(--thumb-up);
-}
-
-.mx-stop > b[data-k='shows'] {
-  background-color: transparent;
-  box-shadow: inset 0 0 0 var(--rim-w) var(--text-2);
-}
-
-/* The outlined thumb stands in a gap of the track (the track's two pieces stop at its edge). */
-.mx-stop[data-hole]::before {
-  bottom: 20px;
-}
-
-.mx-stop[data-hole]::after {
-  display: block;
-  top: 20px;
-  background-color: var(--fill-4);
-}
-
-/* The switches: on or off, the whole row is the target. */
 .mx-sep {
   height: 1px;
   margin: 4px 6px 3px;
   background-color: var(--line);
 }
 
-.mx-togs {
+/* The speeds: Settings' segmented control across the whole width, one row of the grid (a track of
+   28, its options 22), its corners the pane's less the 4 px it stands in. */
+.seg.mx-speeds {
   display: flex;
-  flex-direction: column;
+  width: 100%;
+  height: 28px;
+  border-radius: calc(var(--r-float) - 4px);
 }
 
-.menu-item.mx-tog > svg {
-  color: var(--text-3);
+.mx-speeds > .seg-item {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: calc(var(--r-float) - 7px);
+  cursor: default;
+  outline: none;
 }
 
-.menu-item.mx-tog[data-state='checked'] {
-  color: var(--text);
+.mx-speeds > .seg-item > .seg-pill {
+  border-radius: calc(var(--r-float) - 7px);
 }
 
-.menu-item.mx-tog[data-state='checked'] > svg {
-  color: var(--text);
+.mx-speeds > .seg-item[data-highlighted]:not([data-active='true']) {
+  color: var(--text-2);
+  background-color: var(--fill-1);
+}
+
+.mx-speeds > .seg-item:focus-visible {
+  box-shadow: inset 0 0 0 var(--focus-w) var(--focus);
 }
 
 /* The once-per-session question before a paid speed goes on, in its own row, still under the
@@ -1986,17 +1893,15 @@
 
 .sg-main {
   display: flex;
+  flex: 1 1 auto;
   align-items: baseline;
   gap: 8px;
   min-width: 0;
-  max-width: 64%;
-  flex-shrink: 0;
 }
 
-/* Mentions have no description column: the name and its folder take the whole row. */
+/* No description column: the name, and a file's folder, take the whole row (the list is as wide
+   as its widest row, SuggestMenu `suggestWidth`). */
 .sg-row:is([data-kind='file'], [data-kind='dir'], [data-kind='agent']) .sg-main {
-  flex: 1 1 auto;
-  max-width: none;
   gap: 10px;
 }
 
@@ -2038,42 +1943,16 @@
   text-overflow: ellipsis;
 }
 
-.sg-detail {
-  flex: 1;
-  min-width: 0;
-  margin-left: auto;
-  padding-left: 16px;
-  text-align: right;
-  font-size: var(--t-small);
-  color: var(--text-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* No descriptions in a quiet list: the active row explains itself (opacity only, nothing moves). */
-.sg-detail[data-desc] {
-  opacity: 0;
-  transition: opacity 80ms var(--ease-out);
-}
-
-.sg-row[data-active] .sg-detail[data-desc] {
-  opacity: 1;
-}
-
 .sg-slash {
   color: var(--text-4);
   font-weight: var(--w-regular);
 }
 
+/* A match, quietly: the bright tone and the medium weight, no line (the palette's `.hl`). */
 .sg-hit {
   background: none;
   color: var(--text);
-  font-weight: var(--w-semi);
-  text-decoration: underline;
-  text-decoration-color: rgb(255 255 255 / 0.28);
-  text-decoration-thickness: 1.5px;
-  text-underline-offset: 3px;
+  font-weight: var(--w-medium);
 }
 
 .sg-empty {
@@ -2202,8 +2081,7 @@
 
 /* The check settles onto the row that was picked (the menu is on its way back into its chip by
    then, and the chip already says the new value): one small move, once. */
-:is(.mm-check, .cm-check) > svg,
-.mx-end > .mx-check {
+:is(.mm-check, .cm-check) > svg {
   animation: check-settle 160ms var(--ease-out) backwards;
 }
 
@@ -2215,8 +2093,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  :is(.mm-check, .cm-check) > svg,
-  .mx-end > .mx-check {
+  :is(.mm-check, .cm-check) > svg {
     animation: none;
   }
 }
@@ -2266,12 +2143,29 @@
    stack's hairline): the pane's width and corners. */
 
 /* The clip is the tray's resting box: the tray unfolds up out of the card and folds back into it. */
+/* Only its lower edge cuts (20 in behind the pane): a tray drawn where it stood a moment ago
+   (QueueTray.tsx `glideTray`, on the dock's one clock) may stand higher than its box. */
 .cq-clip {
   position: relative;
   z-index: 0;
   margin-bottom: -20px;
-  border-radius: 20px 20px 0 0;
-  overflow: hidden;
+  clip-path: inset(-480px 0 0 0);
+}
+
+/* The tray's body goes on below its box, so a tray drawn higher than its place never shows a gap
+   above the pane: the panel and its side hairlines, cut by the clip's lower edge. */
+.cq::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  height: 200px;
+  background-color: var(--panel);
+  box-shadow:
+    inset 1px 0 0 var(--rim-light),
+    inset -1px 0 0 var(--rim-light);
+  pointer-events: none;
 }
 
 .cq-clip:empty {
@@ -2295,11 +2189,8 @@
   color: var(--text-2);
 }
 
+/* A word in the strip's own tone, regular: it names the rows, it is not a heading over them. */
 .cq-title {
-  font-weight: var(--w-medium);
-}
-
-.cq-count {
   color: var(--text-3);
 }
 
@@ -2454,6 +2345,11 @@
   transition: opacity var(--d-1) var(--ease);
 }
 
+/* A row standing in until the bridge has the message (QueueTray `expectQueued`). */
+.cq-actions[hidden] {
+  display: none;
+}
+
 .cq-row:is(:hover, :focus-within, :focus-visible) .cq-actions {
   opacity: 1;
 }
@@ -2546,7 +2442,6 @@
   word-break: normal;
   pointer-events: none;
   overflow: hidden;
-  scrollbar-color: transparent transparent;
   user-select: none;
 }
 
@@ -2667,12 +2562,14 @@ button.hc:is(:active, [aria-expanded='true']) {
   rotate: 180deg;
 }
 
-.hc[data-missing] {
+/* No folder yet: a plain chip at rest. Amber only once a send waited on it (Controls.tsx `asked`),
+   until a folder is chosen. */
+.hc[data-asked] {
   color: var(--amber);
 }
 
-.hc[data-missing] .hc-icon,
-.hc[data-missing] .hc-caret {
+.hc[data-asked] .hc-icon,
+.hc[data-asked] .hc-caret {
   color: var(--amber);
 }
 

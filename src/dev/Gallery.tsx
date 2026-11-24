@@ -519,6 +519,29 @@ function PullRequestStates() {
   );
 }
 
+/** A scale of stops, as an effort's levels. */
+const GAL_STOPS = ['Low', 'Medium', 'High', 'Extra high', 'Max'];
+
+/**
+ * The live and the disabled stop slider, with their own state so a drag re-renders only this
+ * (the gallery is large), each in a box of its own width so the word beside it never moves it.
+ */
+function GalStops() {
+  const [stop, setStop] = useState(2);
+  const [peek, setPeek] = useState<number | null>(null);
+  return (
+    <>
+      <div style={{ width: 232, flex: 'none' }} className="gal-stops">
+        <Slider value={stop} stops={GAL_STOPS} onChange={setPeek} onCommit={(i) => { setStop(i); setPeek(null); }} label="Effort" />
+      </div>
+      <span className="faint" style={{ width: 72, flex: 'none' }}>{GAL_STOPS[peek ?? stop]}</span>
+      <div style={{ width: 232, flex: 'none' }} className="gal-stops-off">
+        <Slider value={1} stops={GAL_STOPS.slice(0, 3)} onChange={() => {}} label="Effort, disabled" disabled />
+      </div>
+    </>
+  );
+}
+
 export default function Gallery() {
   useForcedStates();
   const [sw, setSw] = useState(true);
@@ -792,6 +815,7 @@ export default function Gallery() {
                 <Slider value={sl} onChange={setSl} label="Amount" />
               </div>
               <span className="num faint">{sl}</span>
+              <GalStops />
               <Segmented
                 id="g-seg-live"
                 value={seg}

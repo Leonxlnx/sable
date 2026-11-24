@@ -1,6 +1,6 @@
-/* The strips that belong to the composer (until green, spare, the review bar: UntilStrip.tsx,
-   SpareStrip.tsx, review/ReviewBar.tsx), and with them the queue tray (composer.css `.cq`): one
-   stack on the pane's top edge. Each is as wide as the pane, has the pane's corners and its
+/* The strips that belong to the composer (the task strip, until green, spare, the review bar:
+   prompts/TaskStrip.tsx, UntilStrip.tsx, SpareStrip.tsx, review/ReviewBar.tsx), and with them the
+   queue tray (composer.css `.cq`): one stack on the pane's top edge, the task strip farthest. Each is as wide as the pane, has the pane's corners and its
    hairline, and is tucked 20px behind what comes after it (the next strip, or the pane), so a
    strip rises out from behind the edge below it. Nothing of the stack reaches the cove. */
 
@@ -26,6 +26,7 @@
 
 /* The stack's hairline: the pane's rim (its lower part lies behind the next layer). */
 .us::before,
+.ts::before,
 .cq::before {
   content: '';
   position: absolute;

@@ -65,7 +65,7 @@ const FADE_OUT = 120;
 
 /**
  * The governor: when this worker's own frames come late (a loaded machine), detail is shed before
- * frames are: the tail goes (`lite`), the head and the outline stay. Two late frames in a row shed
+ * frames are: the opening shape's dithered edge goes (`lite`), the line and the shape stay. Two late frames in a row shed
  * it for the rest of what is in the air; it comes back with the next message.
  */
 const LATE_MS = 26;

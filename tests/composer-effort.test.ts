@@ -1,21 +1,19 @@
 /**
  * Model and effort on the bar (composer/Phrase.tsx): what one step up or down selects, ultracode
  * as a switch of its own at any level, what the keys do (on the phrase, the chords from the field,
- * in the panel), the menu-aim that keeps the scale with its model, the panel's fixed size and its
- * place at the phrase, the reel a word rolls on, the order a narrow pane sheds in; and the rules
+ * in the panel), the panel's one column and its place at the phrase, a model picked mid-turn, the reel a word rolls on, the order a narrow pane sheds in; and the rules
  * for a speed billed outside the plan.
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { ModelInfo } from '@shared/protocol';
-import { aimsAt } from '../src/features/composer/aim';
 import { linesOf } from '../src/features/composer/attach';
 import { inPose, reel, reelFrom, rollAt, ROLL_MS, ROLL_PX } from '../src/features/composer/reel';
-import { chordKeys, clampStop, landLevel, landUltra, lastStop, levelChord, opensPanel, stepStop, ultraChord, ultraKeys, type KeyLike, type Setting } from '../src/features/composer/effort-track';
+import { chordKeys, clampStop, landLevel, landUltra, lastStop, levelChord, opensPanel, stepStop, ultraChord, ultraKeys, ultraOffered, type KeyLike, type Setting } from '../src/features/composer/effort-track';
 import { flushRight } from '../src/features/composer/menu-place';
 import { capOn } from '../src/features/composer/Chip';
 import { askLine } from '../src/features/composer/paid-speed';
-import { digitLevel, navigate, panelRows, returnsToTrigger, type Shape } from '../src/features/composer/panel-nav';
+import { blocks, digitLevel, listRows, modelDue, navigate, panelReach, panelRows, returnsToTrigger, scaleKey, type Shape } from '../src/features/composer/panel-nav';
 import { defaultableSpeeds, offeredSpeeds, startSpeedFor, toggledSpeed } from '../shared/speed';
 
 const read = (file: string) => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
@@ -99,6 +97,31 @@ describe('ultracode is a switch of its own, at any level', () => {
     expect(landUltra({ level: 2, ultra: true }, false, false)).toEqual({});
   });
 
+  it('is offered only by Claude Code (and the Demo), and only where its caps say so', () => {
+    const on = { features: { ultracode: true } };
+    const off = { features: { ultracode: false } };
+    expect(ultraOffered('claude', on)).toBe(true);
+    expect(ultraOffered('demo', on)).toBe(true);
+    // An account whose CLI has no Workflow tool says so in its caps.
+    expect(ultraOffered('claude', off)).toBe(false);
+    expect(ultraOffered('claude', { features: {} })).toBe(false);
+    // Caps not known yet (a switch of agent or account in flight): not offered.
+    expect(ultraOffered('claude', undefined)).toBe(false);
+    // Never Codex or OpenCode, whatever caps are around (the agent a chat just left included).
+    expect(ultraOffered('codex', on)).toBe(false);
+    expect(ultraOffered('opencode', on)).toBe(false);
+    expect(ultraOffered(undefined, on)).toBe(false);
+  });
+
+  it('the chip, Alt+U and a switch just made follow that one rule, and a switch of agent or account forgets the switch', () => {
+    const composer = read('src/features/composer/Composer.tsx');
+    expect(composer).toMatch(/const ultraOffered = offersUltra\(choice\.provider, caps\);/);
+    expect(composer).toMatch(/const ultra = ultraOffered && shownUltra\(/);
+    expect(composer).toMatch(/if \(ultraOffered && ultraChord\(e, MAC\)\)/);
+    expect(composer).toMatch(/\{ultraOffered && <UltraChip /);
+    expect(composer).toMatch(/const ultraKey = `\$\{choice\.provider\}\|\$\{choice\.accountId \?\? ''\}`;[\s\S]{0,200}if \(ultraPick\) setUltraPick\(null\);/);
+  });
+
   it('sends what it always sent: a level, or ultracode on or off, never the two as one', () => {
     const composer = read('src/features/composer/Composer.tsx');
     // The switch goes to the bridge as `session.setUltracode` (home keeps it for the next chat).
@@ -179,39 +202,72 @@ describe('the keys', () => {
     expect(opensPanel(key('.', { ctrlKey: true }), true)).toBe(false);
   });
 
-  // A panel of three models and Codex, five levels with Extra high in use, ultracode and Fast.
-  const shape: Shape = { models: 4, scale: 5, toggles: 2, owner: 0, level: 1 };
+  // A chat's panel above the phrase: six rows of models on top (Demo Large in use at row 4), a
+  // hairline, three speeds (Standard in use), and the effort slider nearest the phrase.
+  const shape: Shape = { side: 'top', models: 6, scale: 1, speeds: 3, current: 4, speed: 0 };
 
-  it('in the panel, Up and Down move within a column and stop at its ends', () => {
-    expect(navigate({ col: 'models', i: 0 }, 'ArrowDown', false, shape)).toEqual({ col: 'models', i: 1 });
+  it('the blocks stand as on screen: the slider nearest the phrase, then the speeds, then the models', () => {
+    expect(blocks(shape)).toEqual(['models', 'speeds', 'scale']);
+    expect(blocks({ ...shape, side: 'bottom' })).toEqual(['scale', 'speeds', 'models']);
+    // A model with one level or none: its track is there but takes no focus; an agent with no speeds has no row of them.
+    expect(blocks({ ...shape, scale: 0, speeds: 0 })).toEqual(['models']);
+  });
+
+  it('Up and Down move through the models and on into the block next on screen, stopping at the panel’s ends', () => {
+    expect(navigate({ col: 'models', i: 2 }, 'ArrowDown', false, shape)).toEqual({ col: 'models', i: 3 });
+    // From the last model down into the speeds (on the one in use), then the slider, the panel's end.
+    expect(navigate({ col: 'models', i: 5 }, 'ArrowDown', false, { ...shape, speed: 2 })).toEqual({ col: 'speeds', i: 2 });
+    expect(navigate({ col: 'speeds', i: 1 }, 'ArrowDown', false, shape)).toEqual({ col: 'scale', i: 0 });
+    expect(navigate({ col: 'scale', i: 0 }, 'ArrowDown', false, shape)).toBeNull();
+    // And back up: the speeds, then the last model; the first model is the far end.
+    expect(navigate({ col: 'scale', i: 0 }, 'ArrowUp', false, shape)).toEqual({ col: 'speeds', i: 0 });
+    expect(navigate({ col: 'speeds', i: 1 }, 'ArrowUp', false, shape)).toEqual({ col: 'models', i: 5 });
     expect(navigate({ col: 'models', i: 0 }, 'ArrowUp', false, shape)).toBeNull();
-    expect(navigate({ col: 'models', i: 3 }, 'ArrowDown', false, shape)).toBeNull();
-    expect(navigate({ col: 'scale', i: 4 }, 'ArrowDown', false, shape)).toBeNull();
-    expect(navigate({ col: 'toggles', i: 0 }, 'ArrowDown', false, shape)).toEqual({ col: 'toggles', i: 1 });
+    // Below the phrase (home) the slider comes first: down into the speeds, then the first model.
+    const home: Shape = { ...shape, side: 'bottom' };
+    expect(navigate({ col: 'scale', i: 0 }, 'ArrowDown', false, home)).toEqual({ col: 'speeds', i: 0 });
+    expect(navigate({ col: 'speeds', i: 0 }, 'ArrowDown', false, home)).toEqual({ col: 'models', i: 0 });
+    expect(navigate({ col: 'models', i: 0 }, 'ArrowUp', false, home)).toEqual({ col: 'speeds', i: 0 });
+    expect(navigate({ col: 'scale', i: 0 }, 'ArrowUp', false, home)).toBeNull();
+    // No speeds: from the last model straight into the slider.
+    expect(navigate({ col: 'models', i: 5 }, 'ArrowDown', false, { ...shape, speeds: 0 })).toEqual({ col: 'scale', i: 0 });
   });
 
-  it('Right goes from a model to the level its scale shows, Left back to the model the scale belongs to', () => {
-    expect(navigate({ col: 'models', i: 2 }, 'ArrowRight', false, shape)).toEqual({ col: 'scale', i: 1 });
-    expect(navigate({ col: 'scale', i: 3 }, 'ArrowLeft', false, { ...shape, owner: 2 })).toEqual({ col: 'models', i: 2 });
-    expect(navigate({ col: 'scale', i: 3 }, 'ArrowRight', false, shape)).toBeNull();
-    // A model with no levels: Right stays.
-    expect(navigate({ col: 'models', i: 2 }, 'ArrowRight', false, { ...shape, scale: 0 })).toBeNull();
+  it('the scale keeps its own keys: Left, Right, Home, End and the page keys; the panel moves it by none of them', () => {
+    for (const k of ['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']) {
+      expect(scaleKey(k)).toBe(true);
+      expect(navigate({ col: 'scale', i: 0 }, k, false, shape)).toBeNull();
+    }
+    expect(scaleKey('ArrowUp')).toBe(false);
+    expect(scaleKey('ArrowDown')).toBe(false);
   });
 
-  it('Tab goes models, scale, switches and round; Shift+Tab back', () => {
-    expect(navigate({ col: 'models', i: 2 }, 'Tab', false, shape)).toEqual({ col: 'scale', i: 1 });
-    expect(navigate({ col: 'scale', i: 3 }, 'Tab', false, shape)).toEqual({ col: 'toggles', i: 0 });
-    expect(navigate({ col: 'toggles', i: 1 }, 'Tab', false, shape)).toEqual({ col: 'models', i: 0 });
-    expect(navigate({ col: 'models', i: 0 }, 'Tab', true, shape)).toEqual({ col: 'toggles', i: 0 });
-    // No switches (no ultracode, no speed): models and scale only.
-    expect(navigate({ col: 'scale', i: 0 }, 'Tab', false, { ...shape, toggles: 0 })).toEqual({ col: 'models', i: 0 });
+  it('the speeds are one row: Left and Right move along it and stop at its ends', () => {
+    expect(navigate({ col: 'speeds', i: 0 }, 'ArrowRight', false, shape)).toEqual({ col: 'speeds', i: 1 });
+    expect(navigate({ col: 'speeds', i: 2 }, 'ArrowRight', false, shape)).toBeNull();
+    expect(navigate({ col: 'speeds', i: 1 }, 'ArrowLeft', false, shape)).toEqual({ col: 'speeds', i: 0 });
+    expect(navigate({ col: 'speeds', i: 0 }, 'ArrowLeft', false, shape)).toBeNull();
+    expect(navigate({ col: 'speeds', i: 1 }, 'Home', false, shape)).toEqual({ col: 'speeds', i: 0 });
+    expect(navigate({ col: 'speeds', i: 1 }, 'End', false, shape)).toEqual({ col: 'speeds', i: 2 });
+    // Left and Right in the models move nothing.
+    expect(navigate({ col: 'models', i: 2 }, 'ArrowRight', false, shape)).toBeNull();
   });
 
-  it('Home and End: the scale reads upward, so Home is its lowest level and End its highest', () => {
-    expect(navigate({ col: 'scale', i: 1 }, 'Home', false, shape)).toEqual({ col: 'scale', i: 4 });
-    expect(navigate({ col: 'scale', i: 1 }, 'End', false, shape)).toEqual({ col: 'scale', i: 0 });
+  it('Tab goes slider, speeds, models and round, landing on the speed and the model in use; Shift+Tab back', () => {
+    expect(navigate({ col: 'scale', i: 0 }, 'Tab', false, shape)).toEqual({ col: 'speeds', i: 0 });
+    expect(navigate({ col: 'scale', i: 0 }, 'Tab', false, { ...shape, speed: 2 })).toEqual({ col: 'speeds', i: 2 });
+    expect(navigate({ col: 'speeds', i: 1 }, 'Tab', false, shape)).toEqual({ col: 'models', i: 4 });
+    expect(navigate({ col: 'models', i: 2 }, 'Tab', false, shape)).toEqual({ col: 'scale', i: 0 });
+    expect(navigate({ col: 'scale', i: 0 }, 'Tab', true, shape)).toEqual({ col: 'models', i: 4 });
+    // No speeds, and a model with no scale: the models alone.
+    expect(navigate({ col: 'scale', i: 0 }, 'Tab', false, { ...shape, speeds: 0 })).toEqual({ col: 'models', i: 4 });
+    expect(navigate({ col: 'models', i: 1 }, 'Tab', false, { ...shape, speeds: 0, scale: 0 })).toBeNull();
+  });
+
+  it('Home and End: the first and the last model', () => {
     expect(navigate({ col: 'models', i: 2 }, 'Home', false, shape)).toEqual({ col: 'models', i: 0 });
-    expect(navigate({ col: 'models', i: 2 }, 'End', false, shape)).toEqual({ col: 'models', i: 3 });
+    expect(navigate({ col: 'models', i: 2 }, 'End', false, shape)).toEqual({ col: 'models', i: 5 });
+    expect(navigate({ col: 'models', i: 0 }, 'Home', false, shape)).toBeNull();
   });
 
   it('a digit picks a level, 1 the lowest', () => {
@@ -362,38 +418,63 @@ describe('small truths on the pane', () => {
   });
 });
 
-describe('the panel keeps its size', () => {
-  it('as tall as the longest column of any agent it lists, or the longest scale', () => {
-    // Three models and Codex under them (4), five levels: five rows.
-    expect(panelRows([{ models: 3 }, { models: 3 }], [5, 5, 4, 3])).toBe(5);
-    // Codex lists six models: its column (six and a row for Claude Code) sets the size.
-    expect(panelRows([{ models: 3 }, { models: 6 }], [5, 4])).toBe(7);
-    // Home: one agent, no other rows.
-    expect(panelRows([{ models: 4 }], [5, 6, 3, 3])).toBe(6);
-    // A long list scrolls past nine rows; a short one never makes a panel of less than three.
-    expect(panelRows([{ models: 30 }], [5])).toBe(9);
-    expect(panelRows([{ models: 1 }], [0])).toBe(3);
+describe('the panel: one column, the models nearest the phrase, no empty band', () => {
+  it('lists every agent’s models, a header per agent (the first one too) once there are several', () => {
+    // Four models of the chat's agent alone: four rows.
+    expect(listRows(4, [])).toBe(4);
+    // With Codex (six) and OpenCode (none listed): the two agents' models and two headers.
+    expect(listRows(4, [6, 0])).toBe(12);
+    expect(listRows(4, [6, 3])).toBe(16);
+  });
+
+  it('is as tall as its list is now, scrolling past twelve rows, never less than one row', () => {
+    expect(panelRows(4)).toBe(4);
+    expect(panelRows(30)).toBe(12);
+    expect(panelRows(0)).toBe(1);
+  });
+
+  it('decides its side once, for the tallest it can come to (the slider’s row is always there)', () => {
+    // Four models, a scale and speeds: 8 + 4 rows of 28 + the scale's 50, the speeds' 28 and 4 between, a separator of 8.
+    expect(panelReach({ list: 4, scale: true, speeds: true })).toBe(8 + 4 * 28 + 50 + 4 + 28 + 8);
+    // No scale at any model and no speeds: the list alone.
+    expect(panelReach({ list: 4, scale: false, speeds: false })).toBe(8 + 4 * 28);
+    expect(panelReach({ list: 30, scale: true, speeds: false })).toBe(8 + 12 * 28 + 50 + 8);
+  });
+
+  it('is one column: every model row led by its agent’s mark, the check at the end of the model in use', () => {
+    const src = read('src/features/composer/Phrase.tsx');
+    expect(src).not.toMatch(/Ultracode<|data-uc|SwitchLook|mx-rung|mx-scale|mx-agent|aimsAt/);
+    // Every row: the mark, the name, and the check (or, for another agent's model while the chat works, why it waits).
+    expect(src).toMatch(/<ProviderMark provider=\{provider\} size=\{14\} className="mm-mark" \/>\n\s+<span className="mm-name truncate">/);
+    expect(src).toMatch(/<span className="mm-check">\{current && <Icon name="check" size=\{14\} \/>\}<\/span>/);
+    expect(src).toMatch(/<span className="mx-why">After this turn<\/span>/);
+    // The effort is the slider of stops; the speeds are one segmented row.
+    expect(src).toMatch(/<Slider stops=\{stopNames\} value=\{scaleAt\} onChange=\{slide\} onCommit=\{land\}/);
+    expect(src).toMatch(/className="seg mx-speeds"/);
+    // Nearest the phrase what is set for the model (above it: at the bottom), beyond a hairline the list.
+    expect(src).toMatch(/\{place\.side !== 'top' && settings\}[\s\S]*\{listView\}[\s\S]*\{place\.side === 'top' && settings\}/);
+    // The slider's row is always there: a model with one level or none shows the disabled track.
+    expect(src).toMatch(/<Slider stops=\{NO_STOPS\} value=\{0\} onChange=\{\(\) => \{\}\} label=\{`\$\{name\} has no effort levels`\} className="mx-slider" disabled \/>/);
+    expect(read('src/styles/ui.css')).toMatch(/\.seg-pill \{[^}]*background-color: var\(--fill-3\);\n  box-shadow: var\(--press-up\);/s);
   });
 });
 
-describe('menu-aim: the scale stays with its model while the pointer heads into it', () => {
-  // The scale's column: its left edge at x 160, from y 0 to 140 (five rows).
-  const edge = { x: 160, top: 0, bottom: 140 };
-
-  it('a pointer moving toward the scale is aiming, whichever model row it crosses', () => {
-    // From the first model (y 14) down and right, toward Low.
-    expect(aimsAt({ x: 60, y: 14 }, { x: 70, y: 22 }, edge)).toBe(true);
-    // Straight right.
-    expect(aimsAt({ x: 60, y: 70 }, { x: 80, y: 70 }, edge)).toBe(true);
+describe('a model picked while the chat works', () => {
+  it('is due from the next message while the turn that began on another model runs', () => {
+    expect(modelDue(true, true, 'demo-large', 'demo-deep')).toBe(true);
+    // The model the turn runs on, the chat at rest, or a turn whose start this window never saw: nothing to say.
+    expect(modelDue(true, true, 'demo-large', 'demo-large')).toBe(false);
+    expect(modelDue(false, true, 'demo-large', 'demo-deep')).toBe(false);
+    expect(modelDue(true, false, undefined, 'demo-deep')).toBe(false);
+    // A turn that began with no model named (the agent's default) and a model picked since.
+    expect(modelDue(true, true, undefined, 'demo-deep')).toBe(true);
   });
 
-  it('a pointer moving down the list, away from the scale or already in it is not', () => {
-    expect(aimsAt({ x: 60, y: 14 }, { x: 61, y: 60 }, edge)).toBe(false);
-    expect(aimsAt({ x: 60, y: 14 }, { x: 50, y: 20 }, edge)).toBe(false);
-    expect(aimsAt({ x: 60, y: 14 }, { x: 60, y: 42 }, edge)).toBe(false);
-    expect(aimsAt({ x: 150, y: 14 }, { x: 170, y: 20 }, edge)).toBe(false);
-    // Past the scale's bottom corner.
-    expect(aimsAt({ x: 60, y: 130 }, { x: 70, y: 160 }, edge)).toBe(false);
+  it('says so on the bar in the waiting tone, with the tooltip', () => {
+    const src = read('src/features/composer/Phrase.tsx');
+    expect(src).toMatch(/const tip = due \? 'From your next message' :/);
+    expect(src).toMatch(/<span className="ph-name" data-due=\{due \? '' : undefined\}>/);
+    expect(read('src/features/composer/composer.css')).toMatch(/\.ph-name\[data-due\] \{\n  opacity: 0\.6;/);
   });
 });
 

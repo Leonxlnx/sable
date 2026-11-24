@@ -1,12 +1,15 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { Icon } from '@/icons';
+import { quietMarks } from '@/features/palette/Highlight';
 import { highlightRuns } from '@/lib/fuzzy';
 import { play, spring } from '@/lib/motion';
 import { byKeys, useSlidePill } from '@/ui';
 import type { SuggestRow } from './commands';
 
-function Lit({ text, indices }: { text: string; indices?: number[] }) {
+function Lit({ text, indices: all }: { text: string; indices?: number[] }) {
+  // Only an unbroken match is marked (the palette's rule): scattered lit letters read as noise.
+  const indices = quietMarks(all);
   if (!indices?.length) return <>{text}</>;
   return (
     <>
@@ -21,6 +24,39 @@ function Lit({ text, indices }: { text: string; indices?: number[] }) {
       )}
     </>
   );
+}
+
+/** The narrowest the list is (CSS px): a few short commands still read as a menu, not a tag. */
+export const SUGGEST_MIN = 240;
+/** The widest it gets, however wide the composer is. */
+export const SUGGEST_MAX = 560;
+
+/**
+ * The list's width: as wide as its widest row needs (`content`, the menu's padding included),
+ * within the card and `SUGGEST_MIN`..`SUGGEST_MAX`; never narrower than it already is while it is
+ * open (`was`), so filtering never pulls its edge in under the person's eyes.
+ */
+export function suggestWidth(content: number, card: number, was = 0): number {
+  const most = Math.min(card, SUGGEST_MAX);
+  return Math.round(Math.min(most, Math.max(SUGGEST_MIN, content, Math.min(was, most))));
+}
+
+/** Its left edge: at the trigger's side (`originX` from the card's left), inside the card. */
+export function suggestLeft(cardLeft: number, cardWidth: number, width: number, originX: number): number {
+  return cardLeft + Math.max(0, Math.min(cardWidth - width, originX - 18));
+}
+
+/** The width a row's content needs (CSS px), read from its parts' own text widths. */
+function rowNeed(row: HTMLElement): number {
+  let w = 16; // the row's padding
+  const icon = row.querySelector<HTMLElement>('.sg-icon');
+  if (icon) w += 17 + 10;
+  const main = row.querySelector<HTMLElement>('.sg-main');
+  if (main) {
+    const parts = [...main.children] as HTMLElement[];
+    parts.forEach((p, i) => (w += p.scrollWidth + (i ? 8 : 0)));
+  }
+  return w;
 }
 
 /** Opening: about 175 ms to the peak, 3 % overshoot, settled by about 320 ms (rec 1). */
@@ -64,6 +100,8 @@ export function SuggestMenu({
   const opened = useRef(false);
   const tops = useRef(new Map<string, number>());
   const height = useRef(0);
+  const wide = useRef(0);
+  const placeNow = useRef<() => void>(() => {});
 
   // Portalled (so its glass blurs what is really behind it) and pinned to the card.
   useLayoutEffect(() => {
@@ -75,12 +113,26 @@ export function SuggestMenu({
       const b = el.getBoundingClientRect();
       const r = { left: b.left / z, top: b.top / z, bottom: b.bottom / z, width: b.width / z };
       const vh = window.innerHeight / z;
-      const width = Math.min(r.width, 560);
-      // Upward it overlaps the card's top edge by 11px, so it reads as part of the composer.
-      if (placement === 'up') setStyle({ left: r.left, width, bottom: vh - r.top - 11, maxHeight: Math.max(160, r.top + 11 - 16) });
-      // Downward it ends inside the stage (which sits 10px in from the window), never on its edge.
-      else setStyle({ left: r.left, width, top: r.bottom + 6, maxHeight: Math.max(160, vh - r.bottom - 26) });
+      // As wide as its rows need (read from the rows laid out now), at the trigger's side.
+      const ls = list.current;
+      let content = 0;
+      if (ls) {
+        for (const row of ls.querySelectorAll<HTMLElement>('.sg-row')) content = Math.max(content, rowNeed(row));
+        // The menu's padding, and room for its bar when the rows scroll.
+        content += 8 + (ls.scrollHeight > ls.clientHeight + 1 ? 10 : 0);
+      }
+      const width = suggestWidth(content, r.width, wide.current);
+      wide.current = width;
+      const left = suggestLeft(r.left, r.width, width, originX);
+      const next: CSSProperties =
+        // Upward it overlaps the card's top edge by 11px, so it reads as part of the composer.
+        placement === 'up'
+          ? { left, width, bottom: vh - r.top - 11, maxHeight: Math.max(160, r.top + 11 - 16) }
+          : // Downward it ends inside the stage (which sits 10px in from the window), never on its edge.
+            { left, width, top: r.bottom + 6, maxHeight: Math.max(160, vh - r.bottom - 26) };
+      setStyle((was) => (was.left === next.left && was.width === next.width && was.bottom === next.bottom && was.top === next.top && was.maxHeight === next.maxHeight ? was : next));
     };
+    placeNow.current = place;
     place();
     const ro = new ResizeObserver(place);
     ro.observe(el);
@@ -89,7 +141,12 @@ export function SuggestMenu({
       ro.disconnect();
       window.removeEventListener('resize', place);
     };
+    // The trigger's place is read once, when the menu opens: it does not wander while typing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [anchor, placement]);
+
+  // A row wider than the list widens it (never narrower while open).
+  useLayoutEffect(() => placeNow.current(), [rows]);
 
   // Opening grows out of the caret's corner as a clip: from about 55 % of the width and 15 % of the
   // height, with the opacity in over 70 ms. The rows keep their size throughout.
@@ -150,7 +207,8 @@ export function SuggestMenu({
       <div className="sg-list scroll" ref={list} role="listbox" id={id} aria-label="Suggestions" style={{ maxHeight: `min(306px, ${typeof style.maxHeight === 'number' ? style.maxHeight - 10 : 306}px)` }}>
         {rows.length === 0 && <div className="sg-empty">{loading ? 'Searching…' : empty}</div>}
         {rows.map((r, i) => {
-          const head = r.group && r.group !== rows[i - 1]?.group;
+          // A heading only where the list holds more than one group: one group needs no name.
+          const head = r.group && r.group !== rows[i - 1]?.group && rows.some((o) => o.group && o.group !== r.group);
           return (
             <Fragment key={r.id}>
               {head && (
@@ -189,12 +247,7 @@ export function SuggestMenu({
                   {/* Where a file is: its folder, dim, right after the name (elided from its start). */}
                   {r.detail && (r.kind === 'file' || r.kind === 'dir') && <span className="sg-dir">{r.detail}</span>}
                 </span>
-                {/* A command's or skill's description shows on the active row only. */}
-                {r.detail && r.kind !== 'file' && r.kind !== 'dir' && (
-                  <span className="sg-detail" data-desc>
-                    {r.detail}
-                  </span>
-                )}
+                {/* No descriptions: a command is known by its name (the owner's rule for pickers). */}
               </div>
             </Fragment>
           );

@@ -30,10 +30,11 @@ import { HomeChips, ModeMenu, openComposerMenu, useHomeSignedOut, useMenuPlace }
 import { CoveSkin } from './Cove';
 import { PROVIDER_NAME } from '@/art/Logo';
 import { ModelEffort, type PhraseHandle } from './Phrase';
-import { altGraph, levelChord, opensPanel, ultraChord } from './effort-track';
+import { altGraph, levelChord, opensPanel, ultraChord, ultraOffered as offersUltra } from './effort-track';
 import { Highlight } from './Highlight';
-import { NO_QUEUE, QueueTray } from './QueueTray';
+import { NO_QUEUE, QueueTray, expectQueued, takeBackRow } from './QueueTray';
 import { UntilStrip } from './UntilStrip';
+import { TaskSlot } from '@/features/prompts/TaskStrip';
 import { SpareStrip } from './SpareStrip';
 import { CustomStrip } from '@/features/customize/CustomStrip';
 import { ReviewBar } from '@/features/review/ReviewBar';
@@ -305,7 +306,14 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const [bornWith] = useState(() => suggestion);
   const popSide = variant === 'home' ? 'bottom' : 'top';
   const steerable = !!caps?.features.steer;
-  const ultraOffered = !!caps?.features.ultracode;
+  const ultraOffered = offersUltra(choice.provider, caps);
+  // A switch just made belongs to the agent and account it was made on: a switch of either forgets it.
+  const ultraKey = `${choice.provider}|${choice.accountId ?? ''}`;
+  const ultraKeyWas = useRef(ultraKey);
+  if (ultraKeyWas.current !== ultraKey) {
+    ultraKeyWas.current = ultraKey;
+    if (ultraPick) setUltraPick(null);
+  }
   const ultra = ultraOffered && shownUltra(storedUltra, ultraPick?.session === sessionId ? ultraPick : null);
   // "Ultra" is one look across agents: ultracode on (a mode), or an Ultra level (an effort).
   const ultraLook = ultra || isUltraEffort(choice.effort);
@@ -676,6 +684,15 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
         return;
       }
     }
+    // What home starts is read once, here: the message goes to the agent shown when Send was pressed,
+    // whatever an agent's late answer changes in the frame that follows.
+    const choice = sessionId ? null : homeChoice();
+    // From home with no folder chosen: nothing leaves the field, and the folder chip answers in this
+    // frame (its menu opens, the chip in amber until a folder is chosen); Enter again sends.
+    if (!sessionId && !choice) {
+      openComposerMenu('folder');
+      return;
+    }
     const draft = { text, attachments };
     // A command picked by its short name goes out under the full one the agent knows it by.
     const body = expandCommand(trimmed, caps);
@@ -686,14 +703,13 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     const ta = ref.current;
     const flew = !!ta && !!body && !reducedMotion();
     const flight = flew ? launchFlight({ el: ta, text: body }, { dest: sessionId && busy && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId, session: sessionId }) : null;
+    // Queued: its row is in the tray in this frame, the words fly into it (QueueTray `expectQueued`).
+    const expect = sessionId && busy && !steering && body ? expectQueued(sessionId, body, out.text) : null;
     if (variant === 'session') launchKey(card.current);
     // In a session the next placeholder is always the queueing one: the turn is running (or about to).
     // A queued message's words rise through the field into the tray: the placeholder waits for them.
     rollOut(text, variant === 'session' ? 'Queue a follow-up' : null, flew, !!sessionId && busy && !steering);
-    // From home: the composer starts its glide to the dock at once, before the session exists. What
-    // home starts is read once, here: the message goes to the agent shown when Send was pressed,
-    // whatever an agent's late answer changes in the frame that follows.
-    const choice = sessionId ? null : homeChoice();
+    // From home: the composer starts its glide to the dock at once, before the session exists.
     if (choice) beginHandoff(card.current);
     // The press itself only touches the page: the field empties on screen now, and the store, React
     // and the bridge follow once this frame is on the compositor. So the bubble, the key and the
@@ -726,6 +742,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     };
     if (sessionId) {
       const res = await sendMessage(sessionId, out.text, out.attachments, { submitId: pending.id, ...(steer && busy ? { steer: true } : {}) });
+      expect?.(res.ok);
       if (res.ok) {
         sendDone(pending);
         void flight?.settle(true);
@@ -783,7 +800,35 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
         // The message as the bridge had it when the draft took its place: another window may have
         // edited it after this one showed it, and that edit is what comes into the field.
         got = res.previous ?? q;
-      } else got = await takeQueued(sessionId, q.id);
+      } else {
+        // An empty field: the words leave the row and stand in the field in the frame of the click
+        // (the row breaks up or the tray folds, QueueTray `takeBackRow`; the field's words come in on
+        // the same 140 ms), and the bridge gives the message back meanwhile.
+        const release = takeBackRow(sessionId, q.id);
+        setDraft(key, { attachments: q.attachments ?? EMPTY });
+        setText(q.text, q.text.length);
+        setRecall(null);
+        play(ref.current, [{ opacity: 0 }, { opacity: 1 }], { duration: 140, easing: 'ease-out' });
+        window.requestAnimationFrame(focus);
+        got = await takeQueued(sessionId, q.id);
+        const now = useStore.getState().drafts[key];
+        const untouched = (now?.text ?? '') === q.text;
+        if (!got) {
+          // Not given back (the agent took it meanwhile): the field lets go of the words it showed, and the row is as the queue has it.
+          if (untouched) {
+            setDraft(key, { attachments: EMPTY });
+            setText('', 0);
+          }
+          release();
+          return;
+        }
+        // The rows' list catches up with the bridge's answer before the row may show again.
+        window.setTimeout(release, 600);
+        // Edited in another window after this one showed it: that edit is what the field holds.
+        if (untouched && got.text !== q.text) setText(got.text, got.text.length);
+        if (untouched) setDraft(key, { attachments: got.attachments ?? EMPTY });
+        return;
+      }
       if (!got) return;
       // What was typed or attached while the bridge answered stays, after the message.
       const next = swapIn(useStore.getState().drafts[key], before, { text: got.text, attachments: got.attachments ?? EMPTY });
@@ -979,6 +1024,8 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
         />
       )}
 
+      {/* The composer's stack, the farthest first: every strip is tucked behind the next one's top edge (until.css). */}
+      {variant === 'session' && sessionId && <TaskSlot sessionId={sessionId} />}
       {variant === 'session' && sessionId && <UntilStrip sessionId={sessionId} />}
       {variant === 'session' && sessionId && <SpareStrip sessionId={sessionId} />}
       {variant === 'session' && sessionId && <CustomStrip sessionId={sessionId} />}
@@ -1069,7 +1116,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
             <div className="cmp-agent" inert={shell || undefined}>
               {/* Ultracode: a switch of its own beside the phrase, at any level. */}
               {ultraOffered && <UltraChip on={ultra} onToggle={toggleUltra} late={!firstRender.current} />}
-              <ModelEffort ref={phrase} choice={choice} side={popSide} onClosed={focus} ultraOffered={ultraOffered} ultracode={ultra} onUltracode={toggleUltra} />
+              <ModelEffort ref={phrase} choice={choice} side={popSide} onClosed={focus} ultraOffered={ultraOffered} />
             </div>
           </div>
         </div>

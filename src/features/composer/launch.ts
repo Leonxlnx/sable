@@ -4,8 +4,8 @@ import { onFlightClock, RELEASE } from './flight';
 /**
  * The send key answers the press in the same beat as the words leave (`RELEASE`, flight.ts): the
  * disc gives (it sinks in its cove, the channel round it widens) and holds while the words go;
- * on the release the arrow launches up out of it (accelerating, clipped by the disc) and the
- * message's line leaves over the key's top (flight.ts), and as it runs the key comes back up;
+ * the arrow launches up out of it at once (accelerating, clipped by the disc) as the message's
+ * line grows out of the key's top (flight.ts), and as it runs the key comes back up;
  * the stop square grows where the arrow was. Drawn on a copy of the disc in
  * place of the real key for about 340 ms (the real one is hidden meanwhile: it changes twice
  * under it, to the empty key and to the stop key); the real stop key is the same disc with the
@@ -52,7 +52,7 @@ export function launchKey(card: HTMLElement | null) {
     return a;
   };
   on(play(disc, KEY_GIVE, { duration: KEY_GIVE_MS, easing: 'linear' }));
-  on(play(arrow, ARROW_OUT, { duration: ARROW_OUT_MS, delay: RELEASE, easing: ARROW_OUT_EASE, fill: 'both' }));
+  on(play(arrow, ARROW_OUT, { duration: ARROW_OUT_MS, delay: ARROW_OUT_AT, easing: ARROW_OUT_EASE, fill: 'both' }));
   const grow = on(play(sq, SQUARE_IN, { duration: SQUARE_IN_MS, delay: SQUARE_IN_AT, easing: SQUARE_IN_EASE, fill: 'both' }));
   const done = () => {
     show();
@@ -84,14 +84,16 @@ export const KEY_GIVE: Keyframe[] = [
 ];
 
 /**
- * The arrow's way out, from `RELEASE` on: up through the disc's top, gathering speed, as the line
- * leaves over the key (signal-shape.ts `BORN`), so the one becomes the other.
+ * The arrow's way out, from `ARROW_OUT_AT` on: up through the disc's top, gathering speed, as the
+ * line grows out of the key (signal-shape.ts `BORN`), so the one becomes the other.
  */
 export const ARROW_OUT: Keyframe[] = [
   { transform: 'translateY(0px)', opacity: 1 },
   { transform: 'translateY(-30px)', opacity: 0.6 },
 ];
-export const ARROW_OUT_MS = 70;
+export const ARROW_OUT_MS = 60;
+/** The arrow leaves in the press's first frame, with the line (signal-shape.ts `BORN`). */
+export const ARROW_OUT_AT = 4;
 export const ARROW_OUT_EASE = 'cubic-bezier(0.5, 0, 0.85, 0.4)';
 
 /** The stop square grows where the arrow was, once the line has left. */
@@ -100,5 +102,5 @@ export const SQUARE_IN: Keyframe[] = [
   { transform: 'scale(1)', opacity: 1 },
 ];
 export const SQUARE_IN_MS = 190;
-export const SQUARE_IN_AT = RELEASE + 80;
+export const SQUARE_IN_AT = ARROW_OUT_AT + ARROW_OUT_MS + 20;
 export const SQUARE_IN_EASE = 'cubic-bezier(0.16, 1, 0.3, 1)';

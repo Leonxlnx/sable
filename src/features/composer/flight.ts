@@ -9,15 +9,16 @@ import { BORN, COLLAPSE, collapseEase, linearEasing, planSignal, shiftAt, shiftE
 /**
  * A sent message leaves the composer as signal and arrives as a card, made of the app's own
  * ordered dither (signal-shape.ts has the beats and the geometry): the words in the field go in
- * place, a quarter of the 4x4 Bayer cells at a time; a hairline leaves the key's top and runs up
- * to where the message will stand, its tail falling off in dither steps; where it meets the card's
- * lower edge it parts and runs both ways round the card's outline, closing at the top; the card's
- * well and then its words come in by the same quarters, and the conversation's own card takes over.
- * One line, one path, one speed that never steps.
+ * place, a quarter of the 4x4 Bayer cells at a time; one continuous ivory hairline grows out of the
+ * key's top in the first frame and runs up to where the message will stand, its foot on the key
+ * until its head has arrived; there the card opens out of the point of arrival as one growing
+ * shape (its well and its hairline together, only the growing edge cut by the dither) while the
+ * line's tail is drawn up into it; the words stand whole in two frames, and the conversation's own
+ * card takes over.
  *
- * - Who draws what: the line is drawn by a worker on a canvas of its own (signal.ts), the words
- *   and the card are page layers whose quarters (static masks, `quarterTiles`) only change
- *   opacity on the compositor, both on the same clock with steps taken from the same plan.
+ * - Who draws what: the line and the opening shape are drawn by a worker on a canvas of its own
+ *   (signal.ts), under the card's layer; the words and the card are page layers that only change
+ *   opacity on the compositor, both on the same clock with times taken from the same plan.
  *   Nothing runs per frame on the main thread, so a session mounting or a turn starting cannot
  *   make it stutter.
  * - The clock: time zero is one frame before the frame the send first shows in (`begin`,
@@ -476,9 +477,10 @@ function dissolveWords(f: Pick<Flight, 't0' | 'all' | 'started' | 'plan'>, src: 
 
 /**
  * The card the message becomes: the conversation's own `.user-card` (the whole, laid out in flow,
- * which gives the layer its size), and its quarters over it: four of the well
- * (`.send-surface`, the card's numbers) and four of the words. They come in by quarters; at the
- * handover the whole takes their place in one frame (never both: text drawn twice reads bolder).
+ * which gives the layer its size), and over it its two parts: the well (`.send-surface`, the
+ * card's numbers), which takes over from the well the canvas draws as the card opens, and the
+ * words alone, which stand whole in two frames once the opening shape holds them. At the handover
+ * the whole takes their place in one frame (never both: text drawn twice reads bolder).
  */
 function makeCard(text: string, steer: boolean, max: number) {
   const el = document.createElement('div');
@@ -489,7 +491,6 @@ function makeCard(text: string, steer: boolean, max: number) {
   inner.className = 'send-in';
   // A steer lands not yet taken: at the waiting tone (timeline.css `.user[data-queued] .user-card`).
   if (steer) inner.style.opacity = '0.6';
-  const cell = ditherCell();
   const card = () => {
     const c = document.createElement('div');
     c.className = 'user-card';
@@ -505,33 +506,24 @@ function makeCard(text: string, steer: boolean, max: number) {
   const whole = document.createElement('div');
   whole.className = 'send-whole';
   whole.appendChild(card());
-  const wells: HTMLElement[] = [];
-  const quarters: HTMLElement[] = [];
-  for (let q = 0; q < 4; q++) {
-    const w = document.createElement('i');
-    w.className = 'send-surface';
-    wells.push(quarter(w, q, cell));
-  }
-  for (let q = 0; q < 4; q++) {
-    const w = document.createElement('div');
-    w.className = 'send-words';
-    w.appendChild(card());
-    quarters.push(quarter(w, q, cell));
-  }
-  inner.append(whole, ...wells, ...quarters);
+  const well = document.createElement('i');
+  well.className = 'send-surface';
+  const words = document.createElement('div');
+  words.className = 'send-words';
+  words.appendChild(card());
+  inner.append(whole, well, words);
   el.appendChild(inner);
-  return { el, inner, whole, wells, quarters, surface: null };
+  return { el, inner, whole, wells: [well], quarters: [words], surface: null };
 }
 
-/** A queue row's words, as the tray will show them: the whole and its four quarters. */
+/** A queue row's words, as the tray will show them: the whole, and the words that stand first. */
 function makeRowWords(text: string, cs: CSSStyleDeclaration | null) {
   const el = document.createElement('div');
   el.className = 'send-flight';
   el.setAttribute('aria-hidden', 'true');
   const inner = document.createElement('div');
   inner.className = 'send-in';
-  const line = text.split('\n').find((l) => l.trim())?.trim() ?? text;
-  const cell = ditherCell();
+  const line = text.split(/\r?\n/).find((l) => l.trim())?.trim() ?? text;
   const row = () => {
     const words = document.createElement('div');
     words.className = 'send-row-text';
@@ -542,31 +534,45 @@ function makeRowWords(text: string, cs: CSSStyleDeclaration | null) {
   const whole = document.createElement('div');
   whole.className = 'send-whole';
   whole.appendChild(row());
-  const quarters: HTMLElement[] = [];
-  for (let q = 0; q < 4; q++) {
-    const w = document.createElement('div');
-    w.className = 'send-words';
-    w.appendChild(row());
-    quarters.push(quarter(w, q, cell));
-  }
-  inner.append(whole, ...quarters);
+  const words = document.createElement('div');
+  words.className = 'send-words';
+  words.appendChild(row());
+  inner.append(whole, words);
   el.appendChild(inner);
-  return { el, inner, whole, wells: [] as HTMLElement[], quarters, surface: null };
+  return { el, inner, whole, wells: [] as HTMLElement[], quarters: [words], surface: null };
 }
 
 /**
- * The card resolves out of the dither as the outline closes round it: the well's quarters, then
- * the words', each a cut on the compositor; at the handover the whole card takes their place in
- * one frame.
+ * Opacity at the given times (ms after time zero) on the compositor, one animation over the whole
+ * run: each change a cut at its time, or (`glide`) a straight run from the change before.
+ */
+function keyed(f: Pick<Flight, 't0' | 'all' | 'started'>, el: Element, from: number, changes: [number, number, boolean?][]): Animation | null {
+  const last = Math.max(1, ...changes.map((c) => c[0])) + 1;
+  const frames: Keyframe[] = [{ offset: 0, opacity: from }];
+  let prev = from;
+  for (const [t, o, glide] of changes) {
+    const offset = Math.min(1, Math.max(0, t / last));
+    if (!glide) frames.push({ offset, opacity: prev });
+    frames.push({ offset, opacity: o });
+    prev = o;
+  }
+  frames.push({ offset: 1, opacity: prev });
+  return fromKey(f, el, frames, { duration: last });
+}
+
+/**
+ * The card's layers as the shape opens on the canvas: the words whole in two frames once it holds
+ * them, the well taking over from the canvas's in three, and at the handover the whole card in
+ * their place in one frame.
  */
 function unfoldAnims(f: Flight) {
   for (const a of f.anims) a.cancel();
   f.anims = [];
   const p = f.plan;
   const push = (a: Animation | null) => a && f.anims.push(a);
-  f.wells.forEach((w, q) => push(stepped(f, w, 0, [[p.well[q], 1], [p.hand, 0]])));
-  f.quarters.forEach((w, q) => push(stepped(f, w, 0, [[p.words[q], 1], [p.hand, 0]])));
-  push(stepped(f, f.whole, 0, [[p.hand, 1]]));
+  for (const w of f.wells) push(keyed(f, w, 0, [[p.fill[0] ?? p.hand, 0], [p.fill[1] ?? p.hand, 1, true], [p.hand, 0]]));
+  for (const w of f.quarters) push(keyed(f, w, 0, [[p.words[0], 0.5], [p.words[1], 1], [p.hand, 0]]));
+  push(keyed(f, f.whole, 0, [[p.hand, 1]]));
 }
 
 /** Places the landing layer on its box. */
@@ -658,10 +664,10 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
     box = { left: at.left, top: at.top, width: w, height: h, radii: [18, 18, 6, 18] };
     // A steer lands while the view follows a running turn: that follower keeps it clear.
     if (guess && !first && !steer && g.lastBottom != null) room = g.lastBottom / z + LANDING_GAP - guess.top;
-  } else box = rowBoxOf(g, from);
+  } else box = rowBoxOf(g, from, first ? 0 : shrink);
 
   // From here on, writes only.
-  const spec: SignalSpec = { from, to: box, kind: bubble ? 'bubble' : 'row' };
+  const spec: SignalSpec = { from, to: box, kind: bubble ? 'bubble' : 'row', ...(steer ? { tone: 0.6 } : {}) };
   // Under a first message the bar leaves while the line draws: room for that below.
   const signal = pour(spec, first ? 150 : 0);
   const f: Flight = {
@@ -776,11 +782,17 @@ export function holdFlights(sessionId: string): () => void {
   };
 }
 
-/** A queue row's place: the tray's newest row, just above the bar, inside the tray that unfolds behind it. */
-function rowBoxOf(g: Geometry, from: SignalSpec['from']): Box {
+/**
+ * A queue row's place: the tray's newest row, just above the bar, where it comes to rest. The bar
+ * grows upward and its field closes to one line behind the words (`shrink` px): the bar's top, and
+ * the tray standing on it, end up that much lower than they are at the press. Aimed at the top as
+ * it is at the press, the words stood on the tray's head line, 18 px too high, until the row took
+ * over (day 7 video, "it jumps a bit high").
+ */
+function rowBoxOf(g: Geometry, from: SignalSpec['from'], shrink = 0): Box {
   const z = g.z;
   const c = g.card ?? new DOMRect(from.x * z - 400, from.y * z, 434, 60);
-  return { left: c.left / z + ROW.inset, top: c.top / z - ROW.gap - ROW.height, width: c.width / z - ROW.inset * 2, height: ROW.height, radii: [ROW.radius, ROW.radius, ROW.radius, ROW.radius] };
+  return { left: c.left / z + ROW.inset, top: c.top / z + shrink - ROW.gap - ROW.height, width: c.width / z - ROW.inset * 2, height: ROW.height, radii: [ROW.radius, ROW.radius, ROW.radius, ROW.radius] };
 }
 
 /**

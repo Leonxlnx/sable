@@ -14,8 +14,7 @@ const ui = vi.hoisted(() => ({
   content: {} as ComponentProps<typeof RM.Content>,
   changeOpen: (_open: boolean) => {},
   modelPick: () => {},
-  cross: (_pt: { clientX: number; clientY: number }) => {},
-  enterScale: () => {},
+  pick: {} as Record<string, (e: Event) => void>,
   query: '',
   input: { focus: () => {} },
   triggerKey: (_event: unknown) => {},
@@ -29,10 +28,6 @@ vi.mock('radix-ui', async (load) => {
     Root: (p: ComponentProps<typeof RM.Root>) => { ui.changeOpen = p.onOpenChange!; return createElement(actual.DropdownMenu.Root, p); },
     Trigger: actual.DropdownMenu.Trigger, Portal: children,
     RadioGroup: (p: ComponentProps<typeof RM.RadioGroup>) => {
-      if (p.className === 'mx-scale') {
-        Object.assign(p.ref!, { current: { getBoundingClientRect: () => ({ left: 160, top: 0, bottom: 140 }) } });
-        ui.enterScale = () => p.onPointerEnter?.({} as never);
-      }
       if (p.className === 'mx-models' && ui.query) {
         const search = Children.toArray(p.children)[0] as ReactElement<{ children: ReactNode }>;
         for (const child of Children.toArray(search.props.children)) {
@@ -48,7 +43,7 @@ vi.mock('radix-ui', async (load) => {
     },
     RadioItem: (p: ComponentProps<typeof RM.RadioItem>) => {
       if (p.value === 'demo\u0001large') ui.modelPick = () => p.onSelect!(new Event('select'));
-      if (p.value === 'demo\u0001deep') ui.cross = (pt) => p.onPointerMove!(pt as never);
+      if (p.value) ui.pick[p.value] = (e) => p.onSelect!(e);
       return p.children;
     },
   } };
@@ -63,7 +58,7 @@ vi.mock('react', async (load) => {
     useEffect: (effect: () => void | (() => void)) => ui.effects.push(effect) };
 });
 vi.mock('../src/features/composer/Chip', () => ({ Chip: (p: { onKeyDown: typeof ui.triggerKey }) => { ui.triggerKey = p.onKeyDown; return null; } }));
-vi.mock('../src/ui', () => ({ Tip: ({ children }: { children: ReactNode }) => children }));
+vi.mock('../src/ui', () => ({ Tip: ({ children }: { children: ReactNode }) => children, useSlidePill: () => null, Slider: () => null }));
 const model = { id: 'large', name: 'Demo Large', efforts: ['medium', 'high'] };
 function render() {
   const onClosed = vi.fn();
@@ -72,7 +67,7 @@ function render() {
   const choice = { provider: 'demo', caps: { models: [model] }, model, modelId: 'large',
     models: [model, { ...model, id: 'deep' }], effort: 'high', speeds: [], pickModel: vi.fn() } as unknown as Choice;
   renderToStaticMarkup(createElement(ModelEffort, { choice, side: 'top', onClosed,
-    ultraOffered: false, ultracode: false, onUltracode: () => {} }));
+    ultraOffered: false }));
   return { onClosed, choice };
 }
 afterEach(() => { ui.query = ''; ui.effects.length = 0; vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -119,14 +114,15 @@ it('focuses the composer in the model-pick event, before native AltGr input or t
   expect(onClosed).toHaveBeenCalledTimes(1);
 });
 
-it('cancels the crossed model’s 110 ms timer on entry into the effort scale', () => {
-  vi.useFakeTimers();
-  render();
-  ui.content.onPointerMove!({ clientX: 60, clientY: 14 } as never);
-  ui.cross({ clientX: 70, clientY: 22 });
-  expect(vi.getTimerCount()).toBe(1);
-  ui.enterScale();
-  expect(vi.getTimerCount()).toBe(0);
+it('keeps the panel open on a pick of another model of the agent in use that has a scale, and closes on the model in use', () => {
+  const { choice } = render();
+  const other = new Event('select', { cancelable: true });
+  ui.pick['demo\u0001deep'](other);
+  expect(choice.pickModel).toHaveBeenCalledWith('deep');
+  expect(other.defaultPrevented).toBe(true);
+  const same = new Event('select', { cancelable: true });
+  ui.pick['demo\u0001large'](same);
+  expect(same.defaultPrevented).toBe(false);
 });
 
 function keyEvent(key: string, mods = {}) {

@@ -1,14 +1,14 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { AnimatePresence, motion, Reorder, useDragControls, useReducedMotion } from 'motion/react';
 import type { QueuedMessage } from '@shared/protocol';
 import { Icon } from '@/icons';
 import { Tip } from '@/ui';
-import { dissolve } from '@/lib/dissolve';
-import { play, reducedMotion, spring } from '@/lib/motion';
+import { dissolve, ghostOf } from '@/lib/dissolve';
+import { play, reducedMotion } from '@/lib/motion';
 import { landInTray, launchFromTray } from './flight';
+import { STACK_EASE, STACK_MS, aboveTray, glideY, rowMoves, trayShare } from './stack-glide';
 import { removeQueued, reorderQueue, sendQueuedNow } from '@/state/actions';
 import { useStore } from '@/state/store';
-import { Roll } from './Roll';
 
 const NONE: QueuedMessage[] = [];
 const NOBODY: ReadonlySet<string> = new Set();
@@ -18,43 +18,199 @@ export const NO_QUEUE = NONE;
 
 const firstLine = (t: string) => t.split('\n').find((l) => l.trim())?.trim() ?? '';
 
-/** The tray unfolds from behind the composer's top edge: about 140 ms with a 2 px overshoot. */
-const UNFOLD = { type: 'spring' as const, stiffness: 700, damping: 40 };
-/** Rows making room, closing up and settling after a drag. */
-const ROW = { type: 'spring' as const, stiffness: 520, damping: 38 };
-/** The same spring for the tray closing after a row was removed by hand, on the compositor. */
-const CLOSE = spring(ROW.stiffness, ROW.damping);
-/** How deep the tray is tucked behind the composer's top edge (composer.css `.cq-clip`, `.cq`). */
-const TUCK = 20;
-/** The beat the leaving row has to itself before the tray closes over it (ms), as in the sidebar. */
-const BEAT = 50;
+// ── a row in place at the press ──
+// A message queued from the composer has its row in the tray in the frame of the press, before
+// the bridge has it: the dock takes its final layout at once and the words fly into a row that is
+// there (they stood over the last row, or over nothing, for the bridge's round trip). When the
+// bridge's row comes it takes the same element (`alias`); a refusal takes the row away again.
+
+interface Expected {
+  pid: string;
+  /** The words the row shows (and the message in the air is known by). */
+  text: string;
+  /** The words the bridge will hold (with text attachments written in). */
+  match: string;
+  /** The queue's ids when it was sent: its own row is the first new one with its words. */
+  before: ReadonlySet<string>;
+  /** Its bridge row was shown: once that row goes (the agent took it), this one never stands in again. */
+  matched?: boolean;
+}
+const expected = new Map<string, Expected[]>();
+const expectWatch = new Set<() => void>();
+/** A bridge row's id -> the provisional row it took over (bounded: ids only, dropped with the row). */
+const alias = new Map<string, string>();
+let expectSeq = 0;
+const NO_EXPECT: Expected[] = [];
+const sameWords = (a: string, b: string) => a.trim() === b.trim();
+const expectChanged = () => {
+  for (const f of expectWatch) f();
+};
+const watchExpected = (f: () => void) => {
+  expectWatch.add(f);
+  return () => void expectWatch.delete(f);
+};
+const dropExpected = (sessionId: string, pid: string) => {
+  const list = expected.get(sessionId);
+  if (!list?.some((e) => e.pid === pid)) return;
+  const next = list.filter((e) => e.pid !== pid);
+  if (next.length) expected.set(sessionId, next);
+  else expected.delete(sessionId);
+  expectChanged();
+};
 
 /**
- * The tray closes over a row that was taken out of its layout in this task.
- *
- * The tray stands on the composer and grows upward: without the row its box is shorter and its top
- * edge lower, at once. So the whole tray starts lifted and springs home, and what did not move in
- * the layout (the rows under the removed one, the dissolving copy) is held still by the opposite
- * slide. Translate only, one spring, started together: it runs on the compositor, and a queue is
- * used exactly while a turn streams and the page is busy (the height animated by script got five
- * frames a second there: the gap stood for 200 ms and closed in two steps). The lift is at most the
- * tuck's depth, so the tray's lower edge never comes out from behind the composer: the rest of a
- * row's height is taken in the first frame. The list is a scroller and would cut the rows held
- * still at its lower edge: it does not clip meanwhile (it is only closed this way while it has
- * nothing to scroll).
+ * A message is being queued in `sessionId`: its row stands in the tray from now on. Call the
+ * returned function with the bridge's answer: taken, the bridge's row takes this one's place (or,
+ * not in the queue at all, it simply goes); refused, the row goes.
  */
-function closeTray(clip: HTMLElement, list: HTMLElement, still: (HTMLElement | null | undefined)[], height: number) {
-  const by = Math.min(height, TUCK);
-  const timing = { duration: CLOSE.duration, easing: CLOSE.easing, delay: BEAT, fill: 'backwards' as const };
-  list.style.overflow = 'visible';
-  const edge = play(clip, [{ translate: `0 ${-by}px` }, { translate: '0 0' }], timing);
-  for (const el of still) if (el) play(el, [{ translate: `0 ${by}px` }, { translate: '0 0' }], timing);
-  const done = () => {
-    // A second removal right behind this one holds the list open itself.
-    if (!clip.getAnimations().some((a) => a !== edge && a.playState === 'running')) list.style.overflow = '';
+export function expectQueued(sessionId: string, text: string, match = text): (ok: boolean) => void {
+  const before = new Set((useStore.getState().data[sessionId]?.queue ?? NONE).map((q) => q.id));
+  const e: Expected = { pid: `expect:${++expectSeq}`, text, match, before };
+  expected.set(sessionId, [...(expected.get(sessionId) ?? NO_EXPECT), e]);
+  expectChanged();
+  // Never outlives a bridge that did not answer.
+  window.setTimeout(() => dropExpected(sessionId, e.pid), 20_000);
+  return (ok) => {
+    // The bridge's events are in the store before its answer: the queue says whether its row is there.
+    const queue = useStore.getState().data[sessionId]?.queue ?? NONE;
+    const there = ok && queue.some((q) => !e.before.has(q.id) && sameWords(q.text, e.match));
+    // There: it is shown in its place already (`withExpected`); kept a moment for a render still to come.
+    if (there) window.setTimeout(() => dropExpected(sessionId, e.pid), 1500);
+    else dropExpected(sessionId, e.pid);
   };
-  if (edge) edge.finished.then(done, done);
-  else done();
+}
+
+// ── a row taken back to edit ──
+// The row leaves in the frame of the click (its words go into the field on the same clock,
+// Composer `editQueued`), before the bridge has given the message back: a row that waited for that
+// round trip vanished and its words came into the field a frame later. A refusal brings it back.
+const taking = new Map<string, ReadonlySet<string>>();
+
+/** The row `id` of `sessionId` is being taken back into the field; the returned function lets it show again (if still queued). */
+export function takeBackRow(sessionId: string, id: string): () => void {
+  gone.add(id);
+  const next = new Set(taking.get(sessionId) ?? NOBODY);
+  next.add(id);
+  taking.set(sessionId, next);
+  expectChanged();
+  return () => {
+    const now = taking.get(sessionId);
+    if (!now?.has(id)) return;
+    const rest = new Set(now);
+    rest.delete(id);
+    if (rest.size) taking.set(sessionId, rest);
+    else taking.delete(sessionId);
+    if (useStore.getState().data[sessionId]?.queue.some((q) => q.id === id)) gone.delete(id);
+    expectChanged();
+  };
+}
+
+/** The queue as shown: the bridge's rows, the provisional ones taken over, and those still waiting at the end. */
+function withExpected(queue: QueuedMessage[], waiting: Expected[]): QueuedMessage[] {
+  if (!waiting.length) return queue;
+  const taken = new Set<string>();
+  const out = queue;
+  const extra: QueuedMessage[] = [];
+  for (const e of waiting) {
+    const q = queue.find((x) => !taken.has(x.id) && !e.before.has(x.id) && sameWords(x.text, e.match));
+    if (q) {
+      taken.add(q.id);
+      if (!alias.has(q.id)) alias.set(q.id, e.pid);
+      e.matched = true;
+    } else if (!e.matched) extra.push({ id: e.pid, text: e.text, createdAt: 0 });
+  }
+  return extra.length ? [...out, ...extra] : out;
+}
+const isProvisional = (id: string) => id.startsWith('expect:');
+/** The element a row keeps: a bridge row keeps the provisional row's. */
+const keyOf = (id: string) => alias.get(id) ?? id;
+
+/** Rows settling after a drag or a move by keys (motion's own layout slide). */
+const ROW = { type: 'spring' as const, stiffness: 520, damping: 38 };
+/** How long the words of a row that leaves with the tray take to go (ms). */
+const WORDS_OUT = 140;
+/** How long a removed row's words take to go while the row above comes down into its place (ms). */
+const WORDS_GONE = 80;
+
+/** The tray's section (an exiting one may still stand beside a new one for a frame). */
+const trayOf = (clip: HTMLElement) => [...clip.querySelectorAll<HTMLElement>(':scope > .cq')].find((el) => el.style.display !== 'none') ?? null;
+const rowsOf = (clip: HTMLElement) => [...clip.querySelectorAll<HTMLElement>('[data-qrow]')].filter((el) => el.style.display !== 'none');
+
+/** Each row's distance from the tray's lower edge, and the tray's height (0: not there). Reads only. */
+function readTray(clip: HTMLElement): { height: number; rows: Map<string, number> } {
+  const rows = new Map<string, number>();
+  const cq = clip.style.display === 'none' ? null : trayOf(clip);
+  if (!cq) return { height: 0, rows };
+  const list = cq.querySelector<HTMLElement>('.cq-list');
+  const h = cq.offsetHeight;
+  for (const r of rowsOf(clip)) {
+    const id = r.getAttribute('data-qid');
+    if (id && list) rows.set(id, h - (list.offsetTop + r.offsetTop));
+  }
+  return { height: clip.offsetHeight, rows };
+}
+
+/**
+ * The tray's rows changed (one came, left, was removed or taken back): the layout is already
+ * final; everything is drawn where it stood and glides home on the dock's one clock
+ * (`stack-glide.ts`): the tray by its change of height, the rows that stay by what is left of
+ * their own move, a removed row's dead copy held where it was, and the strips and prompt cards
+ * above by what the dock's height changed. The list does not clip meanwhile (a row held still at
+ * its lower edge would be cut), unless it scrolls.
+ */
+function glideTray(clip: HTMLElement, was: { height: number; rows: Map<string, number> }, now: { height: number; rows: Map<string, number> }) {
+  const cq = trayOf(clip);
+  if (!cq || reducedMotion()) return;
+  const m = rowMoves(was.rows, now.rows, was.height, now.height);
+  const share = trayShare(now.height) - trayShare(was.height);
+  if (Math.abs(m.tray) < 0.5 && !m.rows.size) return;
+  const t = performance.now();
+  const list = cq.querySelector<HTMLElement>('.cq-list');
+  const open = list && list.scrollHeight <= list.clientHeight + 1;
+  if (open) list.style.overflow = 'visible';
+  const edge = glideY(cq, m.tray, t);
+  for (const r of rowsOf(clip)) {
+    const own = m.rows.get(r.getAttribute('data-qid') ?? '');
+    if (own) glideY(r, own, t);
+  }
+  // A removed row's copy stands still where the row was: against the tray's glide.
+  for (const g of clip.querySelectorAll<HTMLElement>('[data-qghost]')) {
+    g.removeAttribute('data-qghost');
+    glideY(g, -m.tray, t);
+    // Its words are gone before the row coming down into its place reaches them (the rows have no
+    // fill of their own: the two lines read over each other for a few frames).
+    play(g.firstElementChild, [{ opacity: 1 }, { opacity: 0 }], { duration: WORDS_GONE, easing: 'ease-out', fill: 'forwards' });
+  }
+  if (Math.abs(share) > 0.5) for (const el of aboveTray(clip)) glideY(el, share, t);
+  if (edge && open && list) {
+    const done = () => {
+      if (!cq.getAnimations().some((a) => a !== edge && a.playState === 'running')) list.style.overflow = '';
+    };
+    edge.finished.then(done, done);
+  }
+}
+
+/**
+ * The tray empties: it goes down into the pane as one piece, the head with its last row. A dead
+ * copy (`ghostOf`, held by its lower edge) slides down by what the tray added to the dock while
+ * the tray itself is out of the layout in this frame, so the strips above and the conversation
+ * (Timeline.tsx, the dock's shorter branch) come down with it on the same clock. A row whose words
+ * are still in it (removed by hand, taken back to edit) lets them go first.
+ */
+function foldTray(clip: HTMLElement, height: number, fade: boolean) {
+  const share = trayShare(height);
+  const ghost = reducedMotion() ? null : ghostOf(clip, { anchor: 'bottom' });
+  clip.style.display = 'none';
+  if (!ghost) return;
+  const copy = ghost.firstElementChild as HTMLElement | null;
+  const t = performance.now();
+  // (Words that already flew out of the row are hidden in it, and stay so in the copy.)
+  if (fade) for (const w of ghost.querySelectorAll<HTMLElement>('.cq-text')) if (w.style.opacity !== '0') play(w, [{ opacity: 1 }, { opacity: 0 }], { duration: WORDS_OUT, easing: 'ease-out', fill: 'forwards' });
+  const slide = copy ? play(copy, [{ translate: '0 0' }, { translate: `0 ${share}px` }], { duration: STACK_MS, easing: STACK_EASE, fill: 'forwards' }) : null;
+  for (const el of aboveTray(clip)) glideY(el, -share, t);
+  const off = () => ghost.remove();
+  if (slide) slide.finished.then(off, off);
+  else off();
 }
 
 export interface QueueTrayProps {
@@ -104,32 +260,73 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
       return next;
     });
   }, []);
-  const shown = left.size ? queue.filter((q) => !left.has(q.id)) : queue;
+  const waiting = useSyncExternalStore(watchExpected, () => expected.get(sessionId) ?? NO_EXPECT);
+  const all = useMemo(() => withExpected(queue, waiting), [queue, waiting]);
+  const takingNow = useSyncExternalStore(watchExpected, () => taking.get(sessionId) ?? NOBODY);
+  const shown = left.size || takingNow.size ? all.filter((q) => !left.has(q.id) && !takingNow.has(q.id)) : all;
+  const shownKey = shown.map((q) => q.id).join('\n');
+  // The rows' elements on screen after the last commit (a bridge row keeps its provisional row's).
+  const landed = useRef<ReadonlySet<string>>(new Set());
   const before = useRef<QueuedMessage[]>(NONE);
   const beforeSession = useRef(sessionId);
+  // Where the tray and its rows stood after the last commit (`readTray`): what the next change glides from.
+  const geo = useRef<{ height: number; rows: Map<string, number> }>({ height: 0, rows: new Map() });
   useLayoutEffect(() => {
     const host = clip.current;
     const prev = before.current;
     before.current = queue;
-    // Another chat's queue (a switch): its rows neither land nor leave here.
+    // Another chat's queue (a switch): its rows neither land nor leave here, and nothing glides.
     const same = beforeSession.current === sessionId;
     beforeSession.current = sessionId;
-    if (!host || prev === queue || !same) return;
-    const now = new Set(queue.map((q) => q.id));
-    const was = new Set(prev.map((q) => q.id));
+    if (!host) return;
+    const keys = new Set(shown.map((q) => keyOf(q.id)));
+    const wasKeys = landed.current;
+    landed.current = keys;
+    if (!same) {
+      host.style.display = shown.length ? '' : 'none';
+      geo.current = readTray(host);
+      return;
+    }
     // (The row itself, never one removed by hand that is still folding away, hidden.)
     const textOf = (id: string) => [...host.querySelectorAll<HTMLElement>(`[data-qid="${CSS.escape(id)}"]`)].find((el) => el.style.display !== 'none')?.querySelector<HTMLElement>('.cq-text') ?? null;
-    for (const q of queue) {
-      if (was.has(q.id)) continue;
+    // A row that is new on screen (a provisional row at the press, or one from elsewhere): words in the air land in it.
+    for (const q of shown) {
+      if (wasKeys.has(keyOf(q.id))) continue;
       const el = textOf(q.id);
       if (el) landInTray(el, q.text, sessionId);
     }
-    for (const q of prev) {
-      if (now.has(q.id) || gone.delete(q.id)) continue;
-      const el = textOf(q.id);
-      if (el) launchFromTray(el, q.text, sessionId);
+    if (prev !== queue) {
+      const now = new Set(queue.map((q) => q.id));
+      for (const q of prev) {
+        if (now.has(q.id) || gone.delete(q.id)) continue;
+        const el = textOf(q.id);
+        if (el) launchFromTray(el, q.text, sessionId);
+      }
     }
-  }, [queue, sessionId]);
+    const was = geo.current;
+    if (!shown.length) {
+      // The tray empties: it folds into the pane in one piece (an exiting section still stands).
+      if (host.style.display !== 'none' && was.height > 0) foldTray(host, was.height, true);
+      else host.style.display = 'none';
+      geo.current = { height: 0, rows: new Map() };
+      return;
+    }
+    host.style.display = '';
+    // A row that left goes out of the layout in this frame (motion would hold its place until its
+    // exit ends). One whose words are still in it (taken back to edit, removed elsewhere) breaks into
+    // the tray's dither where it stood, as a removal by hand does.
+    const ids = new Set(shown.map((q) => q.id));
+    const first = trayOf(host)?.querySelector<HTMLElement>('.cq-list')?.firstElementChild;
+    for (const r of host.querySelectorAll<HTMLElement>('[data-qrow]')) {
+      if (ids.has(r.getAttribute('data-qid') ?? '') || r.style.display === 'none') continue;
+      const words = r.querySelector<HTMLElement>('.cq-text');
+      if (words && words.style.opacity !== '0' && first instanceof HTMLElement && !reducedMotion()) dissolve(r, { ground: '--panel', anchor: 'bottom', before: first })?.ghost.setAttribute('data-qghost', '');
+      r.style.display = 'none';
+    }
+    const now = readTray(host);
+    glideTray(host, was, now);
+    geo.current = now;
+  }, [queue, shownKey, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <div className="cq-clip" ref={clip}>
       <AnimatePresence initial={false}>
@@ -139,10 +336,8 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
             className="cq"
             data-spot
             aria-label="Queued messages"
-            initial={reduced ? { opacity: 0 } : { y: '100%' }}
-            animate={reduced ? { opacity: 1 } : { y: 0 }}
-            exit={reduced ? { opacity: 0 } : { y: '100%', transition: { duration: 0.12, ease: [0.4, 0, 1, 1] } }}
-            transition={reduced ? { duration: 0.12, layout: { duration: 0 } } : UNFOLD}
+            // The tray's own motion is the dock's glide (`glideTray`, `foldTray`): nothing here moves it.
+            exit={{ opacity: 1, transition: { duration: 0 } }}
           >
             <TrayBody sessionId={sessionId} queue={shown} held={queue} lives={lives.current} running={running} steerable={steerable} onEdit={onEdit} onFocusComposer={onFocusComposer} reduced={!!reduced} onLeave={leave} />
           </motion.section>
@@ -167,10 +362,16 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
   for (const q of queue) if (!rows.some((r) => r.id === q.id)) rows.push(q);
   const shown = useRef(rows);
   shown.current = rows;
-  // When motion measures the rows for its own slides (a drag, a row the agent took): whenever the
-  // bridge's queue or the order in hand changes, but not when a row is removed by hand, which is
-  // not in the bridge's answer yet: that close is `closeTray`'s, and two slides would add up.
-  const measure = `${held.map((q) => q.id).join()}/${order.map((q) => q.id).join()}`;
+  // When motion measures the rows for its own slides: only a change of order among the same rows
+  // (a drag, a move by keys). A row that comes or goes is the dock's glide (`glideTray`), and two
+  // slides would add up.
+  const measured = useRef({ set: '', measure: '' });
+  const ids = rows.map((q) => q.id);
+  const set = [...ids].sort().join();
+  if (set !== measured.current.set) measured.current = { set, measure: measured.current.measure };
+  else measured.current.measure = ids.join();
+  const measure = measured.current.measure;
+  void held;
 
   const commit = (next: QueuedMessage[]) => {
     const ids = next.map((q) => q.id);
@@ -188,28 +389,22 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
   };
 
   // The row breaks into the tray's own dither where it stood and is out of the list in this frame,
-  // so the tray closes on the click. Its dead copy (`lib/dissolve.ts`) is held by the list's lower
-  // edge, which stays while the tray's top comes down, and stands under the rows: one that comes
-  // down into its place covers it.
+  // so the tray closes on the click (the tray's layout effect glides it, `glideTray`). Its dead copy
+  // (`lib/dissolve.ts`) is held by the list's lower edge and stands under the rows: one that comes
+  // down into its place covers it. The last row is not taken out alone: the tray folds into the
+  // pane with it (`foldTray`), its words going on the way.
   const remove = (q: QueuedMessage, i: number, el: Element | null) => {
     gone.add(q.id);
     const focused = !!el?.contains(document.activeElement);
     const list = listRef.current;
     const row = el instanceof HTMLElement ? el : null;
-    const clip = row?.closest<HTMLElement>('.cq-clip');
     const first = list?.firstElementChild;
-    if (row && list && clip && first instanceof HTMLElement && !reducedMotion()) {
-      // Reads: the row's height, whether the tray gets shorter without it (a list that scrolls does
-      // not), and the rows that stay where they are.
-      const height = row.offsetHeight;
-      const shrinks = rows.length > 1 && list.scrollHeight <= list.clientHeight + 1;
-      const under: HTMLElement[] = [];
-      for (let n = row.nextElementSibling; n; n = n.nextElementSibling) if (n instanceof HTMLElement && n.hasAttribute('data-qrow')) under.push(n);
-      // Writes.
-      const leaving = dissolve(row, { ground: '--panel', anchor: 'bottom', before: first });
+    const last = rows.length <= 1;
+    if (row && !last) {
+      const leaving = first instanceof HTMLElement && !reducedMotion() ? dissolve(row, { ground: '--panel', anchor: 'bottom', before: first }) : null;
+      leaving?.ghost.setAttribute('data-qghost', '');
       row.style.display = 'none';
-      if (shrinks) closeTray(clip, list, [...under, leaving?.ghost], height);
-    } else if (row) row.style.display = 'none';
+    }
     onLeave(q.id, true);
     void removeQueued(sessionId, q.id)
       .then((res) => {
@@ -232,16 +427,16 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
 
   return (
     <>
-      {/* The words of the head and of every row start where the field's own words do (16 in). */}
+      {/* The words of the head and of every row start where the field's own words do (16 in). A
+          word and no number: the rows themselves say how many. */}
       <div className="cq-head">
         <span className="cq-title">Queued</span>
-        <Roll value={queue.length} className="cq-count num" />
       </div>
       <Reorder.Group as="ul" axis="y" values={rows} onReorder={setOrder} className="cq-list scroll" ref={listRef} role="list">
         <AnimatePresence initial={false}>
           {rows.map((q, i) => (
             <Row
-              key={`${q.id}/${lives.get(q.id) ?? 0}`}
+              key={`${keyOf(q.id)}/${lives.get(q.id) ?? 0}`}
               q={q}
               i={i}
               count={rows.length}
@@ -261,7 +456,7 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
               }}
               onRemove={(el) => remove(q, i, el)}
               onKey={(e) => {
-                if (e.target !== e.currentTarget) return;
+                if (e.target !== e.currentTarget || isProvisional(q.id)) return;
                 // (Live rows only: one removed by hand is still in the page for a moment, hidden.)
                 const els = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-qrow]') ?? [])].filter((el) => el.style.display !== 'none');
                 const at = els.indexOf(e.currentTarget);
@@ -315,6 +510,7 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
   const atts = q.attachments?.length ?? 0;
   const text = firstLine(q.text);
   const sendLabel = running && steerable ? 'Steer now' : 'Send now';
+  const provisional = isProvisional(q.id);
 
   const grab = (e: ReactPointerEvent) => {
     if (e.button !== 0 || (e.target as HTMLElement).closest('button')) return;
@@ -336,10 +532,12 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
       data-lifted={lifted || undefined}
       tabIndex={0}
       aria-label={`Queued message ${i + 1} of ${count}: ${text}${atts ? `, ${atts} attached` : ''}. Alt+Arrow keys move it.`}
-      initial={reduced ? { opacity: 0 } : { opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={reduced ? { opacity: 0 } : { opacity: 0, height: 0, transition: { opacity: { duration: 0 }, height: ROW } }}
-      transition={reduced ? { duration: 0.12, layout: { duration: 0 } } : { opacity: { duration: 0.11, ease: [0.16, 1, 0.3, 1] }, y: { duration: 0.11, ease: [0.16, 1, 0.3, 1] }, layout: ROW, default: ROW }}
+      // A row comes and goes with the dock's glide (QueueTray's layout effect): it is simply there,
+      // its words brought by the message that flies in; one that leaves is out of the layout at once.
+      initial={false}
+      animate={{ scale: 1 }}
+      exit={{ opacity: 0, transition: { duration: 0 } }}
+      transition={reduced ? { duration: 0.12, layout: { duration: 0 } } : { layout: ROW, default: ROW }}
       whileDrag={reduced ? undefined : { scale: 1.015 }}
       onDragStart={() => {
         setLifted(true);
@@ -351,7 +549,7 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
       }}
       onPointerDown={grab}
       onKeyDown={onKey}
-      onDoubleClick={(e) => !(e.target as HTMLElement).closest('button') && onEdit()}
+      onDoubleClick={(e) => !provisional && !(e.target as HTMLElement).closest('button') && onEdit()}
     >
       {/* No number before the words: the order is the list's own, and the text keeps the field's edge. */}
       <span className="cq-text truncate">{text || ' '}</span>
@@ -369,7 +567,8 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
           <span className="num">{atts}</span>
         </span>
       )}
-      <span className="cq-actions">
+      {/* A row standing in until the bridge has the message: nothing to act on yet. */}
+      <span className="cq-actions" hidden={provisional || undefined}>
         <Act icon={running && steerable ? 'fast-forward' : 'arrow-up'} label={sendLabel} onClick={onSend} />
         <Act icon="pencil" label="Edit" onClick={onEdit} />
         <Act icon="trash" label="Remove" onClick={() => onRemove(ref.current)} />
