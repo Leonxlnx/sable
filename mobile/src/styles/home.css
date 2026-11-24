@@ -29,10 +29,10 @@
   left: 0;
   right: 0;
   height: calc(var(--sat) + var(--bar-h));
-  padding: var(--sat) 6px 0 20px;
+  padding: var(--sat) 8px 0 var(--gutter);
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--s-3);
   pointer-events: none;
 }
 
@@ -120,8 +120,8 @@
 .home-hero {
   /* room under the title: the horizon's light is seen here, before the cards */
   /* the title and the line under it keep their room whether the line is there or not (the horizon is placed by this block) */
-  min-height: 120px;
-  padding: 10px 22px 34px;
+  min-height: 116px;
+  padding: var(--s-2) var(--gutter) var(--s-8);
   transform-origin: 0 100%;
   animation: hero-out linear both;
   animation-timeline: --home;
@@ -129,10 +129,10 @@
 }
 
 .home-title {
-  font-size: var(--t-display);
+  font-size: var(--t-h1);
   font-weight: var(--w-display);
-  letter-spacing: -0.032em;
-  line-height: 1.12;
+  letter-spacing: -0.024em;
+  line-height: 1.15;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -169,7 +169,7 @@
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 8px 18px 16px;
+  padding: 2px 8px var(--s-4) var(--gutter);
   animation: none;
 }
 
@@ -181,7 +181,8 @@
   height: 48px;
   padding: 0 4px 0 15px;
   border-radius: var(--r-md);
-  background: rgb(255 255 255 / 0.065);
+  /* its own ink: the field's light lies behind it */
+  background: rgb(24 24 27 / 0.94);
   box-shadow: inset 0 0 0 1px var(--line);
   color: var(--text-3);
 }
@@ -238,7 +239,8 @@
 
 /* ── waiting on you: one calm card at the top, its amber light along its foot ── */
 .wait-strip-wrap {
-  padding: 0 14px 6px;
+  /* the card stands 12 px in, its marks at the gutter */
+  padding: 0 var(--s-3) var(--s-1);
   overflow: hidden;
 }
 
@@ -248,8 +250,8 @@
   flex-direction: column;
   gap: 6px;
   width: 100%;
-  padding: 14px 14px 16px 16px;
-  border-radius: var(--r-xl);
+  padding: var(--s-3) var(--s-3) 14px var(--s-2);
+  border-radius: var(--r-lg);
   text-align: left;
   overflow: hidden;
   isolation: isolate;
@@ -266,7 +268,12 @@
 .wait-head {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
+}
+
+/* the waiting mark takes the agent mark's width, so both lines' words start on one edge */
+.wait-head > .smark {
+  width: 15px;
 }
 
 .wait-count {
@@ -324,31 +331,29 @@
 /* ── the folders: a row of chips (all chats, or one folder's) ── */
 .filters {
   display: flex;
-  gap: 8px;
-  padding: 4px 14px 4px;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--gutter);
   overflow-x: auto;
   scrollbar-width: none;
   overscroll-behavior-x: contain;
-  scroll-padding-inline: 14px;
+  scroll-padding-inline: var(--gutter);
 }
 
 .filters::-webkit-scrollbar {
   display: none;
 }
 
-/* a bare chip: flat until held or on (on: set in, a step lighter) */
+/* a folder chip: words only, one fill step of its own ink (the field's light may be behind it), no edge;
+   held, the next step and the give in scale; on, the brightest step with ivory words */
 .filter {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
   flex-shrink: 0;
   max-width: 200px;
-  height: 36px;
-  padding: 0 14px;
+  height: 34px;
+  padding: 0 var(--s-4);
   border-radius: var(--r-pill);
-  /* ink of its own: it lies on the stage, where the field's light may be behind it */
-  background-color: rgb(21 21 24 / 0.9);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.04);
+  background-color: rgb(24 24 27 / 0.92);
   font-size: var(--t-sm);
   font-weight: var(--w-medium);
   color: var(--text-2);
@@ -361,37 +366,28 @@
   text-overflow: ellipsis;
 }
 
-.filter svg {
-  flex-shrink: 0;
-  color: var(--text-3);
-}
-
 .filter:active {
   scale: 0.96;
-  background-color: rgb(30 30 34);
+  background-color: rgb(34 34 38);
+  transition-duration: 70ms;
 }
 
 .filter[aria-pressed='true'] {
-  background-color: rgb(38 38 42);
-  box-shadow: var(--press-down);
+  background-color: rgb(46 46 51);
   color: var(--text);
 }
 
-.filter[aria-pressed='true'] svg {
-  color: var(--text-2);
-}
-
-/* ── the list: pinned, then recent; one card each, rows of two lines ── */
+/* ── the list: pinned, then recent; rows straight on the ink, the agent's mark at the gutter ── */
 .group {
-  padding: 14px 14px 0;
+  padding: var(--s-5) 0 0;
 }
 
-/* a section's name: a quiet label over its card (the chats are what is read) */
+/* a section's name: a quiet label at the gutter (the chats are what is read) */
 .group-name {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 10px 9px;
+  gap: var(--s-2);
+  padding: 0 var(--gutter) var(--s-1);
   font-size: var(--t-sm);
   font-weight: var(--w-medium);
   color: var(--text-3);
@@ -401,26 +397,23 @@
 .rows {
   list-style: none;
   margin: 0;
-  padding: 5px;
-  border-radius: var(--r-xl);
-  background: var(--card);
-  box-shadow: var(--edge), var(--lift);
+  padding: 0;
 }
 
 .rows > li {
   position: relative;
-  border-radius: var(--r-lg);
 }
 
+/* the hairline between two rows runs from the words' edge to the gutter */
 .rows > li + li::before {
   content: '';
   position: absolute;
   z-index: 2;
   top: 0;
-  left: 50px;
-  right: 14px;
+  left: calc(var(--gutter) + 15px + var(--s-3));
+  right: var(--gutter);
   height: 1px;
-  background: rgb(255 255 255 / 0.05);
+  background: rgb(255 255 255 / 0.055);
   pointer-events: none;
 }
 
@@ -435,43 +428,44 @@
   z-index: 1;
   display: flex;
   align-items: center;
-  gap: 13px;
+  gap: var(--s-3);
   width: 100%;
-  min-height: 64px;
-  padding: 0 14px 0 13px;
-  border-radius: var(--r-lg);
+  min-height: var(--row-2);
+  padding: 0 var(--gutter);
   text-align: left;
-  transition: background-color 100ms, scale 140ms var(--ease-out);
+  transition: background-color 100ms;
 }
 
+/* held: the row lights edge to edge in the frame (a full-width row does not scale) */
 .row:active {
-  background-color: rgb(255 255 255 / 0.055);
-}
-
-.rrow:not([data-swiping]) .row:active {
-  scale: 0.985;
+  background-color: rgb(255 255 255 / 0.05);
+  transition-duration: 0ms;
 }
 
 /* moving, the row is opaque over its actions */
 .rrow[data-swiping] .row {
   background-color: var(--card-solid);
-  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.04);
 }
 
 .row-mark {
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 15px;
+  height: 22px;
   flex-shrink: 0;
   align-self: flex-start;
-  margin-top: 12px;
+  /* on the title's line (its 22 px line box starts 11 px down) */
+  margin-top: 11px;
+}
+
+.row-mark .pmark {
+  opacity: 0.8;
 }
 
 .row-main {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   flex: 1;
   min-width: 0;
   padding: 11px 0 12px;
@@ -480,11 +474,13 @@
 .row-title {
   min-width: 0;
   font-size: var(--t-body);
-  color: #e4e3df;
+  font-weight: var(--w-medium);
+  letter-spacing: -0.006em;
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  line-height: 1.4;
+  line-height: 22px;
 }
 
 .row[data-tone='unread'] .row-title {
@@ -496,7 +492,7 @@
   display: flex;
   min-width: 0;
   font-size: var(--t-sm);
-  line-height: 1.35;
+  line-height: 18px;
   color: var(--text-3);
 }
 
@@ -622,30 +618,26 @@
 }
 
 .home-skel {
-  padding: 18px 14px 8px;
+  padding: var(--s-5) 0 var(--s-2);
 }
 
 .home-skel-card {
   display: flex;
   flex-direction: column;
-  padding: 5px;
-  border-radius: var(--r-xl);
-  background: var(--card);
-  box-shadow: var(--edge);
 }
 
 .home-skel-row {
   display: flex;
   align-items: flex-start;
-  gap: 13px;
-  height: 64px;
-  padding: 15px 14px 0 15px;
+  gap: var(--s-3);
+  height: var(--row-2);
+  padding: 15px var(--gutter) 0;
 }
 
 .home-skel-row .skel-dot {
-  width: 18px;
-  height: 18px;
-  border-radius: 6px;
+  width: 15px;
+  height: 15px;
+  border-radius: 5px;
   flex-shrink: 0;
 }
 
@@ -677,7 +669,7 @@
 }
 
 .hits > li + li::before {
-  left: 16px;
+  left: var(--gutter);
 }
 
 .hit {
@@ -685,15 +677,14 @@
   flex-direction: column;
   gap: 6px;
   width: 100%;
-  padding: 13px 14px 14px 15px;
-  border-radius: var(--r-lg);
+  padding: 14px var(--gutter) 15px;
   text-align: left;
-  transition: background-color 100ms, scale 140ms var(--ease-out);
+  transition: background-color 100ms;
 }
 
 .hit:active {
-  background-color: rgb(255 255 255 / 0.055);
-  scale: 0.985;
+  background-color: rgb(255 255 255 / 0.05);
+  transition-duration: 0ms;
 }
 
 .hit-head {
@@ -801,11 +792,16 @@
   bottom: calc(var(--sab) + 12px + 58px + 10px);
   display: flex;
   align-items: center;
-  gap: 13px;
+  gap: 10px;
   height: 62px;
-  padding: 0 9px 0 18px;
+  /* its mark at the gutter, as the rows' */
+  padding: 0 9px 0 var(--s-2);
   border-radius: var(--r-xl);
   text-align: left;
+}
+
+.attn > .smark {
+  width: 15px;
 }
 
 /* ── new chat: the prompt bar at the foot of home ── */
@@ -999,7 +995,7 @@
   padding: 0 18px;
   border-radius: var(--r-lg);
   background: rgb(32 32 36);
-  box-shadow: inset 0 1px 0 0 rgb(255 255 255 / 0.06), var(--shadow-glass);
+  box-shadow: var(--rim-ring), var(--shadow-glass);
   pointer-events: none;
 }
 

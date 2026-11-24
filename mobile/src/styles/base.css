@@ -2,9 +2,9 @@
  * Sable on the phone. The desktop's language at hand size: ink surfaces one small step apart,
  * ivory text, colour only in the dither field and the agent marks (amber: waiting on you, red:
  * an error, green and red numbers in a change). What floats (the prompt bars, sheets, toasts, menus)
- * is liquid glass: a specular rim, an inner edge, a sheen and layered depth, one light from the top
- * left (only the prompt bars blur); a few small controls are tactile (raised a hair, set in when
- * pressed); what scrolls is flat ink. Inter for everything but code. Springs for what moves,
+ * is calm glass: one even hairline rim, a frosted or opaque fill, depth from the shadow alone (only
+ * the prompt bars blur); controls are flat (one fill step, one hairline); what scrolls is flat ink.
+ * One gutter for every screen, a 4 px rhythm. Inter for everything but code. Springs for what moves,
  * transform and opacity only.
  */
 
@@ -74,8 +74,8 @@
   --glass: rgb(19 19 22 / 0.72);
   --glass-up: rgb(25 25 29 / 0.86);
   --blur: blur(24px) saturate(160%);
-  /* a card is its fill, a step over the ground; its edge is a hairline that only finishes it, lit a little along the top */
-  --edge: inset 0 0 0 1px rgb(255 255 255 / 0.045), inset 0 1px 0 0 rgb(255 255 255 / 0.03);
+  /* a card is its fill, a step over the ground; its edge is a hairline that only finishes it, the same all round */
+  --edge: inset 0 0 0 1px rgb(255 255 255 / 0.05);
   --edge-2: inset 0 0 0 1px rgb(255 255 255 / 0.1);
   --lift: 0 18px 40px -22px rgb(0 0 0 / 0.9);
   --lift-2: 0 24px 54px -20px rgb(0 0 0 / 0.92), 0 6px 16px -10px rgb(0 0 0 / 0.6);
@@ -110,17 +110,20 @@
   /* depth: a dark contact line that sharpens the rim, a tight near shadow, a wide soft one */
   --shadow-glass: 0 0 0 1px rgb(0 0 0 / 0.42), 0 2px 5px -1px rgb(0 0 0 / 0.38), 0 14px 34px -12px rgb(0 0 0 / 0.72), 0 34px 70px -34px rgb(0 0 0 / 0.6);
   --shadow-glass-lift: 0 22px 48px -16px rgb(0 0 0 / 0.78), 0 44px 90px -40px rgb(0 0 0 / 0.6);
-  /* tactile: raised a hair at rest (a top light, a contact shadow), set in when pressed or on */
+  /* flat controls (the desktop's "material: flat controls", 21 Nov): a control with a fill of its own is one
+     fill step and one even hairline; held, open or on it keeps the next fill step and the hairline steps up.
+     Never a top light, an inner shade or a lip: states read by fill and the give in scale. */
   --press-up: inset 0 0 0 1px rgb(255 255 255 / 0.06);
-  --press-down: inset 0 1px 2px 0 rgb(0 0 0 / 0.42), inset 0 0 0 1px rgb(0 0 0 / 0.16), 0 1px 0 0 rgb(255 255 255 / 0.04);
-  --press-well: inset 0 1px 2px 0 rgb(0 0 0 / 0.45), inset 0 0 0 1px rgb(0 0 0 / 0.2), 0 1px 0 0 rgb(255 255 255 / 0.045);
-  /* the ivory key (send, stop): a lit top lip, a shaded lower lip, a short drop; pressed, it sinks */
+  --press-down: inset 0 0 0 1px rgb(255 255 255 / 0.11);
+  /* a track (a switch, a segmented control): a darker fill with the same hairline */
+  --press-well: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  /* the ivory key (send, stop): a flat face and a short soft drop; held, the drop shortens */
   --key-face: none;
   --key-up: 0 1px 2px 0 rgb(0 0 0 / 0.36), 0 4px 10px -4px rgb(0 0 0 / 0.5);
-  --key-face-down: linear-gradient(180deg, rgb(0 0 0 / 0.1), rgb(0 0 0 / 0) 55%);
-  --key-down: inset 0 1px 2px 0 rgb(0 0 0 / 0.32), inset 0 0 0 1px rgb(0 0 0 / 0.06), 0 1px 1px 0 rgb(0 0 0 / 0.4);
-  /* the phone's own: the thumb of a switch or a dial, a small ivory key */
-  --thumb-up: inset 0 1.5px 2px -1px rgb(255 255 255 / 0.4), inset 0 -1px 0 0 rgb(0 0 0 / 0.12), 0 1px 2px 0 rgb(0 0 0 / 0.5);
+  --key-face-down: none;
+  --key-down: 0 1px 1px 0 rgb(0 0 0 / 0.4);
+  /* the thumb of a switch or a dial: a flat disc with a short drop */
+  --thumb-up: 0 1px 2px 0 rgb(0 0 0 / 0.5), 0 2px 6px -2px rgb(0 0 0 / 0.4);
   /* the ink of a sheet (and of what floats opaque over a screen) */
   --sheet-ink: rgb(21 21 24);
   --float-ink: rgb(27 27 31);
@@ -142,6 +145,21 @@
   --kb: 0px;
   --kb-ms: 280ms;
   --bar-h: 56px;
+
+  /* one base unit (4 px) and the page's one left and right edge: every screen's title, chips, rows and
+     cards start at the gutter; what marks a row (an agent's mark, a status letter) stands at the gutter
+     and the row's words follow it */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --gutter: 20px;
+  /* a row of a list: one line 52, two lines 64 */
+  --row-1: 52px;
+  --row-2: 64px;
 }
 
 * {
@@ -262,8 +280,7 @@ p {
   border-radius: inherit;
   background-color: var(--glass-pane-lift);
   box-shadow:
-    inset 0 0 0 1px rgb(255 255 255 / 0.035),
-    inset 0 1.5px 2px -1px rgb(255 255 255 / 0.06),
+    inset 0 0 0 1px rgb(255 255 255 / 0.04),
     var(--shadow-glass-lift);
   opacity: 0;
   pointer-events: none;
@@ -402,8 +419,9 @@ p {
   position: relative;
   display: grid;
   place-items: center;
-  width: 44px;
-  height: 44px;
+  /* a thumb's target: 48 px, the bar's height less its margins */
+  width: 48px;
+  height: 48px;
   border-radius: var(--r-pill);
   color: var(--text-2);
   transition: background-color 100ms, transform 120ms var(--ease-out), color 100ms;
@@ -431,7 +449,7 @@ p {
 }
 
 .icon-btn-spacer {
-  width: 44px;
+  width: 48px;
   flex-shrink: 0;
 }
 
@@ -887,7 +905,11 @@ p {
 .tool-key,
 .send,
 .search-clear {
-  --hit: -2px;
+  --hit: -4px;
+}
+
+.filter {
+  --hit: -7px 0;
 }
 
 .setup-chip,

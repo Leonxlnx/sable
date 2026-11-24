@@ -125,7 +125,6 @@ export function ChangesScreen({ id, items, lead }: { id: string; items?: string[
         <span className="icon-btn-spacer" />
       </header>
       <div className="changes-scroll">
-        <h1 className="page-title">Changes</h1>
         {(d || items || (online && !entry.error)) && <Meta items={!!items} data={d} leadText={leadText} status={!online && d ? connWord(connState, listed) : undefined} />}
         {body}
       </div>

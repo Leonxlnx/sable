@@ -169,8 +169,8 @@
 
 .remote-dot {
   position: absolute;
-  top: 11px;
-  right: 10px;
+  top: 13px;
+  right: 12px;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -285,7 +285,8 @@
   padding: 11px 16px 12px;
   border-radius: var(--r-xl) var(--r-xl) 8px var(--r-xl);
   background: var(--ink-3);
-  box-shadow: var(--edge), 0 12px 26px -16px rgb(0 0 0 / 0.85);
+  /* your words are no glass and nothing lifted: one step of ink and one even hairline */
+  box-shadow: var(--edge);
   font-size: var(--t-body);
   line-height: 1.5;
   color: var(--text);
@@ -1724,8 +1725,9 @@
   min-width: 0;
 }
 
-/* Tactile (base.css): the tool key and the setup chip stand a hair above the glass and set in while
-   held or while their sheet is open; the shadow swaps in the same frame as the give in scale. */
+/* Flat controls (base.css): the tool key is one fill step and one even hairline (the desktop's attach
+   disc); the setup chip is bare (the desktop's model chip) until held or while its sheet is open, when it
+   takes the fill step and the hairline. Fill and hairline swap in the frame of the press. */
 .tool-key {
   display: grid;
   place-items: center;
@@ -1753,10 +1755,8 @@
   gap: 7px;
   min-width: 0;
   height: 40px;
-  padding: 0 12px;
+  padding: 0 10px;
   border-radius: var(--r-pill);
-  background-color: var(--fill-2);
-  box-shadow: var(--press-up);
   font-size: var(--t-sm);
   font-weight: var(--w-strong);
   color: var(--text);
@@ -1765,13 +1765,14 @@
 }
 
 .setup-chip:active {
-  background-color: var(--fill-3);
+  background-color: var(--fill-2);
   box-shadow: var(--press-down);
   scale: 0.97;
-  transition-duration: 100ms, 70ms;
+  transition-duration: 0ms, 70ms;
 }
 
 .setup-chip[aria-expanded='true'] {
+  background-color: var(--fill-2);
   box-shadow: var(--press-down);
 }
 
@@ -1798,11 +1799,10 @@
   color: var(--text-4);
 }
 
-/* Send: a tactile ivory key with a dark glyph (base.css --key-*): a soft light on its upper half, a lit
-   top lip, a shaded lower lip and a short drop, a domed disc standing on the glass. Pressed, it sinks
-   (the light leaves the face, the lip turns to an inner shade, the drop shortens) in the same frame as
-   its give in scale. With nothing to send it is a dim glyph on one fill step, the same raised disc as
-   the tool key at the other end. Stop is the same key with a dark square; it never moves. */
+/* Send: the one ivory key, a flat face and a short soft drop (base.css --key-*). Held, it dims a touch,
+   the drop shortens and it gives in scale, in the same frame. With nothing to send it is a dim glyph on
+   one fill step, the same disc as the tool key at the other end. Stop is the same key with a dark
+   square; it never moves. */
 .send {
   display: grid;
   place-items: center;
@@ -2079,8 +2079,7 @@ button.queued-text[data-busy] {
   inset: 0;
   border-radius: inherit;
   box-shadow:
-    inset 0 0 0 1px rgb(255 255 255 / 0.12),
-    inset 0 1px 0 rgb(255 255 255 / 0.1);
+    inset 0 0 0 1px rgb(255 255 255 / 0.12);
   pointer-events: none;
 }
 

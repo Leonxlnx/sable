@@ -661,6 +661,7 @@ function TotalLine({ sid, turn, open, onToggle, landed }: { sid: string; turn: T
             nav.push({ name: 'changes', id: sid, items: edits, ...(lead ? { lead } : {}) });
           }}
         >
+          {files > 0 && <span className="work-files num">{plural(files, 'file')}</span>}
           <span className="diffstat num">
             {add > 0 && <span className="add">+{add}</span>}
             {del > 0 && <span className="del">−{del}</span>}

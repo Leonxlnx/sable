@@ -607,7 +607,7 @@ const LiveRow = memo(function LiveRow({ id, done, now }: { id: string; done: boo
         }}
       >
         <span className="row-mark">
-          <ProviderMark provider={s.provider} size={18} />
+          <ProviderMark provider={s.provider} size={15} />
         </span>
         <span className="row-main">
           <span className="row-title">{s.title}</span>
@@ -685,7 +685,6 @@ function Filters({ value, onChange }: { value: string; onChange: (k: string) => 
       </button>
       {folders.map(([k, name]) => (
         <button key={k} type="button" className="filter" aria-pressed={value === k} onClick={() => onChange(value === k ? '' : k)}>
-          {k === '::chats' ? <Icon name="chat" size={14} /> : <Icon name="folder" size={14} />}
           <span>{name}</span>
         </button>
       ))}
@@ -990,7 +989,7 @@ export const Row = memo(function Row({ id, onMenu, swipe = true, search }: { id:
         }}
       >
         <span className="row-mark">
-          <ProviderMark provider={s.provider} size={18} />
+          <ProviderMark provider={s.provider} size={15} />
         </span>
         <span className="row-main">
           <span className="row-title">{s.title}</span>

@@ -85,7 +85,6 @@ export function Settings() {
         <span className="icon-btn-spacer" />
       </header>
       <div className="settings-scroll">
-        <h1 className="page-title">Settings</h1>
 
         <Computer name={name} state={state} palette={paletteFor(defaultProvider)} />
 

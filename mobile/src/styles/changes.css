@@ -9,31 +9,13 @@
  */
 
 /* ── the list ── */
-.changes {
-  timeline-scope: --chg;
-}
-
-.changes .sub-head-title {
-  animation-timeline: --chg;
-}
-
-.changes .sub-head::before {
-  animation-timeline: --chg;
-}
-
-.changes .page-title {
-  margin-bottom: 8px;
-  animation-timeline: --chg;
-}
-
 .changes-scroll {
   position: relative;
   z-index: 1;
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scroll-timeline: --chg block;
-  padding: calc(var(--sat) + var(--bar-h)) 16px 28px;
+  padding: calc(var(--sat) + var(--bar-h) + var(--s-2)) 0 28px;
 }
 
 .chg-meta {
@@ -41,7 +23,7 @@
   align-items: center;
   gap: 12px;
   min-height: 24px;
-  margin: 0 6px 18px;
+  margin: 0 var(--gutter) var(--s-3);
   font-size: var(--t-sm);
   color: var(--text-2);
 }
@@ -102,38 +84,47 @@
   color: var(--text-2);
 }
 
-/* the files: one ink card, a row each (name over its folder), hairlines inset from the letters */
+/* the files: rows straight on the ink as home's chats (the letter at the gutter, name over its folder),
+   hairlines from the names' edge to the gutter */
+.chg-card {
+  background: none;
+  box-shadow: none;
+  border-radius: 0;
+  overflow: visible;
+}
+
 .chg-row {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--s-3);
   width: 100%;
-  min-height: 64px;
-  padding: 10px 12px 10px 16px;
+  min-height: var(--row-2);
+  padding: 10px var(--s-4) 10px var(--gutter);
   text-align: left;
   transition: background-color 100ms;
 }
 
 button.chg-row:active {
-  background: var(--fill-2);
+  background: rgb(255 255 255 / 0.05);
+  transition-duration: 0ms;
 }
 
 .chg-row + .chg-row::before {
   content: '';
   position: absolute;
   top: 0;
-  left: 46px;
-  right: 16px;
+  left: calc(var(--gutter) + 15px + var(--s-3));
+  right: var(--gutter);
   height: 1px;
-  background: var(--line);
+  background: rgb(255 255 255 / 0.055);
 }
 
 /* the letter says it (monochrome); only a deletion keeps a hint of red, as on the desktop */
 .chg-letter {
-  width: 18px;
+  width: 15px;
   flex-shrink: 0;
-  text-align: center;
+  text-align: left;
   font-size: var(--t-sm);
   font-weight: var(--w-strong);
   color: var(--text-3);
@@ -153,6 +144,8 @@ button.chg-row:active {
 
 .chg-name {
   font-size: var(--t-body);
+  font-weight: var(--w-medium);
+  letter-spacing: -0.006em;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
@@ -233,12 +226,6 @@ button.chg-row:active {
 }
 
 /* ── one file's diff ── */
-.diff .sub-head::before {
-  /* the code scrolls under the bar from the first line */
-  opacity: 1;
-  animation: none;
-}
-
 .dhead-titles {
   flex: 1;
   min-width: 0;
@@ -647,8 +634,8 @@ button.chg-row:active {
 }
 
 .changes-key .changes-dot {
-  top: 10px;
-  right: 9px;
+  top: 12px;
+  right: 11px;
 }
 
 /* a settled turn's change: its own quiet key beside the work line, to what it changed */
@@ -660,17 +647,23 @@ button.chg-row:active {
   position: relative;
   display: inline-flex;
   align-items: center;
+  gap: var(--s-2);
   flex-shrink: 0;
   height: 30px;
-  margin-left: 16px;
-  padding: 0 11px;
+  margin-left: var(--s-2);
+  padding: 0 var(--s-2);
   border-radius: var(--r-pill);
-  background-color: var(--fill-1);
-  box-shadow: inset 0 0 0 1px var(--line);
-  transition: background-color 100ms, transform 100ms;
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  transition: background-color 100ms, scale 120ms var(--ease-out);
 }
 
-/* a finger-sized target around the capsule */
+/* the files it changed and their sum, as words in the line (no capsule): held, it lights */
+.work-files {
+  color: var(--text-3);
+}
+
+/* a finger-sized target around the words */
 .work-changes::after {
   content: '';
   position: absolute;
@@ -678,8 +671,9 @@ button.chg-row:active {
 }
 
 .work-changes:active {
-  background-color: var(--fill-3);
-  transform: scale(0.96);
+  background-color: var(--fill-2);
+  scale: 0.96;
+  transition-duration: 0ms, 70ms;
 }
 
 /* ── the review sheet ── */
@@ -790,4 +784,8 @@ button.chg-row:active {
 
 .rvs-discard {
   height: 44px;
+}
+
+.work-changes .diffstat {
+  font-size: inherit;
 }

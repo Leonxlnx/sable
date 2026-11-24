@@ -266,21 +266,32 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
             </motion.div>
           ) : (
             <motion.div key="keys" className="ask-actions" initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={SNAP}>
-              {grants.map((o, i) => (
-                <button key={o.id} type="button" className={`btn btn-block ask-btn ${i === 0 ? 'btn-primary' : ''}`} disabled={!!busy && busy !== o.id} data-busy={busy === o.id || undefined} onClick={() => choose(o)}>
-                  {busy === o.id ? <span className="dots" /> : o.label}
-                </button>
-              ))}
-              <div className="ask-split">
-                {denials.map((o) => (
-                  <button key={o.id} type="button" className="btn ask-btn ask-deny" disabled={!!busy && busy !== o.id} data-busy={busy === o.id || undefined} onClick={() => choose(o)}>
+              {/* The first grant is the one key of ivory; a second short grant and the denials share one row of
+                  equal keys; Later is a quiet word under them, never a key of the same weight as Deny. */}
+              {(() => {
+                const key = (o: (typeof grants)[number], cls: string) => (
+                  <button key={o.id} type="button" className={`btn ask-btn ${cls}`} disabled={!!busy && busy !== o.id} data-busy={busy === o.id || undefined} onClick={() => choose(o)}>
                     {busy === o.id ? <span className="dots" /> : o.label}
                   </button>
-                ))}
-                <button type="button" className="btn ask-btn btn-ghost ask-later" disabled={!!busy} onClick={() => (haptic('tap'), onLater())}>
-                  {laterLabel}
-                </button>
-              </div>
+                );
+                const pairs = grants.length === 2 && denials.length <= 1 && grants[1].label.length <= 18 && denials.every((o) => o.label.length <= 18);
+                const rest = pairs ? [grants[1]] : grants.slice(1);
+                return (
+                  <>
+                    {grants[0] && key(grants[0], 'btn-block btn-primary')}
+                    {!pairs && rest.map((o) => key(o, 'btn-block'))}
+                    {(pairs || denials.length > 0) && (
+                      <div className="ask-split">
+                        {pairs && key(grants[1], '')}
+                        {denials.map((o) => key(o, 'ask-deny'))}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+              <button type="button" className="btn ask-btn btn-ghost btn-block ask-later" disabled={!!busy} onClick={() => (haptic('tap'), onLater())}>
+                {laterLabel}
+              </button>
             </motion.div>
           )}
         </AnimatePresence>
