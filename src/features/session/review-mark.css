@@ -1,0 +1,38 @@
+/* ── The header's "3 to review": a crumb that opens the Changes tab ──
+   In the crumbs' tone and rhythm: the crumbs' gap (5) and its own padding (6) are the 5 + 6 px
+   between the other crumbs, so its glyph stands where a plain crumb's would. When it is the last
+   crumb it keeps its whole pill. */
+
+.review-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  height: 22px;
+  padding: 0 6px;
+  /* The next crumb's own padding stands in for this one's right side: 5 + 6 px to its glyph. */
+  margin-right: -6px;
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  font-size: var(--t-small);
+  white-space: nowrap;
+  transition: background-color var(--d-1) var(--ease-out), color var(--d-1) var(--ease-out), scale var(--d-1) var(--ease-out);
+}
+
+.review-mark:last-child {
+  margin-right: 0;
+}
+
+.review-mark:hover {
+  background-color: var(--fill-1);
+  color: var(--text-2);
+}
+
+.review-mark:active {
+  scale: 0.97;
+}
+
+.review-mark:focus-visible {
+  outline: var(--focus-w, 2px) solid var(--focus);
+  outline-offset: 1px;
+}

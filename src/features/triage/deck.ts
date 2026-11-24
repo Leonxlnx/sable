@@ -28,7 +28,9 @@ export type DeckEvent =
   | { type: 'next' }
   /** The back card comes to the front. */
   | { type: 'prev' }
-  | { type: 'answer'; key: string; exit: Exit };
+  | { type: 'answer'; key: string; exit: Exit }
+  /** This card comes to the front (a notification's click asked for it); the order behind it is kept. */
+  | { type: 'raise'; key: string };
 
 export const emptyDeck = (keys: string[] = []): DeckState => ({ order: keys, gone: {}, answered: 0 });
 
@@ -49,6 +51,10 @@ export function deckReducer(state: DeckState, e: DeckEvent): DeckState {
       return state.order.length < 2 ? state : { ...state, order: [...state.order.slice(1), state.order[0]] };
     case 'prev':
       return state.order.length < 2 ? state : { ...state, order: [state.order[state.order.length - 1], ...state.order.slice(0, -1)] };
+    case 'raise': {
+      const at = state.order.indexOf(e.key);
+      return at <= 0 ? state : { ...state, order: [...state.order.slice(at), ...state.order.slice(0, at)] };
+    }
     case 'answer':
       if (!state.order.includes(e.key)) return state;
       return { order: state.order.filter((k) => k !== e.key), gone: { ...state.gone, [e.key]: e.exit }, answered: state.answered + 1 };

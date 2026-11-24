@@ -106,7 +106,6 @@ interface Flight {
   target: HTMLElement | null;
   row: HTMLElement | null;
   ending: boolean;
-  onLand?: () => void;
   done: () => void;
   wait: Animation[];
   line: HTMLElement | null;
@@ -1315,7 +1314,6 @@ function land(f: Flight) {
       play(shown, [{ translate: `${dx.toFixed(2)}px ${dy.toFixed(2)}px` }, { translate: '0px 0px' }], { duration: 200, easing: EASE_OUT });
     }
   }
-  f.onLand?.();
   f.el.remove();
   for (const p of f.pourEls) p.remove();
   f.pourEls = [];
@@ -1467,14 +1465,6 @@ export function landInTimeline(root: HTMLElement, text: string, opts: { steer?: 
   f.target = card;
   f.row = root;
   root.style.opacity = '0';
-  const steer = f.steer || !!opts.steer;
-  f.onLand = () => {
-    if (!steer) return;
-    // The wire of a steer draws itself down into the turn (timeline.css `.user-wire[data-draw]`),
-    // and its mark beside the card comes in after the card.
-    root.querySelector('.user-wire')?.setAttribute('data-draw', '');
-    play(root.querySelector('.user-steer'), [{ opacity: 0, transform: 'translateX(4px)' }], { duration: 220, delay: 40, easing: EASE_OUT, fill: 'backwards' });
-  };
   watch(f);
   return true;
 }

@@ -20,7 +20,8 @@ export type GuestEvent =
   | { type: 'console'; id: number; doc: number; lines: GuestLine[]; dropped: number }
   | ({ type: 'net'; id: number; doc: number } & GuestNet)
   | { type: 'net-dropped'; id: number; doc: number; count: number }
-  | { type: 'doc'; id: number; doc: number };
+  | { type: 'doc'; id: number; doc: number }
+  | { type: 'log-ready'; id: number; doc: number };
 
 export type GuestLogLimits = { lines: number; net: number; requests: number };
 
@@ -32,11 +33,21 @@ export class GuestLog {
   private pending = new Map<number, Map<number, Bucket>>();
   /** Request id to [guest, the document current when it started, a navigation's own request]; oldest out past `requests`. */
   private started = new Map<number, [number, number, boolean]>();
+  /** Undefined until the first batch after the loaded renderer answered, then its fixed set of requests. */
+  private loadRequests = new Map<number, number[] | undefined>();
 
   constructor(private limits: GuestLogLimits = { lines: 60, net: 30, requests: 2000 }) {}
 
   doc(id: number): number {
     return this.docs.get(id) ?? 0;
+  }
+
+  loadEnded(id: number, doc: number) {
+    if (this.doc(id) === doc) this.loadRequests.set(id, undefined);
+  }
+
+  awaitingLoadBatch(id: number) {
+    return this.loadRequests.has(id);
   }
 
   /**
@@ -134,6 +145,7 @@ export class GuestLog {
 
   /** A new document committed: the outgoing one's tail first, then the new document, then what waited for it. */
   commit(id: number): GuestEvent[] {
+    this.loadRequests.delete(id);
     const out: GuestEvent[] = [];
     this.take(id, out);
     const doc = this.doc(id) + 1;
@@ -147,11 +159,26 @@ export class GuestLog {
   flush(): GuestEvent[] {
     const out: GuestEvent[] = [];
     for (const id of [...this.pending.keys()]) this.take(id, out);
+    // The marker travels behind the entries, including the last request's outcome, in the same IPC.
+    for (const [id, captured] of this.loadRequests) {
+      const doc = this.doc(id);
+      const requests = captured ?? [];
+      if (!captured) {
+        for (const [request, [guest, startDoc, main]] of this.started) {
+          if (guest === id && (main ? startDoc + 1 : startDoc) === doc) requests.push(request);
+        }
+        this.loadRequests.set(id, requests);
+      }
+      if (requests.some((r) => this.started.get(r)?.[0] === id)) continue;
+      out.push({ type: 'log-ready', id, doc });
+      this.loadRequests.delete(id);
+    }
     return out;
   }
 
   /** A guest is gone. */
   forget(id: number) {
+    this.loadRequests.delete(id);
     this.docs.delete(id);
     this.pending.delete(id);
     for (const [r, s] of this.started) if (s[0] === id) this.started.delete(r);

@@ -5167,6 +5167,8 @@ export class App {
       for (const key of ['pinned', 'archived', 'unread'] as const) {
         if (typeof patch[key] === 'boolean') flags[key] = patch[key];
       }
+      // Muted is kept only while true: unmuting clears the field.
+      if (typeof patch.muted === 'boolean') flags.muted = patch.muted || undefined;
       this.runtime(sessionId).update(flags);
       return { ok: true };
     });

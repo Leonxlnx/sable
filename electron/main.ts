@@ -12,6 +12,7 @@ import { pageHeaders as csp } from './csp';
 import { pickFolder, type ShowFolderDialog } from './folder';
 import { preferredPort } from './port';
 import { windowsThumbs } from './thumbs';
+import { badgePixels, readAttention, TaskbarAttention, type AttentionWindow } from './attention';
 
 // Start-up marks (server/util/boot.ts): the process, the entry (main.cjs) and the bundle (its banner)
 // starting to run, and here, once the bundle's modules have run.
@@ -236,6 +237,59 @@ function windowCalls() {
   });
 }
 
+/*
+ * "This chat needs you" on the taskbar (attention.ts): the page sends the number of chats waiting
+ * and whether a chat just started waiting; a notification's click asks for the window. A
+ * verification run (--screenshot) never flashes or raises its window: it records the calls instead
+ * (`globalThis.__sableAttention.calls`, read through --inspect), and its window has no taskbar button.
+ */
+const attentionLog: { calls: { fn: string; at: number; [k: string]: unknown }[] } = { calls: [] };
+const note = (fn: string, more: Record<string, unknown> = {}) => {
+  attentionLog.calls.push({ fn, at: Date.now(), ...more });
+  if (attentionLog.calls.length > 200) attentionLog.calls.shift();
+};
+
+/** The overlay at the size the taskbar shows it on the window's display (16 px at 100%). */
+function badgeImage(count: number) {
+  const scale = win ? screen.getDisplayMatching(win.getBounds()).scaleFactor : 1;
+  const size = Math.max(16, Math.round(16 * scale));
+  return nativeImage.createFromBitmap(badgePixels(count, size), { width: size, height: size });
+}
+
+const taskbar = new TaskbarAttention({ platform: process.platform, image: badgeImage, dock: isMac ? app.dock : undefined });
+
+/** The window as the taskbar sees it; in a verification run every call is recorded and nothing flashes. */
+function attentionWindow(w: BrowserWindow | undefined): AttentionWindow | undefined {
+  if (!w || !screenshotFile) return w;
+  return {
+    setOverlayIcon: (image, description) => {
+      const img = image as Electron.NativeImage | null;
+      note('setOverlayIcon', { description, size: img ? img.getSize() : null, png: img ? img.toDataURL() : null });
+      w.setOverlayIcon(img, description);
+    },
+    flashFrame: (flag) => note('flashFrame', { flag }),
+    isFocused: () => w.isFocused(),
+    isDestroyed: () => w.isDestroyed(),
+  };
+}
+
+function attentionCalls() {
+  if (screenshotFile) (globalThis as { __sableAttention?: unknown }).__sableAttention = attentionLog;
+  ipcMain.on('sable:attention', (e, msg: unknown) => {
+    const next = readAttention(msg);
+    if (!next || !fromApp(e) || !win) return;
+    taskbar.set(attentionWindow(win), next);
+  });
+  // A notification's click: the window comes forward (restored when minimised).
+  ipcMain.on('sable:attention-focus', (e) => {
+    if (!fromApp(e) || !win) return;
+    if (screenshotFile) return note('focus');
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  });
+}
+
 /** Keeps the page's window controls in step with the window: restore icon while maximised, dimmed while unfocused. */
 function reportWindowState(w: BrowserWindow) {
   // On a Mac the page only needs to know about full screen (the traffic lights go away).
@@ -312,6 +366,17 @@ function guardGuest(contents: WebContents) {
     outbox.push(...guestLog.commit(contents.id));
     if (outboxTimer) clearTimeout(outboxTimer);
     flushBrowserEvents();
+  });
+  contents.on('did-finish-load', () => {
+    const id = contents.id;
+    const doc = guestLog.doc(id);
+    // One trip through the loaded main frame lets its load handlers run before we take the
+    // outstanding requests. A reply from a replaced document cannot certify its successor.
+    void contents.mainFrame.executeJavaScript('void 0').then(() => {
+      if (contents.isDestroyed()) return;
+      guestLog.loadEnded(id, doc);
+      outboxTimer ??= setTimeout(flushBrowserEvents, EVENT_BEAT);
+    }, () => {});
   });
   const ours = () => {
     const host = contents.hostWebContents;
@@ -536,6 +601,8 @@ function hardenBrowser() {
     if (typeof d.webContentsId !== 'number') return;
     // The document the request started on, whatever its outcome (and the request is forgotten).
     const doc = guestLog.end(d.id, d.webContentsId, d.error === undefined);
+    // Even a successful or aborted request can be the last one outstanding at load.
+    if (guestLog.awaitingLoadBatch(d.webContentsId)) outboxTimer ??= setTimeout(flushBrowserEvents, EVENT_BEAT);
     if (!win || win.isDestroyed() || (d.statusCode !== undefined && d.statusCode < 400) || d.error === 'net::ERR_ABORTED') return;
     let url = d.url;
     try {
@@ -629,6 +696,7 @@ function harden() {
   // Electron passes the origin here as a URL with a trailing slash ("http://127.0.0.1:47317/"): compare origins.
   session.defaultSession.setPermissionCheckHandler((_wc, permission, requestingOrigin) => allowed.has(permission) && isAppUrl(requestingOrigin));
   windowCalls();
+  attentionCalls();
 }
 
 /** The Content-Security-Policy of every page the app sends (`csp.ts`), for the origin it runs on now. */
@@ -808,6 +876,8 @@ function createWindow(url: string) {
     w.on('close', () => saveWindowState(w));
   }
   w.on('closed', () => (win = undefined));
+  // Focused: a flash asked for by a chat that waits has done its work.
+  w.on('focus', () => taskbar.stop(attentionWindow(w)));
 
   reportWindowState(w);
   viewShortcuts(w);

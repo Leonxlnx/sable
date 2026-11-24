@@ -1,4 +1,4 @@
-import { memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type { NoticeItem, ThinkingItem, TimelineItem, ToolItem } from '@shared/protocol';
 import { hasWork } from '@shared/work-label';
 import { Tiles } from '@/art/Logo';
@@ -44,6 +44,14 @@ const AFTER = 6;
 const REACH = 16;
 /** How far beyond the view the spacers start building (px). */
 const MARGIN = 1500;
+/**
+ * Scrolling up fast, the spacer starts building as far ahead as the scroll travels in this long
+ * (ms), when that is further than `MARGIN`: at 36,000 px/s, 1,500 px is two frames, less than a
+ * long turn takes to build, and the reader saw the spacer's empty band for 200 ms.
+ */
+const LOOK_AHEAD_MS = 600;
+/** After an open, how long the build ahead waits at most for the veil to have gone (ms). */
+const AFTER_REVEAL_MS = 1500;
 
 interface BuiltState {
   /** Groups before this one are not built (null: not decided yet, the newest that fill a few views are: `build-window.ts`). */
@@ -243,12 +251,71 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
     return () => io.disconnect();
   }, [gapFrom, hidden]);
 
+  // Scrolling up fast: the spacer builds as far ahead as the scroll goes in `LOOK_AHEAD_MS`, not
+  // only within `MARGIN` (the observer above). Read in the scroll's own events, upward only.
+  useEffect(() => {
+    const el = spacer.current;
+    const sc = el?.closest<HTMLElement>('.tl-scroll');
+    if (!el || !sc || !lead) return;
+    let at = 0;
+    let was = sc.scrollTop;
+    let asked = false;
+    const onScroll = () => {
+      const now = performance.now();
+      const st = sc.scrollTop;
+      const speed = at && st < was ? (was - st) / Math.max(1, now - at) : 0;
+      at = now;
+      was = st;
+      const reach = speed * LOOK_AHEAD_MS;
+      if (asked || reach <= MARGIN) return;
+      if (el.getBoundingClientRect().bottom < sc.getBoundingClientRect().top - reach) return;
+      asked = true;
+      startTransition(() =>
+        setBuilt((b) => {
+          const h = hiddenOf(b);
+          if (b.win && b.win.to < h) return { hidden: h, win: { ...b.win, from: Math.max(0, b.win.from - CHUNK) } };
+          return { hidden: Math.max(0, (b.win ? Math.min(b.win.from, h) : h) - CHUNK), win: null };
+        }),
+      );
+    };
+    sc.addEventListener('scroll', onScroll, { passive: true });
+    return () => sc.removeEventListener('scroll', onScroll);
+  }, [lead, hidden]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Once the open's veil has gone, the older groups are built at once, nearest first, one group per
+  // task after a frame (a transition, so React yields inside a long one between its blocks; off
+  // screen a settled turn skips style, layout and paint), whether or not the view moves: a flick up
+  // right after the open found the newest turns built and the rest behind the spacer (a 4,000-line
+  // answer built only as the reader reached it, 200 ms of empty band; scratch/day7/polish).
+  const [eager, setEager] = useState(false);
+  useEffect(() => {
+    const t0 = performance.now();
+    let raf = 0;
+    const look = () => {
+      if (!document.querySelector('.veil') || performance.now() - t0 > AFTER_REVEAL_MS) setEager(true);
+      else raf = requestAnimationFrame(look);
+    };
+    raf = requestAnimationFrame(look);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  useEffect(() => {
+    if (!eager || !hidden || groups.length - hidden >= TAIL + AHEAD) return;
+    let t = 0;
+    const raf = requestAnimationFrame(() => {
+      t = window.setTimeout(() => startTransition(() => setBuilt((b) => settle({ ...b, hidden: Math.max(0, hiddenOf(b) - 1) }))), 0);
+    });
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(t);
+    };
+  }, [eager, hidden, groups.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Ahead of the reader: in idle moments the nearest older groups are built a couple at a time (off
   // screen they skip layout and paint), so reading back up never waits for a chunk to build.
   // Never under a moving scroll (its idle moments between frames are not idle for the reader): the
-  // build waits until the view has been still a moment.
+  // build waits until the view has been still a moment. Before the eager build above starts.
   useEffect(() => {
-    if (!hidden || groups.length - hidden >= TAIL + AHEAD || typeof requestIdleCallback !== 'function') return;
+    if (eager || !hidden || groups.length - hidden >= TAIL + AHEAD || typeof requestIdleCallback !== 'function') return;
     let id = 0;
     const build = () => {
       if (performance.now() - (scrolled?.current ?? 0) < STILL_MS) return void (id = requestIdleCallback(build, { timeout: 4000 }));
@@ -256,7 +323,7 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
     };
     id = requestIdleCallback(build, { timeout: 4000 });
     return () => cancelIdleCallback(id);
-  }, [hidden, groups.length, scrolled]);
+  }, [eager, hidden, groups.length, scrolled]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reveal requests (sable:reveal-item): build the target (with every turn from it down when it is
   // near, as a run of its own when it is far up), open the steps that hide it, then bring it into
@@ -332,7 +399,11 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
   const rows: ReactNode[] = [];
   for (let i = lead; i < groups.length; i++) {
     if (i === gapFrom && gapFrom < hidden) {
-      rows.push(<div key="gap" ref={gap} className="tl-gap" style={{ height: gapHeight }} aria-hidden />);
+      rows.push(
+        <div key="gap" ref={gap} className="tl-gap" style={{ height: gapHeight }} aria-hidden>
+          {SKELETON}
+        </div>,
+      );
       i = hidden - 1;
       continue;
     }
@@ -342,7 +413,11 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
 
   return (
     <>
-      {lead > 0 && <div ref={spacer} className="tl-older" style={{ height: spacerHeight }} aria-hidden />}
+      {lead > 0 && (
+        <div ref={spacer} className="tl-older" style={{ height: spacerHeight }} aria-hidden>
+          {SKELETON}
+        </div>
+      )}
       {rows}
       {layout.queued.map((id) => (
         <ItemRow key={id} id={id} />
@@ -351,6 +426,32 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
     </>
   );
 });
+
+/**
+ * What a spacer shows where turns are not built yet, should the reader get there before they are:
+ * the conversation's quiet skeleton in the column's measures (the veil's waiting lines, app.css
+ * `.stage-wait`), one view of it held in view while the spacer passes (timeline.css `.tl-skel`).
+ */
+const SKEL_TEXT = [
+  [92, 86, 64],
+  [88, 94, 79, 46],
+  [90, 72],
+  [94, 88, 91, 58],
+];
+const SKELETON = (
+  <div className="tl-skel">
+    {[0, 1, 2, 3, 4, 5].map((i) => (
+      <div key={i} className="tl-skel-turn">
+        <i className="skel tl-skel-card" data-short={i % 2 || undefined} />
+        <div className="tl-skel-text">
+          {SKEL_TEXT[i % SKEL_TEXT.length].map((w, j) => (
+            <i key={j} className="skel" style={{ width: `${w}%` }} />
+          ))}
+        </div>
+      </div>
+    ))}
+  </div>
+);
 
 // ─────────────────────────────────── a turn ───────────────────────────────────
 
@@ -920,6 +1021,44 @@ function liveSelector(sessionId: string, seg: Segment, run: StepsChunk | null, h
  *  turn's pulse, and a title that is gone for a quarter of a second reads as a line that went out. */
 const SWAP_OUT_MS = 80;
 
+/**
+ * While the live line is quiet (the agent writes) and a steered message waits under it, the line's
+ * empty slot gives way to the words being written: it is pulled up under them by as much as they
+ * are tall, up to its own height, so the waiting card stands one item's gap under the last words
+ * (it stood 46 px under them: the slot's 38 and its own 8) and still never moves up. Where the words
+ * come in, the slot gives way by the same amount in the same frame, so the card stays where it was
+ * until the words are taller than the slot and then moves down with each line, as any content
+ * pushes it; when the line comes back (a step begins) the slot opens again with it. Read and written
+ * in a ResizeObserver of the turn (after layout, before paint), only while quiet: a margin on the
+ * fold's own element, the line in it invisible meanwhile (timeline.css `.work-head[data-quiet]`).
+ * scratch/day7/polish (quiet-*.json): the card's top per frame.
+ */
+function useQuietSlot(head: RefObject<HTMLDivElement | null>, quiet: boolean) {
+  useLayoutEffect(() => {
+    const fold = quiet ? head.current?.closest<HTMLElement>('.tl-fold') : null;
+    const turn = fold?.closest<HTMLElement>('.tg');
+    if (!fold || !turn) return;
+    let given = 0;
+    const fit = () => {
+      const words = fold.previousElementSibling as HTMLElement | null;
+      // A steered card under the line: waiting, or taken a moment ago and not yet moved to where the
+      // agent took it (the take is its own glide; a slot that opened first made it wobble 13 px).
+      const waits = [...turn.querySelectorAll(':scope > .tl-item > .user[data-steered]')].some((c) => fold.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING);
+      const take = waits && words?.classList.contains('fold-text') ? Math.min(fold.offsetHeight, words.offsetHeight) : 0;
+      if (take === given) return;
+      given = take;
+      fold.style.marginTop = take ? `${-take}px` : '';
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(turn);
+    return () => {
+      ro.disconnect();
+      fold.style.marginTop = '';
+    };
+  }, [head, quiet]);
+}
+
 /** How long the live line stays back after the agent stopped writing (ms). */
 const QUIET_LINGER_MS = 450;
 
@@ -975,6 +1114,8 @@ function LiveLine({ seg, run, from, open, onToggle }: { seg: Segment; run: Steps
   // The words have ended: the line waits a moment before it returns. A turn that ends right after
   // its answer (the usual end) never shows a line under it for a few frames.
   const quiet = useLinger(q === '1', QUIET_LINGER_MS);
+  const head = useRef<HTMLDivElement>(null);
+  useQuietSlot(head, quiet);
   const stall = Number(st) || 0;
   // A command past its own time limit: the line says so, so a hung step never just counts on.
   const stalled = !waiting && stall > 0 && now >= stall;
@@ -1031,7 +1172,7 @@ function LiveLine({ seg, run, from, open, onToggle }: { seg: Segment; run: Steps
   // One element whether or not there is anything to open yet: the line must not be made again when
   // its first step arrives, or its entrance (the words fading in last) would play a second time.
   return (
-    <div className="work-head" data-live data-quiet={quiet || undefined} role="status" aria-live="off">
+    <div ref={head} className="work-head" data-live data-quiet={quiet || undefined} role="status" aria-live="off">
       <button
         type="button"
         className="work-line work-live"

@@ -8,6 +8,7 @@ import { openSession, respondPermission, respondQuestion, setTriage } from '@/st
 import { selectPending, type PendingPrompt } from '@/state/pending';
 import { useStore } from '@/state/store';
 import { deckAction, deckKeyAllowed, deckReducer, emptyDeck, exitOf, type Exit } from './deck';
+import { onFront, takeFront } from './front';
 import { CardBody, type CardHandle, type CardProps } from './TriageCard';
 import '@/features/prompts/prompts.css';
 import './triage.css';
@@ -69,9 +70,11 @@ function Deck() {
   const byKey = useMemo(() => new Map(pending.map((p) => [p.key, p])), [pending]);
   const keys = useMemo(() => pending.map((p) => p.key), [pending]);
   const live = useMemo(() => new Set(keys), [keys]);
-  const [state, dispatch] = useReducer(deckReducer, keys, emptyDeck);
+  // Opened by a notification's click: that chat's card is in front from the first frame.
+  const [state, dispatch] = useReducer(deckReducer, keys, (k) => deckReducer(emptyDeck(k), { type: 'raise', key: takeFront() ?? '' }));
   // Before paint: a request answered elsewhere leaves, a new one joins at the back, in the same frame.
   useLayoutEffect(() => dispatch({ type: 'sync', keys }), [keys]);
+  useEffect(() => onFront((key) => (takeFront(), dispatch({ type: 'raise', key }))), []);
 
   const cards = state.order.flatMap((k) => byKey.get(k) ?? []);
   const shown = cards.slice(0, SHOWN);

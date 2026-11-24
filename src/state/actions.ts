@@ -372,7 +372,7 @@ export function prewarmHome() {
   void bridge.call('provider.prewarm', { provider: c.provider, accountId: c.accountId, cwd: c.cwd, model: c.model, mode: c.mode, effort: c.effort, ultracode: c.ultracode }).catch(() => {});
 }
 
-export const updateSession = (sessionId: string, patch: { pinned?: boolean; archived?: boolean; unread?: boolean }) =>
+export const updateSession = (sessionId: string, patch: { pinned?: boolean; archived?: boolean; unread?: boolean; muted?: boolean }) =>
   bridge.call('session.update', { sessionId, patch }).catch(fail);
 
 export async function closeSession(sessionId: string, remove = false) {

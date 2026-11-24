@@ -261,6 +261,7 @@ function rowActions(s: SessionMeta, ctx: RowCtx): MenuAction[] {
     { icon: s.pinned ? 'pin-off' : 'pin', label: s.pinned ? 'Unpin' : 'Pin', run: () => togglePin(s) },
   ];
   if (!s.unread) list.push({ icon: 'dot', label: 'Mark unread', run: () => void updateSession(s.id, { unread: true }) });
+  list.push(s.muted ? { icon: 'bell', label: 'Unmute', run: () => void updateSession(s.id, { muted: false }) } : { icon: 'bell-off', label: 'Mute notifications', run: () => void updateSession(s.id, { muted: true }) });
   list.push({ icon: 'archive', label: s.archived ? 'Unarchive' : 'Archive', run: () => toggleArchive(s) });
   if (running) list.push({ icon: 'stop', label: 'Stop', run: () => void interrupt(s.id), sepBefore: true });
   list.push({ icon: 'trash', label: 'Delete', tone: 'danger', run: () => ctx.askDelete(s.id), sepBefore: !running });

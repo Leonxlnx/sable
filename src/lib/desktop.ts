@@ -12,6 +12,11 @@ export interface DesktopShell {
   pathForFile?: (file: File) => string;
   /** The commands behind the page's own window controls (Windows, Linux). Missing on older shells. */
   window?: WindowShell;
+  /** The taskbar's part of "this chat needs you" (lib/notify.ts). Missing on older shells. */
+  attention?: {
+    set: (s: { count: number; flash: boolean }) => void;
+    focus: () => void;
+  };
 }
 
 export interface WindowState {

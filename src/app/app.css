@@ -363,8 +363,12 @@
   margin-left: 6px;
 }
 
+/* Centred on the box, a 13px glyph stood 0.8px above the middle of the words' lowercase (box centre
+   31.0, x-height centre 31.8): a 1px top margin moves its centre down half a pixel, onto the middle
+   of the words' ink between cap height and x-height, laid out (no transform, nothing blurred). */
 .topbar-crumb svg {
   flex-shrink: 0;
+  margin-top: 1px;
   opacity: 0.8;
 }
 

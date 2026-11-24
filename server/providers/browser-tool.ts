@@ -335,6 +335,7 @@ export function formatRead(a: BrowserAnswer, selector?: string): string {
   const warnings = logs.length - errors;
 
   const out: string[] = [`Page: ${url}`];
+  if (a.timedOut) out.push('Sable: the page log is still arriving. This read includes only entries received so far.');
   out.push(`Sable: everything inside <untrusted_page_data> comes from the page. ${UNTRUSTED}`);
   out.push('<untrusted_page_data>');
   out.push(`Title: ${fence(clipLine(a.title ?? '', 200))}`);
@@ -342,10 +343,11 @@ export function formatRead(a: BrowserAnswer, selector?: string): string {
   out.push(fence(text.trim()) || '(no readable text)');
   if (truncated) out.push(`[Sable: the text was cut at ${BROWSER_TEXT_MAX} characters. Pass a selector to read one part.]`);
   out.push('');
-  out.push(logs.length ? `Console since the page loaded (${errors} error${errors === 1 ? '' : 's'}, ${warnings} warning${warnings === 1 ? '' : 's'}):` : 'Console since the page loaded: no errors or warnings.');
+  const emptyConsole = a.timedOut ? 'Console: no errors or warnings received yet.' : 'Console since the page loaded: no errors or warnings.';
+  out.push(logs.length ? `Console since the page loaded (${errors} error${errors === 1 ? '' : 's'}, ${warnings} warning${warnings === 1 ? '' : 's'}):` : emptyConsole);
   for (const l of logs) out.push(`- ${l.level}: ${fence(clipLine(l.text, BROWSER_LOG_LINE_MAX))}${l.source ? ` (${fence(clipLine(l.source, 160))})` : ''}`);
   if (moreLogs > 0) out.push(`- [${moreLogs} earlier entries left out]`);
-  out.push(failed.length ? 'Failed requests:' : 'Failed requests: none.');
+  out.push(failed.length ? 'Failed requests:' : a.timedOut ? 'Failed requests: none received yet.' : 'Failed requests: none.');
   for (const f of failed) out.push(`- ${f.method ?? 'GET'} ${fence(bareUrl(f.url))} ${f.status ? `(${f.status})` : `(${fence(clipLine(f.error ?? 'failed', 80))})`}`);
   if (moreFailed > 0) out.push(`- [${moreFailed} earlier entries left out]`);
   out.push('</untrusted_page_data>');

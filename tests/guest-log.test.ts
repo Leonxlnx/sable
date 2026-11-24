@@ -5,6 +5,38 @@ const G = 7;
 const docOf = (evs: GuestEvent[], type: GuestEvent['type']) => evs.filter((e) => e.type === type).map((e) => e.doc);
 
 describe('guest log: every entry carries its own document', () => {
+  it('the load marker follows the inline error and the last load request, while later traffic continues', () => {
+    const log = new GuestLog();
+    log.commit(G);
+    log.console(G, { level: 'error', text: 'A-ERR-MARK' });
+    log.loadEnded(G, 1);
+    log.begin(G, 10); // Its headers reached main after the load event.
+    expect(log.flush()).toEqual([{ type: 'console', id: G, doc: 1, lines: [{ level: 'error', text: 'A-ERR-MARK' }], dropped: 0 }]);
+    log.begin(G, 11); // Background traffic started after the first post-load batch.
+    log.console(G, { level: 'info', text: 'still logging' });
+    log.net(G, log.end(10, G), { method: 'GET', url: '/missing-a', status: 404 });
+    expect(log.flush().map((e) => [e.type, e.doc])).toEqual([['console', 1], ['net', 1], ['log-ready', 1]]);
+    expect(log.size).toBe(1);
+    expect(log.flush()).toEqual([]);
+  });
+
+  it('a replaced or destroyed guest document cannot mark a later load ready', () => {
+    const log = new GuestLog();
+    log.commit(G);
+    log.begin(G, 20);
+    log.loadEnded(G, 1);
+    expect(log.flush()).toEqual([]);
+    log.commit(G);
+    log.loadEnded(G, 1); // The replaced renderer finally answered.
+    expect(log.flush()).toEqual([]);
+    log.loadEnded(G, 2);
+    expect(log.flush()).toEqual([{ type: 'log-ready', id: G, doc: 2 }]); // A's request is still running.
+    log.commit(G);
+    log.loadEnded(G, 3);
+    log.forget(G);
+    expect(log.flush()).toEqual([]);
+  });
+
   it('a request begun on A that fails after B committed is A\'s, never B\'s', () => {
     const log = new GuestLog();
     log.commit(G); // A = 1

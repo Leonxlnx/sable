@@ -68,6 +68,56 @@
   align-items: center;
 }
 
+/* The spacers for turns not built yet (TurnView `TurnList`): should the reader get there first, the
+   conversation's quiet skeleton, one view of it held at the top of the view while the spacer
+   passes (sticky), never an empty band. Off screen the spacer skips its contents' rendering, so
+   the skeleton's sweep costs nothing there. Its measures are the veil's waiting lines (app.css
+   `.stage-wait`), on the column's text edge. */
+.tl-older,
+.tl-gap {
+  flex-shrink: 0;
+  content-visibility: auto;
+}
+
+.tl-skel {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  height: min(100%, 1600px);
+  padding: 30px var(--gutter) 0;
+  overflow: hidden;
+}
+
+.tl-skel-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  flex-shrink: 0;
+}
+
+.tl-skel-card {
+  align-self: flex-end;
+  width: 46%;
+  height: 40px;
+  border-radius: var(--r-xl);
+}
+
+.tl-skel-card[data-short] {
+  width: 28%;
+}
+
+.tl-skel-text {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.tl-skel-text > .skel {
+  height: 9px;
+}
+
 .tl-empty {
   color: var(--text-3);
   font-size: var(--t-ui);

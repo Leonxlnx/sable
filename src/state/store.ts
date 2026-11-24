@@ -27,6 +27,7 @@ import { DEFAULT_ACCOUNT, DEFAULT_SETTINGS } from '@shared/protocol';
 import { bridge, type ConnStatus } from '@/lib/bridge';
 import { bootMark } from '@/lib/boot';
 import { correctsGuess, helloProviders, homeAgent } from '@/lib/sign-in';
+import { attention, heard, startNotify } from '@/lib/notify';
 import type { Reviews } from '@/features/review/model';
 
 export { changedSince } from './revision';
@@ -423,6 +424,8 @@ export function applyWholeItem(sessionId: string, item: TimelineItem) {
 }
 
 export function applySnapshot(snap: SessionSnapshot) {
+  // A limit card that owes a decision is known once the chat's items are (lib/attention.ts).
+  attention.feed({ type: 'timeline.reset', sessionId: snap.session.id, items: snap.items });
   useStore.setState((s) => ({
     sessions: { ...s.sessions, [snap.session.id]: snap.session },
     data: {
@@ -442,36 +445,17 @@ export function applySnapshot(snap: SessionSnapshot) {
 }
 
 /**
- * A session finished or started waiting on the user while they were looking elsewhere:
- * mark it unread and, if they asked for it, raise a system notification.
+ * A session finished while the user was looking elsewhere: mark it unread. What reaches the system
+ * (a notification, the taskbar) is `lib/attention.ts`'s rule, acted on by `lib/notify.ts`.
  */
 function onStatusChange(session: SessionMeta, prev: SessionMeta['status']) {
   const s = useStore.getState();
   // A turn inside an armed `/until` loop is not the end of the work: only the loop's end is news.
   const looping = !!session.until && session.status !== 'error';
   const finished = !looping && (prev === 'running' || prev === 'awaiting') && (session.status === 'idle' || session.status === 'error');
-  const needsYou = session.status === 'awaiting' && prev !== 'awaiting';
-  if (!finished && !needsYou) return;
-  const viewing = s.ui.activeSessionId === session.id;
-  if (viewing && !document.hidden) return;
-  if (finished && !viewing) void bridge.call('session.update', { sessionId: session.id, patch: { unread: true } }).catch(() => {});
-  if (!s.settings.notifyOnDone || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
-  try {
-    const title = needsYou ? 'Waiting for your approval' : session.status === 'error' ? 'Turn ended with an error' : 'Turn finished';
-    const n = new Notification(title, { body: session.title, tag: session.id });
-    n.onclick = () => {
-      window.focus();
-      // The chat may have left the window's memory meanwhile (`trimKept`): shown here, it is fetched (below).
-      if (useStore.getState().sessions[session.id]) {
-        touchKept(session.id);
-        useStore.getState().setUi({ activeSessionId: session.id, race: null });
-        trimKept();
-      }
-      n.close();
-    };
-  } catch {
-    /* notifications are best effort */
-  }
+  if (!finished) return;
+  if (s.ui.activeSessionId === session.id) return;
+  void bridge.call('session.update', { sessionId: session.id, patch: { unread: true } }).catch(() => {});
 }
 
 /** A full window of an account reset: a toast, and a system notification while Sable is not in view. */
@@ -503,6 +487,9 @@ export function mergeMeta(cur: SessionMeta, patch: Partial<SessionMeta>): Sessio
 
 /** Applies one bridge event to the store. Exported for tests; the app feeds it from `startBridge`. */
 export function applyEvent(e: BridgeEvent) {
+  // "This chat needs you" (lib/attention.ts) reads every chat's events, loaded or not.
+  if (e.type === 'item.delta') attention.delta(e.sessionId, e.id, e.field, e.delta);
+  else heard(attention.feed(e, e.type === 'session.updated' ? useStore.getState().sessions[e.id] : undefined));
   switch (e.type) {
     case 'item.delta': {
       const key = `${e.sessionId}\u0000${e.id}\u0000${e.field}`;
@@ -740,6 +727,8 @@ async function hello() {
       ui: { ...s.ui, activeSessionId: active, homeProvider, homeAccount, homeCwd: s.ui.homeCwd ?? app.projects[0]?.path ?? null },
     };
   });
+  attention.seed(app.sessions);
+  if (app.prompts) attention.seedPrompts(app.prompts.permissions, app.prompts.questions);
   // At start the open chat was asked for with hello (`startBridge`): that request is shared, and a
   // chat it has already brought is not asked for again.
   for (const id of onScreen(useStore.getState())) if (again || !useStore.getState().data[id]?.loaded) void loadSession(id, { fresh: again }).catch(() => {});
@@ -816,6 +805,7 @@ export function flushEvents() {
   try {
     for (const e of list) {
       if (e.type === 'item.delta') {
+        attention.delta(e.sessionId, e.id, e.field, e.delta);
         safely(e.type, () =>
           editItems(e.sessionId, (d) => {
             const item = d.items[e.id] as (TimelineItem & Record<string, unknown>) | undefined;
@@ -851,6 +841,7 @@ export function startBridge() {
   });
   // An answer never overtakes the events sent before it: they are applied first.
   bridge.beforeAnswer = flushEvents;
+  startNotify();
   bridge.onStatus((conn) => {
     useStore.setState({ conn });
     if (conn === 'open') bootMark('ws-open');
@@ -893,7 +884,7 @@ export function touchKept(sessionId: string) {
 }
 
 /** The chats on screen: the open one, or both of the race shown. Never dropped. */
-function onScreen(s: Pick<Store, 'ui' | 'sessions'>): string[] {
+export function onScreen(s: Pick<Store, 'ui' | 'sessions'>): string[] {
   if (s.ui.activeSessionId) return [s.ui.activeSessionId];
   const race = s.ui.race;
   if (!race) return [];

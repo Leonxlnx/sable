@@ -219,8 +219,8 @@ function NotifyRow({ on }: { on: boolean }) {
 
   return (
     <>
-      <Row label="Notify when a turn finishes" help="While Sable is in the background.">
-        <Switch label="Notify when a turn finishes" checked={on} onChange={(v) => void toggle(v)} />
+      <Row label="Notifications" help="When a chat waits on you or finishes while you are elsewhere.">
+        <Switch label="Notifications" checked={on} onChange={(v) => void toggle(v)} />
       </Row>
       {problem && (
         <div className="set-note" data-tone="amber" role="status">

@@ -107,6 +107,7 @@ import { KeyboardIcon } from '@phosphor-icons/react/dist/csr/Keyboard';
 import { PaletteIcon } from '@phosphor-icons/react/dist/csr/Palette';
 import { SlidersHorizontalIcon } from '@phosphor-icons/react/dist/csr/SlidersHorizontal';
 import { BellIcon } from '@phosphor-icons/react/dist/csr/Bell';
+import { BellSlashIcon } from '@phosphor-icons/react/dist/csr/BellSlash';
 import { PushPinIcon } from '@phosphor-icons/react/dist/csr/PushPin';
 import { PushPinSlashIcon } from '@phosphor-icons/react/dist/csr/PushPinSlash';
 import { ArchiveIcon } from '@phosphor-icons/react/dist/csr/Archive';
@@ -308,6 +309,7 @@ const ICONS = {
   palette: PaletteIcon,
   sliders: SlidersHorizontalIcon,
   bell: BellIcon,
+  'bell-off': BellSlashIcon,
   pin: PushPinIcon,
   'pin-off': PushPinSlashIcon,
   archive: ArchiveIcon,

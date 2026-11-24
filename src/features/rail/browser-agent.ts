@@ -40,6 +40,7 @@ export interface PageController {
 }
 
 const TEXT_MAX = 20_000;
+const LOAD_LOG_MS = 750;
 const SNAPSHOT_MAX = 12_000;
 const EVAL_MAX = 8_000;
 const EVAL_MS = 5_000;
@@ -291,16 +292,36 @@ async function serve(req: BrowserRequest, attest?: string): Promise<BrowserAnswe
 
   if (req.op === 'read') {
     return marked(tab, 'read', async () => {
-      const r = await c.read(req.selector, TEXT_MAX);
+      const doc = getPage(tab).viewDoc;
+      const changed = () => {
+        const page = getPage(tab);
+        return controllers.get(tab) !== c || page.viewDoc !== doc || (doc !== undefined && (page.logDoc ?? 0) > doc);
+      };
+      // The DOM answer and the shell's batches arrive on separate channels, even for a reload
+      // of the same URL. A ready marker follows this document's entries through the window store.
+      const [r] = await Promise.all([
+        c.read(req.selector, TEXT_MAX),
+        native && waitFor(tab, () => changed() || (!!doc && getPage(tab).loadedLog === doc), LOAD_LOG_MS),
+      ]);
       if (r.badSelector) return { ok: false, url, error: `"${req.selector}" is not a valid CSS selector.` };
       if (r.missing) return { ok: false, url, error: `Nothing on the page matches "${req.selector}".` };
-      const log = getLog(tab);
-      return {
+      const page = getPage(tab);
+      const nowUrl = c.url() || url;
+      if (changed() || (req.expectOrigin && originOf(nowUrl) !== req.expectOrigin)) {
+        return { ok: false, error: 'The page changed during the read. Try again.' };
+      }
+      const answer: BrowserAnswer = {
         ok: true,
-        url: c.url() || url,
-        title: r.title || getPage(tab).title,
+        url: nowUrl,
+        title: r.title || page.title,
         text: r.text.slice(0, TEXT_MAX),
         truncated: r.length > TEXT_MAX,
+        timedOut: native && (!doc || page.loadedLog !== doc),
+      };
+      if (native && (!doc || page.logDoc !== doc)) return answer;
+      const log = getLog(tab);
+      return {
+        ...answer,
         console: log.console.slice(-30),
         failed: log.failed.slice(-30),
         more: { console: log.more.console + Math.max(0, log.console.length - 30), failed: log.more.failed + Math.max(0, log.failed.length - 30) },

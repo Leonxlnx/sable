@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { DropdownMenu as RM } from 'radix-ui';
-import type { Attachment, BrowserConsoleLine } from '@shared/protocol';
+import type { Attachment } from '@shared/protocol';
 import { Icon, type IconName } from '@/icons';
 import { devUrlLabel } from '@/lib/dev-url';
 import { addressParts, isLocalUrl, normalizeAddress, willSearch } from '@/lib/links';
@@ -19,19 +19,16 @@ import {
   activeTab,
   closeTab,
   DEVICES,
-  failedDropped,
   flushSoon,
   forgetVisit,
   getLog,
   getPage,
   getTabs,
-  logDropped,
-  logFailed,
-  logLine,
   moveTab,
   noteVisit,
   openTab,
   pushHistory,
+  receivePageLog,
   reopenTab,
   resetLog,
   selectTab,
@@ -49,6 +46,7 @@ import {
   type AgentWork,
   type Device,
   type FeedEntry,
+  type PageLogEvent,
 } from './browser-store';
 import { useRememberedUrl } from './dev-urls';
 import './browser.css';
@@ -66,20 +64,11 @@ import './browser.css';
  * speed (the shell mutes and slows down the others).
  */
 
-interface BrowserEvent {
-  type: string;
+interface BrowserEvent extends PageLogEvent {
   name?: string;
   id?: number;
-  url?: string;
-  method?: string;
-  status?: number;
-  error?: string;
   key?: string;
   on?: boolean;
-  count?: number;
-  lines?: { level: string; text: string; source?: string }[];
-  /** The page's document a batch came from; 'doc' says a new one committed. */
-  doc?: number;
   /** 'signin-released': which hold ended. */
   hold?: string;
 }
@@ -131,8 +120,6 @@ interface View {
   shown?: boolean;
   /** Reload after a hang: the old process's crash report that follows must not show. */
   restarting?: boolean;
-  /** The shell's count of the page's documents: batches of an older one are dropped. */
-  doc?: number;
   navTimer?: ReturnType<typeof setTimeout>;
   visitTimer?: ReturnType<typeof setTimeout>;
   unregister: () => void;
@@ -184,11 +171,6 @@ function failure(code: number | undefined, url: string): string {
   return `${host} did not load`;
 }
 
-/** A console level from the shell, in the log's words. */
-function levelOf(lv: string): BrowserConsoleLine['level'] {
-  return lv === 'error' ? 'error' : lv === 'warning' ? 'warning' : lv === 'debug' || lv === 'verbose' ? 'debug' : lv === 'info' ? 'info' : 'log';
-}
-
 const desktop = (window as { sableDesktop?: DesktopApi }).sableDesktop;
 const native = !!desktop?.browser;
 const PARTITION = 'persist:sable-browser';
@@ -217,6 +199,9 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
   const page = usePage(tabId);
   const host = useRef<HTMLDivElement>(null);
   const views = useRef(new Map<string, View>());
+  // The shell can commit before the webview tells the window its guest id. Keep those first
+  // events in channel order until attachment, bounded even if a view never attaches.
+  const attachingLog = useRef<BrowserEvent[]>([]);
   const input = useRef<HTMLInputElement>(null);
   const toast = useStore((s) => s.toast);
   const [finding, setFinding] = useState(false);
@@ -352,7 +337,11 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         } catch {
           /* not attached yet */
         }
-        if (v.wcId) syncShown();
+        if (v.wcId) {
+          for (const e of attachingLog.current) if (e.id === v.wcId) receivePageLog(tid, e);
+          attachingLog.current = attachingLog.current.filter((e) => e.id !== v.wcId);
+          syncShown();
+        }
         // A new page view starts with no sign-in hold of its own: one an earlier view had (whose release may have been missed) is not inherited.
         if (v.wcId) setPage(tid, { filled: undefined, hold: undefined, signing: undefined, signedInAs: undefined });
       };
@@ -396,8 +385,8 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         flushSoon();
         // The log starts empty once, on the shell's own `doc` event, in order with the batches.
         // A reload of the same address keeps its title and icon: the engine reports them again only when they change.
-        const same = getPage(tid).url === e.url;
-        setPage(tid, { url: e.url, ...(same ? {} : { title: '', favicon: undefined }), phase: 2 });
+        const p = getPage(tid);
+        setPage(tid, { viewDoc: (p.viewDoc ?? 0) + 1, url: e.url, ...(p.url === e.url ? {} : { title: '', favicon: undefined }), phase: 2 });
         refreshNav(v);
         if (tid === activeTab(sessionId)) setFound(null);
       });
@@ -429,9 +418,10 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         setPage(tid, { crashed: true, hung: undefined, loading: false });
       });
       on('found-in-page', (e) => e.result && tid === activeTab(sessionId) && setFound({ active: e.result.activeMatchOrdinal, total: e.result.matches }));
-      host.current.appendChild(el);
-      views.current.set(tid, v);
+      setPage(tid, { viewDoc: 0, logDoc: undefined, loadedLog: undefined });
       resetLog(tid);
+      views.current.set(tid, v);
+      host.current.appendChild(el);
       // The agent's browser tools reach the page through this (browser-agent.ts); every call has a time limit.
       v.unregister = registerPage({
         sessionId,
@@ -516,29 +506,25 @@ export function BrowserTab({ sessionId, active }: { sessionId: string; active: b
         return;
       }
       const v = byWc(e.id);
-      if (!v) return;
-      // A batch of a document that is no longer the page's is dropped (it would read as the new page's).
-      if ((e.type === 'console' || e.type === 'net' || e.type === 'net-dropped') && typeof e.doc === 'number' && e.doc < (v.doc ?? 0)) return;
-      if (e.type === 'doc' && typeof e.doc === 'number') {
-        v.doc = e.doc;
-        resetLog(v.tabId);
-      } else if (e.type === 'find') guestKey.current('f');
+      if (!v) {
+        if (typeof e.doc === 'number' && [...views.current.values()].some((view) => !view.wcId)) {
+          attachingLog.current.push(e);
+          if (attachingLog.current.length > 256) attachingLog.current.shift();
+        }
+        return;
+      }
+      if (e.type === 'find') guestKey.current('f');
       else if (e.type === 'key' && e.key && v.tabId === activeTab(sessionId)) guestKey.current(e.key);
-      // A request of this page failed (the shell sends the address without its query, and the status or error).
-      else if (e.type === 'net' && e.url) logFailed(v.tabId, { url: e.url, method: e.method, status: e.status, error: e.error });
-      else if (e.type === 'net-dropped') failedDropped(v.tabId, e.count ?? 0);
-      // What the page logged, in capped batches; errors and warnings also go with browser_read.
-      else if (e.type === 'console') {
-        for (const l of e.lines ?? []) if (l.text) logLine(v.tabId, { level: levelOf(l.level), text: l.text, source: l.source });
-        logDropped(v.tabId, e.count ?? 0);
-      } else if (e.type === 'hang') setPage(v.tabId, { hung: e.on ? true : undefined });
+      else if (e.type === 'hang') setPage(v.tabId, { hung: e.on ? true : undefined });
       // Electron main ended a sign-in's hold (a new document replaced the filled one, or nothing was filled).
       else if (e.type === 'signin-released' && e.hold && getPage(v.tabId).hold === e.hold) setPage(v.tabId, { filled: undefined, signing: undefined, hold: undefined, signedInAs: undefined });
       else if (e.type === 'flood') setPage(v.tabId, { flooded: true });
+      else receivePageLog(v.tabId, e);
     });
     const all = views.current;
     return () => {
       off?.();
+      attachingLog.current = [];
       for (const v of [...all.values()]) dispose(v);
       for (const id of getTabs(sessionId).ids) setPage(id, { loading: false, hung: undefined });
     };

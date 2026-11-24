@@ -19,6 +19,7 @@ import { SessionAccount } from '@/features/accounts';
 import { WaitingCount } from '@/features/triage/WaitingCount';
 import { watchLimitWarnings } from '@/features/usage/near-limit';
 import { LaneMark } from '@/features/session/LaneMark';
+import { ReviewMark } from '@/features/session/ReviewMark';
 import { RaceMark, RaceTitle } from '@/features/race/RaceMark';
 import { raceKey } from '@/features/race/race';
 import { ChatMenu } from '@/features/export/ChatMenu';
@@ -974,6 +975,8 @@ function Topbar({ panelShown }: { panelShown: boolean }) {
                 <span className="truncate">{session.branch}</span>
               </span>
             )}
+            {/* Changed files not looked at since they changed: opens the Changes tab. */}
+            <ReviewMark sessionId={session.id} />
             {/* A chat that races another: opens both side by side. */}
             <RaceMark sessionId={session.id} />
             {/* The account, when its agent has several: opens "Continue with another account". */}

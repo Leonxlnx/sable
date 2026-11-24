@@ -28,6 +28,11 @@ export interface PageState {
   nonce: number;
   /** How far a load has come, for the progress line: 1 started, 2 committed, 3 the document is ready. */
   phase: 1 | 2 | 3;
+  /** The same main-frame commits counted by the webview and by the shell's ordered log channel. */
+  viewDoc?: number;
+  logDoc?: number;
+  /** The document whose load batch has arrived in full. */
+  loadedLog?: number;
   error?: string;
   errorCode?: number;
   /** Desktop: the page's renderer went away. */
@@ -209,6 +214,45 @@ export function failedDropped(tabId: string, n: number) {
   l.moreFeed += n;
   logs.set(tabId, l);
   touchLog(tabId);
+}
+
+/** One event as passed through the desktop preload (it renames "dropped" to "count"). */
+export interface PageLogEvent {
+  type: string;
+  doc?: number;
+  count?: number;
+  lines?: { level: string; text: string; source?: string }[];
+  url?: string;
+  method?: string;
+  status?: number;
+  error?: string;
+}
+
+/** Apply the shell's batch in order. Only a new shell document resets the log. */
+export function receivePageLog(tabId: string, e: PageLogEvent) {
+  const doc = getPage(tabId).logDoc;
+  if (e.type === 'doc') {
+    if (e.doc === undefined || e.doc <= (doc ?? 0)) return;
+    resetLog(tabId);
+    setPage(tabId, { logDoc: e.doc, loadedLog: undefined });
+    return;
+  }
+  if (e.doc !== undefined && e.doc !== (doc ?? 0)) return;
+  if (e.type === 'log-ready') {
+    setPage(tabId, { loadedLog: doc });
+  } else if (e.type === 'net' && e.url) {
+    logFailed(tabId, { url: e.url, method: e.method, status: e.status, error: e.error });
+  } else if (e.type === 'net-dropped') {
+    failedDropped(tabId, e.count ?? 0);
+  } else if (e.type === 'console') {
+    for (const l of e.lines ?? []) {
+      if (!l.text) continue;
+      const lv = l.level;
+      const level = lv === 'error' || lv === 'warning' || lv === 'info' ? lv : lv === 'debug' || lv === 'verbose' ? 'debug' : 'log';
+      logLine(tabId, { level, text: l.text, source: l.source });
+    }
+    logDropped(tabId, e.count ?? 0);
+  }
 }
 
 export type Device = 'desktop' | 'tablet' | 'phone';

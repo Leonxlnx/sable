@@ -466,6 +466,8 @@ export interface SessionMeta {
   unread?: boolean;
   pinned?: boolean;
   archived?: boolean;
+  /** The person muted the chat's notifications (its taskbar flash too); absent: not muted (`lib/attention.ts`). */
+  muted?: boolean;
   branch?: string;
   usage: SessionUsage;
   /**
@@ -2583,7 +2585,7 @@ export interface RpcMethods {
   /** Claude Code ultracode on or off: applied live to a running agent, and at every later start. */
   'session.setUltracode': { params: { sessionId: string; on: boolean }; result: { ok: boolean } };
   'session.rename': { params: { sessionId: string; title: string }; result: { ok: boolean } };
-  'session.update': { params: { sessionId: string; patch: Pick<Partial<SessionMeta>, 'pinned' | 'archived' | 'unread'> }; result: { ok: boolean } };
+  'session.update': { params: { sessionId: string; patch: Pick<Partial<SessionMeta>, 'pinned' | 'archived' | 'unread' | 'muted'> }; result: { ok: boolean } };
   'session.close': { params: { sessionId: string; remove?: boolean }; result: { ok: boolean } };
   'session.rewind': { params: { sessionId: string; itemId: string; restoreFiles: boolean }; result: { ok: boolean; message?: string } };
   /** Fork: a new session (same agent, account and settings) that continues from the end of the turn holding `itemId`, with the conversation up to there: the agent's own fork where it has one, otherwise a summary. The original is left as it is. */

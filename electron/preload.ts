@@ -53,6 +53,14 @@ contextBridge.exposeInMainWorld('sableDesktop', {
       return '';
     }
   },
+  /**
+   * "This chat needs you" (src/lib/notify.ts): the number of chats waiting, for the taskbar's overlay,
+   * and one flash when a chat just started waiting; `focus` brings the window forward (a notification's click).
+   */
+  attention: {
+    set: (s: { count: number; flash: boolean }) => ipcRenderer.send('sable:attention', { count: Number(s?.count) || 0, flash: s?.flash === true }),
+    focus: () => ipcRenderer.send('sable:attention-focus'),
+  },
   /** The page's own minimise / maximise / close buttons (Windows, Linux): three commands and the window's state. */
   window: {
     minimize: () => ipcRenderer.send('sable:window', 'minimize'),
