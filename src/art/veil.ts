@@ -164,14 +164,22 @@ interface Cover {
   offs?: Animation[];
   offAt?: number[];
   gate?: Animation;
-  /** What stands on the solid veil when the new view takes long (unseen until then). */
+  /** What stands on the solid veil when the new view takes long (unseen until then), and the timer that brings it. */
   wait?: HTMLElement;
+  waitTimer?: number;
 }
 
 /**
  * A view that is not there this long after the veil went solid gets its waiting state. It comes
  * slowly (ease in and out over `WAIT_IN`), so a view that arrives a moment later has shown almost
  * nothing of it: never a flash of a skeleton. It goes quickly, before the veil opens.
+ *
+ * It is brought in by the page's own timer, never by a delay on the compositor: a view being built
+ * holds the page, and the reveal that drops the waiting state reaches the screen only with the frame
+ * that shows the view. With a delay the compositor faded the skeleton in while a long chat that was
+ * in memory was laid out (a second or two of frames, up to half strength) and the view's frame then
+ * cut it off in one frame. A page that is free while the view is not there (a chat read from disk,
+ * the view's code loading) fires the timer on time.
  */
 export const VEIL_WAIT_AFTER = 180;
 const WAIT_IN = 360;
@@ -214,8 +222,8 @@ export function coverSteps(on: boolean[]): { at: number[]; solidIn: number } {
  * `veilReveal`. Called again while a veil is on the host (a second change of view right behind
  * the first), it carries on from the density that is drawn: nothing ever steps back before solid.
  * `waiting` builds what stands on the solid veil should the new view take long (a quiet skeleton):
- * it is in the page from the start, unseen, and fades in `VEIL_WAIT_AFTER` ms after solid by an
- * animation of its own, so it shows even while the page is busy building the view.
+ * it is in the page from the start, unseen, and fades in `VEIL_WAIT_AFTER` ms after solid, brought
+ * by the page's timer (see `VEIL_WAIT_AFTER`): never while the view is being built and about to land.
  * Says whether a cover is on (false under reduced motion: callers fade instead).
  */
 export function veilCover(host: HTMLElement | null, opts: { color?: string; cell?: number; waiting?: () => HTMLElement | null } = {}): boolean {
@@ -270,18 +278,23 @@ export function veilCover(host: HTMLElement | null, opts: { color?: string; cell
           ];
     return layer.animate(frames, { duration: total, easing: 'linear', fill: 'both' });
   });
-  // The waiting state of a cover that is taken over stays as it is (seen or not): it never starts again.
+  // The waiting state of a cover that is taken over stays as it is (seen or not, its timer still
+  // running or not): it never starts again.
   let wait = old?.wait;
+  let waitTimer = wait ? old?.waitTimer : undefined;
   if (!wait && opts.waiting) {
     const w = opts.waiting();
     if (w) {
       w.classList.add('veil-wait');
+      w.style.opacity = '0';
       el.appendChild(w);
-      w.animate([{ opacity: 0 }, { opacity: 1 }], { duration: WAIT_IN, delay: solidIn + VEIL_WAIT_AFTER, easing: 'cubic-bezier(0.5, 0, 0.5, 1)', fill: 'both' });
+      waitTimer = window.setTimeout(() => {
+        if (w.isConnected) w.animate([{ opacity: 0 }, { opacity: 1 }], { duration: WAIT_IN, easing: 'cubic-bezier(0.5, 0, 0.5, 1)', fill: 'forwards' });
+      }, solidIn + VEIL_WAIT_AFTER);
       wait = w;
     }
   }
-  covers.set(host, { el, layers, anims, solidIn, born: timeNow(), at, revealing: false, wait });
+  covers.set(host, { el, layers, anims, solidIn, born: timeNow(), at, revealing: false, wait, waitTimer });
   return true;
 }
 
@@ -320,7 +333,8 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
   // How long until solid. A cover made in this same frame has not started: it starts with these.
   const started = cover.anims[0]?.startTime as number | null | undefined;
   const wait = started == null ? cover.solidIn : Math.max(0, started + cover.solidIn - timeNow());
-  // A waiting state in view goes first; one that never showed is simply dropped.
+  // A waiting state in view goes first; one that never showed is simply dropped (its timer with it).
+  window.clearTimeout(cover.waitTimer);
   const waiting = cover.wait;
   cover.wait = undefined;
   const seen = !!waiting && getComputedStyle(waiting).opacity !== '0';

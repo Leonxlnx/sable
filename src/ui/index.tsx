@@ -1,9 +1,9 @@
-import { cloneElement, forwardRef, isValidElement, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type FocusEvent, type PointerEvent, type ReactNode, type Ref, type RefObject } from 'react';
+import { cloneElement, forwardRef, isValidElement, useEffect, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type FocusEvent, type PointerEvent, type ReactNode, type Ref, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { Dialog as RD, DropdownMenu as RM, Popover as RP, Slider as RSl, Switch as RS, Tooltip as RT } from 'radix-ui';
 import { Icon, type IconName } from '@/icons';
 import { isMac, shortcutKeys } from '@/lib/format';
-import { fadeShown, play, reducedMotion, slideLeft, spring } from '@/lib/motion';
+import { fadeShown, play, reducedMotion, slideLeft, spring, uiZoom } from '@/lib/motion';
 import { useStore } from '@/state/store';
 import './grow';
 import { movedByKeys } from './glide';
@@ -581,6 +581,31 @@ function slideToast(el: HTMLElement, by: number, fade = false) {
   toastSlides.set(el, slides);
 }
 
+/** The stack's room from the stage's sheet: its bottom-right inset, or above the composer in a chat. */
+const TOAST_INSET = 16;
+
+/**
+ * The stack belongs to the stage: its right edge 16 px in from the sheet's (the side panel's edge
+ * when it is open), its bottom 16 px above the sheet's, or above everything the dock holds in a
+ * chat (waiting cards, the task strip, the composer), so a toast covers none of it. Read when a toast comes or goes and when the window
+ * changes size, never per frame.
+ */
+function placeToasts(host: HTMLElement) {
+  const stage = document.querySelector('.stage');
+  if (!stage) {
+    host.style.removeProperty('--toast-r');
+    host.style.removeProperty('--toast-b');
+    return;
+  }
+  const z = uiZoom();
+  const r = stage.getBoundingClientRect();
+  // In a chat: above all the dock holds (waiting cards, the task strip, the composer and its strips).
+  const composer = document.querySelector('.stage-dock .dock-inner');
+  const top = composer ? composer.getBoundingClientRect().top : r.bottom;
+  host.style.setProperty('--toast-r', `${Math.max(0, (window.innerWidth - r.right) / z + TOAST_INSET)}px`);
+  host.style.setProperty('--toast-b', `${Math.max(0, (window.innerHeight - top) / z + (composer ? 10 : TOAST_INSET))}px`);
+}
+
 export function Toasts() {
   const toasts = useStore((s) => s.toasts);
   const dismiss = useStore((s) => s.dismissToast);
@@ -598,6 +623,7 @@ export function Toasts() {
   useLayoutEffect(() => {
     const host = box.current;
     if (!host) return;
+    if (toasts.length) placeToasts(host);
     const before = places.current;
     const now = new Map<string, ToastPlace>();
     const els = [...host.querySelectorAll<HTMLElement>(':scope > .toast:not([data-gone])')];
@@ -642,6 +668,15 @@ export function Toasts() {
       }
     }
   }, [order]);
+
+  // A window that changes size while toasts stand moves the stack with the stage.
+  const shown = toasts.length > 0;
+  useEffect(() => {
+    if (!shown) return;
+    const on = () => box.current && placeToasts(box.current);
+    window.addEventListener('resize', on);
+    return () => window.removeEventListener('resize', on);
+  }, [shown]);
 
   // On body, above any dialog: `.app` isolates its own stacking context. Pointer events are kept
   // from reaching an open dialog's outside-click handler, so dismissing a toast leaves the dialog open.

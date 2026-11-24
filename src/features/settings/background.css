@@ -273,7 +273,6 @@
 
 .bg-preset-name {
   font-size: var(--t-small);
-  font-weight: var(--w-medium);
   text-align: center;
   white-space: nowrap;
   overflow: hidden;

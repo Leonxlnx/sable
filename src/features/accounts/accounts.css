@@ -4,7 +4,7 @@
 
 /* The trigger: one line of one control height, the agent's mark on the footer's icon column, one
    name, and how much of the most used window is used as a ring and its figure at the end. The mark
-   and the name stand on the sidebar's two columns (a row's mark 12 in from its pill, its words 36
+   and the name stand on the sidebar's two columns (a row's mark 6 in from its pill, its words 32
    in), which are also the columns of the menu that opens above it. */
 .acs-trigger {
   flex: 1;
@@ -13,7 +13,7 @@
   align-items: center;
   gap: 9px;
   height: var(--ctl-h);
-  padding: 0 9px;
+  padding: 0 9px 0 5px;
   border-radius: var(--r-sm);
   text-align: left;
   transition:
@@ -66,52 +66,28 @@
   color: var(--text-3);
 }
 
-/* What is left: a hairline track and an arc of what remains, its figure beside it. */
-.acs-ring {
+/* How much is used: the one usage meter (the menu's rows, the limits beside it, Settings), shorter,
+   and its figure. The level is the meter's; the figure keeps its ink. */
+.acs-foot-used {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   flex-shrink: 0;
-  color: var(--text-3);
+}
+
+.acs-foot-used .acs-meter {
+  width: 22px;
+}
+
+.acs-foot-used .acs-pct {
+  min-width: 0;
+  white-space: nowrap;
   transition: color var(--d-1) var(--ease);
 }
 
-.acs-ring svg {
-  display: block;
-  rotate: -90deg;
-}
-
-.acs-ring-track,
-.acs-ring-arc {
-  fill: none;
-  stroke-width: 1.5;
-}
-
-.acs-ring-track {
-  stroke: var(--line-3);
-}
-
-.acs-ring-arc {
-  stroke: currentColor;
-  stroke-linecap: round;
-}
-
-.acs-ring-pct {
-  font-size: var(--t-small);
-  white-space: nowrap;
-}
-
-.acs-trigger:hover .acs-ring:not([data-level]),
-.acs-trigger[data-state='open'] .acs-ring:not([data-level]) {
+.acs-trigger:hover .acs-pct,
+.acs-trigger[data-state='open'] .acs-pct {
   color: var(--text-2);
-}
-
-.acs-ring[data-level='amber'] {
-  color: var(--amber);
-}
-
-.acs-ring[data-level='red'] {
-  color: var(--red);
 }
 
 /* Its tooltip: who it is in full, then each window's use and reset in columns. */
@@ -345,6 +321,22 @@
 
 .topbar-crumb .sa-trigger svg {
   margin-left: 0;
+}
+
+/* In the crumbs its icon keeps the crumbs' one rhythm: the gap (5) and its padding (6) are the
+   5 + 6 px between the other crumbs. */
+.topbar-crumb .sa-trigger {
+  margin-left: 0;
+}
+
+/* A limit of the chat's own model: its dot and its word. */
+.sa-word {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  margin-left: 3px;
+  white-space: nowrap;
 }
 
 /* ── Add account ── */
@@ -764,12 +756,11 @@
   color: var(--text-3);
 }
 
-.acs-pct[data-level='amber'],
+/* A figure beside a meter keeps its ink (the meter says the level); the pool's figure stands alone. */
 .acs-left[data-level='amber'] {
   color: var(--amber);
 }
 
-.acs-pct[data-level='red'],
 .acs-left[data-level='red'] {
   color: var(--red);
 }

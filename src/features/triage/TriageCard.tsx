@@ -2,7 +2,7 @@ import { useImperativeHandle, useState, type MouseEvent, type ReactNode, type Re
 import { AnimatePresence, motion } from 'motion/react';
 import type { PermissionOption, PermissionRequest, QuestionRequest } from '@shared/protocol';
 import { ProviderMark } from '@/art/Logo';
-import { Glyph, Icon, TOOL_ICON } from '@/icons';
+import { Icon } from '@/icons';
 import { tildePath } from '@/lib/format';
 import { PermissionSubject, restates } from '@/features/prompts/PermissionCard';
 import { useQuestionAnswers, type QuestionAnswers } from '@/features/prompts/QuestionCard';
@@ -82,7 +82,6 @@ function PermissionBody({ p, req, pos, total, armed, handle, onPermission, onOpe
   const [noteFor, setNoteFor] = useState<PermissionOption | null>(null);
   const input = useStore((s) => (req.itemId ? (s.data[p.sessionId]?.items[req.itemId] as { input?: unknown } | undefined)?.input : undefined));
   const keys = optionKeys(req.options);
-  const tool = TOOL_ICON[req.kind] ?? TOOL_ICON.other;
 
   const choose = (o: PermissionOption | undefined) => {
     if (!o || !armed) return false;
@@ -130,7 +129,6 @@ function PermissionBody({ p, req, pos, total, armed, handle, onPermission, onOpe
     <>
       <From p={p} pos={pos} total={total} onOpen={onOpen} />
       <header className="tri-ask">
-        <Glyph name={tool.icon} size={22} iconSize={17} className="tri-ask-icon" />
         <div className="tri-ask-text">
           <h3 className="tri-title">{title}</h3>
           {desc && <p className="tri-desc">{desc}</p>}
@@ -218,7 +216,7 @@ function QuestionBody({ p, req, pos, total, armed, handle, onQuestion, onOpen, r
       <div className="tri-foot">
         <div className="tri-foot-no">
           <Tip label={null} keys="s">
-            <button type="button" className="btn btn-ghost" disabled={sent} onClick={() => armed && x.send(true)}>
+            <button type="button" className="btn btn-ghost tri-skip" disabled={sent} onClick={() => armed && x.send(true)}>
               Skip
             </button>
           </Tip>
@@ -283,7 +281,6 @@ function QuestionPage({ x, refocus }: { x: QuestionAnswers; refocus: () => void 
         transition={{ type: 'spring', stiffness: 460, damping: 38 }}
       >
         <header className="tri-ask">
-          <Glyph name={TOOL_ICON.question.icon} size={22} iconSize={17} className="tri-ask-icon" />
           <h3 className="tri-title tri-ask-text">{q.question}</h3>
         </header>
         <div className="tri-opts" role={multi ? 'group' : 'radiogroup'} aria-label={q.question}>

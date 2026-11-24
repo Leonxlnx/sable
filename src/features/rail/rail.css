@@ -223,17 +223,6 @@
   right: 200px;
 }
 
-/* The dithered light off the pill's leading edge (as .dither-sel draws it). */
-.rail-tab-pill::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  background: var(--dither-fade) left top / var(--dither-fade-size) repeat-y;
-  image-rendering: pixelated;
-  opacity: 0.06;
-}
-
 /* The selected tab's name: in the flow at its own width. */
 .rail-tab-name {
   flex-shrink: 0;
@@ -252,9 +241,12 @@
   padding-left: 5px;
   padding-right: 1px;
   font-size: var(--t-micro);
-  font-weight: var(--w-medium);
+  font-weight: var(--w-regular);
   line-height: 1;
   color: var(--text-3);
+  /* Centred in the tab, the smaller figure stood 2.5 px above the name's baseline (measured at 2.5x:
+     the "2" of "Changes 2" ended 5 device px above the "C"): set down onto the name's baseline. */
+  translate: 0 2.5px;
 }
 
 .rail-tab:hover .rail-tab-count,

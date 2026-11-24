@@ -8,7 +8,7 @@ import { baseName, dayBucket, plural, timeAgo } from '@/lib/format';
 import { fuzzy, wordPrefix } from '@/lib/fuzzy';
 import { homeAccountId, resumeFromHistory } from '@/state/actions';
 import { useStore } from '@/state/store';
-import { byKeys, IconButton, Menu, MenuContent, MenuItem, MenuLabel, MenuSep, MenuTrigger, Modal, Segmented, cx, useSlidePill } from '@/ui';
+import { byKeys, IconButton, Menu, MenuContent, MenuItem, MenuLabel, MenuSep, MenuTrigger, Modal, Segmented, Switch, cx, useSlidePill } from '@/ui';
 import './history.css';
 
 /** Browse and resume conversations the providers keep on disk. */
@@ -220,9 +220,11 @@ function HistoryBody({ onClose }: { onClose: () => void }) {
             onKeyDown={onKey}
           />
         </div>
-        <button type="button" className="chip history-new" aria-pressed={onlyNew} data-on={onlyNew || undefined} onClick={() => setOnlyNew((v) => !v)}>
-          Not in Sable
-        </button>
+        {/* A filter that is on or off: a switch with its words, not a word that toggles. */}
+        <label className="history-new">
+          <span>Not in Sable</span>
+          <Switch checked={onlyNew} onChange={setOnlyNew} label="Only conversations not in Sable" />
+        </label>
         <Menu>
           <MenuTrigger className="chip history-project" aria-label="Project">
             <Icon name={cwd ? 'folder' : 'stack'} size={14} />
@@ -371,7 +373,8 @@ function HistoryRowView({
           )}
         </div>
         <div className="hrow-meta">
-          {entry.branch && (
+          {/* Every detached or plain checkout says HEAD: a branch only when it names one. */}
+          {entry.branch && entry.branch !== 'HEAD' && (
             <span className="hrow-branch truncate">
               <Icon name="branch" size={12} />
               <span className="truncate">{entry.branch}</span>

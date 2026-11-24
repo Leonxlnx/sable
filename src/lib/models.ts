@@ -47,8 +47,11 @@ export const visibilityKey = (provider: ProviderId, modelId: string) => `${provi
  */
 function namedIn(description: string | undefined): string | undefined {
   const head = description?.split(/\s+·\s+/)[0]?.trim();
-  if (!head || head.length > 40) return undefined;
-  return VERSION.test(head) && VERSIONED_NAME.test(head) ? head : undefined;
+  if (!head || head.length > 80) return undefined;
+  if (head.length <= 40 && VERSION.test(head) && VERSIONED_NAME.test(head)) return head;
+  // Claude Code's alias says it in a sentence: "Use the default model (currently Opus 5.5)".
+  const current = /\(currently\s+([^)]{1,40})\)/i.exec(head)?.[1]?.trim();
+  return current && VERSION.test(current) && VERSIONED_NAME.test(current) ? current : undefined;
 }
 
 /**

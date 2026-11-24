@@ -5,8 +5,9 @@ const WIDTH_KEY = 'sable.sidebar.w';
 export const SIDE_DEFAULT_W = 268;
 export const SIDE_MIN_W = 196;
 export const SIDE_MAX_W = 460;
-/** What the stage keeps beside the sidebar, whatever was chosen in a wider window. */
-const STAGE_KEEPS = 620;
+/** What the stage keeps beside the sidebar, whatever was chosen in a wider window (at a 900 px
+    window the sidebar is 220 px, the conversation keeps its column). */
+const STAGE_KEEPS = 680;
 
 export const clampSideWidth = (w: number, max = SIDE_MAX_W) => Math.round(Math.max(SIDE_MIN_W, Math.min(Math.max(SIDE_MIN_W, max), w)));
 
@@ -30,14 +31,14 @@ function saveWidth(w: number | null) {
 }
 
 /**
- * The chosen width goes on .app once (it is inherited: writing it per pointer move would restyle
- * the whole window). It yields in a narrow window so the stage keeps its room, without a listener.
+ * The chosen width (or the default) goes on .app once (it is inherited: writing it per pointer move
+ * would restyle the whole window). It yields in a narrow window so the stage keeps its room, without
+ * a listener: the default too, so a 900 px window does not give the sidebar a third of itself.
  */
 function applyWidth(w: number | null) {
   const app = document.querySelector<HTMLElement>('.app');
   if (!app) return;
-  if (w === null) app.style.removeProperty('--sidebar-w');
-  else app.style.setProperty('--sidebar-w', `min(${w}px, max(${SIDE_MIN_W}px, calc(100 * var(--vw) - ${STAGE_KEEPS}px)))`);
+  app.style.setProperty('--sidebar-w', `min(${w ?? SIDE_DEFAULT_W}px, max(${SIDE_MIN_W}px, calc(100 * var(--vw) - ${STAGE_KEEPS}px)))`);
 }
 
 const zoom = () => parseFloat(document.documentElement.style.zoom) || 1;

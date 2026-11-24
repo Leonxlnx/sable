@@ -68,3 +68,28 @@ export function sendFollower(): (id: string, item: LastMessage | undefined, synt
     return !(item.steered && item.state !== 'queued');
   };
 }
+
+/**
+ * Where the conversation's last line (`.tail`) stands, as far as its glide is concerned: measured
+ * from the end of the conversation while the view keeps the end (`stuck`), from its top otherwise.
+ * Kept at the end, the line never moves on screen when something above it grows or shrinks: the
+ * view moves with it in the same frame. Measured from the top instead, every late height above it
+ * (a widget drawn again, a picture, a fold) read as a move, and the glide threw the line by that
+ * much and back while it stood still: up to 530 px up and down when a long chat was opened again
+ * (day 7, "x sub-agents working jumps around when you click on a chat"). A conversation shorter
+ * than the view has no scroll to keep: its end is the top, so the line glides when it is pushed down.
+ */
+export function tailPlace(offsetTop: number, stuck: boolean, scrollHeight: number, clientHeight: number): number {
+  return stuck ? offsetTop - Math.max(0, scrollHeight - clientHeight) : offsetTop;
+}
+
+/**
+ * How far the line must glide from where it was drawn to its new place (0: none). `prev` is the place
+ * last measured and how it was measured; a change of measure (the reader let go of the end or came
+ * back) is no move.
+ */
+export function tailGlide(prev: { place: number; stuck: boolean } | null, place: number, stuck: boolean, drawnOffset = 0): number {
+  if (!prev || prev.stuck !== stuck) return 0;
+  const d = prev.place + drawnOffset - place;
+  return Math.abs(d) < 2 || Math.abs(d) > 480 ? 0 : d;
+}

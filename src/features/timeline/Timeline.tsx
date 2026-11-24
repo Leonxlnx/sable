@@ -12,7 +12,7 @@ import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
 import { DOCK_GLIDE_MS } from '@/features/session/dock-glide';
-import { glideFrame, sendFollower } from './follow';
+import { glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
 import { useStaged } from '@/features/session/staged';
 import './timeline.css';
 
@@ -130,25 +130,28 @@ export function Timeline({ sessionId }: { sessionId: string }) {
   useEffect(() => () => cancelAnimationFrame(glide.current.raf), []);
 
   // The working line glides to its new place when content appears above it, instead of jumping.
-  const tailAt = useRef<{ top: number; anim: Animation | null } | null>(null);
+  // Its place is read from the end while the view keeps the end (follow.ts `tailPlace`): there a
+  // height that changes above it moves the view with it, and the line stands still.
+  const tailAt = useRef<{ place: number; stuck: boolean; anim: Animation | null } | null>(null);
   const glideTail = useCallback(() => {
     const tail = content.current?.querySelector<HTMLElement>(':scope > .tail');
-    if (!tail) {
+    const el = scroller.current;
+    if (!tail || !el) {
       tailAt.current = null;
       return;
     }
-    const top = tail.offsetTop;
+    const place = tailPlace(tail.offsetTop, stuck.current, el.scrollHeight, el.clientHeight);
     const prev = tailAt.current;
-    tailAt.current = { top, anim: prev?.anim ?? null };
+    tailAt.current = { place, stuck: stuck.current, anim: prev?.anim ?? null };
     if (!prev || !live.current || tail.hasAttribute('data-quiet')) return;
     // Where it is drawn right now (it may still be travelling from the last change).
-    let drawn = prev.top;
+    let drawn = 0;
     if (prev.anim && prev.anim.playState === 'running') {
-      drawn = prev.top + new DOMMatrixReadOnly(getComputedStyle(tail).transform).m42;
+      drawn = new DOMMatrixReadOnly(getComputedStyle(tail).transform).m42;
       prev.anim.cancel();
     }
-    const d = drawn - top;
-    if (Math.abs(d) < 2 || Math.abs(d) > 480) {
+    const d = tailGlide(prev, place, stuck.current, drawn);
+    if (!d) {
       tailAt.current.anim = null;
       return;
     }

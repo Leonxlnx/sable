@@ -52,7 +52,7 @@ export function AgentLineView({ line, provider, onStop, onFinish }: { line: Line
   return (
     <div className="bw-line" role="status" data-kind="driving" aria-label={line.yielding ? `${name} waits while you use this page` : `${name} is using this page`}>
       <ProviderMark provider={provider} size={14} className="bw-line-mark" />
-      <span className="bw-line-text truncate">{line.yielding ? 'waits while you use this page' : 'is using this page'}</span>
+      <span className="bw-line-text truncate">{line.yielding ? `${name} waits while you use this page` : `${name} is using this page`}</span>
       <button type="button" className="btn btn-sm btn-ghost" onClick={onStop}>
         <Icon name="stop" size={13} />
         Stop

@@ -6,6 +6,7 @@ import { setSettings } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { timeAgo } from '@/lib/format';
 import { useNow } from '@/lib/useNow';
+import { quietFocus } from '@/lib/quiet-focus';
 import { Switch } from '@/ui';
 import { Card, Row } from './parts';
 import './phone.css';
@@ -84,7 +85,7 @@ export function Phone() {
             <button type="button" className="btn" onClick={() => void run(() => bridge.call('phone.approve', { requestId: status.request!.id, allow: false }))}>
               Deny
             </button>
-            <button type="button" className="btn btn-primary" autoFocus onClick={() => void run(() => bridge.call('phone.approve', { requestId: status.request!.id, allow: true }))}>
+            <button type="button" className="btn btn-primary" ref={quietFocus} onClick={() => void run(() => bridge.call('phone.approve', { requestId: status.request!.id, allow: true }))}>
               Allow
             </button>
           </div>

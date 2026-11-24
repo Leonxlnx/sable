@@ -142,13 +142,8 @@
   grid-column: 2 / 4;
 }
 
-.ulw[data-level='amber'] .ulw-pct {
-  color: var(--amber);
-}
-
-.ulw[data-level='red'] .ulw-pct {
-  color: var(--red);
-}
+/* The meter beside it says the level (amber, red): the figure keeps its ink, so a used-up window
+   is one red mark, not two. */
 
 .ulw[data-past] .ulw-label {
   color: var(--text-3);
@@ -1150,13 +1145,7 @@
   color: var(--text-2);
 }
 
-.ulo-pct[data-level='amber'] {
-  color: var(--amber);
-}
-
-.ulo-pct[data-level='red'] {
-  color: var(--red);
-}
+/* The level is the meter's alone (as in a window's line). */
 
 .ulo-none {
   grid-column: 3 / 5;

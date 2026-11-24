@@ -64,6 +64,16 @@ describe('model names', () => {
     expect(modelName({ id: 'default', name: 'Default', description: 'Recommended model for your plan' })).toBe('Default');
   });
 
+  it('reads the alias that names its model in a sentence (Claude Code 2.1)', () => {
+    const alias: ModelInfo = { id: 'default', name: 'Default (recommended)', description: 'Use the default model (currently Opus 5.5) · $4/$20 per Mtok', isDefault: true };
+    expect(aliasTarget(alias)).toBe('Opus 5.5');
+    expect(modelName(alias)).toBe('Opus 5.5');
+    const opus: ModelInfo = { id: 'opus', name: 'Opus', description: 'Opus 5.5 · Best for everyday, complex tasks' };
+    // Listed beside the model it names, the alias is left out of the menu; in use, it stands in for it.
+    expect(ids(visibleModels('claude', [alias, opus], undefined))).toEqual(['opus']);
+    expect(visibleModels('claude', [alias, opus], undefined, 'default').map(modelName)).toEqual(['Opus 5.5']);
+  });
+
   it('names a model known only by its id', () => {
     expect(modelNameById('default', CLAUDE)).toBe('Opus 5.5');
     expect(modelNameById('claude-opus-5-5-20261101', CLAUDE)).toBe('Opus 5.5');

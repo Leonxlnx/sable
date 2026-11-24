@@ -32,7 +32,20 @@
 .pc-titles {
   flex: 1;
   min-width: 0;
-  padding-top: 4px;
+  padding-top: 2px;
+}
+
+/* The title's line opens with the request's mark, amber: it waits on the person. */
+.pc-title-marked {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.pc-mark {
+  flex-shrink: 0;
+  margin-top: 1.5px;
+  color: var(--amber);
 }
 
 .pc-title {
@@ -51,18 +64,16 @@
   color: var(--text-2);
 }
 
+/* How many more wait: words in the card's quiet tone, no badge. */
 .pc-more {
   flex-shrink: 0;
   margin-top: 4px;
   height: 22px;
   display: inline-flex;
   align-items: center;
-  padding: 0 8px;
-  border-radius: var(--r-ctl-sm);
-  font-size: var(--t-micro);
-  font-weight: var(--w-medium);
-  color: var(--text-2);
-  background: var(--fill-2);
+  font-size: var(--t-small);
+  color: var(--text-3);
+  white-space: nowrap;
 }
 
 .pc-body {
@@ -280,38 +291,46 @@
 
 /* ── question card ── */
 
+/* One inset: the question, the options' marks, Skip's word and Next's edge keep the card's text
+   edges (14 px). A row's pill (hover, chosen) and Skip's reach 8 px past them, 6 px from the
+   card's edge, their corner the card's less 6. */
 .qc {
   gap: 12px;
 }
 
+/* The stepper and the count stand on the question's first line, at the right; the caret's
+   glyph ends on the text edge. */
 .qc-head {
+  position: absolute;
+  z-index: 1;
+  top: 13px;
+  right: 8px;
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 24px;
+  height: 24px;
 }
 
 .qc-head:empty {
   display: none;
 }
 
-.qc-chip {
-  display: inline-flex;
-  align-items: center;
-  height: 24px;
-  padding: 0 9px;
-  border-radius: var(--r-ctl-sm);
-  font-size: var(--t-small);
-  font-weight: var(--w-medium);
-  color: var(--text-2);
-  background: var(--fill-2);
+.qc[data-head='step'] .qc-question {
+  padding-right: 104px;
+}
+
+.qc[data-head='more'] .qc-question {
+  padding-right: 120px;
+}
+
+.qc[data-head='both'] .qc-question {
+  padding-right: 224px;
 }
 
 .qc-stepper {
   display: flex;
   align-items: center;
   gap: 2px;
-  margin-left: auto;
 }
 
 .qc-head .pc-more {
@@ -324,7 +343,7 @@
 }
 
 .qc-count {
-  min-width: 44px;
+  min-width: 40px;
   text-align: center;
   font-size: var(--t-small);
   color: var(--text-2);
@@ -344,46 +363,50 @@
 .qc-options {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: 12px;
+  gap: 2px;
+  margin: 10px -8px 0;
   max-height: calc(46 * var(--vh));
   overflow: auto;
-  padding: 2px;
-  margin-left: -2px;
-  margin-right: -2px;
   scrollbar-width: thin;
 }
 
+/* A choice is a plain row: nothing at rest, the hover fill under the pointer, and the chosen one
+   a flat pill (one fill step and the even hairline), as a selected row is everywhere. */
 .qc-opt {
   display: flex;
   align-items: center;
   gap: 12px;
   width: 100%;
-  min-height: 46px;
-  padding: 8px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
+  min-height: 40px;
+  padding: 8px;
+  border-radius: calc(var(--r-xl) - 6px);
   text-align: left;
-  background-color: var(--fill-1);
-  transition: background-color var(--d-1) var(--ease);
+  transition:
+    background-color var(--d-1) var(--ease),
+    scale var(--d-spring-soft) var(--spring-soft);
 }
 
 .qc-opt:hover {
-  background-color: var(--fill-2);
+  background-color: var(--fill-1);
 }
 
 button.qc-opt:active {
-  background-color: var(--fill-3);
+  background-color: var(--fill-2);
+  scale: 0.995;
+  transition-duration: var(--d-1), 70ms;
 }
 
 .qc-opt[data-on] {
-  border-color: var(--line-3);
+  background-color: var(--fill-2);
+  box-shadow: var(--press-up);
+}
+
+.qc-opt[data-on]:hover {
   background-color: var(--fill-3);
 }
 
 .qc-opt:focus-visible {
-  outline-offset: var(--focus-offset);
-  border-radius: var(--r-md);
+  outline-offset: -2px;
 }
 
 .qc-opt-text {
@@ -396,7 +419,7 @@ button.qc-opt:active {
 
 .qc-opt-label {
   font-size: var(--t-ui);
-  font-weight: var(--w-medium);
+  line-height: 1.35;
   color: var(--text);
 }
 
@@ -461,11 +484,17 @@ button.qc-opt:active {
 }
 
 .qc-opt.qc-other:focus-within {
-  border-color: var(--focus-field);
+  box-shadow: inset 0 0 0 1px var(--focus-field);
 }
 
+/* Skip's word on the text edge, its pill where the option rows' pills begin. */
 .qc-foot {
   flex-wrap: nowrap;
+  margin-left: -8px;
+}
+
+.qc-foot .qc-skip {
+  padding: 0 8px;
 }
 
 /* ── task strip ── */

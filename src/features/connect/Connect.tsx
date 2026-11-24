@@ -311,17 +311,18 @@ function AccountRow({
                 )}
               </>
             ) : phase === 'in' ? (
-              <>
-                {/* OpenCode signs in to as many model providers as the person adds. */}
-                {provider === 'opencode' && (
-                  <button type="button" className="btn btn-sm btn-ghost acc-quiet" onClick={signIn}>
-                    Sign in
-                  </button>
-                )}
+              // The welcome only signs in: a signed-in row there is its plan alone. OpenCode signs in to
+              // as many model providers as the person adds, so its one action adds one (signing out of
+              // one is in its menu, and only once it has one: on its free models there is nothing to leave).
+              compact ? null : provider === 'opencode' ? (
+                <button type="button" className="btn btn-sm btn-ghost acc-quiet" onClick={signIn}>
+                  Add a provider
+                </button>
+              ) : (
                 <button type="button" className="btn btn-sm btn-ghost acc-quiet" onClick={() => setConfirm('out')}>
                   Sign out
                 </button>
-              </>
+              )
             ) : phase === 'out' ? (
               <button type="button" className={cx('btn btn-sm', primary && 'btn-primary')} onClick={signIn}>
                 <Icon name="sign-in" size={14} />
@@ -370,6 +371,11 @@ function AccountRow({
               {provider !== 'opencode' && (
                 <MenuItem icon="pencil" onSelect={() => setRenaming(true)}>
                   Rename
+                </MenuItem>
+              )}
+              {provider === 'opencode' && signedIn && account.auth.method !== 'free' && (
+                <MenuItem icon="sign-out" onSelect={() => setConfirm('out')}>
+                  Sign out of a provider
                 </MenuItem>
               )}
               {multi && !account.isDefault && (

@@ -4,6 +4,9 @@
  * everything: an icon column 16 px wide whose centre is 20 px from the sidebar's left edge (brand
  * mark, action icon, folder icons, status marks, account mark), a text column at 38 px (wordmark,
  * labels, folder names, titles), and one right edge for times, counts and hover tools.
+ * One inset: every pill (a row's hover and selection, a header's hover, New session, the footer's
+ * controls) stands 6 px in from both edges (`--side-inset`), so the pills and the words inside them
+ * keep one left and one right edge from the top of the sidebar to its foot.
  */
 
 .side {
@@ -13,6 +16,7 @@
   /* What a row's hover tools fade over: the row's own fill composited on the ground. */
   --row-hover: color-mix(in srgb, var(--side-bg) 94%, white);
   --row-active: color-mix(in srgb, var(--side-bg) 91%, white);
+  --side-inset: 6px;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -24,7 +28,7 @@
 
 .side-top {
   flex-shrink: 0;
-  padding: 0 4px 10px 2px;
+  padding: 0 var(--side-inset) 10px;
 }
 
 /* One pixel taller than the top bar and pushed down by one: the stage's hairline sits above its bar,
@@ -42,7 +46,7 @@
   /* The mark's cells fill its 20 px box edge to edge at this size: 8 px to the wordmark. */
   gap: 8px;
   height: 32px;
-  padding: 0 10px 0 8px;
+  padding: 0 10px 0 4px;
   border-radius: var(--r-sm);
   transition: background-color var(--d-1) var(--ease);
 }
@@ -78,7 +82,7 @@
   align-items: center;
   gap: 10px;
   height: 30px;
-  padding: 0 10px;
+  padding: 0 6px;
   border-radius: var(--r-sm);
   font-size: var(--t-ui);
   font-weight: var(--w-medium);
@@ -129,7 +133,7 @@
   flex: 1;
   min-height: 0;
   /* No bottom padding: the bottom fade below is the list's own last 30px (see there). */
-  padding: 0 4px 0 2px;
+  padding: 0 var(--side-inset);
   outline: none;
   /* Opaque, so the scroller gets its own layer even at 1x (where a transparent one keeps LCD text by
      repainting on every scroll step instead). */
@@ -261,16 +265,16 @@
   will-change: transform;
 }
 
-/* Held over a project: it folds to its header and hangs below the pointer, one step in, as it
-   will stand inside the project; the project's header stays in view to answer. `translate` is
+/* Held over a project: it folds to its header and hangs below the pointer, as it will stand
+   inside the project; the project's header stays in view to answer. `translate` is
    separate from the transform that follows the pointer. */
 .sgroup[data-dragging] {
   transition: translate var(--d-2) var(--ease-out);
 }
 
 .sgroup[data-dragging][data-into] {
-  translate: 12px 20px;
-  clip-path: inset(0 12px calc(100% - 30px) 0 round var(--r-sm));
+  translate: 0 20px;
+  clip-path: inset(0 0 calc(100% - 30px) 0 round var(--r-sm));
 }
 
 .sgroup[data-dragging][data-into] .sgroup-tools {
@@ -345,7 +349,7 @@
   align-items: center;
   gap: 10px;
   height: 100%;
-  padding: 0 10px;
+  padding: 0 6px;
   border-radius: var(--r-sm);
   text-align: left;
 }
@@ -357,7 +361,7 @@
 
 .sgroup-head-static {
   gap: 10px;
-  padding: 0 10px;
+  padding: 0 6px;
 }
 
 .sgroup-icon {
@@ -377,15 +381,13 @@
 }
 
 .sgroup-head:hover .sgroup-name,
-.sgroup-head:has(:focus-visible) .sgroup-name,
-.sgroup-head[data-current] .sgroup-name {
+.sgroup-head:has(:focus-visible) .sgroup-name {
   color: var(--text-2);
   transition-duration: 0s;
 }
 
 .sgroup-head:hover .sgroup-icon,
-.sgroup-head:has(:focus-visible) .sgroup-icon,
-.sgroup-head[data-current] .sgroup-icon {
+.sgroup-head:has(:focus-visible) .sgroup-icon {
   color: var(--text-3);
   transition-duration: 0s;
 }
@@ -608,7 +610,7 @@
 
 .srow-mark {
   position: absolute;
-  left: 10px;
+  left: 6px;
   top: 50%;
   translate: 0 -50%;
   display: grid;
@@ -642,7 +644,7 @@
   height: 100%;
   display: flex;
   align-items: center;
-  padding: 0 44px 0 36px;
+  padding: 0 42px 0 32px;
   border-radius: inherit;
   text-align: left;
 }
@@ -679,7 +681,6 @@
 .srow[data-active] .srow-title,
 .srow[data-unread] .srow-title {
   color: var(--text);
-  font-weight: var(--w-medium);
 }
 
 .srow-archived .srow-title {
@@ -703,7 +704,7 @@
 }
 
 .srow-time {
-  padding-right: 10px;
+  padding-right: 8px;
   font-size: var(--t-micro);
   color: var(--text-4);
 }
@@ -713,13 +714,13 @@
   color: var(--text-3);
 }
 
-/* A ring while it works, a dot when it wants you: on the time's right edge. */
+/* A ring while it works, a dot when it wants you: their right edge on the times' right edge. */
 .srow-state {
   display: grid;
-  place-items: center;
+  place-items: center end;
   width: 12px;
   height: 12px;
-  margin-right: 10px;
+  margin-right: 8px;
 }
 
 /* A quieter ring on rows you are not looking at. */
@@ -800,15 +801,10 @@
 }
 
 /* The chat's title as a field: its words stay where the title stood, to the pixel and in its weight
-   (29 + the field's 1px edge + 6 = the title's 36; an open or unread chat's title is medium), so
-   taking the field and giving it back moves no letter. */
+   (25 + the field's 1px edge + 6 = the title's 32), so taking the field and giving it back moves
+   no letter. */
 .srow-rename {
-  margin-left: 29px;
-}
-
-.srow[data-active] .srow-rename,
-.srow[data-unread] .srow-rename {
-  font-weight: var(--w-medium);
+  margin-left: 25px;
 }
 
 /* The folder's name as a field: its words stay where the name stood. */
@@ -839,7 +835,7 @@
   width: 100%;
   height: 30px;
   margin-top: 1px;
-  padding: 0 10px 0 36px;
+  padding: 0 8px 0 32px;
   border-radius: var(--r-sm);
   font-size: var(--t-small);
   color: var(--text-4);
@@ -970,47 +966,20 @@
 
 /* ── projects: folders under one name (Sidebar.tsx SetSection) ── */
 
-/* A project's folders sit one step in, on a faint guide under the project's icon. */
+/* A project's folders stand on the sidebar's one grid, not a step in: every title keeps the one
+   column. The project's own icon (the stack) and the space round the project say what belongs to
+   it: its folders follow closer together than sections do. Every header has the one tone. */
 .sset-body {
   position: relative;
 }
 
 .sset-folders {
   position: relative;
-  padding: 2px 0 0 10px;
+  padding-top: 2px;
 }
 
 .sset-folders > .sgroup + .sgroup {
   margin-top: 4px;
-}
-
-.sset-folders::before {
-  content: '';
-  position: absolute;
-  top: 4px;
-  bottom: 6px;
-  /* Centred under the project's icon (the header's 10 px inset plus half its 16 px box). */
-  left: 17.5px;
-  width: 1px;
-  background-color: var(--line);
-  pointer-events: none;
-}
-
-/* A project reads one step above its folders: name and icon each one tone brighter, and both answer the pointer. */
-.sset-name {
-  color: var(--text-2);
-}
-
-.sset > .sgroup-head .sgroup-icon {
-  color: var(--text-3);
-}
-
-.sset > .sgroup-head:is(:hover, :has(:focus-visible), [data-current]) .sset-name {
-  color: var(--text);
-}
-
-.sset > .sgroup-head:is(:hover, :has(:focus-visible), [data-current]) .sgroup-icon {
-  color: var(--text-2);
 }
 
 /* Folded: the agents of its chats and how many there are; the tools take their place on hover. */
@@ -1041,24 +1010,16 @@
 
 .sset-empty {
   margin: 0;
-  padding: 5px 10px 6px 36px;
+  padding: 5px 8px 6px 32px;
   font-size: var(--t-ui);
   color: var(--text-3);
   animation: var(--empty-in);
 }
 
-/* A folder held over a project: its header answers with a soft ivory edge, its guide lights up. */
+/* A folder held over a project: its header answers with a soft ivory edge. */
 .sgroup[data-drop-into] > .sgroup-head {
   background-color: var(--fill-2);
   box-shadow: inset 0 0 0 1px var(--focus-field);
-}
-
-.sset-folders::before {
-  transition: background-color var(--d-1) var(--ease);
-}
-
-.sgroup[data-drop-into] .sset-folders::before {
-  background-color: var(--focus-field);
 }
 
 /* A project's folder taken out above or below it: a hairline where it will stand. */

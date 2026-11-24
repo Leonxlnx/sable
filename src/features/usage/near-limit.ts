@@ -14,6 +14,10 @@ import { usedPercent } from './words';
  * one whose unused week ends soonest first, then the next at a limit), so one account nearing its
  * limit is not news while another signed-in account of that agent still has room. An account warns
  * only when none does.
+ *
+ * What was already true before this launch is not news: the levels the window starts with (the
+ * bridge's cached figures that come with `app.hello`) and any reading made before the watch began
+ * (a report's `readAt`) are taken as told, silently. Only a crossing seen during this run warns.
  */
 
 const STAY_BELOW = 70;
@@ -23,6 +27,9 @@ const rank = (t: LimitLevel) => (t === 'cap' ? 2 : t === 'near' ? 1 : 0);
 
 /** The last tone announced per account (`accountKey`) since it was last quiet. */
 const announced = new Map<string, Tone>();
+
+/** When the watch began: a reading older than this was made before this launch. */
+let startedAt = 0;
 
 /** The live windows, tightest first (a reset that has passed no longer counts, as in `limitLevel`). */
 function liveWindows(limits: RateLimit[] | undefined, now: number): RateLimit[] {
@@ -37,7 +44,8 @@ function announce(provider: ProviderId, info: { name?: string; accounts?: Accoun
   useStore.getState().toast(text, tone === 'cap' ? 'error' : 'warn');
 }
 
-function check() {
+/** `quiet`: take every level as told without a toast (what the window starts with). */
+function check(quiet = false) {
   const s = useStore.getState();
   const now = Date.now();
   for (const provider of Object.keys(s.providers) as ProviderId[]) {
@@ -67,6 +75,8 @@ function check() {
       // Another account of this agent takes over: said only once none has room (nothing is marked as told).
       if (roomy.some((a) => a !== account)) continue;
       announced.set(key, level);
+      const read = s.limitReports[key]?.readAt;
+      if (quiet || (read !== undefined && read < startedAt)) continue;
       const top = windows[0];
       if (top) announce(provider, info, account, top, level);
     }
@@ -75,9 +85,13 @@ function check() {
 
 /** Starts the warnings (once, from the app shell). Returns the function that stops them. */
 export function watchLimitWarnings(): () => void {
-  check();
+  startedAt = Date.now();
+  // Started after hello (a reload of the module): what is there now was known before.
+  check(useStore.getState().ready);
   const unsubscribe = useStore.subscribe((s, prev) => {
-    if (s.limits !== prev.limits || s.limitReports !== prev.limitReports || s.providers !== prev.providers) check();
+    // Hello's own figures are the start, not a crossing.
+    if (s.ready && !prev.ready) check(true);
+    else if (s.limits !== prev.limits || s.limitReports !== prev.limitReports || s.providers !== prev.providers) check();
   });
   return () => {
     unsubscribe();

@@ -4,7 +4,7 @@
 
 .side-foot {
   flex-shrink: 0;
-  padding: 4px 4px 6px 2px;
+  padding: 4px 6px 6px;
   container: side-foot / inline-size;
 }
 
@@ -28,7 +28,7 @@
   align-items: center;
   gap: 8px;
   height: var(--ctl-h);
-  padding: 0 8px;
+  padding: 0 8px 0 4px;
   border-radius: var(--r-sm);
   text-align: left;
   transition: background-color var(--d-1) var(--ease);
@@ -82,7 +82,7 @@
   width: 100%;
   height: var(--ctl-h);
   margin-bottom: 2px;
-  padding: 0 8px 0 8px;
+  padding: 0 8px 0 4px;
   border-radius: var(--r-sm);
   color: var(--text);
   font-size: var(--t-ui);

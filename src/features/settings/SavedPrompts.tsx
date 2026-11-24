@@ -6,7 +6,7 @@ import { Icon } from '@/icons';
 import { plural } from '@/lib/format';
 import { removePrompt, reorderPrompts, savePrompt, updatePrompt, usePromptsLoaded, useSavedPrompts } from '@/features/saved/prompts-store';
 import { IconButton } from '@/ui';
-import { Empty, Skeleton } from './parts';
+import { Skeleton } from './parts';
 import { promptEdits, RowWrites, type PromptField, type PromptFields } from './prompt-edits';
 import './saved-prompts.css';
 
@@ -67,6 +67,7 @@ export function SavedPrompts() {
     <div className="set-stack sp">
       <div className="set-toolbar">
         {loaded && prompts.length > 0 && <span className="set-context num">{plural(prompts.length, 'prompt')}</span>}
+        {loaded && !rows.length && !creating && <span className="set-empty sp-empty">Prompts you save show here.</span>}
         <span className="grow" />
         <button
           type="button"
@@ -82,15 +83,14 @@ export function SavedPrompts() {
         </button>
       </div>
 
-      <div className="card set-card sp-card" data-spot>
+      {/* Nothing saved: the sentence stands in the toolbar beside New prompt, not in an empty box. */}
+      <div className="card set-card sp-card" data-spot hidden={loaded && !rows.length && !creating}>
         <Collapse open={creating}>
           <NewPrompt onDone={() => setCreating(false)} />
         </Collapse>
         {!loaded ? (
           <Skeleton rows={2} />
-        ) : !rows.length ? (
-          !creating && <Empty>Prompts you save show here.</Empty>
-        ) : (
+        ) : !rows.length ? null : (
           <Reorder.Group as="ul" axis="y" values={rows} onReorder={setOrder} className="sp-list" ref={listRef} role="list" aria-label="Saved prompts" data-after-new={creating || undefined}>
             <AnimatePresence initial={false}>
               {rows.map((p, i) => (

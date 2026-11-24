@@ -25,7 +25,6 @@
   align-items: baseline;
   gap: 8px;
   font-size: var(--t-ui);
-  font-weight: var(--w-medium);
   color: var(--text);
   transition: color var(--d-2) var(--ease);
 }

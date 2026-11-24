@@ -3,7 +3,7 @@ import type { FileDiff, PermissionOption, PermissionRequest } from '@shared/prot
 import { CodeBlock } from '@/components/CodeBlock';
 import { DiffView } from '@/components/DiffView';
 import { Markdown } from '@/components/Markdown';
-import { Glyph, Icon, TOOL_ICON } from '@/icons';
+import { Icon, TOOL_ICON } from '@/icons';
 import { langFromPath, relPath } from '@/lib/format';
 import { respondPermission } from '@/state/actions';
 import { leaveCard } from './leave';
@@ -91,9 +91,11 @@ export function CardWarmup({ active }: { active: boolean }) {
     <div className="pc-warm" aria-hidden>
       <section className="pc glass-card" data-kind="edit">
         <header className="pc-head">
-          <Glyph name={TOOL_ICON.edit.icon} tone="var(--amber)" size={30} />
           <div className="pc-titles">
-            <h3 className="pc-title">Edit warm.ts</h3>
+            <h3 className="pc-title pc-title-marked">
+              <Icon name={TOOL_ICON.edit.icon} size={16} className="pc-mark" />
+              <span>Edit warm.ts</span>
+            </h3>
           </div>
         </header>
         <div className="pc-body">
@@ -235,10 +237,14 @@ export function PermissionCard({ sessionId, req, more }: { sessionId: string; re
 
   return (
     <section className="pc glass-card" data-spot data-kind={req.kind} aria-label={req.title} aria-live="polite">
+      {/* One inset: the amber mark leads the title's line, and everything else (the description,
+          the subject, the answers) starts where the mark does. */}
       <header className="pc-head">
-        <Glyph name={tool.icon} tone="var(--amber)" size={30} />
         <div className="pc-titles">
-          <h3 className="pc-title">{req.title}</h3>
+          <h3 className="pc-title pc-title-marked">
+            <Icon name={tool.icon} size={16} className="pc-mark" />
+            <span>{req.title}</span>
+          </h3>
           {req.description && !restates(req) && <p className="pc-desc">{req.description}</p>}
         </div>
         {more > 0 && <span className="pc-more">{more} more waiting</span>}

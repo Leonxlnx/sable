@@ -991,8 +991,8 @@
   }
 }
 
-/* Mode: one fill step at rest, like a button. Every mode is neutral ivory except bypass, whose icon
-   and label are red (it carries meaning: nothing asks first). The fill stays neutral. */
+/* Mode: one fill step at rest, like a button. Every mode is neutral ivory; bypass keeps a red icon
+   (it carries meaning: nothing asks first), its word the chip's own tone, as in the menu. */
 .cm-mode {
   --chip-bg: var(--fill-2);
   --chip-ring: var(--press-up);
@@ -1017,7 +1017,7 @@
   color: var(--text-2);
 }
 
-/* On the parts, not the chip: a red word that leaves stays red while it goes. */
+/* On the part, not the chip: a red icon that leaves stays red while it goes. */
 .cm-mode > .cm-danger,
 .cm-mode > .cm-danger svg {
   color: var(--red);
@@ -1180,6 +1180,31 @@
   gap: 5px;
   width: 28px;
   padding: 0;
+}
+
+/* Off, it reads as the control it is: the attach button's quiet disc (one fill step and the even
+   hairline), not a stray glyph. */
+.ux:not([data-on]) {
+  --chip-bg: var(--fill-2);
+  --chip-ring: var(--press-up);
+}
+
+.ux:not([data-on]):hover,
+.ux:not([data-on])[aria-expanded='true'] {
+  --chip-bg: var(--fill-3);
+}
+
+.ux:not([data-on]):active {
+  --chip-bg: var(--fill-4);
+  --chip-ring: var(--press-down);
+}
+
+.ux:not([data-on]) svg {
+  color: var(--text-2);
+}
+
+.ux:not([data-on]):hover svg {
+  color: var(--text);
 }
 
 .ux[data-on] {
@@ -2148,6 +2173,12 @@
   color: var(--text-3);
 }
 
+/* A mode that never asks: its icon red here as on the chip, its word the row's own; it holds over
+   the row's lit and hover tones (ui.css `.menu-item … svg`, the glide's own hover rule). */
+.pop .menu-item.mm-row svg.mm-lead.mm-danger.mm-danger:not(.provider-mark) {
+  color: var(--red);
+}
+
 .mm-name {
   flex: 1;
   min-width: 0;
@@ -2259,13 +2290,9 @@
   align-items: center;
   gap: 7px;
   height: 30px;
-  padding: 2px 14px 0;
+  padding: 2px 16px 0;
   font-size: var(--t-small);
   color: var(--text-2);
-}
-
-.cq-head-icon {
-  color: var(--text-3);
 }
 
 .cq-title {
@@ -2347,7 +2374,8 @@
   gap: 9px;
   flex-shrink: 0;
   height: 28px;
-  padding: 0 3px 0 8px;
+  /* The words 16 in from the tray's side, on the field's own edge. */
+  padding: 0 3px 0 10px;
   /* Rows stand 6 in from the tray's sides, as the chips stand 6 in from the pane's: the same 14. */
   border-radius: 14px;
   outline: none;
@@ -2389,9 +2417,7 @@
 .cq-n {
   width: 12px;
   flex-shrink: 0;
-  font-size: var(--t-micro);
   color: var(--text-4);
-  text-align: center;
 }
 
 /* A message kept from a Spare wait: goes out only by hand. */
@@ -2698,20 +2724,36 @@ button.hc:is(:active, [aria-expanded='true']) {
 }
 
 /* An agent's accounts, nested under it. */
+/* An account is a choice like its agent's row: the same size, its name on the agent's name,
+   a step quieter until it is the one in use. */
 .hc-acct {
   gap: 10px;
   min-height: 28px;
-  padding: 3px 9px 3px 33px;
-  font-size: var(--t-small);
+  padding: 3px 8px 3px 33px;
+  font-size: var(--t-ui);
+  color: var(--text-2);
 }
 
 .hc-acct[data-current] {
   color: var(--text);
 }
 
+/* Every agent's mark in one box, so no row stands taller than the others. */
+.menu-item .hc-mark {
+  flex: none;
+  width: 15px;
+  height: 15px;
+}
+
+/* Sign in is a chip's word like the others (amber is for what waits on the person); in the agent
+   menu it is the row's quiet end. */
 .hc-signin {
+  color: inherit;
+}
+
+.cm-check .hc-signin {
   font-size: var(--t-small);
-  color: var(--amber);
+  color: var(--text-3);
 }
 
 /* ── the home-to-session hand-off: the card copy that flies to the dock ── */

@@ -33,7 +33,7 @@
 .cc-name,
 .acc-agent {
   font-size: 13.5px;
-  font-weight: var(--w-semi);
+  font-weight: var(--w-medium);
   letter-spacing: -0.006em;
   color: var(--text);
   white-space: nowrap;
@@ -244,25 +244,12 @@
   color: var(--text);
 }
 
+/* Always in view, quiet: it is the row's last column, so the action before it (Sign in, Sign out)
+   ends on the same edge on every row; hidden but holding its place, it left a bright Sign in
+   standing 30px short of the card's edge for no visible reason. */
 .acc-more {
   margin-left: -2px;
-  opacity: 0;
-  transition:
-    opacity var(--d-1) var(--ease-out),
-    background-color var(--d-1) var(--ease),
-    color var(--d-1) var(--ease);
-}
-
-.acc:hover .acc-more,
-.acc:focus-within .acc-more,
-.acc-more[data-state='open'] {
-  opacity: 1;
-}
-
-@media (hover: none) {
-  .acc-more {
-    opacity: 1;
-  }
+  color: var(--text-3);
 }
 
 .acc-rename {
@@ -397,13 +384,8 @@
   color: var(--text-2);
 }
 
-.acc-limit[data-level='amber'] .cc-limit-pct {
-
-  color: var(--amber);
-}
-.acc-limit[data-level='red'] .cc-limit-pct {
-  color: var(--red);
-}
+/* The meter carries the level (its tone); the figure stays in the text's tone, so a used-up window
+   is one red in view, not two. */
 
 .acc-add {
   display: inline-flex;

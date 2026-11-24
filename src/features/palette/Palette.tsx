@@ -383,8 +383,9 @@ function PaletteRowView({
           {item.hit ? (
             <HitMark hit={item.hit} />
           ) : item.session ? (
+            // Every chat leads with its agent's mark, as in the sidebar; its state stands at the row's end.
             <span className="palette-smark">
-              {statusTone(item.session) === 'idle' ? <Icon name="chat" size={14} className="palette-idle" /> : <StatusMark session={item.session} />}
+              <ProviderMark provider={item.session.provider} size={14} />
             </span>
           ) : (
             <Icon name={item.icon ?? 'command'} size={16} className="palette-icon" />
@@ -438,6 +439,7 @@ function SessionEnd({ session }: { session: SessionMeta }) {
   return (
     <span className="palette-time num">
       {session.archived && <span className="palette-arch">Archived</span>}
+      {tone === 'unread' && <StatusMark session={session} />}
       {timeAgo(session.updatedAt, now)}
     </span>
   );

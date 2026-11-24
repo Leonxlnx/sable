@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId, type ProviderInfo, type RateLimit } from '@shared/protocol';
@@ -51,7 +51,7 @@ const FOCUS_IN_USE = {
 /**
  * The sidebar footer's account switcher. The row is one line that fits the narrowest sidebar: the
  * agent's mark, one name (the account's label when the agent has several, its plan otherwise) and
- * how much of its most used window is used as a small ring and figure, the same figure its row in
+ * how much of its most used window is used as a short meter and figure, the same figure its row in
  * the menu shows. The tooltip says it in full (plan, every window and its reset, how much of the
  * agent's weeks is used across its accounts: always as used, `usage/words.ts`). It opens every
  * agent's accounts as rows with the plan and how full each is, the account in use checked (the open
@@ -130,7 +130,7 @@ export function AccountSwitcher() {
             <span className="acs-trigger-name truncate" data-out={(!on && !current?.auth.checking) || undefined}>
               {name}
             </span>
-            {on && current && <LimitRing provider={focus} accountId={current.id} />}
+            {on && current && <LimitMeter provider={focus} accountId={current.id} />}
           </button>
         </RM.Trigger>
       </Tip>
@@ -283,28 +283,24 @@ function triggerName(provider: ProviderId, account: AccountInfo | undefined, sev
 }
 
 /**
- * How much of the account's most used window is used, as a small ring and its figure ("59%"): the
- * same window and the same figure as the account's row in the menu and one of the bars beside it.
- * (It used to show what was left of another window: "55%" in the footer over "59%" in its own menu.)
- * Quiet ink; amber from 80% used, red when used up. Nothing until the account has figures.
+ * How much of the account's most used window is used, as the one usage meter (shorter) and its
+ * figure ("59%"): the same window, drawing and figure as the account's row in the menu and one of
+ * the lines beside it. Amber from 80% used, red when used up, on the meter alone. Nothing until the
+ * account has figures.
  */
-function LimitRing({ provider, accountId }: { provider: ProviderId; accountId: string }) {
+function LimitMeter({ provider, accountId }: { provider: ProviderId; accountId: string }) {
   const { limits } = useAccountWindows(provider, accountId);
   const now = useNow();
   const figure = accountUsed(limits, now);
   if (!figure) return null;
   const used = figure.pct;
   const level = windowLevel(figure.limit, now);
-  // The arc on the icons' 14 px grid: a hairline track and a 1.5 px arc of what is used.
-  const r = 5.25;
-  const c = 2 * Math.PI * r;
   return (
-    <span className="acs-ring" data-level={level} aria-hidden>
-      <svg width="14" height="14" viewBox="0 0 14 14">
-        <circle className="acs-ring-track" cx="7" cy="7" r={r} />
-        {used > 0 && <circle className="acs-ring-arc" cx="7" cy="7" r={r} strokeDasharray={`${(Math.max(used, 4) / 100) * c} ${c}`} />}
-      </svg>
-      <span className="acs-ring-pct num">{used}%</span>
+    <span className="acs-foot-used" aria-hidden>
+      <span className="meter acs-meter" data-level={level}>
+        <span className="meter-fill" style={{ '--p': Math.max(used, used > 0 ? 3 : 0) / 100 } as CSSProperties} />
+      </span>
+      <span className="acs-pct num">{used}%</span>
     </span>
   );
 }

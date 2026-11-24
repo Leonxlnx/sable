@@ -153,7 +153,7 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
             aria-label={`Mode: ${cur?.name ?? 'default'}`}
             parts={[
               { k: `icon:${MODE_ICON[cur?.tone ?? 'ask']}`, className: cur?.tone === 'danger' ? 'cm-danger' : undefined, node: <Icon name={MODE_ICON[cur?.tone ?? 'ask']} size={15} /> },
-              { k: `label:${cur?.id ?? ''}`, className: cur?.tone === 'danger' ? 'cm-mode-label cm-danger' : 'cm-mode-label', node: cur?.name ?? 'Mode' },
+              { k: `label:${cur?.id ?? ''}`, className: 'cm-mode-label', node: cur?.name ?? 'Mode' },
             ]}
           />
         </RM.Trigger>
@@ -180,7 +180,7 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
               <>
                 {ordered.map((m) => (
                   <RM.Item key={m.id} className="menu-item mm-row" data-current={m.id === anchor || undefined} onSelect={() => choice.setMode(m.id)} {...guard}>
-                    <Icon name={MODE_ICON[m.tone] ?? 'shield'} size={15} className="mm-lead" />
+                    <Icon name={MODE_ICON[m.tone] ?? 'shield'} size={15} className={m.tone === 'danger' ? 'mm-lead mm-danger' : 'mm-lead'} />
                     <span className="mm-name truncate" data-origin-anchor>
                       {m.name}
                     </span>

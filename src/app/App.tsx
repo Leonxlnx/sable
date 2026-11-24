@@ -839,13 +839,13 @@ function ContextMeter({ sessionId }: { sessionId: string }) {
   if (!shown) return null;
   const [p, used, max] = shown.split('|');
   const pct = Number(p);
-  // The chat's context, never an account's limit: the Context tab's own icon (the tab it opens) and
-  // the figure, so it cannot be taken for the account ring in the sidebar footer, which fills as a
-  // plan window is used. The tooltip says what it is in words.
+  // The chat's context, never an account's limit: the word and the figure, so it cannot be taken for
+  // the account's meter in the sidebar footer. The tooltip says it in tokens.
   return (
     <Tip label={`Context: ${used} of ${max} tokens used`}>
       <button type="button" className="ctx-meter" onClick={() => setUi({ railOpen: true, railTab: 'context' })} data-warn={pct > 80 || undefined} aria-label={`Context ${Math.round(pct)}% used. Open the Context tab`}>
-        <Icon name="context" size={15} />
+        {/* A word, not a glyph that needs a guess: "Context 11%". */}
+        <span className="ctx-word">Context</span>
         <span className="num">{Math.round(pct)}%</span>
       </button>
     </Tip>

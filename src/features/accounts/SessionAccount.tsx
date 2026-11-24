@@ -36,17 +36,28 @@ export function SessionAccount({ sessionId }: { sessionId: string }) {
   const rows = lim ? [...lim.own, ...lim.other] : [];
   const goesOn = !!lim?.model && lim.level !== 'cap' && lim.other.some((l) => l.percent >= 100);
   const said = rows.map((l) => `${limitTitle(l.label)} ${windowState(l, lim!.now)}`).join(', ');
-  const tip = said ? `${name}: ${said}${goesOn ? `. ${lim!.model} is not limited` : ''}` : name;
+  // The tooltip says what the crumb is (never only its own label again): the account and its plan.
+  const plan = current?.auth.loggedIn ? planOf(current) : undefined;
+  const who = `Account: ${name}${plan ? ` · ${plan}` : ''}`;
+  const tip = said ? `${who}. ${said}${goesOn ? `. ${lim!.model} is not limited` : ''}` : who;
+  // A word or nothing: a limit of this chat's own model says so in a word beside its dot; another
+  // model's window at its cap (not this chat's) is the tooltip's and the menu's, no mark in the bar.
+  const word = level === 'red' ? 'Limit reached' : level === 'amber' ? 'Near limit' : undefined;
   const menu = { sessionId, provider, accountId, accounts, lim, rows, goesOn, name, moving, setMoving };
 
   return (
     <RM.Root modal={false}>
       <Tip label={tip}>
         <RM.Trigger asChild>
-          <button type="button" className="sa-trigger" aria-label={`Account: ${tip}. Continue with another account`}>
+          <button type="button" className="sa-trigger" aria-label={`${tip}. Continue with another account`}>
             <Icon name="user" size={13} />
             <span className="truncate">{name}</span>
-            {level && <span className="limit-dot" data-level={level} aria-hidden />}
+            {word && (
+              <span className="sa-word">
+                <span className="limit-dot" data-level={level} aria-hidden />
+                {word}
+              </span>
+            )}
             {moving && <Spinner size={11} />}
           </button>
         </RM.Trigger>

@@ -36,7 +36,7 @@ export function About() {
           Version {version || 'unknown'}
           {custom && ' · Customized'}
         </span>
-        <p className="about-line">Claude Code and Codex in one place: every session, step and change in one timeline.</p>
+        <p className="about-line">Your coding agents in one place: every session, step and change in one timeline.</p>
       </div>
 
       <Updates />

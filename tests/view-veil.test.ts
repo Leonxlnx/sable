@@ -92,7 +92,14 @@ describe('a change of view: one veil, one clock, one direction', () => {
     const wait = app.slice(app.indexOf('function waitingChat'), app.indexOf('/**', app.indexOf('function waitingChat')));
     expect(wait).toContain('class="skel');
     expect(wait).not.toMatch(/spinner|Tiles/);
-    // Unseen from the start, brought in by an animation of its own: it shows while the page is busy.
-    expect(veil).toMatch(/w\.animate\(\[\{ opacity: 0 \}, \{ opacity: 1 \}\], \{ duration: WAIT_IN, delay: solidIn \+ VEIL_WAIT_AFTER/);
+    // Unseen from the start, brought in by the page's timer, never by a delay on the compositor: a
+    // view being built holds the page and lands with the frame that drops the waiting state, so with
+    // a compositor delay a long chat in memory showed the skeleton while it was laid out and then cut
+    // it off in one frame. The reveal clears the timer.
+    expect(veil).not.toMatch(/delay: solidIn \+ VEIL_WAIT_AFTER/);
+    expect(veil).toMatch(/waitTimer = window\.setTimeout\(\(\) => \{\s*if \(w\.isConnected\) w\.animate\(\[\{ opacity: 0 \}, \{ opacity: 1 \}\], \{ duration: WAIT_IN,[^}]*\}\);\s*\}, solidIn \+ VEIL_WAIT_AFTER\);/);
+    const reveal = veil.slice(veil.indexOf('export function veilReveal'));
+    expect(reveal.indexOf('window.clearTimeout(cover.waitTimer)')).toBeGreaterThan(-1);
+    expect(reveal.indexOf('window.clearTimeout(cover.waitTimer)')).toBeLessThan(reveal.indexOf('const seen ='));
   });
 });

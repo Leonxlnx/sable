@@ -414,14 +414,15 @@ p .kbds,
 
 /* ───────────── fields ───────────── */
 
-/* A field is a darker well with a hairline. Hover lifts the hairline a step; focus turns it soft
+/* A field is a darker well with a hairline, at rest the faint one of every well (--line: never a
+   bright border while nobody types). Hover lifts the hairline a step; focus turns it soft
    ivory in that frame (a focus mark is never late) while the well deepens over a moment, so the
    focus arrives instead of only snapping. An error (aria-invalid) turns the hairline red. */
 .field {
   width: 100%;
   height: var(--ctl-h);
   padding: 0 10px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--line);
   border-radius: var(--r-ctl);
   background-color: var(--well);
   color: var(--text);
@@ -434,7 +435,7 @@ p .kbds,
 }
 
 .field:hover {
-  border-color: var(--line-3);
+  border-color: var(--line-2);
 }
 
 /* Focus: the hairline turns soft ivory at once; the well deepens behind it. */
@@ -481,7 +482,7 @@ textarea.field {
   width: 100%;
   height: var(--ctl-h);
   padding: 0 6px 0 9px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--line);
   border-radius: var(--r-ctl);
   background-color: var(--well);
   color: var(--text-3);
@@ -490,7 +491,7 @@ textarea.field {
 }
 
 .field-wrap:hover {
-  border-color: var(--line-3);
+  border-color: var(--line-2);
 }
 
 .field-wrap:focus-within {
@@ -1553,21 +1554,12 @@ textarea.field {
    Monochrome ordered dither is the house texture for small accents, never a gradient. */
 
 /* Selected row or tab: put this class on the absolutely positioned pill under the content.
-   A calm fill with an even hairline, plus dithered light falling off from its leading edge. */
+   One flat fill step with an even hairline (flat controls), nothing more: a dithered patch on its
+   leading edge read as dirt on a clean pill. Dither stays in the field, meters and skeletons.
+   (The class keeps its old name for what wears it.) */
 .dither-sel {
   background-color: var(--fill-3);
   box-shadow: var(--press-up);
-}
-
-.dither-sel::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  background: var(--dither-fade) left top / var(--dither-fade-size) repeat-y;
-  image-rendering: pixelated;
-  opacity: 0.06;
-  pointer-events: none;
 }
 
 /* Meter: a track and a fill whose leading edge dissolves in dither.

@@ -74,7 +74,6 @@
   padding: 0 10px;
   border-radius: var(--r-sm);
   font-size: var(--t-ui);
-  font-weight: var(--w-medium);
   color: var(--text-2);
   text-align: left;
   flex-shrink: 0;
@@ -293,7 +292,6 @@
 .set-row-label {
   display: block;
   font-size: var(--t-ui);
-  font-weight: var(--w-medium);
   color: var(--text);
 }
 
@@ -601,7 +599,6 @@
   flex: 1;
   min-width: 0;
   font-size: var(--t-ui);
-  font-weight: var(--w-medium);
   color: var(--text);
 }
 
@@ -742,7 +739,6 @@ button.xrow-head:disabled:hover {
   align-items: center;
   gap: 7px;
   font-size: var(--t-small);
-  font-weight: var(--w-medium);
   color: var(--text-2);
   flex-shrink: 0;
 }

@@ -12,6 +12,8 @@ export const FRAME_SRC = `${import.meta.env.BASE_URL ?? '/'}widget-frame.html`;
 
 /** Partial renders while the code streams in: at most one per this many ms. */
 const PARTIAL_EVERY = 220;
+/** A drawn widget measured smaller than its block holds shrinks once that height has stayed this long (ms). */
+const SHRINK_MS = 600;
 /** Taller than this at rest, a widget is clipped behind "Show all". */
 export const WIDGET_CAP = 560;
 
@@ -67,6 +69,19 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
   const near = useNear(box);
   const remembered = useMemo(() => cachedHeight(cacheKey), [cacheKey]);
   const [h, setH] = useState<number | null>(null);
+  /**
+   * A height measured after the final render. The frame reports its empty page's height before the
+   * code is drawn, so until then `h` is not the widget's: a widget opened again with the chat (its
+   * height remembered) dropped to that height in the frame its render finished and grew back over
+   * 200 ms, and the conversation's last line went with it (day 7, "x sub-agents working jumps").
+   */
+  const [sized, setSized] = useState(false);
+  /**
+   * A smaller height than the block holds that has stayed so for `SHRINK_MS`. A widget whose script
+   * draws it measures its bare page first when the page is busy (a chat opened while its turn runs):
+   * the block keeps what it holds until a smaller height stays.
+   */
+  const [held, setHeld] = useState<number | null>(null);
   const [phase, setPhase] = useState<Phase>('wait');
   const [stopped, setStopped] = useState<false | 'flood' | 'left'>(false);
   /** Times the widget navigated its frame: once it is rebuilt, twice it is stopped. */
@@ -140,6 +155,11 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
     let ready = false;
     let pendingH: unknown = null;
     let sizeRaf = 0;
+    // Whether the final render was reported, and whether the pending height came after it.
+    let drawn = false;
+    let pendingDrawn = false;
+    let lastV: number | null = null;
+    let sizeWait = 0;
     const link: FrameLink = {
       outer,
       flood: new Flood(),
@@ -166,10 +186,17 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
           case 'size':
             // Coalesced: at most one height per animation frame, however many arrive.
             pendingH = m.h;
+            pendingDrawn = drawn;
             sizeRaf ||= requestAnimationFrame(() => {
               sizeRaf = 0;
               const v = guard.push(pendingH, performance.now(), state.sentFinal);
-              if (v !== null && alive) setH(v);
+              if (v !== null) lastV = v;
+              if (!alive) return;
+              if (v !== null) setH(v);
+              if (pendingDrawn) {
+                window.clearTimeout(sizeWait);
+                setSized(true);
+              }
             });
             return;
           case 'hover':
@@ -179,7 +206,15 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
           case 'rendered':
             if (m.final) {
               guard.settle();
+              drawn = true;
               setPhase('final');
+              // The frame measures again after drawing; should no height come (an older frame), the last one stands.
+              window.clearTimeout(sizeWait);
+              sizeWait = window.setTimeout(() => {
+                if (!alive) return;
+                if (lastV !== null) setH(lastV);
+                setSized(true);
+              }, 250);
             } else setPhase((p) => (p === 'final' ? p : 'partial'));
             return;
           case 'prompt':
@@ -202,11 +237,14 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
     return () => {
       alive = false;
       window.clearTimeout(state.timer);
+      window.clearTimeout(sizeWait);
       cancelAnimationFrame(sizeRaf);
       unlink();
       box.current?.closest('.gw')?.removeAttribute('data-hover');
       if (st.current === state) st.current = null;
       setPhase('wait');
+      setSized(false);
+      setHeld(null);
     };
   }, [mounted, push, sessionId, bump, left]);
 
@@ -231,21 +269,23 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
   }, [h, anim]);
 
   const done = phase === 'final';
-  useEffect(() => {
-    if (done && h !== null && final) rememberHeight(cacheKey, h);
-  }, [done, h, final, cacheKey]);
-
+  // Drawn and measured: the widget's own height (see `sized`).
+  const settled = done && sized && h !== null;
   const empty = final && !code.trim();
   const reserve = remembered ?? (whole ? 0 : final ? 160 : 200);
-  let content: number;
-  if (stopped || empty) content = 52;
-  else if (done && h !== null) content = h;
-  else {
-    // While it builds, the block never shrinks: the conversation below it holds still.
-    content = Math.max(floor.current, h ?? reserve);
-    floor.current = content;
-  }
-  if (done) floor.current = 0;
+  const sizing = frameContent({ off: !!stopped || empty, settled, h, floor: floor.current, reserve, shrink: held !== null && held === h });
+  const content = sizing.content;
+  floor.current = sizing.floor;
+  // Measured smaller than what the block holds: it shrinks once that height has stayed.
+  const holding = settled && h !== null && sizing.floor > h;
+  useEffect(() => {
+    if (!holding || h === null) return;
+    const t = window.setTimeout(() => setHeld(h), SHRINK_MS);
+    return () => window.clearTimeout(t);
+  }, [holding, h]);
+  useEffect(() => {
+    if (settled && !holding && h !== null && final) rememberHeight(cacheKey, h);
+  }, [settled, holding, h, final, cacheKey]);
   const clippable = Number.isFinite(cap) && content > cap + 48 && !stopped;
   const clipped = clippable && !expanded;
   const boxH = clipped ? cap : content;
@@ -292,6 +332,19 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
     </div>
   );
 });
+
+/**
+ * The widget's height in the conversation, and the floor it keeps: while it builds, and until the
+ * drawn widget is measured (`settled`), the block never shrinks, so the conversation below it holds
+ * still; once measured it takes its own height, at once when that is as tall or taller, and when it
+ * is smaller only once that height has stayed (`shrink`). `off`: stopped or empty (a note's height).
+ */
+export function frameContent(s: { off: boolean; settled: boolean; h: number | null; floor: number; reserve: number; shrink?: boolean }): { content: number; floor: number } {
+  if (s.off) return { content: 52, floor: s.floor };
+  if (s.settled && s.h !== null && (s.h >= s.floor || s.shrink)) return { content: s.h, floor: 0 };
+  const content = Math.max(s.floor, s.h ?? s.reserve);
+  return { content, floor: content };
+}
 
 /** Rows of dither light that grow in as the code arrives: a sense of progress without a number. */
 function Skeleton({ title, len }: { title: string; len: number }) {

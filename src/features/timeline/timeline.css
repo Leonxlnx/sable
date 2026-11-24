@@ -7,13 +7,14 @@
  */
 
 .tl {
+  --tl-foot: 30px;
   position: relative;
   flex: 1;
   min-height: 0;
   display: flex;
   /* The conversation ends a little above the composer's lower edge: what scrolls behind the
      composer is hidden by it, never seen again in the strip under it. (The dock pads by 18px.) */
-  margin-bottom: 30px;
+  margin-bottom: var(--tl-foot);
 }
 
 .tl-scroll {
@@ -24,6 +25,11 @@
   scrollbar-gutter: stable both-edges;
   /* A scroll moves one composited layer: a long transcript is not re-layerized on every frame. */
   will-change: scroll-position;
+  /* What scrolls under the composer ends where its cove begins (--dock-cut, measured by the dock
+     from the stage's bottom edge, SessionView.tsx `coveTop`): words still pass behind the frosted
+     pane's upper part, never through the channel round the send key or beside the pane's lower
+     corners. A plain rectangle on the scroller's own clip: the layout and the follower are untouched. */
+  clip-path: inset(0 0 max(0px, calc(var(--dock-cut, 0px) - var(--tl-foot))) 0);
 }
 
 /* Content dissolves under the top bar instead of being cut by it: an overlay in the stage colour (no mask on the scroller). */
@@ -1064,101 +1070,11 @@ button:hover > .row-caret {
   color: var(--text-4);
 }
 
-/* A message steered into a running turn: the steer key's arrow, small, beside the card on its first
-   line (User.tsx), named on hover. At the card's waiting tone until the agent takes it. */
-.user-steer {
-  display: grid;
-  flex: none;
-  align-self: flex-start;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  margin: 11px 4px 0 0;
-  border-radius: 50%;
-  color: var(--text-4);
-  transition:
-    color var(--d-1) var(--ease),
-    opacity var(--d-3) var(--ease);
-}
-
-.user-steer svg {
-  transition: transform var(--d-1) var(--ease-out);
-}
-
-.user-steer:hover {
-  color: var(--text-2);
-}
-
-.user-steer:hover svg {
-  transform: translate(1px, -1px);
-}
-
-.user-steer:focus-visible {
-  outline: var(--focus-w) solid var(--focus);
-  outline-offset: 0;
-}
-
-.user-steer[data-waiting] {
-  opacity: 0.6;
-}
-
-/* A message steered into a running turn is wired to it while it waits: a dotted rule from its
-   tail corner down into the turn. When the agent takes it a light runs down the rule once and the
-   rule lets go (User.tsx), so a taken steer stands as a plain card over its reply: a stub left
-   hanging into the margin read as a stray mark. */
-.user-wire {
-  position: absolute;
-  right: 22px;
-  top: 100%;
-  width: 2px;
-  height: 16px;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.user-wire > i {
-  position: absolute;
-  inset: 0;
-  border-left: 2px solid var(--line-3);
-}
-
-.user[data-queued] .user-wire > i {
-  border-left-style: dotted;
-}
-
-.user:not([data-queued]) .user-wire > i {
-  opacity: 0;
-  transition: opacity 420ms var(--ease);
-}
-
-/* The light that runs the wire when the agent takes the message. */
-.user-wire > b {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 2px;
-  height: 8px;
-  background-color: var(--text);
-}
-
-/* Drawn down from the message as the words land (flight.ts sets data-draw): a cover in the
-   ground's colour slides off it, so only a transform moves. */
-.user-wire::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-color: var(--sheet);
-  transform: translateY(101%);
-}
-
-.user-wire[data-draw]::after {
-  animation: wire-draw 380ms var(--ease-out) backwards;
-}
-
-@keyframes wire-draw {
-  from {
-    transform: translateY(0);
-  }
+/* A message steered into a running turn waits at the turn's end in its waiting tone, the card alone
+   (no mark beside it, no wire: the live line stands above it, never below, so a wire had nothing
+   to reach). It stands one item's gap under what the turn shows last, not a new message's. */
+.tg > .tl-item[data-t='user']:has(> .user[data-steered][data-queued]) {
+  padding-top: 8px;
 }
 
 .user-actions {
@@ -2259,9 +2175,9 @@ button:hover > .row-caret {
   min-width: 0;
 }
 
+/* The line's own size and line box: only the tone differs (a smaller size sat 0.5 to 1 px lower). */
 .work-time {
   flex-shrink: 0;
-  font-size: 12px;
   color: var(--text-4);
 }
 
@@ -2335,7 +2251,7 @@ button:hover > .row-caret {
   margin-right: -6px;
   padding: 0 6px 0 8px;
   border-radius: var(--r-ctl-sm);
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--text-3);
   transition:
     background-color var(--d-1) var(--ease),
@@ -2554,7 +2470,7 @@ button:hover > .row-caret {
 }
 
 .turn-meta {
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--text-3);
 }
 
@@ -2581,30 +2497,37 @@ button:hover > .row-caret {
   opacity: 1;
 }
 
+/* After a chip the glyphs keep the row's one rhythm: the space from the chip's words to the copy
+   glyph is the space between two glyphs. */
+.turn-line > * + .turn-acts {
+  margin-left: -6px;
+}
+
 .turn-copy,
-.turn-fork,
-.turn-check {
+.turn-fork {
   --ib: 26px;
   border-radius: var(--r-ctl-sm);
   color: var(--text-4);
 }
 
-.tg:hover :is(.turn-copy, .turn-fork, .turn-check) {
+.tg:hover :is(.turn-copy, .turn-fork) {
   color: var(--text-3);
 }
 
-.turn-acts :is(.turn-copy, .turn-fork, .turn-check):is(:hover, :focus-visible) {
+.turn-acts :is(.turn-copy, .turn-fork):is(:hover, :focus-visible) {
   color: var(--text);
 }
 
-/* The other agent's mark: a filled shape, so a size down from the line icons beside it to carry the
-   same ink, and in their tone (a control carries no colour, the mark's own hue stays with the agent);
-   it answers the pointer with the same one-shot nudge as they do (icons/icons.css). */
+/* "Check with Codex": a chip with its word after the glyphs (a mark alone was a guess), the other
+   agent's mark in the row's tone (a control carries no colour), a size down from the line icons to
+   carry the same ink; it answers the pointer with the same one-shot nudge as they do. */
 .turn-check .provider-mark {
-  color: inherit;
+  color: var(--text-3);
+  transition: color 90ms var(--ease);
 }
 
 .turn-check:is(:hover, :focus-visible) .provider-mark {
+  color: var(--text);
   animation: icon-nudge var(--ai-d1) var(--ai-out);
 }
 
@@ -2618,45 +2541,53 @@ button:hover > .row-caret {
   margin-bottom: 10px;
 }
 
-/* Preview: a quiet control under an answer, one fill step with an almost invisible hairline, like
-   any button. The page's address names it; one page also says "Preview" ahead of the address. */
+/* Preview, Before / after and Check with: bare chips of the row's own height and size, in the
+   row's tone like the copy and fork glyphs beside them: no fill and no edge at rest, the hover fill
+   and the words a step up under the pointer. The page's address names Preview; one page also says
+   "Preview" ahead of it. The first chip of the row hangs its padding into the margin, so its icon
+   stands on the column's edge as the answer's words do. */
 .preview-btn {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   max-width: 280px;
-  height: 28px;
-  padding: 0 11px 0 9px;
+  height: 26px;
+  padding: 0 8px 0 7px;
   border: 0;
-  border-radius: var(--r-sm);
-  box-shadow: inset 0 0 0 1px var(--line);
-  font-size: var(--t-small);
-  font-weight: var(--w-medium);
-  color: var(--text);
-  background-color: var(--fill-1);
+  border-radius: var(--r-ctl-sm);
+  font-size: 12.5px;
+  font-weight: var(--w-regular);
+  color: var(--text-2);
+  background-color: transparent;
   transition:
     background-color var(--d-1) var(--ease),
+    color var(--d-1) var(--ease),
     scale var(--d-spring-soft) var(--spring-soft);
 }
 
+.turn-line > .preview-btn:first-child {
+  margin-left: -7px;
+}
+
 .preview-btn:hover {
-  background-color: var(--fill-2);
+  color: var(--text);
+  background-color: var(--fill-1);
 }
 
 .preview-btn:active {
-  background-color: var(--fill-3);
+  background-color: var(--fill-2);
   scale: var(--press);
-  transition-duration: var(--d-1), 70ms;
+  transition-duration: var(--d-1), var(--d-1), 70ms;
 }
 
 .preview-btn:focus-visible {
   outline: var(--focus-w) solid var(--focus);
-  outline-offset: var(--focus-offset);
+  outline-offset: var(--focus-inset);
 }
 
 .preview-icon {
   flex-shrink: 0;
-  color: var(--text-2);
+  color: var(--text-3);
   transition: color 90ms var(--ease);
 }
 
@@ -2675,7 +2606,6 @@ button:hover > .row-caret {
 
 .preview-host {
   min-width: 0;
-  font-weight: var(--w-regular);
   color: var(--text-3);
   transition: color 90ms var(--ease);
 }

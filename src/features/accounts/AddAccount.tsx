@@ -6,6 +6,7 @@ import { AutoHeight, DrawnCheck, Roll } from '@/features/connect/Connect';
 import { LoginCode } from '@/features/connect/LoginCode';
 import { Icon, type IconName } from '@/icons';
 import { desktop, hasNativeFolderPicker } from '@/lib/desktop';
+import { quietFocus } from '@/lib/quiet-focus';
 import { tildePath } from '@/lib/format';
 import { accountFolders, addAccount, addExistingAccount, cancelLogin, login, removeAccount, renameAccount } from '@/state/actions';
 import { accountKey, useStore } from '@/state/store';
@@ -59,7 +60,8 @@ export function AddAccountDialog() {
   return (
     <Modal open={open} onOpenChange={(o) => !o && close()} title={`Add a ${name} account`} bare className="aa" width={440}>
       <div className="aa-head">
-        <ProviderMark provider={provider} size={20} />
+        {/* While the agent is still to be picked, the title stays still: the segmented control below says which. */}
+        {!choosing && <ProviderMark provider={provider} size={20} />}
         <h2 className="aa-title">{choosing ? 'Add an account' : `Add a ${name} account`}</h2>
         <button type="button" className="icon-btn aa-close" aria-label="Close" onClick={close}>
           <Icon name="x" size={15} />
@@ -114,7 +116,7 @@ function Option({ icon, children, onClick, autoFocus }: { icon: IconName; childr
     <button
       type="button"
       className="aa-option"
-      autoFocus={autoFocus}
+      ref={autoFocus ? quietFocus : undefined}
       disabled={busy}
       onClick={async () => {
         setBusy(true);
@@ -352,7 +354,7 @@ function ExistingFolder({ provider, onBack, onAdded }: { provider: ProviderId; o
             </button>
           </form>
         ) : (
-          <button type="button" className={cx('aa-option')} autoFocus={folders !== null && !folders.length} onClick={() => void choose()}>
+          <button type="button" className={cx('aa-option')} ref={folders !== null && !folders.length ? quietFocus : undefined} onClick={() => void choose()}>
             <Icon name="folder-open" size={17} className="aa-option-icon" />
             <span className="grow">Choose a folder…</span>
           </button>

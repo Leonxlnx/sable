@@ -9,6 +9,7 @@ import { bridge } from '@/lib/bridge';
 import { tildePath } from '@/lib/format';
 import { addProject, goHome, setSettings } from '@/state/actions';
 import { focusComposer } from '@/state/hooks';
+import { quietFocus } from '@/lib/quiet-focus';
 import { useStore } from '@/state/store';
 import { Spinner } from '@/ui';
 import './onboarding.css';
@@ -391,7 +392,7 @@ function Item({ children, reduce, className }: { children: ReactNode; reduce: bo
 
 function GoButton({ label, onPress, autoFocus = true }: { label: string; onPress: (el: HTMLElement) => void; autoFocus?: boolean }) {
   return (
-    <button type="button" className="btn btn-primary btn-lg onb-go" autoFocus={autoFocus} onClick={(e) => onPress(e.currentTarget)}>
+    <button type="button" className="btn btn-primary btn-lg onb-go" ref={autoFocus ? quietFocus : undefined} onClick={(e) => onPress(e.currentTarget)}>
       {label}
       <Icon name="arrow-right" size={15} className="onb-go-arrow" />
     </button>
@@ -404,7 +405,7 @@ function Welcome({ reduce, onNext }: { reduce: boolean; onNext: (from?: Element 
   return (
     <>
       <RollText as="h1" text="Sable" className="onb-name" reduce={reduce} />
-      <RollText text="One place to run Claude Code and Codex. Follow every step, review every change." className="onb-lead" reduce={reduce} stagger={0.009} />
+      <RollText text="One place to run your coding agents. Follow every step, review every change." className="onb-lead" reduce={reduce} stagger={0.009} />
       <Rise reduce={reduce} className="onb-actions" delay={0.16}>
         <GoButton label="Get started" onPress={onNext} />
       </Rise>
@@ -543,7 +544,7 @@ function Folder({ reduce, onChoose, onDone, chooseRef }: { reduce: boolean; onCh
           ) : (
             places.map((p, i) => (
               <Item key={p.path} reduce={reduce}>
-                <button type="button" role="listitem" className="onb-place" data-chosen={chosen === p.path || undefined} autoFocus={i === 0} onClick={() => choose(p.path)}>
+                <button type="button" role="listitem" className="onb-place" data-chosen={chosen === p.path || undefined} ref={i === 0 ? quietFocus : undefined} onClick={() => choose(p.path)}>
                   <Icon name="folder" size={17} className="onb-place-icon" />
                   <span className="onb-place-text">
                     <span className="onb-place-name truncate">{p.name}</span>
@@ -556,7 +557,7 @@ function Folder({ reduce, onChoose, onDone, chooseRef }: { reduce: boolean; onCh
             ))
           )}
           <Item reduce={reduce}>
-            <button type="button" role="listitem" className="onb-place onb-place-pick" autoFocus={places !== null && places.length === 0} onClick={pick}>
+            <button type="button" role="listitem" className="onb-place onb-place-pick" ref={places !== null && places.length === 0 ? quietFocus : undefined} onClick={pick}>
               <Icon name="folder-plus" size={17} className="onb-place-icon" />
               <span className="onb-place-text">
                 <span className="onb-place-name">Choose a folder…</span>

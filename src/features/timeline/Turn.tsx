@@ -10,7 +10,7 @@ import { formatCost, formatTokens, isMac } from '@/lib/format';
 import { openPreview, previewTargets } from '@/lib/links';
 import { checkTurn, forkAt, sendMessage } from '@/state/actions';
 import { useStore } from '@/state/store';
-import { IconButton, Tip } from '@/ui';
+import { IconButton } from '@/ui';
 import { changesOf } from './changes';
 import { canCheckWith, checkedAlready, checkerOf } from './check-turn';
 import { useItem, useTimeline } from './ctx';
@@ -167,11 +167,10 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
             <CopyButton text={() => responseText(items(), turn)} label="Copy response" size={13} className="turn-copy" />
             <IconButton icon="fork" label="Fork from here" size={13} tipSide="top" className="turn-fork" disabled={forking} onClick={fork} />
             {canCheck && checker && (
-              <Tip label={`Check with ${PROVIDER_NAME[checker]}`} side="top">
-                <button type="button" className="icon-btn turn-check" aria-label={`Check with ${PROVIDER_NAME[checker]}`} disabled={checking} onClick={check}>
-                  <ProviderMark provider={checker} size={12} />
-                </button>
-              </Tip>
+              <button type="button" className="preview-btn turn-check" disabled={checking} onClick={check}>
+                <ProviderMark provider={checker} size={12} />
+                <span className="preview-name">Check with {PROVIDER_NAME[checker]}</span>
+              </button>
             )}
           </span>
         )}

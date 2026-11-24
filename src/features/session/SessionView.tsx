@@ -61,6 +61,21 @@ export function SessionLight({ sessionId }: { sessionId: string }) {
 }
 
 /**
+ * How high above the dock's bottom edge the composer's cove begins (the pane's lower edge plus its
+ * `--cove-cut`), read from the layout, never from a drawn box: the composer may be gliding in. The
+ * conversation ends there (timeline.css `.tl-scroll` clip): nothing of it shows in the cove round
+ * the send key or beside the pane's lower corners. 0 when there is no composer.
+ */
+function coveTop(dock: HTMLElement): number {
+  const card = dock.querySelector<HTMLElement>('.cmp-card');
+  if (!card) return 0;
+  let top = 0;
+  for (let n: HTMLElement | null = card; n && n !== dock; n = n.offsetParent as HTMLElement | null) top += n.offsetTop;
+  const cut = parseFloat(getComputedStyle(card).getPropertyValue('--cove-cut')) || 0;
+  return Math.max(0, dock.offsetHeight - top - card.offsetHeight) + cut;
+}
+
+/**
  * What waits above the conversation's end: the prompt cards and the composer. One instance for
  * every session (App keeps it mounted across switches); its contents follow the session.
  */
@@ -83,6 +98,7 @@ export function SessionDock({ sessionId }: { sessionId: string }) {
     const ro = new ResizeObserver(() => {
       const h = el.offsetHeight;
       host.style.setProperty('--dock-h', `${h}px`);
+      host.style.setProperty('--dock-cut', `${coveTop(el)}px`);
       // A card arriving under the task strip, or leaving: the strip stood at the dock's upper edge
       // and jumped the card's height in one frame. It glides there instead (the conversation does
       // the same, Timeline.tsx). Only a strip that was already in view, never one that is entering.
@@ -93,7 +109,11 @@ export function SessionDock({ sessionId }: { sessionId: string }) {
       strip = now;
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      // No dock, no cove: a view without one (a race) keeps its whole conversation.
+      host.style.removeProperty('--dock-cut');
+    };
   }, [exists]);
 
   if (!exists) return null;

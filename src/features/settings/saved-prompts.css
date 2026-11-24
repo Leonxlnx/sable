@@ -4,6 +4,17 @@
   padding: 0;
 }
 
+.sp-card[hidden] {
+  display: none;
+}
+
+/* The empty sentence on the toolbar's line, on the page's left edge. */
+.set-toolbar > .sp-empty {
+  display: block;
+  padding: 0;
+  text-align: left;
+}
+
 .sp-list {
   margin: 0;
   padding: 0;

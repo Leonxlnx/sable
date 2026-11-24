@@ -134,12 +134,13 @@ export function useQuestionAnswers(req: QuestionRequest, deliver: (answers: Reco
   };
 }
 
-/** The header chip and the stepper between questions; `children` (a count) sits at its end. */
+/** The stepper between questions, on the question's first line at the card's right; `children` (a count) sits before it.
+ *  The question's own header ("Logger") is not shown: a kicker above the question only repeats it. */
 export function QuestionHead({ x, children }: { x: QuestionAnswers; children?: ReactNode }) {
-  const { q, qs, step, last } = x;
+  const { qs, step, last } = x;
   return (
     <header className="qc-head">
-      {q?.header && <span className="qc-chip">{q.header}</span>}
+      {children}
       {qs.length > 1 && (
         <div className="qc-stepper">
           <button type="button" className="icon-btn qc-step" aria-label="Previous question" disabled={step === 0} onClick={() => x.go(step - 1)}>
@@ -153,7 +154,6 @@ export function QuestionHead({ x, children }: { x: QuestionAnswers; children?: R
           </button>
         </div>
       )}
-      {children}
     </header>
   );
 }
@@ -281,13 +281,19 @@ export function QuestionCard({ sessionId, req, more }: { sessionId: string; req:
   if (!q) return null;
 
   return (
-    <section ref={card} className="pc qc glass-card" data-spot aria-label="Questions from the agent">
+    <section
+      ref={card}
+      className="pc qc glass-card"
+      data-spot
+      data-head={qs.length > 1 ? (more > 0 ? 'both' : 'step') : more > 0 ? 'more' : undefined}
+      aria-label="Questions from the agent"
+    >
       <QuestionHead x={x}>{more > 0 && <span className="pc-more">{more} more waiting</span>}</QuestionHead>
 
       <QuestionPage x={x} onFieldEscape={() => focusComposer()} />
 
       <div className="pc-foot qc-foot">
-        <button type="button" className="btn btn-ghost" disabled={sent} onClick={() => x.send(true)}>
+        <button type="button" className="btn btn-ghost qc-skip" disabled={sent} onClick={() => x.send(true)}>
           Skip
         </button>
         <span className="grow" />

@@ -400,8 +400,14 @@ a.md-file:focus-visible,
 .md hr {
   height: 1px;
   border: 0;
-  margin: 1.9em 0;
+  margin: 1.6em 0;
   background: var(--line-2);
+}
+
+/* The same space above the rule as below it, whatever stands before it: the spacing rules of a
+   code block or a callout (`.md > .cb + *`) would otherwise set its top. */
+.md > hr:not(:first-child) {
+  margin-top: 1.6em;
 }
 
 .md > hr + * {

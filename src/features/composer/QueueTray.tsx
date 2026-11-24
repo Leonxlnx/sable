@@ -232,8 +232,8 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
 
   return (
     <>
+      {/* The words of the head and of every row start where the field's own words do (16 in). */}
       <div className="cq-head">
-        <Icon name="queue" size={14} className="cq-head-icon" />
         <span className="cq-title">Queued</span>
         <Roll value={queue.length} className="cq-count num" />
       </div>
@@ -353,19 +353,16 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
       onKeyDown={onKey}
       onDoubleClick={(e) => !(e.target as HTMLElement).closest('button') && onEdit()}
     >
+      {/* No number before the words: the order is the list's own, and the text keeps the field's edge. */}
+      <span className="cq-text truncate">{text || ' '}</span>
       {/* Kept from a Spare wait: it goes out only when sent by hand, not when the turn ends. */}
-      {q.byHand ? (
+      {q.byHand && (
         <Tip label="Goes out when you send it" side="top">
           <span className="cq-n" data-hand>
             <Icon name="hand" size={12} />
           </span>
         </Tip>
-      ) : (
-        <span className="cq-n num" aria-hidden>
-          {i + 1}
-        </span>
       )}
-      <span className="cq-text truncate">{text || ' '}</span>
       {atts > 0 && (
         <span className="cq-att" aria-hidden>
           <Icon name="attach" size={12} />

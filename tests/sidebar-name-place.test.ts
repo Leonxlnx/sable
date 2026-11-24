@@ -8,13 +8,15 @@ describe('a chat renamed in place moves no letter', () => {
   const row = read('src/features/sidebar/SessionRow.tsx');
 
   it('puts the field’s words exactly where the title’s stood, in the title’s weight', () => {
-    // The title starts 36 px into the row; the field's words start at its margin + 1 px edge + 6 px padding.
-    expect(css).toMatch(/\.srow-main \{[^}]*padding: 0 44px 0 36px;/);
+    // The title starts 32 px into the row (the row stands 6 px in, the sidebar's one inset); the
+    // field's words start at its margin + 1 px edge + 6 px padding.
+    expect(css).toMatch(/\.srow-main \{[^}]*padding: 0 42px 0 32px;/);
     expect(css).toMatch(/\.srow-rename,\n\.sgroup-rename \{[^}]*padding: 0 6px;\n  border: 1px solid/);
-    expect(css).toMatch(/\.srow-rename \{\n  margin-left: 29px;\n\}/);
-    // An open or unread chat's title is medium: so is its field.
-    expect(css).toMatch(/\.srow\[data-active\] \.srow-title,\n\.srow\[data-unread\] \.srow-title \{[^}]*font-weight: var\(--w-medium\);/);
-    expect(css).toMatch(/\.srow\[data-active\] \.srow-rename,\n\.srow\[data-unread\] \.srow-rename \{\n  font-weight: var\(--w-medium\);\n\}/);
+    expect(css).toMatch(/\.srow-rename \{\n  margin-left: 25px;\n\}/);
+    // Every title is regular (the weight budget: an open or unread chat says so by its ink), so the
+    // field needs no weight of its own.
+    expect(css).not.toMatch(/\.srow\[data-active\] \.srow-title,\n\.srow\[data-unread\] \.srow-title \{[^}]*font-weight/);
+    expect(css).not.toMatch(/\.srow\[data-active\] \.srow-rename/);
   });
 
   it('shows the new name from the frame the field goes, until the bridge has answered', () => {

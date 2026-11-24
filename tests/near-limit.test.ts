@@ -132,3 +132,27 @@ describe('limit warnings with several accounts (use first)', () => {
     expect(texts().map((t) => t.text)).toEqual(['Claude Code (Main) has used 85% of the 5-hour limit', 'Claude Code (Work) has used up the 5-hour limit']);
   });
 });
+
+describe('limit warnings at start: a state known before this launch is not news', () => {
+  it('says nothing for the levels hello brings, and warns for a crossing after it', () => {
+    S.useStore.setState({ ready: false });
+    // Hello: ready and the cached figures in one write (store.ts applies them together).
+    S.useStore.setState({ ready: true, limits: { claude: [win(100, 'Weekly limit')] } });
+    expect(texts()).toEqual([]);
+    // The fresh read says the same: still nothing new.
+    S.useStore.setState({ limits: { claude: [win(100, 'Weekly limit')] } });
+    expect(texts()).toEqual([]);
+    // It resets, then crosses 80% while the app runs: that is news.
+    S.useStore.setState({ limits: { claude: [win(10, 'Weekly limit')] } });
+    S.useStore.setState({ limits: { claude: [win(84, 'Weekly limit')] } });
+    expect(texts()).toEqual([{ text: 'Claude Code has used 84% of the weekly limit', level: 'warn' }]);
+  });
+
+  it('says nothing for a report read before the watch began', () => {
+    S.useStore.setState({
+      limitReports: { claude: { provider: 'claude', accountId: 'default', limits: [win(100)], readAt: Date.now() - 60_000, history: {}, pace: {} } as never },
+      limits: { claude: [win(100)] },
+    });
+    expect(texts()).toEqual([]);
+  });
+});

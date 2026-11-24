@@ -46,15 +46,13 @@
   height: 28px;
   margin-right: 4px;
   padding: 0 9px 0 8px;
-  border: 1px solid var(--line-2);
+  /* The bar is the field: its well is a darker fill with no hairline of its own, so the glass rim
+     stays the one outline (a second ring 4 px inside it, ivory while typing, read as two fields). */
+  border: 1px solid transparent;
   border-radius: calc(var(--r-xl) - 6px);
   background-color: var(--well-strong);
   color: var(--text-3);
   cursor: text;
-}
-
-.cfind-field:focus-within {
-  border-color: var(--focus-field);
 }
 
 .cfind-field input {

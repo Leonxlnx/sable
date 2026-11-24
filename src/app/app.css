@@ -438,16 +438,17 @@
   transform: scaleX(-1);
 }
 
-/* The context ring and its figure: an icon button with a number, same height, pill and timing. */
+/* The chat's context as a word and its figure ("Context 11%"): an icon button's height, pill and
+   timing; its words stand as far from its edges as the icons beside it stand from theirs. */
 .ctx-meter {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   height: 28px;
-  padding: 0 9px 0 6px;
+  padding: 0 7px;
   border-radius: var(--r-ctl);
   font-size: var(--t-small);
-  font-weight: var(--w-medium);
+  font-weight: var(--w-regular);
   color: var(--text-3);
   transition:
     background-color var(--d-1) var(--ease),
@@ -455,8 +456,13 @@
     scale var(--d-spring-soft) var(--spring-soft);
 }
 
-.ctx-meter svg {
-  flex-shrink: 0;
+.ctx-meter .num {
+  color: var(--text-2);
+}
+
+.ctx-meter:hover .num,
+.ctx-meter[data-warn] .num {
+  color: inherit;
 }
 
 .ctx-meter:hover {
@@ -785,10 +791,12 @@ html[data-desktop='darwin']:not([data-fs]) .app[data-sidebar='false'] .topbar {
 
 /* ── toasts ── */
 
+/* On the stage's bottom-right inset, above the composer in a chat (`placeToasts` in ui/index.tsx
+   measures both; the numbers here are its first frame's). */
 .toasts {
   position: fixed;
-  right: 18px;
-  bottom: 18px;
+  right: var(--toast-r, 18px);
+  bottom: var(--toast-b, 18px);
   z-index: var(--z-toast);
   display: flex;
   flex-direction: column;
@@ -800,7 +808,7 @@ html[data-desktop='darwin']:not([data-fs]) .app[data-sidebar='false'] .topbar {
 /* In a session they rise above the composer (its rest height and the stage's gap), so a toast never
    covers the send key, the model or the mode while it is up. */
 body:has(.stage-dock) .toasts {
-  bottom: calc(var(--gap) + 124px);
+  bottom: var(--toast-b, calc(var(--gap) + 124px));
 }
 
 .toast {
