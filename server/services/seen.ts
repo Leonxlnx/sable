@@ -10,7 +10,7 @@
  * lane, a stage) while nothing the agent wrote changed, and the diff of the seen content against the
  * content now is exactly "what is new since I looked". The signature is git's own blob id of the
  * working-tree bytes (`sha1("blob <n>\0" + bytes)`, what `git hash-object --no-filters` gives), so a
- * test can ask git; a deletion is `deleted`; a file over `HASH_MAX` (or past the read budget) is
+ * test can ask git; a deletion is `deleted`; a file over `HASH_MAX` is
  * signed by its size and change time (`big:`), so it reads as new once it changes at all.
  *
  * A chat's first turn records where it began (`base`): the working tree's signatures then count as
@@ -30,15 +30,15 @@
  * is closed except one look when a turn starts (the chat's first only, for `base`) and one when a
  * turn ends (for the count, only in a chat that has seen states), one at a time across chats.
  */
-import { createHash } from 'node:crypto';
+import { createHash, webcrypto } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { lstat, open, type FileHandle } from 'node:fs/promises';
+import { type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { FileDiff, GitFileStatus, SeenFile, SeenMarkResult, SeenState } from '../../shared/protocol';
 import { makeFileDiff } from '../../shared/diff';
-import { within } from '../core/contain';
+import { folderNow, type FolderRoot } from '../core/contain';
 import type { App } from '../app';
-import { gitStatus, repoRoot } from './git';
+import { gitStatus, openOwnFile, repoRoot } from './git';
 
 /** Files a chat keeps a seen state for. */
 export const MAX_FILES = 300;
@@ -95,7 +95,7 @@ export function classify(files: readonly { path: string; oldPath?: string; hash:
     const was = own ?? (f.oldPath ? seen[f.oldPath] : undefined);
     if (!was) return { path: f.path, hash: f.hash, state: 'new' };
     if (was.h === f.hash) return { path: f.path, hash: f.hash, state: 'seen', at: was.at, ...(was.base ? { base: true } : {}) };
-    return { path: f.path, hash: f.hash, state: 'again', at: was.at, ...(was.t !== undefined && !f.hash.startsWith('big:') && f.hash !== 'deleted' ? { since: true } : {}), ...(was.base ? { base: true } : {}) };
+    return { path: f.path, hash: f.hash, state: 'again', at: was.at, ...(was.t !== undefined && !f.hash.startsWith('big:') && f.hash !== 'deleted' && f.hash !== 'link' ? { since: true } : {}), ...(was.base ? { base: true } : {}) };
   });
 }
 
@@ -135,22 +135,28 @@ export function diffSince(file: string, seenText: string | undefined, nowText: s
 
 /**
  * A file's bytes by its own name, under `root` (never through a link, only a plain file), at most
- * `max` bytes: `big` with its size and change time when it is larger. Null when it cannot be read.
+ * HASH_MAX bytes. Reserve the bytes before reading so concurrent reads share the same budget.
  */
-async function readOwn(file: string, root: string, max: number): Promise<{ bytes: Buffer } | { big: string } | null> {
-  if (!within(root, file)) return null;
+async function readOwn(file: string, root: FolderRoot, reserve: (bytes: number) => boolean, deadline?: number): Promise<{ bytes: Buffer; blob: Buffer<ArrayBuffer> } | { big: string } | 'link' | 'skipped' | null> {
   let fh: FileHandle | undefined;
   try {
-    const own = await lstat(file, { bigint: true });
-    if (own.isSymbolicLink() || !own.isFile()) return null;
-    if (own.size > BigInt(max)) return { big: `big:${own.size}:${own.mtimeNs}` };
-    fh = await open(file, 'r');
-    const st = await fh.stat({ bigint: true });
-    if (!st.isFile() || st.ino !== own.ino || st.dev !== own.dev) return null;
-    if (st.size > BigInt(max)) return { big: `big:${st.size}:${st.mtimeNs}` };
-    const buf = Buffer.alloc(Number(st.size));
-    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-    return { bytes: buf.subarray(0, bytesRead) };
+    const got = await openOwnFile(file, root, deadline);
+    if (!got || typeof got === 'string') return got === 'link' ? 'link' : null;
+    fh = got.fh;
+    const st = got.st;
+    if (st.size > BigInt(HASH_MAX)) return { big: `big:${st.size}:${st.mtimeNs}` };
+    if (!reserve(Number(st.size))) return 'skipped';
+    const header = `blob ${st.size}\0`;
+    const blob = Buffer.allocUnsafeSlow(header.length + Number(st.size));
+    blob.write(header, 0, 'ascii');
+    const bytes = blob.subarray(header.length);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await fh.read(bytes, offset, bytes.length - offset, offset);
+      if (!bytesRead) return null;
+      offset += bytesRead;
+    }
+    return { bytes, blob };
   } catch {
     return null;
   } finally {
@@ -164,34 +170,63 @@ const textOf = (bytes: Buffer): string | undefined => (bytes.length > TEXT_MAX *
  * The changed files of `cwd` as git lists them, each signed. Null outside a repository. `only`:
  * just these paths (still only when git lists them).
  */
-export async function signTree(cwd: string, only?: ReadonlySet<string>): Promise<{ files: (Signed & { oldPath?: string; status: string })[] } | null> {
+export async function signTree(cwd: string, only?: ReadonlySet<string>, limits?: { ms: number; entries: number }) {
   const dir = path.resolve(cwd);
-  const st = await gitStatus(dir);
-  if (!st.isRepo) return null;
-  const root = await repoRoot(dir);
-  if (!root) return null;
-  const listed = only ? st.files.filter((f) => only.has(f.path)) : st.files;
+  const deadline = limits ? performance.now() + limits.ms : undefined;
+  let stopped = false;
+  const expired = () => stopped || (deadline !== undefined && performance.now() >= deadline);
+  const files: (Signed & { oldPath?: string; status: string })[] = [];
+  const snapshot = (partial: boolean) => ({ files: files.filter(Boolean), partial });
   let budget = READ_BUDGET;
-  const out: (Signed & { oldPath?: string; status: string })[] = [];
-  for (let i = 0; i < listed.length; i += 8) {
-    const batch = listed.slice(i, i + 8);
-    const signed = await Promise.all(batch.map((f) => signOne(dir, root, f, () => budget)));
-    for (const s of signed) {
-      if (s.read) budget -= s.read;
-      out.push(s.file);
+  const reserve = (n: number) => {
+    if (expired() || n > budget) return false;
+    budget -= n;
+    return true;
+  };
+  const collect = async () => {
+    const top = await repoRoot(dir, limits?.ms);
+    if (expired()) return snapshot(true);
+    if (!top) return null;
+    const root = await folderNow(top);
+    if (typeof root !== 'object') return null;
+    if (expired()) return snapshot(true);
+    const st = await gitStatus(dir, { namesOnly: true, top, deadline, maxEntries: limits?.entries });
+    if (!st.isRepo) return null;
+    const listed = only ? st.files.filter(f => only.has(f.path)) : st.files;
+    let partial = !!st.partial;
+    for (let i = 0; i < listed.length; i += 8) {
+      if (expired()) return snapshot(true);
+      await Promise.all(listed.slice(i, i + 8).map(async (f, j) => {
+        const file = await signOne(dir, root, f, reserve, deadline);
+        if (file) files[i + j] = file;
+        else partial = true;
+      }));
     }
-  }
-  return { files: out };
+    return snapshot(partial || expired());
+  };
+  if (!limits) return collect();
+  // A slow filesystem operation already in progress can finish and close its handle later.
+  // The next chat gets the queue back at the deadline, with an immutable snapshot of this look.
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([collect(), new Promise<ReturnType<typeof snapshot>>(resolve => {
+      timer = setTimeout(() => { stopped = true; resolve(snapshot(true)); }, Math.max(0, deadline! - performance.now()));
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
-async function signOne(dir: string, root: string, f: GitFileStatus, budget: () => number): Promise<{ file: Signed & { oldPath?: string; status: string }; read?: number }> {
+async function signOne(dir: string, root: FolderRoot, f: GitFileStatus, reserve: (bytes: number) => boolean, deadline?: number): Promise<(Signed & { oldPath?: string; status: string }) | null> {
   const base = { path: f.path, status: f.status, ...(f.oldPath ? { oldPath: f.oldPath } : {}) };
-  if (f.status === 'D') return { file: { ...base, hash: 'deleted' } };
-  const got = await readOwn(path.resolve(dir, f.path), root, Math.min(HASH_MAX, Math.max(0, budget())));
-  if (!got) return { file: { ...base, hash: 'unreadable' } };
-  if ('big' in got) return { file: { ...base, hash: got.big } };
+  if (f.status === 'D') return { ...base, hash: 'deleted' };
+  const got = await readOwn(path.resolve(dir, f.path), root, reserve, deadline);
+  if (got === 'skipped') return null;
+  if (got === 'link') return { ...base, hash: 'link' };
+  if (!got) return { ...base, hash: 'unreadable' };
+  if ('big' in got) return { ...base, hash: got.big };
   const text = textOf(got.bytes);
-  return { file: { ...base, hash: blobId(got.bytes), ...(text !== undefined ? { text } : {}) }, read: got.bytes.length };
+  // WebCrypto dispatches the digest to Node's native worker pool.
+  const digest = await webcrypto.subtle.digest('SHA-1', got.blob);
+  return { ...base, hash: Buffer.from(digest).toString('hex'), ...(text !== undefined ? { text } : {}) };
 }
 
 // ───────────────────────────── the store ─────────────────────────────
@@ -233,6 +268,7 @@ export class SeenStore {
       this.cache.set(id, data);
     }
     if (!sameDir(data.cwd, cwd)) {
+      this.known.set(id, false);
       data = { v: 1, cwd, files: {} };
       this.cache.set(id, data);
     }
@@ -365,15 +401,15 @@ export class SeenService {
     return run;
   }
 
-  private setCount(sessionId: string, n: number | undefined) {
+  private setCount(sessionId: string, n: number | undefined, many = false) {
     const rt = this.app.sessions.get(sessionId);
-    if (rt && rt.meta.review !== (n || undefined)) rt.update({ review: n || undefined });
+    if (rt && (rt.meta.review !== (n || undefined) || !!rt.meta.reviewMany !== many)) rt.update({ review: n || undefined, reviewMany: many || undefined });
   }
 
   /** `seen.state`: every changed file, or (`path`) one file with its diff since seen. */
-  async state(sessionId: string, cwd: string, only?: string): Promise<SeenState> {
+  async state(sessionId: string, cwd: string, only?: string, limits?: { ms: number; entries: number }): Promise<SeenState> {
     const dir = this.folder(sessionId, cwd);
-    const tree = await this.serial(() => signTree(dir, only ? new Set([only]) : undefined));
+    const tree = await this.serial(() => signTree(dir, only ? new Set([only]) : undefined, limits));
     if (!tree) {
       if (!only) this.setCount(sessionId, undefined);
       return { repo: false, files: [] };
@@ -381,8 +417,9 @@ export class SeenService {
     const data = this.store.read(sessionId, dir);
     const files = classify(tree.files, data.files);
     if (!only) {
-      this.setCount(sessionId, this.store.has(sessionId) ? toReview(files) : undefined);
-      return { repo: true, files };
+      const known = this.store.has(sessionId);
+      this.setCount(sessionId, known ? toReview(files) : undefined, known && tree.partial);
+      return { repo: true, files, ...(tree.partial ? { partial: true } : {}) };
     }
     const f = files[0];
     const signed = tree.files[0];
@@ -422,34 +459,53 @@ export class SeenService {
     return { ok: true, undo, ...(await this.state(sessionId, dir)) };
   }
 
+  private startedIn = new Map<string, string>();
+
   /** A chat's first turn: the working tree as it was counts as seen (`SeenEntry.base`). */
   async begin(sessionId: string) {
     const rt = this.app.sessions.get(sessionId);
-    const cwd = rt?.meta.cwd;
-    if (!cwd || this.store.has(sessionId)) return;
-    const tree = await this.serial(() => signTree(cwd));
-    if (!tree || this.store.has(sessionId) || !this.app.sessions.has(sessionId)) return;
-    const now = Date.now();
-    const files: Record<string, SeenEntry> = {};
-    for (const s of tree.files) files[s.path] = { h: s.hash, at: now, base: true, ...(s.text !== undefined ? { t: s.text } : {}) };
-    // An empty start is recorded too: from now on this chat counts what it changes.
-    this.store.write(sessionId, { v: 1, cwd, files });
+    if (!rt || this.startedIn.get(sessionId) === rt.meta.cwd) return;
+    let cwd: string;
+    do {
+      cwd = rt.meta.cwd;
+      if (!cwd) return;
+      await this.serial(async () => {
+        if (rt.meta.cwd !== cwd || this.app.sessions.get(sessionId) !== rt) return;
+        if (this.startedIn.get(sessionId) === cwd) return;
+        this.store.read(sessionId, cwd);
+        if (this.store.has(sessionId)) { this.startedIn.set(sessionId, cwd); return; }
+        const tree = await signTree(cwd);
+        if (rt.meta.cwd !== cwd || this.app.sessions.get(sessionId) !== rt) return;
+        if (!tree || this.store.has(sessionId)) { this.startedIn.set(sessionId, cwd); return; }
+        const now = Date.now();
+        const files: Record<string, SeenEntry> = {};
+        for (const s of tree.files) files[s.path] = { h: s.hash, at: now, base: true, ...(s.text !== undefined ? { t: s.text } : {}) };
+        this.store.write(sessionId, { v: 1, cwd, files });
+        this.startedIn.set(sessionId, cwd);
+      });
+    } while (cwd !== rt.meta.cwd && this.app.sessions.get(sessionId) === rt);
+  }
+
+  remove(sessionId: string) {
+    this.startedIn.delete(sessionId);
+    this.store.remove(sessionId);
   }
 
   /** A turn ended: the chat's count, where it has seen states. */
-  async end(sessionId: string) {
+  async end(sessionId: string, limits = { ms: 400, entries: 2000 }) {
     const rt = this.app.sessions.get(sessionId);
     if (!rt?.meta.cwd || !this.store.has(sessionId)) return;
-    await this.state(sessionId, rt.meta.cwd).catch(() => {});
+    return this.state(sessionId, rt.meta.cwd, undefined, limits);
   }
 }
 
 export function registerSeen(app: App): SeenService {
   const s = new SeenService(app);
+  app.beforeFirstInput = id => s.begin(id);
   // Chats that are gone take their seen states with them.
   s.store.prune((id) => app.sessions.has(id));
   const timers = new Map<string, NodeJS.Timeout>();
-  const later = (id: string, fn: () => Promise<void>, ms: number) => {
+  const later = (id: string, fn: () => Promise<unknown>, ms: number) => {
     clearTimeout(timers.get(id));
     timers.set(
       id,
@@ -465,7 +521,7 @@ export function registerSeen(app: App): SeenService {
       clearTimeout(timers.get(e.id));
       timers.delete(e.id);
       was.delete(e.id);
-      s.store.remove(e.id);
+      s.remove(e.id);
       return;
     }
     // A chat made just now records where it begins at once, before its first turn can change anything.
@@ -477,8 +533,7 @@ export function registerSeen(app: App): SeenService {
     const prev = was.get(e.id);
     const now = e.patch.status;
     was.set(e.id, now);
-    if (now === 'running' && prev !== 'running' && prev !== 'awaiting') void s.begin(e.id).catch(() => {});
-    else if ((now === 'idle' || now === 'error') && (prev === 'running' || prev === 'awaiting')) later(e.id, () => s.end(e.id), 1200);
+    if ((now === 'idle' || now === 'error') && (prev === 'running' || prev === 'awaiting')) later(e.id, () => s.end(e.id), 1200);
   });
   app.onDispose(() => {
     off();

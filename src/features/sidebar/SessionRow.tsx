@@ -1,7 +1,7 @@
 import { createContext, memo, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type KeyboardEvent, type ReactNode, type SetStateAction } from 'react';
 import { ContextMenu as RC, DropdownMenu as RM } from 'radix-ui';
 import { DEFAULT_ACCOUNT, type SessionMeta } from '@shared/protocol';
-import { statusLabel, statusTone } from './status';
+import { sameShown, statusLabel, statusTone } from './status';
 import { PROVIDER_NAME, ProviderMark, StatusGlyph } from '@/art/Logo';
 import { fieldBeat } from '@/art/events';
 import { SpareClock, spareLine } from '@/features/composer/SpareStrip';
@@ -40,9 +40,7 @@ const useRenaming = (id: string) => useSyncExternalStore(subscribeRename, () => 
 
 export const SidebarRowContext = createContext<RowCtx>({ setRenaming, askDelete: () => {} });
 
-/** The fields a row shows. Anything else changing on a session (usage, model, options) must not re-render it. */
-const SHOWN = ['id', 'title', 'status', 'unread', 'pinned', 'archived', 'updatedAt', 'activity', 'lastError', 'provider', 'accountId', 'spare', 'background', 'commands'] as const;
-const sameShown = (a: SessionMeta, b: SessionMeta) => SHOWN.every((k) => a[k] === b[k]) && a.until?.phase === b.until?.phase;
+
 
 // ── what each row shows, from one store subscription for the whole list ──
 
@@ -388,6 +386,8 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
   // Waiting to start by itself (Spare): a small clock where the time or the status mark sits. A chat
   // that stopped at a limit and now waits for its reset shows the wait, not the limit's error.
   const waits = !!session.spare && tone !== 'working' && tone !== 'awaiting';
+  const review = session.reviewMany ? 'many' : session.review;
+  const reviewLabel = review === 'many' ? 'Many files to review' : review ? `${plural(review, 'file')} to review` : '';
   const label = waits ? spareLabel(session) : statusLabel(session);
   const who = whoLabel(session, mix);
   const arm = armed ? undefined : () => setArmed(true);
@@ -455,7 +455,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
             tabIndex={-1}
             data-id={session.id}
             aria-current={active ? 'page' : undefined}
-            title={[label, who, session.review ? `${plural(session.review, 'file')} to review` : ''].filter(Boolean).join(' · ') || undefined}
+            title={[label, who, reviewLabel].filter(Boolean).join(' · ') || undefined}
             onClick={() => {
               // The stage answers in this frame, also when the chat has to be fetched first.
               cueOpen(session.id);
@@ -465,7 +465,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
             onKeyDown={onKeyDown}
           >
             <span className="srow-title truncate">{title}</span>
-            <span className="sr-only">{[who ?? PROVIDER_NAME[session.provider], label, session.review ? `${plural(session.review, 'file')} to review` : ''].filter(Boolean).join(', ')}</span>
+            <span className="sr-only">{[who ?? PROVIDER_NAME[session.provider], label, reviewLabel].filter(Boolean).join(', ')}</span>
           </button>
         )}
         {/* Kept while the title is edited, only hidden: the menu Rename came from closes as any menu does. */}
@@ -474,11 +474,11 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
             <span className="srow-state" data-tone="spare">
               <SpareClock size={12} />
             </span>
-          ) : tone === 'idle' && session.review ? (
+          ) : tone === 'idle' && review ? (
             // Changed files not looked at since they changed: the Changes tab's mark and their count, where the time stands.
             <span className="srow-time srow-review num">
               <Icon name="diff" size={11} />
-              {session.review}
+              {review}
             </span>
           ) : tone === 'idle' ? (
             <RowTime ts={session.updatedAt} />

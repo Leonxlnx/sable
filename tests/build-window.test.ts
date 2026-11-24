@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { frameContent } from '../src/features/genui/WidgetFrame';
 import { MIN_TAIL, TAIL, tailStart } from '../src/features/timeline/build-window';
 
 describe('the turns a conversation builds when it opens: by estimated height', () => {
@@ -15,6 +16,16 @@ describe('the turns a conversation builds when it opens: by estimated height', (
     expect(tailStart(Array(40).fill(10), 2_400)).toBe(40 - TAIL);
     expect(tailStart([100, 100, 100], 2_400)).toBe(0);
     expect(tailStart([], 2_400)).toBe(0);
+  });
+
+  it('keeps the same tail window across a settled widget’s transient small report', () => {
+    let floor = 0;
+    const start = (h: number) => {
+      const size = frameContent({ off: false, settled: true, reserve: 160, floor, h });
+      floor = size.floor;
+      return tailStart([800, 600, size.content, 600], 900);
+    };
+    expect([start(400), start(40), start(400)]).toEqual([2, 2, 2]);
   });
 
   it('reaches a kept reading place within the count', () => {

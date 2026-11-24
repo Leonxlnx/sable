@@ -84,14 +84,25 @@ describe('a widget drawn again keeps its height until it is measured', () => {
       seen.push(r.content);
     }
     expect(seen).toEqual([394, 394, 394, 394, 394]);
-    expect(floor).toBe(0);
+    expect(floor).toBe(394);
+  });
+
+  it('holds a settled widget through 400, 40, 400 and a new smaller candidate', () => {
+    let floor = 0;
+    const frame = (h: number, shrink = false) => {
+      const size = frameContent({ settled: true, off: false, h, reserve: 160, floor, shrink });
+      floor = size.floor;
+      return size.content;
+    };
+    expect([frame(400), frame(40), frame(400), frame(80), frame(70), frame(70, true)]).toEqual([400, 400, 400, 400, 400, 70]);
+    expect([frame(400), frame(70)]).toEqual([400, 400]);
   });
 
   it('takes its measured height once drawn: taller at once, smaller once that height has stayed', () => {
-    expect(frameContent({ off: false, settled: true, h: 450, floor: 200, reserve: 200 })).toEqual({ content: 450, floor: 0 });
+    expect(frameContent({ off: false, settled: true, h: 450, floor: 200, reserve: 200 })).toEqual({ content: 450, floor: 450 });
     expect(frameContent({ off: false, settled: true, h: 150, floor: 200, reserve: 200 })).toEqual({ content: 200, floor: 200 });
     const r = frameContent({ off: false, settled: true, h: 150, floor: 200, reserve: 200, shrink: true });
-    expect(r).toEqual({ content: 150, floor: 0 });
+    expect(r).toEqual({ content: 150, floor: 150 });
     expect(frameContent({ off: true, settled: false, h: null, floor: 0, reserve: 160 }).content).toBe(52);
   });
 });

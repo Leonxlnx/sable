@@ -449,7 +449,7 @@ export interface SessionMeta {
   /** Background agents and SDK-list-only tasks lost with a process, awaiting delivery to the agent. */
   lostReports?: { key: string; name: string }[];
   /** Recent automatic lost-work sends and the permanent hold after a recovery process died promptly. */
-  lossWake?: { attempts: number[]; blocked?: true };
+  lossWake?: { attempts: number[]; blocked?: true; delivered?: string };
   /** The limit handover moved this session here from this account (its preferred one). */
   movedFrom?: string;
   /** When `movedFrom` is expected to take work again (the reset of the window that moved the chat): the chat returns then, at rest or before the next message (`App.returnAfterLimit`). */
@@ -476,6 +476,8 @@ export interface SessionMeta {
    * chat that has seen states; absent at 0.
    */
   review?: number;
+  /** The scan stopped at its budget. review counts only the files it signed. */
+  reviewMany?: boolean;
   lastError?: string;
   /** One line describing what the agent is doing right now. */
   activity?: string;
@@ -889,6 +891,7 @@ export interface DiffHunk {
 }
 
 export interface FileDiff {
+  withheld?: 'outside' | 'link' | 'big' | 'unreadable';
   path: string;
   oldPath?: string;
   status: 'modified' | 'added' | 'deleted' | 'renamed';
@@ -1273,6 +1276,7 @@ export interface DirEntry {
 }
 
 export interface GitFileStatus {
+  link?: boolean;
   path: string;
   /** Short status: M, A, D, R, ?, U */
   status: string;
@@ -1302,6 +1306,7 @@ export interface SeenFile {
 }
 
 export interface SeenState {
+  partial?: boolean;
   /** False outside a git repository: there are no seen states there. */
   repo: boolean;
   files: SeenFile[];

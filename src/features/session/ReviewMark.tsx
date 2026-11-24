@@ -11,11 +11,11 @@ import './review-mark.css';
  * which opens on New while anything is new. Nothing at 0.
  */
 export function ReviewMark({ sessionId }: { sessionId: string }) {
-  const n = useStore((s) => s.sessions[sessionId]?.review ?? 0);
+  const n = useStore((s) => s.sessions[sessionId]?.reviewMany ? 'many' : s.sessions[sessionId]?.review ?? 0);
   if (!n) return null;
   return (
     <Tip label="Open Changes">
-      <button type="button" className="review-mark" aria-label={`${plural(n, 'file')} to review. Open Changes`} onClick={() => showRailTab('changes')}>
+      <button type="button" className="review-mark" aria-label={`${n === 'many' ? 'Many files' : plural(n, 'file')} to review. Open Changes`} onClick={() => showRailTab('changes')}>
         <Icon name="diff" size={13} />
         <span className="num">{n} to review</span>
       </button>

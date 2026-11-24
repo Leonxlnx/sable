@@ -14,6 +14,16 @@
  * its failure is the current page's.
  */
 
+import type { OnBeforeRequestListenerDetails, WebRequest } from 'electron';
+
+/** Electron gives the panel session one before-request listener. */
+export function watchGuestRequests(web: Pick<WebRequest, 'onBeforeRequest'>, log: GuestLog, blocked: (d: OnBeforeRequestListenerDetails) => boolean) {
+  web.onBeforeRequest((d, cb) => {
+    if (typeof d.webContentsId === 'number') log.begin(d.webContentsId, d.id, d.resourceType === 'mainFrame');
+    cb({ cancel: blocked(d) });
+  });
+}
+
 export type GuestLine = { level: string; text: string; source?: string };
 export type GuestNet = { url: string; method: string; status?: number; error?: string };
 export type GuestEvent =

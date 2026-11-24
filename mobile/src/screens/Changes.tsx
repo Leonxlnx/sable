@@ -1,7 +1,6 @@
 import { AnimatePresence, motion } from 'motion/react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type { PhoneChangedFile, PhoneChanges } from '@shared/protocol';
-import { stripWrappers } from '@shared/synthetic';
 import { clampToHunk, linesOf, locate, newCommentId, rangeLabel, type ReviewComment } from '@desk/features/review/model';
 import { plural } from '@desk/lib/format';
 import { fit } from '@m/lib/fit';
@@ -12,7 +11,7 @@ import { diffRows, hunkIndex, rowNumber, type DiffRow, type LineRow } from '@m/l
 import { onKeyboard } from '@m/lib/keyboard';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
-import { readReview } from '@m/lib/review';
+import { changesHeading } from '@m/lib/review';
 import { useStore } from '@m/lib/store';
 import { AutoHeight } from '@m/ui/AutoHeight';
 import { Icon, type IconName } from '@m/ui/icons';
@@ -71,16 +70,8 @@ export function ChangesScreen({ id, items, lead }: { id: string; items?: string[
   const connState = useStore((s) => s.conn);
   const listed = useStore((s) => !!s.fresh);
   const desktop = useStore((s) => s.desktop);
-  const leadRaw = useStore((s) => {
-    const it = lead ? s.data[id]?.items[lead] : undefined;
-    return it?.type === 'user' ? it.text : undefined;
-  });
-  // The message that opened the turn, as the chat shows it: a review by what was typed above it, never Claude Code's wrappers.
-  const leadText = useMemo(() => {
-    if (!leadRaw) return undefined;
-    const review = readReview(leadRaw, true);
-    return review ? review.lead || 'Your review' : stripWrappers(leadRaw);
-  }, [leadRaw]);
+  const item = useStore(s => lead ? s.data[id]?.items[lead] : undefined);
+  const leadText = useMemo(() => changesHeading(item), [item]);
   const comments = useComments(id);
   const d = entry.data;
   // Comments on each file's diff as it opens from here (a turn's diff and the working tree's are different diffs).
@@ -144,7 +135,7 @@ function Meta({ items, data, leadText, status }: { items: boolean; data?: PhoneC
     );
   }
   const icon: IconName = kind === 'turn' ? 'chat' : kind === 'edits' ? 'edit' : 'branch';
-  const label = kind === 'turn' ? (leadText?.trim().split('\n')[0].slice(0, 140) ?? 'This turn') || 'This turn' : kind === 'edits' ? 'Edited in this chat' : (data?.branch ?? 'No branch');
+  const label = kind === 'turn' ? (leadText ?? 'This turn') : kind === 'edits' ? 'Edited in this chat' : (data?.branch ?? 'No branch');
   const files = data ? data.files.length + (data.more ?? 0) : 0;
   return (
     <div className="chg-meta">

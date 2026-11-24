@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { BridgeEvent, NoticeItem, PermissionRequest, QuestionRequest, SessionMeta, TimelineItem } from '../shared/protocol';
 import { Attention, answerOf, cut, decide, firstSentence, type Signal, waitingChats, wordsFor } from '../src/lib/attention';
 import { badgePixels, badgeText, readAttention, TaskbarAttention, type AttentionWindow } from '../electron/attention';
+import { sameShown } from '../src/features/sidebar/status';
 import { deckReducer, emptyDeck } from '../src/features/triage/deck';
 
 const meta = (id: string, more: Partial<SessionMeta> = {}): SessionMeta =>
@@ -80,8 +81,8 @@ describe('the rule: what a chat says', () => {
     const a = fresh();
     const out = run(a, [user('c', 1), status('c', 'running'), perm('c', 'p1'), status('c', 'awaiting'), perm('c', 'p1'), perm('c', 'p2')]);
     expect(out).toEqual([
-      { kind: 'waiting', chat: 'c', need: { kind: 'permission', id: 'p1', title: 'Run npm test', plan: false }, first: true },
-      { kind: 'waiting', chat: 'c', need: { kind: 'permission', id: 'p2', title: 'Run npm test', plan: false }, first: false },
+      { kind: 'waiting', chat: 'c', need: { kind: 'permission', id: 'p1', tool: 'bash', plan: false }, first: true },
+      { kind: 'waiting', chat: 'c', need: { kind: 'permission', id: 'p2', tool: 'bash', plan: false }, first: false },
     ]);
     // Answered: awaiting -> running is the same turn, no news; then it ends.
     expect(run(a, [{ type: 'permission.removed', sessionId: 'c', id: 'p1' }, { type: 'permission.removed', sessionId: 'c', id: 'p2' }, status('c', 'running'), status('c', 'idle')])).toHaveLength(1);
@@ -92,9 +93,26 @@ describe('the rule: what a chat says', () => {
     const a = fresh();
     const out = run(a, [perm('c', 'p', { toolName: 'ExitPlanMode', kind: 'plan', title: 'Present plan' }), question('c', 'q', 'Which logger?\nPick one.')]);
     expect(out.map((s) => s.kind === 'waiting' && s.need)).toEqual([
-      { kind: 'permission', id: 'p', title: 'Present plan', plan: true },
+      { kind: 'permission', id: 'p', tool: 'plan', plan: true },
       { kind: 'question', id: 'q', text: 'Which logger?' },
     ]);
+  });
+
+  it('refreshes a sidebar row for review and mute alone', () => {
+    const s = meta('c', { review: 1 });
+    expect(sameShown(s, { ...s, review: undefined })).toBe(false);
+    expect(sameShown(s, { ...s, muted: true })).toBe(false);
+    expect(sameShown(s, { ...s, model: 'other' })).toBe(true);
+  });
+
+  it('reconnect replaces prompts answered away and keeps the other chat waiting', () => {
+    const a = fresh(meta('a'), meta('b'));
+    run(a, [perm('a', 'old'), question('b', 'kept', 'Still waiting')]);
+    a.seedPrompts([], [{ sessionId: 'b', id: 'kept' } as QuestionRequest]);
+    expect(a.waits('a')).toBe(false);
+    expect(a.waits('b')).toBe(true);
+    expect(run(a, [user('a', 1), status('a', 'running'), status('a', 'idle')])).toMatchObject([{ kind: 'finished' }]);
+    expect(a.feed(perm('a', 'next'))[0]).toMatchObject({ first: true });
   });
 
   it('prompts known at start-up are not news', () => {
@@ -141,7 +159,11 @@ describe('the rule: what a chat says', () => {
   it('work lost and the agent woken', () => {
     const a = fresh(meta('c', { lossWake: { attempts: [1] } }));
     expect(run(a, [{ type: 'session.updated', id: 'c', patch: { lossWake: { attempts: [1] } } }])).toEqual([]);
-    expect(run(a, [{ type: 'session.updated', id: 'c', patch: { lossWake: { attempts: [1, 2] } } }])).toEqual([{ kind: 'lost', chat: 'c' }]);
+    const receipt = (attempts: number[], delivered?: string) => a.feed({ type: 'session.updated', id: 'c', patch: { lossWake: { attempts, delivered } } });
+    expect(receipt([1, 2])).toEqual([]);
+    expect(receipt([1, 2], 'batch-one')).toEqual([{ kind: 'lost', chat: 'c' }]);
+    expect(receipt([2, 3], 'batch-one')).toEqual([]);
+    expect(receipt([2, 3], 'batch-two')).toEqual([{ kind: 'lost', chat: 'c' }]);
   });
 
   it('a chat first seen mid-turn counts its end as the person s (its start was not seen)', () => {
@@ -191,11 +213,18 @@ describe('the rule: what a signal does', () => {
 
 describe('the words', () => {
   it('title is the chat s name; the body says what it needs', () => {
-    expect(wordsFor({ kind: 'waiting', chat: 'c', first: true, need: { kind: 'permission', id: 'p', title: 'Run npm test', plan: false } }, 'Fix the login')).toEqual({ title: 'Fix the login', body: 'Waits for approval: Run npm test' });
-    expect(wordsFor({ kind: 'waiting', chat: 'c', first: true, need: { kind: 'permission', id: 'p', title: 'Present plan', plan: true } }, 'x').body).toBe('Plan to approve');
+    expect(wordsFor({ kind: 'waiting', chat: 'c', first: true, need: { kind: 'permission', id: 'p', tool: 'bash', plan: false } }, 'Fix the login')).toEqual({ title: 'Fix the login', body: 'Waits for approval: Run a command' });
+    expect(wordsFor({ kind: 'waiting', chat: 'c', first: true, need: { kind: 'permission', id: 'p', tool: 'plan', plan: true } }, 'x').body).toBe('Plan to approve');
     expect(wordsFor({ kind: 'finished', chat: 'c' }, '').title).toBe('Untitled');
-    expect(wordsFor({ kind: 'finished', chat: 'c', answer: 'Done.' }, 'x').body).toBe('Finished: Done.');
-    expect(wordsFor({ kind: 'failed', chat: 'c', error: 'Exit 1' }, 'x').body).toBe('Failed: Exit 1');
+    expect(wordsFor({ kind: 'finished', chat: 'c', answer: 'Done.' }, 'x').body).toBe('Finished');
+    expect(wordsFor({ kind: 'failed', chat: 'c', error: 'Exit 1' }, 'x').body).toBe('Failed');
+    for (const [kind, label] of [['edit', 'Edit a file'], ['fetch', 'Read a page']] as const) {
+      const [signal] = fresh().feed(perm('c', 'p', { kind, title: 'Private project details' }));
+      expect(wordsFor(signal, 'Chat')).toEqual({ title: 'Chat', body: 'Waits for approval: ' + label });
+    }
+    expect(wordsFor(fresh().feed(question('c', 'q', 'Private question?'))[0], 'Chat').body).toBe('Asks you a question');
+    expect(wordsFor(fresh().feed(limitCard('c', 'l', { provider: 'demo', window: 'Weekly' }))[0], 'Chat').body).toBe('Limit reached');
+    expect(wordsFor({ kind: 'lost', chat: 'c' }, 'Chat').body).toBe('Background work was lost');
   });
 
   it('a long sentence is cut at a word, never mid-word', () => {

@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_ACCOUNT, type NoticeItem, type ProviderId, type SessionOptions, type TimelineItem, type ToolItem, type UserItem } from '@shared/protocol';
 import { AUTH_FAILURE_TEXT, RESUME_UNDER_ANOTHER, parseSynthetic, stripWrappers } from '@shared/synthetic';
 import type { RateLimit, SessionMeta } from '@shared/protocol';
+import { Attention } from '../src/lib/attention';
 import { updateWaits } from '../server/services/update';
 import { App, NotNow } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
@@ -1522,6 +1523,66 @@ describe('a move Sable makes by itself waits for work in the background (D1, E3)
     expect(h.ctl.sent).toHaveLength(0);
     expect(rt.pendingLost().names.join()).toContain('Waiting for CI');
     if (action === 'held phone mode') expect(rt.dangerHeld).toBe(true);
+  });
+
+  it('keeps the phone mode held through an automatic reset', async () => {
+    const h = start(), rt = await chat(h, DEFAULT_ACCOUNT);
+    rt.beginTurn();
+    await h.app.call('session.setMode', { sessionId: rt.id, mode: 'bypassPermissions', answerWaiting: false });
+    rt.endTurn();
+    const card = rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'Limit', limit: { origin: 'background', provider: 'demo' } });
+    const planner = h.app as unknown as { startSpare(rt: SessionRuntime, account: string, wait: { reason: 'reset'; refusalId: string }): Promise<void> };
+    await planner.startSpare(rt, DEFAULT_ACCOUNT, { reason: 'reset', refusalId: card.id });
+    expect(rt.dangerHeld).toBe(true);
+    expect(h.ctl.sent).toEqual([]);
+    expect(rt.get<NoticeItem>(card.id)?.limit?.continuedWith).toBeUndefined();
+  });
+
+  it('a delayed loss stays on its original account after a manual move', async () => {
+    const h = start(), { studio, work } = await twoAccounts(h);
+    const rt = await chat(h, studio.id);
+    rt.update({ lossWake: { attempts: [Date.now() - 599_650, Date.now()] } });
+    command(rt, 'Collect reports', 'reports');
+    rt.tasksLost('process', 'capability');
+    await tick(25);
+    await h.app.call('session.switchAccount', { sessionId: rt.id, accountId: work.id });
+    await tick(400);
+    expect(h.ctl.sent).toEqual([]);
+    await h.app.call('session.send', { sessionId: rt.id, text: 'Check on the reports' });
+    expect(h.ctl.sent[0].text).toContain('Collect reports');
+  });
+
+  it('a confirmed personal turn frees recovery from an older refusal', async () => {
+    const h = start(), rt = await chat(h, DEFAULT_ACCOUNT);
+    rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'Limit', limit: { origin: 'user', provider: 'demo' } });
+    await h.app.call('session.send', { sessionId: rt.id, text: 'hi again' });
+    await until(() => !rt.turnActive, 'the later successful turn');
+    command(rt, 'Collect reports', 'reports');
+    rt.tasksLost('process', 'capability');
+    await until(() => h.ctl.sent.length === 2, 'recovery after the personal turn', 1000);
+    expect(h.ctl.sent[1].text).toContain('Collect reports');
+  });
+
+  it.each([false, true])('announces a loss only after the provider accepts it (accepted %s)', async accepted => {
+    const h = start(), rt = await chat(h, DEFAULT_ACCOUNT);
+    const tracker = new Attention();
+    tracker.seed([rt.meta]);
+    const news: string[] = [];
+    const off = h.app.subscribe(event => news.push(...tracker.feed(event).map(signal => signal.kind)));
+    const entered = gate(), reply = gate(), done = gate();
+    rt.handle!.send = async () => {
+      entered.release();
+      await reply.wait;
+      done.release();
+      if (!accepted) throw Error('input was rejected');
+    };
+    command(rt, 'Collect reports', 'reports');
+    rt.tasksLost('process', 'capability');
+    try {
+      await entered.wait;
+      expect(news).not.toContain('lost');
+    } finally { reply.release(); await done.wait; await tick(); off(); }
+    expect(news.filter(kind => kind === 'lost')).toHaveLength(accepted ? 1 : 0);
   });
 
   it('a personal send in flight receives the loss instead of a second send', async () => {

@@ -16,7 +16,7 @@ import { isLeadIn } from '@/features/timeline/lead-in';
 
 /** What a chat waits on the person for. `id`: the prompt's or the limit card's id. */
 export type Need =
-  | { kind: 'permission'; id: string; title: string; plan: boolean }
+  | { kind: 'permission'; id: string; tool: PermissionRequest['kind']; plan: boolean }
   | { kind: 'question'; id: string; text: string }
   | { kind: 'limit'; id: string; text: string };
 
@@ -48,10 +48,10 @@ interface Chat {
   prompts: Set<string>;
   /** Limit cards that owe a decision. */
   limits: Set<string>;
-  losses: number;
+  delivered?: string;
 }
 
-const blank = (): Chat => ({ until: false, byPerson: false, sawStart: false, changed: false, review: 0, texts: [], prompts: new Set(), limits: new Set(), losses: 0 });
+const blank = (): Chat => ({ until: false, byPerson: false, sawStart: false, changed: false, review: 0, texts: [], prompts: new Set(), limits: new Set() });
 
 /** A limit card the person still has to decide on: decided by the bridge, and nothing carried it on. */
 export function limitOwed(item: TimelineItem | undefined): boolean {
@@ -75,12 +75,13 @@ export class Attention {
       c.status = s.status;
       c.until = !!s.until;
       c.review = s.review ?? 0;
-      c.losses = s.lossWake?.attempts.length ?? 0;
+      c.delivered = s.lossWake?.delivered;
     }
   }
 
   /** Prompts known at start-up or after a reconnect (`withPrompts`): already waiting, so not news. */
   seedPrompts(perms: PermissionRequest[], questions: QuestionRequest[]) {
+    for (const c of this.chats.values()) c.prompts.clear();
     for (const p of perms) this.chat(p.sessionId).prompts.add(p.id);
     for (const q of questions) this.chat(q.sessionId).prompts.add(q.id);
   }
@@ -145,7 +146,7 @@ export class Attention {
         return [];
       }
       case 'permission.added':
-        return this.prompt(e.request.sessionId, e.request.id, { kind: 'permission', id: e.request.id, title: e.request.title, plan: e.request.kind === 'plan' || e.request.toolName === 'ExitPlanMode' });
+        return this.prompt(e.request.sessionId, e.request.id, { kind: 'permission', id: e.request.id, tool: e.request.kind, plan: e.request.kind === 'plan' || e.request.toolName === 'ExitPlanMode' });
       case 'question.added':
         return this.prompt(e.request.sessionId, e.request.id, { kind: 'question', id: e.request.id, text: firstLine(e.request.questions[0]?.question ?? '') });
       case 'permission.removed':
@@ -208,9 +209,9 @@ export class Attention {
       c.review = r;
     }
     if (patch.lossWake !== undefined) {
-      const n = patch.lossWake?.attempts.length ?? 0;
-      if (n > c.losses) out.push({ kind: 'lost', chat });
-      c.losses = n;
+      const delivered = patch.lossWake?.delivered;
+      if (delivered && delivered !== c.delivered) out.push({ kind: 'lost', chat });
+      if (delivered) c.delivered = delivered;
     }
     // A move away from the person's limit, a spare wait: the card's decision is made.
     if (patch.spare || patch.moving) c.limits.clear();
@@ -291,22 +292,28 @@ export interface Words {
   body: string;
 }
 
+const permissionKind: Partial<Record<PermissionRequest['kind'], string>> = {
+  bash: 'Run a command', edit: 'Edit a file', write: 'Edit a file', read: 'Read a file',
+  fetch: 'Read a page', browser: 'Use the browser', search: 'Search files', glob: 'Find files',
+  websearch: 'Search the web', agent: 'Start an agent', device: 'Use a device', share: 'Share files',
+};
+
 /** The notification's words: the chat's name, and what it needs or did in a few words. */
 export function wordsFor(sig: Signal, chatTitle: string): Words {
   const title = cut(chatTitle.trim() || 'Untitled', 64);
   switch (sig.kind) {
     case 'waiting': {
       const n = sig.need;
-      if (n.kind === 'permission') return { title, body: n.plan ? 'Plan to approve' : `Waits for approval: ${cut(n.title, 90)}` };
-      if (n.kind === 'question') return { title, body: n.text ? cut(n.text, 110) : 'Asks you a question' };
-      return { title, body: `${n.text}. Decide how to go on` };
+      if (n.kind === 'permission') return { title, body: n.plan ? 'Plan to approve' : `Waits for approval: ${permissionKind[n.tool] ?? 'Use a tool'}` };
+      if (n.kind === 'question') return { title, body: 'Asks you a question' };
+      return { title, body: 'Limit reached' };
     }
     case 'finished':
-      return { title, body: sig.answer ? `Finished: ${sig.answer}` : 'Finished' };
+      return { title, body: 'Finished' };
     case 'failed':
-      return { title, body: sig.error ? `Failed: ${cut(sig.error, 100)}` : 'Failed' };
+      return { title, body: 'Failed' };
     case 'lost':
-      return { title, body: 'Background work was lost. The agent was told' };
+      return { title, body: 'Background work was lost' };
   }
 }
 

@@ -27,6 +27,7 @@ export type SinceEntry = { state: 'loading' } | { state: 'ok'; diff: FileDiff | 
 
 interface SeenView {
   repo: boolean;
+  partial?: boolean;
   /** By path. */
   files: Record<string, SeenFile>;
   /** Diffs since seen, by path (for the hash they were made for). */
@@ -52,8 +53,8 @@ function apply(sessionId: string, st: SeenState) {
     for (const f of st.files) files[f.path] = f;
     // A diff since seen stays only for the content it was made for.
     const since: Record<string, SinceEntry> = {};
-    for (const [p, e] of Object.entries(v.since)) if (files[p] && (e.state !== 'ok' || e.hash === files[p].hash)) since[p] = e;
-    return { repo: st.repo, files, since };
+    for (const [p, e] of Object.entries(v.since)) if (files[p] && (e.state === 'loading' || (e.state === 'ok' && e.hash === files[p].hash))) since[p] = e;
+    return { repo: st.repo, partial: st.partial, files, since };
   });
 }
 
@@ -79,16 +80,16 @@ export function loadSeen(sessionId: string, cwd: string): Promise<void> {
 /** The diff of what is new since `path` was seen (only for a file the bridge says has one). */
 export function loadSince(sessionId: string, cwd: string, path: string) {
   const f = useSeen.getState().chats[sessionId]?.files[path];
-  if (!f?.since) return;
+  if (f && !f.since) return;
   const cur = useSeen.getState().chats[sessionId]?.since[path];
-  if (cur && (cur.state === 'loading' || (cur.state === 'ok' && cur.hash === f.hash))) return;
+  if (cur && (cur.state !== 'ok' || cur.hash === (f?.hash ?? ''))) return;
   put(sessionId, (v) => ({ since: { ...v.since, [path]: { state: 'loading' } } }));
   bridge
     .call('seen.state', { sessionId, cwd, path }, 30_000)
     .then((st) => {
       const now = st.files[0];
       put(sessionId, (v) => ({
-        since: { ...v.since, [path]: { state: 'ok', diff: st.diff ?? null, hash: now?.hash ?? f.hash } },
+        since: { ...v.since, [path]: { state: 'ok', diff: st.diff ?? null, hash: now?.hash ?? f?.hash ?? '' } },
         ...(now ? { files: { ...v.files, [path]: now } } : {}),
       }));
     })

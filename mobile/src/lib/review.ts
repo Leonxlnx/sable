@@ -1,4 +1,13 @@
+import type { TimelineItem } from '@shared/protocol';
+import { stripWrappers, syntheticOf } from '@shared/synthetic';
 import { parseReview, REVIEW_HEAD, type ParsedReview } from '@desk/features/review/model';
+
+export function changesHeading(lead?: TimelineItem) {
+  if (lead?.type !== 'user' || syntheticOf(lead)?.role === 'hidden') return 'This turn';
+  const review = readReview(lead.text, true);
+  const title = review ? review.lead || 'Your review' : stripWrappers(lead.text);
+  return title.trim().split('\n')[0].slice(0, 140) || 'This turn';
+}
 
 /** A review read back from a message, and whether the phone holds only its start (`more`: Show all fetches the rest). */
 export type PhoneReview = ParsedReview & { more?: boolean };

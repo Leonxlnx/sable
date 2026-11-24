@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from '@/icons';
 import { Flood, HeightGuard } from './guard';
 import { handlePrompt, linkFrame, postToFrame, type FrameLink } from './host';
@@ -278,8 +278,11 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
   floor.current = sizing.floor;
   // Measured smaller than what the block holds: it shrinks once that height has stayed.
   const holding = settled && h !== null && sizing.floor > h;
-  useEffect(() => {
-    if (!holding || h === null) return;
+  useLayoutEffect(() => {
+    if (!holding || h === null) {
+      setHeld(null);
+      return;
+    }
     const t = window.setTimeout(() => setHeld(h), SHRINK_MS);
     return () => window.clearTimeout(t);
   }, [holding, h]);
@@ -341,7 +344,7 @@ export const WidgetFrame = memo(function WidgetFrame({ cacheKey, code, final, ti
  */
 export function frameContent(s: { off: boolean; settled: boolean; h: number | null; floor: number; reserve: number; shrink?: boolean }): { content: number; floor: number } {
   if (s.off) return { content: 52, floor: s.floor };
-  if (s.settled && s.h !== null && (s.h >= s.floor || s.shrink)) return { content: s.h, floor: 0 };
+  if (s.settled && s.h !== null && (s.h >= s.floor || s.shrink)) return { content: s.h, floor: s.h };
   const content = Math.max(s.floor, s.h ?? s.reserve);
   return { content, floor: content };
 }

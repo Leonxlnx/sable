@@ -105,8 +105,8 @@ export function openContainedSync(file: string, root: RootIn): { fd: number; st:
 }
 
 /** Opens `file` (its real place) for reading, async: see the module's comment. Throws when it cannot be opened or is not a plain file (`NotAFile`). */
-export async function openContained(file: string, root: RootIn): Promise<{ fh: FileHandle; st: BigIntStats; inside: boolean }> {
-  const got = await runAsync(check<FileHandle>(file, root));
+export async function openContained(file: string, root: RootIn, requireInside = false): Promise<{ fh: FileHandle; st: BigIntStats; inside: boolean }> {
+  const got = await runAsync(check<FileHandle>(file, root, requireInside));
   return { fh: got.handle, st: got.st, inside: got.inside };
 }
 
@@ -192,7 +192,7 @@ function judged(cwd: string, real: string, st: BigIntStats): FolderNow {
 type Op =
   | { k: 'lstat'; p: string }
   | { k: 'stat'; p: string }
-  | { k: 'open'; p: string }
+  | { k: 'open'; p: string; noFollow?: boolean }
   | { k: 'fstat'; h: unknown }
   | { k: 'close'; h: unknown }
   /** The handle's own path (Linux), or null where the system does not say. */
@@ -271,10 +271,10 @@ function same(a: Seen[], b: Seen[], timedFrom: number): boolean {
 }
 
 /** Opens a plain file: another kind is refused by its lookup before the open and by its handle after it, and the open never waits. */
-function* opened<H>(file: string): Check<{ handle: H; st: BigIntStats }> {
+function* opened<H>(file: string, noFollow = false): Check<{ handle: H; st: BigIntStats }> {
   const was = (yield { k: 'stat', p: file }) as BigIntStats;
   if (!was.isFile()) throw new NotAFile();
-  const handle = (yield { k: 'open', p: file }) as H;
+  const handle = (yield { k: 'open', p: file, noFollow }) as H;
   try {
     const st = (yield { k: 'fstat', h: handle }) as BigIntStats;
     if (!st.isFile()) throw new NotAFile();
@@ -294,17 +294,20 @@ function* tryWalk(chain: Chain): Check<{ seen: Seen[]; wait: number } | null | '
   }
 }
 
-function* check<H>(file: string, rootIn: RootIn): Check<Contained<H>> {
+function* check<H>(file: string, rootIn: RootIn, requireInside = false): Check<Contained<H>> {
   const root = realOf(rootIn);
   const id = typeof rootIn === 'object' ? { dev: rootIn.dev, ino: rootIn.ino } : undefined;
   const chain = root ? chainOf(root, file, id) : null;
   const how = CONTAIN.how;
   // No proof of where an opened file lies here: it is not inside.
-  if (!root || !chain || how === 'none') return { ...(yield* opened<H>(file)), inside: false };
+  if (!root || !chain || how === 'none') {
+    if (requireInside) throw new NotAFile();
+    return { ...(yield* opened<H>(file)), inside: false };
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     const last = attempt === 1;
     if (how === 'proc') {
-      const got = yield* opened<H>(file);
+      const got = yield* opened<H>(file, requireInside);
       const self = (yield { k: 'self', h: got.handle }) as string | null;
       if (self !== null) {
         let ok = false;
@@ -335,7 +338,8 @@ function* check<H>(file: string, rootIn: RootIn): Check<Contained<H>> {
       yield { k: 'sleep', ms: before.wait };
       before = yield* tryWalk(chain);
     }
-    const got = yield* opened<H>(file);
+    if (requireInside && (!before || before === 'gone' || before.wait)) throw new NotAFile();
+    const got = yield* opened<H>(file, requireInside);
     // A link or a junction on the way, or a file with another name: that is final.
     if (before === null || got.st.nlink !== 1n || !got.st.isFile()) return { ...got, inside: false };
     let after: { seen: Seen[]; wait: number } | null | 'gone' = 'gone';
@@ -434,7 +438,7 @@ async function doAsync(op: Op): Promise<unknown> {
     case 'stat':
       return stat(op.p, { bigint: true });
     case 'open':
-      return open(op.p, READ_NOW);
+      return open(op.p, READ_NOW | (op.noFollow ? (constants.O_NOFOLLOW ?? 0) : 0));
     case 'fstat':
       return (op.h as FileHandle).stat({ bigint: true });
     case 'close':

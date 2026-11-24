@@ -5,6 +5,8 @@
  * also when the phone got it cut short (mobile/src/lib/review.ts).
  */
 import { describe, expect, it, vi } from 'vitest';
+import { transcript } from '../server/providers/codex-map';
+import { RESUME_LOST, lostTasksNote } from '@shared/synthetic';
 import type { TimelineItem } from '@shared/protocol';
 
 // The phone imports the desktop's lead-in rules through its own alias.
@@ -186,7 +188,8 @@ describe('phone turns as checkpoints (the desktop since f79fd71)', () => {
 describe('a review message on the phone', async () => {
   const { reviewMessage } = await import('../src/features/review/model');
   const REVIEW = '../mobile/src/lib/review';
-  const { readReview } = (await import(/* @vite-ignore */ REVIEW)) as {
+  const { readReview, changesHeading } = (await import(/* @vite-ignore */ REVIEW)) as {
+    changesHeading: (lead?: TimelineItem) => string;
     readReview: (text: string, cut?: boolean) => { lead: string; comments: { path: string; range?: string; text: string }[]; more?: boolean } | null;
   };
   const comment = (i: number, text = `Comment ${i}`) => ({
@@ -206,6 +209,16 @@ describe('a review message on the phone', async () => {
       ['src/f2.ts', 'line 12', 'Two\n\nparagraphs'],
     ]);
     expect(r?.more).toBeUndefined();
+  });
+
+  it('heads a reloaded Codex recovery edit with This turn', () => {
+    const items = transcript([{ id: 'turn', status: 'completed', items: [
+      { type: 'userMessage', id: 'wake', content: [{ type: 'text', text: RESUME_LOST + lostTasksNote(['fixture']) }] },
+      { type: 'fileChange', id: 'edit', status: 'completed', changes: [{ path: 'a.txt', kind: { type: 'add' }, diff: 'fixture' }] },
+    ] }] as Parameters<typeof transcript>[0]);
+    expect(items[1]).toMatchObject({ type: 'tool' });
+    expect(changesHeading(items[0])).toBe('This turn');
+    expect(changesHeading({ ...items[0], type: 'user', text: 'My own heading' })).toBe('My own heading');
   });
 
   it('leaves every other message alone', () => {

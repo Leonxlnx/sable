@@ -1,10 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { GuestLog, type GuestEvent } from '../electron/guest-log';
+import { watchGuestRequests, GuestLog, type GuestEvent } from '../electron/guest-log';
 
 const G = 7;
 const docOf = (evs: GuestEvent[], type: GuestEvent['type']) => evs.filter((e) => e.type === type).map((e) => e.doc);
 
 describe('guest log: every entry carries its own document', () => {
+  it('owns a request before DNS and keeps a pre-header failure on its starting page', () => {
+    const log = new GuestLog();
+    let before!: (d: { webContentsId: number; id: number; resourceType: string }, cb: (r: { cancel?: boolean }) => void) => void;
+    const web = { onBeforeRequest: (fn: typeof before) => { before = fn; }, onSendHeaders: () => {} };
+    watchGuestRequests(web as unknown as Parameters<typeof watchGuestRequests>[0], log, d => d.id === 2);
+    log.commit(G);
+    before({ webContentsId: G, id: 1, resourceType: 'xhr' }, r => expect(r.cancel).toBe(false));
+    log.loadEnded(G, 1);
+    expect(log.flush()).toEqual([]);
+    log.commit(G);
+    log.net(G, log.end(1, G, false), { method: 'GET', url: '/fixture', error: 'DNS' });
+    expect(docOf(log.flush(), 'net')).toEqual([1]);
+    before({ webContentsId: G, id: 2, resourceType: 'xhr' }, r => expect(r.cancel).toBe(true));
+  });
+
   it('the load marker follows the inline error and the last load request, while later traffic continues', () => {
     const log = new GuestLog();
     log.commit(G);

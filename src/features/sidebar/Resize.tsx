@@ -11,6 +11,21 @@ const STAGE_KEEPS = 680;
 
 export const clampSideWidth = (w: number, max = SIDE_MAX_W) => Math.round(Math.max(SIDE_MIN_W, Math.min(Math.max(SIDE_MIN_W, max), w)));
 
+export function sideRange(width: number, viewport: number) {
+  const max = clampSideWidth(viewport - STAGE_KEEPS);
+  return { now: clampSideWidth(width, max), max };
+}
+
+export function keyWidth(key: string, shift: boolean, range: ReturnType<typeof sideRange>) {
+  const step = shift ? 48 : 16;
+  if (key === 'ArrowLeft') return clampSideWidth(range.now - step, range.max);
+  if (key === 'ArrowRight') return clampSideWidth(range.now + step, range.max);
+  if (key === 'Home') return SIDE_MIN_W;
+  if (key === 'End') return range.max;
+  if (key === 'Enter') return null;
+  return undefined;
+}
+
 function readWidth(): number | null {
   try {
     const raw = localStorage.getItem(WIDTH_KEY);
@@ -43,6 +58,13 @@ function applyWidth(w: number | null) {
 
 const zoom = () => parseFloat(document.documentElement.style.zoom) || 1;
 
+function renderedRange() {
+  const z = zoom();
+  const side = document.querySelector<HTMLElement>('.app-side');
+  const width = side ? side.getBoundingClientRect().width / z : readWidth() ?? SIDE_DEFAULT_W;
+  return sideRange(width, window.innerWidth / z);
+}
+
 /**
  * Drag the sidebar's right edge to resize it (196 to 460 px), double-click or Enter for the
  * default, arrows to step, Home and End for the ends. Lives in the gap between sidebar and stage.
@@ -50,17 +72,28 @@ const zoom = () => parseFloat(document.documentElement.style.zoom) || 1;
 export function SideResize() {
   const [host, setHost] = useState<HTMLElement | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [width, setWidth] = useState<number>(() => readWidth() ?? SIDE_DEFAULT_W);
+  const [range, setRange] = useState(renderedRange);
 
   useLayoutEffect(() => {
     applyWidth(readWidth());
-    setHost(document.querySelector<HTMLElement>('.app'));
+    const app = document.querySelector<HTMLElement>('.app');
+    const side = app?.querySelector('.app-side');
+    setHost(app);
+    const measure = () => {
+      const next = renderedRange();
+      setRange(prev => prev.now === next.now && prev.max === next.max ? prev : next);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (app) observer.observe(app);
+    if (side) observer.observe(side);
+    window.addEventListener('resize', measure);
+    return () => { observer.disconnect(); window.removeEventListener('resize', measure); };
   }, []);
 
   const commit = useCallback((w: number | null) => {
     applyWidth(w);
     saveWidth(w);
-    setWidth(w ?? SIDE_DEFAULT_W);
   }, []);
 
   // A drag that ends outside the window, or an unmount mid-drag, must not leave the cursor behind.
@@ -83,7 +116,7 @@ export function SideResize() {
       const z = zoom();
       const startW = side.getBoundingClientRect().width / z;
       const startX = e.clientX;
-      const max = Math.min(SIDE_MAX_W, window.innerWidth / z - STAGE_KEEPS);
+      const { max } = sideRange(startW, window.innerWidth / z);
       let w = startW;
       let moved = false;
       setDragging(true);
@@ -121,14 +154,8 @@ export function SideResize() {
   );
 
   const onKey = (e: React.KeyboardEvent) => {
-    const step = e.shiftKey ? 48 : 16;
-    let next: number | null;
-    if (e.key === 'ArrowLeft') next = clampSideWidth(width - step);
-    else if (e.key === 'ArrowRight') next = clampSideWidth(width + step);
-    else if (e.key === 'Home') next = SIDE_MIN_W;
-    else if (e.key === 'End') next = SIDE_MAX_W;
-    else if (e.key === 'Enter') next = null;
-    else return;
+    const next = keyWidth(e.key, e.shiftKey, renderedRange());
+    if (next === undefined) return;
     e.preventDefault();
     commit(next);
   };
@@ -142,8 +169,8 @@ export function SideResize() {
       aria-orientation="vertical"
       aria-label="Resize sidebar"
       aria-valuemin={SIDE_MIN_W}
-      aria-valuemax={SIDE_MAX_W}
-      aria-valuenow={width}
+      aria-valuemax={range.max}
+      aria-valuenow={range.now}
       tabIndex={0}
       onPointerDown={onPointerDown}
       onDoubleClick={() => commit(null)}

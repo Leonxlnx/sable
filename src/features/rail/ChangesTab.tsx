@@ -125,7 +125,8 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
   // Seen states known for this tree: every row can say whether it was looked at.
   const known = !!seen?.repo;
   const stateOf = (p: string): SeenFile | undefined => (known ? seen!.files[p] : undefined);
-  const unseen = known ? status.files.filter((f) => stateOf(f.path)?.state !== 'seen') : [];
+  const incomplete = seen?.partial && status.files.some(f => !stateOf(f.path));
+  const unseen = known ? status.files.filter(f => stateOf(f.path) && stateOf(f.path)!.state !== 'seen') : [];
   const seenFiles = known ? status.files.filter((f) => stateOf(f.path)?.state === 'seen') : [];
   const inTurn = status.files.filter((f) => turn.has(posix(f.path)));
   // Opens on what is new when anything is; a scope with nothing in it falls back to the whole list.
@@ -144,7 +145,7 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
   const rows = shown === 'new' ? unseen : shown === 'turn' ? inTurn : status.files;
   const folded = shown === 'new' ? seenFiles : [];
   const visible = seenOpen ? [...rows, ...folded] : rows;
-  const toMark = rows.filter((f) => stateOf(f.path)?.state !== 'seen');
+  const toMark = rows.filter(f => stateOf(f.path) && stateOf(f.path)!.state !== 'seen');
   const allOpen = visible.length > 0 && visible.every((f) => open.has(f.path));
 
   // Mark all seen offers its undo in its own place for a few seconds.
@@ -189,7 +190,7 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
   // Open rows whose file changed since it was seen get the diff of what is new since.
   useEffect(() => {
     if (!seen) return;
-    for (const p of open) if (seen.files[p]?.since) loadSince(sessionId, cwd, p);
+    for (const p of open) if (seen.repo && (!seen.files[p] || seen.files[p].since)) loadSince(sessionId, cwd, p);
   }, [open, seen, sessionId, cwd]);
 
   // When each row was opened: a diff closed after it stood open long enough to be read counts as looked at.
@@ -295,7 +296,7 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
             value={shown}
             onChange={pick}
             options={[
-              { value: 'new' as const, label: <ScopeLabel name="New" n={unseen.length} /> },
+              { value: 'new' as const, label: <ScopeLabel name="New" n={incomplete ? 'many' : unseen.length} /> },
               ...(inTurn.length ? [{ value: 'turn' as const, label: <ScopeLabel name="This turn" n={inTurn.length} /> }] : []),
               { value: 'all' as const, label: <ScopeLabel name="All" n={status.files.length} /> },
             ]}
@@ -328,7 +329,7 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
           </>
         ) : !seen ? null : (
           <>
-            {rows.length === 0 && shown === 'new' && <p className="rail-empty ch-none">Nothing new since you last looked.</p>}
+            {rows.length === 0 && shown === 'new' && <p className="rail-empty ch-none">{incomplete ? 'Open a file in All to check its changes.' : 'Nothing new since you last looked.'}</p>}
             {rows.length > 0 && (
               <LeaveList className="ch-list" order={`${shown}|${rows.map((f) => f.path).join('|')}`}>
                 {(limit < rows.length ? rows.slice(0, limit) : rows).map(row)}
@@ -357,7 +358,7 @@ function RepoChanges({ sessionId, cwd, foot }: { sessionId: string; cwd: string;
 }
 
 /** A scope's name and how many files it holds, the figure a step quieter. */
-function ScopeLabel({ name, n }: { name: string; n: number }) {
+function ScopeLabel({ name, n }: { name: string; n: number | 'many' }) {
   return (
     <>
       {name}
@@ -510,7 +511,7 @@ function useRowLimit(total: number): number {
 }
 
 /** A refresh brings new objects for unchanged files: a row draws again only when what it shows changed. */
-const sameFile = (a: GitFileStatus, b: GitFileStatus) => a === b || (a.path === b.path && a.status === b.status && a.additions === b.additions && a.deletions === b.deletions);
+const sameFile = (a: GitFileStatus, b: GitFileStatus) => a === b || (a.path === b.path && a.status === b.status && a.link === b.link && a.additions === b.additions && a.deletions === b.deletions);
 const sameSeen = (a: SeenFile | undefined, b: SeenFile | undefined) => a === b || (!!a && !!b && a.state === b.state && a.hash === b.hash && a.since === b.since);
 
 /**
@@ -559,7 +560,8 @@ const FileRow = memo(
     const wake = hot ? undefined : () => setHot(true);
     // The same target in both views: a comment written on what is new since stays on its lines in the whole diff.
     const review = useMemo(() => ({ sessionId, scope: `git:${file.path}`, path: file.path }), [sessionId, file.path]);
-    const kind = KIND[file.status];
+    const link = file.link || seen?.hash === 'link' || full?.withheld === 'link';
+    const kind = link ? 'Link, not read' : KIND[file.status];
     const isSeen = seen?.state === 'seen';
     return (
       <div
@@ -595,15 +597,15 @@ const FileRow = memo(
           {seen && <span className="sr-only">{isSeen ? ', seen' : again ? ', changed since you looked' : ', not seen yet'}</span>}
           <span className="ch-stat num rail-row-deco">
             {kind && <span className="ch-kind" data-kind={file.status}>{kind}</span>}
-            {!!file.additions && <span className="dv-add">+{file.additions}</span>}
-            {!!file.deletions && <span className="dv-del">−{file.deletions}</span>}
+            {!link && !!file.additions && <span className="dv-add">+{file.additions}</span>}
+            {!link && !!file.deletions && <span className="dv-del">−{file.deletions}</span>}
           </span>
           <Icon name="caret-right" size={10} className="ch-caret" />
         </button>
         {hot && <RowActions path={file.path} deleted={file.status === 'D'} seen={seen} onSeen={onSeen} />}
         <Collapse open={open}>
           <div className="ch-diff">
-            {again && (
+            {!link && again && (
               <p className="ch-since">
                 {seen.since ? (
                   <>
@@ -617,7 +619,7 @@ const FileRow = memo(
                 )}
               </p>
             )}
-            {deltaReady ? (
+            {link ? <p className="ch-note">Link, not read</p> : deltaReady ? (
               since.diff ? (
                 <DiffView diff={since.diff} showHeader={false} maxLines={240} review={review} />
               ) : (

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import type { BigIntStats } from 'node:fs';
-import { lstat, open, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { lstat, open, opendir, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { DiffHunk, FileDiff, GitCommitResult, GitFileStatus, GitStatus, GitWorktree } from '../../shared/protocol';
 import { makeFileDiff, parseUnifiedDiff } from '../../shared/diff';
@@ -107,13 +107,13 @@ export function runGit(
 }
 
 /** Repository top-level for `cwd`, or null when not a repo / git missing / cwd unreadable. */
-export async function repoRoot(cwd: string): Promise<string | null> {
+export async function repoRoot(cwd: string, timeoutMs = 5000): Promise<string | null> {
   try {
     if (!(await stat(cwd)).isDirectory()) return null;
   } catch {
     return null;
   }
-  const r = await runGit(cwd, ['rev-parse', '--show-toplevel'], { timeoutMs: 5000 });
+  const r = await runGit(cwd, ['rev-parse', '--show-toplevel'], { timeoutMs });
   if (r.code !== 0) return null;
   const top = r.stdout.trim();
   return top ? path.resolve(top) : null;
@@ -161,26 +161,64 @@ export interface FileText {
   size: number;
 }
 
+// Windows directory entries expose FILE_ATTRIBUTE_REPARSE_POINT even for tags lstat treats as
+// ordinary files. Share each directory listing within one pinned look, across its parallel reads.
+type ReparseListing = { at: bigint; links: Promise<Set<string>> };
+const reparseListings = new WeakMap<FolderRoot, Map<string, ReparseListing>>();
+async function reparseOnPath(top: string, file: string, pin: string | FolderRoot, deadline: number) {
+  let cache = typeof pin === 'string' ? undefined : reparseListings.get(pin);
+  if (!cache) {
+    cache = new Map();
+    if (typeof pin !== 'string') reparseListings.set(pin, cache);
+  }
+  let dir = path.dirname(top);
+  for (const name of path.relative(dir, file).split(path.sep)) {
+    const child = path.join(dir, name);
+    const st = await lstat(child, { bigint: true });
+    if (st.isSymbolicLink()) return true;
+    let listing = cache.get(dir);
+    if (!listing || st.ctimeNs >= listing.at) {
+      const entries = async (parent: string) => {
+        const links = new Set<string>();
+        for await (const entry of await opendir(parent, { bufferSize: 128 })) {
+          if (performance.now() >= deadline) throw new Error('Scan deadline reached');
+          if (entry.isSymbolicLink()) links.add(entry.name.toLowerCase());
+        }
+        return links;
+      };
+      listing = { at: BigInt(Date.now()) * 1_000_000n, links: entries(dir) };
+      cache.set(dir, listing);
+    }
+    if ((await listing.links).has(name.toLowerCase())) return true;
+    dir = child;
+  }
+  return false;
+}
+
+/** Reject aliases before opening, then verify the open handle before reading. */
+export async function openOwnFile(file: string, root: string | FolderRoot, deadline = Infinity) {
+  const top = typeof root === 'string' ? root : root.real;
+  if (!under(top, file)) return 'outside' as const;
+  const own = await lstat(file, { bigint: true });
+  if (own.isSymbolicLink() || (process.platform === 'win32' && await reparseOnPath(top, file, root, deadline))) return 'link' as const;
+  if (!own.isFile()) return null;
+  const real = await realpath(file);
+  if (!under(top, real) || path.relative(file, real) !== '') return 'link' as const;
+  const got = await openContained(file, root, true);
+  if (got.inside && own.ino === got.st.ino && own.dev === got.st.dev && own.ctimeNs === got.st.ctimeNs) return got;
+  await got.fh.close();
+  return 'outside' as const;
+}
+
 /** `readText`, saying `outside` when the file is not established to lie in `within` as named, `link` when it is a link there (null: it could not be read). */
 async function readIn(file: string, maxBytes: number, within?: string | FolderRoot): Promise<FileText | 'outside' | 'link' | null> {
   let fh: FileHandle | undefined;
   try {
     let st: BigIntStats;
     if (within) {
-      // By its own name: never resolved, so a link below the folder is never followed.
-      if (!under(typeof within === 'string' ? within : within.real, file)) return 'outside';
-      let own: BigIntStats;
-      try {
-        own = await lstat(file, { bigint: true });
-      } catch {
-        return null;
-      }
-      if (own.isSymbolicLink()) return 'link';
-      if (!own.isFile()) return null;
-      // A link put on the way after that lookup shows in the walks (or the handle's own path): not inside.
-      const got = await openContained(file, within);
+      const got = await openOwnFile(file, within);
+      if (!got || typeof got === 'string') return got;
       fh = got.fh;
-      if (!got.inside) return 'outside';
       st = got.st;
     } else {
       fh = await open(file, 'r');
@@ -270,6 +308,10 @@ export function capDiff(f: FileDiff): FileDiff {
 
 /** Options of `gitStatus` and `gitDiff`. */
 export interface GitScope {
+  namesOnly?: boolean;
+  top?: string;
+  deadline?: number;
+  maxEntries?: number;
   /**
    * Only what lies in `cwd` itself (a pathspec for it, never a sibling folder of the repository), and
    * a file's working-tree text (untracked, or a tracked file's side of its diff: `checkedDiff`) read
@@ -307,24 +349,29 @@ async function stillThere(dir: string, was: FolderRoot): Promise<void> {
   if (typeof now !== 'object' || now.dev !== was.dev || now.ino !== was.ino) throw new Error(FOLDER_CHANGED);
 }
 
-export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitStatus> {
+export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitStatus & { partial?: boolean }> {
   const dir = path.resolve(cwd);
   const none: GitStatus = { isRepo: false, files: [], additions: 0, deletions: 0 };
-  const pin = scope.within ? await chatFolder(dir) : undefined;
-  if (pin === 'gone') return none;
-  const root = await repoRoot(dir);
+  const folder = await folderNow(dir);
+  if (folder === 'changed' && scope.within) throw new Error(FOLDER_CHANGED);
+  if (typeof folder !== 'object') return none;
+  const pin = scope.within ? folder : undefined;
+  const root = scope.top ?? await repoRoot(dir);
   if (!root) return none;
+  const readRoot = pin ?? await folderNow(root);
+  if (typeof readRoot !== 'object') return none;
   // A pathspec for the folder itself: git lists nothing outside it.
   const spec = scope.within ? ['--', '.'] : [];
 
   const [st, unstaged, staged] = await Promise.all([
-    runGit(dir, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all', ...spec], { timeoutMs: 15_000 }),
-    runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff', ...spec], { timeoutMs: 15_000 }),
-    runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff', '--cached', ...spec], { timeoutMs: 15_000 }),
+    runGit(dir, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all', ...spec], { timeoutMs: scope.deadline === undefined ? 15_000 : Math.max(1, scope.deadline - performance.now()) }),
+    scope.namesOnly ? null : runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff', ...spec], { timeoutMs: 15_000 }),
+    scope.namesOnly ? null : runGit(dir, ['diff', '--numstat', '-z', '--no-ext-diff', '--cached', ...spec], { timeoutMs: 15_000 }),
   ]);
+  if (st.timedOut && scope.deadline !== undefined) return { ...none, isRepo: true, partial: true };
   if (st.code !== 0) return none;
   // What git listed is the chat's folder's only while that folder is still the one pinned.
-  if (pin) await stillThere(dir, pin);
+  await stillThere(dir, folder);
   // Files as git names them, from the repository's canonical place: read as named (`readText`).
   const top = pin ? await realDir(root) : root;
 
@@ -332,7 +379,10 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
   let oid = '';
   let head = '';
   const files: (GitFileStatus & { raw: string })[] = [];
-  const recs = st.stdout.split('\0');
+  // A rename consumes two records. Keep the parse bounded for a turn-end look.
+  const stdout = st.truncated ? st.stdout.slice(0, st.stdout.lastIndexOf('\0') + 1) : st.stdout;
+  const recs = stdout.split('\0', scope.maxEntries === undefined ? undefined : 2 * scope.maxEntries + 8);
+  let partial = st.truncated;
   for (let i = 0; i < recs.length; i++) {
     const rec = recs[i];
     if (!rec) continue;
@@ -350,6 +400,7 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
       }
       continue;
     }
+    if (scope.maxEntries !== undefined && files.length >= scope.maxEntries) { partial = true; break; }
     const kind = rec[0];
     if (kind === '1' || kind === '2' || kind === 'u') {
       const fieldCount = kind === '1' ? 8 : kind === '2' ? 9 : 10;
@@ -365,6 +416,7 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
         path: relToCwd(root, dir, raw),
         status: kind === 'u' ? 'U' : mapStatus(x, y),
         staged: kind !== 'u' && x !== '.',
+        ...(fields[kind === 'u' ? 6 : 5] === '120000' ? { link: true } : {}),
         ...(orig ? { oldPath: relToCwd(root, dir, orig) } : {}),
       });
     } else if (kind === '?') {
@@ -374,10 +426,15 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
   }
   result.branch = head && head !== '(detached)' ? head : oid && oid !== '(initial)' ? oid.slice(0, 7) : undefined;
 
+  if (scope.namesOnly) {
+    result.files = files.map(({ raw: _raw, ...f }) => f);
+    return partial ? { ...result, partial } : result;
+  }
+
   // numstat paths are repo-root relative, like porcelain paths.
   const counts = new Map<string, { a: number; d: number }>();
-  if (unstaged.code === 0) parseNumstat(unstaged.stdout, counts);
-  if (staged.code === 0) parseNumstat(staged.stdout, counts);
+  if (unstaged?.code === 0) parseNumstat(unstaged.stdout, counts);
+  if (staged?.code === 0) parseNumstat(staged.stdout, counts);
 
   // Untracked files have no numstat: count their lines, a few files at a time, within a budget.
   const untracked = files.filter((f) => f.status === '?');
@@ -387,9 +444,10 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
   for (let i = 0; i < counted.length && budget > 0; i += 8) {
     const batch = counted.slice(i, i + 8);
     const share = Math.min(MAX_UNTRACKED_BYTES, Math.max(1, Math.floor(budget / batch.length)));
-    const texts = await Promise.all(batch.map((f) => readText(path.join(top, f.raw), share, pin)));
+    const texts = await Promise.all(batch.map((f) => readIn(path.join(top, f.raw), share, readRoot)));
     texts.forEach((t, k) => {
-      if (!t) return;
+      if (t === 'link') batch[k].link = true;
+      if (!t || typeof t === 'string') return;
       budget -= Math.min(t.size, share);
       batch[k].additions = t.binary ? 0 : countLines(t.text);
     });
@@ -398,7 +456,7 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
     if (f.status === '?') {
       f.deletions = 0;
     } else {
-      const c = counts.get(f.raw);
+      const c = f.link ? undefined : counts.get(f.raw);
       f.additions = c?.a ?? 0;
       f.deletions = c?.d ?? 0;
     }
@@ -410,7 +468,7 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
 }
 
 /** A file's diff, or (`GitScope.within`) its place in the list with its text withheld, and why. */
-export type GitFileDiff = FileDiff & { withheld?: 'outside' | 'link' | 'big' | 'unreadable' };
+export type GitFileDiff = FileDiff;
 
 /** The biggest side of a tracked file whose diff is made for the phone (`GitScope.within`): read whole, both sides. */
 const MAX_SIDE_BYTES = 2_000_000;
@@ -504,8 +562,11 @@ export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, 
   // Within the folder: a file named out of it has no diff here, and no file means the folder itself.
   if (scope.within && file && !inside(path.resolve(dir, file), dir)) return [];
   const spec = file ? ['--', path.resolve(dir, file)] : scope.within ? ['--', '.'] : [];
-  const pin = scope.within ? await chatFolder(dir) : undefined;
-  if (pin === 'gone') return [];
+  const folder = await chatFolder(dir);
+  if (folder === 'gone') return [];
+  const pin = scope.within ? folder : undefined;
+  const readRoot = pin ?? await folderNow(root);
+  if (typeof readRoot !== 'object') return [];
   const base = (await hasHead(dir)) ? 'HEAD' : EMPTY_TREE;
   const args = [
     'diff',
@@ -524,7 +585,7 @@ export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, 
       : runGit(dir, ['ls-files', '--others', '--exclude-standard', '-z', '--full-name', ...spec], { timeoutMs: 10_000 }),
   ]);
   // What git gave is the chat's folder's only while that folder is still the one pinned.
-  if (pin) await stillThere(dir, pin);
+  await stillThere(dir, folder);
   const top = pin ? await realDir(root) : root;
   const out: GitFileDiff[] = [];
   const add = (f: GitFileDiff) => {
@@ -537,14 +598,20 @@ export async function gitDiff(cwd: string, file?: string, stagedOnly?: boolean, 
     if (pin && !stagedOnly) {
       // Within the folder (the phone), the working tree's side is never git's reading of the path.
       for (const part of patchParts(d.stdout)) for (const parsed of parseUnifiedDiff(part.text)) add(await checkedDiff(top, root, base, parsed, part.modes, pin));
-    } else for (const parsed of parseUnifiedDiff(d.stdout)) add(parsed);
+    } else {
+      for (const part of patchParts(d.stdout)) {
+        for (const parsed of parseUnifiedDiff(part.text)) {
+          add(part.modes.now === '120000' ? { ...parsed, hunks: [], additions: 0, deletions: 0, withheld: 'link' } : parsed);
+        }
+      }
+    }
   }
   if (others && others.code === 0) {
     const list = others.stdout.split('\0').filter(Boolean).slice(0, MAX_UNTRACKED_FILES);
     let budget = UNTRACKED_BUDGET;
     for (const raw of list) {
       const rel = relToCwd(root, dir, raw);
-      const t = budget > 0 ? await readIn(path.join(top, raw), Math.min(MAX_UNTRACKED_BYTES, budget), pin) : null;
+      const t = budget > 0 ? await readIn(path.join(top, raw), Math.min(MAX_UNTRACKED_BYTES, budget), readRoot) : null;
       if (t === 'outside' || t === 'link') {
         out.push({ path: rel, status: 'added', additions: 0, deletions: 0, hunks: [], withheld: t });
         continue;

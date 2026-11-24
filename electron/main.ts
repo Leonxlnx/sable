@@ -4,8 +4,8 @@ import nodeModule from 'node:module';
 import path from 'node:path';
 import { closeForQuit } from './quit';
 import { startServer, type RunningServer } from '../server/serve';
-import { installSignIn, signInHeld } from './sign-in';
-import { GuestLog } from './guest-log';
+import { cancelSignInRequest, installSignIn, signInHeld } from './sign-in';
+import { GuestLog, watchGuestRequests } from './guest-log';
 import { bootMark } from '../server/util/boot';
 import { fixPathFromLoginShell } from '../server/util/login-env';
 import { pageHeaders as csp } from './csp';
@@ -614,13 +614,7 @@ function hardenBrowser() {
     }
     queueNet(d.webContentsId, doc, { url: url.slice(0, 300), method: d.method, status: d.statusCode, error: d.error?.slice(0, 80) });
   };
-  // A request's start: it belongs to the guest's document current now. onSendHeaders is a plain
-  // listener (onBeforeRequest has one slot, sign-in.ts's); a request that never got here reads as the
-  // document current when it ended. A navigation's own request is marked: its 404 or 500 is the page
-  // it brings, and that answer can end before its page commits (guest-log.ts holds it until then).
-  ses.webRequest.onSendHeaders((d) => {
-    if (typeof d.webContentsId === 'number') guestLog.begin(d.webContentsId, d.id, d.resourceType === 'mainFrame');
-  });
+  watchGuestRequests(ses.webRequest, guestLog, cancelSignInRequest);
   ses.webRequest.onCompleted((d) => {
     countRequest(d.webContentsId);
     reportNet({ id: d.id, webContentsId: d.webContentsId, url: d.url, method: d.method, statusCode: d.statusCode });

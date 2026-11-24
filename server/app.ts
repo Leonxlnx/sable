@@ -237,6 +237,7 @@ const accountKey = (provider: ProviderId, accountId: string) => `${provider}:${a
 
 /** The bridge application: owns providers, sessions and persistence. Transport-agnostic. */
 export class App {
+  beforeFirstInput?: (sessionId: string) => Promise<void>;
   readonly store: Store;
   /** Last known provider info and capabilities, so start-up never waits for the CLIs. */
   readonly cache: DiskCache;
@@ -1631,6 +1632,7 @@ export class App {
       if (count && wake) {
         if (this.pendingLossWake.get(rt) === wake && !rt.pendingLost().count) this.pendingLossWake.delete(rt);
         if (!rt.get(item.id) && this.stopsOf(rt) === wake.stops) {
+          rt.update({ lossWake: { attempts: [], ...rt.meta.lossWake, delivered: wake.id } });
           const changedAccount = (wake.cause === 'move' || wake.cause === 'limit') && rt.meta.accountId !== wake.account;
           const when = changedAccount ? 'when the chat moved' : wake.cause === 'limit' ? 'at the plan limit' :
             wake.cause === 'capability' ? 'when the agent restarted' : "with the agent's process";
@@ -1646,7 +1648,7 @@ export class App {
     return { item: { ...item, text: `${summary ? `${summary}${HANDOVER_JOIN}` : ''}${item.text}${lostTasksNote(lost)}${note ? `\n\n${note}` : ''}` }, count, taken, release };
   }
 
-  private pendingLossWake = new WeakMap<SessionRuntime, { cause: LossTrigger; stops: number; account?: string; notice?: string }>();
+  private pendingLossWake = new WeakMap<SessionRuntime, { id: string; cause: LossTrigger; stops: number; account?: string; notice?: string }>();
   /** Includes the checks before a move can publish its moving flag. */
   private moveAttempts = new WeakMap<SessionRuntime, number>();
   private lossWakeTimers = new Map<SessionRuntime, NodeJS.Timeout>();
@@ -1656,10 +1658,10 @@ export class App {
     const last = this.wakeProcesses.get(rt);
     if (this.disposed) return;
     if (cause === 'death' && last && last.handle === rt.handle && last.generation === rt.processGeneration && Date.now() - last.at < LOSS_WAKE_CRASH_MS) {
-      rt.update({ lossWake: { attempts: rt.meta.lossWake?.attempts ?? [], blocked: true } });
+      rt.update({ lossWake: { attempts: [], ...rt.meta.lossWake, blocked: true } });
     }
     if (!count || rt.stopRequested || rt.meta.lossWake?.blocked) return;
-    this.pendingLossWake.set(rt, { cause, stops: this.stopsOf(rt), account: rt.meta.accountId });
+    this.pendingLossWake.set(rt, { id: randomUUID(), cause, stops: this.stopsOf(rt), account: rt.meta.accountId });
     this.scheduleLossWake(rt);
   }
 
@@ -1674,6 +1676,18 @@ export class App {
     this.lossWakeTimers.set(rt, timer);
   }
 
+  private lastPersonalTurn = new WeakMap<SessionRuntime, string>();
+
+  private limitHoldsWake(rt: SessionRuntime) {
+    const last = this.lastPersonalTurn.get(rt);
+    for (let i = rt.items.length - 1; i >= 0; i--) {
+      const item = rt.items[i];
+      if (item.id === last) break;
+      if (item.type === 'notice' && !item.parentId && item.limit && !item.limit.continuedWith) return true;
+    }
+    return false;
+  }
+
   private async wakeAfterLoss(rt: SessionRuntime) {
     const batch = this.pendingLossWake.get(rt);
     if (!batch || !rt.pendingLost().count || rt.meta.lossWake?.blocked) return;
@@ -1683,7 +1697,7 @@ export class App {
       return !this.disposed && !this.updates?.installing && this.sessions.get(rt.id) === rt && rt.meta.accountId === account &&
         this.pendingLossWake.get(rt) === batch && this.stopsOf(rt) === batch.stops && !rt.stopRequested && !rt.meta.lossWake?.blocked &&
         !rt.dangerHeld && !rt.queue.length && !rt.meta.spare && (!w.turn || ownTurn) && !w.agents && !w.commands &&
-        !this.limitPending(rt) && !this.refusalQueues.has(rt) && !this.openLimit(rt) && !this.sendHolds.has(rt.id) &&
+        !this.limitPending(rt) && !this.refusalQueues.has(rt) && !this.limitHoldsWake(rt) && !this.sendHolds.has(rt.id) &&
         !this.moveAttempts.has(rt) && !this.moving.has(rt.id) && !this.switching.has(rt.id) && !this.sending.has(rt.id) && !this.delivering.has(rt.id) &&
         !this.opening.has(rt.id) && !this.capChecks.has(rt.id) && !this.returnRuns.has(rt.id) && (this.dispatching.get(rt.id)?.size ?? 0) === dispatches;
     };
@@ -1761,6 +1775,7 @@ export class App {
       if (this.disposed || this.sessions.get(rt.id) !== rt || rt.handle !== handle || this.stopsOf(rt) !== stops) throw new NotNow('The agent was stopped or closed before the message went out.');
     };
     if (rt.meta.lane) await this.lanes.ready(rt);
+    if (this.beforeFirstInput) await this.beforeFirstInput(rt.id);
     maySend();
     const out = this.withHandover(rt, item);
     const wake = !rt.get(item.id) && out.count ? this.pendingLossWake.get(rt) : undefined;
@@ -1772,7 +1787,7 @@ export class App {
       if (wake) {
         const at = Date.now();
         this.wakeProcesses.set(rt, { handle, generation: rt.processGeneration, at });
-        rt.update({ lossWake: { attempts: [...recentLossWakes(rt, at), at] } });
+        rt.update({ lossWake: { ...rt.meta.lossWake, attempts: [...recentLossWakes(rt, at), at] } });
       }
       await handle.send(browser ? this.withBrowserPage(rt, out.item) : out.item, { check: maySend, taken: confirms ? taken : undefined, release, uncertain });
       if (!confirms) taken?.();
@@ -2895,7 +2910,7 @@ export class App {
       const card = this.openLimit(rt, wait.refusalId);
       if (from !== accountId || !card || (!wait.refusalId && card.ts > wait.since)) return;
       try {
-        await this.resumeRefused(rt, 'reset', card.id);
+        await this.resumeRefused(rt, 'reset', card.id, true);
       } catch (err) {
         if (!(err instanceof DeliveryMissed) || rt.meta.spare !== wait || this.disposed) throw err;
         rt.notice('error', 'Could not start the waiting message', err.message);
@@ -2906,12 +2921,12 @@ export class App {
     const id = this.spare.pending(rt)[0];
     if (!id) return;
     const moved = from !== accountId ? await this.switchAccount(rt, accountId, { line: `Started with ${this.accountLabel(rt.meta.provider, accountId)}` }) : undefined;
-    await this.sendHeld(rt, id, moved?.carried);
+    await this.sendHeld(rt, id, moved?.carried, true);
   }
 
   /** A held entry goes out: the refused turn carries on (its id), or a queued message as an ordinary send. */
-  private async sendHeld(rt: SessionRuntime, id: string, carried?: 'conversation' | 'summary' | 'none') {
-    if (id === this.refusedMessage(rt)?.id) return void (await this.resumeRefused(rt, carried ?? 'reset'));
+  private async sendHeld(rt: SessionRuntime, id: string, carried?: 'conversation' | 'summary' | 'none', automatic = false) {
+    if (id === this.refusedMessage(rt)?.id) return void (await this.resumeRefused(rt, carried ?? 'reset', undefined, automatic));
     await this.deliverQueued(rt, id);
   }
 
@@ -2920,14 +2935,14 @@ export class App {
    * again, or "carry on" when it got partway). `reset`: on the same account, its window having reset.
    * Nothing is sent when no limit notice is open any more (carried on by hand meanwhile).
    */
-  private async resumeRefused(rt: SessionRuntime, carried: 'conversation' | 'summary' | 'none' | 'reset', refusalId?: string) {
+  private async resumeRefused(rt: SessionRuntime, carried: 'conversation' | 'summary' | 'none' | 'reset', refusalId?: string, automatic = false) {
     this.hydrate(rt);
     const accountId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
     const open = this.openLimit(rt, refusalId);
-    if (!open || rt.turnActive || this.moving.has(rt.id) || this.switching.has(rt.id) || this.dispatching.has(rt.id)) return;
+    if (!open || (automatic && rt.dangerHeld) || rt.turnActive || this.moving.has(rt.id) || this.switching.has(rt.id) || this.dispatching.has(rt.id)) return;
     const release = this.beginDispatch(rt);
     const stops = this.stopsOf(rt), closes = this.closesOf(rt);
-    const valid = () => !this.disposed && this.sessions.get(rt.id) === rt && this.stopsOf(rt) === stops && this.closesOf(rt) === closes &&
+    const valid = () => !(automatic && rt.dangerHeld) && !this.disposed && this.sessions.get(rt.id) === rt && this.stopsOf(rt) === stops && this.closesOf(rt) === closes &&
       (rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId && this.openLimit(rt, refusalId)?.id === open.id;
     try {
       await this.dispatchRefused(rt, carried, open, accountId, valid);
@@ -2944,6 +2959,7 @@ export class App {
       ? this.resumeMessage(rt, refused, carried, open)
       : { id: randomUUID(), ts: Date.now(), type: 'user', text: RESUME_LIMIT_RESET, state: 'sent' };
     const handle = await this.ensureHandle(rt);
+    if (!valid()) return;
     await this.applyDue(rt, handle);
     // Its sender (a phone) removed meanwhile, or credits the setting forbids: nothing goes (review wave 17, #2, #3).
     if (refused && !this.refusedAllowed(rt, refused.id)) return;
@@ -3385,10 +3401,13 @@ export class App {
   private closesOf(rt: SessionRuntime) {
     return this.closes.get(rt.id) ?? 0;
   }
-  private stopped(rt: SessionRuntime) {
+  private cancelLossWake(rt: SessionRuntime) {
     this.pendingLossWake.delete(rt);
     clearTimeout(this.lossWakeTimers.get(rt));
     this.lossWakeTimers.delete(rt);
+  }
+  private stopped(rt: SessionRuntime) {
+    this.cancelLossWake(rt);
     this.stops.set(rt.id, this.stopsOf(rt) + 1);
     this.firstInputs.get(rt.id)?.missed();
   }
@@ -3776,6 +3795,7 @@ export class App {
       // earlier move that no message took yet stays (review wave 8, #22).
       const prev = rt.meta.moveNote;
       const summary = summaryAt && line ? { summary: line.id, ...(refused ? { skip: refused.id } : {}) } : prev?.summary ? { summary: prev.summary, ...(prev.skip ? { skip: prev.skip } : {}) } : {};
+      if (!auto && !opts.line) this.cancelLossWake(rt);
       rt.update({ ...destination, ...usage, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, status: 'idle', lastError: undefined, ...(anchor ? { moveNote: { line: anchor, ...summary } } : {}) });
       committed = true;
       if (openingCaps) rt.setCaps(openingCaps);
@@ -4074,6 +4094,7 @@ export class App {
     this.until.turnOver(rt);
     // What the turn took (nothing of a failed or stopped one, nor of one whose end is not known).
     const consumed = this.consumed(rt, !error && !rt.stopRequested && !hold);
+    if (consumed.length) this.lastPersonalTurn.set(rt, consumed[consumed.length - 1]);
     const heldCard = this.refusalQueues.get(rt);
     if (!hit && heldCard && consumed.length) {
       const at = rt.items.findIndex(i => i.id === heldCard);

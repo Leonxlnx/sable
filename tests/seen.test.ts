@@ -4,14 +4,15 @@
  * Real git in temporary folders decides what changed; the signatures are checked against git's own.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SeenFile } from '@shared/protocol';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
-import { registerGit } from '../server/services/git';
+import * as gitFiles from '../server/services/git';
+import { gitStatus, readText, registerGit } from '../server/services/git';
 import { MAX_FILES, TEXT_MAX, TEXT_TOTAL, blobId, bound, classify, registerSeen, type SeenEntry } from '../server/services/seen';
 
 const temps: string[] = [];
@@ -60,6 +61,41 @@ async function setup(opts: { git?: boolean; before?: (repo: string) => void } = 
   };
   return { home, repo, app, id, seen, state, by, mark, w: (f: string, t: string) => writeFileSync(path.join(repo, f), t) };
 }
+
+describe('tree reads by their own names', () => {
+  it('lists names for signing without counting working-tree lines', async () => {
+    const { repo, w } = await setup();
+    w('fresh.txt', 'one\ntwo\n');
+    expect((await gitStatus(repo, { namesOnly: true })).files[0]).not.toHaveProperty('additions');
+  });
+
+  it('withholds a file link from status, diff and seen', async (ctx) => {
+    const { app, repo, state } = await setup();
+    try { symlinkSync(path.join(repo, 'a.txt'), path.join(repo, 'alias.txt'), 'file'); }
+    catch (e) { return ctx.skip(`File symlinks unavailable: ${String(e)}`); }
+    expect((await gitStatus(repo)).files[0]).toMatchObject({ additions: 0, link: true });
+    expect((await app.call('git.diff', { cwd: repo, path: 'alias.txt' }))[0]).toMatchObject({ hunks: [], withheld: 'link' });
+    expect((await state('alias.txt')).files[0].hash).toBe('link');
+  });
+
+  it('declines a file named through a directory junction', async (ctx) => {
+    const { repo, w, state } = await setup();
+    mkdirSync(path.join(repo, 'alias'));
+    w('alias/sample.txt', 'fixture');
+    const listed = await gitStatus(repo, { namesOnly: true });
+    renameSync(path.join(repo, 'alias'), path.join(repo, 'plain'));
+    try { symlinkSync(path.join(repo, 'plain'), path.join(repo, 'alias'), 'junction'); }
+    catch (e) { return ctx.skip(`Directory junctions unavailable: ${String(e)}`); }
+    // Git's real list from before the directory changed. Both paths stay within this fixture.
+    const previous = vi.spyOn(gitFiles, 'gitStatus').mockResolvedValueOnce(listed);
+    try {
+      const row = await state('alias/sample.txt');
+      expect(row.files[0]).toMatchObject({ path: 'alias/sample.txt', hash: 'link' });
+      expect(row.diff).toBeUndefined();
+    } finally { previous.mockRestore(); }
+    expect(await readText(path.join(repo, 'alias/sample.txt'), 100, repo)).toBeNull();
+  });
+});
 
 describe('the rule', () => {
   it('classifies new, seen and changed again, and keeps a rename on its old name', () => {
@@ -172,6 +208,16 @@ describe('seen states with real git', { timeout: 60_000 }, () => {
     expect(by((await state()).files)['a.txt']).toBe('seen');
   });
 
+  it('leaves a budget-skipped blob unknown until its own scan', async () => {
+    const { repo, state, mark, w } = await setup();
+    w('z.txt', 'seen bytes');
+    await mark('z.txt');
+    const big = Buffer.alloc(8_000_000, 65);
+    for (let i = 0; i < 8; i++) writeFileSync(path.join(repo, `fill-${i}`), big);
+    expect((await state()).files.find(f => f.path === 'z.txt')).toBeUndefined();
+    expect((await state('z.txt')).files[0]).toMatchObject({ hash: blobId(Buffer.from('seen bytes')), state: 'seen' });
+  });
+
   it('a commit does not make a seen change new: the content is what was seen', async () => {
     const { repo, state, by, mark, w } = await setup();
     w('a.txt', 'one\ntwo\nthree\nfour\n');
@@ -216,6 +262,36 @@ describe('seen states with real git', { timeout: 60_000 }, () => {
     await expect(app.call('seen.state', { sessionId: id, cwd: home })).rejects.toThrow(/folder/);
   });
 
+  it('finishes the queued baseline in the final folder before the first provider input', async () => {
+    const { app, seen, repo, home } = await setup();
+    const finalDir = path.join(home, 'final');
+    repoIn(finalDir);
+    const provider = app.provider('demo');
+    const open = provider.open.bind(provider);
+    vi.spyOn(provider, 'open').mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      const send = handle.send.bind(handle);
+      handle.send = (item, options) => {
+        writeFileSync(path.join(finalDir, 'first.txt'), 'first edit');
+        return send(item, options);
+      };
+      return handle;
+    });
+    let release!: () => void;
+    const held = new Promise<void>(r => { release = r; });
+    const queue = seen as unknown as { serial(fn: () => Promise<void>): Promise<void> };
+    void queue.serial(() => held);
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: repo });
+    app.runtime(session.id).update({ cwd: finalDir });
+    const sending = app.call('session.send', { sessionId: session.id, text: 'hi' });
+    try {
+      await new Promise(r => setTimeout(r, 120));
+      expect(existsSync(path.join(finalDir, 'first.txt'))).toBe(false);
+    } finally { release(); await sending; await seen.begin(session.id); }
+    const state = await app.call('seen.state', { sessionId: session.id, cwd: finalDir });
+    expect(state.files).toMatchObject([{ path: 'first.txt', state: 'new' }]);
+  });
+
   it('records where the chat began: what was dirty then is seen, what the turn changes is new', async () => {
     const { app, id, repo, seen, state, by, w } = await setup({ before: (dir) => writeFileSync(path.join(dir, 'a.txt'), 'one\ntwo\nthree\npre\n') });
     w('a.txt', 'one\ntwo\nthree\npre\nagent\n');
@@ -230,6 +306,38 @@ describe('seen states with real git', { timeout: 60_000 }, () => {
     await seen.begin(id);
     expect(by((await state()).files)).toEqual({ 'a.txt': 'again', 'd.txt': 'new' });
     void repo;
+  });
+
+  it('reports many at the turn-end entry cap and retains the signed rows', async () => {
+    const { app, id, seen, w } = await setup();
+    for (let i = 0; i < 9; i++) w(`change-${i}`, 'edited');
+    const result = await seen.end(id, { entries: 2, ms: 5000 });
+    expect(app.runtime(id).meta.reviewMany).toBe(true);
+    expect(app.runtime(id).meta.review).toBe(2);
+    expect(result?.files.map(f => f.path)).toEqual(['change-0', 'change-1']);
+  });
+
+  it('releases the scan queue at the deadline even with a file lookup pending', async () => {
+    const { app, id, seen, w, state } = await setup();
+    w('a.txt', 'modified');
+    let release!: () => void;
+    const held = new Promise<void>(r => { release = r; });
+    const original = gitFiles.openOwnFile;
+    const lookup = vi.spyOn(gitFiles, 'openOwnFile').mockImplementationOnce(async (...args) => {
+      await held;
+      return original(...args);
+    });
+    let elapsed: number;
+    const start = performance.now();
+    const fallback = setTimeout(release, 1800);
+    try {
+      await seen.end(id, { entries: 2000, ms: 400 });
+      elapsed = performance.now() - start;
+      expect(app.runtime(id).meta.reviewMany).toBe(true);
+      expect(elapsed).toBeLessThan(1200);
+      lookup.mockRestore();
+      expect((await state('a.txt')).files).toHaveLength(1);
+    } finally { clearTimeout(fallback); release(); lookup.mockRestore(); }
   });
 
   it('the Demo turn that edits files counts them on the chat when it ends', async () => {

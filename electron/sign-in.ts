@@ -1,4 +1,4 @@
-import { app, ipcMain, safeStorage, session, webContents, type BrowserWindow, type IpcMainInvokeEvent, type WebContents } from 'electron';
+import { app, ipcMain, safeStorage, session, webContents, type BrowserWindow, type IpcMainInvokeEvent, type OnBeforeRequestListenerDetails, type WebContents } from 'electron';
 import { setSignInHolds, SIGN_IN_OFF, SignInStore, signInShips } from '../server/services/sign-ins';
 import { Attestations, codeOf, SignInError, SignInGate, SIGN_IN_WORLD, type Credential, type GuestPage, type SignInCode } from './sign-in-core';
 
@@ -13,6 +13,12 @@ let gate: SignInGate | undefined;
 
 /** The agent's tools are held on this guest (a sign-in is under way, or a filled document is still shown). */
 export const signInHeld = (guestId: number) => !!gate?.held(guestId);
+
+export function cancelSignInRequest(d: OnBeforeRequestListenerDetails) {
+  if (!gate) return false;
+  const body = d.uploadData?.map(u => u.bytes ?? new Uint8Array());
+  return gate.verdict(d.webContentsId, { id: d.id, url: d.url, method: d.method, resourceType: d.resourceType, body }) === 'cancel';
+}
 
 /** safeStorage that really encrypts: on Linux only with a real secret store, never the plain-text fallback. */
 const canEncrypt = () => app.isReady() && safeStorage.isEncryptionAvailable() && (process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text');
@@ -109,10 +115,6 @@ export function installSignIn(opts: { partition: string; home: string; window: (
   // While a password is in play: only the approved submission carries a body, judged again by request
   // id when it is redirected; no request carries the password in its address or in a header.
   const ses = session.fromPartition(opts.partition);
-  ses.webRequest.onBeforeRequest((d, cb) => {
-    const body = d.uploadData ? d.uploadData.map((u) => u.bytes ?? new Uint8Array()) : undefined;
-    cb({ cancel: g.verdict(d.webContentsId, { id: d.id, url: d.url, method: d.method, resourceType: d.resourceType, body }) === 'cancel' });
-  });
   ses.webRequest.onBeforeSendHeaders((d, cb) => {
     cb(g.headers(d.webContentsId, d.requestHeaders) === 'cancel' ? { cancel: true } : { requestHeaders: d.requestHeaders });
   });
