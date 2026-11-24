@@ -18,7 +18,8 @@ const config: CapacitorConfig = {
     backgroundColor: '#070708',
   },
   plugins: {
-    SystemBars: { insetsHandling: 'css', style: 'DARK', initialViewportFitValueHint: 'cover' },
+    // The page's edges are PageInsets.java's alone (one path on every WebView): SystemBars only colours the bars.
+    SystemBars: { insetsHandling: 'disable', style: 'DARK' },
     Keyboard: { resizeOnFullScreen: false },
     LocalNotifications: { smallIcon: 'ic_stat_sable', iconColor: '#f2f1ee' },
   },

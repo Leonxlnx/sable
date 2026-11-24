@@ -79,6 +79,27 @@
   color: var(--text-2);
 }
 
+/* at work: the living tiles and what works, in the place of the folder */
+.chat-work {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-2);
+}
+
+.chat-work-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: work-text-in 160ms var(--ease-out) both;
+}
+
+@keyframes work-text-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+
 .back-btn {
   color: var(--text);
 }

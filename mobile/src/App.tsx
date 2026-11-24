@@ -1,15 +1,18 @@
 import { animate } from 'motion';
 import { AnimatePresence, motion, usePresence } from 'motion/react';
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import type { SessionMeta } from '@shared/protocol';
+import { hasWork } from '@shared/work-label';
 import { goBack, pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
-import { clearNotification, forgetNotificationLines, haptic, inForeground, keepAlive, notify, onAppState, onBackButton, onNotificationTap, onPairLink, setShortcuts } from '@m/lib/native';
+import { clearNotification, forgetNotificationLines, haptic, inForeground, isNative, loadPref, notify, onAppState, onBackButton, onNoteAction, onPairLink, setLive, setShortcuts } from '@m/lib/native';
+import { lastNote, liveEnabled, waitingNote, workEnded } from '@m/lib/notes';
+import { answerFromNote } from '@m/lib/note-answer';
+import { epoch, still } from '@m/lib/epoch';
 import { chatOf, nav, routeKey, useNav, type Route } from '@m/lib/nav';
 import { rowOf, takeOrigin, type Origin } from '@m/lib/open';
 import { pruneComments } from '@m/lib/comments';
 import { takeSwap } from '@m/lib/race';
-import { closeSessionData, getState, hasCachedHome, loadCachedHome, refresh, setState, subscribeStore, useStore } from '@m/lib/store';
+import { closeSessionData, getState, hasCachedHome, loadCachedHome, refresh, setState, subscribeStore, useStore, watchLive } from '@m/lib/store';
 import '@m/lib/keyboard';
 import { fieldBeat } from '@m/ui/Field';
 import { Launch } from '@m/ui/Launch';
@@ -19,7 +22,7 @@ import { Viewer } from '@m/ui/Viewer';
 import { MessageMenu } from './screens/MessageMenu';
 import { Home } from './screens/Home';
 import { Pair } from './screens/Pair';
-import { prefs, Settings } from './screens/Settings';
+import { Settings } from './screens/Settings';
 
 // The conversation (markdown, steps, composer) loads as its own chunk: home draws first, then it is fetched while idle.
 const loadChat = () => import('./screens/Chat');
@@ -29,15 +32,35 @@ const loadChanges = () => import('./screens/Changes');
 const ChangesScreen = lazy(() => loadChanges().then((m) => ({ default: m.ChangesScreen })));
 const DiffScreen = lazy(() => loadChanges().then((m) => ({ default: m.DiffScreen })));
 
-/** Notifies when a turn ends or starts waiting on you while the app is in the background. */
+/** The agent's last note in a chat that just finished: from the conversation when the phone has it, else its newest page, read without marking it read. */
+async function doneText(id: string): Promise<string | null> {
+  const d = getState().data[id];
+  if (d?.roots.length && !d.cached && !d.next) {
+    const roots = d.roots.slice(-40).map((r) => d.items[r]).filter((x): x is NonNullable<typeof x> => !!x);
+    const note = lastNote(roots);
+    if (note) return note;
+  }
+  try {
+    // `peek`: the desktop keeps the chat unread and streams nothing more for it (server/services/phone.ts).
+    const page = await conn.call('phone.tail', { sessionId: id, limit: 12, peek: true });
+    return lastNote(page.items);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Notifies when a turn ends or starts waiting on you while the app is in the background, takes a
+ * chat's notification away once it was read or answered on the desktop.
+ */
 function watchTurns() {
-  let last: Record<string, SessionMeta['status']> = {};
-  let seeded = false;
   let prev = getState().sessions;
+  let seeded = getState().listAt !== undefined;
   let listAt = getState().listAt;
   return () => {
     const { sessions } = getState();
     if (sessions === prev) return;
+    const previous = prev;
     prev = sessions;
     // A whole new list on screen (a reconnect after time away): what changed meanwhile is not news (no
     // wave, no haptic); it seeds again. In the background it still is: the phone was following.
@@ -45,18 +68,23 @@ function watchTurns() {
       listAt = getState().listAt;
       if (inForeground()) seeded = false;
     }
-    const next: typeof last = {};
+    const e0 = epoch();
+    const canNotify = () => still(e0) && !inForeground() && liveEnabled(getState());
     for (const s of Object.values(sessions)) {
-      next[s.id] = s.status;
-      const was = last[s.id];
-      if (!seeded || !was || was === s.status) continue;
-      const ended = (was === 'running' || was === 'awaiting') && (s.status === 'idle' || s.status === 'error');
+      const prior = previous[s.id];
+      if (!seeded || !prior || prior === s) continue;
+      const was = prior.status;
+      // Read on the desktop: its notification has been seen.
+      if (prior.unread && !s.unread) clearNotification(s.id);
+      const ended = workEnded(prior, s);
       const waits = s.status === 'awaiting' && was !== 'awaiting';
-      if (ended && s.status === 'idle') {
+      // Answered on the desktop (the turn goes on): "Waiting for you" is no longer true.
+      if (was === 'awaiting' && (s.status === 'running' || s.status === 'starting')) clearNotification(s.id);
+      if (ended && s.status === 'idle' && inForeground()) {
         // The ring closes on the composer of the chat on screen, or on home on that chat's row at the top (else on the new-chat bar).
-        fieldBeat('done', [...document.querySelectorAll('.layer')].pop()?.querySelector('.composer') ?? document.querySelector(`.home [data-live="${s.id}"]`) ?? document.querySelector('.home-dock'));
+        fieldBeat('done', [...document.querySelectorAll('.layer')].pop()?.querySelector('.composer') ?? document.querySelector(`.home [data-live="${CSS.escape(s.id)}"]`) ?? document.querySelector('.home-dock'));
         // Felt while the app is open: clearly for the chat on screen, a tick for one elsewhere.
-        if (inForeground()) haptic(chatOf(nav.stack[nav.stack.length - 1]) === s.id ? 'success' : 'select');
+        haptic(chatOf(nav.stack[nav.stack.length - 1]) === s.id ? 'success' : 'select');
       }
       if (!waits && !ended) continue;
       if (waits && inForeground()) {
@@ -67,15 +95,26 @@ function watchTurns() {
           if (top) setState({ attention: { id: s.id, at: Date.now() } });
         }
       }
-      if (inForeground() || !prefs.notify) continue;
-      if (waits) void notify(s.title, 'Waiting for you', s.id, 'waiting');
-      else if (ended) void notify(s.title, s.status === 'error' ? (s.lastError ?? 'Stopped with an error') : 'Done', s.id, 'done');
+      if (!canNotify()) continue;
+      const id = s.id;
+      if (waits) {
+        // What it needs comes with its prompt, which may land a moment after the status.
+        window.setTimeout(() => {
+          const cur = getState().sessions[id];
+          if (!cur || cur.status !== 'awaiting' || !canNotify()) return;
+          const w = waitingNote(id, getState().pending);
+          const deviceId = conn.pairing?.deviceId;
+          void notify(cur.title, w.text, id, 'waiting', w.ask && deviceId ? { ...w.ask, deviceId } : undefined);
+        }, 400);
+      } else if (s.status === 'error') void notify(s.title, s.lastError?.trim() || 'Stopped with an error', id, 'failed');
+      else
+        void doneText(id).then((text) => {
+          const cur = getState().sessions[id];
+          if (!cur || cur.status !== 'idle' || hasWork(cur) || !canNotify()) return;
+          void notify(cur.title, text ?? 'Done', id, 'done');
+        });
     }
-    last = next;
-    seeded = true;
-    // Something at work: the connection stays when the app leaves the screen (to say when it ends or waits).
-    const busy = Object.values(sessions).filter((s) => !s.archived && (s.status === 'running' || s.status === 'starting' || s.status === 'awaiting'));
-    keepAlive(prefs.notify && busy.length && getState().conn !== 'unpaired' ? (busy.length === 1 ? busy[0].title : `${busy.length} chats`) : null);
+    seeded = getState().listAt !== undefined;
   };
 }
 
@@ -152,20 +191,28 @@ export function App() {
       onBackButton(goBack),
       pushBack(() => nav.pop()),
       onPairLink((url) => {
-        // The app icon's shortcuts: a new chat (home's bar, focused), or one of the last chats.
-        const m = /^sable:\/\/(new|chat)(?:\/([^/?#]+))?/i.exec(url);
+        // The app icon's shortcuts (a new chat, home's bar focused; one of the last chats) and the
+        // notifications: a chat where it matters (`at=prompt`: the prompt waiting, its sheet opens by
+        // itself; `at=turn`: the newest turn), the summary's home.
+        const m = /^sable:\/\/(new|chat|home)(?:\/([^/?#]+))?(?:\?at=(\w+))?/i.exec(url);
         if (!m) return setLink(url);
-        if (m[1].toLowerCase() === 'new') {
+        const what = m[1].toLowerCase();
+        if (what === 'home') nav.reset();
+        else if (what === 'new') {
           nav.reset();
           window.setTimeout(() => window.dispatchEvent(new Event('sable:newchat')), 350);
-        } else if (m[2]) nav.chat(decodeURIComponent(m[2]));
+        } else if (m[2]) nav.chat(decodeURIComponent(m[2]), m[3] === 'turn' ? 'turn' : undefined);
       }),
-      // A notification opens its chat where it matters: the prompt waiting (its sheet opens by itself), or the newest turn.
-      onNotificationTap((id, kind) => (kind === 'home' ? nav.reset() : nav.chat(id, kind === 'done' ? 'turn' : undefined))),
+      // Allow once or Deny pressed on a chat's notification: answered through the phone's own path.
+      onNoteAction((a) => void answerFromNote(a)),
       // An erasure that could not finish (it goes on at the next start).
       conn.onNotice((text) => setState({ toast: { text, level: 'error', at: Date.now() } })),
     ];
     const stopWatch = subscribeStore(watchTurns());
+    const stopLive = isNative ? watchLive(setLive) : undefined;
+    void loadPref('notify', true).then((notify) => {
+      if (getState().notify === undefined) setState({ notify });
+    });
     const stopShortcuts = subscribeStore(watchShortcuts());
     const idle = window.setTimeout(() => void loadChat().then(() => window.setTimeout(() => void loadChanges(), 800)), 400);
     // Back where it was: Android may have closed the app in the background.
@@ -179,6 +226,7 @@ export function App() {
     return () => {
       offs.forEach((f) => f());
       stopWatch();
+      stopLive?.();
       stopShortcuts();
       clearTimeout(idle);
     };

@@ -58,7 +58,7 @@ export class Intents {
     for (const f of FIELDS) {
       if (!(f in from)) continue;
       if (!k) this.known.set(id, (k = {}));
-      k[f] = from[f];
+      k[f] = from[f] ?? undefined;
     }
   }
 
@@ -131,7 +131,7 @@ export class Intents {
     for (const f of FIELDS) {
       const want = h[f];
       if (!want || !(f in out)) continue;
-      if (out[f] === want.value) delete h[f];
+      if ((out[f] ?? undefined) === want.value) delete h[f];
       else delete out[f];
     }
     if (!FIELDS.some((f) => h[f])) this.held.delete(id);

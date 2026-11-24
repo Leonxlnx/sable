@@ -9,6 +9,7 @@ import type { PermissionRequest, SessionMeta } from '@shared/protocol';
 import { bumpEpoch } from '../mobile/src/lib/epoch';
 
 const fake = vi.hoisted(() => ({
+  cleared: vi.fn(),
   conn: {
     state: 'open',
     pairing: undefined as unknown,
@@ -21,6 +22,7 @@ const fake = vi.hoisted(() => ({
 }));
 vi.mock('../mobile/src/lib/conn', () => ({ conn: fake.conn }));
 vi.mock('../mobile/src/lib/native', () => ({
+  clearAnsweredNote: fake.cleared,
   clearChatNotifications: () => {},
   clearShortcuts: () => {},
   loadPref: async (_k: string, f: unknown) => f,
@@ -43,6 +45,11 @@ vi.stubGlobal('requestAnimationFrame', (f: () => void) => setTimeout(f, 0));
 vi.stubGlobal('cancelAnimationFrame', (h: ReturnType<typeof setTimeout>) => clearTimeout(h));
 
 type Store = {
+  watchLive: (send: (spec: { chats: number; waiting: number; chat?: string; since?: number } | null, stop: boolean) => void) => () => void;
+  applyEventSoon: (e: unknown) => void;
+  intend: (id: string, field: 'speed', value: string | undefined) => number;
+  undoIntent: (id: string, field: 'speed', gen: number) => boolean;
+  loadCachedHome: () => void;
   refresh: (open: string[]) => Promise<{ complete: boolean }>;
   openSession: (id: string) => Promise<void>;
   applyEvent: (e: unknown) => void;
@@ -54,6 +61,87 @@ const STORE = '../mobile/src/lib/store';
 const load = async () => (await import(/* @vite-ignore */ STORE)) as Store;
 
 const meta = (id: string) => ({ id, title: id, provider: 'demo', cwd: '/x', status: 'idle', createdAt: 1, updatedAt: 1 }) as unknown as SessionMeta;
+
+describe('phone session updates', () => {
+  it('removes JSON null fields, including a held pick rolled back after the clear', async () => {
+    const s = await load();
+    s.setState({ sessions: { a: { ...meta('a'), speed: 'fast', background: 2, commands: 3, spare: { reason: 'reset' } } } });
+    const pick = s.intend('a', 'speed', 'other');
+    const patch = (fields: object) => s.applyEvent(JSON.parse(JSON.stringify({ type: 'session.updated', id: 'a', patch: fields })));
+    patch({ speed: null, background: null, spare: null, moving: false, omitted: undefined });
+    expect(s.getState().sessions.a).not.toHaveProperty('background');
+    expect(s.getState().sessions.a).not.toHaveProperty('spare');
+    expect(s.getState().sessions.a).toMatchObject({ speed: 'other', commands: 3, moving: false });
+    expect(s.undoIntent('a', 'speed', pick)).toBe(true);
+    expect(s.getState().sessions.a).not.toHaveProperty('speed');
+    s.intend('a', 'speed', undefined);
+    patch({ speed: null });
+    patch({ speed: 'new', commands: 0 });
+    expect(s.getState().sessions.a).toMatchObject({ speed: 'new', commands: 0 });
+  });
+
+  it('normalizes a last-run cache that already contains a literal null', async () => {
+    const s = await load();
+    s.setState({ fresh: false });
+    mem.set('sable.home', JSON.stringify({ sessions: [{ ...meta('cached'), activity: null, commands: null }] }));
+    s.loadCachedHome();
+    expect(s.getState().sessions.cached).not.toHaveProperty('activity');
+    expect(s.getState().sessions.cached).not.toHaveProperty('commands');
+  });
+
+  it('publishes existing work on subscription and socket patches before the hidden page gets a frame', async () => {
+    const s = await load();
+    const send = vi.fn();
+    s.setState({ conn: 'open', fresh: true, listAt: 1, notify: true, sessions: { a: { ...meta('a'), status: 'running' } } });
+    const stop = s.watchLive(send);
+    try {
+      expect(send.mock.lastCall?.[0]).toMatchObject({ chats: 1, chat: 'a', text: 'Working' });
+      const since = send.mock.lastCall![0].since;
+      s.applyEventSoon({ type: 'session.updated', id: 'a', patch: { status: 'idle', commands: 1 } });
+      expect(send.mock.lastCall?.[0]).toMatchObject({ chats: 1, text: '1 command running', since });
+      s.applyEventSoon({ type: 'session.updated', id: 'a', patch: { commands: null } });
+      expect(send.mock.lastCall).toEqual([null, false]);
+      s.applyEventSoon({ type: 'session.updated', id: 'a', patch: { status: 'starting' } });
+      expect(send.mock.lastCall?.[0]).toMatchObject({ chats: 1, text: 'Starting' });
+      for (const update of [{ notify: false }, { notify: true, fresh: false }, { fresh: true, conn: 'offline' }, { conn: 'unpaired' }]) {
+        s.setState(update);
+        expect(send.mock.lastCall).toEqual([null, true]);
+      }
+      s.setState({ conn: 'open', notify: undefined });
+      expect(send.mock.lastCall).toEqual([null, true]);
+      s.setState({ notify: true });
+      expect(send.mock.lastCall?.[0]).toMatchObject({ chat: 'a', chats: 1 });
+    } finally {
+      stop();
+    }
+  });
+});
+
+it('keeps Open on a closed socket or refused answer and clears only the old post when the desktop answered first', async () => {
+  const s = await load();
+  const modulePath = '../mobile/src/lib/note-answer';
+  const { answerFromNote } = await import(/* @vite-ignore */ modulePath);
+  const action = { sessionId: 'a', requestId: 'r', optionId: 'yes', verb: 'allow', noteId: 23, detail: 'go', token: 'post-r', deviceId: 'phone' };
+  const req = { id: 'r', sessionId: 'a', title: 'go', detail: {}, options: [{ id: 'yes', label: 'Allow once', tone: 'allow' }, { id: 'no', label: 'Deny', tone: 'deny' }] };
+  const call = vi.fn().mockRejectedValueOnce(new Error('lost')).mockResolvedValue({ ok: false });
+  fake.cleared.mockClear();
+  fake.conn.call = call;
+  fake.conn.pairing = { deviceId: 'phone' };
+  s.setState({ conn: 'offline', fresh: true, notify: true, listAt: 1, pending: { permissions: [req], questions: [] } });
+  await answerFromNote(action);
+  expect(call).not.toHaveBeenCalled();
+  s.setState({ conn: 'open' });
+  await answerFromNote(action);
+  expect(call).toHaveBeenCalledExactlyOnceWith('permission.respond', { sessionId: 'a', requestId: 'r', optionId: 'yes' });
+  expect(fake.cleared).not.toHaveBeenCalled();
+  await answerFromNote(action);
+  expect(fake.cleared).toHaveBeenCalledExactlyOnceWith(action);
+  s.setState({ pending: { permissions: [], questions: [] } });
+  await answerFromNote(action);
+  expect(call).toHaveBeenCalledTimes(2);
+  expect(fake.cleared).toHaveBeenCalledTimes(2);
+  fake.conn.pairing = undefined;
+});
 const perm = (id: string, sessionId = 'a') => ({ id, sessionId, tool: 'Bash', title: 'Run', input: {} }) as unknown as PermissionRequest;
 const hello = (over: Record<string, unknown> = {}) => ({ sessions: [meta('a')], providers: [], projects: [], settings: {}, version: 'x', ...over });
 const tick = () => new Promise((r) => setTimeout(r, 0));

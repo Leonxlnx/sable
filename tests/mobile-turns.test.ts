@@ -239,14 +239,15 @@ describe("phone turns with what Claude Code writes in the person's place", () =>
     expect(shapeOf(user('Build it'))).toBe('U');
   });
 
-  it('opens a turn with a notification, stacks the next one, and gives one taken mid-turn a segment', () => {
+  it('opens a turn with a notification, the next one after nothing a turn of its own, and gives one taken mid-turn a segment', () => {
     const two = (s: string) => {
       const { ids, shape } = spec(s);
       return groupTurns(ids, shape, false).groups;
     };
+    // A notification turn that holds nothing woke no work: the next one begins its own (window-F3, day 7).
     const g = two('U1 t2 T3 N4 N5 t6 T7');
-    expect(g).toHaveLength(2);
-    expect((g[1] as TurnGroup).segments.map((s) => s.answer)).toEqual([null, '6']);
+    expect(g).toHaveLength(3);
+    expect((g[2] as TurnGroup).segments.map((s) => s.answer)).toEqual(['6']);
     const t = onlyTurn('U1 w2 N3 w4 t5 T6');
     expect(t.segments.map((s) => s.answer)).toEqual([null, '5']);
     expect(two('U1 w2 i3 N4 t5 T6')).toHaveLength(2);

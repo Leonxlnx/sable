@@ -24,6 +24,7 @@ import { partOfTurn, syntheticOf } from '@shared/synthetic';
 import { conn, type ConnState } from './conn';
 import { reshape, shapeString } from './turns';
 import { Intents, type Field } from './intents';
+import { liveEnabled, liveOf, livePayload, turnSteps, type LiveChat, type LiveSpec } from './notes';
 import { clearChatNotifications, clearShortcuts } from './native';
 import { reconciler, staleFetch } from './stale';
 import { onForget } from './forget';
@@ -78,6 +79,8 @@ export interface SessionData {
 
 export interface State {
   conn: ConnState;
+  /** This phone's notification switch, once read from preferences. */
+  notify?: boolean;
   connError?: string;
   desktop?: string;
   version?: string;
@@ -119,12 +122,15 @@ const hadHome = (() => {
 const NONE: State['pending'] = { permissions: [], questions: [] };
 let state: State = { conn: hadHome ? 'connecting' : 'unpaired', providers: {}, projects: [], sessions: {}, data: {}, limits: {}, caps: {}, loaded: false, pending: NONE };
 const listeners = new Set<() => void>();
+const liveListeners = new Set<(before: State) => void>();
 
 export const getState = () => state;
 
 export function setState(patch: Partial<State> | ((s: State) => Partial<State>)) {
   const p = typeof patch === 'function' ? patch(state) : patch;
+  const before = state;
   state = { ...state, ...p };
+  for (const sync of liveListeners) sync(before);
   if (deferring) return scheduleNotify();
   notifyNow();
 }
@@ -165,6 +171,27 @@ const subscribe = (l: () => void) => {
 
 /** Runs `l` after every change (outside React). */
 export const subscribeStore = subscribe;
+
+/** Android needs the committed state even while WebView frames and timers are suspended. */
+export function watchLive(send: (spec: LiveSpec | null, stop: boolean) => void) {
+  let previous: LiveChat[] = [];
+  const sync = (before?: State) => {
+    const { sessions, data, fresh, notify, conn } = state;
+    if (before && before.sessions === sessions && before.fresh === fresh && before.notify === notify && before.conn === conn && before.listAt === state.listAt) {
+      if (before.data === data || !previous.some(({ id }) => before.data[id]?.roots !== data[id]?.roots)) return;
+    }
+    const enabled = liveEnabled(state);
+    const live = liveOf(enabled ? Object.values(sessions) : [], previous, Date.now(), (id) => {
+      const d = data[id];
+      return d && !d.cached && !d.next ? turnSteps(d.roots.slice(-400).map((r) => d.items[r])) : undefined;
+    });
+    previous = live.chats;
+    send(livePayload(state, live), !enabled);
+  };
+  liveListeners.add(sync);
+  sync();
+  return () => void liveListeners.delete(sync);
+}
 
 export function useStore<T>(selector: (s: State) => T): T {
   return useSyncExternalStore(subscribe, () => selector(state));
@@ -211,7 +238,11 @@ function patchData(id: string, fn: (d: SessionData) => Partial<SessionData>) {
 function patchSession(id: string, patch: Partial<SessionMeta>) {
   const s = state.sessions[id];
   if (!s) return;
-  setState({ sessions: { ...state.sessions, [id]: { ...s, ...patch } } });
+  const next = { ...s, ...patch };
+  for (const key of Object.keys(patch) as (keyof SessionMeta)[]) {
+    if (patch[key] == null) delete next[key];
+  }
+  setState({ sessions: { ...state.sessions, [id]: next } });
 }
 
 // ── what the phone just picked: a chat's model, effort, speed or permission mode (lib/intents.ts) ──
@@ -263,8 +294,19 @@ export function undoIntent(id: string, field: Field, gen: number): boolean {
 /** An update from the desktop without the fields that still wait for their answer (a confirmed field lets go). */
 const sieve = (id: string, patch: Partial<SessionMeta>): Partial<SessionMeta> => picks.sieve(id, patch as Record<string, unknown>) as Partial<SessionMeta>;
 
+/** Older phone caches may contain the literal null that an earlier store kept after a clear. */
+function cleanMeta(meta: SessionMeta): SessionMeta {
+  let next = meta;
+  for (const key of Object.keys(meta) as (keyof SessionMeta)[]) {
+    if (meta[key] != null) continue;
+    if (next === meta) next = { ...meta };
+    delete next[key];
+  }
+  return next;
+}
+
 /** A whole chat from the desktop (a snapshot, a list) with what the phone picked still on top. */
-const withIntents = (s: SessionMeta): SessionMeta => picks.over(s as unknown as Record<string, unknown> & { id: string }) as unknown as SessionMeta;
+const withIntents = (s: SessionMeta): SessionMeta => cleanMeta(picks.over(s as unknown as Record<string, unknown> & { id: string }) as unknown as SessionMeta);
 
 type Tail = (SessionSnapshot | PhoneTail) & { cursor?: string; next?: string };
 
@@ -280,7 +322,7 @@ export function applySnapshot(snap: Tail, cached = false) {
     else roots.push(it.id);
   }
   setState({
-    sessions: { ...state.sessions, [snap.session.id]: withIntents(snap.session) },
+    sessions: cached && state.sessions[snap.session.id] ? state.sessions : { ...state.sessions, [snap.session.id]: withIntents(snap.session) },
     data: {
       ...state.data,
       [snap.session.id]: {
@@ -489,7 +531,7 @@ export function applyEvent(e: BridgeEvent) {
       return;
     }
     case 'session.added':
-      return setState({ sessions: { ...state.sessions, [e.session.id]: e.session } });
+      return setState({ sessions: { ...state.sessions, [e.session.id]: withIntents(e.session) } });
     case 'session.updated':
       return patchSession(e.id, sieve(e.id, e.patch));
     case 'session.removed': {
@@ -893,7 +935,7 @@ conn.on(applyEventSoon);
 onForget(() => forgetDesktop());
 conn.onState(() => {
   if (conn.state === 'unpaired') return forgetDesktop();
-  setState({ conn: conn.state, connError: conn.error, desktop: conn.pairing?.desktop ?? state.desktop });
+  setState({ conn: conn.state, connError: conn.error, desktop: conn.pairing?.desktop ?? state.desktop, ...(conn.state !== 'open' && { listAt: undefined }) });
 });
 
 /**
@@ -944,7 +986,7 @@ export function loadCachedHome() {
     if (!raw || state.fresh) return;
     const c = JSON.parse(raw) as { desktop?: string; sessions: SessionMeta[]; providers: State['providers']; projects: Project[]; settings?: AppSettings; version?: string };
     const sessions: Record<string, SessionMeta> = {};
-    for (const s of c.sessions) sessions[s.id] = s;
+    for (const s of c.sessions) sessions[s.id] = cleanMeta(s);
     setState({ sessions, providers: c.providers ?? {}, projects: c.projects ?? [], settings: c.settings, version: c.version, desktop: c.desktop, loaded: true });
   } catch {
     /* a broken cache is ignored */

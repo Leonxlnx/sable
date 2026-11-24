@@ -52,8 +52,10 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps the connection to the paired computer while an agent works, to tell the user when it is done or waits for an answer." />
+                android:value="Shows a live notification while an agent on the paired computer works, and keeps the connection to it meanwhile, to tell the user when it is done or waits for an answer." />
         </service>
+        <!-- Allow once and Deny on a chat's notification (Notes.java): handed to the page, which answers. -->
+        <receiver android:name=".NoteActionReceiver" android:exported="false" />
     </application>
 
     <!-- Permissions -->
@@ -64,6 +66,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android 16: the working notification may be promoted as a Live Update (a normal permission, granted at install). -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- An APK the agent handed over opens in the installer (Android asks once to allow installs from Sable). -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />

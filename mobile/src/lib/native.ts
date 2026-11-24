@@ -7,7 +7,8 @@ import { Preferences } from '@capacitor/preferences';
 import type { Pairing } from './conn';
 import { removeChecked } from './credential';
 import { NoteBook } from './note-book';
-import { NotePoster, SUMMARY_ID } from './note-post';
+import { NotePoster, type ChatNote } from './note-post';
+import type { LiveSpec, NoteAction } from './notes';
 
 /** Thin wrappers over the Capacitor plugins, quiet when a plugin is missing (the web preview). */
 
@@ -161,15 +162,49 @@ export async function deviceName(): Promise<string> {
 }
 
 // ── notifications: a turn ended or waits on you, while the app is in the background ──
-
-let channelMade = false;
+// Drawn by Android itself (android/…/Notes.java): a channel per tone, one notification per chat
+// that updates in place, grouped under a summary, private on the lock screen. What they say is
+// lib/notes.ts's.
 
 /** One notification per chat: its newest state replaces the last ("Waiting for you", then "Done"). */
 const idFor = (sessionId: string) => {
   let h = 7;
   for (let i = 0; i < sessionId.length; i++) h = (h * 31 + sessionId.charCodeAt(i)) | 0;
-  return (Math.abs(h) % 2_000_000_000) + 2;
+  const id = (Math.abs(h) % 2_000_000_000) + 2;
+  return id === 7001 ? 2_000_000_002 : id; // reserved for KeepAliveService
 };
+
+/** A chat's notification, as Notes.java draws it. */
+interface NoteSpec {
+  id: number;
+  sessionId: string;
+  title: string;
+  text: string;
+  kind: string;
+  lines: string[];
+  chats: number;
+  summary: string[];
+  ask?: ChatNote['ask'];
+}
+
+/** What Android allows Sable: notifications at all, and (Android 16) Live Updates. */
+export interface NoteStatus {
+  enabled: boolean;
+  live?: boolean;
+  sdk: number;
+}
+
+const Notes = registerPlugin<{
+  post(o: NoteSpec): Promise<void>;
+  summary(o: { chats: number; lines: string[] }): Promise<void>;
+  cancel(o: { ids: number[] }): Promise<void>;
+  delivered(): Promise<{ ids: number[] }>;
+  clearAll(): Promise<void>;
+  cancelAction(o: { noteId: number; token: string }): Promise<{ removed: boolean }>;
+  live(o: LiveSpec & { stop?: boolean }): Promise<void>;
+  status(): Promise<NoteStatus>;
+  settings(o: { live?: boolean }): Promise<void>;
+}>('Notes');
 
 export async function notificationsAllowed(): Promise<boolean> {
   if (!isNative) return false;
@@ -190,10 +225,24 @@ export async function askNotifications(): Promise<boolean> {
   }
 }
 
-/** What a notification says happened: a turn ended (or failed), or the chat waits on you; 'home' for the summary. */
-export type NoteKind = 'done' | 'waiting' | 'home';
+/** Notifications and Live Updates as Android has them for Sable (null in a browser). */
+export async function noteStatus(): Promise<NoteStatus | null> {
+  if (!isNative) return null;
+  try {
+    return await Notes.status();
+  } catch {
+    return null;
+  }
+}
 
-const GROUP = 'sable.chats';
+/** Android's own page for Sable's notifications (`live`: its Live Updates page on Android 16). */
+export function openNoteSettings(live = false) {
+  if (!isNative) return;
+  void Notes.settings({ live }).catch(() => {});
+}
+
+/** What a notification says happened: a turn ended (or failed), or the chat waits on you. */
+export type NoteKind = 'done' | 'failed' | 'waiting';
 
 /** The chats with a notification up (kept across restarts, reconciled with Android's): the summary stays while there are two or more. */
 const POSTED = 'sable.notified';
@@ -210,31 +259,21 @@ const poster = new NotePoster(
   {
     // Never ask from the background (the plugin would try to show a prompt): only post when allowed.
     allowed: async () => (await LocalNotifications.checkPermissions()).display === 'granted',
-    prepare: async () => {
-      if (channelMade) return;
-      channelMade = true;
-      await LocalNotifications.createChannel({ id: 'turns', name: 'Turns', description: 'A turn ended or waits for you', importance: 4, visibility: 1, vibration: true }).catch(() => {});
-    },
+    prepare: async () => {},
     delivered: () =>
-      LocalNotifications.getDeliveredNotifications().then(
-        (r) => r.notifications.map((n) => n.id),
+      Notes.delivered().then(
+        (r) => r.ids,
         () => null,
       ),
-    cancel: async (ids) => void (await LocalNotifications.cancel({ notifications: ids.map((id) => ({ id })) })),
-    post: async (n, chats) => {
-      const common = { channelId: 'turns', smallIcon: 'ic_stat_sable', iconColor: '#f2f1ee', isExactNotification: false, group: GROUP };
-      const notifications: Parameters<typeof LocalNotifications.schedule>[0]['notifications'] = [
-        // Shown now, not at a time: no exact alarm (asking for one would open a settings screen, impossible from the background).
-        { ...common, id: n.id, title: n.title, body: n.body, extra: { sessionId: n.sessionId, kind: n.kind }, ...(n.lines.length > 1 ? { inboxList: n.lines, summaryText: n.title } : {}) },
-      ];
-      // Two chats or more: one summary holds them together (its own tap opens home).
-      if (chats > 1) notifications.push({ ...common, id: SUMMARY_ID, title: 'Sable', body: `${chats} chats`, groupSummary: true, summaryText: `${chats} chats`, extra: { kind: 'home' } });
-      await LocalNotifications.schedule({ notifications });
+    cancel: async (ids) => void (await Notes.cancel({ ids })),
+    post: async (n, chats, summary) => {
+      await Notes.post({ id: n.id, sessionId: n.sessionId, title: n.title, text: n.body, kind: n.kind, lines: n.lines, chats, summary, ...(n.ask ? { ask: n.ask } : {}) });
     },
+    summary: (chats, lines) => Notes.summary({ chats, lines }),
     // Each step awaited and none swallowed: an erasure that leaves a chat's line in the shade says so (lib/erase.ts).
     clearAll: async () => {
       if (!isNative) return;
-      await LocalNotifications.removeAllDeliveredNotifications();
+      await Notes.clearAll();
       const p = await LocalNotifications.getPending();
       if (p.notifications.length) await LocalNotifications.cancel({ notifications: p.notifications.map((n) => ({ id: n.id })) });
     },
@@ -245,14 +284,13 @@ const poster = new NotePoster(
 
 /**
  * One notification per chat, grouped under Sable: its newest news as the line, the earlier ones of
- * this time away listed under it when expanded ("Waiting for you", then "Done"). A tap opens the chat
- * where it matters: its prompt when it waits on you, the newest turn when one ended; the group's own
- * line opens home. Two chats finishing together are posted one after the other (the second with the
- * summary of two).
+ * this time away listed under it when expanded. A tap opens the chat where it matters: its prompt
+ * when it waits on you, the newest turn when one ended; the summary opens home. `ask`: Allow once
+ * and Deny on it (lib/notes.ts decides when that is safe).
  */
-export async function notify(title: string, body: string, sessionId: string, kind: NoteKind = 'done') {
+export async function notify(title: string, body: string, sessionId: string, kind: NoteKind = 'done', ask?: ChatNote['ask']) {
   if (!isNative) return;
-  await poster.notify(title, body, sessionId, kind);
+  await poster.notify(title, body, sessionId, kind, ask);
 }
 
 /** Every chat's notification goes, with what was kept of them, and any still on its way (the desktop was forgotten; the erasure itself checks it: `eraseNative`). */
@@ -261,12 +299,17 @@ export function clearChatNotifications() {
 }
 
 /**
- * A chat opened on the phone: its notification goes (after one still going up). The summary goes
- * only with the last chat's (cancelling a summary takes every notification of its group with it).
+ * A chat read (on the phone or the desktop) or answered: its notification goes (after one still
+ * going up). The summary goes only with the last chat's.
  */
 export function clearNotification(sessionId: string) {
   if (!isNative) return;
   void poster.clearOne(sessionId);
+}
+
+/** A later notification in the same chat must survive the older action's round trip. */
+export function clearAnsweredNote(a: NoteAction) {
+  void poster.clearOne(a.sessionId, async () => (await Notes.cancelAction({ noteId: a.noteId, token: a.token })).removed);
 }
 
 /** Back on screen: the lines of the time away start over (the notifications stay until opened or swiped). */
@@ -274,14 +317,18 @@ export function forgetNotificationLines() {
   void poster.forgetLines();
 }
 
-export function onNotificationTap(fn: (sessionId: string, kind: NoteKind) => void) {
+/** Allow once or Deny pressed on a chat's notification (App.tsx answers it through the phone's approval path). */
+export function onNoteAction(fn: (a: NoteAction) => void) {
   if (!isNative) return () => {};
-  const h = LocalNotifications.addListener('localNotificationActionPerformed', (a) => {
-    const x = a.notification.extra as { sessionId?: string; kind?: NoteKind } | undefined;
-    if (x?.sessionId) fn(x.sessionId, x.kind === 'waiting' ? 'waiting' : 'done');
-    else if (x?.kind === 'home') fn('', 'home');
-  });
-  return () => void h.then((x) => x.remove());
+  // Called by NotesPlugin.deliver with evaluateJavascript: a plugin event would wait until the app is on screen.
+  const w = window as unknown as { __sableNoteAction?: (a: NoteAction) => void };
+  const take = (a: NoteAction) => {
+    if (a && typeof a.deviceId === 'string' && typeof a.sessionId === 'string' && typeof a.requestId === 'string' && typeof a.optionId === 'string' && typeof a.detail === 'string' && typeof a.token === 'string' && a.noteId === idFor(a.sessionId) && (a.verb === 'allow' || a.verb === 'deny')) fn(a);
+  };
+  w.__sableNoteAction = take;
+  return () => {
+    if (w.__sableNoteAction === take) delete w.__sableNoteAction;
+  };
 }
 
 // ── the system: share a text, the app icon's shortcuts (android/…/SystemPlugin.java) ──
@@ -320,19 +367,32 @@ export function clearShortcuts() {
   setShortcuts([]);
 }
 
-// ── the connection kept in the background (android/…/KeepAliveService.java) ──
+// ── the live notification and the connection kept in the background (android/…/KeepAliveService.java) ──
 
-const KeepAlive = registerPlugin<{ arm(o: { text?: string }): Promise<void> }>('KeepAlive');
-let armed: string | null = null;
-
+let latestLive: { key: string; payload: LiveSpec & { stop?: boolean } } | undefined;
+let sentLive: { key: string; delivered: Promise<void> } | undefined;
+function publishLive() {
+  const update = latestLive;
+  if (!update) return;
+  const attempt = { key: update.key, delivered: Notes.live(update.payload) };
+  sentLive = attempt;
+  void attempt.delivered.catch(() => {
+    if (sentLive === attempt) sentLive = undefined;
+  });
+  return attempt.delivered;
+}
 /**
- * While a chat runs or waits, `text` names it: leaving the app then keeps the connection (Android
- * would cut it), so the phone can say when it is done or waits. Null lets it go.
+ * What works now (lib/notes.ts `liveWords`), sent on every change: leaving the app then keeps the
+ * connection with a live notification (Android would cut it), so the phone can say when it is done
+ * or waits. `null` (or nothing at work or waiting) lets it go a minute later.
  */
-export function keepAlive(text: string | null) {
-  if (!isNative || text === armed) return;
-  armed = text;
-  void KeepAlive.arm(text ? { text } : {}).catch(() => {});
+export function setLive(spec: LiveSpec | null, stop = false) {
+  if (!isNative) return;
+  const next = spec ?? { chats: 0, waiting: 0, ...(stop && { stop: true }) };
+  const key = JSON.stringify(next);
+  if (sentLive?.key === key) return sentLive.delivered;
+  latestLive = { key, payload: next };
+  return publishLive();
 }
 
 // ── erasing what was kept for a desktop (lib/erase.ts) ──
@@ -363,7 +423,7 @@ export async function eraseNative(): Promise<string[]> {
   await step('notifications', () => poster.clear());
   shortcutsKey = '';
   await step('shortcuts', () => System.shortcuts({ chats: [] }));
-  keepAlive(null);
+  await step('live notification', async () => { await setLive(null, true); });
   return failed;
 }
 
@@ -373,17 +433,16 @@ let foreground = typeof document === 'undefined' || document.visibilityState !==
 export const inForeground = () => foreground;
 
 export function onAppState(fn: (active: boolean) => void) {
-  const onVis = () => {
-    foreground = document.visibilityState === 'visible';
-    fn(foreground);
+  const changed = (active: boolean) => {
+    if (foreground !== active && isNative) publishLive();
+    foreground = active;
+    fn(active);
   };
+  const onVis = () => changed(document.visibilityState === 'visible');
   document.addEventListener('visibilitychange', onVis);
   let remove: (() => void) | undefined;
   if (isNative) {
-    const h = App.addListener('appStateChange', ({ isActive }) => {
-      foreground = isActive;
-      fn(isActive);
-    });
+    const h = App.addListener('appStateChange', ({ isActive }) => changed(isActive));
     remove = () => void h.then((x) => x.remove());
   }
   return () => {

@@ -387,6 +387,7 @@ button.set-row:active {
 
 /* ── pairing ── */
 .pair {
+  inset: 0 var(--sar) 0 var(--sal);
   padding: calc(var(--sat) + 24px) 22px calc(var(--sab) + 22px);
 }
 
@@ -647,7 +648,7 @@ button.set-row:active {
 /* ── scanner: the picture dims around a clear window ── */
 .scanner {
   position: fixed;
-  inset: 0;
+  inset: 0 var(--sar) 0 var(--sal);
   z-index: 100;
   background: #000;
   display: grid;

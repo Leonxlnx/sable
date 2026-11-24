@@ -1,6 +1,16 @@
-import type { SessionMeta, TimelineItem } from '@shared/protocol';
+import type { NoticeItem, SessionMeta, TimelineItem } from '@shared/protocol';
 import { syntheticOf } from '@shared/synthetic';
 import { hasWork } from '@shared/work-label';
+
+/** The action offered by this particular limit card. The desktop rechecks it when the call arrives. */
+export function limitAction(sessionId: string, notice: NoticeItem, next: { id: string; label: string } | undefined, waiting: boolean, now: number) {
+  const limit = notice.limit;
+  if (!limit || limit.continuedWith || limit.moving) return null;
+  const params = { sessionId, refusalId: notice.id };
+  if (next) return { label: `Continue with ${next.label}`, method: 'session.switchAccount', params: { ...params, retry: true, accountId: next.id } } as const;
+  if (!waiting && limit.resetsAt && limit.resetsAt > now) return { label: 'Continue at reset', method: 'spare.atReset', params } as const;
+  return null;
+}
 
 /**
  * The parts of a turn (lib/turns.ts `TurnGroup`) these rules read, written out here so the rules load

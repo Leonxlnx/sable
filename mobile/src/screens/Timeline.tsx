@@ -17,7 +17,7 @@ import { putDraft } from '@m/lib/put-draft';
 import { readReview, type PhoneReview } from '@m/lib/review';
 import { applyChildren, applyFull, fetchItem, getState, sessionData, setState, useStore, type State } from '@m/lib/store';
 import { claimFlight } from '@m/lib/flight';
-import { checkOpener, foldTarget, showKind, turnChanges } from '@m/lib/chat-rules';
+import { checkOpener, foldTarget, limitAction, showKind, turnChanges } from '@m/lib/chat-rules';
 import { foldKey, keepDetail, keepOpen, keptDetail, stepKey, wasOpen } from '@m/lib/folds';
 import { useChanges } from '@m/lib/changes';
 import { runSpan, turnSpan, type Segment, type StepsChunk, type TurnGroup } from '@m/lib/turns';
@@ -241,6 +241,7 @@ const folds = (p: Piece) => (p.k === 'lead' ? p.fold : p.k === 'text' ? p.note :
 function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boolean } {
   const segs = turn.segments;
   const last = segs.length - 1;
+  const active = turn.liveSegment ?? last;
   const running = turn.state === 'running';
   let headSeg = -1;
   let runs = 0;
@@ -250,7 +251,7 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
     for (const c of s.flow) if (c.kind === 'steps') runs++;
   }
   const out: Piece[] = [];
-  for (let si = 0; si <= last; si++) {
+  for (let si = 0; si <= active; si++) {
     const seg = segs[si];
     const place = headSeg < 0 || si < headSeg ? -1 : si === headSeg ? 0 : 1;
     // The last run ends at the turn's record, or at the bridge's word that it was cut.
@@ -272,7 +273,7 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
         continue;
       }
       const next = flow[i + 1];
-      const live = running && si === last && i === flow.length - 1;
+      const live = running && si === active && i === flow.length - 1;
       out.push({
         k: 'run',
         key: `${seg.key}:w${ord++}`,
@@ -285,9 +286,14 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
         ...(live ? { seg } : {}),
       });
     }
-    // Nothing to do yet, or the agent is saying something: the live line waits at the end for its run.
-    if (running && si === last && (!flow.length || flow[flow.length - 1].kind !== 'steps'))
-      out.push({ k: 'run', key: `${seg.key}:w${ord}`, run: null, from: flow.length ? null : seg.lead, until: null, head: false, live: true, seg });
+    if (running && si === active) {
+      // Cards follow the work and precede an empty live line. Taking one
+      // changes its badge in place even when several are waiting together.
+      for (const taken of segs.slice(active + 1)) out.push({ k: 'lead', key: taken.key, id: taken.key, steered: true, fold: false });
+      for (const id of turn.waiting ?? []) out.push({ k: 'lead', key: id, id, steered: true, fold: false });
+      if (flow.at(-1)?.kind !== 'steps')
+        out.push({ k: 'run', key: `${seg.key}:w${ord}`, run: null, from: flow.length ? null : seg.lead, until: null, head: false, live: true, seg });
+    }
   }
   return { pieces: out, multi: runs > 1, head: headSeg >= 0 };
 }
@@ -396,8 +402,12 @@ function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
     return false;
   });
   const [sent, setSent] = useState(false);
+  // The process's own words, when it left any (after the bridge's reason in the notice's detail): a tap shows them.
+  const words = note?.type === 'notice' ? earlyWords(note.detail) : '';
+  const [shown, setShown] = useState(false);
   return (
-    <div className="turn-note">
+    <>
+    <div className="turn-note" onClick={words ? () => setShown(!shown) : undefined} role={words ? 'button' : undefined} aria-expanded={words ? shown : undefined}>
       <Icon name="warning" size={14} /> Ended early
       {why && <span className="work-meta">{why}</span>}
       {canContinue && (
@@ -405,7 +415,8 @@ function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
           type="button"
           className="btn btn-sm notice-action"
           disabled={sent}
-          onClick={() => {
+          onClick={(e) => {
+            e.stopPropagation();
             setSent(true);
             haptic('send');
             void conn.call('session.send', { sessionId: sid, text: 'Continue' }).catch(() => setSent(false));
@@ -415,7 +426,18 @@ function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
         </button>
       )}
     </div>
+    {words && shown && <div className="notice-detail early-words">{words}</div>}
+    </>
   );
+}
+
+/** The process's own words in a cut turn's notice (the bridge's reason, a blank line, then what it said), bounded; '' when none. */
+function earlyWords(detail: string | undefined): string {
+  if (!detail) return '';
+  const at = detail.indexOf('\n\n');
+  if (at < 0) return '';
+  const rest = detail.slice(at + 2).trim();
+  return rest.length > 2000 ? `${rest.slice(0, 2000)}…` : rest;
 }
 
 /** Tells the conversation the reader opened something here: it stops following the newest line, so what opened stays where it is. */
@@ -770,7 +792,7 @@ function LiveLine({ sid, seg, run, from, open, onToggle }: { sid: string; seg: S
 export const ItemRow = memo(function ItemRow({ sid, id, queued }: { sid: string; id: string; queued?: boolean }) {
   const it = useItem<TimelineItem>(sid, id);
   if (!it) return null;
-  if (it.type === 'user') return <UserBubble sid={sid} id={id} queued={queued} />;
+  if (it.type === 'user') return <UserBubble sid={sid} id={id} steered={it.steered} queued={queued && !it.steered} />;
   if (it.type === 'text') return <Answer sid={sid} id={id} tone="answer" />;
   if (it.type === 'notice') return <Notice sid={sid} id={id} />;
   if (it.type === 'tool' && it.check) return <CheckBlock sid={sid} id={id} />;
@@ -1208,7 +1230,6 @@ const Notice = memo(function Notice({ sid, id }: { sid: string; id: string }) {
   const it = useItem<NoticeItem>(sid, id);
   const provider = useStore((s) => s.sessions[sid]?.provider);
   const accounts = useStore((s) => (provider ? s.providers[provider]?.accounts : undefined));
-  const [busy, setBusy] = useState(false);
   if (!it) return null;
   // What a command printed, standing for its turn: a line under the command's (Synthetic.tsx).
   if ((it as TimelineItem).type === 'user') return <UserBubble sid={sid} id={id} />;
@@ -1225,20 +1246,6 @@ const Notice = memo(function Notice({ sid, id }: { sid: string; id: string }) {
         {it.detail && <span className="notice-detail"> · {it.detail}</span>}
         {/* The sign-in itself happens in the agent's own window on the computer: the phone says where. */}
         {!it.detail && it.auth?.state === 'signedOut' && <span className="notice-detail"> · Sign in on your computer</span>}
-        {next && (
-          <button
-            type="button"
-            className="btn btn-sm notice-action"
-            disabled={busy}
-            onClick={() => {
-              setBusy(true);
-              haptic('send');
-              void conn.call('session.switchAccount', { sessionId: sid, accountId: next.id, retry: true }).finally(() => setBusy(false));
-            }}
-          >
-            Continue with {next.label}
-          </button>
-        )}
       </span>
     </div>
   );
@@ -1335,6 +1342,22 @@ function LimitCard({ sid, it, next, went }: { sid: string; it: NoticeItem; next?
   const now = useNow();
   const [busy, setBusy] = useState(false);
   const l = it.limit!;
+  const waiting = useStore((s) => !!s.sessions[sid]?.spare);
+  const online = useStore((s) => s.conn === 'open');
+  const action = limitAction(sid, it, next, waiting, now);
+  const go = async () => {
+    if (!action || busy || !online) return;
+    setBusy(true);
+    haptic('send');
+    try {
+      const r = await conn.call(action.method, action.params);
+      if (!r.ok) throw new Error(('error' in r && r.error) || ('message' in r && r.message) || 'Could not continue this chat');
+    } catch (error) {
+      setState({ toast: { text: (error as Error).message, level: 'error', at: Date.now() } });
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <div className="limit-card">
       <div className="limit-card-head">
@@ -1343,18 +1366,14 @@ function LimitCard({ sid, it, next, went }: { sid: string; it: NoticeItem; next?
         {l.resetsAt && <span className="limit-card-reset num">{resetIn(l.resetsAt, now)}</span>}
       </div>
       {it.detail && <div className="limit-card-detail">{it.detail}</div>}
-      {next && (
+      {action && (
         <button
           type="button"
           className="btn btn-primary btn-block limit-card-go"
-          disabled={busy}
-          onClick={() => {
-            setBusy(true);
-            haptic('send');
-            void conn.call('session.switchAccount', { sessionId: sid, accountId: next.id, retry: true }).finally(() => setBusy(false));
-          }}
+          disabled={busy || !online}
+          onClick={() => void go()}
         >
-          {busy ? <span className="dots" /> : `Continue with ${next.label}`}
+          {busy ? <span className="dots" /> : action.label}
         </button>
       )}
       {went && <div className="limit-card-detail">Carried on with {went}</div>}

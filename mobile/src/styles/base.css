@@ -132,11 +132,12 @@
   --ease-ime: cubic-bezier(0.2, 0, 0, 1);
   --ease-spring: cubic-bezier(0.25, 1.2, 0.45, 1);
 
-  --sat: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
-  /* the gesture bar: what the native side says while the keyboard is up (lib/keyboard.ts), else the bars' own */
-  --sab: var(--sable-bar, var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)));
-  --sal: var(--safe-area-inset-left, env(safe-area-inset-left, 0px));
-  --sar: var(--safe-area-inset-right, env(safe-area-inset-right, 0px));
+  /* each edge's bars (status bar, gesture pill, a camera cutout): set by the native side in one
+     place (lib/keyboard.ts, android/…/PageInsets.java); env() only in a browser */
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
   /* how far the keyboard lifts the page's bottom, and over how long it slides */
   --kb: 0px;
   --kb-ms: 280ms;
@@ -286,7 +287,8 @@ p {
 /* ── the app, screens and layers ── */
 .app {
   position: fixed;
-  inset: 0;
+  /* a landscape phone: the side bars and the camera cutout are the body's ink, never under the page */
+  inset: 0 var(--sar) 0 var(--sal);
   overflow: hidden;
   background: var(--bg);
 }
@@ -750,8 +752,8 @@ p {
 .banner {
   position: fixed;
   z-index: 150;
-  left: 12px;
-  right: 12px;
+  left: calc(var(--sal) + 12px);
+  right: calc(var(--sar) + 12px);
   bottom: calc(var(--sab) + 12px);
   display: flex;
   align-items: center;
@@ -770,8 +772,8 @@ p {
   position: fixed;
   z-index: 190;
   top: calc(var(--sat) + 64px);
-  left: 12px;
-  width: calc(100% - 24px);
+  left: calc(var(--sal) + 12px);
+  width: calc(100% - 24px - var(--sal) - var(--sar));
   display: flex;
   align-items: center;
   gap: 13px;

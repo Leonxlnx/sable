@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { SessionMeta } from '@shared/protocol';
 import { baseName } from '@desk/lib/format';
 import { conn } from '@m/lib/conn';
-import { appVersion, askNotifications, haptic, hapticsEnabled, isNative, loadPref, notificationsAllowed, savePref, setHaptics } from '@m/lib/native';
+import { appVersion, askNotifications, haptic, hapticsEnabled, isNative, noteStatus, notificationsAllowed, openNoteSettings, savePref, setHaptics, type NoteStatus } from '@m/lib/native';
 import { homeFolder } from '@m/lib/race';
 import { nav } from '@m/lib/nav';
 import { setState, useStore } from '@m/lib/store';
@@ -14,9 +14,6 @@ import { LogoMark, ProviderMark, Ring } from '@m/ui/marks';
 import { SNAP } from '@m/ui/motion';
 import { Sheet } from '@m/ui/Sheet';
 import { LimitsSheet } from './Limits';
-
-export const prefs = { notify: true };
-void loadPref('notify', true).then((v) => (prefs.notify = v));
 
 /** A Tailscale address (100.64.0.0/10): reached over the tailnet, from anywhere. */
 const tailnet = (ip?: string) => !!ip && /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip);
@@ -31,8 +28,10 @@ export function Settings() {
   const version = useStore((s) => s.version);
   const defaultProvider = useStore((s) => s.settings?.defaultProvider);
   const archivedCount = useStore((s) => Object.values(s.sessions).filter((x) => x.archived).length);
-  const [notify, setNotify] = useState(prefs.notify);
+  const notify = useStore((s) => s.notify);
   const [allowed, setAllowed] = useState<boolean | null>(null);
+  // Android 16: whether the working notification may show live (a chip, and the island where the system has one).
+  const [status, setStatus] = useState<NoteStatus | null>(null);
   const [haptics, setHapticsOn] = useState(hapticsEnabled);
   const [mine, setMine] = useState<string>();
   const [confirm, setConfirm] = useState(false);
@@ -42,13 +41,21 @@ export function Settings() {
   const name = desktop ?? p?.desktop ?? 'Desktop';
 
   useEffect(() => {
-    void notificationsAllowed().then(setAllowed);
+    const read = () => {
+      void notificationsAllowed().then(setAllowed);
+      void noteStatus().then(setStatus);
+    };
+    read();
     void appVersion().then(setMine);
+    // Back from Android's settings: read again.
+    const again = () => document.visibilityState === 'visible' && read();
+    document.addEventListener('visibilitychange', again);
+    return () => document.removeEventListener('visibilitychange', again);
   }, []);
 
   const toggleNotify = async () => {
     haptic('select');
-    const next = !notify;
+    const next = !(notify && allowed);
     if (next && !allowed) {
       const ok = await askNotifications();
       setAllowed(ok);
@@ -57,8 +64,7 @@ export function Settings() {
         return;
       }
     }
-    setNotify(next);
-    prefs.notify = next;
+    setState({ notify: next });
     savePref('notify', next);
   };
 
@@ -98,13 +104,21 @@ export function Settings() {
           <>
             <h3 className="set-title">This phone</h3>
             <div className="group-card">
-              <button type="button" className="set-row switch-row" role="switch" aria-checked={notify && !!allowed} onClick={() => void toggleNotify()}>
+              <button type="button" className="set-row switch-row" role="switch" disabled={notify === undefined || allowed === null} aria-checked={!!notify && !!allowed} onClick={() => void toggleNotify()}>
                 <Icon name="bell" size={20} />
                 <span className="set-label">Notifications</span>
                 <span className="switch" data-on={(notify && !!allowed) || undefined}>
                   <i />
                 </span>
               </button>
+              {status && status.sdk >= 36 && notify && !!allowed && (
+                <button type="button" className="set-row" onClick={() => (haptic('tap'), openNoteSettings(true))}>
+                  <Icon name="bolt" size={20} />
+                  <span className="set-label">Live updates</span>
+                  <span className="set-val">{status.live === false ? 'Off' : 'On'}</span>
+                  <Icon name="next" size={16} className="set-chev" />
+                </button>
+              )}
               <button type="button" className="set-row switch-row" role="switch" aria-checked={haptics} onClick={toggleHaptics}>
                 <Icon name="vibrate" size={20} />
                 <span className="set-label">Haptics</span>

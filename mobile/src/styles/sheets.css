@@ -31,6 +31,8 @@
   display: flex;
   flex-direction: column;
   max-height: calc(100% - var(--sat) - 26px);
+  /* a landscape phone: clear of the side bars and the camera cutout */
+  margin: 0 var(--sar) 0 var(--sal);
   border-radius: var(--r-sheet) var(--r-sheet) 0 0;
   padding-bottom: calc(var(--sab) + 14px);
   /* the pane: the ink; the rim, the inner edge and the depth are shadows (base.css) */

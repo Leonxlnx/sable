@@ -23,6 +23,8 @@ export interface ChatNote {
   kind: string;
   /** This time away's lines, newest first (more than one: listed under it when expanded). */
   lines: string[];
+  /** Allow once and Deny on it (a permission the notification shows whole: lib/notes.ts `noteAsk`). */
+  ask?: { requestId: string; allow: string; deny: string; detail: string; deviceId: string };
 }
 
 /** What the poster needs of the notifications plugin. */
@@ -34,8 +36,10 @@ export interface NoteApi {
   /** The ids Android shows now, or null when it cannot say. */
   delivered(): Promise<number[] | null>;
   cancel(ids: number[]): Promise<void>;
-  /** Puts up a chat's notification and, when `chats` is two or more, the group's summary naming them. */
-  post(note: ChatNote, chats: number): Promise<void>;
+  /** Puts up a chat's notification and, when `chats` is two or more, the group's summary naming them (`summary`: a line per chat, newest first). */
+  post(note: ChatNote, chats: number, summary: string[]): Promise<void>;
+  /** Refresh an existing summary when a child goes away. */
+  summary?(chats: number, lines: string[]): Promise<void>;
   /** Every notification goes, shown or pending. */
   clearAll(): Promise<void>;
 }
@@ -45,7 +49,9 @@ export const SUMMARY_ID = 1;
 
 export class NotePoster {
   /** Each chat's lines since the app was last on screen, newest first. */
-  private lines = new Map<string, { title: string; lines: string[] }>();
+  private lines = new Map<string, string[]>();
+  /** Each chat's newest notification, for the summary's lines. */
+  private latest = new Map<string, string>();
   private chain: Promise<unknown> = Promise.resolve();
   private gen = 0;
 
@@ -65,16 +71,13 @@ export class NotePoster {
   }
 
   /** A chat's news: its notification, with the summary when two chats or more have one up. */
-  notify(title: string, body: string, sessionId: string, kind: string): Promise<void> {
+  notify(title: string, body: string, sessionId: string, kind: string, ask?: ChatNote['ask']): Promise<void> {
     return this.run(async (live) => {
       if (!(await this.api.allowed()) || !live()) return;
       await this.api.prepare();
       if (!live()) return;
       const line = body.slice(0, 180);
-      const cur = this.lines.get(sessionId) ?? { title, lines: [] };
-      cur.title = title;
-      cur.lines = [line, ...cur.lines.filter((l) => l !== line)].slice(0, 5);
-      this.lines.set(sessionId, cur);
+      const lines = [line, ...(this.lines.get(sessionId) ?? []).filter((l) => l !== line)].slice(0, 5);
       // What is still up: a notification swiped away no longer counts in the summary.
       const delivered = await this.api.delivered().catch(() => null);
       if (!live()) return;
@@ -86,23 +89,39 @@ export class NotePoster {
         if (!live()) return;
       }
       const id = this.idFor(sessionId);
-      await this.api.post({ id, sessionId, title, body: line, kind, lines: cur.lines.slice() }, count);
+      const headline = `${title}: ${line}`;
+      const others = [...this.book.list()].reverse().filter((id) => id !== sessionId).flatMap((id) => this.latest.get(id) ?? []);
+      await this.api.post({ id, sessionId, title, body: line, kind, lines, ...(ask ? { ask } : {}) }, count, [headline, ...others]);
       if (!live()) {
         // Forgotten while it went up: it goes again, and is not written down.
         await this.api.cancel(count > 1 ? [id, SUMMARY_ID] : [id]).catch(() => {});
         return;
       }
       // Written down once it is up (a post that failed leaves nothing behind).
+      this.lines.set(sessionId, lines);
+      this.latest.set(sessionId, headline);
       this.book.add(sessionId);
     });
   }
 
   /** A chat opened on the phone: its notification goes (after any post still going up), the summary only with the last chat's. */
-  clearOne(sessionId: string): Promise<void> {
-    return this.run(async () => {
+  clearOne(sessionId: string, cancelCurrent?: () => Promise<boolean>): Promise<void> {
+    return this.run(async (live) => {
+      if (cancelCurrent && (!(await cancelCurrent()) || !live())) return;
       this.lines.delete(sessionId);
+      this.latest.delete(sessionId);
       const had = this.book.remove(sessionId);
-      await this.api.cancel([this.idFor(sessionId), ...(had && this.book.size === 0 ? [SUMMARY_ID] : [])]).catch(() => {});
+      const ids = cancelCurrent ? [] : [this.idFor(sessionId)];
+      if (had && this.book.size === 0) ids.push(SUMMARY_ID);
+      if (ids.length) await this.api.cancel(ids).catch(() => {});
+      if (!live() || !had || !this.book.size || !this.api.summary) return;
+      const up = await this.api.delivered();
+      if (!live() || !up?.includes(SUMMARY_ID)) return;
+      this.book.reconcile(up);
+      if (!this.book.size) return this.api.cancel([SUMMARY_ID]);
+      const lines = [...this.book.list()].reverse().flatMap((id) => this.latest.get(id) ?? []);
+      await this.api.summary(this.book.size, lines);
+      if (!live()) await this.api.cancel([SUMMARY_ID]);
     });
   }
 
@@ -119,6 +138,7 @@ export class NotePoster {
   clear(): Promise<void> {
     this.gen++;
     this.lines.clear();
+    this.latest.clear();
     this.book.clear();
     const cleared = this.api.clearAll();
     this.chain = Promise.all([this.chain, cleared.catch(() => {})]);

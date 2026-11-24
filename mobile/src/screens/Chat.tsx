@@ -11,7 +11,7 @@ import { homeFolder, openRace, swapTo } from '@m/lib/race';
 import { applyFull, applyOlder, closeGap, fetchItem, fetchNewer, fetchOlder, getState, openAt, openSession, sessionData, setState, showCached, useStore } from '@m/lib/store';
 import { around, growDown, growUp, MOUNT_MAX, rangeOf, SpacerSums, trimTop, type Win } from '@m/lib/window';
 import { matchRanges, searchWords } from '@m/lib/find';
-import { canStop, followSent, newestSent, wholeForFind } from '@m/lib/chat-rules';
+import { canStop, followSent, newestSent, wholeForFind, worksNow } from '@m/lib/chat-rules';
 import { takeSentHere } from '@m/lib/follow';
 import { groupTurns, stabilize } from '@m/lib/turns';
 import { workLabel } from '@shared/work-label';
@@ -90,6 +90,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         title={s.title}
         sub={connState === 'open' ? (s.chat ? undefined : baseName(homeFolder(s))) : undefined}
         status={connState === 'open' ? undefined : connState === 'denied' ? 'Not paired' : listed ? 'Reconnecting' : 'Connecting'}
+        work={connState === 'open' && worksNow(s) ? (s.status === 'running' || s.status === 'starting' ? (s.status === 'starting' ? 'Starting' : 'Working') : (workLabel(s) ?? 'Working')) : undefined}
         mark={<ProviderMark provider={s.provider} size={16} />}
         onBack={() => nav.pop()}
         race={racing ? <RaceKey s={s} /> : undefined}
@@ -151,7 +152,7 @@ function ReadOnlyFoot({ id, status, desktop }: { id: string; status: SessionMeta
   );
 }
 
-function ChatHead({ title, sub, status, mark, onBack, race, right }: { title: string; sub?: string; status?: string; mark?: React.ReactNode; onBack: () => void; race?: React.ReactNode; right?: React.ReactNode }) {
+function ChatHead({ title, sub, status, work, mark, onBack, race, right }: { title: string; sub?: string; status?: string; work?: string; mark?: React.ReactNode; onBack: () => void; race?: React.ReactNode; right?: React.ReactNode }) {
   return (
     <header className="chat-head">
       <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), onBack())}>
@@ -166,6 +167,14 @@ function ChatHead({ title, sub, status, mark, onBack, race, right }: { title: st
           {status ? (
             <motion.div key="status" className="chat-sub chat-status" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
               <Ring size={11} /> {status}
+            </motion.div>
+          ) : work ? (
+            // At work (its turn, or sub-agents and commands it left working): a living mark under the title, wherever the reader is.
+            <motion.div key="work" className="chat-sub chat-work" role="status" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
+              <Tiles size={10} />
+              <span key={work} className="chat-work-text">
+                {work}
+              </span>
             </motion.div>
           ) : sub ? (
             <motion.div key="sub" className="chat-sub" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>

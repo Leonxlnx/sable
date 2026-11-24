@@ -47,7 +47,7 @@ import { canonicalName, isPackageName } from '../../shared/file-name';
 import { partOfTurn, syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
 import { fileLine, saveLines, scopeLines } from '../core/permission-scope';
-import { cap, isSnapshot, lines } from '../core/trim';
+import { cap, isSnapshot, lines, sessionPatchForJson } from '../core/trim';
 import { VERSION } from '../version';
 import { PhoneChangesReader, stepIds } from './phone-changes';
 import { phoneRefusal } from './custom';
@@ -162,7 +162,8 @@ const PHONE_EVENTS = new Set<BridgeEvent['type']>([
   'toast',
 ]);
 
-const ALLOWED = new Set<string>(PHONE_METHODS);
+// The phone can arm a reset only for the particular limit card it shows (narrow).
+const ALLOWED = new Set<string>([...PHONE_METHODS, 'spare.atReset']);
 const OWN = new Set<string>(PHONE_OWN_METHODS);
 
 /** Events that carry a conversation's items: sent only for the conversations a phone has open. */
@@ -867,9 +868,20 @@ export function phoneDetail(items: TimelineItem[], itemId: string): { item: Phon
   return { item: phoneItem(it, { role: 'full', kids: kids.length }), children: kids.slice(-FULL.children).map((k) => phoneItem(k, { role: 'step', kids: count.get(k.id) })) };
 }
 
+// Installed phones shallow-merge updates. Send clears for fields they read as optional or
+// already accept as null. In particular, keep required strings and the usage object intact.
+const PHONE_CLEARABLE = new Set<string>([
+  'accountId', 'movedFrom', 'returnAt', 'activity', 'lastError', 'remote', 'capState', 'moving',
+  'pendingRestart', 'providerSessionId', 'until', 'spare', 'race', 'lane', 'agentHandover', 'moveNote',
+  'background', 'commands', 'options', 'effort', 'speed', 'fast', 'ultracode', 'pinned', 'archived', 'unread', 'branch',
+  'chat', 'custom', 'titleAsked', 'agents', 'returnModels',
+] satisfies (keyof SessionMeta)[]);
+
 /** An event as a phone gets it, or null when it does not need it. */
 export function phoneEvent(event: BridgeEvent, kindOf?: (sessionId: string, id: string) => string | undefined): BridgeEvent | PhoneReset | null {
   switch (event.type) {
+    case 'session.updated':
+      return { ...event, patch: sessionPatchForJson(event.patch, PHONE_CLEARABLE) };
     case 'item.added':
       return { ...event, item: phoneItem(event.item, { role: event.item.type === 'text' && event.item.parentId ? 'step' : 'answer' }) };
     case 'item.delta':
@@ -1040,6 +1052,11 @@ export function phoneCreate(p: Record<string, unknown>): Record<string, unknown>
  */
 function narrow(method: string, params: Record<string, unknown>, queued?: (sessionId: string, id: string) => Attachment[] | undefined): Record<string, unknown> {
   const p = { ...params };
+  if (method === 'spare.atReset' || (method === 'session.switchAccount' && 'refusalId' in p)) {
+    if (typeof p.sessionId !== 'string' || !p.sessionId || typeof p.refusalId !== 'string' || !p.refusalId.trim() || p.refusalId.length > ASK_TEXT.id)
+      throw new Error('Choose a limit card in this chat.');
+    if (method === 'spare.atReset') return { sessionId: p.sessionId, refusalId: p.refusalId };
+  }
   // Pictures as data, never a path on the computer: a message from the phone carries nothing of the desktop's.
   // A submission id is the desktop window's own (it retries a message it put back): a phone's send
   // never carries one, so it cannot be answered with another message's result.
@@ -2085,9 +2102,13 @@ export class PhoneService {
         } else if (own === 'phone.tail' || own === 'phone.item') {
           const sessionId = String(raw.sessionId ?? '');
           // The session's own snapshot (loads it from disk the first time, marks it read), then trimmed.
-          const snap = await this.app.call('session.snapshot', { sessionId });
+          // `peek` (a tail only): the phone reads the newest words for a notification while it is in the
+          // background: the chat stays unread on the desktop and its steps are not streamed to the phone.
+          const peek = own === 'phone.tail' && raw.peek === true;
+          const snap = await this.app.call('session.snapshot', peek ? { sessionId, peek: true } : { sessionId }, { allowed });
+          act();
           if (own === 'phone.tail') {
-            watch(sessionId);
+            if (!peek) watch(sessionId);
             const str = (k: string) => (typeof raw[k] === 'string' ? (raw[k] as string) : undefined);
             const limit = typeof raw.limit === 'number' ? raw.limit : undefined;
             result = phoneTail(snap, { before: str('before'), limit, to: str('to'), around: str('around'), after: str('after') });

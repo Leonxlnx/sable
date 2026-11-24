@@ -15,6 +15,8 @@ const cap = vi.hoisted(() => ({
   conn: {
     state: 'open',
     pairedSecurely: true,
+    on: vi.fn(),
+    onState: vi.fn(),
     opened: [] as (() => void)[],
     onOpen(l: () => void) {
       this.opened.push(l);
@@ -30,7 +32,8 @@ vi.mock('../mobile/node_modules/@capacitor/core', () => ({
   Capacitor: { isNativePlatform: () => true },
   registerPlugin: (name: string) => new Proxy({}, { get: (_t, k) => cap.plugins[name]?.[k as string] }),
 }));
-vi.mock('../mobile/node_modules/@capacitor/app', () => ({ App: {} }));
+vi.mock('../mobile/node_modules/@capacitor/app', () => ({ App: { addListener: async () => ({ remove() {} }) } }));
+vi.mock('@desk/features/timeline/lead-in', async () => await import('../src/features/timeline/lead-in'));
 vi.mock('../mobile/node_modules/@capacitor/device', () => ({ Device: {} }));
 vi.mock('../mobile/node_modules/@capacitor/haptics', () => ({ Haptics: {}, ImpactStyle: {}, NotificationType: {} }));
 vi.mock('../mobile/node_modules/@capacitor/local-notifications', () => ({
@@ -69,7 +72,13 @@ vi.stubGlobal('document', { hidden: false, visibilityState: 'visible', addEventL
 
 cap.plugins.System = { keep: async () => {}, shortcuts: async () => {} };
 cap.plugins.Files = { forgetAll: async () => {}, prune: async () => {} };
-cap.plugins.KeepAlive = { arm: async () => {} };
+// Phone 2.13: the chats' notifications and the live one are Notes.java's (the erasure clears them through it).
+cap.plugins.Notes = {
+  live: async () => {},
+  clearAll: async () => {
+    if (cap.notes.failRemove) throw new Error('not removed');
+  },
+};
 
 describe('the pairing as kept (22)', () => {
   it('there but not a pairing is damaged, never "none"; a read that fails throws as a read failure', async () => {
@@ -105,6 +114,74 @@ describe('an erasure on Android (10)', () => {
     await expect(eraseNative()).resolves.toEqual(['files']);
     cap.plugins.Files.forgetAll = async () => {};
   });
+});
+
+it('delivers the first working payload after idle, dedupes equals, and retries only the current failed delivery', async () => {
+  const { setLive } = await import('../mobile/src/lib/native');
+  let reject!: (error: Error) => void;
+  const live = vi.fn().mockResolvedValue(undefined);
+  cap.plugins.Notes.live = live;
+  try {
+    const work = { chats: 1, waiting: 0, chat: 'a', title: 'A', text: 'Working', since: 22 };
+    setLive(null);
+    live.mockImplementationOnce(() => new Promise<void>((_, fail) => { reject = fail; }));
+    setLive(work);
+    setLive({ ...work });
+    expect(live.mock.calls.map(([payload]) => payload)).toEqual([{ chats: 0, waiting: 0 }, work]);
+    setLive(null);
+    setLive(work);
+    reject(new Error('old call'));
+    await Promise.resolve();
+    setLive(work);
+    expect(live).toHaveBeenCalledTimes(4);
+    live.mockRejectedValueOnce(new Error('unavailable'));
+    setLive(null, true);
+    await Promise.resolve();
+    setLive(null, true);
+    expect(live.mock.calls.slice(4)).toEqual([[{ chats: 0, waiting: 0, stop: true }], [{ chats: 0, waiting: 0, stop: true }]]);
+  } finally {
+    cap.plugins.Notes.live = async () => {};
+  }
+});
+
+it('takes socket work to the real native wrapper before Home and updates it while WebView frames are suspended', async () => {
+  const { onAppState, setLive } = await import('../mobile/src/lib/native');
+  const modulePath = '../mobile/src/lib/store';
+  const s = await import(/* @vite-ignore */ modulePath);
+  const page = Object.assign(new EventTarget(), { visibilityState: 'visible' });
+  const priorDocument = document;
+  vi.stubGlobal('document', page);
+  vi.stubGlobal('requestAnimationFrame', () => 1);
+  vi.stubGlobal('cancelAnimationFrame', () => {});
+  const live = vi.fn().mockResolvedValue(undefined);
+  cap.plugins.Notes.live = live;
+  const off = onAppState(() => {});
+  const stop = s.watchLive(setLive);
+  try {
+    s.setState({ conn: 'open', fresh: true, listAt: 1, notify: true, sessions: { a: { id: 'a', title: 'Chat', status: 'idle' } } });
+    const receive = cap.conn.on.mock.calls[0][0];
+    const update = (patch: object) => receive({ type: 'session.updated', id: 'a', patch });
+    update({ status: 'running' });
+    const working = live.mock.lastCall?.[0];
+    expect(working).toMatchObject({ chats: 1, waiting: 0, chat: 'a', text: 'Working' });
+    page.visibilityState = 'hidden';
+    page.dispatchEvent(new Event('visibilitychange'));
+    expect(live.mock.lastCall).toEqual([working]);
+    update({ status: 'idle', background: 1 });
+    expect(live.mock.lastCall?.[0]).toMatchObject({ chat: 'a', text: '1 sub-agent working', since: working.since });
+    update({ background: null });
+    expect(live.mock.lastCall).toEqual([{ chats: 0, waiting: 0 }]);
+    update({ commands: 2 });
+    expect(live.mock.lastCall?.[0]).toMatchObject({ chats: 1, text: '2 commands running' });
+  } finally {
+    stop();
+    page.visibilityState = 'visible';
+    page.dispatchEvent(new Event('visibilitychange'));
+    off();
+    s.setState({ fresh: false, sessions: {} });
+    vi.stubGlobal('document', priorDocument);
+    cap.plugins.Notes.live = async () => {};
+  }
 });
 
 describe('downloads loading onto an open connection (17)', () => {

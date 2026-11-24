@@ -13,7 +13,8 @@ import { isLeadIn } from '@desk/features/timeline/lead-in';
  * the tests.") fold with the steps they announce and name the live line while those run.
  *
  * Each root item is one character (`shapeOf`):
- *   U a sent message that starts a turn   S a message steered in   Q a queued one (floats to the end)
+ *   U a sent message that starts a turn   Q a queued one (floats to the end)
+ *   s a steer waiting by the live line    S a steer taken here, opening its segment
  *   t the agent's words (an answer candidate)   l a lead-in (folds with the steps it announces)
  *   c command output   p a plan   g a widget or files handed over (all in view, in their place)
  *   w a step (a tool call)   h thinking   k a task list update   n another notice (folded with the work)
@@ -79,6 +80,10 @@ export interface TurnGroup {
   kind: 'turn';
   key: string;
   segments: Segment[];
+  /** Steers still waiting, in send order, after the running turn's content. */
+  waiting?: string[];
+  /** The segment still doing the work when only taken, unanswered cards follow it. */
+  liveSegment?: number;
   end: string | null;
   state: TurnState;
   ids: string[];
@@ -111,8 +116,8 @@ const shapes = new WeakMap<object, string>();
 function shapeRaw(item: TimelineItem): string {
   switch (item.type) {
     case 'user': {
+      if (item.state === 'queued') return item.steered ? 's' : 'Q';
       if (item.steered) return 'S';
-      if (item.state === 'queued') return 'Q';
       const syn = syntheticOf(item);
       if (!syn) return 'U';
       // What a command printed is command output: in view in its place, never folded with the work
@@ -420,6 +425,8 @@ interface Open {
   failed: boolean;
   /** Opened by a message with nothing to show (u): left out when nothing else comes in it. */
   quiet?: boolean;
+  /** Opened by a notification or a message with nothing to show, not by the person's own message. */
+  byNote?: boolean;
 }
 
 /**
@@ -454,7 +461,8 @@ function trailingNotices(o: Open): string[] {
  */
 export function groupTurns(ids: readonly string[], shape: string, busy: boolean, checkOf?: (id: string) => string | undefined): TurnLayout {
   const groups: Group[] = [];
-  const queued: string[] = [];
+  let queued: string[] = [];
+  const waiting: string[] = [];
   const checks: { id: string; at: number }[] = [];
   let open: Open | null = null;
 
@@ -467,7 +475,8 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
     const failed = failedEnd || o.failed;
     const state: TurnState = atEnd && !end && busy && !o.interrupted ? 'running' : failed ? 'failed' : o.interrupted ? 'interrupted' : 'done';
     // A reminder or a caveat with nothing after it: nothing to show.
-    if (o.quiet && state !== 'running' && o.segs.length === 1 && o.segs[0].chars.every((c) => c === '.')) return;
+    // A turn the bridge says was cut is never left out: its "Ended early" line (and the process's words) must stand.
+    if (o.quiet && !opts.early && state !== 'running' && o.segs.length === 1 && o.segs[0].chars.every((c) => c === '.')) return;
     // A settled turn with no record of its end: notices after its last act (an account move's line)
     // came after it. They stand on their own, and the turn's time is not drawn out to theirs.
     const loose = !end && !opts.early && state !== 'running' ? trailingNotices(o) : [];
@@ -479,7 +488,16 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
     }
     const key = o.ids[0];
     const last = o.segs.length - 1;
-    const segments = o.segs.map((s, i) => buildSegment(s, i, key, failed && i === last, state === 'running' && i === last, i < last));
+    // A take alone brings no new work. Keep the same live checkpoint until
+    // something arrives in the new segment, even across several takes at once.
+    const running = state === 'running';
+    let active = last;
+    while (running && active > 0 && o.segs[active].steered && o.segs[active].chars.every((c) => c === '.')) active--;
+    const segments = o.segs.map((s, i) => {
+      // A trailing lead-in above a steer stays in its run throughout the running turn.
+      const live = running && (i >= active || o.segs[i + 1]?.steered);
+      return buildSegment(s, i, key, failed && i === active, live, i < active);
+    });
     if (state !== 'running') keepReport(segments, o.segs, key, state === 'failed');
     // A settled turn whose last segment said nothing (only steps after a steered message): the
     // newest segment that did say something answers it, so the turn keeps its answer and its foot.
@@ -492,17 +510,21 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
       }
     }
     foldNotes(segments);
-    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(opts.early ? { early: opts.early } : {}), ...(next ? { next } : {}) });
+    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(active < last ? { liveSegment: active } : {}), ...(opts.early ? { early: opts.early } : {}), ...(next ? { next } : {}) });
     for (const id of loose) groups.push({ kind: 'item', key: id, id });
   };
 
-  const start = (id: string, steered: boolean, quiet = false) => {
-    open = { ids: [id], segs: [{ lead: id, steered, ids: [], chars: [] }], interrupted: false, failed: false, ...(quiet ? { quiet } : {}) };
+  const start = (id: string, steered: boolean, quiet = false, byNote = quiet) => {
+    open = { ids: [id], segs: [{ lead: id, steered, ids: [], chars: [] }], interrupted: false, failed: false, ...(quiet ? { quiet } : {}), ...(byNote ? { byNote } : {}) };
   };
 
   for (let i = 0; i < ids.length; i++) {
     const id = ids[i];
     let ch = shape[i] ?? '.';
+    if (ch === 's') {
+      waiting.push(id);
+      continue;
+    }
     if (ch === 'Q') {
       queued.push(id);
       continue;
@@ -518,13 +540,24 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
     // A notification: in a running turn a segment of its own (as a steered message), else a turn.
     if (ch === 'N') {
       const o = open as Open | null;
-      if (o && !o.interrupted) {
+      // A turn a notification (or a message with nothing to show) opened and that holds nothing yet
+      // woke no work: the bridge ended it without a record. The next notification begins a turn of
+      // its own, so its work and its time are not folded into a turn that ended long before.
+      if (o && !o.interrupted && !(o.byNote && o.segs.every((sg) => sg.chars.every((c) => c === '.')))) {
         o.ids.push(id);
+        // Taken between a steered message and the reply to it: part of that segment's work, so the
+        // reply (the first words after the message) still stands right under its message.
+        const sg = o.segs[o.segs.length - 1];
+        if (sg.steered && !sg.chars.some((c) => c === 't' || c === 'l')) {
+          sg.ids.push(id);
+          sg.chars.push('N');
+          continue;
+        }
         o.segs.push({ lead: id, steered: false, ids: [], chars: [] });
         continue;
       }
       close(null, false, false, { next: id });
-      start(id, false);
+      start(id, false, false, true);
       continue;
     }
     // A check runs beside the conversation: it never joins (or ends) the turn around it.
@@ -592,6 +625,13 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
     else if (ANSWER.has(ch)) o.failed = false;
   }
   close(null, false, true);
+  if (waiting.length) {
+    const turn = groups.at(-1);
+    if (turn?.kind === 'turn' && turn.state === 'running') {
+      turn.waiting = waiting;
+      for (const id of waiting) turn.ids.push(id);
+    } else queued = waiting.concat(queued);
+  }
   if (!checks.length) return { groups, queued };
   // Each check under the turn it checks; on its own where it stands when that turn is not here.
   const at = new Map<string, number>();
@@ -611,7 +651,7 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
 
 const chunkSig = (c: FlowChunk) => (c.kind === 'steps' ? `${c.key}+${c.ids.length}+${c.count}` : c.id);
 const segSig = (s: Segment) => `${s.lead}>${s.flow.map(chunkSig).join(',')}>${s.reply}>${s.answer}>${s.last}>${s.tail.join(',')}>${s.notes.length}>${s.errors.join(',')}>${s.narr.join(',')}`;
-const turnSig = (g: TurnGroup) => `${g.state}|${g.end}|${g.early ?? ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${g.segments.map(segSig).join(';')}`;
+const turnSig = (g: TurnGroup) => `${g.state}|${g.end}|${g.early ?? ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${g.waiting?.join(',') ?? ''}|${g.liveSegment ?? ''}|${g.segments.map(segSig).join(';')}`;
 
 /**
  * Keeps the objects of turns, segments and runs of steps that did not change since the last
@@ -700,19 +740,22 @@ function lastAct(items: ItemMap, ids: readonly string[], from: number, cap?: str
 }
 
 /**
- * How long a finished turn took (ms), as the desktop reads it: with the agent's record, as the live
- * lines counted it (the agent's own figure where the items' times say less); without one, from its
- * message (or first act) to the end of its last act, never past the next root.
+ * How long a finished turn took (ms), as the desktop reads it: with the agent's record, the record's
+ * own figure whenever it holds one (above 0), else from its message to the record; without one, from
+ * its message (or first act) to the end of its last act, never past the next root.
  */
 export function turnSpan(items: ItemMap, turn: TurnGroup): number | null {
   const lead = turn.segments[0]?.lead;
   const leadTs = lead ? items[lead]?.ts : undefined;
   const end = turn.end ? items[turn.end] : undefined;
   if (end?.type === 'turn') {
+    // The agent's own figure whenever it gave one: the items' times count waits that were no work
+    // (a steered message that waited hours keeps the time it was sent; a turn the bridge ended
+    // without a record before this one began). OpenCode and some Codex history write 0: no figure.
+    if (Number.isFinite(end.durationMs) && end.durationMs > 0) return end.durationMs;
     const start = leadTs ?? items[turn.ids[0]]?.ts;
     if (!start) return null;
-    const wall = end.ts - start;
-    return end.durationMs > wall ? end.durationMs : wall;
+    return Math.max(0, end.ts - start);
   }
   let start = leadTs;
   if (!start) {
