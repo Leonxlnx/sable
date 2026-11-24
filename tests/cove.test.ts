@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { liquidAt, planLiquid, frameBounds, type LiquidSpec } from '../src/features/composer/liquid-shape';
+import { planSignal, signalBounds, type SignalSpec } from '../src/features/composer/signal-shape';
 
 /**
  * The cove of the composer is one static outline written as numbers in composer.css (a CSS
@@ -223,35 +223,19 @@ describe('the cove', () => {
   });
 });
 
-describe('the drop leaves from the key', () => {
+describe('the line leaves from the key', () => {
   // A docked composer: the key's top point in the card's corner, the message landing above it.
-  const spec: LiquidSpec = { from: { x: 1138, y: 742, edge: true, r: 20 }, to: { left: 852, top: 568, width: 306, height: 43, radii: [18, 18, 6, 18] }, kind: 'bubble' };
-  const plan = planLiquid(spec);
+  const spec: SignalSpec = { from: { x: 1138, y: 742, edge: true, r: 20 }, to: { left: 852, top: 568, width: 306, height: 43, radii: [18, 18, 6, 18] }, kind: 'bubble' };
+  const plan = planSignal(spec);
 
-  it('starts behind the key’s disc, whole, and rises straight up out of its top', () => {
-    const r = spec.from.r!;
-    const centre = { x: spec.from.x, y: spec.from.y + r };
-    // Hidden at its birth: all of it inside the disc.
-    expect(Math.hypot(plan.start.x - centre.x, plan.start.y - centre.y) + plan.r).toBeLessThan(r);
-    const d = liquidAt(plan, plan.launch + 4).drop!;
-    expect(d.x).toBeCloseTo(spec.from.x, 0);
-    expect(d.y).toBeLessThan(spec.from.y);
+  it('starts on the key’s top and runs straight up out of it', () => {
+    expect(plan.path[0]).toEqual({ x: spec.from.x, y: spec.from.y });
+    expect(plan.path[1].x).toBe(spec.from.x);
+    expect(plan.path[1].y).toBe(spec.to.top + spec.to.height);
   });
 
-  it('is tied to the key until the thread parts, and the key keeps no swell of its own', () => {
-    for (let t = plan.born + 2; t < plan.snap + 90; t += 6) {
-      const f = liquidAt(plan, t);
-      expect(f.edge?.r).toBe(20);
-      expect(f.edge?.bob).toBe(0);
-      // The collar stays near the neck: well inside the key's width.
-      expect(f.edge!.k).toBeLessThan(plan.r);
-    }
-    expect(liquidAt(plan, plan.snap + 110).edge).toBeUndefined();
-  });
-
-  it('draws round the key’s shoulders, never over its face', () => {
-    const b = frameBounds(liquidAt(plan, plan.launch))!;
-    expect(b.y1).toBeLessThanOrEqual(spec.from.y + 20 * 0.6);
-    expect(b.y1).toBeGreaterThan(spec.from.y);
+  it('draws nothing over the key’s face', () => {
+    const b = signalBounds(plan, 0);
+    expect(b.top + b.height).toBeLessThanOrEqual(Math.ceil(spec.from.y));
   });
 });

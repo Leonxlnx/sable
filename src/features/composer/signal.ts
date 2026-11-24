@@ -1,23 +1,22 @@
 import { reducedMotion, uiZoom } from '@/lib/motion';
-import { makeRenderer, type Backdrop } from './liquid-gl';
-import { liquidAt, liquidBounds, planLiquid, type Box, type LiquidPlan, type LiquidSpec, type Shift } from './liquid-shape';
-import type { LiquidMessage, LiquidReply } from './liquid.worker';
+import { drawing, drawSignal } from './signal-draw';
+import { planSignal, signalBounds, type Box, type Shift, type SignalPlan, type SignalSpec } from './signal-shape';
+import type { SignalMessage, SignalReply } from './signal.worker';
 
 /**
- * The page's side of the liquid (liquid-shape.ts): a worker draws every sent message on canvases
- * of its own (liquid.worker.ts), so nothing here runs per frame and a busy main thread cannot hold
- * the drop.
+ * The page's side of the signal (signal-shape.ts): a worker draws every sent message's line on
+ * canvases of its own (signal.worker.ts), so nothing here runs per frame and a busy main thread
+ * cannot hold it.
  *
  * Three canvases, a short one (a message landing above the composer), a tall one (the first
  * message from home, a long message) and a wide one (a queued row), are handed to the worker
  * once, while the page is idle, and the worker draws a clear frame into each straight away: a
  * canvas only shows a worker's frames once the page's main thread has taken in its surface, and
  * right after a send that thread is busy (a session mounting, a turn starting), so the surface
- * must be in place before. A message
- * only moves its canvas into place (its position, which needs no new surface) and puts it in the
- * page; it is never resized for one. Sized to the flight, not the window: what the worker redraws
- * each frame, and the compositor with it, stays small. Where workers or OffscreenCanvas are
- * missing (or a message does not fit), a canvas of the message's own is drawn here instead.
+ * must be in place before. A message only moves its canvas into place (its position, which needs
+ * no new surface) and puts it in the page; it is never resized for one. Where workers or
+ * OffscreenCanvas are missing (or a line does not fit), a canvas of the message's own is drawn
+ * here instead.
  */
 
 let worker: Worker | null = null;
@@ -38,22 +37,15 @@ interface Slot {
 let slots: Slot[] = [];
 let preparing = false;
 
-/**
- * The canvases, in page px: wide enough for the widest card and its overshoot, as tall as the
- * flights they take; the third holds a queue row (the reading column's width and its margins, a
- * hop's height), which the others are too narrow for: drawn on the main thread instead, a row's
- * ink got almost no frames on a loaded machine.
- */
+/** The canvases, in page px: wide enough for the widest card, as tall as the lines they take; the third for a queue row. */
 const SHAPES = [
   { w: 700, h: 300 },
   { w: 700, h: 900 },
   { w: 820, h: 180 },
 ];
-/** Room kept around a flight inside its canvas, above (late corrections) and below the bar's edge. */
+/** Room kept around a line inside its canvas, above (late corrections) and below the key's top. */
 const ROOM_ABOVE = 60;
 const ROOM_BELOW = 8;
-
-export type { Backdrop };
 
 const canHandOver = () =>
   !broken && typeof Worker === 'function' && typeof OffscreenCanvas !== 'undefined' && typeof HTMLCanvasElement !== 'undefined' && 'transferControlToOffscreen' in HTMLCanvasElement.prototype;
@@ -62,14 +54,13 @@ function acquire(): Worker | null {
   if (!canHandOver()) return null;
   if (!worker) {
     try {
-      worker = new Worker(new URL('./liquid.worker.ts', import.meta.url), { type: 'module' });
+      worker = new Worker(new URL('./signal.worker.ts', import.meta.url), { type: 'module' });
     } catch {
       broken = true;
       return null;
     }
-    worker.onmessage = (e: MessageEvent<LiquidReply>) => {
+    worker.onmessage = (e: MessageEvent<SignalReply>) => {
       const m = e.data;
-      if (m.type === 'lost') return fail();
       if (m.type === 'free') {
         // Nothing left on it (the worker has cleared it): out of the page until the next message.
         const s = slots.find((x) => x.id === m.layer);
@@ -77,8 +68,8 @@ function acquire(): Worker | null {
         return;
       }
       if (import.meta.env.DEV && m.frames) {
-        const w = window as unknown as { __liquidFrames?: number[][] };
-        w.__liquidFrames = [...(w.__liquidFrames ?? []).slice(-4), m.frames];
+        const w = window as unknown as { __signalFrames?: number[][] };
+        w.__signalFrames = [...(w.__signalFrames ?? []).slice(-4), m.frames];
       }
       const end = ends.get(m.id);
       ends.delete(m.id);
@@ -89,7 +80,7 @@ function acquire(): Worker | null {
   return worker;
 }
 
-/** The worker failed (or lost its GPU context): every message in the air settles, later ones draw on the page. */
+/** The worker failed: every message in the air settles, later ones draw on the page. */
 function fail() {
   broken = true;
   worker?.terminate();
@@ -101,19 +92,19 @@ function fail() {
   for (const f of list) f();
 }
 
-const post = (m: LiquidMessage, transfer: Transferable[] = []) => worker?.postMessage(m, transfer);
+const post = (m: SignalMessage, transfer: Transferable[] = []) => worker?.postMessage(m, transfer);
 
 const idle = (fn: () => void, timeout = 3000) => {
   if (typeof requestIdleCallback === 'function') requestIdleCallback(fn, { timeout });
   else window.setTimeout(fn, 1200);
 };
 
-/** Device px per page px: fine enough for a soft shape and its hairline (a 3x screen does not need a 3x canvas). */
-const scaleNow = () => Math.min(2, window.devicePixelRatio || 1) * uiZoom();
+/** Device px per page px: the line stands on whole device pixels. */
+const scaleNow = () => Math.min(3, window.devicePixelRatio || 1) * uiZoom();
 
 /** The canvases, handed to the worker while the page is idle (see the top of this file). */
 function prepare() {
-  // Under reduced motion nothing is ever poured: no worker, no canvases.
+  // Under reduced motion nothing is ever drawn: no worker, no canvases.
   if (slots.length || preparing || !canHandOver() || reducedMotion()) return;
   preparing = true;
   idle(() => {
@@ -131,7 +122,7 @@ function make() {
   slots = SHAPES.map((shape) => {
     const id = ++nextId;
     const el = document.createElement('canvas');
-    el.className = 'send-liquid';
+    el.className = 'send-signal';
     el.setAttribute('aria-hidden', 'true');
     el.width = Math.round(shape.w * scale);
     el.height = Math.round(shape.h * scale);
@@ -159,13 +150,14 @@ function onResize() {
 }
 
 /** Loads the worker and hands it its canvases ahead of the first send, while the page is idle. */
-export function prewarmLiquid() {
+export function prewarmSignal() {
   prepare();
 }
 
 /**
- * Where a canvas of `shape` stands to hold a flight's region (page px), or null when it cannot.
- * Centred on the region, kept inside the window where it can be.
+ * Where a canvas of `shape` stands to hold a line's region (page px), or null when it cannot.
+ * Centred on the region, kept inside the window where it can be. Whole page px, so the line stays
+ * on whole device pixels at an integer scale.
  */
 export function placeFor(region: { left: number; top: number; width: number; height: number }, shape: { w: number; h: number }, win: { w: number; h: number }): { x: number; y: number } | null {
   if (region.width > shape.w || region.height > shape.h) return null;
@@ -174,32 +166,35 @@ export function placeFor(region: { left: number; top: number; width: number; hei
     // Inside the window if that still holds the region; the region wins otherwise.
     return Math.min(lo, Math.max(lo + size - room, Math.min(Math.max(0, ideal), Math.max(0, max - room))));
   };
-  return { x: Math.round(fit(region.left, region.width, shape.w, win.w)), y: Math.round(fit(region.top, region.height, shape.h, win.h)) };
+  // On a 4 px grid where that still holds the region: at 1.25, 1.5 or 2 device px per page px
+  // the canvas then starts on a whole device pixel and the line is never resampled.
+  const snap = (v: number, lo: number, size: number, room: number) => {
+    const s = Math.floor(v / 4) * 4;
+    return s <= lo && s + room >= lo + size ? s : Math.round(v);
+  };
+  return { x: snap(fit(region.left, region.width, shape.w, win.w), region.left, region.width, shape.w), y: snap(fit(region.top, region.height, shape.h, win.h), region.top, region.height, shape.h) };
 }
 
-/** The region a flight draws in, with its room. */
-function regionOf(plan: LiquidPlan) {
-  const b = liquidBounds(plan, 0);
+/** The region a line draws in, with its room. */
+function regionOf(plan: SignalPlan) {
+  const b = signalBounds(plan, 4);
   const top = b.top - ROOM_ABOVE;
-  // Round a key the liquid's collar reaches a little below its top (liquid-shape.ts `frameBounds`).
-  const bottom = Math.max(plan.spec.from.y + (plan.spec.from.r ?? 0) * 0.6, b.top + b.height) + ROOM_BELOW;
+  const bottom = b.top + b.height + ROOM_BELOW;
   return { left: b.left, top, width: b.width, height: bottom - top };
 }
 
 export interface Pour {
-  /** The plan as the worker has it (the words' keyframes are taken from it). */
-  plan: LiquidPlan;
+  /** The plan as the worker has it (the words' and the card's steps are taken from it). */
+  plan: SignalPlan;
   /** Starts drawing, `t0` (the page's clock) being time zero of the plan. */
   start(t0: number): void;
-  /** A better landing before the drop has left (a new shape and place). */
+  /** A better landing before the line has reached it (a new shape and place). */
   retarget(to: Box): void;
   /** The start was a little off (the compositor's own report came in): time zero moves, while nothing shows yet. */
   retime(t0: number): void;
-  /** Before the start: the bar it leaves will glide away under it (liquid-shape.ts `spec.bar`). */
+  /** Before the start: the bar it leaves will glide away under it (signal-shape.ts `spec.bar`). */
   leaving(by: { dx: number; dy: number }): void;
-  /** A still of the field behind it, for the glass to bend (the bitmap is handed over). */
-  backdrop(b: Backdrop): void;
-  /** A late correction after it has left: everything still to come moves by it. */
+  /** A late correction after the line has reached the card: what is still to come moves by it. */
   shift(s: Shift): void;
   /** Fades out what is drawn (a refused message, a send given up). */
   cancel(): void;
@@ -207,7 +202,7 @@ export interface Pour {
   finished: Promise<void>;
 }
 
-/** Dev frame sheets: every pour drawn at a fixed time after its start (see `freezeLiquid`). */
+/** Dev frame sheets: every line drawn at a fixed time after its start (see `freezeSignal`). */
 let frozenAt: number | null = null;
 const local = new Set<() => void>();
 
@@ -236,12 +231,12 @@ function claimSlot(region: Region): Slot | null {
 }
 
 /**
- * Prepares `spec` to be drawn (`below`: px of room to keep under the edge it leaves, for a bar
- * that will leave with it). Nothing is drawn until `start`, so the caller can start it on the
- * frame its other layers start on.
+ * Prepares `spec` to be drawn (`below`: px of room to keep under the key, for a bar that will
+ * leave with it). Nothing is drawn until `start`, so the caller can start it on the frame its
+ * other layers start on.
  */
-export function pour(spec: LiquidSpec, below = 0): Pour {
-  const plan = planLiquid(spec);
+export function pour(spec: SignalSpec, below = 0): Pour {
+  const plan = planSignal(spec);
   const id = ++nextId;
   let resolve!: () => void;
   const finished = new Promise<void>((r) => (resolve = r));
@@ -279,18 +274,14 @@ export function pour(spec: LiquidSpec, below = 0): Pour {
         if (frozenAt != null) post({ type: 'freeze', t: frozenAt });
       },
       retarget(to) {
-        this.plan = planLiquid({ ...this.plan.spec, to }, this.plan.shifts);
+        this.plan = planSignal({ ...this.plan.spec, to }, this.plan.shifts);
         if (started) post({ type: 'retarget', id, spec: this.plan.spec });
       },
       retime(t0) {
         if (started && !over) post({ type: 'retime', id, at: performance.timeOrigin + t0 });
       },
       leaving(by) {
-        if (!started) this.plan = planLiquid({ ...this.plan.spec, bar: by }, this.plan.shifts);
-      },
-      backdrop(b) {
-        if (over) return b.bitmap.close();
-        post({ type: 'backdrop', id, layer: slot.id, back: b }, [b.bitmap]);
+        if (!started) this.plan = planSignal({ ...this.plan.spec, bar: by }, this.plan.shifts);
       },
       shift(s) {
         this.plan.shifts.push(s);
@@ -309,20 +300,25 @@ export function pour(spec: LiquidSpec, below = 0): Pour {
 }
 
 /** No worker canvas: one of the message's own, drawn on this thread. */
-function drawHere(plan: LiquidPlan, finished: Promise<void>, gone: () => void): Pour {
+function drawHere(plan: SignalPlan, finished: Promise<void>, gone: () => void): Pour {
   const b = regionOf(plan);
   const scale = scaleNow();
   const el = document.createElement('canvas');
-  el.className = 'send-liquid';
+  el.className = 'send-signal';
   el.setAttribute('aria-hidden', 'true');
+  el.width = Math.max(1, Math.round(b.width * scale));
+  el.height = Math.max(1, Math.round(b.height * scale));
+  b.left = Math.floor(b.left / 4) * 4;
+  b.top = Math.floor(b.top / 4) * 4;
+  b.width += 4;
+  b.height += 4;
   el.width = Math.max(1, Math.round(b.width * scale));
   el.height = Math.max(1, Math.round(b.height * scale));
   el.style.cssText = `left:${b.left}px;top:${b.top}px;width:${b.width}px;height:${b.height}px;`;
   let started = false;
   let t0 = 0;
   let fade = -1;
-  let r: ReturnType<typeof makeRenderer> = null;
-  let back = 0;
+  let g: CanvasRenderingContext2D | null = null;
   const handle: Pour = {
     plan,
     start(at) {
@@ -330,28 +326,21 @@ function drawHere(plan: LiquidPlan, finished: Promise<void>, gone: () => void): 
       started = true;
       t0 = at;
       document.body.appendChild(el);
-      void finished.then(() => {
-        el.remove();
-        r?.dispose();
-      });
-      r = makeRenderer(el, scale);
-      if (!r) return gone();
+      void finished.then(() => el.remove());
+      g = el.getContext('2d');
+      if (!g) return gone();
       local.add(draw);
       void finished.then(() => local.delete(draw));
       requestAnimationFrame(draw);
     },
     retarget(to) {
-      this.plan = planLiquid({ ...this.plan.spec, to }, this.plan.shifts);
+      this.plan = planSignal({ ...this.plan.spec, to }, this.plan.shifts);
     },
     retime(at) {
       if (started) t0 = at;
     },
     leaving(by) {
-      if (!started) this.plan = planLiquid({ ...this.plan.spec, bar: by }, this.plan.shifts);
-    },
-    backdrop(b) {
-      if (!r) return b.bitmap.close();
-      back = r.backdrop(b);
+      if (!started) this.plan = planSignal({ ...this.plan.spec, bar: by }, this.plan.shifts);
     },
     shift(s) {
       this.plan.shifts.push(s);
@@ -363,22 +352,19 @@ function drawHere(plan: LiquidPlan, finished: Promise<void>, gone: () => void): 
     finished,
   };
   const draw = () => {
-    if (!r) return;
+    if (!g) return;
     const t = frozenAt ?? performance.now() - t0;
-    const f = liquidAt(handle.plan, t);
-    if (fade >= 0) f.alpha *= Math.min(1, Math.max(0, 1 - (t - fade) / 120));
-    if ((f.done || (fade >= 0 && t - fade > 120)) && frozenAt == null) {
-      r.clear();
-      return gone();
-    }
-    r.draw([{ f, back: back || undefined }], { x: b.left, y: b.top });
+    const alpha = fade >= 0 ? Math.min(1, Math.max(0, 1 - (t - fade) / 120)) : 1;
+    g.clearRect(0, 0, el.width, el.height);
+    if ((t > handle.plan.end || (fade >= 0 && t - fade > 120)) && frozenAt == null) return gone();
+    if (drawing(handle.plan, t)) drawSignal(g, [{ plan: handle.plan, t, alpha }], { x: b.left, y: b.top }, scale);
     if (frozenAt == null) requestAnimationFrame(draw);
   };
   return handle;
 }
 
-/** Dev: draws every pour at `t` ms after its start and holds it there (null runs on). */
-export function freezeLiquid(t: number | null) {
+/** Dev: draws every line at `t` ms after its start and holds it there (null runs on). */
+export function freezeSignal(t: number | null) {
   frozenAt = t;
   post({ type: 'freeze', t });
   for (const d of local) requestAnimationFrame(d);

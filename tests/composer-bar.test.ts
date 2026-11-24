@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Capabilities } from '@shared/protocol';
 import { rememberCaps, resetSeenCaps, seenCaps } from '../src/features/composer/caps-seen';
 import { GAP, placeMenu, roomBeside } from '../src/features/composer/menu-place';
-import { INK, inkAt } from '../src/features/composer/liquid-shape';
+import { INK } from '../src/features/composer/signal-shape';
 import { snapShift, toDevicePixel } from '../src/features/composer/pixel-snap';
 
 const read = (file: string) => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
@@ -323,21 +323,12 @@ describe('the person’s message is a well, and the drop lands as it', () => {
     expect(card.rim).toBeLessThan(0.1);
   });
 
-  it('has the same numbers on the card, on the flying copy and in the liquid', () => {
+  it('has the same numbers on the card, on the flying copy and in the signal', () => {
     expect(flying.fill).toEqual(card.fill);
     expect(flying.rim).toBe(card.rim);
     expect(flying.radius).toBe(card.radius);
     expect([...INK.fill, INK.a]).toEqual(card.fill);
     expect(INK.rim).toBe(card.rim);
-  });
-
-  it('is the bar’s dense ink in the air and thins into the well only as it settles', () => {
-    expect(inkAt(0)).toEqual([...INK.air, INK.airA]);
-    expect(inkAt(1)).toEqual([...INK.lift, INK.airA]);
-    expect(inkAt(0.4, 1)).toEqual([...INK.fill, INK.a]);
-    const mid = inkAt(0.5, 0.5);
-    expect(mid[3]).toBeCloseTo((INK.airA + INK.a) / 2, 6);
-    expect(mid[3]).toBeLessThan(inkAt(0.5, 0.25)[3]);
   });
 });
 

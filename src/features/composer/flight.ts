@@ -1,51 +1,48 @@
 import { EASE_OUT, play, reducedMotion, uiZoom } from '@/lib/motion';
 import { CARD_FONT, CARD_LINE, CARD_PAD_TOP, CARD_PAD_X, isLongMessage } from '@/features/timeline/user-card';
 import { holdSend } from './settle';
-import { freezeLiquid, pour, prewarmLiquid, type Pour } from './liquid';
+import { freezeSignal, pour, prewarmSignal, type Pour } from './signal';
 import { fieldBeatAt } from '@/art/events';
-import { BORN, COLLAPSE, collapseAt, collapseEase, footAt, HAND, linearEasing, planLiquid, revealAt, shiftAt, shiftEase, type Box, type LiquidPlan, type LiquidSpec } from './liquid-shape';
+import { quarterTiles } from '@/art/veil';
+import { BORN, COLLAPSE, collapseEase, linearEasing, planSignal, shiftAt, shiftEase, type Box, type SignalPlan, type SignalSpec } from './signal-shape';
 
 /**
- * A sent message leaves the composer as liquid (liquid-shape.ts has the beats and the geometry):
- * the words run down into the pane's corner over the send key as one piece while the field closes
- * to one line on the same curve; for a moment the pane is empty and at rest (it is live at once).
- * Then the liquid comes back out of the key: the key gives, a drop of dark glass rises from
- * behind its top and flies, a thread still tying it to the key until it thins and parts (both
- * ends recoil, the key comes back up); the drop coasts straight up to the bottom-right of where
- * the message will sit, slowing, and spreads there into the card's shape, revealing the words in
- * place as it covers them; the conversation's own card then takes over. One body, one path, one
- * speed that never steps.
+ * A sent message leaves the composer as signal and arrives as a card, made of the app's own
+ * ordered dither (signal-shape.ts has the beats and the geometry): the words in the field go in
+ * place, a quarter of the 4x4 Bayer cells at a time; a hairline leaves the key's top and runs up
+ * to where the message will stand, its tail falling off in dither steps; where it meets the card's
+ * lower edge it parts and runs both ways round the card's outline, closing at the top; the card's
+ * well and then its words come in by the same quarters, and the conversation's own card takes over.
+ * One line, one path, one speed that never steps.
  *
- * - Who draws what: the liquid is drawn by a worker on a canvas of its own (liquid.ts), the words
- *   are page layers animated on the compositor, both on the same clock with keyframes taken from
- *   the same geometry. Nothing runs per frame on the main thread, so a session mounting or a turn
- *   starting cannot make it stutter.
- * - The clock: time zero is one frame before the frame the gathering words first show in
- *   (`begin`, `FIRST_FRAME`), not the key: that first frame already moves, and whatever the main thread
- *   took to get it out, the motion plays from there. Everything of the message runs on that one
- *   clock, the worker's drawing, the page's layers and the send key's part (launch.ts) alike.
+ * - Who draws what: the line is drawn by a worker on a canvas of its own (signal.ts), the words
+ *   and the card are page layers whose quarters (static masks, `quarterTiles`) only change
+ *   opacity on the compositor, both on the same clock with steps taken from the same plan.
+ *   Nothing runs per frame on the main thread, so a session mounting or a turn starting cannot
+ *   make it stutter.
+ * - The clock: time zero is one frame before the frame the send first shows in (`begin`,
+ *   `FIRST_FRAME`), not the key: that first frame already differs (the first quarter of the words
+ *   is gone, the key has begun to give), and whatever the main thread took to get it out, the
+ *   motion plays from there. Everything of the message runs on that one clock, the worker's
+ *   drawing, the page's layers and the send key's part (launch.ts) alike.
  * - The key's handler (`launchFlight`) reads the page once and then only writes; what shows
  *   nothing yet waits for the frame after (`after`).
- * - The drop is glass: it bends a still of the backdrop's field (taken at the send, handed to the
- *   worker), and the field answers it (art/events.ts): the wave starts where the thread parts, a
- *   softer ripple where the drop lands.
+ * - The field answers (art/events.ts): the wave starts where the line leaves the key, a softer
+ *   ripple where it meets the card.
  * - Where it lands is guessed before the row exists (from the stage's geometry, the numbers
  *   timeline.css lays the row out with). When the real row mounts it stays hidden until the card
- *   sits on it. A row known before the drop is clear of the bar simply moves the landing; one
- *   known later bends everything still to come (the drop, the sheet and the words alike) to it.
+ *   sits on it. A row known before the line reaches the card simply moves the landing; one known
+ *   later moves everything still to come (the outline, the card) to it.
  * - The landing is a cut: the copy sits pixel for pixel on the real card and the two swap in one
  *   frame. A row that is still moving then takes the small remainder itself.
  * - The first message from home leaves the home composer the same way; the composer leaves for
- *   the dock while the thread still holds, so the two push off from each other (home/handoff.ts,
- *   `barLeaving`): the liquid's edge rides down with the bar.
- * - A message queued while a turn runs hops into the queue tray's new row, melting into it.
- * - A queued message sent from its row gathers into a drop at the row's end and rises from there.
+ *   the dock while the line still draws (home/handoff.ts, `barLeaving`).
+ * - A message queued while a turn runs runs a short line into the queue tray's new row.
+ * - A queued message sent from its row leaves from the row's end.
  * - When its row is late (a loaded machine, a slow bridge), the card waits where it landed and
  *   says so with one thing only: a hairline that fills slowly along its lower edge, on the
- *   compositor. Its words keep their tone: a card that stepped back to a waiting tone and came
- *   forward again when the row arrived a moment later blinked (every first message from home,
- *   whose chat is still being made). It holds until the row is there (or the bridge refuses the
- *   message: then it goes back into the field with its words).
+ *   compositor. It holds until the row is there (or the bridge refuses the message: then it goes
+ *   back into the field with its words).
  * Under reduced motion there is none of this: the items fade in as before.
  */
 
@@ -82,28 +79,29 @@ interface Flight {
   synced: Animation[];
   /** What the launch read of the page (others acting in the same handler take it from here instead of reading again). */
   read: { card: DOMRect | null; stage: DOMRect | null; column: number; fieldHeight: number; z: number };
-  /** The backdrop's beats still to come (the wave where the thread parts, the ripple where the drop lands). */
+  /** The backdrop's beats still to come (the wave where the line leaves, the ripple where it meets the card). */
   beats: number[];
-  liquid: Pour | null;
-  plan: LiquidPlan;
-  /** The words gathering out of their source (gone once gathered). */
+  signal: Pour | null;
+  plan: SignalPlan;
+  /** The words leaving their source, a layer per quarter of the dither (gone once gone). */
   pourEls: HTMLElement[];
-  /** The landing layer (the message card, or the queue row's words) and its parts: the window the ink reveals the words through, and the words. */
+  /** The landing layer (the message card, or the queue row's words) and its parts: the whole card, and its quarters (the well's and the words'). */
   el: HTMLDivElement;
   inner: HTMLElement;
-  clip: HTMLElement;
-  unfold: HTMLElement;
+  whole: HTMLElement;
+  wells: HTMLElement[];
+  quarters: HTMLElement[];
   surface: HTMLElement | null;
   /** Where the layer stands untransformed: the planned landing. */
   box: Box;
-  /** The reveal and the surface (made again when the landing moves before the drop leaves). */
+  /** The card's steps (made again when the landing moves before the line reaches it). */
   anims: Animation[];
   /** The late correction, played on `inner` (the same curve the worker follows). */
   fixAnim: Animation | null;
   fixEnd: number;
   /** Every animation of the message, for the dev freeze. */
   all: Animation[];
-  /** The liquid has run its course: the card is complete (or the row's words are). */
+  /** The line has run its course: the card is complete (or the row's words are). */
   resting: boolean;
   target: HTMLElement | null;
   row: HTMLElement | null;
@@ -118,7 +116,7 @@ interface Flight {
   restTimer: number;
   /** Where the words stood in their source (a refused message goes back there). */
   home: { left: number; top: number; s0: number };
-  /** The bar the bead forms on, while the bar holds still for it. */
+  /** The bar the line leaves, while the bar holds still for it. */
   bar: HTMLElement | null;
   /** The field closing to one line (left to finish whatever happens to the message). */
   barAnim: Animation | null;
@@ -161,7 +159,7 @@ const pruneUnclaimed = (now: number) => {
   for (let i = unclaimed.length - 1; i >= 0; i--) if (now - unclaimed[i].at >= UNCLAIMED_MS || !unclaimed[i].root.isConnected) unclaimed.splice(i, 1);
 };
 
-/** The bars a bead is joined to: each holds still (`data-pouring`) until the last of its messages has left it. */
+/** The bars a line leaves: each holds still (`data-pouring`) until the last of its messages has left it. */
 const holding = new WeakMap<HTMLElement, number>();
 function holdBar(bar: HTMLElement, ms: number) {
   holding.set(bar, (holding.get(bar) ?? 0) + 1);
@@ -252,10 +250,8 @@ const FIRST_TOP = 56;
 const LANDING_GAP = 26;
 /** The narrowest side padding of a conversation row (timeline.css `.tl-content --gutter`). */
 const MIN_GUTTER = 24;
-/** A bar without a key (nothing sends from one today): the bead forms this far in from its right edge. */
+/** A bar without a key (nothing sends from one today): the line leaves this far in from its right edge. */
 const CORNER = 34;
-/** The words gather this far over the key's top: just inside the pane, past the channel. */
-const OVER_KEY = 8;
 /** A queue row (composer.css `.cq-list`, `.cq-row`): inset in the tray, its height, its corners, where its words start. */
 const ROW = { inset: 6, gap: 6, height: 28, radius: 14, text: 35 };
 
@@ -310,8 +306,6 @@ interface Geometry {
   contentEl: HTMLElement | null;
   fromEnd: number;
   viewH: number;
-  /** The backdrop's field behind the send: its canvas, where it stands (page px), its cell (0: no grid) and its strength. */
-  field: { canvas: HTMLCanvasElement; x: number; y: number; w: number; h: number; cell: number; a: number } | null;
 }
 
 function readGeometry(cardEl: HTMLElement | null, column: number, stageEl: Element | null): Geometry {
@@ -320,13 +314,6 @@ function readGeometry(cardEl: HTMLElement | null, column: number, stageEl: Eleme
   const sc = content?.parentElement ?? null;
   const last = content ? [...content.children].reverse().find((n) => !n.classList.contains('tail')) : null;
   const z = uiZoom();
-  let field: Geometry['field'] = null;
-  for (const c of document.querySelectorAll<HTMLCanvasElement>('.dither[data-ready="true"] > canvas')) {
-    const host = c.parentElement!;
-    const r = c.getBoundingClientRect();
-    if (!r.width || !c.width || (field && r.width * r.height < field.w * field.h * z * z)) continue;
-    field = { canvas: c, x: r.left / z, y: r.top / z, w: r.width / z, h: r.height / z, cell: host.classList.contains('dither-grid') ? r.width / z / c.width : 0, a: parseFloat(getComputedStyle(host).opacity) || 0 };
-  }
   return {
     z,
     column,
@@ -340,7 +327,6 @@ function readGeometry(cardEl: HTMLElement | null, column: number, stageEl: Eleme
     scroller: content?.parentElement?.getBoundingClientRect() ?? null,
     lastBottom: last ? last.getBoundingClientRect().bottom : null,
     contents: contents.length,
-    field,
   };
 }
 
@@ -432,38 +418,68 @@ function fromKey(f: Pick<Flight, 't0' | 'all' | 'started'>, el: Element, frames:
   return a;
 }
 
-/**
- * The words gather out of their source into the corner the bead rises from: the visible text as
- * one layer (clipped to the field), scaled uniformly toward that point and faded on the way, so the
- * paragraph closes into it whole. Nothing of it is cut apart or re-wrapped.
- */
-function gatherWords(f: Pick<Flight, 't0' | 'all' | 'started'>, src: Source, m: Measured, at: { x: number; y: number }): HTMLElement[] {
-  const view = { top: m.view.top, height: Math.max(m.line, m.view.bottom - m.view.top) };
-  const layer = document.createElement('div');
-  layer.className = 'send-gather';
-  layer.setAttribute('aria-hidden', 'true');
-  layer.style.cssText = `left:${m.left}px;top:${view.top}px;width:${m.width}px;height:${view.height}px;transform-origin:${(at.x - m.left).toFixed(1)}px ${(at.y - view.top).toFixed(1)}px;`;
-  const words = document.createElement('div');
-  words.style.cssText = `top:${(m.top - view.top).toFixed(2)}px;width:${m.width}px;${m.font}color:${m.color};`;
-  if (src.oneLine) words.setAttribute('data-one-line', '');
-  words.textContent = src.text.length > 4000 ? src.text.slice(0, 4000) : src.text;
-  layer.appendChild(words);
-  document.body.appendChild(layer);
-  const frames: Keyframe[] = [];
-  const n = 12;
-  for (let k = 0; k <= n; k++) {
-    const u = k / n;
-    const c = collapseAt(u);
-    frames.push({ offset: u, transform: `scale(${c.sx.toFixed(4)}, ${c.sy.toFixed(4)})`, opacity: c.o.toFixed(3) });
-  }
-  fromKey(f, layer, frames, { duration: COLLAPSE });
-  return [layer];
+/** A dither cell of a whole number of device px (about 2), in page px. */
+function ditherCell(): number {
+  const k = (window.devicePixelRatio || 1) * uiZoom();
+  return Math.max(2, Math.round(2 * k)) / k;
+}
+
+/** Masks `el` to quarter `q` of the 4x4 ordered dither (ranks 4q to 4q+3): a static mask, only its opacity ever changes. */
+function quarter(el: HTMLElement, q: number, cell: number) {
+  el.classList.add('send-q');
+  const tile = quarterTiles('#000', cell)[q];
+  el.style.setProperty('mask-image', tile);
+  el.style.setProperty('-webkit-mask-image', tile);
+  el.style.setProperty('mask-size', `${cell * 4}px ${cell * 4}px`);
+  el.style.setProperty('-webkit-mask-size', `${cell * 4}px ${cell * 4}px`);
+  return el;
 }
 
 /**
- * The card the message becomes: the conversation's own `.user-card`, inside the window the ink
- * reveals it through; its surface a layer of its own beside that window (it forms last, with its
- * shadow, which the window would cut).
+ * Steps `el` between shown and hidden at the given times (ms after time zero), each a cut on the
+ * compositor: one animation over the whole run, so nothing of a later step shows before its time.
+ */
+function stepped(f: Pick<Flight, 't0' | 'all' | 'started'>, el: Element, from: number, changes: [number, number][]): Animation | null {
+  const last = Math.max(1, ...changes.map((c) => c[0])) + 1;
+  const frames: Keyframe[] = [{ offset: 0, opacity: from, easing: 'steps(1, end)' }];
+  for (const [t, o] of changes) frames.push({ offset: Math.min(1, Math.max(0, t / last)), opacity: o, easing: 'steps(1, end)' });
+  frames.push({ offset: 1, opacity: changes.length ? changes[changes.length - 1][1] : from });
+  return fromKey(f, el, frames, { duration: last });
+}
+
+/**
+ * The words go in place: the visible text as four layers (clipped to the field), each one
+ * quarter of the dither, gone a quarter at a time, the densest ranks first (sparse, checker,
+ * gone). Nothing of it moves, is cut apart or re-wrapped.
+ */
+function dissolveWords(f: Pick<Flight, 't0' | 'all' | 'started' | 'plan'>, src: Source, m: Measured): HTMLElement[] {
+  const view = { top: m.view.top, height: Math.max(m.line, m.view.bottom - m.view.top) };
+  const cell = ditherCell();
+  const text = src.text.length > 4000 ? src.text.slice(0, 4000) : src.text;
+  const out: HTMLElement[] = [];
+  for (let q = 0; q < 4; q++) {
+    const layer = document.createElement('div');
+    layer.className = 'send-gather';
+    layer.setAttribute('aria-hidden', 'true');
+    layer.style.cssText = `left:${m.left}px;top:${view.top}px;width:${m.width}px;height:${view.height}px;`;
+    quarter(layer, q, cell);
+    const words = document.createElement('div');
+    words.style.cssText = `top:${(m.top - view.top).toFixed(2)}px;width:${m.width}px;${m.font}color:${m.color};`;
+    if (src.oneLine) words.setAttribute('data-one-line', '');
+    words.textContent = text;
+    layer.appendChild(words);
+    document.body.appendChild(layer);
+    stepped(f, layer, 1, [[f.plan.dissolve[3 - q], 0]]);
+    out.push(layer);
+  }
+  return out;
+}
+
+/**
+ * The card the message becomes: the conversation's own `.user-card` (the whole, laid out in flow,
+ * which gives the layer its size), and its quarters over it: four of the well
+ * (`.send-surface`, the card's numbers) and four of the words. They come in by quarters; at the
+ * handover the whole takes their place in one frame (never both: text drawn twice reads bolder).
  */
 function makeCard(text: string, steer: boolean, max: number) {
   const el = document.createElement('div');
@@ -472,87 +488,86 @@ function makeCard(text: string, steer: boolean, max: number) {
   el.style.cssText = `left:0;top:0;width:max-content;max-width:${max}px;`;
   const inner = document.createElement('div');
   inner.className = 'send-in';
-  const clip = document.createElement('div');
-  clip.className = 'send-clip';
-  const unfold = document.createElement('div');
-  unfold.className = 'send-unfold';
-  const surface = document.createElement('i');
-  surface.className = 'send-surface';
-  const card = document.createElement('div');
-  card.className = 'user-card';
-  card.style.maxWidth = 'none';
   // A steer lands not yet taken: at the waiting tone (timeline.css `.user[data-queued] .user-card`).
-  if (steer) card.style.opacity = '0.6';
-  const words = document.createElement('div');
-  words.className = 'user-text';
-  // A long message is clipped in the conversation too, at the same line (timeline.css `.user-text[data-clipped]`).
-  if (isLongMessage(text)) words.setAttribute('data-clipped', '');
-  words.textContent = text;
-  card.appendChild(words);
-  unfold.appendChild(card);
-  clip.appendChild(unfold);
-  inner.append(surface, clip);
+  if (steer) inner.style.opacity = '0.6';
+  const cell = ditherCell();
+  const card = () => {
+    const c = document.createElement('div');
+    c.className = 'user-card';
+    c.style.maxWidth = 'none';
+    const words = document.createElement('div');
+    words.className = 'user-text';
+    // A long message is clipped in the conversation too, at the same line (timeline.css `.user-text[data-clipped]`).
+    if (isLongMessage(text)) words.setAttribute('data-clipped', '');
+    words.textContent = text;
+    c.appendChild(words);
+    return c;
+  };
+  const whole = document.createElement('div');
+  whole.className = 'send-whole';
+  whole.appendChild(card());
+  const wells: HTMLElement[] = [];
+  const quarters: HTMLElement[] = [];
+  for (let q = 0; q < 4; q++) {
+    const w = document.createElement('i');
+    w.className = 'send-surface';
+    wells.push(quarter(w, q, cell));
+  }
+  for (let q = 0; q < 4; q++) {
+    const w = document.createElement('div');
+    w.className = 'send-words';
+    w.appendChild(card());
+    quarters.push(quarter(w, q, cell));
+  }
+  inner.append(whole, ...wells, ...quarters);
   el.appendChild(inner);
-  return { el, inner, clip, unfold, surface };
+  return { el, inner, whole, wells, quarters, surface: null };
 }
 
-/** A queue row's words, as the tray will show them. */
+/** A queue row's words, as the tray will show them: the whole and its four quarters. */
 function makeRowWords(text: string, cs: CSSStyleDeclaration | null) {
   const el = document.createElement('div');
   el.className = 'send-flight';
   el.setAttribute('aria-hidden', 'true');
   const inner = document.createElement('div');
   inner.className = 'send-in';
-  const clip = document.createElement('div');
-  clip.className = 'send-clip';
-  const unfold = document.createElement('div');
-  unfold.className = 'send-unfold';
-  const words = document.createElement('div');
-  words.className = 'send-row-text';
-  if (cs) words.style.cssText = fontOf(cs);
-  words.textContent = text.split('\n').find((l) => l.trim())?.trim() ?? text;
-  unfold.appendChild(words);
-  clip.appendChild(unfold);
-  inner.appendChild(clip);
+  const line = text.split('\n').find((l) => l.trim())?.trim() ?? text;
+  const cell = ditherCell();
+  const row = () => {
+    const words = document.createElement('div');
+    words.className = 'send-row-text';
+    if (cs) words.style.cssText = fontOf(cs);
+    words.textContent = line;
+    return words;
+  };
+  const whole = document.createElement('div');
+  whole.className = 'send-whole';
+  whole.appendChild(row());
+  const quarters: HTMLElement[] = [];
+  for (let q = 0; q < 4; q++) {
+    const w = document.createElement('div');
+    w.className = 'send-words';
+    w.appendChild(row());
+    quarters.push(quarter(w, q, cell));
+  }
+  inner.append(whole, ...quarters);
   el.appendChild(inner);
-  return { el, inner, clip, unfold, surface: null };
+  return { el, inner, whole, wells: [] as HTMLElement[], quarters, surface: null };
 }
 
 /**
- * The words are revealed in place by the spreading ink (revealAt): a window over the card that
- * follows the sheet, its content counter-scaled so the words never move or change size; the card's
- * surface forms as the sheet hands over.
+ * The card resolves out of the dither as the outline closes round it: the well's quarters, then
+ * the words', each a cut on the compositor; at the handover the whole card takes their place in
+ * one frame.
  */
 function unfoldAnims(f: Flight) {
   for (const a of f.anims) a.cancel();
   f.anims = [];
   const p = f.plan;
-  const win: Keyframe[] = [];
-  const words: Keyframe[] = [];
-  const span = p.hand - p.land;
-  const n = Math.max(8, Math.round(span / 12));
-  for (let i = 0; i <= n; i++) {
-    const t = p.land + (span * i) / n;
-    const r = revealAt(p, t);
-    win.push({ offset: i / n, transform: `translate(${r.x.toFixed(2)}px, ${r.y.toFixed(2)}px) scale(${r.sx.toFixed(4)}, ${r.sy.toFixed(4)})` });
-    words.push({ offset: i / n, transform: `scale(${(1 / r.sx).toFixed(4)}, ${(1 / r.sy).toFixed(4)}) translate(${(-r.x).toFixed(2)}px, ${(-r.y).toFixed(2)}px)`, opacity: r.o.toFixed(3) });
-  }
-  win[n] = { offset: 1, transform: 'translate(0px, 0px) scale(1, 1)' };
-  words[n] = { offset: 1, transform: 'scale(1, 1) translate(0px, 0px)', opacity: 1 };
-  const a = fromKey(f, f.clip, win, { duration: span, delay: p.land });
-  const b = fromKey(f, f.unfold, words, { duration: span, delay: p.land });
-  // Until the drop lands the window shows nothing. (Both animations above hold their first frame
-  // through the delay, and for a short message the sheet at the landing is most of the card
-  // already: its words stood there, dim and cut at the window's edge, while the drop was still
-  // on its way.) One step at the landing, held both ways: the compositor makes it on time by
-  // itself, with the main thread busy mounting the conversation.
-  const c = p.land > 0 ? fromKey(f, f.clip, [{ opacity: 0, easing: 'steps(1, end)' }, { opacity: 1 }], { duration: p.land }) : null;
-  for (const x of [a, b, c]) if (x) f.anims.push(x);
-  if (f.surface) {
-    // Linearly: the sheet under it lets go on the matching curve (liquid-shape.ts `handAlpha`).
-    const s = fromKey(f, f.surface, [{ opacity: 0 }, { opacity: 1 }], { duration: HAND, delay: p.hand });
-    if (s) f.anims.push(s);
-  }
+  const push = (a: Animation | null) => a && f.anims.push(a);
+  f.wells.forEach((w, q) => push(stepped(f, w, 0, [[p.well[q], 1], [p.hand, 0]])));
+  f.quarters.forEach((w, q) => push(stepped(f, w, 0, [[p.words[q], 1], [p.hand, 0]])));
+  push(stepped(f, f.whole, 0, [[p.hand, 1]]));
 }
 
 /** Places the landing layer on its box. */
@@ -564,8 +579,10 @@ function place(f: Flight) {
   f.el.style.maxWidth = 'none';
 }
 
-/** The bar holds still (no transitions of its own) while the drop comes out of it and its edge settles. */
+/** The bar holds still (no transitions of its own) while the line leaves it and its field closes. */
 const BAR_HOLD = BORN + 200;
+/** The field closes once the words are mostly gone (their layers stay where the words stood). */
+const FIELD_CLOSES = 56;
 
 /**
  * Lifts `text` out of `source` (the composer's field, or a queue row's text) and keeps it in the
@@ -575,9 +592,9 @@ const BAR_HOLD = BORN + 200;
  * card goes into the page first (hidden), then everything is read at once (one layout, the one
  * the frame needs anyway), then everything is written; nothing is read back after a write. All
  * that the first frame shows or the compositor and the worker need (the words, the card and its
- * reveal, the liquid's canvas) is in place when it returns: a layer that entered the page later
+ * reveal, the line's canvas) is in place when it returns: a layer that entered the page later
  * would only show once the main thread draws again, and right after a send that can take a long
- * time. What is no layer (the timers, the backdrop's beats and its still) follows right after
+ * time. What is no layer (the timers, the backdrop's beats) follows right after
  * that frame (`after`).
  */
 export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: boolean; first?: boolean; session?: string | null }): FlightHandle | null {
@@ -608,7 +625,7 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   }
   const bar = source.oneLine ? null : source.el.closest<HTMLElement>('.cmp-card');
   const g = readGeometry(bar, column, stageEl);
-  // The key the drop leaves from: a disc in the bar's corner (composer.css `.cmp-keys`).
+  // The key the line leaves from: a disc in the bar's corner (composer.css `.cmp-keys`).
   const keyR = bar?.querySelector('.cmp-keys')?.getBoundingClientRect();
   const rowEl = source.oneLine ? source.el.closest<HTMLElement>('[data-qrow]') : null;
   const rowBox = rowEl?.getBoundingClientRect();
@@ -621,7 +638,7 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   const ta = bar && source.el instanceof HTMLTextAreaElement ? source.el : null;
   const oneLine = m.line + m.padY;
   const shrink = ta ? Math.max(0, m.box.bottom - m.box.top - oneLine) : 0;
-  const from: LiquidSpec['from'] =
+  const from: SignalSpec['from'] =
     cardR && keyR?.width
       ? { x: (keyR.left + keyR.width / 2) / z, y: keyR.top / z - (first ? shrink : 0), edge: true, r: keyR.width / 2 / z }
       : cardR
@@ -645,9 +662,9 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   } else box = rowBoxOf(g, from);
 
   // From here on, writes only.
-  const spec: LiquidSpec = { from, to: box, kind: bubble ? 'bubble' : 'row' };
-  // Under a first message the bar leaves with the liquid's edge on it: room for that below.
-  const liquid = pour(spec, first ? 150 : 0);
+  const spec: SignalSpec = { from, to: box, kind: bubble ? 'bubble' : 'row' };
+  // Under a first message the bar leaves while the line draws: room for that below.
+  const signal = pour(spec, first ? 150 : 0);
   const f: Flight = {
     key: norm(source.text),
     dest: opts.dest,
@@ -659,8 +676,8 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
     synced: [],
     read: { card: cardR, stage: g.stage, column, fieldHeight: m.box.bottom - m.box.top, z },
     beats: [],
-    liquid,
-    plan: liquid.plan,
+    signal,
+    plan: signal.plan,
     pourEls: [],
     ...made,
     box,
@@ -690,10 +707,9 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   f.home = { left: m.left - CARD_PAD_X * s0, top: m.top - CARD_PAD_TOP * s0 + (m.line - CARD_LINE * s0) / 2, s0 };
   place(f);
   f.el.style.visibility = '';
-  // The words gather into the pane's corner over the key the drop will come out of (or the row's
-  // end), and the landing is revealed by the sheet.
-  f.pourEls = gatherWords(f, source, m, { x: from.x, y: from.r ? from.y - OVER_KEY : from.y });
-  // A queue row's words are gathering out of it: the row itself shows none (it leaves the tray
+  // The words go in place, and the landing resolves as the line reaches it.
+  f.pourEls = dissolveWords(f, source, m);
+  // A queue row's words are going out of it: the row itself shows none (it leaves the tray
   // meanwhile; one that stays gets its words back).
   if (source.oneLine) {
     const el = source.el;
@@ -701,7 +717,7 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
     window.setTimeout(() => (el.style.opacity = ''), COLLAPSE + 400);
   }
   unfoldAnims(f);
-  // The bar holds still while the drop is tied to it, and its field closes with the words on
+  // The bar holds still while the line leaves it, and its field closes behind the words on
   // their curve (composer.css `.cmp-card[data-pouring]`; the composer's own measure then sets the
   // same height).
   if (bar) holdBar(bar, BAR_HOLD);
@@ -710,7 +726,7 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
     ta.style.height = `${oneLine}px`;
     // Timed from the same frame as the words (a transition would start whenever the busy main
     // thread next gets to it), and above whatever the composer writes meanwhile.
-    f.barAnim = fromKey(f, ta, [{ height: `${(oneLine + shrink).toFixed(2)}px` }, { height: `${oneLine}px` }], { duration: COLLAPSE, easing: linearEasing(collapseEase, 20), fill: 'backwards' });
+    f.barAnim = fromKey(f, ta, [{ height: `${(oneLine + shrink).toFixed(2)}px` }, { height: `${oneLine}px` }], { duration: COLLAPSE, delay: FIELD_CLOSES, easing: linearEasing(collapseEase, 20), fill: 'backwards' });
   }
   pending.push(f);
   // A conversation row that mounted first (the bridge answered before this row left the tray): the
@@ -762,7 +778,7 @@ export function holdFlights(sessionId: string): () => void {
 }
 
 /** A queue row's place: the tray's newest row, just above the bar, inside the tray that unfolds behind it. */
-function rowBoxOf(g: Geometry, from: LiquidSpec['from']): Box {
+function rowBoxOf(g: Geometry, from: SignalSpec['from']): Box {
   const z = g.z;
   const c = g.card ?? new DOMRect(from.x * z - 400, from.y * z, 434, 60);
   return { left: c.left / z + ROW.inset, top: c.top / z - ROW.gap - ROW.height, width: c.width / z - ROW.inset * 2, height: ROW.height, radii: [ROW.radius, ROW.radius, ROW.radius, ROW.radius] };
@@ -792,22 +808,21 @@ function nextTask(fn: () => void) {
  * that moment. The compositor reports it (`lead.ready`), but only once the main thread is free
  * again, which after a send can be much later; so the worker is started right behind the frame
  * (the next task, ahead of the work the send set off) on that task's time, and put right when the
- * report comes in while nothing of the liquid shows yet. Everything of the message that shows
+ * report comes in while nothing of the line shows yet. Everything of the message that shows
  * later than its first frames runs on that same clock (`align`). A hidden window shows no frame: a
  * timer starts the message instead. What the launch left for later follows at once.
  */
 function begin(f: Flight, g: Geometry, lead: Animation | null) {
-  // The layers that show nothing yet (the window the ink reveals the words through, the card's
-  // surface, the waiting state, a bar's glide that still holds) are put on the message's own
-  // clock, the one the worker draws by. Left to start by themselves they run from the moment the
+  // Every layer of the message, the field's words included, is put on the message's own clock,
+  // the one the worker draws by. Left to start by themselves they run from the moment the
   // compositor first shows them, which on a loaded machine is some frames after the worker's
-  // zero; when the compositor's report of that moment then comes too late to move the worker
-  // (below), the two stay apart: the sheet let go on the worker's time and the surface formed on
-  // the compositor's, so for a few frames the card had neither (it blinked before the row took
-  // over). Only the gathering words, which show from the first frame, keep their own start.
+  // zero, and the compositor's report of that moment comes too late to move the worker (below):
+  // a queued message's words still stood in the field, dithered, while its line had already
+  // closed round its row in the tray (the words in two places for 60 ms). On one clock a late
+  // first frame only skips a step of the dissolve.
   const align = () => {
     if (frozenAt != null) return;
-    for (const a of [...f.anims, ...f.wait, ...f.synced]) a.startTime = f.t0;
+    for (const a of new Set([...f.all, ...f.wait, ...f.synced])) a.startTime = f.t0;
   };
   const go = (at: number) => {
     if (f.started) return;
@@ -820,7 +835,7 @@ function begin(f: Flight, g: Geometry, lead: Animation | null) {
         a.currentTime = frozenAt;
       }
     // A message given up before its first frame (its row was no place to land) draws nothing.
-    if (!f.ending) f.liquid?.start(at);
+    if (!f.ending) f.signal?.start(at);
     armRest(f);
     after(f, g);
   };
@@ -831,11 +846,11 @@ function begin(f: Flight, g: Geometry, lead: Animation | null) {
     const at = lead?.startTime;
     if (typeof at !== 'number') return;
     if (!f.started) return go(at);
-    // Only while the drop is still under the edge on both clocks: a correction never shows.
+    // Only while nothing of the line shows yet on either clock: a correction never shows.
     const t = performance.now() - Math.min(at, f.t0);
     if (Math.abs(at - f.t0) < 2 || t > f.plan.born || f.ending || frozenAt != null) return;
     f.t0 = at;
-    f.liquid?.retime(at);
+    f.signal?.retime(at);
     align();
     armRest(f);
   };
@@ -845,20 +860,18 @@ function begin(f: Flight, g: Geometry, lead: Animation | null) {
 
 /**
  * What the launch left for after its first frame (nothing of it shows by itself): a still of the
- * field for the glass, the backdrop's beats, and the timers of the hold.
+ * the backdrop's beats and the timers of the hold.
  */
 function after(f: Flight, g: Geometry) {
   if (f.ending) return;
   const bubble = f.dest === 'timeline';
-  // A queued message stays over the tray's own panel: nothing of the field is behind it to bend.
-  if (bubble) backdropFor(f, g);
   beatsFor(f);
   if (bubble) {
     if (!f.target) review(f);
   } else if (!f.target) f.timer = window.setTimeout(() => !f.target && abort(f), NO_CLAIM_MS);
 }
 
-/** Rests once the liquid has run its course; the gathering words go once gathered. */
+/** Rests once the line has run its course; the words' layers go once gone. */
 function armRest(f: Flight) {
   window.clearTimeout(f.restTimer);
   const left = f.t0 + f.plan.end - performance.now();
@@ -872,38 +885,23 @@ function armRest(f: Flight) {
 }
 
 /**
- * A still of the backdrop's field behind the message, for the drop to bend (liquid-gl.ts): the
- * field's own canvas (a few thousand cells: copying it costs nothing), handed to the worker.
- */
-function backdropFor(f: Flight, g: Geometry) {
-  const b = g.field;
-  if (!b || !f.liquid || typeof createImageBitmap !== 'function' || !b.canvas.isConnected) return;
-  const big = b.canvas.width * b.canvas.height > 600_000;
-  const opts: ImageBitmapOptions = { premultiplyAlpha: 'premultiply', ...(big ? { resizeWidth: Math.round(b.canvas.width / 2), resizeHeight: Math.round(b.canvas.height / 2), resizeQuality: 'low' } : {}) };
-  const liquid = f.liquid;
-  createImageBitmap(b.canvas, opts).then(
-    (bitmap) => liquid.backdrop({ bitmap, x: b.x, y: b.y, w: b.w, h: b.h, cell: b.cell, a: b.a }),
-    () => {},
-  );
-}
-
-/**
- * The backdrop answers the drop (art/events.ts): the pressure wave from where the thread parts,
- * and a softer ripple from where the drop touches down. A queued message's wave is quieter, and
- * its landing (a hop away) has none.
+ * The backdrop answers the line (art/events.ts): the pressure wave from where it leaves the key,
+ * and a softer ripple from where it meets the card. A queued message's wave is quieter, and its
+ * landing (a hop away) has none.
  */
 function beatsFor(f: Flight) {
   const p = f.plan;
   const z = uiZoom();
   const at = (ms: number, fn: () => void) => f.beats.push(window.setTimeout(fn, Math.max(0, f.t0 + ms - performance.now())));
-  at(p.spec.from.edge ? p.snap : p.launch + 40, () => {
-    const o = footAt(f.plan.spec, f.plan.snap);
+  at(p.snap, () => {
+    const o = f.plan.spec.from;
     fieldBeatAt('send', o.x * z, o.y * z, f.dest === 'tray' ? 0.6 : 1);
   });
   if (f.dest !== 'timeline') return;
   at(p.land, () => {
     const s = shiftAt(f.plan, f.plan.land);
-    fieldBeatAt('pulse', (f.plan.impact.x + s.x) * z, (f.plan.impact.y + s.y) * z, 0.5);
+    const meet = f.plan.path[f.plan.path.length - 1];
+    fieldBeatAt('pulse', (meet.x + s.x) * z, (meet.y + s.y) * z, 0.5);
   });
 }
 
@@ -940,21 +938,21 @@ export function launchRead(bar: HTMLElement): { card: { left: number; top: numbe
 
 /**
  * The bar this message is leaving is about to glide away (the first message from home,
- * home/handoff.ts): the liquid's edge rides with it, by (dx, dy) in all, from `BAR_LEAVES` on.
+ * home/handoff.ts): recorded on the plan, by (dx, dy) in all, from `BAR_LEAVES` on.
  * Returns how to put an animation on the message's clock (its time zero is the message's first
  * frame), or null when no message is leaving that bar.
  */
 export function barLeaving(bar: HTMLElement, by: { dx: number; dy: number }): ((a: Animation) => void) | null {
   const f = leavingFlight(bar);
   if (!f) return null;
-  f.liquid?.leaving(by);
-  if (f.liquid) f.plan = f.liquid.plan;
+  f.signal?.leaving(by);
+  if (f.signal) f.plan = f.signal.plan;
   return onFlightClock(bar);
 }
 
 /**
  * How to put an animation on the clock of the message leaving `bar` in this same handler (its
- * time zero is the message's first frame, the clock its drop is drawn by): the send key's part
+ * time zero is the message's first frame, the clock its line is drawn by): the send key's part
  * (launch.ts), the home bar's glide. Null when no message is leaving that bar.
  */
 export function onFlightClock(bar: HTMLElement): ((a: Animation) => void) | null {
@@ -1200,7 +1198,7 @@ function goBack(f: Flight): Promise<void> {
   const tone = parseFloat(getComputedStyle(f.inner).opacity) || 1;
   endWait(f);
   f.line?.remove();
-  f.liquid?.cancel();
+  f.signal?.cancel();
   for (const p of f.pourEls) p.remove();
   f.pourEls = [];
   const finish = (a: Animation | null) =>
@@ -1232,8 +1230,9 @@ function goBack(f: Flight): Promise<void> {
   f.el.style.transformOrigin = '0 0';
   const back = play(f.el, frames, { duration: end, easing: 'linear', fill: 'forwards' });
   if (tone < 1) play(f.inner, [{ opacity: tone }, { opacity: 1 }], { duration: 160, easing: EASE_OUT, fill: 'forwards' });
-  // The surface goes as the words settle back into the field.
-  play(f.surface, [{ opacity: 1 }, { opacity: 0 }], { duration: Math.min(end, 220), delay: Math.max(0, end - 220), easing: 'linear', fill: 'forwards' });
+  // The well goes as the words settle back into the field (the whole card's own, `::before`).
+  const well = f.whole.querySelector<HTMLElement>('.user-card');
+  if (well) play(well, [{ backgroundColor: 'transparent' }], { duration: 1, fill: 'forwards' });
   return finish(back);
 }
 
@@ -1254,7 +1253,7 @@ function targetAt(f: Flight): { left: number; top: number; width: number; height
   return { left: r.left / z, top: r.top / z - gap - slide, width: r.width / z, height: r.height / z };
 }
 
-/** The liquid has run its course. With a target the real thing takes over; without one the card waits. */
+/** The line has run its course. With a target the real thing takes over; without one the card waits. */
 function rest(f: Flight) {
   f.resting = true;
   if (frozen || !f.target || f.ending) return;
@@ -1333,7 +1332,7 @@ function abort(f: Flight) {
   dropBeats(f);
   const shown = f.row ?? f.target;
   if (shown) shown.style.opacity = '';
-  f.liquid?.cancel();
+  f.signal?.cancel();
   for (const p of f.pourEls) p.remove();
   f.pourEls = [];
   const done = () => f.el.remove();
@@ -1369,9 +1368,9 @@ function certainTarget(target: HTMLElement): boolean {
 }
 
 /**
- * The real landing takes over from the guess. Before the drop has left, the landing simply moves
+ * The real landing takes over from the guess. Before the line reaches the card, the landing simply moves
  * (nothing of it shows yet). After that, everything still to come moves by the difference: the
- * worker shifts the drop and the sheet, the words' layer takes the same shift on the same curve.
+ * worker shifts the outline, the card's layer takes the same shift on the same curve.
  */
 function aim(f: Flight) {
   const to = targetAt(f);
@@ -1381,13 +1380,13 @@ function aim(f: Flight) {
   const dx = to.left - (f.box.left + cur.x);
   const dy = to.top - (f.box.top + cur.y);
   const resized = Math.abs(to.width - f.box.width) > 0.5 || Math.abs(to.height - f.box.height) > 0.5;
-  if (t < f.plan.launch - 8 && f.liquid) {
+  if (t < f.plan.launch - 8 && f.signal) {
     if (Math.abs(dx) < 0.3 && Math.abs(dy) < 0.3 && !resized) return;
     const height = f.dest === 'tray' ? f.box.height : to.height;
     f.box = { ...f.box, left: to.left, top: to.top, width: to.width, height };
     place(f);
-    f.liquid.retarget(f.box);
-    f.plan = f.liquid.plan;
+    f.signal.retarget(f.box);
+    f.plan = f.signal.plan;
     unfoldAnims(f);
     armRest(f);
     return;
@@ -1399,8 +1398,8 @@ function aim(f: Flight) {
   // Lands where the row is by the time it touches down (or soon after, when it already has).
   const dur = Math.max(160, f.plan.land - t);
   const s = { at: t, dx, dy, dur };
-  if (f.liquid) f.liquid.shift(s);
-  if (f.liquid?.plan !== f.plan) f.plan.shifts.push(s);
+  if (f.signal) f.signal.shift(s);
+  if (f.signal?.plan !== f.plan) f.plan.shifts.push(s);
   f.fixEnd = f.t0 + t + dur;
   // The words' layer follows the same sum of shifts, from now to the end of the last one.
   const frames: Keyframe[] = [];
@@ -1459,9 +1458,11 @@ export function landInTimeline(root: HTMLElement, text: string, opts: { steer?: 
   // The card becomes this card: the same width and lines, its marks and attachments.
   const width = card.getBoundingClientRect().width / uiZoom();
   const copy = card.cloneNode(true) as HTMLElement;
-  copy.style.cssText = `max-width:none;width:${width.toFixed(2)}px;transition:none;opacity:${getComputedStyle(card).opacity};`;
-  f.unfold.querySelector('.user-card')?.replaceWith(copy);
-  // Past the drop's leaving the landing keeps its place and only shifts: the surface takes the real width now.
+  copy.style.cssText = `max-width:none;width:${width.toFixed(2)}px;transition:none;opacity:1;`;
+  // Its tone (a steer not yet taken waits at a lower one) on the layer, so the well's quarters take it too.
+  f.inner.style.opacity = getComputedStyle(card).opacity;
+  for (const c of f.el.querySelectorAll('.user-card')) c.replaceWith(copy.cloneNode(true));
+  // Past the line's arrival the landing keeps its place and only shifts: the card takes the real width now.
   f.el.style.width = `${width.toFixed(2)}px`;
   f.target = card;
   f.row = root;
@@ -1481,7 +1482,7 @@ export function landInTimeline(root: HTMLElement, text: string, opts: { steer?: 
 /**
  * Where a row rests is only known once the conversation has laid out around it (the turn it starts
  * settles in the effects after it mounts): measured on the next frame, and again just before the
- * drop leaves and just before it touches down, so a late change bends its flight instead of
+ * line reaches the card and just before, so a late change moves it instead of
  * showing as a jump at the landing.
  */
 function watch(f: Flight) {
@@ -1501,11 +1502,12 @@ export function landInTray(textEl: HTMLElement, text: string, session?: string |
   if (!f) return false;
   // The words take the row's type and stand where its text starts.
   const row = textEl.closest<HTMLElement>('[data-qrow]');
-  const words = f.unfold.querySelector<HTMLElement>('.send-row-text');
-  if (words && row) {
+  const words = f.el.querySelectorAll<HTMLElement>('.send-row-text');
+  if (words.length && row) {
     const cs = getComputedStyle(textEl);
     const z = uiZoom();
-    words.style.cssText = `${fontOf(cs)}padding-left:${((textEl.getBoundingClientRect().left - row.getBoundingClientRect().left) / z).toFixed(2)}px;`;
+    const css = `${fontOf(cs)}padding-left:${((textEl.getBoundingClientRect().left - row.getBoundingClientRect().left) / z).toFixed(2)}px;`;
+    for (const w of words) w.style.cssText = css;
   }
   f.target = textEl;
   textEl.style.opacity = '0';
@@ -1532,7 +1534,7 @@ let frozenAt: number | null = null;
 function freezeFlights(t: number | null) {
   frozen = t != null;
   frozenAt = t;
-  freezeLiquid(t);
+  freezeSignal(t);
   for (const f of pending) {
     for (const a of [...f.all, ...f.synced]) {
       if (t == null) {
@@ -1550,11 +1552,11 @@ function freezeFlights(t: number | null) {
 }
 
 function devHook() {
-  const w = window as unknown as { __sableLiquid?: object };
-  if (!w.__sableLiquid)
-    w.__sableLiquid = {
+  const w = window as unknown as { __sableSignal?: object };
+  if (!w.__sableSignal)
+    w.__sableSignal = {
       freeze: freezeFlights,
-      plan: (spec: LiquidSpec) => planLiquid(spec),
+      plan: (spec: SignalSpec) => planSignal(spec),
       inAir: () => pending.length,
       easing: linearEasing(shiftEase),
       debug: () =>
@@ -1562,5 +1564,5 @@ function devHook() {
     };
 }
 
-// The worker that draws the liquid is loaded while the page is idle, ahead of the first send.
-if (typeof window !== 'undefined') prewarmLiquid();
+// The worker that draws the line is loaded while the page is idle, ahead of the first send.
+if (typeof window !== 'undefined') prewarmSignal();

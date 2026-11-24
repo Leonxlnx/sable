@@ -945,8 +945,8 @@ button:hover > .row-caret {
    carry it. The field's light passes through it a little dimmed. The words are set like the
    answer's (markdown.css `.md`). Time and actions appear above its right end on hover. Its
    numbers are shared with the bubble that flies here from the composer (user-card.ts; the fill
-   and the hairline also live in composer.css `.send-surface` and liquid-shape.ts `INK`: change
-   them together, tests/composer-liquid.test.ts compares the three). */
+   and the hairline also live in composer.css `.send-surface` and signal-shape.ts `INK`: change
+   them together, tests/composer-bar.test.ts compares the three). */
 .user {
   position: relative;
   display: flex;

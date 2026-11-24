@@ -1,5 +1,5 @@
 import { barLeaving, HOLD_MS, launchRead, RELEASE } from '@/features/composer/flight';
-import { BAR_LEAVES, COLLAPSE, collapseEase, GLIDE, linearEasing } from '@/features/composer/liquid-shape';
+import { BAR_LEAVES, COLLAPSE, collapseEase, GLIDE, linearEasing } from '@/features/composer/signal-shape';
 import { holdSend } from '@/features/composer/settle';
 import { ARROW_OUT, ARROW_OUT_EASE, ARROW_OUT_MS, KEY_GIVE, KEY_GIVE_MS, SQUARE_IN, SQUARE_IN_AT, SQUARE_IN_EASE, SQUARE_IN_MS } from '@/features/composer/launch';
 import { reducedMotion, uiZoom } from '@/lib/motion';
@@ -11,10 +11,9 @@ import { reducedMotion, uiZoom } from '@/lib/motion';
  * the real card hides. The ghost glides on a spring (about 350 ms) from the centre of the home
  * screen to where the session's docked composer will sit, predicted from the stage's geometry, so
  * it moves without waiting for the session to exist. While the sent words gather into its corner
- * and the drop comes out of its top edge (composer/flight.ts) it holds still, its field closing to
- * one line with the words; it leaves as the drop flies, a thread of liquid still between them
- * (drawn on the card's edge as the glide moves it), so the two push off from each other, the drop
- * up to the top of the column and the bar down to the dock. When the
+ * and the line leaves its key (composer/flight.ts) it holds still, its field closing to one line
+ * behind the words; it leaves while the line still runs, so the two push off from each other, the
+ * line up to the top of the column and the bar down to the dock. When the
  * session view mounts, its composer claims the flight: the spring is re-aimed at the real card
  * (keeping its velocity), the real card stays hidden until the ghost lands on it, and then the two
  * swap in one frame.
@@ -106,8 +105,7 @@ export const handoffActive = () => phase === 'flying';
 
 /**
  * Critically damped, near the top of the app's range: the card is docked in about 350 ms. The
- * numbers and the stepping are liquid-shape.ts's `GLIDE`: the sent message's liquid draws the
- * card's edge on the same samples while its thread still holds.
+ * numbers and the stepping are signal-shape.ts's `GLIDE`.
  */
 const STIFF = GLIDE.stiff;
 const DAMP = GLIDE.damp;
@@ -283,7 +281,7 @@ export function beginHandoff(card: HTMLElement | null) {
     field.value = '';
     // Blank on the way down: the message just left, and the docked card brings its own placeholder.
     field.placeholder = '';
-    // Closing with the words as they gather (their time and curve, liquid-shape.ts).
+    // Closing behind the words as they go (their time and curve, signal-shape.ts).
     field.style.transition = `height ${COLLAPSE}ms ${linearEasing(collapseEase, 20)}`;
   }
   copy.querySelector('.cmp-roll')?.remove();
@@ -321,10 +319,9 @@ export function beginHandoff(card: HTMLElement | null) {
     clear.push(el.animate([{ opacity: 1, transform: 'translateY(0px)' }, { opacity: 0, transform: 'translateY(-6px)' }], { duration: 80, easing: 'linear', fill: 'forwards' }));
   }
 
-  // A message is leaving this card as liquid (composer/flight.ts): the card holds while the drop
-  // comes out of its edge and leaves as it flies, the thread between them still holding, so the
-  // two push off from each other. The liquid draws the edge where the glide has it, and the glide
-  // runs on the message's clock.
+  // A message is leaving this card as signal (composer/flight.ts): the card holds while its line
+  // leaves the key and leaves while the line still runs up, so the two push off from each other.
+  // The glide runs on the message's clock.
   const onClock = barLeaving(card, { dx: target.left - start.left, dy: target.top - start.top });
   const hold = onClock ? BAR_LEAVES : 0;
   const f: Flight = { ghost, source: card, start, dock: null, path: [], move: null, size: null, clear, fixes: 0, hold, timer: 0, ending: false, done: holdSend() };
