@@ -58,7 +58,7 @@ export const OVER_MAX = { items: 512, chars: 4 * 1024 * 1024 };
 /** Items at the end of the chat a new base leaves to the tail (where streaming happens). */
 export const TAIL_KEEP = 24;
 /** Above this size a base is read line by line (one string cannot hold much more than 512 MB). */
-export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024 };
+export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024, part: 16 * 1024 * 1024 };
 
 type BaseFile = { gen?: number; items: TimelineItem[]; todos?: Todo[]; queue?: QueuedMessage[] };
 
@@ -70,27 +70,63 @@ const WORKER = `
 const { parentPort, workerData } = require('node:worker_threads');
 const fs = require('node:fs');
 const { file, byLine } = workerData;
+const { ack } = workerData;
 const whole = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+// A big base is read in pieces and handed over in pieces (PART bytes of lines at a time), each
+// dropped here once it is sent: this thread never holds the conversation. Every thread of the
+// desktop app shares one 4 GB heap, so a chat of a gigabyte held here and again on the main thread
+// ended the app. The main thread says how many pieces it has taken (ack): at most two are on the way.
+const PART = workerData.part;
 function lines() {
-  const buf = fs.readFileSync(file);
-  const at = buf.indexOf(10);
-  if (at < 0) return null;
-  const m = /^\\{"gen":(\\d+),"items":\\[$/.exec(buf.subarray(0, at).toString('utf8'));
-  if (!m) return null;
-  const items = [];
-  let pos = at + 1;
-  for (let nl = buf.indexOf(10, pos); nl >= 0; nl = buf.indexOf(10, pos)) {
-    const line = buf.subarray(pos, nl).toString('utf8');
-    items.push(JSON.parse(line.endsWith(',') ? line.slice(0, -1) : line));
-    pos = nl + 1;
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    const buf = Buffer.allocUnsafe(8 << 20);
+    let rest = Buffer.alloc(0);
+    let gen, part = [], bytes = 0, sent = 0;
+    const send = () => {
+      parentPort.postMessage({ part });
+      part = [];
+      bytes = 0;
+      sent++;
+      for (let got = Atomics.load(ack, 0); got < sent - 2; got = Atomics.load(ack, 0)) Atomics.wait(ack, 0, got, 1000);
+    };
+    for (let pos = 0; pos < size; ) {
+      const n = fs.readSync(fd, buf, 0, buf.length, pos);
+      if (n <= 0) break;
+      pos += n;
+      let chunk = rest.length ? Buffer.concat([rest, buf.subarray(0, n)]) : buf.subarray(0, n);
+      for (let at = chunk.indexOf(10); at >= 0; at = chunk.indexOf(10)) {
+        const line = chunk.subarray(0, at).toString('utf8');
+        chunk = chunk.subarray(at + 1);
+        if (gen === undefined) {
+          const m = /^\\{"gen":(\\d+),"items":\\[$/.exec(line);
+          if (!m) return null;
+          gen = Number(m[1]);
+        } else {
+          part.push(JSON.parse(line.endsWith(',') ? line.slice(0, -1) : line));
+          bytes += at;
+          if (bytes >= PART) send();
+        }
+      }
+      // An older file is one long line: no head within the first piece read.
+      if (gen === undefined) return null;
+      rest = Buffer.from(chunk);
+    }
+    const foot = rest.toString('utf8');
+    if (gen === undefined || !foot.startsWith(']')) return sent ? false : null;
+    const end = JSON.parse('{"items":[' + foot);
+    if (part.length) send();
+    return { gen, items: [], todos: end.todos, queue: end.queue };
+  } finally {
+    fs.closeSync(fd);
   }
-  const foot = buf.subarray(pos).toString('utf8');
-  if (!foot.startsWith(']')) return null;
-  const rest = JSON.parse('{"items":[' + foot);
-  return { gen: Number(m[1]), items, todos: rest.todos, queue: rest.queue };
 }
 try {
-  parentPort.postMessage({ ok: true, value: (byLine && lines()) || whole() });
+  const read = byLine ? lines() : null;
+  if (read === false) parentPort.postMessage({ ok: false });
+  else if (read) parentPort.postMessage({ ok: true, value: read, parts: true });
+  else parentPort.postMessage({ ok: true, value: whole() });
 } catch {
   parentPort.postMessage({ ok: false });
 }
@@ -98,14 +134,41 @@ try {
 
 function readInWorker(file: string, byLine: boolean): Promise<Read<BaseFile>> {
   return new Promise((resolve, reject) => {
-    const w = new Worker(WORKER, { eval: true, workerData: { file, byLine } });
-    w.once('message', (r: Read<BaseFile>) => {
-      resolve(r);
+    const ack = new Int32Array(new SharedArrayBuffer(4));
+    const w = new Worker(WORKER, { eval: true, workerData: { file, byLine, ack, part: READ.part } });
+    const items: TimelineItem[] = [];
+    w.on('message', (m: { part: TimelineItem[] } | (Read<BaseFile> & { parts?: boolean })) => {
+      if ('part' in m) {
+        for (const item of m.part) items.push(item);
+        Atomics.add(ack, 0, 1);
+        Atomics.notify(ack, 0);
+        return;
+      }
+      if (m.ok && m.value && m.parts) m.value.items = items;
+      resolve(m.ok ? { ok: true, value: m.value } : { ok: false });
       void w.terminate();
     });
     w.once('error', reject);
     w.once('exit', (code) => reject(new Error(`The reading worker ended (${code})`)));
   });
+}
+
+/** The complete lines within the last `bytes` of a file (a base's newest items), without reading the rest. */
+function lastLines(file: string, bytes: number): string[] {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, 'r');
+    const size = statSync(file).size;
+    const n = Math.min(size, bytes);
+    const buf = Buffer.allocUnsafe(n);
+    readSync(fd, buf, 0, n, size - n);
+    const all = buf.toString('utf8').split('\n');
+    return n < size ? all.slice(1) : all;
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 /** Pieces of the base written per step (characters). */
 const CHUNK = 1 << 20;
@@ -247,7 +310,44 @@ export class SessionFiles {
     }
     if (size < READ.inWorkerAbove) return this.load(id);
     const read = await readInWorker(file, size > READ.byLineAbove).catch(() => undefined);
-    return read ? this.finish(id, read, size, mtime) : this.load(id);
+    if (read) return this.finish(id, read, size, mtime);
+    // A worker that failed on a very big file is never followed by the same read on the main thread
+    // (it would hold the app, and the memory that ended the worker would end the app): unreadable for now.
+    return size > READ.byLineAbove ? this.finish(id, { ok: false }, size, mtime) : this.load(id);
+  }
+
+  /** The base holds this item as it is now: an ordinary save does not write it again. */
+  holds(id: string, itemId: string): boolean {
+    const b = this.bases.get(id);
+    return !!b && !b.old && !this.force.has(id) && b.idSet.has(itemId) && !b.over.has(itemId);
+  }
+
+  /**
+   * Whether a restart notice is on disk, without reading the conversation again: in the tail (small),
+   * else among the newest lines of the base (a chat small enough to be written whole, or a base just
+   * written). Call after the save that should have written it.
+   */
+  async holdsNotice(id: string, notice: string): Promise<boolean> {
+    await this.writing.get(id)?.catch(() => {});
+    if (this.force.has(id)) return false;
+    const is = (i: unknown) => {
+      const n = i as { id?: unknown; type?: unknown; early?: unknown } | null;
+      return !!n && typeof n === 'object' && n.id === notice && n.type === 'notice' && n.early === 'restart';
+    };
+    const tail = readJson<{ items?: unknown[]; over?: unknown[] }>(this.tailOf(id));
+    if (tail.ok && tail.value && [...(Array.isArray(tail.value.items) ? tail.value.items : []), ...(Array.isArray(tail.value.over) ? tail.value.over : [])].some(is)) return true;
+    for (const raw of lastLines(this.pathOf(id), 32 << 20)) {
+      if (!raw.includes(notice)) continue;
+      const line = raw.endsWith(',') ? raw.slice(0, -1) : raw;
+      try {
+        const v = JSON.parse(line) as unknown;
+        // A small chat of an older version is one line: its items are inside.
+        if (is(v) || (Array.isArray((v as { items?: unknown[] } | null)?.items) && (v as { items: unknown[] }).items.some(is))) return true;
+      } catch {
+        /* the head or the foot: not an item */
+      }
+    }
+    return false;
   }
 
   private finish(id: string, read: Read<BaseFile>, size: number, mtime: number): SessionData {

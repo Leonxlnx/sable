@@ -203,7 +203,11 @@ export class Store {
     const save = data();
     const items = save.items.map(item => {
       let copy = this.savedItems.get(item);
-      if (!copy || save.dirty === 'all' || save.dirty.has(item.id)) {
+      const dirty = save.dirty === 'all' || save.dirty.has(item.id);
+      // What the base already holds unchanged is not written by this save, so no copy of it is made:
+      // copying every step at the first save after a long chat was read held all its output twice.
+      if (!copy && !dirty && this.sessionFiles.holds(id, item.id)) return item;
+      if (!copy || dirty) {
         // Keep immutable strings (including large tool output) shared. Freeze nested
         // payloads too: a task or attachment can change while an older base is writing.
         copy = { ...item };
@@ -224,9 +228,8 @@ export class Store {
   /** SessionFiles retries failed writes on the next save. Only acknowledge a restart notice seen on disk. */
   async savedRestartNotice(id: string, notice: string): Promise<boolean> {
     await this.flushSession(id);
-    const reader = new SessionFiles((key) => this.sessionPath(key));
-    const file = await reader.loadAsync(id);
-    return !file.unreadable && file.items.some((i) => i.id === notice && i.type === 'notice' && i.early === 'restart');
+    // Never by reading the conversation again: a chat of a gigabyte read a second time ended the app.
+    return this.sessionFiles.holdsNotice(id, notice);
   }
 
   deleteSession(id: string) {
