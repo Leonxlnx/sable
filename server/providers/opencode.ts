@@ -25,7 +25,7 @@ import type {
   TurnItem,
   UserItem,
 } from '../../shared/protocol';
-import type { SessionRuntime } from '../core/runtime';
+import { lostLine, type SessionRuntime } from '../core/runtime';
 import { runCli } from '../util/proc';
 import { openCodeConfig } from '../services/config';
 import { openConsole, type ConsoleWindow } from '../util/console';
@@ -75,6 +75,8 @@ export class OpenCodeProvider implements Provider {
 
   /** ACP session id → session */
   readonly sessions = new Map<string, OpenCodeSession>();
+  /** Process ownership also covers a pending resume and a stopped prompt outside the routing table. */
+  readonly attached = new Map<OpenCodeSession, AcpClient>();
   private acp: AcpClient | null = null;
   private starting: Promise<AcpClient> | null = null;
   private disposed = false;
@@ -106,8 +108,8 @@ export class OpenCodeProvider implements Provider {
             await acp.close();
             throw new Error('OpenCode provider is shut down');
           }
-          acp.onNotification = (m, p) => this.onNotification(m, p);
-          acp.onRequest = (m, p) => this.onRequest(m, p);
+          acp.onNotification = (m, p) => { if (this.acp === acp) this.onNotification(m, p); };
+          acp.onRequest = (m, p) => this.acp === acp ? this.onRequest(m, p) : Promise.resolve({ outcome: { outcome: 'cancelled' } });
           acp.onExit = (info) => this.onExit(acp, info);
           this.acp = acp;
           return acp;
@@ -120,19 +122,19 @@ export class OpenCodeProvider implements Provider {
   }
 
   /** The process stopped answering (a stopped prompt that never ends): it is stopped; each chat opens again with its next message. */
-  abandon() {
-    const acp = this.acp;
-    if (!acp) return;
+  abandon(acp: AcpClient) {
     this.ctx.log('[opencode] giving up the process');
-    // The next message starts a new one at once, never this one while it closes.
-    this.acp = null;
+    if (this.acp === acp) this.acp = null;
+    // Detach every chat before one can resume on the replacement. The old child's eventual exit
+    // then owns no sessions, even if a resumed conversation has the same ACP session id.
+    this.detach(acp, 'closed', 'OpenCode did not answer Stop.');
     void acp.close().catch(() => {});
   }
 
   private armIdle() {
     clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      if (this.sessions.size || this.capsLoading || this.starting) return this.armIdle();
+      if (this.attached.size || this.capsLoading || this.starting) return this.armIdle();
       const acp = this.acp;
       if (!acp) return;
       this.ctx.log('[opencode] stopping idle process');
@@ -153,8 +155,16 @@ export class OpenCodeProvider implements Provider {
       .join('\n');
     this.ctx.log('[opencode] process exited', info.code ?? info.signal ?? '', tail);
     const msg = `OpenCode stopped${info.code !== null ? ` (code ${info.code})` : ''}`;
-    for (const s of [...this.sessions.values()]) s.onServerDied(msg, tail);
-    this.sessions.clear();
+    this.detach(acp, 'died', [msg, tail].filter(Boolean).join('\n'));
+  }
+
+  private detach(acp: AcpClient, reason: 'closed' | 'died', detail: string) {
+    for (const [s, owner] of this.attached) {
+      if (owner !== acp) continue;
+      this.attached.delete(s);
+      if (this.sessions.get(s.sessionId) === s) this.sessions.delete(s.sessionId);
+      s.onServerDied(reason, detail);
+    }
   }
 
   private onNotification(method: string, p: Obj) {
@@ -351,7 +361,13 @@ export class OpenCodeProvider implements Provider {
 
   async open(rt: SessionRuntime, opts: { loadTranscript?: boolean }): Promise<ProviderSession> {
     const session = new OpenCodeSession(this, rt);
-    await session.attach(!!opts.loadTranscript);
+    try {
+      await session.attach(!!opts.loadTranscript);
+    } catch (err) {
+      this.attached.delete(session);
+      if (this.sessions.get(session.sessionId) === session) this.sessions.delete(session.sessionId);
+      throw err;
+    }
     return session;
   }
 
@@ -363,7 +379,8 @@ export class OpenCodeProvider implements Provider {
     this.disposed = true;
     clearTimeout(this.idleTimer);
     await this.cancelLogin();
-    for (const s of this.sessions.values()) s.onServerDied('OpenCode provider is shut down');
+    for (const s of this.attached.keys()) s.onServerDied('closed', 'OpenCode provider is shut down');
+    this.attached.clear();
     this.sessions.clear();
     const acp = this.acp ?? (await this.starting?.catch(() => null)) ?? null;
     this.acp = null;
@@ -380,10 +397,8 @@ interface ToolState {
   input: Obj;
 }
 
-interface Queued {
+interface Queued extends SendOptions {
   item: UserItem;
-  /** Its sender's guard (`SendOptions.check`), asked again when it goes. */
-  check?: () => void;
 }
 
 /** A turn: `sent` once its prompt went to OpenCode, `done` once it ended. */
@@ -391,6 +406,8 @@ interface Turn {
   stop?: NodeJS.Timeout;
   done: boolean;
   sent?: boolean;
+  /** A loss note is received with this prompt's first output or its successful answer. */
+  receipts?: Queued[];
   /** Its `session/prompt` request, settled when OpenCode answers it. */
   prompt?: Promise<unknown>;
 }
@@ -443,6 +460,9 @@ class OpenCodeSession implements ProviderSession {
   async attach(loadTranscript: boolean) {
     const rt = this.rt;
     const acp = await this.provider.client();
+    if (this.closed) throw new Error('Session is closed');
+    this.provider.attached.set(this, acp);
+    const ownsProcess = () => !this.closed && acp.alive && this.provider.attached.get(this) === acp;
     const base = { cwd: rt.meta.cwd, mcpServers: [] as unknown[] };
     const stored = rt.meta.providerSessionId;
     let found: Obj | undefined;
@@ -454,26 +474,30 @@ class OpenCodeSession implements ProviderSession {
           this.provider.sessions.set(stored, this);
           this.replaying = {};
           found = await acp.request('session/load', { sessionId: stored, ...base }, 120_000);
-          this.endReplay();
+          if (ownsProcess()) this.endReplay();
         } else {
           found = await acp.request('session/resume', { sessionId: stored, ...base }, 60_000);
         }
-        this.sessionId = stored;
       } catch (err) {
+        if (!ownsProcess()) throw err;
         this.replaying = undefined;
-        this.provider.sessions.delete(stored);
+        if (this.provider.sessions.get(stored) === this) this.provider.sessions.delete(stored);
         this.log('could not resume', stored, errMsg(err));
         found = undefined;
         rt.notice('info', 'OpenCode no longer has this conversation', 'Starting a new one in the same folder.');
       }
     }
     const resp: Obj = found ?? (await acp.request('session/new', base, 60_000));
-    if (!found) this.sessionId = String(resp.sessionId);
+    if (!ownsProcess()) throw new Error('OpenCode session closed while opening');
+    this.sessionId = found ? stored! : String(resp.sessionId);
     this.provider.sessions.set(this.sessionId, this);
     this.options = (resp.configOptions as Obj[]) ?? [];
     this.readApplied();
     const info = this.provider.readOptions(this.options);
-    rt.setCaps(this.provider.capsOf(info, await this.provider.servers(rt.meta.cwd)));
+    const servers = await this.provider.servers(rt.meta.cwd);
+    if (!ownsProcess()) throw new Error('OpenCode session closed while opening');
+    this.dead = false;
+    rt.setCaps(this.provider.capsOf(info, servers));
     const model = this.applied.model;
     rt.update({ providerSessionId: this.sessionId, model: rt.meta.model || model || '', mode: MODES.some((m) => m.id === rt.meta.mode) ? rt.meta.mode : 'build' });
     if (!rt.meta.model && !model) {
@@ -496,29 +520,33 @@ class OpenCodeSession implements ProviderSession {
    * ends here, and the next message starts a process again and resumes the conversation there
    * (`revive`) instead of failing as a closed session forever (review wave 8, #23).
    */
-  onServerDied(message: string, detail?: string) {
-    if (this.closed || this.dead) return;
+  onServerDied(reason: 'closed' | 'died', detail: string) {
+    if (this.closed) return;
     this.dead = true;
     const rt = this.rt;
     this.prompts.abort();
     const turn = this.turn;
     if (turn) {
+      this.finishReceipts(turn, false);
       turn.done = true;
       clearTimeout(turn.stop);
       this.turn = undefined;
     }
+    const waiting = this.lingering;
     this.lingering = undefined;
-    this.closeText();
-    if (rt.turnActive) {
-      rt.settle('error');
-      rt.notice('error', message, detail);
-      rt.endTurn(message);
-    }
+    this.replaying = undefined;
+    this.text = this.thinking = undefined;
+    const commands = rt.tasksLost('process', reason === 'died' ? 'death' : undefined);
+    rt.processGeneration++;
+    rt.stopBackground();
+    rt.cutTurn(reason, { detail });
+    if (commands.length) rt.lossNotice = rt.notice('info', lostLine(commands.length, 'process'), commands.join('\n')).id;
+    if (waiting) this.drainQueue();
+    else for (const entry of this.queue.splice(0)) entry.release?.();
   }
 
   /** A dead handle opens its conversation again on a new process (`session/resume`, or a new one with a notice). */
   private async revive() {
-    this.dead = false;
     this.prompts = new AbortController();
     this.tools.clear();
     await this.attach(false);
@@ -537,10 +565,8 @@ class OpenCodeSession implements ProviderSession {
     const giveUp = setTimeout(() => {
       if (this.lingering !== lingering) return;
       this.log('a stopped prompt never answered: stopping the process');
-      this.lingering = undefined;
-      this.dead = true;
-      this.provider.abandon();
-      this.drainQueue();
+      const acp = this.provider.attached.get(this);
+      if (acp) this.provider.abandon(acp);
     }, STOP_GIVE_UP_MS);
     giveUp.unref?.();
     const lingering: Promise<void> = (turn.prompt ?? Promise.resolve())
@@ -599,11 +625,11 @@ class OpenCodeSession implements ProviderSession {
     check?.();
     // One prompt at a time: the message waits for the turn to end, or for a stopped prompt that has not answered yet.
     if (this.turn || this.lingering) {
-      this.queue.push({ item, ...(check ? { check } : {}) });
+      this.queue.push({ item, ...opts });
       if (item.state !== 'queued') this.rt.patch<UserItem>(item.id, { state: 'queued' });
       return;
     }
-    await this.startTurn([{ item, ...(check ? { check } : {}) }], false);
+    await this.startTurn([{ item, ...opts }], false);
   }
 
   /**
@@ -613,7 +639,7 @@ class OpenCodeSession implements ProviderSession {
    */
   private async startTurn(entries: Queued[], fromQueue: boolean) {
     const rt = this.rt;
-    const turn: Turn = { done: false };
+    const turn: Turn = { done: false, receipts: entries };
     this.turn = turn;
     rt.beginTurn('Thinking');
     for (const { item } of entries) if (item.state === 'queued') rt.taken(item.id);
@@ -622,7 +648,9 @@ class OpenCodeSession implements ProviderSession {
     let acp: AcpClient;
     try {
       if (this.dead) await this.revive();
+      if (turn.done || this.closed) return;
       await this.applyChoices();
+      if (turn.done || this.closed) return;
       acp = await this.provider.client();
     } catch (err) {
       this.completeTurn(turn, started, undefined, errMsg(err));
@@ -638,11 +666,14 @@ class OpenCodeSession implements ProviderSession {
         // Its sender may no longer act: nothing went, and the bridge ends the turn it began.
         turn.done = true;
         this.turn = undefined;
+        this.finishReceipts(turn, false);
+        if (entries[0]?.taken && rt.turnActive) rt.endTurn(undefined, { hold: true });
         throw err;
       }
     } else {
       live = entries.filter((x) => {
         if (!x.check || passes(x.check)) return true;
+        x.release?.();
         rt.remove(x.item.id);
         rt.notice('info', 'A message from a removed phone was not sent');
         return false;
@@ -653,6 +684,7 @@ class OpenCodeSession implements ProviderSession {
         rt.endTurn();
         return;
       }
+      turn.receipts = live;
     }
     const items = live.map((x) => x.item);
     const blocks = items.length === 1 ? promptBlocks(items[0].text, items[0].attachments) : items.flatMap((it, i) => promptBlocks(i ? `\n\n${it.text}` : it.text, it.attachments));
@@ -672,6 +704,7 @@ class OpenCodeSession implements ProviderSession {
     const reason = String(result?.stopReason ?? (error ? 'error' : 'end_turn'));
     const compacting = items.length === 1 && /^\/compact(\s|$)/.test(items[0].text.trim());
     const cancelled = reason === 'cancelled';
+    this.finishReceipts(turn, !!result && turn.sent === true && !cancelled);
     if (this.closed && !rt.turnActive) return;
     rt.cancelPrompts();
     rt.settle(error ? 'error' : 'cancelled');
@@ -692,13 +725,25 @@ class OpenCodeSession implements ProviderSession {
     this.drainQueue();
   }
 
+  private finishReceipts(turn: Turn, taken: boolean) {
+    const entries = turn.receipts;
+    turn.receipts = undefined;
+    for (const entry of entries ?? []) {
+      if (entry.taken) (taken ? entry.taken : entry.release)?.();
+    }
+  }
+
   private drainQueue() {
     if (!this.queue.length || this.turn || this.lingering || this.closed) return;
     // Messages the bridge took back (the turn was stopped or failed before they were taken) go out from its queue, not twice.
     // One whose sender may no longer act (a phone removed while it waited) never goes, and leaves the chat.
     const q = this.queue.splice(0).filter((x) => {
-      if (this.rt.get<UserItem>(x.item.id)?.state !== 'queued') return false;
+      if (this.rt.get<UserItem>(x.item.id)?.state !== 'queued') {
+        x.release?.();
+        return false;
+      }
       if (!x.check || passes(x.check)) return true;
+      x.release?.();
       this.rt.remove(x.item.id);
       this.rt.notice('info', 'A message from a removed phone was not sent');
       return false;
@@ -713,6 +758,7 @@ class OpenCodeSession implements ProviderSession {
     // Its prompt has not gone yet (the choices are still being applied): the turn ends here, and nothing goes.
     if (!turn.sent) return this.completeTurn(turn, this.rt.turnStartedAt || Date.now(), { stopReason: 'cancelled' });
     const acp = await this.provider.client().catch(() => null);
+    if (turn.done || this.turn !== turn) return;
     acp?.notify('session/cancel', { sessionId: this.sessionId });
     // The prompt answers "cancelled" by itself; if it does not, the turn ends anyway, and the session
     // takes nothing new until that prompt has answered (`stopTimedOut`).
@@ -734,6 +780,9 @@ class OpenCodeSession implements ProviderSession {
     if (this.closed) return;
     const rt = this.rt;
     const chunk = typeof u.content?.text === 'string' ? u.content.text : '';
+    if (this.turn?.sent && chunk && (u.sessionUpdate === 'agent_message_chunk' || u.sessionUpdate === 'agent_thought_chunk')) {
+      this.finishReceipts(this.turn, true);
+    }
     switch (u.sessionUpdate) {
       case 'user_message_chunk': {
         if (!this.replaying) return;
@@ -773,6 +822,8 @@ class OpenCodeSession implements ProviderSession {
         return;
       }
       case 'tool_call':
+        if (this.turn?.sent && u.toolCallId && !this.tools.has(String(u.toolCallId))) this.finishReceipts(this.turn, true);
+        return this.onTool(u);
       case 'tool_call_update':
         return this.onTool(u);
       case 'plan':
@@ -934,7 +985,19 @@ class OpenCodeSession implements ProviderSession {
     this.closed = true;
     this.lingering = undefined;
     this.prompts.abort();
-    this.queue = [];
+    if (this.turn) {
+      this.finishReceipts(this.turn, false);
+      clearTimeout(this.turn.stop);
+      this.turn.done = true;
+      this.turn = undefined;
+    }
+    for (const entry of this.queue.splice(0)) entry.release?.();
+    if (this.rt.meta.commands) {
+      const lost = this.rt.tasksLost('process');
+      if (lost.length) this.rt.notice('info', 'The chat closed with background work still running', lost.join('\n'));
+    }
+    if (this.rt.meta.background) this.rt.stopBackground();
+    this.provider.attached.delete(this);
     if (this.provider.sessions.get(this.sessionId) === this) this.provider.sessions.delete(this.sessionId);
     this.provider.sessionClosed();
   }

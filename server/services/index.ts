@@ -15,6 +15,7 @@ import { registerPrompts } from './prompts';
 import { registerPulls } from './pulls';
 import { registerScripts } from './scripts';
 import { registerSearch } from './search';
+import { registerSeen } from './seen';
 import { registerTerm } from './term';
 import { registerThumbs } from './thumbs';
 import { registerUsage } from './usage';
@@ -45,4 +46,5 @@ export function registerServices(app: App, opts: ServiceOptions = {}) {
   registerThumbs(app);
   registerCustom(app);
   registerPulls(app);
+  registerSeen(app);
 }

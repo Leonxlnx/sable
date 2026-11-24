@@ -468,6 +468,12 @@ export interface SessionMeta {
   archived?: boolean;
   branch?: string;
   usage: SessionUsage;
+  /**
+   * Changed files of the chat's folder the person has not looked at since they changed (seen states,
+   * `server/services/seen.ts`): set when the Changes tab reads them and when a turn ends, only in a
+   * chat that has seen states; absent at 0.
+   */
+  review?: number;
   lastError?: string;
   /** One line describing what the agent is doing right now. */
   activity?: string;
@@ -1271,6 +1277,40 @@ export interface GitFileStatus {
   staged: boolean;
   additions?: number;
   deletions?: number;
+  /** A rename git recorded (staged): the name it had, relative like `path`. */
+  oldPath?: string;
+}
+
+/**
+ * One changed file against what the person has seen of it in this chat (`seen.state`): `seen` its
+ * content is the one they marked seen (or the one there when the chat began, `base`), `new` never
+ * seen here, `again` changed since it was seen.
+ */
+export interface SeenFile {
+  path: string;
+  /** The working-tree content's signature now (git's blob id; `deleted`; `big:…` by size and time). Mark with it. */
+  hash: string;
+  state: 'seen' | 'new' | 'again';
+  /** When it was seen (ms). */
+  at?: number;
+  /** The seen state is where the chat began, not a mark of the person's. */
+  base?: boolean;
+  /** `again` with the seen text kept: `seen.state` with `path` gives the diff of what is new since. */
+  since?: boolean;
+}
+
+export interface SeenState {
+  /** False outside a git repository: there are no seen states there. */
+  repo: boolean;
+  files: SeenFile[];
+  /** With `path`: the diff from the seen content to the content now, when it can be made. */
+  diff?: FileDiff;
+}
+
+export interface SeenMarkResult extends SeenState {
+  ok: boolean;
+  /** Takes this mark back once (`seen.mark` with `undo`). */
+  undo?: string;
 }
 
 export interface GitStatus {
@@ -2703,6 +2743,17 @@ export interface RpcMethods {
   /** A commit message written by a small model from the folder's changes. Stages and commits nothing. */
   /** On the person's click: one small request to the chat's own agent and account (as chat titles). */
   'git.draft': { params: { sessionId: string; cwd: string }; result: { ok: boolean; message?: string; error?: string } };
+  /**
+   * What the person has seen of the chat's changed files (`SeenFile` each; `server/services/seen.ts`).
+   * `cwd` must be the chat's folder. With `path`, that file only, with its diff since seen. Sets the
+   * chat's `review` count. Not on the phone's allowlist.
+   */
+  'seen.state': { params: { sessionId: string; cwd: string; path?: string }; result: SeenState };
+  /**
+   * Marks files seen as the window showed them (`hash` from `seen.state`), `unmark`s them (new again),
+   * or takes a mark back (`undo`, once). Answers with the state after it. Not on the phone's allowlist.
+   */
+  'seen.mark': { params: { sessionId: string; cwd: string; files?: { path: string; hash: string }[]; unmark?: string[]; undo?: string }; result: SeenMarkResult };
   /** The branch, its base and a draft title and description for a pull request. Pushes nothing. */
   'pulls.context': { params: { cwd: string }; result: GitPullContext };
   /** Pushes the branch to origin, then opens a pull request for it with gh. */

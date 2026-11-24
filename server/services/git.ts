@@ -356,7 +356,8 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
       const fields = rec.split(' ');
       const xy = fields[1];
       const raw = fields.slice(fieldCount).join(' ');
-      if (kind === '2') i++; // original path follows as its own NUL-terminated record
+      // The original path follows as its own NUL-terminated record.
+      const orig = kind === '2' ? recs[++i] : undefined;
       const x = xy[0];
       const y = xy[1];
       files.push({
@@ -364,6 +365,7 @@ export async function gitStatus(cwd: string, scope: GitScope = {}): Promise<GitS
         path: relToCwd(root, dir, raw),
         status: kind === 'u' ? 'U' : mapStatus(x, y),
         staged: kind !== 'u' && x !== '.',
+        ...(orig ? { oldPath: relToCwd(root, dir, orig) } : {}),
       });
     } else if (kind === '?') {
       const raw = rec.slice(2);

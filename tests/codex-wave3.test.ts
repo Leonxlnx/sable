@@ -12,10 +12,11 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import type { NoticeItem } from '@shared/protocol';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { NoticeItem, ToolItem } from '@shared/protocol';
 import { App } from '../server/app';
 import { CodexProvider } from '../server/providers/codex';
+import { CodexRpc } from '../server/providers/codex-rpc';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -61,14 +62,20 @@ async function codexFake(answers: Answers = {}) {
       return {};
     },
   };
+  let currentRpc!: CodexRpc;
+  const starts = vi.spyOn(CodexRpc, 'start').mockImplementation(async () => {
+    currentRpc = { ...rpc, alive: true, close: async () => {} } as unknown as CodexRpc;
+    return currentRpc;
+  });
+  cleanups.push(() => { starts.mockRestore(); });
   let provider!: CodexProvider;
   const app = new App({
     home,
+    userHome: home,
     providers: [
       (ctx) => {
         const p = new CodexProvider(ctx);
         const anyP = p as unknown as Record<string, unknown>;
-        anyP.client = async () => rpc;
         anyP.version = async () => ({ installed: true, version: '1' });
         anyP.caps = async () => ({ models: [{ id: 'm', name: 'M', isDefault: true }], modes: [], commands: [], skills: [], agents: [], mcpServers: [], tools: [], skillTrigger: '$', features: { steer: true, compact: true } });
         provider ??= p;
@@ -86,7 +93,10 @@ async function codexFake(answers: Answers = {}) {
   const started = (turn: string, threadId = 'th1') => notify('turn/started', { threadId, turn: { id: turn, status: 'inProgress', items: [] } });
   const complete = (turn: string, s = 'completed', threadId = 'th1') => notify('turn/completed', { threadId, turn: { id: turn, status: s, items: [] } });
   const count = (method: string) => calls.filter((c) => c.method === method).length;
-  const serverDied = () => (provider as unknown as { onExit(rpc: unknown, info: unknown): void }).onExit(rpc, { code: 1, signal: null, stderr: '' });
+  const serverDied = () => {
+    currentRpc.alive = false;
+    currentRpc.onExit!({ code: 1, signal: null, stderr: 'test process exited' });
+  };
   const session = () => [...provider.sessions.values()][0] as unknown as Record<string, unknown>;
   return {
     app,
@@ -99,6 +109,7 @@ async function codexFake(answers: Answers = {}) {
     complete,
     count,
     serverDied,
+    processes: () => starts.mock.calls.length,
     session,
     provider,
     send: (text: string) => app.call('session.send', { sessionId: id, text }),
@@ -106,6 +117,149 @@ async function codexFake(answers: Answers = {}) {
     interrupted: (turnId: string) => calls.some((c) => c.method === 'turn/interrupt' && c.params.turnId === turnId),
   };
 }
+
+describe('Codex native process exit', () => {
+  async function withReceiver(answers?: Answers) {
+    const h = await codexFake(answers);
+    await h.send('split the work');
+    h.notify('item/completed', { turnId: 'turn1', item: { type: 'collabAgentToolCall', id: 'spawn1', tool: 'spawnAgent', status: 'completed',
+      receiverThreadIds: ['child'], prompt: 'Check formatting', agentsStates: { child: { status: 'running' } } } });
+    h.started('child-turn', 'child');
+    h.complete('turn1');
+    expect(h.rt.meta.background).toBe(1);
+    return h;
+  }
+
+  it('cuts an open turn once and settles its running tool', async () => {
+    const h = await codexFake();
+    await h.send('run tests');
+    h.notify('item/started', { turnId: 'turn1', item: { id: 'shell', type: 'commandExecution', command: 'test', cwd: h.rt.meta.cwd, status: 'inProgress' } });
+    h.serverDied();
+    await tick();
+    expect(h.rt.get<ToolItem>('turn1:shell')?.status).toBe('cancelled');
+    expect(h.rt.items.filter(i => i.type === 'notice' && i.early)).toMatchObject([{ text: 'Ended early', early: 'died', detail: expect.stringContaining('test process exited') }]);
+    expect(h.rt.items.filter(i => i.type === 'turn')).toHaveLength(0);
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.processes()).toBe(1);
+  });
+
+  it('resumes the thread for a lost receiver and holds a second crash within two minutes', async () => {
+    const h = await withReceiver();
+    h.serverDied();
+    expect(h.rt.get<ToolItem>('turn1:spawn1')?.result?.agent?.background).toBe('stopped');
+    expect(h.rt.meta.background ?? 0).toBe(0);
+    await until(() => h.count('turn/start') === 2, 'recovery prompt');
+    expect(h.processes()).toBe(2);
+    expect(h.calls.filter(c => c.method === 'thread/resume')).toMatchObject([{ params: { threadId: 'th1' } }]);
+    expect(JSON.stringify(h.calls.filter(c => c.method === 'turn/start')[1].params.input)).toContain('spawn1');
+    expect(h.rt.items.filter(i => i.type === 'user')).toHaveLength(1);
+    expect(h.rt.items.filter(i => i.type === 'notice' && i.early)).toHaveLength(0);
+    const notices = () => h.rt.items.filter((i): i is NoticeItem => i.type === 'notice' && !!i.detail?.includes('spawn1'));
+    expect(notices()).toMatchObject([{ text: expect.stringContaining('The agent was told'), detail: expect.stringContaining('Check formatting') }]);
+    h.notify('item/completed', { turnId: 'turn2', item: { type: 'collabAgentToolCall', id: 'spawn2', tool: 'spawnAgent', status: 'completed',
+      receiverThreadIds: ['child2'], prompt: 'Check again', agentsStates: { child2: { status: 'running' } } } });
+    h.serverDied();
+    await tick();
+    expect(h.rt.meta.lossWake?.blocked).toBe(true);
+    expect(h.rt.pendingLost().names.join()).toContain('spawn2');
+    expect(h.rt.items.filter(i => i.type === 'notice' && i.early)).toHaveLength(1);
+    expect(h.processes()).toBe(2);
+    expect(h.count('turn/start')).toBe(2);
+  });
+
+  it('cuts the recovery turn if the replacement dies during thread/resume', async () => {
+    const reply = gate();
+    const h = await withReceiver({ 'thread/resume': async () => { await reply.wait(); throw new Error('Codex exited'); } });
+    h.serverDied();
+    try {
+      await until(() => h.count('thread/resume') === 1, 'resume before a second exit');
+      h.serverDied();
+    } finally { reply.open(undefined); }
+    await tick();
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.rt.meta.lossWake?.blocked).toBe(true);
+    expect(h.rt.pendingLost().count).toBe(1);
+    expect(h.count('turn/start')).toBe(1);
+    expect(h.rt.items.filter(i => i.type === 'notice' && i.early)).toMatchObject([{ early: 'died' }]);
+    expect(h.rt.items.some(i => i.type === 'notice' && i.text.includes('The agent was told'))).toBe(false);
+  });
+
+  it('sends the loss once when a personal steer overlaps the recovery receipt', async () => {
+    const reply = gate();
+    const h = await withReceiver({ 'turn/start': async (_p, n) => {
+      if (n === 2) await reply.wait();
+      return { turn: { id: `turn${n}` } };
+    } });
+    h.serverDied();
+    await until(() => h.count('turn/start') === 2, 'recovery RPC');
+    const steering = h.app.call('session.send', { sessionId: h.id, text: 'Also check the imports', steer: true });
+    try {
+      await until(() => h.rt.items.some(i => i.type === 'user' && i.text === 'Also check the imports'), 'personal steer');
+      await tick();
+    } finally { reply.open(undefined); }
+    await steering;
+    expect(h.calls.filter(c => c.method === 'turn/steer')).toHaveLength(1);
+    const inputs = h.calls.filter(c => c.method === 'turn/steer' || c.method === 'turn/start');
+    expect(inputs.filter(c => JSON.stringify(c.params.input).includes('spawn1'))).toHaveLength(1);
+    expect(h.rt.pendingLost().count).toBe(0);
+  });
+
+  it('releases the loss and ends the recovery turn if thread/resume is refused', async () => {
+    const h = await withReceiver({ 'thread/resume': async (p, n) => {
+      if (n === 1) throw new Error('resume refused');
+      return { thread: { id: p.threadId, model: 'm' }, model: 'm' };
+    } });
+    h.serverDied();
+    await until(() => h.count('thread/resume') === 1 && !h.rt.turnActive, 'refused recovery resume');
+    expect(h.rt.items.filter(i => i.type === 'notice' && i.detail?.includes('spawn1'))).toMatchObject([
+      { text: expect.stringContaining("hasn't confirmed") },
+    ]);
+    expect(h.rt.pendingLost().count).toBe(1);
+    await h.send('try again');
+    expect(JSON.stringify(h.calls.filter(c => c.method === 'turn/start').at(-1)?.params.input)).toContain('spawn1');
+    expect(h.rt.pendingLost().count).toBe(0);
+  });
+
+  it('keeps the receiver loss for the next personal message after Stop', async () => {
+    const h = await withReceiver();
+    const watcher = h.rt.add<ToolItem>({ type: 'tool', kind: 'bash', name: 'Bash', title: 'Watch tests', status: 'done', detail: {} });
+    h.rt.taskStarted(watcher.id, { id: 'watch-tests', kind: 'monitor' });
+    await h.stop();
+    h.serverDied();
+    await tick();
+    expect(h.processes()).toBe(1);
+    expect(h.rt.items.filter(i => i.type === 'notice' && i.detail?.includes('spawn1'))).toHaveLength(1);
+    expect(h.rt.get<ToolItem>(watcher.id)?.task).toMatchObject({ state: 'lost', why: 'process' });
+    expect(h.rt.pendingLost().count).toBe(2);
+    await h.send('carry on');
+    expect(JSON.stringify(h.calls.filter(c => c.method === 'turn/start').at(-1)?.params.input)).toContain('spawn1');
+    expect(JSON.stringify(h.calls.filter(c => c.method === 'turn/start').at(-1)?.params.input)).toContain('watch-tests');
+    expect(h.rt.pendingLost().count).toBe(0);
+  });
+
+  it('remembers a receiver whose turn started before a spawn with no state report', async () => {
+    const h = await codexFake();
+    await h.send('split the work');
+    h.started('early-turn', 'child');
+    h.notify('item/completed', { turnId: 'turn1', item: { type: 'collabAgentToolCall', id: 'early-spawn', tool: 'spawnAgent', status: 'completed',
+      receiverThreadIds: ['child'], prompt: 'Review names', agentsStates: {} } });
+    h.complete('turn1');
+    h.serverDied();
+    await until(() => h.count('turn/start') === 2, 'wake for early receiver');
+    expect(JSON.stringify(h.calls.filter(c => c.method === 'turn/start')[1].params.input)).toContain('Review names');
+    expect(h.rt.get<ToolItem>('turn1:early-spawn')?.result?.agent?.background).toBe('stopped');
+  });
+
+  it('cancels a pending receiver wake when the chat closes', async () => {
+    const h = await withReceiver();
+    h.serverDied();
+    await h.app.call('session.close', { sessionId: h.id });
+    await tick();
+    expect(h.rt.handle).toBeUndefined();
+    expect(h.count('turn/start')).toBe(1);
+    expect(h.processes()).toBe(1);
+  });
+});
 
 it('restores the queued instruction once when quit interrupts turn/start', async () => {
   const reply = gate();

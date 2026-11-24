@@ -1610,7 +1610,7 @@ export class App {
     const pending = rt.meta.agentHandover;
     const kept = this.handovers.get(rt.id);
     const moved = rt.meta.moveNote;
-    const { names: lost, count, taken: toldLost, release } = rt.meta.provider === 'claude' ? rt.reserveLost() : rt.pendingLost();
+    const { names: lost, count, taken: toldLost, release } = rt.meta.provider === 'demo' ? rt.pendingLost() : rt.reserveLost();
     const wake = this.pendingLossWake.get(rt);
     const lossNotice = rt.lossNotice;
     if (!pending && !moved && kept === undefined && !lost.length) return { item };
@@ -1707,11 +1707,10 @@ export class App {
       if (!ready(1) || await this.heldForCredits(rt) || !ready(1)) return;
       await this.applyDue(rt, handle);
       if (!ready(1)) return;
-      // Codex takes its turn synchronously and checks the sender again just before its RPC.
-      // Its own generation check rejects a turn replaced in between.
+      // Both RPC providers open their turn before the final sender check and guard its identity at dispatch.
       let admitted = false;
       const check = () => {
-        if (!ready(1, admitted && rt.meta.provider === 'codex')) throw new NotNow('The chat changed before the agent could carry on.');
+        if (!ready(1, admitted && (rt.meta.provider === 'codex' || rt.meta.provider === 'opencode'))) throw new NotNow('The chat changed before the agent could carry on.');
         admitted = true;
       };
       await this.sendWithHandover(rt, handle, { type: 'user', id: randomUUID(), ts: now, state: 'sent', text: RESUME_LOST }, check, false, read => {
@@ -1766,7 +1765,7 @@ export class App {
     const out = this.withHandover(rt, item);
     const wake = !rt.get(item.id) && out.count ? this.pendingLossWake.get(rt) : undefined;
     if (item.text === RESUME_LOST && !rt.get(item.id) && !wake) { out.release?.(); return; }
-    const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex';
+    const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex' || (rt.meta.provider === 'opencode' && !!out.count);
     const taken = receipt ? () => { out.taken?.(); receipt(true); } : out.taken;
     const release = receipt ? () => { out.release?.(); receipt(false); } : out.release;
     try {
