@@ -47,7 +47,7 @@ import { canonicalName, isPackageName } from '../../shared/file-name';
 import { partOfTurn, syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
 import { fileLine, saveLines, scopeLines } from '../core/permission-scope';
-import { cap, isSnapshot, lines, sessionPatchForJson } from '../core/trim';
+import { cap, isLight, LIGHT, isSnapshot, lines, sessionPatchForJson } from '../core/trim';
 import { VERSION } from '../version';
 import { PhoneChangesReader, stepIds } from './phone-changes';
 import { phoneRefusal } from './custom';
@@ -223,7 +223,7 @@ export function widgetPics(input: unknown): string[] {
 
 /** How many pictures a phone may ask for: a result's (a screenshot), then a widget's own. */
 function picCount(it: Partial<ToolItem>, kind: string | undefined = it.kind): number {
-  const n = (it.result?.images?.length ?? 0) + (kind === 'widget' ? widgetPics(it.input).length : 0);
+  const n = (it.result?.images?.length ?? (isLight(it) ? it[LIGHT] : 0)) + (kind === 'widget' ? widgetPics(it.input).length : 0);
   return Math.min(n, MAX_PICS);
 }
 
@@ -357,6 +357,7 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
  */
 export function phonePatch(patch: Partial<TimelineItem>, kind?: string): Partial<PhoneItem> | null {
   const p = { ...patch } as Record<string, unknown>;
+  delete p[LIGHT];
   delete p.input;
   delete p.inputText;
   delete p.output;
@@ -859,13 +860,13 @@ export function phoneResult(method: string, result: unknown): unknown {
 }
 
 /** One item with more of it, and the last steps nested under it. */
-export function phoneDetail(items: TimelineItem[], itemId: string): { item: PhoneItem; children: PhoneItem[] } {
+export function phoneDetail(items: TimelineItem[], itemId: string, whole: (item: TimelineItem) => TimelineItem = i => i): { item: PhoneItem; children: PhoneItem[] } {
   const it = items.find((i) => i.id === itemId);
   if (!it) throw new Error('That part of the conversation is no longer there');
   const kids = items.filter((i) => i.parentId === itemId);
   const count = new Map<string, number>();
   for (const k of items) if (k.parentId) count.set(k.parentId, (count.get(k.parentId) ?? 0) + 1);
-  return { item: phoneItem(it, { role: 'full', kids: kids.length }), children: kids.slice(-FULL.children).map((k) => phoneItem(k, { role: 'step', kids: count.get(k.id) })) };
+  return { item: phoneItem(whole(it), { role: 'full', kids: kids.length }), children: kids.slice(-FULL.children).map((k) => phoneItem(k, { role: 'step', kids: count.get(k.id) })) };
 }
 
 // Installed phones shallow-merge updates. Send clears for fields they read as optional or
@@ -1545,8 +1546,7 @@ export class PhoneService {
 
   /** `phone.image`: one picture of a step's result in this chat (a data URL of an image, capped), nothing else. */
   private async image(sessionId: string, itemId: string, index: number): Promise<{ data: string }> {
-    const snap = await this.app.call('session.snapshot', { sessionId });
-    const item = snap.items.find((i) => i.id === itemId);
+    const { item } = await this.app.call('session.item', { sessionId, itemId });
     // A result's pictures first, then a widget's own, as `pics` counts them.
     const shots = item?.type === 'tool' ? (item.result?.images ?? []) : [];
     const src =
@@ -2112,7 +2112,7 @@ export class PhoneService {
             const str = (k: string) => (typeof raw[k] === 'string' ? (raw[k] as string) : undefined);
             const limit = typeof raw.limit === 'number' ? raw.limit : undefined;
             result = phoneTail(snap, { before: str('before'), limit, to: str('to'), around: str('around'), after: str('after') });
-          } else result = phoneDetail(snap.items, String(raw.itemId ?? ''));
+          } else result = phoneDetail(snap.items, String(raw.itemId ?? ''), item => this.app.store.wholeItem(sessionId, item));
         } else if (own === 'phone.answer') {
           // By the ids the phone got, into the agent's own keys (the original question and option words).
           const sessionId = String(raw.sessionId ?? '');

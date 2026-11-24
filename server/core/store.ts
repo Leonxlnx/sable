@@ -3,6 +3,7 @@ import { writeFile, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { isBackdropImageId, migrateBackdrop, migrateQuietDefault, normalizeBackdrop } from '../../shared/backdrop';
+import { isLight, LIGHT } from './trim';
 import { SessionFiles, type SessionData, type SessionSave } from './session-file';
 import { DEFAULT_SETTINGS, type AppSettings, type FolderGroup, type Project, type ProviderId, type QueuedMessage, type SessionMeta, type TimelineItem, type Todo } from '../../shared/protocol';
 
@@ -50,6 +51,18 @@ export function fillMissing<T>(defaults: T, saved: unknown): T {
     else if (plain(d) && plain(out[k])) out[k] = fillMissing(d, out[k]);
   }
   return out as T;
+}
+
+/** Freeze just the fields resident in memory. Immutable strings can be shared even inside a
+ * result or attachment. The index and original line bytes have a separate lifetime. */
+function snapshotItem(item: TimelineItem): TimelineItem {
+  const clone = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(clone);
+    if (!v || typeof v !== 'object') return v;
+    if (Object.getPrototypeOf(v) !== Object.prototype) return structuredClone(v);
+    return Object.fromEntries(Object.entries(v).map(([k, value]) => [k, clone(value)]));
+  };
+  return clone(item) as TimelineItem;
 }
 
 /** JSON persistence under ~/.sable. Writes are debounced and atomic. */
@@ -182,6 +195,25 @@ export class Store {
     return this.sessionFiles.loadAsync(id);
   }
 
+  wholeItem(id: string, item: TimelineItem): TimelineItem {
+    return this.sessionFiles.wholeItem(id, item);
+  }
+
+  /** Keep runtime references valid when a rewind or a late event makes an old step live again. */
+  promote(id: string, item: TimelineItem) {
+    if (isLight(item)) {
+      const whole = this.wholeItem(id, item);
+      Reflect.deleteProperty(item, LIGHT);
+      delete item.more;
+      Object.assign(item, whole);
+    }
+    return item;
+  }
+
+  copySession(source: string, destination: string, items: TimelineItem[]) {
+    return this.sessionFiles.copyBase(source, destination, items.map(snapshotItem));
+  }
+
   /** `data` is read when the write happens; its `dirty` names the items changed since the last save. */
   saveSession(id: string, data: () => SessionSave) {
     if (this.sealed) return;
@@ -203,17 +235,8 @@ export class Store {
     const save = data();
     const items = save.items.map(item => {
       let copy = this.savedItems.get(item);
-      const dirty = save.dirty === 'all' || save.dirty.has(item.id);
-      // What the base already holds unchanged is not written by this save, so no copy of it is made:
-      // copying every step at the first save after a long chat was read held all its output twice.
-      if (!copy && !dirty && this.sessionFiles.holds(id, item.id)) return item;
-      if (!copy || dirty) {
-        // Keep immutable strings (including large tool output) shared. Freeze nested
-        // payloads too: a task or attachment can change while an older base is writing.
-        copy = { ...item };
-        for (const [key, value] of Object.entries(copy)) {
-          if (value && typeof value === 'object') Object.assign(copy, { [key]: structuredClone(value) });
-        }
+      if (!copy || save.dirty === 'all' || save.dirty.has(item.id)) {
+        copy = snapshotItem(item);
         this.savedItems.set(item, copy);
       }
       return copy;
@@ -228,8 +251,7 @@ export class Store {
   /** SessionFiles retries failed writes on the next save. Only acknowledge a restart notice seen on disk. */
   async savedRestartNotice(id: string, notice: string): Promise<boolean> {
     await this.flushSession(id);
-    // Never by reading the conversation again: a chat of a gigabyte read a second time ended the app.
-    return this.sessionFiles.holdsNotice(id, notice);
+    return this.sessionFiles.savedRestartNotice(id, notice);
   }
 
   deleteSession(id: string) {

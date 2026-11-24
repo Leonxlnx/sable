@@ -76,10 +76,13 @@ export function samePage(a: string, b: string): boolean {
 const isEdit = (it: TimelineItem | undefined): boolean => it?.type === 'tool' && (it.kind === 'edit' || it.kind === 'write');
 
 /** What a finished item says about local pages. */
-function pagesIn(it: TimelineItem | undefined): string[] {
+function pagesIn(it: TimelineItem | undefined, whole?: (item: TimelineItem) => TimelineItem): string[] {
   if (!it) return [];
   if (it.type === 'text') return localPages(it.text);
-  if (it.type === 'tool' && it.kind === 'bash') return localPages(`${it.output ?? ''}\n${it.result?.text ?? ''}`);
+  if (it.type === 'tool' && it.kind === 'bash') {
+    const step = (whole?.(it) ?? it) as ToolItem;
+    return localPages(`${step.output ?? ''}\n${step.result?.text ?? ''}`);
+  }
   if (it.type === 'tool' && it.kind === 'browser' && isLocalPage(it.detail.url)) return [it.detail.url];
   return [];
 }
@@ -91,6 +94,7 @@ export interface CaptureHost {
   dir: string;
   items(sessionId: string): readonly TimelineItem[];
   item(sessionId: string, id: string): TimelineItem | undefined;
+  whole?(sessionId: string, item: TimelineItem): TimelineItem;
   /** The page the session's Browser tab shows. */
   page(sessionId: string): string | undefined;
   /** Every session that exists (captures of others are removed). */
@@ -205,7 +209,7 @@ export class CaptureService {
               t.edited = true;
               t.editDone ??= p.endedAt ?? this.now();
             }
-          } else this.named(e.sessionId, t, pagesIn(it));
+          } else this.named(e.sessionId, t, pagesIn(it, item => this.host.whole?.(e.sessionId, item) ?? item));
           return;
         }
         case 'session.removed':
@@ -286,7 +290,7 @@ export class CaptureService {
       if (t.pages.length && turnId) this.remember(sessionId, t.pages[t.pages.length - 1]);
       return;
     }
-    const named = namedInTurn(items, turnId);
+    const named = namedInTurn(items, turnId, item => this.host.whole?.(sessionId, item) ?? item);
     const url = named[0] ?? [...t.befores.keys()][0] ?? this.knownPage(sessionId);
     if (!url) return;
     this.track(this.after(sessionId, turnId, url, t));
@@ -498,14 +502,14 @@ export function leadOf(items: readonly TimelineItem[]): string | undefined {
 }
 
 /** Local pages the turn names: its last words first, then what its commands printed, latest first. */
-export function namedInTurn(items: readonly TimelineItem[], turnId: string): string[] {
+export function namedInTurn(items: readonly TimelineItem[], turnId: string, whole?: (item: TimelineItem) => TimelineItem): string[] {
   const at = items.findIndex((i) => i.id === turnId);
   if (at < 0) return [];
   const turn = items.slice(at + 1).filter((i) => !i.parentId);
   const out: string[] = [];
   const add = (urls: string[]) => urls.forEach((u) => !out.includes(u) && out.push(u));
   for (let i = turn.length - 1; i >= 0; i--) if (turn[i].type === 'text') add(pagesIn(turn[i]));
-  for (let i = turn.length - 1; i >= 0; i--) if (turn[i].type === 'tool') add(pagesIn(turn[i]));
+  for (let i = turn.length - 1; i >= 0; i--) if (turn[i].type === 'tool') add(pagesIn(turn[i], whole));
   return out;
 }
 
@@ -518,6 +522,7 @@ export function registerCapture(app: App, opts: { enabled?: boolean } = {}) {
       dir: path.join(app.store.dir, 'captures'),
       items: (id) => app.sessions.get(id)?.items ?? [],
       item: (sid, id) => app.sessions.get(sid)?.get(id),
+      whole: (sid, item) => app.store.wholeItem(sid, item),
       // A page held for a sign-in is never captured (its picture would be published).
       page: (id) => (anyPageHeld() ? undefined : app.sessions.get(id)?.browserPage?.url),
       sessions: () => app.store.state.sessions.map((s) => s.id),

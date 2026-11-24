@@ -46,21 +46,28 @@ type Session = Record<string, unknown> & ProviderSession;
 type Pushed = { uuid: string; priority?: string; message: { content: unknown } };
 
 function fakeProcess(pushed: Pushed[], interrupt: () => Promise<void>) {
-  const buf: unknown[] = [];
+  const buf: { frame: unknown; handled: () => void }[] = [];
   let wake: (() => void) | undefined;
   let closed = false;
   return {
     closed: () => closed,
-    out(m: unknown) {
-      buf.push(m);
-      wake?.();
+    out(frame: unknown) {
+      return new Promise<void>(handled => {
+        buf.push({ frame, handled });
+        wake?.();
+      });
     },
     q: {
       interrupt,
       close: () => void (closed = true),
       async *[Symbol.asyncIterator]() {
         for (;;) {
-          while (buf.length) yield buf.shift();
+          while (buf.length) {
+            const { frame, handled } = buf.shift()!;
+            yield frame;
+            // The pump asks for another frame only after it has handled or discarded this one.
+            handled();
+          }
           await new Promise<void>((r) => (wake = r));
           wake = undefined;
         }
@@ -113,10 +120,8 @@ async function claudeApp(opts: { interrupt?: () => Promise<void> } = {}) {
   const snap = await app.call('session.create', { provider: 'claude', cwd, mode: 'default' });
   const id = snap.session.id;
   const rt = app.runtime(id);
-  const message = async (m: Record<string, unknown>, proc = procs.at(-1)) => {
+  const message = (m: Record<string, unknown>, proc = procs.at(-1)) =>
     proc!.out({ session_id: 'cc1', ...m });
-    await tick(5);
-  };
   const send = async (text: string) => {
     const n = pushed.length;
     await app.call('session.send', { sessionId: id, text });
@@ -168,6 +173,35 @@ describe('#11: a Claude Code result that cannot be told apart', () => {
     expect(h.rt.turnActive).toBe(false);
     expect(h.turns().map((t) => t.error)).toEqual([undefined]);
   }, 10_000);
+
+  it('the second result ends its turn before the queued first message starts another', async () => {
+    const h = await claudeApp();
+    const first = await h.send('first');
+    vi.useFakeTimers();
+    try {
+      await h.stop();
+      await vi.advanceTimersByTimeAsync(2_500);
+      expect(h.rt.queue.map(q => q.text)).toEqual(['first']);
+      await h.send('second');
+
+      const activeAfterFrame = h.result().then(() => h.rt.turnActive);
+      // Run the queue dispatch before inspecting the chat, as in the failing order.
+      await vi.advanceTimersByTimeAsync(5);
+      expect(h.pushed.map(m => m.message.content)).toEqual(['first', 'second', 'first']);
+      expect(h.pushed[2].uuid).not.toBe(first);
+      expect(await activeAfterFrame).toBe(false);
+      expect(h.rt.turnActive).toBe(true);
+      expect(h.turns().map(t => t.error)).toEqual([undefined]);
+
+      await h.result(true, h.procs[0]);
+      expect(h.rt.turnActive).toBe(true);
+      await h.result();
+      expect(h.rt.turnActive).toBe(false);
+      expect(h.turns().map(t => t.error)).toEqual([undefined, undefined]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it('a message withdrawn at the stop and read after all: its own result ends the turn it begins', async () => {
     const h = await claudeApp();

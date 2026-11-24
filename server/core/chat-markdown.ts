@@ -146,7 +146,7 @@ function userWords(it: UserItem): { text: string; command?: boolean } | null {
   return text || it.attachments?.length ? { text } : null;
 }
 
-/** The conversation as Markdown. `items` is the whole timeline, in order. */
+/** Format each step from the fields kept by the old-turn cut. Long output and picture data stay on disk. */
 export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd' | 'chat' | 'createdAt'>, items: TimelineItem[], opts: ChatMarkdownOptions = {}): string {
   const agentName = opts.agentName ?? ((p: ProviderId) => AGENT[p] ?? p);
   const cwd = meta.cwd ?? '';

@@ -45,13 +45,14 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
   };
   http.on('upgrade', onUpgrade);
 
+  const wholeItem = app.store.wholeItem.bind(app.store);
   wss.on('connection', (ws: WebSocket) => {
     bootMark('bridge:connected');
     const send = (frame: ServerFrame) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(frame));
     };
     // Whole timelines reach a window with finished steps' bulk cut (`session.item` has the rest).
-    const unsubscribe = app.subscribe((event) => send({ event: eventForWindow(event) }));
+    const unsubscribe = app.subscribe((event) => send({ event: eventForWindow(event, wholeItem) }));
     ws.on('message', async (raw) => {
       let req: RpcRequest;
       try {
@@ -62,7 +63,7 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
       try {
         const t = trace ? performance.now() : 0;
         const result = await app.call(req.method, req.params as never);
-        const frame = JSON.stringify({ id: req.id, ok: true, result: resultForWindow(result) });
+        const frame = JSON.stringify({ id: req.id, ok: true, result: resultForWindow(result, wholeItem) });
         // Measuring runs (SABLE_BOOT_TRACE=1): each call, when it came, how long it took, how big its answer was.
         if (trace) console.log(`[rpc] ${req.method} ${(performance.timeOrigin + t).toFixed(1)} ${(performance.now() - t).toFixed(1)}ms ${frame.length}B`);
         if (ws.readyState === ws.OPEN) ws.send(frame);

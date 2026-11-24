@@ -1,10 +1,16 @@
-import { closeSync, existsSync, openSync, readFileSync, readSync, rmSync, statSync } from 'node:fs';
-import { open, rename } from 'node:fs/promises';
+import { constants as bufferLimits } from 'node:buffer';
+import * as fs from 'node:fs';
+import { closeSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
+import { open } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
 import type { QueuedMessage, TimelineItem, Todo } from '../../shared/protocol';
+import { cutItem, isLight, LIGHT, recentStart, workerCut } from './trim';
 
 /**
- * A session's timeline on disk, as a base file and a small tail.
+ * A session's timeline on disk, as a base file and a small tail. For a large line-format base
+ * the reader keeps settled old steps as socket previews plus a generation-bound byte index.
+ * The stored preview is the baseline for late changes. Only the original line supplies hidden fields.
  *
  * A long chat holds hundreds of megabytes (images in tool output, long outputs). Writing all of it
  * again after every streamed word kept the bridge (the desktop's main process) busy for about a
@@ -58,129 +64,136 @@ export const OVER_MAX = { items: 512, chars: 4 * 1024 * 1024 };
 /** Items at the end of the chat a new base leaves to the tail (where streaming happens). */
 export const TAIL_KEEP = 24;
 /** Above this size a base is read line by line (one string cannot hold much more than 512 MB). */
-export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024, part: 16 * 1024 * 1024 };
+export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024 };
 
+type Line = { offset: number; length: number; chars: number; preview?: TimelineItem };
+type LineIndex = Map<string, Line>;
+type Tail = SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] };
 type BaseFile = { gen?: number; items: TimelineItem[]; todos?: Todo[]; queue?: QueuedMessage[] };
+type IndexedRead = { base: BaseFile; index?: LineIndex; tail: Tail | null };
 
-/**
- * The base read in a worker thread (plain CommonJS, so it runs the same in tests, the dev server and
- * the packaged app): the same rules as `readJson` / `readBaseByLine`.
- */
+function readBytes(io: typeof fs, fd: number, offset: number, length: number): Buffer {
+  const bytes = Buffer.allocUnsafe(length);
+  for (let at = 0; at < length;) {
+    const n = io.readSync(fd, bytes, at, length - at, offset + at);
+    if (!n) throw new Error('Incomplete session file');
+    at += n;
+  }
+  return bytes;
+}
+
+/** One implementation for synchronous callers and the standalone worker. Pass its dependencies explicitly. */
+function readIndexed(io: typeof fs, file: string, tailFile: string | undefined, cut: typeof cutItem,
+  boundary: typeof recentStart, bytes: typeof readBytes, options: typeof workerCut, maxLegacy: number): IndexedRead {
+  const fd = io.openSync(file, 'r');
+  try {
+    let tail: Tail | null = null;
+    if (tailFile) {
+      try {
+        tail = JSON.parse(io.readFileSync(tailFile, 'utf8'));
+        if (!Array.isArray(tail?.items)) throw new Error('Invalid session tail');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+    }
+    const size = io.fstatSync(fd).size;
+    const prefix = bytes(io, fd, 0, Math.min(80, size)).toString();
+    const head = /^\{"gen":(\d+),"items":\[\n/.exec(prefix);
+    if (!head) {
+      if (!tailFile || size > maxLegacy || prefix.startsWith('{"gen":') && prefix.includes('\n')) throw new Error('Invalid session header');
+      const base = JSON.parse(io.readFileSync(fd, 'utf8'));
+      if (!Array.isArray(base?.items)) throw new Error('Invalid legacy session');
+      return { base, tail };
+    }
+    const gen = Number(head[1]);
+    const index: LineIndex = new Map();
+    const items: TimelineItem[] = [];
+    const chunk = Buffer.allocUnsafe(1 << 20);
+    let parts: Buffer[] = [];
+    let pos = head[0].length, offset = pos, comma = true;
+    while (pos < size) {
+      const n = io.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
+      if (!n) throw new Error('Incomplete session file');
+      let from = 0;
+      for (let nl = chunk.indexOf(10); nl >= 0 && nl < n; nl = chunk.indexOf(10, from)) {
+        const part = chunk.subarray(from, nl);
+        const line = parts.length ? Buffer.concat([...parts, part]) : part;
+        if (!comma) throw new Error('Missing item separator');
+        comma = line.at(-1) === 44;
+        const length = line.length - Number(comma);
+        const json = line.toString('utf8', 0, length);
+        const item = JSON.parse(json) as TimelineItem;
+        if (typeof item.id !== 'string' || index.has(item.id) || Object.hasOwn(item, options.mark)) throw new Error('Invalid session item');
+        const range: Line = { offset, length, chars: json.length };
+        const view = tailFile ? cut(item, options.old) : item;
+        if (view !== item && item.type === 'tool') {
+          // Round-trip the preview: a V8 substring can otherwise pin the entire output it came from.
+          range.preview = JSON.parse(JSON.stringify({ ...view, [options.mark]: item.result?.images?.length ?? 0 })) as TimelineItem;
+          items.push(structuredClone(range.preview));
+        } else items.push(item);
+        index.set(items[items.length - 1].id, range);
+        from = nl + 1;
+        offset = pos + from;
+        parts = [];
+      }
+      if (from < n) parts.push(Buffer.from(chunk.subarray(from, n)));
+      pos += n;
+    }
+    const foot = Buffer.concat(parts).toString('utf8');
+    if (!foot.startsWith(']') || items.length && comma) throw new Error('Invalid session footer');
+    const rest = JSON.parse('{"items":[' + foot);
+    // A quit tail can rewind the base or add turns. Promote only steps recent in the actual chat.
+    const active = tail?.baseGen === gen && Array.isArray(tail.items) ? tail : undefined;
+    const from = active && Number.isInteger(active.from) && active.from! >= 0 && active.from! <= items.length ? active.from! : items.length;
+    const newer = new Map(active?.over?.map(i => [i.id, i]));
+    const visible = active ? items.slice(0, from).map(i => newer.get(i.id) ?? i).concat(active.items) : items;
+    for (let i = boundary(visible, options.turns); i < from; i++) {
+      const item = items[i], range = index.get(item.id)!;
+      if (range.preview && !newer.has(item.id)) {
+        items[i] = JSON.parse(bytes(io, fd, range.offset, range.length).toString('utf8'));
+        delete range.preview;
+      }
+    }
+    return { base: { gen, items, todos: rest.todos, queue: rest.queue }, index, tail };
+  } finally { io.closeSync(fd); }
+}
+
 const WORKER = `
 const { parentPort, workerData } = require('node:worker_threads');
-const fs = require('node:fs');
-const { file, byLine } = workerData;
-const { ack } = workerData;
-const whole = () => JSON.parse(fs.readFileSync(file, 'utf8'));
-// A big base is read in pieces and handed over in pieces (PART bytes of lines at a time), each
-// dropped here once it is sent: this thread never holds the conversation. Every thread of the
-// desktop app shares one 4 GB heap, so a chat of a gigabyte held here and again on the main thread
-// ended the app. The main thread says how many pieces it has taken (ack): at most two are on the way.
-const PART = workerData.part;
-function lines() {
-  const fd = fs.openSync(file, 'r');
-  try {
-    const size = fs.fstatSync(fd).size;
-    const buf = Buffer.allocUnsafe(8 << 20);
-    let rest = Buffer.alloc(0);
-    let gen, part = [], bytes = 0, sent = 0;
-    const send = () => {
-      parentPort.postMessage({ part });
-      part = [];
-      bytes = 0;
-      sent++;
-      for (let got = Atomics.load(ack, 0); got < sent - 2; got = Atomics.load(ack, 0)) Atomics.wait(ack, 0, got, 1000);
-    };
-    for (let pos = 0; pos < size; ) {
-      const n = fs.readSync(fd, buf, 0, buf.length, pos);
-      if (n <= 0) break;
-      pos += n;
-      let chunk = rest.length ? Buffer.concat([rest, buf.subarray(0, n)]) : buf.subarray(0, n);
-      for (let at = chunk.indexOf(10); at >= 0; at = chunk.indexOf(10)) {
-        const line = chunk.subarray(0, at).toString('utf8');
-        chunk = chunk.subarray(at + 1);
-        if (gen === undefined) {
-          const m = /^\\{"gen":(\\d+),"items":\\[$/.exec(line);
-          if (!m) return null;
-          gen = Number(m[1]);
-        } else {
-          part.push(JSON.parse(line.endsWith(',') ? line.slice(0, -1) : line));
-          bytes += at;
-          if (bytes >= PART) send();
-        }
-      }
-      // An older file is one long line: no head within the first piece read.
-      if (gen === undefined) return null;
-      rest = Buffer.from(chunk);
-    }
-    const foot = rest.toString('utf8');
-    if (gen === undefined || !foot.startsWith(']')) return sent ? false : null;
-    const end = JSON.parse('{"items":[' + foot);
-    if (part.length) send();
-    return { gen, items: [], todos: end.todos, queue: end.queue };
-  } finally {
-    fs.closeSync(fd);
-  }
-}
+// tsx annotates nested functions with __name when the server runs from source.
+const __name = f => f;
+const opts = workerData.options;
+const { cutItem } = (${workerCut.factory})(opts.recent, opts.keepFiles, (${workerCut.task}));
 try {
-  const read = byLine ? lines() : null;
-  if (read === false) parentPort.postMessage({ ok: false });
-  else if (read) parentPort.postMessage({ ok: true, value: read, parts: true });
-  else parentPort.postMessage({ ok: true, value: whole() });
-} catch {
-  parentPort.postMessage({ ok: false });
-}
+  const value = (${readIndexed})(require('node:fs'), workerData.file, workerData.tail, cutItem,
+    (${workerCut.boundary}), (${readBytes}), opts, workerData.maxLegacy);
+  parentPort.postMessage({ ok: true, value });
+} catch { parentPort.postMessage({ ok: false }); }
 `;
 
-function readInWorker(file: string, byLine: boolean): Promise<Read<BaseFile>> {
-  return new Promise((resolve, reject) => {
-    const ack = new Int32Array(new SharedArrayBuffer(4));
-    const w = new Worker(WORKER, { eval: true, workerData: { file, byLine, ack, part: READ.part } });
-    const items: TimelineItem[] = [];
-    w.on('message', (m: { part: TimelineItem[] } | (Read<BaseFile> & { parts?: boolean })) => {
-      if ('part' in m) {
-        for (const item of m.part) items.push(item);
-        Atomics.add(ack, 0, 1);
-        Atomics.notify(ack, 0);
-        return;
-      }
-      if (m.ok && m.value && m.parts) m.value.items = items;
-      resolve(m.ok ? { ok: true, value: m.value } : { ok: false });
-      void w.terminate();
-    });
-    w.once('error', reject);
-    w.once('exit', (code) => reject(new Error(`The reading worker ended (${code})`)));
+function readInWorker(file: string, tail: string): Promise<Read<IndexedRead>> {
+  return new Promise(resolve => {
+    const w = new Worker(WORKER, { eval: true, workerData: { file, tail, options: workerCut, maxLegacy: bufferLimits.MAX_STRING_LENGTH },
+      resourceLimits: { maxOldGenerationSizeMb: 384, maxYoungGenerationSizeMb: 24 } });
+    w.once('message', resolve);
+    w.once('error', () => resolve({ ok: false }));
+    w.once('exit', () => resolve({ ok: false }));
   });
 }
-
-/** The complete lines within the last `bytes` of a file (a base's newest items), without reading the rest. */
-function lastLines(file: string, bytes: number): string[] {
-  let fd: number | undefined;
-  try {
-    fd = openSync(file, 'r');
-    const size = statSync(file).size;
-    const n = Math.min(size, bytes);
-    const buf = Buffer.allocUnsafe(n);
-    readSync(fd, buf, 0, n, size - n);
-    const all = buf.toString('utf8').split('\n');
-    return n < size ? all.slice(1) : all;
-  } catch {
-    return [];
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-}
-/** Pieces of the base written per step (characters). */
+/** Bytes batched per asynchronous write. */
 const CHUNK = 1 << 20;
 
 interface Base {
+  index?: LineIndex;
+  /** Byte ranges of restart notices in the last successful write, generation-bound. */
+  notices?: { file: string; prefix: string; rows: Map<string, { line: Line; json: string }> };
   gen: number;
   /** The base prefix whose order and changed items are known. */
   ids: string[];
   /** Normal streaming saves keep everything from here onward together in the tail. */
   settled: number;
   idSet: Set<string>;
-  /** The base file's size (bytes as read, characters as written): the small-base rule. */
+  /** Preserve the small-base rule: file bytes as read, JSON characters as written. */
   size: number;
   /** Read from a file of an older version (no generation): the first save writes the base anew. */
   old?: boolean;
@@ -192,49 +205,19 @@ type Read<T> = { ok: true; value: T | null } | { ok: false };
 
 /** null when the file is missing; not ok when it exists but cannot be read. */
 function readJson<T>(file: string): Read<T> {
-  if (!existsSync(file)) return { ok: true, value: null };
   try {
-    return { ok: true, value: JSON.parse(readFileSync(file, 'utf8')) as T };
-  } catch {
-    return { ok: false };
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    return value && Array.isArray(value.items) ? { ok: true, value } : { ok: false };
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? { ok: true, value: null } : { ok: false };
   }
 }
 
 /** A big base, one item per line (as `writeBase` writes it), parsed piece by piece. */
-export function readBaseByLine(file: string): Read<{ gen?: number; items: TimelineItem[]; todos?: Todo[]; queue?: QueuedMessage[] }> {
-  let fd: number | undefined;
+export function readBaseByLine(file: string): Read<BaseFile> {
   try {
-    fd = openSync(file, 'r');
-    const size = statSync(file).size;
-    const items: TimelineItem[] = [];
-    let head: string | undefined;
-    let pending = Buffer.alloc(0);
-    const buf = Buffer.alloc(16 << 20);
-    for (let pos = 0; pos < size; ) {
-      const n = readSync(fd, buf, 0, buf.length, pos);
-      if (n <= 0) break;
-      pos += n;
-      let chunk = Buffer.concat([pending, buf.subarray(0, n)]);
-      let at: number;
-      // Every complete line is the head or one item; the last line (no line break) is the foot.
-      while ((at = chunk.indexOf(10)) >= 0) {
-        const line = chunk.subarray(0, at).toString('utf8');
-        chunk = chunk.subarray(at + 1);
-        if (head === undefined) head = line;
-        else items.push(JSON.parse(line.endsWith(',') ? line.slice(0, -1) : line) as TimelineItem);
-      }
-      pending = Buffer.from(chunk);
-    }
-    const foot = pending.toString('utf8');
-    const m = /^\{"gen":(\d+),"items":\[$/.exec(head ?? '');
-    if (!m || !foot.startsWith(']')) return { ok: false };
-    const rest = JSON.parse(`{"items":[${foot}`) as { todos?: Todo[]; queue?: QueuedMessage[] };
-    return { ok: true, value: { gen: Number(m[1]), items, todos: rest.todos, queue: rest.queue } };
-  } catch {
-    return { ok: false };
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
+    return { ok: true, value: readIndexed(fs, file, undefined, cutItem, recentStart, readBytes, workerCut, 0).base };
+  } catch { return { ok: false }; }
 }
 
 /**
@@ -268,6 +251,8 @@ export class SessionFiles {
   private bases = new Map<string, Base>();
   /** The write in progress per session: the next waits for it (two writes never share a temporary file). */
   private writing = new Map<string, Promise<void>>();
+  /** Readers with an open Windows file handle (a worker load or a fork copying the source). */
+  private reading = new Map<string, Set<Promise<unknown>>>();
   /** Sessions whose last write failed: what changed is no longer known, so the next write is whole. */
   private force = new Set<string>();
   /** Files that exist but could not be read: never written over. */
@@ -277,93 +262,82 @@ export class SessionFiles {
 
   constructor(private readonly pathOf: (id: string) => string) {}
 
+  private trackRead<T>(id: string, work: Promise<T>): Promise<T> {
+    const reads = this.reading.get(id) ?? new Set();
+    this.reading.set(id, reads);
+    reads.add(work);
+    return work.finally(() => {
+      reads.delete(work);
+      if (!reads.size) this.reading.delete(id);
+    });
+  }
+
   private tailOf(id: string) {
     return this.pathOf(id).replace(/\.json$/, '.tail.json');
   }
 
   load(id: string): SessionData {
     const file = this.pathOf(id);
-    let size = 0, mtime = 0;
-    try {
-      if (existsSync(file)) ({ size, mtimeMs: mtime } = statSync(file));
-    } catch {
-      /* read below says */
+    let size: number, mtime: number;
+    try { ({ size, mtimeMs: mtime } = statSync(file)); }
+    catch (err) {
+      return this.finish(id, (err as NodeJS.ErrnoException).code === 'ENOENT' ? { ok: true, value: null } : { ok: false }, 0, 0);
     }
-    let read: Read<BaseFile> = size > READ.byLineAbove ? readBaseByLine(file) : readJson<BaseFile>(file);
-    // A big file of an older version is one long line (up to about 512 MB): read it whole.
-    if (!read.ok && size > READ.byLineAbove) read = readJson<BaseFile>(file);
-    return this.finish(id, read, size, mtime);
+    if (size >= READ.inWorkerAbove || size > READ.byLineAbove) {
+      try {
+        const loaded = readIndexed(fs, file, this.tailOf(id), cutItem, recentStart, readBytes, workerCut, bufferLimits.MAX_STRING_LENGTH);
+        return this.finish(id, { ok: true, value: loaded.base }, size, mtime, loaded);
+      } catch { return this.finish(id, { ok: false }, size, mtime); }
+    }
+    return this.finish(id, readJson<BaseFile>(file), size, mtime);
   }
 
-  /**
-   * As `load`, but a big file is read and parsed in a worker thread: the main process (the desktop's
-   * window and every other chat) keeps running while a chat of hundreds of megabytes loads; only
-   * handing the parsed timeline over takes a moment on it.
-   */
   async loadAsync(id: string): Promise<SessionData> {
     const file = this.pathOf(id);
-    let size = 0, mtime = 0;
-    try {
-      if (existsSync(file)) ({ size, mtimeMs: mtime } = statSync(file));
-    } catch {
-      /* read below says */
+    let stat;
+    try { stat = statSync(file); }
+    catch (err) {
+      return this.finish(id, (err as NodeJS.ErrnoException).code === 'ENOENT' ? { ok: true, value: null } : { ok: false }, 0, 0);
     }
-    if (size < READ.inWorkerAbove) return this.load(id);
-    const read = await readInWorker(file, size > READ.byLineAbove).catch(() => undefined);
-    if (read) return this.finish(id, read, size, mtime);
-    // A worker that failed on a very big file is never followed by the same read on the main thread
-    // (it would hold the app, and the memory that ended the worker would end the app): unreadable for now.
-    return size > READ.byLineAbove ? this.finish(id, { ok: false }, size, mtime) : this.load(id);
+    if (stat.size < READ.inWorkerAbove) return this.load(id);
+    const previous = this.bases.get(id);
+    const read = await this.trackRead(id, readInWorker(file, this.tailOf(id))).catch(() => ({ ok: false as const }));
+    // A synchronous hydrate that won the race owns the installed index.
+    if (this.deleted.has(id) || this.bases.get(id) !== previous) return { items: [], todos: [], unreadable: true };
+    if (!read.ok || !read.value) return this.finish(id, { ok: false }, stat.size, stat.mtimeMs);
+    return this.finish(id, { ok: true, value: read.value.base }, stat.size, stat.mtimeMs, read.value);
   }
 
-  /** The base holds this item as it is now: an ordinary save does not write it again. */
-  holds(id: string, itemId: string): boolean {
-    const b = this.bases.get(id);
-    return !!b && !b.old && !this.force.has(id) && b.idSet.has(itemId) && !b.over.has(itemId);
-  }
-
-  /**
-   * Whether a restart notice is on disk, without reading the conversation again: in the tail (small),
-   * else among the newest lines of the base (a chat small enough to be written whole, or a base just
-   * written). Call after the save that should have written it.
-   */
-  async holdsNotice(id: string, notice: string): Promise<boolean> {
-    await this.writing.get(id)?.catch(() => {});
-    if (this.force.has(id)) return false;
-    const is = (i: unknown) => {
-      const n = i as { id?: unknown; type?: unknown; early?: unknown } | null;
-      return !!n && typeof n === 'object' && n.id === notice && n.type === 'notice' && n.early === 'restart';
-    };
-    const tail = readJson<{ items?: unknown[]; over?: unknown[] }>(this.tailOf(id));
-    if (tail.ok && tail.value && [...(Array.isArray(tail.value.items) ? tail.value.items : []), ...(Array.isArray(tail.value.over) ? tail.value.over : [])].some(is)) return true;
-    for (const raw of lastLines(this.pathOf(id), 32 << 20)) {
-      if (!raw.includes(notice)) continue;
-      const line = raw.endsWith(',') ? raw.slice(0, -1) : raw;
-      try {
-        const v = JSON.parse(line) as unknown;
-        // A small chat of an older version is one line: its items are inside.
-        if (is(v) || (Array.isArray((v as { items?: unknown[] } | null)?.items) && (v as { items: unknown[] }).items.some(is))) return true;
-      } catch {
-        /* the head or the foot: not an item */
-      }
-    }
-    return false;
-  }
-
-  private finish(id: string, read: Read<BaseFile>, size: number, mtime: number): SessionData {
+  private finish(id: string, read: Read<BaseFile>, size: number, mtime: number, loaded?: IndexedRead): SessionData {
     if (!read.ok) {
       this.unreadable.add(id);
       return { items: [], todos: [], unreadable: true };
     }
     this.unreadable.delete(id);
     const base = read.value;
-    if (!base) return { items: [], todos: [] };
+    if (!base) {
+      // An orphaned or inaccessible tail still belongs to a conversation.
+      try { statSync(this.tailOf(id)); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          this.bases.delete(id);
+          return { items: [], todos: [] };
+        }
+      }
+      this.unreadable.add(id);
+      return { items: [], todos: [], unreadable: true };
+    }
     const old = typeof base.gen !== 'number';
     // A legacy base has no generation field. Its unchanged file timestamp identifies
     // a quit tail until the next ordinary save migrates it to a numbered base.
     const gen = old ? -mtime : (base.gen as number);
+    if (!old && (!Number.isSafeInteger(gen) || gen < 0 || gen >= Number.MAX_SAFE_INTEGER)) {
+      this.unreadable.add(id);
+      return { items: [], todos: [], unreadable: true };
+    }
+    lastGen = Math.max(lastGen, gen);
     const items = Array.isArray(base.items) ? base.items : [];
-    const tailRead = readJson<SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] }>(this.tailOf(id));
+    const tailRead = loaded ? { ok: true as const, value: loaded.tail } : readJson<Tail>(this.tailOf(id));
     // A tail that is there but cannot be read (held by another program for a moment) is not a missing tail:
     // the base alone is an older conversation, and the next save would write a tail over the newer one.
     if (!tailRead.ok) {
@@ -371,11 +345,17 @@ export class SessionFiles {
       return { items: [], todos: [], unreadable: true };
     }
     const tail = tailRead.value;
+    const invalid = (item: TimelineItem) => !item || typeof item.id !== 'string' || isLight(item);
+    if ((!loaded?.index && items.some(invalid)) ||
+      (tail?.baseGen === gen && (tail.items.some(invalid) || (Array.isArray(tail.over) && tail.over.some(invalid))))) {
+      this.unreadable.add(id);
+      return { items: [], todos: [], unreadable: true };
+    }
     let from = items.length;
     let data: SessionData = { items, todos: base.todos ?? [], queue: base.queue };
     const over = new Set<string>();
     if (tail && tail.baseGen === gen && Array.isArray(tail.items)) {
-      from = typeof tail.from === 'number' && tail.from >= 0 && tail.from <= items.length ? tail.from : items.length;
+      from = typeof tail.from === 'number' && Number.isInteger(tail.from) && tail.from >= 0 && tail.from <= items.length ? tail.from : items.length;
       let head = items.slice(0, from);
       // Settled items changed since the base was written: their newest form, in their place.
       if (Array.isArray(tail.over) && tail.over.length) {
@@ -390,8 +370,63 @@ export class SessionFiles {
       data = { items: head.concat(tail.items), todos: tail.todos ?? base.todos ?? [], queue: tail.queue ?? base.queue };
     }
     const settled = items.slice(0, from).map((i) => i.id);
-    this.bases.set(id, { gen, ids: settled, settled: from, idSet: new Set(settled), size, old, over });
+    this.bases.set(id, { gen, index: loaded?.index, ids: settled, settled: from, idSet: new Set(settled), size, old, over });
     return data;
+  }
+
+  wholeItem(id: string, item: TimelineItem): TimelineItem {
+    if (!isLight(item)) return item;
+    const source = new BaseReader(this.pathOf(id), this.bases.get(id));
+    try { return source.whole(item); }
+    finally { source.close(); }
+  }
+
+  /** Pin the source generation before yielding. The destination has its own base before it is published. */
+  async copyBase(sourceId: string, destId: string, items: TimelineItem[]): Promise<SessionData> {
+    const source = new BaseReader(this.pathOf(sourceId), this.bases.get(sourceId));
+    try {
+      if (items.some(isLight)) source.open();
+      await this.trackRead(sourceId, this.writeBase(destId, { items, todos: [] }, source));
+    } finally { source.close(); }
+    const recent = recentStart(items, workerCut.turns);
+    return { items: items.map((item, i) => i < recent ? item : this.wholeItem(destId, item)), todos: [] };
+  }
+
+  async savedRestartNotice(id: string, notice: string): Promise<boolean> {
+    await this.writing.get(id);
+    const base = this.bases.get(id);
+    const proof = base?.notices;
+    const row = proof?.rows.get(notice);
+    if (!proof || !row || this.force.has(id)) return false;
+    // Seek straight to the notice in the committed tail (or the just-rewritten base).
+    // Compare its actual bytes, including type and early, without parsing another timeline.
+    let fh;
+    try {
+      if (proof.file === this.tailOf(id)) {
+        if (base.old) {
+          if (-statSync(this.pathOf(id)).mtimeMs !== base.gen) return false;
+        } else {
+          const fd = openSync(this.pathOf(id), 'r');
+          try {
+            const head = `{"gen":${base.gen},"items":[\n`;
+            if (readBytes(fs, fd, 0, head.length).toString() !== head) return false;
+          } finally { closeSync(fd); }
+        }
+      }
+      const handle = fh = await open(proof.file, 'r');
+      const match = async (offset: number, expected: Buffer) => {
+        const buf = Buffer.allocUnsafe(Math.min(expected.length, 65536));
+        for (let at = 0; at < expected.length;) {
+          const { bytesRead } = await handle.read(buf, 0, Math.min(buf.length, expected.length - at), offset + at);
+          if (!bytesRead || !buf.subarray(0, bytesRead).equals(expected.subarray(at, at + bytesRead))) return false;
+          at += bytesRead;
+        }
+        return true;
+      };
+      return await match(0, Buffer.from(proof.prefix)) && await match(row.line.offset, Buffer.from(row.json)) &&
+        this.bases.get(id)?.notices === proof;
+    } catch { return false; }
+    finally { await fh?.close(); }
   }
 
   /** Writes what changed. Calls for one session run one after another. */
@@ -431,8 +466,8 @@ export class SessionFiles {
     };
     drop();
     // A write in flight renames its file into place after this: remove again once it is done.
-    const w = this.writing.get(id);
-    if (w) void w.finally(drop);
+    const pending = [...(this.reading.get(id) ?? []), this.writing.get(id)];
+    void Promise.allSettled(pending).then(drop);
   }
 
   /** Waits for the writes in progress. */
@@ -467,7 +502,9 @@ export class SessionFiles {
       if (save.dirty !== 'all') for (const d of save.dirty) if (base.idSet.has(d)) over.add(d);
       if (final && (save.dirty === 'all' || this.force.has(id))) over = new Set(base.ids.slice(0, from));
       if (over.size) for (let i = 0; i < from; i++) {
-        if (over.has(items[i].id)) overItems.push(items[i]);
+        const item = items[i];
+        if (over.has(item.id) && isLight(item) && isDeepStrictEqual(item, base.index?.get(item.id)?.preview)) over.delete(item.id);
+        if (over.has(item.id)) overItems.push(item);
       }
       if (!final && overItems.length > OVER_MAX.items) whole = true;
     }
@@ -475,13 +512,20 @@ export class SessionFiles {
       const tmp = `${this.tailOf(id)}.${process.pid}.tmp`;
       const head = `{"baseGen":${base.gen},"from":${from},"items":[\n`;
       const end = `\n],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
-      const sizes = await writePieces(tmp, head, items.slice(from), '\n],"over":[\n', overItems, end);
+      const source = new BaseReader(this.pathOf(id), base);
+      let written;
+      try {
+        written = await writeLines(tmp, [{ head, items: items.slice(from) }, { head: '\n],"over":[\n', items: overItems }], end, source);
+      } finally { source.close(); }
+      const [tailSize, overSize] = written.sizes;
       // A big tail folds into the base only when that moves the boundary well on: otherwise a few
       // huge items at the end would have the whole base written again on every save. Changed
       // settled items past their bound go into the base too.
-      if (final || (sizes.over <= OVER_MAX.chars && (sizes.items <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP))) {
-        await renameRetry(tmp, this.tailOf(id));
-        base.over = over;
+      if (final || (overSize <= OVER_MAX.chars && (tailSize <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP))) {
+        await renameRetry(tmp, this.tailOf(id), () => {
+          base.notices = { file: this.tailOf(id), prefix: head, rows: written.notices };
+          base.over = over!;
+        });
         this.force.delete(id);
         return;
       }
@@ -491,12 +535,9 @@ export class SessionFiles {
         /* a leftover temporary file is written over next time */
       }
     }
-    const gen = nextGen();
-    const size = await writeBase(this.pathOf(id), gen, { ...save, items });
-    // The base includes its live suffix too. Remember those IDs so a final save can
-    // reuse unchanged large outputs even inside the ordinary streaming tail.
-    const ids = items.map(i => i.id);
-    this.bases.set(id, { gen, ids, settled: settledEnd(items), idSet: new Set(ids), size, over: new Set() });
+    const source = new BaseReader(this.pathOf(id), base);
+    try { await this.writeBase(id, { ...save, items }, source); }
+    finally { source.close(); }
     this.force.delete(id);
     // The new base holds everything: the old tail no longer matches it (and is ignored if this fails).
     try {
@@ -505,13 +546,31 @@ export class SessionFiles {
       /* ignored on the next read: its baseGen is another */
     }
   }
+
+  private async writeBase(id: string, save: SessionData, source: BaseReader) {
+    const gen = nextGen();
+    const file = this.pathOf(id), tmp = `${file}.${process.pid}.tmp`;
+    const head = `{"gen":${gen},"items":[\n`;
+    const foot = `${save.items.length ? '\n' : ''}],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
+    const written = await writeLines(tmp, [{ head, items: save.items }], foot, source);
+    // Windows cannot replace an open destination. Its old index stays live until the rename.
+    source.close();
+    const readers = this.reading.get(id);
+    if (readers?.size) await Promise.allSettled(readers);
+    const ids = save.items.map(i => i.id);
+    const base: Base = { gen, ids, settled: settledEnd(save.items), idSet: new Set(ids), size: written.size,
+      index: written.index, over: new Set(), notices: { file, prefix: head, rows: written.notices } };
+    await renameRetry(tmp, file, () => { if (!this.deleted.has(id)) this.bases.set(id, base); });
+  }
 }
 
 /** Windows refuses a rename while another program (a virus scanner, a reader) has the file open for a moment: try again briefly. */
-async function renameRetry(from: string, to: string) {
+async function renameRetry(from: string, to: string, commit: () => void) {
   for (let i = 0; ; i++) {
     try {
-      return await rename(from, to);
+      fs.renameSync(from, to);
+      commit();
+      return;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (i >= 4 || (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES')) throw err;
@@ -520,63 +579,108 @@ async function renameRetry(from: string, to: string) {
   }
 }
 
-/**
- * `head`, the items of `first` one per line, `mid`, the items of `second` likewise, `end`: written
- * in pieces of about a megabyte (each item serialized on its own), so a big tail never holds the
- * event loop for long. Returns the characters `first` and `second` took.
- */
-async function writePieces(file: string, head: string, first: TimelineItem[], mid: string, second: TimelineItem[], end: string): Promise<{ items: number; over: number }> {
-  const fh = await open(file, 'w');
-  const sizes = { items: 0, over: 0 };
-  try {
-    let buf = head;
-    const put = async (list: TimelineItem[], key: 'items' | 'over') => {
-      for (let i = 0; i < list.length; i++) {
-        const line = JSON.stringify(list[i]) + (i < list.length - 1 ? ',\n' : '');
-        sizes[key] += line.length;
-        buf += line;
-        if (buf.length >= CHUNK) {
-          await fh.write(buf, null, 'utf8');
-          buf = '';
-        }
-      }
-    };
-    await put(first, 'items');
-    buf += mid;
-    await put(second, 'over');
-    buf += end;
-    await fh.write(buf, null, 'utf8');
-  } finally {
-    await fh.close();
+/** Apply edits to the projected fields only. A missing image or a shortened string in the
+ * original preview stands for the intact disk value. Start with disk order for byte-stable saves. */
+function overlay(disk: unknown, before: unknown, now: unknown): unknown {
+  if (isDeepStrictEqual(before, now)) return disk;
+  const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  if (!record(disk) || !record(before) || !record(now)) return now;
+  const out = { ...disk };
+  for (const key of Object.keys(before)) if (!Object.hasOwn(now, key)) delete out[key];
+  for (const key of Object.keys(now)) {
+    if (!Object.hasOwn(before, key)) Object.defineProperty(out, key, { value: now[key], enumerable: true, writable: true, configurable: true });
+    else if (!isDeepStrictEqual(before[key], now[key])) out[key] = overlay(disk[key], before[key], now[key]);
   }
-  return sizes;
+  return out;
 }
 
-/**
- * The whole timeline as the base, one item per line (JSON escapes line breaks inside strings, so
- * every line holds one item), in pieces of about a megabyte so the event loop keeps running.
- * Returns its size in characters.
- */
-async function writeBase(file: string, gen: number, save: SessionData): Promise<number> {
-  const tmp = `${file}.${process.pid}.tmp`;
-  const fh = await open(tmp, 'w');
-  let size = 0;
-  try {
-    let buf = `{"gen":${gen},"items":[\n`;
-    for (let i = 0; i < save.items.length; i++) {
-      buf += JSON.stringify(save.items[i]) + (i < save.items.length - 1 ? ',\n' : '\n');
-      if (buf.length >= CHUNK) {
-        size += buf.length;
-        await fh.write(buf, null, 'utf8');
-        buf = '';
+/** A descriptor pins exactly the generation that supplied the offsets through a save or fork. */
+class BaseReader {
+  private fd?: number;
+  constructor(private file: string, private base: Base | undefined) {}
+
+  open() {
+    if (this.fd === undefined) {
+      if (!this.base?.index) throw new Error('Missing session base index');
+      this.fd = openSync(this.file, 'r');
+      const header = `{"gen":${this.base.gen},"items":[\n`;
+      if (readBytes(fs, this.fd, 0, header.length).toString() !== header) throw new Error('Session base generation changed');
+    }
+    return this.fd;
+  }
+
+  close() {
+    if (this.fd !== undefined) closeSync(this.fd);
+    this.fd = undefined;
+  }
+
+  encode(item: TimelineItem): { bytes: Buffer; chars: number } {
+    if (isLight(item)) {
+      const line = this.base?.index?.get(item.id);
+      if (line?.preview && isDeepStrictEqual(item, line.preview)) {
+        return { bytes: readBytes(fs, this.open(), line.offset, line.length), chars: line.chars };
       }
     }
-    buf += `],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
-    size += buf.length;
-    await fh.write(buf, null, 'utf8');
-  } finally {
-    await fh.close();
+    const json = JSON.stringify(this.whole(item));
+    return { bytes: Buffer.from(json), chars: json.length };
   }
-  await renameRetry(tmp, file);
-  return size;
+
+  whole(item: TimelineItem): TimelineItem {
+    if (!isLight(item)) return item;
+    const line = this.base?.index?.get(item.id);
+    if (!line?.preview) throw new Error('Missing original step');
+    const disk = JSON.parse(readBytes(fs, this.open(), line.offset, line.length).toString());
+    if (disk.id !== item.id) throw new Error('Session item offset changed');
+    const { [LIGHT]: _pictures, more: _more, ...view } = item;
+    if (!isLight(line.preview)) throw new Error('Missing original preview');
+    const { [LIGHT]: _originalPictures, more: _originalMore, ...before } = line.preview;
+    return overlay(disk, before, view) as TimelineItem;
+  }
+}
+
+/** Write bounded batches. A projected item's opaque bytes pass straight from one base to the next. */
+async function writeLines(file: string, sections: { head: string; items: TimelineItem[] }[], foot: string, source: BaseReader) {
+  const fh = await open(file, 'w');
+  const index: LineIndex = new Map();
+  const notices = new Map<string, { line: Line; json: string }>();
+  const sizes: number[] = [];
+  let size = 0, chars = 0, pending = 0;
+  let buffers: Buffer[] = [];
+  const append = (bytes: Buffer) => {
+    buffers.push(bytes);
+    pending += bytes.length;
+    size += bytes.length;
+  };
+  const flush = async () => {
+    await fh.writeFile(Buffer.concat(buffers, pending));
+    buffers = [];
+    pending = 0;
+  };
+  try {
+    for (const section of sections) {
+      append(Buffer.from(section.head));
+      chars += section.head.length;
+      const start = chars;
+      for (let i = 0; i < section.items.length; i++) {
+        if (i) {
+          append(Buffer.from(',\n'));
+          chars += 2;
+        }
+        const item = section.items[i];
+        const encoded = source.encode(item);
+        const bytes = encoded.bytes;
+        const line: Line = { offset: size, length: bytes.length, chars: encoded.chars };
+        chars += line.chars;
+        if (isLight(item)) line.preview = structuredClone(item);
+        index.set(item.id, line);
+        if (item.type === 'notice' && item.early === 'restart') notices.set(item.id, { line, json: bytes.toString() });
+        append(bytes);
+        if (pending >= CHUNK) await flush();
+      }
+      sizes.push(chars - start);
+    }
+    append(Buffer.from(foot));
+    await flush();
+    return { size: chars + foot.length, sizes, index, notices };
+  } finally { await fh.close(); }
 }

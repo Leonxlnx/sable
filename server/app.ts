@@ -51,7 +51,7 @@ import { cleanCommit, commitPrompt } from './core/commit-draft';
 import { SessionRuntime, autoTitle, lostLine, pendingPrompts, type BackgroundLimit, type LossTrigger } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
-import { sessionPatchForJson } from './core/trim';
+import { isLight, recentStart, RECENT_TURNS, settled, sessionPatchForJson } from './core/trim';
 import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_AT_START_MS, RETURN_RECHECK_MS, returnRetryMs, returnsAtStart, returnTarget, runningOnCredits } from './core/limit-policy';
 import { rankAccount } from '../shared/use-first';
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
@@ -566,6 +566,29 @@ export class App {
   };
 
   emit = (event: BridgeEvent) => {
+    // A rewind can move a disk-backed step into the recent turns. A late patch/delta can
+    // restart one. Restore that item in place before subscribers or the provider use it again.
+    if (event.type === 'timeline.reset') {
+      const rt = this.sessions.get(event.sessionId);
+      for (let i = recentStart(event.items, RECENT_TURNS); rt && i < event.items.length; i++) {
+        if (isLight(event.items[i])) event.items[i] = { ...this.store.promote(rt.id, rt.items[i]) };
+      }
+    } else if (event.type === 'item.added' && isLight(event.item)) {
+      event = { ...event, item: this.store.wholeItem(event.sessionId, event.item) };
+    } else if (event.type === 'item.patch' || event.type === 'item.delta') {
+      const item = this.sessions.get(event.sessionId)?.get(event.id);
+      if (item && isLight(item)) {
+        if (event.type === 'item.delta' && event.field === 'output') {
+          // The runtime already appended to the preview.
+          item.output = item.output?.slice(0, -event.delta.length);
+          this.store.promote(event.sessionId, item);
+          item.output = (item.output ?? '') + event.delta;
+        } else if (!settled(item) || (event.type === 'item.patch' && ('result' in event.patch || 'output' in event.patch))) {
+          this.store.promote(event.sessionId, item);
+          if (event.type === 'item.patch' && 'result' in event.patch) event = { ...event, patch: { ...event.patch, result: item.result } as Partial<ToolItem> };
+        }
+      }
+    }
     // Subscribers in this process still see native values. Socket frames carry explicit clears.
     if (event.type === 'session.updated') {
       const { patch } = event;
@@ -4482,7 +4505,7 @@ export class App {
     return this.createSession(p, extra);
   }
 
-  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string }; custom?: boolean } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
+  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string }; custom?: boolean; fork?: { source: string; items: TimelineItem[] } } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
     if (!this.registryReady()) throw new Error('Sable could not read your saved chats and settings.');
     const settings = this.store.state.settings;
     let accountId = p.accountId ?? this.defaultAccountId(p.provider);
@@ -4526,13 +4549,22 @@ export class App {
     const options = withDefaultOptions(p.provider, p.options ?? settings.sessionOptions?.[p.provider]);
     if (options && Object.keys(options).length) meta.options = { ...options };
     const rt = this.makeRuntime(meta);
+    if (extra.fork) {
+      try {
+        const file = await this.store.copySession(extra.fork.source, rt.id, extra.fork.items);
+        rt.loadRestored(file.items, file.todos);
+      } catch (err) {
+        this.store.deleteSession(rt.id);
+        throw err;
+      }
+    }
     this.sessions.set(meta.id, rt);
     if (capStart) rt.notice('info', capStart.line);
     // Continue in the other agent: the first message carries a compact account of the source
     // conversation (read from Sable's timeline; the source and its transcript stay untouched).
     const source = p.handoverFrom ? this.sessions.get(p.handoverFrom) : undefined;
     if (source) {
-      this.hydrate(source);
+      await this.hydrateAsync(source);
       const summary = handoverText(withoutChecks(source.items), { from: this.provider(source.meta.provider, source.meta.accountId ?? DEFAULT_ACCOUNT).name });
       if (summary) {
         this.handovers.set(meta.id, summary);
@@ -4562,7 +4594,7 @@ export class App {
     const closes = this.closesOf(rt);
     const opened = this.lanes.atStart(rt, p.title ?? p.chat?.text).then(() => {
       if (this.disposed || this.closesOf(rt) !== closes) throw new NotNow('The chat was closed.');
-      return provider.open(rt, { loadTranscript: !!p.resume });
+      return provider.open(rt, { loadTranscript: !!p.resume && !extra.fork });
     }).then(
       (handle) => {
         // Closed while it was starting: let the agent go.
@@ -4944,8 +4976,7 @@ export class App {
 
     this.register('session.snapshot', async ({ sessionId, peek }) => {
       const rt = this.runtime(sessionId);
-      await this.hydrateAsync(rt).catch(() => {});
-      this.hydrate(rt);
+      await this.hydrateAsync(rt);
       // Fetched ahead of an open (`peek`): not read yet.
       if (rt.meta.unread && !peek) rt.update({ unread: false });
       return rt.snapshot();
@@ -4954,11 +4985,10 @@ export class App {
     // (a picture of a file asked after a restart) is read off the main thread, one read for all, as a snapshot is.
     this.register('session.item', async ({ sessionId, itemId }) => {
       const rt = this.runtime(sessionId);
-      await this.hydrateAsync(rt).catch(() => {});
-      this.hydrate(rt);
+      await this.hydrateAsync(rt);
       const item = rt.get(itemId);
       if (!item) throw new Error('That part of the conversation is no longer there');
-      return { item: { ...item } };
+      return { item: { ...this.store.wholeItem(sessionId, item) } };
     });
 
     // A retry of a submission the bridge already took (its window lost the answer) is answered, not sent again.
@@ -4968,8 +4998,7 @@ export class App {
       const rt = this.runtime(sessionId);
       // A chat not read yet (a phone's message after a restart): read off the main thread, as a snapshot is;
       // a big one read here synchronously held the window for most of a second.
-      await this.hydrateAsync(rt).catch(() => {});
-      this.hydrate(rt);
+      await this.hydrateAsync(rt);
       // `/model <name>` changes the model; it never goes to the agent (whose own /model restarts it).
       const model = typeof text === 'string' && !attachments?.length ? /^\/model(?:\s+([\s\S]*))?$/i.exec(text.trim()) : null;
       if (model) return this.modelCommand(rt, (model[1] ?? '').trim());
@@ -5240,7 +5269,7 @@ export class App {
     // fails) the new session starts from a summary up to there. The source is never changed.
     this.register('session.fork', async ({ sessionId, itemId }) => {
       const src = this.runtime(sessionId);
-      this.hydrate(src);
+      await this.hydrateAsync(src);
       const cut = cutAt(src.items, itemId);
       if (!cut) throw new Error('That point is no longer in the conversation.');
       const m = src.meta;
@@ -5253,7 +5282,7 @@ export class App {
           resume = null;
         }
       }
-      const snap = await this.call('session.create', {
+      const snap = await this.createSession({
         provider: m.provider,
         cwd: m.cwd,
         model: m.model || undefined,
@@ -5265,7 +5294,7 @@ export class App {
         speed: m.speed,
         title: `${m.title} (fork)`,
         ...(resume ? { resume } : {}),
-      });
+      }, src.items.some(isLight) ? { fork: { source: src.id, items: cut.kept } } : {});
       const rt = this.runtime(snap.session.id);
       if (resume) rt.notice('info', `Forked from ${m.title}`);
       else {

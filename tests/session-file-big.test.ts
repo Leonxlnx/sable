@@ -2,7 +2,8 @@
  * A very long chat (a base of 1.3 GB) ended the desktop app: every thread shares one 4 GB heap, and
  * the chat was held in the reading worker, again on the main thread, and a third time by the first
  * save. What holds here: the worker hands a big base over in pieces and keeps none, a restart notice
- * is confirmed without reading the chat again, and a save copies only what it writes.
+ * is confirmed without reading the chat again. (How little of a long chat is held at all:
+ * session-file-light.test.ts.)
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -95,38 +96,5 @@ describe('a very long chat is held once', () => {
     store.saveSession('s', () => ({ items: [step(1), { ...notice, id: 'n2' } as TimelineItem], todos: [], dirty: 'all' }));
     expect(await store.savedRestartNotice('s', 'n2')).toBe(true);
     expect(await store.savedRestartNotice('s', 'n1')).toBe(false);
-  });
-
-  it('a save after a read copies only what it writes', async () => {
-    const home = tmp();
-    const store = new Store(home);
-    writeBase(path.join(home, 'sessions', 'a.json'), Array.from({ length: 6000 }, (_, i) => step(i)));
-    const data = store.loadSession('a');
-    const added = { id: 'new', ts: 9e9, type: 'text', text: 'hello', streaming: false } as TimelineItem;
-    const items = [...data.items, added];
-    let seen: TimelineItem[] = [];
-    const files = (store as unknown as { sessionFiles: SessionFiles }).sessionFiles;
-    const save = files.save.bind(files);
-    files.save = (id, get, final) => {
-      seen = get().items;
-      return save(id, get, final);
-    };
-    store.saveSession('a', () => ({ items, todos: [], dirty: new Set(['new']) }));
-    await store.savedRestartNotice('a', 'none');
-    expect(seen).toHaveLength(6001);
-    // Settled steps the base holds go to the save as they are (no second copy of their output); the new item is a copy.
-    expect(seen[0]).toBe(items[0]);
-    expect(seen[5999]).toBe(items[5999]);
-    expect(seen[6000]).not.toBe(added);
-    expect(seen[6000]).toEqual(added);
-    // A changed settled step is copied, and travels in the tail.
-    const changed = { ...items[3], title: 'Run again' } as TimelineItem;
-    const next = items.slice();
-    next[3] = changed;
-    store.saveSession('a', () => ({ items: next, todos: [], dirty: new Set(['i3']) }));
-    await store.savedRestartNotice('a', 'none');
-    expect(seen[3]).not.toBe(changed);
-    expect(seen[3]).toEqual(changed);
-    expect(JSON.parse(readFileSync(path.join(home, 'sessions', 'a.tail.json'), 'utf8')).over.map((i: TimelineItem) => i.id)).toEqual(['i3']);
   });
 });

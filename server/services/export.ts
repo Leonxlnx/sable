@@ -51,7 +51,7 @@ export function registerExport(app: App, opts: ExportOptions = {}) {
 
   const markdown = async (sessionId: string) => {
     if (typeof sessionId !== 'string' || !sessionId) throw new Error('Missing sessionId');
-    // The whole conversation (loads it from disk when it was not open; nothing is cut here).
+    // Markdown reads messages, commands, diffs and outcomes. All are resident in a light timeline.
     const snap = await app.call('session.snapshot', { sessionId });
     const name = (p: string) => AGENT[p] ?? app.providers.get(p as never)?.name ?? p;
     return { markdown: chatMarkdown(snap.session, snap.items, { agentName: name }), fileName: markdownFileName(snap.session.title) };
