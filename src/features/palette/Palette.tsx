@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { Dialog as RD } from 'radix-ui';
 import { DEFAULT_ACCOUNT, type MessageHit, type ProviderId, type SessionMeta } from '@shared/protocol';
-import { hasWork } from '@shared/work-label';
 import { ProviderMark } from '@/art/Logo';
 import { accountName as nameOfAccount, focusComposer } from '@/state/hooks';
 import { StatusMark, statusLabel, statusTone } from '@/features/sidebar/SessionRow';
@@ -425,15 +424,17 @@ function HitEnd({ hit }: { hit: MessageHit }) {
 function SessionEnd({ session }: { session: SessionMeta }) {
   const now = useNow();
   const label = statusLabel(session);
-  // Its sub-agents or background commands still work: working, as the sidebar says (the label names them).
-  if (session.status === 'running' || session.status === 'starting' || (session.status !== 'awaiting' && hasWork(session)))
+  const tone = statusTone(session);
+  // The sidebar's rule (`statusTone`): its turn, an /until check, or sub-agents and background
+  // commands that still work make it working (the label names them).
+  if (tone === 'working')
     return (
       <span className="palette-status">
         <span className="truncate shimmer">{label}</span>
       </span>
     );
-  if (session.status === 'awaiting') return <span className="palette-status is-amber">Waiting for you</span>;
-  if (session.status === 'error') return <span className="palette-status is-red">Error</span>;
+  if (tone === 'awaiting') return <span className="palette-status is-amber">Waiting for you</span>;
+  if (tone === 'error') return <span className="palette-status is-red">Error</span>;
   return (
     <span className="palette-time num">
       {session.archived && <span className="palette-arch">Archived</span>}

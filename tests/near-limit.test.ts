@@ -53,7 +53,7 @@ beforeEach(() => {
 describe('limit warnings', () => {
   it('warns once when a window reaches 80%, and not again while it stays there', () => {
     S.useStore.setState({ limits: { claude: [win(85)] } });
-    expect(texts()).toEqual([{ text: 'Claude Code is at 85% of the 5-hour limit', level: 'warn' }]);
+    expect(texts()).toEqual([{ text: 'Claude Code has used 85% of the 5-hour limit', level: 'warn' }]);
 
     S.useStore.setState({ limits: { claude: [win(90)] } });
     S.useStore.setState({ limits: { claude: [win(95)] } });
@@ -103,7 +103,7 @@ describe('limit warnings', () => {
       } as never,
       limits: { 'claude:work': [win(88)] },
     });
-    expect(texts()).toEqual([{ text: 'Claude Code (Work) is at 88% of the 5-hour limit', level: 'warn' }]);
+    expect(texts()).toEqual([{ text: 'Claude Code (Work) has used 88% of the 5-hour limit', level: 'warn' }]);
   });
 });
 
@@ -129,6 +129,6 @@ describe('limit warnings with several accounts (use first)', () => {
     two([win(30)], [win(88)]);
     expect(texts()).toEqual([]);
     two([win(85)], [win(100)]);
-    expect(texts().map((t) => t.text)).toEqual(['Claude Code (Main) is at 85% of the 5-hour limit', 'Claude Code (Work) has used up the 5-hour limit']);
+    expect(texts().map((t) => t.text)).toEqual(['Claude Code (Main) has used 85% of the 5-hour limit', 'Claude Code (Work) has used up the 5-hour limit']);
   });
 });

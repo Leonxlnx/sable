@@ -413,6 +413,27 @@
   pointer-events: none;
 }
 
+/* Search, there while the sidebar (which has its own) is away: its slot opens and closes with the
+   sidebar's column, the same duration and curve as the mark's slot, so the actions to its left travel
+   in one motion with the stage's edge instead of stepping by a slot in one frame. */
+.topbar-search {
+  display: flex;
+  flex-shrink: 0;
+  justify-content: flex-end;
+  width: 28px;
+  transition:
+    width calc(var(--d-3) * 1.3) var(--ease-out),
+    margin-left calc(var(--d-3) * 1.3) var(--ease-out),
+    opacity var(--d-2) var(--ease);
+}
+
+.topbar-search[data-away] {
+  width: 0;
+  margin-left: -2px;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .flip-x svg {
   transform: scaleX(-1);
 }

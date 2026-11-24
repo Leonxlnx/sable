@@ -14,7 +14,7 @@ import { Icon } from '@/icons';
 import { useStore } from '@/state/store';
 import { AgentDetail } from './AgentDetail';
 import { ShownCtx, indexFor, usePaneTick, useProgress, useShown } from './agents-hooks';
-import { OUTCOME_WORD, commandRows, commandState, figuresOf, liveKey, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress } from './agents-model';
+import { OUTCOME_WORD, commandState, commandsView, figuresOf, liveKey, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress } from './agents-model';
 import { LeaveList } from './leave';
 import './agents.css';
 
@@ -71,8 +71,9 @@ function AgentsList({ sessionId }: { sessionId: string }) {
   const ids = useShown((s) => agents(s.data[sessionId]));
   const live = useShown((s) => liveKey(s.data[sessionId]?.items, agents(s.data[sessionId])));
   const asked = useShown((s) => users(s.data[sessionId]));
-  const started = useShown((s) => commands(s.data[sessionId]));
-  const ended = useShown((s) => notes(s.data[sessionId]));
+  // The commands follow their own state too (a task started, ended, lost): see `commandsView`.
+  const readCommands = useMemo(() => commandsView(commands, notes), [commands, notes]);
+  const cmds = useShown((s) => readCommands(s.data[sessionId]));
   const cwd = useStore((s) => s.sessions[sessionId]?.cwd ?? '');
   const home = useStore((s) => s.home);
   const ctx = useMemo<TimelineCtxValue>(() => ({ sessionId, cwd, home, live: ON, stuck: ON }), [sessionId, cwd, home]);
@@ -81,7 +82,6 @@ function AgentsList({ sessionId }: { sessionId: string }) {
     const d = useStore.getState().data[sessionId];
     return overview(ids, live, d?.items ?? {}, asked, d?.roots);
   }, [ids, live, asked, sessionId]);
-  const cmds = useMemo(() => commandRows(started, useStore.getState().data[sessionId]?.items ?? {}, ended), [started, ended, sessionId]);
 
   // What the person opened or closed (waves, the commands) and where they asked for every row.
   // Remembered with the rows' own folds while the app is open.

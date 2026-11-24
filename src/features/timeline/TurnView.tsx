@@ -15,7 +15,7 @@ import { REVEAL_EVENT, rootOf, type RevealDetail } from './reveal';
 import { changesOf } from './changes';
 import { Tail } from './Tail';
 import { TurnFoot } from './Turn';
-import { runSpan, shapeIndex, turnSpan, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
+import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnSpan, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
 import { stallAt } from './stall';
@@ -94,7 +94,7 @@ function stabilize(layout: TurnLayout, cache: Map<string, unknown>, kept: WeakMa
       put(k, seg);
       return seg;
     });
-    const k = `t|${g.state}|${g.end}|${g.early ?? ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${segments.map(segSig).join(';')}`;
+    const k = `t|${g.state}|${g.end}|${g.early ?? ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${g.waiting?.join(',') ?? ''}|${g.liveSegment ?? ''}|${segments.map(segSig).join(';')}`;
     const prev = (next.get(k) ?? cache.get(k)) as TurnGroup | undefined;
     const turn = prev ?? { ...g, segments };
     put(k, turn);
@@ -375,27 +375,44 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
   const [flat, setFlat] = useState(running);
   if (flat && open) setFlat(false);
   const toggle = useCallback(() => setWanted(!wanted), [setWanted, wanted]);
+  const active = turn.liveSegment ?? last;
+  const current = turn.segments[active];
+  const liveAfterCards = liveBelowCards(turn, running);
+  // A steer keeps the same keyed row from its send through its reply. Work in
+  // progress stays above it. An empty live line waits below a taken card. While a
+  // steer still waits, the live line stays above it whatever the work ends in: below
+  // the cards after a note and above them once the next step began, the waiting card
+  // went up by the line's height and came back at every note (win2 day 7 film: 600,
+  // 562, 600 px), and with a real agent it stood up there for the whole pause.
+  const rows: ReactNode[] = [];
+  for (const [i, seg] of turn.segments.entries()) {
+    if (seg.steered && seg.lead) rows.push(<ItemRow key={`card:${seg.lead}`} id={seg.lead} />);
+    if (i > active) continue;
+    rows.push(
+      <SegmentView
+        key={`seg:${seg.key}`}
+        seg={seg}
+        turn={i === headSeg ? turn : undefined}
+        after={turn.segments[i + 1]?.lead ?? turn.end ?? turn.early}
+        cap={i === last ? turn.next : undefined}
+        index={i}
+        place={headSeg < 0 || i < headSeg ? -1 : i === headSeg ? 0 : 1}
+        running={running}
+        live={running && i === active && !liveAfterCards}
+        open={open}
+        nest={!running && !flat}
+        multi={runs > 1}
+        onToggle={toggle}
+      />,
+    );
+  }
+  for (const id of turn.waiting ?? []) rows.push(<ItemRow key={`card:${id}`} id={id} />);
+  if (liveAfterCards) {
+    rows.push(<RunPiece key="live" run={null} from={current.flow.length ? null : current.lead} until={null} head={false} live first={!current.flow.length} settled={false} open={false} multi={runs > 1} nest={false} seg={current} onToggle={toggle} />);
+  }
   return (
     <section className="tg" data-state={turn.state} data-turn={turn.key}>
-      {turn.segments.map((seg, i) => (
-        <SegmentView
-          key={seg.key}
-          seg={seg}
-          // The turn itself only where its line stands: a segment a steer cut skips rendering when a step joins the turn.
-          turn={i === headSeg ? turn : undefined}
-          // The last run ends at the turn's record, or at the bridge's word that it was cut.
-          after={turn.segments[i + 1]?.lead ?? turn.end ?? turn.early}
-          cap={i === last ? turn.next : undefined}
-          index={i}
-          place={headSeg < 0 || i < headSeg ? -1 : i === headSeg ? 0 : 1}
-          running={running}
-          live={running && i === last}
-          open={open}
-          nest={!running && !flat}
-          multi={runs > 1}
-          onToggle={toggle}
-        />
-      ))}
+      {rows}
       {turn.early && <EndedEarly turn={turn} />}
       <TurnFoot turn={turn} />
       {turn.checks?.map((id) => (
@@ -439,6 +456,9 @@ const EndedEarly = memo(function EndedEarly({ turn }: { turn: TurnGroup }) {
   const line = turn.early ?? '';
   const note = useItem<NoticeItem>(line);
   const why = note?.type === 'notice' && note.early ? EARLY_WHY[note.early] : '';
+  // The process's own words, when it left any: they follow the bridge's reason in the notice's detail.
+  const words = note?.type === 'notice' ? earlyWords(note.detail) : '';
+  const [shown, setShown] = useState(false);
   const canContinue = useStore((s) => mayContinue(s, sessionId, line));
   const [sent, setSent] = useState(false);
   const carryOn = () => {
@@ -449,17 +469,31 @@ const EndedEarly = memo(function EndedEarly({ turn }: { turn: TurnGroup }) {
   return (
     <div className="tl-item turn" data-state="early" data-item-id={line || undefined}>
       <div className="turn-line">
-        <span className="turn-note">
-          <Icon name="circle-dashed" size={12} />
-          Ended early
-          {why && <span className="work-time">{why}</span>}
-        </span>
+        {words ? (
+          <button type="button" className="turn-note early-toggle" aria-expanded={shown} onClick={() => setShown(!shown)}>
+            <Icon name="circle-dashed" size={12} />
+            Ended early
+            {why && <span className="work-time">{why}</span>}
+            <Icon name="caret-right" size={10} className="row-caret" />
+          </button>
+        ) : (
+          <span className="turn-note">
+            <Icon name="circle-dashed" size={12} />
+            Ended early
+            {why && <span className="work-time">{why}</span>}
+          </span>
+        )}
         {canContinue && (
           <button type="button" className="btn btn-sm" onClick={carryOn} disabled={sent}>
             Continue
           </button>
         )}
       </div>
+      {words && (
+        <Collapse open={shown} className="tl-fold">
+          <div className="early-words">{words}</div>
+        </Collapse>
+      )}
     </div>
   );
 });
@@ -498,8 +532,8 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, cap, index, pl
   const headAt = place === 0 ? flow.findIndex((c) => c.kind === 'steps' || (c.kind === 'text' && seg.notes.includes(c.id))) : -1;
 
   const out: ReactNode[] = [];
-  if (seg.lead) {
-    if (index > 0 && !seg.steered) out.push(<LeadPiece key={seg.lead} id={seg.lead} open={place < 1 || shown} nest={place === 1 && nest} />);
+  if (seg.lead && !seg.steered) {
+    if (index > 0) out.push(<LeadPiece key={seg.lead} id={seg.lead} open={place < 1 || shown} nest={place === 1 && nest} />);
     else out.push(<ItemRow key={seg.lead} id={seg.lead} />);
   }
   let ord = 0;

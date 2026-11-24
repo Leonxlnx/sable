@@ -50,6 +50,27 @@ export function willMove(id: string, before: readonly string[] | undefined, afte
   return false;
 }
 
+/**
+ * How far the row glides (screen pixels; the start's offset from where it now lies). `was` is where
+ * its card stood on screen before the move, `now` where it lies after the new layout, read in a layout
+ * effect, before the conversation keeps its end (Timeline.tsx's ResizeObserver runs after the layout
+ * effects and before paint). `endShift`: how far that keeping of the end will scroll the view in this
+ * frame, in screen pixels (0 when the reader is scrolled away or nothing grew).
+ *
+ * The glide starts where the eye last saw the card. Measured against the layout alone, the start
+ * left out the scroll that the same frame makes: when the take also added content (the reply's first
+ * words, a note), the card jumped up with the view and then glided down to its place, so it went too
+ * far up and came back (day 7 film: 600 to 498 px in one frame, then down to 525).
+ */
+export function glideOffset(was: number, now: number, endShift: number): number {
+  return was - (now - endShift);
+}
+
+/** How far keeping the end will scroll a view that sticks to it (in its own pixels). */
+export function endShift(stuck: boolean, scrollHeight: number, clientHeight: number, scrollTop: number): number {
+  return stuck ? Math.max(0, scrollHeight - clientHeight - scrollTop) : 0;
+}
+
 export interface LeftRow {
   /** Where its card stood, in the window's pixels. */
   left: number;

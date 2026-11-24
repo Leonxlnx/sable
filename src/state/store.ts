@@ -490,6 +490,17 @@ function announceReset(e: Extract<BridgeEvent, { type: 'limit.reset' }>) {
   }
 }
 
+/**
+ * A chat's meta with a `session.updated` patch on it. A field the bridge clears comes as `null`
+ * (JSON drops a key whose value is undefined, so a field cleared to undefined would never reach the
+ * window: a chat moved back to its default account kept naming the account it left): it is removed.
+ */
+export function mergeMeta(cur: SessionMeta, patch: Partial<SessionMeta>): SessionMeta {
+  const next = { ...cur, ...patch } as Record<string, unknown>;
+  for (const [k, v] of Object.entries(patch)) if (v === null) delete next[k];
+  return next as unknown as SessionMeta;
+}
+
 /** Applies one bridge event to the store. Exported for tests; the app feeds it from `startBridge`. */
 export function applyEvent(e: BridgeEvent) {
   switch (e.type) {
@@ -563,7 +574,7 @@ export function applyEvent(e: BridgeEvent) {
       useStore.setState((s) => {
         const cur = s.sessions[e.id];
         if (!cur) return s;
-        return { sessions: { ...s.sessions, [e.id]: { ...cur, ...e.patch } } };
+        return { sessions: { ...s.sessions, [e.id]: mergeMeta(cur, e.patch) } };
       });
       if (before && e.patch.status && e.patch.status !== before.status) onStatusChange({ ...before, ...e.patch }, before.status);
       return;

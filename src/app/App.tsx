@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ComponentType, type ReactNode, type RefObject } from 'react';
 import { AnimatePresence, cancelFrame, frame, motion, MotionConfig, usePresence, type Variants } from 'motion/react';
 import { Launch, launchPlays } from '@/art/LaunchLayer';
-import { LogoMark, ProviderMark } from '@/art/Logo';
+import { LogoMark } from '@/art/Logo';
 import { veil, veilCover, veilHeld, veilReveal, type VeilRun } from '@/art/veil';
 import { reducedMotion, uiZoom } from '@/lib/motion';
 import { Home } from '@/features/home/Home';
@@ -9,6 +9,7 @@ import { handoffActive, handoffPhase, subscribeHandoff } from '@/features/home/h
 import { afterSend } from '@/features/composer/settle';
 import { useOnboarding } from '@/features/onboarding/useOnboarding';
 import { Sidebar } from '@/features/sidebar/Sidebar';
+import { AgentWorkMark } from '@/features/session/WorkMark';
 import { Icon } from '@/icons';
 import { windowShell } from '@/lib/desktop';
 import { baseName, formatTokens } from '@/lib/format';
@@ -838,14 +839,13 @@ function ContextMeter({ sessionId }: { sessionId: string }) {
   if (!shown) return null;
   const [p, used, max] = shown.split('|');
   const pct = Number(p);
-  // A ring drawn on the icons' 16 px grid: a hairline track and a 1.5 px arc, so it weighs what the line icons beside it weigh.
+  // The chat's context, never an account's limit: the Context tab's own icon (the tab it opens) and
+  // the figure, so it cannot be taken for the account ring in the sidebar footer, which fills as a
+  // plan window is used. The tooltip says what it is in words.
   return (
-    <Tip label={`${used} of ${max} context used`}>
-      <button type="button" className="ctx-meter" onClick={() => setUi({ railOpen: true, railTab: 'context' })} data-warn={pct > 80 || undefined} aria-label={`Context ${Math.round(pct)}% used`}>
-        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden>
-          <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeOpacity="0.22" strokeWidth="1" />
-          <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" pathLength={100} strokeDasharray={`${Math.max(1.5, pct)} 100`} transform="rotate(-90 8 8)" />
-        </svg>
+    <Tip label={`Context: ${used} of ${max} tokens used`}>
+      <button type="button" className="ctx-meter" onClick={() => setUi({ railOpen: true, railTab: 'context' })} data-warn={pct > 80 || undefined} aria-label={`Context ${Math.round(pct)}% used. Open the Context tab`}>
+        <Icon name="context" size={15} />
         <span className="num">{Math.round(pct)}%</span>
       </button>
     </Tip>
@@ -956,7 +956,8 @@ function Topbar({ panelShown }: { panelShown: boolean }) {
 
       {session ? (
         <div className="topbar-title">
-          <ProviderMark provider={session.provider} size={15} />
+          {/* The agent's mark, with an arc round it while the chat is at work (its turn, sub-agents, commands). */}
+          <AgentWorkMark sessionId={session.id} provider={session.provider} />
           <TitleName key={session.id} id={session.id} title={session.title} />
           <span className="topbar-crumb">
             {/* A chat without a folder: its own folder is named after its first message, so the title already says it. */}
@@ -992,7 +993,11 @@ function Topbar({ panelShown }: { panelShown: boolean }) {
         {session && <CapabilitiesButton sessionId={session.id} />}
         {session && <ChatMenu sessionId={session.id} />}
         {/* The sidebar's top row has the search; the bar shows it only while the sidebar is away. */}
-        {!sidebarOpen && <IconButton icon="search" label="Search and commands" keys="mod+k" onClick={() => setUi({ paletteOpen: true })} />}
+        {/* Always in the bar: its slot folds and unfolds on the sidebar's own clock (app.css), so the
+            actions beside it travel with the stage instead of jumping a slot when the sidebar toggles. */}
+        <span className="topbar-search" data-away={sidebarOpen || undefined} inert={sidebarOpen}>
+          <IconButton icon="search" label="Search and commands" keys="mod+k" onClick={() => setUi({ paletteOpen: true })} />
+        </span>
         {/* While the panel shows, its own header carries this toggle at this same spot (beside the
             window controls), so one place opens and closes it: this one folds away meanwhile. */}
         {session && (

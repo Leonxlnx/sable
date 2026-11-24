@@ -99,7 +99,7 @@
 }
 
 .ring-active {
-  animation: spin 0.9s linear infinite;
+  animation: spin 1.6s linear infinite;
   /* Its own layer while it turns: a spinner never repaints what is around it. */
   will-change: transform;
 }

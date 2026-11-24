@@ -12,7 +12,7 @@ import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
 import { DOCK_GLIDE_MS } from '@/features/session/dock-glide';
-import { glideFrame } from './follow';
+import { glideFrame, sendFollower } from './follow';
 import { useStaged } from '@/features/session/staged';
 import './timeline.css';
 
@@ -376,17 +376,19 @@ export function Timeline({ sessionId }: { sessionId: string }) {
   // Sending a message always returns to the end.
   const count = roots.length;
   const lastId = roots[count - 1];
+  // Each message is followed once: the agent taking a steer moves it to the end again (window-F4).
+  const followsSend = useMemo(() => sendFollower(), [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!lastId) return;
     const item = useStore.getState().data[sessionId]?.items[lastId];
     // A notification Claude Code writes into the chat is not a send: a reader scrolled up stays put.
-    if (item?.type === 'user' && !syntheticOf(item) && live.current) {
+    if (followsSend(lastId, item, item?.type === 'user' && !!syntheticOf(item)) && live.current) {
       // The view travels to the message: it rises from behind the composer as the scroll catches up.
       stuck.current = true;
       setAway(false);
       follow();
     }
-  }, [lastId, sessionId, follow]);
+  }, [lastId, sessionId, follow, followsSend]);
 
   // Revealing an older item (TurnList builds and scrolls to it) lets go of the end first,
   // or the growth above would pin the view straight back down.

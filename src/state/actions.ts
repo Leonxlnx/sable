@@ -823,9 +823,9 @@ export const accountFolders = (provider: ProviderId) => bridge.call('account.fol
  * Moves an idle session to another account of its agent (the conversation carries over where it
  * can). `retry` sends the message a plan limit refused again. Resolves null when the bridge refused.
  */
-export async function switchSessionAccount(sessionId: string, accountId: string, retry = false) {
+export async function switchSessionAccount(sessionId: string, accountId: string, retry = false, refusalId?: string) {
   try {
-    return await bridge.call('session.switchAccount', { sessionId, accountId, retry });
+    return await bridge.call('session.switchAccount', { sessionId, accountId, retry, refusalId });
   } catch (err) {
     fail(err);
     return null;
@@ -847,9 +847,9 @@ export async function spareSend(sessionId: string, text: string, attachments?: A
 }
 
 /** "Continue at reset": the chat carries on with the refused turn once its account's window resets. */
-export async function continueAtReset(sessionId: string): Promise<boolean> {
+export async function continueAtReset(sessionId: string, refusalId: string): Promise<boolean> {
   try {
-    const r = await bridge.call('spare.atReset', { sessionId });
+    const r = await bridge.call('spare.atReset', { sessionId, refusalId });
     if (!r.ok && r.error) useStore.getState().toast(r.error);
     return r.ok;
   } catch (err) {

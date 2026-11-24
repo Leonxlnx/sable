@@ -77,3 +77,25 @@ describe('the conversation follower', () => {
     expect(top).toBe(115);
   });
 });
+
+describe('window-F4: following a sent message', () => {
+  it('follows a message once: the agent taking a steer moves it to the end again, and a reader scrolled up stays', async () => {
+    const { sendFollower } = await import('../src/features/timeline/follow');
+    const follows = sendFollower();
+    const steer = { type: 'user', steered: true, state: 'queued' };
+    // Sent mid-turn: it lands at the end and the view goes with it.
+    expect(follows('s1', steer, false)).toBe(true);
+    // The agent wrote more (the last root is its text), the reader scrolled up, then the agent took
+    // the steer: the same message is the last root again, now sent. No follow.
+    expect(follows('t1', { type: 'text' }, false)).toBe(false);
+    expect(follows('s1', { ...steer, state: 'sent' }, false)).toBe(false);
+    // A queued message taken at a turn's start moves the same way.
+    expect(follows('q1', { type: 'user', state: 'queued' }, false)).toBe(true);
+    expect(follows('q1', { type: 'user', state: 'sent' }, false)).toBe(false);
+    // A steer first seen already taken (the view was not live when it was sent) is no send.
+    expect(follows('s2', { type: 'user', steered: true, state: 'sent' }, false)).toBe(false);
+    // A fresh message is followed; a notification the harness wrote is not.
+    expect(follows('u2', { type: 'user', state: 'sent' }, false)).toBe(true);
+    expect(follows('n1', { type: 'user', state: 'sent' }, true)).toBe(false);
+  });
+});

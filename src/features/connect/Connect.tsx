@@ -4,10 +4,11 @@ import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId, type RateLimit } fr
 import { ProviderMark, PROVIDER_NAME, Ring } from '@/art/Logo';
 import { CopyButton } from '@/components/CopyButton';
 import { Icon } from '@/icons';
-import { resetIn } from '@/lib/format';
 import { useNow } from '@/lib/useNow';
 import { tildePath } from '@/lib/format';
 import { openAddAccount } from '@/features/accounts/model';
+import { windowLevel } from '@/features/usage/format';
+import { resetsText, usedPercent, usedText } from '@/features/usage/words';
 import { LoginCode } from './LoginCode';
 import { cancelLogin, login, logout, moveAccount, openSettings, refreshLimits, refreshProvider, removeAccount, renameAccount, setDefaultAccount } from '@/state/actions';
 import { useAccounts } from '@/state/hooks';
@@ -476,16 +477,17 @@ function MiniLimits({ limits }: { limits: RateLimit[] }) {
   return (
     <div className="acc-limits" aria-label="Plan limits">
       {limits.map((l) => {
-        const pct = Math.max(0, Math.min(100, l.percent));
-        const level = pct > 95 ? 'red' : pct > 80 ? 'amber' : undefined;
-        const reset = resetIn(l.resetsAt, now);
+        // The share used, read and rounded as everywhere else (usage/words.ts), with the same levels.
+        const pct = usedPercent(l, now);
+        const level = windowLevel(l, now);
+        const reset = resetsText(l.resetsAt, now);
         return (
-          <span key={l.id} className="acc-limit" data-level={level} title={reset ? `${l.label}: resets in ${reset}` : l.label}>
+          <span key={l.id} className="acc-limit" data-level={level} title={`${l.label}: ${usedText(pct)}${reset ? `, ${reset}` : ''}`}>
             <span className="acc-limit-label truncate">{l.label}</span>
             <span className="cc-limit-track meter" data-level={level}>
               <span className="meter-fill" style={{ '--p': pct / 100 } as CSSProperties} />
             </span>
-            <span className="cc-limit-pct num">{Math.round(pct)}%</span>
+            <span className="cc-limit-pct num">{pct}%</span>
           </span>
         );
       })}

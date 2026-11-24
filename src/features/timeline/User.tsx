@@ -17,7 +17,13 @@ import { EASE_OUT, play, reducedMotion, uiZoom } from '@/lib/motion';
 import { MessageAgain } from './Again';
 import { useTimeline } from './ctx';
 import { Stamp } from './Stamp';
-import { MOVE_GLIDE_MS, isLongMessage, rowLeft, rowMoved, willMove } from './user-card';
+import { MOVE_GLIDE_MS, endShift, glideOffset, isLongMessage, rowLeft, rowMoved, willMove } from './user-card';
+
+/** How far the conversation will scroll this frame to keep its end (its own pixels; user-card.ts `endShift`). */
+function shiftOf(el: HTMLElement, stuck: boolean): number {
+  const sc = el.closest<HTMLElement>('.tl-scroll');
+  return sc ? endShift(stuck, sc.scrollHeight, sc.clientHeight, sc.scrollTop) : 0;
+}
 
 /** The steer key's arrow (composer/SendKey.tsx `steer`), drawn small: up and leaning into the turn. */
 function SteerMark() {
@@ -33,7 +39,7 @@ function SteerMark() {
 
 /** The person's message: their words on the right in the composer's material, with its time, copy and rewind on hover. */
 export const UserMessage = memo(function UserMessage({ item }: { item: UserItem }) {
-  const { sessionId } = useTimeline();
+  const { sessionId, stuck } = useTimeline();
   const canRewind = useStore((s) => !!s.data[sessionId]?.caps?.features.rewind);
   const idle = useStore((s) => {
     const st = s.sessions[sessionId]?.status;
@@ -76,7 +82,7 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
       const now = card?.getBoundingClientRect();
       const z = uiZoom();
       const dx = now ? (was.left - now.left) / z : 0;
-      const dy = now ? (was.top - now.top) / z : 0;
+      const dy = now ? glideOffset(was.top, now.top, shiftOf(el, stuck.current) * z) / z : 0;
       // The whole row travels (its mark beside the card with it), from where the card stood.
       if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) play(el, [{ transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)` }, { transform: 'translate(0px, 0px)' }], { duration: MOVE_GLIDE_MS, easing: EASE_OUT });
       if (was.queued && !queued) fieldBeat('pulse', card, 0.6);
@@ -115,7 +121,7 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
     if (!now) return;
     const z = uiZoom();
     const dx = (was.left - now.left) / z;
-    const dy = (was.top - now.top) / z;
+    const dy = glideOffset(was.top, now.top, shiftOf(el, stuck.current) * z) / z;
     if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) play(el, [{ transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)` }, { transform: 'translate(0px, 0px)' }], { duration: MOVE_GLIDE_MS, easing: EASE_OUT });
   });
 

@@ -38,9 +38,11 @@ describe('the work label', () => {
     expect(statusLabel(meta({ background: 2, commands: 1 }))).toBe('2 sub-agents, 1 command');
     // Its own turn failed, the command still runs: not at rest.
     expect(statusTone(meta({ status: 'error', lastError: 'x', commands: 1 }))).toBe('working');
-    // Waiting on the person comes first; a running turn says what it does.
+    // Waiting on the person comes first; a running turn says what it does, and what still works beside it (day 7).
     expect(statusTone(meta({ status: 'awaiting', commands: 1 }))).toBe('awaiting');
-    expect(statusLabel(meta({ status: 'running', activity: 'Reading', commands: 1 }))).toBe('Reading');
+    expect(statusLabel(meta({ status: 'running', activity: 'Reading' }))).toBe('Reading');
+    expect(statusLabel(meta({ status: 'running', activity: 'Reading', commands: 1 }))).toBe('Reading · 1 command');
+    expect(statusLabel(meta({ status: 'starting', background: 2, commands: 1 }))).toBe('Working · 2 sub-agents, 1 command');
     expect(statusTone(meta())).toBe('idle');
     expect(statusLabel(meta())).toBeNull();
   });
@@ -61,5 +63,36 @@ describe('the tail: how long the oldest command has run', () => {
     // A new timeline reads every item again.
     expect(since({ items: { d: cmd('d', 900) }, rev: 9 })).toBe(900);
     expect(since({ items: {}, rev: 10 })).toBe(0);
+  });
+});
+
+describe('the tail line while work goes on after the turn (day 7)', () => {
+  it('says what works, monitors apart from commands', async () => {
+    const { tailLabel } = await import('../shared/work-label');
+    expect(tailLabel({ agents: 2, commands: 0 })).toBe('2 sub-agents working');
+    expect(tailLabel({ agents: 1, commands: 0 })).toBe('1 sub-agent working');
+    expect(tailLabel({ agents: 0, commands: 1 })).toBe('Waiting for 1 background command');
+    expect(tailLabel({ agents: 0, commands: 3 })).toBe('Waiting for 3 background commands');
+    expect(tailLabel({ agents: 0, commands: 1, monitors: 1 })).toBe('Waiting for 1 monitor');
+    expect(tailLabel({ agents: 0, commands: 2, monitors: 1 })).toBe('Waiting for 1 command, 1 monitor');
+    expect(tailLabel({ agents: 2, commands: 1 })).toBe('2 sub-agents, 1 command working');
+    expect(tailLabel({ agents: 0, commands: 0 })).toBeNull();
+    expect(tailLabel({ agents: 0, commands: 1, monitors: 5 })).toBe('Waiting for 1 monitor');
+  });
+
+  it('times all of it from the oldest piece still at work', async () => {
+    const { workSince } = await import('../src/features/timeline/Tail');
+    const read = workSince();
+    const agent = (id: string, ts: number, background: 'running' | 'done'): ToolItem =>
+      ({ id, ts, type: 'tool', name: 'Agent', kind: 'agent', title: id, status: 'done', detail: {}, result: { agent: { background } } }) as ToolItem;
+    const mon = (id: string, since: number): ToolItem =>
+      ({ id, ts: since, type: 'tool', name: 'Monitor', kind: 'other', title: id, status: 'done', detail: {}, task: { id: `t-${id}`, kind: 'monitor', state: 'running', since } }) as ToolItem;
+    const items: Record<string, TimelineItem> = { a: agent('a', 400, 'running'), m: mon('m', 600) };
+    expect(read({ items, rev: 1 })).toEqual({ since: 400, monitors: 1 });
+    items.a = agent('a', 400, 'done');
+    expect(read({ items, rev: 2, changed: { since: 1, ids: ['a'] } })).toEqual({ since: 600, monitors: 1 });
+    // Nothing changed: the same answer (the tail does not render).
+    const same = read({ items, rev: 2, changed: { since: 1, ids: ['a'] } });
+    expect(read({ items, rev: 2 })).toBe(same);
   });
 });

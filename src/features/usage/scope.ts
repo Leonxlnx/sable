@@ -4,7 +4,7 @@ import { windowForModel } from '@shared/limit-windows';
 import { modelNameById } from '@/lib/models';
 import type { LimitLevel } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
-import { clock } from './format';
+import { resetsText, windowState } from './words';
 
 export { windowModel } from '@shared/limit-windows';
 
@@ -59,10 +59,10 @@ export function limitTitle(label: string | undefined): string {
   return /limit$/i.test(label) ? label : `${label} limit`;
 }
 
-/** "Fable weekly limit reached · resets Sat 00:00", "5-hour limit at 86% · resets 14:20". */
-export function limitLine(l: Pick<RateLimit, 'label' | 'percent' | 'resetsAt'>, now = Date.now()): string {
-  const state = l.percent >= 100 ? 'reached' : `at ${Math.round(l.percent)}%`;
-  return `${limitTitle(l.label)} ${state}${l.resetsAt && l.resetsAt > now ? ` · resets ${clock(l.resetsAt, now)}` : ''}`;
+/** "Fable weekly limit used up · resets Sat 00:00", "5-hour limit 86% used · resets in 2h 10m". */
+export function limitLine(l: Pick<RateLimit, 'id' | 'label' | 'percent' | 'resetsAt'>, now = Date.now()): string {
+  const reset = resetsText(l.resetsAt, now);
+  return `${limitTitle(l.label)} ${windowState(l as RateLimit, now)}${reset ? ` · ${reset}` : ''}`;
 }
 
 const NO_LIMITS: RateLimit[] = [];

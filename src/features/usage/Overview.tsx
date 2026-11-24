@@ -9,12 +9,13 @@ import { accountKey, useStore } from '@/state/store';
 import { Segmented, Tip } from '@/ui';
 import { duration, exactTime, isApiKey, isScopedWindow } from './format';
 import { AccountLimits, type AccountRef } from './Limits';
-import { planShort, poolTotals, poolWeeksText, units, type PoolInput, type PoolPart, type PoolTotal } from './plans';
+import { planShort, poolTotals, poolWeeksText, poolWeeksUsed, units, type PoolInput, type PoolPart, type PoolTotal } from './plans';
 import { livePercent, NEAR_AT, overview, type RoomInput, type RoomRow, type SortBy } from './room';
+import { usedPercent, usedText } from './words';
 
 const SORT_KEY = 'sable.usage.sort';
 const SORTS: { value: SortBy; label: string }[] = [
-  { value: 'room', label: 'Room left' },
+  { value: 'room', label: 'Least used' },
   { value: 'reset', label: 'Reset' },
   { value: 'agent', label: 'Agent' },
 ];
@@ -83,7 +84,7 @@ function cells(limits: RateLimit[] | undefined, now: number): [RateLimit | undef
 
 /**
  * Settings > Usage with many accounts: every account as one line (agent, name, each window as a
- * thin meter with its figure, time to the reset), ordered by room left, by reset or by agent. The
+ * thin meter with the share used, time to the reset), ordered by the least used, by reset or by agent. The
  * accounts at or near a cap sit apart; the one with the most room carries one small mark. A line
  * opens that account's windows in full, in the same columns.
  */
@@ -147,7 +148,7 @@ const OverviewRow = memo(function OverviewRow({ row, now, best, open, pending, o
   const { ref } = input;
   const plan = planShort(ref.account.auth);
   const [short, week] = cells(input.limits, now);
-  const label = `${PROVIDER_NAME[input.provider as ProviderId]}, ${input.name}${row.room !== undefined ? `, ${row.room}% left` : ''}${best ? ', most room right now' : ''}`;
+  const label = `${PROVIDER_NAME[input.provider as ProviderId]}, ${input.name}${row.tight ? `, ${usedText(usedPercent(row.tight, now))}` : ''}${best ? ', least used right now' : ''}`;
   return (
     <div className="ulo-item" role="listitem" data-state={state} data-open={open || undefined}>
       <button type="button" className="ulo-row" aria-expanded={open} aria-label={label} onClick={onToggle}>
@@ -156,7 +157,7 @@ const OverviewRow = memo(function OverviewRow({ row, now, best, open, pending, o
           <span className="ulo-name truncate">{input.name}</span>
           {plan && <span className="ulo-plan truncate">{plan}</span>}
           {best && (
-            <Tip label="Most room right now">
+            <Tip label="Least used right now">
               <span className="ulo-best" aria-hidden />
             </Tip>
           )}
@@ -195,7 +196,7 @@ function Meter({ tag, pct, label }: { tag: string; pct: number; label: string })
   return (
     <span className="ulo-cell">
       <span className="ulo-win">{tag}</span>
-      <span className="meter ulo-meter" data-level={lv} role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
+      <span className="meter ulo-meter" data-level={lv} role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-valuetext={usedText(pct)}>
         <span className="meter-fill" style={{ '--p': Math.max(pct, pct > 0 ? 3 : 0) / 100 } as CSSProperties} />
       </span>
       <span className="ulo-pct num" data-level={lv}>
@@ -206,7 +207,7 @@ function Meter({ tag, pct, label }: { tag: string; pct: number; label: string })
 }
 
 function Cell({ limit, now }: { limit: RateLimit; now: number }) {
-  const pct = Math.round(livePercent(limit, now));
+  const pct = usedPercent(limit, now);
   // A week that is one model's (Fable, Opus) says so on hover.
   return isScopedWindow(limit) ? (
     <Tip label={limit.label}>
@@ -220,8 +221,8 @@ function Cell({ limit, now }: { limit: RateLimit; now: number }) {
 }
 
 /**
- * What is left across each agent's accounts, weighted by plan, above the accounts and in their
- * columns: the agent, how many weeks of its largest plan are left of how many, and the 5-hour and
+ * How much is used across each agent's accounts, weighted by plan, above the accounts and in their
+ * columns: the agent, how many weeks of its largest plan are used of how many, and the 5-hour and
  * weekly windows of all its accounts together as used. Agents with one account have none.
  */
 export function LimitsTotals({ refs }: { refs: AccountRef[] }) {
@@ -230,7 +231,7 @@ export function LimitsTotals({ refs }: { refs: AccountRef[] }) {
   const totals = useMemo(() => poolTotals(inputs, now), [inputs, now]);
   if (!totals.length) return null;
   return (
-    <div className="ult card" data-spot role="list" aria-label="Left across accounts">
+    <div className="ult card" data-spot role="list" aria-label="Used across accounts">
       {totals.map((t) => (
         <TotalRow key={t.provider} total={t} />
       ))}
@@ -239,17 +240,17 @@ export function LimitsTotals({ refs }: { refs: AccountRef[] }) {
 }
 
 function TotalRow({ total: t }: { total: PoolTotal }) {
-  const left = poolWeeksText(t);
+  const said = poolWeeksText(t);
   const mix = t.plans.map((p) => `${p.count} ${p.name}`).join(', ');
   const used = (p: PoolPart) => Math.min(100, Math.round(p.used));
   return (
-    <div className="ult-row" role="listitem" aria-label={`${PROVIDER_NAME[t.provider]}: ${left}`}>
+    <div className="ult-row" role="listitem" aria-label={`${PROVIDER_NAME[t.provider]}: ${said}`}>
       <ProviderMark provider={t.provider} size={14} className="ulo-mark" />
       <span className="ult-who">
         <span className="ulo-name truncate">{PROVIDER_NAME[t.provider]}</span>
         <Tip label={mix}>
           <span className="ult-left num truncate" tabIndex={0}>
-            <span className="ult-figure">{units(t.week.left)}</span> of {units(t.week.size)} {t.unit} weeks left
+            <span className="ult-figure">{units(poolWeeksUsed(t))}</span> of {units(t.week.size)} {t.unit} weeks used
           </span>
         </Tip>
       </span>

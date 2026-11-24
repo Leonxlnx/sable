@@ -42,3 +42,29 @@ export function glideFrame(g: Glide, top: number, target: number, w: number, dt:
   }
   return { top: g.pos, done: false };
 }
+
+/** What a message must be for its arrival at the end to bring the view there (see `sendFollower`). */
+export interface LastMessage {
+  type: string;
+  steered?: boolean;
+  state?: string;
+}
+
+/**
+ * Whether a message that has just become the conversation's last root is a send the view follows:
+ * only the first time it gets there. The agent taking a steered message moves it to the end again
+ * (`SessionRuntime.taken`), and a reader who scrolled up meanwhile must stay where they are (review
+ * window-F4); a steer already taken when it first gets there (a view that was not live when it was
+ * sent) is no send either. `synthetic`: words the agent's harness wrote in the person's place.
+ */
+export function sendFollower(): (id: string, item: LastMessage | undefined, synthetic: boolean) => boolean {
+  const seen = new Set<string>();
+  return (id, item, synthetic) => {
+    if (item?.type !== 'user' || synthetic) return false;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    // Bounded: only the newest few matter.
+    if (seen.size > 64) seen.delete(seen.values().next().value as string);
+    return !(item.steered && item.state !== 'queued');
+  };
+}

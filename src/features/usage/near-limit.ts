@@ -3,6 +3,7 @@ import { PROVIDER_NAME } from '@/art/Logo';
 import { accountName, limitLevel, type LimitLevel } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { windowPhrase } from './LimitReset';
+import { usedPercent } from './words';
 
 /**
  * In-app warnings as an account nears its plan limits: one toast when a window reaches 80%, a
@@ -32,7 +33,7 @@ function announce(provider: ProviderId, info: { name?: string; accounts?: Accoun
   const who = (info?.accounts?.length ?? 0) > 1 ? accountName(account) : undefined;
   const subject = `${info?.name ?? PROVIDER_NAME[provider]}${who ? ` (${who})` : ''}`;
   const text =
-    tone === 'cap' ? `${subject} has used up ${windowPhrase(window)}` : `${subject} is at ${Math.round(window.percent)}% of ${windowPhrase(window)}`;
+    tone === 'cap' ? `${subject} has used up ${windowPhrase(window)}` : `${subject} has used ${usedPercent(window, Date.now())}% of ${windowPhrase(window)}`;
   useStore.getState().toast(text, tone === 'cap' ? 'error' : 'warn');
 }
 

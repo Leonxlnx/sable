@@ -279,6 +279,44 @@ export function commandRows(ids: readonly string[], items: Items, notes: Readonl
   return { ids: live.length || bad.length ? [...live, ...bad, ...rest] : rest, running: live.length, failed: bad.length };
 }
 
+/**
+ * What each command's state hangs on, one entry per command: its task mark (the bridge's word:
+ * running, done, lost...) and its step's status. A change of any of them changes the key, while the
+ * lists of commands and notifications keep their identity (the bridge patches the step in place).
+ */
+export function commandKey(items: Items | undefined, ids: readonly string[]): string {
+  let k = '';
+  for (const id of ids) {
+    const it = items?.[id];
+    k += it?.type === 'tool' ? `${it.task?.state ?? ''}:${it.status},` : ',';
+  }
+  return k;
+}
+
+/**
+ * The Agents tab's commands (`commandRows`), worked out again whenever a command is started, a
+ * notification tells an end, or a command's own state changes (its task started, ended, was lost
+ * with its process or reconciled as stopped: none of those writes a new list, review window-F2).
+ * The same object while none of that changed.
+ */
+export function commandsView(commands: (t: Timeline | undefined) => readonly string[], notes: (t: Timeline | undefined) => ReadonlyMap<string, EndNote>): (t: Timeline | undefined) => Commands {
+  let ids: readonly string[] | null = null;
+  let ended: ReadonlyMap<string, EndNote> | null = null;
+  let key = '';
+  let out: Commands = { ids: [], running: 0, failed: 0 };
+  return (t) => {
+    const started = commands(t);
+    const seen = notes(t);
+    const k = commandKey(t?.items, started);
+    if (started === ids && seen === ended && k === key) return out;
+    ids = started;
+    ended = seen;
+    key = k;
+    out = commandRows(started, t?.items ?? {}, seen);
+    return out;
+  };
+}
+
 /** The sub-agent whose work a nested step is (the nearest agent above it); undefined for the chat's own. */
 export function ownerAgent(items: Items, item: TimelineItem): ToolItem | undefined {
   let up = item.parentId ? items[item.parentId] : undefined;

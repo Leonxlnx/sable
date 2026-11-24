@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'motion/react';
 import type { SessionMeta } from '@shared/protocol';
-import { hasWork } from '@shared/work-label';
+import { statusTone } from '@/features/sidebar/status';
 import { ProviderMark, StatusGlyph } from '@/art/Logo';
 import { baseName, timeAgo } from '@/lib/format';
 import { openSession, prefetchSession } from '@/state/actions';
@@ -126,9 +126,9 @@ export function QuickSwitch() {
               {i === index && <span ref={pill} className="qs-pill dither-sel" aria-hidden />}
               <ProviderMark provider={s.provider} size={14} className="qs-mark" />
               <span className="qs-title truncate">{s.title || 'New session'}</span>
-              {/* Only a session that is working or waiting on you carries a mark. */}
-              {(s.status === 'running' || s.status === 'starting' || (s.status !== 'awaiting' && hasWork(s))) && <StatusGlyph tone="working" />}
-              {s.status === 'awaiting' && <StatusGlyph tone="awaiting" />}
+              {/* Only a session that is working (its turn, a check, sub-agents or commands: the sidebar's
+                  rule, `statusTone`) or waiting on you carries a mark. */}
+              {(statusTone(s) === 'working' || statusTone(s) === 'awaiting') && <StatusGlyph tone={statusTone(s)} />}
               <span className="qs-where truncate">{baseName(s.cwd)}</span>
               <span className="qs-when num">{timeAgo(s.updatedAt)}</span>
             </div>

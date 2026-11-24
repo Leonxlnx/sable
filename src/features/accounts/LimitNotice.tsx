@@ -2,16 +2,15 @@ import { memo, useRef, useState } from 'react';
 import { DEFAULT_ACCOUNT, type NoticeItem } from '@shared/protocol';
 import { PROVIDER_NAME } from '@/art/Logo';
 import { Icon } from '@/icons';
-import { resetIn } from '@/lib/format';
 import { useNow } from '@/lib/useNow';
 import { continueAtReset, spendLimitReset, switchSessionAccount } from '@/state/actions';
 import { SpareClock } from '@/features/composer/SpareStrip';
 import { offersText, useResetOffers, useResets } from '@/features/usage/LimitReset';
 import { ResetInAgentAction, resetRunLine, useResetInAgent } from '@/features/usage/ResetInAgent';
-import { accountName, useLimitLevel } from '@/state/hooks';
+import { accountName } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { Spinner } from '@/ui';
-import { DATE_LOCALE, timeOf } from '@/features/usage/format';
+import { resetsLine } from '@/features/usage/words';
 import { limitTitle } from '@/features/usage/scope';
 
 /** "5-hour limit" stays as it is; a model's week reads "Fable weekly limit", the whole plan's "weekly limit". */
@@ -20,17 +19,9 @@ function windowName(window?: string) {
   return /^weekly/i.test(title) || /^(5-hour|plan)/i.test(title) ? title.replace(/^(\S)/, (c) => c.toLowerCase()) : title;
 }
 
-/** When a window resets, as a clock time (with the day when it is not today) and how long until then. */
+/** When a window resets, as every limit says it (`usage/words.ts`): "Resets in 3h 20m", "Resets Tue 14:00". */
 export function resetLine(resetsAt: number | undefined, now: number): string | undefined {
-  if (!resetsAt || resetsAt <= now) return undefined;
-  const d = new Date(resetsAt);
-  const today = new Date(now);
-  const time = timeOf(resetsAt);
-  const sameDay = d.toDateString() === today.toDateString();
-  const tomorrow = new Date(now + 86_400_000).toDateString() === d.toDateString();
-  const day = sameDay ? '' : tomorrow ? 'tomorrow ' : `${d.toLocaleDateString(DATE_LOCALE, { weekday: 'long' })} `;
-  const left = resetIn(resetsAt, now);
-  return `Resets ${day}at ${time}${left ? `, in ${left}` : ''}`;
+  return resetsLine(resetsAt, now);
 }
 
 /**
@@ -52,10 +43,9 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
   const [moving, setMoving] = useState(false);
 
   const self = accounts?.find((a) => a.id === (limit.accountId ?? DEFAULT_ACCOUNT));
-  const next = limit.next ? accounts?.find((a) => a.id === limit.next && a.auth.loggedIn) : undefined;
-  const nextLevel = useLimitLevel(provider, next?.id);
+  const next = accounts?.find((a) => a.id === limit.next);
   // Moving there by itself (continue at a limit): no button for what happens anyway.
-  const offer = next && nextLevel !== 'cap' && !limit.moving ? next : undefined;
+  const offer = !limit.moving ? next : undefined;
   const auto = limit.moving && !limit.continuedWith && next ? next : undefined;
   const went = limit.continuedWith ? accounts?.find((a) => a.id === limit.continuedWith) : undefined;
 
@@ -65,7 +55,7 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
   // Spare: with no other account to go on with, the chat can wait for this window's reset and carry on then.
   const waiting = useStore((s) => (sid ? !!s.sessions[sid]?.spare : false));
   const [pinning, setPinning] = useState(false);
-  const canWait = !offer && !auto && !limit.continuedWith && !!sid && !waiting && !!limit.resetsAt && limit.resetsAt > now;
+  const canWait = !offer && !auto && !limit.continuedWith && !!sid && !waiting && !!limit.resetsAt;
   const waitButton = canWait && (
     <button
       type="button"
@@ -73,11 +63,11 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
       disabled={pinning || busy}
       onClick={() => {
         setPinning(true);
-        void continueAtReset(sid!).finally(() => setPinning(false));
+        void continueAtReset(sid!, item.id).finally(() => setPinning(false));
       }}
     >
       {pinning ? <Spinner size={12} /> : <SpareClock size={14} />}
-      Continue at reset
+      {limit.resetsAt! > now ? 'Continue at reset' : 'Continue now'}
     </button>
   );
 
@@ -124,7 +114,7 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
       disabled={moving || busy}
       onClick={() => {
         setMoving(true);
-        void switchSessionAccount(sid, offer.id, true).finally(() => setMoving(false));
+        void switchSessionAccount(sid, offer.id, true, item.id).finally(() => setMoving(false));
       }}
     >
       {moving ? <Spinner size={12} /> : <Icon name="arrow-right" size={14} />}
@@ -163,6 +153,7 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
           {limitTitle(limit.window)} reached on {who}
         </div>
         {(resetNote || agentLine || reset || item.detail) && <div className="lim-detail">{resetNote ?? agentLine ?? (reset && offersLine ? `${reset} · ${offersLine}` : reset) ?? item.detail}</div>}
+        {item.limit?.provider && !limit.next && !limit.continuedWith && !limit.moving && <div className="lim-detail">No other account has room</div>}
         {viaAgent && inAgent.via === 'terminal' && !agentRun && <div className="lim-detail">Run {inAgent.command} in a terminal to use a reset</div>}
       </div>
       {ask === 'done' ? (
@@ -180,20 +171,7 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
           <button type="button" className="btn btn-sm lim-reset" disabled={busy} onClick={() => (setResetNote(undefined), setAsk('ask'))}>
             Use a reset
           </button>
-          {offer && sid && (
-            <button
-              type="button"
-              className="btn btn-sm lim-go"
-              disabled={moving || busy}
-              onClick={() => {
-                setMoving(true);
-                void switchSessionAccount(sid, offer.id, true).finally(() => setMoving(false));
-              }}
-            >
-              {moving ? <Spinner size={12} /> : <Icon name="arrow-right" size={14} />}
-              Continue with {accountName(offer)}
-            </button>
-          )}
+          {moveButton}
           {waitButton}
         </span>
       ) : agentRun === 'cleared' ? (
@@ -216,21 +194,7 @@ export const LimitNotice = memo(function LimitNotice({ item, sessionId }: { item
       ) : waitButton ? (
         waitButton
       ) : (
-        offer &&
-        sid && (
-          <button
-            type="button"
-            className="btn btn-sm lim-go"
-            disabled={moving || busy}
-            onClick={() => {
-              setMoving(true);
-              void switchSessionAccount(sid, offer.id, true).finally(() => setMoving(false));
-            }}
-          >
-            {moving ? <Spinner size={12} /> : <Icon name="arrow-right" size={14} />}
-            Continue with {accountName(offer)}
-          </button>
-        )
+        moveButton
       )}
     </div>
   );

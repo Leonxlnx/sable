@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { AccountInfo, ProviderId } from '@shared/protocol';
 import { ProviderMark } from '@/art/Logo';
 import { isApiKey } from '@/features/usage/format';
+import { usedPercent, usedText } from '@/features/usage/words';
 import { setAccountCap } from '@/state/actions';
 import { accountName } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
@@ -35,7 +36,13 @@ export function AccountCaps({ agents }: { agents: ProviderId[] }) {
 
 function CapRow({ provider, account }: { provider: ProviderId; account: AccountInfo }) {
   const name = accountName(account);
-  const used = useStore((s) => (s.limits[accountKey(provider, account.id)] ?? account.limits)?.find((l) => l.id === 'seven_day' || (l.id.startsWith('codex:') && (l.windowMins ?? 0) >= 10_080))?.percent);
+  // The account's week, read as every other figure is (the bridge's record first) and rounded once (usage/words.ts).
+  const week = useStore((s) => {
+    const key = accountKey(provider, account.id);
+    const known = s.limitReports[key]?.limits;
+    return (known?.length ? known : (s.limits[key] ?? account.limits))?.find((l) => l.id === 'seven_day' || (l.id.startsWith('codex:') && (l.windowMins ?? 0) >= 10_080));
+  });
+  const used = week ? usedPercent(week, Date.now()) : undefined;
   const cap = useStore((s) => s.settings.accountCaps?.[`${provider}:${account.id}`]?.weekly);
   // Past its weekly cap: the figure steps forward (sessions move off it between turns).
   const over = used !== undefined && !!cap && used >= cap;
@@ -45,7 +52,7 @@ function CapRow({ provider, account }: { provider: ProviderId; account: AccountI
       <span className="acct-cap-name truncate">{name}</span>
       {used !== undefined && (
         <span className="acct-cap-used num" data-over={over || undefined}>
-          {used}% used
+          {usedText(used)}
         </span>
       )}
       <CapField provider={provider} accountId={account.id} kind="weekly" label={`${name}: weekly cap`} />

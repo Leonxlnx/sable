@@ -1,11 +1,14 @@
 import { memo, useState } from 'react';
-import { workCounts, workLabel } from '@shared/work-label';
+import { worksInBackground } from '@shared/background';
+import { tailLabel, workCounts } from '@shared/work-label';
 import { Tiles } from '@/art/Logo';
 import { Icon } from '@/icons';
 import { showRailTab } from '@/state/actions';
 import { changedSince } from '@/state/revision';
 import { useStore, type SessionData } from '@/state/store';
-import { useTimeline } from './ctx';
+import { useFresh, useTimeline } from './ctx';
+
+const NO_WORK: WorkSince = { since: 0, monitors: 0 };
 import { shortDuration, useTick } from './util';
 
 /** `${turnStart}|${quiet}`: when the running turn began, and whether its last item is streaming prose. */
@@ -58,6 +61,51 @@ export function commandsSince() {
   };
 }
 
+/** What still works in the background, read from the items: when the oldest of it began, and how many of the commands are monitors. */
+export interface WorkSince {
+  /** When the oldest of everything still at work began (sub-agents, workflows, commands, monitors), or 0. */
+  since: number;
+  /** Running tasks that are monitors (the rest of `SessionMeta.commands` are commands). */
+  monitors: number;
+}
+
+/**
+ * `commandsSince` for all background work: running tasks (`ToolItem.task`) and sub-agents or
+ * workflows still at work (`worksInBackground`), followed write by write the same way.
+ */
+export function workSince() {
+  let items: object | null = null;
+  let rev = -1;
+  const running = new Map<string, { at: number; monitor: boolean }>();
+  let out: WorkSince = { since: 0, monitors: 0 };
+  return (d: Pick<SessionData, 'items' | 'rev' | 'changed'> | undefined): WorkSince => {
+    if (!d) return { since: 0, monitors: 0 };
+    if (d.items === items && d.rev === rev) return out;
+    const changed = d.items === items ? changedSince(d, rev) : null;
+    const look = (id: string) => {
+      const it = d.items[id];
+      if (it?.type === 'tool' && it.task?.state === 'running') running.set(id, { at: it.task.since, monitor: it.task.kind === 'monitor' });
+      else if (it?.type === 'tool' && worksInBackground(it)) running.set(id, { at: it.ts, monitor: false });
+      else running.delete(id);
+    };
+    if (changed) for (const id of changed) look(id);
+    else {
+      running.clear();
+      for (const id in d.items) look(id);
+    }
+    items = d.items;
+    rev = d.rev;
+    let since = 0;
+    let monitors = 0;
+    for (const r of running.values()) {
+      if (!since || r.at < since) since = r.at;
+      if (r.monitor) monitors++;
+    }
+    if (since !== out.since || monitors !== out.monitors) out = { since, monitors };
+    return out;
+  };
+}
+
 /** "45s", "4m", "1h 5m": how long a background command has run, to the minute once past one. */
 function waited(ms: number): string {
   const s = Math.max(1, Math.round(ms / 1000));
@@ -80,16 +128,21 @@ export const Tail = memo(function Tail() {
   const info = useStore((s) => tailInfo(s.data[sessionId]));
   const agents = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).agents);
   const commands = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).commands);
-  const [since] = useState(commandsSince);
-  const oldest = useStore((s) => (commands ? since(s.data[sessionId]) : 0));
+  const [read] = useState(workSince);
+  const work = useStore((s) => (agents || commands ? read(s.data[sessionId]) : NO_WORK));
   const working = status === 'running' || status === 'starting';
-  const now = useTick(working || (!agents && oldest > 0));
+  const background = !working && status !== 'awaiting' && (agents > 0 || commands > 0);
+  const now = useTick(working || (background && work.since > 0));
+  // Laid out with the chat (history): it simply stands. Only work that begins while the person
+  // watches rises in.
+  const fresh = useFresh();
   if (!working && status !== 'awaiting') {
-    if (!agents && !commands) return null;
-    const label = agents ? workLabel({ background: agents, commands }) : `Waiting for ${commands} background ${commands === 1 ? 'command' : 'commands'}`;
-    const ran = !agents && oldest ? now - oldest : 0;
+    if (!background) return null;
+    // The bridge's counts are the truth; the items only tell which commands are monitors.
+    const label = tailLabel({ agents, commands, monitors: Math.min(work.monitors, commands) });
+    const ran = work.since ? now - work.since : 0;
     return (
-      <button type="button" className="tail tail-bg" onClick={() => showRailTab('agents')} aria-label={`${label}. Open Agents`}>
+      <button type="button" className="tail tail-bg" data-enter={fresh || undefined} onClick={() => showRailTab('agents')} aria-label={`${label}. Open Agents`}>
         <span className="row-slot">
           <Tiles size={14} />
         </span>
@@ -112,7 +165,7 @@ export const Tail = memo(function Tail() {
 
   if (status === 'awaiting') {
     return (
-      <div className="tail" data-status="awaiting" role="status">
+      <div className="tail" data-status="awaiting" data-enter={fresh || undefined} role="status">
         <span className="row-slot tail-wait-icon">
           <Icon name="hourglass" size={15} />
         </span>
@@ -122,7 +175,7 @@ export const Tail = memo(function Tail() {
   }
 
   return (
-    <div className="tail" data-status={status} data-quiet={quietRaw === '1' || undefined} role="status" aria-live="off">
+    <div className="tail" data-status={status} data-enter={fresh || undefined} data-quiet={quietRaw === '1' || undefined} role="status" aria-live="off">
       <span className="row-slot">
         <Tiles size={14} />
       </span>

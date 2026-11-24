@@ -134,14 +134,17 @@ export function poolTotals(inputs: PoolInput[], now: number): PoolTotal[] {
   return out;
 }
 
-/** Percent of an agent's weeks left: the complement of the used figure the Usage page draws (49% used, 51% left). */
-export function poolLeftPercent(t: PoolTotal): number {
-  return 100 - Math.min(100, Math.round(t.week.used));
+/** Percent of an agent's weeks used across its accounts: the figure the Usage page's meter draws (usage is always said as used, `words.ts`). */
+export function poolUsedPercent(t: PoolTotal): number {
+  return Math.min(100, Math.round(t.week.used));
 }
 
-/** "4.8 of 9.4 Ultra weeks left". */
+/** The weeks used in units of the largest plan: the whole less what is left. */
+export const poolWeeksUsed = (t: PoolTotal) => Math.max(0, t.week.size - t.week.left);
+
+/** "4.6 of 9.4 Ultra weeks used". */
 export function poolWeeksText(t: PoolTotal): string {
-  return `${units(t.week.left)} of ${units(t.week.size)} ${t.unit} weeks left`;
+  return `${units(poolWeeksUsed(t))} of ${units(t.week.size)} ${t.unit} weeks used`;
 }
 
 /** "2.6", "2", "0.4", "12": one decimal while it matters. */

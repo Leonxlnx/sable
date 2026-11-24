@@ -22,9 +22,11 @@ const MAX_LINES = 3;
 export function LaneSection({ sessionId, lane, cwd }: { sessionId: string; lane: SessionLane; cwd: string }) {
   const entry = useLaneForecast(sessionId, lane.path);
   const f = entry?.forecast;
-  const status = useStore((s) => s.sessions[sessionId]?.status);
+  const working = useStore((s) => {
+    const m = s.sessions[sessionId];
+    return m?.status === 'running' || m?.status === 'starting' || m?.status === 'awaiting' || !!m?.background || !!m?.commands;
+  });
   const title = useStore((s) => s.sessions[sessionId]?.title ?? '');
-  const working = status === 'running' || status === 'starting' || status === 'awaiting';
   const [message, setMessage] = useState(() => drafts.get(lane.path) ?? '');
   const [busy, setBusy] = useState<'land' | 'discard' | null>(null);
   const [confirm, setConfirm] = useState(false);
@@ -64,10 +66,13 @@ export function LaneSection({ sessionId, lane, cwd }: { sessionId: string; lane:
     const res = await landLane(sessionId, message.trim() || title);
     setBusy(null);
     // The conversation says where it landed; the header's mark folds back into the branch.
-    if (res.ok) drafts.delete(lane.path);
-    else setError(res.error ?? 'Could not land the lane.');
+    if (res.ok) {
+      drafts.delete(lane.path);
+      if (useStore.getState().sessions[sessionId]?.lane?.path === lane.path) void refreshLane(sessionId);
+    } else setError(res.error ?? 'Could not land the lane.');
   };
   const discard = async () => {
+    if (working || busy) return;
     setBusy('discard');
     setError(null);
     const res = await discardLane(sessionId);
@@ -126,7 +131,7 @@ export function LaneSection({ sessionId, lane, cwd }: { sessionId: string; lane:
           <button type="button" className="btn btn-sm btn-ghost" autoFocus onClick={() => setConfirm(false)}>
             Cancel
           </button>
-          <button type="button" className="btn btn-sm btn-danger" disabled={busy === 'discard'} onClick={() => void discard()}>
+          <button type="button" className="btn btn-sm btn-danger" disabled={working || !!busy} onClick={() => void discard()}>
             {busy === 'discard' ? <Spinner size={12} /> : <Icon name="trash" size={14} />}
             Discard
           </button>
@@ -159,10 +164,10 @@ export function LaneSection({ sessionId, lane, cwd }: { sessionId: string; lane:
             />
           )}
           <div className="lane-actions">
-            <button type="button" className="btn btn-sm btn-ghost" disabled={!!busy} onClick={() => setConfirm(true)}>
+            <button type="button" className="btn btn-sm btn-ghost" disabled={working || !!busy} onClick={() => setConfirm(true)}>
               Discard lane
             </button>
-            <Tip label={working ? 'Lands when the turn has ended' : f?.uncommitted ? `Commits ${plural(f.uncommitted, 'file')}, then lands on ${target}` : `Lands on ${target}`} keys="mod+enter" side="top">
+            <Tip label={working ? 'Wait for the agent to finish before landing' : f?.uncommitted ? `Commits ${plural(f.uncommitted, 'file')}, then lands on ${target}` : `Lands on ${target}`} keys="mod+enter" side="top">
               <button type="submit" className="btn btn-sm btn-primary lane-land-btn" disabled={!canLand} aria-disabled={!canLand}>
                 {busy === 'land' && <Spinner size={12} />}
                 Land on {target}

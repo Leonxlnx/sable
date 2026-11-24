@@ -2509,6 +2509,30 @@ button:hover > .row-caret {
   color: var(--text-4);
 }
 
+/* A cut turn whose process left words: the line opens to them, as a work line opens to its steps. */
+.early-toggle {
+  border-radius: var(--r-xs);
+  transition: color var(--d-1) var(--ease);
+}
+
+.early-toggle:hover {
+  color: var(--text-2);
+}
+
+.early-toggle:focus-visible {
+  outline: var(--focus-w) solid var(--focus);
+  outline-offset: 2px;
+}
+
+.early-words {
+  margin: 2px 0 6px 18px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .turn-hover {
   display: inline-flex;
   align-items: center;
@@ -2671,18 +2695,23 @@ button:hover > .row-caret {
   padding: 0 var(--gutter);
   flex-shrink: 0;
   font-size: 12.5px;
-  /* A short rise, the working mark building tile by tile in its diagonal order, then the label. */
+}
+
+/* Work that begins while the person watches (Tail marks it `data-enter`): a short rise, the working
+   mark building tile by tile in its diagonal order, then the label. Laid out with the chat it simply
+   stands, from the first frame. */
+.tail[data-enter] {
   animation: rise-in 300ms var(--ease-out) 120ms backwards;
 }
 
-.tail .tiles-active i {
+.tail[data-enter] .tiles-active i {
   animation:
     tile-wave 1.5s var(--ease) infinite,
     tile-build 260ms var(--ease-out) backwards;
   animation-delay: calc(var(--d) * 105ms), calc(var(--d) * 42ms + 140ms);
 }
 
-.tail .tail-label {
+.tail[data-enter] .tail-label {
   animation: fade-in 220ms var(--ease) 260ms backwards;
 }
 
@@ -2737,6 +2766,29 @@ button:hover > .row-caret {
   animation: fade-in 200ms var(--ease) backwards;
 }
 
+/* The title keeps its sweep after it has faded in: the fades above set the whole `animation`, which
+   took `.shimmer`'s loop away for good, and a still title reads as a stalled turn. */
+.tl-work[data-enter][data-live] > .work-head .work-live-title.shimmer {
+  animation:
+    fade-in 220ms var(--ease) 380ms backwards,
+    shimmer 2.4s linear infinite;
+}
+
+.tl-work[data-next][data-live] > .work-head .work-live-title.shimmer {
+  animation:
+    fade-in 200ms var(--ease) backwards,
+    shimmer 2.4s linear infinite;
+}
+
+/* Effects shed (`data-quality`): the fade stays, the sweep goes, as for every `.shimmer`. */
+:root[data-quality] .tl-work[data-enter][data-live] > .work-head .work-live-title.shimmer {
+  animation: fade-in 220ms var(--ease) 380ms backwards;
+}
+
+:root[data-quality] .tl-work[data-next][data-live] > .work-head .work-live-title.shimmer {
+  animation: fade-in 200ms var(--ease) backwards;
+}
+
 @keyframes tile-build {
   from {
     scale: 0;
@@ -2744,12 +2796,13 @@ button:hover > .row-caret {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tail {
+  .tail[data-enter] {
     animation: fade-in var(--d-3) var(--ease);
   }
-  .tail .tail-label,
+  .tail[data-enter] .tail-label,
   .tl-work[data-next][data-live] > .work-head :is(.work-label, .work-time),
-  .tl-work[data-enter][data-live] > .work-head :is(.work-label, .work-time) {
+  .tl-work[data-enter][data-live] > .work-head :is(.work-label, .work-time),
+  :root .tl-work[data-live] > .work-head .work-live-title.shimmer.shimmer {
     animation: none;
   }
   .tl-work[data-enter][data-live] > .work-head {

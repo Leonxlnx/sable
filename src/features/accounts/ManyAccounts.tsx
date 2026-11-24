@@ -3,8 +3,9 @@ import { DropdownMenu as RM } from 'radix-ui';
 import type { AccountInfo, LimitsReport, ProviderId, ProviderInfo, RateLimit } from '@shared/protocol';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { isApiKey, planText, windowLevel } from '@/features/usage/format';
-import { poolLeftPercent, poolTotals, poolWeeksText, type PoolInput, type PoolTotal } from '@/features/usage/plans';
-import { livePercent, roomRow, tightest, type RoomInput, type RoomRow } from '@/features/usage/room';
+import { poolTotals, poolUsedPercent, poolWeeksText, type PoolInput, type PoolTotal } from '@/features/usage/plans';
+import { roomRow, type RoomInput, type RoomRow } from '@/features/usage/room';
+import { accountUsed, usedPercent, usedText } from '@/features/usage/words';
 import { Icon } from '@/icons';
 import { useNow } from '@/lib/useNow';
 import { accountName } from '@/state/hooks';
@@ -15,7 +16,7 @@ import { rankWords, shortUntil, useFirstRanks } from './order';
 import type { UseFirstRank } from '@shared/use-first';
 import { appliesTo } from '@/features/usage/scope';
 
-/** From this many accounts on, the switcher filters, groups and orders by room left. */
+/** From this many accounts on, the switcher filters, groups and orders its accounts. */
 export const MANY_ACCOUNTS = 8;
 
 const COLLAPSED_KEY = 'sable.accounts.collapsed';
@@ -51,7 +52,7 @@ function entriesOf(provider: ProviderId, info: ProviderInfo | undefined, reports
   });
 }
 
-/** What is left across an agent's accounts, weighted by plan (as on the Usage page); undefined below two accounts with figures. */
+/** How much is used across an agent's accounts, weighted by plan (as on the Usage page); undefined below two accounts with figures. */
 function poolOf(entries: Entry[], now: number): PoolTotal | undefined {
   return poolTotals(entries, now)[0];
 }
@@ -213,7 +214,7 @@ export function ManyAccounts({
               >
                 <ProviderMark provider={g.id} size={14} className="acs-mark" />
                 <span className="acs-name truncate">{PROVIDER_NAME[g.id]}</span>
-                {g.pool ? <PoolLeft total={g.pool} /> : <span className="acs-left num">{free} of {g.rows.length} with room</span>}
+                {g.pool ? <PoolUsed total={g.pool} /> : <span className="acs-left num">{free} of {g.rows.length} with room</span>}
                 <span className="acs-end">
                   <Icon name="caret-down" size={11} className="acs-fold" />
                 </span>
@@ -233,7 +234,7 @@ export const planOf = (a: AccountInfo) => (a.auth.loggedIn ? (planWord(a) ?? pla
 function ManyRow({ row, now, rank, inUse, single, onPeek, onSelect }: { row: RoomRow<Entry>; now: number; rank?: UseFirstRank; inUse: boolean; single?: boolean; onPeek: () => void; onSelect: () => void }) {
   const { account, provider } = row.input;
   const plan = planOf(account);
-  const used = row.tight ? Math.round(livePercent(row.tight, now)) : undefined;
+  const used = row.tight ? usedPercent(row.tight, now) : undefined;
   const words = rankWords(rank, now);
   const mark = accountMark(account, inUse ? account.id : undefined);
   return (
@@ -244,7 +245,7 @@ function ManyRow({ row, now, rank, inUse, single, onPeek, onSelect }: { row: Roo
       data-out={!account.auth.loggedIn || undefined}
       onFocus={onPeek}
       onSelect={onSelect}
-      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${used}% used` : ''}${words ? `, ${words.toLowerCase()}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${markWords(mark)}`}
+      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${usedText(used)}` : ''}${words ? `, ${words.toLowerCase()}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${markWords(mark)}`}
     >
       {single ? (
         <ProviderMark provider={provider} size={14} className="acs-mark" />
@@ -307,7 +308,7 @@ export function EndsCell({ rank, now }: { rank: UseFirstRank | undefined; now: n
  */
 export function UsedCell({ limit, now }: { limit: RateLimit | undefined; now: number }) {
   if (!limit) return <span className="acs-used" aria-hidden />;
-  const used = Math.round(livePercent(limit, now));
+  const used = usedPercent(limit, now);
   const level = windowLevel(limit, now);
   return (
     <span className="acs-used" aria-hidden>
@@ -330,23 +331,22 @@ export function AccountUsed({ provider, accountId, model }: { provider: Provider
   });
   const now = useNow();
   // For a session, only the windows that hold back its model: another model's full week is not this chat's.
-  return <UsedCell limit={tightest(model ? limits?.filter((l) => appliesTo(l, model)) : limits, now)} now={now} />;
+  return <UsedCell limit={accountUsed(model ? limits?.filter((l) => appliesTo(l, model)) : limits, now)?.limit} now={now} />;
 }
 
-/** "51% left": an agent's weeks left across its accounts, weighted by plan; amber near the end (as its used meter on the Usage page), red at it. */
-function PoolLeft({ total }: { total: PoolTotal }) {
-  const left = poolLeftPercent(total);
+/** "49% used": an agent's weeks used across its accounts, weighted by plan; amber from 80% (as its meter on the Usage page), red when used up. */
+function PoolUsed({ total }: { total: PoolTotal }) {
+  const used = poolUsedPercent(total);
   return (
-    <span className="acs-left num" data-level={left <= 0 ? 'red' : left <= 20 ? 'amber' : undefined}>
-      {left}% left
+    <span className="acs-left num" data-level={used >= 100 ? 'red' : used >= 80 ? 'amber' : undefined}>
+      {usedText(used)}
     </span>
   );
 }
 
 /**
- * The one figure the sidebar footer shows beside the account in focus: what is left of its agent's
- * weeks across all its accounts, weighted by plan (one Ultra counts as ten Pro), the same total the
- * Usage page draws ("51% left"; the tooltip says it in weeks). Nothing while the agent has fewer
+ * How much of an agent's weeks is used across all its accounts, weighted by plan (one Ultra counts
+ * as ten Pro), the same total the Usage page draws ("49% used"; the tooltip says it in weeks). Nothing while the agent has fewer
  * than two accounts with a known plan and figures: the account's own limit mark says it all then.
  */
 export function usePool(provider: ProviderId, info: ProviderInfo | undefined): PoolTotal | undefined {
@@ -361,7 +361,7 @@ export function PoolFigure({ provider, total }: { provider: ProviderId; total: P
   return (
     <Tip label={`${PROVIDER_NAME[provider]}: ${poolWeeksText(total)}`} side="top">
       <span className="acs-room">
-        <PoolLeft total={total} />
+        <PoolUsed total={total} />
       </span>
     </Tip>
   );

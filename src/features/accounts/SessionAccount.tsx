@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { DEFAULT_ACCOUNT, type AccountInfo, type RateLimit } from '@shared/protocol';
-import { clock } from '@/features/usage/format';
+import { resetsText, windowState } from '@/features/usage/words';
 import { limitTitle, useSessionLimits } from '@/features/usage/scope';
 import { Icon } from '@/icons';
 import { openSettings, switchSessionAccount } from '@/state/actions';
@@ -10,7 +10,8 @@ import { useStore } from '@/state/store';
 import { Spinner, Tip } from '@/ui';
 import { AccountUsed, planOf } from './ManyAccounts';
 
-const stateOf = (l: RateLimit) => (l.percent >= 100 ? 'reached' : `at ${Math.round(l.percent)}%`);
+/** "used up", "82% used": the share used, as everywhere (`usage/words.ts`). */
+const stateOf = (l: RateLimit) => windowState(l, Date.now());
 
 /**
  * The account a session runs under, quietly in the session's header, only when its agent has more
@@ -101,7 +102,7 @@ function SessionAccountMenu({ sessionId, provider, accountId, accounts, lim, row
                       <span className="sa-limit-text">
                         {limitTitle(l.label)} {stateOf(l)}
                       </span>
-                      {l.resetsAt && <span className="sa-limit-reset num">{clock(l.resetsAt)}</span>}
+                      {resetsText(l.resetsAt, Date.now()) && <span className="sa-limit-reset num">{resetsText(l.resetsAt, Date.now())}</span>}
                     </div>
                   );
                 })}

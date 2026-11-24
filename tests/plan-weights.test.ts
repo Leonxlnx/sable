@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AuthState, ProviderId, RateLimit } from '@shared/protocol';
-import { planSize, poolLeftPercent, poolTotals, poolWeeksText, poolWindow, units, type PoolInput } from '../src/features/usage/plans';
+import { planSize, poolTotals, poolUsedPercent, poolWeeksText, poolWindow, units, type PoolInput } from '../src/features/usage/plans';
 
 const NOW = Date.parse('2026-11-18T12:00:00Z');
 const WEEK_RESET = NOW + 3 * 86_400_000;
@@ -82,16 +82,16 @@ describe('left across accounts', () => {
     expect(t.short!.left).toBeCloseTo(0.8 + 1 + 0 + 0.625 * (0.9 + 0.5 + 1));
     expect(units(t.week.left)).toBe('2.8');
     expect(units(t.week.size)).toBe('4.9');
-    // The sidebar's one figure: the complement of the used share the Usage page draws.
-    expect(poolLeftPercent(t)).toBe(56);
-    expect(poolWeeksText(t)).toBe('2.8 of 4.9 Ultra weeks left');
+    // The sidebar's one figure is the used share the Usage page draws: usage is always said as used.
+    expect(poolUsedPercent(t)).toBe(44);
+    expect(poolWeeksText(t)).toBe('2.1 of 4.9 Ultra weeks used');
   });
 
-  it('says nothing is left once every week is used up, and never more than everything', () => {
+  it('says everything is used once every week is used up, and never more than everything', () => {
     const full = poolTotals([acct('claude', claude('Ultra'), [week(100)]), acct('claude', claude('Pro'), [week(100)])], NOW)[0];
-    expect(poolLeftPercent(full)).toBe(0);
+    expect(poolUsedPercent(full)).toBe(100);
     const fresh = poolTotals([acct('claude', claude('Ultra'), [week(0)]), acct('claude', claude('Pro'), [week(0)])], NOW)[0];
-    expect(poolLeftPercent(fresh)).toBe(100);
+    expect(poolUsedPercent(fresh)).toBe(0);
   });
 
   it('counts a window whose reset passed as empty', () => {

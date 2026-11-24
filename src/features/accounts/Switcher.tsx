@@ -4,9 +4,8 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { DEFAULT_ACCOUNT, type AccountInfo, type ProviderId, type ProviderInfo, type RateLimit } from '@shared/protocol';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { LimitsGlance } from '@/features/usage';
-import { clock, orderWindows, windowLevel } from '@/features/usage/format';
+import { orderWindows, windowLevel } from '@/features/usage/format';
 import { useAccountWindows } from '@/features/usage/Limits';
-import { livePercent, tightest } from '@/features/usage/room';
 import { useNow } from '@/lib/useNow';
 import { Tip } from '@/ui';
 import { Icon } from '@/icons';
@@ -16,7 +15,8 @@ import { accountKey, useStore } from '@/state/store';
 import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, MarkCell, planOf, SignIn, usePool } from './ManyAccounts';
 import { useAccountOrder } from './order';
 import type { UseFirstRank } from '@shared/use-first';
-import { poolLeftPercent } from '@/features/usage/plans';
+import { poolUsedPercent } from '@/features/usage/plans';
+import { accountUsed, resetsText, usedPercent, usedText } from '@/features/usage/words';
 import { accountAgents, accountInUse, accountMark, accountsOf, markWords, openAddAccount, planWord } from './model';
 import { signedOut } from '@/lib/sign-in';
 
@@ -52,11 +52,10 @@ const FOCUS_IN_USE = {
  * The sidebar footer's account switcher. The row is one line that fits the narrowest sidebar: the
  * agent's mark, one name (the account's label when the agent has several, its plan otherwise) and
  * how much of its most used window is used as a small ring and figure, the same figure its row in
- * the menu shows. The tooltip says it in full (plan, every window, resets, what is left across the
- * agent's accounts). It opens every agent's
- * It opens every agent's
- * accounts as rows with the plan and how full each is, the account in use checked (the open chat's
- * own; `accountMark` in model.ts). Pointing at a row (or
+ * the menu shows. The tooltip says it in full (plan, every window and its reset, how much of the
+ * agent's weeks is used across its accounts: always as used, `usage/words.ts`). It opens every
+ * agent's accounts as rows with the plan and how full each is, the account in use checked (the open
+ * chat's own; `accountMark` in model.ts). Pointing at a row (or
  * moving to it with the keys) shows that account's limits beside the menu. Picking one makes it the
  * account new sessions use.
  */
@@ -100,13 +99,13 @@ export function AccountSwitcher() {
   // The ring is drawn, not read: its figure goes into the control's name.
   const windows = useAccountWindows(focus, current?.id ?? DEFAULT_ACCOUNT).limits;
   const now = useNow();
-  const tight = on ? tightest(windows, now) : undefined;
+  const used = on ? accountUsed(windows, now) : undefined;
   const described = [
     PROVIDER_NAME[focus],
     several && current ? accountName(current) : undefined,
     on ? (plan ? `${plan} plan` : undefined) : current?.auth.checking ? undefined : 'not signed in',
-    tight ? `${Math.round(livePercent(tight, now))}% of ${tight.label} used` : undefined,
-    pool ? `${poolLeftPercent(pool)}% left across its accounts` : undefined,
+    used ? `${used.limit.label} ${usedText(used.pct)}` : undefined,
+    pool ? `${usedText(poolUsedPercent(pool))} across its accounts` : undefined,
   ]
     .filter(Boolean)
     .join(', ');
@@ -292,10 +291,10 @@ function triggerName(provider: ProviderId, account: AccountInfo | undefined, sev
 function LimitRing({ provider, accountId }: { provider: ProviderId; accountId: string }) {
   const { limits } = useAccountWindows(provider, accountId);
   const now = useNow();
-  const tight = tightest(limits, now);
-  if (!tight) return null;
-  const used = Math.round(livePercent(tight, now));
-  const level = windowLevel(tight, now);
+  const figure = accountUsed(limits, now);
+  if (!figure) return null;
+  const used = figure.pct;
+  const level = windowLevel(figure.limit, now);
   // The arc on the icons' 14 px grid: a hairline track and a 1.5 px arc of what is used.
   const r = 5.25;
   const c = 2 * Math.PI * r;
@@ -324,12 +323,12 @@ function TriggerTip({ provider, account, several, plan, pool }: { provider: Prov
         <span key={l.id} className="acs-tip-row">
           <span className="acs-tip-label">{l.label}</span>
           <span className="acs-tip-pct num" data-level={windowLevel(l, now)}>
-            {Math.round(livePercent(l, now))}% used
+            {usedText(usedPercent(l, now))}
           </span>
-          <span className="acs-tip-reset num">{l.resetsAt && l.resetsAt > now ? clock(l.resetsAt, now) : ''}</span>
+          <span className="acs-tip-reset num">{resetsText(l.resetsAt, now) ?? ''}</span>
         </span>
       ))}
-      {pool && <span className="acs-tip-pool num">{poolLeftPercent(pool)}% left across its accounts</span>}
+      {pool && <span className="acs-tip-pool num">{usedText(poolUsedPercent(pool))} across its accounts</span>}
     </span>
   );
 }

@@ -9,7 +9,7 @@ import { cx, IconButton, Switch, Tip } from '@/ui';
 import { clock, duration, exactTime, isApiKey, NUMBER_LOCALE, orderWindows, STALE_MS, windowLevel, windowNote } from './format';
 import { LimitsOverview, LimitsTotals } from './Overview';
 import { planShort } from './plans';
-import { livePercent } from './room';
+import { resetsText, usedPercent, usedText } from './words';
 import { fullTarget, LimitReset, resetTarget } from './LimitReset';
 import { useResetInAgent } from './ResetInAgent';
 import { useLimitsTicker } from './ticker';
@@ -29,14 +29,14 @@ const AGED_MS = 10 * 60_000;
  */
 export const WindowLine = memo(function WindowLine({ limit, pace, now }: { limit: RateLimit; pace?: LimitPace; now: number }) {
   const past = !!limit.resetsAt && limit.resetsAt <= now;
-  const pct = Math.round(livePercent(limit, now));
+  const pct = usedPercent(limit, now);
   const level = windowLevel(limit, now);
   const note = windowNote(limit, pace, now);
   return (
     <div className="ulw" data-level={level} data-past={past || undefined}>
       <span className="ulw-label truncate">{limit.label}</span>
       <span className="ulw-bar">
-        <span className="meter ulw-meter" data-level={level} role="progressbar" aria-label={limit.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
+        <span className="meter ulw-meter" data-level={level} role="progressbar" aria-label={limit.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-valuetext={usedText(pct)}>
           <span className="meter-fill" style={{ '--p': Math.max(pct, pct > 0 ? 1.5 : 0) / 100 } as CSSProperties} />
         </span>
         <span className="ulw-pct num">{pct}%</span>
@@ -444,7 +444,7 @@ function ResetCell({ at, now }: { at?: number; now: number }) {
   if (!at || at <= now) return <span className="ulw-reset" />;
   return (
     <Tip label={exactTime(at)} side="bottom">
-      <span className="ulw-reset num" tabIndex={0} aria-label={`Resets in ${duration(at - now)}`}>
+      <span className="ulw-reset num" tabIndex={0} aria-label={resetsText(at, now)}>
         {duration(at - now)}
       </span>
     </Tip>
