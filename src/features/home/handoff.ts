@@ -1,7 +1,7 @@
 import { barLeaving, HOLD_MS, launchRead, RELEASE } from '@/features/composer/flight';
 import { BAR_LEAVES, COLLAPSE, collapseEase, GLIDE, linearEasing } from '@/features/composer/signal-shape';
 import { holdSend } from '@/features/composer/settle';
-import { ARROW_OUT, ARROW_OUT_EASE, ARROW_OUT_MS, KEY_GIVE, KEY_GIVE_MS, SQUARE_IN, SQUARE_IN_AT, SQUARE_IN_EASE, SQUARE_IN_MS } from '@/features/composer/launch';
+import { ARROW_OUT, ARROW_OUT_AT, ARROW_OUT_EASE, ARROW_OUT_MS, KEY_GIVE, KEY_GIVE_MS, SQUARE_IN, SQUARE_IN_AT, SQUARE_IN_EASE, SQUARE_IN_MS } from '@/features/composer/launch';
 import { reducedMotion, uiZoom } from '@/lib/motion';
 
 /**
@@ -300,7 +300,7 @@ export function beginHandoff(card: HTMLElement | null) {
     sq.className = 'sk-launch-sq';
     key.appendChild(sq);
     keyAnims.push(
-      arrow.animate(ARROW_OUT, { duration: ARROW_OUT_MS, delay: RELEASE, easing: ARROW_OUT_EASE, fill: 'forwards' }),
+      arrow.animate(ARROW_OUT, { duration: ARROW_OUT_MS, delay: ARROW_OUT_AT, easing: ARROW_OUT_EASE, fill: 'forwards' }),
       key.animate(KEY_GIVE, { duration: KEY_GIVE_MS, easing: 'linear' }),
       sq.animate(SQUARE_IN, { duration: SQUARE_IN_MS, delay: SQUARE_IN_AT, easing: SQUARE_IN_EASE, fill: 'both' }),
     );

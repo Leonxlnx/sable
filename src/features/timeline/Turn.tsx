@@ -8,13 +8,13 @@ import { Icon } from '@/icons';
 import { PROVIDER_NAME, ProviderMark } from '@/art/Logo';
 import { formatCost, formatTokens, isMac } from '@/lib/format';
 import { openPreview, previewTargets } from '@/lib/links';
-import { checkTurn, forkAt, sendMessage } from '@/state/actions';
+import { checkTurn, forkAt, sendMessage, wholeMessage } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton } from '@/ui';
 import { changesOf } from './changes';
 import { canCheckWith, checkedAlready, checkerOf } from './check-turn';
 import { useItem, useTimeline } from './ctx';
-import { responseText, type TurnGroup } from './turns';
+import { responseText, turnShows, type TurnGroup } from './turns';
 import { stampParts } from './util';
 
 const textOf = (it: TimelineItem | undefined) => (it?.type === 'text' ? it.text.trim() : '');
@@ -108,9 +108,11 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
     if (!user || !syn) return user;
     return syn.role === 'command' ? { ...user, text: syntheticLine(syn) } : undefined;
   };
-  const retry = () => {
+  const retry = async () => {
     const user = again();
-    if (user) void sendMessage(sessionId, user.text, user.attachments ?? []);
+    if (!user) return;
+    const message = await wholeMessage(sessionId, user);
+    if (message) void sendMessage(sessionId, user.text, message.attachments ?? []);
   };
 
   const parts: string[] = [];
@@ -121,7 +123,10 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
 
   const retryShown = failed && !limitHolds && !!again();
   const errorShownHere = failed && end?.type === 'turn' && !!end.error && !errorShown;
-  if (!previews.length && !retryShown && !errorShownHere && !hasAnswer && !parts.length && turn.state !== 'interrupted') return null;
+  // A turn with nothing in view (work the agent began by itself that came to nothing, a result that
+  // booked only a cost) shows no figures either: "$0.10" alone under a message reads as a fault.
+  const shown = hasAnswer || turnShows(turn);
+  if (!previews.length && !retryShown && !errorShownHere && (!shown || !parts.length) && !hasAnswer && turn.state !== 'interrupted') return null;
   // When the turn ended: shown with the facts where the conversation is too narrow for the times in its margin (timeline.css).
   const when = end?.type === 'turn' && end.ts ? stampParts(end.ts) : null;
 
@@ -136,19 +141,7 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
           </div>
         </div>
       )}
-      <div className="turn-line">
-        {/* One page: "Preview" and its address. Several: each named by its address alone. */}
-        {previews.map((p) => (
-          <LazyTip key={p.url} label={`Opens in the Browser tab. ${isMac ? 'Cmd' : 'Ctrl'}+click opens your browser`} side="top">
-            <button type="button" className="preview-btn" onClick={(e) => openPreview(p.url, e.ctrlKey || e.metaKey)} aria-label={`Preview ${p.label}`}>
-              <Icon name="browser" size={14} className="preview-icon" />
-              {previews.length === 1 && <span className="preview-name">Preview</span>}
-              <span className={previews.length === 1 ? 'preview-host truncate' : 'preview-name truncate'}>{p.label}</span>
-            </button>
-          </LazyTip>
-        ))}
-        {/* A turn that edited a local page: its before and after, beside Preview. */}
-        <BeforeAfter sessionId={sessionId} turnId={turn.key} />
+      <div className="turn-line" data-bare={(!hasAnswer && !previews.length && !retryShown && turn.state !== 'interrupted') || undefined}>
         {retryShown && (
           <button type="button" className="btn btn-sm" onClick={retry}>
             <Icon name="refresh" size={13} />
@@ -161,18 +154,31 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
             Interrupted
           </span>
         )}
+        {/* One row of one kind, always there under an answer: the glyphs first, then the chips,
+            then the figures (on hover), all in the row's one quiet tone; the one pointed at lights. */}
         {hasAnswer && (
-          // Always there under an answer: quiet at rest, brighter on hover.
           <span className="turn-acts">
             <CopyButton text={() => responseText(items(), turn)} label="Copy response" size={13} className="turn-copy" />
             <IconButton icon="fork" label="Fork from here" size={13} tipSide="top" className="turn-fork" disabled={forking} onClick={fork} />
-            {canCheck && checker && (
-              <button type="button" className="preview-btn turn-check" disabled={checking} onClick={check}>
-                <ProviderMark provider={checker} size={12} />
-                <span className="preview-name">Check with {PROVIDER_NAME[checker]}</span>
-              </button>
-            )}
           </span>
+        )}
+        {/* One page: "Preview" and its address. Several: each named by its address alone. */}
+        {previews.map((p) => (
+          <LazyTip key={p.url} label={`Opens in the Browser tab. ${isMac ? 'Cmd' : 'Ctrl'}+click opens your browser`} side="top">
+            <button type="button" className="preview-btn" onClick={(e) => openPreview(p.url, e.ctrlKey || e.metaKey)} aria-label={`Preview ${p.label}`}>
+              <Icon name="browser" size={14} className="preview-icon" />
+              {previews.length === 1 && <span className="preview-name">Preview</span>}
+              <span className={previews.length === 1 ? 'preview-host truncate' : 'preview-name truncate'}>{p.label}</span>
+            </button>
+          </LazyTip>
+        ))}
+        {/* A turn that edited a local page: its before and after, beside Preview. */}
+        <BeforeAfter sessionId={sessionId} turnId={turn.key} />
+        {hasAnswer && canCheck && checker && (
+          <button type="button" className="preview-btn turn-check" disabled={checking} onClick={check}>
+            <ProviderMark provider={checker} size={12} />
+            <span className="preview-name">Check with {PROVIDER_NAME[checker]}</span>
+          </button>
         )}
         <span className="turn-hover">
           {parts.length > 0 && (

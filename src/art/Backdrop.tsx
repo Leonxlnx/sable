@@ -155,11 +155,12 @@ export function Backdrop({ surface, view = 'home', config, provider, status = 'i
     const awaiting = status === 'awaiting';
     const palette: DitherPalette = awaiting ? 'amber' : cfg.colour === 'mono' ? 'mono' : custom ? 'custom' : SESSION_PALETTE[agent];
     const k = amount / SESSION_REFERENCE;
-    const base = glowing ? 0.9 : awaiting ? 0.82 : 0.72;
+    // Working is a presence over the composer, not a mound: the band was about four times home's (audit of 24 Nov).
+    const base = glowing ? 0.7 : awaiting ? 0.82 : 0.72;
     // The horizon is a thin arc, not a floor of light: it holds a quiet presence at any amount
     // above zero (a line that cannot be seen is no horizon), and the amount adds to it.
     const rest = Math.min(0.7, 0.3 + 0.2 * k);
-    const lit2 = Math.min(1, 0.52 + 0.3 * k);
+    const lit2 = Math.min(0.85, 0.44 + 0.27 * k);
     // Working: the band drifts quicker. Waiting on you: it turns amber and stills (the field eases
     // its speed to nothing and stops drawing), so the stillness itself says "your turn".
     return (
@@ -173,6 +174,8 @@ export function Backdrop({ surface, view = 'home', config, provider, status = 'i
         opacity={glowing || awaiting ? lit2 : rest}
         reactGain={0.85}
         awake={working && surface === 'session'}
+        // The stage's band: a canvas of a fixed size, the light eased to the dock and the stage.
+        band={surface === 'session'}
       />
     );
   }

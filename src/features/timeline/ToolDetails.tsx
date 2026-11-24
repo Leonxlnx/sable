@@ -15,29 +15,6 @@ import { stepScope } from '@/features/review/jump';
 import { useTimeline, useWhole } from './ctx';
 import { hostOf, isActive, looksJson, partialJsonString, prettyJson } from './util';
 
-/** Whether a row has anything to reveal. */
-export function hasDetails(item: ToolItem): boolean {
-  const r = item.result;
-  const d = item.detail;
-  switch (item.kind) {
-    case 'bash':
-      return !!d.command || !!item.output || !!r?.text;
-    case 'edit':
-    case 'write':
-      return true;
-    case 'read':
-      return !!r?.file?.content || !!d.path;
-    case 'todo':
-      return !!d.todos?.length;
-    case 'question':
-      return !!d.questions?.length;
-    case 'skill':
-      return !!r?.text || !!d.skill;
-    default:
-      return !!r || item.input !== undefined || !!d.pattern || !!d.query || !!d.url;
-  }
-}
-
 // ───────────────────────────────── bash ─────────────────────────────────
 
 const MAX_OUTPUT = 120_000;

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { UserItem } from '@shared/protocol';
 import { stripWrappers, syntheticOf } from '@shared/synthetic';
-import { rewindTo, sendMessage } from '@/state/actions';
+import { rewindTo, sendMessage, wholeMessage } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger } from '@/ui';
 import { useTimeline } from './ctx';
@@ -46,14 +46,15 @@ export function MessageAgain({ item }: { item: UserItem }) {
   const edit = async () => {
     if (busy) return;
     setBusy(true);
-    const ok = await rewindTo(sessionId, item.id, false);
+    const message = await wholeMessage(sessionId, item);
+    const ok = message && await rewindTo(sessionId, item.id, false);
     setBusy(false);
     if (!ok) return;
     setOpen(false);
     const st = useStore.getState();
     // Something already typed is kept under the message, not replaced by it.
     const typed = st.drafts[sessionId]?.text.trim() ? `\n\n${st.drafts[sessionId]?.text}` : '';
-    st.setDraft(sessionId, { text: text + typed, attachments: [...(item.attachments ?? []), ...(st.drafts[sessionId]?.attachments ?? [])] });
+    st.setDraft(sessionId, { text: text + typed, attachments: [...(message.attachments ?? []), ...(st.drafts[sessionId]?.attachments ?? [])] });
     requestAnimationFrame(() => {
       const field = document.querySelector<HTMLTextAreaElement>('.dock textarea');
       field?.focus();
@@ -64,8 +65,8 @@ export function MessageAgain({ item }: { item: UserItem }) {
   const retry = async () => {
     if (busy) return;
     setBusy(true);
-    const ok = await rewindTo(sessionId, item.id, false);
-    if (ok) await sendMessage(sessionId, text, item.attachments ?? []);
+    const message = await wholeMessage(sessionId, item);
+    if (message && await rewindTo(sessionId, item.id, false)) await sendMessage(sessionId, text, message.attachments ?? []);
     setBusy(false);
   };
 

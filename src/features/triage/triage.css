@@ -160,8 +160,6 @@
      past, 10 px from the card's edge, their corner the card's less 10. */
   padding: 12px 18px 18px;
   overflow: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar) transparent;
   container-type: inline-size;
   opacity: 1;
   /* The next card's words come in once the answered one has mostly gone. */
@@ -329,7 +327,6 @@
   max-height: calc(46 * var(--vh));
   margin: 0 -8px;
   overflow: auto;
-  scrollbar-width: thin;
 }
 
 /* A choice is a plain row: nothing at rest, the hover fill, and the chosen one a flat pill. */

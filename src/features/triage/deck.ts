@@ -151,3 +151,15 @@ export function optionKeys(options: PermissionOption[]): OptionKeys {
   const hints = options.map((o, i) => (o === allow ? '↵' : o === always ? '⇧↵' : o === deny ? 'D' : i < 9 ? String(i + 1) : ''));
   return { allow, always, deny, hints };
 }
+
+/**
+ * One order of a permission's answers wherever it is asked (the card in the chat and the deck's):
+ * every no first, apart on the left; then the other answers in the agent's order; the plain allow
+ * (the primary, Enter's answer) last, on the right edge.
+ */
+export function answerOrder(options: PermissionOption[]): { no: PermissionOption[]; yes: PermissionOption[] } {
+  const { allow } = optionKeys(options);
+  const no = options.filter((o) => o.tone === 'deny' && o !== allow);
+  const yes = options.filter((o) => o.tone !== 'deny' && o !== allow);
+  return { no, yes: allow ? [...yes, allow] : yes };
+}

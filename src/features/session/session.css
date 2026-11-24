@@ -19,7 +19,7 @@
   left: 0;
   right: 0;
   bottom: 0;
-  height: min(64%, calc((var(--dock-h, 126px) - 3px) * 1.89));
+  height: min(64%, calc((var(--dock-h, 126px) - 3px) * 1.6));
   pointer-events: none;
 }
 
@@ -28,22 +28,33 @@
   pointer-events: none;
 }
 
-/* The upward fade is an overlay in the stage colour, not a mask over the animated field. */
-.session-light::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(to top, rgb(13 13 15 / 0) 0%, rgb(13 13 15 / 0.1) 52%, rgb(13 13 15 / 0.7) 80%, var(--sheet) 100%);
-}
-
 /* The band arrives by the field's own fade (art.css: from nothing once its first frame is drawn).
    No animation of its own here: one running on the field's opacity kept that fade from starting,
-   so the band appeared whole in one frame, some time after everything else had settled. The
-   fade under it (::after) is in the stage colour over the stage: present from the first frame. */
+   so the band appeared whole in one frame, some time after everything else had settled.
+   Its canvas never changes size with the stage or the dock: a box as wide as the window and as tall
+   as the band can ever be, centred on the band and cut by the stage. This box above only measures
+   the band; the field (DitherField `band`) eases its light to it and to the stage's width, and
+   draws the upward fade into the stage's ink itself (field.ts `bandFade`). A resized canvas was
+   redrawn at its new size in one frame: the arc jumped when the sidebar's freeze let go, and the
+   whole pattern stepped with every line typed. */
 .session-light > .dither {
+  inset: auto;
+  left: 50%;
+  bottom: 0;
+  width: calc(100vw / var(--ui-zoom, 1));
+  height: calc(64vh / var(--ui-zoom, 1));
+  translate: -50% 0;
   transition-duration: 1200ms;
   /* Even in and out: a light coming up, not a thing arriving. */
   transition-timing-function: cubic-bezier(0.3, 0, 0.3, 1);
+}
+
+/* The cells' hairline screen stays on the band, fading upward as the light does (it is static, so
+   a mask is allowed here); over the bare stage it read as a ruled sheet. */
+.session-light > .dither-grid::after {
+  top: auto;
+  height: min(100%, calc((var(--dock-h, 126px) - 3px) * 1.6));
+  mask-image: linear-gradient(to top, #000 0%, rgb(0 0 0 / 0.9) 52%, rgb(0 0 0 / 0.3) 80%, transparent 100%);
 }
 
 /* The dock's layer in the stage (App.tsx): above the conversation; above the dither veil too while

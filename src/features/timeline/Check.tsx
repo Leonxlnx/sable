@@ -8,7 +8,6 @@ import { FileLinksProvider, useResolvedFiles } from '@/lib/file-links';
 import { plural } from '@/lib/format';
 import { stopCheck } from '@/state/actions';
 import { useStore } from '@/state/store';
-import { IconButton } from '@/ui';
 import { TrailStep, useTicker } from './Agent';
 import { agentLimitText, agentTrail, readTrail } from './agent-line';
 import { checkFailure, findingsMessage, hasFindings, withLineRefs } from './check-turn';
@@ -60,7 +59,12 @@ export const CheckBlock = memo(function CheckBlock({ item, tail = TAIL, scope = 
           </span>
           <Icon name="caret-right" size={10} className="row-caret" />
         </button>
-        {live && <IconButton icon="stop" label="Stop the check" size={11} tipSide="top" className="check-stop" onClick={() => void stopCheck(sessionId, item.id)} />}
+        {/* The word, not a lone 9 px square at the column's far end (it read as a stray pixel). */}
+        {live && (
+          <button type="button" className="btn btn-sm btn-ghost check-stop" aria-label="Stop the check" onClick={() => void stopCheck(sessionId, item.id)}>
+            Stop
+          </button>
+        )}
       </div>
       <div className="agent-under">
         <Collapse open={!!why}>{why && <div className="agent-line check-why truncate">{why}</div>}</Collapse>

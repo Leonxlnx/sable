@@ -348,6 +348,22 @@ export function runOf(runs: readonly NavRun[], mark: number): number {
 // ── the rail ──
 
 /** Between two runs on the rail (px). */
+/** The rail shows once the conversation is this many views tall, and hides again below `RAIL_HIDE`. */
+export const RAIL_SHOW = 2;
+export const RAIL_HIDE = 1.8;
+/**
+ * The fewest messages the rail is worth showing for. With one or two, one message is always in
+ * view or a scroll away, and two short dashes at the stage's edge read as a stray glyph: the rail
+ * says nothing until it has something to say.
+ */
+export const RAIL_MARKS = 3;
+
+/** Whether the rail shows: a conversation long enough to need it (`shown`: it shows now, so it hides only a little lower). */
+export function railShown(scrollHeight: number, viewHeight: number, marks: number, shown: boolean): boolean {
+  if (viewHeight <= 0 || marks < RAIL_MARKS) return false;
+  return scrollHeight > (shown ? RAIL_HIDE : RAIL_SHOW) * viewHeight;
+}
+
 export const RAIL_GAP = 6;
 /** Between two messages of the open run (px), and the least when the rail runs out of track. */
 const PITCH = 5;

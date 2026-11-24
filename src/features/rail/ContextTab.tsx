@@ -92,18 +92,21 @@ export function ContextTab({ sessionId, active }: { sessionId: string; active: b
       </div>
     <div className="rail-scroll scroll">
       <div className="rail-stack cx-stack">
-        <section className="cx-card card" aria-label="Context window">
+        {/* One flat list on the panel, no card: the ring and its figure at a heading's size, then the
+            categories, the session's figures and the plan's limits as rows of label and figure. */}
+        <section className="cx-sec" aria-label="Context window">
           {view ? (
             <>
               <div className="cx-figure">
                 <Ring segments={view.segments} max={view.max} buffer={view.buffer} />
                 <div className="cx-numbers">
-                  <div className="cx-pct num" data-warn={pct > 80 || undefined}>
-                    {pct < 1 && pct > 0 ? '<1' : Math.round(pct)}
-                    <span className="cx-pct-sign">%</span>
-                  </div>
-                  <div className="cx-of num">
-                    {formatTokens(view.total)} of {formatTokens(view.max)} tokens
+                  <div className="cx-head num">
+                    <span className="cx-pct" data-warn={pct > 80 || undefined}>
+                      {pct < 1 && pct > 0 ? '<1' : Math.round(pct)}%
+                    </span>
+                    <span className="cx-of">
+                      {formatTokens(view.total)} of {formatTokens(view.max)}
+                    </span>
                   </div>
                   <div className="cx-left num">
                     {view.buffer > 0
@@ -175,13 +178,13 @@ export function ContextTab({ sessionId, active }: { sessionId: string; active: b
           <div className="rail-h">
             <span>This session</span>
           </div>
-          <div className="cx-stats">
+          <ul className="cx-legend cx-stats">
             <Stat label="Input" value={formatTokens(usage?.inputTokens)} />
             <Stat label="Output" value={formatTokens(usage?.outputTokens)} />
             <Stat label="Cached" value={formatTokens(usage?.cacheReadTokens)} />
-            <Stat label="Turns" value={String(usage?.turns ?? 0)} wide />
-            <Stat label="Cost" value={formatCost(usage?.costUsd)} wide />
-          </div>
+            <Stat label="Turns" value={String(usage?.turns ?? 0)} />
+            <Stat label="Cost" value={formatCost(usage?.costUsd)} />
+          </ul>
         </section>
 
         {provider && <Limits provider={provider} accountId={session.accountId} />}
@@ -197,17 +200,20 @@ function share(tokens: number, max: number) {
   return `${Math.round(p)}%`;
 }
 
-function Stat({ label, value, wide }: { label: string; value: string; wide?: boolean }) {
+/** One of the session's figures: a row of label and figure, as the categories above it. */
+function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="cx-stat card" data-wide={wide || undefined}>
-      <span className="cx-stat-value num">{value}</span>
-      <span className="cx-stat-label">{label}</span>
-    </div>
+    <li className="cx-row">
+      <span className="cx-name truncate">{label}</span>
+      <span className="cx-tokens num">{value}</span>
+    </li>
   );
 }
 
+/** The ring's size on the panel (CSS px): beside a heading's figure, not a display. */
+const RING = 40;
 const R = 52;
-const STROKE = 11;
+const STROKE = 16;
 const C = 2 * Math.PI * R;
 const GAP = 2.2;
 
@@ -223,7 +229,7 @@ function Ring({ segments, max, buffer }: { segments: Segment[]; max: number; buf
   const bufLen = (buffer / max) * C;
   const bufStart = C - bufLen;
   return (
-    <svg className="cx-ring" viewBox="0 0 128 128" width={128} height={128} aria-hidden>
+    <svg className="cx-ring" viewBox="0 0 128 128" width={RING} height={RING} aria-hidden>
       <defs>
         <pattern id="cx-hatch" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
           <rect width="4" height="4" fill="rgb(255 255 255 / 0.04)" />
@@ -271,7 +277,7 @@ function Limits({ provider, accountId }: { provider: ProviderId; accountId?: str
           <IconButton icon="refresh" label="Read limits now" size={13} onClick={() => void readLimitsNow(provider, accountId)} className="rail-h-btn" />
         </span>
       </div>
-      <div className="ul-rail card">
+      <div className="ul-rail cx-limits">
         {/* The tab keeps them current while it is shown; the glance only shows them. */}
         <LimitsGlance provider={provider} accountId={accountId} read={false} />
       </div>

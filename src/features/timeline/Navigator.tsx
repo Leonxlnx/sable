@@ -12,7 +12,7 @@ import { Kbd } from '@/ui';
 import { useTimeline } from './ctx';
 import { estimate } from './items';
 import { findMarks, onFindMarks, takeConversation, takeSteps, type NavFeed, type NavLayout } from './nav-bus';
-import { firstLine, groupAt, groupBoxes, groupHeight, indexLines, indexWindow, isBuilt, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, rowsMoved, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
+import { firstLine, groupAt, groupBoxes, groupHeight, indexLines, indexWindow, isBuilt, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, railShown, RAIL_HIDE, RAIL_SHOW, rowsMoved, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
 import { revealItem, rootOf } from './reveal';
 import type { Group, TurnGroup } from './turns';
 import { stampParts } from './util';
@@ -24,9 +24,6 @@ const LAND = 18;
 const FAR = 1.5;
 /** The glide at the end of a far jump (px). */
 const GLIDE = 220;
-/** The rail shows once the conversation is this many views tall, and hides again below `HIDE`. */
-const SHOW = 2;
-const HIDE = 1.8;
 /** The reading line, as a share of the view's height from its top: the message above it is the one being read. */
 const READ = 0.42;
 /** Keys pressed while a jump is on its way step on from where it goes (ms). */
@@ -283,7 +280,7 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
     const tr = track.current?.clientHeight ?? 0;
     const sH = sc.scrollHeight;
     // The track alone (the composer grew by a line): the rail keeps its middle and only learns its room.
-    const crosses = sH > SHOW * cH !== g.sH > SHOW * cH || sH > HIDE * cH !== g.sH > HIDE * cH;
+    const crosses = sH > RAIL_SHOW * cH !== g.sH > RAIL_SHOW * cH || sH > RAIL_HIDE * cH !== g.sH > RAIL_HIDE * cH;
     if (tr !== g.track || crosses) setGeo((geoRef.current = { ...g, track: tr, sH: crosses ? sH : g.sH }));
   }, [feed, scroller, measure]);
 
@@ -356,8 +353,7 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
 
   // Shown only when the conversation is long enough to need it.
   const [shown, setShown] = useState(false);
-  const tall = geo.cH > 0 && geo.sH > (shown ? HIDE : SHOW) * geo.cH;
-  const show = tall && marks.length >= 2;
+  const show = railShown(geo.sH, geo.cH, marks.length, shown);
   useEffect(() => setShown(show), [show]);
 
   // ── where the view is ──

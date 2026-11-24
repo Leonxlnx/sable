@@ -778,6 +778,15 @@ export function liveBelowCards(turn: Pick<TurnGroup, 'segments' | 'liveSegment'>
 }
 
 /**
+ * Whether a turn has anything of the agent's in view: work, something said or shown, an error. A
+ * turn that has none (a result that booked only a cost, work the agent began by itself that came to
+ * nothing) shows no figures of its own either: a cost standing alone under a message reads as a fault.
+ */
+export function turnShows(turn: Pick<TurnGroup, 'segments'>): boolean {
+  return turn.segments.some((s) => s.work.length > 0 || s.flow.length > 0 || !!s.answer || !!s.reply || !!s.last || s.tail.length > 0 || s.errors.length > 0);
+}
+
+/**
  * The agent's own words in a cut turn's notice (`cutTurn`: the bridge's reason, a blank line, then
  * what the process said as it went), bounded; '' when it said nothing.
  */

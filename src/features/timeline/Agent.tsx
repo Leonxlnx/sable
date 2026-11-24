@@ -191,7 +191,7 @@ function AgentBody({ item, live }: { item: ToolItem; live: boolean }) {
   const errorText = failed ? (item.result?.stderr || item.result?.text || '').trim() : '';
 
   return (
-    <div className="agent-body">
+    <div className="agent-body" inert={item.more} aria-busy={item.more}>
       {prompt && (
         <button type="button" className="agent-prompt" aria-expanded={whole} aria-label={whole ? 'Show less of the task' : 'Show the whole task'} onClick={() => setWhole((w) => !w)}>
           {prompt}

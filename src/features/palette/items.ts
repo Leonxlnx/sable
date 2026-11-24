@@ -17,7 +17,7 @@ import { openRace, raceFolder, raceKey } from '@/features/race/race';
 import { goToMessage, goToMessageTarget } from '@/features/timeline/nav-bus';
 import { useStore, type RailTab } from '@/state/store';
 
-export type PaletteGroup = 'Recent' | 'Sessions' | 'Projects' | 'Prompts' | 'Actions' | 'Commands' | 'Skills' | 'Messages';
+export type PaletteGroup = 'Recent' | 'Sessions' | 'Projects' | 'Prompts' | 'Actions' | 'Panel' | 'Settings' | 'Commands' | 'Skills' | 'Messages';
 
 /** What an item turns the palette into instead of running (it stays open): naming the composer's text to save it. */
 export type PaletteMode = 'save-prompt';
@@ -125,7 +125,7 @@ export function buildItems(opts: {
   act('settings', 'Settings', 'settings', () => openSettings(), { keys: 'mod+,', keywords: 'preferences' });
   for (const s of SETTINGS_SECTIONS) {
     if (s.id === 'shortcuts') continue;
-    act(`settings:${s.id}`, s.label, s.icon, () => openSettings(s.id), { sub: 'Settings', keywords: `settings preferences ${s.keywords}` });
+    act(`settings:${s.id}`, s.label, s.icon, () => openSettings(s.id), { group: 'Settings', keywords: `settings preferences ${s.keywords}` });
   }
   // Customize Sable: the Customize chat, and the way back while something of the person's is applied.
   act('customize', 'Customize Sable', 'wand', () => void openCustomize(), { keywords: 'customize customise redesign restyle theme css styles look sidebar change sable agent' });
@@ -148,7 +148,7 @@ export function buildItems(opts: {
     act('toggle-panel', ui().railOpen ? 'Hide panel' : 'Show panel', 'sidebar', () => setUi({ railOpen: !ui().railOpen }), { keys: 'mod+j', keywords: 'toggle panel rail' });
     for (const t of RAIL_TABS) {
       const title = t.id === 'browser' ? 'Open browser' : t.label;
-      act(`panel:${t.id}`, title, t.icon, () => setUi({ railOpen: true, railTab: t.id }), { sub: 'Panel', keys: railTabKeys(t.id), keywords: RAIL_WORDS[t.id] ?? 'panel show open' });
+      act(`panel:${t.id}`, title, t.icon, () => setUi({ railOpen: true, railTab: t.id }), { group: 'Panel', keys: railTabKeys(t.id), keywords: RAIL_WORDS[t.id] ?? 'panel show open' });
     }
     // Switch agent: the same chat goes on with Claude Code or Codex (and back), from a handover.
     const other: ProviderId | undefined = opts.active.provider === 'claude' ? 'codex' : opts.active.provider === 'codex' ? 'claude' : undefined;
@@ -172,7 +172,7 @@ export function buildItems(opts: {
 
   for (const p of opts.installed) {
     if (p === opts.homeProvider && !opts.activeId) continue;
-    act(`provider:${p}`, `New session with ${PROVIDER_NAME[p]}`, 'compose', () => (setUi({ homeProvider: p }), goHome()), { sub: 'Switch provider', keywords: 'switch provider agent' });
+    act(`provider:${p}`, `New session with ${PROVIDER_NAME[p]}`, 'compose', () => (setUi({ homeProvider: p }), goHome()), { keywords: 'switch provider agent' });
   }
 
   act('shortcuts', 'Keyboard shortcuts', 'keyboard', () => openSettings('shortcuts'), { keywords: 'keys hotkeys bindings' });
@@ -200,8 +200,7 @@ export function buildItems(opts: {
         id: `cmd:${c.name}`,
         group: isSkill ? 'Skills' : 'Commands',
         title: `${isSkill ? opts.caps.skillTrigger : '/'}${label(c.name)}`,
-        sub: c.description,
-        keywords: c.name,
+        keywords: [c.name, c.description].filter(Boolean).join(' '),
         icon: isSkill ? 'skill' : 'prompt',
         tone: isSkill ? SKILL_TONE : undefined,
         run: () => focusComposer(`${isSkill ? opts.caps!.skillTrigger : '/'}${label(c.name)} `),
@@ -214,8 +213,7 @@ export function buildItems(opts: {
         id: `skill:${sk.name}`,
         group: 'Skills',
         title: `${opts.caps.skillTrigger}${label(sk.name)}`,
-        sub: sk.description,
-        keywords: sk.name,
+        keywords: [sk.name, sk.description].filter(Boolean).join(' '),
         icon: 'skill',
         tone: SKILL_TONE,
         run: () => focusComposer(`${opts.caps!.skillTrigger}${label(sk.name)} `),

@@ -410,14 +410,11 @@ export function withPrompts(data: Record<string, SessionData>, prompts: PendingP
   return next;
 }
 
-/**
- * A step fetched whole (`session.item`) in place of the cut one the snapshot brought
- * (`ToolItem.more`). Only that item changes; an item that is no longer cut stays as it is.
- */
-export function applyWholeItem(sessionId: string, item: TimelineItem) {
+/** Replace only the row that requested this response. A rewind, patch or newer snapshot wins the race. */
+export function applyWholeItem(sessionId: string, item: TimelineItem, asked?: TimelineItem) {
   editItems(sessionId, (d) => {
     const cur = d.items[item.id];
-    if (cur?.type !== 'tool' || !cur.more) return null;
+    if (!cur || cur.type !== item.type || !('more' in cur) || !cur.more || (asked && cur !== asked)) return null;
     d.items[item.id] = item;
     return { ids: [item.id] };
   });
@@ -864,8 +861,13 @@ export function startBridge() {
 // that holds only their waiting prompts. A dropped chat is fetched again when it is opened.
 // After the socket dropped, kept chats may have missed events: they are dropped too (`hello`).
 
-/** How many chats stay loaded besides those on screen, and how many items they may hold between them. */
-export const KEEP = { chats: 8, items: 20_000 };
+/**
+ * How many chats stay loaded besides those on screen, and how many items they may hold between them.
+ * 120,000 since old turns come as rows (a few hundred bytes a step, `server/core/trim.ts`): with
+ * 20,000 a long chat (12,000 to 60,000 items are real) was never kept beside another, so every
+ * switch between two long chats fetched tens of megabytes again.
+ */
+export const KEEP = { chats: 8, items: 120_000 };
 /** When each chat was last opened or fetched ahead (a counter, not a clock), and how many items it held then. */
 const used = new Map<string, { at: number; items: number }>();
 let useSeq = 0;

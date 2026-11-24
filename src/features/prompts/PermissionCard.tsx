@@ -11,6 +11,7 @@ import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { PathLabel } from '@/ui';
 import { usePromptKeys } from './keys';
+import { answerOrder, optionKeys } from '@/features/triage/deck';
 
 
 /** One labelled value. Code (commands, patterns) is set in the code font; a path is a label in the UI font. */
@@ -201,8 +202,10 @@ export function PermissionCard({ sessionId, req, more }: { sessionId: string; re
   const [sent, setSent] = useState(false);
   const input = useStore((s) => (req.itemId ? (s.data[sessionId]?.items[req.itemId] as { input?: unknown } | undefined)?.input : undefined));
   const deny = req.options.find((o) => o.tone === 'deny');
-  // Enter takes the lit (allow) answer; without one, the first.
-  const primary = req.options.find((o) => o.tone === 'allow') ?? req.options[0];
+  // Enter takes the lit (allow) answer, the deck's own; without one, the first.
+  const primary = optionKeys(req.options).allow ?? req.options[0];
+  // The deck's order: no apart on the left, the plain allow last on the right.
+  const { no, yes } = answerOrder(req.options);
   const tool = TOOL_ICON[req.kind] ?? TOOL_ICON.other;
 
   const respond = (o: PermissionOption, msg?: string) => {
@@ -234,6 +237,22 @@ export function PermissionCard({ sessionId, req, more }: { sessionId: string; re
     }
   });
 
+
+  const button = (o: PermissionOption) => (
+    <button
+      key={o.id}
+      type="button"
+      disabled={sent}
+      className={o === primary ? 'btn btn-primary' : o.tone === 'deny' ? 'btn btn-ghost' : 'btn'}
+      data-tone={o.tone}
+      title={o.hint ? `${o.label}. ${o.hint}` : o.label}
+      onClick={() => choose(o)}
+    >
+      <span>{o.label}</span>
+      {/* A long option (a whole command) keeps its own words; its hint is in the tooltip. */}
+      {o.hint && o.label.length <= HINT_ROOM && <span className="pc-hint">{o.hint}</span>}
+    </button>
+  );
 
   return (
     <section className="pc glass-card" data-spot data-kind={req.kind} aria-label={req.title} aria-live="polite">
@@ -290,21 +309,8 @@ export function PermissionCard({ sessionId, req, more }: { sessionId: string; re
         </div>
       ) : (
         <div className="pc-foot">
-          {req.options.map((o, i) => (
-            <button
-              key={o.id}
-              type="button"
-              disabled={sent}
-              className={o.tone === 'allow' ? 'btn btn-primary' : o.tone === 'always' ? 'btn' : 'btn btn-ghost'}
-              data-tone={o.tone}
-              title={o.hint ? `${o.label}. ${o.hint}` : o.label}
-              onClick={() => choose(o)}
-            >
-              <span>{o.label}</span>
-              {/* A long option (a whole command) keeps its own words; its hint is in the tooltip. */}
-              {o.hint && o.label.length <= HINT_ROOM && <span className="pc-hint">{o.hint}</span>}
-            </button>
-          ))}
+          {no.length > 0 && <div className="pc-foot-no">{no.map(button)}</div>}
+          <div className="pc-foot-yes">{yes.map(button)}</div>
         </div>
       )}
     </section>

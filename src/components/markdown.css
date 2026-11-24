@@ -731,3 +731,10 @@ a.md-file:focus-visible,
     animation: none;
   }
 }
+
+/* A long text's pieces (Markdown.tsx, md-pieces.ts): each a box of its own that skips layout and
+   paint while out of view, standing in for its estimated height until it has been laid out once.
+   It is an `.md` itself, so the block rules hold inside it; between two pieces, the paragraph gap. */
+.md-piece {
+  content-visibility: auto;
+}

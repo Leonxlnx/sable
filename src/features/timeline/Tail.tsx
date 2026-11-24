@@ -147,8 +147,8 @@ export const Tail = memo(function Tail() {
     const ran = work.since ? now - work.since : 0;
     return (
       <button type="button" className="tail tail-bg" data-enter={fresh || undefined} onClick={() => showRailTab('agents')} aria-label={`${label}. Open Agents`}>
-        <span className="row-slot">
-          <Tiles size={14} />
+        <span className="work-ind">
+          <Tiles size={12} />
         </span>
         <span className="tail-label truncate">{label}</span>
         {ran >= 1000 && (
@@ -170,8 +170,8 @@ export const Tail = memo(function Tail() {
   if (status === 'awaiting') {
     return (
       <div className="tail" data-status="awaiting" data-enter={fresh || undefined} role="status">
-        <span className="row-slot tail-wait-icon">
-          <Icon name="hourglass" size={15} />
+        <span className="work-ind tail-wait-icon">
+          <Icon name="hourglass" size={13} />
         </span>
         <span className="tail-wait">Waiting for you</span>
       </div>
@@ -180,11 +180,18 @@ export const Tail = memo(function Tail() {
 
   return (
     <div className="tail" data-status={status} data-enter={fresh || undefined} data-quiet={(!check && quietRaw === '1') || undefined} role="status" aria-live="off">
-      <span className="row-slot">
-        <Tiles size={14} />
+      <span className="work-ind">
+        <Tiles size={12} />
       </span>
       <span className="tail-label shimmer truncate">{check ? workLabel({ until: check }) : status === 'starting' ? 'Starting' : activity || 'Working'}</span>
-      {elapsed >= 1000 && <span className="tail-time num">{shortDuration(elapsed)}</span>}
+      {elapsed >= 1000 && (
+        <>
+          <span className="tail-time" aria-hidden>
+            ·
+          </span>
+          <span className="tail-time num">{shortDuration(elapsed)}</span>
+        </>
+      )}
     </div>
   );
 });

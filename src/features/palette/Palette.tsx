@@ -12,7 +12,7 @@ import { fuzzy, wordPrefix } from '@/lib/fuzzy';
 import { useNow } from '@/lib/useNow';
 import { useStore } from '@/state/store';
 import { byKeys, Kbd, PathLabel, cx, useSlidePill } from '@/ui';
-import { Highlight } from './Highlight';
+import { Highlight, quietMarks } from './Highlight';
 import { buildItems, loadRecent, pushRecent, type PaletteGroup, type PaletteItem } from './items';
 import { openMessage } from './jump';
 import { takeRun } from './once';
@@ -25,8 +25,9 @@ interface Row {
   indices?: number[];
 }
 
-const LIMITS: Record<PaletteGroup, number> = { Recent: 5, Sessions: 8, Projects: 5, Prompts: 6, Actions: 14, Commands: 10, Skills: 10, Messages: MAX_HITS };
-const EMPTY_LIMITS: Record<PaletteGroup, number> = { Recent: 5, Sessions: 6, Projects: 4, Prompts: 4, Actions: 40, Commands: 6, Skills: 6, Messages: 0 };
+const LIMITS: Record<PaletteGroup, number> = { Recent: 5, Sessions: 8, Projects: 5, Prompts: 6, Actions: 14, Panel: 8, Settings: 8, Commands: 10, Skills: 10, Messages: MAX_HITS };
+// The rows that open a panel tab or a Settings page are groups of their own, named once by their heading.
+const EMPTY_LIMITS: Record<PaletteGroup, number> = { Recent: 5, Sessions: 6, Projects: 4, Prompts: 4, Actions: 40, Panel: 20, Settings: 30, Commands: 6, Skills: 6, Messages: 0 };
 
 /** The command palette (mod+k): sessions, projects, saved prompts, actions, the open session's commands, and messages across chats. */
 export function Palette() {
@@ -121,7 +122,7 @@ function PaletteBody({ onRun }: { onRun: (item: PaletteItem) => void }) {
   const q = scope ? query.slice(1).trim() : query.trim();
 
   const rows = useMemo<Row[]>(() => {
-    const pool = items.filter((it) => (scope === 'actions' ? it.group === 'Actions' || it.group === 'Commands' || it.group === 'Skills' : scope === 'sessions' ? it.group === 'Sessions' : true));
+    const pool = items.filter((it) => (scope === 'actions' ? it.group === 'Actions' || it.group === 'Panel' || it.group === 'Settings' || it.group === 'Commands' || it.group === 'Skills' : scope === 'sessions' ? it.group === 'Sessions' : true));
 
     if (!q) {
       const out: Row[] = [];
@@ -146,17 +147,18 @@ function PaletteBody({ onRun }: { onRun: (item: PaletteItem) => void }) {
         counts[it.group] = n + 1;
         out.push({ item: it, group: it.group });
       }
-      return order(out, scope ? undefined : ['Recent', 'Sessions', 'Projects', 'Prompts', 'Actions', 'Commands', 'Skills']);
+      return order(out, scope ? undefined : ['Recent', 'Sessions', 'Projects', 'Prompts', 'Actions', 'Panel', 'Settings', 'Commands', 'Skills']);
     }
 
     const scored: (Row & { score: number })[] = [];
+    const words = q.trim().split(/\s+/).filter(Boolean).length;
     for (const it of pool) {
       const onTitle = fuzzy(q, it.title);
       let score: number;
       let indices: number[] | undefined;
       if (onTitle) {
         score = onTitle.score;
-        indices = onTitle.indices;
+        indices = quietMarks(onTitle.indices, words);
       } else {
         const wide = wordPrefix(q, [it.title, it.sub, it.keywords].filter(Boolean).join(' '));
         if (wide === null) continue;

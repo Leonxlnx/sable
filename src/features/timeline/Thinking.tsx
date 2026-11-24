@@ -5,6 +5,8 @@ import { Markdown } from '@/components/Markdown';
 import { Icon } from '@/icons';
 import { useStore } from '@/state/store';
 import { Elapsed } from './Tool';
+import { useWhole } from './ctx';
+import { thinkingRow } from './step-row';
 import { shortDuration } from './util';
 
 /**
@@ -14,8 +16,8 @@ import { shortDuration } from './util';
 export const Thinking = memo(function Thinking({ item }: { item: ThinkingItem }) {
   const show = useStore((s) => s.settings.showThinking);
   const [open, setOpen] = useState(false);
-  const canOpen = show && item.text.trim().length > 0;
-  const label = item.streaming ? 'Thinking' : 'Thought';
+  useWhole(item, open && show);
+  const { canOpen, label } = thinkingRow(item, show);
 
   const head = (
     <>
@@ -41,7 +43,7 @@ export const Thinking = memo(function Thinking({ item }: { item: ThinkingItem })
       )}
       {show && (
         <Collapse open={open}>
-          <div className="think-body">
+          <div className="think-body" inert={item.more} aria-busy={item.more}>
             <Markdown text={item.text} streaming={item.streaming} />
           </div>
         </Collapse>

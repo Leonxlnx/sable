@@ -9,7 +9,7 @@ import { useQuestionAnswers, type QuestionAnswers } from '@/features/prompts/Que
 import type { PendingPrompt } from '@/state/pending';
 import { useStore } from '@/state/store';
 import { PathLabel, Tip } from '@/ui';
-import { optionKeys, type DeckAction } from './deck';
+import { answerOrder, optionKeys, type DeckAction } from './deck';
 
 /** The front card's answer to a key the deck passed on: true when it was taken. */
 export interface CardHandle {
@@ -122,8 +122,7 @@ function PermissionBody({ p, req, pos, total, armed, handle, onPermission, onOpe
       </KeyTip>
     );
   };
-  const no = req.options.filter((o) => o.tone === 'deny');
-  const yes = req.options.filter((o) => o.tone !== 'deny' && o !== keys.allow);
+  const { no, yes } = answerOrder(req.options);
 
   return (
     <>
@@ -179,7 +178,6 @@ function PermissionBody({ p, req, pos, total, armed, handle, onPermission, onOpe
           {no.length > 0 && <div className="tri-foot-no">{no.map(button)}</div>}
           <div className="tri-foot-yes">
             {yes.map(button)}
-            {keys.allow && button(keys.allow)}
           </div>
         </div>
       )}

@@ -1,8 +1,64 @@
-import { useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import type { Todo } from '@shared/protocol';
 import { Ring as Spinner } from '@/art/Logo';
 import { Collapse } from '@/components/Collapse';
 import { Icon } from '@/icons';
+import { useStore } from '@/state/store';
+
+const NONE_T: Todo[] = [];
+
+/** As the composer's other strips rise out from behind the pane's edge (UntilStrip.tsx). */
+const rise = {
+  initial: { opacity: 0, y: 10, scale: 0.985 },
+  animate: { opacity: 1, y: 0, scale: 1 },
+  exit: { opacity: 0, y: 4, transition: { duration: 0.14, ease: [0.5, 0, 0.9, 0.4] as const } },
+  transition: { type: 'spring' as const, stiffness: 460, damping: 36 },
+};
+
+/** How long "All tasks done" stays after the last task is checked off. */
+const DONE_HOLD = 1600;
+
+/**
+ * The strip shows while a task is open. When the last one is checked off it stays a moment, full,
+ * then leaves; a finished list never comes back with the next turn.
+ */
+function useTaskStrip(todos: Todo[]): boolean {
+  const open = todos.some((t) => t.status !== 'completed');
+  const [held, setHeld] = useState(false);
+  const was = useRef(open);
+  useEffect(() => {
+    const before = was.current;
+    was.current = open;
+    if (open) return setHeld(false);
+    if (!before || !todos.length) return;
+    setHeld(true);
+    const t = window.setTimeout(() => setHeld(false), DONE_HOLD);
+    return () => window.clearTimeout(t);
+  }, [open, todos.length]);
+  return todos.length > 0 && (open || held);
+}
+
+/**
+ * The task strip in the composer's stack (Composer.tsx): the farthest of the strips tucked behind
+ * the pane's top edge (until.css), so it stays with the composer whatever card asks above it and
+ * nothing of the conversation shows between it and the pane.
+ */
+export const TaskSlot = memo(function TaskSlot({ sessionId }: { sessionId: string }) {
+  const todos = useStore((s) => s.data[sessionId]?.todos ?? NONE_T);
+  const status = useStore((s) => s.sessions[sessionId]?.status);
+  const running = status === 'running' || status === 'awaiting' || status === 'starting';
+  const show = useTaskStrip(todos);
+  return (
+    <AnimatePresence initial={false}>
+      {show && (
+        <motion.div key="tasks" className="us-slot" data-slot="tasks" {...rise}>
+          <TaskStrip sessionId={sessionId} todos={todos} running={running} />
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+});
 
 /** Expanded/collapsed per session while the app is open. */
 const openBySession = new Map<string, boolean>();
@@ -35,7 +91,7 @@ export function TaskStrip({ sessionId, todos, running }: { sessionId: string; to
   const listId = `tasks-${sessionId}`;
 
   return (
-    <section className="ts glass-card" data-spot data-open={open || undefined}>
+    <section className="ts" data-spot data-open={open || undefined}>
       <button type="button" className="ts-row" aria-expanded={open} aria-controls={listId} onClick={() => setOpen(!open)}>
         <Ring done={done} total={todos.length} />
         <span className="ts-count num">

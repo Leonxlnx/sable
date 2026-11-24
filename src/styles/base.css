@@ -240,45 +240,44 @@ kbd {
 
 /* ── scrollbars: thin, appear on hover ── */
 
-/* A scroller nested in a .scroll that is not one itself gets the standard thin bar in the hover
-   tone (scrollbar-color is inherited, so it is set on the direct children only). */
-.scroll > * {
-  scrollbar-color: var(--scrollbar) transparent;
-}
-
-/* Drawn with the ::-webkit-scrollbar parts only: Chromium ignores those once scrollbar-width or
-   scrollbar-color is set on the scroller, and Windows' own thin bar then draws arrow buttons that
-   sit in a glass pane's rounded corner. No buttons, and the track stops short of the corners. */
+/* One bar for every scroller, nested or not, drawn with the ::-webkit-scrollbar parts only.
+   Chromium ignores those parts on an element whose scrollbar-width or scrollbar-color is not
+   auto, and scrollbar-color is inherited: one such declaration on a holder brings Windows' own
+   bar, with its arrow buttons, back to every scroller inside it. So neither property is set
+   anywhere here (only `scrollbar-width: none` where a scroller hides its bar). No buttons, the
+   thumb shows while the pointer is over its scroller, and a .scroll's track stops short of a
+   rounded pane's corners. */
 .scroll {
   overflow: auto;
   overscroll-behavior: contain;
 }
 
-.scroll::-webkit-scrollbar {
+::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 
-.scroll::-webkit-scrollbar-thumb {
+::-webkit-scrollbar-thumb {
   background: transparent;
   border: 3px solid transparent;
   border-radius: 99px;
   background-clip: content-box;
 }
 
-.scroll:hover::-webkit-scrollbar-thumb {
-  background-color: rgb(255 255 255 / 0.16);
+:hover::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar);
 }
 
-.scroll::-webkit-scrollbar-thumb:hover {
-  background-color: rgb(255 255 255 / 0.3);
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-hover);
 }
 
-.scroll::-webkit-scrollbar-corner {
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-.scroll::-webkit-scrollbar-button {
+::-webkit-scrollbar-button {
   display: none;
   width: 0;
   height: 0;

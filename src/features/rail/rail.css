@@ -1745,19 +1745,15 @@ textarea.field.ch-commit-field {
 
 /* ───────────── context ───────────── */
 
-/* One left edge: the bar's text, the section headings and the cards under them (a heading stands on
-   its card's edge, as in Settings). One inset inside every card: 14 px and the hairline. */
+/* One flat list on the panel (no card, no tile): one left edge for the bar's text, the headings,
+   the ring and every row; one right edge for the figures and the headings' buttons. */
 .cx-stack {
-  gap: 20px;
-  padding: 0 16px 16px;
+  gap: 22px;
+  padding: 2px 16px 16px;
 }
 
 .cx-stack .rail-h {
-  margin: 0 0 8px;
-}
-
-.cx-card {
-  padding: 16px 14px;
+  margin: 0 0 4px;
 }
 
 /* A heading's buttons end where the bar's button ends: one column down the panel. */
@@ -1766,17 +1762,14 @@ textarea.field.ch-commit-field {
 }
 
 .cx-figure {
-  position: relative;
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 12px;
+  min-height: 40px;
 }
 
-/* The drawing's own 6 px of air goes out of the card's inset: the ring's outer edge stands on the
-   column of the words under it. */
 .cx-ring {
   flex-shrink: 0;
-  margin-left: -6px;
 }
 
 .cx-arc {
@@ -1789,15 +1782,22 @@ textarea.field.ch-commit-field {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  gap: 2px;
+  gap: 1px;
+}
+
+/* The figure at a heading's size: the share, then what it is of. */
+.cx-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .cx-pct {
-  font-size: 44px;
-  font-weight: 560;
+  font-size: var(--t-lead);
+  font-weight: var(--w-medium);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.04em;
-  line-height: 1;
   color: var(--text);
 }
 
@@ -1805,18 +1805,11 @@ textarea.field.ch-commit-field {
   color: var(--amber);
 }
 
-.cx-pct-sign {
-  margin-left: 2px;
-  font-size: 22px;
-  letter-spacing: 0;
-  color: var(--text-3);
-}
-
 .cx-of {
-  margin-top: 6px;
   font-size: var(--t-ui);
-  font-weight: var(--w-medium);
   color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .cx-left {
@@ -1827,9 +1820,11 @@ textarea.field.ch-commit-field {
 .cx-legend {
   display: flex;
   flex-direction: column;
-  margin-top: 16px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
+  margin-top: 10px;
+}
+
+.cx-stats {
+  margin-top: 0;
 }
 
 .cx-row {
@@ -1837,7 +1832,7 @@ textarea.field.ch-commit-field {
   align-items: center;
   gap: 9px;
   height: 28px;
-  font-size: var(--t-small);
+  font-size: var(--t-ui);
   color: var(--text-2);
 }
 
@@ -1863,7 +1858,6 @@ textarea.field.ch-commit-field {
   background: var(--dither-50) 0 0 / 2px 2px;
   image-rendering: pixelated;
   opacity: 0.6;
-
 }
 
 .cx-name {
@@ -1878,7 +1872,6 @@ textarea.field.ch-commit-field {
 
 .cx-row-quiet .cx-tokens {
   color: var(--text-2);
-  font-weight: var(--w-regular);
 }
 
 .cx-share {
@@ -1890,7 +1883,7 @@ textarea.field.ch-commit-field {
 .cx-note {
   font-size: var(--t-small);
   color: var(--text-3);
-  margin-top: 14px;
+  margin-top: 10px;
 }
 
 .cx-compact {
@@ -1898,9 +1891,7 @@ textarea.field.ch-commit-field {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line);
+  margin-top: 12px;
 }
 
 .cx-compact-wrap {
@@ -1908,36 +1899,9 @@ textarea.field.ch-commit-field {
   display: inline-flex;
 }
 
-.cx-stats {
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 8px;
-}
-
-.cx-stat {
-  grid-column: span 2;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 11px 14px 10px;
-  border-radius: var(--r-md);
-  min-width: 0;
-}
-
-.cx-stat[data-wide] {
-  grid-column: span 3;
-}
-
-.cx-stat-value {
-  font-size: var(--t-lead);
-  font-weight: var(--w-medium);
-  letter-spacing: -0.015em;
-  color: var(--text);
-}
-
-.cx-stat-label {
-  font-size: var(--t-small);
-  color: var(--text-3);
+/* The plan's limits on the panel too: the glance with no card round it. */
+.cx-stack .cx-limits {
+  padding: 0;
 }
 
 /* ── narrow panel ── */
@@ -1948,20 +1912,6 @@ textarea.field.ch-commit-field {
 }
 
 @container rail (max-width: 360px) {
-  .cx-figure {
-    gap: 14px;
-  }
-  .cx-ring {
-    width: 100px;
-    height: 100px;
-    margin-left: -5px;
-  }
-  .cx-pct {
-    font-size: 36px;
-  }
-  .cx-of {
-    font-size: var(--t-small);
-  }
   .cx-left {
     display: none;
   }

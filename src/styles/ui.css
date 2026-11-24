@@ -707,6 +707,153 @@ textarea.field {
   border-radius: 50%;
 }
 
+/* A slider of stops (`Slider` with `stops`, StopSlider in ui/index.tsx): the value's word over the
+   thumb, a 4 px track with a mark at each stop, the filled part the meter's ivory with its dither
+   edge leading into the thumb, a flat disc of 14. The whole block is the hit area. The thumb, the
+   fill and the word are placed by `translate` from script (1:1 while dragged, a settle after);
+   nothing here transitions a place. */
+.sls {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 0 7px;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+  cursor: default;
+}
+
+.sls[data-disabled] {
+  opacity: var(--ctl-disabled);
+  pointer-events: none;
+}
+
+/* The word's lane: one line, cut at its top and bottom so a rolling word never shows twice. */
+.sls-lane {
+  position: relative;
+  display: block;
+  height: 18px;
+  overflow: hidden;
+}
+
+.sls-anchor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 100%;
+}
+
+.sls-word {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform: translate(-50%, 0);
+  font-size: var(--t-ui);
+  line-height: 18px;
+  font-weight: var(--w-medium);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.sls-word[data-ghost]:not([data-leaving]) {
+  visibility: hidden;
+}
+
+.sls-rail {
+  position: relative;
+  display: block;
+  height: 14px;
+}
+
+.sls-track {
+  position: absolute;
+  top: 5px;
+  right: 0;
+  left: 0;
+  height: 4px;
+  border-radius: 99px;
+  background-color: rgb(255 255 255 / 0.07);
+  overflow: hidden;
+}
+
+.sls-fill {
+  position: absolute;
+  inset: 0;
+  padding-right: 8px;
+  background: rgb(242 241 238 / 0.82) content-box;
+}
+
+.sls-fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  background: var(--dither-edge) left top / 8px 4px repeat-y;
+  image-rendering: pixelated;
+  opacity: 0.82;
+}
+
+/* A stop: a 3 px mark on the track, a step lighter than the empty track, ink where it is filled. */
+.sls-tick {
+  position: absolute;
+  top: 5.5px;
+  left: 0;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background-color: rgb(255 255 255 / 0.26);
+}
+
+.sls-tick[data-on] {
+  background-color: rgb(0 0 0 / 0.42);
+}
+
+.sls-thumb {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background-color: var(--text);
+  box-shadow: var(--thumb-up);
+  transition:
+    scale var(--d-spring-soft) var(--spring-soft),
+    background-color var(--d-1) var(--ease);
+}
+
+.sls:hover .sls-thumb {
+  background-color: #fff;
+}
+
+/* Held, it gives (70 ms) and stays given while dragged; let go, it comes back on the soft spring. */
+.sls[data-dragging] .sls-thumb {
+  scale: 0.9;
+  background-color: #fff;
+  transition-duration: 70ms, var(--d-1);
+  transition-timing-function: var(--ease-out), var(--ease);
+}
+
+/* No stop set (the agent decides, "Default"): the thumb is an outline at the start and nothing is
+   filled, until a stop is taken. */
+.sls[data-unset] .sls-thumb {
+  background-color: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--text-2);
+}
+
+.sls[data-unset] :is(.sls-fill, .sls-track + .sls-tick) {
+  visibility: hidden;
+}
+
+.sls:focus-visible:not([data-pointer]) .sls-thumb {
+  outline: var(--focus-w) solid var(--focus);
+  outline-offset: 3px;
+}
+
 /* ───────────── segmented control ───────────── */
 
 .seg {

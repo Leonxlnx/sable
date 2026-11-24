@@ -145,6 +145,14 @@ export function veil(host: HTMLElement | null, mode: VeilMode, opts: { duration?
 /** The cover's steps and the uncovering's (ms each); a step's two states are a frame apart. */
 export const VEIL_STEP_IN = 22;
 export const VEIL_STEP_OUT = 34;
+/**
+ * The quick change, for a view that is already here (a chat whose conversation is in the window):
+ * the veil never goes solid. It steps up to three quarters of its cells, a frame a step, while the
+ * new view is built under the old one (which still shows through), the views switch on the
+ * frame the new one is there, and it steps down again, a frame a step: no blank stage, and the new
+ * view in its place, at rest, from its first frame.
+ */
+export const VEIL_QUICK = { peak: 3, step: 16 };
 const FRAME = 16;
 /** The rise of what arrives, as it resolves (ms). */
 const RISE_MS = 320;
@@ -152,6 +160,10 @@ const RISE_MS = 320;
 interface Cover {
   el: HTMLElement;
   layers: HTMLElement[];
+  /** How many quarters it goes up to (4: solid; the quick change stops at 3), and its steps up and down (ms). */
+  peak: number;
+  stepIn: number;
+  stepOut: number;
   /** The cover's animations: their start is the clock everything else is tied to. */
   anims: Animation[];
   /** Milliseconds from the cover's start to solid. */
@@ -210,11 +222,15 @@ export function quartersOn(c: { born: number; at: number[]; start: number | null
   });
 }
 
-/** The cover's keyframes for each quarter, given which are on already: the rest turn on in the dither's order. */
-export function coverSteps(on: boolean[]): { at: number[]; solidIn: number } {
+/**
+ * The cover's keyframes for each quarter, given which are on already: the rest turn on in the
+ * dither's order, up to `peak` quarters (those past it never: `Infinity`). `solidIn` is when the
+ * peak is reached.
+ */
+export function coverSteps(on: boolean[], peak = 4, stepIn = VEIL_STEP_IN): { at: number[]; solidIn: number } {
   let step = 0;
-  const at = on.map((x) => (x ? -1 : step++ * VEIL_STEP_IN));
-  return { at, solidIn: step ? (step - 1) * VEIL_STEP_IN + FRAME : 0 };
+  const at = on.map((x, q) => (x ? -1 : q >= peak ? Infinity : step++ * stepIn));
+  return { at, solidIn: step ? (step - 1) * stepIn + FRAME : 0 };
 }
 
 /**
@@ -226,10 +242,15 @@ export function coverSteps(on: boolean[]): { at: number[]; solidIn: number } {
  * by the page's timer (see `VEIL_WAIT_AFTER`): never while the view is being built and about to land.
  * Says whether a cover is on (false under reduced motion: callers fade instead).
  */
-export function veilCover(host: HTMLElement | null, opts: { color?: string; cell?: number; waiting?: () => HTMLElement | null } = {}): boolean {
+export function veilCover(host: HTMLElement | null, opts: { color?: string; cell?: number; waiting?: () => HTMLElement | null; quick?: boolean } = {}): boolean {
   if (!host || reduced() || typeof host.animate !== 'function') return false;
   const cell = opts.cell ?? 4;
   const old = covers.get(host);
+  // A quick change taken over by a full one goes on to solid; a full one never steps back to quick.
+  const quick = !!opts.quick && (!old || old.peak < 4);
+  const peak = quick ? VEIL_QUICK.peak : 4;
+  const stepIn = quick ? VEIL_QUICK.step : VEIL_STEP_IN;
+  const stepOut = quick ? VEIL_QUICK.step : VEIL_STEP_OUT;
   // The quarters drawn right now (a reveal under way has some off again).
   const on = old
     ? quartersOn(
@@ -263,12 +284,14 @@ export function veilCover(host: HTMLElement | null, opts: { color?: string; cell
     });
     host.appendChild(el);
   }
-  const { at, solidIn } = coverSteps(on);
+  const { at, solidIn } = coverSteps(on, peak, stepIn);
   const total = Math.max(solidIn, FRAME);
   const anims = layers.map((layer, q) => {
-    // On already, or the first to come: there from the first frame.
+    // On already, or the first to come: there from the first frame. Past the peak: never.
     const frames: Keyframe[] =
-      at[q] <= 0
+      at[q] === Infinity
+        ? [{ opacity: 0 }, { opacity: 0 }]
+        : at[q] <= 0
         ? [{ opacity: 1 }, { opacity: 1 }]
         : [
             { opacity: 0, offset: 0 },
@@ -278,11 +301,16 @@ export function veilCover(host: HTMLElement | null, opts: { color?: string; cell
           ];
     return layer.animate(frames, { duration: total, easing: 'linear', fill: 'both' });
   });
+  // On the clock from the input, not from the frame that first shows it: the input's own task (a
+  // row's click) renders the chat's row and the header first, and left to start by itself the
+  // cover began only with that frame, some 25 ms on, and everything tied to it came that much later.
+  const born = timeNow();
+  for (const a of anims) a.startTime = born;
   // The waiting state of a cover that is taken over stays as it is (seen or not, its timer still
   // running or not): it never starts again.
   let wait = old?.wait;
   let waitTimer = wait ? old?.waitTimer : undefined;
-  if (!wait && opts.waiting) {
+  if (!wait && opts.waiting && !quick) {
     const w = opts.waiting();
     if (w) {
       w.classList.add('veil-wait');
@@ -294,7 +322,7 @@ export function veilCover(host: HTMLElement | null, opts: { color?: string; cell
       wait = w;
     }
   }
-  covers.set(host, { el, layers, anims, solidIn, born: timeNow(), at, revealing: false, wait, waitTimer });
+  covers.set(host, { el, layers, peak, stepIn, stepOut, anims, solidIn, born, at, revealing: false, wait, waitTimer });
   return true;
 }
 
@@ -330,9 +358,19 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
   const cover = host ? covers.get(host) : undefined;
   if (!host || !cover) return SETTLED;
   cover.revealing = true;
-  // How long until solid. A cover made in this same frame has not started: it starts with these.
+  // How long until solid. A cover made in this same task has not started: it starts now, with these.
+  // Everything below is pinned to this moment (`pin`): left to start by itself, an animation starts
+  // with the frame that first shows it, which after a view was built and laid out is a frame or two
+  // later, and the switch and the uncovering came that much late, on top of the build.
+  const now = timeNow();
   const started = cover.anims[0]?.startTime as number | null | undefined;
-  const wait = started == null ? cover.solidIn : Math.max(0, started + cover.solidIn - timeNow());
+  if (started == null) for (const a of cover.anims) a.startTime = now;
+  const wait = started == null ? cover.solidIn : Math.max(0, started + cover.solidIn - now);
+  // Each animation holds its first keyframe before it starts (`fill` both or backwards).
+  const pin = (a: Animation) => {
+    a.startTime = now;
+    return a;
+  };
   // A waiting state in view goes first; one that never showed is simply dropped (its timer with it).
   window.clearTimeout(cover.waitTimer);
   const waiting = cover.wait;
@@ -348,12 +386,14 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
   const at = (ms: number, total: number) => Math.min(1, Math.max(0, ms / total));
   for (const el of sw.hide ?? []) {
     const cur = getComputedStyle(el).opacity;
-    el.animate(wait > 0 ? [{ opacity: cur, offset: 0 }, { opacity: cur, offset: at(wait, hold) }, { opacity: 0, offset: 1 }] : [{ opacity: 0 }, { opacity: 0 }], { duration: hold, easing: 'linear', fill: 'forwards' });
+    pin(el.animate(wait > 0 ? [{ opacity: cur, offset: 0 }, { opacity: cur, offset: at(wait, hold) }, { opacity: 0, offset: 1 }] : [{ opacity: 0 }, { opacity: 0 }], { duration: hold, easing: 'linear', fill: 'both' }));
   }
-  const from = sw.rise ? `translateY(${sw.rise}px)` : 'none';
+  // The quick change shows the new view in its place from its first frame: nothing rises.
+  const rise = cover.peak < 4 ? 0 : sw.rise;
+  const from = rise ? `translateY(${rise}px)` : 'none';
   for (const el of sw.show ?? []) {
-    const total = hold + RISE_MS;
-    el.animate(
+    const total = hold + (rise ? RISE_MS : FRAME);
+    pin(el.animate(
       [
         { opacity: 0, transform: from, offset: 0, easing: 'linear' },
         { opacity: 0, transform: from, offset: at(wait, total), easing: 'linear' },
@@ -361,29 +401,37 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
         { opacity: 1, transform: 'none', offset: 1 },
       ],
       { duration: total, fill: 'backwards' },
-    );
+    ));
   }
-  // Off in the reverse of the order they came on, so the content resolves sparse last.
-  const offAt = cover.layers.map((_, q) => hold + (3 - q) * VEIL_STEP_OUT);
+  // Off in the reverse of the order they came on, so the content resolves sparse last (a quarter
+  // that never came on is off from the start).
+  const top = Math.min(cover.peak, 4) - 1;
+  const offAt = cover.layers.map((_, q) => hold + Math.max(0, top - q) * cover.stepOut);
   // Each quarter's whole way in its own keyframes, on from the first frame: never a delay with the
   // cover's finished animation showing through it meanwhile.
-  const out = hold + 3 * VEIL_STEP_OUT + FRAME;
+  const out = hold + top * cover.stepOut + FRAME;
   const offs = cover.layers.map((layer, q) =>
-    layer.animate(
-      [
-        { opacity: 1, offset: 0 },
-        { opacity: 1, offset: at(offAt[q], out) },
-        { opacity: 0, offset: at(offAt[q] + FRAME, out) },
-        { opacity: 0, offset: 1 },
-      ],
-      { duration: out, easing: 'linear', fill: 'forwards' },
-    ),
+    pin(layer.animate(
+      q > top
+        ? [{ opacity: 0 }, { opacity: 0 }]
+        : [
+            { opacity: 1, offset: 0 },
+            { opacity: 1, offset: at(offAt[q], out) },
+            { opacity: 0, offset: at(offAt[q] + FRAME, out) },
+            { opacity: 0, offset: 1 },
+          ],
+      // `both`: pinned to the reveal's moment, which the compositor may see as a moment ahead of its
+      // own frame; before its start a `forwards` fill drew the layer at its own opacity (none), and
+      // the new view showed clear for two frames, then under the veil again.
+      { duration: out, easing: 'linear', fill: 'both' },
+    )),
   );
   cover.offs = offs;
   cover.offAt = offAt;
   // The gate is a clock only: an animation of nothing, on the same timeline.
   const gate = new Animation(new KeyframeEffect(null, null, { duration: Math.max(1, hold) }), document.timeline);
   gate.play();
+  pin(gate);
   cover.gate = gate;
   const end = () => {
     window.clearTimeout(cap);
@@ -393,7 +441,7 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
     cover.el.remove();
   };
   // A hidden window finishes no animation: the veil never outlives its run by long.
-  const cap = window.setTimeout(end, hold + 3 * VEIL_STEP_OUT + 1500);
+  const cap = window.setTimeout(end, out + 1500);
   return { solid: quiet(gate.finished), done: quiet(Promise.all(offs.map((a) => a.finished))).then(end) };
 }
 

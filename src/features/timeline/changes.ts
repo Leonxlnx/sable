@@ -1,4 +1,5 @@
 import type { TimelineItem } from '@shared/protocol';
+import { turnSpan, type TurnGroup } from './turns';
 
 export interface Changes {
   files: number;
@@ -26,4 +27,12 @@ export function changesOf(items: Record<string, TimelineItem | undefined>, child
   };
   walk(ids, 0);
   return { files: files.size, add, del };
+}
+
+/** The finished turn's Worked line, including edits nested under its agents. */
+export function foldedTurn(items: Record<string, TimelineItem | undefined>, children: Record<string, string[] | undefined>, turn: TurnGroup) {
+  const work = turn.segments.length === 1 ? turn.segments[0].work : turn.segments.flatMap(s => s.work);
+  const steps = turn.segments.reduce((n, s) => n + s.steps, 0);
+  return { span: turnSpan(items, turn), changes: changesOf(items, children, work), steps,
+    thought: !steps && work.some(id => items[id]?.type === 'thinking') };
 }

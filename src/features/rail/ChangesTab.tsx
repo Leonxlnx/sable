@@ -4,6 +4,7 @@ import { Collapse } from '@/components/Collapse';
 import { DiffView } from '@/components/DiffView';
 import { Icon } from '@/icons';
 import { plural, relPath } from '@/lib/format';
+import { loadWholeItem } from '@/state/actions';
 import { focusComposer } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { IconButton, Segmented, Spinner, Tip } from '@/ui';
@@ -700,11 +701,21 @@ export function StatusLetter({ status, small }: { status: string; small?: boolea
 
 interface EditedFile extends FileDiff {
   edits: number;
+  /** The steps whose edits make up this file's diff, in order. */
+  from: string[];
 }
 
 /** The diffs carried by this session's edit/write tools, merged per file in order. */
 function useSessionEdits(sessionId: string, cwd: string): EditedFile[] {
   const ids = useToolIds(sessionId, (it) => (it.kind === 'edit' || it.kind === 'write') && it.status === 'done' && !!it.result?.diff?.length);
+  // An edit of an older turn reaches the window as a row (its files and counts, no hunks: `ToolItem.more`)
+  // and is fetched whole when its file is opened here: the list is put together again as each arrives.
+  const cut = useStore((s) => {
+    const items = s.data[sessionId]?.items;
+    let n = 0;
+    for (const id of ids) if ((items?.[id] as ToolItem | undefined)?.more) n++;
+    return n;
+  });
   return useMemo(() => {
     const items = useStore.getState().data[sessionId]?.items ?? {};
     const byPath = new Map<string, EditedFile>();
@@ -714,19 +725,21 @@ function useSessionEdits(sessionId: string, cwd: string): EditedFile[] {
         const path = relPath(d.path, cwd);
         const cur = byPath.get(path);
         if (!cur) {
-          byPath.set(path, { ...d, path, hunks: [...d.hunks], edits: 1 });
+          byPath.set(path, { ...d, path, hunks: [...d.hunks], edits: 1, from: [id] });
           continue;
         }
         cur.additions += d.additions;
         cur.deletions += d.deletions;
         cur.hunks = [...cur.hunks, ...d.hunks];
         cur.edits++;
+        cur.from.push(id);
         if (d.status === 'deleted') cur.status = 'deleted';
         else if (cur.status === 'deleted') cur.status = 'modified';
       }
     }
     return [...byPath.values()];
-  }, [ids, sessionId, cwd]);
+    // `cut`: an edit that arrived whole changes no id, only what the list is made of.
+  }, [ids, cut, sessionId, cwd]);
 }
 
 function SessionEdits({ sessionId, cwd }: { sessionId: string; cwd: string }) {
@@ -736,6 +749,15 @@ function SessionEdits({ sessionId, cwd }: { sessionId: string; cwd: string }) {
     (r) => r.sessionId === sessionId && r.scope.startsWith('edits:'),
     (r) => setOpen(withPath(r.scope.slice(6))),
   );
+  // An open file's diff needs its edits whole: the ones that came as rows are asked for (once each).
+  useEffect(() => {
+    if (!open.size) return;
+    const items = useStore.getState().data[sessionId]?.items ?? {};
+    for (const f of files) {
+      if (!open.has(f.path)) continue;
+      for (const id of f.from) if ((items[id] as ToolItem | undefined)?.more) void loadWholeItem(sessionId, id);
+    }
+  }, [open, files, sessionId]);
   // One target per file, kept while the file stays, so its diff only draws again when it changes.
   const reviews = useMemo(() => new Map(files.map((f) => [f.path, { sessionId, scope: `edits:${f.path}`, path: f.path }])), [files, sessionId]);
   const adds = files.reduce((n, f) => n + f.additions, 0);

@@ -260,15 +260,12 @@
   animation: var(--empty-in);
 }
 
-/* Fuzzy-matched characters: brighter and underlined, not coloured. */
+/* Matched characters, quietly: the text's own bright tone and the medium weight, no line, no colour
+   (only an unbroken match is marked at all, `quietMarks`). */
 .hl {
   background: none;
   color: var(--text);
-  font-weight: var(--w-semi);
-  text-decoration: underline;
-  text-decoration-color: rgb(255 255 255 / 0.28);
-  text-decoration-thickness: 1.5px;
-  text-underline-offset: 3px;
+  font-weight: var(--w-medium);
 }
 
 /* ── messages across chats ── */

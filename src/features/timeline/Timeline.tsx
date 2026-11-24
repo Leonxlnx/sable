@@ -12,7 +12,7 @@ import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
 import { keptAt } from './build-window';
-import { DOCK_GLIDE_MS } from '@/features/session/dock-glide';
+import { DOCK_GLIDE_EASE, DOCK_GLIDE_MS } from '@/features/session/dock-glide';
 import { glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
 import { useStaged } from '@/features/session/staged';
 import './timeline.css';
@@ -25,6 +25,14 @@ const AWAY = 160;
 const FOLLOW_W = 24;
 /** Dev only: `?nonav` leaves the conversation's map out, to measure what it costs (scripts/perf-headless.mjs with SABLE_URL). */
 const NO_NAV = import.meta.env.DEV && typeof location !== 'undefined' && new URLSearchParams(location.search).has('nonav');
+
+/** The live line stands held at the top of the view (sticky): a transform on the content would carry it off. Reads only. */
+function heldLive(inner: HTMLElement, el: HTMLElement): boolean {
+  const head = inner.querySelector<HTMLElement>('.tl-work[data-live]');
+  if (!head) return false;
+  const held = el.getBoundingClientRect().top + (parseFloat(getComputedStyle(head).top) || 0);
+  return Math.abs(head.getBoundingClientRect().top - held) < 1;
+}
 
 /**
  * The conversation. A scroller that stays with the newest content until the reader
@@ -236,7 +244,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
         const head = inner.querySelector<HTMLElement>('.tl-work[data-live]');
         const headTop = head?.getBoundingClientRect().top ?? 0;
         const held = head ? el.getBoundingClientRect().top + (parseFloat(getComputedStyle(head).top) || 0) : 0;
-        const timing = { duration: DOCK_GLIDE_MS, easing: EASE_OUT };
+        const timing = { duration: DOCK_GLIDE_MS, easing: DOCK_GLIDE_EASE };
         if (play(inner, [{ translate: `0 ${-d}px` }, { translate: '0 0' }], timing) && head && headTop - d < held - 0.5) {
           const reach = Math.min(1, Math.max(0, 1 - (headTop - held) / d));
           const hold = play(head, [{ translate: `0 ${held - headTop + d}px`, offset: 0 }, { translate: '0 0', offset: reach }, { translate: '0 0', offset: 1 }], timing);
@@ -257,7 +265,15 @@ export function Timeline({ sessionId }: { sessionId: string }) {
         if (rewrapped) pin();
         // The dock got taller (a permission card, a question, the queue tray came): the conversation
         // travels up with it instead of stepping by the card's height.
-        else if (taller) follow();
+        else if (taller && -less > 24 && live.current && !glide.current.raf && !heldLive(inner, el)) {
+          // By a whole card or the queue tray: the end is kept in this frame and the conversation is
+          // drawn where it stood, gliding up on the dock's clock (the tray and the strips glide on
+          // the same, composer/stack-glide.ts). A scroll glide on the main thread stepped under load.
+          const top = el.scrollTop;
+          pin();
+          const moved = el.scrollTop - top;
+          if (moved > 0.5) play(inner, [{ translate: `0 ${moved}px` }, { translate: '0 0' }], { duration: DOCK_GLIDE_MS, easing: DOCK_GLIDE_EASE });
+        } else if (taller) follow();
         else keepEnd();
       } else setAway(el.scrollHeight - el.scrollTop - el.clientHeight > AWAY);
     });

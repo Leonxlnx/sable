@@ -636,8 +636,6 @@ button:hover > .row-caret {
 
 .vscroll {
   overflow: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar) transparent;
 }
 
 /* column-reverse: the scroller rests at its end and stays there as output grows. */
@@ -1405,9 +1403,8 @@ button:hover > .row-caret {
 }
 
 .check-stop {
-  --ib: 24px;
   flex-shrink: 0;
-  border-radius: var(--r-ctl-sm);
+  margin-right: -8px;
   color: var(--text-3);
 }
 
@@ -2099,6 +2096,19 @@ button:hover > .row-caret {
   left: calc(var(--gutter) + var(--nest) - 15px);
 }
 
+/* Opened, the turn reads by rank: the answer in full ink on the column's edge, the notes along the
+   way one level in and a step back (`--text-2`), their steps quieter still. The reply to a steered
+   message keeps the answer's ink on the notes' inset: it answers the person. While the turn runs,
+   a note is the newest thing said and stands in full ink (it is not nested then). */
+.fold-text.nest > .collapse-inner > .tl-item[data-mid] .md {
+  --md-fg: var(--text-2);
+}
+
+/* What is bright in an answer (inline code, strong words) steps back with the note. */
+.fold-text.nest > .collapse-inner > .tl-item[data-mid] .md :is(.md-code, strong) {
+  color: var(--text-2);
+}
+
 /* The answer after the opened checkpoints: a little more air, so the last word reads as the last word. */
 .tl-fold.nest + .fold-text:not(.nest) > .collapse-inner > .tl-item[data-answer] {
   padding-top: 14px;
@@ -2508,14 +2518,15 @@ button:hover > .row-caret {
 }
 
 .tg:hover .turn-hover,
-.turn-hover:focus-within {
+.turn-hover:focus-within,
+.turn-line[data-bare] > .turn-hover {
   opacity: 1;
   transition: none;
 }
 
-/* The newest turn keeps its facts and the copy of its answer in view: the end of the conversation
-   closes with a quiet line, and earlier turns show theirs on hover as before. */
-.tl-content > .tg:last-child .turn-hover {
+/* The newest turn keeps its facts in view: the end of the conversation closes with a quiet line,
+   and earlier turns show theirs on hover. (`last-of-type`: the working line after it is no turn.) */
+.tl-content > .tg:last-of-type .turn-hover {
   opacity: 1;
 }
 
@@ -2524,31 +2535,17 @@ button:hover > .row-caret {
   color: var(--text-3);
 }
 
-/* Copy and Fork under an answer. The newest turn keeps them in view, quiet (the icons a step
-   dimmer); an earlier turn shows them while the pointer or the focus is in it, in their place (the
-   row keeps its height), so a long conversation is not ruled by a column of small icons. */
+/* Copy and Fork lead the row under every answer, always there in the row's one quiet tone (a row
+   that came only on hover held its height empty under every earlier answer: a hole, then icons).
+   The first glyph stands on the column's edge as the answer's words do. */
 .turn-acts {
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  margin-left: -5px;
-  opacity: 0;
-  transition: opacity 90ms var(--ease);
+  margin-left: -7px;
 }
 
-.tg:hover .turn-acts,
-.turn-acts:focus-within,
-.turn-acts:has([data-copied], [data-state='open'], [data-state='delayed-open'], [data-state='instant-open']) {
-  opacity: 1;
-  transition: none;
-}
-
-.tl-content > .tg:last-child .turn-acts {
-  opacity: 1;
-}
-
-/* After a chip the glyphs keep the row's one rhythm: the space from the chip's words to the copy
-   glyph is the space between two glyphs. */
+/* After a chip or a note the glyphs keep the row's one rhythm. */
 .turn-line > * + .turn-acts {
   margin-left: -6px;
 }
@@ -2557,10 +2554,6 @@ button:hover > .row-caret {
 .turn-fork {
   --ib: 26px;
   border-radius: var(--r-ctl-sm);
-  color: var(--text-4);
-}
-
-.tg:hover :is(.turn-copy, .turn-fork) {
   color: var(--text-3);
 }
 
@@ -2568,9 +2561,29 @@ button:hover > .row-caret {
   color: var(--text);
 }
 
-/* "Check with Codex": a chip with its word after the glyphs (a mark alone was a guess), the other
-   agent's mark in the row's tone (a control carries no colour), a size down from the line icons to
-   carry the same ink; it answers the pointer with the same one-shot nudge as they do. */
+/* A chip after the glyphs: the space from the fork glyph to the chip's icon is the space between two glyphs. */
+.turn-acts ~ .preview-btn {
+  margin-left: -6px;
+}
+
+/* "Check with Codex": a chip with its word (a mark alone was a guess), the other agent's mark in
+   the row's tone (a control carries no colour). On the newest turn it is there; under an earlier
+   answer it comes with the pointer, as the figures do, so a long conversation is not lined with it. */
+.turn-check {
+  opacity: 0;
+  transition:
+    opacity 90ms var(--ease),
+    background-color var(--d-1) var(--ease),
+    color var(--d-1) var(--ease),
+    scale var(--d-spring-soft) var(--spring-soft);
+}
+
+.tg:hover .turn-check,
+.turn-check:focus-visible,
+.tl-content > .tg:last-of-type .turn-check {
+  opacity: 1;
+}
+
 .turn-check .provider-mark {
   color: var(--text-3);
   transition: color 90ms var(--ease);
@@ -2607,7 +2620,7 @@ button:hover > .row-caret {
   border-radius: var(--r-ctl-sm);
   font-size: 12.5px;
   font-weight: var(--w-regular);
-  color: var(--text-2);
+  color: var(--text-3);
   background-color: transparent;
   transition:
     background-color var(--d-1) var(--ease),
@@ -2654,27 +2667,26 @@ button:hover > .row-caret {
   flex-shrink: 1;
 }
 
+/* The address in the chip's own tone: Preview and its page are one name, not a label and a dimmer value. */
 .preview-host {
   min-width: 0;
-  color: var(--text-3);
-  transition: color 90ms var(--ease);
-}
-
-.preview-btn:hover .preview-host {
-  color: var(--text-2);
 }
 
 /* ───────────── the working line (before a turn has a message to hang from) ───────────── */
 
+/* The conversation's last line reads as the live line it follows: its tiles on the column's edge
+   where the live line's and "Worked" stand (a 22 px slot put them 4 px in, at 14 px against 12),
+   the same size and gaps, one row's gap under what stands last. */
 .tail {
   display: flex;
   align-items: center;
-  gap: 10px;
-  height: 30px;
-  margin-top: 6px;
+  gap: 8px;
+  height: 28px;
+  margin-top: 4px;
   padding: 0 var(--gutter);
   flex-shrink: 0;
   font-size: 12.5px;
+  color: var(--text-2);
 }
 
 /* Work that begins while the person watches (Tail marks it `data-enter`): a short rise, the working
@@ -2799,7 +2811,6 @@ button:hover > .row-caret {
 }
 
 .tail-time {
-  font-size: 12px;
   color: var(--text-3);
   flex-shrink: 0;
 }

@@ -1,4 +1,4 @@
-import { cloneElement, forwardRef, isValidElement, useEffect, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type FocusEvent, type PointerEvent, type ReactNode, type Ref, type RefObject } from 'react';
+import { cloneElement, forwardRef, isValidElement, useEffect, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type FocusEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent, type ReactNode, type Ref, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { Dialog as RD, DropdownMenu as RM, Popover as RP, Slider as RSl, Switch as RS, Tooltip as RT } from 'radix-ui';
 import { Icon, type IconName } from '@/icons';
@@ -9,6 +9,7 @@ import './grow';
 import { movedByKeys } from './glide';
 import { quietFocus } from '@/lib/quiet-focus';
 import { fitDir, watchDir } from './path-fit';
+import { holdX, nearestStop, settleAt, settleMs, stopKey, stopX, wordLeft } from './stops';
 
 /** React wrappers around the primitives in styles/ui.css. Keep this file small and boring. */
 
@@ -437,6 +438,10 @@ export function Switch({ checked, onChange, label, disabled }: { checked: boolea
 /**
  * A thin track with an ivory fill and a small solid thumb. Arrow keys step, Page Up/Down step
  * by ten, Home/End go to the ends. `onCommit` fires when a drag or key press ends.
+ *
+ * With `stops` (their names, lowest first) it is a scale of a few stops instead (StopSlider):
+ * `value` is a stop's index (-1: none set), `onChange` says the nearest stop while it is dragged,
+ * `onCommit` the stop it lands on.
  */
 export function Slider({
   value,
@@ -447,6 +452,8 @@ export function Slider({
   step = 1,
   label,
   className,
+  stops,
+  disabled,
 }: {
   value: number;
   onChange: (v: number) => void;
@@ -457,7 +464,11 @@ export function Slider({
   /** Accessible name (the visible label usually says the same). */
   label: string;
   className?: string;
+  /** The stops' names, lowest first: a scale of stops with the value's word over the thumb. */
+  stops?: readonly string[];
+  disabled?: boolean;
 }) {
+  if (stops) return <StopSlider value={value} stops={stops} onChange={onChange} onCommit={onCommit} label={label} className={className} disabled={disabled} />;
   return (
     <RSl.Root
       className={cx('slider', className)}
@@ -473,6 +484,333 @@ export function Slider({
       </RSl.Track>
       <RSl.Thumb className="slider-thumb" aria-label={label} />
     </RSl.Root>
+  );
+}
+
+/** The stop slider's thumb, a disc of this many px (ui.css `.sls-thumb`). */
+const STOP_THUMB = 14;
+/** One frame at 60 Hz: a settle starts this far in, so its first painted frame has moved. */
+const FRAME_MS = 16;
+/** The word's roll: one line, the old word gone and the new one whole by 60 % of the way (composer/reel.ts). */
+const ROLL_PX = 14;
+const ROLL_MS = 170;
+const ROLL_EASE = 'cubic-bezier(0.25, 0.8, 0.25, 1)';
+
+/**
+ * A scale of a few stops (an effort's levels): a 4 px track with a mark at each stop, its filled
+ * part ivory with the meter's dither edge, a flat disc of a thumb, and the value's word standing
+ * over the thumb.
+ * - Dragged, the thumb follows the pointer 1:1 (from where it was taken, so it never jumps under
+ *   the pointer) and the fill with it; the word is the nearest stop's from the moment it is
+ *   nearest, rolling the way the value went. Let go, the thumb settles on that stop (120 to 160 ms,
+ *   a hair past) and gives a little as it lands.
+ * - A press on the track brings the thumb to the pointer and the drag goes on from there; a press
+ *   and release without a move lands on the nearest stop.
+ * - Left and Down step down, Right and Up up, Home and End the ends (stops.ts `stopKey`); the wheel
+ *   does nothing. Every key it answers stops there, so a menu round it never takes them.
+ * Transform and opacity only, set per frame while dragged without a render; a render only when the
+ * nearest stop changes.
+ */
+function StopSlider({
+  value,
+  stops,
+  onChange,
+  onCommit,
+  label,
+  className,
+  disabled,
+}: {
+  value: number;
+  stops: readonly string[];
+  onChange: (i: number) => void;
+  onCommit?: (i: number) => void;
+  label: string;
+  className?: string;
+  disabled?: boolean;
+}) {
+  const n = stops.length;
+  const rail = useRef<HTMLSpanElement>(null);
+  const thumb = useRef<HTMLSpanElement>(null);
+  const fill = useRef<HTMLSpanElement>(null);
+  const anchor = useRef<HTMLSpanElement>(null);
+  const width = useRef(0);
+  const [railW, setRailW] = useState(0);
+  // Where the thumb's centre stands now (px from the rail's left), and the settle under way.
+  const x = useRef(0);
+  // Where the word's anchor stands (its centre, px from the rail's left).
+  const anchorX = useRef(0);
+  const settle = useRef<{ from: number; to: number; start: number; ms: number; frame: number } | null>(null);
+  useEffect(() => () => cancelAnimationFrame(settle.current?.frame ?? 0), []);
+  const drag = useRef<{ id: number; grab: number; moved: boolean; startX: number } | null>(null);
+  // The nearest stop while dragged (shown at once); null at rest, where `value` rules.
+  const [live, setLive] = useState<number | null>(null);
+  const shown = live ?? value;
+  const latest = useRef({ onChange, onCommit, value, n });
+  latest.current = { onChange, onCommit, value, n };
+
+  /** Puts the thumb, the fill, the ticks and the word's anchor where a thumb centred at `cx` stands. */
+  const place = (cx: number) => {
+    x.current = cx;
+    const w = width.current;
+    thumb.current?.style.setProperty('translate', `${(cx - STOP_THUMB / 2).toFixed(2)}px 0`);
+    // The fill ends at the thumb's near edge, so its dithered end leads into the thumb.
+    fill.current?.style.setProperty('translate', `${(cx - STOP_THUMB / 2 + 1 - w).toFixed(2)}px 0`);
+    const a = anchor.current;
+    if (a) {
+      const word = a.querySelector<HTMLElement>('.sls-word:not([data-leaving])');
+      const ww = word?.offsetWidth ?? 0;
+      anchorX.current = wordLeft(cx, ww, w) + ww / 2;
+      a.style.setProperty('translate', `${anchorX.current.toFixed(2)}px 0`);
+    }
+    const r = rail.current;
+    if (r) for (const t of r.querySelectorAll<HTMLElement>('.sls-tick')) t.toggleAttribute('data-on', Number(t.dataset.x) <= cx - STOP_THUMB / 2 + 1);
+  };
+
+  /** Where the thumb stands at this moment, a settle under way included (worked out from its own clock, never a computed style). */
+  const nowX = () => {
+    const s = settle.current;
+    return s ? settleAt(s.from, s.to, s.start, s.ms, performance.now()).x : x.current;
+  };
+
+  const stopSettle = () => {
+    const s = settle.current;
+    if (!s) return;
+    const at = nowX();
+    settle.current = null;
+    cancelAnimationFrame(s.frame);
+    place(at);
+  };
+
+  /**
+   * Glides the thumb to stop `i`, and gives as it lands. One clock drives the thumb, the fill, the
+   * ticks and the word in the same frame (a thumb on the compositor with the rest following by
+   * frame left the fill a frame behind: up to 30 px past the thumb on a key's step). It starts one
+   * frame in, so the first painted frame already answers.
+   */
+  const glideTo = (i: number, give: boolean) => {
+    const w = width.current;
+    if (!w) return;
+    const from = nowX();
+    stopSettle();
+    const to = stopX(i, n, w, STOP_THUMB);
+    if (reducedMotion() || Math.abs(to - from) < 0.5) {
+      place(to);
+    } else {
+      const s = { from, to, start: performance.now() - FRAME_MS, ms: settleMs(to - from), frame: 0 };
+      settle.current = s;
+      const tick = (now: number) => {
+        if (settle.current !== s) return;
+        const at = settleAt(s.from, s.to, s.start, s.ms, now);
+        // The hair past a stop never takes the thumb past the track's ends.
+        place(holdX(at.x, w, STOP_THUMB));
+        if (at.done) settle.current = null;
+        else s.frame = requestAnimationFrame(tick);
+      };
+      s.frame = requestAnimationFrame(tick);
+    }
+    if (give) play(thumb.current, [{ scale: '1' }, { scale: '0.86', offset: 0.35 }, { scale: '1.04', offset: 0.75 }, { scale: '1' }], { duration: 200, easing: 'ease-out' });
+  };
+
+  // The rail's width, now and whenever it changes (the panel's size is fixed, so this is rare).
+  useLayoutEffect(() => {
+    const r = rail.current;
+    if (!r) return;
+    const measure = () => {
+      width.current = r.offsetWidth;
+      setRailW(width.current);
+      if (!drag.current && !settle.current) place(stopX(Math.max(0, latest.current.value), latest.current.n, width.current, STOP_THUMB));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(r);
+    return () => ro.disconnect();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The value changed from outside (a key, another model's scale, the bridge): the thumb glides
+  // there. A scale of another length is simply there.
+  const was = useRef({ value, n });
+  useLayoutEffect(() => {
+    const prev = was.current;
+    was.current = { value, n };
+    if (drag.current || !width.current) return;
+    if (prev.n !== n) {
+      stopSettle();
+      place(stopX(Math.max(0, value), n, width.current, STOP_THUMB));
+    } else if (prev.value !== value && !settle.current) glideTo(Math.max(0, value), false);
+  }, [value, n]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The word rolls the way the value went (the anchor holds both while they hand over).
+  const shownWas = useRef(shown);
+  useLayoutEffect(() => {
+    const from = shownWas.current;
+    shownWas.current = shown;
+    const wasAt = anchorX.current;
+    const a = anchor.current;
+    if (!a) return;
+    if (from === shown || reducedMotion()) {
+      place(x.current);
+      return;
+    }
+    const way = shown > from ? -1 : 1;
+    const word = a.querySelector<HTMLElement>('.sls-word:not([data-leaving])');
+    const ghost = a.querySelector<HTMLElement>('.sls-word[data-ghost]');
+    if (word && ghost) {
+      // The old word, kept as a copy that leaves; the new one comes in from the other side.
+      ghost.textContent = from >= 0 ? (stops[from] ?? '') : '';
+      ghost.setAttribute('data-leaving', '');
+      ghost.getAnimations().forEach((g) => g.cancel());
+      const out = ghost.animate(
+        [
+          { opacity: 1, transform: 'translate(-50%, 0px)' },
+          { opacity: 0, transform: `translate(-50%, ${way * ROLL_PX * 0.6}px)`, offset: 0.6 },
+          { opacity: 0, transform: `translate(-50%, ${way * ROLL_PX}px)` },
+        ],
+        { duration: ROLL_MS, easing: ROLL_EASE },
+      );
+      out.onfinish = () => {
+        ghost.removeAttribute('data-leaving');
+        ghost.textContent = '';
+        ghost.style.removeProperty('left');
+      };
+      word.animate(
+        [
+          { opacity: 0, transform: `translate(-50%, ${-way * ROLL_PX}px)` },
+          { opacity: 1, transform: `translate(-50%, ${-way * ROLL_PX * 0.4}px)`, offset: 0.6 },
+          { opacity: 1, transform: 'translate(-50%, 0px)' },
+        ],
+        { duration: ROLL_MS, easing: ROLL_EASE },
+      );
+      place(x.current);
+      // At an end the word is held inside the track by its own width, so a word of another width
+      // stands elsewhere: the leaving one keeps its own place instead of jumping with the anchor.
+      ghost.style.setProperty('left', `${(wasAt - anchorX.current).toFixed(2)}px`);
+      return;
+    }
+    place(x.current);
+  }, [shown]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Every render (rare: the nearest stop, the width, the stops): the ticks and the word's anchor follow the thumb.
+  useLayoutEffect(() => {
+    if (width.current && !settle.current) place(x.current);
+  });
+
+  /** The thumb's centre for a pointer at clientX, in the rail's own px (Interface size and zoom included). */
+  const railX = (clientX: number) => {
+    const r = rail.current!;
+    const b = r.getBoundingClientRect();
+    return ((clientX - b.left) * r.offsetWidth) / (b.width || 1);
+  };
+
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    if (disabled || e.button !== 0 || !rail.current || n < 2) return;
+    e.preventDefault();
+    // Taken by the pointer: focused without the ring, which comes back with the first key.
+    e.currentTarget.setAttribute('data-pointer', '');
+    (e.currentTarget as HTMLElement).focus({ preventScroll: true });
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const px = railX(e.clientX);
+    const at = nowX();
+    stopSettle();
+    // Taken by the thumb: it keeps where it was taken. Elsewhere: it comes to the pointer.
+    const onThumb = Math.abs(px - at) <= STOP_THUMB / 2 + 3;
+    drag.current = { id: e.pointerId, grab: onThumb ? px - at : 0, moved: false, startX: e.clientX };
+    e.currentTarget.setAttribute('data-dragging', '');
+    if (!onThumb) {
+      const to = holdX(px, width.current, STOP_THUMB);
+      place(to);
+      const i = nearestStop(to, n, width.current, STOP_THUMB);
+      if (i !== shown) {
+        setLive(i);
+        latest.current.onChange(i);
+      } else setLive(i);
+    } else setLive(nearestStop(at, n, width.current, STOP_THUMB));
+  };
+
+  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    const d = drag.current;
+    if (!d || d.id !== e.pointerId) return;
+    if (Math.abs(e.clientX - d.startX) > 2) d.moved = true;
+    const to = holdX(railX(e.clientX) - d.grab, width.current, STOP_THUMB);
+    place(to);
+    const i = nearestStop(to, n, width.current, STOP_THUMB);
+    if (i !== live) {
+      setLive(i);
+      latest.current.onChange(i);
+    }
+  };
+
+  const release = (e: PointerEvent<HTMLDivElement>, commit: boolean) => {
+    const d = drag.current;
+    if (!d || d.id !== e.pointerId) return;
+    drag.current = null;
+    e.currentTarget.removeAttribute('data-dragging');
+    const i = nearestStop(x.current, n, width.current, STOP_THUMB);
+    setLive(null);
+    glideTo(commit ? i : Math.max(0, value), true);
+    if (commit && i !== value) latest.current.onCommit?.(i);
+    else if (!commit) latest.current.onChange(value);
+  };
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (disabled || e.ctrlKey || e.metaKey || e.altKey) return;
+    e.currentTarget.removeAttribute('data-pointer');
+    const to = stopKey(e.key, value, n);
+    if (to === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (to === value) {
+      // An end holds: the thumb leans the way it was pushed and comes back.
+      const dir = e.key === 'ArrowLeft' || e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === 'Home' ? -1 : 1;
+      play(thumb.current, [{ transform: 'translateX(0px)' }, { transform: `translateX(${dir * 2}px)`, offset: 0.3 }, { transform: 'translateX(0px)' }], { duration: 220, easing: 'ease-out' });
+      return;
+    }
+    latest.current.onChange(to);
+    latest.current.onCommit?.(to);
+  };
+
+  const ticks = [];
+  if (railW && n > 1) {
+    for (let i = 0; i < n; i++) {
+      const left = stopX(i, n, railW, STOP_THUMB) - 1.5;
+      ticks.push(<span key={i} className="sls-tick" data-x={left.toFixed(2)} style={{ translate: `${left.toFixed(2)}px 0` }} />);
+    }
+  }
+
+  return (
+    <div
+      className={cx('sls', className)}
+      role="slider"
+      tabIndex={disabled ? -1 : 0}
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={Math.max(0, n - 1)}
+      aria-valuenow={Math.max(0, shown)}
+      aria-valuetext={stops[shown] ?? 'Default'}
+      aria-disabled={disabled || undefined}
+      data-disabled={disabled || undefined}
+      data-unset={shown < 0 || undefined}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={(e) => release(e, true)}
+      onPointerCancel={(e) => release(e, false)}
+      onLostPointerCapture={(e) => release(e, true)}
+      onKeyDown={onKeyDown}
+      onBlur={(e) => e.currentTarget.removeAttribute('data-pointer')}
+    >
+      <span className="sls-lane" aria-hidden>
+        <span ref={anchor} className="sls-anchor">
+          <span className="sls-word">{stops[shown] ?? 'Default'}</span>
+          <span className="sls-word" data-ghost="" />
+        </span>
+      </span>
+      <span ref={rail} className="sls-rail">
+        <span className="sls-track">
+          <span ref={fill} className="sls-fill" />
+        </span>
+        {ticks}
+        <span ref={thumb} className="sls-thumb" />
+      </span>
+    </div>
   );
 }
 

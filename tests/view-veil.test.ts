@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { coverSteps, quartersOn, VEIL_STEP_IN, VEIL_WAIT_AFTER } from '../src/art/veil';
+import { coverSteps, quartersOn, VEIL_QUICK, VEIL_STEP_IN, VEIL_WAIT_AFTER } from '../src/art/veil';
 
 const read = (p: string) => readFileSync(p, 'utf8');
 
@@ -56,13 +56,18 @@ describe('a change of view: one veil, one clock, one direction', () => {
     expect(reveal).toContain('cover.anims[0]?.startTime');
     expect(reveal).toMatch(/for \(const el of sw\.hide \?\? \[\]\)[\s\S]*?el\.animate\(/);
     expect(reveal).toMatch(/for \(const el of sw\.show \?\? \[\]\)[\s\S]*?el\.animate\(/);
-    // The quarters go off after the hold, in the reverse of the order they came on.
-    expect(reveal).toContain('hold + (3 - q) * VEIL_STEP_OUT');
+    // The quarters go off after the hold, in the reverse of the order they came on (from the
+    // highest that came on: three for the quick change, four for the full cover).
+    expect(reveal).toContain('hold + Math.max(0, top - q) * cover.stepOut');
     // Each quarter's way out is whole in its keyframes, on from the first frame. As a short animation
     // behind a delay, the quarters went off early when the page committed the new view: what had been
     // covered showed for some frames under a quarter of the veil, then the veil was solid again.
     expect(reveal).not.toMatch(/delay:/);
     expect(reveal).toMatch(/\{ opacity: 1, offset: at\(offAt\[q\], out\) \},\s*\{ opacity: 0, offset: at\(offAt\[q\] \+ FRAME, out\) \}/);
+    // Pinned to the moment of the reveal, not to the frame that first shows them (a frame or two
+    // after a view was built and laid out): the switch never comes late on top of the build.
+    expect(reveal).toContain('a.startTime = now;');
+    expect((reveal.match(/pin\(/g) ?? []).length).toBeGreaterThanOrEqual(4);
     // The gate is a clock on the same timeline, not an animation of the veil.
     expect(reveal).toContain('new Animation(new KeyframeEffect(null, null,');
     // In a swap the stage's own variants move nothing and fade nothing.
@@ -70,6 +75,27 @@ describe('a change of view: one veil, one clock, one direction', () => {
     expect(app).not.toContain('VEIL_SWAP_AT');
     expect(app).not.toMatch(/veil\(el, 'swap'\)/);
     expect((app.match(/<HoldForVeil \/>/g) ?? []).length).toBe(3);
+  });
+
+  it('changes to a chat that is already here without ever going solid', () => {
+    // Three quarters at most, a frame a step: the old chat shows through while the new one is built.
+    expect(VEIL_QUICK.peak).toBe(3);
+    expect(VEIL_QUICK.step).toBe(16);
+    const quick = coverSteps([false, false, false, false], VEIL_QUICK.peak, VEIL_QUICK.step);
+    expect(quick.at).toEqual([0, 16, 32, Infinity]);
+    expect(quick.solidIn).toBe(48);
+    // Never a quarter past the peak, whatever was on.
+    expect(coverSteps([true, false, false, false], 3, 16).at).toEqual([-1, 0, 16, Infinity]);
+    const cover = { born: 1000, at: quick.at, start: 1016 as number | null };
+    expect(quartersOn(cover, 5000)).toEqual([true, true, true, false]);
+    // Down a frame a step from the peak, the new view in its place (nothing rises).
+    const reveal = veil.slice(veil.indexOf('export function veilReveal'));
+    expect(reveal).toContain('const rise = cover.peak < 4 ? 0 : sw.rise;');
+    // Chosen for a chat whose conversation is in the window, from another chat; no waiting state.
+    const hook = app.slice(app.indexOf('function useShownView'), app.indexOf('export function App()'));
+    expect(hook).toContain('quick: !!shown.sessionId && warmChat(live.sessionId)');
+    expect(hook).toContain('quick: !!now.shown.sessionId && warmChat(id)');
+    expect(veil).toContain('if (!wait && opts.waiting && !quick) {');
   });
 
   it('starts the cover before the new view is built', () => {

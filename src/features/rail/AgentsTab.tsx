@@ -14,7 +14,7 @@ import { Icon } from '@/icons';
 import { useStore } from '@/state/store';
 import { AgentDetail } from './AgentDetail';
 import { ShownCtx, indexFor, usePaneTick, useProgress, useShown } from './agents-hooks';
-import { OUTCOME_WORD, commandState, commandsView, figuresOf, liveKey, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress } from './agents-model';
+import { OUTCOME_WORD, STATE_MARK, agentState, agentsHeader, commandRowState, commandState, commandsView, figuresOf, liveKey, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress, type RowState } from './agents-model';
 import { LeaveList } from './leave';
 import './agents.css';
 
@@ -127,6 +127,8 @@ function AgentsList({ sessionId }: { sessionId: string }) {
       if (shown.more) rows.push({ key: 'm:cmd', as: 'm:cmd', node: () => <MoreRow key="m:cmd" id="m:cmd" group={COMMANDS} count={shown.more} onFlip={flip} /> });
     }
   }
+  // The tail line's units (sub-agents and commands that work now), then how many ended.
+  const head = agentsHeader({ working: view.working.length, running: cmds.running, agentsDone: view.done, agentsFailed: view.failed, commands: cmds.ids.length, commandsFailed: cmds.failed });
   const keys = rows.map((r) => r.key);
   const arrived = useEntrances(rows.map((r) => r.as));
 
@@ -144,8 +146,8 @@ function AgentsList({ sessionId }: { sessionId: string }) {
         <span className="rail-bar-title">Agents</span>
         {/* How many work now (and which commands run); once none does, how many there were. What failed is said beside it. */}
         <span className="rail-bar-meta num">
-          {[cmds.running ? `${cmds.running} ${cmds.running === 1 ? 'command' : 'commands'} running` : '', view.working.length ? `${view.working.length} working` : view.done ? `${view.done} done` : ''].filter(Boolean).join(' · ')}
-          {view.failed > 0 && <span className="agx-bar-failed"> · {view.failed} failed</span>}
+          {head.label}
+          {head.failed > 0 && <span className="agx-bar-failed">{head.label ? ' · ' : ''}{head.failed} failed</span>}
         </span>
       </div>
       <div className="rail-scroll scroll agx-scroll">
@@ -260,12 +262,11 @@ const LiveCard = memo(function LiveCard({ sessionId, id, fresh }: { sessionId: s
     <div role="listitem" data-flip={id} className="agx-card" data-spot="" data-open={open || undefined} data-new={fresh || undefined} data-awaiting={awaiting || undefined}>
       <button type="button" className="agx-card-btn" aria-expanded={open} onClick={toggle}>
         <span className="agx-line">
-          {/* One mark: amber while it waits for you, the other agent's mark for a hand-over, else the ring. */}
-          <span className="agx-mark" aria-hidden>
-            {awaiting ? <span className="agx-wait-dot" /> : provider ? <ProviderMark provider={provider} size={13} /> : <Ring size={12} label={null} />}
-          </span>
+          {/* Its state first, as every row: amber while it waits for you, else the ring. */}
+          <StateMark state={awaiting ? 'waiting' : 'running'} />
           <span className="sr-only">{awaiting ? 'Waiting for you' : 'Working'}</span>
           <span className="agx-title truncate">{agentTask(item)}</span>
+          {provider && <Who provider={provider} />}
           <span className="agx-time num">
             <Since ts={item.ts} />
           </span>
@@ -362,6 +363,27 @@ function WorkflowLive({ run }: { run: WorkflowRun }) {
   );
 }
 
+// ── a row's state ──
+
+/** The mark every row of the tab leads with: where it stands (`STATE_MARK`), never what kind it is. */
+function StateMark({ state }: { state: RowState }) {
+  const m = STATE_MARK[state];
+  return (
+    <span className="agx-mark" data-state={state} aria-hidden>
+      {m === 'ring' ? <Ring size={12} label={null} /> : m === 'wait' ? <span className="agx-wait-dot" /> : <Icon name={m} size={m === 'x' ? 11 : m === 'check' ? 12 : 13} weight={m === 'x' ? 'bold' : undefined} />}
+    </span>
+  );
+}
+
+/** A hand-over's agent (the other agent did the work), after the task, quiet. */
+function Who({ provider }: { provider: NonNullable<ReturnType<typeof agentProvider>> }) {
+  return (
+    <span className="agx-who" aria-hidden>
+      <ProviderMark provider={provider} size={12} />
+    </span>
+  );
+}
+
 // ── done ──
 
 /**
@@ -379,17 +401,14 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
   const f = figuresOf(item);
   const provider = agentProvider(item) ?? item.check?.agent ?? null;
   const word = outcome === 'done' ? '' : OUTCOME_WORD[outcome];
-  // A plain done row is checked: the column every row leads with is never empty (an empty one read as a misindent).
-  const mark = outcome === 'failed' ? <Icon name="x" size={11} weight="bold" /> : provider ? <ProviderMark provider={provider} size={12} /> : item.workflow ? <Icon name="tree" size={13} /> : outcome === 'done' ? <Icon name="check" size={12} /> : null;
   const launched = !!item.result?.agent?.background || !!item.detail.background;
   const endedAt = noted || (launched ? 0 : (item.endedAt ?? 0));
   return (
     <div role="listitem" data-flip={id} className="agx-row" data-outcome={outcome} data-open={open || undefined} data-new={fresh || undefined}>
       <button type="button" className="agx-row-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span className="agx-mark" aria-hidden>
-          {mark}
-        </span>
+        <StateMark state={agentState(outcome)} />
         <span className="agx-title truncate">{agentTask(item)}</span>
+        {provider && <Who provider={provider} />}
         <span className="agx-meta num">
           {word ? <span className="agx-outcome">{word}</span> : <span className="sr-only">Done</span>}
           {!word && f.ms >= 1000 && <span className="agx-dur">{shortDuration(f.ms)}</span>}
@@ -455,9 +474,7 @@ const CommandRow = memo(function CommandRow({ sessionId, id, fresh }: { sessionI
         aria-label={`${name}${owner ? `, started by ${owner}` : ''}. ${word || 'Done'}. Show in conversation`}
         onClick={() => revealItem(sessionId, id)}
       >
-        <span className="agx-mark" aria-hidden>
-          {state === 'failed' ? <Icon name="x" size={11} weight="bold" /> : state === 'starting' || state === 'running' ? <Ring size={12} label={null} /> : <Icon name="terminal" size={13} />}
-        </span>
+        <StateMark state={commandRowState(state)} />
         <span className="agx-title truncate">
           {name}
           {owner && <span className="agx-outcome"> · {owner}</span>}

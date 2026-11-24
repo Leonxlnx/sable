@@ -4,13 +4,14 @@ import { Collapse } from '@/components/Collapse';
 import { Markdown } from '@/components/Markdown';
 import { Icon, TOOL_ICON } from '@/icons';
 import { lastDevUrl } from '@/lib/dev-url';
-import { formatDuration, plural, relPath } from '@/lib/format';
+import { formatDuration, plural } from '@/lib/format';
 import { PathLabel } from '@/ui';
 import { DevUrlChip } from '@/features/rail/DevUrlChip';
 import { stepOf, useJumpOpen } from '@/features/review/jump';
 import { AgentBlock } from './Agent';
 import { useTimeline } from './ctx';
-import { ToolDetails, hasDetails } from './ToolDetails';
+import { ToolDetails } from './ToolDetails';
+import { errorText, hasDetails, rowText } from './step-row';
 import { isActive, partialJsonString, shortDuration, useTick } from './util';
 
 /** Live seconds for a running call. Hidden for the first two seconds: most calls are done by then. */
@@ -85,57 +86,9 @@ function ToolMeta({ item }: { item: ToolItem }) {
   );
 }
 
-/**
- * What the row says: the verb, then its target. A file is a path in the interface face (folder dim,
- * name regular); a command or a folder follows as a quieter phrase.
- */
-function rowText(item: ToolItem, cwd: string, home: string): { verb: string; path?: string; sub?: string } {
-  const d = item.detail;
-  switch (item.kind) {
-    case 'read':
-    case 'edit':
-    case 'write': {
-      if (!d.path) return { verb: item.title };
-      const rel = relPath(d.path, cwd, home);
-      const base = rel.slice(rel.lastIndexOf('/') + 1);
-      const verb = item.title.endsWith(base) ? item.title.slice(0, -base.length).trim() : '';
-      return verb ? { verb, path: rel } : { verb: item.title };
-    }
-    case 'bash': {
-      if (!d.command) return { verb: item.title };
-      const text = d.command.split('\n')[0];
-      const norm = (s: string) => s.trim().replace(/\s+/g, ' ');
-      // Codex titles a command with the command itself: say it once.
-      return norm(text) && norm(text) !== norm(item.title) ? { verb: item.title, sub: text } : { verb: item.title };
-    }
-    case 'search': {
-      const where = d.glob ?? (d.path ? relPath(d.path, cwd, home) : '');
-      return { verb: item.title, sub: where && where !== '.' ? `in ${where}` : undefined };
-    }
-    // The task strip over the composer carries the live task; the trail only records the list's count.
-    case 'todo':
-      return { verb: 'Tasks' };
-    case 'skill':
-      return { verb: item.title, sub: d.description };
-    case 'mcp':
-      return { verb: item.title, sub: d.server && d.tool && !item.title.includes(d.tool) ? `${d.server} · ${d.tool}` : undefined };
-    default:
-      return { verb: item.title };
-  }
-}
-
 /** Rows start folded; an answered question shows its answers, since that is the whole point of it. */
 function autoOpen(item: ToolItem): boolean {
   return item.kind === 'question' && item.status === 'done';
-}
-
-/** First lines of what went wrong, shown under the row without opening it. */
-function errorText(item: ToolItem): string | null {
-  if (item.status !== 'error' || item.kind === 'bash') return null;
-  const text = (item.result?.stderr || item.result?.text || '').trim();
-  if (!text) return null;
-  const lines = text.split('\n');
-  return lines.length > 3 ? lines.slice(0, 3).join('\n') + '\n…' : text;
 }
 
 /** The last lines a running command printed, in a window of fixed height: the trail never jumps. */
@@ -205,7 +158,7 @@ function ToolRow({ item }: { item: ToolItem }) {
       )}
       {expandable && (
         <Collapse open={open}>
-          <div className="tool-details">
+          <div className="tool-details" inert={item.more} aria-busy={item.more}>
             <ToolDetails item={item} />
           </div>
         </Collapse>

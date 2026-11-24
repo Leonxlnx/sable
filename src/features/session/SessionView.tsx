@@ -4,9 +4,7 @@ import { Composer } from '@/features/composer/Composer';
 import { PromptDock } from '@/features/prompts/PromptDock';
 import { Timeline } from '@/features/timeline/Timeline';
 import { afterSend } from '@/features/composer/settle';
-import { EASE_OUT, play } from '@/lib/motion';
 import { useStore } from '@/state/store';
-import { DOCK_GLIDE_MS } from './dock-glide';
 import { ConversationFind } from './FindBar';
 import { useStaged } from './staged';
 import './session.css';
@@ -93,20 +91,11 @@ export function SessionDock({ sessionId }: { sessionId: string }) {
     const el = dock.current;
     const host = el?.closest<HTMLElement>('.stage-body');
     if (!el || !host) return;
-    let was = 0;
-    let strip: Element | null = null;
+    // The task strip is the composer's own (Composer.tsx `TaskSlot`): a card arriving above it
+    // moves nothing of the stack, which stands on the dock's bottom edge.
     const ro = new ResizeObserver(() => {
-      const h = el.offsetHeight;
-      host.style.setProperty('--dock-h', `${h}px`);
+      host.style.setProperty('--dock-h', `${el.offsetHeight}px`);
       host.style.setProperty('--dock-cut', `${coveTop(el)}px`);
-      // A card arriving under the task strip, or leaving: the strip stood at the dock's upper edge
-      // and jumped the card's height in one frame. It glides there instead (the conversation does
-      // the same, Timeline.tsx). Only a strip that was already in view, never one that is entering.
-      const now = el.querySelector(':scope > .dock-inner > .pd-slot[data-slot="tasks"]');
-      const d = h - was;
-      if (was && now && now === strip && Math.abs(d) > 24 && Math.abs(d) < 900) play(now, [{ translate: `0 ${d}px` }, { translate: '0 0' }], { duration: DOCK_GLIDE_MS, easing: EASE_OUT });
-      was = h;
-      strip = now;
     });
     ro.observe(el);
     return () => {

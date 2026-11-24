@@ -1,4 +1,4 @@
-import { memo, useRef, type ReactNode } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { Token, Tokens } from 'marked';
 import { fileIcon } from '@/features/composer/file-icon';
 import { Icon, type IconName } from '@/icons';
@@ -8,6 +8,7 @@ import { PENDING_HREF, lexBlocks, repairTail, type LexState } from '@/lib/md';
 import { FenceWidget, MermaidBlock, WIDGET_FENCE } from '@/features/genui/blocks';
 import { numericColumns, TableCopy, wideColumns } from '@/features/genui/table';
 import { CodeBlock } from './CodeBlock';
+import { inPieces, pieceHeight, piecesOf } from './md-pieces';
 import { ImageView } from './ImageView';
 import './markdown.css';
 
@@ -358,6 +359,30 @@ export const Markdown = memo(function Markdown({ text, streaming = false, head, 
   const blocks = state.current.blocks;
   let last = blocks.length - 1;
   while (last >= 0 && blocks[last].token.type === 'space') last--;
+  // A long settled text mounts in pieces, its end first and one bounded piece more above per frame,
+  // each a box that skips layout out of view (md-pieces.ts): never one commit of thousands of lines.
+  // Decided once, at mount: a text that streamed in is already whole and stays as it is.
+  const [long] = useState(() => !streaming && inPieces(blocks.map((b) => b.raw.length)));
+  const pieces = useMemo(() => (long ? piecesOf(blocks.map((b) => b.raw.length)) : null), [long, blocks]);
+  const [shown, setShown] = useState(1);
+  const more = !!pieces && shown < pieces.length;
+  useEffect(() => {
+    if (!more) return;
+    const raf = requestAnimationFrame(() => setShown((n) => n + 1));
+    return () => cancelAnimationFrame(raf);
+  }, [more, shown]);
+  if (pieces) {
+    const sizes = blocks.map((b) => b.raw.length);
+    return (
+      <div className={`md ${className ?? ''}`} data-pieces={more || undefined}>
+        {pieces.slice(Math.max(0, pieces.length - shown)).map(([a, b]) => (
+          <div key={a} className="md md-piece" style={{ containIntrinsicSize: `auto ${pieceHeight(sizes, a, b)}px` }}>
+            {blocks.slice(a, b).map((bl, j) => (bl.token.type === 'space' ? null : <Block key={a + j} raw={bl.raw} token={bl.token} live={false} tail={false} />))}
+          </div>
+        ))}
+      </div>
+    );
+  }
   return (
     <div className={`md ${className ?? ''}`} data-streaming={streaming || undefined} data-head={head}>
       {blocks.map((b, i) => (b.token.type === 'space' ? null : <Block key={i} raw={b.raw} token={b.token} live={streaming && i === last} tail={!!head && i === last} />))}

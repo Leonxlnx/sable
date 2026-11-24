@@ -13,6 +13,7 @@ import { EASE_OUT, play, reducedMotion } from '@/lib/motion';
 import { usePrewarm } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { handoffPhase, subscribeHandoff } from './handoff';
+import { lastFolder } from './last-folder';
 import './home.css';
 
 export const PROVIDER_PALETTE: Record<ProviderId, DitherPalette> = { claude: 'ember', codex: 'iris', opencode: 'mint', demo: 'forest' };
@@ -69,6 +70,30 @@ function useArrival(mark: RefObject<HTMLDivElement | null>, title: RefObject<HTM
   }, [mark, title, composer]);
 }
 
+/**
+ * Home starts on the folder the person last worked in (last-folder.ts), from its first frame: on
+ * every arrival, unless "No folder" was chosen or the way home named a folder, and when the chats arrive after home did (the
+ * first start) while no folder is set. A folder picked on home stays until home is left.
+ */
+/** The way home named a folder itself (a project's new chat: `goHome(cwd)` sets it with the view). */
+let named = false;
+useStore.subscribe((s, prev) => {
+  if (prev.ui.activeSessionId && !s.ui.activeSessionId) named = s.ui.homeCwd !== prev.ui.homeCwd || s.ui.homeChat !== prev.ui.homeChat;
+});
+
+function useLastFolder() {
+  useLayoutEffect(() => {
+    const s = useStore.getState();
+    if (s.ui.homeChat || named) return;
+    const f = lastFolder(s.sessions);
+    if (f && f !== s.ui.homeCwd) s.setUi({ homeCwd: f });
+  }, []);
+  const late = useStore((s) => (s.ui.homeCwd || s.ui.homeChat ? null : lastFolder(s.sessions)));
+  useEffect(() => {
+    if (late) useStore.getState().setUi({ homeCwd: late });
+  }, [late]);
+}
+
 /** The empty stage: the mark, one question, one composer, light across the whole stage. Memoized: the shell re-renders as a session mounts over it. */
 export const Home = memo(function Home() {
   // Latched: once the first message has left, the home screen stays emptied while it fades out
@@ -87,6 +112,7 @@ export const Home = memo(function Home() {
   const composer = useRef<HTMLDivElement>(null);
   usePrewarm('.home-composer');
   useArrival(mark, title, composer);
+  useLastFolder();
 
   // The mark listens: each keystroke in the composer glints one of its missing corner cells.
   useEffect(() => {

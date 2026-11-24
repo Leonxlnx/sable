@@ -25,14 +25,7 @@
 .hscroll {
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
   overscroll-behavior-x: contain;
-}
-
-.hscroll:hover,
-.hscroll:focus-within {
-  scrollbar-color: var(--scrollbar) transparent;
 }
 
 .hscroll::-webkit-scrollbar {

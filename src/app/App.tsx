@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ComponentType, type ReactNode, type RefObject } from 'react';
-import { AnimatePresence, cancelFrame, frame, motion, MotionConfig, usePresence, type Variants } from 'motion/react';
+import { AnimatePresence, cancelFrame, frame, motion, MotionConfig, useMotionValue, usePresence, type MotionValue, type Variants } from 'motion/react';
 import { Launch, launchPlays } from '@/art/LaunchLayer';
 import { LogoMark } from '@/art/Logo';
 import { veil, veilCover, veilHeld, veilReveal, type VeilRun } from '@/art/veil';
@@ -230,6 +230,15 @@ function waitingChat(): HTMLElement {
   return el;
 }
 
+/**
+ * A chat whose conversation is in the window (kept, or its snapshot already here): its view is
+ * built in one task, so the change to it is the quick one (veil.ts `VEIL_QUICK`): the old chat
+ * shows through the dither while the new one is built, the two switch the frame it is there, and
+ * the stage is never blank. Everything else (a chat still to be read, home, a race) keeps the full
+ * cover and its waiting state.
+ */
+const warmChat = (id: string | null | undefined) => !!id && !!useStore.getState().data[id]?.loaded;
+
 /** The veil has gone and no other is on its way: the dock is no longer held above it. */
 function settle(el: HTMLElement) {
   if (!veilHeld(el)) el.removeAttribute('data-session-swap');
@@ -320,7 +329,7 @@ function useShownView(live: StageView, body: RefObject<HTMLElement | null>): { s
     // Session to session: the dock stays above the veil, so only the conversation dissolves.
     el?.toggleAttribute('data-session-swap', shown.key !== 'home' && live.key !== 'home');
     // (Already on when the row's press started it, open-cue below.)
-    if (!veilHeld(el)) veilCover(el, { waiting: live.sessionId ? waitingChat : undefined });
+    if (!veilHeld(el)) veilCover(el, { waiting: live.sessionId ? waitingChat : undefined, quick: !!shown.sessionId && warmChat(live.sessionId) });
     let t = 0;
     const raf = requestAnimationFrame(() => {
       t = window.setTimeout(() => setShown(live), 0);
@@ -345,7 +354,7 @@ function useShownView(live: StageView, body: RefObject<HTMLElement | null>): { s
       const now = state.current;
       if (!el || now.shown.key == null || now.live.key !== now.shown.key || id === now.shown.sessionId || reducedMotion() || handoffActive()) return;
       el.toggleAttribute('data-session-swap', now.shown.key !== 'home');
-      veilCover(el, { waiting: waitingChat });
+      veilCover(el, { waiting: waitingChat, quick: !!now.shown.sessionId && warmChat(id) });
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         const s = state.current;
@@ -398,6 +407,10 @@ export function App() {
   const [railMode, setRailMode] = useState({ shown: railShown, step: false });
   if (railMode.shown !== railShown) setRailMode({ shown: railShown, step: railSteps(railShown) });
   const railStep = railMode.step;
+  // The column's width as motion holds it: `slideRail` sets it in the frame of the press, so
+  // motion's own next render writes that width and not the one before it.
+  const railWidth = useMotionValue<number | string>(0);
+  railWidthValue = railWidth;
   useRailMotion(railShown, railStep);
   // A closed panel keeps its contents while the session stays (inert, zero wide, its panes told
   // they are hidden): opening it again mounts nothing, and the Browser's pages are not loaded again.
@@ -528,6 +541,7 @@ export function App() {
               <motion.aside
                 key="rail"
                 className="app-rail"
+                style={{ width: railWidth }}
                 data-open={railShown || undefined}
                 inert={!railShown}
                 // The panel's contents resolve through the dither veil (and dissolve into it on close),
@@ -536,10 +550,10 @@ export function App() {
                 animate={railShown ? { width: 'var(--rail-fit)', opacity: 1 } : { width: 0, opacity: reducedMotion() ? 0 : 1 }}
                 exit={{ width: 0, opacity: reducedMotion() ? 0 : 1, transition: RAIL_SPRING }}
                 // Just past critical damping: the edge arrives without passing its place, so nothing
-                // beside it ever moves back. Where the panel slides over the conversation instead
-                // (`slideRail`), the width is set in one step when the slide ends: this only
-                // confirms it a moment later.
-                transition={railStep ? { duration: 0, delay: (railShown ? RAIL_SLIDE_IN : RAIL_SLIDE_OUT).duration / 1000 + 0.08 } : RAIL_SPRING}
+                // beside it ever moves back. Where the panel slides instead (`slideRail`), the column
+                // takes its width in the frame of the press: set there, and held here at once (a
+                // delayed confirmation let motion hold the old width until it came).
+                transition={railStep ? { duration: 0 } : RAIL_SPRING}
                 // Closed but kept: the same clean-up as when it leaves the page.
                 onAnimationComplete={railShown ? releaseRail : railGone}
               >
@@ -718,21 +732,23 @@ function useRailMotion(shown: boolean, step: boolean) {
 
 const RAIL_SPRING = { type: 'spring', stiffness: 400, damping: 42 } as const;
 /**
- * The slide (a compositor animation). In: it arrives decelerating, like the spring. Out: it leaves
- * without a tail, so the stage widens the moment the panel has gone (on the spring's long tail the
- * stage stood narrow beside an empty strip for a quarter of a second).
+ * The slide (a compositor animation), the panel's one clock where the column changes its width.
+ * In: it arrives decelerating, like the spring. Out: it leaves without a tail. The stage is at its
+ * final width from the first frame either way (`slideRail`), so nothing settles after it.
  */
-const RAIL_SLIDE_IN = { duration: 300, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' };
-const RAIL_SLIDE_OUT = { duration: 220, easing: 'cubic-bezier(0.35, 0, 0.5, 1)' };
+const RAIL_SLIDE_IN = { duration: 220, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' };
+const RAIL_SLIDE_OUT = { duration: 180, easing: 'cubic-bezier(0.35, 0, 0.5, 1)' };
 const railSlide = { anim: null as Animation | null, aside: null as HTMLElement | null };
+/** The rail column's width as motion holds it (App), for `stepRailWidth`. */
+let railWidthValue: MotionValue<number | string> | null = null;
 
 /**
  * Whether the conversation's column has to change its width for the panel (the window has no room
  * to keep it). Following the stage's edge live there wrapped every line of the conversation again
- * on each frame of the spring. Instead the conversation keeps the width it has while the panel
- * slides over its edge (opening) or out (closing), a transform on the compositor, and takes its
- * new width in one step when the slide has ended: one wrap, with the line the reader is on kept
- * where it is. A window with room for the column at both ends is not touched by this.
+ * on each frame of the spring. Instead the stage takes its new width in the frame of the press (one
+ * wrap, with the line the reader is on kept where it is) and the panel slides by transform on the
+ * compositor: into its column when it opens, over the widened stage when it closes. A window with
+ * room for the column at both ends is not touched by this.
  */
 function railSteps(opening: boolean): boolean {
   if (reducedMotion()) return false;
@@ -764,7 +780,14 @@ function stopRailSlide() {
   if (aside) delete aside.dataset.step;
 }
 
-/** The panel slides in over the stage's edge, or out; the stage takes its new width when it has. */
+/**
+ * The stage takes its new width now, in the frame of the press; the panel slides on one clock.
+ * Opening, it slides into its column (already its width, so the stage beside it is final); closing,
+ * the column is gone at once and the panel leaves over the widened stage (`data-step`: drawn out of
+ * its column of no width, with the stage's round end travelling at its edge). Waiting with the
+ * stage's width until the slide had ended showed the conversation cut by the panel for a third of
+ * a second and then re-laid out in one jump: "it takes a second and then reorganizes".
+ */
 function slideRail(opening: boolean) {
   const aside = document.querySelector<HTMLElement>('.app-rail');
   const inner = aside?.querySelector<HTMLElement>(':scope > .app-rail-inner');
@@ -775,16 +798,14 @@ function slideRail(opening: boolean) {
   const was = railSlide.anim;
   if (was && railSlide.aside === aside && was.playState === 'running') from = new DOMMatrixReadOnly(getComputedStyle(inner).transform).m41;
   stopRailSlide();
-  // Not laid out yet (opening): the panel is drawn over the stage, out of its column of no width.
-  if (aside.getBoundingClientRect().width < 1) aside.dataset.step = '';
+  stepRailWidth(aside, opening ? fit : 0);
+  if (!opening) aside.dataset.step = '';
   const anim = inner.animate([{ transform: `translateX(${from.toFixed(2)}px)` }, { transform: `translateX(${opening ? 0 : fit}px)` }], { ...(opening ? RAIL_SLIDE_IN : RAIL_SLIDE_OUT), fill: 'both' });
   railSlide.anim = anim;
   railSlide.aside = aside;
   anim.finished.then(
     () => {
-      if (railSlide.anim !== anim) return;
-      stepRailWidth(aside, opening ? fit : 0);
-      stopRailSlide();
+      if (railSlide.anim === anim) stopRailSlide();
     },
     () => {},
   );
@@ -811,6 +832,7 @@ function stepRailWidth(aside: HTMLElement, width: number) {
     }
   }
   aside.style.width = `${width}px`;
+  railWidthValue?.jump(width);
   if (!anchor || !scroller) return;
   const d = anchor.getBoundingClientRect().top - top;
   if (Math.abs(d) > 0.5) scroller.scrollTop += d;

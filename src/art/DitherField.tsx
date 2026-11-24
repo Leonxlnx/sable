@@ -344,7 +344,7 @@ interface Port {
   dispose(): void;
 }
 
-interface Props extends Partial<Omit<Look, 'pointer' | 'react'>> {
+interface Props extends Partial<Omit<Look, 'pointer' | 'react' | 'band'>> {
   /** Cell size in CSS pixels (dither texture); large stages may use coarser cells. */
   cell?: number;
   /** Draw hairline gaps between cells (dither texture). */
@@ -365,7 +365,17 @@ interface Props extends Partial<Omit<Look, 'pointer' | 'react'>> {
   image?: ImageBitmap | null;
   opacity?: number;
   className?: string;
+  /**
+   * The session's horizon: the canvas keeps a fixed size (its CSS, session.css) and the band it
+   * draws is measured from the host's parent (the band's height) and the stage (its width), sent
+   * to the worker as `Look.band` and eased there. A stage or dock that changes size moves the light,
+   * never the canvas.
+   */
+  band?: boolean;
 }
+
+/** The band height at which the session's pattern has its scale (the dock at rest: (126 - 3) × 1.6). */
+const BAND_REF_PX = 197;
 
 /** A window that has lost focus for this long stops drawing until it is back (a short grace, so a
  * focus hop into the panel browser or a native dialog does not flicker the field). */
@@ -399,8 +409,13 @@ export function DitherField({
   sat,
   imageColour,
   overlay,
+  band = false,
 }: Props) {
   const wrap = useRef<HTMLDivElement>(null);
+  /** The band as last measured (Look.band), sent with every look. */
+  const bandRef = useRef<[number, number, number] | null>(null);
+  const bandOn = useRef(band);
+  bandOn.current = band;
   // A dialog over the app hides (and blurs) the page's fields: they hold still underneath it.
   const covered = useStore((s) => !!(s.ui.settings || s.ui.paletteOpen || s.ui.historyOpen || s.ui.projectPicker));
   const coveredRef = useRef(covered);
@@ -413,7 +428,7 @@ export function DitherField({
   const [gen, setGen] = useState(0);
   const look: Look = { variant, palette, focus, gain, speed, seed, full, spot, angle, hue, sat, imageColour, overlay, react: react ? reactGain : 0 };
   const live = useRef(look);
-  live.current = look;
+  live.current = band ? { ...look, band: bandRef.current } : look;
   // What the running effect reads when it (re)lays out or decides whether to move.
   const cellRef = useRef(cell);
   cellRef.current = cell;
@@ -446,6 +461,25 @@ export function DitherField({
   useEffect(() => {
     const host = wrap.current;
     if (!host) return;
+    // The band (see `band`): the parent is its box, the stage its width. Measured before the
+    // engine starts, so its first frame already draws it where it is.
+    const bandBox = bandOn.current ? host.parentElement : null;
+    const bandStage = bandBox ? ((bandBox.closest('.stage') as HTMLElement | null) ?? bandBox) : null;
+    const measureBand = (): boolean => {
+      if (!bandBox || !bandStage) return false;
+      const h = host.getBoundingClientRect();
+      if (!h.width || !h.height) return false;
+      const z = (host as HTMLElement & { currentCSSZoom?: number }).currentCSSZoom || 1;
+      const b = bandBox.getBoundingClientRect();
+      const s = bandStage.getBoundingClientRect();
+      const next: [number, number, number] = [Math.min(1, s.width / h.width), Math.min(1, Math.max(0.05, b.height / h.height)), (BAND_REF_PX * z) / h.height];
+      const was = bandRef.current;
+      if (was && Math.abs(was[0] - next[0]) < 1e-4 && Math.abs(was[1] - next[1]) < 1e-4 && Math.abs(was[2] - next[2]) < 1e-4) return false;
+      bandRef.current = next;
+      live.current = { ...live.current, band: next };
+      return true;
+    };
+    measureBand();
     // A canvas handed to a worker cannot be taken back, so each run (mount, or the worker failing) starts with a fresh one.
     const el = document.createElement('canvas');
     host.appendChild(el);
@@ -565,6 +599,18 @@ export function DitherField({
     resize();
     const ro = new ResizeObserver(resize);
     ro.observe(host);
+    // The band follows its box and the stage frame by frame as a look (no canvas resize); the
+    // worker eases to it.
+    const bandRo = bandBox
+      ? new ResizeObserver(() => {
+          if (measureBand()) p.look(live.current);
+        })
+      : null;
+    if (bandBox && bandStage) {
+      bandRo?.observe(bandBox);
+      if (bandStage !== bandBox) bandRo?.observe(bandStage);
+      bandRo?.observe(host);
+    }
 
     // ── when it may run ──
     const reduced = matchMedia('(prefers-reduced-motion: reduce)');
@@ -682,6 +728,7 @@ export function DitherField({
       clearTimeout(parkTimer);
       clearTimeout(pending);
       ro.disconnect();
+      bandRo?.disconnect();
       io.disconnect();
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('focus', onFocus);

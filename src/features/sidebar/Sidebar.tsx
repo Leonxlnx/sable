@@ -21,7 +21,7 @@ import { FoldBody, foldCue, screenful, Unfolding } from './fold';
 import { nudgeFolder, pressFolder, releaseFolderDrag, type FolderDrop } from './folder-drag';
 import { holdListEnd, leaveRow } from './leave';
 import { SideResize } from './Resize';
-import { createGroupsSelector, idsOf, loadCollapsed, pathKey, saveCollapsed, toggleCollapsed, unfoldKeys, type ChatsGroup, type Mix, type ProjectGroup, type SetGroup, type TopEntry } from './groups';
+import { createGroupsSelector, holdGroups, idsOf, loadCollapsed, pathKey, saveCollapsed, toggleCollapsed, unfoldKeys, type ChatsGroup, type Mix, type ProjectGroup, type SetGroup, type TopEntry } from './groups';
 import { arrive, cued, moveCue } from './move';
 import { NameField } from './NameField';
 import { holdFocus, onCloseAutoFocus } from './rename';
@@ -133,7 +133,19 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
   // A task behind the store, and after a sent message has landed: a new session's row, the re-sort
   // and its slide are drawn once the send's frames are over, never in them (and a burst of updates
   // sorts once). Rows show their own status at once (they subscribe themselves).
-  const groups = useLaggedStore(selectGroups, Object.is, LAG);
+  const live = useLaggedStore(selectGroups, Object.is, LAG);
+  // No row moves under the person: while the pointer is over the list or a key moves through it, the
+  // order holds (`holdGroups`: states, new and removed chats still show) and settles when they leave.
+  const [holding, setHolding] = useState(false);
+  const inside = useRef({ pointer: false, keys: false });
+  const hold = (k: 'pointer' | 'keys', on: boolean) => {
+    if (inside.current[k] === on) return;
+    inside.current[k] = on;
+    setHolding(inside.current.pointer || inside.current.keys);
+  };
+  const shownRef = useRef(live);
+  const groups = useMemo(() => (holding ? holdGroups(shownRef.current, live) : live), [live, holding]);
+  shownRef.current = groups;
   const ready = useStore((s) => s.ready);
   // The open session's folder, not its id: switching sessions within a folder does not re-render the list.
   const activeKey = useLaggedStore(selectActiveKey, Object.is, LAG);
@@ -182,7 +194,31 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
   const order = `pinned:${idsOf(groups.pinned)}` + groups.top.map(entryOrder).join('');
 
   return (
-    <div {...props} className="side-list scroll" tabIndex={0} aria-label="Sessions list" onKeyDown={onListKey} onFocus={onListFocus} onBlur={onListBlur} onScroll={onListScroll} onWheel={onListWheel}>
+    <div
+      {...props}
+      className="side-list scroll"
+      tabIndex={0}
+      aria-label="Sessions list"
+      onKeyDown={(e) => {
+        if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) hold('keys', true);
+        onListKey(e);
+      }}
+      onFocus={onListFocus}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) hold('keys', false);
+        onListBlur(e);
+      }}
+      onPointerEnter={(e) => {
+        props.onPointerEnter?.(e);
+        if (e.pointerType !== 'touch') hold('pointer', true);
+      }}
+      onPointerLeave={(e) => {
+        props.onPointerLeave?.(e);
+        hold('pointer', false);
+      }}
+      onScroll={onListScroll}
+      onWheel={onListWheel}
+    >
       {!ready ? (
         <SkeletonRows />
       ) : empty ? (

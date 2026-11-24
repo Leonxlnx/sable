@@ -237,6 +237,62 @@ export function buildGroups(
 
 export const idsOf = (list: SessionMeta[]) => list.map((s) => s.id).join(' ');
 
+// ── an order that holds while the person is in the list ──
+
+/**
+ * `next` in `prev`'s order: what both hold keeps the place it had, what is new comes first (a chat
+ * just made is the newest), what went is gone. `next` itself when nothing moved.
+ */
+export function keepOrder<T>(prev: readonly T[], next: T[], key: (t: T) => string): T[] {
+  const at = new Map<string, number>();
+  prev.forEach((t, i) => at.set(key(t), i));
+  const fresh = next.filter((t) => !at.has(key(t)));
+  const kept = next.filter((t) => at.has(key(t))).sort((a, b) => at.get(key(a))! - at.get(key(b))!);
+  const out = [...fresh, ...kept];
+  return out.every((t, i) => t === next[i]) ? next : out;
+}
+
+const byId = (s: SessionMeta) => s.id;
+
+function holdFolder(prev: ProjectGroup | undefined, next: ProjectGroup): ProjectGroup {
+  if (!prev) return next;
+  const sessions = keepOrder(prev.sessions, next.sessions, byId);
+  return sessions === next.sessions ? next : { ...next, sessions };
+}
+
+/**
+ * The list as the person sees it while the pointer is over it or a key moves through it: no row,
+ * folder or project changes its place under them (another chat's turn ending, a background tick).
+ * Every row still shows its own state, chats made or removed still come and go; the order settles
+ * to `next` once the pointer leaves (the list's own slide shows the move then).
+ */
+export function holdGroups(prev: SidebarGroups, next: SidebarGroups): SidebarGroups {
+  if (prev === next) return next;
+  const folders = new Map(prev.projects.map((f) => [f.key, f]));
+  const sets = new Map(prev.top.flatMap((e) => (e.kind === 'group' ? [[e.key, e] as const] : [])));
+  const pinned = keepOrder(prev.pinned, next.pinned, byId);
+  const top = keepOrder(prev.top, next.top, (e) => e.key).map((e): TopEntry => {
+    if (e.kind === 'folder') {
+      const folder = holdFolder(folders.get(e.key), e.folder);
+      return folder === e.folder ? e : { ...e, folder };
+    }
+    if (e.kind === 'group') {
+      const was = sets.get(e.key);
+      const order = was ? keepOrder(was.folders, e.folders, (f) => f.key) : e.folders;
+      const held = order.map((f) => holdFolder(folders.get(f.key), f));
+      return held.every((f, i) => f === e.folders[i]) ? e : { ...e, folders: held };
+    }
+    const wasChats = prev.chats;
+    const sessions = wasChats ? keepOrder(wasChats.sessions, e.chats.sessions, byId) : e.chats.sessions;
+    return sessions === e.chats.sessions ? e : { ...e, chats: { ...e.chats, sessions } };
+  });
+  const same = pinned === next.pinned && top.every((e, i) => e === next.top[i]);
+  if (same) return next;
+  const projects = top.flatMap((e) => (e.kind === 'folder' ? [e.folder] : e.kind === 'group' ? e.folders : []));
+  const chatsEntry = top.find((e) => e.kind === 'chats');
+  return { ...next, pinned, top, projects, chats: chatsEntry?.kind === 'chats' ? chatsEntry.chats : next.chats };
+}
+
 const folderSig = (p: ProjectGroup) => `${p.key}|${p.name}|${p.path}|${p.pinned ? 1 : 0}|${p.mix ?? ''}|${p.attention ?? ''}|${idsOf(p.sessions)}|${idsOf(p.archived)}`;
 
 /** Everything the list's structure shows: order, membership, names, marks. Rows show the rest themselves. */

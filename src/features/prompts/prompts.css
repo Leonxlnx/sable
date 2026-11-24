@@ -254,6 +254,31 @@
   gap: 8px;
 }
 
+/* The deck's order (triage `answerOrder`): no apart on the left, the plain allow last on the right. */
+.pc-foot-no,
+.pc-foot-yes {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.pc-foot-yes {
+  justify-content: flex-end;
+  margin-left: auto;
+}
+
+/* A ghost's word on the text edge, as in the deck: its pill reaches 8 px past it. */
+.pc-foot-no {
+  margin-left: -8px;
+}
+
+.pc-foot-no .btn-ghost {
+  padding: 0 8px;
+}
+
 .pc-foot .btn {
   gap: 8px;
   /* A long option (an "Always allow" with a whole command) stays inside the card: its words cut. */
@@ -367,7 +392,6 @@
   margin: 10px -8px 0;
   max-height: calc(46 * var(--vh));
   overflow: auto;
-  scrollbar-width: thin;
 }
 
 /* A choice is a plain row: nothing at rest, the hover fill under the pointer, and the chosen one
@@ -497,11 +521,14 @@ button.qc-opt:active {
   padding: 0 8px;
 }
 
-/* ── task strip ── */
+/* ── task strip: the farthest strip of the composer's stack (until.css), tucked 20 px behind the
+   next one's top edge, with the pane's corners and its hairline ── */
 
 .ts {
-  border-radius: var(--r-lg);
-  overflow: hidden;
+  position: relative;
+  padding-bottom: 20px;
+  border-radius: var(--r-pane) var(--r-pane) 0 0;
+  background-color: var(--panel);
 }
 
 .ts-row {
@@ -510,10 +537,14 @@ button.qc-opt:active {
   gap: 10px;
   width: 100%;
   height: 38px;
-  padding: 0 12px;
+  padding: 0 7px 0 14px;
   text-align: left;
-  border-radius: calc(var(--r-lg) - 1px);
+  border-radius: calc(var(--r-pane) - 1px) calc(var(--r-pane) - 1px) 0 0;
   transition: background-color var(--d-1) var(--ease);
+}
+
+.ts[data-open] .ts-row {
+  border-radius: calc(var(--r-pane) - 1px) calc(var(--r-pane) - 1px) var(--r-sm) var(--r-sm);
 }
 
 .ts-row:hover {
@@ -568,6 +599,7 @@ button.qc-opt:active {
 
 .ts-caret {
   flex-shrink: 0;
+  margin-right: 7px;
   color: var(--text-3);
   transform: rotate(180deg);
   transition: transform var(--d-3) var(--ease-out);
@@ -582,7 +614,7 @@ button.qc-opt:active {
   flex-direction: column;
   gap: 2px;
   max-height: calc(34 * var(--vh));
-  padding: 2px 12px 10px;
+  padding: 2px 14px 10px;
 }
 
 .ts-item {

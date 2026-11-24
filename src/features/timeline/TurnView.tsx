@@ -12,10 +12,10 @@ import { useFresh, useItem, useTimeline } from './ctx';
 import { foldKey, setFold, useFold } from './fold';
 import { ItemList, ItemRow, estimate } from './items';
 import { REVEAL_EVENT, rootOf, type RevealDetail } from './reveal';
-import { changesOf } from './changes';
+import { foldedTurn } from './changes';
 import { Tail } from './Tail';
 import { TurnFoot } from './Turn';
-import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnSpan, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
+import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
 import { keptAt, rememberTurnSize, tailStart, TAIL, turnSizes, VIEWS } from './build-window';
@@ -676,7 +676,11 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, cap, index, pl
     }
     if (c.kind === 'text') {
       const note = seg.notes.includes(c.id);
-      out.push(<TextPiece key={c.id} id={c.id} open={!note || shown} nest={note && nest} answer={c.id === seg.answer || c.id === seg.reply} tail={seg.tail.includes(c.id)} />);
+      // Opened, everything between the turn's line and its answer stands on one inset: the reply to
+      // a steered message too (it stood back on the column's edge between nested checkpoints, the
+      // left edge stepping in and out four times in 400 px). Closed, the reply stays on the edge.
+      const reply = c.id === seg.reply && open && place >= 0;
+      out.push(<TextPiece key={c.id} id={c.id} open={!note || shown} nest={(note && nest) || reply} answer={c.id === seg.answer || c.id === seg.reply} tail={seg.tail.includes(c.id)} />);
       continue;
     }
     const head = i === headAt;
@@ -891,16 +895,7 @@ function TotalLine({ turn, open, onToggle, landed }: { turn: TurnGroup; open: bo
   const { sessionId } = useTimeline();
   const { span, changes, steps, thought } = useMemo(() => {
     const d = useStore.getState().data[sessionId];
-    const items = d?.items ?? {};
-    const work = turn.segments.length === 1 ? turn.segments[0].work : turn.segments.flatMap((s) => s.work);
-    const count = turn.segments.reduce((n, s) => n + s.steps, 0);
-    return {
-      span: turnSpan(items, turn),
-      changes: changesOf(items, d?.children ?? {}, work),
-      steps: count,
-      // Work that was only thinking says so ("Thought for 6s"), with no count of steps.
-      thought: !count && work.some((id) => items[id]?.type === 'thinking'),
-    };
+    return foldedTurn(d?.items ?? {}, d?.children ?? {}, turn);
   }, [sessionId, turn]);
   const took = span && span >= 1000 ? shortDuration(span) : '';
   return (
@@ -1141,7 +1136,9 @@ function LiveLine({ seg, run, from, open, onToggle }: { seg: Segment; run: Steps
     const el = label.current;
     if (!el || was < 0) return;
     const wide = el.offsetWidth;
-    if (Math.abs(was - wide) < 1) return;
+    // A shorter title: the figures simply follow it (a glide from the old end left a hole after
+    // the words for 180 ms). Only a longer title needs them to make room first.
+    if (wide < was || Math.abs(was - wide) < 1) return;
     for (let n = el.nextElementSibling; n; n = n.nextElementSibling) n.animate([{ transform: `translateX(${was - wide}px)` }, { transform: 'translateX(0)' }], { duration: 180, easing: 'cubic-bezier(0.2, 0, 0, 1)', composite: 'add' });
     if (wide > was) el.animate([{ opacity: 0 }, { opacity: 0, offset: 0.25 }, { opacity: 1 }], { duration: 240, easing: 'ease-out' });
   }, [title, waiting]);

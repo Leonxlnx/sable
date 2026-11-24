@@ -166,26 +166,28 @@ describe('a queued message removed leaves in the frame of the click', () => {
     const remove = tray.slice(tray.indexOf('const remove = ('), tray.indexOf('const move = ('));
     expect(remove).toContain("dissolve(row, { ground: '--panel', anchor: 'bottom', before: first })");
     expect(remove.indexOf('onLeave(q.id, true);')).toBeGreaterThan(remove.indexOf('dissolve(row'));
-    // Out of the layout in the click: every read of the tray comes before that.
-    expect(remove.indexOf('// Writes.')).toBeGreaterThan(remove.indexOf('row.offsetHeight'));
-    expect(remove.slice(remove.indexOf('// Writes.'))).not.toMatch(/offsetHeight|scrollHeight|getBoundingClientRect/);
+    // The copy is held where the row stood while the tray glides (QueueTray `glideTray`).
+    expect(remove).toContain("leaving?.ghost.setAttribute('data-qghost', '');");
     expect(remove).toContain("row.style.display = 'none';");
     expect(remove.indexOf('onLeave(q.id, true);')).toBeLessThan(remove.indexOf('removeQueued(sessionId, q.id)'));
+    // The last row is not taken out alone: the tray folds into the pane with it (`foldTray`).
+    expect(remove).toContain('const last = rows.length <= 1;');
+    expect(remove).toContain('if (row && !last) {');
     // Not taken by the bridge: the row comes back.
     expect(remove).toContain('onLeave(q.id, false)');
     // The glyph fragments drawn over the neighbours are gone from the tray.
     expect(tray).not.toContain('shatter');
-    // The tray shows what is left from that frame on, and folds away with its last row.
-    expect(tray).toContain('const shown = left.size ? queue.filter((q) => !left.has(q.id)) : queue;');
+    // The tray shows what is left from that frame on (and a row taken back to edit is gone too).
+    expect(tray).toContain('const shown = left.size || takingNow.size ? all.filter((q) => !left.has(q.id) && !takingNow.has(q.id)) : all;');
     expect(tray).toContain('{shown.length > 0 && (');
   });
 
   it('brings a refused removal back as a new row that can fly again', () => {
-    // The row that left may still be in the page, hidden and folding away: the one that comes back
-    // is another element (its key counts the returns), never that one, still hidden.
+    // The row that left may still be in the page, hidden: the one that comes back is another
+    // element (its key counts the returns), never that one, still hidden.
     expect(tray).toContain('lives.current.set(id, (lives.current.get(id) ?? 0) + 1);');
-    expect(tray).toContain('key={`${q.id}/${lives.get(q.id) ?? 0}`}');
-    const leave = tray.slice(tray.indexOf('const leave = useCallback('), tray.indexOf('const shown = left.size'));
+    expect(tray).toContain('key={`${keyOf(q.id)}/${lives.get(q.id) ?? 0}`}');
+    const leave = tray.slice(tray.indexOf('const leave = useCallback('), tray.indexOf('const waiting = useSyncExternalStore'));
     // Back in the tray, it is no longer "removed by hand": taken by the agent later, it flies.
     expect(leave).toMatch(/if \(!on\) \{[^}]*gone\.delete\(id\);/);
     // A flight never starts from the hidden row.
@@ -197,7 +199,7 @@ describe('a queued message removed leaves in the frame of the click', () => {
     // The bridge's answer is read: not removed and no longer in the queue means it went out.
     expect(remove).toMatch(/\.then\(\(res\) => \{[^}]*res\.ok === false && !shown\.current\.some\(\(x\) => x\.id === q\.id\)\) useStore\.getState\(\)\.toast\('That message had already gone out\.'\);/);
     // A return is counted only for a row that is really back in the queue.
-    const leave = tray.slice(tray.indexOf('const leave = useCallback('), tray.indexOf('const shown = left.size'));
+    const leave = tray.slice(tray.indexOf('const leave = useCallback('), tray.indexOf('const waiting = useSyncExternalStore'));
     expect(leave).toMatch(/if \(held\.current\.some\(\(q\) => q\.id === id\)\) \{[^}]*lives\.current\.set\(id,[^}]*\} else lives\.current\.delete\(id\);/);
     // Arrow keys count live rows only: a hidden row still in the page shifted the focus by one,
     // and Delete then removed the wrong message.
@@ -206,21 +208,28 @@ describe('a queued message removed leaves in the frame of the click', () => {
     expect(keys).toContain('const at = els.indexOf(e.currentTarget);');
   });
 
-  it('closes the tray on the compositor: translate only, one spring, never a height by script', () => {
+  it('closes the tray on the compositor: one glide for the whole dock, never a height by script', () => {
     // A queue is used while a turn streams: the height animated by script got five frames a second.
-    const close = tray.slice(tray.indexOf('function closeTray'), tray.indexOf('export interface QueueTrayProps'));
-    expect(close).toContain("play(clip, [{ translate: `0 ${-by}px` }, { translate: '0 0' }], timing)");
-    expect(close).toContain("play(el, [{ translate: `0 ${by}px` }, { translate: '0 0' }], timing)");
-    expect(close).not.toMatch(/style\.height|height: 0|requestAnimationFrame/);
-    // Never lifted further than the tray is tucked behind the composer: its lower edge stays hidden.
-    expect(close).toContain('const by = Math.min(height, TUCK);');
-    expect(tray).toContain('const TUCK = 20;');
+    const glide = tray.slice(tray.indexOf('function glideTray'), tray.indexOf('export interface QueueTrayProps'));
+    expect(glide).not.toMatch(/style\.height|height: 0|requestAnimationFrame/);
+    // The tray, the rows that stay, a removed row's copy and what stands above: one clock (stack-glide.ts).
+    expect(glide).toContain('const edge = glideY(cq, m.tray, t);');
+    expect(glide).toContain('glideY(g, -m.tray, t);');
+    expect(glide).toContain('for (const el of aboveTray(clip)) glideY(el, share, t);');
+    // The last row: the tray goes into the pane as one dead copy, the strips come down with it.
+    expect(glide).toContain("const ghost = reducedMotion() ? null : ghostOf(clip, { anchor: 'bottom' });");
+    expect(glide).toContain("clip.style.display = 'none';");
+    const sg = readFileSync('src/features/composer/stack-glide.ts', 'utf8');
+    expect(sg).toContain("play(el, [{ translate: `0 ${from.toFixed(2)}px` }, { translate: '0 0' }], { duration: STACK_MS, easing: STACK_EASE })");
     const css = readFileSync('src/features/composer/composer.css', 'utf8').replace(/\r\n/g, '\n');
     expect(css).toMatch(/\.cq-clip \{[^}]*margin-bottom: -20px;/);
+    // Only its lower edge cuts, and the tray's body goes on below its box: a tray drawn higher never shows a gap.
+    expect(css).toMatch(/\.cq-clip \{[^}]*clip-path: inset\(-480px 0 0 0\);/);
+    expect(css).toMatch(/\.cq::after \{[^}]*top: 100%;[^}]*background-color: var\(--panel\);/);
     expect(css).toMatch(/\.cq \{[^}]*padding-bottom: 20px;/);
-    // motion does not measure the rows for a slide of its own when a row is removed by hand.
+    // motion slides the rows itself only for a change of order among the same rows.
     expect(tray).toContain('layoutDependency={measure}');
-    expect(tray).toContain("const measure = `${held.map((q) => q.id).join()}/${order.map((q) => q.id).join()}`;");
+    expect(tray).toContain('if (set !== measured.current.set) measured.current = { set, measure: measured.current.measure };');
   });
 
   it('never leaves a copy that could be taken for the row', () => {

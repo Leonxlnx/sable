@@ -18,6 +18,13 @@
   animation: cfind-in 180ms var(--ease-out) backwards;
 }
 
+/* While the bar is open the conversation starts under it: the first message stood with its top
+   edge under the bar's rim (the bar ends 50 px down, the first card began at 48). The bar's bottom
+   plus one row's gap; scrolled anywhere but the top, scroll anchoring keeps what is read in place. */
+.session:has(> .cfind) .tl-content {
+  padding-top: 44px;
+}
+
 @keyframes cfind-in {
   from {
     opacity: 0;

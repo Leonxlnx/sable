@@ -231,6 +231,22 @@ describe('store event application', () => {
     expect(data().caps).toBe(caps);
   });
 
+  it('hydrates thinking and message rows and discards an answer for a superseded row', () => {
+    const message: UserItem = { ...user, more: true, attachments: [{ id: 'p', kind: 'image', name: 'p.png', dataUrl: '' }] };
+    const thought = { type: 'thinking' as const, id: 'thought', ts: 2, streaming: false, text: 'start', more: true };
+    S.applySnapshot({ session: meta(), items: [message, thought], permissions: [], questions: [], todos: [], queue: [] });
+    const whole = { ...user, attachments: [{ id: 'p', kind: 'image' as const, name: 'p.png', dataUrl: 'data:image/png;base64,AAA' }] };
+    const asked = data().items[thought.id];
+    S.applyWholeItem(SID, whole, data().items[user.id]);
+    expect(data().items[user.id]).toEqual(whole);
+    feed({ type: 'item.patch', sessionId: SID, id: thought.id, patch: { endedAt: 12 } });
+    const full = { ...thought, text: 'start and finish', endedAt: 12, more: undefined };
+    S.applyWholeItem(SID, full, asked);
+    expect(data().items[thought.id]).toHaveProperty('more', true);
+    S.applyWholeItem(SID, full, data().items[thought.id]);
+    expect(data().items[thought.id]).toEqual(full);
+  });
+
   it('puts a step fetched whole in place of the cut one, touching nothing else; live deltas still apply', () => {
     const cut: ToolItem = { ...subBash, id: 'b1', parentId: undefined, status: 'done', output: 'start\n…\nend', more: true };
     const live: ToolItem = { ...subBash, id: 'b2', parentId: undefined, status: 'running', output: 'building\n' };

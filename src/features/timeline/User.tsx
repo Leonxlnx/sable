@@ -5,7 +5,7 @@ import { CopyButton } from '@/components/CopyButton';
 import { ImageView } from '@/components/ImageView';
 import { Icon } from '@/icons';
 import { formatBytes } from '@/lib/format';
-import { rewindTo } from '@/state/actions';
+import { loadWholeItem, rewindTo } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger, Switch } from '@/ui';
 import { fieldBeat } from '@/art/events';
@@ -17,7 +17,8 @@ import { EASE_OUT, play, uiZoom } from '@/lib/motion';
 import { MessageAgain } from './Again';
 import { useTimeline } from './ctx';
 import { Stamp } from './Stamp';
-import { MOVE_GLIDE_MS, endShift, glideOffset, isLongMessage, rowLeft, rowMoved, willMove } from './user-card';
+import { hasThumbnail } from './step-row';
+import { MOVE_GLIDE_MS, endShift, glideOffset, isLongMessage, rowLeft, rowMoved, watchMessage, willMove } from './user-card';
 
 /** How far the conversation will scroll this frame to keep its end (its own pixels; user-card.ts `endShift`). */
 function shiftOf(el: HTMLElement, stuck: boolean): number {
@@ -43,8 +44,8 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
   useEffect(() => (actions ? undefined : afterSend(() => setActions(true))), [actions]);
 
   const queued = item.state === 'queued';
-  const images = item.attachments?.filter((a) => a.kind === 'image' && a.dataUrl) ?? [];
-  const files = item.attachments?.filter((a) => !(a.kind === 'image' && a.dataUrl)) ?? [];
+  const images = item.attachments?.filter((a) => hasThumbnail(a, item.more)) ?? [];
+  const files = item.attachments?.filter((a) => !hasThumbnail(a, item.more)) ?? [];
   // A review sent from the review bar: what was typed, then the comments as a short list. Wrappers
   // the agent's harness added to the words (a reminder) are not shown.
   const text = useMemo(() => stripWrappers(item.text), [item.text]);
@@ -54,6 +55,9 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
 
   // The message sent from the composer (or a queue row) lands here: it flies in as this bubble and the two swap.
   const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (item.more && root.current) return watchMessage(root.current, () => void loadWholeItem(sessionId, item.id));
+  }, [item, sessionId]);
   const queuedNow = useRef(queued);
   queuedNow.current = queued;
   useLayoutEffect(() => {
@@ -187,11 +191,11 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
         )}
         {images.length > 0 && (
           <div className="user-images">
-            {images.map((a) => (
-              <ImageView key={a.id} src={a.dataUrl!} alt={a.name} className="user-thumb">
+            {images.map((a) => a.dataUrl ? (
+              <ImageView key={a.id} src={a.dataUrl} alt={a.name} className="user-thumb">
                 <img src={a.dataUrl} alt="" loading="lazy" />
               </ImageView>
-            ))}
+            ) : <span key={a.id} className="user-thumb" role="img" aria-label={a.name} />)}
           </div>
         )}
         {words && (

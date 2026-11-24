@@ -146,10 +146,11 @@
   padding-left: var(--gap);
 }
 
-/* The panel sliding in over the conversation's edge, in a window where the column cannot keep its
-   width (App.tsx `slideRail`): its column has no width yet, so the stage beside it is not laid out
-   again while it moves; the panel is drawn out of it, over the stage, on the app's ground (its gap
-   to the stage must not show the conversation through). The column takes its width when the slide ends. */
+/* The panel leaving over the widened stage, in a window where the column cannot keep its width
+   (App.tsx `slideRail`): the stage took its final width in the frame of the press, so the column
+   has none; the panel is drawn out of it, over the stage, on the app's ground (its gap to the stage
+   must not show the conversation through). Opening, the column is its width at once and the panel
+   slides into it. */
 .app-rail[data-step] {
   position: relative;
   z-index: 10;

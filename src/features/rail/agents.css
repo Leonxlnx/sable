@@ -409,9 +409,21 @@
   color: var(--red);
 }
 
-/* A finished hand-over keeps its agent's mark, one step quieter than on a working card. */
-.agx-row .agx-mark .provider-mark[data-provider='codex'] {
-  color: var(--text-2);
+/* Every row leads with its state (AgentsTab `StateMark`): failed is the one red. */
+.agx-mark[data-state='failed'] {
+  color: var(--red);
+}
+
+/* A hand-over's agent, after the task: its mark, quiet (one step quieter on a finished row). */
+.agx-who {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.agx-row .agx-who .provider-mark[data-provider='codex'] {
+  color: var(--text-3);
 }
 
 /* A background command: its mark is the terminal's, quiet; a word and the time it was last heard of. */

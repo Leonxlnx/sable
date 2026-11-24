@@ -2,6 +2,7 @@ import type { TaskMark, TimelineItem, ToolItem, WorkflowRun } from '@shared/prot
 import { syntheticOf, type TaskOutcome } from '@shared/synthetic';
 import { isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
 import { changedSince } from '@/state/revision';
+import { workLabel } from '@shared/work-label';
 
 /**
  * What the Agents tab reads from a session, worked out so that a streamed step costs next to
@@ -618,4 +619,51 @@ export function waveRows(wave: Wave, all: boolean): { ids: readonly string[]; mo
   if (all || wave.ids.length <= WAVE_ROWS + 2) return { ids: wave.ids, more: 0 };
   const n = Math.min(Math.max(WAVE_ROWS, wave.failed), WAVE_MOST);
   return { ids: wave.ids.slice(0, n), more: wave.ids.length - n };
+}
+
+// ── every row's state, first ──
+
+/** Where a row of the tab stands, whatever it is (a sub-agent, a workflow, a background command). */
+export type RowState = 'running' | 'waiting' | 'done' | 'failed' | 'stopped' | 'denied' | 'lost' | 'unknown';
+
+/** An agent's outcome as a row's state. */
+export function agentState(outcome: Outcome): RowState {
+  return outcome === 'interrupted' ? 'stopped' : outcome;
+}
+
+/** A background command's state as a row's state ("starting" is running: it works). */
+export function commandRowState(state: CommandState): RowState {
+  return state === 'starting' ? 'running' : state;
+}
+
+/**
+ * The mark every row leads with: its state, never its kind (no terminal or tree glyph in that
+ * column). Running is the ring, waiting on the person the amber dot, done the quiet check, failed
+ * the red cross, stopped a dash, denied the prohibit sign, lost the dashed circle (its process went),
+ * unknown a question mark (it gave no word of its end). Each row's words say the same beside it.
+ */
+export const STATE_MARK: Record<RowState, 'ring' | 'wait' | 'check' | 'x' | 'minus' | 'prohibit' | 'circle-dashed' | 'question'> = {
+  running: 'ring',
+  waiting: 'wait',
+  done: 'check',
+  failed: 'x',
+  stopped: 'minus',
+  denied: 'prohibit',
+  lost: 'circle-dashed',
+  unknown: 'question',
+};
+
+/**
+ * The tab's header, in the units the conversation's tail line and the sidebar use (sub-agents and
+ * commands, `workLabel`): what works now ("1 sub-agent, 1 command", "2 sub-agents working", "1
+ * command running"); once nothing works, how many ended well ("4 done", agents and commands
+ * together); what failed is said apart (`failed`, every failure of both).
+ */
+export function agentsHeader(n: { working: number; running: number; agentsDone: number; agentsFailed: number; commands: number; commandsFailed: number }): { label: string; failed: number } {
+  const failed = n.agentsFailed + n.commandsFailed;
+  const now = workLabel({ background: n.working, commands: n.running });
+  if (now) return { label: now, failed };
+  const ended = n.agentsDone + Math.max(0, n.commands - n.running);
+  const ok = Math.max(0, ended - failed);
+  return { label: ok ? `${ok} done` : '', failed };
 }

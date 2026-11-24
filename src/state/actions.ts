@@ -4,7 +4,8 @@ import { bridge } from '@/lib/bridge';
 import { addComment, clearReview, editComment, removeComment, reviewMessage, type ReviewComment } from '@/features/review/model';
 import { accountLiveCaps, applySnapshot, applyWholeItem, capsKey, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
 import { seenCaps } from '@/features/composer/caps-seen';
-import type { PullFailures, PullStatus } from '@shared/protocol';
+import { ultraOffered } from '@/features/composer/effort-track';
+import type { PullFailures, PullStatus, UserItem } from '@shared/protocol';
 
 /** Everything the UI can ask the bridge to do. Components call these, never bridge.call directly. */
 
@@ -56,7 +57,7 @@ export function prefetchSession(id: string) {
   void loadSession(id, { peek: true }).catch(() => {});
 }
 
-const wholeAsked = new Map<string, Promise<void>>();
+const wholeAsked = new WeakMap<object, Promise<void>>();
 
 /**
  * A step the bridge sent cut (`ToolItem.more`: a long output or result, pictures), fetched whole
@@ -64,16 +65,26 @@ const wholeAsked = new Map<string, Promise<void>>();
  * asked again the next time it is needed.
  */
 export function loadWholeItem(sessionId: string, itemId: string): Promise<void> {
-  const key = `${sessionId}\u0000${itemId}`;
-  let p = wholeAsked.get(key);
+  const row = useStore.getState().data[sessionId]?.items[itemId];
+  if (!row || !('more' in row) || !row.more) return Promise.resolve();
+  let p = wholeAsked.get(row);
   if (!p) {
     p = bridge
       .call('session.item', { sessionId, itemId })
-      .then(({ item }) => applyWholeItem(sessionId, item), () => {})
-      .finally(() => wholeAsked.delete(key));
-    wholeAsked.set(key, p);
+      .then(({ item }) => applyWholeItem(sessionId, item, row), () => {})
+      .finally(() => wholeAsked.delete(row));
+    wholeAsked.set(row, p);
   }
   return p;
+}
+
+/** Read attachments before a destructive rewind or retry. A failed fetch leaves the message in place. */
+export async function wholeMessage(sessionId: string, item: UserItem) {
+  if (!item.more) return item;
+  await loadWholeItem(sessionId, item.id);
+  const current = useStore.getState().data[sessionId]?.items[item.id];
+  if (current?.type === 'user' && !current.more) return current;
+  fail(new Error('Could not load the message attachments.'));
 }
 
 // The section Settings last showed, so reopening it lands where you left off (for as long as the app is open).
@@ -207,7 +218,7 @@ export function homeChoice(): NewSessionChoice | null {
   const mode = ui.homeMode[provider] ?? settings.defaultModes[provider] ?? caps?.modes[0]?.id;
   const effort = ui.homeEffort[provider] ?? settings.defaultEfforts[provider];
   const offered = accountLiveCaps(providerCaps, provider, ui.homeCwd, accountId) ?? seenCaps(provider, accountId);
-  const ultracode = ui.homeUltracode && offered?.features.ultracode ? true : undefined;
+  const ultracode = ui.homeUltracode && ultraOffered(provider, offered ?? undefined) ? true : undefined;
   return { provider, cwd: ui.homeCwd, model, mode, effort, accountId, ...(ultracode ? { ultracode } : {}), ...(ui.homeChat ? { chat: {} } : {}) };
 }
 

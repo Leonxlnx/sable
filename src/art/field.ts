@@ -52,6 +52,13 @@ export interface Look {
   pointer?: [number, number] | null;
   /** How strongly beats (send, done, fail) show on this field: 0 none, 1 full; above 1 lifts a dim field's beats. */
   react?: number;
+  /**
+   * The session's horizon in a canvas of a fixed size (DitherField `band`): the stage's width and
+   * the band's height as shares of the canvas, and a reference band height (the noise's unit) as a
+   * share of its height. The worker eases to them, so a change of the stage or the dock is a glide,
+   * never a resized canvas. Absent: the band is the whole canvas.
+   */
+  band?: [number, number, number] | null;
 }
 
 /**
@@ -289,6 +296,18 @@ const HORIZON_SAG = 0.6;
 const HORIZON_GLOW = 0.36;
 const HORIZON_RIM = 0.08;
 const HORIZON_GROUND = 0.24;
+/**
+ * What the band's upward fade leaves of the light at `by` band heights from its top (0 top, 1
+ * bottom): the stops of the old overlay in the stage colour, 0 / 0.1 / 0.7 / 1 of ink at 0 / 52 /
+ * 80 / 100 % up from the bottom. Above the band nothing is left.
+ */
+export function bandFade(by: number): number {
+  const u = 1 - by;
+  if (u <= 0) return 1;
+  if (u >= 1) return 0;
+  const ink = u <= 0.52 ? (0.1 * u) / 0.52 : u <= 0.8 ? 0.1 + (0.6 * (u - 0.52)) / 0.28 : 0.7 + (0.3 * (u - 0.8)) / 0.2;
+  return 1 - ink;
+}
 const STREAK_COS = Math.cos(-0.6);
 const STREAK_SIN = Math.sin(-0.6);
 /** Streaks run along a 35° diagonal, rising to the right on screen (y grows downward). */
@@ -346,6 +365,15 @@ export class Field {
   private spectrum: number;
   private readonly focusNow: number[];
   private readonly par = [0, 0];
+  /** The band as eased (see Look.band): stage width share, band height share, noise unit share. */
+  private readonly bandNow = [1, 1, 1];
+  private banded = false;
+  /** Per frame: the horizon's half width and its band's height and top, in canvas heights; the noise's scale and the band's strength. */
+  private hA = 0.5;
+  private hH = 1;
+  private hTop = 0;
+  private hN = 1;
+  private hK = 1;
   private gainNow: number;
   private fullNow: number;
   private clock: number;
@@ -503,6 +531,7 @@ export class Field {
     this.clock = look.seed * 10;
     this.speedNow = look.speed;
     if (look.spot) [this.spotNow[0], this.spotNow[1], this.spotNow[2]] = look.spot;
+    if (look.band) [this.bandNow[0], this.bandNow[1], this.bandNow[2]] = look.band;
   }
 
   step(s: Look, now: number, aspect: number) {
@@ -579,6 +608,21 @@ export class Field {
     sn[2] += ((spot ? spot[2] : 1) - sn[2]) * ks;
     moved += Math.abs((spot ? spot[0] : 0.5) - sn[0]) + Math.abs((spot ? spot[1] : 0.5) - sn[1]) + Math.abs((spot ? spot[2] : 1) - sn[2]);
     if (Math.abs(sn[2] - (spot ? spot[2] : 1)) < 0.002) sn[2] = spot ? spot[2] : 1;
+    // The band glides to the stage's width and the dock's height (a time constant of about 70 ms:
+    // with the sidebar's own ease-out it lands within its 260 ms); its first value is taken as it is.
+    const band = s.band ?? null;
+    const bn = this.bandNow;
+    const kb = !this.banded && band ? 1 : Math.min(1, dt * 14);
+    this.banded = !!band;
+    for (let i = 0; i < 3; i++) {
+      const to = band ? band[i] : 1;
+      const d = to - bn[i];
+      if (Math.abs(d) < 0.0005) bn[i] = to;
+      else {
+        bn[i] += d * kb;
+        moved += Math.abs(d) * 4;
+      }
+    }
     // Reach → falloff radius (in stage units, so the light spreads as an ellipse matching the
     // stage); near full reach the falloff blends into even light.
     const reach = sn[2];
@@ -613,6 +657,13 @@ export class Field {
     const t = this.clock;
     this.t = t;
     this.aspect = aspect;
+    this.hH = bn[1];
+    this.hTop = 1 - bn[1];
+    this.hA = bn[0] * aspect * 0.5;
+    this.hN = 1 / bn[2];
+    // A tall pane is no tall fire: past its reference height the band's light falls off.
+    const tall = bn[1] / bn[2];
+    this.hK = tall <= 1 ? 1 : 1 / Math.sqrt(tall);
     this.full = s.full;
     this.fx = this.focusNow[0] * aspect;
     this.fy = this.focusNow[1];
@@ -806,7 +857,17 @@ export class Field {
    * The part of row `py` that can be lit, as px from out[0] to out[1] (empty when out[0] > out[1]).
    * Outside it the light has fallen to nothing, so those cells are ground and are not evaluated.
    */
+  /** A band in a taller canvas: row `py` lies above it (a margin for a beat's bend), so it is ground. */
+  aboveBand(py: number): boolean {
+    return this.banded && this.mode === 'streak' && (py - this.hTop) / this.hH < -0.2;
+  }
+
   span(py: number, out: Float32Array) {
+    if (this.aboveBand(py)) {
+      out[0] = 1;
+      out[1] = 0;
+      return;
+    }
     if (this.reach === Infinity) {
       out[0] = -1e9;
       out[1] = 1e9;
@@ -1203,8 +1264,11 @@ export class Field {
       const grain = sample(B, px * 0.6 - t * 0.01, py * 0.6 + sd);
       v = shape * (0.34 + 0.6 * grain) + core * 0.3;
     } else if (mode === 'streak') {
-      const qx = (px * STREAK_COS - py * STREAK_SIN) * 0.085 + sd;
-      const qy = (px * STREAK_SIN + py * STREAK_COS) * 0.9;
+      // In reference band heights: the pattern keeps its scale whatever the band measures.
+      const nx = px * this.hN;
+      const ny = py * this.hN;
+      const qx = (nx * STREAK_COS - ny * STREAK_SIN) * 0.085 + sd;
+      const qy = (nx * STREAK_SIN + ny * STREAK_COS) * 0.9;
       const n = sample(A, qx + t * 0.011, qy);
       const n2 = sample(B, qx * 0.5 - t * 0.007, qy * 2.3 + 0.31);
       // Over a floor: the horizon's edge stays one line, and the noise breaks its brightness, not its shape.
@@ -1229,21 +1293,28 @@ export class Field {
    * into it, so the line is drawn in broken dither, not as a stroke.
    */
   private horizon(px: number, py: number): number {
-    const a = this.aspect * 0.5;
+    // In band heights: the band is the stage's width and the dock's height inside a canvas of a
+    // fixed size (Look.band; without one the band is the canvas and these are the identity).
+    const h = this.hH;
+    const by = (py - this.hTop) / h;
+    const a = this.hA / h;
     const r = (a * a + HORIZON_SAG * HORIZON_SAG) / (2 * HORIZON_SAG);
-    const ex = px - a;
-    const ey = py - HORIZON_APEX - r;
+    const ex = (px - this.aspect * 0.5) / h;
+    const ey = by - HORIZON_APEX - r;
     // Above the edge: positive.
     const d = Math.sqrt(ex * ex + ey * ey) - r;
     const side = ex / a;
     const reach = 1 - 0.74 * side * side;
     if (reach <= 0) return 0;
+    // In a band of its own, the upward fade into the stage's ink (what `.session-light::after` was).
+    const k0 = this.banded ? this.hK * bandFade(by) : 1;
+    if (k0 <= 0) return 0;
     if (d >= 0) {
       const g = 1 - d / HORIZON_GLOW;
-      return g <= 0 ? 0 : g * g * 0.8 * reach;
+      return g <= 0 ? 0 : g * g * 0.8 * reach * k0;
     }
     const k = -d / HORIZON_RIM;
-    return (k >= 1 ? HORIZON_GROUND : 1 - (1 - HORIZON_GROUND) * k * k * (3 - 2 * k)) * reach;
+    return (k >= 1 ? HORIZON_GROUND : 1 - (1 - HORIZON_GROUND) * k * k * (3 - 2 * k)) * reach * k0;
   }
 
   /** Falloff (or, full bleed, the sweep, hollow and roll-off), the floor, the palette and the spectrum's hues. */
@@ -1545,6 +1616,15 @@ function ditherRenderer(el: Surface, soft = false): Renderer | null {
         let k = 0;
         for (let j = 0; j < ch; j++) {
           const py = (2 * j + 0.5) / h;
+          if (field.aboveBand(py)) {
+            // The session's band in its taller canvas: rows above it are ground, never evaluated.
+            for (let i = 0; i < cw; i++, k += 3) {
+              coarse[k] = r0;
+              coarse[k + 1] = g0;
+              coarse[k + 2] = b0;
+            }
+            continue;
+          }
           for (let i = 0; i < cw; i++, k += 3) {
             field.shade(((2 * i + 0.5) / w) * aspect, py, c);
             coarse[k] = c[0];

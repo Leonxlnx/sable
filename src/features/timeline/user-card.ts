@@ -98,3 +98,19 @@ export function rowMoved(id: string, now: number): LeftRow | null {
   gone.delete(id);
   return now - was.at <= MOVE_MS ? was : null;
 }
+
+/** TurnList can mount thousands of old cards behind its spacer. Only nearby cards fetch their attachments. */
+const nearby = new WeakMap<Element, () => void>();
+const nearView = { rootMargin: '400px', scrollMargin: '400px' };
+let observer: IntersectionObserver | undefined;
+export function watchMessage(el: Element, load: () => void) {
+  observer ??= new IntersectionObserver(entries => {
+    for (const entry of entries) if (entry.isIntersecting) nearby.get(entry.target)?.();
+  }, nearView);
+  nearby.set(el, load);
+  observer.observe(el);
+  return () => {
+    observer?.unobserve(el);
+    nearby.delete(el);
+  };
+}
