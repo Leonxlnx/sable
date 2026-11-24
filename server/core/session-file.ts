@@ -112,8 +112,10 @@ const CHUNK = 1 << 20;
 
 interface Base {
   gen: number;
-  /** The items the base settles (the timeline before `from`). */
+  /** The base prefix whose order and changed items are known. */
   ids: string[];
+  /** Normal streaming saves keep everything from here onward together in the tail. */
+  settled: number;
   idSet: Set<string>;
   /** The base file's size (bytes as read, characters as written): the small-base rule. */
   size: number;
@@ -218,16 +220,16 @@ export class SessionFiles {
 
   load(id: string): SessionData {
     const file = this.pathOf(id);
-    let size = 0;
+    let size = 0, mtime = 0;
     try {
-      size = existsSync(file) ? statSync(file).size : 0;
+      if (existsSync(file)) ({ size, mtimeMs: mtime } = statSync(file));
     } catch {
       /* read below says */
     }
     let read: Read<BaseFile> = size > READ.byLineAbove ? readBaseByLine(file) : readJson<BaseFile>(file);
     // A big file of an older version is one long line (up to about 512 MB): read it whole.
     if (!read.ok && size > READ.byLineAbove) read = readJson<BaseFile>(file);
-    return this.finish(id, read, size);
+    return this.finish(id, read, size, mtime);
   }
 
   /**
@@ -237,18 +239,18 @@ export class SessionFiles {
    */
   async loadAsync(id: string): Promise<SessionData> {
     const file = this.pathOf(id);
-    let size = 0;
+    let size = 0, mtime = 0;
     try {
-      size = existsSync(file) ? statSync(file).size : 0;
+      if (existsSync(file)) ({ size, mtimeMs: mtime } = statSync(file));
     } catch {
       /* read below says */
     }
     if (size < READ.inWorkerAbove) return this.load(id);
     const read = await readInWorker(file, size > READ.byLineAbove).catch(() => undefined);
-    return read ? this.finish(id, read, size) : this.load(id);
+    return read ? this.finish(id, read, size, mtime) : this.load(id);
   }
 
-  private finish(id: string, read: Read<BaseFile>, size: number): SessionData {
+  private finish(id: string, read: Read<BaseFile>, size: number, mtime: number): SessionData {
     if (!read.ok) {
       this.unreadable.add(id);
       return { items: [], todos: [], unreadable: true };
@@ -257,9 +259,11 @@ export class SessionFiles {
     const base = read.value;
     if (!base) return { items: [], todos: [] };
     const old = typeof base.gen !== 'number';
-    const gen = old ? 0 : (base.gen as number);
+    // A legacy base has no generation field. Its unchanged file timestamp identifies
+    // a quit tail until the next ordinary save migrates it to a numbered base.
+    const gen = old ? -mtime : (base.gen as number);
     const items = Array.isArray(base.items) ? base.items : [];
-    const tailRead = old ? ({ ok: true, value: null } as const) : readJson<SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] }>(this.tailOf(id));
+    const tailRead = readJson<SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] }>(this.tailOf(id));
     // A tail that is there but cannot be read (held by another program for a moment) is not a missing tail:
     // the base alone is an older conversation, and the next save would write a tail over the newer one.
     if (!tailRead.ok) {
@@ -286,19 +290,30 @@ export class SessionFiles {
       data = { items: head.concat(tail.items), todos: tail.todos ?? base.todos ?? [], queue: tail.queue ?? base.queue };
     }
     const settled = items.slice(0, from).map((i) => i.id);
-    this.bases.set(id, { gen, ids: settled, idSet: new Set(settled), size, old, over });
+    this.bases.set(id, { gen, ids: settled, settled: from, idSet: new Set(settled), size, old, over });
     return data;
   }
 
   /** Writes what changed. Calls for one session run one after another. */
-  save(id: string, data: () => SessionSave): Promise<void> {
+  save(id: string, data: () => SessionSave, final = false): Promise<void> {
     if (this.deleted.has(id) || this.unreadable.has(id)) return Promise.resolve();
     const prev = this.writing.get(id) ?? Promise.resolve();
-    const next = prev.then(() => (this.deleted.has(id) || this.unreadable.has(id) ? undefined : this.write(id, data()))).catch(() => void this.force.add(id));
+    const next = prev.then(() => (this.deleted.has(id) || this.unreadable.has(id) ? undefined : this.write(id, data(), final))).catch(err => {
+      this.force.add(id);
+      if (final) throw err;
+    });
     this.writing.set(id, next);
-    void next.finally(() => this.writing.get(id) === next && this.writing.delete(id));
+    void next.finally(() => this.writing.get(id) === next && this.writing.delete(id)).catch(() => {});
     return next;
   }
+
+  /** An in-flight save already captured this exact version. Only write again if it failed. */
+  async retryAfterWrite(id: string, snapshot: SessionSave) {
+    await this.writing.get(id);
+    if (this.force.has(id)) await this.save(id, () => snapshot, true);
+  }
+
+  needsRetry(id: string) { return this.force.has(id); }
 
   remove(id: string) {
     this.deleted.add(id);
@@ -325,13 +340,19 @@ export class SessionFiles {
     await Promise.all([...this.writing.values()]);
   }
 
-  private async write(id: string, save: SessionSave) {
+  private async write(id: string, save: SessionSave, final: boolean) {
     const base = this.bases.get(id);
     // The order as of now: an item moved during a long base write must not appear twice or not at all.
     const items = save.items.slice();
-    let whole = !base || base.old || this.force.has(id) || save.dirty === 'all' || base.size < SMALL_BASE || items.length < base.ids.length;
-    if (!whole && base) {
-      for (let i = 0; i < base.ids.length; i++) {
+    // At quit keep the existing generation. A rewind can shorten the matching prefix.
+    let from = base?.settled ?? 0;
+    let whole = !base || base.old || this.force.has(id) || save.dirty === 'all' || base.size < SMALL_BASE || items.length < from;
+    if (final && base) {
+      whole = false;
+      from = 0;
+      while (from < base.ids.length && items[from]?.id === base.ids[from]) from++;
+    } else if (!whole && base) {
+      for (let i = 0; i < from; i++) {
         if (items[i].id !== base.ids[i]) {
           whole = true;
           break;
@@ -340,16 +361,17 @@ export class SessionFiles {
     }
     // Settled items changed since the base was written travel in the tail (`over`), up to a bound.
     let over: Set<string> | undefined;
+    const overItems: TimelineItem[] = [];
     if (!whole && base) {
       over = new Set(base.over);
       if (save.dirty !== 'all') for (const d of save.dirty) if (base.idSet.has(d)) over.add(d);
-      if (over.size > OVER_MAX.items) whole = true;
+      if (final && (save.dirty === 'all' || this.force.has(id))) over = new Set(base.ids.slice(0, from));
+      if (over.size) for (let i = 0; i < from; i++) {
+        if (over.has(items[i].id)) overItems.push(items[i]);
+      }
+      if (!final && overItems.length > OVER_MAX.items) whole = true;
     }
     if (!whole && base && over) {
-      const from = base.ids.length;
-      const byId = new Map<string, TimelineItem>();
-      if (over.size) for (let i = 0; i < from; i++) if (over.has(items[i].id)) byId.set(items[i].id, items[i]);
-      const overItems = [...byId.values()];
       const tmp = `${this.tailOf(id)}.${process.pid}.tmp`;
       const head = `{"baseGen":${base.gen},"from":${from},"items":[\n`;
       const end = `\n],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
@@ -357,9 +379,10 @@ export class SessionFiles {
       // A big tail folds into the base only when that moves the boundary well on: otherwise a few
       // huge items at the end would have the whole base written again on every save. Changed
       // settled items past their bound go into the base too.
-      if ((sizes.items <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP) && sizes.over <= OVER_MAX.chars) {
+      if (final || (sizes.over <= OVER_MAX.chars && (sizes.items <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP))) {
         await renameRetry(tmp, this.tailOf(id));
         base.over = over;
+        this.force.delete(id);
         return;
       }
       try {
@@ -370,9 +393,10 @@ export class SessionFiles {
     }
     const gen = nextGen();
     const size = await writeBase(this.pathOf(id), gen, { ...save, items });
-    const end = settledEnd(items);
-    const settled = items.slice(0, end).map((i) => i.id);
-    this.bases.set(id, { gen, ids: settled, idSet: new Set(settled), size, over: new Set() });
+    // The base includes its live suffix too. Remember those IDs so a final save can
+    // reuse unchanged large outputs even inside the ordinary streaming tail.
+    const ids = items.map(i => i.id);
+    this.bases.set(id, { gen, ids, settled: settledEnd(items), idSet: new Set(ids), size, over: new Set() });
     this.force.delete(id);
     // The new base holds everything: the old tail no longer matches it (and is ignored if this fails).
     try {

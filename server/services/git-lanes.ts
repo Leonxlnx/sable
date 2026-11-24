@@ -10,12 +10,13 @@
  * only that lane's.
  */
 import { randomBytes } from 'node:crypto';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { FileDiff, LaneForecast, LaneLandResult, SessionLane } from '../../shared/protocol';
 import { parseUnifiedDiff } from '../../shared/diff';
-import { capDiff, gitError, repoRoot, runGit, type GitResult } from './git';
+import { capDiff, gitError, repoRoot, runGit, worktreeRecords, type GitResult } from './git';
+import { findProgram, projectFolders } from '../util/which';
 
 const T_FAST = 10_000;
 const T_TREE = 60_000;
@@ -31,14 +32,18 @@ const ok = (r: GitResult) => r.code === 0;
 const line = (r: GitResult) => r.stdout.trim();
 const nul = (s: string) => s.split('\0').filter(Boolean);
 
-let mergeTreeOk: Promise<boolean> | undefined;
+let version: { binary: string; supported: Promise<boolean> } | undefined;
 /** `git merge-tree --write-tree` needs git 2.38 or newer. Asked once. */
-export function canDryMerge(): Promise<boolean> {
-  mergeTreeOk ??= runGit(tmpdir(), ['version'], { timeoutMs: T_FAST }).then((r) => {
+export function canDryMerge(cwd: string): Promise<boolean> {
+  const binary = findProgram('git', { outside: projectFolders(cwd) });
+  if (!binary) return Promise.resolve(false);
+  if (binary === version?.binary) return version.supported;
+  const supported = runGit(cwd, ['version'], { timeoutMs: T_FAST }).then((r) => {
     const m = r.stdout.match(/(\d+)\.(\d+)/);
     return !!m && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 38));
   });
-  return mergeTreeOk;
+  version = { binary, supported };
+  return supported;
 }
 
 /** A branch-safe slug of a title: `refactor-the-session-module` (at most `max` characters). */
@@ -80,23 +85,6 @@ const isDir = (p: string) => {
   }
 };
 
-/** A link this module made (a junction on Windows): removed without touching what it points at. */
-function unlinkLink(p: string) {
-  let st;
-  try {
-    st = lstatSync(p);
-  } catch {
-    return;
-  }
-  if (!st.isSymbolicLink()) return;
-  try {
-    unlinkSync(p);
-  } catch {
-    // A directory junction on Windows: rmdir removes the link itself, never the target's contents.
-    rmdirSync(p);
-  }
-}
-
 export interface CreateLaneOptions {
   /** The session's folder (a repository, or a folder inside one). */
   folder: string;
@@ -118,18 +106,24 @@ export async function createLane(o: CreateLaneOptions): Promise<{ lane: SessionL
   const head = await runGit(root, ['rev-parse', '--verify', '-q', 'HEAD^{commit}'], { timeoutMs: T_FAST });
   if (!ok(head)) return { error: head.missing ? 'Git is not installed or not on PATH.' : 'This repository has no commits yet.' };
   const base = line(head);
-  const cur = await runGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { timeoutMs: T_FAST });
-  const from = ok(cur) ? line(cur) || undefined : undefined;
-  const branch = await freeBranch(root, o.slug);
+  const cur = await runGit(root, ['symbolic-ref', '--quiet', 'HEAD'], { timeoutMs: T_FAST });
+  const from = ok(cur) ? line(cur).replace(/^refs\/heads\//, '') : undefined;
+  let rel: string;
   if (existsSync(o.dir)) return { error: 'The lane folder already exists.' };
-  mkdirSync(path.dirname(o.dir), { recursive: true });
-  const add = await runGit(root, ['worktree', 'add', '--quiet', '-b', branch, o.dir, base], { timeoutMs: T_CHECKOUT });
-  if (!ok(add)) {
-    // Leave nothing half made behind.
-    await runGit(root, ['worktree', 'remove', '--force', o.dir], { timeoutMs: T_TREE });
-    if (existsSync(o.dir)) rmSync(o.dir, { recursive: true, force: true });
-    await runGit(root, ['worktree', 'prune'], { timeoutMs: T_FAST });
-    await runGit(root, ['branch', '-D', branch], { timeoutMs: T_FAST });
+  try {
+    rel = path.relative(realpathSync.native(root), realpathSync.native(o.folder));
+    if (path.isAbsolute(rel) || rel === '..' || rel.startsWith('..' + path.sep)) return { error: 'The project folder moved outside its checkout.' };
+    mkdirSync(path.dirname(o.dir), { recursive: true });
+  } catch {
+    return { error: 'Could not open the project folder or create the worktrees folder.' };
+  }
+  let branch: string;
+  for (let attempt = 0; ; attempt++) {
+    branch = await freeBranch(root, o.slug);
+    const add = await runGit(root, ['worktree', 'add', '--quiet', '-b', branch, '--', o.dir, base], { timeoutMs: T_CHECKOUT });
+    if (ok(add)) break;
+    // Another creator won the ref. Git owns rollback of its own worktree add.
+    if (attempt < 12 && !existsSync(o.dir) && /already exists|reference exists|cannot lock ref/i.test(add.stderr) && await branchExists(root, branch)) continue;
     return { error: gitError(add, 'Could not make the lane.') };
   }
   const links: string[] = [];
@@ -147,20 +141,37 @@ export async function createLane(o: CreateLaneOptions): Promise<{ lane: SessionL
       /* no link: the agent installs there if it needs to */
     }
   }
-  const rel = path.relative(root, path.resolve(o.folder));
   const lane: SessionLane = { folder: path.resolve(o.folder), root, path: path.resolve(o.dir), branch, base, ...(from ? { from } : {}), createdAt: Date.now(), ...(links.length ? { links } : {}), ...(o.provisional ? { provisional: true } : {}) };
-  return { lane, cwd: rel && !rel.startsWith('..') ? path.join(lane.path, rel) : lane.path };
+  const cwd = path.join(lane.path, rel);
+  try {
+    // Git does not check out empty or untracked directories. Only make the directory, never
+    // copy another chat's files, and do not create it through a checked-out symlink.
+    let parent = lane.path;
+    for (const part of rel.split(path.sep).filter(Boolean)) {
+      parent = path.join(parent, part);
+      if (!existsSync(parent)) mkdirSync(parent);
+      if (!lstatSync(parent).isDirectory()) throw new Error();
+    }
+  } catch {
+    await removeLane(lane, { force: true });
+    return { error: 'The project subfolder could not be opened in the lane.' };
+  }
+  return { lane, cwd };
 }
 
 /** Renames a lane's branch (its first message names it). Returns the new name, or null. */
 export async function renameLane(lane: SessionLane, slug: string): Promise<string | null> {
   if (!slug) return null;
+  if ('error' in await registration(lane)) return null;
   // A busy machine can keep git waiting past the fast timeout (or a scanner holds a ref file for a
   // moment): the rename is tried again a few times before the made-up name stays.
   let tried: string | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     // A try that timed out may still have gone through: then the branch already has the new name.
-    if (tried && !(await branchExists(lane.root, lane.branch)) && (await branchExists(lane.root, tried))) return tried;
+    const current = await runGit(lane.path, ['symbolic-ref', '--quiet', 'HEAD'], { timeoutMs: T_FAST });
+    if (!ok(current)) return null;
+    if (tried && line(current) === 'refs/heads/' + tried) return tried;
+    if (line(current) !== 'refs/heads/' + lane.branch) return null;
     const next = await freeBranch(lane.root, slug);
     tried = next;
     if (next === lane.branch) return null;
@@ -171,24 +182,64 @@ export async function renameLane(lane: SessionLane, slug: string): Promise<strin
   return null;
 }
 
-/** Uncommitted paths of a checkout (repository-relative, untracked included). */
-async function dirtyPaths(dir: string): Promise<string[] | null> {
-  const r = await runGit(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { timeoutMs: T_TREE });
-  if (!ok(r)) return null;
-  const out: string[] = [];
+/** Both sides of renames and partial staging. Submodule working files cannot be committed by the parent. */
+export async function checkoutChanges(dir: string, ignored = false) {
+  const r = await runGit(dir, ['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none', ...(ignored ? ['--ignored=matching'] : [])], { timeoutMs: T_TREE });
+  if (!ok(r) || r.truncated) return null;
+  const paths = new Set<string>();
+  const ignoredPaths: string[] = [];
+  const staged = new Set<string>();
+  const unstaged = new Set<string>();
+  let problem: string | undefined;
   const recs = r.stdout.split('\0');
   for (let i = 0; i < recs.length; i++) {
     const rec = recs[i];
-    if (rec.length < 4) continue;
-    const xy = rec.slice(0, 2);
-    out.push(rec.slice(3));
-    // A rename or copy: the original path follows as its own record (and is changed too).
-    if (xy[0] === 'R' || xy[0] === 'C') {
-      i++;
-      if (recs[i]) out.push(recs[i]);
+    if (!rec) continue;
+    if (rec[0] === '?' || rec[0] === '!') {
+      const file = rec.slice(2).replace(/\/$/, '');
+      if (rec[0] === '!') ignoredPaths.push(file);
+      paths.add(file);
+      unstaged.add(file);
+      continue;
+    }
+    const fields = rec.split(' ');
+    const file = fields.slice(rec[0] === 'u' ? 10 : rec[0] === '2' ? 9 : 8).join(' ');
+    if (rec[0] === 'u') problem = 'Resolve the conflicts in the lane first.';
+    const sub = fields[2];
+    if (sub.startsWith('S') && (sub[2] === 'M' || sub[3] === 'U')) problem = 'Commit or move the changes inside the lane’s submodule first.';
+    paths.add(file);
+    if (fields[1][0] !== '.') staged.add(file);
+    if (fields[1][1] !== '.') unstaged.add(file);
+    if (rec[0] === '2') {
+      const old = recs[++i];
+      paths.add(old);
+      staged.add(old);
     }
   }
-  return out;
+  if (!problem && [...staged].some((p) => unstaged.has(p))) problem = 'Commit or unstage the partially staged files in the lane first.';
+  return { paths: [...paths], ignoredPaths, problem };
+}
+
+/** Local data Git cannot include in the parent commit. A shared dependency link is disposable,
+ * but an ignored local file or a submodule's private object store can be its only copy. */
+async function removableChanges(lane: SessionLane, admin: string): Promise<{ paths: string[] } | { error: string }> {
+  const changes = await checkoutChanges(lane.path, true);
+  if (!changes) return { error: 'Could not read the lane.' } as const;
+  if (changes.problem) return { error: changes.problem } as const;
+  const shared = new Set((lane.links ?? []).filter((p) => LANE_LINKS.includes(p) && lstatSync(path.join(lane.path, p), { throwIfNoEntry: false })?.isSymbolicLink()));
+  const local = changes.ignoredPaths.find((p) => !shared.has(p));
+  if (local) return { error: 'The lane still contains the ignored file or folder “' + local + '”.' };
+  if (existsSync(path.join(admin, 'modules'))) return { error: 'The lane contains a local submodule repository. Save its files and Git history before discarding.' };
+  // A gitlink can exist without a .gitmodules entry (an embedded repository).
+  const index = await runGit(lane.path, ['ls-files', '--stage', '-z'], { timeoutMs: T_TREE });
+  if (!ok(index) || index.truncated) return { error: 'Could not check the lane’s submodules.' };
+  for (const entry of nul(index.stdout)) {
+    if (!entry.startsWith('160000 ')) continue;
+    const sub = entry.slice(entry.indexOf('\t') + 1);
+    if (existsSync(path.join(lane.path, sub, '.git'))) return { error: 'The lane still contains the local repository for submodule “' + sub + '”. Save its files and Git history before discarding.' };
+  }
+  const ignored = new Set(changes.ignoredPaths);
+  return { paths: changes.paths.filter((p) => !ignored.has(p)) };
 }
 
 /**
@@ -199,9 +250,10 @@ async function dirtyPaths(dir: string): Promise<string[] | null> {
 export async function snapshotLane(dir: string): Promise<{ commit: string; uncommitted: number } | { error: string }> {
   const head = await runGit(dir, ['rev-parse', '--verify', '-q', 'HEAD^{commit}'], { timeoutMs: T_FAST });
   if (!ok(head)) return { error: gitError(head, 'The lane has no commit.') };
-  const dirty = await dirtyPaths(dir);
+  const dirty = await checkoutChanges(dir);
   if (!dirty) return { error: 'Could not read the lane.' };
-  if (!dirty.length) return { commit: line(head), uncommitted: 0 };
+  if (dirty.problem) return { error: dirty.problem };
+  if (!dirty.paths.length) return { commit: line(head), uncommitted: 0 };
   const real = line(await runGit(dir, ['rev-parse', '--path-format=absolute', '--git-path', 'index'], { timeoutMs: T_FAST }));
   const tmp = path.join(tmpdir(), `sable-lane-${process.pid}-${randomBytes(4).toString('hex')}.index`);
   const env = { ...SNAPSHOT_ENV, GIT_INDEX_FILE: tmp };
@@ -218,7 +270,7 @@ export async function snapshotLane(dir: string): Promise<{ commit: string; uncom
     if (!ok(tree)) return { error: gitError(tree, 'Could not read the lane.') };
     const commit = await runGit(dir, ['commit-tree', line(tree), '-p', line(head), '-m', 'Sable lane snapshot'], { timeoutMs: T_FAST, env });
     if (!ok(commit)) return { error: gitError(commit, 'Could not read the lane.') };
-    return { commit: line(commit), uncommitted: dirty.length };
+    return { commit: line(commit), uncommitted: dirty.paths.length };
   } finally {
     rmSync(tmp, { force: true });
     rmSync(`${tmp}.lock`, { force: true });
@@ -226,18 +278,79 @@ export async function snapshotLane(dir: string): Promise<{ commit: string; uncom
 }
 
 /** The folder's branch and its head; `error` on a detached head or a merge or rebase in progress. */
-async function targetOf(root: string): Promise<{ name: string; head: string } | { error: string }> {
+async function targetOf(root: string, expected?: string): Promise<{ name: string; head: string } | { error: string }> {
   const [cur, head] = await Promise.all([
-    runGit(root, ['symbolic-ref', '--quiet', '--short', 'HEAD'], { timeoutMs: T_FAST }),
+    runGit(root, ['symbolic-ref', '--quiet', 'HEAD'], { timeoutMs: T_FAST }),
     runGit(root, ['rev-parse', '--verify', '-q', 'HEAD^{commit}'], { timeoutMs: T_FAST }),
   ]);
   if (head.missing) return { error: 'Git is not installed or not on PATH.' };
   if (!ok(cur) || !line(cur)) return { error: 'The folder is not on a branch.' };
   if (!ok(head)) return { error: 'The folder has no commit.' };
-  for (const ref of ['MERGE_HEAD', 'REBASE_HEAD', 'CHERRY_PICK_HEAD']) {
-    if (ok(await runGit(root, ['rev-parse', '--verify', '-q', ref], { timeoutMs: T_FAST }))) return { error: 'The folder is in the middle of a merge or rebase.' };
+  const name = line(cur).replace(/^refs\/heads\//, '');
+  if (expected && expected !== name) return { error: 'Switch the folder back to ' + expected + ' before landing the lane.' };
+  const gitDir = await runGit(root, ['rev-parse', '--absolute-git-dir'], { timeoutMs: T_FAST });
+  if (!ok(gitDir)) return { error: 'Could not read the checkout.' };
+  if (operationIn(line(gitDir))) {
+    return { error: 'Finish the Git operation in the checkout first.' };
   }
-  return { name: line(cur), head: line(head) };
+  return { name, head: line(head) };
+}
+
+const operationIn = (admin: string) => ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer'].some((p) => existsSync(path.join(admin, p)));
+
+function gitPointer(file: string): string {
+  const st = lstatSync(file);
+  if (!st.isFile() || st.size > 32_768) throw new Error();
+  return readFileSync(file, 'utf8').replace(/\r?\n$/, '');
+}
+
+/** An old session path can now contain a different checkout. Verify its registration and its
+ * worktree's own Git directory (including the backlink) before staging or removing anything. */
+async function registration(lane: SessionLane, purpose: 'manage' | 'send' = 'manage'): Promise<{ entry?: Map<string, string>; admin?: string } | { error: string }> {
+  const [records, common] = await Promise.all([worktreeRecords(lane.root), runGit(lane.root, ['rev-parse', '--path-format=absolute', '--git-common-dir'], { timeoutMs: T_FAST })]);
+  if (!records || !ok(common)) return { error: 'Could not read the worktrees in the original folder.' };
+  const index = records.findIndex((r) => path.relative(r.get('worktree') ?? '', lane.path) === '');
+  const entry = records[index];
+  if (index === 0 || (purpose === 'manage' && entry?.has('locked'))) return { error: 'The checkout is the main worktree or is locked in Git.' } as const;
+  if (purpose === 'manage' && entry && entry.get('branch') !== 'refs/heads/' + lane.branch) return { error: 'The lane is no longer on ' + lane.branch + '. Switch it back before continuing.' } as const;
+  if (existsSync(lane.path)) {
+    try {
+      if (!entry || entry.has('prunable') || !lstatSync(lane.path).isDirectory()) throw new Error();
+      const marker = path.join(lane.path, '.git');
+      const pointer = gitPointer(marker);
+      if (!pointer.startsWith('gitdir: ')) throw new Error();
+      const admin = realpathSync.native(path.resolve(lane.path, pointer.slice(8)));
+      const parent = realpathSync.native(path.join(line(common), 'worktrees'));
+      const back = path.resolve(admin, gitPointer(path.join(admin, 'gitdir')));
+      if (path.relative(parent, path.dirname(admin)) || path.relative(realpathSync.native(back), realpathSync.native(marker))) throw new Error();
+      return { entry, admin };
+    } catch {
+      return { error: 'The folder no longer contains this lane.' };
+    }
+  }
+  return { entry } as const;
+}
+
+export async function laneProblem(lane: SessionLane, purpose: 'manage' | 'send' = 'manage'): Promise<string | undefined> {
+  if (!isDir(lane.path)) return 'The lane folder is gone. Its branch may still hold your commits.';
+  const registered = await registration(lane, purpose);
+  if ('error' in registered) return registered.error;
+  if (!registered.admin) return 'The lane folder is gone.';
+  if (purpose === 'manage' && operationIn(registered.admin)) return 'Finish the Git operation in the lane first.';
+}
+
+/** Git also refuses a file in the way of a directory (in either direction). */
+function overlapping(dirty: string[], changed: string[]): string[] {
+  const key = (p: string) => process.platform === 'win32' ? p.toLowerCase() : p;
+  const touched = new Set(changed.map(key));
+  const parents = new Set<string>();
+  function ancestors(p: string) {
+    const parts: string[] = [];
+    for (let i = p.indexOf('/'); i >= 0; i = p.indexOf('/', i + 1)) parts.push(p.slice(0, i));
+    return parts;
+  }
+  for (const p of touched) for (const parent of ancestors(p)) parents.add(parent);
+  return dirty.filter((p) => touched.has(key(p)) || parents.has(key(p)) || ancestors(key(p)).some((parent) => touched.has(parent)));
 }
 
 /** Files and lines `to` brings over its merge base with `from`. */
@@ -278,9 +391,10 @@ const none = (reason: string, extra: Partial<LaneForecast> = {}): LaneForecast =
 
 /** Whether the lane would land on the folder's current branch now. Changes nothing. */
 export async function forecastLane(lane: SessionLane): Promise<LaneForecast> {
-  if (!isDir(lane.path)) return none('The lane folder is gone.');
-  if (!(await canDryMerge())) return none('Lanes need git 2.38 or newer.');
-  const target = await targetOf(lane.root);
+  const problem = await laneProblem(lane);
+  if (problem) return none(problem);
+  if (!(await canDryMerge(lane.path))) return none('Lanes need git 2.38 or newer.');
+  const target = await targetOf(lane.root, lane.from);
   if ('error' in target) return none(target.error);
   const snap = await snapshotLane(lane.path);
   if ('error' in snap) return none(snap.error, { target: target.name });
@@ -289,13 +403,12 @@ export async function forecastLane(lane: SessionLane): Promise<LaneForecast> {
     aheadBehind(lane.root, target.head, laneHead),
     changesBetween(lane.root, target.head, snap.commit),
     dryMerge(lane.root, target.head, snap.commit),
-    dirtyPaths(lane.root),
+    checkoutChanges(lane.root, true),
   ]);
   if (!changes || !conflicts || !dirty) return none('Could not compare the lane with the folder.', { target: target.name, ...counts, uncommitted: snap.uncommitted });
-  const touched = new Set(changes.paths);
-  const blocked = dirty.filter((p) => touched.has(p));
+  const blocked = overlapping(dirty.paths, changes.paths);
   const base = { target: target.name, ...counts, uncommitted: snap.uncommitted, files: changes.paths.length, additions: changes.additions, deletions: changes.deletions, conflicts, blocked };
-  if (!changes.paths.length) return { ...base, state: 'nothing' };
+  if (!changes.paths.length && !counts.ahead) return { ...base, state: 'nothing' };
   if (conflicts.length) return { ...base, state: 'conflicts' };
   if (blocked.length) return { ...base, state: 'blocked' };
   return { ...base, state: 'clean' };
@@ -319,9 +432,10 @@ async function commitLane(lane: SessionLane, message: string): Promise<{ ok: tru
  * Does not end the lane (see `removeLane`).
  */
 export async function landLane(lane: SessionLane, message: string): Promise<LaneLandResult> {
-  if (!isDir(lane.path)) return { ok: false, error: 'The lane folder is gone.' };
-  if (!(await canDryMerge())) return { ok: false, error: 'Lanes need git 2.38 or newer.' };
-  const target = await targetOf(lane.root);
+  const problem = await laneProblem(lane);
+  if (problem) return { ok: false, error: problem };
+  if (!(await canDryMerge(lane.path))) return { ok: false, error: 'Lanes need git 2.38 or newer.' };
+  const target = await targetOf(lane.root, lane.from);
   if ('error' in target) return { ok: false, error: target.error };
   // Nothing in the folder changes before the dry run says it lands: check the snapshot first.
   const snap = await snapshotLane(lane.path);
@@ -330,12 +444,11 @@ export async function landLane(lane: SessionLane, message: string): Promise<Lane
   if (!pre) return { ok: false, error: 'Could not compare the lane with the folder.' };
   if (pre.length) return { ok: false, conflicts: pre, error: 'The lane conflicts with the branch.' };
   const changes = await changesBetween(lane.root, target.head, snap.commit);
-  const dirty = await dirtyPaths(lane.root);
+  const dirty = await checkoutChanges(lane.root, true);
   if (!changes || !dirty) return { ok: false, error: 'Could not compare the lane with the folder.' };
-  const touched = new Set(changes.paths);
-  const blocked = dirty.filter((p) => touched.has(p));
+  const blocked = overlapping(dirty.paths, changes.paths);
   if (blocked.length) return { ok: false, blocked, error: 'The folder has uncommitted edits in files the lane changes.' };
-  if (!changes.paths.length) return { ok: false, error: 'There is nothing to land.' };
+  if (!changes.paths.length && !(await aheadBehind(lane.root, target.head, snap.commit)).ahead) return { ok: false, error: 'There is nothing to land.' };
 
   if (snap.uncommitted) {
     const c = await commitLane(lane, message);
@@ -343,35 +456,57 @@ export async function landLane(lane: SessionLane, message: string): Promise<Lane
   }
   const laneHead = line(await runGit(lane.path, ['rev-parse', 'HEAD'], { timeoutMs: T_FAST }));
   const commits = Number(line(await runGit(lane.root, ['rev-list', '--count', `${target.head}..${laneHead}`], { timeoutMs: T_TREE }))) || 0;
-  const forward = async (): Promise<GitResult> => runGit(lane.root, ['merge', '--ff-only', '--quiet', lane.branch], { timeoutMs: T_CHECKOUT });
+  const forward = async (commit: string, how: 'fast-forward' | 'merge' | 'rebase'): Promise<LaneLandResult> => {
+    const current = await targetOf(lane.root, target.name);
+    if ('error' in current || current.head !== target.head) return { ok: false, error: 'The base branch changed during landing. Check the forecast and try again.' };
+    const ff = await runGit(lane.root, ['merge', '--ff-only', '--no-overwrite-ignore', '--no-autostash', '--quiet', commit], { timeoutMs: T_CHECKOUT });
+    return ok(ff) ? { ok: true, how, commits, target: target.name } : { ok: false, error: gitError(ff, 'Could not land the lane.') };
+  };
 
   // The branch has not moved since the lane began: it moves forward to the lane.
   if (ok(await runGit(lane.root, ['merge-base', '--is-ancestor', target.head, laneHead], { timeoutMs: T_FAST }))) {
-    const ff = await forward();
-    return ok(ff) ? { ok: true, how: 'fast-forward', commits, target: target.name } : { ok: false, error: gitError(ff, 'Could not land the lane.') };
+    return forward(laneHead, 'fast-forward');
   }
   // It moved: replay the lane's commits on it (in the lane), then move it forward.
-  const rebase = await runGit(lane.path, ['rebase', '--quiet', target.head], { timeoutMs: T_CHECKOUT });
+  const rebase = await runGit(lane.path, ['-c', 'rebase.updateRefs=false', 'rebase', '--rebase-merges', '--no-autostash', '--quiet', target.head], { timeoutMs: T_CHECKOUT });
   if (ok(rebase)) {
-    const ff = await forward();
-    if (ok(ff)) return { ok: true, how: 'rebase', commits, target: target.name };
-    return { ok: false, error: gitError(ff, 'Could not land the lane.') };
+    const rebased = await runGit(lane.path, ['rev-parse', '--verify', 'HEAD^{commit}'], { timeoutMs: T_FAST });
+    if (!ok(rebased)) return { ok: false, error: 'Could not read the rebased lane.' };
+    return forward(line(rebased), 'rebase');
   }
-  await runGit(lane.path, ['rebase', '--abort'], { timeoutMs: T_TREE });
-  // A replay that stops on a conflict of its own (one the end result does not have): a merge commit.
-  const merge = await runGit(lane.root, ['merge', '--no-ff', '--no-edit', '--quiet', '-m', `Land ${lane.branch}`, lane.branch], { timeoutMs: T_CHECKOUT });
-  if (ok(merge)) return { ok: true, how: 'merge', commits, target: target.name };
-  if (ok(await runGit(lane.root, ['rev-parse', '--verify', '-q', 'MERGE_HEAD'], { timeoutMs: T_FAST }))) await runGit(lane.root, ['merge', '--abort'], { timeoutMs: T_TREE });
-  return { ok: false, error: gitError(merge, 'Could not land the lane.') };
+  const abort = await runGit(lane.path, ['rebase', '--abort'], { timeoutMs: T_TREE });
+  if (!ok(abort)) return { ok: false, error: 'Could not replay the lane. Check its Git status before landing again.' };
+  // Build the fallback commit directly from Git's merged tree. The base index may contain
+  // someone else's staged work, so never use it as the index for a merge commit.
+  const merged = await runGit(lane.root, ['merge-tree', '--write-tree', target.head, laneHead], { timeoutMs: T_TREE });
+  if (!ok(merged)) return { ok: false, error: 'The lane could not be merged. Its commits are still on its branch.' };
+  const commit = await runGit(lane.root, ['commit-tree', line(merged), '-p', target.head, '-p', laneHead, '-m', 'Land ' + lane.branch], { timeoutMs: T_TREE });
+  return ok(commit) ? forward(line(commit), 'merge') : { ok: false, error: gitError(commit, 'Could not make the merge commit.') };
 }
 
 /**
  * Ends a lane: its links, its worktree and its branch (`force`: even with unlanded work). The
  * caller makes sure `lane.path` is one of Sable's lanes.
  */
-export async function removeLane(lane: SessionLane, opts: { force?: boolean } = {}): Promise<{ ok: true } | { error: string }> {
-  for (const name of lane.links ?? LANE_LINKS) unlinkLink(path.join(lane.path, name));
+export async function removeLane(lane: SessionLane, opts: { force?: boolean; keepUnmergedBranch?: boolean } = {}): Promise<{ ok: true; branchKept?: boolean } | { error: string }> {
+  const registered = await registration(lane);
+  if ('error' in registered) return registered;
+  if (!opts.force && registered.admin && operationIn(registered.admin)) return { error: 'Finish the Git operation in the lane before removing it.' };
+  let keepBranch = false;
+  if (!opts.force && await branchExists(lane.root, lane.branch)) {
+    const landed = await runGit(lane.root, ['merge-base', '--is-ancestor', 'refs/heads/' + lane.branch, 'HEAD'], { timeoutMs: T_FAST });
+    if (!ok(landed)) {
+      if (!opts.keepUnmergedBranch) return { error: 'The lane still has commits to land.' };
+      keepBranch = true;
+    }
+  }
   if (isDir(lane.path)) {
+    if (!registered.admin) return { error: 'The folder no longer contains this lane.' };
+    if (!opts.force) {
+      const status = await removableChanges(lane, registered.admin);
+      if ('error' in status) return status;
+      if (status.paths.length) return { error: 'The lane still has local files. Move them or discard the lane explicitly.' };
+    }
     // Node removes the folder itself: it unlinks any link or junction left inside without following
     // it (git for Windows walks into junctions it does not know, which could reach the main checkout's
     // node_modules). git then only forgets the worktree.
@@ -381,9 +516,15 @@ export async function removeLane(lane: SessionLane, opts: { force?: boolean } = 
       return { error: (err as Error).message.includes('EBUSY') ? 'The lane folder is in use. Close what has it open and try again.' : 'Could not remove the lane folder.' };
     }
   }
-  await runGit(lane.root, ['worktree', 'prune'], { timeoutMs: T_FAST });
-  const del = await runGit(lane.root, ['branch', opts.force ? '-D' : '-d', lane.branch], { timeoutMs: T_FAST });
-  if (!ok(del) && (await branchExists(lane.root, lane.branch))) return { error: gitError(del, 'Could not remove the lane’s branch.') };
+  if (registered.entry) {
+    const removed = await runGit(lane.root, ['worktree', 'remove', '--force', '--', lane.path], { timeoutMs: T_TREE });
+    if (!ok(removed)) return { error: gitError(removed, 'Could not unregister the lane.') };
+  }
+  if (keepBranch) return { ok: true, branchKept: true };
+  const del = await runGit(lane.root, ['branch', opts.force ? '-D' : '-d', '--', lane.branch], { timeoutMs: T_FAST });
+  // The checkout is gone. Git may protect the branch (for example its upstream is behind).
+  // The chat can go home and the retained ref is still available to the person.
+  if (!ok(del) && (await branchExists(lane.root, lane.branch))) return { ok: true, branchKept: true };
   return { ok: true };
 }
 
@@ -394,9 +535,11 @@ export async function removeLane(lane: SessionLane, opts: { force?: boolean } = 
  */
 export async function laneDiff(lane: SessionLane): Promise<FileDiff[]> {
   if (!isDir(lane.path)) return [];
-  const [target, snap] = await Promise.all([targetOf(lane.root), snapshotLane(lane.path)]);
+  if (await laneProblem(lane)) return [];
+  const snap = await snapshotLane(lane.path);
   if ('error' in snap) return [];
-  const mb = await runGit(lane.root, ['merge-base', 'error' in target ? lane.base : target.head, snap.commit], { timeoutMs: T_FAST });
+  const target = lane.from ? 'refs/heads/' + lane.from : 'HEAD';
+  const mb = await runGit(lane.root, ['merge-base', target, snap.commit], { timeoutMs: T_FAST });
   const from = ok(mb) ? line(mb) : lane.base;
   const d = await runGit(lane.root, ['diff', '--no-color', '--no-ext-diff', '-M', '--src-prefix=a/', '--dst-prefix=b/', from, snap.commit], { timeoutMs: T_TREE, maxBytes: 32_000_000 });
   if (d.code !== 0 && !d.stdout) return [];

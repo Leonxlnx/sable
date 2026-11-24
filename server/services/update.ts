@@ -4,6 +4,7 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync
 import os from 'node:os';
 import path from 'node:path';
 import type { App } from '../app';
+import { workOf, type WorkSession } from '../core/work';
 import type { UpdateState } from '../../shared/protocol';
 import { VERSION } from '../version';
 import { installMac } from './update-mac';
@@ -80,7 +81,7 @@ interface UpdaterOptions {
   platform?: NodeJS.Platform;
   arch?: string;
   /** Starts the installer (tests replace it). */
-  run?: (file: string) => void;
+  run?: (file: string) => void | Promise<void>;
   /** Whether agents are at work anywhere now, and a way to hear when that may have changed. */
   busy?: () => boolean;
   /**
@@ -121,6 +122,8 @@ export class Updater {
   dispose() {
     for (const t of this.timers) clearTimeout(t);
     this.timers = [];
+    this.busyCheck = undefined;
+    this.armRecheck();
   }
 
   private set(patch: Partial<UpdateState>) {
@@ -260,24 +263,20 @@ export class Updater {
       return this.state;
     }
     if (this.state.status !== 'ready' || !this.file || !this.opts.host) throw new Error('No update is ready to install.');
-    if (this.opts.busy?.()) {
+    if (this.left) return this.state;
+    if (this.opts.busy?.() || !this.go()) {
       this.busyCheck = () => {
-        if (this.opts.busy?.()) return this.armRecheck();
-        this.busyCheck = undefined;
-        this.armRecheck();
-        // Called from an event of the bridge: a start that fails (a Mac app that cannot replace
-        // itself) is said in the state, never thrown into the listener.
         try {
-          this.go();
+          if (!this.go()) return this.armRecheck();
         } catch (err) {
           this.set({ pending: undefined, error: (err as Error).message });
         }
+        this.busyCheck = undefined;
+        this.armRecheck();
       };
       this.set({ pending: true });
       this.armRecheck();
-      return this.state;
     }
-    this.go();
     return this.state;
   }
 
@@ -285,7 +284,7 @@ export class Updater {
   private armRecheck() {
     clearTimeout(this.recheck);
     this.recheck = undefined;
-    const at = this.busyCheck ? this.opts.recheckAt?.() : undefined;
+    const at = this.busyCheck ? this.opts.recheckAt?.() ?? Date.now() + 3000 : undefined;
     if (at === undefined) return;
     this.recheck = setTimeout(() => this.workChanged(), Math.max(1000, at - Date.now() + 50));
     this.recheck.unref?.();
@@ -299,20 +298,39 @@ export class Updater {
   /** The installer was started: nothing replaces its file any more. */
   private left = false;
 
+  get installing() { return this.left; }
+
+  private launch(file: string) {
+    const child = (this.opts.platform ?? process.platform) === 'darwin'
+      ? installMac(file)
+      : spawn(file, ['/S', '--force-run'], { detached: true, stdio: 'ignore', windowsHide: true });
+    return new Promise<void>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('spawn', () => { child.unref(); resolve(); });
+    });
+  }
+
   private go() {
+    if (this.left) return true;
+    if (this.opts.busy?.()) return false;
     const file = this.file!;
     this.left = true;
-    const run =
-      this.opts.run ??
-      ((f: string) => {
-        // A Mac swaps the app bundle with a script that waits for this process to end, then opens the new one.
-        if ((this.opts.platform ?? process.platform) === 'darwin') return installMac(f);
-        // Silent, then the installer starts Sable again; it outlives this process.
-        spawn(f, ['/S', '--force-run'], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const quit = () => {
+      this.set({ pending: undefined });
+      this.opts.host?.quit();
+    };
+    try {
+      const started = this.opts.run ? this.opts.run(file) : this.launch(file);
+      if (!started) quit();
+      else void started.then(quit, (err: Error) => {
+        this.left = false;
+        this.set({ pending: undefined, error: err.message });
       });
-    run(file);
-    this.set({ pending: undefined });
-    setTimeout(() => this.opts.host?.quit(), 400).unref?.();
+    } catch (err) {
+      this.left = false;
+      throw err;
+    }
+    return true;
   }
 }
 
@@ -320,10 +338,10 @@ export class Updater {
  * How long a background command holds a restart for an update: a test run the agent waits on does,
  * a dev server that runs all day does not hold the update for ever.
  */
-export const COMMAND_UPDATE_WAIT_MS = 30 * 60_000;
+export { COMMAND_HOLDS_MS as COMMAND_UPDATE_WAIT_MS } from '../core/work';
 
 /** A session as the update's wait reads it: `newestCommandAt`, when its youngest background command still running began. */
-export type UpdateSession = { meta: { status: string; background?: number; commands?: number }; turnActive: boolean; readonly newestCommandAt?: number };
+export type UpdateSession = WorkSession;
 
 /**
  * Whether an update's restart waits for work now: a turn, a session starting, sub-agents still
@@ -335,11 +353,11 @@ export function updateWaits(sessions: Iterable<UpdateSession>, now = Date.now())
   let busy = false;
   let recheckAt: number | undefined;
   for (const rt of sessions) {
-    if (rt.turnActive || rt.meta.status === 'running' || rt.meta.status === 'starting' || (rt.meta.background ?? 0) > 0) return { busy: true };
-    const at = (rt.meta.commands ?? 0) > 0 ? rt.newestCommandAt : undefined;
-    if (at !== undefined && now - at < COMMAND_UPDATE_WAIT_MS) {
+    const work = workOf(rt, true, now);
+    if (rt.meta.moving || work.turn || work.agents || rt.meta.status === 'running' || rt.meta.status === 'starting' || rt.meta.status === 'awaiting') return { busy: true };
+    if (work.holds !== undefined) {
       busy = true;
-      recheckAt = Math.max(recheckAt ?? 0, at + COMMAND_UPDATE_WAIT_MS);
+      recheckAt = Math.max(recheckAt ?? 0, work.holds);
     }
   }
   return busy ? { busy, recheckAt } : { busy };
@@ -349,7 +367,7 @@ export function updateWaits(sessions: Iterable<UpdateSession>, now = Date.now())
 export function registerUpdates(app: App, host?: UpdateHost) {
   const updater = new Updater((state) => app.emit({ type: 'update.state', state }), {
     host: process.platform === 'win32' || process.platform === 'darwin' ? host : undefined,
-    busy: () => updateWaits(app.sessions.values()).busy,
+    busy: () => app.preparingWork || updateWaits(app.sessions.values()).busy,
     recheckAt: () => updateWaits(app.sessions.values()).recheckAt,
   });
   app.updates = updater;

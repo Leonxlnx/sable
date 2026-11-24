@@ -112,6 +112,7 @@ export function lastUnanswered(items: readonly TimelineItem[]): UserItem | undef
     const it = items[i];
     if (it.parentId) continue;
     if (it.type === 'text' && it.text.trim()) return undefined;
+    if (it.type === 'notice' && (it.early || it.variant === 'interrupted')) return undefined;
     if (it.type === 'user' && personWords(it)) return it;
   }
   return undefined;
@@ -129,12 +130,13 @@ const NOTE_TODO = 90;
  * `lost`: the same message names background tasks the move lost (shared/synthetic.ts
  * `lostTasksNote`), so the note does not say that nothing else changed.
  */
-export function moveNote(items: readonly TimelineItem[], todos: readonly Todo[], opts: { skip?: string; lost?: boolean } = {}): string {
+export function moveNote(items: readonly TimelineItem[], todos: readonly Todo[], opts: { skip?: string; lost?: boolean; wake?: string } = {}): string {
   const lines = [
-    opts.lost
+    opts.lost || opts.wake
       ? 'This conversation moved to another account of the same person, in the same folder with the same files.'
       : 'This conversation moved to another account of the same person. Nothing else changed: the same folder, the same files.',
   ];
+  if (opts.wake) lines.push(opts.wake);
   const waiting = lastUnanswered(items.filter((i) => i.id !== opts.skip));
   if (waiting) lines.push(`Their last message before the move has no answer yet: "${clip(personWords(waiting), NOTE_QUOTE)}"`);
   const open = todos.filter((t) => t.status !== 'completed');

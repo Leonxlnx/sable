@@ -36,6 +36,7 @@ import type { TitlePrompt } from '../core/titles';
 import { codexForkTurn, cutAt } from '../core/fork';
 import type { Provider, ProviderContext, ProviderSession, SendOptions } from './types';
 import { codexPlan } from './plans';
+import { windowForModel } from '../../shared/limit-windows';
 import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import { WIDGET_DESCRIPTION, WIDGET_FENCE_HINT, WIDGET_INPUT_SCHEMA, WIDGET_TOOL, dynamicToolAnswer, widgetsEnabled } from './widget-tool';
 import { BROWSER_CORE, BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOLS, browserDynamicAnswer, browserOp, browserTabEnabled, SABLE_BROWSER_NAMESPACE } from './browser-tool';
@@ -294,9 +295,9 @@ export class CodexProvider implements Provider {
   }
 
   /** The used-up window of the last known limits (for a refused turn's notice). */
-  fullWindow(): RateLimit | undefined {
+  fullWindow(model?: string): RateLimit | undefined {
     return mapLimits([...this.snapshots.values()])
-      .filter((l) => l.percent >= 100)
+      .filter((l) => l.percent >= 100 && (!l.resetsAt || l.resetsAt > Date.now()) && (model === undefined || windowForModel(l, model)))
       .sort((a, b) => (b.resetsAt ?? 0) - (a.resetsAt ?? 0))[0];
   }
 
@@ -1059,6 +1060,7 @@ class CodexSession implements ProviderSession {
   private loaded = false;
   private closed = false;
   private turnId?: string;
+  private turnUserId?: string;
   private turnStarting?: Promise<unknown>;
   private queue: Queued[] = [];
   /** The mode changed since a start last carried the policy: the next turn/start sends it. */
@@ -1437,7 +1439,16 @@ class CodexSession implements ProviderSession {
 
   // ── sending ──
 
+  private receipts = new WeakMap<UserItem, () => void>();
+
+  private confirmInput(item: UserItem) {
+    const taken = this.receipts.get(item);
+    this.receipts.delete(item);
+    taken?.();
+  }
+
   async send(item: UserItem, opts?: SendOptions) {
+    if (opts?.taken) this.receipts.set(item, opts.taken);
     if (!existsSync(this.rt.meta.cwd)) throw new Error(`The folder ${this.rt.meta.cwd} does not exist.`);
     // The sender's guard, asked right before the message goes (review wave 6, #3): after the thread loads, and when a waiting one goes later.
     const check = opts?.check;
@@ -1454,7 +1465,7 @@ class CodexSession implements ProviderSession {
     rt.beginTurn('Thinking');
     // Queued messages move down to where the agent picks them up (steered ones stay where they were sent).
     for (const it of items) if (it.state === 'queued') rt.taken(it.id);
-    this.resetTurnState();
+    this.resetTurnState(items.at(-1)?.id);
     // This turn's generation, before the first await: a Stop (or anything that ends or replaces the
     // turn) while the thread reloads changes it, and then nothing is sent.
     const gen = this.gen;
@@ -1473,7 +1484,10 @@ class CodexSession implements ProviderSession {
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }
-    if ((await this.dispatchStart(gen, 'turn/start', params, check)) && rev === this.policyRev) this.policyDirty = false;
+    if (await this.dispatchStart(gen, 'turn/start', params, check)) {
+      for (const item of items) this.confirmInput(item);
+      if (rev === this.policyRev) this.policyDirty = false;
+    }
   }
 
   /**
@@ -1757,7 +1771,7 @@ class CodexSession implements ProviderSession {
     return !this.closed && this.rt.turnActive && this.gen === gen && !this.interrupting && !this.rt.stopRequested;
   }
 
-  private resetTurnState() {
+  private resetTurnState(userItemId?: string) {
     this.gen++;
     this.sawActive = false;
     this.idleSeen = false;
@@ -1768,6 +1782,7 @@ class CodexSession implements ProviderSession {
     this.strayMaybe = this.strayMaybeEnd = undefined;
     clearTimeout(this.idleTimer);
     this.turnId = undefined;
+    this.turnUserId = userItemId;
     this.turnErrors.clear();
     this.compactSeen = false;
     this.turnTokens = { input: 0, output: 0 };
@@ -1779,13 +1794,21 @@ class CodexSession implements ProviderSession {
     check?.();
     // A turn the user is stopping drops input steered into it: the message waits instead (the bridge
     // hands it back to the queue when the turn ends).
-    if (this.turnId && this.rt.turnActive && this.loaded && !this.rt.stopRequested) {
+    const turn = this.turnId;
+    if (turn && this.rt.turnActive && this.loaded && !this.rt.stopRequested) {
       try {
         const rpc = await this.provider.client();
         check?.();
         // The person waits for a reply: the agent is told to answer first (after their words; the
         // conversation shows only what they wrote, and a transcript read back drops the note).
-        await rpc.request('turn/steer', { threadId: this.threadId, input: [...input, { type: 'text', text: STEER_FIRST_BLOCK, text_elements: [] } as UserInput], expectedTurnId: this.turnId }, 30_000);
+        if (this.turnId !== turn || !this.rt.turnActive || this.rt.stopRequested) throw new Error('The turn changed before the steer.');
+        await rpc.request('turn/steer', { threadId: this.threadId, input: [...input, { type: 'text', text: STEER_FIRST_BLOCK, text_elements: [] } as UserInput], expectedTurnId: turn }, 30_000);
+        if (this.turnId === turn && this.rt.turnActive) {
+          // Concurrent steers can be acknowledged out of order. Keep the latest accepted card.
+          const latest = this.rt.items.findLast(i => i.id === item.id || i.id === this.turnUserId);
+          this.turnUserId = latest?.id ?? item.id;
+        }
+        this.confirmInput(item);
         this.rt.patch<UserItem>(item.id, { state: 'sent' });
         return;
       } catch (err) {
@@ -1834,7 +1857,7 @@ class CodexSession implements ProviderSession {
       return;
     }
     rt.beginTurn(name === 'compact' ? 'Compacting context' : 'Reviewing');
-    this.resetTurnState();
+    this.resetTurnState(item.id);
     // As for a message: the command's generation before the first await, checked right before it goes.
     const gen = this.gen;
     if (this.optionsDirty) await this.reloadForOptions();
@@ -2241,8 +2264,9 @@ class CodexSession implements ProviderSession {
         // Refused at a plan limit ("You've hit your usage limit…"): a limit notice the bridge can act on.
         const info = (e.error as { codexErrorInfo?: unknown } | undefined)?.codexErrorInfo;
         if (!e.willRetry && (info === 'usageLimitExceeded' || /usage limit/i.test(msg))) {
-          const full = this.provider.fullWindow();
-          rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: msg, detail: e.error?.additionalDetails ?? undefined, limit: { resetsAt: full?.resetsAt, window: full?.label } });
+          const full = this.provider.fullWindow(rt.meta.model ?? '');
+          const owner = rt.turnActive && (!tid || !this.turnId || this.turnId === tid) ? this.turnUserId : undefined;
+          rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: msg, detail: e.error?.additionalDetails ?? undefined, limit: { resetsAt: full?.resetsAt, window: full?.label, ...(owner ? { origin: 'user', userItemId: owner } : {}) } });
           return;
         }
         rt.notice(e.willRetry ? 'retry' : 'error', msg, e.error?.additionalDetails ?? undefined);

@@ -97,6 +97,8 @@ async function claudeApp(opts: { streams?: boolean } = {}) {
     providers: [
       (ctx) => {
         const p = new ClaudeProvider(ctx);
+        // Each fixture starts a fresh fake CLI. Other tests may have exercised a CLI with named results.
+        p.seen.names = false;
         const any = p as unknown as Record<string, unknown>;
         any.info = async () => ({ id: 'claude', name: 'Claude Code', installed: true, auth: { loggedIn: true } });
         any.caps = async () => ({ models: [{ id: 'm', name: 'M', isDefault: true }], modes: [], commands: [], skills: [], agents: [], mcpServers: [], tools: [], features: { steer: true } });

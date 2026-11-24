@@ -455,16 +455,30 @@ export function resetFromText(text: string, now = Date.now()): number | undefine
   const time = /(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/.exec(t);
   const date = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/.exec(t);
   if (!time && !date) return undefined;
-  const d = new Date(now);
-  let h = time ? Number(time[1]) % 12 : 0;
-  if (time?.[3] === 'pm') h += 12;
-  const at = new Date(d.getFullYear(), date ? MONTHS.indexOf(date[1]) : d.getMonth(), date ? Number(date[2]) : d.getDate(), h, time?.[2] ? Number(time[2]) : 0);
-  // The next one: a date already past is next year's, a time already past today is tomorrow's.
-  if (at.getTime() <= now) {
-    if (date) at.setFullYear(at.getFullYear() + 1);
-    else at.setDate(at.getDate() + 1);
+  // The notice names the CLI's time zone. A remote bridge may have a different local clock.
+  const zone = /\(([^()]+)\)/.exec(text)?.[1];
+  let clock: Intl.DateTimeFormat | undefined;
+  if (zone) {
+    try {
+      clock = new Intl.DateTimeFormat('en', { timeZone: zone, timeZoneName: 'longOffset' });
+    } catch { /* Older CLIs sometimes print a display name instead of an IANA zone. */ }
   }
-  return at.getTime();
+  const offsetAt = (utc: number) => {
+    if (!clock) return -new Date(utc).getTimezoneOffset() * 60_000;
+    const offset = clock.formatToParts(utc).find((p) => p.type === 'timeZoneName')?.value ?? '';
+    const parts = /GMT([+-])(\d+):(\d+)/.exec(offset);
+    return parts ? (parts[1] === '-' ? -1 : 1) * (Number(parts[2]) * 60 + Number(parts[3])) * 60_000 : 0;
+  };
+  const d = new Date(now + offsetAt(now));
+  const hour = time ? Number(time[1]) % 12 + (time[3] === 'pm' ? 12 : 0) : 0;
+  const wall = new Date(Date.UTC(d.getUTCFullYear(), date ? MONTHS.indexOf(date[1]) : d.getUTCMonth(), date ? Number(date[2]) : d.getUTCDate(), hour, Number(time?.[2] ?? 0)));
+  // Resolve the offset on the target date as a reset can cross a daylight-saving transition.
+  const instant = () => wall.getTime() - offsetAt(wall.getTime() - offsetAt(wall.getTime()));
+  if (instant() <= now) {
+    if (date) wall.setUTCFullYear(wall.getUTCFullYear() + 1);
+    else wall.setUTCDate(wall.getUTCDate() + 1);
+  }
+  return instant();
 }
 
 // ── background tasks and wake-ups ──

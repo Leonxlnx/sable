@@ -180,8 +180,8 @@ export function spareRoom(a: SpareAccount, now: number, model?: string, floor = 
  * undefined when none is. A full window whose reset is not known holds it too: `Infinity` (review
  * wave 8, #18; it was left out, so the chat went on at a window still full).
  */
-export function stillFull(limits: RateLimit[], now: number, model?: string): number | undefined {
-  const full = live(limits, now).filter((l) => l.percent >= 100 && forModel(l, model));
+export function stillFull(limits: RateLimit[], now: number, model?: string, resetModels: string[] = []): number | undefined {
+  const full = live(limits, now).filter((l) => l.percent >= 100 && (forModel(l, model) || resetModels.some(m => forModel(l, m))));
   if (!full.length) return undefined;
   return full.some((l) => !l.resetsAt) ? Infinity : Math.max(...full.map((l) => l.resetsAt!));
 }
@@ -191,6 +191,7 @@ export interface SpareItem {
   provider: ProviderId;
   /** The model its turns run on (`effectiveModel`); undefined when not known (every per-model window counts). */
   model?: string;
+  resetModels?: string[];
   wait: SpareWait;
   /** Its session is working or starting: nothing starts there now. */
   busy?: boolean;
@@ -252,7 +253,7 @@ export function planSpare(input: SpareInput): SparePlan {
       continue;
     }
     const acc = input.accounts[it.provider]?.find((a) => a.id === accountId);
-    const later = acc ? stillFull(acc.limits, now, it.model) : undefined;
+    const later = acc ? stillFull(acc.limits, now, it.model, it.resetModels) : undefined;
     if (later === Infinity) {
       // Full with no reset known: it waits, and looks again in a while (a reading may tell).
       out.waits[it.sessionId] = { accountId };
@@ -310,6 +311,7 @@ export interface SpareHost {
   busy: (rt: SessionRuntime) => boolean;
   /** The model its turns run on (`effectiveModel`); undefined when that cannot be told. */
   model: (rt: SessionRuntime) => string | undefined;
+  resetModels?: (rt: SessionRuntime) => string[];
   accounts: (provider: ProviderId) => Promise<SpareAccount[]>;
   /** Reads the account's limits again (no tokens). True when the agent gave a new reading (a failed read hands back the last known rows). */
   refresh: (provider: ProviderId, accountId: string) => Promise<boolean>;
@@ -405,14 +407,14 @@ export class SpareWaits {
   }
 
   /** "Continue at reset": the chat's last open limit notice continues on its account at its reset. */
-  atReset(rt: SessionRuntime): { ok: boolean; spare?: SpareWait; error?: string } {
+  atReset(rt: SessionRuntime, refusalId?: string): { ok: boolean; spare?: SpareWait; error?: string } {
     this.host.hydrate(rt);
-    const notice = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId);
+    const notice = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId && (!refusalId || i.id === refusalId));
     if (!notice) return { ok: false, error: 'There is no limit to wait for' };
     const at = notice.limit!.resetsAt;
     if (!at) return { ok: false, error: 'The reset time is not known yet' };
     const held = rt.meta.spare?.held?.length ? { held: rt.meta.spare.held } : {};
-    const wait: SpareWait = { reason: 'reset', since: this.now(), at, accountId: notice.limit!.accountId ?? rt.meta.accountId ?? DEFAULT_ACCOUNT, ...held };
+    const wait: SpareWait = { reason: 'reset', since: this.now(), at, refusalId: notice.id, accountId: notice.limit!.accountId ?? rt.meta.accountId ?? DEFAULT_ACCOUNT, ...held };
     rt.update({ spare: wait });
     this.poke();
     return { ok: true, spare: wait };
@@ -557,7 +559,9 @@ export class SpareWaits {
       // Only a chat that one of the cleared windows held (another model's week is not its wait); the
       // planner then checks every window that holds it, against the fresh reading (review wave 8, #18).
       const model = this.host.model(rt);
-      if (windows && !windows.some((l) => forModel(l, model))) continue;
+      this.host.hydrate(rt);
+      const models = [model, ...(this.host.resetModels?.(rt) ?? [])];
+      if (windows && !windows.some(l => models.some(m => forModel(l, m)))) continue;
       if (wait.at !== undefined && wait.at > now) rt.update({ spare: { ...wait, at: now } });
       due = true;
     }
@@ -620,14 +624,14 @@ export class SpareWaits {
   }
 
   private item(rt: SessionRuntime, busy: boolean): SpareItem {
-    return { sessionId: rt.id, provider: rt.meta.provider, model: this.host.model(rt), wait: rt.meta.spare!, busy };
+    return { sessionId: rt.id, provider: rt.meta.provider, model: this.host.model(rt), resetModels: rt.meta.spare?.reason === 'reset' ? this.host.resetModels?.(rt) : undefined, wait: rt.meta.spare!, busy };
   }
 
   private async plan(waits: SessionRuntime[]): Promise<SparePlan> {
     const providers = [...new Set(waits.map((rt) => rt.meta.provider))];
     const accounts: Partial<Record<ProviderId, SpareAccount[]>> = {};
     for (const p of providers) accounts[p] = await this.host.accounts(p).catch(() => []);
-    const items = waits.map((rt) => this.item(rt, this.host.busy(rt) || this.starting.has(rt.id)));
+    const items = waits.filter(rt => rt.meta.spare && this.alive(rt)).map(rt => this.item(rt, this.host.busy(rt) || this.starting.has(rt.id)));
     return planSpare({ now: this.now(), accounts, items, running: this.running.size + this.starting.size });
   }
 
@@ -656,6 +660,7 @@ export class SpareWaits {
   private async begin(rt: SessionRuntime, s: SpareStart): Promise<'started' | 'stale' | 'held'> {
     const provider = rt.meta.provider;
     const key = `${provider}:${s.accountId}`;
+    const wait = rt.meta.spare;
     this.starting.add(rt.id);
     try {
       let failed = false;
@@ -668,8 +673,7 @@ export class SpareWaits {
           this.host.log('spare: limits read failed', (err as Error).message);
         }
       }
-      const wait = rt.meta.spare;
-      if (!wait || this.disposed || !this.alive(rt)) return 'held';
+      if (!wait || rt.meta.spare !== wait || this.disposed || !this.alive(rt)) return 'held';
       if (failed || this.now() - (this.readAt.get(key) ?? 0) > SPARE_FRESH_MS) {
         this.host.log('spare: no fresh limits for', key, 'so nothing starts this round');
         return 'stale';
@@ -681,6 +685,8 @@ export class SpareWaits {
       }
       // The account as just read must still take it (another may lead now: this one is still fine).
       const fresh = (await this.host.accounts(provider).catch(() => [] as SpareAccount[])).filter((a) => a.id === s.accountId);
+      if (this.disposed || !this.alive(rt) || rt.meta.spare !== wait) return 'held';
+      if (wait.reason === 'reset' && !fresh[0]?.limits.length) return 'stale';
       const again = planSpare({ now: this.now(), accounts: { [provider]: fresh }, items: [this.item(rt, this.host.busy(rt))], running: this.running.size + this.starting.size - 1 });
       if (!again.start.some((x) => x.sessionId === rt.id && x.accountId === s.accountId)) {
         this.show([rt], again);
@@ -707,6 +713,7 @@ export class SpareWaits {
       rt.update({ spare: held.length ? { reason: 'spare', since: wait.since, held } : null });
       return 'started';
     } catch (err) {
+      if (this.disposed || !this.alive(rt) || rt.meta.spare !== wait) return 'held';
       this.host.log('spare start failed', (err as Error).message);
       rt.notice('error', 'Could not start the waiting message', (err as Error).message);
       this.release(rt);

@@ -12,7 +12,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NoticeItem, TurnItem, UserItem } from '@shared/protocol';
 import { App } from '../server/app';
 import type { SessionRuntime } from '../server/core/runtime';
@@ -207,9 +207,19 @@ describe('#11: a Claude Code result that cannot be told apart', () => {
     expect(h.turns().map((t) => t.error)).toEqual([undefined]);
   }, 10_000);
 
-  it('the last background task ending lets the old process go: the waiting message goes to a new one', async () => {
+  it('the last background task gives the old process its notification grace, then sends the waiting message to a new one', async () => {
     const h = await settledWithTask();
-    await h.system({ subtype: 'task_notification', task_id: 't1', status: 'completed' });
+    vi.useFakeTimers();
+    try {
+      const end = h.system({ subtype: 'task_notification', task_id: 't1', status: 'completed' });
+      await vi.advanceTimersByTimeAsync(2_999);
+      await end;
+      expect(h.procs[0].closed()).toBe(false);
+      expect(h.pushed).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+    } finally {
+      vi.useRealTimers();
+    }
     expect(h.procs).toHaveLength(2);
     expect(h.procs[0].closed()).toBe(true);
     expect(h.pushed).toHaveLength(2);
@@ -221,17 +231,20 @@ describe('#11: a Claude Code result that cannot be told apart', () => {
     expect(h.turns().map((t) => t.error)).toEqual([undefined]);
   }, 10_000);
 
-  it('a waiting message can be stopped: nothing reaches Claude Code, it stays in the conversation, stopped, and the task keeps running', async () => {
+  it('stopping a waiting message returns it to the queue and keeps the background task running', async () => {
     const h = await settledWithTask();
+    const waiting = h.rt.items.find((i) => i.type === 'user' && i.text === 'second')!;
     await h.stop();
     expect(h.rt.turnActive).toBe(false);
     expect(h.pushed).toHaveLength(1);
     expect(h.procs[0].closed()).toBe(false);
     expect(notices(h.rt).filter((n) => n.variant === 'interrupted')).toHaveLength(2);
-    expect(h.rt.items.some((i) => i.type === 'user' && i.text === 'second')).toBe(true);
+    expect(h.rt.get(waiting.id)).toBeUndefined();
+    expect(h.rt.queue).toMatchObject([{ id: waiting.id, text: 'second' }]);
     // Nothing it held is sent later either.
     await h.system({ subtype: 'session_state_changed', state: 'idle' });
     expect(h.pushed).toHaveLength(1);
+    expect(h.rt.queue.map((q) => q.id)).toEqual([waiting.id]);
   }, 10_000);
 
   it('a stop Claude Code never confirmed keeps the turn until its process is closed; nothing of that process reaches the next turn', async () => {

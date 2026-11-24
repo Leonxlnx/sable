@@ -314,6 +314,29 @@ describe('the note of tasks lost with their process', () => {
     expect(parseSynthetic(`${RESUME_AFTER_RESET}${note}`)).toMatchObject({ role: 'hidden' });
   });
 
+  it('keeps the file in a file-only replay whose leading blank lines were trimmed', () => {
+    const path = '@/work/spec.pdf';
+    expect(userText(note.trimStart() + '\n\n' + path)).toBe(path);
+    const quoted = 'Sable lost track of these background tasks in my example.\n\n' + path;
+    expect(userText(quoted)).toBe(quoted);
+  });
+
+  it.each([
+    ['Claude file paths', '', '@C:\\work files\\spec.pdf @C:\\work\\notes.txt'],
+    ['Codex file reference', '', '[Attached file: /work/spec.pdf]'],
+    ['Codex inline file', '', '<attachment name="spec.txt">\nFile contents\n</attachment>'],
+    ['Browser and file', "\n\n[Sable: the user's Browser tab shows localhost:5173/ titled \"Build\". browser_read reads it.]", '@/work/spec.pdf'],
+    ['move note and file', '\n\n<system-reminder>This conversation moved to another account.</system-reminder>', '@/work/spec.pdf'],
+    ['submit hook', '\n\n<user-prompt-submit-hook>Answer the message first.</user-prompt-submit-hook>', ''],
+    ['local command caveat', '\n\n<local-command-caveat>Local command</local-command-caveat>', ''],
+  ])('hides the loss note before %s and preserves the attached file', (_kind, wrapper, file) => {
+    const text = 'Review it' + note + wrapper + (file ? '\n\n' + file : '');
+    const expected = 'Review it' + (file ? '\n\n' + file : '');
+    expect(userText(text)).toBe(expected);
+    expect(stripWrappers(text.replace(/\n/g, '\r\n'))).toBe(expected);
+    expect(readableTitle(text)).not.toContain('Sable lost track');
+  });
+
   it('the same words inside what the person wrote stay theirs', () => {
     const pasted = `Why did Sable say this?${note}
 

@@ -1,11 +1,14 @@
 /** Lanes at the git level, on temporary repositories only. */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { createLane, forecastLane, landLane, laneSlug, removeLane, renameLane } from '../server/services/git-lanes';
-import { worktreesRoot } from '../server/core/lanes';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createLane, forecastLane, landLane, laneDiff, laneSlug, removeLane, renameLane } from '../server/services/git-lanes';
+import * as gitService from '../server/services/git';
+import { carryClaudeToFolder, claudeFolderKey, worktreesRoot } from '../server/core/lanes';
+import { gitWorktrees, gitStatus } from '../server/services/git';
+import { projectFolders, findProgram } from '../server/util/which';
 import type { SessionLane } from '@shared/protocol';
 
 const temps: string[] = [];
@@ -17,7 +20,7 @@ const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd,
 
 /** A repository with one commit on `main`, an ignored node_modules, and a lanes folder beside it. */
 function repo() {
-  const home = mkdtempSync(path.join(tmpdir(), 'sable-lanes-'));
+  const home = mkdtempSync(path.join(tmpdir(), 'sable lanes '));
   temps.push(home);
   const root = path.join(home, 'app');
   mkdirSync(path.join(root, 'src'), { recursive: true });
@@ -43,7 +46,20 @@ async function lane(r: ReturnType<typeof repo>, slug = 'refactor-session', folde
   return made;
 }
 
-describe('lanes', { timeout: 30_000 }, () => {
+// Each landing drives several dozen real Git processes, including on shared Windows runners.
+const gitTestTimeout = 120_000;
+
+describe('lanes', { timeout: gitTestTimeout }, () => {
+  it('checks Git capability with the same checkout exclusions as the forecast', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    const run = vi.spyOn(gitService, 'runGit');
+    try {
+      // Include the first version probe when there is one. A warm probe needs no subprocess.
+      await forecastLane(l);
+      expect(run.mock.calls.filter(([, args]) => args[0] === 'version').every(([cwd]) => cwd === l.path)).toBe(true);
+    } finally { run.mockRestore(); }
+  });
   it('slugs a title into a branch name', () => {
     expect(laneSlug('Refactor the session module, please!')).toBe('refactor-the-session-module');
     expect(laneSlug('Über café: fix ü')).toBe('uber-cafe-fix-u');
@@ -196,6 +212,307 @@ describe('lanes', { timeout: 30_000 }, () => {
     expect(await createLane({ folder: home, dir: path.join(home, 'l'), slug: 'x' })).toEqual({ error: 'This folder is not a git repository.' });
     git(home, 'init', '-q');
     expect(await createLane({ folder: home, dir: path.join(home, 'l'), slug: 'x' })).toEqual({ error: 'This repository has no commits yet.' });
+  });
+});
+
+describe('lane checkout integrity', { timeout: gitTestTimeout }, () => {
+  it('keeps an empty project subfolder usable in a new checkout', async () => {
+    const r = repo();
+    const folder = path.join(r.root, '..notes');
+    mkdirSync(folder);
+    const made = await lane(r, 'inner', folder);
+    expect(made.cwd).toBe(path.join(made.lane.path, '..notes'));
+    expect(existsSync(made.cwd)).toBe(true);
+  });
+
+  it('reports an unusable worktrees folder in words', async () => {
+    const r = repo();
+    const result = await createLane({ folder: r.root, dir: path.join(r.root, 'README.md', 'lane'), slug: 'folder' });
+    expect(result).toEqual({ error: expect.stringMatching(/folder/i) });
+    expect(git(r.root, 'branch', '--list', 'sable/*')).toBe('');
+  });
+
+  it('allocates distinct branches to simultaneous requests with the same title', async () => {
+    const r = repo();
+    const made = await Promise.all(['one', 'two', 'three'].map((name) => createLane({ folder: r.root, dir: path.join(r.lanes, name), slug: 'same' })));
+    expect(made.every((m) => 'lane' in m)).toBe(true);
+    expect(new Set(made.map((m) => 'lane' in m && m.lane.branch)).size).toBe(3);
+  });
+
+  it.each(['detached', 'renamed', 'deleted'] as const)('preserves work when the lane branch is %s', async (kind) => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    if (kind === 'renamed') git(l.path, 'branch', '-m', 'mine');
+    else git(l.path, 'switch', '--detach');
+    if (kind === 'deleted') git(l.path, 'branch', '-D', l.branch);
+    writeFileSync(path.join(l.path, 'valuable'), 'keep me');
+    expect((await forecastLane(l)).state).toBe('unavailable');
+    expect((await landLane(l, 'work')).ok).toBe(false);
+    expect(git(l.path, 'status', '--porcelain')).toContain('?? valuable');
+    expect(git(r.root, 'rev-parse', 'HEAD')).toBe(l.base);
+  });
+
+  it('waits for the original base branch when the folder switched branches', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    git(r.root, 'switch', '-qc', 'unrelated');
+    git(r.root, 'branch', '-D', 'main');
+    writeFileSync(path.join(l.path, 'work'), 'keep me');
+    expect(await forecastLane(l)).toMatchObject({ state: 'unavailable', reason: expect.stringContaining('main') });
+    expect((await landLane(l, 'work')).ok).toBe(false);
+    expect((await laneDiff(l)).map((f) => f.path)).toEqual(['work']);
+    expect(git(r.root, 'rev-parse', 'HEAD')).toBe(l.base);
+  });
+
+  it('never renames a recycled branch after the worktree switched away', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r, 'provisional');
+    git(l.path, 'switch', '-qc', 'my-checkout');
+    expect(await renameLane(l, 'first-message')).toBeNull();
+    expect(git(r.root, 'branch', '--list', l.branch)).toContain(l.branch);
+    expect(git(l.path, 'branch', '--show-current')).toBe('my-checkout');
+  });
+
+  it('leaves an unfinished merge in place even when it has no file changes', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    git(r.root, 'commit', '-q', '--allow-empty', '-m', 'Base checkpoint');
+    git(l.path, 'merge', '--no-ff', '--no-commit', 'main');
+    expect(git(l.path, 'status', '--porcelain')).toBe('');
+    expect((await forecastLane(l)).state).toBe('unavailable');
+    expect(await removeLane(l, { keepUnmergedBranch: true })).toHaveProperty('error');
+    expect(git(l.path, 'rev-parse', 'MERGE_HEAD')).toBe(git(r.root, 'rev-parse', 'HEAD'));
+  });
+
+  it('blocks ignored base files and file versus directory collisions before committing', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    writeFileSync(path.join(r.root, '.git', 'info', 'exclude'), 'settings.local\n');
+    writeFileSync(path.join(r.root, 'settings.local'), 'my settings');
+    writeFileSync(path.join(l.path, 'settings.local'), 'lane settings');
+    git(l.path, 'add', '-f', 'settings.local');
+    mkdirSync(path.join(r.root, 'result'));
+    writeFileSync(path.join(r.root, 'result', 'draft'), 'my draft');
+    writeFileSync(path.join(l.path, 'result'), 'lane result');
+    const f = await forecastLane(l);
+    expect(f.state).toBe('blocked');
+    expect(f.blocked.sort()).toEqual(['result/draft', 'settings.local']);
+    expect((await landLane(l, 'work')).ok).toBe(false);
+    expect(git(l.path, 'rev-parse', 'HEAD')).toBe(l.base);
+    expect(readFileSync(path.join(r.root, 'settings.local'), 'utf8')).toBe('my settings');
+  });
+
+  it('preserves a staged version that differs from the lane working copy', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    writeFileSync(path.join(l.path, 'README.md'), 'staged');
+    git(l.path, 'add', 'README.md');
+    writeFileSync(path.join(l.path, 'README.md'), 'unstaged');
+    expect((await forecastLane(l)).state).toBe('unavailable');
+    expect((await landLane(l, 'work')).ok).toBe(false);
+    expect(git(l.path, 'show', ':README.md')).toBe('staged');
+  });
+
+  it('preserves local edits inside an initialized submodule', async () => {
+    const lib = repo();
+    const r = repo();
+    writeFileSync(path.join(r.root, '.gitmodules'), '[submodule "lib"]\n\tpath = lib\n\turl = ./lib\n');
+    git(r.root, 'add', '.gitmodules');
+    git(r.root, 'update-index', '--add', '--cacheinfo', '160000,' + git(lib.root, 'rev-parse', 'HEAD') + ',lib');
+    git(r.root, 'commit', '-qm', 'Add lib');
+    const { lane: l } = await lane(r);
+    cpSync(lib.root, path.join(l.path, 'lib'), { recursive: true });
+    writeFileSync(path.join(l.path, 'lib', 'README.md'), 'nested work');
+    git(l.path, 'config', 'submodule.lib.ignore', 'all');
+    writeFileSync(path.join(l.path, 'work'), 'parent work');
+    expect(await forecastLane(l)).toMatchObject({ state: 'unavailable', reason: expect.stringMatching(/submodule/i) });
+    expect((await landLane(l, 'work')).ok).toBe(false);
+    expect(readFileSync(path.join(l.path, 'lib', 'README.md'), 'utf8')).toBe('nested work');
+  });
+
+  it.each(['registered', 'embedded'])('preserves the only repository containing a submodule commit when the parent is clean (%s)', async (kind) => {
+    const r = repo();
+    const lib = repo();
+    if (kind === 'registered') {
+      writeFileSync(path.join(r.root, '.gitmodules'), '[submodule "lib"]\n\tpath = lib\n\turl = ./lib\n');
+      git(r.root, 'add', '.gitmodules');
+    }
+    git(r.root, 'update-index', '--add', '--cacheinfo', '160000,' + git(lib.root, 'rev-parse', 'HEAD') + ',lib');
+    git(r.root, 'commit', '-qm', 'Add lib');
+    mkdirSync(path.join(r.root, 'lib'));
+    expect(git(r.root, 'status', '--porcelain')).toBe('');
+    const { lane: l } = await lane(r);
+    const nested = path.join(l.path, 'lib');
+    cpSync(lib.root, nested, { recursive: true });
+    git(nested, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '--allow-empty', '-m', 'Unpublished');
+    git(l.path, 'add', 'lib');
+    git(l.path, 'commit', '-qm', 'Use unpublished lib');
+    expect(await forecastLane(l)).toMatchObject({ state: 'clean', files: 1 });
+    expect((await landLane(l, 'Use lib')).ok).toBe(true);
+    expect(await removeLane(l, { keepUnmergedBranch: true })).toMatchObject({ error: expect.stringMatching(/submodule/i) });
+    expect(git(nested, 'log', '-1', '--format=%s')).toBe('Unpublished');
+  });
+
+  it('lands tracked work beside an ignored lane file and preserves that file on cleanup', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    writeFileSync(path.join(r.root, '.git', 'info', 'exclude'), 'local-only\n');
+    writeFileSync(path.join(l.path, 'local-only'), 'important local data');
+    writeFileSync(path.join(l.path, 'new'), 'to land');
+    expect(await forecastLane(l)).toMatchObject({ state: 'clean', files: 1 });
+    expect((await landLane(l, 'work')).ok).toBe(true);
+    expect(await removeLane(l)).toMatchObject({ error: expect.stringContaining('local-only') });
+    expect(readFileSync(path.join(l.path, 'local-only'), 'utf8')).toBe('important local data');
+  });
+
+  it('lands history-only commits', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    git(l.path, 'commit', '-q', '--allow-empty', '-m', 'Checkpoint');
+    expect(await forecastLane(l)).toMatchObject({ state: 'clean', ahead: 1, files: 0 });
+    expect((await landLane(l, 'work')).ok).toBe(true);
+    expect(git(r.root, 'log', '-1', '--format=%s')).toBe('Checkpoint');
+  });
+
+  it('falls back to a two-parent merge without including staged base work', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    writeFileSync(path.join(l.path, 'README.md'), 'intermediate');
+    git(l.path, 'commit', '-qam', 'Intermediate');
+    git(l.path, 'restore', '--source', l.base, '--', 'README.md');
+    writeFileSync(path.join(l.path, 'work'), 'result');
+    git(l.path, 'add', '-A');
+    git(l.path, 'commit', '-qm', 'Final');
+    const tip = git(l.path, 'rev-parse', 'HEAD');
+    writeFileSync(path.join(r.root, 'README.md'), 'new base');
+    git(r.root, 'commit', '-qam', 'Base moved');
+    const base = git(r.root, 'rev-parse', 'HEAD');
+    writeFileSync(path.join(r.root, 'mine'), 'keep staged');
+    git(r.root, 'add', 'mine');
+    expect(await landLane(l, 'land')).toMatchObject({ ok: true, how: 'merge' });
+    expect(git(r.root, 'show', '-s', '--format=%P', 'HEAD')).toBe([base, tip].join(' '));
+    expect(git(r.root, 'status', '--porcelain')).toBe('A  mine');
+  });
+
+  it('keeps a detached base untouched and compares lane files from their fork point', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    writeFileSync(path.join(l.path, 'work'), 'local');
+    writeFileSync(path.join(r.root, 'other'), 'base only');
+    git(r.root, 'add', 'other');
+    git(r.root, 'commit', '-qm', 'Advance base');
+    expect((await laneDiff(l)).map((f) => f.path)).toEqual(['work']);
+    git(r.root, 'switch', '--detach');
+    expect(await forecastLane(l)).toMatchObject({ state: 'unavailable', reason: expect.stringContaining('branch') });
+    expect((await landLane(l, 'work')).ok).toBe(false);
+    expect(git(r.root, 'status', '--porcelain')).toBe('');
+  });
+
+  it('omits already landed commits from the lane diff when the base checkout switches away', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    writeFileSync(path.join(l.path, 'already landed'), 'first');
+    git(l.path, 'add', '-A');
+    git(l.path, 'commit', '-qm', 'First part');
+    git(r.root, 'merge', '--ff-only', l.branch);
+    writeFileSync(path.join(l.path, 'still to land'), 'second');
+    git(r.root, 'switch', '-qc', 'other', l.base);
+    expect((await laneDiff(l)).map((f) => f.path)).toEqual(['still to land']);
+  });
+
+  it('refuses an unrelated folder at the old lane path and respects a locked lane', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    git(r.root, 'worktree', 'lock', l.path);
+    expect(await removeLane(l, { force: true })).toHaveProperty('error');
+    expect(existsSync(l.path)).toBe(true);
+    git(r.root, 'worktree', 'unlock', l.path);
+    renameSync(l.path, l.path + '-saved');
+    mkdirSync(l.path);
+    writeFileSync(path.join(l.path, 'mine'), 'keep');
+    expect(await removeLane(l, { force: true })).toHaveProperty('error');
+    expect(readFileSync(path.join(l.path, 'mine'), 'utf8')).toBe('keep');
+  });
+
+  it('forgets only the requested missing checkout, before or after Git prunes it', async () => {
+    const r = repo();
+    const { lane: a } = await lane(r, 'first');
+    const { lane: b } = await lane(r, 'second');
+    rmSync(a.path, { recursive: true, force: true });
+    rmSync(b.path, { recursive: true, force: true });
+    expect((await forecastLane(a)).reason).toMatch(/gone/);
+    expect(await removeLane(a, { force: true })).toEqual({ ok: true });
+    expect(git(r.root, 'worktree', 'list', '--porcelain')).toContain(b.branch);
+    git(r.root, 'worktree', 'prune');
+    expect(await removeLane(b, { force: true })).toEqual({ ok: true });
+    expect(git(r.root, 'branch', '--list', 'sable/*')).toBe('');
+  });
+
+  it('lists usable locked and detached trees with literal branch names and omits missing trees', async () => {
+    const r = repo();
+    const branch = "feature/tom's-$fix";
+    const dir = path.join(r.home, 'linked checkout');
+    git(r.root, 'worktree', 'add', '-qb', branch, dir);
+    git(r.root, 'worktree', 'lock', dir);
+    const detached = path.join(r.home, 'detached');
+    git(r.root, 'worktree', 'add', '-q', '--detach', detached);
+    const gone = await lane(r, 'gone');
+    rmSync(gone.cwd, { recursive: true, force: true });
+    const trees = await gitWorktrees(dir);
+    expect(trees.map((w) => w.path).sort()).toEqual([r.root, dir, detached].sort());
+    expect(trees.find((w) => w.path === dir)?.branch).toBe(branch);
+    expect(trees.find((w) => w.path === detached)?.head).toBe(git(dir, 'rev-parse', 'HEAD').slice(0, 7));
+  });
+
+  it('reads a checkout across drive letters and excludes shared project tools from lookup', async () => {
+    const r = repo();
+    const scratch = path.resolve('scratch/day6/lanes');
+    mkdirSync(scratch, { recursive: true });
+    const other = mkdtempSync(path.join(scratch, 'repo with spaces '));
+    temps.push(other);
+    git(other, 'init', '-q', '-b', 'main');
+    git(other, 'config', 'user.name', 'Test');
+    git(other, 'config', 'user.email', 'test@example.com');
+    git(other, 'config', 'commit.gpgsign', 'false');
+    git(other, 'commit', '-qm', 'first', '--allow-empty');
+    const made = await createLane({ folder: other, dir: path.join(r.lanes, 'my lane'), slug: 'cross-drive' });
+    if ('error' in made) throw new Error(made.error);
+    const excluded = projectFolders(made.cwd);
+    const bin = path.join(other, 'bin');
+    expect(findProgram('tool', { outside: excluded, env: { Path: bin, PATH: bin }, isProgram: () => true })).toBeNull();
+    expect((await gitStatus(made.cwd)).branch).toBe(made.lane.branch);
+    expect((await gitWorktrees(made.cwd)).map((w) => w.path)).toContain(other);
+    writeFileSync(path.join(made.cwd, 'across drives'), 'in the lane');
+    expect(await forecastLane(made.lane)).toMatchObject({ state: 'clean', uncommitted: 1 });
+    expect(git(made.cwd, 'diff', '--cached', '--name-only')).toBe('');
+    expect(await landLane(made.lane, 'Across drives')).toMatchObject({ ok: true });
+    expect(readFileSync(path.join(other, 'across drives'), 'utf8')).toBe('in the lane');
+  });
+
+  it('identifies the current branch when home picked a junction to the checkout', async () => {
+    const r = repo();
+    const { lane: l } = await lane(r);
+    const alias = path.join(r.home, 'shortcut');
+    symlinkSync(l.path, alias, 'junction');
+    const list = await gitWorktrees(path.join(alias, 'src'));
+    expect(list.find((tree) => tree.path === alias)?.branch).toBe(l.branch);
+  });
+
+  it('carries the latest conversation back from the lane', () => {
+    const r = repo();
+    const next = path.join(r.lanes, 'chat');
+    const transcript = (cwd: string) => path.join(r.home, 'projects', claudeFolderKey(cwd), 'abc.jsonl');
+    mkdirSync(path.dirname(transcript(r.root)), { recursive: true });
+    writeFileSync(transcript(r.root), 'first');
+    expect(carryClaudeToFolder(r.home, 'abc', next, r.root)).toBe(true);
+    writeFileSync(transcript(next), 'second');
+    expect(carryClaudeToFolder(r.home, 'abc', r.root, next)).toBe(true);
+    expect(readFileSync(transcript(r.root), 'utf8')).toBe('second');
+    // Some existing conversations have their transcript under a different provider folder key.
+    renameSync(path.dirname(transcript(next)), path.join(r.home, 'projects', 'previous-key'));
+    writeFileSync(path.join(r.home, 'projects', 'previous-key', 'abc.jsonl'), 'third');
+    expect(carryClaudeToFolder(r.home, 'abc', r.root, next)).toBe(true);
+    expect(readFileSync(transcript(r.root), 'utf8')).toBe('third');
   });
 });
 

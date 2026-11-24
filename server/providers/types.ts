@@ -50,6 +50,12 @@ export interface ProviderContext {
 export interface SendOptions {
   /** Throws when the sender may no longer act: asked right before the message goes. */
   check?: () => void;
+  /** Called once when the agent confirms delivery of this specific input. */
+  taken?: () => void;
+  /** A legacy result ended the input without enough evidence to retry it safely. */
+  uncertain?: () => void;
+  /** Release this send's reserved handover when delivery is abandoned. Idempotent. */
+  release?: () => void;
 }
 
 /** A live connection between one SessionRuntime and the provider's agent process. */
@@ -94,7 +100,7 @@ export interface ProviderSession {
    * the agent scheduled is due (only when it can be read for certain). Absent: nothing is known
    * (treat as none).
    */
-  liveWork?(): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; wakeAt?: number };
+  liveWork?(): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; newestCommandAt?: number; wakeAt?: number; notificationUntil?: number };
   /**
    * Resolves when the agent's process has exited after `close()`; rejects when it has not within the
    * provider's bound (then its transcript may still be written).

@@ -37,7 +37,39 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+it('holds returned unread inputs through an automatic continuation while the limit decision stays live', () => {
+  const { rt, ends } = make();
+  rt.beginTurn();
+  const message = rt.add<UserItem>({ type: 'user', state: 'sent', text: 'retry separately' });
+  rt.returnUntaken({ ids: new Set([message.id]), holdQueue: true });
+  rt.endTurn(undefined, { backgroundLimit: true });
+  rt.beginTurn('Continuing on another account');
+  rt.endTurn();
+  expect(rt.stopRequested).toBe(false);
+  expect(ends.map(e => e.hold)).toEqual([true, true]);
+  expect(rt.takeQueued(message.id)?.text).toBe('retry separately');
+  expect(rt.unreadQueueHeld).toBe(false);
+});
+
 describe('background commands', () => {
+  it('reserves each lost-task note for one in-flight send and releases an abandoned batch', () => {
+    const { rt } = make();
+    rt.taskStarted(rt.add<ToolItem>(bash()).id, { id: 'first', kind: 'command' });
+    rt.tasksLost('process');
+    const reserve = () => rt.reserveLost();
+    const a = reserve();
+    expect(a.names.join()).toContain('task first');
+    expect(reserve().names).toEqual([]);
+    expect(rt.takeLost()).toEqual([]);
+    a.release();
+    const retry = reserve();
+    a.release();
+    expect(retry.names).toEqual(a.names);
+    expect(rt.reserveLost().names).toEqual([]);
+    retry.taken();
+    expect(rt.pendingLost().names).toEqual([]);
+  });
+
   it('a step that left a command running is counted apart from sub-agents, until word of its end', () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
@@ -145,9 +177,52 @@ describe('background commands', () => {
     expect(lostLine(2, 'move')).toBe('2 background commands were lost when the chat moved');
     expect(lostLine(1, 'restart')).toBe('1 background command was lost when Sable closed');
   });
+
+  it('names the plan limit for one or several lost commands', () => {
+    expect(lostLine(1, 'limit')).toBe('1 background command was lost at the plan limit');
+    expect(lostLine(2, 'limit')).toBe('2 background commands were lost at the plan limit');
+  });
 });
 
 describe('a chat read after a restart', () => {
+  it('recovers a saved move loss without repeating the notice to the person', () => {
+    const { rt } = make();
+    rt.taskStarted(rt.add<ToolItem>(bash()).id, { id: 'b1', kind: 'command' });
+    rt.tasksLost('move');
+    const restored = make().rt;
+    expect(restored.loadRestored(structuredClone(rt.items))).toEqual([]);
+    expect(restored.takeLost()).toEqual(['"Run app tests" (command, task b1)']);
+  });
+
+  it('retries a lost-task note across restarts and acknowledges only the accepted batch', () => {
+    const first = make().rt;
+    first.taskStarted(first.add<ToolItem>(bash()).id, { id: 'b1', kind: 'command' });
+    first.tasksLost('move');
+    const words = '"Run app tests" (command, task b1)';
+    const restored = make().rt;
+    expect(restored.loadRestored(structuredClone(first.items))).toEqual([]);
+    // Preparing a send that is refused changes nothing in the saved timeline.
+    expect(restored.pendingLost().names).toEqual([words]);
+    const retry = make().rt;
+    retry.loadRestored(structuredClone(restored.items));
+    const accepted = retry.pendingLost();
+    expect(accepted.names).toEqual([words]);
+    retry.reset(structuredClone(retry.items));
+    const watch = retry.add<ToolItem>(bash({ title: 'Watch logs', detail: {} }));
+    retry.taskStarted(watch.id, { id: 'm1', kind: 'monitor' });
+    retry.tasksLost('process');
+    retry.markSaved();
+    accepted.taken();
+    expect(retry.takeDirty()).toEqual(new Set([first.items[0].id]));
+    accepted.taken();
+    expect(retry.takeDirty()).toEqual(new Set());
+    const next = make().rt;
+    expect(next.loadRestored(structuredClone(retry.items))).toEqual([]);
+    expect(next.pendingLost().names).toEqual(['"Watch logs" (monitor, task m1)']);
+    next.taskEnded('m1', 'done');
+    expect(next.pendingLost().names).toEqual([]);
+  });
+
   it('marks a command still running as lost when Sable closed, counts nothing, and tells the agent next', () => {
     const { rt } = make();
     const items: TimelineItem[] = [
@@ -266,6 +341,24 @@ describe('a turn the bridge knows was cut', () => {
     expect(rt.get<ToolItem>(step.id)).toMatchObject({ status: 'cancelled', endedAt: 12_000 });
     expect(notices(rt)).toEqual([]);
     expect(ends).toHaveLength(1);
+  });
+
+  it.each([
+    { id: 'end', ts: 3, type: 'turn', durationMs: 2 },
+    { id: 'end', ts: 3, type: 'notice', variant: 'interrupted', text: 'Stopped' },
+    { id: 'end', ts: 3, type: 'notice', variant: 'info', early: 'closed', text: 'Ended early' },
+  ] satisfies TimelineItem[])('restart after a saved end only settles stragglers ($type, $variant)', (end) => {
+    const { rt } = make();
+    rt.loadRestored([
+      { ...bash(), id: 'step', ts: 1, status: 'running' },
+      end,
+      { id: 'notice', ts: 4, type: 'notice', variant: 'info', text: lostLine(1, 'process') },
+      { id: 'child', ts: 5, type: 'text', parentId: 'step', text: 'Late output', streaming: false },
+    ]);
+    rt.cutTurn('restart', { at: 5 });
+    expect(notices(rt).filter((n) => n.early === 'restart')).toEqual([]);
+    expect(rt.get<ToolItem>('step')!.status).toBe('cancelled');
+    expect(rt.get<ToolItem>('step')!.endedAt).toBeUndefined();
   });
 
   it('restart: written from the load path with the time of the turn\'s last item, once', () => {

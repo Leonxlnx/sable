@@ -306,6 +306,7 @@ describe('steering with Codex', () => {
 async function claude() {
   const events: BridgeEvent[] = [];
   const p = new ClaudeProvider({ emit: (e) => events.push(e), log: () => {}, settings: () => DEFAULT_SETTINGS });
+  p.seen.names = false; // This fake CLI learns support for named results within its own fixture.
   const anyP = p as unknown as Record<string, unknown>;
   anyP.caps = async () => ({ models: [{ id: 'm', name: 'M', isDefault: true }], modes: [], commands: [], skills: [], agents: [], mcpServers: [], tools: [], features: { steer: true } });
   anyP.readLimits = async () => [];

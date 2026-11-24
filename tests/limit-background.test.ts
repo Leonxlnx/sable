@@ -144,6 +144,86 @@ async function crewOnMax3(opts: { capped?: boolean; ultra?: boolean; ms?: { sett
 const hit = (i: number) => ({ stepId: `toolu_${i}`, window: '5-hour limit', resetsAt: Date.now() + 38 * 60_000, detail: "You've hit your 5-hour limit" });
 
 describe('seven background agents refused at a limit with the turn ended', { timeout: 20_000 }, () => {
+  it('rechecks continue-at-limit after the background stop', async () => {
+    const h = await crewOnMax3({ capped: true });
+    let entered = false, release!: () => void;
+    const stop = new Promise<void>(r => { release = r; });
+    (h.rt.handle as ProviderSession & { stopBackgroundWork(): Promise<boolean> }).stopBackgroundWork = async () => { entered = true; await stop; return false; };
+    h.rt.limitInBackground(hit(1));
+    await until(() => entered, 'the background stop');
+    await h.app.call('app.setSettings', { patch: { continueAtLimit: false } });
+    release();
+    await until(() => !cards(h.rt.items)[0].limit?.moving, 'the decision');
+    expect(h.rt.meta.accountId).toBe(h.max3.id);
+    expect(h.sent).toEqual([]);
+  });
+
+  it.each([false, true])('holds a queued message through a refused wake decision (provider flagged %s)', async (flagged) => {
+    const h = await crewOnMax3({ capped: true });
+    h.rt.beginTurn('Wake', { keepHold: true });
+    h.rt.enqueue('queued by the person');
+    h.rt.endTurn(undefined, flagged ? { hold: true, backgroundLimit: true } : undefined);
+    h.rt.limitInBackground({ window: '5-hour limit', resetsAt: Date.now() + 60000 });
+    await until(() => h.sent.some(s => s.text.startsWith('queued by the person')), 'the queued message');
+    expect(h.sent.map(s => s.account)).toEqual([h.ultra3.id, h.ultra3.id]);
+  });
+  it('keeps the queue and automatic reset stopped for a wake refused after Stop', async () => {
+    const h = await crewOnMax3({ capped: true });
+    h.rt.beginTurn('Wake', { keepHold: true });
+    h.rt.enqueue('held after Stop');
+    await h.app.call('session.interrupt', { sessionId: h.rt.id });
+    if (h.rt.turnActive) h.rt.endTurn(undefined, { hold: true, backgroundLimit: true });
+    h.rt.limitInBackground({ window: '5-hour limit', resetsAt: Date.now() + 60000 });
+    await until(() => cards(h.rt.items).some(n => !!n.limit?.provider && !n.limit.moving), 'the stopped refusal decision');
+    expect(h.rt.meta.accountId).toBe(h.max3.id);
+    expect(h.rt.meta.spare).toBeFalsy();
+    expect(h.rt.queue.map(q => q.text)).toEqual(['held after Stop']);
+    expect(h.sent).toHaveLength(0);
+  });
+  it('moves-M1 gives the last background refusal precedence over the cap move at rest', async () => {
+    const h = await crewOnMax3({ capped: true });
+    await h.app.call('app.setSettings', { patch: { accountCaps: { [`demo:${h.max3.id}`]: { session: 90 } } } });
+    for (let i = 1; i <= 7; i++) h.rt.limitInBackground(hit(i));
+    await until(() => h.sent.length > 0, 'the refused work continuing');
+    expect(cards(h.rt.items)[0].limit).toMatchObject({ accountId: h.max3.id, continuedWith: h.ultra3.id });
+    expect(h.sent[0].text.startsWith(RESUME_UNDER_ANOTHER)).toBe(true);
+  });
+
+  it('moves-M2 retries the same destination after a wake interrupted the first decision', async () => {
+    const h = await crewOnMax3({ capped: true });
+    let stopping = false;
+    let release!: () => void;
+    const wait = new Promise<void>((r) => (release = r));
+    (h.rt.handle as ProviderSession & { stopBackgroundWork(): Promise<boolean> }).stopBackgroundWork = async () => { stopping = true; await wait; return false; };
+    h.rt.limitInBackground(hit(1));
+    await until(() => stopping, 'the stop');
+    h.rt.beginTurn('Thinking', { keepHold: true });
+    release();
+    await until(() => !cards(h.rt.items)[0].limit?.moving, 'abandoning the first move');
+    for (let i = 2; i <= 7; i++) h.rt.stopAtLimit((t) => t.id === `toolu_${i}`, hit(i));
+    h.rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'Limit', limit: { window: '5-hour limit' } });
+    h.rt.endTurn('Limit');
+    await until(() => h.sent.length > 0, 'the second attempt');
+    expect(h.sent[0].account).toBe(h.ultra3.id);
+  });
+
+  it('C7 closing during the background stop cancels Continue on the other account', async () => {
+    const h = await crewOnMax3();
+    h.rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'Limit', limit: { window: '5-hour limit' } });
+    let stopping = false;
+    let release!: () => void;
+    const wait = new Promise<void>((r) => (release = r));
+    (h.rt.handle as ProviderSession & { stopBackgroundWork(): Promise<boolean> }).stopBackgroundWork = async () => { stopping = true; await wait; return true; };
+    const move = h.app.call('session.switchAccount', { sessionId: h.rt.id, accountId: h.ultra3.id, retry: true }).catch((e: Error) => e);
+    await until(() => stopping, 'the background stop');
+    await h.app.call('session.close', { sessionId: h.rt.id });
+    release();
+    expect(await move).toBeInstanceOf(Error);
+    expect(h.rt.meta.accountId).toBe(h.max3.id);
+    expect(h.sent).toHaveLength(0);
+    expect(h.rt.handle).toBeUndefined();
+  });
+
   it('says it once, moves at once, and carries on with a continuation naming them', async () => {
     const h = await crewOnMax3();
     // Five are refused with their next request; two are still in a long command.
@@ -632,7 +712,7 @@ describe('review wave 17', { timeout: 25_000 }, () => {
     expect(notices(h.rt.items).some((n) => n.text === 'A sub-agent could not be stopped')).toBe(true);
   });
 
-  it("#6 Codex: a sub-agent whose turn started before its spawn registered it is still interrupted", async () => {
+  async function codexChat() {
     const home = temp('sable-limit-codex-');
     const cwd = path.join(home, 'proj');
     mkdirSync(cwd);
@@ -650,10 +730,11 @@ describe('review wave 17', { timeout: 25_000 }, () => {
     let provider!: InstanceType<typeof CodexProvider>;
     const app = new App({
       home: path.join(home, 'data'),
+      userHome: home,
       quiet: true,
       providers: [
         (ctx) => {
-          const p = new CodexProvider(ctx);
+          const p = new CodexProvider({ ...ctx, account: { id: DEFAULT_ACCOUNT, dir: home } });
           const anyP = p as unknown as Record<string, unknown>;
           anyP.client = async () => rpc;
           anyP.version = async () => ({ installed: true, version: '1' });
@@ -666,9 +747,70 @@ describe('review wave 17', { timeout: 25_000 }, () => {
     cleanups.push(() => app.dispose());
     const snap = await app.call('session.create', { provider: 'codex', cwd, mode: 'auto', model: 'm' });
     const rt = app.runtime(snap.session.id);
+    const notify = (method: string, p: unknown) => (provider as unknown as { onNotification(m: string, p: unknown): void }).onNotification(method, p);
+    await until(() => !!rt.handle, 'the fake app-server thread');
+    return { app, rt, asked, notify, provider };
+  }
+
+  it('D5 Codex keeps the starting request and attachment when an unread steer follows', async () => {
+    const { app, rt, notify } = await codexChat();
+    const handle = rt.handle as unknown as { ensureLoaded(): Promise<void> };
+    const loaded = handle.ensureLoaded.bind(handle);
+    let release!: () => void;
+    const wait = new Promise<void>(r => { release = r; });
+    handle.ensureLoaded = async () => { await wait; await loaded(); };
+    const attachments: UserItem['attachments'] = [{ id: 'attach', kind: 'file', name: 'test.txt', path: 'test.txt' }];
+    const send = app.call('session.send', { sessionId: rt.id, text: 'original request', attachments });
+    await until(() => rt.turnActive, 'original request starting');
+    const steer = app.call('session.send', { sessionId: rt.id, steer: true, text: 'unread steer' });
+    try {
+      await until(() => rt.items.some(i => i.type === 'user' && i.text === 'unread steer'), 'unread steer');
+      notify('error', { threadId: 'th1', willRetry: false, error: { message: 'Usage limit', codexErrorInfo: 'usageLimitExceeded' } });
+      notify('turn/completed', { threadId: 'th1', turn: { id: 'turn1', status: 'failed', error: { message: 'Usage limit' } } });
+      const card = cards(rt.items).at(-1)!;
+      const owner = rt.get<UserItem>(card.limit?.userItemId ?? '');
+      expect(owner).toMatchObject({ text: 'original request', attachments });
+      expect(rt.queue.map(q => q.text)).toContain('unread steer');
+    } finally { release(); await Promise.allSettled([send, steer]); }
+  });
+
+  it('uses the shared Codex window for an ordinary model when Spark resets later', async () => {
+    const { app, rt, notify } = await codexChat();
+    await app.call('session.send', { sessionId: rt.id, text: 'ordinary chat' });
+    const reset = Date.now() + 3600000;
+    for (const [limitId, resetsAt] of [['codex', reset], ['Spark', reset + 3600000]] as const) {
+      notify('account/rateLimits/updated', { rateLimits: { limitId, primary: { usedPercent: 100, resetsAt, windowDurationMins: 300 } } });
+    }
+    notify('error', { threadId: 'th1', turnId: 'turn1', willRetry: false, error: { message: 'Usage limit', codexErrorInfo: 'usageLimitExceeded' } });
+    expect(cards(rt.items).at(-1)?.limit?.resetsAt).toBe(reset);
+  });
+
+  it('keeps the lost-task note when Stop precedes Codex turn/start', async () => {
+    const { app, rt, asked } = await codexChat();
+    const step = rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Run tests', status: 'done', detail: {} });
+    rt.taskStarted(step.id, { id: 'ci', kind: 'command' });
+    rt.tasksLost('process');
+    const handle = rt.handle as unknown as { ensureLoaded(): Promise<void> };
+    const load = handle.ensureLoaded.bind(handle);
+    let release!: () => void, entered = false;
+    handle.ensureLoaded = () => new Promise(r => { entered = true; release = r; });
+    const send = app.call('session.send', { sessionId: rt.id, text: 'interrupted' });
+    await until(() => entered, 'loading the thread');
+    await app.call('session.interrupt', { sessionId: rt.id });
+    release(); await send;
+    expect(asked.filter(a => a.method === 'turn/start')).toHaveLength(0);
+    expect(rt.get<ToolItem>(step.id)?.task?.lossTold).toBeFalsy();
+    handle.ensureLoaded = load;
+    await app.call('session.send', { sessionId: rt.id, text: 'actual send' });
+    expect(JSON.stringify(asked.find(a => a.method === 'turn/start')?.params.input)).toContain('task ci');
+    expect(rt.get<ToolItem>(step.id)?.task?.lossTold).toBe(true);
+  });
+
+  it("#6 Codex: a sub-agent whose turn started before its spawn registered it is still interrupted", async () => {
+    const { app, rt, asked, notify, provider } = await codexChat();
     await app.call('session.send', { sessionId: rt.id, text: 'split the work' });
     await until(() => provider.sessions.size > 0 && rt.turnActive, 'the turn');
-    const notify = (method: string, p: unknown) => (provider as unknown as { onNotification(m: string, p: unknown): void }).onNotification(method, p);
+
     // sub1's turn starts before the spawn's result registers it; sub2's start is never seen.
     notify('turn/started', { threadId: 'sub1', turn: { id: 'early1', status: 'inProgress', items: [] } });
     notify('item/completed', {

@@ -46,7 +46,7 @@ export interface RunningServer {
   url: string;
   port: number;
   /** Disposes the bridge (agent child processes exit) and closes the HTTP server. Safe to call twice. */
-  close(): Promise<void>;
+  close(saved?: () => void): Promise<void>;
   /** Calls `onChange` when agents start working anywhere, and when all have stopped for a minute (`core/awake.ts`). */
   watchBusy(onChange: (busy: boolean) => void): () => void;
   /** Calls `onChange` when a paired phone starts or stops needing the computer awake (`core/awake.ts`). */
@@ -216,11 +216,14 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   bootMark('server:bridge');
 
   let closing: Promise<void> | undefined;
-  const close = () =>
+  const close = (saved?: () => void) =>
     (closing ??= (async () => {
-      await bridge.dispose().catch(() => {});
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      try {
+        await bridge.dispose(saved);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     })());
 
   const watchBusy = (onChange: (busy: boolean) => void) => watchAwake({ get sessions() { return bridge.app.sessions.values(); }, subscribe: (l) => bridge.app.subscribe(l) }, onChange);

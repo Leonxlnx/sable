@@ -13,6 +13,8 @@
  * tests/background-turns.test.ts, and, where the adapter's own reading loop matters, on a fake SDK
  * `query` whose stream a test writes to and ends.
  */
+import { EventEmitter } from 'node:events';
+import { authGate } from '../server/core/auth-gate';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, type NoticeItem, type SessionMeta, type ToolItem, type TurnItem, type UserItem } from '@shared/protocol';
 import { SessionRuntime, type BackgroundLimit } from '../server/core/runtime';
@@ -33,7 +35,9 @@ const sdk = vi.hoisted(() => {
     q: Record<string | symbol, unknown>;
   };
   const procs: Proc[] = [];
-  function fakeQuery(p: { prompt: AsyncIterable<unknown> }) {
+  const child = { use: false };
+  function fakeQuery(p: { prompt: AsyncIterable<unknown>; options?: { spawnClaudeCodeProcess: (request: unknown) => unknown } }) {
+    if (child.use) p.options!.spawnClaudeCodeProcess({});
     const buf: unknown[] = [];
     let wake: (() => void) | undefined;
     let done = false;
@@ -79,7 +83,7 @@ const sdk = vi.hoisted(() => {
     procs.push(proc);
     return proc.q;
   }
-  return { procs, fakeQuery };
+  return { procs, fakeQuery, child };
 });
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => ({ ...(await importOriginal<object>()), query: (p: { prompt: AsyncIterable<unknown> }) => sdk.fakeQuery(p) }));
@@ -88,6 +92,8 @@ const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
   vi.useRealTimers();
   while (cleanups.length) await cleanups.pop()!();
+  sdk.child.use = false;
+  vi.restoreAllMocks();
   resetRemoteKeeper();
   sdk.procs.length = 0;
 });
@@ -186,6 +192,80 @@ async function atRest(opts: Parameters<typeof claude>[0] = {}) {
 // ─────────────────────────────── D-turn: a turn for all root work ───────────────────────────────
 
 describe('a turn for all root work', () => {
+  it.each(['answered', 'timed out'])('keeps the wake refusal when the unread steer is %s', async (end) => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    await h.message(result([h.first.uuid]));
+    await h.replay('wake', '<task-notification><task-id>w</task-id><status>completed</status></task-notification>', { isSynthetic: true });
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (_rt, hit) => void hits.push(hit);
+    const refusal = () => h.message({ type: 'assistant', error: 'rate_limit', message: { model: '<synthetic>', content: [{ type: 'text', text: "You've hit your Fable limit" }] } });
+    if (end === 'timed out') await refusal();
+    const b = await h.send('answer this');
+    if (end === 'answered') await refusal();
+    await h.message(result(undefined, { is_error: true, errors: ['HTTP 429'] }));
+    if (end === 'answered') await h.message(result([b.uuid]));
+    else {
+      vi.advanceTimersByTime(61_000);
+      expect(h.rt.queue.map(q => q.id)).toEqual([b.item.id]);
+    }
+    expect(h.rt.stopRequested).toBe(false);
+    expect(h.notices().filter(n => n.limit)).toEqual([]);
+    expect(hits).toMatchObject([{ window: 'Weekly · Fable' }]);
+    expect(h.rt.turnActive).toBe(false);
+  });
+
+  it.each(['wake after timeout', 'personal before timeout', 'personal after timeout'])('publishes the stopped result refusal for its original owner (%s)', async (which) => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    const wake = which === 'wake after timeout';
+    const stoppedCard = vi.fn();
+    h.rt.onStoppedLimit = stoppedCard;
+    if (wake) {
+      await h.message(result([h.first.uuid]));
+      await h.state('running');
+    }
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (_rt, hit) => void hits.push(hit);
+    h.rt.stopRequested = true;
+    await h.session.interrupt();
+    if (!which.includes('before')) vi.advanceTimersByTime(2501);
+    await h.message(result(wake ? undefined : [h.first.uuid], { is_error: true, errors: ["You've hit your Fable limit"] }));
+    expect(stoppedCard).toHaveBeenCalledTimes(which === 'personal after timeout' ? 1 : 0);
+    if (wake) expect(hits).toMatchObject([{ window: 'Weekly · Fable' }]);
+    else expect(h.notices().filter(n => n.limit).map(n => n.limit)).toMatchObject([{ userItemId: h.first.item.id, window: 'Weekly · Fable' }]);
+    expect(h.rt.stopRequested).toBe(true);
+    expect(h.rt.turnActive).toBe(false);
+  });
+
+  it('uses the settled wake window for a bare 429 after Stop', async () => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    await h.message(result([h.first.uuid]));
+    await h.state('running');
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (_rt, hit) => void hits.push(hit);
+    const reset = Date.parse('2026-11-25T14:00:00Z');
+    await h.message({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day_overage_included', resetsAt: reset / 1000 } });
+    await h.session.interrupt();
+    vi.advanceTimersByTime(2501);
+    await h.message(result(undefined, { is_error: true, errors: ['HTTP 429'] }));
+    expect(hits).toMatchObject([{ window: 'Weekly · Fable', resetsAt: reset }]);
+  });
+
+  it('publishes notification grace to a waitable move at the last task end', async () => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    await h.background(1);
+    await h.message(result([h.first.uuid]));
+    const rest = vi.fn(() => h.session.liveWork!());
+    h.rt.onRest = rest;
+    await h.system({ subtype: 'task_notification', task_id: 'b1', status: 'completed' });
+    expect(rest.mock.results[0]?.value).toMatchObject({ commands: 0, notificationUntil: Date.now() + 3000 });
+    vi.advanceTimersByTime(3001);
+    expect(h.session.liveWork!()).not.toHaveProperty('notificationUntil');
+  });
+
   it('work Claude Code takes up after a result, with no message replayed and no state event, is a turn of its own; its result ends it', async () => {
     const h = await atRest();
     await h.text('I started the tests.');
@@ -248,6 +328,20 @@ describe('a turn for all root work', () => {
     expect(h.notices().filter((n) => n.limit)).toHaveLength(0);
   });
 
+  it.each(['Sable', 'Claude app'])("keeps the person's refused turn on its limit card (%s)", async (from) => {
+    const h = await atRest();
+    await h.message(result([h.first.uuid]));
+    const uuid = from === 'Sable' ? (await h.send('keep going')).uuid : 'phone';
+    await h.replay(uuid, 'keep going');
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (_rt, hit) => void hits.push(hit);
+    await h.message({ type: 'assistant', uuid: 'limited', error: 'rate_limit', message: { model: '<synthetic>', content: [{ type: 'text', text: "You've hit your Fable limit" }] } });
+    await h.message(result([uuid], { is_error: true, errors: ['Usage limit reached'] }));
+    expect(h.notices().filter((n) => n.limit)).toHaveLength(1);
+    expect(h.rt.meta.status).toBe('error');
+    expect(hits).toEqual([]);
+  });
+
   it("Claude Code's stand-in and the errors it writes itself begin no turn", async () => {
     const h = await atRest();
     await h.message(result([h.first.uuid]));
@@ -256,6 +350,119 @@ describe('a turn for all root work', () => {
     await h.message({ type: 'assistant', uuid: 'ov', parent_tool_use_id: null, error: 'overloaded', message: { id: 'm-ov', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'API Error: Repeated 529 Overloaded errors' }] } });
     expect(h.rt.turnActive).toBe(false);
     expect(h.rt.meta.status).toBe('idle');
+  });
+
+  it('keeps the personal 429 after a refused wake and a concurrent steer', async () => {
+    const h = await atRest();
+    await h.message(result([h.first.uuid]));
+    await h.replay('wake', '<task-notification><task-id>w</task-id><status>completed</status></task-notification>', { isSynthetic: true });
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (_rt, hit) => void hits.push(hit);
+    await h.message({ type: 'assistant', uuid: 'refusal', error: 'rate_limit', message: { model: '<synthetic>', content: [{ type: 'text', text: "You've hit your Fable limit" }] } });
+    const b = await h.send('answer this');
+    const ends: { error?: string; backgroundOnly?: boolean }[] = [];
+    h.rt.onTurnEnd = (_rt, error, opts) => { ends.push({ error, backgroundOnly: !!opts?.backgroundLimit }); };
+    await h.message(result(undefined, { is_error: true, errors: ['HTTP 429'] }));
+    expect(h.rt.turnActive).toBe(true);
+    await h.message(result([b.uuid], { is_error: true, errors: ["You've hit your 5-hour limit"] }));
+    expect(h.notices().filter((n) => n.limit)).toHaveLength(1);
+    expect(h.rt.meta.lastError).toContain('5-hour');
+    expect(ends).toEqual([{ error: "You've hit your 5-hour limit", backgroundOnly: false }]);
+    expect(h.notices().find((n) => n.limit)?.limit?.userItemId).toBe(b.item.id);
+    expect(hits).toEqual([expect.objectContaining({ window: 'Weekly · Fable' })]);
+    expect(h.rt.turnActive).toBe(false);
+  });
+
+  it('holds queued work through the refused wake handoff', async () => {
+    const h = await atRest();
+    await h.message(result([h.first.uuid]));
+    await h.state('running');
+    const queued = h.rt.enqueue('next account');
+    h.rt.onTurnEnd = (rt, error, opts) => {
+      expect(opts?.backgroundLimit).toBe(true);
+      if (!error && !opts?.hold && !rt.stopRequested) rt.takeQueued();
+    };
+    const decisions: string[][] = [];
+    h.rt.onBackgroundLimit = (rt) => decisions.push(rt.queue.map((q) => q.id));
+    await h.message(result(undefined, { is_error: true, errors: ['HTTP 429'] }));
+    expect(decisions).toEqual([[queued.id]]);
+    expect(h.rt.turnActive).toBe(false);
+  });
+
+  it.each(['stop', 'exit'] as const)('hands off the wake refusal after %s', async (end) => {
+    const h = await atRest({ live: true });
+    await h.message(result([h.first.uuid]));
+    await h.state('running');
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (rt, hit) => {
+      expect(rt.turnActive).toBe(false);
+      hits.push(hit);
+    };
+    const words = "You've hit your Fable limit · resets Nov 25, 3pm (Europe/Berlin). Switch to another model to continue.";
+    if (end === 'stop') {
+      h.rt.stopRequested = true;
+      await h.session.interrupt();
+      await h.message(result(undefined, { is_error: true, errors: [words], api_error_status: 429 }));
+      expect(h.notices().some((n) => n.variant === 'interrupted')).toBe(true);
+      expect(h.rt.stopRequested).toBe(true);
+    } else {
+      await h.message({ type: 'assistant', uuid: 'refusal', error: 'rate_limit', message: { model: '<synthetic>', content: [{ type: 'text', text: words }] } });
+      h.proc().end();
+      await until(() => !h.rt.turnActive, 'wake cut');
+      expect(h.notices().some((n) => n.early === 'died')).toBe(true);
+    }
+    expect(hits).toEqual([expect.objectContaining({ window: 'Weekly · Fable' })]);
+    expect(hits[0].stepId).toBeUndefined();
+  });
+
+  it('a result-only HTTP 429 uses the window and reset from the rejected rate-limit event', async () => {
+    const h = await atRest();
+    await h.message(result([h.first.uuid]));
+    await h.state('running');
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (_rt, hit) => void hits.push(hit);
+    const reset = Date.parse('2026-11-25T14:00:00Z');
+    await h.message({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day_overage_included', resetsAt: reset / 1000 } });
+    await h.message(result(undefined, { is_error: true, errors: ['API Error: 429 Too Many Requests'] }));
+    expect(hits).toEqual([expect.objectContaining({ window: 'Weekly · Fable', resetsAt: reset })]);
+    expect(h.rt.meta.status).toBe('idle');
+    expect(h.notices().filter((n) => n.limit)).toHaveLength(0);
+  });
+
+  it.each(['notification', 'result-only 429', 'result-only words', 'idle'] as const)('hands the refused Fable wake to the runtime at rest (%s)', async (end) => {
+    vi.useFakeTimers({ now: new Date('2026-11-23T20:48:40Z') });
+    const h = await atRest();
+    h.rt.update({ model: 'opus' });
+    await h.message(result([h.first.uuid]));
+    await h.state('idle');
+    await h.state('running');
+    const words = "You've hit your Fable limit · resets Nov 25, 3pm (Europe/Berlin). Switch to another model to continue.";
+    const hits: BackgroundLimit[] = [];
+    h.rt.onBackgroundLimit = (rt, hit) => {
+      expect(rt.turnActive).toBe(false);
+      hits.push(hit);
+    };
+    const info = { status: 'rejected', rateLimitType: 'seven_day_overage_included', overageStatus: 'rejected' };
+    if (end === 'notification' || end === 'idle') {
+      await h.replay('wake', '<task-notification><task-id>w</task-id><status>completed</status><summary>Workflow finished</summary></task-notification>', { isSynthetic: true });
+      await h.message({ type: 'assistant', uuid: 'refusal', error: 'rate_limit', apiErrorStatus: 429, message: { model: '<synthetic>', content: [{ type: 'text', text: words }] } });
+      await h.message({ type: 'rate_limit_event', rate_limit_info: info });
+      expect(h.notices().filter((n) => n.limit)).toHaveLength(0);
+      expect(hits).toEqual([]);
+    }
+    if (end === 'idle') {
+      await h.state('idle');
+      const settled = h.turns().length;
+      await h.message(result(undefined, { is_error: true, errors: [words] }));
+      expect(h.turns()).toHaveLength(settled);
+    }
+    else await h.message(result(undefined, { is_error: true, errors: [end === 'result-only 429' ? 'HTTP 429' : words], ...(end === 'result-only 429' ? { api_error_status: 429 } : {}) }));
+    expect(hits).toHaveLength(1);
+    expect(hits[0].stepId).toBeUndefined();
+    if (end !== 'result-only 429') expect(hits[0]).toMatchObject({ window: 'Weekly · Fable', resetsAt: Date.parse('2026-11-25T14:00:00Z') });
+    expect(h.rt.meta.status).toBe('idle');
+    expect(h.turns().at(-1)?.error).toBeUndefined();
+    expect(h.notices().filter((n) => n.limit)).toHaveLength(0);
   });
 
   it("output after a stop's safety net settled the turn begins none (it is that turn's); the late result leaves nothing open", async () => {
@@ -333,10 +540,13 @@ describe('what the process holds', () => {
     expect(h.session.liveWork()).toMatchObject({ commands: 1 });
     expect(h.session.holdsWork()).toBe(true);
     await h.system({ subtype: 'task_updated', task_id: 'b7', patch: { status: 'killed' } });
+    expect(h.session.liveWork().commands).toBe(0);
+    await vi.advanceTimersByTimeAsync(3001);
     expect(h.session.holdsWork()).toBe(false);
   });
 
   it('the Remote Control keeper never lets go of a process with a command running, and a release that finds work declines', async () => {
+    vi.useFakeTimers();
     const h = await atRest({ options: { remoteControl: true } });
     await h.background(1);
     await h.message(result([h.first.uuid]));
@@ -344,6 +554,8 @@ describe('what the process holds', () => {
     expect(h.holder().busy()).toBe(true);
     expect(remoteToRelease([h.holder()], Date.now() + 3 * 3600_000)).toEqual([]);
     await h.system({ subtype: 'task_notification', task_id: 'b1', tool_use_id: 'toolu_b1', status: 'completed', summary: 'done' });
+    expect(h.session.holdsWork()).toBe(true);
+    await vi.advanceTimersByTimeAsync(3001);
     expect(h.holder().busy()).toBe(false);
     expect(remoteToRelease([h.holder()], Date.now() + 46 * 60_000)).toEqual([h.holder()]);
     // The agent began work while the release waited for its slot: declined, the process kept.
@@ -409,9 +621,86 @@ describe('what the process holds', () => {
     expect(h.notices().map((n) => n.text)).toContain('Browser control starts when the background command finishes');
     await h.system({ subtype: 'task_notification', task_id: 'b1', tool_use_id: 'toolu_b1', status: 'completed', summary: 'done' });
     await tick();
+    expect(h.closes()).toBe(0);
+    await h.state('running');
+    await h.replay('note', '<task-notification><task-id>b1</task-id><summary>Tests done</summary></task-notification>');
+    await h.text('All tests passed.');
+    vi.useFakeTimers();
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(h.closes()).toBe(0);
+    await h.message(result());
+    await h.state('idle');
+    await vi.advanceTimersByTimeAsync(10);
     expect(h.closes()).toBe(1);
     // Said once.
     expect(h.notices().filter((n) => n.text.endsWith('when the background command finishes'))).toHaveLength(1);
+  });
+
+  it('a last task disappearing from the list leaves time to deliver its notification before replacing the process', async () => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    h.p.seen.names = false;
+    await h.background(1);
+    await h.session.interrupt();
+    await vi.advanceTimersByTimeAsync(2600);
+    await h.send('review the result');
+    expect(h.pushed).toHaveLength(1);
+    await h.system({ subtype: 'background_tasks_changed', tasks: [] });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.closes()).toBe(0);
+    expect(h.pushed).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(h.closes()).toBe(1);
+    expect(h.pushed).toHaveLength(2);
+    expect(step(h.rt, 'toolu_b1').task?.state).toBe('stopped');
+  });
+
+  it('holds the process for housekeeping throughout notification grace', async () => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    await h.background(1);
+    await h.message(result([h.first.uuid]));
+    await h.system({ subtype: 'background_tasks_changed', tasks: [] });
+    expect(h.holder().busy()).toBe(true);
+    expect(h.session.holdsWork()).toBe(true);
+    await vi.advanceTimersByTimeAsync(3001);
+    expect(h.holder().busy()).toBe(false);
+  });
+
+  it('rechecks an option at scheduled wake expiry without another frame', async () => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    await h.call('sw', 'ScheduleWakeup', {});
+    await h.done('sw', { scheduledFor: Date.now() + 60_000 });
+    await h.message(result([h.first.uuid]));
+    await h.session.setOptions!({ browser: true });
+    await vi.advanceTimersByTimeAsync(179_000);
+    expect(h.closes()).toBe(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.closes()).toBe(1);
+  });
+
+  it('a replacement process already has the pending option', async () => {
+    const h = await atRest({ live: true });
+    await h.session.setOptions!({ browser: true });
+    h.proc().end();
+    await until(() => !h.q(), 'first SDK stream to end');
+    const replacement = await h.send('use the browser');
+    await h.message(result([replacement.uuid]));
+    await tick();
+    expect(h.proc().closed).toBe(false);
+  });
+
+  it('waits silently between result and CLI idle for an option restart', async () => {
+    const h = await atRest();
+    await h.state('running');
+    await h.session.setOptions!({ browser: true });
+    await h.message(result([h.first.uuid]));
+    await tick();
+    expect(h.notices().map((n) => n.text)).toEqual(['Browser control starts after this turn']);
+    await h.state('idle');
+    await tick();
+    expect(h.closes()).toBe(1);
   });
 
   it("stopping background work at a limit is not held by the CLI's own running: the command is asked to stop, then lost with the process", async () => {
@@ -426,7 +715,7 @@ describe('what the process holds', () => {
     expect(asked).toEqual(['b1']);
     expect(h.closes()).toBe(1);
     expect(step(h.rt, 'toolu_b1').task).toMatchObject({ state: 'lost', why: 'limit' });
-    expect(h.notices().at(-1)).toMatchObject({ text: "1 background command was lost with the agent's process", detail: 'Run app tests 1' });
+    expect(h.notices().at(-1)).toMatchObject({ text: '1 background command was lost at the plan limit', detail: 'Run app tests 1' });
   });
 
   it("the CLI's own running while its background agents work is theirs, not a turn: a move at a limit and a send after a sign-in are not held by it", async () => {
@@ -452,7 +741,26 @@ describe('what the process holds', () => {
 // ─────────────────────────────── D-tasks: background commands ───────────────────────────────
 
 describe('background commands', () => {
+  it('publishes SDK-list-only work to the chat, counts a linked step once and clears on exit', async () => {
+    const h = await atRest();
+    await h.message(result([h.first.uuid]));
+    await h.system({ subtype: 'background_tasks_changed', tasks: [
+      { task_id: 'c', task_type: 'local_bash' }, { task_id: 'a', task_type: 'local_agent' },
+      { task_id: 'ambient', task_type: 'monitor', ambient: true },
+    ] });
+    expect(h.rt.meta).toMatchObject({ commands: 1, background: 1, status: 'idle' });
+    expect(h.session.holdsWork()).toBe(true);
+    await h.call('bash-step', 'Bash', { command: 'build', run_in_background: true });
+    await h.done('bash-step', { backgroundTaskId: 'c' });
+    expect(h.rt.meta.commands).toBe(1);
+    await h.system({ subtype: 'task_notification', task_id: 'c', status: 'completed' });
+    expect(h.rt.meta).toMatchObject({ commands: 0, background: 1 });
+    await h.session.close();
+    expect(h.rt.meta).toMatchObject({ commands: 0, background: 0 });
+  });
+
   it('a command run in the background is counted from its own result and its task, and ends with its notification', async () => {
+    vi.useFakeTimers();
     const h = await atRest();
     await h.call('toolu_b1', 'Bash', { command: 'pnpm test', description: 'Run app tests', run_in_background: true });
     await h.done('toolu_b1', { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b1' });
@@ -468,10 +776,72 @@ describe('background commands', () => {
     await h.system({ subtype: 'task_notification', task_id: 'b1', tool_use_id: 'toolu_b1', status: 'failed', summary: 'Background command "Run app tests" failed with exit code 1' });
     expect(step(h.rt, 'toolu_b1').task).toMatchObject({ state: 'failed' });
     expect(h.rt.meta.commands).toBe(0);
+    expect(h.session.holdsWork()).toBe(true);
+    await vi.advanceTimersByTimeAsync(3001);
+    expect(h.session.holdsWork()).toBe(false);
+  });
+
+  it.each(['notification', 'list'])('a result-only command holds its process until its %s', async (end) => {
+    const h = await atRest();
+    await h.call('cmd', 'Bash', { command: 'test' });
+    await h.done('cmd', { backgroundTaskId: 'command' });
+    await h.message(result([h.first.uuid]));
+    expect(h.rt.meta.commands).toBe(1);
+    expect(h.session.liveWork().commands).toBe(1);
+    expect(h.holder().busy()).toBe(true);
+    if (end === 'list') await h.system({ subtype: 'background_tasks_changed', tasks: [] });
+    else await h.system({ subtype: 'task_notification', task_id: 'command', status: 'completed' });
+    expect(h.session.liveWork().commands).toBe(0);
+  });
+
+  it('settles the superseded agent while a monitor keeps the task list live', async () => {
+    const h = await atRest();
+    await h.call('watcher', 'Monitor', { description: 'watch' });
+    await h.done('watcher', { taskId: 'monitor' });
+    for (const run of ['a', 'b']) {
+      await h.call('tool-' + run, 'Agent', { description: run, run_in_background: true });
+      await h.system({ subtype: 'task_started', task_id: 'agent', run_id: run, tool_use_id: 'tool-' + run, task_type: 'local_agent', is_backgrounded: true });
+      await h.done('tool-' + run, { status: 'async_launched', agentId: 'agent' }, null, 'Agent running in background');
+    }
+    await h.system({ subtype: 'task_notification', task_id: 'agent', run_id: 'a', status: 'completed' });
+    expect(step(h.rt, 'tool-b').result?.agent?.background).toBe('running');
+    await h.system({ subtype: 'task_notification', task_id: 'agent', run_id: 'b', status: 'completed' });
+    await h.system({ subtype: 'background_tasks_changed', tasks: [{ task_id: 'monitor', task_type: 'monitor' }] });
+    expect(step(h.rt, 'tool-a').result?.agent?.background).toBe('stopped');
+    expect(step(h.rt, 'tool-b').result?.agent?.background).toBe('done');
+    expect(h.rt.meta.background).toBe(0);
+    expect(h.session.liveWork().commands).toBe(1);
+  });
+
+  it('late frames for a previous run leave the resumed task working', async () => {
+    vi.useFakeTimers();
+    const h = await atRest();
+    const start = async (run: string) => {
+      const id = 'tool-' + run;
+      await h.call(id, 'Agent', { description: run, run_in_background: true });
+      await h.system({ subtype: 'task_started', task_id: 'agent', run_id: run, tool_use_id: id, task_type: 'local_agent', is_backgrounded: true });
+      await h.done(id, { status: 'async_launched', agentId: 'agent' }, null, 'Agent running in background');
+    };
+    const end = (run: string) => h.system({ subtype: 'task_notification', task_id: 'agent', run_id: run, status: 'completed' });
+    await start('a');
+    await end('a');
+    await start('b');
+    await h.message(result([h.first.uuid]));
+    await h.system({ subtype: 'task_progress', task_id: 'agent', run_id: 'a', summary: 'stale' });
+    await end('a');
+    await h.system({ subtype: 'task_updated', task_id: 'agent', run_id: 'a', patch: { status: 'completed' } });
+    await h.system({ subtype: 'background_tasks_changed', tasks: [{ task_id: 'agent', run_id: 'a', ambient: true }] });
+    expect(h.session.liveWork().agents).toBe(1);
+    expect(step(h.rt, 'tool-b').result?.agent?.background).toBe('running');
+    expect(step(h.rt, 'tool-b').output).not.toBe('stale');
+    await end('b');
+    expect(h.session.holdsWork()).toBe(true);
+    await vi.advanceTimersByTimeAsync(3001);
     expect(h.session.holdsWork()).toBe(false);
   });
 
   it('a command moved to the background at its timeout is counted; a start after its end never marks it running again', async () => {
+    vi.useFakeTimers();
     const h = await atRest();
     await h.call('toolu_t1', 'Bash', { command: 'pnpm e2e', description: 'Run e2e' });
     await h.system({ subtype: 'task_started', task_id: 't1', tool_use_id: 'toolu_t1', task_type: 'local_bash', is_backgrounded: false });
@@ -488,6 +858,8 @@ describe('background commands', () => {
     expect(step(h.rt, 'toolu_t1').task?.state).toBe('done');
     expect(h.session.holdsWork()).toBe(true); // the person's turn still runs
     await h.message(result([h.first.uuid]));
+    expect(h.session.holdsWork()).toBe(true);
+    await vi.advanceTimersByTimeAsync(3001);
     expect(h.session.holdsWork()).toBe(false);
   });
 
@@ -637,6 +1009,48 @@ describe('a process that goes away', () => {
     expect(over).toBe(true);
     expect(ended).toBe(false);
     g.proc().end();
+  });
+
+  it('a failed spawn leaves no writer after the replacement exits', async () => {
+    const failed = new EventEmitter();
+    const replacement = Object.assign(new EventEmitter(), { pid: 123 });
+    const children = [failed, replacement];
+    vi.spyOn(authGate, 'spawner').mockReturnValue(() => children.shift()! as ReturnType<ReturnType<typeof authGate.spawner>>);
+    sdk.child.use = true;
+    const h = await atRest({ live: true });
+    failed.on('error', () => {});
+    failed.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT', syscall: 'spawn claude' }));
+    h.proc().end(new Error('failed to launch'));
+    await until(() => !h.q(), 'failed query cleanup');
+    const b = await h.send('retry');
+    await h.message(result([b.uuid]));
+    replacement.emit('exit', 0, null);
+    vi.useFakeTimers();
+    const closed = h.session.close();
+    const confirmed = expect(h.session.exited()).resolves.toBeUndefined();
+    const checked = Promise.all([closed, confirmed]);
+    await Promise.all([checked, vi.advanceTimersByTimeAsync(3100)]);
+  });
+
+  it.each(['close', 'iterator first'])('exited waits for the spawned child after SDK cleanup (%s)', async (order) => {
+    const child = new EventEmitter();
+    vi.spyOn(authGate, 'spawner').mockReturnValue(() => child as ReturnType<ReturnType<typeof authGate.spawner>>);
+    sdk.child.use = true;
+    const h = await atRest({ live: true });
+    await h.message(result([h.first.uuid]));
+    if (order === 'iterator first') {
+      h.proc().end();
+      await until(() => !h.q(), 'SDK cleanup');
+    }
+    vi.useFakeTimers();
+    const close = h.session.close();
+    const exit = h.session.exited();
+    child.emit('error', Object.assign(new Error('kill failed'), { syscall: 'kill', code: 'EPERM' }));
+    const bound = expect(exit).rejects.toThrow(/not ended/);
+    await vi.advanceTimersByTimeAsync(3100);
+    await Promise.all([close, bound]);
+    child.emit('exit', 0, null);
+    await expect(h.session.exited()).resolves.toBeUndefined();
   });
 
   it('a result for a step already settled keeps the end it got then', async () => {

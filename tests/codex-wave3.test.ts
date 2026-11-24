@@ -107,6 +107,42 @@ async function codexFake(answers: Answers = {}) {
   };
 }
 
+it('restores the queued instruction once when quit interrupts turn/start', async () => {
+  const reply = gate();
+  const h = await codexFake({ 'turn/start': async () => { await reply.wait(); return { turn: { id: 'turn1' } }; } });
+  const entry = h.rt.enqueue('Only explain the change');
+  const sending = h.app.call('queue.sendNow', { sessionId: h.id, id: entry.id });
+  try {
+    await until(() => h.count('turn/start') === 1, 'pending turn/start');
+    let saved!: () => void;
+    const durable = new Promise<void>(resolve => { saved = resolve; });
+    const quitting = h.app.dispose(saved);
+    await durable;
+    const restored = new App({ home: h.app.store.dir, userHome: h.app.store.dir, providers: [() => h.provider], quiet: true });
+    try {
+      const snap = await restored.call('session.snapshot', { sessionId: h.id });
+      expect(snap.queue).toEqual([]);
+      expect(snap.items.filter(i => i.type === 'user' && i.text === entry.text)).toMatchObject([{ id: entry.id }]);
+      expect(h.count('turn/start')).toBe(1);
+    } finally {
+      reply.open(undefined);
+      await quitting;
+      await restored.dispose();
+    }
+  } finally { reply.open(undefined); await sending; }
+});
+
+it('attributes a limit before output to the accepted corrective steer', async () => {
+  const h = await codexFake();
+  await h.send('Change the files');
+  h.started('turn1');
+  await h.app.call('session.send', { sessionId: h.id, text: 'Only explain the change', steer: true });
+  const correction = h.rt.items.find(i => i.type === 'user' && i.text === 'Only explain the change')!;
+  expect(h.count('turn/steer')).toBe(1);
+  h.notify('error', { turnId: 'turn1', willRetry: false, error: { message: 'Usage limit reached', codexErrorInfo: 'usageLimitExceeded' } });
+  expect(h.rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit)?.limit?.userItemId).toBe(correction.id);
+});
+
 describe('#10: a command start is tracked like a message', () => {
   it('a /review stopped while review/start is out is interrupted on the server once its id comes', async () => {
     const g = gate();

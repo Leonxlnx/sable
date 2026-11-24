@@ -1,4 +1,5 @@
-import type { BridgeEvent, SessionSnapshot, TimelineItem, ToolItem, ToolKind, ToolResult, ToolStatus } from '../../shared/protocol';
+import { DEFAULT_ACCOUNT, type BridgeEvent, type SessionMeta, type SessionSnapshot, type TimelineItem, type ToolItem, type ToolKind, type ToolResult, type ToolStatus } from '../../shared/protocol';
+import { runsTask } from '../../shared/background';
 
 // ── what a window gets of an existing conversation ──
 //
@@ -73,7 +74,7 @@ const WHOLE = new Set<ToolKind>(['widget', 'todo', 'question', 'plan', 'share'])
  * opening it and go to the composer as they are.
  */
 function settled(t: ToolItem): boolean {
-  return SETTLED.has(t.status) && !WHOLE.has(t.kind) && !t.check && t.result?.agent?.background !== 'running' && t.workflow?.status !== 'running';
+  return SETTLED.has(t.status) && !WHOLE.has(t.kind) && !t.check && !runsTask(t) && t.result?.agent?.background !== 'running' && t.workflow?.status !== 'running';
 }
 
 const size = (list: string[]) => list.reduce((n, s) => n + s.length + 3, 0);
@@ -134,6 +135,13 @@ export function resultForWindow<T>(result: T): T {
 
 // Every window gets the same event object: it is cut once.
 const cutEvents = new WeakMap<BridgeEvent, BridgeEvent>();
+
+/** JSON omits undefined. A missing patch key means keep the old value, so send an explicit clear. */
+export function sessionPatchForJson(patch: Partial<SessionMeta>, clearable?: ReadonlySet<string>) {
+  return Object.fromEntries(Object.entries(patch)
+    .filter(([key, value]) => value != null || !clearable || clearable.has(key))
+    .map(([key, value]) => [key, value ?? (key === 'accountId' ? DEFAULT_ACCOUNT : null)]));
+}
 
 /** An event as a window gets it: a reset timeline cut; everything live as it is. */
 export function eventForWindow(event: BridgeEvent): BridgeEvent {

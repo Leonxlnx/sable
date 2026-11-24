@@ -60,7 +60,7 @@ function updater(json: unknown, opts: { busy?: () => boolean; recheckAt?: () => 
   const ran: string[] = [];
   const quit = vi.fn();
   const gh = github(json, opts.bytes);
-  const u = new Updater((s) => states.push(s), { host: { quit }, dir, version: '0.2.4', platform: 'win32', fetch: gh.fetcher, run: (f) => ran.push(f), busy: opts.busy, recheckAt: opts.recheckAt, manual: true });
+  const u = new Updater((s) => states.push(s), { host: { quit }, dir, version: '0.2.4', platform: 'win32', fetch: gh.fetcher, run: (f) => { ran.push(f); }, busy: opts.busy, recheckAt: opts.recheckAt, manual: true });
   return { u, states, ran, quit, dir, gh };
 }
 
@@ -282,6 +282,43 @@ describe('the updater', () => {
     }
   });
 
+  it('waits through live notification grace and rechecks work at installer launch', async () => {
+    const now = Date.now();
+    let grace = now + 3000;
+    let reads = 0;
+    const chat = { meta: { status: 'idle' }, turnActive: false, handle: { liveWork: () => ({
+      agents: 0, commands: 0, turn: false, notificationUntil: grace,
+    }) } };
+    const { u, ran } = updater(release('0.2.5'), {
+      busy: () => { reads++; return updateWaits([chat]).busy; },
+      recheckAt: () => updateWaits([chat]).recheckAt,
+    });
+    await u.check();
+    expect(u.install().pending).toBe(true);
+    expect(ran).toEqual([]);
+    grace = 0;
+    chat.turnActive = true;
+    u.workChanged();
+    expect(ran).toEqual([]);
+    chat.turnActive = false;
+    u.workChanged();
+    expect(ran).toHaveLength(1);
+    u.install();
+    expect(ran).toHaveLength(1);
+    expect(reads).toBeGreaterThan(2);
+  });
+
+  it('keeps a restart pending when new work appears at the final check', async () => {
+    const busy = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    const { u, ran } = updater(release('0.2.5'), { busy });
+    await u.check();
+    expect(u.install().pending).toBe(true);
+    expect(ran).toHaveLength(0);
+    busy.mockReturnValue(false);
+    u.workChanged();
+    expect(ran).toHaveLength(1);
+  });
+
   it('what the restart waits for', () => {
     const now = 10 * COMMAND_UPDATE_WAIT_MS;
     const idle = (extra: Partial<UpdateSession> = {}): UpdateSession => ({ meta: { status: 'idle' }, turnActive: false, ...extra });
@@ -296,6 +333,27 @@ describe('the updater', () => {
     });
     // A count of none: a time left over says nothing.
     expect(updateWaits([idle({ meta: { status: 'idle', commands: 0 }, newestCommandAt: now })], now)).toEqual({ busy: false });
+  });
+
+  it('keeps turn admission closed until the installer reports whether it started', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'sable-update-ack-'));
+    dirs.push(dir);
+    const quit = vi.fn();
+    let failed!: (err: Error) => void;
+    const launching = new Promise<void>((_, reject) => { failed = reject; });
+    const u = new Updater(() => {}, {
+      host: { quit }, dir, version: '0.2.4', platform: 'win32', fetch: github(release('0.2.5')).fetcher,
+      run: () => launching, manual: true,
+    });
+    await u.check();
+    u.install();
+    expect(u.installing).toBe(true);
+    expect(quit).not.toHaveBeenCalled();
+    failed(new Error('Installer failed to start'));
+    await launching.catch(() => {});
+    expect(u.installing).toBe(false);
+    expect(u.state.error).toBe('Installer failed to start');
+    expect(quit).not.toHaveBeenCalled();
   });
 
   it('an installer that cannot start once the agents finish says so, and nothing quits', async () => {

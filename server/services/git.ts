@@ -574,28 +574,36 @@ export async function gitBranches(cwd: string): Promise<{ current?: string; bran
   return { current, branches };
 }
 
-/**
- * The working trees of the repository at `cwd`, main checkout first (lanes included). Bare,
- * locked and prunable entries are left out, and so is any tree whose folder is gone.
- */
-export async function gitWorktrees(cwd: string): Promise<GitWorktree[]> {
-  const dir = path.resolve(cwd);
-  if (!(await repoRoot(dir))) return [];
-  const r = await runGit(dir, ['worktree', 'list', '--porcelain'], { timeoutMs: 5000 });
-  if (r.code !== 0) return [];
-  const blocks = r.stdout
-    .split(/\r?\n\r?\n/)
-    .map((b) => b.trim())
-    .filter(Boolean);
-  const out: GitWorktree[] = [];
-  for (const [i, block] of blocks.entries()) {
+/** Git's registrations, including locked and missing trees. Null means the list could not be read. */
+export async function worktreeRecords(dir: string) {
+  const r = await runGit(dir, ['worktree', 'list', '--porcelain', '-z'], { timeoutMs: 10_000 });
+  if (r.code !== 0 || r.truncated) return null;
+  return r.stdout.split('\0\0').filter(Boolean).map((block) => {
     const fields = new Map<string, string>();
-    for (const line of block.split(/\r?\n/)) {
+    for (const line of block.split('\0')) {
       const sp = line.indexOf(' ');
       fields.set(sp < 0 ? line : line.slice(0, sp), sp < 0 ? '' : line.slice(sp + 1));
     }
+    return fields;
+  });
+}
+
+/** The checkouts usable from home. Locking protects a worktree from removal while it is away. */
+export async function gitWorktrees(cwd: string): Promise<GitWorktree[]> {
+  const dir = path.resolve(cwd);
+  const root = await repoRoot(dir);
+  if (!root) return [];
+  const records = await worktreeRecords(dir);
+  if (!records) return [];
+  const canonical = await realDir(root);
+  // Home can have reached this checkout through a junction. Keep the spelling it selected.
+  let alias = dir;
+  while (path.relative(await realDir(alias), canonical) !== '' && alias !== path.dirname(alias)) alias = path.dirname(alias);
+  if (path.relative(await realDir(alias), canonical) !== '') alias = dir;
+  const out: GitWorktree[] = [];
+  for (const [i, fields] of records.entries()) {
     const tree = fields.get('worktree');
-    if (!tree || fields.has('bare') || fields.has('locked') || fields.has('prunable')) continue;
+    if (!tree || fields.has('bare') || fields.has('prunable')) continue;
     const resolved = path.resolve(tree);
     try {
       if (!(await stat(resolved)).isDirectory()) continue;
@@ -604,7 +612,7 @@ export async function gitWorktrees(cwd: string): Promise<GitWorktree[]> {
     }
     const ref = fields.get('branch');
     out.push({
-      path: resolved,
+      path: path.relative(await realDir(resolved), canonical) === '' ? alias : resolved,
       branch: ref ? ref.replace(/^refs\/heads\//, '') : undefined,
       head: fields.get('HEAD')?.slice(0, 7) || undefined,
       main: i === 0,

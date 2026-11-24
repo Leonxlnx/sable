@@ -57,9 +57,11 @@ function fake(id: ProviderId, name: string, log: Log) {
       if (id !== 'demo') rt.setCaps(fakeCaps());
       log.opened.push({ provider: id, resumed });
       const send = s.send.bind(s);
-      s.send = async (item) => {
+      s.send = async (item, options) => {
         log.sent.push({ provider: id, text: item.text, conversation: rt.meta.providerSessionId });
-        return send(item);
+        options?.check?.();
+        await send(item);
+        if (id === 'codex') options?.taken?.(); // The real adapter acknowledges an accepted turn/start.
       };
       const setModel = s.setModel.bind(s);
       s.setModel = async (model) => {

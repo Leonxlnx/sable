@@ -32,3 +32,23 @@ export function workLabel(s: Work): string | null {
   if (commands) return `${c} running`;
   return null;
 }
+
+/**
+ * The conversation's tail line while the chat's own turn is over and its work goes on: "2 sub-agents
+ * working", "Waiting for 1 background command", "Waiting for 1 monitor", "2 sub-agents, 1 command
+ * working"; null when nothing works. `monitors`: how many of `commands` are monitors.
+ */
+export function tailLabel(s: { agents: number; commands: number; monitors?: number }): string | null {
+  const agents = count(s.agents);
+  const all = count(s.commands);
+  const monitors = Math.min(count(s.monitors), all);
+  const commands = all - monitors;
+  const parts: string[] = [];
+  if (agents) parts.push(`${agents} ${agents === 1 ? 'sub-agent' : 'sub-agents'}`);
+  if (commands) parts.push(`${commands} ${commands === 1 ? 'command' : 'commands'}`);
+  if (monitors) parts.push(`${monitors} ${monitors === 1 ? 'monitor' : 'monitors'}`);
+  if (!parts.length) return null;
+  if (agents) return `${parts.join(', ')} working`;
+  if (commands && !monitors) return `Waiting for ${commands} background ${commands === 1 ? 'command' : 'commands'}`;
+  return `Waiting for ${parts.join(', ')}`;
+}

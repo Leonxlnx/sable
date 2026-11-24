@@ -86,6 +86,12 @@ export interface AccountFolder {
 
 /** A turn the agent refused because the account is at a plan limit (on the notice that says so). */
 export interface LimitHit {
+  /** Whether this refusal interrupted a person's request or work the agent began independently. */
+  origin?: 'user' | 'background';
+  /** The original timeline message to retry, including its attachments. */
+  userItemId?: string;
+  /** Another window refused a CLI wake while the person's own request was being refused. */
+  wakeWindow?: string;
   /** Filled in by the bridge when the turn ends. */
   provider?: ProviderId;
   accountId?: string;
@@ -438,10 +444,14 @@ export interface SessionMeta {
   fast?: boolean;
   /** The chosen speed (`ModelInfo.speeds` id); absent or `standard` is standard. `fast` mirrors it being non-standard. */
   speed?: string;
+  /** Sable restarted mid-turn. Kept until the recovered timeline records how the turn ended. */
+  pendingRestart?: boolean;
   /** The limit handover moved this session here from this account (its preferred one). */
   movedFrom?: string;
   /** When `movedFrom` is expected to take work again (the reset of the window that moved the chat): the chat returns then, at rest or before the next message (`App.returnAfterLimit`). */
   returnAt?: number;
+  /** Model-specific quota windows that must have room before returning to the preferred account. */
+  returnModels?: string[];
   /** A chat started without a folder: it runs in a fresh folder Sable made for it under the chats folder (`AppSettings.chatsFolder`). */
   chat?: boolean;
   /** Claude Code ultracode is on for this session (see `Capabilities.features.ultracode`). */
@@ -484,6 +494,8 @@ export interface SessionMeta {
   until?: UntilState | null;
   /** The session works in a lane of its own (a git worktree on a branch of its own); `cwd` is inside it. Null once it landed or was discarded (patches travel as JSON). */
   lane?: SessionLane | null;
+  /** Landed worktrees kept for local files, oldest first. Explicit discard can clean up the latest. */
+  retainedLanes?: SessionLane[];
   /** The chat races another on the same task (`SessionRace`). Null once its rival was deleted (patches travel as JSON). */
   race?: SessionRace | null;
   /** The chat waits to start by itself: on spare quota, or at a limit's reset (`SpareWait`). Null once it started or was cancelled (patches travel as JSON). */
@@ -588,6 +600,8 @@ export function matchModel(query: string, models: ModelInfo[]): ModelInfo | unde
  */
 export interface SpareWait {
   reason: 'spare' | 'reset';
+  /** The limit card this reset was armed for. */
+  refusalId?: string;
   /** When the chat began to wait (first come, first served). */
   since: number;
   /** reset: when the account's window resets. spare: when it is expected to start, when a window that resets then is what holds it. */
@@ -1109,6 +1123,8 @@ export interface TaskMark {
   endedAt?: number;
   /** Why it is `stopped` or `lost`: the process ended or was let go, Sable restarted, the chat moved, a limit, the person. */
   why?: 'process' | 'restart' | 'move' | 'limit' | 'you';
+  /** The agent accepted a message carrying the note about this lost task. */
+  lossTold?: true;
 }
 
 /** Closes a turn: duration, cost, token counts. */
@@ -1775,6 +1791,7 @@ export type BridgeEvent =
   | { type: 'projects.updated'; projects: Project[]; groups?: FolderGroup[]; chatsOrder?: number }
   | { type: 'settings.updated'; settings: AppSettings }
   | { type: 'session.added'; session: SessionMeta }
+  /** Native changes use undefined for clears. JSON sends null for a clear and DEFAULT_ACCOUNT for a cleared account. */
   | { type: 'session.updated'; id: string; patch: Partial<SessionMeta> }
   | { type: 'session.removed'; id: string }
   | { type: 'session.caps'; id: string; caps: Capabilities }
@@ -2128,7 +2145,14 @@ export interface PhoneMethods {
    * a bounded page around that root item instead (whole turns, `at` names it, `next` when it stops
    * before the newest); `after`: the page that starts at that root, toward the newest.
    */
-  'phone.tail': { params: { sessionId: string; before?: string; limit?: number; to?: string; around?: string; after?: string }; result: PhoneTail };
+  'phone.tail': {
+    params: {
+      sessionId: string; before?: string; limit?: number; to?: string; around?: string; after?: string;
+      /** Read a page without marking the chat read or adding it to this phone's stream. */
+      peek?: boolean;
+    };
+    result: PhoneTail;
+  };
   /** One item with more of it (a step's output and change, a long text in full) and the last steps nested under it. */
   'phone.item': { params: { sessionId: string; itemId: string }; result: { item: PhoneItem; children: PhoneItem[] } };
   /**
@@ -2406,7 +2430,11 @@ export interface RpcMethods {
    * the compaction starts (`compacting`), and the move follows when it ends, said in the chat.
    */
   'session.switchAccount': {
-    params: { sessionId: string; accountId: string; retry?: boolean };
+    params: {
+      sessionId: string; accountId: string; retry?: boolean;
+      /** The particular refusal to continue when one turn reported several inputs. */
+      refusalId?: string;
+    };
     result: { ok: boolean; carried: 'conversation' | 'summary' | 'none'; message?: string; compacting?: boolean };
   };
 
@@ -2557,7 +2585,14 @@ export interface RpcMethods {
   /** Spare (`SpareWait`): queues a message held until there is spare quota (`/spare`). Answers the wait, or why not. */
   'spare.send': { params: { sessionId: string; text: string; attachments?: Attachment[] }; result: { ok: boolean; spare?: SpareWait; error?: string } };
   /** "Continue at reset": the chat's last limit notice continues on its account once its window resets. */
-  'spare.atReset': { params: { sessionId: string }; result: { ok: boolean; spare?: SpareWait; error?: string } };
+  'spare.atReset': {
+    params: {
+      sessionId: string;
+      /** The refusal whose input and reset the person selected. */
+      refusalId?: string;
+    };
+    result: { ok: boolean; spare?: SpareWait; error?: string };
+  };
   /** Stops waiting; held messages stay in the queue. */
   'spare.cancel': { params: { sessionId: string }; result: { ok: boolean } };
   /** Sends the first held message now, as a normal send, and stops waiting. */

@@ -68,14 +68,13 @@ const CUT_DETAIL: Record<'died' | 'closed' | 'restart', string> = {
  */
 export function lostLine(count: number, why: LostWhy): string {
   const what = count === 1 ? '1 background command was' : `${count} background commands were`;
+  if (why === 'limit') return `${what} lost at the plan limit`;
   return why === 'move' ? `${what} lost when the chat moved` : why === 'restart' ? `${what} lost when Sable closed` : `${what} lost with the agent's process`;
 }
 
 /** At most this many lost tasks are named to the agent at once, each cut to `TASK_NAME_MAX` characters. */
 const LOST_NAMES_MAX = 12;
 const TASK_NAME_MAX = 90;
-/** Lost tasks kept for the agent's next message: a chat that loses more before it is told keeps the newest. */
-const LOST_KEPT = 64;
 
 /** A task step's name as the person knows it: what the agent said it does, else the step's label. */
 function taskName(i: ToolItem): string {
@@ -96,6 +95,13 @@ export function stoppedBackground(i: TimelineItem): TimelineItem {
  * One open session: metadata, the normalized timeline and any prompt waiting on the
  * user. Provider adapters write to it; every mutation is broadcast to the UI.
  */
+export interface ReportedTask {
+  id: string;
+  itemId?: string;
+  agent: boolean;
+  since?: number;
+}
+
 export class SessionRuntime {
   items: TimelineItem[] = [];
   caps?: Capabilities;
@@ -140,17 +146,23 @@ export class SessionRuntime {
     this.carried = false;
   }
   private stopped = false;
+  /** Unread messages returned to the queue wait for the person's next send. */
+  unreadQueueHeld = false;
   /** The running turn carries a stop's hold it did not make (the agent began it by itself): the person's next message lifts it (`personSent`). */
   private carried = false;
   /**
    * Called after every turn end; `error` is set when the turn failed. `hold`: the agent could not say
    * how the turn ended (it went idle without its end), so nothing queued goes out by itself.
+   * A backgroundLimit end is followed immediately by the refused wake's handoff at rest.
    */
-  onTurnEnd?: (rt: SessionRuntime, error?: string, opts?: { hold?: boolean }) => void;
+  onTurnEnd?: (rt: SessionRuntime, error?: string, opts?: { hold?: boolean; backgroundLimit?: boolean }) => void;
   /** Called as a turn begins (an until loop's check in flight gives way to it). */
+  canBeginTurn?: () => boolean;
   onTurnStart?: (rt: SessionRuntime) => void;
   /** A plan limit refused work of the chat outside its own turn (a background agent's request, or the agent's own): the bridge decides (`limitInBackground`). */
   onBackgroundLimit?: (rt: SessionRuntime, hit: BackgroundLimit) => void;
+  /** First evidence of a personal limit arrived after Stop settled its turn. Offer a manual continuation. */
+  onStoppedLimit?: (rt: SessionRuntime, notice: NoticeItem) => void;
   /** The last background work ended with no turn running: the chat is at rest. */
   onRest?: (rt: SessionRuntime) => void;
   /** The limit notice the bridge wrote when work outside a turn met a limit: a turn refused at it says it there (one notice). */
@@ -209,14 +221,12 @@ export class SessionRuntime {
    */
   loadRestored(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]): string[] {
     const changed: string[] = [];
-    const lost: string[] = [];
     const names: string[] = [];
     const out = items.map((i) => {
       let s = stoppedBackground(i);
       if (runsTask(s)) {
         names.push(taskName(s));
         s = { ...s, task: { ...s.task, state: 'lost', why: 'restart' } };
-        lost.push(i.id);
       }
       if (s !== i) changed.push(i.id);
       return s;
@@ -224,7 +234,6 @@ export class SessionRuntime {
     this.load(out, todos, queue);
     this.markSaved();
     for (const id of changed) this.markDirty(id);
-    for (const id of lost) this.keepLost(id);
     return names;
   }
 
@@ -236,15 +245,15 @@ export class SessionRuntime {
     this.index = new Map(items.map((i) => [i.id, i]));
     this.working.clear();
     this.running.clear();
+    this.lost.clear();
     this.taskSteps.clear();
     for (const i of items) {
       if (worksInBackground(i)) this.working.add(i.id);
-      if (i.type === 'tool' && i.task) this.taskSteps.set(i.task.id, i.id);
+      this.trackTask(i);
       if (runsTask(i)) this.running.add(i.id);
     }
     // As read: whoever loads gets the whole chat next (a snapshot), so nothing is announced here.
-    this.meta.background = this.working.size;
-    this.meta.commands = this.running.size;
+    Object.assign(this.meta, this.taskCounts());
   }
 
   // ── background work ──
@@ -255,6 +264,16 @@ export class SessionRuntime {
   private running = new Set<string>();
   /** The step of each task the chat has seen, by the agent's own task id. */
   private taskSteps = new Map<string, string>();
+  /** Steps whose lost-task note has yet to reach the agent. */
+  private lost = new Set<string>();
+  private lossReservations = new Map<string, { token: symbol; task: NonNullable<ToolItem['task']> }>();
+
+  private trackTask(item: TimelineItem) {
+    if (item.type !== 'tool') return;
+    if (item.task) this.taskSteps.set(item.task.id, item.id);
+    if (item.task?.state === 'lost' && !item.task.lossTold) this.lost.add(item.id);
+    else this.lost.delete(item.id);
+  }
 
   /**
    * A step was added or changed: the chat's counts of background work follow it. At rest (`onRest`)
@@ -263,31 +282,42 @@ export class SessionRuntime {
    * only for a young one).
    */
   private trackBackground(item: TimelineItem) {
-    if (item.type === 'tool' && item.task) this.taskSteps.set(item.task.id, item.id);
+    this.trackTask(item);
     const works = worksInBackground(item);
     const runs = runsTask(item);
-    const patch: Partial<SessionMeta> = {};
-    let agentsDone = false;
-    let commandsDone = false;
-    if (works !== this.working.has(item.id)) {
-      if (works) this.working.add(item.id);
-      else {
-        this.working.delete(item.id);
-        agentsDone = !this.working.size;
-      }
-      patch.background = this.working.size;
+    if (works === this.working.has(item.id) && runs === this.running.has(item.id)) return;
+    if (works) this.working.add(item.id);
+    else this.working.delete(item.id);
+    if (runs) this.running.add(item.id);
+    else this.running.delete(item.id);
+    this.publishTaskCounts();
+  }
+
+  private reportedTasks: ReportedTask[] = [];
+
+  setReportedTasks(tasks: ReportedTask[]) {
+    if (!tasks.length && !this.reportedTasks.length) return;
+    this.reportedTasks = tasks;
+    this.publishTaskCounts();
+  }
+
+  private taskCounts() {
+    let background = this.working.size;
+    let commands = this.running.size;
+    for (const task of this.reportedTasks) {
+      if (task.agent) {
+        if (!task.itemId || !this.working.has(task.itemId)) background++;
+      } else if (!this.running.has(this.taskSteps.get(task.id) ?? task.itemId ?? '')) commands++;
     }
-    if (runs !== this.running.has(item.id)) {
-      if (runs) this.running.add(item.id);
-      else {
-        this.running.delete(item.id);
-        commandsDone = !this.running.size;
-      }
-      patch.commands = this.running.size;
-    }
-    if (!('background' in patch) && !('commands' in patch)) return;
-    this.update(patch);
-    if (!this.turnActive && !this.working.size && (agentsDone || commandsDone)) this.onRest?.(this);
+    return { background, commands };
+  }
+
+  private publishTaskCounts() {
+    const { background, commands } = this.taskCounts();
+    const agentsDone = !!this.meta.background && !background;
+    const commandsDone = !!this.meta.commands && !commands;
+    this.update({ background, commands });
+    if (!this.turnActive && !background && (agentsDone || commandsDone)) this.onRest?.(this);
   }
 
   /** When the youngest background command or monitor still running began; undefined when none runs. */
@@ -297,6 +327,7 @@ export class SessionRuntime {
       const i = this.index.get(id);
       if (runsTask(i)) at = Math.max(at ?? 0, i.task.since);
     }
+    for (const t of this.reportedTasks) if (!t.agent && t.since !== undefined) at = Math.max(at ?? 0, t.since);
     return at;
   }
 
@@ -327,17 +358,7 @@ export class SessionRuntime {
     if (item?.type !== 'tool' || item.task?.id !== taskId) return;
     const t = item.task;
     if (t.state !== 'running' && t.state !== 'lost') return;
-    this.lost.delete(item.id);
     this.patch<ToolItem>(item.id, { task: { id: t.id, kind: t.kind, state, since: t.since, endedAt: Math.max(at ?? Date.now(), t.since) } });
-  }
-
-  /** Task steps lost since the agent was last told (`takeLost`), oldest first. */
-  private lost = new Set<string>();
-
-  private keepLost(id: string) {
-    this.lost.delete(id);
-    this.lost.add(id);
-    if (this.lost.size > LOST_KEPT) this.lost.delete(this.lost.values().next().value as string);
   }
 
   /**
@@ -352,33 +373,63 @@ export class SessionRuntime {
       const item = this.index.get(id);
       if (!runsTask(item)) continue;
       names.push(taskName(item));
-      this.keepLost(id);
       this.patch<ToolItem>(id, { task: { ...item.task, state: 'lost', why } });
     }
     return names;
   }
 
   /**
-   * The tasks lost since the last call, as the agent knows them (`"Run app tests" (command, task
-   * b1x2)`; at most 12, then "N more"), for the hidden note its next message carries
-   * (shared/synthetic.ts `lostTasksNote`). Empties the list; a task whose end was heard since is left
-   * out. Take it only with a message the agent accepted.
+   * The lost tasks to mention with a send (at most twelve names, then "N more").
+   * Call `taken` once that send is accepted. Losses that arrive meanwhile wait for the next send.
    */
-  takeLost(): string[] {
-    const out: string[] = [];
-    let more = 0;
+  pendingLost() {
+    return this.lostBatch();
+  }
+
+  /** Claim these losses while one send waits for its delivery receipt. */
+  reserveLost() {
+    return this.lostBatch(Symbol());
+  }
+
+  private lostBatch(token?: symbol) {
+    const names: string[] = [];
+    const batch = new Map<string, NonNullable<ToolItem['task']>>();
     for (const id of this.lost) {
       const item = this.index.get(id);
       if (item?.type !== 'tool' || item.task?.state !== 'lost') continue;
-      if (out.length >= LOST_NAMES_MAX) {
-        more++;
-        continue;
+      if (token) {
+        const held = this.lossReservations.get(id);
+        if (held?.task.id === item.task.id && held.task.since === item.task.since) continue;
+        this.lossReservations.set(id, { token, task: item.task });
       }
-      out.push(`"${taskName(item).replace(/"/g, "'")}" (${item.task.kind}, task ${item.task.id})`);
+      batch.set(id, item.task);
+      if (names.length < LOST_NAMES_MAX) {
+        names.push(`"${taskName(item).replace(/"/g, "'")}" (${item.task.kind}, task ${item.task.id})`);
+      }
     }
-    if (more) out.push(`${more} more`);
-    this.lost.clear();
-    return out;
+    if (batch.size > names.length) names.push(`${batch.size - names.length} more`);
+    const release = () => {
+      if (token) for (const id of batch.keys()) {
+        if (this.lossReservations.get(id)?.token === token) this.lossReservations.delete(id);
+      }
+    };
+    const taken = () => {
+      release();
+      for (const [id, sent] of batch) {
+        const task = this.get<ToolItem>(id)?.task;
+        if (task?.state === 'lost' && !task.lossTold && task.id === sent.id && task.since === sent.since) {
+          this.patch<ToolItem>(id, { task: { ...task, lossTold: true } });
+        }
+      }
+    };
+    return { names, taken, release };
+  }
+
+  /** Takes and acknowledges the current list together, for an already accepted message. */
+  takeLost(): string[] {
+    const batch = this.reserveLost();
+    batch.taken();
+    return batch.names;
   }
 
   /**
@@ -432,6 +483,7 @@ export class SessionRuntime {
   // ── queue ──
 
   private queueChanged() {
+    if (!this.queue.length) this.unreadQueueHeld = false;
     this.emit({ type: 'queue.updated', sessionId: this.id, queue: this.queue.map((q) => ({ ...q })) });
     this.onDirty(this, 'items');
   }
@@ -533,7 +585,9 @@ export class SessionRuntime {
   /** Puts messages back at the front of the queue (steered messages the agent never took). */
   requeue(messages: QueuedMessage[]) {
     if (!messages.length) return;
-    this.queue.unshift(...messages.map((m) => ({ ...m, attachments: m.attachments?.length ? m.attachments : undefined })));
+    const returned = new Set(messages.map(m => m.id));
+    this.queue = [...messages, ...this.queue.filter(q => !returned.has(q.id))];
+    for (const id of returned) this.rollbackReserved(id);
     this.queueChanged();
   }
 
@@ -542,11 +596,14 @@ export class SessionRuntime {
    * left waiting, as after a restart) go back to the front of the queue in the order they were
    * sent, so none is lost. With `reason`, one quiet line in the timeline says so. Returns how many.
    */
-  returnUntaken(opts: { all?: boolean; reason?: 'stopped' | 'failed' | 'closed' } = {}): number {
-    const untaken = this.items.filter((i): i is UserItem => i.type === 'user' && !i.parentId && i.state === 'queued' && (opts.all || !!i.steered));
+  returnUntaken(opts: { ids?: ReadonlySet<string>; all?: boolean; byHand?: ReadonlySet<string>; holdQueue?: boolean; reason?: 'stopped' | 'failed' | 'closed' } = {}): number {
+    const candidates = opts.ids ? Array.from(opts.ids, id => this.index.get(id)) : this.items;
+    const untaken = candidates.filter((i): i is UserItem => i?.type === 'user' && !i.parentId &&
+      (!!opts.ids || i.state === 'queued' && (opts.all || !!i.steered)));
     if (!untaken.length) return 0;
+    if (opts.holdQueue) this.unreadQueueHeld = true;
     for (const u of untaken) this.remove(u.id);
-    this.requeue(untaken.map((u) => ({ id: u.id, text: u.text, attachments: u.attachments, createdAt: u.ts })));
+    this.requeue(untaken.map((u) => ({ id: u.id, text: u.text, attachments: u.attachments, createdAt: u.ts, ...(opts.byHand?.has(u.id) ? { byHand: true } : {}) })));
     if (opts.reason) {
       const one = untaken.length === 1;
       const it = one ? 'it' : 'them';
@@ -767,7 +824,7 @@ export class SessionRuntime {
       this.lost.delete(g);
     }
     for (const [task, step] of [...this.taskSteps]) if (gone.has(step)) this.taskSteps.delete(task);
-    if (had || ran) this.update({ ...(had ? { background: this.working.size } : {}), ...(ran ? { commands: this.running.size } : {}) });
+    if (had || ran) this.publishTaskCounts();
   }
 
   reset(items: TimelineItem[]) {
@@ -776,16 +833,10 @@ export class SessionRuntime {
     this.load(items, this.todos);
     this.emit({ type: 'timeline.reset', sessionId: this.id, items: items.map((i) => ({ ...i })) });
     this.onDirty(this, 'items');
-    // `load` set the counts silently: a reset happens under clients that are listening.
-    if (before !== this.working.size) {
-      this.meta.background = before;
-      this.update({ background: this.working.size });
-    }
-    if (commands !== this.running.size) {
-      this.meta.commands = commands;
-      this.update({ commands: this.running.size });
-    }
-    for (const id of [...this.lost]) if (!this.index.has(id)) this.lost.delete(id);
+    // Re-publish the effective counts after the silent load.
+    this.meta.background = before;
+    this.meta.commands = commands;
+    this.publishTaskCounts();
   }
 
   notice(variant: NoticeItem['variant'], text: string, detail?: string, parentId?: string) {
@@ -835,13 +886,17 @@ export class SessionRuntime {
    * queued either, until the person sends something.
    */
   beginTurn(activity?: string, opts: { keepHold?: boolean } = {}) {
+    if (this.canBeginTurn?.() === false) return;
     const hold = !!opts.keepHold && this.stopped && !this.turnActive;
     this.turnActive = true;
     this.turnStartedAt = Date.now();
     this.stopped = hold;
     this.carried = hold;
-    // A turn of the person's own is past the limit notice its background work met; one the agent begins by itself (a notification) is not.
-    if (!opts.keepHold) this.limitCard = undefined;
+    // An undecided background card can be taken over by the person's refusal in this turn.
+    if (!opts.keepHold && this.limitCard) {
+      const limit = this.get<NoticeItem>(this.limitCard)?.limit;
+      if (!limit || limit.provider || limit.continuedWith) this.limitCard = undefined;
+    }
     this.setSuggestion(undefined);
     this.update({ status: 'running', lastError: undefined, activity, updatedAt: Date.now() });
     this.onTurnStart?.(this);
@@ -854,12 +909,12 @@ export class SessionRuntime {
     this.stopped = false;
   }
 
-  endTurn(error?: string, opts?: { hold?: boolean }) {
+  endTurn(error?: string, opts?: { hold?: boolean; backgroundLimit?: boolean }) {
     this.turnActive = false;
     this.carried = false;
     this.cancelPrompts();
     this.update({ status: error ? 'error' : 'idle', lastError: error, activity: undefined, updatedAt: Date.now() });
-    this.onTurnEnd?.(this, error, opts);
+    this.onTurnEnd?.(this, error, this.unreadQueueHeld ? { ...opts, hold: true } : opts);
   }
 
   /** How long, between `from` and `to`, the session waited for the user (some prompt was open). */
@@ -1076,7 +1131,7 @@ export class SessionRuntime {
     return !i.parentId && (i.type === 'turn' || (i.type === 'notice' && (i.variant === 'interrupted' || !!i.early)));
   }
 
-  /** When the last turn began, read from the items (a chat read from disk has no turn of this run): the first root after the last record of an end. */
+  /** The first root act after the last end record. Informational notices can arrive at rest. */
   private lastTurnStart(): number {
     // Nothing after the last end: no turn is open, and whatever still runs is older than any.
     let start = Infinity;
@@ -1084,7 +1139,7 @@ export class SessionRuntime {
       const i = this.items[k];
       if (i.parentId) continue;
       if (SessionRuntime.endsTurn(i)) break;
-      start = i.ts;
+      if (i.type !== 'notice') start = i.ts;
     }
     return start;
   }
@@ -1097,19 +1152,16 @@ export class SessionRuntime {
    * then one notice says so ("Ended early", `early`; `detail`: the agent's own words, after the
    * reason) and the turn ends with the queue held. No turn open: what was left running in the process
    * is settled and nothing is written, except for `restart`, which the load path asks for with no turn
-   * open (once: a chat whose last word is already such a notice gets no second).
+   * open and only when the timeline has work after its last end record.
    * Mark what ran in the background first (`stopBackground`, `tasksLost`): this settles steps only.
    */
   cutTurn(reason: 'died' | 'closed' | 'restart', opts: { at?: number; detail?: string } = {}) {
     const at = opts.at ?? Date.now();
     const open = this.turnActive;
     this.settleSteps('cancelled', { at }, false);
-    if (!open && reason !== 'restart') return;
-    const last = this.items.findLast((i) => !i.parentId);
-    if (open || !(last?.type === 'notice' && last.early)) {
-      const detail = opts.detail?.trim() ? `${CUT_DETAIL[reason]}\n\n${opts.detail.trim()}` : CUT_DETAIL[reason];
-      this.add<NoticeItem>({ type: 'notice', variant: 'info', text: 'Ended early', detail, early: reason, ts: at });
-    }
+    if (!open && (reason !== 'restart' || this.lastTurnStart() === Infinity)) return;
+    const detail = opts.detail?.trim() ? `${CUT_DETAIL[reason]}\n\n${opts.detail.trim()}` : CUT_DETAIL[reason];
+    this.add<NoticeItem>({ type: 'notice', variant: 'info', text: 'Ended early', detail, early: reason, ts: at });
     if (open) this.endTurn(undefined, { hold: true });
   }
 

@@ -196,10 +196,10 @@ describe('how a turn ended: only the bridge says it was cut', () => {
       const cut = mk({ type: 'notice', variant: 'info', text: 'cut', early: 'closed', ts: t0 + 600_000 });
       const t3 = groups([u, a, b, cut])[0] as TurnGroup;
       expect(span(items([u, a, b, cut]), t3)).toBe(600_000);
-      // With the agent's record, as before: the wall time, or the agent's own figure where that is more.
+      // With the agent's record: its own figure (C12, day 7), never the wall time around it.
       const rec = mk({ type: 'turn', durationMs: 90_000, ts: t0 + 125_000 });
       const t4 = groups([u, a, rec])[0] as TurnGroup;
-      expect(span(items([u, a, rec]), t4)).toBe(125_000);
+      expect(span(items([u, a, rec]), t4)).toBe(90_000);
     });
   }
 });

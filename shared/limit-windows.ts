@@ -52,7 +52,11 @@ const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '');
  */
 export function windowForModel(l: RateLimit, model: string | { id?: string; name?: string } | undefined): boolean {
   const own = windowModel(l);
-  if (!own) return true;
+  return !own || matchesWindowModel(own, model);
+}
+
+/** Match a model from a refusal or a usage row against a picker id or name. */
+export function matchesWindowModel(own: string, model: string | { id?: string; name?: string } | undefined): boolean {
   const want = norm(own);
   const names = typeof model === 'string' ? [model] : model ? [model.id, model.name] : [];
   return !!want && names.some((x) => !!x && norm(x).includes(want));

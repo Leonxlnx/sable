@@ -79,37 +79,24 @@ const SWEEP_ARGS = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command'];
 
 function scheduleSweep(pid: number, startedAt: number) {
   sweepQueue.set(pid, startedAt);
-  if (sweepTimer) return;
-  sweepTimer = setTimeout(() => {
-    sweepTimer = null;
-    const entries = [...sweepQueue];
-    sweepQueue.clear();
-    try {
-      const p = spawn('powershell.exe', [...SWEEP_ARGS, sweepScript(entries)], { windowsHide: true, stdio: 'ignore' });
-      const t = setTimeout(() => p.kill(), 15_000);
-      t.unref();
-      p.on('error', () => clearTimeout(t));
-      p.on('exit', () => clearTimeout(t));
-      pendingSweeps.add(p);
-      p.on('exit', () => pendingSweeps.delete(p));
-    } catch {
-      /* best effort */
-    }
-  }, 150);
+  sweepTimer ??= setTimeout(flushSweep, 150);
 }
 
-const pendingSweeps = new Set<ChildProcess>();
+const pendingSweeps = new Set<Promise<void>>();
 
-/** Resolves once queued/running orphan sweeps are done (dispose and tests). */
-async function drainSweeps() {
+function flushSweep() {
   if (sweepTimer) clearTimeout(sweepTimer);
   sweepTimer = null;
   const entries = [...sweepQueue];
   sweepQueue.clear();
-  if (entries.length) {
-    spawnSync('powershell.exe', [...SWEEP_ARGS, sweepScript(entries)], { windowsHide: true, stdio: 'ignore', timeout: 15_000 });
-  }
-  await Promise.all([...pendingSweeps].map((p) => new Promise<void>((r) => (p.exitCode !== null ? r() : p.once('exit', () => r())))));
+  if (!entries.length) return;
+  const done = new Promise<void>(resolve => {
+    const p = spawn('powershell.exe', [...SWEEP_ARGS, sweepScript(entries)], { windowsHide: true, stdio: 'ignore', timeout: 15_000 });
+    p.once('error', () => resolve());
+    p.once('close', () => resolve());
+  }).catch(() => {});
+  pendingSweeps.add(done);
+  void done.then(() => pendingSweeps.delete(done));
 }
 
 function killRun(run: Run) {
@@ -347,9 +334,13 @@ export function registerTerm(app: App) {
     const runs = [...mine].map((id) => live.get(id)).filter((r): r is Run => !!r);
     for (const run of runs) {
       run.killed = true;
-      killSync(run.child);
-      if (process.platform === 'win32' && run.child.pid !== undefined) sweepQueue.set(run.child.pid, run.startedAt);
+      if (process.platform === 'win32' && run.child.pid !== undefined) {
+        killTree(run.child);
+        live.delete(run.id); // The asynchronous taskkill owns this tree, including across shell exit.
+        sweepQueue.set(run.child.pid, run.startedAt);
+      } else killSync(run.child);
     }
-    await drainSweeps();
+    flushSweep();
+    await Promise.all([...pendingSweeps]);
   });
 }

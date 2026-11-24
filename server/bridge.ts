@@ -76,11 +76,11 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
 
   return {
     app,
-    async dispose() {
+    async dispose(saved?: () => void) {
       http.off('upgrade', onUpgrade);
       for (const c of wss.clients) c.terminate();
       wss.close();
-      await app.dispose();
+      await app.dispose(saved);
     },
   };
 }

@@ -75,7 +75,7 @@ export function canReplace(bundle: string): boolean {
  * when Sable is not running from an app bundle it may replace; the zip is then shown in Finder so the
  * person can drag the new Sable into Applications by hand.
  */
-export function installMac(zip: string, opts: { execPath?: string; pid?: number } = {}): void {
+export function installMac(zip: string, opts: { execPath?: string; pid?: number } = {}) {
   const bundle = appBundleOf(opts.execPath ?? process.execPath);
   if (!bundle || !canReplace(bundle)) {
     try {
@@ -86,9 +86,9 @@ export function installMac(zip: string, opts: { execPath?: string; pid?: number 
     throw new Error(`Sable cannot replace itself here. Open ${path.basename(zip)} from the Finder window that appeared and drag Sable into Applications.`);
   }
   // An environment of its own: the system's tools only, nothing of this process's (no test overrides).
-  spawn('/bin/sh', ['-c', MAC_INSTALL_SCRIPT, 'sable-update', String(opts.pid ?? process.pid), zip, bundle], {
+  return spawn('/bin/sh', ['-c', MAC_INSTALL_SCRIPT, 'sable-update', String(opts.pid ?? process.pid), zip, bundle], {
     detached: true,
     stdio: 'ignore',
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: process.env.HOME ?? '/', TMPDIR: process.env.TMPDIR ?? '/tmp' },
-  }).unref();
+  });
 }

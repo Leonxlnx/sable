@@ -2,6 +2,7 @@ import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import nodeModule from 'node:module';
 import path from 'node:path';
+import { closeForQuit } from './quit';
 import { startServer, type RunningServer } from '../server/serve';
 import { installSignIn, signInHeld } from './sign-in';
 import { GuestLog } from './guest-log';
@@ -938,12 +939,16 @@ function customize(s: RunningServer) {
 }
 
 app.on('before-quit', (e) => {
-  if (quitting || !server) return;
+  if (!server) return;
   e.preventDefault();
+  if (quitting) return;
   quitting = true;
   if (win && !win.isDestroyed() && !screenshotFile) saveWindowState(win);
-  // Dispose the bridge (agent child processes exit) before the process goes; never hang on it.
-  void Promise.race([server.close(), sleep(3000)]).finally(() => app.exit(typeof process.exitCode === 'number' ? process.exitCode : 0));
+  if (win && !win.isDestroyed()) win.hide();
+  void closeForQuit(server.close).catch(err => {
+    console.error('[quit]', err);
+    process.exitCode = 1;
+  }).finally(() => app.exit(typeof process.exitCode === 'number' ? process.exitCode : 0));
 });
 // On a Mac closing the window leaves the app running in the Dock (agents keep working, the phone stays
 // connected); clicking the Dock icon opens a window again, Cmd+Q quits.
@@ -963,6 +968,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on('second-instance', (_e, argv) => {
+    if (quitting) return;
     // Started again with `--original`: the running app leaves the person's changes out from now on.
     if (argv.includes('--original') && server && server.ignoreCustom() && win && !win.isDestroyed()) win.webContents.reload();
     if (!win || win.isDestroyed()) {

@@ -5,7 +5,7 @@
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import type { Question, TextItem, ThinkingItem, Todo, ToolItem, UserItem } from '../../shared/protocol';
+import type { Question, TextItem, ThinkingItem, Todo, ToolItem, TurnItem, UserItem } from '../../shared/protocol';
 import { makeFileDiff } from '../../shared/diff';
 import * as C from './demo-codebase';
 import { COMMANDS, SKILLS, contextBreakdown } from './demo-catalog';
@@ -1986,10 +1986,104 @@ const notifications: Scenario = async ({ s }) => {
   arrive('<system-reminder>\nThe user ran local commands in the terminal. Nothing to answer.\n</system-reminder>');
 };
 
+/**
+ * Work that outlives its turn (day 7: "BITTE EIN INDIKATOR wenn du noch arbeitest auch subagents"):
+ * a dev server and a test watcher in the background, a monitor on the build and a workflow. The turn
+ * ends with all four at work; they end one by one while the chat rests, as the bridge marks them
+ * (`ToolItem.task`, the workflow's own status): the test watcher's notification opens a short wake
+ * turn, the workflow finishes, the monitor ends, and the dev server is stopped last, about a minute
+ * after the turn. The conversation's tail must say what still works the whole time.
+ */
+const outlive: Scenario = async ({ s }) => {
+  const tasks = path.join(tmpdir(), 'claude', 'relay-api', 'tasks');
+  await s.say('I will start the dev server and the test watcher in the background, watch the build, and run the fixes as a workflow.');
+  const command = async (taskId: string, cmd: string, description: string) => {
+    const t = await s.tool({ name: 'Bash', kind: 'bash', title: description, detail: { command: cmd, description, cwd: s.cwd }, input: { command: cmd, description, run_in_background: true } });
+    s.start(t);
+    await s.pause(120, 220);
+    s.complete(t, { text: `Command running in background with ID: ${taskId}. Output is being written to: ${path.join(tasks, `${taskId}.output`)}` });
+    s.patchTool(t, { task: { id: taskId, kind: 'command', state: 'running', since: Date.now() } });
+    return t;
+  };
+  const server = await command('b7dev01', 'pnpm dev', 'Start the dev server');
+  const watcher = await command('b7tst02', 'pnpm test --watch', 'Watch the tests');
+  const monitor = await s.tool({ name: 'Monitor', kind: 'other', title: 'Watch the build', detail: { description: 'Watch the build' }, input: { description: 'Watch the build' } });
+  s.start(monitor);
+  await s.pause(100, 160);
+  s.complete(monitor, { text: 'Monitoring the build output.' });
+  s.patchTool(monitor, { task: { id: 'm7bld03', kind: 'monitor', state: 'running', since: Date.now() } });
+  const phases = [
+    { title: 'Fix', detail: 'one agent per finding makes the change' },
+    { title: 'Verify', detail: 'run the tests and review the diff' },
+  ];
+  const wf = await s.tool({ name: 'Workflow', kind: 'agent', title: 'Fix and verify the auth findings', detail: { subagent: 'Workflow', description: 'Fix and verify the auth findings', background: true }, input: {} });
+  type Row = { index: number; label: string; phase: number; state: 'queued' | 'running' | 'done' | 'error'; startedAt?: number; tokens?: number; steps?: number; durationMs?: number; activity?: string };
+  const rows: Row[] = [
+    { index: 1, label: 'fix:limiter', phase: 1, state: 'running', startedAt: Date.now(), activity: 'Keying the limiter on the account' },
+    { index: 2, label: 'fix:expiry', phase: 1, state: 'running', startedAt: Date.now(), activity: 'Fixing SessionStore.size' },
+  ];
+  const t0 = Date.now();
+  const rt = s.rt;
+  const push = (phase: number, status: 'running' | 'done' = 'running') =>
+    rt.patch<ToolItem>(wf, {
+      workflow: { name: 'auth-fixes', phases, phase, agents: rows.map((r) => ({ ...r })), status, tokens: rows.reduce((n, r) => n + (r.tokens ?? 0), 0), steps: rows.reduce((n, r) => n + (r.steps ?? 0), 0), ...(status === 'done' ? { durationMs: Date.now() - t0 } : {}) },
+      ...(status === 'done' ? { result: { text: 'Workflow launched in the background.', agent: { background: 'done' as const } } } : {}),
+    });
+  push(1);
+  s.start(wf);
+  await s.pause(200, 300);
+  s.complete(wf, { text: 'Workflow launched in the background.', agent: { background: 'running' } });
+  await s.say('All four are running: the dev server, the test watcher, the build monitor and the workflow. I will pick each one up as it finishes.');
+  s.finish();
+
+  // After the turn, on the bridge's own clock: the script is gone once this returns, so the runtime is written directly.
+  const k = Math.max(0.05, Number(process.env.SABLE_DEMO_SPEED) || 1);
+  const at = (ms: number, fn: () => void) =>
+    setTimeout(() => {
+      try {
+        fn();
+      } catch {
+        /* the chat was closed or removed meanwhile */
+      }
+    }, ms / k).unref?.();
+  const end = (id: string, state: 'done' | 'failed' | 'stopped') => {
+    const it = rt.get<ToolItem>(id);
+    if (it?.task?.state === 'running') rt.patch<ToolItem>(id, { task: { ...it.task, state, endedAt: Date.now() } });
+  };
+  at(9_000, () => {
+    rows[0] = { ...rows[0], state: 'done', steps: 6, tokens: 21_400, durationMs: Date.now() - t0 };
+    rows[1] = { ...rows[1], steps: 4, tokens: 14_000, activity: 'Running the session tests' };
+    rows.push({ index: 3, label: 'verify', phase: 2, state: 'running', startedAt: Date.now(), activity: 'Reviewing the diff' });
+    push(2);
+  });
+  at(16_000, () => {
+    end(watcher, 'done');
+    // Its notification wakes the agent: a short turn of its own, then the chat rests again.
+    const wake = !rt.turnActive;
+    if (wake) rt.beginTurn('Reading the test results', { keepHold: true });
+    rt.add<UserItem>({ type: 'user', state: 'sent', text: taskNote({ id: 'b7tst02', toolUseId: watcher, status: 'completed', summary: 'Background command "Watch the tests" completed (exit code 0)', outputFile: path.join(tasks, 'b7tst02.output') }) });
+    at(1_400, () => {
+      rt.add<TextItem>({ type: 'text', text: 'The test watcher is done: 214 passed. The workflow, the build monitor and the dev server are still at work.', streaming: false });
+      if (wake) {
+        rt.add<TurnItem>({ type: 'turn', durationMs: 1_400, stopReason: 'end_turn' });
+        rt.endTurn();
+      }
+    });
+  });
+  at(28_000, () => {
+    rows[1] = { ...rows[1], state: 'done', steps: 9, tokens: 26_000, durationMs: Date.now() - t0 };
+    rows[2] = { ...rows[2], state: 'done', steps: 5, tokens: 18_200, durationMs: Date.now() - t0 };
+    push(2, 'done');
+  });
+  at(40_000, () => end(monitor, 'done'));
+  at(60_000, () => end(server, 'stopped'));
+};
+
 // ─────────────────────────────────── selection ──────────────────────────────────
 
 export const SCENARIOS = {
   flagship,
+  outlive,
   plan,
   questions,
   agents,
@@ -2038,6 +2132,8 @@ const KEYWORDS: [RegExp, ScenarioId][] = [
   [/\buntil[\s-]+green\b/i, 'untilSetup'],
   // Background tasks finishing and local commands, as Claude Code writes them in the person's place.
   [/\bnotifications?\b/i, 'notifications'],
+  // Work that goes on after its turn: background commands, a monitor, a workflow (day 7).
+  [/\b(outlive|lingering)\b/i, 'outlive'],
   // Before / after captures of a local page (demo-site.ts).
   [/\bbefore\s*\/?\s*after\b|\bbeforeafter\b/i, 'beforeafter'],
   // Signing in on a page in the Browser tab, watched (demo-portal.ts): before the plain browser tools.

@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -51,7 +51,7 @@ export function inside(root: string, child: string, platform: NodeJS.Platform = 
   const p = api(platform);
   const fold = (s: string) => (platform === 'win32' ? p.resolve(s).toLowerCase() : p.resolve(s));
   const rel = p.relative(fold(root), fold(child));
-  return rel === '' || (!rel.startsWith('..') && !p.isAbsolute(rel));
+  return rel !== '..' && !rel.startsWith('..' + p.sep) && !p.isAbsolute(rel);
 }
 
 /** The PATH entries a lookup may use: absolute ones only, in order, none inside `outside`. */
@@ -103,6 +103,27 @@ function realHome(): string {
 const found = new Map<string, { at: number; real: string; list: string[] }>();
 const FOUND_MS = 5000;
 
+/** A linked worktree's .git file points into the shared repository. Its checkout can supply
+ * linked dependencies, so programs there are project programs too. Read only Git's path files. */
+function sharedCheckout(top: string): string[] {
+  const marker = path.join(top, '.git');
+  try {
+    const st = statSync(marker);
+    if (!st.isFile() || st.size > 8192) return [];
+    const pointer = /^gitdir: (.+)\r?\n?$/.exec(readFileSync(marker, 'utf8'));
+    if (!pointer) return [];
+    let dir = defaultReal(path.resolve(top, pointer[1].trimEnd()));
+    while (dir !== path.dirname(dir)) {
+      if (path.basename(dir) === '.git') {
+        const checkout = path.dirname(dir);
+        return inside(checkout, realHome()) || checkout === path.dirname(checkout) ? [] : [checkout];
+      }
+      dir = path.dirname(dir);
+    }
+  } catch { /* no shared checkout */ }
+  return [];
+}
+
 /**
  * The folders a tool that works in `dir` must not come from: the folder (as named and as it really
  * is) and the checkout it belongs to. Asked for every git and gh call, so the folder's real path is
@@ -117,7 +138,7 @@ export function projectFolders(dir: string, now = Date.now()): string[] {
   const known = found.get(start);
   if (known && known.real === realDir && now - known.at < FOUND_MS) return known.list;
   const top = checkoutTop(start, { realDir });
-  const list = [...new Set([start, realDir, ...(top ? [top] : [])])];
+  const list = [...new Set([start, realDir, ...(top ? [top, ...sharedCheckout(top)] : [])])];
   if (top) {
     if (found.size >= 128) found.clear();
     found.set(start, { at: now, real: realDir, list });

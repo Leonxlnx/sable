@@ -510,15 +510,15 @@ export const signInBackgroundNote = (names: string[]) => (names.length ? `${SIGN
  */
 const LOST_TASKS_HEAD = '\n\nSable lost track of these background tasks when the agent process that ran them went away: ';
 const LOST_TASKS_TAIL = '. They may have ended with it or may still be running, and no notification will come for them. Check what they left (their output, ports, files) before you start any of them again.';
-// Known only as the last words before any trailing wrapper or the Browser tab's line: the same words in the middle of a message stay the person's.
-const LOST_TASKS = /\n\nSable lost track of these background tasks when the agent process that ran them went away: [^\n]{1,4000}\. They may have ended with it or may still be running, and no notification will come for them\. Check what they left \(their output, ports, files\) before you start any of them again\.(?=\s*(?:$|<(?:system-reminder|system_reminder)[\s>]|\[Sable: ))/;
+// After the harness wrappers and Browser line come off, only the provider's file attachments may follow.
+const LOST_TASKS = /(?:^|\n\n)Sable lost track of these background tasks when the agent process that ran them went away: [^\n]{1,4000}\. They may have ended with it or may still be running, and no notification will come for them\. Check what they left \(their output, ports, files\) before you start any of them again\.\s*(?=$|\n\n(?:@\S|\[Attached file: |<attachment[\s>]))/;
 export const lostTasksNote = (names: string[]) => (names.length ? `${LOST_TASKS_HEAD}${names.join('; ')}${LOST_TASKS_TAIL}` : '');
 
 const SABLE_OPENERS = ['This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, 'The check `'];
 const HANDOVER_HEAD = /^(?:This continues a conversation (?:that started under another account|the user had with [^\n]{1,200} in this folder)|Since your last reply here, the user went on with [^\n]{1,200} in this conversation)\. Here is what happened (?:so far|since), oldest first:\n/;
 /** The whole of an `/until` round's failure (server/core/until.ts `failureMessage`): its head, then the output fenced or "It printed nothing.", and nothing after: the output ends at the first line that is the closing fence, so words and a fenced block of the person's own after a pasted failure stay theirs. */
 const UNTIL_FAILURE = /^The check `[^`\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n(?:(?!\1[ \t]*(?:\n|$))[^\n]*\n)*\1)$/;
-const BROWSER_LINE = /\n\n\[Sable: the user's Browser tab shows \S+?(?: titled "[^"\n]*")?\. browser_read reads it\.\]\s*$/;
+const BROWSER_LINE = /\n\n\[Sable: the user's Browser tab shows \S+?(?: titled "[^"\n]*")?\. browser_read reads it\.\]\s*(?=$|\n\n(?:@\S|\[Attached file: |<attachment[\s>]))/;
 
 /** A whole message of Sable's own (a turn carried on, an /until round): the message, else ''. */
 function sableMessage(lead: string): string {
@@ -548,16 +548,15 @@ function withoutHandover(text: string): string {
   return /^[^\n]*\n(?:User|Agent): /.test(text) ? '' : text;
 }
 
-/** Whether a message holds words Sable added to the person's (a handover, a carry-on trailer, the Browser tab's line, the note of lost tasks). */
-const SABLE_ADDED = (text: string) => HANDOVER_HEAD.test(text.trimStart()) || text.includes(RESUME_SUMMARY_TRAILER) || BROWSER_LINE.test(text) || RESUME_BACKGROUND.test(text) || LOST_TASKS.test(text);
-
 /** A person's message without the wrappers the harness may have added to it, nor the words Sable added. */
 export function stripWrappers(text: string): string {
-  let out = text;
-  if (SABLE_ADDED(out)) out = withoutHandover(out.replace(/\r\n?/g, '\n').trimStart()).replace(BROWSER_LINE, '').replace(LOST_TASKS, '').replace(RESUME_BACKGROUND, '').replace(RESUME_SUMMARY_TRAILER, '');
-  if (!out.includes('<')) return out === text ? text : out.trim();
-  for (const tag of STRIP_TAGS) out = out.replace(new RegExp(`<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?(?:</${tag}>|$)`, 'g'), '');
-  return out === text ? text : out.trim();
+  const src = text.replace(/\r\n?/g, '\n');
+  let out = HANDOVER_HEAD.test(src.trimStart()) ? withoutHandover(src.trimStart()) : src;
+  if (out.includes('<')) {
+    for (const tag of STRIP_TAGS) out = out.replace(new RegExp(`<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?(?:</${tag}>|$)`, 'g'), '');
+  }
+  out = out.replace(BROWSER_LINE, '').replace(LOST_TASKS, '').replace(RESUME_BACKGROUND, '').replace(RESUME_SUMMARY_TRAILER, '');
+  return out === src ? text : out.trim();
 }
 
 /** The words of a user message for lists, titles, search and summaries: plain, whatever wrote it. */
@@ -577,9 +576,7 @@ export function userItemText(item: { type: string; text?: string }): string {
  * `<task-notification>`): its plain words, '' when nothing readable is left.
  */
 export function readableTitle(title: string): string {
-  if (!title.includes('<') && !maybeSynthetic(title)) return title;
-  const s = parseSynthetic(title);
-  const line = s ? syntheticLine(s) : stripWrappers(title);
+  const line = userText(title);
   if (line === title) return title;
   const one = line.replace(/\s+/g, ' ').trim();
   return one.length > 56 ? `${one.slice(0, 54).trimEnd()}…` : one;

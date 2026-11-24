@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -63,12 +63,34 @@ export class Store {
   private sessionTimers = new Map<string, NodeJS.Timeout>();
   private sessionPending = new Map<string, () => SessionSave>();
   /** Sable is going down: nothing more is written (`seal`). */
-  private sealed = false;
+  private sealed?: Promise<void>;
+  private unreadableState = false;
+  private writingState: Promise<void> = Promise.resolve();
+  /** Frozen item versions shared by concurrent saves until the runtime marks the item dirty. */
+  private savedItems = new WeakMap<TimelineItem, TimelineItem>();
+  private activeSaves = new Map<string, SessionSave>();
 
   constructor(dir?: string) {
     this.dir = dir ?? process.env.SABLE_HOME ?? path.join(homedir(), '.sable');
     mkdirSync(path.join(this.dir, 'sessions'), { recursive: true });
-    this.state = this.readJson<StateFile>(this.statePath) ?? { projects: [], settings: { ...DEFAULT_SETTINGS }, sessions: [], accounts: [] };
+    this.state = this.readState() ?? { projects: [], settings: { ...DEFAULT_SETTINGS }, sessions: [], accounts: [] };
+    this.normalizeState();
+  }
+
+  get registryUnavailable() { return this.unreadableState; }
+
+  reloadRegistry(): boolean {
+    if (!this.unreadableState) return true;
+    if (this.sealed) return false;
+    const restored = this.readState();
+    if (!restored) return false;
+    this.state = restored;
+    this.normalizeState();
+    this.unreadableState = false;
+    return true;
+  }
+
+  private normalizeState() {
     const saved = (this.state.settings && typeof this.state.settings === 'object' ? this.state.settings : {}) as Partial<AppSettings>;
     // A config the user already has is never rebuilt from the old switches below.
     const hadBackdrop = !!saved.backdropConfig && typeof saved.backdropConfig === 'object';
@@ -109,11 +131,13 @@ export class Store {
     return path.join(this.dir, 'sessions', `${id}.json`);
   }
 
-  private readJson<T>(file: string): T | null {
+  private readState(): StateFile | null {
     try {
-      if (!existsSync(file)) return null;
-      return JSON.parse(readFileSync(file, 'utf8')) as T;
-    } catch {
+      const state = JSON.parse(readFileSync(this.statePath, 'utf8'));
+      if (!plain(state)) throw new Error('Invalid session registry');
+      return state as unknown as StateFile;
+    } catch (err) {
+      this.unreadableState ||= (err as NodeJS.ErrnoException).code !== 'ENOENT';
       return null;
     }
   }
@@ -135,17 +159,18 @@ export class Store {
     const data = this.pending.get(file);
     if (!data) return;
     this.pending.delete(file);
-    try {
+    const contents = JSON.stringify(data());
+    this.writingState = this.writingState.catch(() => {}).then(async () => {
       const tmp = `${file}.${process.pid}.tmp`;
-      await writeFile(tmp, JSON.stringify(data()), 'utf8');
+      await writeFile(tmp, contents, 'utf8');
       await rename(tmp, file);
-    } catch {
-      /* best effort */
-    }
+    });
+    if (this.sealed) await this.writingState;
+    else await this.writingState.catch(() => {});
   }
 
   saveState() {
-    this.schedule(this.statePath, () => this.state, 400);
+    if (!this.unreadableState) this.schedule(this.statePath, () => this.state, 400);
   }
 
   loadSession(id: string): SessionData {
@@ -175,14 +200,42 @@ export class Store {
     const data = this.sessionPending.get(id);
     if (!data) return Promise.resolve();
     this.sessionPending.delete(id);
-    return this.sessionFiles.save(id, data);
+    const save = data();
+    const items = save.items.map(item => {
+      let copy = this.savedItems.get(item);
+      if (!copy || save.dirty === 'all' || save.dirty.has(item.id)) {
+        // Keep immutable strings (including large tool output) shared. Freeze nested
+        // payloads too: a task or attachment can change while an older base is writing.
+        copy = { ...item };
+        for (const [key, value] of Object.entries(copy)) {
+          if (value && typeof value === 'object') Object.assign(copy, { [key]: structuredClone(value) });
+        }
+        this.savedItems.set(item, copy);
+      }
+      return copy;
+    });
+    const snapshot = { items, dirty: save.dirty === 'all' ? 'all' as const : new Set(save.dirty), todos: structuredClone(save.todos), queue: structuredClone(save.queue) };
+    this.activeSaves.set(id, snapshot);
+    return this.sessionFiles.save(id, () => snapshot, !!this.sealed).finally(() => {
+      if (this.activeSaves.get(id) === snapshot && !this.sessionFiles.needsRetry(id)) this.activeSaves.delete(id);
+    });
+  }
+
+  /** SessionFiles retries failed writes on the next save. Only acknowledge a restart notice seen on disk. */
+  async savedRestartNotice(id: string, notice: string): Promise<boolean> {
+    await this.flushSession(id);
+    const reader = new SessionFiles((key) => this.sessionPath(key));
+    const file = await reader.loadAsync(id);
+    return !file.unreadable && file.items.some((i) => i.id === notice && i.type === 'notice' && i.early === 'restart');
   }
 
   deleteSession(id: string) {
+    if (this.sealed) return;
     const t = this.sessionTimers.get(id);
     if (t) clearTimeout(t);
     this.sessionTimers.delete(id);
     this.sessionPending.delete(id);
+    this.activeSaves.delete(id);
     this.sessionFiles.remove(id);
   }
 
@@ -195,16 +248,31 @@ export class Store {
       clearTimeout(t);
       this.sessionTimers.delete(id);
     }
-    await Promise.all([...[...this.pending.keys()].map((f) => this.flushFile(f)), ...[...this.sessionPending.keys()].map((id) => this.flushSession(id))]);
-    await this.sessionFiles.idle();
+    const writes = [
+      ...[...this.pending.keys()].map(f => this.flushFile(f)),
+      ...[...this.sessionPending.keys()].map(id => this.flushSession(id)),
+      this.sealed ? this.writingState : this.writingState.catch(() => {}),
+      this.sessionFiles.idle(),
+    ];
+    const failed = (await Promise.allSettled(writes)).find(r => r.status === 'rejected');
+    if (failed) throw failed.reason;
   }
 
   /**
-   * Writes nothing from here on (after a last `flush`): Sable is going down, and every chat stays on
-   * disk as it stood then. What closing the agents changes in them afterwards is said when each chat
-   * is read again, as after a crash (app.ts `dispose`).
+   * Capture the quit boundary before yielding. Older writes finish first. Their data and the
+   * debounced changes get one final snapshot independent of subsequent provider events.
    */
-  seal() {
-    this.sealed = true;
+  seal(): Promise<void> {
+    if (this.sealed) return this.sealed;
+    this.sealed = Promise.resolve(); // Freeze before reading the pending callbacks.
+    if (!this.unreadableState) this.pending.set(this.statePath, () => this.state);
+    const retries = [...this.activeSaves]
+      .filter(([id]) => !this.sessionPending.has(id))
+      .map(([id, snapshot]) => this.sessionFiles.retryAfterWrite(id, snapshot));
+    this.sealed = Promise.allSettled([this.flush(), ...retries]).then(results => {
+      const failed = results.find(r => r.status === 'rejected');
+      if (failed) throw failed.reason;
+    });
+    return this.sealed;
   }
 }

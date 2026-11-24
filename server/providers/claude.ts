@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
   query as sdkQuery,
@@ -49,7 +50,7 @@ import type {
   TurnItem,
   UserItem,
 } from '../../shared/protocol';
-import { lostLine, type LostWhy, type MessageOutcome, type SessionRuntime } from '../core/runtime';
+import { lostLine, type BackgroundLimit, type LostWhy, type MessageOutcome, type SessionRuntime } from '../core/runtime';
 import type { TitlePrompt } from '../core/titles';
 import { dropRemote, holdRemote, idleSince, type RemoteHolder } from '../core/remote-keep';
 import { claudeForkPoint, cutAt } from '../core/fork';
@@ -59,7 +60,7 @@ import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoic
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
-import { isAuthFailure, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
+import { HANDOVER_JOIN, isAuthFailure, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled, cleanToolInput, streamsInput } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
@@ -78,6 +79,9 @@ type Obj = Record<string, any>;
  * sign-in. The options' own stderr callback still gets what the process writes there.
  */
 const query: typeof sdkQuery = (p) => sdkQuery({ ...p, options: { ...p.options, spawnClaudeCodeProcess: p.options?.spawnClaudeCodeProcess ?? authGate.spawner(p.options?.stderr) } });
+
+// All accounts use the same installed binary. Sessions opened before a named result learn it too.
+const seenCli = { names: false };
 
 const IDLE_CLOSE_MS = 8 * 60_000;
 /**
@@ -291,7 +295,7 @@ export class ClaudeProvider implements Provider {
    * session runs the same binary, so a chat's first result after Sable started is read with what the
    * others already showed (review of 23 Nov, D-own).
    */
-  readonly seen = { names: false };
+  readonly seen = seenCli;
   /** The account's own config folder; undefined for the built-in default account. */
   private readonly configDir?: string;
 
@@ -623,7 +627,7 @@ export class ClaudeProvider implements Provider {
     if (!existsSync(choice.cwd)) return;
     const input = new PushQueue<SDKUserMessage>();
     const owner: WarmOwner = {};
-    const q = query({ prompt: input, options: this.agentOptions({ ...choice, model: choice.model ?? '', mode: choice.mode ?? 'default' }, owner) });
+    const q = sessionQuery(input, this.agentOptions({ ...choice, model: choice.model ?? '', mode: choice.mode ?? 'default' }, owner), owner);
     const timer = setTimeout(() => void this.discardWarm(), WARM_TTL_MS);
     timer.unref?.();
     this.warm = { key, q, input, owner, timer };
@@ -1142,6 +1146,33 @@ const COMPUTER_USE_SERVER = 'computer-use';
 /** Who answers permission prompts for an agent process (set when a session adopts a warm one). */
 interface WarmOwner {
   session?: ClaudeSession;
+  childExited?: Promise<void>;
+  streamEnded?: () => void;
+}
+
+/** Capture the actual process even when it starts asynchronously or is adopted from the warm pool. */
+function sessionQuery(prompt: PushQueue<SDKUserMessage>, options: Options, owner: WarmOwner): Query {
+  const spawnProcess = options.spawnClaudeCodeProcess ?? authGate.spawner(options.stderr);
+  let spawned = false;
+  let exit!: () => void;
+  owner.childExited = new Promise<void>((resolve) => { exit = resolve; });
+  // A query that failed before spawning has no child to wait for.
+  owner.streamEnded = () => { if (!spawned) exit(); };
+  return query({
+    prompt,
+    options: {
+      ...options,
+      spawnClaudeCodeProcess(request) {
+        const child = spawnProcess(request);
+        spawned = true;
+        child.once('exit', exit);
+        child.once('error', (err) => {
+          if (/^spawn(?: |$)/.test((err as NodeJS.ErrnoException).syscall ?? '')) exit();
+        });
+        return child;
+      },
+    },
+  });
 }
 
 /** Everything a process is started with: a warm process is only reused for the same choice. */
@@ -1202,7 +1233,13 @@ function mapMcp(s: Obj): McpServerInfo {
 
 interface StreamState {
   messageId?: string;
-  blocks: Map<number, { itemId: string; type: 'text' | 'thinking' | 'tool'; name?: string; json: string; peeked?: string }>;
+  blocks: Map<number, { itemId: string; type: 'text' | 'thinking' | 'tool'; name?: string; json: string; peeked?: string; confirmed?: boolean }>;
+}
+
+type UserPayload = Pick<UserItem, 'text' | 'attachments'>;
+
+function samePayload(a: UserPayload, b: UserPayload) {
+  return a.text === b.text && isDeepStrictEqual(a.attachments ?? [], b.attachments ?? []);
 }
 
 /** A message a session sent, as it remembers it (`ClaudeSession.own`). */
@@ -1218,15 +1255,23 @@ interface OwnSend {
   /** Claude Code took it (replayed, stamped on a reply, or found by its words); and replayed it under its own uuid. */
   read: boolean;
   replayed: boolean;
+  answered?: boolean;
+  guessed?: boolean;
+  onTaken?: () => void;
+  uncertain?: () => void;
+  release?: () => void;
+  /** Exact Sable-added blocks that can distinguish a replay from an identical app message. */
+  proofBlocks: string[];
+  /** Root text crossed by a delayed replay, in case the result identifies it as this send's reply. */
+  crossed?: string[];
   /** A replay under another uuid taken for it by its words: the app's own message after all if this one comes back under its own (`unalias`). */
-  alias?: { uuid: string; text: string; attachments?: Attachment[]; at: number };
+  alias?: { uuid: string; text: string; attachments?: Attachment[]; at: number; after?: string; identified: boolean; answer?: { outcome: MessageOutcome; resultId?: string } };
 }
 
 class ClaudeSession implements ProviderSession {
   private q?: Query;
   private input?: PushQueue<SDKUserMessage>;
   private streams = new Map<string, StreamState>();
-  private streamedMessages = new Set<string>();
   private pendingUsers = new Map<string, string>(); // sdk uuid → UserItem id
   /**
    * Every message this session sent, by the uuid it went with (review of 23 Nov, D-own): its card, its
@@ -1251,9 +1296,11 @@ class ClaudeSession implements ProviderSession {
    */
   private wakes = 0;
   /** This CLI names the messages a result answers (`user_message_uuids`, or `user_message_uuid`); older ones do not. */
-  private namesMessages = false;
+  private get namesMessages() { return this.provider.seen.names; }
   /** A message of ours Claude Code replayed under another uuid (a folded steer): its uuid there → ours. */
   private aliases = new Map<string, string>();
+  /** A later replay can bind an unfamiliar result UUID to any of the inputs still awaiting an answer then. */
+  private unmatchedResults = new Map<string, { pending: Set<string>; turn: number; before: string; result: string; error?: string; final?: string }>();
   /** Our messages whose result has not come yet, by sdk uuid → UserItem id: each result says what its messages came to (`rt.answered`). */
   private sentItems = new Map<string, string>();
   /**
@@ -1262,7 +1309,7 @@ class ClaudeSession implements ProviderSession {
    * is shown as it went, and its copy in the queue is taken out (never sent twice) unless the person
    * changed it there since; sent again from the queue meanwhile, the card that went is this one too.
    */
-  private withdrawn = new Map<string, { itemId: string; text: string; attachments?: UserItem['attachments']; at: number }>();
+  private withdrawn = new Map<string, { itemId: string; text: string; attachments?: UserItem['attachments']; steered?: boolean; at: number }>();
   /** The CLI's own state (session_state_changed), as last reported. */
   private cliState?: 'idle' | 'running' | 'requires_action';
   private interrupted = false;
@@ -1276,7 +1323,7 @@ class ClaudeSession implements ProviderSession {
    * that names only such messages, or (naming none) the next one owed, is that settled turn's, come
    * late (`late`), and pays for those messages only.
    */
-  private owed: Map<string, string>[] = [];
+  private owed: { names: Map<string, string>; notices: Map<string | undefined, string>; window?: BackgroundLimit; wakeReported: boolean }[] = [];
   /**
    * Messages held back from the process (`hold`): a result it still owes (`owed`) could not be told
    * from theirs, and it cannot be let go for a new one while background tasks run in it. They go once
@@ -1304,7 +1351,11 @@ class ClaudeSession implements ProviderSession {
   private taskInfo = new Map<string, { kind: TaskKind; since: number }>();
   /** Tasks whose end was heard: a start that comes after its end never marks one running again. */
   private endedTasks = new Set<string>();
-  private listTimer?: NodeJS.Timeout;
+
+  private taskRuns = new Map<string, string>();
+  private taskEndUntil = 0;
+  private taskEndTimer?: NodeJS.Timeout;
+  private restartTimer?: NodeJS.Timeout;
   /**
    * The step each task of this process belongs to (task id to item id), from the task events that named
    * it: a task's end that names no step still finds it, and the live task list settles a step whose task
@@ -1329,9 +1380,8 @@ class ClaudeSession implements ProviderSession {
   private releaseTimer?: NodeJS.Timeout;
   /** Let go by the bridge (`close`): it never starts a process again, so a message meant for it never reaches the account the chat left. */
   private retired = false;
-  /** The end of each process's stream (`pump`), and of the one let go last (`exited`). */
-  private exits = new WeakMap<object, Promise<void>>();
-  private leaving?: Promise<void>;
+  /** Children which may still be writing this session's transcript, including after SDK cleanup. */
+  private exits = new Set<Promise<void>>();
   /**
    * The CLI's running total (`total_cost_usd`) as last seen in this process, which each result's cost
    * is counted from (review of 23 Nov, D-cost). A process that resumes a conversation starts from the
@@ -1364,7 +1414,54 @@ class ClaudeSession implements ProviderSession {
   liveCaps = false;
   /** This turn was refused at a plan limit: the window that refused it, and the notice that says so. */
   private limitHit?: { resetsAt?: number; window?: string };
-  private limitNoticeId?: string;
+  /** Each independently refused input keeps its own retry card until this turn settles. */
+  private turnLimits = new Map<string | undefined, string>();
+  private wakeLimit?: { hit: BackgroundLimit; provisional?: string };
+  /** An idle/frame-only refusal was already handed off, but the CLI can still send its closing result. */
+  private limitResultOwed = false;
+
+  private autonomousTurn(): boolean {
+    if (!this.rt.turnActive || this.agentTurnAt !== this.rt.turnStartedAt) return false;
+    for (const delivery of this.awaiting.values()) if (delivery.read) return false;
+    return true;
+  }
+
+  private refusal(words: string, event = this.limitHit): BackgroundLimit {
+    const named = agentLimitOf(words);
+    const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(words)?.[1]));
+    const detail = words.replace(/\|\d{9,13}\b/, '').trim();
+    const window = named?.window === 'Plan limit' ? event?.window ?? named.window : named?.window ?? event?.window;
+    const eventReset = !event?.window || event.window === window ? event?.resetsAt : undefined;
+    return { window, resetsAt: eventReset ?? stamp ?? named?.resetsAt, ...(detail && !isStandIn(detail) ? { detail } : {}) };
+  }
+
+  /** Reuse a pending limit card for the person's turn and fill in any window learned later. */
+  private showTurnLimit({ window, resetsAt, detail }: BackgroundLimit, uuid?: string, notices = this.turnLimits) {
+    const rt = this.rt;
+    const own = uuid && this.own.get(this.aliases.get(uuid) ?? uuid);
+    const card = own ? rt.get(own.itemId) : uuid ? rt.items.findLast((i) => i.type === 'user' && i.providerId === uuid) : undefined;
+    const owner = card?.type === 'user' ? { origin: 'user' as const, userItemId: card.id } : {};
+    const key = uuid ? this.aliases.get(uuid) ?? uuid : undefined;
+    const existing = notices.get(key) ?? notices.get(undefined);
+    const pending = !existing && notices === this.turnLimits && this.openLimitCard(window);
+    const id = existing ?? (pending || undefined);
+    const notice = id ? rt.get<NoticeItem>(id) : undefined;
+    if (!notice?.limit) {
+      const added = rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: errorLabel('rate_limit'), detail, limit: { window, resetsAt, ...owner } });
+      notices.set(key, added.id);
+      return added;
+    }
+    notices.delete(undefined);
+    notices.set(key, notice.id);
+    const limit = { ...notice.limit, ...owner, window: notice.limit.window ?? window, resetsAt: notice.limit.resetsAt ?? resetsAt };
+    if (pending) {
+      rt.limitCard = undefined;
+      rt.move(notice.id, { detail: detail ?? notice.detail, limit });
+    } else if (limit.window !== notice.limit.window || limit.resetsAt !== notice.limit.resetsAt || limit.userItemId !== notice.limit.userItemId) {
+      rt.patch<NoticeItem>(notice.id, { limit });
+    }
+    return notice;
+  }
 
   /** When this chat was last used (a message, a turn's end, Remote Control on): for the Remote Control keeper. */
   private lastActive = Date.now();
@@ -1375,8 +1472,6 @@ class ClaudeSession implements ProviderSession {
     private rt: SessionRuntime,
     private provider: ClaudeProvider,
   ) {
-    // What the CLI was seen to do in another chat holds for this one (the same binary).
-    this.namesMessages = provider.seen.names;
     this.remoteHolder = {
       id: rt.id,
       lastActive: () => this.lastActive,
@@ -1405,7 +1500,7 @@ class ClaudeSession implements ProviderSession {
   holdsWork(): boolean {
     if (this.rt.turnActive) return true;
     if (!this.q) return false;
-    return this.worksNow() || this.wakeDue();
+    return this.worksNow() || this.wakeDue() || Date.now() < this.taskEndUntil;
   }
 
   /** Work running in the process now, a turn aside: a prompt open, the CLI's own word that it works, a live task. */
@@ -1434,6 +1529,14 @@ class ClaudeSession implements ProviderSession {
     return out;
   }
 
+  private *backgroundTasks() {
+    for (const id of this.liveIds()) {
+      if (this.foreground.has(id)) continue;
+      const info = this.taskInfo.get(id);
+      yield { id, itemId: this.taskItems.get(id), agent: info?.kind === 'agent', since: info?.since };
+    }
+  }
+
   /** The next wake-up the agent scheduled in this process that is not yet past its grace. */
   private wakeAt(now = Date.now()): number | undefined {
     let at: number | undefined;
@@ -1451,27 +1554,29 @@ class ClaudeSession implements ProviderSession {
    * and workflows, background commands and monitors (and any other task that is not ambient), when the
    * oldest of those commands began, and its next scheduled wake-up. Nothing without a process.
    */
-  liveWork(): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; wakeAt?: number } {
+  liveWork(): ReturnType<NonNullable<ProviderSession['liveWork']>> {
     if (!this.q) return { turn: false, agents: 0, commands: 0 };
     let agents = 0;
     let commands = 0;
     let oldest: number | undefined;
-    for (const id of this.liveIds()) {
-      // A task a call blocks on is that call's, and so the turn's.
-      if (this.foreground.has(id)) continue;
-      const info = this.taskInfo.get(id);
-      if (info?.kind === 'agent') agents++;
+    let newest: number | undefined;
+    for (const task of this.backgroundTasks()) {
+      if (task.agent) agents++;
       else {
         commands++;
-        if (info) oldest = Math.min(oldest ?? info.since, info.since);
+        if (task.since !== undefined) {
+          oldest = Math.min(oldest ?? task.since, task.since);
+          newest = Math.max(newest ?? task.since, task.since);
+        }
       }
     }
     const wakeAt = this.wakeAt();
     // The CLI says it runs for as long as its background agents run (its idle comes once they are
     // done, sdk.d.ts): that is their work, counted as agents, not a turn. Read as a turn it would hold
     // a move at a limit off the very agents that move stops, and a send after a sign-in for minutes.
-    const turn = this.rt.turnActive || (this.cliBusy() && !agents);
-    return { turn, agents, commands, ...(oldest !== undefined ? { oldestCommandAt: oldest } : {}), ...(wakeAt !== undefined ? { wakeAt } : {}) };
+    const turn = this.rt.turnActive || this.promptsOpen() || this.foreground.size > 0 || (this.cliBusy() && !agents);
+    return { turn, agents, commands, ...(oldest !== undefined ? { oldestCommandAt: oldest, newestCommandAt: newest } : {}), ...(wakeAt !== undefined ? { wakeAt } : {}),
+      ...(Date.now() < this.taskEndUntil ? { notificationUntil: this.taskEndUntil } : {}) };
   }
 
   /** Whether the open turn runs in this session's process: a close ends no turn of another's (review of 23 Nov, D2). */
@@ -1480,13 +1585,13 @@ class ClaudeSession implements ProviderSession {
   }
 
   /**
-   * Resolves once the process let go last has really ended (its stream is over); rejects when it has
-   * not after `EXIT_WAIT_MS`, so a move never copies a transcript its process may still be writing
+   * Resolves once the children of this handle have exited. Rejects when a child has
+   * still not exited after `EXIT_WAIT_MS`, so a move never copies a transcript it may still be writing
    * (app.ts `moveAccount`).
    */
   exited(): Promise<void> {
-    const p = this.leaving;
-    if (!p) return Promise.resolve();
+    if (!this.exits.size) return Promise.resolve();
+    const p = Promise.all(this.exits);
     return new Promise<void>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('The agent process has not ended yet.')), EXIT_WAIT_MS);
       void p.then(() => {
@@ -1501,8 +1606,12 @@ class ClaudeSession implements ProviderSession {
     if (names.length) this.rt.notice('info', lostLine(names.length, why), names.join('\n'));
   }
 
-  /** A process's tasks and wake-ups are its own: a new or ended one has none. */
-  private forgetTasks() {
+  /** Tasks, wakes, pending option changes and unmatched frames belong to one query. */
+  private resetProcessState() {
+    this.wakeLimit = undefined;
+    this.limitResultOwed = false;
+    this.limitHit = undefined;
+    this.turnLimits = new Map();
     this.liveTasks.clear();
     this.foreground.clear();
     this.level = undefined;
@@ -1510,9 +1619,17 @@ class ClaudeSession implements ProviderSession {
     this.taskInfo.clear();
     this.endedTasks.clear();
     this.taskItems.clear();
+    this.streams.clear();
+    this.taskRuns.clear();
+    this.unmatchedResults.clear();
+    this.taskEndUntil = 0;
+    this.rt.setReportedTasks([]);
+    this.restartPending = undefined;
+    this.restartTold = false;
+    clearTimeout(this.restartTimer);
+    clearTimeout(this.taskEndTimer);
     this.loopWakeAt = undefined;
     this.cronWakes.clear();
-    clearTimeout(this.listTimer);
     clearTimeout(this.releaseTimer);
   }
 
@@ -1541,14 +1658,14 @@ class ClaudeSession implements ProviderSession {
     const warm = !meta.providerSessionId && !this.resumeAt ? this.provider.takeWarm(warmKey(meta, this.provider.concise(), this.provider.widgets(), this.provider.profileText())) : undefined;
     let q: Query;
     let input: PushQueue<SDKUserMessage>;
+    const owner: WarmOwner = warm?.owner ?? {};
+    owner.session = this;
     if (warm) {
-      warm.owner.session = this;
       ({ q, input } = warm);
       this.log('claude: adopted the prewarmed agent process');
     } else {
       input = new PushQueue<SDKUserMessage>();
-      const owner: WarmOwner = { session: this };
-      q = query({ prompt: input, options: this.provider.agentOptions(meta, owner, this.resumeAt) });
+      q = sessionQuery(input, this.provider.agentOptions(meta, owner, this.resumeAt), owner);
     }
     this.booting = !warm;
     this.resumeAt = undefined;
@@ -1565,12 +1682,12 @@ class ClaudeSession implements ProviderSession {
     this.liveCaps = false;
     // A new process owes no result of the last one's turns, and runs none of its tasks.
     this.owed = [];
-    this.forgetTasks();
+    this.resetProcessState();
     this.heardAt = Date.now();
-    this.exits.set(
-      q,
-      this.pump(q).catch((err) => this.log('claude: reading the agent process failed:', (err as Error).message)),
-    );
+    const exit = owner.childExited!; // Installed when this query was created, including for a warm process.
+    this.exits.add(exit);
+    void exit.then(() => this.exits.delete(exit));
+    void this.pump(q).catch((err) => this.log('claude: reading the agent process failed:', (err as Error).message)).finally(owner.streamEnded);
     void q
       .initializationResult()
       .then(async (init) => {
@@ -1707,18 +1824,20 @@ class ClaudeSession implements ProviderSession {
       this.restartPending = subject;
       this.restartTold = false;
       this.rt.notice('info', `${subject} after this turn`);
-    } else if (this.holdsWork()) {
+    } else {
       this.restartPending = subject;
-      this.restartTold = true;
-      this.rt.notice('info', `${subject} ${this.whenFree()}`);
-    } else this.restart();
+      this.restartTold = false;
+      this.restartWhenFree();
+    }
   }
 
   /** The restart a changed option waits for, once the turn is over and nothing else holds the process; said once when background work still does. */
   private restartWhenFree() {
     if (!this.restartPending || this.retired || this.rt.turnActive) return;
+    if (Date.now() < this.taskEndUntil) return;
     if (this.holdsWork()) {
-      if (!this.restartTold) {
+      if (!this.worksNow() && this.wakeDue()) this.freeLater(this.wakeAt()! + WAKE_GRACE_MS + 1 - Date.now());
+      if (!this.restartTold && (this.liveIds().size || this.promptsOpen() || this.wakeDue())) {
         this.restartTold = true;
         this.rt.notice('info', `${this.restartPending} ${this.whenFree()}`);
       }
@@ -1728,8 +1847,24 @@ class ClaudeSession implements ProviderSession {
   }
 
   /** Looks at a waiting restart once the event at hand is handled. */
-  private freeLater() {
-    if (this.restartPending) setTimeout(() => this.restartWhenFree(), 0);
+  private freeLater(ms = 0) {
+    if (!this.restartPending) return;
+    clearTimeout(this.restartTimer);
+    this.restartTimer = setTimeout(() => this.restartWhenFree(), ms);
+    this.restartTimer.unref?.();
+  }
+
+  /** Allow the CLI to deliver a finished task's notification and begin the turn it wakes. */
+  private waitForNotification() {
+    this.taskEndUntil = Date.now() + LIST_GRACE_MS;
+    clearTimeout(this.taskEndTimer);
+    this.taskEndTimer = setTimeout(() => {
+      for (const task of this.unlistedCommands()) this.taskOver(task, 'stopped', undefined, true);
+      this.taskEndUntil = 0;
+      this.release();
+      this.restartWhenFree();
+    }, LIST_GRACE_MS);
+    this.taskEndTimer.unref?.();
   }
 
   /** When a waiting restart can happen, as the person reads it. */
@@ -1756,7 +1891,7 @@ class ClaudeSession implements ProviderSession {
     try {
       for await (const m of q) {
         // A process let go (closed, restarted, set aside after a stop): what it still writes is no turn's
-        // here. It is read on to its end all the same: that end is when the process is gone (`exited`).
+        // here. Drain its iterator while the spawner independently watches for the child's exit.
         if (this.q !== q) continue;
         try {
           this.onMessage(m);
@@ -1770,14 +1905,16 @@ class ClaudeSession implements ProviderSession {
     // Let go by Sable: what it held was settled then (`shutdown`).
     if (this.q !== q) return;
     // The process ended by itself.
+    const wakeLimit = this.takeWakeLimit();
+    this.releaseQueryReceipts(q);
     this.q = undefined;
     this.input = undefined;
-    this.streams.clear();
-    this.forgetTasks();
+    this.resetProcessState();
     this.wakes = 0;
     this.cliState = undefined;
     this.owed = [];
     clearTimeout(this.wakeNet);
+    clearTimeout(this.unreadNet);
     clearTimeout(this.idleTimer);
     dropRemote(this.remoteHolder);
     // What the process had not read went with it.
@@ -1787,11 +1924,12 @@ class ClaudeSession implements ProviderSession {
     // its commands and monitors are lost (a child of its shell may outlive it unseen, so never "ended").
     this.rt.stopBackground();
     const lost = this.rt.tasksLost('process');
-    if (this.held && this.rt.turnActive && !this.closed) {
+    if (!wakeLimit && this.held && this.rt.turnActive && !this.closed) {
       // Messages held back from it never reached it (they are all the running turn has): they go to a new one.
       this.tellLost(lost, 'process');
       return this.release();
     }
+    for (const held of this.held ?? []) this.releaseReceipt(this.own.get(held.uuid ?? ''));
     this.held = undefined;
     this.retire(this.sentItems.keys(), 'failed');
     if (this.rt.turnActive && !this.closed) {
@@ -1805,6 +1943,7 @@ class ClaudeSession implements ProviderSession {
       // No turn open: the steps it left running end with it, at this moment, and nothing is said of them.
       this.rt.cutTurn('died');
     }
+    if (wakeLimit) this.rt.limitInBackground(wakeLimit);
     // Said once, after the turn's own line: the agent is told with its next message (`takeLost`).
     this.tellLost(lost, 'process');
   }
@@ -1834,13 +1973,15 @@ class ClaudeSession implements ProviderSession {
   }
 
   /** Word of a task's end (its notification, or its state): it no longer holds the process, and a command's step says how it ended. */
-  private taskOver(id: string, state: 'done' | 'failed' | 'stopped', at?: number) {
+  private taskOver(id: string, state: 'done' | 'failed' | 'stopped', at?: number, fromList = false) {
+    if (!fromList && !this.foreground.has(id) && !this.endedTasks.has(id) && !this.ambient.has(id)) this.waitForNotification();
     this.liveTasks.delete(id);
     this.foreground.delete(id);
     this.level?.delete(id);
     this.endedTasks.add(id);
     if (this.endedTasks.size > 500) this.endedTasks.delete(this.endedTasks.values().next().value as string);
     this.rt.taskEnded(id, state, at);
+    if (fromList) return; // The list's notification grace already scheduled release and restart.
     // The last one ended: messages held for this process's owed result can go, and a waiting restart too.
     this.release();
     this.freeLater();
@@ -1858,25 +1999,26 @@ class ClaudeSession implements ProviderSession {
     const called = (i: TimelineItem) => i.type === 'tool' && i.status !== 'running' && i.status !== 'pending' && i.status !== 'awaiting';
     const gone = new Set<string>();
     for (const [task, id] of this.taskItems) if (!live.has(task)) gone.add(id);
+    const off = this.unlistedCommands();
+    if (off.size && Date.now() >= this.taskEndUntil) this.waitForNotification();
     if (!live.size) this.rt.stopBackground(called);
     else if (gone.size) this.rt.stopBackground((i) => gone.has(i.id) && called(i));
-    const off: string[] = [];
-    for (const [task, info] of this.taskInfo) {
-      if ((info.kind !== 'command' && info.kind !== 'monitor') || live.has(task) || this.liveTasks.has(task) || this.endedTasks.has(task)) continue;
-      const step = this.taskItems.get(task);
-      if (step && this.rt.get<ToolItem>(step)?.task?.state === 'running') off.push(task);
-    }
     // A task off the list is forgotten once its step's call has returned (a running call's own end still comes).
     for (const [task, id] of [...this.taskItems]) {
       const item = this.rt.get(id);
-      if (!live.has(task) && !off.includes(task) && (!item || called(item))) this.taskItems.delete(task);
+      if (!live.has(task) && !off.has(task) && (!item || called(item))) this.taskItems.delete(task);
     }
-    clearTimeout(this.listTimer);
-    if (!off.length) return;
-    this.listTimer = setTimeout(() => {
-      for (const task of off) if (this.level && !this.level.has(task) && !this.liveTasks.has(task) && !this.endedTasks.has(task)) this.taskOver(task, 'stopped');
-    }, LIST_GRACE_MS);
-    this.listTimer.unref?.();
+  }
+
+  private unlistedCommands() {
+    const missing = new Set<string>();
+    if (!this.level) return missing;
+    for (const [task, id] of this.taskItems) {
+      if (this.level.has(task) || this.liveTasks.has(task) || this.foreground.has(task) || this.endedTasks.has(task)) continue;
+      const mark = this.rt.get<ToolItem>(id)?.task;
+      if (mark?.id === task && mark.state === 'running') missing.add(task);
+    }
+    return missing;
   }
 
   /**
@@ -1948,17 +2090,18 @@ class ClaudeSession implements ProviderSession {
   private shutdown(why: LostWhy = 'process'): string[] {
     clearTimeout(this.idleTimer);
     clearTimeout(this.wakeNet);
+    clearTimeout(this.unreadNet);
     dropRemote(this.remoteHolder);
     const q = this.q;
     let lost: string[] = [];
     if (q) {
+      this.releaseQueryReceipts(q);
       this.clearLiveState();
       // Its pump, which settles all this when the process ends by itself, skips a process let go here (review wave 7, #5).
-      this.forgetTasks();
+      this.resetProcessState();
       this.rt.stopBackground();
       lost = this.rt.tasksLost(why);
       if (!this.rt.turnActive) this.rt.cutTurn('closed');
-      this.leaving = this.exits.get(q);
     }
     this.q = undefined;
     this.cliState = undefined;
@@ -1988,8 +2131,10 @@ class ClaudeSession implements ProviderSession {
     clearTimeout(this.releaseTimer);
     clearTimeout(this.unreadNet);
     // Nothing of its process reaches it any more: what it sent is no longer looked for.
+    for (const own of this.own.values()) this.releaseReceipt(own);
     this.own.clear();
     const owned = this.ownsTurn();
+    const wakeLimit = this.takeWakeLimit();
     const lost = this.shutdown();
     if (owned) {
       this.turnSeq++;
@@ -1998,6 +2143,7 @@ class ClaudeSession implements ProviderSession {
       this.wakes = 0;
       this.retire(this.sentItems.keys(), 'stopped');
       this.rt.cutTurn('closed');
+      if (wakeLimit) this.rt.limitInBackground(wakeLimit);
     }
     this.tellLost(lost, 'process');
     this.provider.sessions.delete(this);
@@ -2022,6 +2168,15 @@ class ClaudeSession implements ProviderSession {
   // ── commands from the UI ──
 
   async send(item: UserItem, opts?: SendOptions) {
+    try {
+      this.sendInput(item, opts);
+    } catch (error) {
+      opts?.release?.();
+      throw error;
+    }
+  }
+
+  private sendInput(item: UserItem, opts?: SendOptions) {
     // The sender's guard (review wave 6, #3): everything from here to the push into the stream runs at once.
     opts?.check?.();
     // Let go by the bridge (the chat moved, or closed): never a process on the account it left (review of 23 Nov, D6).
@@ -2037,7 +2192,7 @@ class ClaudeSession implements ProviderSession {
     // waits instead (`held`) until that result is told apart (`release`). A wake-up it scheduled does
     // not hold the person's message: it goes, and the wake-up with the process.
     if (this.q && !this.rt.turnActive && this.owed.length && !this.namesMessages) {
-      if (this.worksNow()) {
+      if (this.worksNow() || Date.now() < this.taskEndUntil) {
         this.held ??= [];
         this.recheckHeld();
       } else this.setAside();
@@ -2048,8 +2203,19 @@ class ClaudeSession implements ProviderSession {
     this.pendingUsers.set(uuid, item.id);
     const images = (item.attachments ?? []).filter((a) => a.kind === 'image' && a.dataUrl);
     const files = (item.attachments ?? []).filter((a) => a.kind !== 'image' && a.path);
+    const card = this.rt.get<UserItem>(item.id);
     let text = item.text;
-    if (files.length) text += '\n\n' + files.map((f) => `@${f.path}`).join(' ');
+    if (files.length) {
+      // The app adds notes after the person's words, sometimes with a handover before them.
+      // File references belong with the words, so the transcript reader can strip the trailing notes.
+      const words = card?.type === 'user' ? card.text : text;
+      const joined = text.indexOf(HANDOVER_JOIN + words);
+      let end = text.length;
+      if (joined >= 0 && (!words || !text.startsWith(words))) end = joined + HANDOVER_JOIN.length + words.length;
+      else if (text.startsWith(words)) end = words.length;
+      const references = files.map((f) => `@${f.path}`).join(' ');
+      text = text.slice(0, end) + '\n\n' + references + text.slice(end);
+    }
     // Steered into a running turn: the person waits for a reply, so the agent is told to answer first
     // (a block of its own after their words; the conversation shows only what they wrote). Not for a
     // slash command, which is not a question.
@@ -2068,9 +2234,19 @@ class ClaudeSession implements ProviderSession {
     this.awaiting.set(uuid, { read: false });
     this.sentItems.set(uuid, item.id);
     // Sable's own for good (D-own): its card's words, and what went (Sable may have added a summary, a line, files).
-    const card = this.rt.get<UserItem>(item.id);
-    this.own.set(uuid, { itemId: item.id, words: plainWords(card?.type === 'user' ? card.text : item.text), sent: plainWords(text), at: Date.now(), q: this.q, read: false, replayed: false });
-    while (this.own.size > OWN_MAX) this.own.delete(this.own.keys().next().value!);
+    this.own.set(uuid, {
+      itemId: item.id, words: plainWords(card?.type === 'user' ? card.text : item.text), sent: plainWords(text),
+      at: Date.now(), q: this.held ? undefined : this.q, read: false, replayed: false, onTaken: opts?.taken, release: opts?.release, uncertain: opts?.uncertain,
+      proofBlocks: [
+        ...(steerFirst ? [STEER_FIRST_BLOCK] : []),
+        ...(card?.type === 'user' && item.text !== card.text ? [text] : []),
+      ],
+    });
+    while (this.own.size > OWN_MAX) {
+      const oldest = this.own.keys().next().value!;
+      this.releaseReceipt(this.own.get(oldest));
+      this.own.delete(oldest);
+    }
     // Its result says what it came to (`retire`): until then it went ok for nobody (the bridge names a chat only from one that did).
     this.rt.expectOutcome(item.id);
     this.interrupted = false;
@@ -2079,6 +2255,7 @@ class ClaudeSession implements ProviderSession {
     if (!this.rt.turnActive) {
       this.rt.beginTurn(command ? `Running ${command}` : this.booting ? 'Starting' : 'Thinking');
       this.agentTurnAt = -1;
+      this.limitResultOwed = false;
     }
     // Steered into a turn the agent began by itself after a stop: the person lifts the stop's hold.
     else this.rt.personSent();
@@ -2111,7 +2288,7 @@ class ClaudeSession implements ProviderSession {
     const held = this.held;
     if (!held) return;
     if (this.q && this.owed.length && !this.namesMessages) {
-      if (this.worksNow()) return this.recheckHeld();
+      if (this.worksNow() || Date.now() < this.taskEndUntil) return this.recheckHeld();
       this.setAside();
     }
     clearTimeout(this.releaseTimer);
@@ -2180,7 +2357,9 @@ class ClaudeSession implements ProviderSession {
   private terminate() {
     this.log('claude: the stop was not confirmed; the agent process is closed');
     // Its background sub-agents and workflows end with it, its commands are lost (`shutdown`).
+    const wakeLimit = this.takeWakeLimit();
     const lost = this.shutdown();
+    this.wakeLimit = wakeLimit && { hit: wakeLimit };
     this.owed = [];
     this.streams.clear();
     this.wakes = 0;
@@ -2199,13 +2378,13 @@ class ClaudeSession implements ProviderSession {
     for (const [alias, u] of this.aliases) if (names.get(u) === u) names.set(alias, u);
     // Nothing read and nothing that woke it: Claude Code began no turn for it, and owes no result.
     if (!names.size && !this.wakes) return;
-    this.owed.push(names);
+    this.owed.push({ names, notices: this.turnLimits, window: this.limitHit, wakeReported: !!this.wakeLimit });
     if (this.owed.length > 8) this.owed.shift();
   }
 
   /** Message `uuid` is answered in a turn of its own after all: no settled turn owes its result any more. */
   private forgive(uuid: string) {
-    this.owed = this.owed.filter((debt) => {
+    this.owed = this.owed.filter(({ names: debt }) => {
       const had = debt.size;
       for (const [name, u] of [...debt]) if (u === uuid) debt.delete(name);
       // A turn Claude Code began by itself (no message of anyone's) still owes its own.
@@ -2220,21 +2399,21 @@ class ClaudeSession implements ProviderSession {
    * a turn that had read more still owes their results. Claude Code answers its turns in order: what
    * was owed before the result that came is not coming any more.
    */
-  private late(m: Obj): boolean {
-    if (!this.owed.length) return false;
+  private late(m: Obj) {
+    if (!this.owed.length) return;
     const named = resultUuids(m);
     if (named.length) this.learnNames();
-    const at = named.length ? this.owed.findIndex((s) => named.every((u) => s.has(u))) : this.owed.findIndex((s) => !this.namesMessages || !s.size);
+    const at = named.length ? this.owed.findIndex(s => named.every(u => s.names.has(u))) : this.owed.findIndex(s => !this.namesMessages || !s.names.size);
     if (at < 0) {
       this.owed = [];
-      return false;
+      return;
     }
     this.owed.splice(0, at);
-    const debt = this.owed[0];
-    const paid = new Set(named.length ? named.map((u) => debt.get(u)) : [debt.values().next().value]);
-    for (const [name, u] of [...debt]) if (paid.has(u)) debt.delete(name);
-    if (!debt.size) this.owed.shift();
-    return true;
+    const { names, notices, window, wakeReported } = this.owed[0];
+    const paid = new Set(named.length ? named.map(u => names.get(u)) : [names.values().next().value]);
+    for (const [name, u] of names) if (paid.has(u)) names.delete(name);
+    if (!names.size) this.owed.shift();
+    return { owner: [...paid].at(-1), notices, window, wakeReported };
   }
 
   async setModel(model: string) {
@@ -2471,10 +2650,12 @@ class ClaudeSession implements ProviderSession {
     const before = rt.turnActive ? rt.turnStartedAt : -1;
     const seq = this.turnSeq;
     this.handleMessage(m);
+    if (m.type === 'system' && TASK_FRAMES.has(any.subtype)) rt.setReportedTasks([...this.backgroundTasks()]);
     if (!rt.turnActive) return;
     if (rt.turnStartedAt !== before || this.turnSeq !== seq) {
       // Begun by Claude Code with this frame: the chat was just used (the Remote Control keeper, the idle close).
       this.agentTurnAt = rt.turnStartedAt;
+      this.limitResultOwed = false;
       this.lastActive = now;
       this.armWakeNet();
     }
@@ -2514,10 +2695,11 @@ class ClaudeSession implements ProviderSession {
     const rt = this.rt;
     if (!rt.turnActive || rt.turnStartedAt !== at || this.agentTurnAt !== at || !this.q) return;
     const quiet = Date.now() - Math.max(this.rootHeardAt, at);
-    const busy = this.awaiting.size > 0 || !!this.held || this.interrupted || this.promptsOpen() || this.cliBusy() || this.rootStepRunning();
+    const busy = !!this.held || this.interrupted || this.promptsOpen() || this.cliBusy() || this.rootStepRunning();
     if (busy || quiet < WAKE_QUIET_MS) return this.armWakeNet(busy ? WAKE_QUIET_MS : WAKE_QUIET_MS - quiet + 50);
+    if (this.unread()) return this.unreadNetDue(at);
     this.log('claude: a turn the agent began went quiet with no end; it is over');
-    this.finishTurn(undefined, false);
+    this.finishTurn(undefined, false, this.awaiting.size > 0);
   }
 
   /** Whether a root step of the open turn still runs (a call the agent waits on). */
@@ -2552,13 +2734,24 @@ class ClaudeSession implements ProviderSession {
         return this.onResult(any);
       case 'system':
         return this.onSystem(any);
+      case 'conversation_reset': {
+        const session = any.new_conversation_id;
+        if (typeof session === 'string' && session) {
+          this.lastTotalCost = 0;
+          this.costFresh = false;
+          this.rt.update({ providerSessionId: session, usage: { ...this.rt.meta.usage, cliCost: { session, total: 0 } } });
+        }
+        return;
+      }
       case 'rate_limit_event': {
         // The windows come with the event itself: no usage read needed.
         const hit = this.provider.onRateLimit(any.rate_limit_info);
         if (hit) {
           this.limitHit = hit;
-          const n = this.limitNoticeId ? this.rt.get<NoticeItem>(this.limitNoticeId) : undefined;
-          if (n?.limit && !n.limit.resetsAt) this.rt.patch<NoticeItem>(n.id, { limit: { ...n.limit, ...hit } });
+          for (const [uuid, id] of this.turnLimits) {
+            const limit = this.rt.get<NoticeItem>(id)?.limit;
+            if (limit && (!limit.window || limit.window === hit.window)) this.showTurnLimit(hit, uuid);
+          }
         }
         return;
       }
@@ -2578,7 +2771,6 @@ class ClaudeSession implements ProviderSession {
       case 'message_start':
         s.messageId = ev.message?.id;
         s.blocks.clear();
-        if (s.messageId) this.streamedMessages.add(s.messageId);
         break;
       case 'content_block_start': {
         const b = ev.content_block ?? {};
@@ -2663,6 +2855,21 @@ class ClaudeSession implements ProviderSession {
     if (!item.parentId) rt.update({ activity: view.title });
   }
 
+  /** A message_start alone is no proof that this particular block reached the timeline. */
+  private confirmStreamed(parent: string | undefined, message: string | undefined, type: 'text' | 'thinking', full: string): boolean {
+    const stream = this.streams.get(parent ?? '');
+    if (!message || stream?.messageId !== message) return false;
+    for (const block of stream.blocks.values()) {
+      if (block.type !== type || block.confirmed) continue;
+      const item = this.rt.get<TextItem | ThinkingItem>(block.itemId);
+      if (item?.type !== type || !full.startsWith(item.text)) continue;
+      block.confirmed = true;
+      if (item.text !== full || item.streaming) this.rt.patch<TextItem | ThinkingItem>(item.id, { text: full, streaming: false });
+      return true;
+    }
+    return false;
+  }
+
   private onAssistant(m: Obj) {
     const rt = this.rt;
     const parentId: string | undefined = m.parent_tool_use_id ?? undefined;
@@ -2671,7 +2878,7 @@ class ClaudeSession implements ProviderSession {
     // Keyed by uuid, not message.id: the CLI sends one assistant message per content block under one id.
     // After /compact it re-sends local command output (/context, /cost) it already showed.
     const texts = ((msg.content as Obj[] | undefined) ?? []).filter((b) => b.type === 'text' && b.text).map((b) => String(b.text));
-    const repeat = (m.uuid && this.seenMessages.has(m.uuid)) || (synthetic && this.compacted && texts.length > 0 && texts.every((t) => this.syntheticTexts.has(t)));
+    const repeat = (m.uuid && this.seenMessages.has(m.uuid)) || (synthetic && !m.error && this.compacted && texts.length > 0 && texts.every((t) => this.syntheticTexts.has(t)));
     if (m.uuid) this.seenMessages.add(m.uuid);
     if (repeat) return;
     if (m.uuid && !parentId) this.chain.push(m.uuid);
@@ -2679,13 +2886,13 @@ class ClaudeSession implements ProviderSession {
       rt.remove(this.retryNotice);
       this.retryNotice = undefined;
     }
-    const streamed = msg.id && this.streamedMessages.has(msg.id);
     // Refused at a plan limit: the CLI's own words ("usage limit reached…") become the limit notice, not a reply.
     // The turn's own request: its notice. A sub-agent's, or anything outside a turn (background agents
     // working on after the turn ended): no notice of its own; the step stops at the limit and the
     // bridge says it once for the chat (`SessionRuntime.limitInBackground`).
     const refusedAtLimit = m.error === 'rate_limit';
-    const atLimit = refusedAtLimit && !parentId && rt.turnActive;
+    if (refusedAtLimit && m.rate_limit_info) this.limitHit = this.provider.onRateLimit(m.rate_limit_info) ?? this.limitHit;
+    const atLimit = refusedAtLimit && !parentId && rt.turnActive && !this.autonomousTurn();
     // Claude Code's own words for a request that failed (an API error, a refusal at a limit): said by
     // the notice below, never as the agent's answer. Its stand-in "No response requested." (written
     // when a cut conversation is taken up again, and as a refused request's words) is nobody's words.
@@ -2694,7 +2901,7 @@ class ClaudeSession implements ProviderSession {
     // The agent's own output at the root while no turn is open begins one (`wake`), after the refusal
     // above is read: a refusal at a limit outside the person's turn stays the background's to decide
     // (`limitInBackground`). A frame Claude Code wrote itself (a stand-in, a refusal, an error) is no work.
-    if (!parentId && !synthetic && ((msg.content as Obj[] | undefined) ?? []).some((b) => (b.type === 'text' && b.text) || (b.type === 'thinking' && b.thinking) || b.type === 'tool_use' || b.type === 'server_tool_use')) this.wake();
+    if (!parentId && !synthetic && !m.error && ((msg.content as Obj[] | undefined) ?? []).some((b) => (b.type === 'text' && b.text) || (b.type === 'thinking' && b.thinking) || b.type === 'tool_use' || b.type === 'server_tool_use')) this.wake();
     if (synthetic) for (const t of texts) this.syntheticTexts.add(t);
     for (const b of (msg.content as Obj[] | undefined) ?? []) {
       if (b.type === 'tool_use' || b.type === 'server_tool_use') {
@@ -2703,34 +2910,25 @@ class ClaudeSession implements ProviderSession {
           rt.add<ToolItem>({ id: b.id, type: 'tool', name: b.name, ...view, status: 'pending', parentId });
         }
         this.toolReady(b.id, b.name, b.input ?? {});
-      } else if (!streamed && !refusedAtLimit && !standIn && !failedWords && b.type === 'text' && b.text) {
+      } else if (!refusedAtLimit && !standIn && !failedWords && b.type === 'text' && b.text && !this.confirmStreamed(parentId, msg.id, 'text', b.text)) {
         rt.add<TextItem>({ type: 'text', text: b.text, streaming: false, parentId });
-      } else if (!streamed && b.type === 'thinking' && b.thinking) {
+      } else if (b.type === 'thinking' && b.thinking && !this.confirmStreamed(parentId, msg.id, 'thinking', b.thinking)) {
         rt.add<ThinkingItem>({ type: 'thinking', text: b.thinking, streaming: false, endedAt: Date.now(), parentId });
       }
     }
-    if (refusedAtLimit && !atLimit) {
-      const said = texts.join(' ');
-      const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(said)?.[1]));
-      const named = agentLimitOf(said);
-      const words = said.replace(/\|\d{9,13}\b/, '').trim();
-      rt.limitInBackground({
-        stepId: parentId,
-        window: this.limitHit?.window ?? named?.window,
-        resetsAt: this.limitHit?.resetsAt ?? stamp ?? named?.resetsAt,
-        ...(words && !isStandIn(words) ? { detail: words } : {}),
-      });
-    } else if (atLimit) {
-      // One notice for the chat: one written while its background work met the limit is this turn's too
-      // (while nothing is decided on it yet).
-      this.limitNoticeId ??= this.openLimitCard();
-      if (!this.limitNoticeId) {
-        const said = texts.join(' ');
-        // Older CLIs say "Claude AI usage limit reached|<reset time in epoch seconds>".
-        const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(said)?.[1]));
-        const words = said.replace(/\|\d{9,13}\b/, '').trim();
-        const detail = words && !isStandIn(words) ? words : undefined;
-        this.limitNoticeId = rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: errorLabel(m.error), detail, limit: { resetsAt: this.limitHit?.resetsAt ?? stamp, window: this.limitHit?.window } }).id;
+    if (refusedAtLimit) {
+      const hit = this.refusal(texts.join(' '));
+      const provisional = !parentId && !rt.turnActive && this.provisionalAtRest();
+      if (provisional) {
+        // Its UUID may still prove this was a separate app request. The existing wake
+        // bound hands it off at rest if no identifying result follows.
+        this.wake();
+        this.wakeLimit = { hit, provisional: provisional.uuid };
+      } else if (atLimit) this.showTurnLimit(hit, resultUuids(m).at(-1) ?? (this.awaiting.size === 1 ? this.awaiting.keys().next().value : undefined));
+      else if (!parentId && rt.turnActive) this.wakeLimit = { hit };
+      else {
+        if (!parentId) this.limitResultOwed = true;
+        rt.limitInBackground(parentId ? { ...hit, stepId: parentId } : hit);
       }
     } else if (refusedForSignIn(m.error, synthetic ? texts : [])) {
       // Refused for the sign-in (its words are Claude Code's, never an answer): no red box per request.
@@ -2759,44 +2957,6 @@ class ClaudeSession implements ProviderSession {
   private onUser(m: Obj) {
     const rt = this.rt;
     if (m.isReplay) {
-      // One of Sable's own on its way: replayed when the agent takes it.
-      if (m.uuid && this.pendingUsers.has(m.uuid)) return void this.takeOwn(m.uuid, 'replay');
-      const back = m.uuid ? this.withdrawn.get(m.uuid) : undefined;
-      if (back && !m.parent_tool_use_id) {
-        // A steer withdrawn at a stop that Claude Code read after all: it is this turn's, shown as it
-        // went to Claude Code. Its copy in the queue goes (never sent twice), unless the person changed
-        // it there since: those are newer words of theirs, and they stay queued.
-        this.withdrawn.delete(m.uuid);
-        this.chain.push(m.uuid);
-        this.awaiting.set(m.uuid, { read: true });
-        const o = this.own.get(m.uuid);
-        if (o) o.read = o.replayed = true;
-        let id = back.itemId;
-        if (rt.get<UserItem>(id)?.type === 'user') rt.taken(id, { providerId: m.uuid });
-        else {
-          const copy = rt.queue.find((q) => q.id === id);
-          const same = (a?: UserItem['attachments'], b?: UserItem['attachments']) => (a ?? []).map((x) => x.id).join('\n') === (b ?? []).map((x) => x.id).join('\n');
-          // Sent again from the queue meanwhile (C5): the card that went is this message too. Claude Code
-          // has it twice now; the conversation shows it once.
-          const again = copy ? undefined : this.sentAgain(back);
-          if (again) {
-            id = again;
-            rt.taken(id, { providerId: m.uuid });
-          } else {
-            if (copy && copy.text === back.text && same(copy.attachments, back.attachments)) rt.takeQueued(id);
-            else if (copy) id = randomUUID();
-            rt.add<UserItem>({ id, type: 'user', text: back.text || replayText(m.message?.content) || '', attachments: back.attachments, state: 'sent', providerId: m.uuid });
-          }
-        }
-        this.sentItems.set(m.uuid, id);
-        this.rt.expectOutcome(id);
-        // Its result answers it in the turn it begins now, never as a settled turn's debt (`owe`).
-        this.forgive(m.uuid);
-        // Begun by Claude Code, not the person: the stop's hold on the queue stays through it.
-        if (!rt.turnActive) rt.beginTurn('Thinking', { keepHold: true });
-        this.release();
-        return;
-      }
       if (m.parent_tool_use_id) return;
       // One of Sable's own whose turn's bookkeeping let it go before Claude Code took it (a result named
       // it, or its turn ended, first): still the person's message, never one from the Claude app.
@@ -2813,19 +2973,26 @@ class ClaudeSession implements ProviderSession {
       // One of ours under another uuid (a steer the CLI folded in): only one it has not read yet, and only
       // by its very words. A message from the app that merely holds them stays the app's; one with the
       // same words is the app's again once ours comes back under its own uuid (`unalias`).
-      const mine = this.ownByWords(text, echo);
+      const mine = this.ownByWords(text, echo, content);
       if (mine) {
-        const [uuid, o] = mine;
+        const [uuid, o, identified] = mine;
+        if (o.guessed) this.takeOwn(uuid, 'match');
+        this.reclaim(uuid, m.uuid ?? uuid, !this.unmatchedResults.get(m.uuid)?.pending.has(uuid));
         this.pendingUsers.delete(uuid);
         this.markRead(uuid);
         o.read = true;
         if (m.uuid && m.uuid !== uuid) {
           // A result may name it by either uuid.
           this.aliases.set(m.uuid, uuid);
-          o.alias = { uuid: m.uuid, text, attachments: appPictures(content, APP_PICTURES), at: Date.now() };
+          if (identified) this.confirmDelivery(o);
+          // A second verified spelling can coexist with an earlier ambiguous app replay.
+          if (!o.alias || o.alias.identified) {
+            o.alias = { uuid: m.uuid, text, attachments: appPictures(content, APP_PICTURES), at: Date.now(), identified, after: rt.items.at(-1)?.id };
+          }
         }
         if (m.uuid) this.chain.push(m.uuid);
-        rt.taken(o.itemId, { providerId: m.uuid });
+        if (!o.answered || identified) this.takeCard(o, m.uuid);
+        this.bindEarlierResult(uuid, o, m.uuid);
         return;
       }
       const synthetic = !!syn || m.isSynthetic === true;
@@ -2899,10 +3066,12 @@ class ClaudeSession implements ProviderSession {
     for (const [task, step] of [...this.taskItems]) if (step === item.id && this.foreground.has(task) && task !== bg?.id) this.taskOver(task, 'done');
     if (bg && !this.endedTasks.has(bg.id) && !this.ambient.has(bg.id)) {
       // Its call returned with the task still running (moved to the background at its timeout, or by the person): it goes on.
-      if (this.foreground.delete(bg.id)) this.liveTasks.add(bg.id);
+      this.foreground.delete(bg.id);
+      this.liveTasks.add(bg.id);
       this.taskItems.set(bg.id, item.id);
       this.noteTask(bg.id, undefined, item.name);
       this.backgrounded(bg.id, this.rt.get<ToolItem>(item.id));
+      this.rt.setReportedTasks([...this.backgroundTasks()]);
     }
     const wake = wakeOf(item.name, input, structured);
     if (wake?.loop !== undefined) this.loopWakeAt = wake.loop ?? undefined;
@@ -2935,18 +3104,96 @@ class ClaudeSession implements ProviderSession {
   }
 
   /**
-   * Messages the CLI has answered for (`uuids`, or all sent so far): taken, even when no replay said so.
+   * Messages still pending at a normal turn end are taken, even when no replay said so.
    * Each card gets the uuid it went with (D-own): a replay of it that comes after all is a repeat of a
    * message of Sable's own, also once the chat is read again.
    */
-  private takeUsers(uuids?: readonly unknown[]) {
-    for (const uuid of uuids ?? [...this.pendingUsers.keys()]) {
-      const itemId = typeof uuid === 'string' ? this.pendingUsers.get(uuid) : undefined;
-      if (!itemId) continue;
-      this.pendingUsers.delete(uuid as string);
+  private takeUsers() {
+    for (const [uuid, itemId] of this.pendingUsers) {
+      this.pendingUsers.delete(uuid);
       const card = this.rt.get<UserItem>(itemId);
-      if (card?.type === 'user' && (card.state === 'queued' || !card.providerId)) this.rt.taken(itemId, { providerId: uuid as string });
+      if (card?.type === 'user' && (card.state === 'queued' || !card.providerId)) this.rt.taken(itemId, { providerId: uuid });
     }
+  }
+
+  /**
+   * Place a queued steer at its acknowledgement. A late stamp or result may identify a reply
+   * that is already on screen. Keep those same text items below the card, including a block
+   * still receiving deltas. Work from an earlier result or before a tool call stays in place.
+   */
+  private takeCard(own: OwnSend, providerId: string, reply?: Set<string> | 'result') {
+    const rt = this.rt;
+    const card = rt.get<UserItem>(own.itemId);
+    if (card?.state !== 'queued') {
+      rt.taken(own.itemId, { providerId });
+      return;
+    }
+    const tail: string[] = [];
+    for (let i = rt.items.length - 1; i >= 0; i--) {
+      const row = rt.items[i];
+      if (row.id === card.id) break;
+      if (row.parentId || (row.type === 'user' && row.state === 'queued')) continue;
+      if (row.type !== 'text') break;
+      tail.push(row.id);
+    }
+    tail.reverse();
+    // A replay can arrive between the text delta and the full assistant frame.
+    const streamed = this.streams.get('')?.blocks.values() ?? [];
+    const known = reply ?? new Set(Array.from(streamed).filter((b) => !b.confirmed && b.type === 'text').map((b) => b.itemId));
+    rt.taken(card.id, { providerId });
+    own.crossed = tail.filter((id) => known !== 'result' && !known.has(id));
+    for (const id of tail) if (known === 'result' || known.has(id)) rt.move(id, {}, true);
+  }
+
+  /** A withdrawn send was consumed after all. Preserve any edits to the copy waiting in the queue. */
+  private reclaim(uuid: string, providerId: string, awaitsResult = true): boolean {
+    const back = this.withdrawn.get(uuid);
+    if (!back) return false;
+    this.withdrawn.delete(uuid);
+    const rt = this.rt;
+    const copy = rt.queue.find((q) => q.id === back.itemId);
+    let id = back.itemId;
+    if (copy) {
+      if (!samePayload(copy, back) || !rt.takeQueued(id)) id = randomUUID();
+    } else if (!rt.get(id)) id = this.sentAgain(back) ?? id;
+    const card = rt.get(id);
+    if (card?.type === 'user' && samePayload(card, back)) rt.taken(id, { providerId });
+    else {
+      if (card) id = randomUUID();
+      rt.add<UserItem>({ id, type: 'user', text: back.text, attachments: back.attachments, steered: back.steered, state: 'sent', providerId });
+    }
+    const own = this.own.get(uuid);
+    if (own) {
+      own.read = true;
+      own.itemId = id;
+    }
+    if (awaitsResult) this.awaiting.set(uuid, { read: true });
+    this.sentItems.set(uuid, id);
+    rt.expectOutcome(id);
+    this.forgive(uuid);
+    if (awaitsResult && !rt.turnActive) rt.beginTurn('Thinking', { keepHold: true });
+    this.release();
+    return true;
+  }
+
+  /** The previously unidentified result was this card's. Restore its position before that reply. */
+  private bindEarlierResult(uuid: string, own: OwnSend, replay: string) {
+    const paid = this.unmatchedResults.get(replay);
+    if (!paid?.pending.has(uuid)) return;
+    this.unmatchedResults.delete(replay);
+    own.answered = true;
+    this.awaiting.delete(uuid);
+    this.retire([uuid], paid.error ? 'failed' : 'ok', paid.result);
+    const rt = this.rt;
+    const card = rt.get<UserItem>(own.itemId);
+    const anchor = rt.items.findIndex((i) => i.id === paid.before);
+    if (card && anchor >= 0 && rt.items.indexOf(card) > anchor) {
+      const ordered = rt.items.filter((i) => i.id !== card.id);
+      ordered.splice(anchor, 0, card);
+      rt.reset(ordered);
+    }
+    if (card?.steered && paid.final) this.finishSteerReply(own, paid.final, paid.result);
+    if (rt.turnActive && this.turnSeq === paid.turn && !this.awaiting.size) this.finishTurn(paid.error, false);
   }
 
   /** Claude Code read a message of ours (it replayed it). */
@@ -2973,7 +3220,6 @@ class ClaudeSession implements ProviderSession {
 
   /** The CLI names the messages a result answers: every session of this provider reads its results so from now on. */
   private learnNames() {
-    this.namesMessages = true;
     this.provider.seen.names = true;
   }
 
@@ -2982,30 +3228,32 @@ class ClaudeSession implements ProviderSession {
    * it (`stamp`). False when the uuid is not one Sable sent. On its way, it is taken where the agent
    * took it. Let go by its turn's bookkeeping first (a result named it, or its turn ended, before
    * Claude Code read it): still the person's message, never one from the Claude app; it stands where
-   * the agent took it, and the work it begins is its turn, whose own result ends it (review of 23 Nov,
-   * D-own). A repeat changes nothing.
+   * the agent took it. A result already naming it is proof of delivery, so a subsequent replay
+   * leaves its card and turn in place.
    */
-  private takeOwn(uuid: string, via: 'replay' | 'stamp'): boolean {
+  private takeOwn(uuid: string, via: 'replay' | 'stamp' | 'match', reply?: Set<string>): boolean {
     const o = this.own.get(uuid);
-    if (!o) return false;
+    if (!o) return this.reclaim(uuid, uuid);
+    if (via !== 'match') this.confirmDelivery(o);
     const rt = this.rt;
+    // Its canonical identity distinguishes this send from a provisional match with the same content.
+    if (o.alias && !o.alias.identified) this.unalias(o, uuid);
     if (via === 'replay') {
       if (o.replayed) return true;
       o.replayed = true;
       if (!this.chain.includes(uuid)) this.chain.push(uuid);
-      // Back under its own uuid: the message taken for it by its words was the app's after all.
-      if (o.alias) this.unalias(o, uuid);
     }
+    if (this.reclaim(uuid, uuid)) return true;
     const itemId = this.pendingUsers.get(uuid);
     if (itemId) {
       // From here on what the agent writes was written knowing the message.
       this.pendingUsers.delete(uuid);
       this.markRead(uuid);
       o.read = true;
-      rt.taken(itemId, { providerId: uuid });
+      this.takeCard(o, uuid, reply);
       return true;
     }
-    if (o.read) return true;
+    if (o.read || o.answered) return true;
     o.read = true;
     const card = rt.get<UserItem>(o.itemId);
     // Only from the process it went to, and soon after: anything else is a repeat of what was settled.
@@ -3038,40 +3286,72 @@ class ClaudeSession implements ProviderSession {
   private unalias(o: OwnSend, uuid: string) {
     const a = o.alias!;
     o.alias = undefined;
-    o.read = false;
     this.aliases.delete(a.uuid);
     const rt = this.rt;
-    if (rt.get<UserItem>(o.itemId)?.type === 'user') rt.patch<UserItem>(o.itemId, { providerId: uuid });
-    rt.add<UserItem>({ ts: a.at, type: 'user', text: a.text, ...(a.attachments ? { attachments: a.attachments } : {}), state: 'sent', providerId: a.uuid, remote: true });
+    const card = rt.get<UserItem>(o.itemId);
+    if (card) rt.patch<UserItem>(card.id, { providerId: uuid });
+    const remote = rt.add<UserItem>({ ts: a.at, type: 'user', text: a.text, attachments: a.attachments, state: 'sent', providerId: a.uuid, remote: true });
+    if (a.answer) {
+      // Its result named only the app's UUID. Replace the provisional card in that exchange
+      // and let the canonical acknowledgement take Sable's send here.
+      rt.answered([remote.id], a.answer.outcome, a.answer.resultId);
+      if (card) {
+        const place = rt.items.indexOf(card);
+        const ordered = rt.items.filter((i) => i !== remote && i !== card);
+        ordered.splice(place, 0, remote);
+        ordered.push(card);
+        rt.reset(ordered);
+      }
+      o.answered = false;
+    } else {
+      this.awaiting.set(a.uuid, { read: true });
+      if (!rt.turnActive) rt.beginTurn('Thinking');
+    }
+    if (!o.answered) o.read = false;
   }
 
   /**
    * A message of Sable's own that Claude Code has not read yet whose very words a replay under another
    * uuid has (wrappers, the steer note and Sable's additions aside): the oldest. Never by a part of the
-   * words, never one already read.
+   * words. A result can precede the replay, including when the CLI rewrites its UUID.
    */
-  private ownByWords(text: string, echo: string): [string, OwnSend] | undefined {
-    const said = text ? plainWords(text) : '';
-    const command = echo ? plainWords(echo) : '';
-    if (!said && !command) return undefined;
-    for (const uuid of this.pendingUsers.keys()) {
-      const o = this.own.get(uuid);
-      if (!o || o.read) continue;
-      if ((!!said && (said === o.sent || said === o.words)) || (!!command && command === o.words)) return [uuid, o];
+  private ownByWords(text: string, echo: string, content: unknown): [string, OwnSend, boolean] | undefined {
+    const said = plainWords(text);
+    const command = plainWords(echo);
+    const images = Array.isArray(content) ? content.filter((b) => b?.type === 'image') : [];
+    if (!said && !command && !images.length) return;
+    const blocks = Array.isArray(content) ? content : [{ type: 'text', text: content }];
+    const textBlocks = new Set(blocks.filter(b => b?.type === 'text').map(b => b.text));
+    let late: [string, OwnSend, boolean] | undefined;
+    for (const [uuid, o] of this.own) {
+      const decorated = o.proofBlocks.some(block => textBlocks.has(block));
+      if (!decorated && (o.alias || textBlocks.has(STEER_FIRST_BLOCK))) continue;
+      const withdrawn = this.withdrawn.get(uuid);
+      const pending = o.q === this.q && (this.pendingUsers.has(uuid) || !!withdrawn);
+
+      if (!decorated && (o.q !== this.q || o.replayed || (!pending && !o.answered && !o.guessed))) continue;
+      if (!pending && Date.now() - o.at > OWN_LATE_MS) continue;
+      const attachments = withdrawn?.attachments ?? this.rt.get<UserItem>(o.itemId)?.attachments ?? [];
+      const files = attachments.some((a) => a.kind !== 'image' && a.path);
+      const sameWords = said === o.sent || (!files && (said === o.words || (!!command && command === o.words)));
+      if (!sameWords) continue;
+      const sentImages = attachments.filter((a) => a.kind === 'image' && a.dataUrl);
+      if (images.length !== sentImages.length || !images.every((b, i) => b.source?.type === 'base64' && sentImages[i].dataUrl === `data:${b.source.media_type};base64,${b.source.data}`)) continue;
+      if (pending) return [uuid, o, decorated];
+      late = [uuid, o, decorated];
     }
-    return undefined;
+    return late;
   }
 
   /**
    * A steer withdrawn at a stop that the person sent again from the queue (its words, after the stop):
    * the card that went then, if it is still there.
    */
-  private sentAgain(back: { text: string; at: number }): string | undefined {
-    const words = plainWords(back.text);
-    if (!words) return undefined;
+  private sentAgain(back: UserPayload & { at: number }): string | undefined {
     for (const o of this.own.values()) {
-      if (o.at < back.at || o.words !== words) continue;
-      if (this.rt.get<UserItem>(o.itemId)?.type === 'user') return o.itemId;
+      if (o.at < back.at) continue;
+      const card = this.rt.get<UserItem>(o.itemId);
+      if (card?.type === 'user' && samePayload(card, back)) return card.id;
     }
     return undefined;
   }
@@ -3084,7 +3364,13 @@ class ClaudeSession implements ProviderSession {
     const named = resultUuids(m);
     if (!named.length) return;
     this.learnNames();
-    for (const u of named) this.takeOwn(u, 'stamp');
+    const stream = this.streams.get('');
+    const message = m.type === 'assistant' ? m.message?.id : m.event?.type === 'message_start' ? m.event.message?.id : stream?.messageId;
+    const reply = new Set<string>();
+    if (stream && message && stream.messageId === message) {
+      for (const block of stream.blocks.values()) if (block.type === 'text') reply.add(block.itemId);
+    }
+    for (const u of named) this.takeOwn(u, 'stamp', reply);
   }
 
   /**
@@ -3092,10 +3378,12 @@ class ClaudeSession implements ProviderSession {
    * at the same limit is said by it. A decided one (moved on, or waiting for its reset) is history,
    * and a new refusal gets a card of its own, which the bridge decides again (review of 23 Nov, D4).
    */
-  private openLimitCard(): string | undefined {
+  private openLimitCard(window?: string): string | undefined {
     const id = this.rt.limitCard;
     const card = id ? this.rt.get<NoticeItem>(id) : undefined;
-    return card?.type === 'notice' && card.limit && !card.limit.provider && !card.limit.continuedWith ? card.id : undefined;
+    if (card?.type !== 'notice' || !card.limit || card.limit.provider || card.limit.continuedWith) return;
+    if (window && card.limit.window && window !== 'Plan limit' && card.limit.window !== 'Plan limit' && window !== card.limit.window) return;
+    return card.id;
   }
 
   /**
@@ -3108,13 +3396,11 @@ class ClaudeSession implements ProviderSession {
    * one answers its messages in order (review of 23 Nov, D-own; a message that never comes back is
    * bounded by `armUnreadNet`).
    */
-  private answer(m: Obj): string[] {
-    const named = resultUuids(m);
+  private answer(m: Obj, named: string[]): string[] {
     if (named.length) {
       this.learnNames();
       const ids = named.map((u) => this.aliases.get(u) ?? u);
       // The messages this result answers for (a steer folded into the turn is one of them).
-      this.takeUsers(ids);
       for (const id of ids) this.awaiting.delete(id);
       for (const u of named) this.aliases.delete(u);
       return ids;
@@ -3156,24 +3442,142 @@ class ClaudeSession implements ProviderSession {
    * it went is kept with it: the queue's copy may be edited meanwhile.
    */
   private withdrawUnread() {
+    const ids = new Set<string>();
     for (const [uuid, a] of [...this.awaiting]) {
       if (a.read) continue;
+      this.releaseReceipt(this.own.get(uuid));
       this.awaiting.delete(uuid);
       const itemId = this.sentItems.get(uuid) ?? this.pendingUsers.get(uuid);
       this.pendingUsers.delete(uuid);
       this.sentItems.delete(uuid);
+      if (itemId) ids.add(itemId);
       const row = itemId ? this.rt.get<UserItem>(itemId) : undefined;
-      if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined, at: Date.now() });
+      if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined, steered: row?.steered, at: Date.now() });
     }
     while (this.withdrawn.size > 50) this.withdrawn.delete(this.withdrawn.keys().next().value!);
+    return ids;
+  }
+
+  /** A completed reply can precede the replay, or arrive only as the result's final text. */
+  private finishSteerReply(own: OwnSend, final: unknown, footer?: string) {
+    const rt = this.rt;
+    const text = typeof final === 'string' ? final.trim() : '';
+    const end = footer ? rt.items.findIndex(i => i.id === footer) : rt.items.length;
+    if (end < 0) return;
+    for (let i = end - 1; i >= 0 && rt.items[i].id !== own.itemId; i--) {
+      const row = rt.items[i];
+      if (row.parentId) continue;
+      if (row.type === 'turn') break;
+      if (row.type === 'text' && row.text.trim() && (!text || row.text.trim() === text)) return;
+    }
+    const previous = footer ? [] : own.crossed ?? [];
+    const reply = text ? previous.find((id) => rt.get<TextItem>(id)?.text.trim() === text) : previous.at(-1);
+    if (reply) rt.move(reply, {}, true);
+    else if (text && !isStandIn(text) && !parseSynthetic(text)) {
+      const answer = rt.add<TextItem>({ type: 'text', ts: rt.items[end]?.ts, text: final as string, streaming: false });
+      if (footer) {
+        const ordered = rt.items.slice(0, -1);
+        ordered.splice(end, 0, answer);
+        rt.reset(ordered);
+      }
+    }
+  }
+
+  private releaseQueryReceipts(q: Query) {
+    for (const own of this.own.values()) if (own.q === q) this.releaseReceipt(own);
+  }
+
+  private releaseReceipt(own: OwnSend | undefined) {
+    if (!own?.release) return;
+    const release = own.release;
+    own.release = undefined;
+    own.uncertain = undefined;
+    release();
+  }
+
+  private confirmDelivery(own: OwnSend | undefined) {
+    if (!own?.onTaken || own.q !== this.q) return;
+    const taken = own.onTaken;
+    own.onTaken = undefined;
+    own.release = undefined;
+    own.uncertain = undefined;
+    taken();
+  }
+
+  private provisionalAtRest() {
+    for (const own of Array.from(this.own.values()).reverse()) {
+      const alias = own.alias;
+      if (own.q === this.q && own.answered && alias && !alias.identified && !alias.answer &&
+          this.rt.items.at(-1)?.id === alias.after && Date.now() - alias.at <= OWN_LATE_MS) return alias;
+    }
+  }
+
+  /** Distinct consumed UUIDs, in one result or consecutive results, prove two messages. */
+  private separateAppResult(named: string[]) {
+    const rt = this.rt;
+    let refusal: BackgroundLimit | undefined;
+    for (const [uuid, own] of this.own) {
+      const alias = own.alias;
+      if (own.q !== this.q || !alias || alias.identified || alias.answer || !named.includes(alias.uuid)) continue;
+      if (!own.answered && !named.includes(uuid)) continue;
+      const canonicalResult = rt.answeredBy(own.itemId);
+      const after = Math.max(rt.items.findIndex((i) => i.id === alias.after), rt.items.findIndex((i) => i.id === canonicalResult));
+      rt.patch<UserItem>(own.itemId, { providerId: uuid });
+      const remote = rt.add<UserItem>({ ts: alias.at, type: 'user', text: alias.text, attachments: alias.attachments, state: 'sent', providerId: alias.uuid, remote: true });
+      if (after >= 0 && after + 1 < rt.items.length - 1) {
+        const ordered = rt.items.slice(0, -1);
+        ordered.splice(after + 1, 0, remote);
+        rt.reset(ordered);
+      }
+      this.sentItems.set(alias.uuid, remote.id);
+      this.awaiting.set(alias.uuid, { read: true });
+      if (!rt.turnActive) rt.beginTurn('Thinking');
+      else rt.personSent();
+      this.aliases.delete(alias.uuid);
+      own.alias = undefined;
+      if (this.wakeLimit?.provisional === alias.uuid) refusal = this.takeWakeLimit();
+    }
+    return refusal;
   }
 
   private onResult(m: Obj) {
     const rt = this.rt;
     // The result of a turn the stop's safety net already settled, come late: what it cost counts, and
     // nothing else of it. It answers nothing of the running turn, and never reads that turn's stop.
-    const late = this.late(m);
-    const answered = late ? [] : this.answer(m);
+    const named = resultUuids(m);
+    const appRefusal = named.length ? this.separateAppResult(named) : undefined;
+    const settledLimit = this.limitResultOwed && !this.awaiting.size && !named.length;
+    this.limitResultOwed = false;
+    for (const uuid of named) this.confirmDelivery(this.own.get(uuid));
+    const debt = this.late(m);
+    const late = !!debt || settledLimit;
+    for (const uuid of named) {
+      if (this.reclaim(uuid, uuid, !late) && late) {
+        const own = this.own.get(uuid);
+        if (own) own.answered = true;
+        this.retire([uuid], m.is_error || m.subtype !== 'success' ? 'failed' : 'ok');
+      }
+    }
+    const autonomous = this.autonomousTurn();
+    const onlyOutstanding = this.awaiting.size === 1;
+    const answered = late ? [] : this.answer(m, named);
+    const wakeResult = !answered.length && (autonomous || !!this.wakeLimit);
+    for (const uuid of answered) {
+      const own = this.own.get(uuid);
+      if (!own) continue;
+      own.answered = own.read || named.length > 0;
+      own.guessed = !own.answered;
+      if (!named.length && own.q === this.q) {
+        const reply = typeof m.result === 'string' && m.result.trim() && !isStandIn(m.result);
+        const answeredAlone = onlyOutstanding && !autonomous && !this.interrupted && !m.is_error && m.subtype === 'success' && (reply || Number(m.usage?.output_tokens) > 0);
+        if ((!own.alias || own.alias.identified) && (own.read || answeredAlone)) this.confirmDelivery(own);
+        else own.uncertain?.();
+        own.uncertain = undefined;
+      }
+      if (this.pendingUsers.delete(uuid)) this.takeCard(own, uuid, 'result');
+      if (!m.is_error && m.subtype === 'success' && rt.get<UserItem>(own.itemId)?.steered) this.finishSteerReply(own, m.result);
+      own.crossed = undefined;
+    }
     // Messages held back for a result owed go once that result is in (`release` checks what is still owed).
     this.release();
     // Its own messages are taken when they are replayed: whatever woke the model is answered by now.
@@ -3193,50 +3597,60 @@ class ClaudeSession implements ProviderSession {
     const window = Object.values((m.modelUsage as Record<string, Obj>) ?? {}).reduce((max, u) => Math.max(max, Number(u.contextWindow ?? 0)), 0);
     if (window) usage.contextWindow = window;
     rt.update({ usage });
-    if (late) {
-      if (this.q) void this.provider.readLimits(this.q);
-      return;
-    }
-
-    this.compacted = false;
     const failed = m.subtype !== 'success' || m.is_error;
     const wasInterrupted = this.interrupted;
-    let error: string | undefined;
-    if (failed && !wasInterrupted) {
-      error =
+    let failure: string | undefined;
+    if (failed) {
+      failure =
         (Array.isArray(m.errors) && m.errors.length ? m.errors.join('\n') : undefined) ??
         (typeof m.result === 'string' && m.result ? m.result : undefined) ??
         resultLabel(m.subtype);
     }
+    const error = wasInterrupted ? undefined : failure;
     // Refused for the sign-in: the bridge says it once for the chat (or sends once more), never the CLI's words on the turn's line.
     const signIn = !!error && (refusedForSignIn(undefined, [error]) || authFailurePending(rt.id, turnOf(rt)));
-    if (signIn && error) noteAuthFailure(rt.id, undefined, turnOf(rt));
+    if (!late && signIn && error) noteAuthFailure(rt.id, undefined, turnOf(rt));
     // Cut off at a plan limit while it worked ("You've hit your 5-hour limit · resets 6pm (Europe/Berlin)",
     // a 429): a limit like one met at the start, said by the chat's one limit notice (the bridge moves
     // it at the turn's end), never as "The turn ended with an error" with "Try again".
-    const cutAtLimit = !!error && !signIn && (m.error === 'rate_limit' || Number(m.api_error_status) === 429 || !!agentLimitOf(error) || /usage limit reached/i.test(error));
-    if (cutAtLimit && error) {
-      this.limitNoticeId ??= this.openLimitCard();
-      if (!this.limitNoticeId) {
-        const named = agentLimitOf(error);
-        const stamp = epochMs(Number(/\|(\d{9,13})\b/.exec(error)?.[1]));
-        this.limitNoticeId = rt.add<NoticeItem>({
-          type: 'notice',
-          variant: 'error',
-          text: errorLabel('rate_limit'),
-          detail: error.replace(/\|\d{9,13}\b/, '').trim() || undefined,
-          limit: { resetsAt: this.limitHit?.resetsAt ?? stamp ?? named?.resetsAt, window: this.limitHit?.window ?? named?.window },
-        }).id;
-      } else {
-        // The notice learns the reset from the words when no event gave it.
-        const n = rt.get<NoticeItem>(this.limitNoticeId);
-        const named = agentLimitOf(error);
-        if (n?.limit && named && (!n.limit.resetsAt || !n.limit.window)) rt.patch<NoticeItem>(n.id, { limit: { ...n.limit, resetsAt: n.limit.resetsAt ?? named.resetsAt, window: n.limit.window ?? named.window } });
+    const cutAtLimit = !!failure && !signIn && (
+      m.error === 'rate_limit' || Number(m.api_error_status ?? m.apiErrorStatus) === 429 ||
+      !!agentLimitOf(failure) || /usage limit reached|\b(?:http|api error|status code)\s*:?\s*429\b|\b429\s+too many requests\b/i.test(failure)
+    );
+    if (late) {
+      if (debt && cutAtLimit && failure) {
+        const hit = this.refusal(failure, debt.window ?? (rt.turnActive ? {} : this.limitHit));
+        if (debt.owner) {
+          const known = debt.notices.has(debt.owner) || debt.notices.has(undefined);
+          const notice = this.showTurnLimit(hit, debt.owner, debt.notices);
+          if (!known) rt.onStoppedLimit?.(rt, notice);
+        } else if (!debt.wakeReported) {
+          if (rt.turnActive) this.wakeLimit ??= { hit };
+          else rt.limitInBackground(hit);
+        }
+      }
+      if (this.q) void this.provider.readLimits(this.q);
+      return;
+    }
+    this.compacted = false;
+    if (cutAtLimit && error && !rt.turnActive) {
+      rt.limitInBackground(this.refusal(error));
+      this.limitHit = undefined;
+      return;
+    }
+    if (wakeResult && cutAtLimit && failure) {
+      const hit = this.refusal(failure);
+      if (!this.wakeLimit) this.wakeLimit = { hit };
+      else {
+        this.wakeLimit.hit.window ??= hit.window;
+        this.wakeLimit.hit.resetsAt ??= hit.resetsAt;
       }
     }
+    if (appRefusal) this.showTurnLimit(appRefusal, answered.at(-1));
+    else if (cutAtLimit && failure && !wakeResult) this.showTurnLimit(this.refusal(failure), answered.at(-1));
     const inputTokens = Number(m.usage?.input_tokens ?? 0) + Number(m.usage?.cache_read_input_tokens ?? 0) + Number(m.usage?.cache_creation_input_tokens ?? 0);
     const outputTokens = Number(m.usage?.output_tokens ?? 0);
-    const shownError = signIn || cutAtLimit ? undefined : error;
+    const shownError = signIn || cutAtLimit || (wakeResult && this.wakeLimit) ? undefined : error;
     // A message of ours still on its way to Claude Code is no part of what this result closes: a result
     // that answers none of ours then belongs to earlier work (a turn it took up by itself, a start that
     // failed, a resumed process's first word) and never ends the person's turn. Its line stands above
@@ -3247,8 +3661,24 @@ class ClaudeSession implements ProviderSession {
     // What the messages this result answers came to, whatever the turn does next, and the result's
     // line in the timeline that closes their answer.
     const resultId = wasInterrupted || blank ? undefined : randomUUID();
-    this.retire(answered, wasInterrupted ? 'stopped' : failed ? 'failed' : 'ok', resultId);
+    const outcome = wasInterrupted ? 'stopped' : failed ? 'failed' : 'ok';
+    for (const uuid of answered) {
+      const own = this.own.get(uuid);
+      if (own?.alias && named.includes(own.alias.uuid) && !named.includes(uuid)) own.alias.answer = { outcome, resultId };
+    }
+    this.retire(answered, outcome, resultId);
     if (resultId) {
+      if (this.awaiting.size) {
+        const pending = new Set(this.awaiting.keys());
+        const last = rt.items.findLast((i) => !i.parentId);
+        for (const u of answered) if (!this.own.has(u) && !this.chain.includes(u)) {
+          this.unmatchedResults.set(u, {
+            pending, turn: this.turnSeq, before: last?.type === 'text' ? last.id : resultId,
+            result: resultId, error, final: !failed && typeof m.result === 'string' ? m.result : undefined,
+          });
+        }
+        while (this.unmatchedResults.size > OWN_MAX) this.unmatchedResults.delete(this.unmatchedResults.keys().next().value!);
+      }
       rt.add<TurnItem>({
         id: resultId,
         type: 'turn',
@@ -3267,7 +3697,7 @@ class ClaudeSession implements ProviderSession {
       // Messages it has not answered yet are still coming (a steer it has not read): their turn starts
       // right away. One that never comes back does not keep it for ever (`armUnreadNet`).
       rt.update({ activity: 'Thinking' });
-      if (this.unread()) this.armUnreadNet();
+      this.armUnreadNet();
       return;
     }
     // A stop holds through the turn's end: steers it has not read go back to the queue (finishTurn), and
@@ -3278,10 +3708,21 @@ class ClaudeSession implements ProviderSession {
         .then(() => q.interrupt())
         .catch(() => {});
     }
-    this.finishTurn(error, wasInterrupted);
+    this.finishTurn(wakeResult && this.wakeLimit ? undefined : error, wasInterrupted);
+    this.limitResultOwed = false;
   }
 
-  private finishTurn(error: string | undefined, interrupted: boolean) {
+  private takeWakeLimit(): BackgroundLimit | undefined {
+    const hit = this.wakeLimit?.hit;
+    this.wakeLimit = undefined;
+    if (hit) {
+      if (!hit.window || hit.window === 'Plan limit') hit.window = this.limitHit?.window ?? hit.window;
+      if (!this.limitHit?.window || this.limitHit.window === hit.window) hit.resetsAt = this.limitHit?.resetsAt ?? hit.resetsAt;
+    }
+    return hit;
+  }
+
+  private finishTurn(error: string | undefined, interrupted: boolean, hold = false) {
     const rt = this.rt;
     if (!rt.turnActive) return;
     // This turn is settled: its stop's safety net and its quiet bounds go with it.
@@ -3289,24 +3730,33 @@ class ClaudeSession implements ProviderSession {
     clearTimeout(this.interruptTimer);
     clearTimeout(this.wakeNet);
     clearTimeout(this.unreadNet);
-    if (interrupted) this.withdrawUnread();
+    if (interrupted) rt.returnUntaken({ ids: this.withdrawUnread(), reason: 'stopped' });
     // Messages no result named on its own (an older CLI, a steer folded in, one the turn went idle
     // without answering) come to the turn's stop or failure. Otherwise what they came to is not known:
     // nothing is recorded, and a message with no word of its own is never taken as having gone ok.
     if (interrupted || error) this.retire(this.sentItems.keys(), interrupted ? 'stopped' : 'failed');
-    else this.sentItems.clear();
+    else {
+      for (const uuid of this.sentItems.keys()) this.releaseReceipt(this.own.get(uuid));
+      this.sentItems.clear();
+    }
     this.interrupted = false;
     this.awaiting.clear();
     this.aliases.clear();
     this.wakes = 0;
+    const wakeLimit = this.takeWakeLimit();
+    const backgroundOnly = !!wakeLimit && !this.turnLimits.size && !error;
     this.limitHit = undefined;
-    this.limitNoticeId = undefined;
+    this.turnLimits = new Map();
     rt.settle(interrupted ? 'cancelled' : error ? 'error' : 'cancelled');
     if (interrupted) rt.notice('interrupted', 'Interrupted');
     // Every message sent has had its result: a steer whose replay never came (or came under
     // another uuid) was taken all the same. After an interrupt the bridge takes untaken ones back.
     else this.takeUsers();
-    rt.endTurn(error);
+    rt.endTurn(error, wakeLimit ? { hold: true, backgroundLimit: backgroundOnly } : { hold });
+    if (wakeLimit) {
+      this.limitResultOwed = true;
+      rt.limitInBackground(wakeLimit);
+    }
     this.scheduleIdleClose();
     // A changed option restarts the process once nothing holds it any more (`restartWhenFree`).
     if (this.restartPending) this.freeLater();
@@ -3330,14 +3780,18 @@ class ClaudeSession implements ProviderSession {
 
   private unreadNetDue(at: number) {
     const rt = this.rt;
-    if (!rt.turnActive || rt.turnStartedAt !== at || !this.q || !this.unread()) return;
-    let since = this.heardAt;
+    if (!rt.turnActive || rt.turnStartedAt !== at || !this.q || !this.awaiting.size) return;
+    let since = Math.max(this.rootHeardAt, at);
     for (const [uuid, a] of this.awaiting) if (!a.read) since = Math.max(since, this.own.get(uuid)?.at ?? 0);
     const quiet = Date.now() - since;
-    const busy = !!this.held || this.interrupted || this.promptsOpen() || this.cliBusy() || this.rootStepRunning();
+    const rootBusy = this.cliBusy() && quiet < CLI_TRUST_MS;
+    const busy = !!this.held || this.interrupted || this.promptsOpen() || rootBusy || this.rootStepRunning();
     if (busy || quiet < UNREAD_QUIET_MS) return this.armUnreadNet(busy ? UNREAD_QUIET_MS : UNREAD_QUIET_MS - quiet + 50);
-    this.log('claude: a message never came back from the agent; its turn ends without it');
-    this.finishTurn(undefined, false);
+    this.log('claude: an outstanding message received no result before the quiet bound');
+    if (this.unread()) {
+      rt.returnUntaken({ ids: this.withdrawUnread(), reason: 'stopped', holdQueue: true });
+    }
+    this.finishTurn(undefined, false, true);
   }
 
   /**
@@ -3359,8 +3813,32 @@ class ClaudeSession implements ProviderSession {
     return first ? 0 : total;
   }
 
+  private currentTaskRun(m: Obj): boolean {
+    if (!m.task_id || typeof m.run_id !== 'string') return true;
+    const id = String(m.task_id);
+    const last = this.taskRuns.get(id);
+    if (last && m.run_id < last) return false;
+    if (last !== m.run_id) {
+      this.taskRuns.set(id, m.run_id);
+      if (last) {
+        const superseded = this.taskItems.get(id);
+        if (superseded) {
+          this.rt.stopBackground((item) => item.id === superseded);
+          this.rt.taskEnded(id, 'stopped');
+        }
+        this.endedTasks.delete(id);
+        this.taskInfo.delete(id);
+        this.taskItems.delete(id);
+        this.foreground.delete(id);
+        this.ambient.delete(id);
+      }
+    }
+    return true;
+  }
+
   private onSystem(m: Obj) {
     const rt = this.rt;
+    if (m.task_id && !this.currentTaskRun(m)) return;
     switch (m.subtype) {
       case 'init': {
         if (Array.isArray(m.skills)) this.skillNames = m.skills.map(String);
@@ -3425,10 +3903,15 @@ class ClaudeSession implements ProviderSession {
       case 'background_tasks_changed': {
         // Every live background task (replace, never merge: a missed start or end leaves nothing stale).
         // Ambient ones (watchers, housekeeping) are nobody's work and never hold the process.
+        const previous = this.liveIds();
         const level = new Set<string>();
         for (const t of (m.tasks as Obj[] | undefined) ?? []) {
           if (!t?.task_id) continue;
           const id = String(t.task_id);
+          if (!this.currentTaskRun(t)) {
+            if (previous.has(id) && !this.foreground.has(id)) level.add(id);
+            continue;
+          }
           if (t.ambient === true) {
             this.ambient.add(id);
             continue;
@@ -3440,6 +3923,7 @@ class ClaudeSession implements ProviderSession {
         this.level = level;
         // The list covers every background task started before it (they join it before their start is said).
         for (const id of [...this.liveTasks]) if (!this.foreground.has(id)) this.liveTasks.delete(id);
+        if ([...previous].some((id) => !level.has(id) && !this.foreground.has(id))) this.waitForNotification();
         this.reconcileTasks();
         // The last one ended: messages held for this process's owed result can go to a new one, and a waiting restart.
         this.release();
@@ -3525,7 +4009,7 @@ class ClaudeSession implements ProviderSession {
         // A message of ours it has not read yet keeps the turn: its own turn is still to come (bounded,
         // `armUnreadNet`). After a stop, idle is the end whatever it has not read (that goes back to the queue).
         if (m.state === 'idle' && rt.turnActive && (this.interrupted || !this.unread())) this.finishTurn(undefined, this.interrupted);
-        else if (m.state === 'idle' && rt.turnActive) this.armUnreadNet();
+        else if (m.state === 'idle' && rt.turnActive) this.unreadNetDue(rt.turnStartedAt);
         // Work it started on its own, with no message to replay (a scheduled wake-up): a turn like any other
         // (`wake`), which its result or the next idle ends. From idle, or as the first word of a new process
         // (a process taking up work by itself); after a prompt it is the same work going on (a sub-agent's

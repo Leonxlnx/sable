@@ -32,6 +32,8 @@ const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
 async function claude() {
   const events: BridgeEvent[] = [];
   const p = new ClaudeProvider({ emit: (e) => events.push(e), log: () => {}, settings: () => DEFAULT_SETTINGS });
+  // This harness starts a fresh fake CLI for each test.
+  p.seen.names = false;
   const anyP = p as unknown as Record<string, unknown>;
   anyP.caps = async () => ({ models: [{ id: 'm', name: 'M', isDefault: true }], modes: [], commands: [], skills: [], agents: [], mcpServers: [], tools: [], features: { steer: true } });
   anyP.readLimits = async () => [];

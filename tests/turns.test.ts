@@ -29,7 +29,7 @@ describe('shapeOf', () => {
     const cases: [TimelineItem, string][] = [
       [{ ...base, type: 'user', text: 'hi' }, 'U'],
       [{ ...base, type: 'user', text: 'hi', state: 'queued' }, 'Q'],
-      [{ ...base, type: 'user', text: 'hi', state: 'queued', steered: true }, 'S'],
+      [{ ...base, type: 'user', text: 'hi', state: 'queued', steered: true }, 's'],
       [{ ...base, type: 'user', text: 'hi', state: 'sent', steered: true }, 'S'],
       [{ ...base, type: 'text', text: 'Hello', streaming: false }, 't'],
       [{ ...base, type: 'text', text: '', streaming: true }, 'l'],
@@ -66,7 +66,7 @@ describe('shapeIndex', () => {
     const items: Record<string, TimelineItem> = { m: user('m'), s1: user('s1', true), w: tool('w'), s2: user('s2', true) };
     let roots = ['m', 's1', 'w', 's2'];
     let d = { items, rev: 1, changed: { since: 0, ids: ['m', 's1', 'w', 's2'] } };
-    expect(index(d, roots)).toBe('USwS');
+    expect(index(d, roots)).toBe('Usws');
     // Both taken: they stand behind the step, in their order (first and last root unchanged).
     items.s1 = { ...items.s1, state: 'sent' } as TimelineItem;
     items.s2 = { ...items.s2, state: 'sent' } as TimelineItem;
@@ -593,13 +593,17 @@ describe("what Claude Code writes in the person's place (shared/synthetic.ts)", 
     expect(t.state).toBe('done');
   });
 
-  it('stacks notifications that come together in one turn, the answer under the last', () => {
+  it('gives notifications that come with nothing between them a turn each, the answer under the last', () => {
+    // A notification turn that holds nothing woke no work (the bridge ended it without a record, or
+    // the next one came at once): the next notification begins its own turn (window-F3, day 7), so
+    // its work and time are never folded into a turn that may have ended an hour before.
     const { groups } = turns('U1 t2 T3 N4 N5 t6 T7');
-    expect(groups).toHaveLength(2);
-    const t = groups[1] as TurnGroup;
-    expect(t.segments.map((s) => s.lead)).toEqual(['4', '5']);
-    expect(t.segments[0].flow).toEqual([]);
-    expect(t.segments[1].answer).toBe('6');
+    expect(groups).toHaveLength(3);
+    expect((groups[1] as TurnGroup).segments.map((s) => s.lead)).toEqual(['4']);
+    expect((groups[1] as TurnGroup).segments[0].flow).toEqual([]);
+    const t = groups[2] as TurnGroup;
+    expect(t.segments.map((s) => s.lead)).toEqual(['5']);
+    expect(t.segments[0].answer).toBe('6');
   });
 
   it('gives a notification taken while the agent works a segment of its own', () => {

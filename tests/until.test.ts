@@ -442,7 +442,7 @@ async function app(home = mkdtempSync(path.join(tmpdir(), 'sable-until-'))) {
 describe('until green in the app (Demo agent, real check)', () => {
   it('the Demo scenario fails twice and goes green on round 3; a queued message goes before the check', async () => {
     const { app: a, home } = await app();
-    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    cleanups.unshift(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     const cwd = path.join(home, 'relay-api');
     mkdirSync(cwd, { recursive: true });
     const snap = await a.call('session.create', { provider: 'demo', cwd, mode: 'bypassPermissions' });
@@ -475,7 +475,8 @@ describe('until green in the app (Demo agent, real check)', () => {
   it('/until off stops it; a loop armed when Sable closes says so when the session is opened again', async () => {
     const first = await app();
     const home = first.home;
-    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    // Dispose both app instances first. Windows releases the stopped check's cwd on process exit.
+    cleanups.unshift(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     const cwd = path.join(home, 'proj');
     mkdirSync(cwd, { recursive: true });
     const snap = await first.app.call('session.create', { provider: 'demo', cwd, mode: 'bypassPermissions' });
@@ -506,7 +507,7 @@ describe('until green in the app (Demo agent, real check)', () => {
     // The check's process lets go of its folder a moment after it ends (Windows, a busy machine: under a
     // full parallel run two seconds were not enough). Waited for without blocking; a temporary folder
     // that still cannot be removed is left to the system, it is not what this test is about.
-    cleanups.push(() => rm(home, { recursive: true, force: true, maxRetries: 60, retryDelay: 250 }).catch(() => {}));
+    cleanups.unshift(() => rm(home, { recursive: true, force: true, maxRetries: 60, retryDelay: 250 }).catch(() => {}));
     const cwd = path.join(home, 'proj');
     mkdirSync(cwd, { recursive: true });
     const snap = await a.call('session.create', { provider: 'demo', cwd, mode: 'bypassPermissions' });
@@ -571,7 +572,7 @@ const endOf = (rt: SessionRuntime) => rt.items.findLast((i): i is NoticeItem => 
 describe('until green across accounts', () => {
   it('survives the move to another account at a cap, and goes green there', async () => {
     const { app: a, home } = await app();
-    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    cleanups.unshift(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     const studio = await demoAccount(a, 'Studio', 'light');
     const work = await demoAccount(a, 'Work', 'light');
     await a.call('app.setSettings', { patch: { accountCaps: { [`demo:${studio.id}`]: { weekly: 70 } } } });
@@ -587,7 +588,7 @@ describe('until green across accounts', () => {
 
   it("stops when the loop has used its share of the account's week", async () => {
     const { app: a, home } = await app();
-    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    cleanups.unshift(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
     const studio = await demoAccount(a, 'Studio', 'light');
     const rt = await project(a, home, studio.id);
     await a.call('until.set', { sessionId: rt.id, text: 'node check.mjs' });
