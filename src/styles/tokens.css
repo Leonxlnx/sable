@@ -163,8 +163,12 @@
      any angle and any offset. So where one CSS px is less than two device px the ring is two
      device px wide (--rim-w) and its fill is thinned by the same factor (--rim-k, 1px over the
      width): it holds the light of a 1px hairline, evenly. Below 2 device px only; at 2x and above
-     1px is already two. (Settings' interface size zooms the root: there the ring is a little wider
-     than two device px, which keeps it even.) */
+     1px is already two. That includes 100%, the commonest scale: the composer's ring is a path,
+     anti-aliased where the pane stands, and the pane seldom stands on whole pixels (an odd stage
+     width puts it half a pixel off), so a ring of one device pixel fell across two at half
+     strength on some edges and stood crisp on the others (measured: an edge at 62% of the mean
+     beside one at 119%). (Settings' interface size zooms the root: there the ring is a little
+     wider than two device px, which keeps it even.) */
   --rim-w: 1px;
   --rim-k: 1;
   --rim-hair: rgb(255 255 255 / calc(0.094 * var(--rim-k)));
@@ -263,7 +267,13 @@
   --tone-dim: var(--red-dim);
 }
 
-/* The rim's width in whole device pixels (two) at the display scales Windows offers below 200%. */
+/* The rim's width in whole device pixels (two) at the display scales Windows offers below 200%, 100% included. */
+@media (max-resolution: 1.04dppx) {
+  :root {
+    --rim-w: 2px;
+    --rim-k: 0.5;
+  }
+}
 @media (min-resolution: 1.05dppx) and (max-resolution: 1.15dppx) {
   :root {
     --rim-w: 1.8182px;

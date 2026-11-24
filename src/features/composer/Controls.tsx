@@ -1,5 +1,4 @@
-import { pickedByKey } from '@/ui/glide';
-import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from 'react';
+import { Fragment, memo, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { DropdownMenu as RM } from 'radix-ui';
 import { useShallow } from 'zustand/react/shallow';
 import type { ModelInfo, ProviderId } from '@shared/protocol';
@@ -7,15 +6,14 @@ import { isSignedIn } from '@/features/connect/plan';
 import { ProviderMark, PROVIDER_NAME } from '@/art/Logo';
 import { Icon, MODE_ICON } from '@/icons';
 import { baseName, tildePath } from '@/lib/format';
-import { fuzzy } from '@/lib/fuzzy';
-import { modelName, visibleModels } from '@/lib/models';
+import { visibleModels } from '@/lib/models';
 import { uiZoom } from '@/lib/motion';
 import { worktrees } from '@/lib/workspace';
 import { pathKey } from '@/features/sidebar/groups';
 import type { GitWorktree } from '@shared/protocol';
-import { goHomeChat, homeAccountId, openSettings, setHomeAccount, switchAgent } from '@/state/actions';
+import { goHomeChat, homeAccountId, openSettings, setHomeAccount } from '@/state/actions';
 import { accountName } from '@/state/hooks';
-import { capsKey, ensureProviderCaps, refreshStaleCaps, useStore } from '@/state/store';
+import { capsKey, ensureProviderCaps, useStore } from '@/state/store';
 import { PathLabel, Tip } from '@/ui';
 import { planWord } from '@/features/accounts/model';
 import { LimitDot } from '@/features/usage';
@@ -31,15 +29,15 @@ import { signedOut } from '@/lib/sign-in';
  */
 export const ChipSkeleton = ({ w }: { w: number }) => <span className="chip-skel" style={{ width: w }} aria-hidden />;
 
-/** The model and mode menus share one width so they read as a pair. */
-const MENU_W = 232;
+/** The mode menu's width. */
+const MENU_W = 208;
 
-/** Slash commands ("/model", "/mode", "/effort") open the toolbar menus through this event. */
+/** `/mode` opens the mode menu through this event (`/model` and `/effort` open the panel, Phrase.tsx). */
 export const MENU_EVENT = 'sable:composer-menu';
-export const openComposerMenu = (which: 'model' | 'mode' | 'effort') => window.dispatchEvent(new CustomEvent(MENU_EVENT, { detail: which }));
+export const openComposerMenu = (which: 'mode') => window.dispatchEvent(new CustomEvent(MENU_EVENT, { detail: which }));
 
 /** Open state kept inside the control, so opening a menu re-renders the menu and nothing else. */
-function useMenuOpen(which: 'model' | 'mode') {
+function useMenuOpen(which: 'mode') {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     const on = (e: Event) => (e as CustomEvent<string>).detail === which && setOpen(true);
@@ -54,7 +52,7 @@ function useMenuOpen(which: 'model' | 'mode') {
  * one (a menu flipped by the window edge can open under the pointer). A release shortly after
  * opening, with no press inside the menu, is ignored.
  */
-function useReleaseGuard(open: boolean) {
+export function useReleaseGuard(open: boolean) {
   const at = useRef(0);
   const pressed = useRef(false);
   if (open && !at.current) {
@@ -70,8 +68,8 @@ function useReleaseGuard(open: boolean) {
 }
 
 /**
- * The mode and model menus open above their trigger, aligned to its outer edge, 8px away, like the
- * effort popover. Focus goes to the current row at the start of the next frame, not inside the task
+ * The mode menu opens above its trigger, aligned to its outer edge, 8px away, like the model and
+ * effort panel. Focus goes to the current row at the start of the next frame, not inside the task
  * that opens the menu (Radix's own focus on the menu first would be a second focus move, and a
  * second forced style pass, there). A search field that already took focus keeps it.
  */
@@ -169,7 +167,7 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
           alignOffset={place.alignOffset}
           avoidCollisions={false}
           collisionPadding={10}
-          style={{ width: MENU_W - 24 }}
+          style={{ width: MENU_W }}
           {...FOCUS_CURRENT}
           onCloseAutoFocus={(e) => {
             e.preventDefault();
@@ -197,10 +195,10 @@ export const ModeMenu = memo(function ModeMenu({ choice, side, onClosed }: MenuP
   );
 });
 
-// ───────────────────────── model ─────────────────────────
+// ───────────────────────── model (the panel is Phrase.tsx) ─────────────────────────
 
 /** A name with the characters a filter matched drawn brighter. */
-function Hits({ text, indices }: { text: string; indices?: number[] }) {
+export function Hits({ text, indices }: { text: string; indices?: number[] }) {
   if (!indices?.length) return <>{text}</>;
   const set = new Set(indices);
   return (
@@ -218,255 +216,6 @@ function Hits({ text, indices }: { text: string; indices?: number[] }) {
   );
 }
 
-/** A list this long gets its filter field at once (typing brings it up in any list). */
-const LONG_LIST = 9;
-
-/**
- * The model menu, for the keyboard first. It lists the models of one agent: the chat's own when
- * it opens. Where the person is signed in to other agents, their marks stand on the menu's first
- * line: the left and right arrows (or a click) turn the list to another agent's models, one step
- * away, and picking one of those switches the chat to that agent in place. Up and down move, Enter
- * picks, and typing filters every agent's models at once, each row then led by its agent's mark.
- * Picking a model keeps the effort last used with it.
- */
-export const ModelPopover = memo(function ModelPopover({ choice, side, onClosed }: MenuProps) {
-  const [open, setOpen] = useMenuOpen('model');
-  const guard = useReleaseGuard(open);
-  const [query, setQuery] = useState('');
-  // The agent whose models the list shows; the chat's own each time the menu opens.
-  const [tab, setTab] = useState<ProviderId>(choice.provider);
-  const chip = useRef<HTMLButtonElement>(null);
-  const late = useRef(false);
-  // Its list scrolls: a few rows are room enough to stay on its side.
-  const place = useMenuPlace(chip, open, side, Math.min(240, choice.models.length * ROW_H + 68));
-  // An hour-old list is asked for again while the menu is open (new models appear without a restart).
-  useEffect(() => {
-    if (!open) return;
-    const s = useStore.getState();
-    const meta = choice.provider === s.ui.homeProvider && !s.ui.activeSessionId ? undefined : s.sessions[s.ui.activeSessionId ?? ''];
-    refreshStaleCaps(choice.provider, meta ? meta.cwd : s.ui.homeCwd, choice.accountId);
-  }, [open, choice.provider, choice.accountId]);
-  const content = useRef<HTMLDivElement>(null);
-  const field = useRef<HTMLInputElement>(null);
-  const others = useOtherAgentModels(choice, open);
-  // The chat switches agents only between turns.
-  const busy = useStore((s) => {
-    const st = choice.sessionId ? s.sessions[choice.sessionId]?.status : undefined;
-    return st === 'running' || st === 'starting' || st === 'awaiting';
-  });
-
-  useEffect(() => {
-    if (open) return;
-    setQuery('');
-    setTab(choice.provider);
-  }, [open, choice.provider]);
-
-  const agents = useMemo(() => [choice.provider, ...others.map((o) => o.provider).filter((p, i, all) => all.indexOf(p) === i)], [choice.provider, others]);
-  const shown = agents.includes(tab) ? tab : choice.provider;
-  const q = query.trim();
-  const mine = shown === choice.provider;
-
-  // The rows changed under the keyboard (another agent's list, a filter cleared): the first row,
-  // or the model in use, takes focus, so the arrows and Enter go on working.
-  const wasOpen = useRef(false);
-  useLayoutEffect(() => {
-    // Not in the commit that opens the menu: its first focus is FOCUS_CURRENT's, a frame later.
-    const was = wasOpen.current;
-    wasOpen.current = open;
-    if (!open || !was) return;
-    const pop = content.current;
-    if (!pop || pop.dataset.state === 'closed') return;
-    const at = document.activeElement;
-    if (at && at !== pop && pop.contains(at)) return;
-    (pop.querySelector<HTMLElement>('[data-mrow][data-current]') ?? pop.querySelector<HTMLElement>('[data-mrow]:not([data-disabled])'))?.focus({ preventScroll: true });
-  }, [open, shown, q === '']); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // A filter typed with focus on a row: the field appears and takes the keyboard from there.
-  useLayoutEffect(() => {
-    const f = field.current;
-    if (!open || !q || !f || document.activeElement === f) return;
-    f.focus({ preventScroll: true });
-    f.setSelectionRange(f.value.length, f.value.length);
-  }, [open, q]);
-
-  if (!choice.caps) late.current = true;
-  if (!choice.caps) return choice.capsPending ? <ChipSkeleton w={96} /> : null;
-  if (!choice.caps.models.length) return null;
-
-  const own = choice.models.map((m) => {
-    const name = modelName(m) ?? m.id;
-    return { provider: choice.provider, m, name, hit: q ? fuzzy(q, name) : undefined };
-  });
-  const away = others.map((o) => {
-    const name = modelName(o.m) ?? o.m.id;
-    return { ...o, name, hit: q ? fuzzy(q, name) : undefined };
-  });
-  // A filter looks through every agent's models, the chat's own first; else one agent's list.
-  const rows = q ? [...own, ...away].filter((r) => r.hit) : mine ? own : away.filter((r) => r.provider === shown);
-  const withField = !!q || rows.length > LONG_LIST;
-  const withTabs = agents.length > 1 && !q;
-
-  const name = choice.modelLabel ?? 'Model';
-  const pick = (provider: ProviderId, id: string) => {
-    if (provider === choice.provider) {
-      choice.pickModel(id);
-      setOpen(false);
-      return;
-    }
-    // Another agent's model switches the chat to that agent, in place (never while a turn runs).
-    if (busy) return;
-    setOpen(false);
-    if (choice.sessionId) void switchAgent(choice.sessionId, provider, id);
-  };
-  const turn = (by: number) => {
-    const i = agents.indexOf(shown);
-    setTab(agents[(i + by + agents.length) % agents.length]);
-  };
-
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    const inField = e.target === field.current;
-    // Left and right turn to the next agent's models (in the field they move its caret once it holds words).
-    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && withTabs && !(inField && query)) {
-      e.preventDefault();
-      turn(e.key === 'ArrowRight' ? 1 : -1);
-      return;
-    }
-    if (inField) return;
-    // Typing anywhere in the menu filters (Radix's own typeahead would only jump).
-    if (e.key.length === 1 && (e.key !== ' ' || query)) {
-      e.preventDefault();
-      setQuery((v) => v + e.key);
-    } else if (e.key === 'Backspace' && query) {
-      e.preventDefault();
-      setQuery((v) => v.slice(0, -1));
-    }
-  };
-
-  return (
-    <RM.Root open={open} onOpenChange={setOpen} modal={false}>
-      <Tip label="Model" side="top">
-        <RM.Trigger asChild>
-          <Chip ref={chip} className="tb-chip cm-model" anchor="right" data-late={late.current || undefined} aria-label={`Model: ${name}`} parts={[{ k: name, className: 'chip-give', node: <span data-origin-anchor>{name}</span> }]} />
-        </RM.Trigger>
-      </Tip>
-      <RM.Portal>
-        <RM.Content
-          ref={content}
-          className="pop cm-pop mm-pop"
-          data-spot
-          side={place.side}
-          align="end"
-          sideOffset={place.sideOffset}
-          alignOffset={place.alignOffset}
-          avoidCollisions={false}
-          collisionPadding={10}
-          loop
-          style={{ width: MENU_W }}
-          aria-label="Model"
-          {...FOCUS_CURRENT}
-          onKeyDown={onKeyDown}
-          onEscapeKeyDown={(e) => {
-            if (!query) return;
-            e.preventDefault();
-            setQuery('');
-          }}
-          onCloseAutoFocus={(e) => {
-            e.preventDefault();
-            onClosed();
-          }}
-        >
-          <Later>
-            {() => (
-              <>
-                {withTabs && (
-                  // The agents, as their marks: the one whose models are listed says its name.
-                  <div className="mm-agents" role="tablist" aria-label="Agent">
-                    {agents.map((p) => (
-                      <button key={p} type="button" role="tab" tabIndex={-1} className="mm-agent" aria-selected={p === shown} aria-label={PROVIDER_NAME[p]} onPointerDown={(e) => e.preventDefault()} onClick={() => setTab(p)}>
-                        <ProviderMark provider={p} size={14} className="mm-mark" />
-                        {p === shown && <span className="mm-agent-name">{PROVIDER_NAME[p]}</span>}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {withField && (
-                  <div className="mm-search">
-                    <Icon name="search" size={14} />
-                    <input
-                      ref={field}
-                      className="mm-field"
-                      value={query}
-                      placeholder="Search models"
-                      aria-label="Search models"
-                      spellCheck={false}
-                      onChange={(e) => setQuery(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Escape') return;
-                        // The agents' line answers the arrows while the field is empty (the menu's own handler).
-                        if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !query) return;
-                        e.stopPropagation();
-                        if (e.key === 'ArrowDown') {
-                          e.preventDefault();
-                          content.current?.querySelector<HTMLElement>('[data-mrow]:not([data-disabled])')?.focus();
-                        } else if (e.key === 'Enter') {
-                          const first = rows.find((r) => r.provider === choice.provider || !busy);
-                          if (!first) return;
-                          e.preventDefault();
-                          pick(first.provider, first.m.id);
-                          // What is typed while the menu leaves goes to the composer, as after a row's pick.
-                          pickedByKey();
-                        }
-                      }}
-                    />
-                  </div>
-                )}
-                <div className="mm-list scroll">
-                  {rows.map(({ provider, m, name, hit }, i) => {
-                    const home = provider === choice.provider;
-                    const current = home && m.id === choice.modelId;
-                    // Models in sections (OpenCode: free, Zen, Go...): a label where a section begins.
-                    const section = !q && m.group && m.group !== rows[i - 1]?.m.group ? m.group : undefined;
-                    return (
-                      <Fragment key={`${provider}:${m.id}`}>
-                        {section && (
-                          <>
-                            {i > 0 && <RM.Separator className="menu-sep" />}
-                            <div className="mm-group" role="presentation">
-                              {section}
-                            </div>
-                          </>
-                        )}
-                        <RM.Item
-                          className={home ? 'menu-item mm-row' : 'menu-item mm-row mm-away'}
-                          data-mrow
-                          data-current={current || undefined}
-                          disabled={!home && busy}
-                          aria-label={home ? undefined : `Switch to ${PROVIDER_NAME[provider]} with ${name}`}
-                          onSelect={() => pick(provider, m.id)}
-                          {...guard}
-                        >
-                          {/* One agent's list needs no mark on every row; a filter across agents does. */}
-                          {q && agents.length > 1 && <ProviderMark provider={provider} size={14} className="mm-mark" />}
-                          <span className="mm-name truncate" data-origin-anchor={home || undefined}>
-                            <Hits text={name} indices={hit?.indices} />
-                          </span>
-                          <span className="mm-check">{current ? <Icon name="check" size={14} /> : !home && <Icon name="arrow-right" size={13} />}</span>
-                        </RM.Item>
-                      </Fragment>
-                    );
-                  })}
-                  {!rows.length && <div className="mm-empty">{q ? `No model matches “${q}”.` : 'This agent lists no models.'}</div>}
-                </div>
-              </>
-            )}
-          </Later>
-        </RM.Content>
-      </RM.Portal>
-    </RM.Root>
-  );
-});
-
 const NO_OTHERS: { provider: ProviderId; m: ModelInfo }[] = [];
 const AGENTS: ProviderId[] = ['claude', 'codex', 'opencode'];
 
@@ -474,7 +223,7 @@ const AGENTS: ProviderId[] = ['claude', 'codex', 'opencode'];
  * In a session, the models of the other agents the user is signed in to (what their own pickers
  * list), loaded when the menu first opens. Empty on home, where the agent is chosen beside it.
  */
-function useOtherAgentModels(choice: Choice, open: boolean) {
+export function useOtherAgentModels(choice: Choice, open: boolean) {
   const sessionId = choice.sessionId;
   const cwd = useStore((s) => (sessionId ? (s.sessions[sessionId]?.cwd ?? null) : null));
   const signedIn = useStore(useShallow((s) => AGENTS.filter((p) => p !== choice.provider && isSignedIn(s.providers[p]))));
@@ -713,16 +462,20 @@ function useTrees(cwd: string | null): GitWorktree[] {
   const [got, setGot] = useState<{ cwd: string | null; list: GitWorktree[] }>(() => ({ cwd, list: cwd ? seenTrees(cwd) : NO_TREES }));
   useEffect(() => {
     if (!cwd) return;
-    let live = true;
-    worktrees(cwd)
-      .then((l) => {
-        if (!live) return;
-        rememberTrees(cwd, l);
-        setGot({ cwd, list: l });
-      })
-      .catch(() => {});
+    let latest = 0;
+    const refresh = () => {
+      const request = ++latest;
+      void worktrees(cwd).then((list) => {
+        if (request !== latest) return;
+        rememberTrees(cwd, list);
+        setGot({ cwd, list });
+      }).catch(() => {});
+    };
+    refresh();
+    window.addEventListener('focus', refresh);
     return () => {
-      live = false;
+      latest++;
+      window.removeEventListener('focus', refresh);
     };
   }, [cwd]);
   // Another folder: what is known of that one, never the last folder's branch for a frame.
@@ -774,7 +527,10 @@ function BranchChip({ onClosed }: { onClosed: () => void }) {
                   const name = treeName(w);
                   const folder = baseName(w.path);
                   return (
-                    <RM.Item key={w.path} className="menu-item cm-row" title={w.path} onSelect={() => setUi({ homeCwd: w.path, homeChat: false })}>
+                    <RM.Item key={w.path} className="menu-item cm-row" title={w.path} onSelect={() => {
+                      rememberTrees(w.path, list);
+                      setUi({ homeCwd: w.path, homeChat: false });
+                    }}>
                       <Icon name="branch" size={15} className="hc-icon" />
                       <span className="cm-row-name grow truncate">{name}</span>
                       {folder !== name && <span className="cm-row-dim truncate">{folder}</span>}

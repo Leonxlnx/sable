@@ -24,6 +24,9 @@ export function takePaidAsk(sessionId: string | null | undefined): string | unde
   return s;
 }
 
+/** What the question's row says: the speed by its name and what turning it on means ("Fast · Billed as extra usage"). */
+export const askLine = (speedName: string) => `${speedName} · Billed as extra usage`;
+
 /** Tests only. */
 export function resetPaid() {
   confirmed.clear();

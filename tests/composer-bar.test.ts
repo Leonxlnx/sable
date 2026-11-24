@@ -1,14 +1,14 @@
 /**
- * The prompt bar of 22 Nov: where its menus stand, the agent's last known answer for the bar's
- * first frame, the path of ultracode's moment, the shade, and the message card the drop lands as.
+ * The prompt bar: where its menus stand, the agent's last known answer for the bar's first frame,
+ * ultracode's moment, the shade, and the message card the drop lands as.
  */
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Capabilities } from '@shared/protocol';
 import { rememberCaps, resetSeenCaps, seenCaps } from '../src/features/composer/caps-seen';
 import { GAP, placeMenu, roomBeside } from '../src/features/composer/menu-place';
-import { rimRun } from '../src/features/composer/ultra-run';
 import { INK, inkAt } from '../src/features/composer/liquid-shape';
+import { snapShift, toDevicePixel } from '../src/features/composer/pixel-snap';
 
 const read = (file: string) => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 
@@ -50,11 +50,12 @@ describe('a menu the bar opens stands by its own chip', () => {
 
   it('is what every menu of the bar uses, and their rows nest in the menu’s corner', () => {
     const controls = read('src/features/composer/Controls.tsx');
-    expect(controls.match(/sideOffset=\{place\.sideOffset\}/g)?.length).toBe(2);
+    // The mode menu; the model and effort panel is Phrase.tsx's.
+    expect(controls.match(/sideOffset=\{place\.sideOffset\}/g)?.length).toBe(1);
     expect(controls).not.toMatch(/panePlace|usePanePlace|closest<HTMLElement>\('\.cmp-card'\)/);
     // The side comes from the placement on all four menus, and Radix never flips it (a flipped mode
     // menu kept the row order of the side it left).
-    for (const file of ['Controls.tsx', 'Thinking.tsx', 'Composer.tsx']) {
+    for (const file of ['Controls.tsx', 'Phrase.tsx', 'Composer.tsx']) {
       const src = read(`src/features/composer/${file}`);
       expect(src).toContain('side={place.side}');
       expect(src).toContain('useMenuPlace(');
@@ -63,7 +64,15 @@ describe('a menu the bar opens stands by its own chip', () => {
     }
     // The home chips' menus (agent, folder, working tree) hang below their chips by the same gap.
     expect(controls.match(/side="bottom"\s+align="start"\s+sideOffset=\{GAP\}/g)?.length).toBe(3);
-    expect(read('src/features/composer/Thinking.tsx')).toMatch(/sideOffset=\{place\.sideOffset\}\s*alignOffset=\{place\.alignOffset\}/);
+    // The panel hangs from the phrase's right end, which holds whatever the phrase says
+    // (tests/composer-effort.test.ts has the rule).
+    const phrase = read('src/features/composer/Phrase.tsx');
+    expect(phrase).toMatch(/align="end"\s*sideOffset=\{place\.sideOffset\}\s*alignOffset=\{0\}/);
+    // Its width is its two columns, the gap between them and its padding.
+    const w = /--mx-col-m: (\d+)px;\n  --mx-col-s: (\d+)px;\n  --mx-gap: (\d+)px;/.exec(read('src/features/composer/composer.css'));
+    expect(Number(w?.[1]) + Number(w?.[2]) + Number(w?.[3]) + 8).toBe(Number(/export const PANEL_W = (\d+);/.exec(phrase)?.[1]));
+    // The scale's column starts on the 4 px grid its edges are laid out on.
+    expect((4 + Number(w?.[1]) + Number(w?.[3])) % 4).toBe(0);
     expect(read('src/features/composer/Composer.tsx')).toMatch(/sideOffset=\{place\.sideOffset\} alignOffset=\{place\.alignOffset\}/);
     // A menu's corner is 16 and its rows stand 4 in: 12, for the row and the highlight under it.
     const css = read('src/features/composer/composer.css');
@@ -154,62 +163,84 @@ describe('the agent’s last known answer fills the bar’s first frame', () => 
   });
 });
 
-describe('ultracode’s moment: two lights round the pane’s rim', () => {
-  const run = rimRun(760, 90, 640);
-  const far = (pts: { x: number; y: number }[]) => pts.slice(1).reduce((s, p, i) => s + Math.hypot(p.x - pts[i].x, p.y - pts[i].y), 0);
-
-  it('leave the chip both ways along the bottom edge', () => {
-    expect([run.a[0].x, run.a[0].y]).toEqual([640, 90]);
-    expect([run.b[0].x, run.b[0].y]).toEqual([640, 90]);
-    expect(run.a[1]).toMatchObject({ x: 0, y: 90 });
-    // The other one turns into the cove where the bottom edge ends (66 from the corner).
-    expect(run.b[1]).toMatchObject({ x: 760 - 66, y: 90 });
-  });
-
-  it('travel the same distance at one speed and meet in one point on the far side', () => {
-    expect(far(run.a)).toBeCloseTo(run.length, 6);
-    expect(far(run.b)).toBeCloseTo(run.length, 6);
-    const [ea, eb] = [run.a.at(-1)!, run.b.at(-1)!];
-    expect(ea.x).toBeCloseTo(eb.x, 6);
-    expect(ea.y).toBeCloseTo(eb.y, 6);
-    expect(run.meet.y).toBe(0);
-    // On the top edge, about as far from the left as the chip stands from the right.
-    expect(run.meet.x).toBeGreaterThan(60);
-    expect(run.meet.x).toBeLessThan(140);
-  });
-
-  it('are timed by the distance covered (the offsets of one eased run)', () => {
-    for (const path of [run.a, run.b]) {
-      let done = 0;
-      path.forEach((p, i) => {
-        if (i) done += Math.hypot(p.x - path[i - 1].x, p.y - path[i - 1].y);
-        expect(p.at).toBeCloseTo(done / run.length, 6);
-      });
-      expect(path[0].at).toBe(0);
-      expect(path.at(-1)!.at).toBe(1);
-    }
-  });
-
-  it('holds for a chip anywhere on the line and for a tall pane', () => {
-    for (const [w, h, x] of [
-      [300, 90, 200],
-      [760, 250, 700],
-      [760, 112, 10],
-    ]) {
-      const r = rimRun(w, h, x);
-      expect(far(r.a)).toBeCloseTo(far(r.b), 6);
-      expect(r.a.at(-1)!.x).toBeCloseTo(r.b.at(-1)!.x, 6);
-      expect(r.a.at(-1)!.y).toBeCloseTo(r.b.at(-1)!.y, 6);
-    }
-  });
-
-  it('moves discs inside the rim’s own rings: transform and opacity, and the field answers once', () => {
+describe('ultracode’s moment: one even hairline, and the field answers once', () => {
+  // 23 Nov: the two lights that ran round the rim are gone (the owner wants the rim even): the
+  // clearer hairline comes up all round at once, on the rim's own ring, and the field pulses once.
+  it('comes up all round at once, on the rim’s own ring: opacity only, nothing runs round it', () => {
     const src = read('src/features/composer/Ultracode.tsx');
-    expect(src).toContain("fieldBeatAt('pulse'");
-    expect(src).toMatch(/<i className="cr-edge">\s*<b data-way="a" \/>\s*<b data-way="b" \/>/);
+    expect(src).toContain('<CoveRing className="uc-line" />');
+    expect(src).not.toMatch(/rimRun|data-way|translate\(/);
     expect(src).not.toMatch(/boxShadow|filter/);
     const css = read('src/features/composer/composer.css');
-    expect(css).not.toContain('uc-flash');
+    expect(css).toMatch(/\.uc\[data-phase='rise'\] > \.uc-line \{\n  animation: fade-in /);
+    expect(css).not.toMatch(/uc-run|uc-flash/);
+  });
+
+  it('the field answers once, from ultracode’s own chip, with a real beat and no flash (drawn by the worker)', () => {
+    const src = read('src/features/composer/Ultracode.tsx');
+    expect(src.match(/fieldBeat\(/g)?.length).toBe(1);
+    // The wave without the flash at its start, from the chip that is on (the phrase for an Ultra level).
+    expect(src).toContain("fieldBeat('pulse', beatFrom(card.current), BEAT)");
+    expect(src).toMatch(/card\?\.querySelector\('\.ux\[data-on\]'\) \?\? card\?\.querySelector\('\.ph'\) \?\? card/);
+    const beat = Number(/const BEAT = ([\d.]+);/.exec(src)?.[1]);
+    // More than the soft pulse it was (0.7), within what the field takes (1.6).
+    expect(beat).toBeGreaterThanOrEqual(1);
+    expect(beat).toBeLessThanOrEqual(1.6);
+  });
+});
+
+describe('the pane stands on whole device pixels', () => {
+  // The pane's fill, words and rim are a compositor layer of their own (they lie above its blur), placed
+  // where the card's first whole CSS pixel falls on the screen. Between device pixels it is drawn smeared.
+  const lands = (pos: number, dpr: number) => (Math.floor(pos + 1 / 128) + snapShift(pos, dpr)) * dpr;
+
+  it('moves the card by the missing part of a device pixel, at most half of one', () => {
+    // The docked pane in a 760 px tall window at 125%: its top at CSS pixel 643, device pixel 803.75.
+    expect(snapShift(643, 1.25)).toBeCloseTo(0.2, 6);
+    expect(lands(643, 1.25)).toBeCloseTo(804, 6);
+    // One line taller (22 px): 621 is 776.25, a quarter of a pixel the other way.
+    expect(snapShift(621, 1.25)).toBeCloseTo(-0.2, 6);
+    for (const dpr of [1.1, 1.25, 1.5, 1.75]) {
+      for (let pos = 300; pos < 340; pos += 0.37) {
+        const d = lands(pos, dpr);
+        expect(Math.abs(d - Math.round(d))).toBeLessThan(1e-6);
+        expect(Math.abs(snapShift(pos, dpr)) * dpr).toBeLessThanOrEqual(0.5 + 1e-9);
+      }
+    }
+  });
+
+  it('moves nothing where a CSS pixel is whole device pixels, or where the pane already stands on one', () => {
+    for (const pos of [0, 312, 312.67, 643, 643.5]) {
+      expect(snapShift(pos, 1)).toBe(0);
+      expect(snapShift(pos, 2)).toBe(0);
+    }
+    // 348 at 125% is device pixel 435; home's pane at 312.67 starts on CSS pixel 312, device pixel 390.
+    expect(snapShift(348, 1.25)).toBe(0);
+    expect(snapShift(348.5, 1.25)).toBe(0);
+    expect(snapShift(312.67, 1.25)).toBe(0);
+  });
+
+  it('puts a line on the nearest whole device pixel (where a chip’s two skin windows meet, before it glides)', () => {
+    for (const dpr of [1, 1.25, 1.5, 1.75, 2, 2.5]) {
+      for (let pos = 900; pos < 906; pos += 0.13) {
+        const on = (pos + toDevicePixel(pos, dpr)) * dpr;
+        expect(Math.abs(on - Math.round(on))).toBeLessThan(1e-6);
+        expect(Math.abs(toDevicePixel(pos, dpr)) * dpr).toBeLessThanOrEqual(0.5 + 1e-9);
+      }
+    }
+    // A chip that ends at 1045.5 with a cap of 20: the line at 1025.5 is device pixel 1281.875 at 125%.
+    expect(toDevicePixel(1025.5, 1.25)).toBeCloseTo(0.1, 6);
+    expect(toDevicePixel(1024, 1.25)).toBe(0);
+    expect(toDevicePixel(Number.NaN, 1.25)).toBe(0);
+  });
+
+  it('counts from the card’s first whole pixel, not from its own fraction (the layer starts there)', () => {
+    // Half a pixel in (an odd stage width): the same shift as on the pixel before it.
+    expect(snapShift(41.5, 1.25)).toBeCloseTo(snapShift(41, 1.25), 9);
+    // A position a rounding error short of a whole pixel is that pixel.
+    expect(snapShift(642.9999, 1.25)).toBeCloseTo(0.2, 3);
+    expect(snapShift(Number.NaN, 1.25)).toBe(0);
+    expect(snapShift(10, 0)).toBe(0);
   });
 });
 
@@ -334,7 +365,7 @@ describe('nothing on the bar blinks', () => {
     expect(css).toMatch(/:is\(\.cmp-card, \.gal\) \.tb-chip:focus-visible \{\n  outline: none;\n  --chip-ring: inset 0 0 0 var\(--focus-w\) var\(--focus\);/);
     // After every rule that sets the ring of one of the bar's chips for another state.
     const after = css.slice(css.indexOf(':is(.cmp-card, .gal) .tb-chip:focus-visible') + 40);
-    expect(after).not.toMatch(/\.(tb-chip|th-chip|cm-mode|cm-model)[^{}]*\{[^}]*--chip-ring:/);
+    expect(after).not.toMatch(/\.(tb-chip|ph|ux|cm-mode)[^{}]*\{[^}]*--chip-ring:/);
   });
 
   it('the emptied field shows no caret while its words still leave', () => {

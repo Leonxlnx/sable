@@ -6,16 +6,19 @@
 
    The card (`.cmp-card`) stays a plain rectangle that everything measures and lays out in; it
    paints nothing itself. Its paint is the layers of Cove.tsx, all static:
-   - the glass (`.cmp-glass`): one even frosted fill with a backdrop blur, clipped to the pane's
-     outline; the pane's inner glow, the same all round (the cove's from a disc of its own);
+   - the frost (`.cmp-frost`): the backdrop blur alone, cut to the pane's outline by a mask;
+   - the glass (`.cmp-glass`): one even frosted fill, clipped to the pane's outline; the pane's
+     inner glow, the same all round (the cove's from a disc of its own);
    - the rim (`.cmp-rim`): one even hairline along the whole outline, the cove included;
-   - the shade (`.cmp-shade`): the contact line and the shadows of glass, with what falls into the
-     channel.
+   - the shade (`.cmp-shade`): the contact line and the shadows of glass, hugging the cove's curve
+     too. Nothing else falls into the cove: round the key, in the channel and out to the card's
+     corner, the field is as crisp and as bright as it is outside the pane.
    No glint, no sheen, no thinner edges. Focus draws no ring, never lightens the pane and never
    darkens what is round it: two layers only fade in, both inside the outline (a little more ink
    in the glass, the hairline a step clearer all the way round). Monochrome: the only colour is
    the field's, through the glass and in the channel. Only those opacities and the pointer's
-   light (ui/spot.ts) ever move. */
+   light (ui/spot.ts) ever move. (The card itself is moved by a fraction of a pixel where a CSS
+   pixel is no whole number of device pixels, so its layers stand on whole ones: pixel-snap.ts.) */
 
 .composer {
   position: relative;
@@ -53,6 +56,17 @@
     arc to 20px 0 of 20px cw,
     close
   );
+  /* The same outline as a mask, for the pane's blur (`.cmp-frost`). A backdrop blur is not cut by
+     a clip-path once a round-cornered ancestor clips as well (the stage's sheet does): Chromium
+     then draws the blurred backdrop against the outer clip and the element's own box, and the
+     blur filled the whole card, cove and corner included: a dark blurred square behind the key.
+     A mask travels with the backdrop. Three layers that overlap by 20, so no line shows where
+     they meet at any display scale: everything above the cove, everything left of it, and the
+     corner's piece, 86 square (the cove's 66 and the overlap), drawn as the same three arcs. */
+  --cove-frost:
+    linear-gradient(#000 0 0) 0 0 / 100% calc(100% - 66px) no-repeat,
+    linear-gradient(#000 0 0) 0 100% / calc(100% - 66px) 86px no-repeat,
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='86' height='86'%3E%3Cpath d='M0 0H86V20A20 20 0 0 1 66 40A26 26 0 0 0 40 66A20 20 0 0 1 20 86H0Z'/%3E%3C/svg%3E") 100% 100% / 86px 86px no-repeat;
   /* The rim along the cove: the band between that curve and the same curve the rim's width in
      (tokens.css --rim-w: 1px, or two device pixels where 1px is less). The inner curve is the
      outer one offset: the horns' radii less the width, the cove's more, and they still meet on
@@ -125,14 +139,22 @@
   /* cove:end */
   /* The pane's depth (tokens.css --shadow-pane, --rim-inner), layer by layer, for the corner's
      quarter, where the pane's outline is not a box's: the contact line and the near shadow follow
-     the cove; the soft shadow is the whole silhouette's (pane and key together are the box); the
-     channel keeps a shade of its own. The bar lies on the field: it casts little, so the field
-     keeps its colour round it, and focus adds nothing outside the pane. */
+     the cove; the soft shadow is the whole silhouette's (pane and key together are the box).
+     Nothing else falls into the cove: round the key the field is as crisp and as bright as it is
+     outside the pane. The bar lies on the field: it casts little, so the field keeps its colour
+     round it, and focus adds nothing outside the pane. */
   --cove-contact: var(--pane-contact);
   --cove-near: var(--pane-near);
   --cove-far: var(--pane-far);
   --cove-glow: 0 0 12px 0 rgb(255 255 255 / 0.02);
-  --cove-gap-shade: rgb(0 0 0 / 0.22);
+  /* How far a layer that is cut by a path paints past the outline. Chromium snaps a box's own
+     fill to whole device pixels and does not snap its clip-path: with the fill as large as the
+     outline, a pane at a fraction of a pixel (an odd stage width, home's centred column, any
+     scale that is no whole number) lost up to a pixel of its rim along the top and left edges
+     and none along the others. Measured at 125% with the pane half a pixel off: the left edge at
+     89% of the mean and the top at 119%. With the fill reaching past the outline the path alone
+     decides every edge, at any offset. */
+  --cove-bleed: 2px;
   /* The hairlines of the controls on the pane (the attach disc, the chips): the flat controls' own
      (tokens.css --press-up, --press-down) at the rim's width and with its thinned light, so a
      round control reads as even round its curve as the pane's rim does. */
@@ -148,6 +170,7 @@
 /* ── the pane's paint (Cove.tsx) ── */
 
 .cmp-shade,
+.cmp-frost,
 .cmp-glass,
 .cove-ring {
   position: absolute;
@@ -163,24 +186,45 @@
   position: absolute;
 }
 
-/* The glass: the fill and the blur, cut to the pane. */
+/* The frost: the blur of what is behind the pane, and nothing else. Cut to the pane by a mask
+   (--cove-frost above has why a clip-path does not do it); its three plain corners are the box's
+   own, which a backdrop blur follows exactly. It paints nothing itself, so its edge is never
+   seen: the glass over it has the outline. */
+.cmp-frost {
+  z-index: -1;
+  -webkit-backdrop-filter: var(--blur-pane);
+  backdrop-filter: var(--blur-pane);
+  -webkit-mask: var(--cove-frost);
+  mask: var(--cove-frost);
+}
+
+/* The glass: the fill, cut to the pane. Its box reaches past the outline (--cove-bleed) and the
+   path is laid out in its content box, which is the card's own box. */
 .cmp-glass {
   --cmp-fill: var(--glass-pane);
+  inset: calc(var(--cove-bleed) * -1);
   z-index: -1;
+  padding: var(--cove-bleed);
   background-color: var(--cmp-fill);
   background-image: var(--grain);
   background-size: var(--grain-size);
-  -webkit-backdrop-filter: var(--blur-pane);
-  backdrop-filter: var(--blur-pane);
+  clip-path: var(--cove-pane) content-box;
+}
+
+/* The pane's thickness: the faint glow just inside the rim, on the card's own box. */
+.cmp-glass::after {
+  content: '';
+  position: absolute;
+  inset: var(--cove-bleed);
+  border-radius: 20px;
   box-shadow: var(--rim-inner);
-  clip-path: var(--cove-pane);
 }
 
 /* The inner glow along the cove: the light of a disc as large as the cove, falling outward into
    the pane (the box's own inset glow never reaches this edge). */
 .gl-glow {
-  right: var(--cove-disc-out);
-  bottom: var(--cove-disc-out);
+  right: calc(var(--cove-disc-out) + var(--cove-bleed));
+  bottom: calc(var(--cove-disc-out) + var(--cove-bleed));
   width: var(--cove-disc);
   height: var(--cove-disc);
   border-radius: 50%;
@@ -201,15 +245,20 @@
    (tokens.css --rim-w: two device pixels where 1px is less, which always holds one whole pixel
    at any angle). Every fill laid on them is thinned by the same factor (--rim-k), so the ring
    holds the light of a 1px hairline at every display scale, the same along the edges as round
-   the corners. */
+   the corners. Each part's fill reaches past the outline (--cove-bleed) and its path is laid out
+   in its content box, the card's own: the band is whole on every side wherever the pane stands. */
+.cove-ring > .cr-edge,
+.cove-ring > .cr-cove {
+  inset: calc(var(--cove-bleed) * -1);
+  padding: var(--cove-bleed);
+}
+
 .cove-ring > .cr-edge {
-  inset: 0;
-  clip-path: var(--rim-rest);
+  clip-path: var(--rim-rest) content-box;
 }
 
 .cove-ring > .cr-cove {
-  inset: 0;
-  clip-path: var(--cove-band);
+  clip-path: var(--cove-band) content-box;
 }
 
 /* The rim: one even hairline, the same along the cove as along the straight edges. */
@@ -234,9 +283,11 @@
 
 /* The shade, under the glass. Away from the cove it is the pane's own token on a box (cut off
    where the cove begins). In the corner's quarter the outline is not a box's: the soft shadow
-   is the box's (pane and key together), the contact line and the near shadow are drawn
-   by three discs, the cove's inward, the horns' outward, each kept to its own stretch of the
-   curve, and the channel has a soft shade of its own (a box's shadow is never drawn inside it). */
+   is the box's (pane and key together, and a box's shadow is never drawn inside the box), the
+   contact line and the near shadow are drawn by three discs, the cove's inward, the horns'
+   outward, each kept to its own stretch of the curve: a shade a few px deep that hugs the pane's
+   edge and falls off. The channel and the corner beyond the key have nothing of their own (a
+   dark disc lay there until 24 Nov and read as the card's rectangle behind the key). */
 .cmp-shade {
   z-index: -2;
 }
@@ -258,17 +309,6 @@
   inset: 0;
   border-radius: inherit;
   box-shadow: var(--cove-far);
-}
-
-/* The channel is a narrow gap between two panes close over the ground: it keeps a soft shade of
-   its own, even along the channel and falling off where the channel opens to the outside. */
-.sh-gap {
-  right: calc(var(--cove-disc-out) - 10px);
-  bottom: calc(var(--cove-disc-out) - 10px);
-  width: calc(var(--cove-disc) + 20px);
-  height: calc(var(--cove-disc) + 20px);
-  border-radius: 50%;
-  background: radial-gradient(circle closest-side, var(--cove-gap-shade) 72%, transparent);
 }
 
 .sh-cove {
@@ -333,10 +373,12 @@
   background-color: rgb(255 255 255 / calc(0.035 * var(--rim-k)));
 }
 
+/* The disc's origin is the card's corner (ui/spot.ts moves it in the card's own pixels): its part
+   reaches --cove-bleed past the card on every side. */
 .cmp-card > .spot-ring > .spot-part > i {
   position: absolute;
-  left: calc(var(--spot-r) * -1);
-  top: calc(var(--spot-r) * -1);
+  left: calc(var(--spot-r) * -1 + var(--cove-bleed));
+  top: calc(var(--spot-r) * -1 + var(--cove-bleed));
   width: calc(var(--spot-r) * 2);
   height: calc(var(--spot-r) * 2);
   background: radial-gradient(circle closest-side, var(--spot), transparent);
@@ -350,16 +392,29 @@
 /* When the governor sheds effects, the glass goes opaque and stops blurring. Its ink is then the
    tone the pane has over the bare stage (tokens.css --glass-pane-solid), never the lighter grey of
    an opaque menu: under load the bar must not turn into a pale slab. */
+:root[data-quality] .cmp-frost {
+  display: none;
+}
+
 :root[data-quality] .cmp-glass {
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
   --cmp-fill: var(--glass-pane-solid);
 }
 
 /* Where a shape cannot be drawn the pane is a plain rounded box and the key lies on its corner. */
 @supports not (clip-path: shape(from 0 0, hline to 1px, close)) {
+  .cmp-frost {
+    -webkit-mask: none;
+    mask: none;
+  }
+
   .cmp-glass {
+    inset: 0;
+    padding: 0;
     clip-path: none;
+  }
+
+  .cmp-glass::after {
+    inset: 0;
   }
 
   .sh-body {
@@ -368,6 +423,7 @@
 
   /* The rim as every other pane's: a masked ring round the box. */
   .cove-ring > .cr-edge {
+    inset: 0;
     padding: var(--rim-w);
     border-radius: inherit;
     clip-path: none;
@@ -841,8 +897,14 @@
    transform, so the edge glides on the compositor). Each pill runs on far past the other's
    window, so the two always meet on a straight part: together they are one pill in every frame,
    hairline and all, and nothing is ever scaled. `--chip-room` is how far the moving window
-   reaches past the chip while a wider pill is on its way in. */
+   reaches past the chip while a wider pill is on its way in. A chip that is a disc (ultracode's
+   mark alone, the mode as its icon) is too short for a straight part: there the windows meet in
+   its middle (`--chip-cap`, half the chip), where both pills are at their full height, so the two
+   caps make one exact circle. Before a glide Chip.tsx (`seat`) moves that line onto a whole device
+   pixel (`--chip-cap-px`, `--chip-half-fix`: half a device pixel at most), or the gliding window,
+   which the compositor cuts, and the one that stays overlap by a column while it moves. */
 [data-chip] > .chip-skin {
+  --chip-cap: min(var(--chip-cap-px, 20px), calc(50% + var(--chip-half-fix, 0px)));
   position: absolute;
   inset: 0;
   z-index: -1;
@@ -870,7 +932,7 @@
 
 [data-anchor='right'] > .chip-skin > .cs-fix {
   right: 0;
-  width: 20px;
+  width: var(--chip-cap);
 }
 
 [data-anchor='right'] > .chip-skin > .cs-fix > i {
@@ -879,7 +941,7 @@
 
 [data-anchor='right'] > .chip-skin > .cs-move {
   left: calc(var(--chip-room, 0px) * -1);
-  right: 20px;
+  right: var(--chip-cap);
 }
 
 [data-anchor='right'] > .chip-skin > .cs-move > i {
@@ -888,7 +950,7 @@
 
 [data-anchor='left'] > .chip-skin > .cs-fix {
   left: 0;
-  width: 20px;
+  width: var(--chip-cap);
 }
 
 [data-anchor='left'] > .chip-skin > .cs-fix > i {
@@ -896,7 +958,7 @@
 }
 
 [data-anchor='left'] > .chip-skin > .cs-move {
-  left: 20px;
+  left: var(--chip-cap);
   right: calc(var(--chip-room, 0px) * -1);
 }
 
@@ -960,13 +1022,6 @@
   color: var(--red);
 }
 
-/* Model, then effort: two chips side by side, the model's name and the scale. */
-.cm-model {
-  flex-shrink: 1;
-  padding: 0 9px 0 10px;
-  color: var(--text);
-}
-
 /* A chip of an agent nothing is known of yet (never seen on this machine): a still, quiet pill in
    the chip's place, so the line keeps its layout. Nothing shimmers; the chips that take its place
    come in together, once (`data-late`). An agent seen before never shows this (caps-seen.ts). */
@@ -976,10 +1031,6 @@
   height: 28px;
   border-radius: var(--r-pill);
   background-color: var(--fill-1);
-}
-
-.cmp-agent > .chip-skel + .chip-skel {
-  margin-left: 4px;
 }
 
 /* From a third of its strength, not from nothing: the pill it replaces is gone in the same frame,
@@ -1011,6 +1062,7 @@
 .cmp-agent {
   display: flex;
   align-items: center;
+  gap: 4px;
   min-width: 0;
   transition:
     opacity var(--d-1) var(--ease),
@@ -1040,125 +1092,142 @@
   animation: fade-in var(--d-2) var(--ease-out);
 }
 
-/* ── effort: the scale, set on the bar (Thinking.tsx) ──
-   At rest the chip is the scale itself: one pip per level, lit up to the level, and the level's
-   name. It is dragged sideways (or stepped with the arrow keys) and the pips answer in the frame;
-   a click opens the ladder. The chip hugs its label, its right end (before the cove) holds, and a
-   new name is one glide of its left end with the model's name riding along (Chip.tsx). */
-.th-chip {
-  flex-shrink: 0;
-  gap: 7px;
-  padding: 0 10px 0 9px;
+/* ── model and effort: one phrase on the bar (Phrase.tsx) ──
+   "Opus 5.5 · Extra high": one chip with the bar's skin and states. The model in --text, the dot in
+   --text-3, the level a step quieter until the chip is pointed at, open or focused. The phrase is
+   as wide as its words and reads tight at every level: the name, the dot with one gap each side,
+   the level. Its right end holds (the end by the key, so it always ends the same distance from
+   it, and the panel hangs from it); a new level rolls in by the way it went and what stands left
+   of the word glides by the difference (Chip.tsx). The slot holds the chip, so it can give in a
+   narrow pane. */
+.ph-slot {
+  display: grid;
+  grid-template-columns: minmax(0, auto);
+  min-width: 0;
+}
+
+.ph-slot > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+.ph {
+  gap: 0;
+  padding: 0 10px;
   color: var(--text);
-  /* A drag on it is the scale's, never the page's. */
-  touch-action: none;
 }
 
-/* Past the plain levels (ultracode on, an Ultra level) the chip is on: one fill step and the even
-   hairline, as every engaged control. */
-.th-chip[data-ultra] {
+/* A word that rolls (the level; ultracode's word) is cut at its chip's top and bottom, never at
+   its sides: the skin's moving end may reach past the chip while it glides. */
+.ph,
+.ux {
+  overflow-x: visible;
+  overflow-y: clip;
+}
+
+.ph-bolt {
+  margin-right: 5px;
+}
+
+.ph .ph-bolt svg {
+  color: var(--text);
+}
+
+/* The model's name is the part of the line that gives. */
+.ph > .ph-model {
+  flex-shrink: 1;
+  overflow: hidden;
+}
+
+.ph-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The dot is the gap: 15 wide with the glyph in its middle, so the words stand as far from it on
+   both sides at every level and the phrase reads as one. */
+.ph-dot {
+  flex: none;
+  justify-content: center;
+  width: 15px;
+  color: var(--text-3);
+}
+
+.ph-word {
+  color: var(--text-2);
+  transition: color var(--d-1) var(--ease);
+}
+
+.ph:is(:hover, :focus-visible, [aria-expanded='true']) .ph-word {
+  color: var(--text);
+}
+
+/* A level pointed at in the panel, before the click: in the word's own place, a step dimmer. */
+.ph-word > [data-preview] {
+  color: var(--text-3);
+}
+
+/* ── ultracode: a switch of its own beside the phrase (Ultracode.tsx) ──
+   Off, its mark alone: a bare round chip of 28 in the quiet tone of every chip without a fill.
+   On, a chip that is on, as every engaged control: the hover fill held, the hairline a step up,
+   the mark ivory, and the word after the mark. The mark stands 7 in from the chip's far end in
+   both (a disc of 14 about the cap's own centre), so it rides that end as the chip opens. */
+.ux {
+  flex: none;
+  justify-content: center;
+  gap: 5px;
+  width: 28px;
+  padding: 0;
+}
+
+.ux[data-on] {
   --chip-bg: var(--fill-2);
-  --chip-ring: var(--press-up);
+  --chip-ring: var(--press-down);
+  width: auto;
+  padding: 0 11px 0 7px;
+  color: var(--text);
+  /* A chip with a fill says its word at the mode chip's weight. */
+  font-weight: var(--w-medium);
 }
 
-.th-chip[data-ultra]:is(:hover, [aria-expanded='true']) {
+.ux[data-on] svg,
+.ux[data-on]:hover svg {
+  color: var(--text);
+}
+
+/* Turning off: the chip keeps its fill while its end comes home (Ultracode.tsx), so the mark rides
+   a pill that closes; the fill lets go once it is a disc again. The hairline went with the state,
+   in the frame. */
+.ux[data-closing] {
+  --chip-bg: var(--fill-2);
+}
+
+.ux[data-on]:hover {
   --chip-bg: var(--fill-3);
 }
 
-.th-chip[data-ultra]:is(:active, [aria-expanded='true']) {
-  --chip-ring: var(--press-down);
-}
-
-/* While it is dragged it holds its edge, as an open chip does. */
-.th-chip[data-scrub] {
-  --chip-bg: var(--fill-2);
-  --chip-ring: var(--press-down);
-  color: var(--text);
-  cursor: ew-resize;
-}
-
-.th-chip[data-bare] {
-  padding: 0 9px;
-}
-
-.th-pips {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  height: 12px;
-}
-
-/* A pip: flat ivory, dim until the level reaches it. A change runs along the pips from where the
-   scale stood (`--d`, the pip's distance from there), 16 ms a pip: a move, never a swap. */
-.th-pips > i {
-  display: block;
-  width: 3px;
-  height: 10px;
-  border-radius: 1.5px;
-  background-color: var(--text);
-  opacity: 0.2;
-  transition: opacity 90ms linear calc(var(--d, 0) * 16ms);
-}
-
-.th-pips > i[data-on] {
-  opacity: 0.92;
-}
-
-/* What lies past the plain levels (an Ultra level, ultracode): a step apart, and only an outline
-   until the scale reaches it. */
-.th-pips > i[data-far] {
-  margin-left: 2px;
-}
-
-.th-pips > i[data-far]:not([data-on]) {
-  background-color: transparent;
-  box-shadow: inset 0 0 0 1px var(--text);
-  opacity: 0.34;
-}
-
-/* Ultracode's moment, its beginning: a charge runs up the scale to its end, pip by pip, and
-   leaves it as the lights set off round the pane (Ultracode.tsx starts them as it arrives). */
-.th-chip[data-burst] .th-pips > i {
-  animation: th-pip-wave 300ms var(--ease-out) calc(var(--i, 0) * 26ms) backwards;
-}
-
-@keyframes th-pip-wave {
-  0% {
-    scale: 1 1;
-  }
-  34% {
-    scale: 1 1.6;
-  }
-  100% {
-    scale: 1 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .th-pips > i {
-    transition: none;
-  }
-
-  .th-chip[data-burst] .th-pips > i {
-    animation: none;
-  }
-}
-
-.th-bolt {
-  flex: none;
-  color: var(--text);
+.ux[data-on]:active {
+  --chip-bg: var(--fill-4);
 }
 
 /* A narrow pane (the side panel open, a small window, a larger Interface size) sheds in this
-   order, and the cove and the key never change: the effort's name goes and its pips stay; the
-   model's name shortens (it is the one part of the line that gives); the mode chip becomes its
-   icon. */
-@container cmp (max-width: 400px) {
-  .th-chip {
-    padding: 0 9px;
+   order, and the cove and the key never change: ultracode keeps its mark alone (on, a disc that
+   is on); then the model's name and the dot go (the panel and the tooltip still say it) and the
+   level's word stays, since the keys change it; then the mode chip becomes its icon. */
+@container cmp (max-width: 520px) {
+  .ux[data-on] {
+    width: 28px;
+    padding: 0;
   }
 
-  .th-word {
+  .ux > .ux-word {
+    display: none;
+  }
+}
+
+@container cmp (max-width: 400px) {
+  .ph[data-word] > :is(.ph-model, .ph-dot) {
     display: none;
   }
 }
@@ -1186,116 +1255,311 @@
   --chip-ring: inset 0 0 0 var(--focus-w) var(--focus);
 }
 
-/* ── the ladder: every stop by name, the highest on top ── */
-
-.th-pop {
+/* ── the panel at the phrase (Phrase.tsx): the models and their scale side by side, the switches
+   across the whole width at the far end from the phrase ──
+   Every row of both columns is one pitch of 28, so the panel reads as one grid. Both columns are
+   as tall as the panel opened with (`--mx-rows`) and both stand on the line nearest the phrase:
+   above it (a chat) on the bottom line, the other agents over the models; below it (home) they
+   hang from the top line. A shorter column's spare rows are then one band at the far side, never
+   a hole in two corners. The columns stand 4 apart, so a lit model and a lit level on one line
+   are two pills. Every edge of the scale lies on a whole device pixel at 100, 125, 150, 175 and
+   200%: the columns start on a multiple of 4 px (the pane's padding, the models' width, the gap),
+   the axis is 14 in, the thumb 12 on a 4 px grid, and the track's width is a whole number of
+   device pixels centred on the axis (`--mx-track`). */
+.mx {
+  --mx-col-m: 152px;
+  --mx-col-s: 124px;
+  --mx-gap: 4px;
+  --mx-track: 2px;
+  width: calc(var(--mx-col-m) + var(--mx-gap) + var(--mx-col-s) + 8px);
   min-width: 0;
-  width: 196px;
 }
 
-/* A stop: its piece of the scale, then its name. The pieces stand over one another like the pips
-   stand side by side: lit up to the level, the level's own the brightest. */
-.th-row {
-  gap: 11px;
-  min-height: 28px;
-  padding: 3px 8px 3px 11px;
-}
-
-.th-row[data-current] {
-  color: var(--text);
-  font-weight: var(--w-medium);
-}
-
-.th-seg {
-  flex: none;
-  width: 3px;
-  height: 20px;
-  border-radius: 1.5px;
-  background-color: var(--text);
-  opacity: 0.16;
-}
-
-.th-row[data-lit] > .th-seg {
-  opacity: 0.5;
-}
-
-.th-row[data-current] > .th-seg {
-  opacity: 0.95;
-}
-
-/* Past the plain levels: a step apart, an outline until it is reached (as on the chip). */
-.th-row-far {
-  margin-bottom: 4px;
-}
-
-.th-row-far:not([data-lit]) > .th-seg {
-  background-color: transparent;
-  box-shadow: inset 0 0 0 1px var(--text);
-  opacity: 0.34;
-}
-
-/* The level kept under ultracode. */
-.menu-item.th-row > .th-kept {
-  color: var(--text-3);
-}
-
-.th-sep {
-  margin: 4px 6px;
-}
-
-/* A speed beyond standard: on or off. Its bolt stands on the scale's line. */
-.th-speed {
-  gap: 6px;
-  padding-left: 6px;
-}
-
-.menu-item.th-speed[data-state='checked'] {
-  color: var(--text);
-}
-
-.menu-item.th-speed[data-state='checked'] > .th-lead {
-  color: var(--text);
-}
-
-/* A speed billed outside the plan names its cost on its row; the name gives before the cost does. */
-.th-cost {
-  flex: none;
-  font-size: var(--t-micro);
-  white-space: nowrap;
-  color: var(--text-3);
-}
-
-/* The once-per-session question before a paid speed is turned on. */
-.th-ask {
-  padding: 6px 4px 4px;
-  animation: th-name-in 140ms var(--ease-out);
-}
-
-@keyframes th-name-in {
-  from {
-    opacity: 0;
-    translate: 0 3px;
+@media (min-resolution: 1.2dppx) and (max-resolution: 1.3dppx) {
+  .mx {
+    --mx-track: 2.4px;
   }
 }
 
-.th-ask-q {
-  margin: 0 0 10px;
-  padding: 0 4px;
-  color: var(--text-2);
-  line-height: 1.45;
+@media (min-resolution: 1.45dppx) and (max-resolution: 1.55dppx) {
+  .mx {
+    --mx-track: 2.6667px;
+  }
 }
 
-.th-ask-row {
+@media (min-resolution: 1.7dppx) and (max-resolution: 1.8dppx) {
+  .mx {
+    --mx-track: 1.7143px;
+  }
+}
+
+.mx-cols {
+  display: grid;
+  grid-template-columns: var(--mx-col-m) var(--mx-col-s);
+  column-gap: var(--mx-gap);
+}
+
+.mx-models,
+.mx-scale {
   display: flex;
-  justify-content: flex-end;
-  gap: 6px;
+  flex-direction: column;
+  min-width: 0;
+  height: calc(var(--mx-rows, 5) * 28px);
 }
 
-/* ── the "ultra" edge (Ultracode.tsx): turning on, two lights run round the pane's rim from the
-   chip and meet on the far side; then a still, slightly clearer hairline stays ──
-   Rings on the rim's own pixels (Cove.tsx `CoveRing`, so they follow the cove). The lights are
-   soft discs moved inside those rings: only the hairline under them shows. Transform and opacity
-   only; monochrome; nothing turns in a loop. */
+.mx-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.mx-list > * {
+  flex-shrink: 0;
+}
+
+/* Above the phrase both columns stand on the bottom line. The models by a margin, not by the
+   column's own alignment: a list longer than the column must still scroll from its first row.
+   A filter's results hang under its field. */
+.mx[data-side='top'] .mx-scale {
+  justify-content: flex-end;
+}
+
+.mx[data-side='top'] .mx-models:not([data-filter]) > .mx-list > :first-child {
+  margin-top: auto;
+}
+
+.mx .menu-item {
+  height: 28px;
+  min-height: 28px;
+  padding: 0 8px;
+}
+
+.mx-row,
+.mx-agent,
+.mx-tog {
+  gap: 8px;
+}
+
+/* The row in use reads the same in every menu of the bar (the mode menu, the home chips' menus,
+   here): ivory, with the check at the row's end. So a model's row ends in a seat of 14 for it; a
+   model of another agent has its arrow there, an agent's row its caret. What leads a row is an
+   agent's mark, and the seat for it stands only where some row has one (Phrase.tsx `marks`). */
+.mx-lead,
+.mx-end {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 14px;
+}
+
+.mx-row[data-current] {
+  color: var(--text);
+}
+
+.menu-item.mx-row .mx-check {
+  color: var(--text);
+}
+
+/* Another agent's model: the arrow says it carries the conversation over, quiet until pointed at. */
+.menu-item .mx-away {
+  color: var(--text-4);
+}
+
+.menu-item.mx-row:is([data-highlighted], :hover) .mx-away {
+  color: var(--text-2);
+}
+
+.menu-item:is(.mx-row, .mx-agent):is([data-highlighted], [data-current]) .mm-mark {
+  opacity: 1;
+}
+
+.menu-item .mx-caret {
+  color: var(--text-3);
+}
+
+/* The model whose scale stands beside it, while the pointer or the keys work in the scale: lit one
+   step below the highlight, as a row whose submenu is open. */
+.mx-row[data-owner] {
+  background-color: var(--fill-1);
+  color: var(--text);
+}
+
+.mx .mm-search {
+  flex: none;
+  margin: 0;
+}
+
+.mx .mx-rung {
+  padding-left: 30px;
+}
+
+/* The level in use: ivory as every row in use; its mark is the scale's thumb. */
+.mx-rung[data-current] {
+  color: var(--text);
+}
+
+.mx-none {
+  padding: 0 8px;
+  line-height: 28px;
+  font-size: var(--t-ui);
+  color: var(--text-3);
+  animation: var(--empty-in);
+}
+
+/* The scale: the house slider stood on end, the names beside it its stops. Each rung draws its own
+   piece of the axis (a track in --fill-4, lit below the level in use), so nothing is measured;
+   the ends stop 2 px past the first and last stop. The level in use is the ivory thumb; the level
+   another model would come back at is the same thumb outlined: nothing is picked yet. */
+.mx-stop {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 14px;
+  width: 0;
+  pointer-events: none;
+}
+
+.mx-stop::before,
+.mx-stop::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--mx-track) / -2);
+  width: var(--mx-track);
+  background-color: var(--fill-4);
+}
+
+.mx-stop::after {
+  display: none;
+  background-color: var(--text-3);
+}
+
+.mx-stop[data-lit]::after {
+  display: block;
+}
+
+.mx-stop[data-end='top']::before,
+.mx-stop[data-lit='half']::after {
+  top: 12px;
+}
+
+.mx-stop[data-end='top']::before {
+  border-radius: 1px 1px 0 0;
+}
+
+.mx-stop[data-end='bottom']::before,
+.mx-stop[data-end='bottom']::after {
+  bottom: 12px;
+  border-radius: 0 0 1px 1px;
+}
+
+.mx-stop[data-end='only']::before {
+  display: none;
+}
+
+.mx-stop > b {
+  position: absolute;
+  z-index: 1;
+  top: 8px;
+  left: -6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background-color: var(--text);
+  box-shadow: var(--thumb-up);
+}
+
+.mx-stop > b[data-k='shows'] {
+  background-color: transparent;
+  box-shadow: inset 0 0 0 var(--rim-w) var(--text-2);
+}
+
+/* The outlined thumb stands in a gap of the track (the track's two pieces stop at its edge). */
+.mx-stop[data-hole]::before {
+  bottom: 20px;
+}
+
+.mx-stop[data-hole]::after {
+  display: block;
+  top: 20px;
+  background-color: var(--fill-4);
+}
+
+/* The switches: on or off, the whole row is the target. */
+.mx-sep {
+  height: 1px;
+  margin: 4px 6px 3px;
+  background-color: var(--line);
+}
+
+.mx-togs {
+  display: flex;
+  flex-direction: column;
+}
+
+.menu-item.mx-tog > svg {
+  color: var(--text-3);
+}
+
+.menu-item.mx-tog[data-state='checked'] {
+  color: var(--text);
+}
+
+.menu-item.mx-tog[data-state='checked'] > svg {
+  color: var(--text);
+}
+
+/* The once-per-session question before a paid speed goes on, in its own row, still under the
+   speed's name: Enter turns it on, Escape leaves it off. The row holds the focus and shows it as
+   every row does, by the highlight. */
+.mx-ask {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 3px 0 8px;
+  border-radius: 12px;
+  font-size: var(--t-ui);
+  color: var(--text-2);
+  animation: mx-ask-in 140ms var(--ease-out);
+}
+
+.mx-ask:focus,
+.mx-ask:focus-visible {
+  outline: none;
+  background-color: var(--hl);
+  color: var(--text);
+}
+
+.mx-ask > svg {
+  flex: none;
+  color: var(--text);
+}
+
+.mx-ask-on {
+  --h: var(--ctl-h-xs);
+  padding: 0 9px;
+  border-radius: var(--r-ctl-xs);
+  font-size: var(--t-small);
+}
+
+@keyframes mx-ask-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mx-ask {
+    animation: none;
+  }
+}
+
+/* ── the "ultra" edge (Ultracode.tsx): turning on, the pane's rim takes one slightly clearer
+   hairline that comes up all round at once, and the field answers once from ultracode's chip ──
+   The rim's own ring (Cove.tsx `CoveRing`, so it follows the cove): the same strength on every side
+   and round every corner. Opacity only; monochrome; nothing runs round the rim. */
 
 .uc {
   position: absolute;
@@ -1309,27 +1573,13 @@
   background-color: rgb(242 241 238 / calc(0.09 * var(--rim-k)));
 }
 
-/* The hairline comes up behind the lights and is whole as they meet. */
-.uc[data-phase='run'] > .uc-line {
-  animation: fade-in 320ms var(--ease) 300ms backwards;
+.uc[data-phase='rise'] > .uc-line {
+  animation: fade-in 340ms var(--ease) 60ms backwards;
 }
 
 .uc[data-phase='drain'] > .uc-line {
   opacity: 0;
   transition: opacity 280ms var(--ease);
-}
-
-.uc-run > i > b {
-  position: absolute;
-  left: 0;
-  top: 0;
-  width: 150px;
-  height: 150px;
-  margin: -75px 0 0 -75px;
-  border-radius: 50%;
-  background: radial-gradient(circle closest-side, rgb(242 241 238 / 0.78), rgb(242 241 238 / 0.3) 38%, transparent);
-  opacity: 0;
-  will-change: transform, opacity;
 }
 
 /* ── the key: send and stop share the cove ── */
@@ -1858,7 +2108,7 @@
   color: var(--text);
 }
 
-/* Model and mode menus: one family. Short rows (lead, name, check), no headers, no descriptions. */
+/* The mode menu (and Settings' model lists): short rows (lead, name, check), no headers, no descriptions. */
 .mm-pop {
   display: flex;
   flex-direction: column;
@@ -1866,26 +2116,8 @@
   max-height: calc(var(--radix-dropdown-menu-content-available-height, 100vh) / var(--ui-zoom, 1));
 }
 
-.mm-list {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  max-height: min(340px, calc(46 * var(--vh)));
-}
-
-.mm-list > *,
-.mm-pop > :not(.mm-list) {
+.mm-pop > * {
   flex-shrink: 0;
-}
-
-/* Where a section of models begins (an agent that lists them in sections): the menu's own quiet
-   label (ui.css `.menu-label`), nothing more. */
-.mm-group {
-  padding: 7px 8px 3px;
-  font-size: var(--t-micro);
-  font-weight: var(--w-medium);
-  color: var(--text-3);
-  pointer-events: none;
 }
 
 .mm-row {
@@ -1932,23 +2164,14 @@
   flex-shrink: 0;
 }
 
-/* Another agent's model: the arrow says it carries the conversation over, quiet until pointed at. */
-.mm-away .mm-check {
-  color: var(--text-4);
-  transition: color 90ms var(--ease);
-}
-
-.mm-away:is([data-highlighted], :hover) .mm-check {
-  color: var(--text-2);
-}
-
 .menu-item.mm-row .mm-check svg {
   color: var(--text);
 }
 
 /* The check settles onto the row that was picked (the menu is on its way back into its chip by
    then, and the chip already says the new value): one small move, once. */
-:is(.mm-check, .cm-check) > svg {
+:is(.mm-check, .cm-check) > svg,
+.mx-end > .mx-check {
   animation: check-settle 160ms var(--ease-out) backwards;
 }
 
@@ -1960,63 +2183,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  :is(.mm-check, .cm-check) > svg {
+  :is(.mm-check, .cm-check) > svg,
+  .mx-end > .mx-check {
     animation: none;
   }
-}
-
-/* The agents, as their marks, on the menu's first line: the one whose models are listed says its
-   name on one fill step, the others are their marks alone, dim until pointed at. Left and right
-   turn the list from one to the next. */
-.mm-agents {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  height: 28px;
-  margin-bottom: 2px;
-}
-
-.mm-agent {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  height: 28px;
-  min-width: 32px;
-  padding: 0 9px;
-  border-radius: 12px;
-  font-size: var(--t-ui);
-  color: var(--text-2);
-  transition: background-color var(--d-1) var(--ease);
-}
-
-.mm-agent:hover {
-  background-color: var(--fill-1);
-}
-
-.mm-agent:active {
-  background-color: var(--fill-2);
-}
-
-.mm-agent[aria-selected='true'] {
-  padding: 0 11px 0 9px;
-  font-weight: var(--w-medium);
-  color: var(--text);
-  background-color: var(--fill-2);
-  box-shadow: var(--press-up);
-}
-
-.mm-agent[aria-selected='true'] > .mm-mark {
-  opacity: 1;
-}
-
-.mm-agent:hover > .mm-mark {
-  opacity: 1;
-}
-
-.mm-agent:focus-visible {
-  outline: var(--focus-w) solid var(--focus);
-  outline-offset: -1px;
 }
 
 .mm-search {

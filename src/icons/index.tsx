@@ -72,6 +72,7 @@ import { CaretRightIcon } from '@phosphor-icons/react/dist/csr/CaretRight';
 import { CaretLeftIcon } from '@phosphor-icons/react/dist/csr/CaretLeft';
 import { CaretUpIcon } from '@phosphor-icons/react/dist/csr/CaretUp';
 import { CaretUpDownIcon } from '@phosphor-icons/react/dist/csr/CaretUpDown';
+import { CaretDoubleUpIcon } from '@phosphor-icons/react/dist/csr/CaretDoubleUp';
 import { ArrowUpIcon } from '@phosphor-icons/react/dist/csr/ArrowUp';
 import { ArrowDownIcon } from '@phosphor-icons/react/dist/csr/ArrowDown';
 import { ArrowRightIcon } from '@phosphor-icons/react/dist/csr/ArrowRight';
@@ -270,6 +271,8 @@ const ICONS = {
   'caret-left': CaretLeftIcon,
   'caret-up': CaretUpIcon,
   'caret-updown': CaretUpDownIcon,
+  /** Ultracode (the composer's switch and its row in the model and effort panel): two heads, one riding on the other. */
+  ultracode: CaretDoubleUpIcon,
   'arrow-up': ArrowUpIcon,
   'arrow-down': ArrowDownIcon,
   'arrow-right': ArrowRightIcon,
@@ -398,6 +401,7 @@ const THIN: Partial<Record<IconName, IconWeight>> = {
   'caret-left': 'bold',
   'caret-up': 'bold',
   'caret-updown': 'bold',
+  ultracode: 'bold',
   check: 'bold',
   checks: 'bold',
   x: 'bold',

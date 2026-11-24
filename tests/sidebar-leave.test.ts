@@ -123,8 +123,8 @@ describe('an answered card leaves in the frame of the answer', () => {
     const question = read('src/features/prompts/QuestionCard.tsx');
     expect(question.indexOf('leaveCard(req.id, back)')).toBeGreaterThan(-1);
     expect(question.indexOf('leaveCard(req.id, back)')).toBeLessThan(question.indexOf('void respondQuestion(sessionId, req.id, answers)'));
-    // A key during a drag of the effort scale is the drag's: Escape never skips a waiting question.
-    expect(read('src/features/prompts/keys.ts')).toContain("if (document.querySelector('.th-chip[data-scrub]')) return false;");
+    // The effort scale that was dragged on the bar is gone (Phrase.tsx): nothing of it is left in the prompts' keys.
+    expect(read('src/features/prompts/keys.ts')).not.toContain('th-chip');
     expect(read('src/features/prompts/PromptDock.tsx')).toContain('data-req={head.req.id}');
   });
 });

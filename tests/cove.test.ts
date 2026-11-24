@@ -163,7 +163,8 @@ describe('the cove', () => {
   // Walked as real paths on a one-line docked pane, at each of those widths.
   const W = 760;
   const H = 90;
-  const widths = [1, 1.6, 1.3333, 1.8182, 1.1429];
+  // 2px is the ring at 100% (two device pixels there too, since 24 Nov).
+  const widths = [1, 2, 1.6, 1.3333, 1.8182, 1.1429];
 
   it('draws the cove’s rim between that curve and the same curve the rim’s width inside the pane', () => {
     for (const w of widths) {

@@ -65,8 +65,9 @@ describe('empty states', () => {
       ['src/features/rail/TasksTab.tsx', /className="rail-empty">([^<]+)</],
       ['src/features/rail/AgentsTab.tsx', /className="rail-empty">([^<]+)</],
       ['src/features/accounts/ManyAccounts.tsx', /className="acs-empty">([^<]+)</],
-      ['src/features/composer/Controls.tsx', /className="mm-empty">\{q \? `([^`]+)`/],
-      ['src/features/composer/Controls.tsx', /className="mm-empty">\{q \? `[^`]+` : '([^']+)'/],
+      ['src/features/composer/Phrase.tsx', /className="mm-empty">\{q \? `([^`]+)`/],
+      ['src/features/composer/Phrase.tsx', /className="mm-empty">\{q \? `[^`]+` : '([^']+)'/],
+      ['src/features/composer/Phrase.tsx', /className="mx-none">([^<]+)</],
     ];
     for (const [file, re] of words) {
       const m = read(file).match(re);

@@ -28,7 +28,8 @@ export function rememberedEffort(provider: ProviderId, model: ModelInfo): Effort
   return e && model.efforts?.includes(e) ? e : undefined;
 }
 
-function remember(provider: ProviderId, modelId: string, effort: Effort) {
+/** Keeps the effort a model was last used with (also for a model of another agent the chat switches to). */
+export function remember(provider: ProviderId, modelId: string, effort: Effort) {
   const next = { ...efforts(), [`${provider}:${modelId}`]: effort };
   remembered = next;
   try {

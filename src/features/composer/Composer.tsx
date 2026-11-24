@@ -20,15 +20,17 @@ import { readFiles, withTextAttachments } from './attach';
 import { AttachmentRow } from './Attachments';
 import { useChoice } from './choice';
 import { paidAsk, paidConfirmed } from './paid-speed';
+import { usePixelSnap } from './pixel-snap';
 import { APP_COMMANDS, appCommandsFor, commandRows, expandCommand, mentionRows, skillRows, type CommandCtx, type SuggestRow } from './commands';
 import { keepDrafts } from './drafts';
 import { carryOver, leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
 import { holdSend, moveSend, sendBack, sendDone } from './pending';
 import { watchWidth } from './width-watch';
-import { HomeChips, ModelPopover, ModeMenu, openComposerMenu, useHomeSignedOut, useMenuPlace } from './Controls';
+import { HomeChips, ModeMenu, openComposerMenu, useHomeSignedOut, useMenuPlace } from './Controls';
 import { CoveSkin } from './Cove';
 import { PROVIDER_NAME } from '@/art/Logo';
-import { ModelEffort } from './Thinking';
+import { ModelEffort, type PhraseHandle } from './Phrase';
+import { levelChord, opensPanel, ultraChord } from './effort-track';
 import { Highlight } from './Highlight';
 import { NO_QUEUE, QueueTray } from './QueueTray';
 import { UntilStrip } from './UntilStrip';
@@ -38,7 +40,7 @@ import { ReviewBar } from '@/features/review/ReviewBar';
 import { SendKey } from './SendKey';
 import { SuggestMenu } from './SuggestMenu';
 import { modelCommand } from './model-command';
-import { UltraEdge } from './Ultracode';
+import { UltraChip, UltraEdge } from './Ultracode';
 import './composer.css';
 
 export interface ComposerProps {
@@ -251,6 +253,15 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const mirror = useRef<HTMLTextAreaElement>(null);
   const hl = useRef<HTMLDivElement>(null);
   const card = useRef<HTMLDivElement>(null);
+  // The pane on whole device pixels at 125, 150 and 175% (pixel-snap.ts): its rim even, its words crisp.
+  usePixelSnap(card);
+  // Whether this is the composer's first render: what joins the bar later comes in, what stands in its first frame is simply there.
+  const firstRender = useRef(true);
+  useEffect(() => {
+    firstRender.current = false;
+  }, []);
+  // Model and effort on the bar (Phrase.tsx): the keys from the field step it and open its panel.
+  const phrase = useRef<PhraseHandle>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const pendingCaret = useRef<number | null>(null);
   const listId = useId();
@@ -502,17 +513,17 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const ctx: CommandCtx = useMemo(
     () => ({
       sessionId,
-      openModel: () => openComposerMenu('model'),
+      openModel: () => phrase.current?.open('model'),
       setModel: (name: string) => modelCommand(name, choice),
       openMode: () => openComposerMenu('mode'),
-      openEffort: () => openComposerMenu('effort'),
-      // A paid speed (Claude's fast mode) is asked for in the effort popover the first time in a session.
+      openEffort: () => phrase.current?.open('level'),
+      // A paid speed (Claude's fast mode) is asked for in the model and effort panel the first time in a session.
       toggleSpeed: speeds.length
         ? () => {
             const next = toggledSpeed(speedModel, speed, speeds);
             if (sessionId && speeds.find((s) => s.id === next)?.paid && !paidConfirmed(sessionId)) {
               paidAsk(sessionId, next);
-              openComposerMenu('effort');
+              phrase.current?.open('speed');
             } else setSpeed(next);
           }
         : undefined,
@@ -828,6 +839,14 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     const mod = MAC ? e.metaKey : e.ctrlKey;
     const ta = e.currentTarget;
 
+    // One level up or down from the field: nothing opens and the caret stays where it was.
+    const lvl = shell ? null : levelChord(e, MAC);
+    if (lvl) {
+      e.preventDefault();
+      phrase.current?.step(lvl);
+      return;
+    }
+
     if (menuOpen) {
       if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && rows.length) {
         e.preventDefault();
@@ -924,7 +943,23 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const placeholder = ghost || (shell && text === '!') ? '' : variant === 'home' ? (signedOut ? `Sign in to ${PROVIDER_NAME[homeAgent]} to start` : 'Describe a task or ask a question') : queueing ? 'Queue a follow-up' : fresh ? 'Describe a task or ask a question' : 'Reply';
 
   return (
-    <div className="composer" data-variant={variant}>
+    <div
+      className="composer"
+      data-variant={variant}
+      onKeyDown={(e) => {
+        if (shell) return;
+        // Alt+U anywhere in the composer switches ultracode, at whatever level; a held key switches once.
+        if (ultraOffered && ultraChord(e, MAC)) {
+          e.preventDefault();
+          if (!e.repeat) toggleUltra(!ultra);
+          return;
+        }
+        // Ctrl+. anywhere in the composer (the field, a chip, the panel) opens the model and effort panel, or closes it.
+        if (!opensPanel(e, MAC)) return;
+        e.preventDefault();
+        phrase.current?.toggle();
+      }}
+    >
       {menuOpen && (
         <SuggestMenu
           id={listId}
@@ -1031,8 +1066,9 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
           </div>
           <div className="cmp-side cmp-right">
             <div className="cmp-agent" inert={shell || undefined}>
-              <ModelPopover choice={choice} side={popSide} onClosed={focus} />
-              <ModelEffort choice={choice} side={popSide} onClosed={focus} ultraOffered={ultraOffered} ultracode={ultra} onUltracode={toggleUltra} />
+              {/* Ultracode: a switch of its own beside the phrase, at any level. */}
+              {ultraOffered && <UltraChip on={ultra} onToggle={toggleUltra} late={!firstRender.current} />}
+              <ModelEffort ref={phrase} choice={choice} side={popSide} onClosed={focus} ultraOffered={ultraOffered} ultracode={ultra} onUltracode={toggleUltra} />
             </div>
           </div>
         </div>

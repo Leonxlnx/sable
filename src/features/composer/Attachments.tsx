@@ -2,10 +2,11 @@ import { memo } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import type { Attachment } from '@shared/protocol';
 import { Icon } from '@/icons';
+import { linesOf } from './attach';
 import { shatter } from './shatter';
 import { formatBytes } from '@/lib/format';
 
-const meta = (a: Attachment) => (a.kind === 'file' ? (a.size ? formatBytes(a.size) : 'File') : a.text != null ? `${a.text.replace(/\n$/, '').split('\n').length} lines` : formatBytes(a.size));
+const meta = (a: Attachment) => (a.kind === 'file' ? (a.size ? formatBytes(a.size) : 'File') : a.text != null ? linesOf(a.text) : formatBytes(a.size));
 
 /**
  * What will travel with the message: image thumbnails and one-line file chips. Removing one breaks

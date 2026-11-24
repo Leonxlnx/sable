@@ -895,7 +895,7 @@ const SCENARIOS = {
     await finishedSession();
     return measure('menu-model', async () => {
       for (let i = 0; i < 2; i++) {
-        await page.click('.cm-model');
+        await page.click('button.ph');
         await sleep(400);
         await page.keyboard.press('Escape');
         await sleep(400);
@@ -906,7 +906,7 @@ const SCENARIOS = {
     await finishedSession();
     return measure('menu-effort', async () => {
       for (let i = 0; i < 2; i++) {
-        await page.click('.th-chip');
+        await page.click('button.ph');
         await sleep(400);
         await page.keyboard.press('Escape');
         await sleep(400);
@@ -941,11 +941,11 @@ const SCENARIOS = {
   menus: async () => {
     await finishedSession();
     return measure('menus', async () => {
-      await page.click('.cm-model');
+      await page.click('button.ph');
       await sleep(400);
       await page.keyboard.press('Escape');
       await sleep(400);
-      await page.click('.th-chip');
+      await page.click('button.ph');
       await sleep(400);
       await page.keyboard.press('Escape');
       await sleep(400);

@@ -115,10 +115,10 @@ describe('#8: the palette takes a pick again every time it opens', () => {
 
 describe('#9: a pick by Enter in a menu\'s search field hands the keys on', () => {
   it('arms the same hand-off as a row\'s pick', () => {
-    const src = read('src/features/composer/Controls.tsx');
-    // One pick for the chat's own models and another agent's (the model menu lists either): the
-    // first row that can be picked, then the hand-off.
-    expect(src).toMatch(/pick\(first\.provider, first\.m\.id\);[^}]*pickedByKey\(\);/);
+    const src = read('src/features/composer/Phrase.tsx');
+    // One pick for the chat's own models and another agent's (the model and effort panel lists
+    // either): the first row that can be picked, then the hand-off.
+    expect(src).toMatch(/pickModelRow\(first\.provider, first\.m\);[^}]*pickedByKey\(\);/);
     expect(read('src/ui/glide.ts')).toMatch(/export function pickedByKey\(\) \{\s*window\.setTimeout\(seal, 0\);/);
   });
 });

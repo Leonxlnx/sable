@@ -33,6 +33,13 @@ export interface Placed {
 /** The gap between a menu and its chip. */
 export const GAP = 8;
 
+/**
+ * Radix `alignOffset` (with `align="start"`) that stands a menu's right edge on its chip's right
+ * edge: the model and effort panel hangs from the phrase's end, which is the end by the key. A
+ * chip wider than its menu gives a positive offset, a narrower one a negative.
+ */
+export const flushRight = (chipWidth: number, menuWidth: number): number => chipWidth - menuWidth;
+
 /** The window's own margin a menu keeps (the menus' `collisionPadding`). */
 export const MARGIN = 10;
 

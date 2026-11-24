@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from 'react';
 import { Icon, type IconName } from '@/icons';
 import { IconSheet } from './IconSheet';
 import {
@@ -25,11 +25,10 @@ import { ProviderMark } from '@/art/Logo';
 import { Chip, type ChipPart } from '@/features/composer/Chip';
 import { CoveSkin } from '@/features/composer/Cove';
 import { SendGlyphSvg } from '@/features/composer/SendKey';
-import { Pips } from '@/features/composer/Thinking';
 import { PullRow } from '@/features/rail/PullRequest';
 import { BrowserAgentStates } from '@/features/rail/BrowserAgentGallery';
 import { Notice, NoticeCard } from '@/features/timeline/Notice';
-import type { Effort, NoticeItem, PullCheck, PullRequestInfo } from '@shared/protocol';
+import type { NoticeItem, PullCheck, PullRequestInfo } from '@shared/protocol';
 import '@/app/app.css';
 import '@/features/composer/composer.css';
 import '@/features/sidebar/sidebar.css';
@@ -234,13 +233,30 @@ const MODE: ChipPart[] = [
   { k: 'icon', node: <Icon name="hand" size={15} /> },
   { k: 'label', className: 'cm-mode-label', node: 'Ask first' },
 ];
-const MODEL: ChipPart[] = [{ k: 'name', className: 'chip-give', node: 'Opus 5.5' }];
-/** The effort chip as the composer builds it: the scale's pips (a level 1 to 5, ultracode past the end) and the stop's name. */
-const SCALE: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
-const effortParts = (word: string, level: number, ultra = false): ChipPart[] => [
-  { k: 'pips', node: <Pips efforts={SCALE} pos={ultra ? SCALE.length : level - 1} ultra /> },
-  { k: `word:${ultra ? 'Ultracode' : word}`, className: 'th-word', node: ultra ? 'Ultracode' : word },
+/** Model and effort as the composer builds them (Phrase.tsx): one phrase as wide as its words, the level a step quieter. */
+const LEVELS = ['Low', 'Medium', 'High', 'Extra high', 'Max'];
+const phraseParts = (word: string, model = 'Opus 5.5'): ChipPart[] => [
+  { k: `model:${model}`, className: 'ph-model', node: <span className="ph-name">{model}</span> },
+  { k: 'dot', className: 'ph-dot', node: '·' },
+  { k: `word:${word}`, className: 'ph-word', node: <span>{word}</span> },
 ];
+const Phrase = ({ word, ...rest }: { word: string } & ButtonHTMLAttributes<HTMLButtonElement> & { 'data-roll'?: string }) => (
+  <span className="ph-slot" data-chip-slot="">
+    <Chip className="tb-chip ph" anchor="right" data-word="" parts={phraseParts(word)} {...rest} />
+  </span>
+);
+/** Ultracode's switch as the composer builds it (Ultracode.tsx): its mark alone, or a chip that is on with its word. */
+const Ultra = ({ on, ...rest }: { on?: boolean } & ButtonHTMLAttributes<HTMLButtonElement> & { 'data-roll'?: string }) => (
+  <Chip
+    className="tb-chip ux"
+    anchor="right"
+    data-on={on || undefined}
+    aria-label="Ultracode"
+    aria-pressed={!!on}
+    parts={[{ k: 'mark', className: 'ux-mark', node: <Icon name="ultracode" size={14} /> }, ...(on ? [{ k: 'word', className: 'ux-word', node: 'Ultracode' }] : [])]}
+    {...rest}
+  />
+);
 
 /**
  * The composer, static: the pane of glass with its cove, the chips on its last line and the key
@@ -271,8 +287,8 @@ function GlassComposer({ focus, state = 'rest', width, ultra }: { focus?: boolea
         </div>
         <div className="cmp-side cmp-right">
           <div className="cmp-agent">
-            <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} />
-            <Chip className="tb-chip th-chip" anchor="right" data-ultra={ultra || undefined} parts={effortParts('Extra high', 4, ultra)} />
+            <Ultra on={ultra} />
+            <Phrase word="Extra high" />
           </div>
         </div>
       </div>
@@ -288,82 +304,112 @@ function GlassComposer({ focus, state = 'rest', width, ultra }: { focus?: boolea
   );
 }
 
-/** A chip whose label changes on a click, to watch the change itself (Chip.tsx): the edge glides, the neighbour rides, no word leaves its chip. */
+/**
+ * The bar's two changes, each on a click, to watch the change itself (Chip.tsx): the level rolls
+ * the way it went and nothing beside it moves; ultracode's chip opens away from the phrase with
+ * its mark riding on its end, and the word rolls up behind.
+ */
 function ChipChange() {
-  const steps: { word: string; level: number; ultra?: boolean }[] = [
-    { word: 'High', level: 3 },
-    { word: 'Extra high', level: 4 },
-    { word: 'Extra high', level: 4, ultra: true },
-    { word: 'Low', level: 1 },
-  ];
   const [i, setI] = useState(0);
-  const s = steps[i % steps.length];
+  const [on, setOn] = useState(false);
+  const flipped = useRef(false);
+  // Up the levels to the top, then back down.
+  const at = i % 8;
+  const word = LEVELS[at < 5 ? at : 8 - at];
+  const up = at > 0 && at < 5;
+  const rollUltra = flipped.current ? (on ? 'up' : 'down') : undefined;
+  useLayoutEffect(() => {
+    flipped.current = false;
+  });
   return (
-    <div className="cmp-agent" style={{ justifyContent: 'flex-end', width: 260 }}>
-      <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} />
-      <Chip className="tb-chip th-chip" anchor="right" data-ultra={s.ultra || undefined} aria-label="Next label" onClick={() => setI(i + 1)} parts={effortParts(s.word, s.level, s.ultra)} />
+    <div className="cmp-agent" style={{ width: 300, justifyContent: 'flex-end' }}>
+      <Ultra
+        on={on}
+        data-roll={rollUltra}
+        onClick={() => {
+          flipped.current = true;
+          setOn(!on);
+        }}
+      />
+      <Phrase word={word} data-roll={i ? (up ? 'up' : 'down') : undefined} aria-label="Next level" onClick={() => setI(i + 1)} />
     </div>
   );
 }
 
 /**
- * The ladder the effort chip opens (composer/Thinking.tsx, `.th-pop`), static: every stop by name,
- * the highest on top, ultracode a step apart above them, then the speeds beyond standard.
- * `at` is the level in use (from 0); `ultra`: ultracode is on and that level is kept under it.
+ * The model and effort panel (composer/Phrase.tsx, `.mx`), static: the switches, the models with
+ * the other agents under them and the scale of levels beside them. `preview`: resting on another
+ * model, whose level the scale shows outlined.
  */
-function Ladder({ at, ultra, highlight }: { at: number; ultra?: boolean; highlight?: number }) {
-  const names = ['Low', 'Medium', 'High', 'Extra high', 'Max'];
-  return (
-    <div className="pop cm-pop th-pop" data-static="" style={{ flex: 'none' }}>
-      <div className="menu-item th-row th-row-far" data-current={ultra ? '' : undefined} data-lit={ultra ? '' : undefined} role="menuitem">
-        <i className="th-seg" />
+function PanelStatic({ preview, side = 'top', ultra }: { preview?: boolean; side?: 'top' | 'bottom'; ultra?: boolean }) {
+  const models = ['Opus 5.5', 'Sonnet 5', 'Haiku 4.5'];
+  const levels = side === 'top' ? LEVELS : LEVELS.slice(0, 4);
+  const at = preview ? 2 : 3;
+  const switches = (
+    <div className="mx-togs">
+      <div className="menu-item mx-tog" data-state={ultra ? 'checked' : 'unchecked'} role="menuitemcheckbox">
+        <Icon name="ultracode" size={14} />
         <span className="grow">Ultracode</span>
+        <span className="switch mx-switch" data-state={ultra ? 'checked' : 'unchecked'}>
+          <span className="switch-thumb" />
+        </span>
       </div>
-      {names
-        .map((n, i) => (
-          <div key={n} className="menu-item th-row" data-current={!ultra && i === at ? '' : undefined} data-lit={ultra || i <= at ? '' : undefined} data-highlighted={i === highlight ? '' : undefined} role="menuitem">
-            <i className="th-seg" />
-            <span className="grow">{n}</span>
-            {ultra && i === at && <Icon name="check" size={13} className="th-kept" />}
-          </div>
-        ))
-        .reverse()}
-      <div className="menu-sep th-sep" />
-      <div className="menu-item th-row th-speed" data-state="unchecked" role="menuitemcheckbox">
-        <Icon name="bolt" size={13} className="th-lead" />
-        <span className="grow truncate">Fast</span>
-        <span className="th-cost">Extra usage</span>
-        <span className="mm-check" />
+      <div className="menu-item mx-tog" data-state="checked" role="menuitemcheckbox">
+        <Icon name="bolt" size={14} />
+        <span className="grow">Fast</span>
+        <span className="switch mx-switch" data-state="checked">
+          <span className="switch-thumb" />
+        </span>
       </div>
     </div>
   );
-}
-
-/** The model menu (composer/Controls.tsx, `.mm-pop`), static: the agents as marks on its first line, the listed agent's models under it. */
-function ModelMenu() {
-  const models = ['Opus 5.5', 'Fable 5.2', 'Sonnet 5.5', 'Haiku 5.5'];
+  const agent = (
+    <div className="menu-item mx-agent" role="menuitem">
+      <span className="mx-lead">
+        <ProviderMark provider="codex" size={14} className="mm-mark" />
+      </span>
+      <span className="grow truncate">Codex</span>
+      <span className="mx-end">
+        <Icon name="caret-right" size={12} className="mx-caret" />
+      </span>
+    </div>
+  );
   return (
-    <div className="pop cm-pop mm-pop" data-static="" style={{ width: 232 }}>
-      <div className="mm-agents" role="tablist" aria-label="Agent">
-        <button type="button" role="tab" className="mm-agent" aria-selected="true">
-          <ProviderMark provider="claude" size={14} className="mm-mark" />
-          <span className="mm-agent-name">Claude Code</span>
-        </button>
-        <button type="button" role="tab" className="mm-agent" aria-selected="false" aria-label="Codex">
-          <ProviderMark provider="codex" size={14} className="mm-mark" />
-        </button>
-        <button type="button" role="tab" className="mm-agent" aria-selected="false" aria-label="OpenCode">
-          <ProviderMark provider="opencode" size={14} className="mm-mark" />
-        </button>
-      </div>
-      <div className="mm-list">
-        {models.map((n, i) => (
-          <div key={n} className="menu-item mm-row" data-current={i === 0 ? '' : undefined} data-highlighted={i === 1 ? '' : undefined} role="menuitem">
-            <span className="mm-name truncate">{n}</span>
-            <span className="mm-check">{i === 0 && <Icon name="check" size={14} />}</span>
+    // As it stands above the phrase (a chat) or below it (home): the columns stand on the line nearest it, the switches at the far end.
+    <div className="pop cm-pop mx" data-static="" data-side={side} style={{ ['--mx-rows' as string]: 5, flex: 'none' }}>
+      {side === 'top' && switches}
+      {side === 'top' && <div className="mx-sep" />}
+      <div className="mx-cols">
+        <div className="mx-models">
+          <div className="mx-list">
+            {side === 'top' && agent}
+            {models.map((n, i) => (
+              <div key={n} className="menu-item mx-row" data-current={i === 0 ? '' : undefined} data-owner={preview && i === 1 ? '' : undefined} role="menuitemradio">
+                <span className="mx-lead" />
+                <span className="mm-name truncate">{n}</span>
+                <span className="mx-end">{i === 0 && <Icon name="check" size={14} className="mx-check" />}</span>
+              </div>
+            ))}
+            {side !== 'top' && agent}
           </div>
-        ))}
+        </div>
+        <div className="mx-scale">
+          {[...levels].reverse().map((n, j) => {
+            const i = levels.length - 1 - j;
+            const end = i === levels.length - 1 ? 'top' : i === 0 ? 'bottom' : undefined;
+            return (
+              <div key={n} className="menu-item mx-rung" data-current={!preview && i === at ? '' : undefined} data-highlighted={preview && i === at + 1 ? '' : undefined} role="menuitemradio">
+                <i className="mx-stop" data-end={end} data-lit={!preview && i <= at ? (i === at ? 'half' : 'all') : undefined} data-hole={preview && i === at ? '' : undefined}>
+                  {i === at && <b data-k={preview ? 'shows' : 'set'} />}
+                </i>
+                <span className="truncate">{n}</span>
+              </div>
+            );
+          })}
+        </div>
       </div>
+      {side !== 'top' && <div className="mx-sep" />}
+      {side !== 'top' && switches}
     </div>
   );
 }
@@ -612,26 +658,30 @@ export default function Gallery() {
             )}
           />
           <States label="Mode" render={(s) => <Chip className="tb-chip cm-mode" anchor="left" parts={MODE} disabled={dis(s)} />} />
-          <States label="Model" render={(s) => <Chip className="tb-chip cm-model" anchor="right" parts={MODEL} disabled={dis(s)} />} />
-          <States label="Effort" render={(s) => <Chip className="tb-chip th-chip" anchor="right" parts={effortParts('High', 3)} disabled={dis(s)} />} />
-          <States label="Effort, ultra" render={(s) => <Chip className="tb-chip th-chip" anchor="right" data-ultra="" parts={effortParts('High', 3, true)} disabled={dis(s)} />} />
+          <States label="Model and effort" render={(s) => <Phrase word="High" disabled={dis(s)} />} />
+          <States label="Ultracode, off" render={(s) => <Ultra disabled={dis(s)} />} />
+          <States label="Ultracode, on" render={(s) => <Ultra on disabled={dis(s)} />} />
           <div className="gal-row">
-            <div className="gal-label">Effort, every stop of the scale</div>
+            <div className="gal-label">Every level, each in the phrase's one width; a level pointed at in the panel; an agent not seen yet</div>
             <div className="gal-cell gal-wide" style={{ gap: 6, flexWrap: 'wrap' }}>
-              {['Low', 'Medium', 'High', 'Extra high', 'Max'].map((w, i) => (
-                <Chip key={w} className="tb-chip th-chip" anchor="right" parts={effortParts(w, i + 1)} />
+              {LEVELS.map((w) => (
+                <Phrase key={w} word={w} />
               ))}
-              <Chip className="tb-chip th-chip" anchor="right" data-ultra="" parts={effortParts('Max', 5, true)} />
+              <Chip className="tb-chip ph" anchor="right" data-word="" aria-expanded="true" parts={[...phraseParts('Max').slice(0, 2), { k: 'word:Max', className: 'ph-word', node: <span data-preview="">Max</span> }]} />
+              <span className="chip-skel" style={{ width: 150 }} />
             </div>
           </div>
           <div className="gal-row">
-            <div className="gal-label">Effort while dragged; an agent not seen yet</div>
-            <div className="gal-cell gal-wide" style={{ gap: 16 }}>
-              <Chip className="tb-chip th-chip" anchor="right" data-scrub="" parts={effortParts('Extra high', 4)} />
-              <span className="cmp-agent">
-                <span className="chip-skel" style={{ width: 96 }} />
-                <span className="chip-skel" style={{ width: 78 }} />
-              </span>
+            <div className="gal-label">Ultracode beside the phrase: off, on</div>
+            <div className="gal-cell gal-wide" style={{ gap: 24, flexWrap: 'wrap' }}>
+              <div className="cmp-agent">
+                <Ultra />
+                <Phrase word="High" />
+              </div>
+              <div className="cmp-agent">
+                <Ultra on />
+                <Phrase word="Max" />
+              </div>
             </div>
           </div>
           <States
@@ -676,12 +726,11 @@ export default function Gallery() {
                 <Icon name="plus" size={14} />
               </button>
               <Chip className="tb-chip cm-mode" anchor="left" aria-expanded="true" parts={MODE} />
-              <Chip className="tb-chip cm-model" anchor="right" aria-expanded="true" parts={MODEL} />
-              <Chip className="tb-chip th-chip" anchor="right" aria-expanded="true" parts={effortParts('High', 3)} />
+              <Phrase word="High" aria-expanded="true" />
             </div>
           </div>
           <div className="gal-row">
-            <div className="gal-label">A label changes (click the effort)</div>
+            <div className="gal-label">A level changes (click the phrase); ultracode switches (click its mark)</div>
             <div className="gal-cell gal-wide">
               <ChipChange />
             </div>
@@ -824,11 +873,12 @@ export default function Gallery() {
               </div>
               <GlassComposer state="stop" ultra />
               <div className="gal-caption" style={{ marginTop: 18 }}>
-                Narrow: 420, 330
+                Narrow, ultracode on: 500 (its mark alone), 390 (the level alone), 320 (the mode as its icon)
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <GlassComposer width={420} />
-                <GlassComposer width={330} />
+                <GlassComposer width={500} ultra />
+                <GlassComposer width={390} ultra />
+                <GlassComposer width={320} ultra />
               </div>
               <div className="gal-caption" style={{ marginTop: 18 }}>
                 Message
@@ -843,16 +893,13 @@ export default function Gallery() {
               <div className="gal-caption">Menu (.pop)</div>
               <MenuRows highlight={1} />
               <div className="gal-caption" style={{ marginTop: 18 }}>
-                Effort's ladder: a level, and ultracode over it
+                Model and effort, above the phrase (a chat): the level in use; another model's level outlined. Below it (home), ultracode on
               </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'flex-start' }}>
-                <Ladder at={2} highlight={3} />
-                <Ladder at={2} ultra />
+                <PanelStatic />
+                <PanelStatic preview />
+                <PanelStatic side="bottom" ultra />
               </div>
-              <div className="gal-caption" style={{ marginTop: 18 }}>
-                Models: the agents as marks
-              </div>
-              <ModelMenu />
             </div>
             <div className="gal-glass-col">
               <div className="gal-caption">Frosted (.glass)</div>

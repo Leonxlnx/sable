@@ -16,6 +16,12 @@ const newId = () => `att-${Date.now().toString(36)}-${(seq++).toString(36)}`;
 
 const sizeOf = (a: Attachment) => a.size ?? a.text?.length ?? 0;
 
+/** How long a text attachment is, as its chip says it: "1 line", "24 lines" (a last line break counts for nothing). */
+export function linesOf(text: string): string {
+  const n = text.replace(/\n$/, '').split('\n').length;
+  return `${n} ${n === 1 ? 'line' : 'lines'}`;
+}
+
 function readAs(file: File, how: 'dataUrl' | 'text'): Promise<string> {
   return new Promise((resolve, reject) => {
     const r = new FileReader();

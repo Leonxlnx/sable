@@ -1,18 +1,35 @@
 /**
- * The effort scale's rules, kept apart from the view so they can be tested.
+ * The effort's rules, kept apart from the view so they can be tested.
  *
- * The scale is a row of stops: one per level the model offers, lowest first, and, where the agent
- * has it, one more past the end, a step apart: ultracode. A position is a stop's index; -1 is
- * "nothing set" (a model whose level the agent decides, or ultracode off where there are no
- * levels). Dragging the chip, the arrow keys on it and a row of its menu all end in `land()`,
- * which says what to send.
+ * The levels a model offers are a scale: one stop per level, lowest first. A position is a
+ * level's index; -1 is "nothing set" (a model whose level the agent decides). The phrase on the
+ * bar steps it one stop at a time (its own Up and Down, the chord from the field) and the panel
+ * picks from it.
+ *
+ * Ultracode is no stop of that scale. It is a switch of its own, at any level: turning it on or
+ * off never touches the level, a level stepped or picked never touches it, and the scale ends at
+ * its top level (Claude Code's Max) whatever ultracode does. (Until 24 Nov it stood as one more
+ * stop past the top and took the level's word; the owner: "bei claude kann man ultracode nutzen
+ * wann man will bei jedem effort".)
  */
 
-export interface Scale {
-  /** How many levels the model offers. */
-  levels: number;
-  /** Ultracode can be switched here: one more stop, past the last level. */
-  ultra: boolean;
+/** The last stop's index (-1: the model offers no level). */
+export const lastStop = (levels: number) => levels - 1;
+
+/** A position held to the scale: a level's index, or -1 where nothing is set. */
+export const clampStop = (pos: number, levels: number) => (levels > 0 ? Math.max(-1, Math.min(levels - 1, pos)) : -1);
+
+/**
+ * One step from `pos`, up (1) or down (-1); null where there is nowhere to go. The ends hold: up
+ * from the top level stays there (the word nudges, it never wraps round and never becomes
+ * anything but a level), down from the lowest stays, and "nothing set" steps only up, onto the
+ * lowest level.
+ */
+export function stepStop(pos: number, dir: 1 | -1, levels: number): number | null {
+  if (levels <= 0) return null;
+  const next = pos + dir;
+  if (next > levels - 1 || next < 0) return null;
+  return next;
 }
 
 /** What is set: the level's index (-1: none) and whether ultracode is on. */
@@ -21,76 +38,68 @@ export interface Setting {
   ultra: boolean;
 }
 
-/** The last stop's index (-1: the scale has no stop at all). */
-export const lastStop = (s: Scale) => s.levels + (s.ultra ? 1 : 0) - 1;
-
-/** The ultracode stop's index, or -1 where it is not offered. */
-export const ultraStop = (s: Scale) => (s.ultra ? s.levels : -1);
-
-/** Where a setting stands on the scale: past the end while ultracode is on, else on its level. */
-export const positionOf = (v: Setting, s: Scale) => (s.ultra && v.ultra ? s.levels : Math.min(v.level, s.levels - 1));
-
-/** The lowest position: the first level, or "off" on a scale that is ultracode alone. */
-const floor = (s: Scale) => (s.levels > 0 ? 0 : -1);
-
-export const clampStop = (pos: number, s: Scale) => Math.max(floor(s), Math.min(lastStop(s), pos));
-
-/** How far the pointer travels per stop while the chip is dragged, and how far before a press is a drag. */
-export const SCRUB_PX = 12;
-export const SCRUB_SLOP = 4;
-
-/** The stop a drag stands on: every `SCRUB_PX` to the right is one stop up, from where it began. */
-export function scrubStop(from: number, dx: number, s: Scale, px = SCRUB_PX): number {
-  if (lastStop(s) < 0) return from;
-  // Toward zero, so the first stop needs a whole step in either direction.
-  const steps = dx >= 0 ? Math.floor(dx / px) : -Math.floor(-dx / px);
-  // Back where it began, or down from "nothing set" (-1, which is no stop to clamp to): what it began with.
-  if (steps === 0 || (from < floor(s) && steps < 0)) return from;
-  return clampStop(from + steps, s);
-}
-
-/** The stop a key on the chip moves to; null when the key is not the scale's or there is nowhere to go. */
-export function keyStop(pos: number, key: string, s: Scale): number | null {
-  let next: number;
-  if (key === 'ArrowRight') next = pos + 1;
-  else if (key === 'ArrowLeft') next = pos - 1;
-  else if (key === 'Home') next = floor(s);
-  else if (key === 'End') next = lastStop(s);
-  else return null;
-  next = clampStop(next, s);
-  return next === pos ? null : next;
-}
-
-export const SCALE_KEYS = /^(Arrow(Left|Right)|Home|End)$/;
-
-export interface Landing {
-  /** The level to send (its index), when it changes. */
+/** What a change sends: the level (its index) when it changes, ultracode when it changes. Never both. */
+export interface Change {
   level?: number;
-  /** Ultracode to switch, when it changes. */
   ultra?: boolean;
 }
 
-/**
- * What landing on `pos` changes.
- * - The stop past the end turns ultracode on and leaves the level as it is: it is kept under it.
- * - A level turns ultracode off and sets that level. One exception: a single step down from
- *   ultracode by key only leaves it, back to the level that was kept, or to none where the agent
- *   decides the level (the person switched ultracode off; they did not ask for the top level).
- * - -1 on a scale that is ultracode alone turns it off.
- */
-export function land(now: Setting, pos: number, s: Scale, via: 'key' | 'drag' | 'pick'): Landing {
-  const out: Landing = {};
-  const to = clampStop(pos, s);
-  if (s.ultra && to === s.levels) {
-    if (!now.ultra) out.ultra = true;
-    return out;
-  }
-  if (now.ultra) out.ultra = false;
-  if (to < 0) return out;
-  const stepDown = via === 'key' && now.ultra && to === s.levels - 1;
-  if (!stepDown && to !== now.level) out.level = to;
-  return out;
+/** Landing on a level: that level when it is another one. Ultracode stays as it is. */
+export function landLevel(now: Setting, pos: number, levels: number): Change {
+  const to = clampStop(pos, levels);
+  return to >= 0 && to !== now.level ? { level: to } : {};
 }
 
-/** How many of the level pips are lit at a position: all of them past the end. */
-export const litLevels = (pos: number, s: Scale) => (pos >= s.levels ? s.levels : Math.max(0, pos + 1));
+/** Switching ultracode: on or off when that is a change. The level stays as it is. */
+export function landUltra(now: Setting, on: boolean, offered: boolean): Change {
+  return offered && on !== now.ultra ? { ultra: on } : {};
+}
+
+/** What a key event says, for the rules below. */
+export interface KeyLike {
+  key: string;
+  code?: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+}
+
+/** The effort keys' modifier: Alt alone (Command+Option on a Mac, where Option with a key types). */
+const effortMod = (e: KeyLike, mac: boolean) => !e.shiftKey && (mac ? e.metaKey && e.altKey && !e.ctrlKey : e.altKey && !e.ctrlKey && !e.metaKey);
+
+/**
+ * The chord that steps the level from the field, with nothing opening and the caret where it
+ * was: Alt+Right one level up, Alt+Left one down. Alt+Up and Down are the navigator's, and
+ * Ctrl+Shift+Up and Down select to the paragraph's end in a field; Alt with the side arrows does
+ * nothing in a field on Windows. On a Mac Option with an arrow moves by word, so there it is
+ * Command+Option.
+ */
+export function levelChord(e: KeyLike, mac: boolean): 1 | -1 | null {
+  if (!effortMod(e, mac)) return null;
+  return e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : null;
+}
+
+/** The keys the chord is shown and announced with. */
+export const chordKeys = (mac: boolean) => (mac ? 'mod+alt+←→' : 'alt+←→');
+
+/**
+ * The key that switches ultracode from anywhere in the composer: Alt+U (Command+Option+U on a
+ * Mac), the effort keys' own modifier. Free everywhere: Alt with a digit is the side panel's tabs,
+ * Alt with an arrow the navigator's, the find bar's and the level's; no Ctrl or Command key is a
+ * U. Read by the letter the key types, or by its place where Alt makes it type something else
+ * (Option+U on a Mac is a dead key). A held key switches once.
+ */
+export function ultraChord(e: KeyLike, mac: boolean): boolean {
+  if (!effortMod(e, mac)) return false;
+  return /^[a-z]$/i.test(e.key) ? e.key.toLowerCase() === 'u' : e.code === 'KeyU';
+}
+
+/** The keys ultracode's switch is shown and announced with. */
+export const ultraKeys = (mac: boolean) => (mac ? 'mod+alt+u' : 'alt+u');
+
+/** Ctrl+. (Command+. on a Mac) opens the model and effort panel from anywhere in the composer. */
+export function opensPanel(e: KeyLike, mac: boolean): boolean {
+  const mod = mac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  return mod && !e.altKey && !e.shiftKey && (e.key === '.' || e.code === 'Period');
+}
