@@ -109,8 +109,13 @@
   user-select: none;
 }
 
+/* The bar lives in the card's right padding (14px, the bar 10): its gutter is always kept and the
+   margin gives it back, so a diff is as wide as the card's words and buttons, scrolling or not
+   (it used to end 10px short of the buttons' edge). */
 .pc-scroll {
   max-height: min(calc(38 * var(--vh)), 360px);
+  margin-right: -10px;
+  scrollbar-gutter: stable;
   border-radius: var(--r-md);
 }
 
@@ -168,9 +173,12 @@
 
 /* The plan fades out at its lower edge while more is below, as the diffs do: across the padding
    and down over it to the well's edge (sticky insets count from inside the padding). */
+/* 40 tall (the diffs' 28 plus the well's 12 of padding it runs down over), so a line cut at the
+   well's edge stands wholly under the fade, never as bare tops of glyphs. */
 .pc-plan > .pc-fade {
   bottom: -12px;
-  margin: -28px -16px 0;
+  height: 40px;
+  margin: -40px -16px 0;
   border-radius: 0 0 calc(var(--r-md) - 1px) calc(var(--r-md) - 1px);
 }
 

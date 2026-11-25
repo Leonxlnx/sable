@@ -47,3 +47,14 @@ export function statusLabel(s: SessionMeta): string | null {
   if (s.status === 'error') return s.lastError ? `Error: ${s.lastError}` : 'Error';
   return null;
 }
+
+/**
+ * The account a chat runs on, as its row says it while pointed at: the account's own label, only
+ * when the agent has more than one account (else there is nothing to tell apart), never an email
+ * (a label that is one, or none at all, says nothing).
+ */
+export function accountWord(accounts: readonly { id: string; label: string }[] | undefined, accountId: string | undefined): string | null {
+  if (!accounts || accounts.length < 2) return null;
+  const label = accounts.find((a) => a.id === (accountId ?? 'default'))?.label.trim();
+  return label && !label.includes('@') ? label : null;
+}

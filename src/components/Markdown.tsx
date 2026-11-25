@@ -8,7 +8,7 @@ import { PENDING_HREF, lexBlocks, repairTail, type LexState } from '@/lib/md';
 import { FenceWidget, MermaidBlock, WIDGET_FENCE } from '@/features/genui/blocks';
 import { numericColumns, TableCopy, wideColumns } from '@/features/genui/table';
 import { CodeBlock } from './CodeBlock';
-import { inPieces, pieceHeight, piecesOf } from './md-pieces';
+import { columnAlign, inPieces, pieceHeight, piecesOf } from './md-pieces';
 import { ImageView } from './ImageView';
 import './markdown.css';
 
@@ -296,10 +296,11 @@ function block(t: Token, live: boolean, key: string, tail = false): ReactNode {
     case 'table': {
       const tb = t as Tokens.Table;
       const plain = { header: tb.header.map((c) => c.text), rows: tb.rows.map((r) => r.map((c) => c.text)) };
-      // Columns of figures align right in tabular digits, unless the author aligned them.
+      // Columns of figures align right in tabular digits (also where the author centred them: one
+      // edge per column, md-pieces.ts `columnAlign`); a left the author set holds.
       const figures = numericColumns(plain);
       const wide = wideColumns(plain);
-      const align: Tokens.Table['align'] = tb.header.map((_, i) => tb.align[i] ?? (figures[i] ? 'right' : null));
+      const align: Tokens.Table['align'] = tb.header.map((_, i) => columnAlign(tb.align[i], figures[i]));
       const tall = tb.rows.length > 12;
       return (
         <div className="md-tablewrap" key={key}>

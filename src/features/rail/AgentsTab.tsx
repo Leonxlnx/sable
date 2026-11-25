@@ -118,17 +118,17 @@ function AgentsList({ sessionId }: { sessionId: string }) {
   });
   if (cmds.ids.length) {
     // A few stand open; many fold to their line unless one runs or failed.
-    const open = chosen(COMMANDS) ?? (cmds.ids.length <= 4 || cmds.running > 0 || cmds.failed > 0);
-    rows.push({ key: 'h:cmd', as: 'h:cmd', node: (fresh) => <GroupHead key="h:cmd" id="h:cmd" group={COMMANDS} label="Commands" count={cmds.ids.length} running={cmds.running} failed={cmds.failed} always open={open} onFlip={flip} fresh={fresh} /> });
+    const open = chosen(COMMANDS) ?? (cmds.ids.length <= 4 || cmds.running > 0 || cmds.serving > 0 || cmds.failed > 0);
+    rows.push({ key: 'h:cmd', as: 'h:cmd', node: (fresh) => <GroupHead key="h:cmd" id="h:cmd" group={COMMANDS} label="Commands" count={cmds.ids.length} running={cmds.running} serving={cmds.serving} failed={cmds.failed} always open={open} onFlip={flip} fresh={fresh} /> });
     if (open) {
       // Everything running shows, as every failure does (`waveRows` lists those first).
-      const shown = waveRows({ user: COMMANDS, ids: cmds.ids, failed: cmds.running + cmds.failed }, all(COMMANDS));
+      const shown = waveRows({ user: COMMANDS, ids: cmds.ids, failed: cmds.running + cmds.serving + cmds.failed }, all(COMMANDS));
       for (const id of shown.ids) rows.push({ key: `c:${id}`, as: `c:${id}`, node: (fresh) => <CommandRow key={`c:${id}`} sessionId={sessionId} id={id} fresh={fresh} /> });
       if (shown.more) rows.push({ key: 'm:cmd', as: 'm:cmd', node: () => <MoreRow key="m:cmd" id="m:cmd" group={COMMANDS} count={shown.more} onFlip={flip} /> });
     }
   }
   // The tail line's units (sub-agents and commands that work now), then how many ended.
-  const head = agentsHeader({ working: view.working.length, running: cmds.running, agentsDone: view.done, agentsFailed: view.failed, commands: cmds.ids.length, commandsFailed: cmds.failed });
+  const head = agentsHeader({ serving: cmds.serving, working: view.working.length, running: cmds.running, agentsDone: view.done, agentsFailed: view.failed, commands: cmds.ids.length, commandsFailed: cmds.failed });
   const keys = rows.map((r) => r.key);
   const arrived = useEntrances(rows.map((r) => r.as));
 
@@ -193,7 +193,7 @@ function useEntrances(keys: readonly string[]): ReadonlySet<string> {
  * in it (`always`: also open, with what runs in it, as the commands' line says "1 running 4 failed").
  * It folds the group.
  */
-const GroupHead = memo(function GroupHead({ id, group, time, label, count, running = 0, failed, always, open, onFlip, fresh, title }: { id: string; group: string; time?: string; label: string; count: number; running?: number; failed: number; always?: boolean; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; title?: string }) {
+const GroupHead = memo(function GroupHead({ id, group, time, label, count, running = 0, serving = 0, failed, always, open, onFlip, fresh, title }: { id: string; group: string; time?: string; label: string; count: number; running?: number; serving?: number; failed: number; always?: boolean; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; title?: string }) {
   return (
     <div role="listitem" data-flip={id} className="agx-wave" data-open={open || undefined} data-new={fresh || undefined}>
       <button type="button" className="agx-wave-btn" aria-expanded={open} onClick={() => onFlip(group, !open)} title={title}>
@@ -203,6 +203,7 @@ const GroupHead = memo(function GroupHead({ id, group, time, label, count, runni
         {time && <span className="agx-wave-time num">{time}</span>}
         <span className="agx-wave-label truncate">{label}</span>
         {running > 0 && <span className="agx-wave-count num">{running} running</span>}
+        {serving > 0 && <span className="agx-wave-count num">{serving} serving</span>}
         {/* Folded, the line says what failed inside; open, the failed rows stand first under it. */}
         {failed > 0 && (always || !open) && <span className="agx-wave-failed num">{failed} failed</span>}
         <span className="agx-wave-count num">{count}</span>
@@ -427,6 +428,7 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
 const COMMAND_WORD: Record<CommandState, string> = {
   starting: 'Starting',
   running: 'Running',
+  serving: 'Serving',
   done: '',
   failed: 'Failed',
   stopped: 'Stopped',
@@ -461,7 +463,7 @@ const CommandRow = memo(function CommandRow({ sessionId, id, fresh }: { sessionI
   });
   if (!item) return null;
   const state = commandState(item, note);
-  const word = state === 'lost' ? ((item.task?.why && LOST_WORD[item.task.why]) ?? COMMAND_WORD.lost) : COMMAND_WORD[state];
+  const word = state === 'lost' ? ((item.task?.why && LOST_WORD[item.task.why]) ?? COMMAND_WORD.lost) : state === 'serving' && typeof item.task?.serving === 'string' ? `Serving ${item.task.serving}` : COMMAND_WORD[state];
   const ended = item.task?.endedAt ?? note?.ts;
   const when = state === 'unknown' ? clock(item.ts) : state === 'done' || state === 'failed' || state === 'stopped' ? (ended ? clock(ended) : '') : '';
   const name = item.detail.description || item.title;
@@ -481,7 +483,7 @@ const CommandRow = memo(function CommandRow({ sessionId, id, fresh }: { sessionI
         </span>
         <span className="agx-meta num">
           {word && <span className="agx-outcome">{word}</span>}
-          {state === 'running' && item.task && (
+          {(state === 'running' || state === 'serving') && item.task && (
             <span className="agx-dur">
               <Since ts={item.task.since} />
             </span>

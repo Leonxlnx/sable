@@ -74,3 +74,28 @@ describe('the band glides', () => {
     expect(sp[0]).toBeLessThan(sp[1]);
   });
 });
+
+it('draws the latest look during a continuous still-mode resize', async () => {
+  const { FieldEngine } = await import('../src/art/field');
+  const { vi } = await import('vitest');
+  vi.useFakeTimers();
+  const draws: Look[] = [];
+  const engine = Object.assign(Object.create(FieldEngine.prototype), { look: look(null), draw() { draws.push(engine.look); } });
+  try {
+    for (let i = 1; i <= 20; i++) {
+      engine.setLook(look([0.6, i / 40, 0.3]));
+      vi.advanceTimersByTime(35);
+    }
+    expect(draws).toHaveLength(10);
+    expect(draws.at(-1)?.band?.[1]).toBe(0.5);
+    vi.advanceTimersByTime(2000);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+it('slideRail restores a wrapped anchor in layout pixels at either zoom', async () => {
+  const { anchorCorrection } = await import('../src/lib/motion');
+  expect(anchorCorrection(125, 1.25)).toBe(100);
+  expect(anchorCorrection(-80, 0.8)).toBe(-100);
+  expect(anchorCorrection(14, 1)).toBe(14);
+});

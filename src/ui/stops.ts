@@ -102,3 +102,5 @@ export function settleAt(from: number, to: number, start: number, ms: number, no
   if (p >= 1) return { x: to, done: true };
   return { x: from + (to - from) * settleEase(Math.max(0, p)), done: false };
 }
+
+export const shouldGlide = (active: { to: number } | null, target: number) => active?.to !== target;

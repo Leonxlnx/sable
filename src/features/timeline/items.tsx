@@ -10,6 +10,7 @@ import { FileLinksProvider, useResolvedFiles } from '@/lib/file-links';
 import { plural } from '@/lib/format';
 import { useStore } from '@/state/store';
 import { stepEntrance, useFresh, useItem, useTimeline } from './ctx';
+import { takesStandIn } from './stand-in';
 import { FileShare } from './FileCard';
 import { Notice } from './Notice';
 import { steadyTail, useSmoothLength } from './smooth';
@@ -192,8 +193,10 @@ export const LiveText = memo(function LiveText({ text, streaming, id }: { text: 
  */
 export const ItemRow = memo(function ItemRow({ id, nested = false, answer = false, mid = false }: { id: string; nested?: boolean; answer?: boolean; mid?: boolean }) {
   const item = useItem(id);
-  const fresh = useFresh(item?.ts) && (!nested || stepEntrance(id));
   const { sessionId } = useTimeline();
+  // A message that takes the place of its stand-in (stand-in.ts) is already on screen: no entrance.
+  const [replaces] = useState(() => !nested && takesStandIn(sessionId, item));
+  const fresh = useFresh(item?.ts) && (!nested || stepEntrance(id)) && !replaces;
   if (!item) return null;
   // Written by the agent's harness in the person's place (a task finished, a slash command): a line, not a message.
   const syn = item.type === 'user' && !item.until ? syntheticOf(item) : null;

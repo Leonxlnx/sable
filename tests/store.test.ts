@@ -405,6 +405,10 @@ describe('items revisions: one item changes in place, the revision says so', () 
     feed({ type: 'item.patch', sessionId: SID, id: 'e1', patch: { status: 'done' } as Partial<TimelineItem> });
     expect(ids(st())).toEqual(['e1']);
     expect(sig(st())).toBe('running|1');
+    const rows = toolIdsSelector(SID, (it) => it.kind === 'edit' && it.status === 'done', true);
+    const firstRows = rows(st());
+    feed({ type: 'item.patch', sessionId: SID, id: 'e1', patch: { title: 'Changed diff' } });
+    expect(rows(st())).not.toBe(firstRows);
     const one = ids(st());
     feed({ type: 'item.delta', sessionId: SID, id: 't1', field: 'text', delta: ' on it' });
     frame();

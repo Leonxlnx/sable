@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { inPieces, pieceBefore, pieceHeight, piecesOf, PIECE, PIECES_FROM } from '../src/components/md-pieces';
+import { columnAlign, inPieces, pieceBefore, pieceHeight, piecesOf, PIECE, PIECES_FROM } from '../src/components/md-pieces';
 
 const sum = (a: readonly number[], from: number, to: number) => a.slice(from, to).reduce((x, y) => x + y, 0);
 
@@ -32,5 +32,16 @@ describe('a long text goes on the page in pieces, its end first', () => {
   it('stands in for a piece by its lines and blocks', () => {
     expect(pieceHeight([100, 250, 5], 0, 3)).toBe(26 + 14 + 3 * 26 + 14 + 26 + 14);
     expect(pieceHeight([100, 250, 5], 1, 2)).toBe(3 * 26 + 14);
+  });
+});
+
+describe('a table column has one edge (columnAlign)', () => {
+  it('figures stand on the right, also where the author centred them; a left set by the author holds', () => {
+    expect(columnAlign(null, true)).toBe('right');
+    expect(columnAlign('center', true)).toBe('right');
+    expect(columnAlign('right', true)).toBe('right');
+    expect(columnAlign('left', true)).toBe('left');
+    expect(columnAlign('center', false)).toBe('center');
+    expect(columnAlign(null, false)).toBe(null);
   });
 });

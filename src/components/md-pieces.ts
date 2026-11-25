@@ -52,3 +52,14 @@ export function pieceHeight(sizes: readonly number[], start: number, end: number
   for (let i = start; i < end; i++) h += Math.max(1, Math.ceil(sizes[i] / 100)) * 26 + 14;
   return Math.round(h);
 }
+
+/**
+ * How a table column's header and cells are set (pure): one edge per column. A column of figures
+ * stands on the right in tabular digits, also where the author centred it: a centred column of
+ * figures under a wider header drew two left edges a few pixels apart ("Status" at 600, its 401s
+ * at 606). Elsewhere the author's choice holds; no choice is the left (null).
+ */
+export function columnAlign(author: 'left' | 'right' | 'center' | null | undefined, figures: boolean): 'left' | 'right' | 'center' | null {
+  if (figures) return author === 'left' ? 'left' : 'right';
+  return author ?? null;
+}

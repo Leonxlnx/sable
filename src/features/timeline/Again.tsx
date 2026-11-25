@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { UserItem } from '@shared/protocol';
 import { stripWrappers, syntheticOf } from '@shared/synthetic';
-import { rewindTo, sendMessage, wholeMessage } from '@/state/actions';
+import { repeatMessage } from './repeat-message';
 import { useStore } from '@/state/store';
 import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger } from '@/ui';
 import { useTimeline } from './ctx';
@@ -28,7 +28,7 @@ function useIsLast(sessionId: string, id: string): boolean {
  * - Retry, on your last message: the same message is sent again in place of the answer.
  * Both use the existing rewind and leave files as they are.
  */
-export function MessageAgain({ item }: { item: UserItem }) {
+export function MessageAgain({ item, turnId }: { item: UserItem; turnId: () => string }) {
   const { sessionId } = useTimeline();
   const canRewind = useStore((s) => !!s.data[sessionId]?.caps?.features.rewind);
   const idle = useStore((s) => {
@@ -46,15 +46,10 @@ export function MessageAgain({ item }: { item: UserItem }) {
   const edit = async () => {
     if (busy) return;
     setBusy(true);
-    const message = await wholeMessage(sessionId, item);
-    const ok = message && await rewindTo(sessionId, item.id, false);
+    const ok = await repeatMessage(sessionId, item, text, 'edit', turnId());
     setBusy(false);
     if (!ok) return;
     setOpen(false);
-    const st = useStore.getState();
-    // Something already typed is kept under the message, not replaced by it.
-    const typed = st.drafts[sessionId]?.text.trim() ? `\n\n${st.drafts[sessionId]?.text}` : '';
-    st.setDraft(sessionId, { text: text + typed, attachments: [...(message.attachments ?? []), ...(st.drafts[sessionId]?.attachments ?? [])] });
     requestAnimationFrame(() => {
       const field = document.querySelector<HTMLTextAreaElement>('.dock textarea');
       field?.focus();
@@ -65,8 +60,7 @@ export function MessageAgain({ item }: { item: UserItem }) {
   const retry = async () => {
     if (busy) return;
     setBusy(true);
-    const message = await wholeMessage(sessionId, item);
-    if (message && await rewindTo(sessionId, item.id, false)) await sendMessage(sessionId, text, message.attachments ?? []);
+    await repeatMessage(sessionId, item, text, 'retry', turnId());
     setBusy(false);
   };
 

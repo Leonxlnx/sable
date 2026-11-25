@@ -18,8 +18,9 @@ import { TurnFoot } from './Turn';
 import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
-import { keptAt, rememberTurnSize, tailStart, TAIL, turnSizes, VIEWS } from './build-window';
+import { forgetLists, holdList, keptAt, listFor, rememberTurnSize, tailStart, TAIL, turnSizes, VIEWS } from './build-window';
 import { stallAt } from './stall';
+import { SWAP_OUT_MS, swapsAtOnce } from './live-title';
 import { shortDuration, thinkingHeadline, useHeld, useTick } from './util';
 
 /** How many more groups each step up builds (what an open builds: `build-window.ts`). */
@@ -125,14 +126,37 @@ function keepChunk(c: FlowChunk, cache: Map<string, unknown>, next: Map<string, 
   return chunk;
 }
 
-/** The estimated height of groups [from, to), as their spacer stands for them. */
-function spanHeight(groups: readonly Group[], from: number, to: number, sessionId: string): number {
+/**
+ * The estimated height of groups [from, to), as their spacer stands for them. A turn's estimate is
+ * kept by its object in `known` (a turn that changes is a new object; a single item is read each
+ * time, as a widget's height arrives later), so moving the spacer's edge by one group, as the
+ * build after an open does once per task, no longer reads every turn of a long chat again.
+ */
+function spanHeight(groups: readonly Group[], from: number, to: number, sessionId: string, known?: WeakMap<object, number>): number {
   if (from >= to) return 0;
   const items = useStore.getState().data[sessionId]?.items ?? {};
   let h = 0;
-  for (let i = from; i < to; i++) h += turnSizes.get(`${sessionId}|${groups[i].key}`) ?? groupHeight(groups[i], items, estimate);
+  for (let i = from; i < to; i++) {
+    const g = groups[i];
+    const size = turnSizes.get(`${sessionId}|${g.key}`);
+    if (size !== undefined) {
+      h += size;
+      continue;
+    }
+    let e = g.kind === 'turn' ? known?.get(g) : undefined;
+    if (e === undefined) {
+      e = groupHeight(g, items, estimate);
+      if (g.kind === 'turn') known?.set(g, e);
+    }
+    h += e;
+  }
   return h;
 }
+
+/** Drops the kept lists of chats the window no longer holds (`build-window.ts` `forgetLists`). */
+useStore.subscribe((s, prev) => {
+  if (s.data !== prev.data) forgetLists((id) => !!s.data[id]?.loaded);
+});
 
 /**
  * The conversation as turns: each message, one quiet line for the work behind it (its checkpoints
@@ -143,25 +167,28 @@ function spanHeight(groups: readonly Group[], from: number, to: number, sessionI
  */
 export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
   const { sessionId, scrolled, nav } = useTimeline();
+  // What this chat's list worked out the last time it was on screen (build-window.ts `listFor`):
+  // the shape index, the grouping and the stable turns, so a switch back reads nothing again.
+  const keep = useMemo(() => listFor(sessionId, () => ({ shapes: shapeIndex(), grouping: turnsIndex(), cache: new Map<string, unknown>(), kept: new WeakMap<TurnGroup, Kept>(), heights: new WeakMap<object, number>() })), [sessionId]);
+  useEffect(() => holdList(keep), [keep]);
   // One character per root item (see `turns.ts`), following the items write by write: a streamed
   // word re-reads the item it grew, not every root.
-  const [shapes] = useState(shapeIndex);
+  const shapes = keep.shapes;
   const shape = useStore(useMemo(() => (s: Store) => shapes(s.data[sessionId], ids), [shapes, sessionId, ids]));
   const busy = useStore((s) => {
     const st = s.sessions[sessionId]?.status;
     return st === 'running' || st === 'starting' || st === 'awaiting';
   });
-  const cache = useRef(new Map<string, unknown>());
   // The grouping, regrouping only from the last message the timeline has not changed before (a new
   // step regroups the running turn, not the conversation), and the turns it kept.
-  const [grouping] = useState(turnsIndex);
-  const [kept] = useState(() => new WeakMap<TurnGroup, Kept>());
+  const { grouping, cache, heights } = keep;
+  const kept = keep.kept as WeakMap<TurnGroup, Kept>;
   const layout = useMemo(() => {
     // The turn a check belongs to never changes, so reading it here (once per shape) is enough.
     const items = useStore.getState().data[sessionId]?.items;
     const checkOf = (id: string) => (items?.[id] as ToolItem | undefined)?.check?.turn;
-    return stabilize(grouping(ids, shape, busy, checkOf), cache.current, kept);
-  }, [grouping, kept, ids, shape, busy, sessionId]);
+    return stabilize(grouping(ids, shape, busy, checkOf), cache, kept);
+  }, [grouping, cache, kept, ids, shape, busy, sessionId]);
   const groups = layout.groups;
   const running = busy && groups.some((g) => g.kind === 'turn' && g.state === 'running');
 
@@ -200,9 +227,9 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
   }, [nav, groups, lead, gapFrom, hidden]);
 
   const spacer = useRef<HTMLDivElement>(null);
-  const spacerHeight = useMemo(() => spanHeight(groups, 0, lead, sessionId), [lead, groups, sessionId]);
+  const spacerHeight = useMemo(() => spanHeight(groups, 0, lead, sessionId, heights), [lead, groups, sessionId, heights]);
   const gap = useRef<HTMLDivElement>(null);
-  const gapHeight = useMemo(() => spanHeight(groups, gapFrom, hidden, sessionId), [gapFrom, hidden, groups, sessionId]);
+  const gapHeight = useMemo(() => spanHeight(groups, gapFrom, hidden, sessionId, heights), [gapFrom, hidden, groups, sessionId, heights]);
 
   useEffect(() => {
     const el = spacer.current;
@@ -848,7 +875,7 @@ function WorkHead({ mode, run, from, until, cap, first, seg, turn, open, onToggl
     if (before === mode || mode === 'live') return;
     // Reduced motion: no travel, the summary line simply fades in.
     if (reducedMotion()) {
-      el.current?.querySelector('.work-head')?.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 220, easing: 'ease-out' });
+      el.current?.querySelector('.work-head')?.animate([{ opacity: 0.5 }, { opacity: 1 }], { duration: 200, easing: 'ease-out' });
       return;
     }
     setLanded(true);
@@ -1012,9 +1039,6 @@ function liveSelector(sessionId: string, seg: Segment, run: StepsChunk | null, h
   };
 }
 
-/** How long the old title takes to fade before the new one comes in (ms). Short: the line is the
- *  turn's pulse, and a title that is gone for a quarter of a second reads as a line that went out. */
-const SWAP_OUT_MS = 80;
 
 /**
  * While the live line is quiet (the agent writes) and a steered message waits under it, the line's
@@ -1075,10 +1099,13 @@ function useLinger(on: boolean, ms: number): boolean {
 function useSwap(value: string): [string, boolean] {
   const [shown, setShown] = useState(value);
   const [out, setOut] = useState(false);
+  const [born] = useState(() => performance.now());
   useEffect(() => {
     // Back to the title on screen before the old one had gone: it simply stays.
     if (value === shown) return setOut(false);
-    if (reducedMotion()) {
+    // A line still arriving (its words fading in, `next-in`) takes its first real title at once: a
+    // fade through nothing right after it came read as the line going out at every checkpoint.
+    if (reducedMotion() || swapsAtOnce(born, performance.now())) {
       setShown(value);
       return;
     }

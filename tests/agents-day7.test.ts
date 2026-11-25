@@ -69,6 +69,8 @@ describe('window-F2: the commands follow their own state', () => {
     expect(second.ids[0]).toBe('dev');
     // Nothing changed: the same object (the tab does not render).
     expect(view(t)).toBe(second);
+    t.patch('dev', { task: { id: 'b', kind: 'command', state: 'running', since: 11, serving: 'localhost:3311' } });
+    expect(view(t)).toMatchObject({ running: 0, serving: 1 });
   });
 
   it('a command lost with its process, or reconciled as stopped, stops counting', () => {

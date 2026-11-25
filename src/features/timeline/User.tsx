@@ -5,7 +5,8 @@ import { CopyButton } from '@/components/CopyButton';
 import { ImageView } from '@/components/ImageView';
 import { Icon } from '@/icons';
 import { formatBytes } from '@/lib/format';
-import { loadWholeItem, rewindTo } from '@/state/actions';
+import { requestWhileCut } from './whole-request';
+import { rewindTo } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger, Switch } from '@/ui';
 import { fieldBeat } from '@/art/events';
@@ -56,7 +57,10 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
   // The message sent from the composer (or a queue row) lands here: it flies in as this bubble and the two swap.
   const root = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (item.more && root.current) return watchMessage(root.current, () => void loadWholeItem(sessionId, item.id));
+    if (!item.more || !root.current) return;
+    let stop: (() => void) | undefined;
+    const unwatch = watchMessage(root.current, () => { stop ??= requestWhileCut(sessionId, item.id); });
+    return () => { unwatch(); stop?.(); };
   }, [item, sessionId]);
   const queuedNow = useRef(queued);
   queuedNow.current = queued;
@@ -142,7 +146,7 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
         <div className="user-actions">
           {!queued && <Stamp ts={item.ts} prefix={item.steered ? 'Steered' : undefined} className="user-stamp" />}
           {text && <CopyButton text={text} label="Copy message" />}
-          <MessageAgain item={item} />
+          <MessageAgain item={item} turnId={() => root.current?.closest<HTMLElement>('[data-turn]')?.dataset.turn ?? item.id} />
           {canRewind && idle && !queued && (
             <Popover open={open} onOpenChange={setOpen}>
               <PopoverTrigger asChild>

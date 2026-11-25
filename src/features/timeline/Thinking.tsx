@@ -5,7 +5,7 @@ import { Markdown } from '@/components/Markdown';
 import { Icon } from '@/icons';
 import { useStore } from '@/state/store';
 import { Elapsed } from './Tool';
-import { useWhole } from './ctx';
+import { useWholeAhead, useWholeOpen } from './ctx';
 import { thinkingRow } from './step-row';
 import { shortDuration } from './util';
 
@@ -16,7 +16,9 @@ import { shortDuration } from './util';
 export const Thinking = memo(function Thinking({ item }: { item: ThinkingItem }) {
   const show = useStore((s) => s.settings.showThinking);
   const [open, setOpen] = useState(false);
-  useWhole(item, open && show);
+  // A cut thinking (an old turn's) opens once its whole text is here: never on its short head first.
+  const drawn = useWholeOpen(item, open && show);
+  const ahead = useWholeAhead(item);
   const { canOpen, label } = thinkingRow(item, show);
 
   const head = (
@@ -33,7 +35,7 @@ export const Thinking = memo(function Thinking({ item }: { item: ThinkingItem })
   return (
     <div className="think" data-open={open || undefined}>
       {canOpen ? (
-        <button type="button" className="row-btn think-row" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        <button type="button" className="row-btn think-row" aria-expanded={open} onPointerDown={show && !open ? ahead : undefined} onClick={() => setOpen((o) => !o)}>
           {head}
         </button>
       ) : (
@@ -42,7 +44,7 @@ export const Thinking = memo(function Thinking({ item }: { item: ThinkingItem })
         </div>
       )}
       {show && (
-        <Collapse open={open}>
+        <Collapse open={drawn}>
           <div className="think-body" inert={item.more} aria-busy={item.more}>
             <Markdown text={item.text} streaming={item.streaming} />
           </div>

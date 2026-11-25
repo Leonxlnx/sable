@@ -1,7 +1,7 @@
 import { createContext, memo, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type KeyboardEvent, type ReactNode, type SetStateAction } from 'react';
 import { ContextMenu as RC, DropdownMenu as RM } from 'radix-ui';
 import { DEFAULT_ACCOUNT, type SessionMeta } from '@shared/protocol';
-import { sameShown, statusLabel, statusTone } from './status';
+import { accountWord, sameShown, statusLabel, statusTone } from './status';
 import { PROVIDER_NAME, ProviderMark, StatusGlyph } from '@/art/Logo';
 import { fieldBeat } from '@/art/events';
 import { SpareClock, spareLine } from '@/features/composer/SpareStrip';
@@ -340,6 +340,16 @@ function whoLabel(s: SessionMeta, mix: RowMix): string | null {
 }
 
 /**
+ * The account the chat runs on, a dim word leading the row's hover tools ("Ultra4"): built with the
+ * tools when the row is first pointed at, read from the store then (no subscription of its own), so
+ * nothing about it shows or costs at rest.
+ */
+function RowAccount({ session }: { session: SessionMeta }) {
+  const word = accountWord(useStore.getState().providers[session.provider]?.accounts, session.accountId);
+  return word ? <span className="srow-acct truncate">{word}</span> : null;
+}
+
+/**
  * The pointer (or focus) resting on a row this long fetches its chat ahead (`prefetchSession`), so
  * the click finds the conversation here. Passing over rows on the way elsewhere fetches nothing.
  * One timer for the whole list: one row is under the pointer at a time.
@@ -489,6 +499,7 @@ export const SessionRow = memo(function SessionRow({ id, enter, mix }: { id: str
           )}
           {armed && (
             <span className="srow-acts">
+              <RowAccount session={session} />
               <button type="button" className="srow-act" tabIndex={-1} aria-label={session.pinned ? 'Unpin' : 'Pin'} onClick={() => togglePin(session)}>
                 <Icon name={session.pinned ? 'pin-off' : 'pin'} size={14} />
               </button>

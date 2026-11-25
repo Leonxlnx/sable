@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { SessionMeta, TimelineItem, ToolItem } from '../shared/protocol';
-import { hasWork, workCounts, workLabel } from '../shared/work-label';
+import { hasWork, servingLabel, workCounts, workLabel } from '../shared/work-label';
 import { statusLabel, statusTone } from '../src/features/sidebar/SessionRow';
 import { commandsSince } from '../src/features/timeline/Tail';
 
@@ -12,6 +12,22 @@ const meta = (extra: Partial<SessionMeta> = {}): SessionMeta =>
   ({ id: 's', provider: 'claude', cwd: '.', title: 't', titleSource: 'auto', model: 'm', mode: 'default', status: 'idle', createdAt: 0, updatedAt: 0, usage: { inputTokens: 0, outputTokens: 0, turns: 0 }, ...extra }) as SessionMeta;
 
 describe('the work label', () => {
+  it('reserves serving for the chat and gives working commands priority', () => {
+    const s = meta({ serving: 1, servingAddress: 'localhost:3311' });
+    expect(servingLabel(s)).toBe('Serving localhost:3311');
+    expect(servingLabel({ serving: 2 })).toBe('Serving 2 local servers');
+    expect(hasWork(s)).toBe(false);
+    expect(workLabel(s)).toBeNull();
+    expect(statusTone(s)).toBe('idle');
+    expect(statusLabel(s)).toBeNull();
+    for (const serving of [0, 1]) {
+      const mixed = meta({ serving, commands: 1 });
+      expect(hasWork(mixed)).toBe(true);
+      expect(workLabel(mixed)).toBe('1 command running');
+      expect(statusTone(mixed)).toBe('working');
+    }
+  });
+
   it('names commands and sub-agents apart', () => {
     expect(workLabel({ commands: 1 })).toBe('1 command running');
     expect(workLabel({ commands: 3 })).toBe('3 commands running');

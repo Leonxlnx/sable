@@ -8,9 +8,10 @@ import { Icon } from '@/icons';
 import { PROVIDER_NAME, ProviderMark } from '@/art/Logo';
 import { formatCost, formatTokens, isMac } from '@/lib/format';
 import { openPreview, previewTargets } from '@/lib/links';
-import { checkTurn, forkAt, sendMessage, wholeMessage } from '@/state/actions';
+import { checkTurn, forkAt } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { IconButton } from '@/ui';
+import { repeatMessage } from './repeat-message';
 import { changesOf } from './changes';
 import { canCheckWith, checkedAlready, checkerOf } from './check-turn';
 import { useItem, useTimeline } from './ctx';
@@ -111,8 +112,7 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
   const retry = async () => {
     const user = again();
     if (!user) return;
-    const message = await wholeMessage(sessionId, user);
-    if (message) void sendMessage(sessionId, user.text, message.attachments ?? []);
+    await repeatMessage(sessionId, user, user.text, 'footer', turn.key);
   };
 
   const parts: string[] = [];

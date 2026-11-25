@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from 'react';
+import { memo, useContext, useEffect, useMemo, useState } from 'react';
 import type { ToolItem, WorkflowAgent, WorkflowRun } from '@shared/protocol';
 import { Ring } from '@/art/Logo';
 import { Markdown } from '@/components/Markdown';
@@ -8,8 +8,8 @@ import { shortDuration } from '@/features/timeline/util';
 import { clock } from '@/features/usage/format';
 import { Icon, TOOL_ICON } from '@/icons';
 import { formatTokens, plural } from '@/lib/format';
-import { loadWholeItem } from '@/state/actions';
-import { useShown } from './agents-hooks';
+import { requestWhileCut } from '../timeline/whole-request';
+import { ShownCtx, useShown } from './agents-hooks';
 import { figuresOf, latestSteps, outcomeOf, stepCount } from './agents-model';
 
 /** How many of its latest steps an opened agent lists; the conversation has every one. */
@@ -25,10 +25,10 @@ const LONG_REPORT = 700;
  */
 export function AgentDetail({ sessionId, item, live, endedAt = 0 }: { sessionId: string; item: ToolItem; live: boolean; endedAt?: number }) {
   // A long report or result comes cut to the window: opened, it is asked for whole.
-  const more = !!item.more;
+  const more = useContext(ShownCtx) && !!item.more;
   useEffect(() => {
-    if (more) void loadWholeItem(sessionId, item.id);
-  }, [more, sessionId, item.id]);
+    if (more) return requestWhileCut(sessionId, item.id);
+  }, [more, sessionId, item]);
 
   return (
     <div className="agx-detail">

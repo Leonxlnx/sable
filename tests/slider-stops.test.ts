@@ -138,3 +138,13 @@ describe('settleAt: one clock for the thumb, the fill and the word', () => {
     expect(settleEase(1)).toBe(1);
   });
 });
+
+it('retargets a second key from the current glide to the newly committed stop', async () => {
+  const { shouldGlide, settleAt } = await import('../src/ui/stops');
+  const active = { from: 10, to: 30, start: 0, ms: 120 };
+  const from = settleAt(active.from, active.to, active.start, active.ms, 36).x;
+  const target = shouldGlide(active, 50) ? 50 : active.to;
+  expect(settleAt(from, target, 36, 120, 36).x).toBe(from);
+  expect(settleAt(from, target, 36, 120, 156).x).toBe(50);
+  expect(shouldGlide(active, 30)).toBe(false);
+});

@@ -1,6 +1,6 @@
 import { memo, useState } from 'react';
 import { worksInBackground } from '@shared/background';
-import { tailLabel, workCounts, workLabel } from '@shared/work-label';
+import { servingLabel, tailLabel, waited, workCounts, workLabel } from '@shared/work-label';
 import { Tiles } from '@/art/Logo';
 import { Icon } from '@/icons';
 import { showRailTab } from '@/state/actions';
@@ -44,7 +44,7 @@ export function commandsSince() {
       const changed = d.items === items ? changedSince(d, rev) : null;
       const look = (id: string) => {
         const it = d.items[id];
-        if (it?.type === 'tool' && it.task?.state === 'running') running.set(id, it.task.since);
+        if (it?.type === 'tool' && it.task?.state === 'running' && !it.task.serving) running.set(id, it.task.since);
         else running.delete(id);
       };
       if (changed) for (const id of changed) look(id);
@@ -84,7 +84,7 @@ export function workSince() {
     const changed = d.items === items ? changedSince(d, rev) : null;
     const look = (id: string) => {
       const it = d.items[id];
-      if (it?.type === 'tool' && it.task?.state === 'running') running.set(id, { at: it.task.since, monitor: it.task.kind === 'monitor' });
+      if (it?.type === 'tool' && it.task?.state === 'running' && !it.task.serving) running.set(id, { at: it.task.since, monitor: it.task.kind === 'monitor' });
       else if (it?.type === 'tool' && worksInBackground(it)) running.set(id, { at: it.ts, monitor: false });
       else running.delete(id);
     };
@@ -106,14 +106,6 @@ export function workSince() {
   };
 }
 
-/** "45s", "4m", "1h 5m": how long a background command has run, to the minute once past one. */
-function waited(ms: number): string {
-  const s = Math.max(1, Math.round(ms / 1000));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`;
-}
-
 /**
  * The line under the transcript while the agent works: what it is doing and for how long (the
  * stop button and Esc stop it). It steps back while prose is streaming, since the words are the signal.
@@ -132,24 +124,25 @@ export const Tail = memo(function Tail() {
   const info = useStore((s) => tailInfo(s.data[sessionId]));
   const agents = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).agents);
   const commands = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).commands);
+  const serving = useStore((s) => servingLabel(s.sessions[sessionId] ?? {}));
+  const servingSince = useStore((s) => s.sessions[sessionId]?.servingSince);
   const [read] = useState(workSince);
   const work = useStore((s) => (agents || commands ? read(s.data[sessionId]) : NO_WORK));
   const working = status === 'running' || status === 'starting' || !!check;
   const background = !working && status !== 'awaiting' && (agents > 0 || commands > 0);
-  const now = useTick(working || (background && work.since > 0));
+  const since = background ? work.since : servingSince;
+  const now = useTick(working || (status !== 'awaiting' && !!since));
   // Laid out with the chat (history): it simply stands. Only work that begins while the person
   // watches rises in.
   const fresh = useFresh();
   if (!working && status !== 'awaiting') {
-    if (!background) return null;
+    if (!background && !serving) return null;
     // The bridge's counts are the truth; the items only tell which commands are monitors.
-    const label = tailLabel({ agents, commands, monitors: Math.min(work.monitors, commands) });
-    const ran = work.since ? now - work.since : 0;
+    const label = tailLabel({ agents, commands, monitors: Math.min(work.monitors, commands) }) ?? serving;
+    const ran = since ? now - since : 0;
     return (
       <button type="button" className="tail tail-bg" data-enter={fresh || undefined} onClick={() => showRailTab('agents')} aria-label={`${label}. Open Agents`}>
-        <span className="work-ind">
-          <Tiles size={12} />
-        </span>
+        {background && <span className="work-ind"><Tiles size={12} /></span>}
         <span className="tail-label truncate">{label}</span>
         {ran >= 1000 && (
           <>

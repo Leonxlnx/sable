@@ -3,7 +3,6 @@ import type {
   UpdateState,
   FolderGroup,
   AppSettings,
-  Attachment,
   BackdropConfig,
   BridgeEvent,
   Capabilities,
@@ -56,6 +55,8 @@ export interface SessionData {
    * revision before it was `since`. Absent after a new timeline (snapshot, reset). See `changedSince`.
    */
   changed?: { since: number; ids: readonly string[] };
+  /** Release this timeline on leaving: at least one preview was fetched whole. */
+  hydrated?: boolean;
   /** Top-level item ids in order. A new array whenever it changes. */
   roots: string[];
   /** Sub-agent item ids by parent tool id. A new object (and a new array for that parent) whenever one changes. */
@@ -88,10 +89,7 @@ export interface Toast {
   again?: number;
 }
 
-export interface Draft {
-  text: string;
-  attachments: Attachment[];
-}
+export type Draft = import('@/features/composer/restore').FieldDraft;
 
 interface Ui {
   activeSessionId: string | null;
@@ -410,13 +408,39 @@ export function withPrompts(data: Record<string, SessionData>, prompts: PendingP
   return next;
 }
 
+/**
+ * The rows that opened steps, thinking lines and messages arrived as, per chat. When the chat leaves
+ * the screen they are put back (`restoreRows`), so what was opened costs nothing off screen and the
+ * chat STAYS loaded: dropping a chat because a step had been opened made every return to it cold.
+ */
+const rowsOf = new Map<string, Map<string, { row: TimelineItem; whole: TimelineItem }>>();
+
 /** Replace only the row that requested this response. A rewind, patch or newer snapshot wins the race. */
 export function applyWholeItem(sessionId: string, item: TimelineItem, asked?: TimelineItem) {
   editItems(sessionId, (d) => {
     const cur = d.items[item.id];
     if (!cur || cur.type !== item.type || !('more' in cur) || !cur.more || (asked && cur !== asked)) return null;
     d.items[item.id] = item;
-    return { ids: [item.id] };
+    let rows = rowsOf.get(sessionId);
+    if (!rows) rowsOf.set(sessionId, (rows = new Map()));
+    rows.set(item.id, { row: cur, whole: item });
+    trimOffscreenSoon(sessionId);
+    return { ids: [item.id], patch: { hydrated: true } };
+  });
+}
+
+/** Puts back the rows of what was fetched whole (only where the whole item still stands: a later change wins). */
+function restoreRows(sessionId: string) {
+  const rows = rowsOf.get(sessionId);
+  rowsOf.delete(sessionId);
+  editItems(sessionId, (d) => {
+    const ids: string[] = [];
+    if (rows) for (const [id, { row, whole }] of rows) {
+      if (d.items[id] !== whole) continue;
+      d.items[id] = row;
+      ids.push(id);
+    }
+    return { ids, patch: { hydrated: false } };
   });
 }
 
@@ -439,6 +463,8 @@ export function applySnapshot(snap: SessionSnapshot) {
       },
     },
   }));
+  // A click sharing this snapshot can put its chat on screen before the budget is applied.
+  trimOffscreenSoon(snap.session.id);
 }
 
 /**
@@ -505,6 +531,7 @@ export function applyEvent(e: BridgeEvent) {
         if (known && e.moved && !e.item.parentId && d.roots.at(-1) !== e.item.id) return { ids, patch: { roots: [...d.roots.filter((id) => id !== e.item.id), e.item.id] } };
         // An item the timeline already holds is replaced where it stands.
         if (known) return { ids };
+        trimOffscreenSoon(e.sessionId);
         if (e.item.parentId) return { ids, patch: { children: { ...d.children, [e.item.parentId]: [...(d.children[e.item.parentId] ?? []), e.item.id] } } };
         return { ids, patch: { roots: [...d.roots, e.item.id] } };
       });
@@ -545,13 +572,16 @@ export function applyEvent(e: BridgeEvent) {
       return;
     case 'timeline.reset':
       deltaBuffer.clear();
-      patchData(e.sessionId, () => indexItems(e.items));
+      rowsOf.delete(e.sessionId);
+      patchData(e.sessionId, () => ({ ...indexItems(e.items), hydrated: false }));
+      trimOffscreenSoon(e.sessionId);
       return;
     case 'session.added':
       useStore.setState((s) => ({
         sessions: { ...s.sessions, [e.session.id]: e.session },
         data: s.data[e.session.id] ? s.data : { ...s.data, [e.session.id]: { ...emptyData(), loaded: true } },
       }));
+      trimOffscreenSoon(e.session.id);
       return;
     case 'session.updated': {
       const before = useStore.getState().sessions[e.id];
@@ -868,8 +898,8 @@ export function startBridge() {
  * switch between two long chats fetched tens of megabytes again.
  */
 export const KEEP = { chats: 8, items: 120_000 };
-/** When each chat was last opened or fetched ahead (a counter, not a clock), and how many items it held then. */
-const used = new Map<string, { at: number; items: number }>();
+/** When each chat was last opened or fetched ahead (a counter, not a clock). */
+const used = new Map<string, number>();
 let useSeq = 0;
 /** Snapshot requests in flight, one per chat. */
 const fetching = new Map<string, Promise<void>>();
@@ -878,11 +908,14 @@ const fetching = new Map<string, Promise<void>>();
 export function resetKept() {
   used.clear();
   fetching.clear();
+  rowsOf.clear();
+  clearTimeout(trimTimer);
+  trimTimer = undefined;
 }
 
 /** Marks a chat as just used (opened, fetched ahead): the last to be dropped. */
 export function touchKept(sessionId: string) {
-  used.set(sessionId, { at: ++useSeq, items: used.get(sessionId)?.items ?? 0 });
+  used.set(sessionId, ++useSeq);
 }
 
 /** The chats on screen: the open one, or both of the race shown. Never dropped. */
@@ -910,26 +943,40 @@ function forgetKept(data: Record<string, SessionData>, keep: string[]): Record<s
   return next;
 }
 
+let trimTimer: ReturnType<typeof setTimeout> | undefined;
+function trimOffscreenSoon(id: string) {
+  if (trimTimer !== undefined || id === useStore.getState().ui.activeSessionId) return;
+  trimTimer = setTimeout(() => { trimTimer = undefined; trimKept(); }, 0);
+}
+
 /** Drops the least recently used loaded chats beyond `KEEP` (never those on screen). */
 export function trimKept() {
+  // A chat off screen holds rows only: what was opened in it goes back to its row first.
+  const shown = new Set(onScreen(useStore.getState()));
+  for (const [id, d] of Object.entries(useStore.getState().data)) if (d.loaded && d.hydrated && !shown.has(id)) restoreRows(id);
   const s = useStore.getState();
   const keep = new Set(onScreen(s));
   const kept = Object.entries(s.data)
     .filter(([id, d]) => d.loaded && !keep.has(id))
-    .sort((a, b) => (used.get(b[0])?.at ?? 0) - (used.get(a[0])?.at ?? 0));
+    .sort((a, b) => (used.get(b[0]) ?? 0) - (used.get(a[0]) ?? 0));
   const drop: string[] = [];
   let items = 0;
-  kept.forEach(([id, d], i) => {
-    items += used.get(id)?.items ?? d.roots.length;
-    if (i >= KEEP.chats || (i > 0 && items > KEEP.items)) drop.push(id);
-  });
+  let chats = 0;
+  for (const [id, d] of kept) {
+    const count = d.roots.length + Object.values(d.children).reduce((n, children) => n + children.length, 0);
+    if (chats >= KEEP.chats || items + count > KEEP.items) drop.push(id);
+    else { chats++; items += count; }
+  }
   if (!drop.length) return;
   useStore.setState((st) => {
     const data = { ...st.data };
     for (const id of drop) if (data[id]?.loaded) data[id] = unloaded(data[id]);
     return { data };
   });
-  for (const id of drop) used.delete(id);
+  for (const id of drop) {
+    used.delete(id);
+    rowsOf.delete(id);
+  }
 }
 
 /**
@@ -952,8 +999,7 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
       // dropped, and the older answer then replaced hello's prompts, so an approval could vanish.)
       if (useStore.getState().ready && !useStore.getState().sessions[sessionId]) return;
       applySnapshot(snap);
-      used.set(sessionId, { at: used.get(sessionId)?.at ?? ++useSeq, items: snap.items.length });
-      trimKept();
+      if (!used.has(sessionId)) touchKept(sessionId);
     })
     .finally(() => {
       if (fetching.get(sessionId) === p) fetching.delete(sessionId);
@@ -967,6 +1013,7 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
 // before it switches, so its request is the one in flight here and nothing is asked twice.
 useStore.subscribe((s, prev) => {
   const id = s.ui.activeSessionId;
+  if (id !== prev.ui.activeSessionId || s.ui.race !== prev.ui.race) trimKept();
   if (!id || id === prev.ui.activeSessionId || !s.ready) return;
   if (s.sessions[id] && !s.data[id]?.loaded) void loadSession(id).catch(() => {});
 });

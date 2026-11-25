@@ -9,7 +9,7 @@ import { PathLabel } from '@/ui';
 import { DevUrlChip } from '@/features/rail/DevUrlChip';
 import { stepOf, useJumpOpen } from '@/features/review/jump';
 import { AgentBlock } from './Agent';
-import { useTimeline } from './ctx';
+import { useTimeline, useWholeAhead, useWholeOpen } from './ctx';
 import { ToolDetails } from './ToolDetails';
 import { errorText, hasDetails, rowText } from './step-row';
 import { isActive, partialJsonString, shortDuration, useTick } from './util';
@@ -122,6 +122,9 @@ function ToolRow({ item }: { item: ToolItem }) {
   const [choice, setChoice] = useState<boolean | null>(null);
   const expandable = hasDetails(item);
   const open = expandable && (choice ?? autoOpen(item));
+  // A cut step (an old turn's) opens its details once it is whole: never on the cut row first (ctx.ts).
+  const drawn = useWholeOpen(item, open);
+  const ahead = useWholeAhead(item);
   // The review bar's list jumps to a comment on this edit: the step opens to show it.
   useJumpOpen((r) => stepOf(r.scope) === item.id, () => setChoice(true), item.kind === 'edit' || item.kind === 'write');
   const active = isActive(item);
@@ -136,7 +139,7 @@ function ToolRow({ item }: { item: ToolItem }) {
 
   return (
     <div className="tool" data-status={item.status} data-open={open || undefined} data-server={server ? '' : undefined}>
-      <button type="button" className="row-btn tool-row" aria-expanded={expandable ? open : undefined} data-static={!expandable || undefined} tabIndex={expandable ? undefined : -1} onClick={() => expandable && setChoice(!open)}>
+      <button type="button" className="row-btn tool-row" aria-expanded={expandable ? open : undefined} data-static={!expandable || undefined} tabIndex={expandable ? undefined : -1} onPointerDown={expandable && !open ? ahead : undefined} onClick={() => expandable && setChoice(!open)}>
         <span className="tool-icon">
           <Icon name={icon.icon} size={14} />
         </span>
@@ -157,7 +160,7 @@ function ToolRow({ item }: { item: ToolItem }) {
         </Collapse>
       )}
       {expandable && (
-        <Collapse open={open}>
+        <Collapse open={drawn}>
           <div className="tool-details" inert={item.more} aria-busy={item.more}>
             <ToolDetails item={item} />
           </div>
@@ -170,7 +173,10 @@ function ToolRow({ item }: { item: ToolItem }) {
 // ─────────────────────────────────── plan ───────────────────────────────────
 
 function PlanCard({ item }: { item: ToolItem }) {
-  const [open, setOpen] = useState(true);
+  // While its approval waits in the dock (the prompt card shows the whole plan there), the
+  // conversation's copy is its title line: the plan stood twice on screen. Answered, it opens again.
+  const [choice, setChoice] = useState<boolean | null>(null);
+  const open = choice ?? item.status !== 'awaiting';
   const typing = !item.detail.plan && item.input === undefined;
   const plan = item.detail.plan ?? partialJsonString(item.inputText, 'plan') ?? '';
   const state =
@@ -188,7 +194,7 @@ function PlanCard({ item }: { item: ToolItem }) {
 
   return (
     <div className="plan" data-status={item.status} data-spot>
-      <button type="button" className="plan-head" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+      <button type="button" className="plan-head" aria-expanded={open} onClick={() => setChoice(!open)}>
         <span className="agent-icon">
           <Icon name="compass" size={15} />
         </span>

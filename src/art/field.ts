@@ -2097,6 +2097,7 @@ export class FieldEngine {
   /** A frozen clock (development frame sheets), or null. */
   private fixed: number | null = null;
   private timer: ReturnType<typeof setTimeout> | 0 = 0;
+  private settlesLeft = 0;
   private settle: ReturnType<typeof setInterval> | 0 = 0;
   private drawn = false;
   /** The last 20 frame costs; their median is reported, so one stall on a busy machine does not skew it. */
@@ -2196,11 +2197,11 @@ export class FieldEngine {
     this.look = { ...look, pointer: this.look.pointer };
     if (this.animate && this.running && this.quality < MAX_QUALITY) return this.wake();
     // Still mode: run a short burst so the change eases in.
-    if (this.settle) clearInterval(this.settle);
-    let n = 0;
+    this.settlesLeft = 15;
+    if (this.settle) return;
     this.settle = setInterval(() => {
       this.draw();
-      if (++n > 14 && this.settle) {
+      if (--this.settlesLeft === 0 && this.settle) {
         clearInterval(this.settle);
         this.settle = 0;
       }

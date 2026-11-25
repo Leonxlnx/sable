@@ -186,7 +186,7 @@ describe('a queued message removed leaves in the frame of the click', () => {
     // The row that left may still be in the page, hidden: the one that comes back is another
     // element (its key counts the returns), never that one, still hidden.
     expect(tray).toContain('lives.current.set(id, (lives.current.get(id) ?? 0) + 1);');
-    expect(tray).toContain('key={`${keyOf(q.id)}/${lives.get(q.id) ?? 0}`}');
+    expect(tray).toContain('key={`${keyOf(q)}/${lives.get(q.id) ?? 0}`}');
     const leave = tray.slice(tray.indexOf('const leave = useCallback('), tray.indexOf('const waiting = useSyncExternalStore'));
     // Back in the tray, it is no longer "removed by hand": taken by the agent later, it flies.
     expect(leave).toMatch(/if \(!on\) \{[^}]*gone\.delete\(id\);/);

@@ -278,13 +278,15 @@ export const updateQueued = (sessionId: string, id: string, text: string, attach
     return { ok: false };
   });
 export const removeQueued = (sessionId: string, id: string) => bridge.call('queue.remove', { sessionId, id }).catch(fail);
-/** Takes a queued message out to edit it (e.g. back into the composer). Null when it already went out. */
-export async function takeQueued(sessionId: string, id: string): Promise<QueuedMessage | null> {
+/** A missing reply or reservation cannot establish who owns the draft. */
+export async function takeQueued(sessionId: string, id: string): Promise<import('@/features/composer/restore').TakeResult> {
   try {
-    return (await bridge.call('queue.take', { sessionId, id })).message ?? null;
+    const { message, taken } = await bridge.call('queue.take', { sessionId, id });
+    if (message) return { kind: 'message', message };
+    return { kind: taken ? 'taken' : 'unknown' };
   } catch (err) {
     fail(err);
-    return null;
+    return { kind: 'unknown' };
   }
 }
 /** New queue order (drag to reorder): `ids` first, in that order. Applied to the store at once; `queue.updated` confirms it. */
@@ -403,7 +405,7 @@ export async function rewindTo(sessionId: string, itemId: string, restoreFiles: 
     return r.ok;
   } catch (err) {
     fail(err);
-    return false;
+    return null; // The rewind may have committed before its answer was lost.
   }
 }
 

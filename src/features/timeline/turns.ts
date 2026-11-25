@@ -189,10 +189,25 @@ export function shapeOf(item: TimelineItem | undefined): string {
 }
 
 /**
+ * `shapeOf` remembered per item object: an item never changes in place (a change is a new object),
+ * so its character stays true for as long as the object lives. A chat opened again, or a timeline
+ * read again from the start, reads a lead-in's sentences or a message's wrappers once per item, not
+ * once per read: a 60,000-item chat's shape is then a walk of lookups (scratch/day7/design4-speed).
+ */
+const shapes = new WeakMap<TimelineItem, string>();
+export function shapeOfKept(item: TimelineItem | undefined): string {
+  if (!item) return '.';
+  let c = shapes.get(item);
+  if (c === undefined) shapes.set(item, (c = shapeOf(item)));
+  return c;
+}
+
+/**
  * The shape of a session's roots (one `shapeOf` character per root), followed write by write: a
  * write re-reads only the items it changed (`changedSince`), roots that grew at their end add their
  * new characters, and anything else (a new timeline, a removed root, a write it did not see) reads
- * every root again. The result is always the string `roots.map((id) => shapeOf(items[id])).join('')`.
+ * every root again (each item's character remembered, `shapeOfKept`). The result is always the
+ * string `roots.map((id) => shapeOf(items[id])).join('')`.
  */
 export function shapeIndex() {
   let ids: readonly string[] = [];
@@ -225,7 +240,7 @@ export function shapeIndex() {
       chars = new Array<string>(roots.length);
       pos = new Map();
       for (let i = 0; i < roots.length; i++) {
-        chars[i] = shapeOf(d.items[roots[i]]);
+        chars[i] = shapeOfKept(d.items[roots[i]]);
         pos.set(roots[i], i);
       }
       out = chars.join('');
@@ -241,7 +256,7 @@ export function shapeIndex() {
       }
       let tail = '';
       for (let i = n; i < roots.length; i++) {
-        const c = shapeOf(d.items[roots[i]]);
+        const c = shapeOfKept(d.items[roots[i]]);
         chars.push(c);
         pos.set(roots[i], i);
         tail += c;

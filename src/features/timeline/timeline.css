@@ -54,6 +54,13 @@
   outline: none;
 }
 
+/* The bar ends where the dock begins (its tray and strips included): it ran on down beside the
+   tray and the composer, a thumb drawn over what floats there. The scroller itself still reaches
+   behind the dock (what scrolls passes behind the pane's upper part). */
+.tl-scroll::-webkit-scrollbar-track {
+  margin-bottom: max(0px, calc(var(--dock-h, 150px) - var(--tl-foot)));
+}
+
 .tl-content {
   --gutter: max(24px, calc((100% - var(--column)) / 2));
   container: tl / inline-size;
@@ -1044,6 +1051,42 @@ button:hover > .row-caret {
 .user-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* A message on its way (StandIn.tsx): the card itself, in its place at the end, before the bridge
+   has added its row. Nothing to act on yet; when the row is late it says so with the send's one
+   sign (composer.css `.send-wait`): a hairline filling slowly along the card's lower edge. */
+.tl-item[data-standin] .user-actions {
+  display: none;
+}
+
+.tl-item[data-standin] .user-card::after {
+  content: '';
+  position: absolute;
+  left: 16px;
+  right: 9px;
+  bottom: 0;
+  height: 1px;
+  background-color: color-mix(in srgb, var(--text) 50%, transparent);
+  transform: scaleX(0);
+  transform-origin: 0 50%;
+  pointer-events: none;
+  animation: standin-wait 9000ms cubic-bezier(0.2, 0.7, 0.3, 1) 600ms forwards;
+}
+
+@keyframes standin-wait {
+  1.5% {
+    transform: scaleX(0.03);
+  }
+  to {
+    transform: scaleX(0.94);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tl-item[data-standin] .user-card::after {
+    animation: none;
+  }
 }
 
 /* A long message (user-card.ts) stops at its tenth whole line, which ends in an ellipsis: no
@@ -2370,19 +2413,18 @@ button:hover > .row-caret {
   margin-top: 1px;
 }
 
-/* ── the end of a segment: the live line hands over to its summary, almost at once ── */
+/* ── the end of a segment: the live line hands over to its summary, at once ──
+   The summary is on screen from the frame the checkpoint closes and only settles into its tone: no
+   delay, no travel, never from nothing. It used to wait 60 ms at opacity 0 and rise 4 px; in that
+   frame the new note and the next live line's words also started at 0, so the end of the running
+   turn went blank for a frame at every checkpoint (packaged films, scratch/day7/design4-flash). */
 .work-head[data-landed] > * {
-  animation: land-in 300ms var(--ease-out) 60ms backwards;
-}
-
-.work-head[data-landed] > :nth-child(2) {
-  animation-delay: 120ms;
+  animation: land-in 200ms var(--ease-out) backwards;
 }
 
 @keyframes land-in {
   from {
-    opacity: 0;
-    transform: translateY(4px);
+    opacity: 0.5;
   }
 }
 
@@ -2753,9 +2795,16 @@ button:hover > .row-caret {
    that closed the one before, with no travel. At the end of the conversation it stands where the
    line before it stood (the view keeps the end), so the working tiles stay on and only the words
    fade in, as a new title does: the whole line fading in from nothing blinked the indicator out
-   at every checkpoint. */
+   at every checkpoint. The words start a third in (`next-in`), never from nothing: the line had
+   words a frame before, and the note above arrives from nothing in the same frame. */
 .tl-work[data-next][data-live] > .work-head :is(.work-label, .work-time) {
-  animation: fade-in 200ms var(--ease) backwards;
+  animation: next-in 160ms var(--ease) backwards;
+}
+
+@keyframes next-in {
+  from {
+    opacity: 0.35;
+  }
 }
 
 /* The title keeps its sweep after it has faded in: the fades above set the whole `animation`, which
@@ -2768,7 +2817,7 @@ button:hover > .row-caret {
 
 .tl-work[data-next][data-live] > .work-head .work-live-title.shimmer {
   animation:
-    fade-in 200ms var(--ease) backwards,
+    next-in 160ms var(--ease) backwards,
     shimmer 2.4s linear infinite;
 }
 
@@ -2778,7 +2827,7 @@ button:hover > .row-caret {
 }
 
 :root[data-quality] .tl-work[data-next][data-live] > .work-head .work-live-title.shimmer {
-  animation: fade-in 200ms var(--ease) backwards;
+  animation: next-in 160ms var(--ease) backwards;
 }
 
 @keyframes tile-build {
@@ -2874,8 +2923,11 @@ button:hover > .row-caret {
 
 /* A lead-in among the opened steps ("Let me run the tests."): the agent's note on the step after
    it, in the steps' own size and one tone back, so the run reads as steps with their reasons. */
+/* Words between the steps of an opened run stand on the steps' text edge, after the icon column
+   (`.tool-icon` 16 and the row's gap 8): inside the rail there is one edge for everything read,
+   the icons hang before it. They stood on the icons' edge, 24 px before the titles beside them. */
 .story .tl-sub[data-t='text'] {
-  padding: 4px 0 3px;
+  padding: 4px 0 3px calc(16px + 8px);
 }
 
 .story .tl-sub[data-t='text'] .md {

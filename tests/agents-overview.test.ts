@@ -207,7 +207,7 @@ describe('background commands', () => {
     expect(commandState(bash('x', { status: 'running' }), undefined)).toBe('starting');
     expect(commandState(bash('x', { status: 'error' }), undefined)).toBe('failed');
     // What failed first, then newest first (nothing here says one runs).
-    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'serve', 'build'], running: 0, failed: 1 });
+    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'serve', 'build'], serving: 0, running: 0, failed: 1 });
   });
 
   it("read the bridge's own word first: running first with its time, then what failed, then the newest", () => {
@@ -215,19 +215,19 @@ describe('background commands', () => {
     const t = new Tl()
       .add(user('u1', 1))
       .add(bash('old', { ts: 2 }))
-      .add(bash('server', { ts: 3, task: task('running', 3) }))
+      .add(bash('server', { ts: 3, task: task('running', 3, { serving: 'localhost:3311' }) }))
       .add(bash('lint', { ts: 4, task: task('failed', 4, { endedAt: 9 }) }))
       .add(bash('tests', { ts: 5, task: task('running', 5) }))
       .add(bash('gone', { ts: 6, task: task('lost', 6, { why: 'move' }) }))
       .add(bash('build', { ts: 7, task: task('done', 7, { endedAt: 8 }) }));
     const notes = noteIndex()(t);
-    expect(commandState(t.items.server as ToolItem, undefined)).toBe('running');
+    expect(commandState(t.items.server as ToolItem, undefined)).toBe('serving');
     expect(commandState(t.items.gone as ToolItem, undefined)).toBe('lost');
     // A note that says otherwise does not outrank the bridge.
     expect(commandState(t.items.build as ToolItem, { ts: 9, outcome: 'failed' })).toBe('done');
     // A chat saved before the bridge kept it: started, never running.
     expect(commandState(t.items.old as ToolItem, undefined)).toBe('unknown');
-    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['server', 'tests', 'lint', 'build', 'gone', 'old'], running: 2, failed: 1 });
+    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'server', 'lint', 'build', 'gone', 'old'], serving: 1, running: 1, failed: 1 });
   });
 
   it('lists a command the bridge marked on a step that was not sent to the background, and one a sub-agent started', () => {

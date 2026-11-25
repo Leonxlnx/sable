@@ -11,6 +11,8 @@ import { Navigator } from './Navigator';
 import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
+import { StandInCards } from './StandIn';
+import { useStandIns } from './stand-in';
 import { keptAt } from './build-window';
 import { DOCK_GLIDE_EASE, DOCK_GLIDE_MS } from '@/features/session/dock-glide';
 import { glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
@@ -431,7 +433,9 @@ export function Timeline({ sessionId }: { sessionId: string }) {
 
   // A chat whose first message waits for spare quota (or a reset) is not empty: the strip above the composer says when it starts.
   const waiting = useStore((s) => !!s.sessions[sessionId]?.spare);
-  const empty = loaded && count === 0 && !waiting;
+  // A message on its way stands at the end already (stand-in.ts): the chat is not empty.
+  const standing = useStandIns().some((x) => x.session === sessionId);
+  const empty = loaded && count === 0 && !waiting && !standing;
 
   return (
     <TimelineCtx.Provider value={ctx}>
@@ -439,6 +443,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
         <div className="tl-scroll scroll" ref={scroller} tabIndex={-1}>
           <div className="tl-content" ref={content} data-empty={empty || undefined}>
             {empty ? <p className="tl-empty">Send a message to start.</p> : loaded && <TurnList ids={roots} />}
+            {loaded && <StandInCards sessionId={sessionId} />}
           </div>
         </div>
         {!NO_NAV && mapped && <Navigator key={sessionId} sessionId={sessionId} feed={feed} scroller={scroller} content={content} hold={hold} />}

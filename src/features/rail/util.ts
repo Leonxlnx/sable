@@ -15,8 +15,8 @@ const NONE: string[] = [];
  * in timeline order. Returns the same array until the matching set changes, so
  * streaming text elsewhere in the session does not re-render the caller.
  */
-export function useToolIds(sessionId: string, test: (it: ToolItem) => boolean): string[] {
-  const selector = useMemo(() => toolIdsSelector(sessionId, test), [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+export function useToolIds(sessionId: string, test: (it: ToolItem) => boolean, observeRows = false): string[] {
+  const selector = useMemo(() => toolIdsSelector(sessionId, test, observeRows), [sessionId, observeRows]); // eslint-disable-line react-hooks/exhaustive-deps
   return useStore(selector);
 }
 
@@ -25,8 +25,8 @@ export function useToolIds(sessionId: string, test: (it: ToolItem) => boolean): 
  * every item is read again only for a new timeline. Exported for tests.
  * `test` is expected to be a stable predicate; callers pass inline arrows that only read the item.
  */
-export function toolIdsSelector(sessionId: string, test: (it: ToolItem) => boolean) {
-  let lastItems: unknown = null;
+export function toolIdsSelector(sessionId: string, test: (it: ToolItem) => boolean, observeRows = false) {
+  let lastRows: ToolItem[] = [];
   let lastRev = -1;
   let lastKey = '';
   let lastIds: string[] = NONE;
@@ -37,9 +37,8 @@ export function toolIdsSelector(sessionId: string, test: (it: ToolItem) => boole
   return (s: ReturnType<typeof useStore.getState>): string[] => {
     const d = s.data[sessionId];
     if (!d) return NONE;
-    if (d.items === lastItems && d.rev === lastRev) return lastIds;
-    const changed = d.items === lastItems ? changedSince(d, lastRev) : null;
-    lastItems = d.items;
+    if (d.rev === lastRev) return lastIds;
+    const changed = changedSince(d, lastRev);
     lastRev = d.rev;
     let moved = false;
     const take = (id: string) => {
@@ -51,6 +50,7 @@ export function toolIdsSelector(sessionId: string, test: (it: ToolItem) => boole
       }
       if (!order.has(id)) order.set(id, seq++);
       const want = it.type === 'tool' && test(it);
+      if (want && observeRows) moved = true;
       if (want === match.has(id)) return;
       if (want) match.add(id);
       else match.delete(id);
@@ -67,7 +67,9 @@ export function toolIdsSelector(sessionId: string, test: (it: ToolItem) => boole
     if (!moved) return lastIds;
     const ids = [...match].sort((a, b) => d.items[a].ts - d.items[b].ts || order.get(a)! - order.get(b)!);
     const key = ids.join('\u0000');
-    if (key !== lastKey) {
+    const rows = observeRows ? ids.map(id => d.items[id] as ToolItem) : lastRows;
+    if (key !== lastKey || rows.some((row, i) => row !== lastRows[i])) {
+      lastRows = rows;
       lastKey = key;
       lastIds = ids.length ? ids : NONE;
     }

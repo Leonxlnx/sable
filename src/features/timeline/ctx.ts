@@ -1,7 +1,8 @@
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import type { TimelineItem } from '@shared/protocol';
 import { loadWholeItem } from '@/state/actions';
 import { useStore } from '@/state/store';
+import { requestWhileCut } from './whole-request';
 import type { NavFeed } from './nav-bus';
 
 export interface TimelineCtxValue {
@@ -33,8 +34,42 @@ export function useWhole(item: TimelineItem, open = true) {
   const { sessionId } = useTimeline();
   const more = open && 'more' in item && !!item.more;
   useEffect(() => {
-    if (more && sessionId) void loadWholeItem(sessionId, item.id);
+    if (more && sessionId) return requestWhileCut(sessionId, item.id);
   }, [more, sessionId, item]);
+}
+
+/** How long an opened row that came cut waits for its whole content before it opens on what it has (ms). */
+export const WHOLE_WAIT_MS = 400;
+
+/**
+ * Whether a row asked open may draw its details: at once when it came whole; when it came cut
+ * (`more`: an old turn's step or thinking, CLAUDE.md 0.2.31) once the whole item is here, or after
+ * `WHOLE_WAIT_MS` on what it has. Opening on the cut content first showed its short head, then the
+ * whole text arriving a moment later grew the details again under the reader (a flash of cut text
+ * and a second jump of everything below). The control answers in the frame of the click (its caret,
+ * `aria-expanded`); only the details wait, usually one round trip to the bridge.
+ */
+export function useWholeOpen(item: TimelineItem, open: boolean): boolean {
+  useWhole(item, open);
+  const more = 'more' in item && !!item.more;
+  const [late, setLate] = useState(false);
+  useEffect(() => {
+    if (!open || !more) return setLate(false);
+    const t = window.setTimeout(() => setLate(true), WHOLE_WAIT_MS);
+    return () => window.clearTimeout(t);
+  }, [open, more, item.id]);
+  return open && (!more || late);
+}
+
+/**
+ * A press handler for a cut row's control: the whole item is asked on the press, so it is usually
+ * here by the click (a press lasts 60 to 120 ms; the round trip in the packaged app about 100) and
+ * the details open in the frame of the click instead of a round trip after it.
+ */
+export function useWholeAhead(item: TimelineItem): (() => void) | undefined {
+  const { sessionId } = useTimeline();
+  const more = 'more' in item && !!item.more;
+  return useMemo(() => (more && sessionId ? () => void loadWholeItem(sessionId, item.id) : undefined), [more, sessionId, item]);
 }
 
 /**

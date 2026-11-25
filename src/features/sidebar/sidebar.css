@@ -774,6 +774,22 @@
   pointer-events: none;
 }
 
+/* The account the chat runs on, leading the tools in the time's own size and tone: a word, no chip. */
+.srow-acct {
+  max-width: 76px;
+  margin-right: 4px;
+  font-size: var(--t-micro);
+  color: var(--text-3);
+  pointer-events: none;
+}
+
+/* With the word the title's fade is longer and the word stands clear of the cut title: it must
+   never read as the title's last word. */
+.srow-acts:has(> .srow-acct) {
+  padding-left: 32px;
+  background: linear-gradient(to right, transparent, var(--row-bg) 26px);
+}
+
 /* They take the pointer in the frame they begin to show, never while the time still stands there
    (pointer-events steps with the opacity's delay). Reached with the keys, they are there at once. */
 .srow:hover .srow-acts,

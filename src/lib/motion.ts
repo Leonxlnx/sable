@@ -114,3 +114,6 @@ export function pulseFrom(el: Element | null | undefined, strength = 1) {
   if (!r.width) return;
   window.dispatchEvent(new CustomEvent<PulseDetail>(PULSE_EVENT, { detail: { x: r.left + r.width / 2, y: r.top + r.height / 2, strength } }));
 }
+
+/** The scrollTop adjustment for an anchor's movement in viewport pixels. */
+export const anchorCorrection = (delta: number, zoom: number) => delta / (zoom || 1);

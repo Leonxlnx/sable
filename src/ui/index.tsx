@@ -9,7 +9,7 @@ import './grow';
 import { movedByKeys } from './glide';
 import { quietFocus } from '@/lib/quiet-focus';
 import { fitDir, watchDir } from './path-fit';
-import { holdX, nearestStop, settleAt, settleMs, stopKey, stopX, wordLeft } from './stops';
+import { holdX, nearestStop, shouldGlide, settleAt, settleMs, stopKey, stopX, wordLeft } from './stops';
 
 /** React wrappers around the primitives in styles/ui.css. Keep this file small and boring. */
 
@@ -541,7 +541,7 @@ function StopSlider({
   const anchorX = useRef(0);
   const settle = useRef<{ from: number; to: number; start: number; ms: number; frame: number } | null>(null);
   useEffect(() => () => cancelAnimationFrame(settle.current?.frame ?? 0), []);
-  const drag = useRef<{ id: number; grab: number; moved: boolean; startX: number } | null>(null);
+  const drag = useRef<{ id: number; grab: number; moved: boolean; startX: number; target?: number } | null>(null);
   // The nearest stop while dragged (shown at once); null at rest, where `value` rules.
   const [live, setLive] = useState<number | null>(null);
   const shown = live ?? value;
@@ -616,7 +616,9 @@ function StopSlider({
     const r = rail.current;
     if (!r) return;
     const measure = () => {
-      width.current = r.offsetWidth;
+      const w = r.offsetWidth;
+      if (w !== width.current && settle.current) stopSettle();
+      width.current = w;
       setRailW(width.current);
       if (!drag.current && !settle.current) place(stopX(Math.max(0, latest.current.value), latest.current.n, width.current, STOP_THUMB));
     };
@@ -636,7 +638,7 @@ function StopSlider({
     if (prev.n !== n) {
       stopSettle();
       place(stopX(Math.max(0, value), n, width.current, STOP_THUMB));
-    } else if (prev.value !== value && !settle.current) glideTo(Math.max(0, value), false);
+    } else if (prev.value !== value && shouldGlide(settle.current, stopX(value, n, width.current, STOP_THUMB))) glideTo(Math.max(0, value), false);
   }, [value, n]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // The word rolls the way the value went (the anchor holds both while they hand over).
@@ -709,6 +711,7 @@ function StopSlider({
     (e.currentTarget as HTMLElement).focus({ preventScroll: true });
     e.currentTarget.setPointerCapture(e.pointerId);
     const px = railX(e.clientX);
+    const retarget = !!settle.current;
     const at = nowX();
     stopSettle();
     // Taken by the thumb: it keeps where it was taken. Elsewhere: it comes to the pointer.
@@ -717,8 +720,11 @@ function StopSlider({
     e.currentTarget.setAttribute('data-dragging', '');
     if (!onThumb) {
       const to = holdX(px, width.current, STOP_THUMB);
-      place(to);
       const i = nearestStop(to, n, width.current, STOP_THUMB);
+      if (retarget) {
+        drag.current.target = i;
+        glideTo(i, false);
+      } else place(to);
       if (i !== shown) {
         setLive(i);
         latest.current.onChange(i);
@@ -730,6 +736,8 @@ function StopSlider({
     const d = drag.current;
     if (!d || d.id !== e.pointerId) return;
     if (Math.abs(e.clientX - d.startX) > 2) d.moved = true;
+    if (d.target !== undefined && !d.moved) return;
+    stopSettle();
     const to = holdX(railX(e.clientX) - d.grab, width.current, STOP_THUMB);
     place(to);
     const i = nearestStop(to, n, width.current, STOP_THUMB);
@@ -744,7 +752,7 @@ function StopSlider({
     if (!d || d.id !== e.pointerId) return;
     drag.current = null;
     e.currentTarget.removeAttribute('data-dragging');
-    const i = nearestStop(x.current, n, width.current, STOP_THUMB);
+    const i = !d.moved && d.target !== undefined ? d.target : nearestStop(x.current, n, width.current, STOP_THUMB);
     setLive(null);
     glideTo(commit ? i : Math.max(0, value), true);
     if (commit && i !== value) latest.current.onCommit?.(i);

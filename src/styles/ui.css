@@ -778,23 +778,12 @@ textarea.field {
   overflow: hidden;
 }
 
+/* Flat to the thumb: a meter ends in dither, but a slider's fill meets its thumb, and a dithered
+   end there read as a speck of dirt beside it at 1.25 (the composer's effort, Settings' sliders). */
 .sls-fill {
   position: absolute;
   inset: 0;
-  padding-right: 8px;
-  background: rgb(242 241 238 / 0.82) content-box;
-}
-
-.sls-fill::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 8px;
-  background: var(--dither-edge) left top / 8px 4px repeat-y;
-  image-rendering: pixelated;
-  opacity: 0.82;
+  background-color: rgb(242 241 238 / 0.82);
 }
 
 /* A stop: a 3 px mark on the track, a step lighter than the empty track, ink where it is filled. */

@@ -245,11 +245,12 @@ export function commandIndex(): (t: Timeline | undefined) => readonly string[] {
  * command that gave no word of its end since it was started: it may have gone with its process long
  * ago, so it is never called running.
  */
-export type CommandState = 'starting' | 'running' | 'done' | 'failed' | 'stopped' | 'lost' | 'unknown';
+export type CommandState = 'starting' | 'running' | 'serving' | 'done' | 'failed' | 'stopped' | 'lost' | 'unknown';
 
 const TASK_STATE: Record<TaskMark['state'], CommandState> = { running: 'running', done: 'done', failed: 'failed', stopped: 'stopped', lost: 'lost' };
 
 export function commandState(item: ToolItem, note: EndNote | undefined): CommandState {
+  if (item.task?.state === 'running' && item.task.serving) return 'serving';
   if (item.task) return TASK_STATE[item.task.state] ?? 'unknown';
   if (item.status === 'error' || item.status === 'denied') return 'failed';
   if (item.status === 'cancelled') return 'stopped';
@@ -261,23 +262,25 @@ export function commandState(item: ToolItem, note: EndNote | undefined): Command
 export interface Commands {
   /** Running first (the longest runner on top), then what failed, then the rest, newest first. */
   ids: string[];
+  serving: number;
   running: number;
   failed: number;
 }
 
 export function commandRows(ids: readonly string[], items: Items, notes: ReadonlyMap<string, EndNote>): Commands {
   const live: string[] = [];
+  const serving: string[] = [];
   const bad: string[] = [];
   const rest: string[] = [];
   for (let i = ids.length - 1; i >= 0; i--) {
     const it = items[ids[i]];
     if (!isBackgroundCommand(it)) continue;
     const state = commandState(it, notes.get(it.id));
-    (state === 'running' ? live : state === 'failed' ? bad : rest).push(it.id);
+    (state === 'running' ? live : state === 'serving' ? serving : state === 'failed' ? bad : rest).push(it.id);
   }
   // The oldest running first, as the working agents stand.
   if (live.length > 1) live.sort((a, b) => ((items[a] as ToolItem).task?.since ?? 0) - ((items[b] as ToolItem).task?.since ?? 0));
-  return { ids: live.length || bad.length ? [...live, ...bad, ...rest] : rest, running: live.length, failed: bad.length };
+  return { ids: [...live, ...serving, ...bad, ...rest], serving: serving.length, running: live.length, failed: bad.length };
 }
 
 /**
@@ -289,7 +292,7 @@ export function commandKey(items: Items | undefined, ids: readonly string[]): st
   let k = '';
   for (const id of ids) {
     const it = items?.[id];
-    k += it?.type === 'tool' ? `${it.task?.state ?? ''}:${it.status},` : ',';
+    k += it?.type === 'tool' ? `${it.task?.state ?? ''}:${!!it.task?.serving}:${it.status},` : ',';
   }
   return k;
 }
@@ -304,7 +307,7 @@ export function commandsView(commands: (t: Timeline | undefined) => readonly str
   let ids: readonly string[] | null = null;
   let ended: ReadonlyMap<string, EndNote> | null = null;
   let key = '';
-  let out: Commands = { ids: [], running: 0, failed: 0 };
+  let out: Commands = { ids: [], serving: 0, running: 0, failed: 0 };
   return (t) => {
     const started = commands(t);
     const seen = notes(t);
@@ -624,7 +627,7 @@ export function waveRows(wave: Wave, all: boolean): { ids: readonly string[]; mo
 // ── every row's state, first ──
 
 /** Where a row of the tab stands, whatever it is (a sub-agent, a workflow, a background command). */
-export type RowState = 'running' | 'waiting' | 'done' | 'failed' | 'stopped' | 'denied' | 'lost' | 'unknown';
+export type RowState = 'running' | 'serving' | 'waiting' | 'done' | 'failed' | 'stopped' | 'denied' | 'lost' | 'unknown';
 
 /** An agent's outcome as a row's state. */
 export function agentState(outcome: Outcome): RowState {
@@ -644,6 +647,7 @@ export function commandRowState(state: CommandState): RowState {
  */
 export const STATE_MARK: Record<RowState, 'ring' | 'wait' | 'check' | 'x' | 'minus' | 'prohibit' | 'circle-dashed' | 'question'> = {
   running: 'ring',
+  serving: 'minus',
   waiting: 'wait',
   done: 'check',
   failed: 'x',
@@ -659,10 +663,11 @@ export const STATE_MARK: Record<RowState, 'ring' | 'wait' | 'check' | 'x' | 'min
  * command running"); once nothing works, how many ended well ("4 done", agents and commands
  * together); what failed is said apart (`failed`, every failure of both).
  */
-export function agentsHeader(n: { working: number; running: number; agentsDone: number; agentsFailed: number; commands: number; commandsFailed: number }): { label: string; failed: number } {
+export function agentsHeader(n: { serving?: number; working: number; running: number; agentsDone: number; agentsFailed: number; commands: number; commandsFailed: number }): { label: string; failed: number } {
   const failed = n.agentsFailed + n.commandsFailed;
   const now = workLabel({ background: n.working, commands: n.running });
   if (now) return { label: now, failed };
+  if (n.serving) return { label: `${n.serving} serving`, failed };
   const ended = n.agentsDone + Math.max(0, n.commands - n.running);
   const ok = Math.max(0, ended - failed);
   return { label: ok ? `${ok} done` : '', failed };

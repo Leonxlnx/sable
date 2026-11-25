@@ -3,7 +3,7 @@ import { AnimatePresence, cancelFrame, frame, motion, MotionConfig, useMotionVal
 import { Launch, launchPlays } from '@/art/LaunchLayer';
 import { LogoMark } from '@/art/Logo';
 import { veil, veilCover, veilHeld, veilReveal, type VeilRun } from '@/art/veil';
-import { reducedMotion, uiZoom } from '@/lib/motion';
+import { anchorCorrection, reducedMotion, uiZoom } from '@/lib/motion';
 import { Home } from '@/features/home/Home';
 import { handoffActive, handoffPhase, subscribeHandoff } from '@/features/home/handoff';
 import { afterSend } from '@/features/composer/settle';
@@ -763,6 +763,8 @@ function railSteps(opening: boolean): boolean {
   if (!fit) {
     // The panel has not been made yet: its width as the stylesheet will give it.
     const probe = document.createElement('div');
+    // `--rail-fit` is set on this class (app.css: never on .app, where its change restyled everything).
+    probe.className = 'app-rail-probe';
     probe.style.cssText = 'position:absolute;visibility:hidden;height:0;width:var(--rail-fit)';
     app.appendChild(probe);
     fit = probe.offsetWidth;
@@ -835,7 +837,7 @@ function stepRailWidth(aside: HTMLElement, width: number) {
   railWidthValue?.jump(width);
   if (!anchor || !scroller) return;
   const d = anchor.getBoundingClientRect().top - top;
-  if (Math.abs(d) > 0.5) scroller.scrollTop += d;
+  if (Math.abs(d) > 0.5) scroller.scrollTop += anchorCorrection(d, scroller.currentCSSZoom || uiZoom());
 }
 
 /**
