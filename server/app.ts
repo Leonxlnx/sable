@@ -52,7 +52,7 @@ import { cleanCommit, commitPrompt } from './core/commit-draft';
 import { SessionRuntime, autoTitle, lostLine, pendingPrompts, type BackgroundLimit, type LossTrigger } from './core/runtime';
 import { Store, type StoredAccount } from './core/store';
 import { DiskCache } from './core/cache';
-import { isLight, recentStart, RECENT_TURNS, sessionPatchForJson } from './core/trim';
+import { isLight, recentStart, RECENT_TURNS, sessionPatchForJson, SNAPSHOT_THRESHOLD, snapshotEnd, snapshotPage } from './core/trim';
 import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, creditsKey, decideAtLimit, dueResets, hasCap, limitStoppedAgents, nextResetAlert, readingShowsRoom, RETURN_AT_START_MS, RETURN_RECHECK_MS, returnRetryMs, returnsAtStart, returnTarget, runningOnCredits } from './core/limit-policy';
 import { rankAccount } from '../shared/use-first';
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
@@ -578,6 +578,11 @@ export class App {
   // enqueue publishes a row copy synchronously. Tag both copies before any subscriber sees it.
   private enqueueSubmission?: { rt: SessionRuntime; id: string };
   emit = (event: BridgeEvent) => {
+    if (event.type === 'timeline.reset' || event.type === 'item.added' || event.type === 'item.removed' ||
+        event.type === 'item.patch' || event.type === 'item.delta') {
+      const rt = this.sessions.get(event.sessionId);
+      if (rt) this.snapshotEnds.delete(rt.items);
+    }
     const submission = this.enqueueSubmission;
     if (submission && event.type === 'queue.updated' && event.sessionId === submission.rt.id) {
       this.enqueueSubmission = undefined;
@@ -682,7 +687,8 @@ export class App {
     const h = this.handlers.get(method);
     if (!h) throw new Error(`Unknown method: ${method}`);
     const id = (params as { sessionId?: string } | undefined)?.sessionId;
-    if (id && this.lazy.has(id)) {
+    const wantsEnd = method === 'session.snapshot' && (params as RpcMethods['session.snapshot']['params']).page === 'end';
+    if (id && this.lazy.has(id) && !wantsEnd) {
       await this.hydrateAsync(this.runtime(id));
       still(ctx);
     }
@@ -1314,6 +1320,8 @@ export class App {
   }
 
   private lazy = new Set<string>();
+  /** Geometry only. Every timeline event invalidates it before publication. */
+  private snapshotEnds = new WeakMap<TimelineItem[], ReturnType<typeof snapshotEnd>>();
 
   /** Folders being pinned (core/contain.ts `pinFolder`), one at a time so a start with many chats does not crowd the disk. */
   private pinning: Promise<unknown> = Promise.resolve();
@@ -1427,6 +1435,7 @@ export class App {
     rt.returnUntaken({ all: true, reason: 'closed', byHand: inFlight });
     const lost = this.untilLost.get(rt.id);
     if (lost) this.untilLost.delete(rt.id), this.until.restored(rt, lost);
+    if (rt.items.length > SNAPSHOT_THRESHOLD) this.snapshotEnds.set(rt.items, snapshotEnd(rt.items));
     if (restartNotice) {
       void this.store.savedRestartNotice(rt.id, restartNotice).then((saved) => {
         if (saved && !this.disposed && this.sessions.get(rt.id) === rt) rt.update({ pendingRestart: undefined });
@@ -1469,7 +1478,10 @@ export class App {
     if (this.sendHolds.has(rt.id) || (this.refusalQueues.has(rt) && this.limitPending(rt))) return this.queueBehindHold(rt, text, attachments, ctx, extra?.id);
     const stops = this.stopsOf(rt);
     await this.lanes.ready(rt);
-    if (this.stopsOf(rt) === stops && !rt.items.some((i) => i.type === 'user')) await this.lanes.beforeFirstSend(rt, text);
+    if (this.stopsOf(rt) === stops && !rt.items.some((i) => i.type === 'user')) {
+      if (rt.meta.provider === 'claude' || rt.meta.provider === 'codex') await this.firstWord(undefined, FIRST_WORD_WAIT_MS);
+      await this.lanes.beforeFirstSend(rt, text);
+    }
     still(ctx);
     if (this.stopsOf(rt) === stops && !rt.turnActive && !this.opening.has(rt.id)) {
       // Back to the account a limit moved it from, when that one takes work again (as a model change,
@@ -4491,6 +4503,7 @@ export class App {
   async state(settled = false): Promise<AppState> {
     const providers = await Promise.all([...this.providers.values()].map((p) => (settled ? this.providerInfoSettled(p.id) : this.providerInfoFast(p.id)).catch(() => fallbackInfo(p))));
     return {
+      snapshotThreshold: SNAPSHOT_THRESHOLD,
       version: VERSION,
       platform: process.platform,
       home: homedir(),
@@ -4576,9 +4589,6 @@ export class App {
     const settings = this.store.state.settings;
     let accountId = p.accountId ?? this.defaultAccountId(p.provider);
     this.provider(p.provider, accountId);
-    // The agents a session may hand work to are read when it starts: a first answer still on its way
-    // counts (a few seconds at most: an agent that hangs is left out).
-    await this.firstWord(undefined, FIRST_WORD_WAIT_MS);
     // An account past its cap: the session starts on the next one under its own (a resumed
     // conversation stays where it lives).
     const capStart = p.resume ? undefined : await this.underCapStart(p.provider, accountId, p.model ?? settings.defaultModels[p.provider], p.cwd).catch(() => undefined);
@@ -4659,7 +4669,20 @@ export class App {
     }
     // A folder another session is working in: the session starts in a lane of its own.
     const closes = this.closesOf(rt);
-    const opened = this.lanes.atStart(rt, p.title ?? p.chat?.text).then(() => {
+    const findingAgents = this.asking.size > 0;
+    const laneReady = this.lanes.atStart(rt, p.title ?? p.chat?.text);
+    // A fresh Codex thread fixes its tools at thread/start. While the agents are
+    // still checking in, let the first send open it through ensureHandle.
+    if (findingAgents && p.provider === 'codex' && !p.resume && !extra.fork) {
+      const ready = laneReady.then(() => { if (!rt.turnActive) rt.update({ status: 'idle' }); });
+      this.opening.set(rt.id, ready);
+      void ready.catch(err => rt.update({ status: 'error', lastError: String(err) })).finally(() => {
+        if (this.opening.get(rt.id) === ready) this.opening.delete(rt.id);
+      });
+      this.persistSessions();
+      return rt.snapshot();
+    }
+    const opened = laneReady.then(() => {
       if (this.disposed || this.closesOf(rt) !== closes) throw new NotNow('The chat was closed.');
       return provider.open(rt, { loadTranscript: !!p.resume && !extra.fork, chainFrom: extra.fork?.chainFrom });
     }).then(
@@ -4683,7 +4706,7 @@ export class App {
     // A slow start answers early (status "starting"): the UI opens the session and the first
     // message shows at once, waiting in deliver() for the agent.
     let timer: NodeJS.Timeout | undefined;
-    await Promise.race([opened, new Promise<void>((r) => (timer = setTimeout(r, 1500)))]);
+    if (!findingAgents) await Promise.race([opened, new Promise<void>((r) => (timer = setTimeout(r, 1500)))]);
     clearTimeout(timer);
     this.persistSessions();
     return rt.snapshot();
@@ -5055,12 +5078,36 @@ export class App {
     // ── sessions ──
     this.register('session.create', (p, ctx) => this.createSession(p, {}, ctx));
 
-    this.register('session.snapshot', async ({ sessionId, peek }) => {
+    this.register('session.snapshot', async ({ sessionId, peek, page, keepFrom }) => {
       const rt = this.runtime(sessionId);
+      if (page === 'end' && this.lazy.has(sessionId)) {
+        const preview = this.store.readSessionEnd(sessionId);
+        if (preview) {
+          setImmediate(() => {
+            if (!this.disposed && this.sessions.get(sessionId) === rt) void this.hydrateAsync(rt).catch(err => this.log('session read failed', String(err)));
+          });
+          if (rt.meta.unread && !peek) rt.update({ unread: false });
+          return { ...rt.snapshot(), ...preview };
+        }
+      }
       await this.hydrateAsync(rt);
       // Fetched ahead of an open (`peek`): not read yet.
       if (rt.meta.unread && !peek) rt.update({ unread: false });
-      return rt.snapshot();
+      const snap = rt.snapshot();
+      if (!page || snap.items.length <= SNAPSHOT_THRESHOLD && typeof page === 'string') return snap;
+      if (typeof page !== 'string') return snapshotPage(snap, page);
+      let end = this.snapshotEnds.get(rt.items);
+      if (!end) this.snapshotEnds.set(rt.items, end = snapshotEnd(rt.items));
+      // Restore can settle an old running turn. Keep its displayed rows in the
+      // replacement even if the ordinary idle tail starts further down now.
+      if (page === 'real' && keepFrom && end.start && rt.items[end.start]?.id !== keepFrom) {
+        let roots = end.roots;
+        for (let i = end.start - 1; i >= 0; i--) {
+          if (!rt.items[i].parentId) roots--;
+          if (rt.items[i].id === keepFrom) { end = { start: i, roots }; break; }
+        }
+      }
+      return snapshotPage(snap, 'end', end);
     });
     // A window gets finished steps cut (core/trim.ts): one whole, when it opens. A chat not read yet
     // (a picture of a file asked after a restart) is read off the main thread, one read for all, as a snapshot is.

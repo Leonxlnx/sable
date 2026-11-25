@@ -1798,6 +1798,8 @@ export interface PullFailures {
 }
 
 export interface AppState {
+  /** The desktop bridge pages conversations above this item count. */
+  snapshotThreshold?: number;
   version: string;
   platform: string;
   home: string;
@@ -2439,7 +2441,12 @@ export interface ProjectScripts {
 
 // ──────────────────────────────────── RPC ───────────────────────────────────
 
+export interface SnapshotCursor { at: number; id: string; roots: number }
+
 export interface SessionSnapshot {
+  /** Absent on whole answers. Counts are -1 on a provisional view of an uncounted base.
+   * recentAt is the page-relative cut boundary in the complete timeline. */
+  page?: { kind: 'end' | 'older' | 'provisional'; before: number; rootsBefore: number; recentAt: number };
   session: SessionMeta;
   items: TimelineItem[];
   caps?: Capabilities;
@@ -2568,7 +2575,7 @@ export interface RpcMethods {
     result: SessionSnapshot;
   };
   /** `peek`: fetched ahead of an open (the pointer resting on its row), so the chat stays unread. */
-  'session.snapshot': { params: { sessionId: string; peek?: boolean }; result: SessionSnapshot };
+  'session.snapshot': { params: { sessionId: string; peek?: boolean; page?: 'end' | 'real' | SnapshotCursor; keepFrom?: string }; result: SessionSnapshot };
   /** One item whole, as the bridge holds it (a step a window got cut, `ToolItem.more`). */
   'session.item': { params: { sessionId: string; itemId: string }; result: { item: TimelineItem } };
   /**

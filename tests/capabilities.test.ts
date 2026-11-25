@@ -237,12 +237,12 @@ describe('start-up cache', () => {
     expect(race.indexOf('await this.firstWord();')).toBeLessThan(race.indexOf('this.otherAgents()'));
     expect(race.indexOf('await this.firstWord();')).toBeGreaterThan(-1);
     const create = app.slice(app.indexOf('private async createSession('), app.indexOf('private async createSession(') + 900);
-    expect(create).toContain('await this.firstWord(undefined, FIRST_WORD_WAIT_MS);');
+    expect(create).not.toContain('await this.firstWord(');
     // A phone's hello waits past every CLI's own limit and inside the phone's own 30 s.
     expect(app).toContain('const SETTLED_INFO_WAIT_MS = 24_000;');
   });
 
-  it('a new chat in the first second of a first start waits for the agents\' first word, within a bound', async () => {
+  it('a new chat answers within 50 ms with an agent that never answers', async () => {
     const home = tmp();
     const bin = path.join(home, 'claude.exe');
     writeFileSync(bin, '');
@@ -250,14 +250,13 @@ describe('start-up cache', () => {
     process.env.SABLE_CLAUDE_BIN = bin;
     try {
       const state = { infoCalls: 0, capsCalls: 0, models: ['opus'], delay: 300 };
-      const { app, events } = makeApp(home, [fakeClaude(state), (ctx) => new DemoProvider(ctx, { speed: 0 })]);
+      const { app } = makeApp(home, [ctx => ({ ...fakeClaude(state)(ctx), info: () => new Promise(() => {}) }), (ctx) => new DemoProvider(ctx, { speed: 0 })]);
       const hello = await app.call('app.hello', {});
       expect(hello.providers.find((p) => p.id === 'claude')!.auth.checking).toBe(true);
-      // A Demo chat started right away: by the time it exists, Claude Code's answer is in and cached.
+      const began = performance.now();
       const snap = await app.call('session.create', { provider: 'demo', cwd: home });
       expect(snap.session.provider).toBe('demo');
-      expect(app.cache.get<ProviderInfo>('info:claude')?.auth.loggedIn).toBe(true);
-      expect(events.some((e) => e.type === 'provider.updated' && e.provider.id === 'claude')).toBe(true);
+      expect(performance.now() - began).toBeLessThan(50);
     } finally {
       if (was === undefined) delete process.env.SABLE_CLAUDE_BIN;
       else process.env.SABLE_CLAUDE_BIN = was;

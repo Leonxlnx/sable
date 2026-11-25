@@ -36,7 +36,8 @@ describe('a sign-in not read yet', () => {
     const menu = src('features/accounts/Switcher.tsx');
     expect((menu.match(/if \(signedOut\(a\.auth\)\) return openSettings\('accounts'\);/g) ?? []).length).toBe(2);
     expect(menu).not.toContain("if (!a.auth.loggedIn) return openSettings('accounts');");
-    expect(src('features/accounts/SessionAccount.tsx')).toContain("a.auth.loggedIn ? planOf(a) : a.auth.checking ? '' : 'Signed out'");
+    // (The plan is left out where it only repeats the name: `planBeside`.)
+    expect(src('features/accounts/SessionAccount.tsx')).toContain("a.auth.loggedIn ? planBeside(accountName(a), planOf(a)) : a.auth.checking ? '' : 'Signed out'");
   });
 
   it('keeps the answer an event brought before hello was applied', () => {

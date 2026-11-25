@@ -1,11 +1,12 @@
-import { scanSession, sessionTail } from './session-json';
+import { isUtf8 } from 'node:buffer';
+import { largeRowReader, scanSession, sessionTail } from './session-json';
 import * as fs from 'node:fs';
 import { closeSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { open } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
 import type { QueuedMessage, TimelineItem, Todo } from '../../shared/protocol';
-import { cutItem, isLight, LIGHT, recentStart, workerCut } from './trim';
+import { cutItem, isLight, LIGHT, recentStart, workerCut, SNAPSHOT_THRESHOLD, snapshotEnd, turnBoundary } from './trim';
 
 /**
  * A session's timeline on disk, as a base file and a small tail. For a large base the reader
@@ -64,11 +65,14 @@ export const OVER_MAX = { items: 512, chars: 4 * 1024 * 1024 };
 /** Items at the end of the chat a new base leaves to the tail (where streaming happens). */
 export const TAIL_KEEP = 24;
 /** Above this size a base is read line by line (one string cannot hold much more than 512 MB). */
-export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024, part: 1 << 20, tailStream: 1 << 20, tailLimit: 32 << 20 };
+export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024, part: 4 << 20, tailStream: 1 << 20, tailLimit: 32 << 20 };
 
-type Line = { offset: number; length: number; chars: number; preview?: TimelineItem };
+type Line = { offset: number; length: number; chars: number; preview?: TimelineItem; json?: string };
+function baseline(line?: Line) {
+  return line?.preview ?? (line?.json ? JSON.parse(line.json) as TimelineItem : undefined);
+}
 type LineIndex = Map<string, Line>;
-type Tail = SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] };
+type Tail = SessionData & { baseCount?: number; baseRoots?: number; endId?: string; baseGen?: number; from?: number; over?: TimelineItem[] };
 type BaseFile = { over?: TimelineItem[]; gen?: number; items: TimelineItem[]; todos?: Todo[]; queue?: QueuedMessage[] };
 type IndexedRead = { stamp?: number; base: BaseFile; index?: LineIndex; tail: Tail | null };
 
@@ -84,7 +88,7 @@ function readBytes(io: typeof fs, fd: number, offset: number, length: number): B
 
 /** A recent cut can lose a localhost announcement or the first lines of an error.
  * Flag the exceptional rows whose later old preview must come from disk. */
-function project(item: TimelineItem, recent: boolean, cut: typeof cutItem, options: typeof workerCut) {
+function project(item: TimelineItem, recent: boolean, cut: typeof cutItem, options: typeof workerCut, detach = true) {
   const view = cut(item, recent ? options.recent : options.old);
   if (view === item) return item;
   const result = item.type === 'tool' ? item.result : undefined;
@@ -98,11 +102,160 @@ function project(item: TimelineItem, recent: boolean, cut: typeof cutItem, optio
     ...(item.type === 'tool' && item.input !== undefined ? { input: true } : {}),
     ...(item.type === 'tool' && view.type === 'tool' && view.detail.background && !item.detail.background ? { legacyBackground: true } : {}) };
   // Detach substrings from the full strings backing the parsed line.
-  return JSON.parse(JSON.stringify({ ...view, [options.mark]: mark })) as TimelineItem;
+  const marked = { ...view, [options.mark]: mark } as TimelineItem;
+  // The worker message already copies the strings across heaps.
+  return detach ? structuredClone(marked) : marked;
 }
 
 type Row = { tail: boolean; key: string; value: any; line?: Line };
 type Header = { base: BaseFile; tail: Tail | null; stamp?: number };
+
+
+/** A bounded read of complete canonical lines at the end of a base. Byte offsets
+ * also let the streaming reader cut the recent rows without a second parse. */
+function baseEnd(io: typeof fs, fd: number, size: number, limit: number, bytes: typeof readBytes) {
+  const head = /^\{"gen":(\d+),"items":\[\n/.exec(bytes(io, fd, 0, Math.min(80, size)).toString());
+  if (!head || !Number.isSafeInteger(Number(head[1])) || Number(head[1]) >= Number.MAX_SAFE_INTEGER) return;
+  const start = head[0].length;
+  const offset = Math.max(start, size - limit);
+  const buf = bytes(io, fd, offset, size - offset);
+  const nl = buf.lastIndexOf(10);
+  // Older bases could end with an array of unmatched overrides. Its rows
+  // have the same shape as timeline rows and cannot form a display suffix.
+  if (nl < 0 || buf[nl + 1] !== 93 || buf.includes('\n],"over":[')) return;
+  const footer = JSON.parse('{"items":[' + buf.toString('utf8', nl + 1));
+  if (Object.keys(footer).some(k => !['items', 'todos', 'queue', 'itemCount', 'rootCount', 'endId'].includes(k)) ||
+      !Array.isArray(footer.todos) || (footer.queue !== undefined && !Array.isArray(footer.queue))) return;
+  // The provisional read stops at its byte budget. Hydration can keep walking
+  // backwards a block at a time, even across a single multi-megabyte record.
+  function *backwards(extend = false) {
+    let block = buf, at = offset, cursor = nl, end = offset + nl;
+    while (end > start) {
+      const prev = cursor ? block.lastIndexOf(10, cursor - 1) : -1;
+      if (prev < 0 && at > start) {
+        if (!extend) return;
+        const length = Math.min(limit, at - start);
+        at -= length;
+        block = bytes(io, fd, at, length);
+        cursor = length;
+        continue;
+      }
+      const begin = at + prev + 1;
+      const length = end - begin;
+      const inBlock = end <= at + block.length ? block.subarray(prev + 1, end - at) : undefined;
+      const last = end === offset + nl;
+      yield { offset: begin, after: end + 1, length, parse() {
+        const line = inBlock ?? bytes(io, fd, begin, length);
+        if (!last && line.at(-1) !== 44) throw new Error('Invalid session separator');
+        const item = JSON.parse(line.toString('utf8', 0, length - Number(!last))) as TimelineItem;
+        if (!item || typeof item.id !== 'string' || Object.hasOwn(item, '\0sable.baseStep')) throw new Error('Invalid session item');
+        return item;
+      } };
+      if (prev < 0) break;
+      end = at + prev;
+      cursor = prev;
+    }
+  }
+  return { gen: Number(head[1]), start, footer, end: offset + nl, backwards };
+}
+
+/** Bounded fast path for the writer's line format. Unusual layouts and large
+ * replacement tails use the general streaming parser below. */
+function scanLines(io: typeof fs, fd: number, tailFd: number | undefined, projectItems: boolean,
+  cut: typeof cutItem, options: typeof workerCut, projectRow: typeof project, emit: (row: Row, bytes: number) => void,
+  bytes: typeof readBytes, endOf: typeof baseEnd, large: ReturnType<typeof largeRowReader>): Header | undefined {
+  const size = io.fstatSync(fd).size;
+  const end = endOf(io, fd, size, 4 << 20, bytes);
+  if (!end) return;
+  let tail: Tail | null = null;
+  let count: number | undefined = end.footer.itemCount;
+  if (tailFd !== undefined) {
+    const tailSize = io.fstatSync(tailFd).size;
+    if (tailSize > 4 << 20) return;
+    tail = JSON.parse(bytes(io, tailFd, 0, tailSize).toString());
+    if (!tail || !Array.isArray(tail.items) || tail.over && !Array.isArray(tail.over)) return;
+    if (tail.baseGen !== end.gen) tail = null;
+    // A pre-count on older files needs only line separators, no text decoding.
+    count ??= tail?.baseCount;
+    if (tail && !Number.isSafeInteger(count)) {
+      const chunk = Buffer.allocUnsafe(1 << 20);
+      count = 0;
+      for (let at = end.start; at <= end.end;) {
+        const n = io.readSync(fd, chunk, 0, Math.min(chunk.length, end.end + 1 - at), at);
+        if (!n) throw Error('Incomplete session');
+        const part = chunk.subarray(0, n);
+        for (let i = part.indexOf(10); i >= 0; i = part.indexOf(10, i + 1)) count++;
+        at += n;
+      }
+    }
+  }
+  const from = tail && Number.isInteger(tail.from) && tail.from! >= 0 && tail.from! <= count! ? tail.from! : Infinity;
+  const over = new Map(tail?.over?.map(i => [i.id, i]));
+  let skip = Math.max(0, (count ?? 0) - from);
+  let turns = tail?.items.filter(i => i.type === 'turn').length ?? 0;
+  let recent = turns > options.turns ? Infinity : end.start;
+  const maxTurnBytes = 8192;
+  if (recent !== Infinity && projectItems) {
+    for (const row of end.backwards(true)) {
+      if (skip-- > 0) continue;
+      // Turn records are small. Validate this assumption below on the forward
+      // pass, including tail overrides, before accepting the projection.
+      if (row.length > maxTurnBytes) continue;
+      const item = row.parse();
+      if ((over.get(item.id) ?? item).type === 'turn' && ++turns > options.turns) { recent = row.after; break; }
+    }
+  }
+  let ordinal = 0, offset = end.start;
+  const block = Buffer.allocUnsafe(1 << 20);
+  const projectOld = (item: TimelineItem) => projectRow(item, false, cut, options, false);
+  const projectRecent = (item: TimelineItem) => projectRow(item, true, cut, options, false);
+  let parts: Buffer[] = [];
+  for (let at = offset; at <= end.end;) {
+    const n = io.readSync(fd, block, 0, Math.min(block.length, end.end + 1 - at), at);
+    if (!n) throw Error('Incomplete session');
+    const chunk = block.subarray(0, n);
+    let start = 0;
+    for (let nl = chunk.indexOf(10); nl >= 0; nl = chunk.indexOf(10, start)) {
+      const last = at + nl === end.end;
+      let buffer = chunk, begin = start, stop = nl;
+      if (parts.length) {
+        parts.push(chunk.subarray(start, nl));
+        buffer = Buffer.concat(parts);
+        begin = 0;
+        stop = buffer.length;
+        parts = [];
+      }
+      if (!last && buffer[stop - 1] !== 44) throw Error('Invalid session separator');
+      const length = stop - begin - Number(!last);
+      const isRecent = offset >= recent;
+      let compact;
+      if (length >= 32 << 10 && projectItems && ordinal < from) {
+        try { compact = large(buffer.subarray(begin, begin + length), isRecent, isRecent ? projectRecent : projectOld); }
+        catch { /* An ambiguous candidate still gets one ordinary parse of its full record. */ }
+      }
+      let value = compact?.value, chars = compact?.chars ?? 0;
+      if (!value) {
+        const json = buffer.toString('utf8', begin, begin + length);
+        const item = JSON.parse(json);
+        if (!item || typeof item.id !== 'string' || Object.hasOwn(item, options.mark)) throw Error('Invalid session item');
+        chars = json.length;
+        value = ordinal >= from ? { id: item.id, type: item.type, parentId: item.parentId } :
+          projectItems ? projectRow(item, isRecent, cut, options, false) : item;
+      }
+      if (!value || typeof value.id !== 'string') throw Error('Invalid session item');
+      if (stop - begin > maxTurnBytes && isRecent && ordinal < from && (over.get(value.id) ?? value).type === 'turn')
+        throw Error('Oversized turn record');
+      emit({ key: 'items', tail: false, value, line: { offset, length, chars } }, length);
+      ordinal++;
+      start = nl + 1;
+      offset = at + start;
+    }
+    if (start < n) parts.push(Buffer.from(chunk.subarray(start)));
+    at += n;
+  }
+  if (count !== undefined && ordinal !== count) throw Error('Session row count changed');
+  return { base: { ...end.footer, gen: end.gen, items: [] }, tail };
+}
 
 type TurnPosition = { id: string; turn: boolean; at?: number; retained?: boolean };
 
@@ -133,7 +286,7 @@ function turnPositions(turns: number) {
  * and the override types are retained. The second pass sends the actual projection of each row. */
 function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, cut: typeof cutItem,
   options: typeof workerCut, scan: typeof scanSession, projectRow: typeof project, merge: typeof sessionTail,
-  positions: ReturnType<typeof turnPositions>, emit: (row: Row, bytes: number) => void): Header {
+  positions: ReturnType<typeof turnPositions>, fast: typeof scanLines, bytes: typeof readBytes, endOf: typeof baseEnd, large: ReturnType<typeof largeRowReader>, reset: () => void, emit: (row: Row, bytes: number) => void): Header {
   const fd = io.openSync(file, 'r');
   let tailFd: number | undefined;
   try {
@@ -144,7 +297,17 @@ function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, 
     if (tailFile) {
       try { tailFd = io.openSync(tailFile, 'r'); }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
-      if (tailFd !== undefined) tail = scan(io, tailFd, (key, item) => {
+    }
+    try {
+      const canonicalRead = fast(io, fd, tailFd, !!tailFile, cut, options, projectRow, emit, bytes, endOf, large);
+      if (canonicalRead) return canonicalRead;
+    } catch {
+      // A valid JSON base can wrap lines differently or include an over section.
+      // Discard any speculative batches before the general parser validates it.
+      reset();
+    }
+    if (tailFd !== undefined) {
+      tail = scan(io, tailFd, (key, item) => {
         if (key === 'over' && item) {
           hasOverrides = true;
           positions.add({ id: item.id, turn: item.type === 'turn' });
@@ -169,8 +332,8 @@ function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, 
       const line = key === 'items' ? { offset, length, chars } : undefined;
       if (line && tailFile) {
         // The suffix is validated, but its obsolete bodies never travel beside the quit tail.
-        if (from !== null && count >= from) value = { id: value.id, type: value.type };
-        else value = projectRow(value, count >= recent, cut, options);
+        if (from !== null && count >= from) value = { id: value.id, type: value.type, parentId: value.parentId };
+        else value = projectRow(value, count >= recent, cut, options, false);
         count++;
       }
       emit({ key, tail: false, value, line }, length);
@@ -184,15 +347,29 @@ function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, 
   } finally { if (tailFd !== undefined) io.closeSync(tailFd); io.closeSync(fd); }
 }
 
+/** Keep the compact baseline as immutable JSON. Crossing heaps copies one
+ * string, and parsing it creates the separately mutable runtime row. */
+function packRow(row: Row, mark: string) {
+  if (row.line && Object.hasOwn(row.value, mark)) {
+    row.line.json = JSON.stringify(row.value);
+    row.value = { id: row.value.id };
+  }
+  return row;
+}
+
 function collectRead() {
   const base: Record<string, any[]> = Object.create(null), tail: Record<string, any[]> = Object.create(null);
   const index: LineIndex = new Map();
   return {
+    reset() {
+      for (const key of Object.keys(base)) delete base[key];
+      for (const key of Object.keys(tail)) delete tail[key];
+      index.clear();
+    },
     add({ key, tail: suffix, value, line }: Row) {
-      ((suffix ? tail : base)[key] ??= []).push(value);
+      ((suffix ? tail : base)[key] ??= []).push(line?.json ? JSON.parse(line.json) : value);
       if (line) {
         if (index.has(value.id)) throw new Error('Duplicate session item');
-        if (isLight(value)) line.preview = structuredClone(value);
         index.set(value.id, line);
       }
     },
@@ -204,13 +381,14 @@ function collectRead() {
 
 function readIndexed(file: string, tailFile?: string) {
   const rows = collectRead();
-  return rows.finish(scanIndexed(fs, file, tailFile, cutItem, workerCut, scanSession, project, sessionTail, turnPositions(workerCut.turns), rows.add));
+  return rows.finish(scanIndexed(fs, file, tailFile, cutItem, workerCut, scanSession, project, sessionTail, turnPositions(workerCut.turns), scanLines, readBytes, baseEnd, largeRowReader(isUtf8, workerCut), rows.reset, row => rows.add(packRow(row, LIGHT))));
 }
 
 const WORKER = `
 const { parentPort, workerData } = require('node:worker_threads');
 const __name = f => f;
 const { options, ack, part } = workerData;
+const pack = (${packRow});
 const { cutItem } = (${workerCut.factory})(options.recent, options.keepFiles, (${workerCut.task}));
 let rows = [], bytes = 0, positions = [];
 function send(message) {
@@ -241,8 +419,8 @@ const layout = {
 };
 try {
   const header = (${scanIndexed})(require('node:fs'), workerData.file, workerData.tail, cutItem, options,
-    (${scanSession}), (${project}), (${sessionTail}), layout, (row, length) => {
-      rows.push(row);
+    (${scanSession}), (${project}), (${sessionTail}), layout, (${scanLines}), (${readBytes}), (${baseEnd}), (${largeRowReader})(require('node:buffer').isUtf8, options), () => { rows = []; bytes = 0; send({ reset: true }); }, (row, length) => {
+      rows.push(pack(row, options.mark));
       if ((bytes += length) >= part) flush();
     });
   flush();
@@ -258,9 +436,10 @@ function readInWorker(file: string, tail: string): Promise<Read<IndexedRead>> {
     const start = new Float64Array(new SharedArrayBuffer(8));
     const w = new Worker(WORKER, { eval: true, workerData: { file, tail, options: workerCut, ack, start, part: READ.part },
       resourceLimits: { maxOldGenerationSizeMb: 384, maxYoungGenerationSizeMb: 24 } });
-    w.on('message', (msg: { positions?: TurnPosition[]; boundary?: { active: boolean; suffix: number; count: number }; rows?: Row[]; header?: Header }) => {
+    w.on('message', (msg: { reset?: boolean; positions?: TurnPosition[]; boundary?: { active: boolean; suffix: number; count: number }; rows?: Row[]; header?: Header }) => {
       try {
-        if (msg.positions) {
+        if (msg.reset) collected.reset();
+        else if (msg.positions) {
           for (const pos of msg.positions) layout.add(pos);
           const b = msg.boundary;
           if (b) start[0] = layout.start(b.active, b.suffix, b.count);
@@ -285,6 +464,8 @@ function readInWorker(file: string, tail: string): Promise<Read<IndexedRead>> {
 const CHUNK = 1 << 20;
 
 interface Base {
+  count: number;
+  roots: number;
   index?: LineIndex;
   stamp?: number;
   orphans?: TimelineItem[];
@@ -385,6 +566,76 @@ export class SessionFiles {
     let tailSize = 0;
     try { tailSize = statSync(this.tailOf(id)).size; } catch { /* The reader handles missing and unreadable files. */ }
     return fileSize + tailSize >= READ.inWorkerAbove || fileSize > READ.byLineAbove || tailSize > READ.tailStream;
+  }
+
+
+  /** Display-only, never installs an index or changes the file's read/write state. */
+  readEnd(id: string) {
+    let fd: number | undefined, tailFd: number | undefined;
+    try {
+      fd = openSync(this.pathOf(id), 'r');
+      const size = fs.fstatSync(fd).size;
+      const limit = 2 << 20;
+      if (size < 64 << 10) return;
+      const end = baseEnd(fs, fd, size, limit, readBytes);
+      if (!end || size < limit && end.footer.itemCount === undefined) return;
+      let count = end.footer.itemCount, roots = end.footer.rootCount;
+      if (count !== undefined && (!Number.isSafeInteger(count) || count <= SNAPSHOT_THRESHOLD ||
+        !Number.isSafeInteger(roots) || roots < 0 || roots > count)) return;
+      try { tailFd = openSync(this.tailOf(id), 'r'); }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+      let tail: Tail | null = null, from = count;
+      const valid = (item: TimelineItem) => item && typeof item.id === 'string' && typeof item.type === 'string' && !isLight(item);
+      if (tailFd !== undefined) {
+        const length = fs.fstatSync(tailFd).size;
+        if (length > limit) return;
+        tail = JSON.parse(readBytes(fs, tailFd, 0, length).toString());
+        if (tail?.baseCount !== undefined) {
+          if (count !== undefined && (count !== tail.baseCount || roots !== tail.baseRoots)) return;
+          count = tail.baseCount;
+          roots = tail.baseRoots;
+        }
+        if (!Number.isSafeInteger(count) || !Number.isSafeInteger(roots) || roots < 0 || roots > count) return;
+        if (!tail || tail.baseGen !== end.gen || !Number.isSafeInteger(tail.from) || tail.from! < 0 || tail.from! > count ||
+            !Array.isArray(tail.items) || !tail.items.every(valid) ||
+            tail.over !== undefined && (!Array.isArray(tail.over) || !tail.over.every(valid)) ||
+            tail.todos !== undefined && !Array.isArray(tail.todos) || tail.queue !== undefined && !Array.isArray(tail.queue)) return;
+        from = sessionTail(end.gen, 0, tail, count, new Map())!.from;
+      }
+      const over = new Map(tail?.over?.map(item => [item.id, item]));
+      const suffix = tail?.items ?? [];
+      const reverse: TimelineItem[] = [];
+      const endId = tail ? tail.endId : end.footer.endId;
+      let found = !endId || suffix.some(i => i.id === endId);
+      let prompts = suffix.filter(turnBoundary).length;
+      let skip = count === undefined ? 0 : count - from;
+      let omittedRoots = roots;
+      for (const record of end.backwards()) {
+        const item = record.parse();
+        if (!valid(item)) return;
+        if (skip > 0) { skip--; if (!item.parentId) omittedRoots--; continue; }
+        if (prompts >= 9 && found && !over.size) break;
+        const replacement = over.get(item.id) ?? item;
+        over.delete(item.id);
+        if (!item.parentId) omittedRoots--;
+        reverse.push(replacement);
+        if (replacement.id === endId) found = true;
+        if (turnBoundary(replacement)) prompts++;
+      }
+      if (skip || over.size || !found || prompts < 9) return;
+      const rows = reverse.reverse().concat(suffix);
+      if (new Set(rows.map(i => i.id)).size !== rows.length) return;
+      const start = snapshotEnd(rows).start;
+      if (!turnBoundary(rows[start]) || endId && rows[start].id !== endId) return;
+      const before = count === undefined ? -1 : from - reverse.length + start;
+      if (count !== undefined && (before < 0 || omittedRoots < 0 || from + suffix.length <= SNAPSHOT_THRESHOLD)) return;
+      for (let i = 0; i < start; i++) if (!rows[i].parentId) omittedRoots++;
+      return { items: rows.slice(start), todos: tail?.todos ?? end.footer.todos as Todo[],
+        queue: (tail?.queue ?? end.footer.queue ?? []) as QueuedMessage[],
+        page: { kind: 'provisional' as const, before, rootsBefore: count === undefined ? -1 : omittedRoots,
+          recentAt: Math.max(0, recentStart(rows, workerCut.turns) - start) } };
+    } catch { return; }
+    finally { if (tailFd !== undefined) closeSync(tailFd); if (fd !== undefined) closeSync(fd); }
   }
 
   load(id: string): SessionData {
@@ -488,7 +739,7 @@ export class SessionFiles {
       this.warned.add(id);
       console.warn('Preserving unmatched session overrides', id, orphans.length);
     }
-    this.bases.set(id, { gen, orphans, stamp: loaded?.stamp, index: loaded?.index, ids: settled, settled: from, idSet: new Set(settled), size, old, over });
+    this.bases.set(id, { gen, count: items.length, roots: items.reduce((n, i) => n + Number(!i.parentId), 0), orphans, stamp: loaded?.stamp, index: loaded?.index, ids: settled, settled: from, idSet: new Set(settled), size, old, over });
     return data;
   }
 
@@ -500,7 +751,7 @@ export class SessionFiles {
     if (isLight(item) && !!item[LIGHT].recent === recent) return item;
     const source = new BaseReader(this.pathOf(id), base);
     try {
-      const clean = line.preview && isDeepStrictEqual(item, line.preview);
+      const clean = isDeepStrictEqual(item, baseline(line));
       let view: TimelineItem;
       if (isLight(item) && !recent && !item[LIGHT].reread) {
         const { [LIGHT]: mark, ...row } = item;
@@ -513,7 +764,10 @@ export class SessionFiles {
         if (!isLight(item) && !isDeepStrictEqual(item, source.original(line))) return item;
       }
       // A frozen save may still have the other cut. BaseReader reconstructs that baseline from disk.
-      if (clean || !isLight(item)) line.preview = isLight(view) ? structuredClone(view) : undefined;
+      if (clean || !isLight(item)) {
+        delete line.json;
+        line.preview = isLight(view) ? structuredClone(view) : undefined;
+      }
       return view;
     } finally { source.close(); }
   }
@@ -652,7 +906,7 @@ export class SessionFiles {
       if (final && (save.dirty === 'all' || this.force.has(id))) over = new Set(base.ids.slice(0, from));
       if (over.size) for (let i = 0; i < from; i++) {
         const item = items[i];
-        if (over.has(item.id) && isLight(item) && isDeepStrictEqual(item, base.index?.get(item.id)?.preview)) over.delete(item.id);
+        if (over.has(item.id) && isLight(item) && isDeepStrictEqual(item, baseline(base.index?.get(item.id)))) over.delete(item.id);
         if (over.has(item.id)) overItems.push(item);
       }
       if (!final && overItems.length > OVER_MAX.items) whole = true;
@@ -660,7 +914,8 @@ export class SessionFiles {
     if (!whole && base && over) {
       const tmp = `${this.tailOf(id)}.${process.pid}.tmp`;
       const head = `{"baseGen":${base.gen},"from":${from},"items":[\n`;
-      const end = `\n],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
+      const endId = final && items.length > SNAPSHOT_THRESHOLD ? items[snapshotEnd(items).start].id : undefined;
+      const end = `\n],"baseCount":${base.count},"baseRoots":${base.roots}${endId ? ',"endId":' + JSON.stringify(endId) : ''},"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
       const source = new BaseReader(this.pathOf(id), base);
       let written;
       try {
@@ -721,7 +976,10 @@ export class SessionFiles {
     const gen = nextGen();
     const file = this.pathOf(id), tmp = `${file}.${process.pid}.tmp`;
     const head = `{"gen":${gen},"items":[\n`;
-    const foot = `${save.items.length ? '\n' : ''}],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
+    const roots = save.items.reduce((n, i) => n + Number(!i.parentId), 0);
+    const endId = save.items.length > SNAPSHOT_THRESHOLD ? save.items[snapshotEnd(save.items).start].id : undefined;
+    const counts = endId ? `,"endId":${JSON.stringify(endId)}${orphans?.length ? ',"hasOver":true' : ''},"itemCount":${save.items.length},"rootCount":${roots}` : '';
+    const foot = `${save.items.length ? '\n' : ''}]${counts},"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
     const sections = [{ head, items: save.items }];
     if (orphans?.length) sections.push({ head: '\n],"over":[\n', items: orphans });
     const written = await writeLines(tmp, sections, foot, source);
@@ -730,7 +988,7 @@ export class SessionFiles {
     const readers = this.reading.get(id);
     if (readers?.size) await Promise.allSettled(readers);
     const ids = save.items.map(i => i.id);
-    const base: Base = { gen, orphans, ids, settled: settledEnd(save.items), idSet: new Set(ids), size: written.size,
+    const base: Base = { gen, count: save.items.length, roots, orphans, ids, settled: settledEnd(save.items), idSet: new Set(ids), size: written.size,
       index: written.index, over: new Set(), notices: { file, prefix: head, rows: written.notices } };
     await renameRetry(tmp, file, () => { if (!this.deleted.has(id)) this.bases.set(id, base); });
     return base;
@@ -813,7 +1071,7 @@ class BaseReader {
       const line = this.base?.index?.get(item.id);
       if (!line) throw new Error('Missing original step');
       const bytes = readBytes(fs, this.open(), line.offset, line.length);
-      if (line.preview && isDeepStrictEqual(item, line.preview)) return { bytes, chars: line.chars };
+      if (isDeepStrictEqual(item, baseline(line))) return { bytes, chars: line.chars };
       const disk = JSON.parse(bytes.toString());
       whole = this.merge(item, line, disk);
       if (whole === disk) return { bytes, chars: line.chars };
@@ -837,10 +1095,11 @@ class BaseReader {
     if (!isLight(item)) return item;
     if (disk.id !== item.id) throw new Error('Session item offset changed');
     const { [LIGHT]: _pictures, more: _more, ...view } = item;
-    const baseline = line.preview && isLight(line.preview) && !!line.preview[LIGHT].recent === !!item[LIGHT].recent
-      ? line.preview : project(disk, !!item[LIGHT].recent, cutItem, workerCut);
-    if (!isLight(baseline)) return overlay(disk, baseline, view) as TimelineItem;
-    const { [LIGHT]: _originalPictures, more: _originalMore, ...before } = baseline;
+    const saved = baseline(line);
+    const originalView = saved && isLight(saved) && !!saved[LIGHT].recent === !!item[LIGHT].recent
+      ? saved : project(disk, !!item[LIGHT].recent, cutItem, workerCut);
+    if (!isLight(originalView)) return overlay(disk, originalView, view) as TimelineItem;
+    const { [LIGHT]: _originalPictures, more: _originalMore, ...before } = originalView;
     return overlay(disk, before, view) as TimelineItem;
   }
 }

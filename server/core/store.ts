@@ -191,6 +191,10 @@ export class Store {
     if (!this.unreadableState) this.schedule(this.statePath, () => this.state, 400);
   }
 
+  readSessionEnd(id: string) {
+    return this.sessionFiles.readEnd(id);
+  }
+
   loadSession(id: string): SessionData {
     return this.sessionFiles.load(id);
   }

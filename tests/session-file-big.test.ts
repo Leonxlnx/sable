@@ -6,12 +6,12 @@
  * session-file-light.test.ts.)
  */
 import { createRequire } from 'node:module';
-import { isLight } from '../server/core/trim';
+import { cutItems, isLight, LIGHT } from '../server/core/trim';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import type { TimelineItem } from '../shared/protocol';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { TimelineItem, ToolItem } from '../shared/protocol';
 import { READ, SessionFiles } from '../server/core/session-file';
 import { Store } from '../server/core/store';
 
@@ -37,6 +37,96 @@ const filesOf = (home: string) => new SessionFiles((id) => path.join(home, 'sess
 const small = () => Object.assign(READ, { inWorkerAbove: 512, byLineAbove: 1024, part: 4096 });
 
 describe('a very long chat is held once', () => {
+  it('projects multi-block picture, command and file turns exactly without parsing a picture body', async () => {
+    const home = tmp(), file = path.join(home, 'sessions', 'a.json');
+    const image = 'data:image/png;base64,' + 'A'.repeat(360000);
+    const command = ('test output ' + 'x'.repeat(70) + '\n✓ → 🙂\t').repeat(1100).slice(0, 90000);
+    const content = ('const value = 10\n' + 'é'.repeat(15)).repeat(2000).slice(0, 60000);
+    const items: TimelineItem[] = [];
+    for (let turn = 0; turn < 7; turn++) {
+      items.push({ type: 'user', ts: 0, id: 'u' + turn, text: 'Continue' });
+      for (let k = 0; k < 12; k++) {
+        const bash = k % 3 === 1;
+        items.push({ type: 'tool', name: bash ? 'Bash' : 'Read', kind: bash ? 'bash' : 'read', status: 'done',
+          title: 'Read ✓', ts: 0, id: 'step-' + items.length, detail: {}, result: k % 3 === 0 ? { images: [image, image] } :
+            bash ? { text: command, exitCode: 0 } : { file: { path: 'file.ts', content } } });
+      }
+      items.push({ type: 'turn', ts: 0, id: 'turn-' + turn, durationMs: 1 });
+    }
+    writeBase(file, items);
+    READ.inWorkerAbove = 1;
+    const expected = cutItems(items);
+    // Count full-size JSON.parse inputs in the synchronous entry point to the
+    // shared scanner. This catches the two-pass regression without a time limit.
+    const parse = vi.spyOn(JSON, 'parse');
+    let fullPictures: number;
+    try {
+      expect(filesOf(home).load('a').items.length).toBe(items.length);
+      fullPictures = parse.mock.calls.filter(([s]) => s.length >= image.length && s.includes('data:image/png')).length;
+    } finally { parse.mockRestore(); }
+    expect(fullPictures).toBe(0);
+    const files = filesOf(home), loaded = await files.loadAsync('a');
+    expect(loaded.items.length).toBe(expected.length);
+    for (const [i, item] of loaded.items.entries()) {
+      const { [LIGHT]: mark, ...row } = item as TimelineItem & { [LIGHT]?: { pictures: number } };
+      expect(row).toStrictEqual(expected[i]);
+      if (row.type === 'tool' && (items[i] as ToolItem).result?.images) expect(mark?.pictures).toBe(2);
+      expect(files.wholeItem('a', item)).toStrictEqual(items[i]);
+    }
+  });
+
+  it('preserves ambiguous large values and rejects malformed bytes inside elided fields', async () => {
+    const home = tmp(), file = path.join(home, 'sessions', 'a.json');
+    const image = 'A'.repeat(40000), mid = 'x'.repeat(20000);
+    const base = step(0) as ToolItem;
+    const tools: ToolItem[] = [
+      { ...base, result: { images: [image] } },
+      { ...base, result: { text: mid + '\nhttp://localhost:8300/\n' + mid } },
+      { ...base, result: { images: [image + '"\\🙂'] } },
+      { ...base, result: { images: [image] }, status: 'running' },
+      { ...base, result: { text: mid + '\nerror\n' + mid }, status: 'error' },
+      { ...base, input: { images: [image], text: mid + mid }, result: { images: ['small'] } },
+      { ...base, result: { images: ['tiny'] } },
+      { ...base, result: { text: mid + '☕'.repeat(600) + mid } },
+    ];
+    const items: TimelineItem[] = tools.map((t, i) => ({ ...t, id: 't' + i }));
+    for (let i = 0; i < 4; i++) items.push({ id: 'end' + i, ts: 1, type: 'turn', durationMs: 1 });
+    writeBase(file, items);
+    READ.inWorkerAbove = 1;
+    const original = readFileSync(file, 'utf8');
+    const duplicate = original.replace('"images":["tiny"]', '"images":["' + image + '"],"images":["tiny"]');
+    writeFileSync(file, duplicate);
+    const files = filesOf(home), loaded = await files.loadAsync('a');
+    expect(loaded.items.map(it => {
+      const { [LIGHT]: _, ...row } = it as TimelineItem & { [LIGHT]?: unknown };
+      return row;
+    })).toStrictEqual(cutItems(items));
+    for (const bad of ['\u0001', '\\q', '\\']) {
+      writeFileSync(file, duplicate.replace(image, image.slice(0, -1) + bad));
+      expect((await filesOf(home).loadAsync('a')).unreadable).toBe(true);
+    }
+  });
+
+  it('recovers the recent boundary when a tail override turns a large step into a turn record', async () => {
+    const home = tmp(), file = path.join(home, 'sessions', 'a.json');
+    const items: TimelineItem[] = [];
+    for (let i = 0; i < 5; i++) {
+      items.push({ ...step(i) as ToolItem, result: { text: 'x'.repeat(50000) } });
+      if (i !== 1) items.push({ id: 'end' + i, ts: i, type: 'turn', durationMs: 1 });
+    }
+    writeBase(file, items);
+    const override: TimelineItem = { id: 'i1', ts: 1, type: 'turn', durationMs: 2 };
+    writeFileSync(path.join(home, 'sessions', 'a.tail.json'), JSON.stringify({ baseGen: 7, items: [], over: [override] }));
+    READ.inWorkerAbove = 1;
+    READ.part = 4096;
+    const expected = cutItems(items.map(it => it.id === override.id ? override : it));
+    const loaded = await filesOf(home).loadAsync('a');
+    expect(loaded.items.map(it => {
+      const { [LIGHT]: _, ...row } = it as TimelineItem & { [LIGHT]?: unknown };
+      return row;
+    })).toStrictEqual(expected);
+  });
+
   it('reads a big base in pieces through the worker, complete and in order', async () => {
     const home = tmp();
     const file = path.join(home, 'sessions', 'a.json');

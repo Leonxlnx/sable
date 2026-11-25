@@ -1,5 +1,6 @@
-import { DEFAULT_ACCOUNT, type BridgeEvent, type SessionMeta, type SessionSnapshot, type TimelineItem, type ToolItem, type ToolKind, type ToolResult, type ToolStatus } from '../../shared/protocol';
-import { runsTask } from '../../shared/background';
+import { DEFAULT_ACCOUNT, type BridgeEvent, type SessionMeta, type SessionSnapshot, type SnapshotCursor, type TimelineItem, type ToolItem, type ToolKind, type ToolResult, type ToolStatus } from '../../shared/protocol';
+import { syntheticOf } from '../../shared/synthetic';
+import { runsTask, worksInBackground } from '../../shared/background';
 
 // ── what a window gets of an existing conversation ──
 //
@@ -234,8 +235,7 @@ export const workerCut = {
 };
 
 /** The old disk-backed steps already have exactly the window's cut. */
-export function cutItems(items: TimelineItem[], whole?: (item: TimelineItem) => TimelineItem): TimelineItem[] {
-  const from = recentStart(items, RECENT_TURNS);
+export function cutItems(items: TimelineItem[], whole?: (item: TimelineItem) => TimelineItem, from = recentStart(items, RECENT_TURNS)): TimelineItem[] {
   return items.map((item, i) => {
     if (isLight(item)) {
       if (whole && (!settled(item) || (i >= from) !== !!item[LIGHT].recent)) return cutItem(whole(item), i < from ? OLD : RECENT);
@@ -246,13 +246,75 @@ export function cutItems(items: TimelineItem[], whole?: (item: TimelineItem) => 
   });
 }
 
+
+export const SNAPSHOT_THRESHOLD = 2048;
+
+export function turnBoundary(item: TimelineItem) {
+  if (item.parentId || item.type !== 'user' || item.steered || item.state === 'queued') return false;
+  const syn = syntheticOf(item);
+  return !syn || syn.role === 'command';
+}
+
+/** Eight ordinary prompt boundaries cover the largest tailStart can build.
+ * A queued steer, streaming row or background task takes its entire turn too. */
+export function snapshotEnd(items: TimelineItem[]) {
+  let start = 0, prompts = 0, live = items.length;
+  let roots = 0, shownRoots = 0;
+  const parents = new Set<string>();
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (!it.parentId) roots++;
+    if ((parents.size && parents.delete(it.id)) || it.type === 'tool' && (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting' || runsTask(it) || worksInBackground(it)) ||
+        (it.type === 'text' || it.type === 'thinking') && it.streaming || it.type === 'user' && it.state === 'queued' ||
+        it.type === 'notice' && it.limit?.provider && !it.limit.continuedWith && !it.limit.atReset) {
+      live = i;
+      if (it.parentId) parents.add(it.parentId);
+    }
+    if (prompts >= 8 && live >= start || !turnBoundary(it)) continue;
+    if (++prompts === 8 || i <= live && live < start) {
+      start = i;
+      shownRoots = roots;
+    }
+  }
+  return start && start <= live ? { start, roots: roots - shownRoots } : { start: 0, roots: 0 };
+}
+
+export function snapshotPage(snap: SessionSnapshot, request: 'end' | SnapshotCursor, known?: ReturnType<typeof snapshotEnd>): SessionSnapshot {
+  const items = snap.items;
+  let end = items.length, start: number, roots: number;
+  if (request === 'end') {
+    if (end <= SNAPSHOT_THRESHOLD) return snap;
+    ({ start, roots } = known ?? snapshotEnd(items));
+    if (!start) return snap;
+  } else {
+    end = request.at;
+    // A rewind or move crossed this boundary. A whole authoritative answer
+    // replaces the interrupted read, including events applied along the way.
+    if (!Number.isSafeInteger(end) || end <= 0 || items[end]?.id !== request.id) return snap;
+    start = Math.max(0, end - 512);
+    // Align pages to sent messages where possible so grouping can keep its suffix.
+    const floor = Math.max(0, start - 64);
+    while (start > floor && !turnBoundary(items[start])) start--;
+    roots = request.roots;
+    for (let i = start; i < end; i++) if (!items[i].parentId) roots--;
+  }
+  return { ...snap,
+    // Metadata is live in the window after the first answer. A waiting queue
+    // may contain image attachments and must not ride along on every page.
+    ...(request !== 'end' && { permissions: [], questions: [], todos: [], queue: [], caps: undefined, suggestion: undefined }),
+    items: items.slice(start, end), page: {
+    kind: request === 'end' ? 'end' : 'older',
+    before: start, rootsBefore: roots, recentAt: Math.max(0, recentStart(items, RECENT_TURNS) - start),
+  } };
+}
+
 /** A conversation as RPC results carry it (session.snapshot, session.create, session.fork, ...). */
 export const isSnapshot = (r: unknown): r is SessionSnapshot => !!r && typeof r === 'object' && Array.isArray((r as SessionSnapshot).items) && !!(r as SessionSnapshot).session;
 
 /** An RPC result as a window gets it: a conversation (opened, created, forked, carried over) with its items cut. */
 type ResolveItem = (sessionId: string, item: TimelineItem) => TimelineItem;
 export function resultForWindow<T>(result: T, resolve?: ResolveItem): T {
-  if (isSnapshot(result)) return { ...result, items: cutItems(result.items, resolve && (i => resolve(result.session.id, i))) };
+  if (isSnapshot(result)) return { ...result, items: cutItems(result.items, resolve && (i => resolve(result.session.id, i)), result.page?.recentAt) };
   // race.start returns its new conversations together.
   const sessions = (result as { sessions?: unknown[] } | null)?.sessions;
   if (Array.isArray(sessions) && sessions.some(isSnapshot)) return { ...result, sessions: sessions.map(s => resultForWindow(s, resolve)) };

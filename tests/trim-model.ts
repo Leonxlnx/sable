@@ -1,6 +1,10 @@
 import { expect } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import type { TimelineItem } from '../shared/protocol';
-import { cutItem, OLD } from '../server/core/trim';
+import { READ, SessionFiles } from '../server/core/session-file';
+import { cutItem, cutItems, LIGHT, OLD } from '../server/core/trim';
 import { figuresOf, isBackgroundCommand, outcomeOf } from '../src/features/rail/agents-model';
 import { agentLine, agentTask, agentType } from '../src/features/timeline/agent-line';
 import { foldedTurn } from '../src/features/timeline/changes';
@@ -43,4 +47,24 @@ export function expectSameRows(items: TimelineItem[]) {
     expect(cutItem(cutItem(items[i]), OLD), it.id).toEqual(it);
   });
   expect(turns(rows)).toEqual(turns(items));
+
+  // Run the same Demo and synthetic corpora through the indexed reader. Compare
+  // the stored projections directly, before the socket has a chance to cut again.
+  const dir = mkdtempSync(path.join(tmpdir(), 'sable-cut-corpus-'));
+  const file = path.join(dir, 'corpus.json'), threshold = READ.inWorkerAbove;
+  try {
+    const lines = items.map(i => JSON.stringify(i));
+    writeFileSync(file, '{"gen":42,"items":[\n' + lines.join(',\n') + '\n],"todos":[]}');
+    const expected = cutItems(lines.map(s => JSON.parse(s)));
+    READ.inWorkerAbove = 1;
+    const loaded = new SessionFiles(() => file).load('corpus');
+    expect(loaded.unreadable).toBeUndefined();
+    expect(loaded.items.map(it => {
+      const { [LIGHT]: _, ...row } = it as TimelineItem & { [LIGHT]?: unknown };
+      return row;
+    })).toStrictEqual(expected);
+  } finally {
+    READ.inWorkerAbove = threshold;
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
