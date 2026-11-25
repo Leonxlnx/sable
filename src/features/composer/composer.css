@@ -2344,6 +2344,25 @@
   color: var(--text);
 }
 
+/* Why a message is here, in the bridge's words (queue-rows.ts `rowDelivery`: "Issued to Claude.
+   Receipt unknown."): the row's second tone, after the words. It keeps its own width and the words
+   give way; it never takes more than 45% of the row, so in a narrow pane it is cut before the
+   words are gone. */
+.cq-why {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  font-size: var(--t-small);
+  color: var(--text-3);
+  transition: opacity var(--d-1) var(--ease);
+}
+
+/* The first act's label grows out over the reason's end: the reason steps back while that act is
+   pointed at or focused, so the pill never cuts it mid-word. */
+.cq-row:has(.cq-act:first-child:is(:hover, :focus-visible)) .cq-why {
+  opacity: 0;
+}
+
 .cq-att {
   display: inline-flex;
   align-items: center;

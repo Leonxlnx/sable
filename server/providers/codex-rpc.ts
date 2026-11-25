@@ -6,7 +6,7 @@ import type { InitializeParams, InitializeResponse, RequestId } from './codex-ty
 import { homedir } from 'node:os';
 import { authGate, gateKey, GATE } from '../core/auth-gate';
 import type { AuthScope, EndReason } from '../core/auth-journal';
-import { cliCommand, killTree as stopTree } from '../util/proc';
+import { cliCommand, killTree as stopTree, retireReader } from '../util/proc';
 import { trustedPathDirs } from '../util/which';
 
 /**
@@ -207,6 +207,7 @@ export class CodexRpc {
     env?: Record<string, string>;
     /** Opt into experimental methods (remote control lives there). */
     experimental?: boolean;
+    spawned?: (rpc: CodexRpc) => void;
     /** Extra `-c key=value` config overrides for this app-server process. */
     config?: string[];
   }): Promise<CodexRpc> {
@@ -237,6 +238,7 @@ export class CodexRpc {
       throw err;
     }
     const rpc = new CodexRpc(child, opts.log, opts.owner);
+    opts.spawned?.(rpc);
     const active = servers.get(folder) ?? new Set<CodexRpc>();
     servers.set(folder, active);
     active.add(rpc);
@@ -366,6 +368,12 @@ export class CodexRpc {
       const e = err as RpcError;
       this.respondError(id, typeof e.code === 'number' ? e.code : -32603, e.message || 'client error');
     } finally { this.answering--; }
+  }
+
+  async forceDelegate() {
+    this.forced = true;
+    this.endReason = 'timeout';
+    if (this.alive) await retireReader(this.child);
   }
 
   /** Graceful stop: close stdin (app-server exits on EOF), then force-kill the tree. */

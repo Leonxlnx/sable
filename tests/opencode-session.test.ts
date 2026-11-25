@@ -48,18 +48,24 @@ function fakeAcp(holdResume = false) {
 
 it('reads a switched delegate report from a chunked OpenCode history replay', async () => {
   const fake = fakeAcp();
+  let release!: () => void;
+  fake.acp.close = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
   const reader = fake.acp as unknown as AcpClient;
   const start = vi.spyOn(AcpClient, 'start').mockResolvedValue(reader);
   try {
     const provider = new OpenCodeProvider({ emit() {}, log() {} });
     const id = 'c3445196-413b-464f-82df-5be423802949';
     const text = delegateReport('Review', 'done', 'Findings', id);
-    const receipts = provider.delegateReceipts('thread', process.cwd());
+    const receipts = provider.delegateReceipts('thread', process.cwd(), undefined, { ids: new Set([id]), tools: new Map() });
     await vi.waitFor(() => expect(fake.calls[0]?.method).toBe('session/load'));
     for (const piece of [text.slice(0, 30), text.slice(30)]) {
       reader.onNotification!('session/update', { sessionId: 'thread', update: { sessionUpdate: 'user_message_chunk', messageId: 'user', content: { text: piece } } });
     }
     fake.calls[0].resolve({});
+    let known: Set<string> | undefined;
+    void receipts.then(found => { known = found.ids; });
+    try { await vi.waitFor(() => expect(known).toEqual(new Set([id]))); }
+    finally { release?.(); }
     expect((await receipts).ids).toEqual(new Set([id]));
   } finally { start.mockRestore(); }
 });
@@ -115,6 +121,23 @@ describe('OpenCode shared process exit', () => {
     };
     return { processes, current, create, update, die, atRest, command };
   }
+
+  it('delivers an active parent’s reserved report through the bridge and ACP queue', async () => {
+    const h = await setup();
+    const rt = await h.create();
+    const row = rt.add<ToolItem>({ type: 'tool', name: 'delegate_to_codex', kind: 'agent', status: 'done',
+      detail: {}, title: 'Check', result: { text: 'Finished checking' }, delegateReport: 'pending' });
+    rt.pendingDelegateReports.add(row.id);
+    rt.onDelegateReport!();
+    await vi.waitFor(() => expect(rt.reservedDelegateReports.has(row.id)).toBe(true));
+    await new Promise(resolve => setTimeout(resolve, 60));
+    h.current().prompts()[0].resolve({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(h.current().prompts()).toHaveLength(2));
+    expect(JSON.stringify(h.current().prompts()[1].params.prompt)).toContain('Finished checking');
+    h.current().prompts()[1].resolve({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(row.delegateReport).toBe('delivered'));
+    expect(rt.items.filter(i => i.type === 'user')).toHaveLength(1);
+  });
 
   it('cuts each open prompt once, wakes only the resting chat with lost work, and leaves closed chats alone', async () => {
     const h = await setup();
@@ -309,6 +332,20 @@ describe('OpenCode turns', () => {
     await sent;
     expect(fake.prompts()).toHaveLength(0);
     expect(rt.turnActive).toBe(false);
+  });
+
+  it('drains a hidden delegate report after an active prompt', async () => {
+    const { session, fake, user, rt } = await chat();
+    await session.send(user('first'));
+    const taken = vi.fn(), release = vi.fn();
+    await session.send({ type: 'user', id: 'hidden', ts: 1, state: 'sent', text: 'report' }, { delegateReport: true, taken, release });
+    fake.prompts()[0].resolve({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(fake.prompts()).toHaveLength(2));
+    expect(fake.prompts()[1].params.prompt).toEqual([{ type: 'text', text: 'report' }]);
+    fake.prompts()[1].resolve({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(taken).toHaveBeenCalledTimes(1));
+    expect(rt.get('hidden')).toBeUndefined();
+    expect(release).not.toHaveBeenCalled();
   });
 
   it('a message from a removed phone that waited in the queue never goes', async () => {

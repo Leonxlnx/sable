@@ -13,6 +13,7 @@ import {
   steerWaitLine,
   steerWaitSpoken,
   waitedRoom,
+  waitReason,
   waitedWords,
   waitingOn,
   waitsAsSteer,
@@ -229,6 +230,74 @@ describe('the line under a waiting steer', () => {
     for (const autoAt of [undefined, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(steerWaitLine({ item: steer({ steerWait: { autoAt } }), steps: [build], now: T0 }).phase).toBe('waiting');
     }
+  });
+});
+
+describe('why a steer still waits', () => {
+  const build = { title: 'Run the build', ts: T0 - 130_000 };
+
+  it('reads the bridge’s reason as one bounded line, and nothing where it gave none', () => {
+    expect(waitReason({ reason: '  Claude did not\nconfirm   withdrawal. ' })).toBe('Claude did not confirm withdrawal.');
+    for (const wait of [undefined, null, {}, { reason: '' }, { reason: '   ' }, { reason: 7 as unknown as string }]) expect(waitReason(wait)).toBe('');
+    const long = waitReason({ reason: 'x'.repeat(400) });
+    expect(long).toHaveLength(160);
+    expect(long.endsWith('…')).toBe(true);
+  });
+
+  it('stands where the countdown stood when the bridge has no time of its own, and keeps Send now', () => {
+    const line = steerWaitLine({ item: steer({ steerWait: { stepId: 'build', reason: 'Automatic interruption limit reached.' } }), steps: [build], now: T0 });
+    expect(line).toEqual({ phase: 'held', why: 'Automatic interruption limit reached.', label: '', clock: '', room: '', action: true, disabled: false, cost: 'Interrupts the running step' });
+    expect(steerWaitSpoken(line)).toBe('Automatic interruption limit reached.');
+  });
+
+  it('stands before the countdown while the bridge will try once more', () => {
+    const item = steer({ steerWait: { stepId: 'build', autoAt: T0 + 60_000, reason: 'Claude did not confirm withdrawal.' } });
+    const line = steerWaitLine({ item, steps: [build], now: T0 + 2_000 });
+    expect(line).toMatchObject({ phase: 'countdown', why: 'Claude did not confirm withdrawal.', label: 'Sends in', clock: '0:58', action: true, disabled: false });
+    expect(steerWaitSpoken(line)).toBe('Claude did not confirm withdrawal. Sends in 0:58');
+  });
+
+  it('shows no countdown without a time: a time that passed leaves the reason, never "Sends in"', () => {
+    const item = steer({ steerWait: { autoAt: T0 + 30_000, reason: 'Claude did not confirm the turn ended.' } });
+    expect(steerWaitLine({ item, steps: [build], now: T0 + 30_000 + AUTO_GRACE_MS })).toMatchObject({ phase: 'held', why: 'Claude did not confirm the turn ended.', label: '', clock: '' });
+    for (const autoAt of [undefined, Number.NaN]) {
+      expect(steerWaitLine({ item: steer({ steerWait: { autoAt, reason: 'Refused.' } }), steps: [], now: T0 })).toMatchObject({ phase: 'held', why: 'Refused.', clock: '' });
+    }
+  });
+
+  it('is not said while the message is on its way', () => {
+    const item = steer({ steerWait: { autoAt: T0 + 30_000, reason: 'Claude did not confirm withdrawal.' } });
+    expect(steerWaitLine({ item, steps: [build], now: T0, sending: true })).toMatchObject({ phase: 'sending', why: '', label: 'Sending', disabled: true });
+    expect(steerWaitLine({ item, steps: [build], now: T0 + 31_000 })).toMatchObject({ phase: 'sending', why: '', label: 'Sending' });
+  });
+
+  it('never borrows a sibling’s countdown once its own tries are spent: the bridge’s send leaves it out', () => {
+    const c = chat([
+      user('ask'),
+      steer({ id: 'capped', steerWait: { stepId: 'build', reason: 'Automatic interruption limit reached.' } }),
+      steer({ id: 'fresh', ts: T0 + 5_000, steerWait: { autoAt: T0 + 35_000 } }),
+      steer({ id: 'retry', ts: T0 + 6_000, steerWait: { autoAt: T0 + 60_000, reason: 'Claude did not confirm withdrawal.' } }),
+    ]);
+    const first = firstAutoAt(c.item, c.roots);
+    expect(first).toBe(T0 + 35_000);
+    const at = (id: string) => steerWaitLine({ item: c.item(id) as UserItem, steps: [], autoAt: first, now: T0 + 10_000 });
+    // The capped card keeps its reason and Send now, and shows no time, before and after the sibling's send.
+    expect(at('capped')).toEqual({ phase: 'held', why: 'Automatic interruption limit reached.', label: '', clock: '', room: '', action: true, disabled: false, cost: 'Interrupts what the agent is doing' });
+    expect(steerWaitLine({ item: c.item('capped') as UserItem, steps: [], autoAt: first, now: T0 + 36_000 })).toMatchObject({ phase: 'held', clock: '' });
+    // Cards the send still takes count down to the earliest time: a plain one, and one with a reason and its own time.
+    expect(at('fresh')).toMatchObject({ phase: 'countdown', why: '', clock: '0:25' });
+    expect(at('retry')).toMatchObject({ phase: 'countdown', why: 'Claude did not confirm withdrawal.', clock: '0:25' });
+  });
+
+  it('is cut before the words and the clock after it are, on the desktop and on the phone', () => {
+    const css = read('src/features/timeline/timeline.css');
+    expect(css).toMatch(/\n\.steer-wait-why \{\s*min-width: 0;\s*\}/);
+    expect(css).toMatch(/\n\.steer-wait-why \+ \.steer-wait-label \{\s*flex-shrink: 0;\s*\}/);
+    const phone = read('mobile/src/styles/chat.css');
+    expect(phone).toMatch(/\n\.steer-note-label\[data-why\] \+ \.steer-note-label \{\s*flex-shrink: 0;\s*\}/);
+    const screen = read('mobile/src/screens/Timeline.tsx');
+    expect(screen).toMatch(/\{line\.why && <span className="steer-note-label" data-why>\{line\.why\}<\/span>\}/);
+    expect(screen).toMatch(/\{line\.label && <span className="steer-note-label">\{line\.label\}<\/span>\}/);
   });
 });
 

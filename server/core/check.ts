@@ -1,5 +1,5 @@
 import type { LimitHit, NoticeItem, ProviderId, TextItem, TimelineItem, ToolItem, ToolResult, UserItem } from '../../shared/protocol';
-import { partOfTurn, syntheticOf, userText } from '../../shared/synthetic';
+import { partOfTurn, syntheticOf, userItemText } from '../../shared/synthetic';
 import type { AgentCall } from '../providers/agent-tool';
 import type { SessionRuntime } from './runtime';
 
@@ -220,7 +220,7 @@ export function buildBrief(items: TimelineItem[], turnId: string, cwd: string, c
   if (!slice) return null;
   const edits = editsOf(items, slice.roots).filter(edit => edit.result?.diff?.length || edit.detail.path);
   const files = filesOf(edits, cwd);
-  const request = slice.asks.map((u, i) => (i === 0 ? userText(u.text) : `(Added while it worked) ${userText(u.text)}`)).join('\n\n');
+  const request = slice.asks.map((u, i) => (i === 0 ? userItemText(u) : `(Added while it worked) ${userItemText(u)}`)).join('\n\n');
   const answer = [...slice.roots].reverse().find((i): i is TextItem => i.type === 'text' && !!i.text.trim())?.text ?? '';
 
   const parts: string[] = [];

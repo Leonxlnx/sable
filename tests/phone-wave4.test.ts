@@ -172,12 +172,14 @@ it.each([false, true])('retains accepted queued input when the socket sleeps (re
   const rt = await chatOf(app, c, home);
   rt.beginTurn();
   const submission = { sessionId: rt.id, text: 'after sleep', submitId: 'phone-reconnect' };
-  expect((await c.call('session.send', submission)).ok).toBe(true);
+  expect(await c.call('session.send', submission)).toMatchObject({ ok: true, result: { submitId: submission.submitId } });
   expect(rt.queue[0].phoneSender).toMatchObject({ deviceId });
   c.ws.close();
   await c.closed;
   const { c: next } = await helloSecure(port, pair);
   await next.next(f => 'welcome' in f);
+  expect(await next.call('session.submission', { sessionId: rt.id, submitId: 'never-sent' })).toMatchObject({ ok: true, result: { ok: false } });
+  expect(await next.call('session.submission', { sessionId: rt.id, submitId: submission.submitId })).toMatchObject({ ok: true, result: { ok: true, submitId: submission.submitId } });
   expect((await next.call('session.send', submission)).ok).toBe(true);
   expect(rt.queue).toHaveLength(1);
   if (revoked) phone.revoke(deviceId);

@@ -459,6 +459,11 @@
   white-space: nowrap;
 }
 
+/* why it still waits, in the desktop's words: it is cut before "Sends in" and its clock are */
+.steer-note-label[data-why] + .steer-note-label {
+  flex-shrink: 0;
+}
+
 /* the clock keeps the room of its widest form (drawn unseen in the same cell): the row stands on its
    right end, so a clock as wide as its own words would push the label left and right as it ticks.
    Before the key its words start at the room's left (the spare character lies in the gap before the
@@ -2084,6 +2089,24 @@ button.queued-text:focus-visible {
   border-radius: 6px;
 }
 button.queued-text[data-busy] {
+  color: var(--text-3);
+}
+
+/* a message whose delivery is not known: the desktop's reason as a second line under its words
+   (screens/Composer.tsx `QueueRow`), each line cut by itself; both fit the row's 50 px */
+.queued-text[data-why] {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+}
+.queued-text[data-why] > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queued-why {
+  font-size: var(--t-caption);
   color: var(--text-3);
 }
 

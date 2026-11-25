@@ -9,6 +9,9 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { TimelineItem } from '@shared/protocol';
 import { DELEGATE_REPORT, delegateReport, HANDOVER_HEAD_ACCOUNT, HANDOVER_TAIL, HANDOVER_JOIN, STEER_NOW_BLOCK, userItemText } from '@shared/synthetic';
+import { lostTasksNote } from '@shared/synthetic';
+import { STEER_FIRST_BLOCK } from '@shared/protocol';
+import { moveNote } from '../server/core/move-context';
 import { chatMarkdown } from '../server/core/chat-markdown';
 import { saidOf } from '../server/services/search';
 import { handoverText } from '../server/accounts/handover';
@@ -51,6 +54,32 @@ it('keeps personal quotations and hides the handover report in transcript, expor
     expect(md).toContain(words);
     expect(md).not.toContain(DELEGATE_REPORT);
   }
+});
+
+it('keeps a lone unmarked reminder and unwraps a suffix on a legacy card', () => {
+  for (const block of [STEER_FIRST_BLOCK, STEER_NOW_BLOCK]) {
+    expect(userItemText(user('old', block))).toBe(block);
+    expect(userItemText(user('old', 'my words\n\n' + block))).toBe('my words');
+    expect(userItemText({ type: 'user', text: 'my words\n\n' + block, authored: true })).toBe('my words\n\n' + block);
+  }
+});
+
+it('recognizes decorations around the report heading in composer order', () => {
+  const prefix = HANDOVER_HEAD_ACCOUNT + '\nAgent: Done\n' + HANDOVER_TAIL + HANDOVER_JOIN;
+  const report = '\n\n' + delegateReport('Review', 'done', 'Child finished');
+  const browser = "\n\n[Sable: the user's Browser tab shows https://example.test titled \"Review\". browser_read reads it.]";
+  const second = '\n\n' + delegateReport('Build', 'failed', 'Quoted </system-reminder>', '0de3438b-efa0-4891-9acc-042089f10b86');
+  for (const head of ['', prefix]) for (const lost of [false, true]) for (const moved of [false, true]) {
+    const note = moved ? '\n\n' + moveNote([], [], { lost }) : '';
+    const payload = head + DELEGATE_REPORT + lostTasksNote(lost ? ['Build'] : []) + note + report;
+    for (const more of ['', second]) for (const tab of ['', browser])
+      expect(saidOf([user('hidden', payload + more + tab)])).toEqual([]);
+  }
+});
+
+it('omits an old steered check result from personal handover text', () => {
+  const card = { ...user('u', 'internal failure'), steered: true, until: { check: { round: 1 } } } as TimelineItem;
+  expect(handoverText([card])).not.toContain('internal failure');
 });
 
 describe('titles', () => {

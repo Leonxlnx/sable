@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline';
 import { record, type AuthScope, type EndReason } from './auth-journal';
 import { PassThrough } from 'node:stream';
 import { isAuthFailure } from '../../shared/synthetic';
-import { retireReader } from '../util/proc';
+import { retireReader, terminateDelegateProcess } from '../util/proc';
 
 /**
  * Schedules Sable-owned starts per config folder. Refreshes inside a CLI and processes
@@ -371,9 +371,12 @@ export class GatedProcess extends EventEmitter {
   async terminateDelegate() {
     if (this.ended) return;
     if (!this.child) return this.askClose('SIGKILL');
-    const exited = new Promise<void>(resolve => this.once('exit', () => resolve()));
-    await retireReader(this.child);
-    await exited;
+    const child = this.child;
+    let end!: () => void;
+    const exited = new Promise<void>(resolve => { end = resolve; this.once('exit', end); });
+    const kill = () => retireReader(child);
+    try { await terminateDelegateProcess(() => !this.ended && child.exitCode === null && !child.signalCode, exited, kill, kill); }
+    finally { this.off('exit', end); }
   }
 
   kill(signal: NodeJS.Signals = 'SIGTERM'): boolean {

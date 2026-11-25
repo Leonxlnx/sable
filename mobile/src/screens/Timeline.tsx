@@ -2,10 +2,11 @@ import { AnimatePresence, motion } from 'motion/react';
 import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { NoticeItem, PhoneItem, ProviderId, TextItem, ThinkingItem, TimelineItem, ToolItem, TurnItem, UntilCheck, UserItem } from '@shared/protocol';
 import { noticeLevel } from '@shared/notice';
-import { stripWrappers, syntheticOf } from '@shared/synthetic';
+import { syntheticOf, userItemText } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
 import { leadTitle } from '@desk/features/timeline/lead-in';
 import { firstAutoAt, steerWaitLine, steerWaitSpoken, waitingOn, waitsAsSteer } from '@desk/features/timeline/steer-wait';
+import { delegateWord } from '@desk/features/timeline/delegate-word';
 import { epoch, still } from '@m/lib/epoch';
 import { useNow } from '@m/lib/useNow';
 import { onScreen } from '@m/lib/screen';
@@ -402,6 +403,7 @@ const EARLY_WHY: Record<NonNullable<NoticeItem['early']>, string> = {
 function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
   const line = turn.early ?? '';
   const note = useItem<NoticeItem>(sid, line);
+  const submitId = useRef<string | null>(null);
   const why = note?.type === 'notice' && note.early ? EARLY_WHY[note.early] : '';
   const canContinue = useStore((s) => {
     const meta = s.sessions[sid];
@@ -431,7 +433,9 @@ function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
             e.stopPropagation();
             setSent(true);
             haptic('send');
-            void conn.call('session.send', { sessionId: sid, text: 'Continue' }).catch(() => setSent(false));
+            // One id for this line's Continue: pressed again after a failure, it is the same send.
+            submitId.current ??= crypto.randomUUID();
+            void conn.call('session.send', { sessionId: sid, text: 'Continue', submitId: submitId.current }).catch(() => setSent(false));
           }}
         >
           Continue
@@ -853,7 +857,8 @@ const UserBubble = memo(function UserBubble({ sid, id, steered, queued }: { sid:
   const images = it.attachments?.filter((a) => a.dataUrl && a.kind === 'image') ?? [];
   const files = it.attachments?.filter((a) => !(a.dataUrl && a.kind === 'image')) ?? [];
   const waitingSteer = steered && it.state === 'queued';
-  const words = review ? review.lead : stripWrappers(it.text);
+  // A card the person sent keeps every word, also a quoted note of Sable's (`userItemText`).
+  const words = review ? review.lead : userItemText(it);
   return (
     <div className="user-row" data-id={id} data-steered={steered || undefined} data-queued={queued || waitingSteer || undefined}>
       <div
@@ -861,7 +866,7 @@ const UserBubble = memo(function UserBubble({ sid, id, steered, queued }: { sid:
         className="user-bubble"
         data-long={long && !open ? true : undefined}
         onClick={() => long && (haptic('select'), setOpen((v) => !v))}
-        onContextMenu={(e) => holdMessage(e, e.currentTarget.parentElement, () => (cut ? fetchItem(sid, id).then((r) => stripWrappers((r.item as UserItem).text)) : words || it.text))}
+        onContextMenu={(e) => holdMessage(e, e.currentTarget.parentElement, () => (cut ? fetchItem(sid, id).then((r) => userItemText(r.item as UserItem)) : words || it.text))}
       >
         {images.length > 0 && (
           <div className="user-images">
@@ -1281,6 +1286,9 @@ function AgentBlock({ sid, id, it, name, running, background, kids }: { sid: str
   const steps = (children ?? []).slice(-40);
   // A sub-agent from the other agent (delegate_to_codex / delegate_to_claude): its own mark.
   const other = otherAgent(it);
+  // A task handed to the other agent (the desktop's `delegateWord`): "Stopping" while its child winds
+  // down, and once it has ended where its report stands ("Report pending", "With your next message").
+  const report = delegateWord(it);
   const toggle = () => {
     haptic('select');
     // Its steps stay on the desktop until asked for (the last 40).
@@ -1293,11 +1301,11 @@ function AgentBlock({ sid, id, it, name, running, background, kids }: { sid: str
         <span className="block-head">
           <span className="block-icon">{running ? <Tiles size={13} /> : other ? <ProviderMark provider={other} size={16} /> : <Icon name="agent" size={16} />}</span>
           <span className="block-title">{name}</span>
-          <span className="block-aside">{it.status === 'error' ? 'Failed' : running ? (background ? 'In the background' : 'Working') : 'Done'}</span>
+          <span className="block-aside">{report === 'Stopping' ? 'Stopping' : it.status === 'error' ? 'Failed' : running ? (background ? 'In the background' : 'Working') : 'Done'}</span>
         </span>
         {it.detail?.description && it.detail.description !== name && <span className="block-desc">{it.detail.description}</span>}
         <span className="block-sub num">
-          {[stats?.steps ? plural(stats.steps, 'step') : kids ? plural(kids, 'step') : '', stats?.tokens && `${formatTokens(stats.tokens)} tokens`, stats?.durationMs && formatDuration(stats.durationMs)].filter(Boolean).join(' · ')}
+          {[report !== 'Stopping' && report, stats?.steps ? plural(stats.steps, 'step') : kids ? plural(kids, 'step') : '', stats?.tokens && `${formatTokens(stats.tokens)} tokens`, stats?.durationMs && formatDuration(stats.durationMs)].filter(Boolean).join(' · ')}
           {kids > 0 && <Icon name="caretDown" size={12} weight="bold" className="block-caret" />}
         </span>
       </button>

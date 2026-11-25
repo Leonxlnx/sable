@@ -98,10 +98,11 @@ describe('#7: a submission id answers only the message it was given for', () => 
     expect(n).toBe(2);
   });
 
-  it("a phone's send never carries one", () => {
+  it("a phone's raw id is scoped to its device while a desktop retry matches its words and files", () => {
     const phone = read('server/services/phone.ts');
     expect(phone).toMatch(/if \(method === 'session\.send'\) delete p\.submitId;/);
-    expect(read('server/app.ts')).toContain('}, messagePrint(text, attachments)));');
+    expect(phone).toContain("params.submitId = 'phone-' + sha256(JSON.stringify([device.id, raw.submitId]));");
+    expect(read('server/app.ts')).toContain("}, ctx.phoneSender ? 'phone' : messagePrint(text, attachments)));");
   });
 });
 

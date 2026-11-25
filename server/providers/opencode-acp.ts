@@ -99,7 +99,7 @@ export class AcpClient {
     done();
   }
 
-  static async start(opts: { log: (...a: unknown[]) => void; clientVersion: string; env?: NodeJS.ProcessEnv }): Promise<AcpClient> {
+  static async start(opts: { log: (...a: unknown[]) => void; clientVersion: string; env?: NodeJS.ProcessEnv; initTimeoutMs?: number }): Promise<AcpClient> {
     const cmd = opencodeCommand(['acp'], opts.env);
     opts.log('[opencode] spawning', cmd.file, cmd.args.join(' '));
     const child = spawn(cmd.file, cmd.args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: cmd.shell, env: cmd.env });
@@ -113,7 +113,7 @@ export class AcpClient {
           clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
           clientInfo: { name: 'sable', title: 'Sable', version: opts.clientVersion },
         },
-        30_000,
+        opts.initTimeoutMs ?? 30_000,
       );
     } catch (err) {
       await acp.close();

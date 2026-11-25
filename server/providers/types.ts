@@ -51,6 +51,8 @@ export interface ProviderContext {
 
 /** How a message goes to the agent (`ProviderSession.send`). */
 export interface SendOptions {
+  /** Start of the unmodified card text in Sable's composed prompt (used for transcript block boundaries). */
+  personalOffset?: number;
   /** The person explicitly interrupted work to have this message answered. */
   steerNow?: boolean;
   /** A delegate reported to the parent. This input belongs to Sable. */
@@ -62,7 +64,7 @@ export interface SendOptions {
   /** A legacy result ended the input without enough evidence to retry it safely. */
   uncertain?: () => void;
   /** Release this send's reserved handover when delivery is abandoned. Idempotent. */
-  release?: () => void;
+  release?: (unissued?: true) => void;
 }
 
 /** A live connection between one SessionRuntime and the provider's agent process. */
@@ -142,7 +144,7 @@ export interface Provider {
   /** A dedicated process when its lifetime must be independent of other chats. */
   forDelegate?(): Provider;
   terminateOpeningDelegate?(): Promise<void>;
-  delegateReceipts?(session: string, cwd: string, after?: string): Promise<DelegateReceipts>;
+  delegateReceipts?(session: string, cwd: string, after: string | undefined, wanted: import('../core/delegate-result').WantedReceipts, signal?: AbortSignal): Promise<DelegateReceipts>;
   info(force?: boolean): Promise<ProviderInfo>;
   login(): Promise<void>;
   cancelLogin(): Promise<void>;

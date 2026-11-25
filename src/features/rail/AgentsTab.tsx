@@ -6,7 +6,7 @@ import { userItemText } from '@shared/synthetic';
 import { worksInBackground } from '@shared/background';
 import { ProviderMark, Ring } from '@/art/Logo';
 import { Collapse } from '@/components/Collapse';
-import { agentProvider, agentTask, isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
+import { agentProvider, agentTask, delegateWord, isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
 import { TimelineCtx, type TimelineCtxValue } from '@/features/timeline/ctx';
 import { foldKey, getFold, setFold, useFold } from '@/features/timeline/fold';
 import { revealItem } from '@/features/timeline/reveal';
@@ -300,7 +300,9 @@ function AgentLive({ item, progress: p, awaiting }: { item: ToolItem; progress: 
   // A run of quick steps reads as a calm sequence of titles, not a flicker.
   const now = useHeld(p.now, 700);
   const bg = item.status === 'done' && worksInBackground(item);
-  const doing = awaiting ? 'Needs your approval' : now || (bg && !p.steps ? 'Working in the background' : 'Starting');
+  // A handed-over task the person stopped says so until its child has wound down.
+  const stopping = delegateWord(item) === 'Stopping';
+  const doing = awaiting ? 'Needs your approval' : stopping ? 'Stopping' : now || (bg && !p.steps ? 'Working in the background' : 'Starting');
   return (
     <>
       <span className="agx-sub">
@@ -405,7 +407,10 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
   const outcome = outcomeOf(item);
   const f = figuresOf(item);
   const provider = agentProvider(item) ?? item.check?.agent ?? null;
-  const word = outcome === 'done' ? '' : OUTCOME_WORD[outcome];
+  // A handed-over task whose report the chat's agent has not read yet says where the report stands
+  // ("Report pending", "With your next message"); how it ended is the row's mark.
+  const report = delegateWord(item);
+  const word = report || (outcome === 'done' ? '' : OUTCOME_WORD[outcome]);
   const launched = !!item.result?.agent?.background || !!item.detail.background;
   const endedAt = noted || (launched ? 0 : (item.endedAt ?? 0));
   return (
@@ -415,7 +420,8 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
         <span className="agx-title truncate">{agentTask(item)}</span>
         {provider && <Who provider={provider} />}
         <span className="agx-meta num">
-          {word ? <span className="agx-outcome">{word}</span> : <span className="sr-only">Done</span>}
+          {report && outcome !== 'done' && <span className="sr-only">{OUTCOME_WORD[outcome]}. </span>}
+          {word ? <span className="agx-outcome" data-report={report ? '' : undefined}>{word}</span> : <span className="sr-only">Done</span>}
           {!word && f.ms >= 1000 && <span className="agx-dur">{shortDuration(f.ms)}</span>}
         </span>
       </button>

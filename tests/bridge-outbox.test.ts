@@ -146,6 +146,20 @@ describe('submissions on the bridge (finding 1, the connection died after sendin
     expect(n).toBe(3);
   });
 
+  it('keeps an in-flight submission while completed receipts expire', async () => {
+    let t = 0, calls = 0, release!: () => void;
+    const barrier = new Promise<void>(done => { release = done; });
+    const subs = new Submissions<{ ok: boolean }>(1000, 1, () => t);
+    const send = async () => { calls++; await barrier; return { ok: true }; };
+    const original = subs.run('chat', 'phone', send);
+    t = 2000;
+    await subs.run('chat', 'other', async () => ({ ok: true }));
+    const retry = subs.run('chat', 'phone', send);
+    release();
+    await Promise.all([original, retry]);
+    expect(calls).toBe(1);
+  });
+
   it('forgets after its time', async () => {
     let t = 0;
     const subs = new Submissions<{ ok: boolean }>(1000, 500, () => t);

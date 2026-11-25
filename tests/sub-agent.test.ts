@@ -1,10 +1,12 @@
 /** Sub-agents from the other agent: the child's work nests under the calling step, its answer is the result. */
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BridgeEvent, ToolItem } from '@shared/protocol';
 import { App } from '../server/app';
+import { GatedProcess } from '../server/core/auth-gate';
 import { runSubAgent, claimStep } from '../server/core/sub-agent';
 import { AGENT_INPUT_SCHEMA, agentToolDescription, agentOfTool, describeAgentCall, readAgentCall } from '../server/providers/agent-tool';
 import { DemoProvider } from '../server/providers/demo';
@@ -27,6 +29,21 @@ function setup() {
 }
 
 describe('sub-agent tool', () => {
+  it('bounds Claude Code tree retirement when the owned process never confirms exit', async () => {
+    const process = Object.setPrototypeOf(new EventEmitter(), GatedProcess.prototype) as GatedProcess;
+    // A physical process stand-in with no PID cannot invoke the system's tree killer.
+    const kill = vi.fn();
+    Object.assign(process, { ended: false, child: { pid: undefined, exitCode: null, signalCode: null, kill } });
+    vi.useFakeTimers();
+    try {
+      const termination = expect(process.terminateDelegate()).rejects.toThrow(/exit was not confirmed/i);
+      await vi.advanceTimersByTimeAsync(4800);
+      await termination;
+      expect(kill.mock.calls.filter(([signal]) => signal === 'SIGKILL')).toHaveLength(4);
+      expect(process.listenerCount('exit')).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('names its agent and reads its call', () => {
     expect(agentOfTool('delegate_to_codex')).toBe('codex');
     expect(agentOfTool('mcp__sable__delegate_to_codex')).toBe('codex');

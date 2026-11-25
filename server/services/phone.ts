@@ -306,7 +306,7 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
   const until = (it.type === 'user' || it.type === 'notice') && it.until?.check?.output ? { until: { ...it.until, check: { ...it.until.check, output: cap(it.until.check.output, full ? FULL.field : 3000) } } } : {};
   switch (it.type) {
     case 'user': {
-      const { attachments, more: _more, ...rest } = it;
+      const { attachments, issuedTo, more: _more, ...rest } = it;
       Reflect.deleteProperty(rest, LIGHT);
       return { ...rest, ...textCap(it.text, full ? FULL.text : it.until ? LIMITS.step : LIMITS.answer), ...(attachments ? { attachments: trimAttachments(attachments) } : {}), ...until };
     }
@@ -338,6 +338,8 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
         status: it.status,
         ...(it.delegateReport ? { delegateReport: it.delegateReport } : {}),
         ...(it.delegateWait ? { delegateWait: it.delegateWait } : {}),
+        ...(it.delegateReceiptState && { delegateReceiptState: it.delegateReceiptState }),
+        ...(it.delegateRetryId && { delegateRetryId: it.delegateRetryId }),
         detail,
         ...(it.endedAt ? { endedAt: it.endedAt } : {}),
         ...(it.waitedMs ? { waitedMs: it.waitedMs } : {}),
@@ -377,6 +379,8 @@ export function phonePatch(patch: Partial<TimelineItem>, kind?: string): Partial
   delete p.handed;
   delete p.delegateAttempt;
   delete p.delegateCaller;
+  delete p.delegateReceiversPending;
+  delete p.issuedTo;
   delete p.delegateContinuations;
   delete p.delegateDeliveryId;
   if (p.detail) p.detail = trimDetail(p.detail as ToolDetail, LIMITS.field);
@@ -747,7 +751,7 @@ const QUEUE_TEXT = LIMITS.answer;
 export const QUEUE_PAGE = 20;
 export const PROMPTS_PAGE = 20;
 const trimQueue = (q: QueuedMessage[]) =>
-  q.map((m) => ({ ...m, ...(m.attachments ? { attachments: trimAttachments(m.attachments) } : {}), ...(m.text.length > QUEUE_TEXT ? { text: m.text.slice(0, QUEUE_TEXT), cut: true } : {}) })) as QueuedMessage[];
+  q.map(({ issuedPayload, issuedTo, ...m }) => ({ ...m, ...(m.attachments ? { attachments: trimAttachments(m.attachments) } : {}), ...(m.text.length > QUEUE_TEXT ? { text: m.text.slice(0, QUEUE_TEXT), cut: true } : {}) })) as QueuedMessage[];
 
 /**
  * Byte budgets, counted in UTF-8 as the frames go out: `app.hello` for a phone (its chats' list, and
@@ -872,7 +876,9 @@ export function phoneResult(method: string, result: unknown): unknown {
   if (method === 'queue.take') {
     // Its words whole (the phone edits them); its pictures without their data.
     const r = result as { message?: QueuedMessage };
-    return r.message ? { ...r, message: { ...r.message, ...(r.message.attachments ? { attachments: trimAttachments(r.message.attachments) } : {}) } } : r;
+    if (!r.message) return r;
+    const { issuedPayload, issuedTo, ...message } = r.message;
+    return { ...r, message: { ...message, ...(message.attachments ? { attachments: trimAttachments(message.attachments) } : {}) } };
   }
   return result;
 }
@@ -1766,7 +1772,7 @@ export class PhoneService {
       }
       // A phone from before receipts: gone out to a phone still allowed, the message leaves the queue (if it is still that revision); otherwise it stays as it was.
       if (err || !allowed()) return rt.rollbackReserved(qid);
-      this.app.takeReserved(rt, qid, held.rev);
+      if (this.app.takeReserved(rt, qid, held.rev)) void rt.persistInput?.().catch(err => rt.notice('error', 'Could not save the queue', String(err)));
     });
   }
 
@@ -1803,22 +1809,27 @@ export class PhoneService {
    * the same receipt answers the same. Kept: a held message leaves the queue now; one that went back
    * meanwhile leaves it if it is still there as it was; `taken` says whether it is out of the queue.
    */
-  private takeDone(deviceId: string, raw: Record<string, unknown>): { taken: boolean } {
+  private async takeDone(deviceId: string, raw: Record<string, unknown>): Promise<{ taken: boolean }> {
     const take = typeof raw.take === 'string' ? raw.take : '';
     const t = this.takes.get(take);
     if (!t || t.deviceId !== deviceId) return { taken: false };
-    if (t.state === 'taken') return { taken: true };
+    const rt = this.app.sessions.get(t.sessionId);
+    if (!rt) return { taken: false };
+    if (t.state === 'taken') {
+      await this.app.store.persistInput(rt.id, true);
+      return { taken: true };
+    }
     if (raw.kept === false) {
       this.releaseTake(take);
       return { taken: false };
     }
-    const rt = this.app.sessions.get(t.sessionId);
-    if (!rt) return { taken: false };
     clearTimeout(t.timer);
     // Went back meanwhile: taken now only while it is still that message, unchanged and not reserved by another take.
     if (t.state === 'released' && !rt.reserveQueued(t.id)) return { taken: false };
     const out = this.app.takeReserved(rt, t.id, t.rev);
     Object.assign(t, { state: out ? 'taken' : 'released', at: Date.now(), timer: undefined });
+    // This device RPC bypasses App.call's shutdown fence. A sealed snapshot cannot acknowledge a take.
+    if (out) await this.app.store.persistInput(rt.id, true);
     return { taken: !!out };
   }
 
@@ -2189,7 +2200,7 @@ export class PhoneService {
           return void (await this.takeQueued(link, req.id, raw, allowed, device.id));
         } else if (own === 'phone.takeDone') {
           act();
-          result = this.takeDone(device.id, raw);
+          result = await this.takeDone(device.id, raw);
         } else if (own === 'session.setMode') {
           // A mode that never asks answers only what the phone could allow itself; what only the desktop may answer keeps waiting there.
           const sessionId = String(raw.sessionId ?? '');
@@ -2210,7 +2221,10 @@ export class PhoneService {
           }
         } else {
           const params = narrow(req.method, raw, (sessionId, id) => this.app.sessions.get(sessionId)?.queue.find((q) => q.id === id)?.attachments);
-          if (own === 'session.send' && typeof raw.submitId === 'string' && raw.submitId.length > 0 && raw.submitId.length <= 128) {
+          const submission = own === 'session.send' || own === 'session.submission';
+          if (submission && (raw.submitId !== undefined || own === 'session.submission') && (typeof raw.submitId !== 'string' || !raw.submitId.length || raw.submitId.length > 128))
+            throw new Error('A submission ID must contain 1 to 128 characters.');
+          if (submission && typeof raw.submitId === 'string' && raw.submitId.length > 0 && raw.submitId.length <= 128) {
             params.submitId = 'phone-' + sha256(JSON.stringify([device.id, raw.submitId]));
           }
           // An answer from the phone allows only what the phone was shown, and answers questions it got whole.
@@ -2223,7 +2237,9 @@ export class PhoneService {
           act();
           // The guard goes along: a handler that waits (a send for the agent to start, a model change to apply) asks it again before it acts.
           // (`settled`: a phone knows a sign-in only as in or out, so its hello never says "not known yet".)
-          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed, settled: true, ...((own === 'session.send' || own === 'queue.sendNow') && { phoneSender }) }));
+          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed, settled: true, ...((submission || own === 'queue.sendNow') && { phoneSender }) }));
+          if (submission && params.submitId && (result as { ok?: boolean })?.ok)
+            result = { ...result as object, submitId: raw.submitId };
           // Folder browsing for a new chat: folders only, never file names.
           if (req.method === 'fs.list' && result && typeof result === 'object') {
             const r = result as { entries?: { dir: boolean }[] };

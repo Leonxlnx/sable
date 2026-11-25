@@ -12,7 +12,7 @@ export function forkHistory(items: TimelineItem[], whole: (row: TimelineItem) =>
     const active = ['running', 'pending', 'awaiting'].includes(row.status);
     if (!active && !row.delegateReport && !row.delegateDeliveryId && row.result?.agent?.background !== 'running'
       && row.workflow?.status !== 'running' && row.task?.state !== 'running' && row.task?.state !== 'lost') return row;
-    const { delegateCaller, delegateReport, delegateAttempt, delegateDeliveryId, delegateContinuations, delegateWait, ...copy } = whole(row) as typeof row;
+    const { delegateRetryId, delegateReceiptState, delegateReceiversPending, delegateCaller, delegateReport, delegateAttempt, delegateDeliveryId, delegateContinuations, delegateWait, ...copy } = whole(row) as typeof row;
     if (active) copy.status = 'cancelled';
     if (copy.result?.agent?.background === 'running') copy.result = { ...copy.result, agent: { ...copy.result.agent, background: 'stopped' } };
     if (copy.workflow?.status === 'running') copy.workflow = { ...copy.workflow, status: 'stopped' };
@@ -29,11 +29,12 @@ export function forkHistory(items: TimelineItem[], whole: (row: TimelineItem) =>
 export function cutAt(items: TimelineItem[], itemId: string): { kept: TimelineItem[]; next?: UserItem } | null {
   const at = items.findIndex((i) => i.id === itemId);
   if (at < 0) return null;
+  const history = (row: TimelineItem) => row.type !== 'user' || row.state !== 'queued' && !row.issuedUuid;
   for (let i = at + 1; i < items.length; i++) {
     const it = items[i];
-    if (it.type === 'user' && !it.parentId && it.state !== 'queued') return { kept: items.slice(0, i), next: it };
+    if (it.type === 'user' && !it.parentId && history(it)) return { kept: items.slice(0, i).filter(history), next: it };
   }
-  return { kept: items.filter((i) => !(i.type === 'user' && i.state === 'queued')) };
+  return { kept: items.filter(history) };
 }
 
 /**

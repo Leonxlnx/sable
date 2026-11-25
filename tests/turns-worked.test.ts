@@ -20,6 +20,14 @@ const record = (ts?: number, durationMs?: number) => row('turn', ts, { durationM
 const stop = (ts: number) => row('notice', ts, { variant: 'interrupted', text: 'Stopped' });
 const byId = (rows: TimelineItem[]) => Object.fromEntries(rows.map(r => [r.id, r]));
 const clockStep = (close: number) => [user(100_000), step(101_000, 106_000), record(close, 0)];
+// The record ends just inside the tool, just outside it, or starts just inside it.
+const skewed = (close: number) => [user(100_000), step(101_000, 106_000), record(close, 20_000)];
+const skewedEnds = [105_999, 106_001, 121_001];
+
+it.each(skewedEnds)('exports the twenty-second provider stretch with the closing clock at %i', close => {
+  const md = chatMarkdown({ title: 'Timing', provider: 'demo', cwd: '', createdAt: 1 }, skewed(close));
+  expect(md.split('\n').filter(s => s.startsWith('**Steps**'))).toEqual(['**Steps** (1, 20 s)']);
+});
 
 it.each([90_000, 86_400_000])('exports five measured seconds when the closing clock steps to %i', close => {
   const md = chatMarkdown({ title: 'Timing', provider: 'demo', cwd: '', createdAt: 1 }, clockStep(close));
@@ -31,6 +39,9 @@ for (const [platform, model] of Object.entries({ desktop: desk, phone })) {
     model.groupTurns(rows.map(r => r.id), rows.map(model.shapeOf).join(''), busy).groups[0] as desk.TurnGroup;
   const span = (rows: TimelineItem[]) => model.turnSpan(byId(rows), group(rows));
   describe(platform, () => {
+    it.each(skewedEnds)('keeps the twenty-second provider stretch with the closing clock at %i', close => {
+      expect(span(skewed(close))).toBe(20_000);
+    });
     it.each([90_000, 86_400_000])('keeps the measured tool interval when the closing clock steps to %i', close => {
       const rows = clockStep(close);
       expect(span(rows)).toBe(5000);

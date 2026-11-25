@@ -2,6 +2,8 @@ import type { TimelineItem } from './protocol';
 import { noticeLevel } from './notice';
 
 type ItemMap = Record<string, TimelineItem | undefined>;
+// Tool and provider clocks are sampled independently at either edge of a record.
+const RECORD_SKEW_MS = 250;
 
 /**
  * Where one item's own time ends, for a turn's or a checkpoint's span, or null when it is no act of
@@ -89,7 +91,7 @@ export function workedSpan(items: ItemMap, ids: readonly string[], from: string 
       const at = actEnd(it);
       if (at !== null && Number.isFinite(at)) {
         lastAct = Math.max(lastAct ?? it.ts, at);
-        if (it.ts < coverage) {
+        if (it.ts < coverage && !(at >= coverage && coverage - it.ts <= RECORD_SKEW_MS)) {
           first ??= it.ts;
           last = Math.max(last ?? first, at);
         }
@@ -105,6 +107,13 @@ export function workedSpan(items: ItemMap, ids: readonly string[], from: string 
         const it = items[ids[i]];
         const at = actEnd(it);
         if (it && hasTime(it.ts) && at !== null && Number.isFinite(at)) intervals.push([it.ts, Math.min(at, capAt)]);
+      }
+      // Place the measured stretch at the last observed end. The interval union counts
+      // overlapping acts once, including when the provider clock moved backwards.
+      if (duration && (!checkpoint || lead !== undefined)) {
+        const start = checkpoint ? Math.max(lastAct - duration, lead!) : lastAct - duration;
+        const stop = checkpoint && closer !== record ? closingTime ?? lastAct : lastAct;
+        intervals.push([start, Math.min(lastAct, stop, capAt)]);
       }
       return lastAct;
     }

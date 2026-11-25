@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type {
   BridgeEvent,
@@ -20,12 +21,12 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { agentOfTool } from '../providers/agent-tool';
-import { isCompactOutput, userText } from '../../shared/synthetic';
+import { isCompactOutput, userItemText } from '../../shared/synthetic';
 import { runsTask, worksInBackground } from '../../shared/background';
 import { taskServing } from './task-serving';
 import { turnLive, TurnLiveIndex } from '../../shared/turn-live';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
-import { anonymousDelegateStep, restoreWorkingDelegate, savedDelegateEnds } from './delegate-result';
+import { anonymousDelegateStep, resultDigest, restoreWorkingDelegate, savedDelegateEnds } from './delegate-result';
 import { backgroundAgentName } from './limit-policy';
 
 export type Emit = (event: BridgeEvent) => void;
@@ -140,8 +141,10 @@ export class SessionRuntime {
     return danger && !this.dangerHeld;
   }
   /** Sable owns these children independently of their provider's tool requests. */
-  readonly delegates = new Map<string, { detach(): void; stop(person: boolean): void; ended: Promise<unknown> }>();
+  readonly delegates = new Map<string, { detach(): void; callerGone?(): void; stop(person: boolean): void; revoke?(): void; quit?(): Promise<void>; ended: Promise<unknown> }>();
   onDelegateReport?: () => void;
+  /** Include an unissued report's destination in the result save. Call back once that save succeeds. */
+  stageDelegateReports?: () => (() => void) | undefined;
   readonly pendingDelegateReports = new Set<string>();
   readonly reservedDelegateReports = new Map<string, symbol>();
   private owedDelegateReports = new Set<string>();
@@ -224,12 +227,13 @@ export class SessionRuntime {
     for (const call of this.delegates.values()) call.stop(person);
   }
 
-  holdDelegateReports(why: 'stop' | 'budget') {
+  holdDelegateReports(why: 'stop' | 'budget', unissued?: (attempt: NonNullable<ToolItem['delegateAttempt']>) => boolean) {
     const ids = why === 'stop' ? [...this.pendingDelegateReports, ...this.reservedDelegateReports.keys()] : this.pendingDelegateReports;
     let changed = false;
     for (const id of ids) {
       const row = this.get<ToolItem>(id);
-      if (row?.delegateReport !== 'pending' || row.delegateWait === why || row.delegateWait === 'stop' || (why === 'budget' && row.delegateAttempt)) continue;
+      if (row?.delegateReport !== 'pending' || row.delegateWait === why || row.delegateWait === 'stop') continue;
+      if (why === 'budget' && (row.delegateWait === 'retry' || row.delegateAttempt && !unissued?.(row.delegateAttempt))) continue;
       this.patch<ToolItem>(id, { delegateWait: why });
       changed = true;
     }
@@ -250,10 +254,17 @@ export class SessionRuntime {
     if (v) this.clearSteerWaits();
     this.stopped = v;
     this.carried = false;
+    if (!v) this.onWakeEligibilityChanged?.();
   }
   private stopped = false;
   /** Unread messages returned to the queue wait for the person's next send. */
-  unreadQueueHeld = false;
+  private unreadHeld = false;
+  get unreadQueueHeld() { return this.unreadHeld; }
+  set unreadQueueHeld(value: boolean) {
+    if (this.unreadHeld === value) return;
+    this.unreadHeld = value;
+    this.onWakeEligibilityChanged?.();
+  }
   /** Preserve a phone sender's guard when its unread timeline card returns to the queue. */
   onReturnUntaken?: (item: UserItem) => void;
   /** The running turn carries a stop's hold it did not make (the agent began it by itself): the person's next message lifts it (`personSent`). */
@@ -271,6 +282,8 @@ export class SessionRuntime {
   onBackgroundLimit?: (rt: SessionRuntime, hit: BackgroundLimit) => void;
   /** First evidence of a personal limit arrived after Stop settled its turn. Offer a manual continuation. */
   onStoppedLimit?: (rt: SessionRuntime, notice: NoticeItem) => void;
+  /** A queue, limit or work transition can make an owed report eligible. */
+  onWakeEligibilityChanged?: () => void;
   /** The last background work ended with no turn running: the chat is at rest. */
   onRest?: (rt: SessionRuntime) => void;
   /** Sable took work away, or the process died (also reported with zero losses for crash protection). */
@@ -288,12 +301,16 @@ export class SessionRuntime {
     }
     const row = this.get<ToolItem>(id);
     if (row?.delegateCaller !== this.processGeneration || !this.foregroundResults.has(id)) return;
+    this.promote?.(row);
+    const digest = resultDigest(row.result?.text);
+    if (anonymousDelegateStep(content) !== 'delegate-' + row.delegateDeliveryId && (!digest || digest !== resultDigest(content))) return;
     this.patch<ToolItem>(id, { delegateCaller: undefined, delegateAttempt: undefined });
     void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the delegate receipt', String(err)));
   }
 
   endDelegateGeneration() {
     this.processGeneration++;
+    for (const owner of this.delegates.values()) owner.callerGone?.();
     const hadResults = this.foregroundResults.size > 0;
     for (const id of this.foregroundResults) {
       this.patch<ToolItem>(id, { delegateCaller: undefined, delegateReport: this.stopRequested ? 'stopped' : 'pending' });
@@ -312,7 +329,8 @@ export class SessionRuntime {
       this.reservedDelegateReports.delete(id);
       this.foregroundResults.delete(id);
       if (owner) {
-        owner.stop(true);
+        if (owner.revoke) owner.revoke();
+        else owner.stop(true);
         cleanup.push(owner.ended);
       }
     }
@@ -597,6 +615,7 @@ export class SessionRuntime {
   tasksLost(why: LostWhy, trigger?: LossTrigger): string[] {
     const names: string[] = [];
     const reports: string[] = [];
+    const independent = this.delegates.size && this.subtree(this.delegates.keys());
     if (trigger) {
       for (const t of this.reportedTasks) {
         if (this.running.has(this.taskSteps.get(t.id) ?? '') || (t.itemId && this.working.has(t.itemId))) continue;
@@ -607,11 +626,11 @@ export class SessionRuntime {
       if (trigger === 'death' || trigger === 'capability') {
         for (const id of this.working) {
           const step = this.get<ToolItem>(id)!;
-          if (!step.delegateReport) reports.push(backgroundAgentName(step));
+          if (!step.delegateReport && !(independent && independent.has(id))) reports.push(backgroundAgentName(step));
         }
       }
     }
-    const ids = this.items.filter((i) => this.running.has(i.id)).map((i) => i.id);
+    const ids = this.items.filter((i) => this.running.has(i.id) && !(independent && independent.has(i.id))).map((i) => i.id);
     for (const id of ids) {
       const item = this.index.get(id);
       if (!runsTask(item)) continue;
@@ -747,16 +766,20 @@ export class SessionRuntime {
 
   // ── queue ──
 
+  /** Only pre-pairing callers have a socket guard. Its owner is this chat's waiting row. */
+  readonly transientQueueGuards = new Map<string, () => boolean>();
+
   private queueChanged() {
     if (!this.queue.length) this.unreadQueueHeld = false;
+    this.onWakeEligibilityChanged?.();
     this.emit({ type: 'queue.updated', sessionId: this.id, queue: this.queue.map((q) => ({ ...q })) });
     this.onDirty(this, 'items');
   }
 
-  enqueue(text: string, attachments?: QueuedMessage['attachments'], phoneSender?: QueuedMessage['phoneSender']): QueuedMessage {
+  enqueue(text: string, attachments?: QueuedMessage['attachments'], phoneSender?: QueuedMessage['phoneSender'], until?: QueuedMessage['until']): QueuedMessage {
     // Nothing without words goes in (a page of the queue reads each one's).
     if (typeof text !== 'string') throw new Error('A message needs its words.');
-    const q: QueuedMessage = { id: randomUUID(), text, attachments: attachments?.length ? attachments : undefined, createdAt: Date.now(), ...(phoneSender && { phoneSender }) };
+    const q: QueuedMessage = { id: randomUUID(), text, attachments: attachments?.length ? attachments : undefined, createdAt: Date.now(), ...(phoneSender && { phoneSender }), ...(until && { until }) };
     this.queue.push(q);
     this.queueChanged();
     return q;
@@ -774,15 +797,22 @@ export class SessionRuntime {
     const files = attachments === undefined ? q.attachments : attachments.length ? attachments : undefined;
     if (!text.trim() && !files?.length) {
       this.queue.splice(at, 1);
+      this.transientQueueGuards.delete(id);
+      this.queueRev.delete(id);
     } else {
-      this.queue[at] = { ...q, text, attachments: files };
-      // A later receipt for the original payload cannot acknowledge the edited words.
-      if (q.issuedUuid && (q.text !== text || attachments !== undefined)) {
-        delete this.queue[at].issuedUuid;
-        this.queue[at].steerWait = { reason: 'Edited after the previous delivery attempt.' };
+      if (q.text === text && isDeepStrictEqual(q.attachments ?? [], files ?? [])) {
+        this.queueChanged(); // Spare also publishes its hold by updating the same payload.
+        return true;
       }
+      const edited = { ...q, text, attachments: files };
+      if (q.issuedUuid) {
+        edited.issuedPayload ??= { text: q.text, attachments: q.attachments };
+        if (edited.issuedPayload.text === text && isDeepStrictEqual(edited.issuedPayload.attachments ?? [], files ?? [])) delete edited.issuedPayload;
+        edited.byHand = true;
+      }
+      this.queue[at] = edited;
+      this.queueRev.set(id, (this.queueRev.get(id) ?? 0) + 1);
     }
-    this.queueRev.set(id, (this.queueRev.get(id) ?? 0) + 1);
     this.queueChanged();
     return true;
   }
@@ -820,6 +850,7 @@ export class SessionRuntime {
     const at = this.queue.findIndex((x) => x.id === id);
     const out = at >= 0 && had === rev && (this.queueRev.get(id) ?? 0) === rev ? this.queue.splice(at, 1)[0] : undefined;
     if (out) {
+      this.transientQueueGuards.delete(id);
       this.queueRev.delete(id);
       this.queueChanged();
     }
@@ -855,15 +886,55 @@ export class SessionRuntime {
   queueReason(id: string, reason: string) {
     const entry = this.queue.find(q => q.id === id);
     if (!entry) return;
-    entry.steerWait = { reason };
-    this.queueChanged();
+    if (entry.steerWait?.reason !== reason) {
+      entry.steerWait = { reason };
+      this.queueChanged();
+    }
+  }
+
+  markStillQueued(id: string, uuid: string) {
+    const card = this.get<UserItem>(id);
+    const row = card?.issuedUuid === uuid ? card : this.queue.find(q => q.issuedUuid === uuid);
+    if (!row?.issuedTo) return;
+    const issuedTo = { ...row.issuedTo, stillQueued: true };
+    const steerWait = { reason: 'Claude still has this input queued.' };
+    if (row === card) this.patch<UserItem>(id, { issuedTo, steerWait });
+    else {
+      Object.assign(row, { issuedTo, steerWait, byHand: true });
+      this.queueChanged();
+    }
+  }
+
+  /** A native receipt belongs to the payload that went out, even if the waiting row was edited. */
+  confirmSteerReceipt(uuid: string): UserItem | undefined {
+    const row = this.queue.find(q => q.issuedUuid === uuid);
+    if (!row || this.get(row.id)) return;
+    const edited = row.issuedPayload;
+    if (edited) {
+      delete row.issuedPayload;
+      delete row.issuedUuid;
+      delete row.issuedTo;
+      row.byHand = true;
+      this.queueReason(row.id, 'Claude received the original message. The edit waits for you.');
+    } else {
+      this.rollbackReserved(row.id);
+      this.takeQueued(row.id);
+    }
+    return this.add<UserItem>({
+      type: 'user', id: edited ? undefined : row.id, ts: row.createdAt,
+      text: (edited ?? row).text, attachments: (edited ?? row).attachments,
+      ...(row.until ? { until: row.until } : { steered: true, authored: true }), phoneSender: row.phoneSender,
+      submitPrint: row.submitPrint, state: 'sent', providerId: uuid,
+    });
   }
 
   confirmDropped(uuid: string) {
     const entry = this.queue.find(q => q.issuedUuid === uuid);
     if (!entry) return;
     delete entry.issuedUuid;
-    delete entry.byHand;
+    delete entry.issuedTo;
+    if (!entry.issuedPayload) delete entry.byHand;
+    delete entry.issuedPayload;
     entry.steerWait = { reason: 'Claude confirmed withdrawal.' };
     this.queueChanged();
   }
@@ -897,7 +968,8 @@ export class SessionRuntime {
       id: u.id, text: u.text, attachments: u.attachments, createdAt: u.ts,
       ...(u.submitPrint && { submitPrint: u.submitPrint }), ...(u.phoneSender && { phoneSender: u.phoneSender }),
       ...(u.steerOrder && { steerOrder: u.steerOrder }), ...(u.steerAttempts && { steerAttempts: u.steerAttempts }),
-      ...(u.issuedUuid && { issuedUuid: u.issuedUuid, steerWait: { reason: 'Issued to Claude. Receipt unknown.' } }),
+      ...(u.until && { until: u.until }),
+      ...(u.issuedUuid && { issuedUuid: u.issuedUuid, issuedTo: u.issuedTo, steerWait: { reason: u.issuedTo?.stillQueued ? 'Claude still has this input queued.' : 'Issued to Claude. Receipt unknown.' } }),
       ...(u.issuedUuid || opts.byHand?.has(u.id) ? { byHand: true } : {}),
     }));
     this.requeue(returned);
@@ -920,6 +992,7 @@ export class SessionRuntime {
     const at = id ? this.queue.findIndex((x) => x.id === id) : this.queue.length ? 0 : -1;
     if (at < 0 || this.reserved.has(this.queue[at].id)) return undefined;
     const [q] = this.queue.splice(at, 1);
+    this.transientQueueGuards.delete(q.id);
     this.queueRev.delete(q.id);
     this.queueChanged();
     return q;
@@ -986,6 +1059,7 @@ export class SessionRuntime {
     const previous = item.type === 'tool' ? item.task : undefined;
     const taken = item.type === 'user' && item.state === 'queued' && (patch as Partial<UserItem>).state === 'sent';
     Object.assign(item, patch);
+    if (item.type === 'notice' && 'limit' in patch) this.onWakeEligibilityChanged?.();
     if (item.type === 'tool' && ('delegateReport' in patch || 'delegateCaller' in patch)) {
       if (item.delegateCaller !== undefined && item.delegateAttempt?.tool) this.foregroundResults.add(id);
       else this.foregroundResults.delete(id);
@@ -1119,7 +1193,7 @@ export class SessionRuntime {
     const item = this.index.get(id);
     if (item?.type !== 'user') return;
     const issued = item.issuedUuid;
-    if (issued) patch = { ...patch, issuedUuid: undefined };
+    if (issued) patch = { ...patch, issuedUuid: undefined, issuedTo: undefined };
     if (item.state !== 'queued') this.patch<UserItem>(id, { state: 'sent', ...patch });
     else this.move(id, { state: 'sent', ...patch } as Partial<TimelineItem>, !!item.steered || !!item.steerAttempts);
     if (issued) void this.persistInput?.().catch(err => this.notice('error', 'Could not save the delivery receipt', (err as Error).message));
@@ -1165,6 +1239,8 @@ export class SessionRuntime {
         }
       }
     }
+    if (this.delegates.size || this.pendingDelegateReports.size || this.reservedDelegateReports.size) void this.revokeDelegates(gone);
+    if (removed.type === 'notice' && removed.limit) this.onWakeEligibilityChanged?.();
     for (const g of gone) this.index.delete(g);
     if (this.nextHead && gone.has(this.nextHead.id)) this.nextHead = undefined;
     if (this.liveTurn) {
@@ -1204,6 +1280,7 @@ export class SessionRuntime {
       this.liveTurn = new TurnLiveIndex();
       for (const item of items) if (previous.has(item.id)) this.liveTurn.put(item);
     }
+    this.onWakeEligibilityChanged?.();
     this.emit({ type: 'timeline.reset', sessionId: this.id, items: items.map((i) => ({ ...i })) });
     this.onDirty(this, 'items');
     // Re-publish the effective counts after the silent load.
@@ -1228,6 +1305,7 @@ export class SessionRuntime {
       }
     }
     if (!Object.keys(changed).length) return;
+    if ('commands' in changed || 'background' in changed || 'spare' in changed || 'accountId' in changed || 'status' in changed || 'lossWake' in changed) this.onWakeEligibilityChanged?.();
     this.emit({ type: 'session.updated', id: this.id, patch: changed });
     this.onDirty(this, 'meta');
   }
@@ -1344,6 +1422,7 @@ export class SessionRuntime {
     if (!this.carried) return;
     this.carried = false;
     this.stopped = false;
+    this.onWakeEligibilityChanged?.();
   }
 
   endTurn(error?: string, opts?: { hold?: boolean; backgroundLimit?: boolean }) {
@@ -1528,10 +1607,9 @@ export class SessionRuntime {
    * (it ended, or Sable restarted): they died with it and their end will never be reported.
    */
   stopBackground(only?: (item: TimelineItem) => boolean) {
-    if (!only) this.stopDelegates(false);
+    const independent = this.delegates.size && this.subtree(this.delegates.keys());
     for (const item of this.items) {
-      if (only && !only(item)) continue;
-      if (this.delegates.has(item.id)) continue;
+      if (independent && independent.has(item.id) || only && !only(item)) continue;
       const stopped = stoppedBackground(item);
       if (stopped === item || stopped.type !== 'tool') continue;
       const was = item as ToolItem;
@@ -1557,7 +1635,7 @@ export class SessionRuntime {
   private settleSteps(reason: 'cancelled' | 'error', opts: { endUnknown?: boolean; at?: number }, live: boolean) {
     const roots = [...this.apart];
     // A separate delegate process can still be confirming its interrupt after its parent died.
-    if (!live) for (const id of this.delegates.keys()) if (this.get<ToolItem>(id)?.delegateReport) roots.push(id);
+    if (!live) roots.push(...this.delegates.keys());
     if (live) for (const i of this.items) if (worksInBackground(i) || runsTask(i)) roots.push(i.id);
     const keep = roots.length ? this.subtree(roots) : undefined;
     const from = this.turnStartedAt || this.lastTurnStart();
@@ -1642,10 +1720,10 @@ export function pendingPrompts(runtimes: Iterable<SessionRuntime>): PendingPromp
   return out;
 }
 
-export function autoTitle(text: string): string {
+export function autoTitle(text: string, authored = false): string {
   // What the agent's harness writes in the person's place reads by its plain words, never as tags.
   const line =
-    userText(text)
+    userItemText({ type: 'user', text, authored })
       .replace(/```[\s\S]*?```/g, ' ')
       .split('\n')
       .map((l) => l.trim())

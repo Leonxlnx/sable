@@ -8,8 +8,9 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resultDigest } from '../server/core/delegate-result';
 import { runSubAgent } from '../server/core/sub-agent';
-import type { SessionRuntime } from '../server/core/runtime';
+import { SessionRuntime } from '../server/core/runtime';
 import type { Provider } from '../server/providers/types';
 import type { TextItem, ToolItem } from '../shared/protocol';
 import { delegateReport, parseSynthetic } from '../shared/synthetic';
@@ -183,10 +184,10 @@ it.each([false, true])('Stop interrupts the exact child Codex turn and closes it
   expect(parent.rt.pendingDelegateReports.size).toBe(0);
 });
 
-it('keeps a delegated Codex root until its receiver ends and retries unsubscribe', async () => {
+it.each(['completed','idle'])('keeps a delegated Codex root until its receiver ends and retries unsubscribe (%s)', async end => {
   const parent = await codexFake();
   let failed = false;
-  const codex = await codexFake({ unsubscribe: () => { if (!failed) { failed = true; throw Error('temporary'); } } });
+  const codex = await codexFake({ turnsList: () => ({ data: [{ id: 'subturn', status: 'completed' }] }), unsubscribe: () => { if (!failed) { failed = true; throw Error('temporary'); } } });
   const step = parent.rt.add<ToolItem>({ type: 'tool', name: 'delegate_to_codex', kind: 'agent', title: 'Review', status: 'running', detail: {} });
   const result = runSubAgent({ provider: () => codex.provider, accountFor: () => undefined, defaultModel: () => 'm', modeFor: () => 'default', log() {} },
     parent.rt, { agent: 'codex', description: 'Review', prompt: 'inspect', background: true }, step.id);
@@ -199,13 +200,37 @@ it('keeps a delegated Codex root until its receiver ends and retries unsubscribe
   await tick();
   expect(parent.rt.delegates.has(step.id)).toBe(true);
   expect(step.delegateReport).toBe('working');
-  codex.notify('turn/completed', { threadId: 'receiver', turn: { id: 'subturn', status: 'completed' } });
+  if (end === 'idle') {
+    await parent.rt.persistDelegate!();
+    const disk = parent.app.store.loadSession(parent.id).items;
+    expect(disk.find(i => i.id === step.id)).toMatchObject({ delegateReceiversPending: true });
+    const restored = new SessionRuntime({ ...parent.rt.meta }, () => {}, () => {});
+    restored.loadRestored(disk);
+    expect(restored.get<ToolItem>(step.id)?.result?.text).toContain('Sable restarted');
+    // A pre-field save still has the running receiver on its spawn row.
+    const older = structuredClone(parent.rt.items);
+    delete (older.find(i => i.id === step.id) as ToolItem).delegateReceiversPending;
+    restored.loadRestored(older);
+    expect(restored.get<ToolItem>(step.id)?.result?.text).toContain('Sable restarted');
+    codex.notify('thread/status/changed', { threadId: 'receiver', status: { type: 'idle' } });
+  } else codex.notify('turn/completed', { threadId: 'receiver', turn: { id: 'subturn', status: 'completed' } });
   await until(() => !parent.rt.delegates.size, 'receiver finish');
   expect(codex.calls.filter(c => c.method === 'thread/unsubscribe').map(c => c.params.threadId)).toContain('th1');
   expect(codex.count('thread/unsubscribe')).toBeGreaterThanOrEqual(2);
 });
 
-it('reconciles a Codex report by ID and waits for the native turn before retrying an absent one', async () => {
+it('checks the recorded Codex dynamic result instead of trusting the call ID or status', async () => {
+  const h = await codexFake({ threadRead: () => ({ thread: { turns: [{ id: 'turn', status: 'completed', items: [
+    { id: 'wrong', type: 'dynamicToolCall', status: 'failed', contentItems: [{ type: 'inputText', text: 'Interrupted' }] },
+    { id: 'good', type: 'dynamicToolCall', status: 'completed', contentItems: [{ type: 'inputText', text: 'answer' }] },
+    { id: 'other', type: 'dynamicToolCall', status: 'completed', contentItems: [{ type: 'inputText', text: 'answer' }] },
+  ] }] } }) });
+  const wanted = { digest: resultDigest('answer') };
+  const receipts = await h.provider.delegateReceipts('th1', '', undefined, { ids: new Set(), tools: new Map([['turn:good', wanted], ['turn:wrong', wanted]]) });
+  expect([...receipts.ids]).toEqual(['tool:turn:good']);
+});
+
+it('reconciles a Codex report by ID and waits for a personal retry decision for an absent one', async () => {
   const id = 'fea5b259-ff81-4da5-9670-bf4f16ae95ce';
   const words = delegateReport('Review', 'done', 'Findings', id);
   let active = true;
@@ -220,17 +245,23 @@ it('reconciles a Codex report by ID and waits for the native turn before retryin
   expect(h.rt.get<ToolItem>('call1')?.delegateReport).toBe('pending');
   expect(h.count('turn/start')).toBe(0);
   active = false;
-  await h.send('continue');
+  expect(h.rt.get<ToolItem>('call1')?.delegateReceiptState).toBe('unknown');
+  await h.app.call('session.send', { sessionId: h.id, text: '/report-retry ' + h.rt.get<ToolItem>('call1')!.delegateRetryId });
+  await until(() => h.count('turn/start') > 0, 'requested resend');
   const input = h.calls.find(c => c.method === 'turn/start')?.params.input as { text: string }[];
   expect(input[0].text).toContain('dfed6fdd-3fba-4c20-b5d6-25145a92a43f');
   expect(input[0].text).not.toContain(id);
   h.complete('turn1');
 });
 
-it('hard-closes the dedicated app-server after unconfirmed interrupts without closing its account peer', async () => {
+it.each(['immediate', 'retry', 'force'])('hard-closes the dedicated app-server after unconfirmed interrupts without closing its account peer (exit delayed %s)', async delayed => {
   const h = await codexFake();
   const rpc = {
-    alive: true, ended: Promise.resolve(), close: vi.fn(async () => { rpc.alive = false; }),
+    alive: true, ended: new Promise<void>(() => {}), close: vi.fn(async () => {
+      if (delayed === 'force' || delayed === 'retry' && rpc.close.mock.calls.length === 1) return new Promise<void>(() => {});
+      rpc.alive = false;
+    }),
+    forceDelegate: vi.fn(async () => { rpc.alive = false; }),
     request: vi.fn(async (method: string) => {
       if (method === 'thread/start') return { thread: { id: 'only-child' }, model: 'm' };
       if (method === 'turn/start') return { turn: { id: 'only-turn' } };
@@ -249,12 +280,17 @@ it('hard-closes the dedicated app-server after unconfirmed interrupts without cl
     await h.provider.ctx.runAgent!(h.rt, { agent: 'codex', description: 'Hard close', prompt: 'inspect', background: true }, undefined);
     await until(() => rpc.request.mock.calls.some(([method]) => method === 'turn/start'), 'isolated child started');
     await h.app.call('session.close', { sessionId: h.id, remove: true });
+    expect(h.app.sessions.has(h.id)).toBe(false);
+    expect(rpc.alive).toBe(true);
+    await until(() => !rpc.alive, 'deleted process retired', 9000);
+    expect(rpc.forceDelegate).toHaveBeenCalledTimes(delayed === 'force' ? 1 : 0);
     expect(rpc.close).toHaveBeenCalledWith(0, 'timeout');
     expect(rpc.request.mock.calls.filter(([method]) => method === 'turn/interrupt').length).toBeGreaterThan(1);
+    expect(rpc.close.mock.calls.length).toBeGreaterThanOrEqual(delayed === 'immediate' ? 1 : 2);
     expect(start).toHaveBeenCalledTimes(1);
     expect(h.count('turn/interrupt')).toBe(0);
   } finally { vi.restoreAllMocks(); }
-});
+}, 12_000);
 
 const lastTurn = (rt: SessionRuntime) => rt.items.findLast((i) => i.type === 'turn') as { stopReason?: string; error?: string } | undefined;
 

@@ -1,3 +1,4 @@
+import { terminateDelegateProcess } from '../util/proc';
 import { VERSION } from '../version';
 import { record, type AuthScope, type StartReason } from '../core/auth-journal';
 import { authGate, gateKey, noteAuthFailure } from '../core/auth-gate';
@@ -46,7 +47,7 @@ import { CodexRpc, RpcError, resolveCodexCommand, type ExitInfo } from './codex-
 import { serviceTierFor } from './codex-map';
 import { AGENT_INPUT_SCHEMA, AGENT_TOOLS, agentOfTool, agentToolDescription, readAgentCall } from './agent-tool';
 import { PROFILE_DESCRIPTION, PROFILE_INPUT_SCHEMA, PROFILE_TOOL, isProfileTool, profileDynamicAnswer } from './profile-tool';
-import { anonymousDelegateStep } from '../core/delegate-result';
+import { toolReceipt, type WantedReceipts } from '../core/delegate-result';
 import { readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
 import { compactScope, fileLine, withScope } from '../core/permission-scope';
@@ -304,22 +305,25 @@ export class CodexProvider implements Provider {
     return this.env?.CODEX_HOME ?? process.env.CODEX_HOME ?? path.join(homedir(), '.codex');
   }
 
-  async delegateReceipts(session: string) {
-    const rpc = await this.client();
+  async delegateReceipts(session: string, _cwd: string, _after: string | undefined, wanted: WantedReceipts, signal = AbortSignal.timeout(3000)) {
+    const deadline = Date.now() + 3000;
+    const rpc = await this.client('history');
+    signal.throwIfAborted();
     const receipts = new Set<string>();
-    const response = await rpc.request<{ thread: Thread }>('thread/read', { threadId: session, includeTurns: true }, 60_000);
+    const response = await rpc.request<{ thread: Thread }>('thread/read', { threadId: session, includeTurns: true }, Math.max(1, deadline - Date.now()));
+    signal.throwIfAborted();
     if (!response.thread?.turns?.length) throw new Error('The Codex conversation is unavailable for report reconciliation.');
     for (const turn of response.thread.turns) for (const item of turn.items ?? []) {
       if (item.type === 'userMessage') for (const block of item.content) {
-        if (block.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, receipts);
+        if (block.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, receipts, wanted.ids);
       }
       if (item.type === 'dynamicToolCall' && (item.status === 'completed' || item.status === 'failed')) {
-        receipts.add('tool:' + turn.id + ':' + item.id);
-        const synthetic = anonymousDelegateStep(item.contentItems);
-        if (synthetic) receipts.add('tool:' + synthetic);
+        const key = toolReceipt(turn.id + ':' + item.id, item.contentItems, wanted.tools);
+        if (key) receipts.add('tool:' + key);
       }
     }
-    return { ids: receipts, settled: response.thread.turns.every(turn => Array.isArray(turn.items) && ['completed', 'failed', 'interrupted'].includes(turn.status)) };
+    // A terminal turn in a replay does not prove this particular input was durably excluded.
+    return { ids: receipts, settled: receipts.size > 0 && receipts.size === wanted.ids.size + wanted.tools.size };
   }
 
   /** Copies the thread's rollout from another account's CODEX_HOME into this one (see accounts/handover). */
@@ -381,11 +385,11 @@ export class CodexProvider implements Provider {
     this.armIdle();
     if (!this.starting) {
       // Experimental API: remote control lives there (the rest of the protocol is unchanged).
-      this.starting = CodexRpc.start({ log: this.ctx.log, clientVersion: CLIENT_VERSION, env: this.env, experimental: true, folder: gateKey(this.id, this.configHome()), owner: this.rpcOwner, scope: this.scope(reason), closing: () => this.disposed || !!this.ctx.closing?.() })
+      this.starting = CodexRpc.start({ log: this.ctx.log, clientVersion: CLIENT_VERSION, env: this.env, experimental: true, spawned: this.delegateOwner ? rpc => { this.spawnedDelegate = rpc; } : undefined, folder: gateKey(this.id, this.configHome()), owner: this.rpcOwner, scope: this.scope(reason), closing: () => this.disposed || !!this.ctx.closing?.() })
         .then(async (rpc) => {
           if (this.disposed) {
-            await rpc.close(this.delegateOwner ? 0 : undefined, this.delegateOwner ? 'timeout' : 'quit');
-            if (this.delegateOwner) await rpc.ended;
+            if (this.delegateOwner) await this.stopDelegateRpc(rpc, true);
+            else await rpc.close(undefined, 'quit');
             throw new Error('Codex provider is shut down');
           }
           rpc.onNotification = (m, p) => { if (this.rpc === rpc) this.onNotification(m, p); };
@@ -1081,8 +1085,15 @@ export class CodexProvider implements Provider {
   }
 
   private disposal?: Promise<void>;
+  private spawnedDelegate?: CodexRpc;
+  private retiringDelegate?: Promise<void>;
 
   dispose(hard = false): Promise<void> { return this.disposal ??= this.closeProcesses(hard); }
+
+  private stopDelegateRpc(rpc: CodexRpc, hard: boolean) {
+    return this.retiringDelegate ??= terminateDelegateProcess(() => rpc.alive, rpc.ended,
+      retry => hard || retry ? rpc.close(0, 'timeout') : rpc.close(undefined, 'quit'), () => rpc.forceDelegate());
+  }
 
   private async closeProcesses(hard: boolean) {
     this.disposed = true;
@@ -1091,12 +1102,16 @@ export class CodexProvider implements Provider {
     for (const s of this.sessions.values()) s.abortPrompts();
     this.sessions.clear();
     this.attached.clear();
-    const rpc = this.rpc ?? (await this.starting?.catch(() => null)) ?? null;
+    const rpc = this.rpc ?? this.spawnedDelegate ?? (await this.starting?.catch(() => null)) ?? null;
     this.rpc = null;
     await Promise.all([...this.delegateProcesses].map(child => child.dispose(true)));
-    await rpc?.close(hard ? 0 : undefined, hard ? 'timeout' : 'quit');
-    if (this.delegateOwner) await rpc?.ended;
-    this.delegateOwner?.delegateProcesses.delete(this);
+    try {
+      if (rpc && this.delegateOwner) await this.stopDelegateRpc(rpc, hard);
+      else await rpc?.close(hard ? 0 : undefined, hard ? 'timeout' : 'quit');
+    } finally {
+      this.spawnedDelegate = undefined;
+      this.delegateOwner?.delegateProcesses.delete(this);
+    }
     await this.closingRpc;
   }
 }
@@ -1431,7 +1446,7 @@ class CodexSession implements ProviderSession {
 
   async close(reason?: Parameters<ProviderSession['close']>[0]) {
     if (this.closed) return;
-    this.rt.stopDelegates(this.rt.stopRequested || reason === 'close' || reason === 'quit');
+    if (reason === 'close' || this.rt.stopRequested) this.rt.stopDelegates(true);
     if (this.rt.turnActive) await this.interrupt().catch(() => {});
     this.closed = true;
     this.rt.endDelegateGeneration();
@@ -1833,12 +1848,12 @@ class CodexSession implements ProviderSession {
   }
 
   /** The thread's latest few turns as its store has them (newest first); undefined when it cannot say. */
-  private async storedTurns(): Promise<Turn[] | undefined> {
+  private async storedTurns(threadId = this.threadId): Promise<Turn[] | undefined> {
     // Asked of the app-server that runs the thread (never one started for this).
     if (!this.loaded || this.provider.sessions.get(this.threadId) !== this) return undefined;
     try {
       const rpc = await this.provider.client();
-      const r = await rpc.request<{ data?: Turn[] }>('thread/turns/list', { threadId: this.threadId, limit: IDLE_LOOKUP_TURNS, sortDirection: 'desc', itemsView: 'notLoaded' }, 10_000);
+      const r = await rpc.request<{ data?: Turn[] }>('thread/turns/list', { threadId, limit: IDLE_LOOKUP_TURNS, sortDirection: 'desc', itemsView: 'notLoaded' }, 10_000);
       return Array.isArray(r?.data) ? r.data : undefined;
     } catch (err) {
       this.log('thread/turns/list failed', errMsg(err));
@@ -2202,18 +2217,7 @@ class CodexSession implements ProviderSession {
     const failed = this.errorOf(turnId);
     if (failed) return this.completeTurn({ status: 'failed', error: failed });
     if (this.interrupting || rt.stopRequested) return this.completeTurn({ status: 'interrupted' });
-    let stored: Turn | undefined;
-    // Asked of the app-server that runs the thread (never one started for this).
-    if (this.loaded && this.provider.sessions.get(this.threadId) === this) {
-      try {
-        const rpc = await this.provider.client();
-        // The latest few, so the turn's own record is found also when the thread went on to another.
-        const r = await rpc.request<{ data?: Turn[] }>('thread/turns/list', { threadId: this.threadId, limit: IDLE_LOOKUP_TURNS, sortDirection: 'desc', itemsView: 'notLoaded' }, 10_000);
-        stored = r?.data?.find((x) => x?.id === turnId);
-      } catch (err) {
-        this.log('thread/turns/list failed; the turn is asked about again', errMsg(err));
-      }
-    }
+    const stored = (await this.storedTurns())?.find(t => t.id === turnId);
     if (!current()) return;
     // Known by now (an error or a stop came while the thread was asked).
     const late = this.errorOf(turnId);
@@ -2493,6 +2497,16 @@ class CodexSession implements ProviderSession {
       if (spawn) this.rt.limitInBackground({ stepId: spawn, window: full?.label, resetsAt: full?.resetsAt });
       return;
     }
+    if (method === 'thread/status/changed' && p?.status?.type === 'idle' && this.receiverLive.has(tid)) {
+      if (!this.receiverProbes.has(tid)) this.probeReceiverIdle(tid);
+      return;
+    }
+    const currentTurn = this.receiverTurns.get(tid);
+    if (method === 'turn/completed' && currentTurn && p?.turn?.id && p.turn.id !== currentTurn) return;
+    if (method.startsWith('item/') && (!currentTurn || p?.turnId === currentTurn)) {
+      clearTimeout(this.receiverProbes.get(tid));
+      this.receiverProbes.delete(tid);
+    }
     // The receiver's running turn, so a limit can stop it for real (`stopBackgroundWork`).
     if (method === 'turn/started' && typeof p?.turn?.id === 'string') this.receiverTurns.set(tid, p.turn.id);
     else if (method === 'turn/completed' || method === 'thread/closed') this.receiverTurns.delete(tid);
@@ -2508,6 +2522,9 @@ class CodexSession implements ProviderSession {
   private receiverState(tid: string, state: AgentBackground | undefined, gone = false) {
     const spawn = this.receivers.get(tid);
     if (!spawn || !state) return;
+    clearTimeout(this.receiverProbes.get(tid));
+    this.receiverProbes.delete(tid);
+    if (state !== 'running') this.receiverTurns.delete(tid);
     if (state === 'running') this.receiverLive.add(tid);
     else this.receiverLive.delete(tid);
     if (!this.receiverLive.size) this.receiversDone?.();
@@ -2525,12 +2542,34 @@ class CodexSession implements ProviderSession {
     if (was === shown || (shown !== 'running' && was !== 'running')) return;
     this.rt.patch<ToolItem>(spawn, { result: { ...item.result, agent: { ...item.result?.agent, background: shown } } });
   }
+  private receiverProbes = new Map<string, NodeJS.Timeout>();
+  private probeReceiverIdle(tid: string, wait = THREAD_IDLE_GRACE_MS, attempt = 0) {
+    clearTimeout(this.receiverProbes.get(tid));
+    const turn = this.receiverTurns.get(tid);
+    const timer = setTimeout(async () => {
+      const turns = await this.storedTurns(tid);
+      if (this.receiverProbes.get(tid) !== timer) return;
+      const stored = turn ? turns?.find(t => t.id === turn) : turns?.[0];
+      if (stored?.status === 'completed' || stored?.status === 'failed' || stored?.status === 'interrupted') {
+        this.receiverState(tid, stored.status === 'completed' ? 'done' : stored.status === 'failed' ? 'failed' : 'stopped');
+      } else if (this.idleRecheckMs[attempt] !== undefined) {
+        this.probeReceiverIdle(tid, this.idleRecheckMs[attempt], attempt + 1);
+      } else {
+        this.receiverProbes.delete(tid);
+        this.rt.notice('info', 'Codex has not confirmed the receiver’s last turn', 'The delegate waits for confirmation or Stop.');
+      }
+    }, wait);
+    this.receiverProbes.set(tid, timer);
+  }
   private receiverLive = new Set<string>();
-  private receiversDone?: () => void;
+  private receiversDone?: (lost?: boolean) => void;
 
   waitForReceivers(): Promise<void> | undefined {
     if (!this.receiverLive.size) return;
-    return new Promise<void>(resolve => { this.receiversDone = resolve; }).then(() => this.waitForReceivers());
+    return new Promise<boolean | undefined>(resolve => { this.receiversDone = resolve; }).then(lost => {
+      if (lost) throw new Error('The Codex process ended while its receivers were working.');
+      return this.waitForReceivers();
+    });
   }
 
   async interruptReceivers() { await this.stopBackgroundWork(); }
@@ -2585,8 +2624,12 @@ class CodexSession implements ProviderSession {
     const spawns = new Set(this.receivers.values());
     for (const tid of this.receivers.keys()) if (this.provider.receivers.get(tid) === this) this.provider.receivers.delete(tid);
     this.receivers.clear();
+    for (const timer of this.receiverProbes.values()) clearTimeout(timer);
+    this.receiverProbes.clear();
+    const lost = processEnded && this.receiverLive.size > 0;
     this.receiverLive.clear();
-    this.receiversDone?.();
+    this.receiversDone?.(lost);
+    this.receiversDone = undefined;
     this.receiverTurns.clear();
     if (processEnded || spawns.size) this.rt.stopBackground(processEnded ? undefined : i => spawns.has(i.id));
   }
@@ -2598,7 +2641,7 @@ class CodexSession implements ProviderSession {
     const id = `${n.turnId}:${item.id}`;
     const existing = rt.get(id);
     if (completed && item.type === 'dynamicToolCall') rt.delegateReceipt(id, item.contentItems);
-    if (existing?.type === 'tool' && existing.delegateReport) return;
+    if (existing?.type === 'tool' && (existing.delegateDeliveryId || existing.delegateReport)) return;
     if (item.type === 'fileChange' && existing?.type === 'tool') rt.promote?.(existing);
     if (item.type === 'contextCompaction' && completed) {
       if (this.compactSeen) return;

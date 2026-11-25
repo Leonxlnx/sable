@@ -1,5 +1,5 @@
 import { constants as bufferLimits, isUtf8 } from 'node:buffer';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { largeRowReader, scanSession, sessionTail } from './session-json';
 import * as fs from 'node:fs';
 import { closeSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -63,6 +63,10 @@ export const TAIL_MAX = 8 * 1024 * 1024;
  *  size a tail reaches before it is folded anyway. (A cap of 1 MiB kept every long chat that rests with a
  *  tail of a few megabytes, which is the usual case, from ever being brought over.) */
 const MIGRATION_TAIL_MAX = TAIL_MAX;
+// The optional writer allocates a replacement offset map, even for a byte-for-byte copy.
+const MIGRATION_ROWS_MAX = 131_072;
+const PRIVATE_ROW_MAX = 16 << 20;
+const PRIVATE_PAYLOAD_MAX = 64 << 20;
 /** A base smaller than this is simply written whole every time (as before). */
 export const SMALL_BASE = 4 * 1024 * 1024;
 /** Changed settled items the tail carries (`over`) before the base is written again with them: count, and characters. */
@@ -77,6 +81,18 @@ function baseline(line?: Line) {
   return line?.preview ?? (line?.json ? JSON.parse(line.json) as TimelineItem : undefined);
 }
 type LineIndex = Map<string, Line>;
+
+function fitsPrivateRead(baseSize: number, tailSize: number, index?: LineIndex) {
+  if (!index) return baseSize <= PRIVATE_ROW_MAX;
+  // Charge raw footer/metadata and uncut rows. A packed preview takes at most two
+  // bytes per UTF-16 unit. A private parser may still need one original row at a time.
+  let bytes = baseSize + tailSize;
+  for (const line of index.values()) {
+    if (line.length > PRIVATE_ROW_MAX) return false;
+    if (line.json) bytes += 2 * line.json.length - line.length;
+  }
+  return bytes <= PRIVATE_PAYLOAD_MAX;
+}
 type Tail = SessionData & { baseCount?: number; baseRoots?: number; endId?: string; baseGen?: number; from?: number; over?: TimelineItem[] };
 type BaseFile = { over?: TimelineItem[]; gen?: number; itemCount?: number; items: TimelineItem[]; todos?: Todo[]; queue?: QueuedMessage[] };
 type IndexedRead = Header & { index?: LineIndex };
@@ -299,7 +315,8 @@ function turnPositions(turns: number) {
  * and the override types are retained. The second pass sends the actual projection of each row. */
 function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, cut: typeof cutItem,
   options: typeof workerCut, scan: typeof scanSession, projectRow: typeof project, merge: typeof sessionTail,
-  positions: ReturnType<typeof turnPositions>, fast: typeof scanLines, bytes: typeof readBytes, endOf: typeof baseEnd, large: ReturnType<typeof largeRowReader>, reset: () => void, emit: (row: Row, bytes: number) => void, migrationTailLimit?: number): Header {
+  positions: ReturnType<typeof turnPositions>, fast: typeof scanLines, bytes: typeof readBytes, endOf: typeof baseEnd, large: ReturnType<typeof largeRowReader>, reset: () => void, emit: (row: Row, bytes: number) => void,
+  migrationTailLimit?: number, expected?: { base: fs.Stats; tail?: fs.Stats }, matches = sameFile): Header {
   const fd = io.openSync(file, 'r');
   let tailFd: number | undefined;
   try {
@@ -311,6 +328,8 @@ function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, 
       try { tailFd = io.openSync(tailFile, 'r'); }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
     }
+    if (expected && (!matches(expected.base, stat) || !matches(expected.tail, tailFd === undefined ? undefined : io.fstatSync(tailFd))))
+      throw Error('Changed migration source');
     if (migrationTailLimit !== undefined && tailFd !== undefined) {
       if (io.fstatSync(tailFd).size > migrationTailLimit) throw Error('Large migration tail');
       scan(io, tailFd, () => {}, 'tail');
@@ -456,20 +475,20 @@ try {
       // and cap the row count so the main thread only installs a short batch.
       bytes += row.line?.json ? 2 * row.line.json.length + 128 : length;
       if (bytes >= part || rows.length >= 128) flush();
-    }, workerData.migrationTailLimit);
+    }, workerData.migrationTailLimit, workerData.source, (${sameFile}));
   flush();
   parentPort.postMessage({ header });
 } catch { parentPort.postMessage({ failed: true }); }
 `;
 
-function readInWorker(file: string, tail: string, guard?: { check(): void; signal: AbortSignal }): Promise<Read<IndexedRead>> {
+function readInWorker(file: string, tail: string, guard?: { check(): void; signal: AbortSignal; source: { base: fs.Stats; tail?: fs.Stats } }): Promise<Read<IndexedRead>> {
   return new Promise(resolve => {
     const ack = new Int32Array(new SharedArrayBuffer(4));
     ack[0] = 1;
     const collected = collectRead();
     const layout = turnPositions(workerCut.turns);
     const start = new Float64Array(new SharedArrayBuffer(8));
-    const w = new Worker(WORKER, { eval: true, workerData: { file, tail, options: workerCut, ack, start, part: READ.part, migrationTailLimit: guard && MIGRATION_TAIL_MAX },
+    const w = new Worker(WORKER, { eval: true, workerData: { file, tail, options: workerCut, ack, start, part: READ.part, migrationTailLimit: guard && MIGRATION_TAIL_MAX, source: guard?.source },
       resourceLimits: { maxOldGenerationSizeMb: 384, maxYoungGenerationSizeMb: 24 } });
     const stop = () => { void w.terminate(); };
     guard?.signal.addEventListener('abort', stop, { once: true });
@@ -559,47 +578,87 @@ function incompleteMigration(file: string) {
   } finally { closeSync(fd); }
 }
 
-function tailBytes(file: string, expected: fs.Stats) {
+function foldedTailProof(file: string, expected: fs.Stats) {
   if (expected.size > MIGRATION_TAIL_MAX || !expected.isFile()) throw Error('Unknown migration tail');
   const fd = openSync(file, 'r');
   try {
     if (!sameFile(expected, fs.fstatSync(fd))) throw Error('Migration tail changed');
-    return readBytes(fs, fd, 0, expected.size);
+    const stat = fs.fstatSync(fd, { bigint: true });
+    return { stat, hash: createHash('sha256').update(readBytes(fs, fd, 0, expected.size)).digest('hex') };
   } finally { closeSync(fd); }
 }
 
 /** Only a complete counted migration carries the digest of the exact tail that
  * it folded and a digest of its own bytes through that declaration. */
-function recoverFoldedTail(file: string, tail: string) {
-  const tailStat = fs.lstatSync(tail);
-  if (!tailStat.isFile() || tailStat.size > MIGRATION_TAIL_MAX || !fs.lstatSync(file).isFile()) return;
-  const fd = openSync(file, 'r');
+function verifyFoldedTail(io: typeof fs, hashOf: typeof createHash, bytesAt: typeof readBytes,
+  file: string, tail: string, threshold: number, tailLimit: number) {
+  if (!io.lstatSync(file).isFile() || !io.lstatSync(tail).isFile()) return;
+  const fd = io.openSync(file, 'r');
   try {
-    const base = fs.fstatSync(fd);
-    const length = Math.min(320, base.size);
-    const trailer = readBytes(fs, fd, base.size - length, length).toString();
+    const base = io.fstatSync(fd, { bigint: true });
+    if (!base.isFile()) return;
+    const size = Number(base.size), length = Math.min(320, size);
+    const trailer = bytesAt(io, fd, size - length, length).toString();
     const proof = /,"itemCount":(\d+),"rootCount":(\d+),"foldedTail":"([-\d.e+]+)\/([a-f0-9]{64})\/([a-f0-9]{64})"\}$/.exec(trailer);
     if (!proof) return;
     const [, count, roots, fromGen, tailHash, baseHash] = proof;
-    if (!Number.isSafeInteger(+count) || +count <= SNAPSHOT_THRESHOLD || +roots > +count) return;
-    const bytes = tailBytes(tail, tailStat);
-    if (createHash('sha256').update(bytes).digest('hex') !== tailHash || JSON.parse(bytes.toString()).baseGen !== Number(fromGen)) return;
-    const head = /^\{"gen":(\d+),"items":\[\n/.exec(readBytes(fs, fd, 0, Math.min(80, base.size)).toString());
+    if (!Number.isSafeInteger(+count) || +count <= threshold || +roots > +count) return;
+    const tailFd = io.openSync(tail, 'r');
+    let tailStat;
+    try {
+      tailStat = io.fstatSync(tailFd, { bigint: true });
+      if (!tailStat.isFile() || tailStat.size > tailLimit) return;
+      const bytes = bytesAt(io, tailFd, 0, Number(tailStat.size));
+      if (hashOf('sha256').update(bytes).digest('hex') !== tailHash || JSON.parse(bytes.toString()).baseGen !== Number(fromGen)) return;
+    } finally { io.closeSync(tailFd); }
+    const head = /^\{"gen":(\d+),"items":\[\n/.exec(bytesAt(io, fd, 0, Math.min(80, size)).toString());
     if (!head || !Number.isSafeInteger(Number(head[1])) || Number(head[1]) <= Number(fromGen)) return;
-    const hash = createHash('sha256'), buf = Buffer.allocUnsafe(CHUNK);
-    const until = base.size - 66; // The digest excludes its own 64 digits and the closing quote and brace.
+    const hash = hashOf('sha256'), buf = Buffer.allocUnsafe(1 << 20);
+    const until = size - 66; // The digest excludes its own 64 digits and the closing quote and brace.
     let rows = -1; // The first newline belongs to the header.
     for (let at = 0; at < until;) {
-      const n = fs.readSync(fd, buf, 0, Math.min(buf.length, until - at), at);
+      const n = io.readSync(fd, buf, 0, Math.min(buf.length, until - at), at);
       if (!n) return;
       const block = buf.subarray(0, n);
       hash.update(block);
       for (let lf = block.indexOf(10); lf >= 0; lf = block.indexOf(10, lf + 1)) rows++;
       at += n;
     }
-    if (rows === Number(count) && hash.digest('hex') === baseHash &&
-        sameFile(base, fs.lstatSync(file)) && sameFile(tailStat, fs.lstatSync(tail))) fs.unlinkSync(tail);
+    if (rows === Number(count) && hash.digest('hex') === baseHash) return { base, tailStat };
+  } finally { io.closeSync(fd); }
+}
+
+function sameRenamedFile(a: fs.BigIntStats, b?: fs.BigIntStats) {
+  return b?.ino === a.ino && b.dev === a.dev && b.size === a.size && b.mtimeNs === a.mtimeNs;
+}
+
+/** Even an older bridge can publish between stat and rename. Only unlink a private
+ * name, with the verified inode still open. link() restores a displaced replacement
+ * exclusively, so a subsequent save at the public name always wins. */
+function removeFoldedTail(file: string, tail: string, base: fs.BigIntStats, expected: fs.BigIntStats) {
+  const matches = (a: fs.BigIntStats, b?: fs.BigIntStats) => sameRenamedFile(a, b) && b?.ctimeNs === a.ctimeNs;
+  const atPath = (name: string) => fs.lstatSync(name, { bigint: true, throwIfNoEntry: false });
+  if (!matches(base, atPath(file)) || !matches(expected, atPath(tail))) return;
+  const fd = openSync(tail, 'r');
+  try {
+    if (!matches(expected, fs.fstatSync(fd, { bigint: true }))) return;
+    const held = tail + '.recover.' + randomUUID();
+    fs.renameSync(tail, held);
+    let verified = false;
+    try {
+      const pinned = fs.fstatSync(fd, { bigint: true }), moved = fs.lstatSync(held, { bigint: true });
+      // A rename itself can advance ctime.
+      verified = pinned.dev === moved.dev && pinned.ino === moved.ino && matches(base, atPath(file)) &&
+        expected.size === pinned.size && expected.mtimeNs === pinned.mtimeNs;
+    } finally {
+      if (!verified) fs.linkSync(held, tail); // If a third writer won, preserve both versions.
+    }
+    fs.unlinkSync(held);
   } finally { closeSync(fd); }
+}
+
+function recoveryBusy(err: unknown) {
+  return ['EBUSY', 'EACCES', 'EPERM', 'EAGAIN', 'EMFILE', 'ENFILE'].includes((err as NodeJS.ErrnoException)?.code ?? '');
 }
 
 /** null when the file is missing; not ok when it exists but cannot be read. */
@@ -661,27 +720,85 @@ export class SessionFiles {
   private deleted = new Set<string>();
 
   constructor(private readonly pathOf: (id: string) => string,
-    private readonly compactLive?: (id: string, saved: TimelineItem, preview: TimelineItem) => void) {}
+    private readonly compactLive?: (id: string, saved: TimelineItem, preview: TimelineItem) => void,
+    private readonly exclusively = (action: () => void) => { action(); return true; },
+    private readonly writerAdmission?: () => Promise<void> | undefined) {}
 
   /** Called only by the starting Store while it owns the sessions directory. */
   recoverMigrations(entries: fs.Dirent[]) {
+    const candidates = new Set<string>();
+    let retry = false;
     for (const entry of entries) {
       if (!entry.isFile()) continue;
       try {
+        const held = /^(.+)\.tail\.json\.recover\.([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})$/.exec(entry.name);
+        if (held) {
+          const tail = this.tailOf(held[1]), claimed = tail + '.recover.' + held[2];
+          try { fs.linkSync(claimed, tail); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err; }
+          const a = fs.lstatSync(claimed, { bigint: true }), b = fs.lstatSync(tail, { bigint: true });
+          if (a.dev === b.dev && a.ino === b.ino) fs.unlinkSync(claimed);
+          candidates.add(held[1]);
+          continue;
+        }
         const temp = /^(.+)\.json\.migrate\.([1-9]\d*)\.([a-f0-9]{64})\.tmp$/.exec(entry.name);
         if (temp) {
           const file = this.pathOf(temp[1]), tail = this.tailStat(temp[1]);
-          try { process.kill(Number(temp[2]), 0); continue; }
-          catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ESRCH') continue; }
+          if (this.writing.has(temp[1])) continue;
           const base = fs.lstatSync(file, { throwIfNoEntry: false });
           const tmp = file + '.migrate.' + temp[2] + '.' + temp[3] + '.tmp';
+          // Older Stores do not renew their owner files. A live PID with a
+          // recently written temp can still be copying in such a Store.
+          try {
+            process.kill(Number(temp[2]), 0);
+            if (Date.now() - statSync(tmp).mtimeMs < 86_400_000) { retry = true; continue; }
+          } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ESRCH') continue; }
           if (base?.isFile() && tail !== null && temp[3] === migrationSource(base, tail) || incompleteMigration(tmp)) fs.unlinkSync(tmp);
         } else if (entry.name.endsWith('.tail.json')) {
-          const id = entry.name.slice(0, -10);
-          recoverFoldedTail(this.pathOf(id), this.tailOf(id));
+          candidates.add(entry.name.slice(0, -10));
         }
-      } catch { /* Inaccessible, changed or ambiguous files stay in place. */ }
+      } catch (err) { retry ||= recoveryBusy(err); }
     }
+    return { ids: [...candidates], retry };
+  }
+
+  /** One worker per recovery pass. It only reads. The owner admits the next
+   * chat after applying the previous result under a fresh startup lock. */
+  async verifyMigrations(ids: string[], signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted || !ids.length) return true;
+    const worker = new Worker(`
+      const { parentPort } = require('node:worker_threads');
+      parentPort.on('message', ({ file, tail }) => {
+        let proof;
+        try {
+          proof = (${verifyFoldedTail})(require('node:fs'), require('node:crypto').createHash,
+            (${readBytes}), file, tail, ${SNAPSHOT_THRESHOLD}, ${MIGRATION_TAIL_MAX});
+        } catch (err) { if ((${recoveryBusy})(err)) proof = 'retry'; }
+        parentPort.postMessage(proof);
+      });
+    `, { eval: true });
+    let index = 0, complete = false, retry = false;
+    const stop = () => { void worker.terminate(); };
+    signal.addEventListener('abort', stop, { once: true });
+    try {
+      return await new Promise<boolean>(resolve => {
+        worker.once('error', stop);
+        worker.once('exit', () => resolve(complete));
+        const send = () => worker.postMessage({ file: this.pathOf(ids[index]), tail: this.tailOf(ids[index]) });
+        worker.on('message', (proof: ReturnType<typeof verifyFoldedTail> | 'retry') => {
+          if (signal.aborted) return;
+          const id = ids[index];
+          if (proof === 'retry') retry = true;
+          else if (proof && !this.exclusively(() => removeFoldedTail(this.pathOf(id), this.tailOf(id), proof.base, proof.tailStat))) {
+            stop();
+            return;
+          }
+          if (++index < ids.length) send();
+          else { complete = !retry; stop(); }
+        });
+        send();
+      });
+    } finally { signal.removeEventListener('abort', stop); }
   }
 
   private trackRead<T>(id: string, work: Promise<T>): Promise<T> {
@@ -886,7 +1003,9 @@ export class SessionFiles {
     const installed: Base = { gen, count: items.length, roots, orphans, stamp: loaded?.stamp, index: loaded?.index,
       ids: settled, settled: from, idSet, size: stat!.size, old, over };
     if (stat && tailStat !== null && (tailStat?.size ?? 0) <= MIGRATION_TAIL_MAX &&
-        data.items.length > SNAPSHOT_THRESHOLD && !Object.hasOwn(base, 'itemCount') && !orphans.length) {
+        data.items.length > SNAPSHOT_THRESHOLD && !Object.hasOwn(base, 'itemCount') && !orphans.length &&
+        Math.max(items.length, data.items.length) <= MIGRATION_ROWS_MAX &&
+        (loaded?.copyLines && !tail || fitsPrivateRead(stat.size, tailStat?.size ?? 0, loaded?.index))) {
       const validMeta = (doc: BaseFile | Tail) => (doc.todos === undefined || Array.isArray(doc.todos)) && (doc.queue === undefined || Array.isArray(doc.queue));
       const cleanTail = !tailStat && !tail || !!tailStat && !!merge && tail?.from === from && validMeta(tail) &&
         (tail.baseCount === undefined && tail.baseRoots === undefined || tail.baseCount === items.length && tail.baseRoots === roots) &&
@@ -1065,7 +1184,7 @@ export class SessionFiles {
           // Small unindexed files, a replacement tail, or nonempty footer values need private
           // rows. Restore in a worker; never serialize objects the runtime received 20s ago.
           const privateFiles = new SessionFiles(this.pathOf);
-          const loaded = await readInWorker(file, this.tailOf(id), { check, signal: controller.signal });
+          const loaded = await readInWorker(file, this.tailOf(id), { check, signal: controller.signal, source: { base: read.base, tail: read.tail } });
           await unchanged();
           if (!loaded.ok || !loaded.value) return;
           data = privateFiles.finish(id, { ok: true, value: loaded.value.base }, read.base, read.tail, loaded.value);
@@ -1074,10 +1193,10 @@ export class SessionFiles {
         }
         await source.startCopy(read.base);
         await unchanged();
-        const foldedTail = read.tail && base.gen + '/' + createHash('sha256').update(tailBytes(this.tailOf(id), read.tail)).digest('hex');
-        await this.writeBase(id, data, source, undefined, { tmp, foldedTail, check, unchanged, opened: () => { writingTemp = true; } });
+        const folded = read.tail && foldedTailProof(this.tailOf(id), read.tail);
+        const foldedTail = folded && base.gen + '/' + folded.hash;
+        await this.writeBase(id, data, source, undefined, { tmp, foldedTail, check, unchanged, opened: () => { writingTemp = true; } }, folded?.stat);
         writingTemp = false;
-        if (read.tail && sameFile(read.tail, await tailStamp())) await unlink(this.tailOf(id));
       } catch { /* All pre-commit failures leave the source pair intact. */ }
       finally {
         await source?.endCopy().catch(() => {});
@@ -1112,9 +1231,10 @@ export class SessionFiles {
     void Promise.allSettled(pending).then(drop);
   }
 
-  /** Waits for the writes in progress. */
-  async idle() {
-    await Promise.all([...this.writing.values()]);
+  /** With a chat ID, capture only its current write barrier. Quit captures all writers. */
+  async idle(id?: string) {
+    if (id !== undefined) await this.writing.get(id);
+    else await Promise.all([...this.writing.values()]);
   }
 
   private async write(id: string, save: SessionSave, final: boolean) {
@@ -1175,7 +1295,7 @@ export class SessionFiles {
         await renameRetry(tmp, this.tailOf(id), () => {
           base.notices = { file: this.tailOf(id), prefix: head, rows: written.notices };
           base.over = over!;
-        });
+        }, undefined, this.writerAdmission);
         this.force.delete(id);
         return;
       }
@@ -1186,16 +1306,14 @@ export class SessionFiles {
       }
     }
     const source = new BaseReader(this.pathOf(id), base);
+    const tail = this.tailOf(id);
+    let replacing;
+    try { replacing = fs.lstatSync(tail, { bigint: true, throwIfNoEntry: false }); }
+    catch { /* A tail of unknown identity stays in place. */ }
     let committed: Base;
-    try { committed = await this.writeBase(id, { ...save, items }, source, base?.orphans); }
+    try { committed = await this.writeBase(id, { ...save, items }, source, base?.orphans, undefined, replacing); }
     finally { source.close(); }
     this.force.delete(id);
-    // The new base holds everything: the old tail no longer matches it (and is ignored if this fails).
-    try {
-      rmSync(this.tailOf(id), { force: true });
-    } catch {
-      /* ignored on the next read: its baseGen is another */
-    }
     if (!final && this.compactLive && committed.size >= READ.inWorkerAbove) {
       const recent = recentStart(items, workerCut.turns);
       let since = performance.now();
@@ -1216,7 +1334,7 @@ export class SessionFiles {
     }
   }
 
-  private async writeBase(id: string, save: SessionData | DiskLayout, source: BaseReader, orphans?: TimelineItem[], migration?: MigrationWrite) {
+  private async writeBase(id: string, save: SessionData | DiskLayout, source: BaseReader, orphans?: TimelineItem[], migration?: MigrationWrite, folded?: fs.BigIntStats) {
     const gen = nextGen();
     const file = this.pathOf(id), tmp = migration?.tmp ?? `${file}.${process.pid}.tmp`;
     const head = `{"gen":${gen},"items":[\n`;
@@ -1230,6 +1348,7 @@ export class SessionFiles {
     const sections: WriteSection[] = ['ids' in save ? { head, ids: save.ids } : { head, items: save.items }];
     if (orphans?.length) sections.push({ head: '\n],"over":[\n', items: orphans });
     const written = await writeLines(tmp, sections, foot, source, Infinity, migration);
+    const staged = folded?.isFile() && await stat(tmp, { bigint: true });
     // Windows cannot replace an open destination. Its old index stays live until the rename.
     if (migration) await source.endCopy();
     source.close();
@@ -1244,14 +1363,24 @@ export class SessionFiles {
     const previous = migration && this.bases.get(id);
     if (previous) previous.replacing = base;
     try {
-      await renameRetry(tmp, file, () => { if (!this.deleted.has(id)) this.bases.set(id, base); }, migration);
+      await renameRetry(tmp, file, () => { if (!this.deleted.has(id)) this.bases.set(id, base); }, migration, this.writerAdmission);
     } finally { if (previous) delete previous.replacing; }
+    if (folded && staged) {
+      try {
+        this.exclusively(() => {
+          const committed = fs.lstatSync(file, { bigint: true });
+          if (sameRenamedFile(staged, committed)) removeFoldedTail(file, this.tailOf(id), committed, folded);
+        });
+      } catch { /* A changed or inaccessible pair stays on disk. */ }
+    }
     return base;
   }
 }
 
 /** Windows refuses a rename while another program (a virus scanner, a reader) has the file open for a moment: try again briefly. */
-async function renameRetry(from: string, to: string, commit: () => void, migration?: MigrationWrite) {
+async function renameRetry(from: string, to: string, commit: () => void, migration?: MigrationWrite, admit?: () => Promise<void> | undefined) {
+  const admission = admit?.();
+  if (admission) await admission;
   for (let i = 0; ; i++) {
     if (migration) { await migration.unchanged(); migration.check(); }
     try {

@@ -69,6 +69,18 @@ it('drains the final dirty answer to the tail during an active large-chat save',
   expect(new Store(dir).loadSession('chat').items.at(-1)).toMatchObject({ text: 'final' });
 });
 
+it('commits one chat while an unrelated chat write is held', async () => {
+  const store = new Store(folder());
+  const files = (store as unknown as { sessionFiles: { writing: Map<string, Promise<void>> } }).sessionFiles;
+  let resume!: () => void;
+  files.writing.set('other', new Promise(resolve => { resume = resolve; }));
+  store.saveSession('mine', () => ({ items: [], todos: [], dirty: 'all' }));
+  let saved = false;
+  const commit = store.persistInput('mine').then(() => { saved = true; });
+  try { await vi.waitFor(() => expect(saved).toBe(true)); }
+  finally { resume(); await commit; await store.seal(); }
+});
+
 it('seals a small chat with a dirty tail behind its first write and reports failed final writes', async () => {
   const dir = folder();
   const store = new Store(dir);

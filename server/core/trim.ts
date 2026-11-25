@@ -358,7 +358,9 @@ function oversizedRow(item: TimelineItem): TimelineItem {
   switch (item.type) {
     case 'tool': return { ...base, type: item.type, kind: item.kind, status: item.status,
       name: item.name.slice(0, 120), title: item.title.slice(0, 256), detail: {} };
-    case 'user': return { ...base, type: item.type, text: item.text.slice(0, 256), state: item.state, steered: item.steered, steerWait: item.steerWait, authored: item.authored, issuedUuid: item.issuedUuid };
+    case 'user': return { ...base, type: item.type, text: item.text.slice(0, 256), state: item.state, steered: item.steered, steerWait: item.steerWait, authored: item.authored,
+      submitPrint: item.submitPrint, remote: item.remote, phoneSender: item.phoneSender, issuedUuid: item.issuedUuid, issuedTo: item.issuedTo,
+      ...(item.until?.check && { until: { check: { ...item.until.check, command: (item.until.check.command ?? '').slice(0, 256), output: undefined } } }) };
     case 'text': case 'thinking': return { ...base, type: item.type, text: item.text.slice(0, 256), streaming: item.streaming };
     case 'notice': return { ...base, type: item.type, variant: item.variant, text: item.text.slice(0, 256) };
     case 'turn': return { ...base, type: item.type, durationMs: item.durationMs };

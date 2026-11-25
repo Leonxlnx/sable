@@ -5,7 +5,7 @@ import { Icon } from '@/icons';
 import { Tip } from '@/ui';
 import { dissolve, ghostOf } from '@/lib/dissolve';
 import { play, reducedMotion } from '@/lib/motion';
-import { acknowledgedOrder, bindRow, keyOf, withExpected, type ExpectedRow } from './queue-rows';
+import { acknowledgedOrder, bindRow, keyOf, rowActs, rowDelivery, withExpected, type ExpectedRow } from './queue-rows';
 import { landInTray, launchFromTray } from './flight';
 import { STACK_EASE, STACK_MS, aboveTray, clearFor, glideY, rowMoves, trayShare } from './stack-glide';
 import { removeQueued, reorderQueue, sendQueuedNow } from '@/state/actions';
@@ -492,7 +492,10 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
   const [lifted, setLifted] = useState(false);
   const atts = q.attachments?.length ?? 0;
   const text = firstLine(q.text);
-  const sendLabel = running && steerable ? 'Steer now' : 'Send now';
+  // Its delivery (queue-rows.ts): the bridge's reason in the row's second tone, and for a message
+  // whose delivery is not known "Send again" and "Discard" in place of "Send now" and "Remove".
+  const delivery = rowDelivery(q);
+  const acts = rowActs(delivery, running && steerable);
   const provisional = isProvisional(q.id);
 
   const grab = (e: ReactPointerEvent) => {
@@ -513,8 +516,9 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
       data-qrow
       data-qid={q.id}
       data-lifted={lifted || undefined}
+      data-why={delivery.reason ? '' : undefined}
       tabIndex={0}
-      aria-label={`Queued message ${i + 1} of ${count}: ${text}${atts ? `, ${atts} attached` : ''}. Alt+Arrow keys move it.`}
+      aria-label={`Queued message ${i + 1} of ${count}: ${text}${atts ? `, ${atts} attached` : ''}. ${delivery.reason ? `${delivery.reason} ` : ''}Alt+Arrow keys move it.`}
       // A row comes and goes with the dock's glide (QueueTray's layout effect): it is simply there,
       // its words brought by the message that flies in; one that leaves is out of the layout at once.
       initial={false}
@@ -536,8 +540,14 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
     >
       {/* No number before the words: the order is the list's own, and the text keeps the field's edge. */}
       <span className="cq-text truncate">{text || ' '}</span>
+      {/* Why it is here, in the bridge's words ("Issued to Claude. Receipt unknown."). */}
+      {delivery.reason && (
+        <span className="cq-why truncate" title={delivery.reason}>
+          {delivery.reason}
+        </span>
+      )}
       {/* Kept from a Spare wait: it goes out only when sent by hand, not when the turn ends. */}
-      {q.byHand && (
+      {delivery.hand && (
         <Tip label="Goes out when you send it" side="top">
           <span className="cq-n" data-hand>
             <Icon name="hand" size={12} />
@@ -552,9 +562,9 @@ function Row({ q, i, count, running, steerable, reduced, onDragStart, onDragEnd,
       )}
       {/* A row standing in until the bridge has the message: nothing to act on yet. */}
       <span className="cq-actions" hidden={provisional || undefined}>
-        <Act icon={running && steerable ? 'fast-forward' : 'arrow-up'} label={sendLabel} onClick={onSend} />
+        <Act icon={running && steerable ? 'fast-forward' : 'arrow-up'} label={acts.send} onClick={onSend} />
         <Act icon="pencil" label="Edit" onClick={onEdit} />
-        <Act icon="trash" label="Remove" onClick={() => onRemove(ref.current)} />
+        <Act icon="trash" label={acts.remove} onClick={() => onRemove(ref.current)} />
       </span>
     </Reorder.Item>
   );

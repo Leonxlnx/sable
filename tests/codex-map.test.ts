@@ -1,5 +1,7 @@
 /** Codex app-server shapes mapped into Sable's model (pure helpers only, no process). */
 import { describe, expect, it } from 'vitest';
+import { STEER_FIRST_BLOCK } from '@shared/protocol';
+import { delegateReport, lostTasksNote, userItemText } from '@shared/synthetic';
 import type { TextItem, ThinkingItem, ToolItem, TurnItem, UserItem } from '@shared/protocol';
 import {
   activityFor,
@@ -274,6 +276,22 @@ describe('draftItem and transcript', () => {
     expect(draftItem(X({ type: 'contextCompaction' }), { streaming: true })).toBeNull();
     expect(draftItem(X({ type: 'contextCompaction' }))).toEqual({ type: 'notice', variant: 'compact', text: 'Context compacted' });
     expect(draftItem(X({ type: 'somethingNew' }))).toMatchObject({ type: 'tool', kind: 'other', title: 'something New' });
+  });
+
+  it("imports a person's own reminder block even when Sable appended the same reminder", () => {
+    for (const words of [STEER_FIRST_BLOCK, 'I quoted this:\n\n' + STEER_FIRST_BLOCK]) {
+      for (const content of [[words], [words, STEER_FIRST_BLOCK]]) {
+        const [row] = transcript(X([{ id: 't', items: [{ type: 'userMessage', id: 'u', content: content.map(text => ({ type: 'text', text })) }] }]));
+        expect(userItemText(row)).toBe(words);
+      }
+    }
+  });
+
+  it('removes a carried report before the file suffix that Codex builds', () => {
+    const text = 'review this' + lostTasksNote(['Build']) + '\n\n' + delegateReport('Review', 'done', 'private receipt');
+    const content = [...buildInput(text, [{ id: 'f', name: 'notes.txt', kind: 'text', text: 'my notes' }], []), { type: 'text', text: STEER_FIRST_BLOCK }];
+    const [row] = transcript(X([{ id: 't', items: [{ type: 'userMessage', id: 'u', content }] }]));
+    expect(userItemText(row)).toBe('review this\n\n<attachment name="notes.txt">\nmy notes\n</attachment>');
   });
 
   it('transcript rebuilds turns with stable ids, cancelling tools left running', () => {

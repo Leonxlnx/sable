@@ -76,6 +76,26 @@ it('says Sending once the bridge’s time has come, with the action in place and
   expect(html).not.toContain('steer-wait-clock');
 });
 
+it('says why it still waits where the countdown stood, with Send now still there', () => {
+  const html = show(steer({ steerWait: { stepId: 'agent', reason: 'Automatic interruption limit reached.' } }), [ask, agent]);
+  expect(html).toContain('data-phase="held"');
+  expect(html).toContain('aria-label="Automatic interruption limit reached."');
+  expect(html).toMatch(/steer-wait-why truncate"[^>]*>Automatic interruption limit reached\.</);
+  // No empty label and no clock beside the reason.
+  expect(html).not.toContain('steer-wait-label');
+  expect(html).not.toContain('steer-wait-clock');
+  expect(html).toMatch(/<button type="button" class="steer-now"[^>]*>.*Send now<\/button>/);
+  expect(html).not.toContain('aria-disabled');
+});
+
+it('says the reason before the countdown while the bridge will try once more', () => {
+  const html = show(steer({ steerWait: { stepId: 'agent', autoAt: NOW + 57_500, reason: 'Claude did not confirm withdrawal.' } }), [ask, agent]);
+  expect(html).toContain('data-phase="countdown"');
+  expect(html).toContain('aria-label="Claude did not confirm withdrawal. Sends in 0:58"');
+  expect(html.indexOf('steer-wait-why')).toBeLessThan(html.indexOf('steer-wait-label'));
+  expect(html).toMatch(/steer-wait-label[^>]*>Sends in</);
+});
+
 it('names the agent’s next step when no step is known', () => {
   const html = show(steer({ steerWait: {} }), [ask]);
   expect(html).toContain('aria-label="Waiting for Claude Code’s next step 20s"');

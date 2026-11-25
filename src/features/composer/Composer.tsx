@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useReduc
 import { createPortal } from 'react-dom';
 import { DropdownMenu as RM } from 'radix-ui';
 import type { Attachment, QueuedMessage } from '@shared/protocol';
-import { stripWrappers, syntheticLine, syntheticOf } from '@shared/synthetic';
+import { syntheticLine, syntheticOf, userItemText } from '@shared/synthetic';
 import { beginHandoff, bindHandoff, cancelHandoff, claimHandoff, takeHomeDraft } from '@/features/home/handoff';
 import { Icon } from '@/icons';
 import { pathForFile } from '@/lib/desktop';
@@ -889,7 +889,9 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
         if (s.role === 'command') out.push(syntheticLine(s));
         continue;
       }
-      out.push(stripWrappers(it.text));
+      // (A check Sable sent back in the person's place has no words of theirs: nothing to recall.)
+      const words = userItemText(it);
+      if (words.trim()) out.push(words);
     }
     return out;
   };

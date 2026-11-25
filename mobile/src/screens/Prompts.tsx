@@ -8,6 +8,7 @@ import { diffLines, renderMarkdown } from '@m/lib/md';
 import { answerCall, fileLabel, optionKey, patchLines, permissionKeys, questionKey, questionsDesktopOnly, scopeOf } from '@m/lib/asks';
 import { haptic } from '@m/lib/native';
 import { sessionData, setState, useStore } from '@m/lib/store';
+import { permissionShown } from '@m/lib/shown';
 import { AutoHeight } from '@m/ui/AutoHeight';
 import { Icon, TOOL_ICON } from '@m/ui/icons';
 import { StatusMark } from '@m/ui/marks';
@@ -86,6 +87,8 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
   const [note, setNote] = useState<PermissionOption | null>(null);
   const [message, setMessage] = useState('');
   useEffect(() => (note ? pushBack(() => (setNote(null), true)) : undefined), [note]);
+  // This card is on screen: what a mode change from this phone may answer (lib/shown.ts).
+  useEffect(() => permissionShown(sid, req), [sid, req]);
   const answer = async (o: PermissionOption, msg?: string) => {
     if (busy) return;
     setBusy(o.id);

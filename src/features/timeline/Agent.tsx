@@ -11,7 +11,7 @@ import { EASE_OUT, play } from '@/lib/motion';
 import { accountName } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { Spinner } from '@/ui';
-import { agentLine, agentProvider, agentTask, agentTrail, agentType, isAgentLive, readTrail, workflowGlance, workflowProgressText } from './agent-line';
+import { agentLine, agentProvider, agentTask, agentTrail, agentType, delegateWord, isAgentLive, readTrail, workflowGlance, workflowProgressText } from './agent-line';
 import { CheckBlock } from './Check';
 import { EMPTY, useItem, useTimeline, useWhole } from './ctx';
 import { foldKey, useFold } from './fold';
@@ -48,9 +48,13 @@ const SubAgentBlock = memo(function SubAgentBlock({ item, tail = TAIL, extra, sc
   const type = agentType(item);
   const task = agentTask(item);
   const awaiting = item.status === 'awaiting';
+  // A handed-over task the person stopped, while its child winds down (`delegateReport: 'stopping'`).
+  const stopping = live && delegateWord(item) === 'Stopping';
   const line = live ? null : agentLine(item, steps);
   const error = !open && item.status === 'error' ? firstLines(item.result?.stderr || item.result?.text) : '';
-  const shown = ids.length + (now ? 1 : 0);
+  // (A child stopped before its first step says "Stopping" on its line, not "Starting" under it.)
+  const doing = stopping && now === 'Starting' ? '' : now;
+  const shown = ids.length + (doing ? 1 : 0);
   const rows = useTicker(trail);
 
   return (
@@ -70,6 +74,8 @@ const SubAgentBlock = memo(function SubAgentBlock({ item, tail = TAIL, extra, sc
           <span className="tool-meta">
             {awaiting ? (
               <span>Needs your approval</span>
+            ) : stopping ? (
+              <span>Stopping</span>
             ) : live ? (
               <>
                 {steps > 0 && <span className="num">{plural(steps, 'step')}</span>}
@@ -86,6 +92,15 @@ const SubAgentBlock = memo(function SubAgentBlock({ item, tail = TAIL, extra, sc
           {line && (
             <div className="agent-line num">
               <span className={line.why ? 'agent-why' : line.tone === 'error' ? 'tool-fail' : undefined}>{line.why ? `${line.state}: ${line.why}` : line.state}</span>
+              {/* Where a handed-over task's report stands: it has ended, the chat's agent has not read it yet. */}
+              {line.report && (
+                <>
+                  <span className="agent-dot" aria-hidden>
+                    ·
+                  </span>
+                  <span>{line.report}</span>
+                </>
+              )}
               {line.parts.map((p) => (
                 <Fragment key={p}>
                   <span className="agent-dot" aria-hidden>
@@ -106,9 +121,9 @@ const SubAgentBlock = memo(function SubAgentBlock({ item, tail = TAIL, extra, sc
               {ids.map((id) => (
                 <TrailStep key={id} id={id} />
               ))}
-              {now && (
-                <div key={now} className="agent-now">
-                  <span className="shimmer">{now}</span>
+              {doing && (
+                <div key={doing} className="agent-now">
+                  <span className="shimmer">{doing}</span>
                 </div>
               )}
             </div>

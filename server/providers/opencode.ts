@@ -341,15 +341,16 @@ export class OpenCodeProvider implements Provider {
 
   /** A report can reach OpenCode after a provider switch. Replay on a separate connection
    * so loading its history never feeds old frames to the live chat. */
-  async delegateReceipts(session: string, cwd: string) {
-    const reader = await AcpClient.start({ log: this.ctx.log, clientVersion: VERSION });
+  async delegateReceipts(session: string, cwd: string, _after: string | undefined, wanted: import('../core/delegate-result').WantedReceipts, signal = AbortSignal.timeout(3000)) {
+    const deadline = Date.now() + 3000;
+    const reader = await AcpClient.start({ log: this.ctx.log, clientVersion: VERSION, initTimeoutMs: 3000 });
     const ids = new Set<string>();
     let words = '', message: string | undefined, sawUser = false;
     reader.onNotification = (method, p) => {
       if (method !== 'session/update' || p.sessionId !== session) return;
       const update = p.update;
       if (update?.sessionUpdate !== 'user_message_chunk' || message !== update.messageId) {
-        readDelegateIds(words, ids);
+        readDelegateIds(words, ids, wanted.ids);
         words = '';
       }
       if (update?.sessionUpdate === 'user_message_chunk') {
@@ -359,11 +360,16 @@ export class OpenCodeProvider implements Provider {
       }
     };
     try {
-      await reader.request('session/load', { sessionId: session, cwd, mcpServers: [] }, 60_000);
+      signal.throwIfAborted();
+      await reader.request('session/load', { sessionId: session, cwd, mcpServers: [] }, Math.max(1, deadline - Date.now()));
+      signal.throwIfAborted();
       if (!sawUser) throw new Error('The OpenCode conversation is unavailable for report reconciliation.');
-      readDelegateIds(words, ids);
-      return { ids, settled: true };
-    } finally { await reader.close(); }
+      readDelegateIds(words, ids, wanted.ids);
+      return { ids, settled: ids.size === wanted.ids.size && !wanted.tools.size };
+    } finally {
+      reader.onNotification = undefined;
+      void reader.close().catch(err => this.ctx.log('OpenCode receipt reader close failed', err));
+    }
   }
 
   async history(cwd?: string, limit?: number): Promise<HistoryEntry[]> {
@@ -570,7 +576,7 @@ class OpenCodeSession implements ProviderSession {
     rt.cutTurn(reason, { detail });
     if (commands.length) rt.lossNotice = rt.notice('info', lostLine(commands.length, 'process'), commands.join('\n')).id;
     if (waiting) this.drainQueue();
-    else for (const entry of this.queue.splice(0)) entry.release?.();
+    else for (const entry of this.queue.splice(0)) entry.release?.(true);
   }
 
   /** A dead handle opens its conversation again on a new process (`session/resume`, or a new one with a notice). */
@@ -654,7 +660,7 @@ class OpenCodeSession implements ProviderSession {
     // One prompt at a time: the message waits for the turn to end, or for a stopped prompt that has not answered yet.
     if (this.turn || this.lingering) {
       this.queue.push({ item, ...opts });
-      if (item.state !== 'queued') this.rt.patch<UserItem>(item.id, { state: 'queued' });
+      if (!opts?.delegateReport && item.state !== 'queued') this.rt.patch<UserItem>(item.id, { state: 'queued' });
       return;
     }
     await this.startTurn([{ item, ...opts }], false);
@@ -701,9 +707,11 @@ class OpenCodeSession implements ProviderSession {
     } else {
       live = entries.filter((x) => {
         if (!x.check || passes(x.check)) return true;
-        x.release?.();
-        rt.remove(x.item.id);
-        rt.notice('info', 'A message from a removed phone was not sent');
+        x.release?.(true);
+        if (!x.delegateReport) {
+          rt.remove(x.item.id);
+          rt.notice('info', 'A message from a removed phone was not sent');
+        }
         return false;
       });
       if (!live.length) {
@@ -757,7 +765,8 @@ class OpenCodeSession implements ProviderSession {
     const entries = turn.receipts;
     turn.receipts = undefined;
     for (const entry of entries ?? []) {
-      if (entry.taken) (taken ? entry.taken : entry.release)?.();
+      if (entry.taken && taken) entry.taken();
+      else if (entry.taken) entry.release?.(turn.sent ? undefined : true);
     }
   }
 
@@ -766,14 +775,16 @@ class OpenCodeSession implements ProviderSession {
     // Messages the bridge took back (the turn was stopped or failed before they were taken) go out from its queue, not twice.
     // One whose sender may no longer act (a phone removed while it waited) never goes, and leaves the chat.
     const q = this.queue.splice(0).filter((x) => {
-      if (this.rt.get<UserItem>(x.item.id)?.state !== 'queued') {
-        x.release?.();
+      if (!x.delegateReport && this.rt.get<UserItem>(x.item.id)?.state !== 'queued') {
+        x.release?.(true);
         return false;
       }
       if (!x.check || passes(x.check)) return true;
-      x.release?.();
-      this.rt.remove(x.item.id);
-      this.rt.notice('info', 'A message from a removed phone was not sent');
+      x.release?.(true);
+      if (!x.delegateReport) {
+        this.rt.remove(x.item.id);
+        this.rt.notice('info', 'A message from a removed phone was not sent');
+      }
       return false;
     });
     if (!q.length) return;
@@ -1019,7 +1030,7 @@ class OpenCodeSession implements ProviderSession {
       this.turn.done = true;
       this.turn = undefined;
     }
-    for (const entry of this.queue.splice(0)) entry.release?.();
+    for (const entry of this.queue.splice(0)) entry.release?.(true);
     if (this.rt.meta.commands || this.rt.meta.serving) {
       const lost = this.rt.tasksLost('process');
       if (lost.length) this.rt.notice('info', 'The chat closed with background work still running', lost.join('\n'));

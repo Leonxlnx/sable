@@ -13,6 +13,8 @@
  * Pure: no imports, no node or DOM.
  */
 
+import { STEER_FIRST_BLOCK } from './protocol';
+
 export type TaskKind = 'command' | 'agent' | 'monitor' | 'task';
 /** How a task ended, read from its status, its exit code and its summary. */
 export type TaskOutcome = 'done' | 'failed' | 'stopped' | 'running' | 'unknown';
@@ -73,8 +75,9 @@ export interface Synthetic {
 
 export const DELEGATE_REPORT = 'A background sub-agent reported.';
 /** Collect receipts only from the provider's stored user inputs. */
-export function readDelegateIds(text: string, into: Set<string>) {
-  for (const match of text.matchAll(/<system-reminder>A background sub-agent reported\.\n[^<]*?\nDelivery ID: ([\da-f-]{36})\n/g)) into.add(match[1]);
+export function readDelegateIds(text: string, into: Set<string>, wanted?: ReadonlySet<string>) {
+  const blocks = /<system-reminder>A background sub-agent reported\.\n[^<]*?\nDelivery ID: ([\da-f-]{36})\n[^<]*<\/system-reminder>/g;
+  for (const match of text.matchAll(blocks)) if (!wanted || wanted.has(match[1])) into.add(match[1]);
 }
 export function delegateReport(title: string, outcome: string, report: string, deliveryId?: string) {
   // A report can quote markup, including the reminder's own closing tag.
@@ -361,12 +364,14 @@ export function maybeSynthetic(text: string): boolean {
 
 const cache = new WeakMap<object, Synthetic | null>();
 
-type UserWords = { type: string; text?: string; authored?: boolean; submitPrint?: string; steered?: boolean; remote?: boolean };
+type UserWords = { type: string; text?: string; authored?: boolean; submitPrint?: string; steered?: boolean; remote?: boolean; until?: { check?: unknown } };
 const personal = (item: UserWords) => item.authored || item.submitPrint || item.steered || item.remote;
 
 /** Classify imported text only when the card carries no personal origin. */
 export function syntheticOf(item: UserWords | undefined | null): Synthetic | null {
-  if (!item || personal(item) || item.type !== 'user' || typeof item.text !== 'string') return null;
+  if (!item || item.type !== 'user' || typeof item.text !== 'string') return null;
+  if (item.until?.check) return { role: 'hidden', parts: [{ kind: 'hidden', tag: 'until', text: '' }] };
+  if (personal(item) || literalSteer(item.text)) return null;
   if (!maybeSynthetic(item.text)) return null;
   let s = cache.get(item);
   if (s === undefined) {
@@ -559,11 +564,16 @@ function sableMessage(lead: string): string {
   for (const tag of STRIP_TAGS) bare = bare.replace(new RegExp(`\\s*<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?</${tag}>`, 'g'), '');
   const t = bare.replace(BROWSER_LINE, '').trimEnd().replace(LOST_TASKS, '').replace(RESUME_BACKGROUND, '').replace(SIGN_IN_BACKGROUND, '').trim();
   if (t === RESUME_AFTER_RESET || t === RESUME_UNDER_ANOTHER || t === RESUME_LIMIT_RESET || t === RESUME_AFTER_SIGN_IN || t === RESUME_LOST) return t;
-  const reportStart = DELEGATE_REPORT + '\n\n<system-reminder>' + DELEGATE_REPORT + '\n';
-  if (lead.startsWith(reportStart)) {
-    // Legacy phone previews can end inside an escaped report body. The two Sable
-    // headings and a complete outcome line identify that envelope.
-    if (t === DELEGATE_REPORT || /^[^<>\n]+ \((?:done|failed|stopped|cancelled|error)\)\n[^<]*$/.test(lead.slice(reportStart.length))) return DELEGATE_REPORT;
+  if (lead.startsWith(DELEGATE_REPORT)) {
+    const heading = '\n\n<system-reminder>' + DELEGATE_REPORT + '\n';
+    const at = lead.lastIndexOf(heading);
+    if (at >= 0) {
+      if (importedSteerText(lead) === DELEGATE_REPORT) return DELEGATE_REPORT;
+      // A phone preview can end inside a report. Require its outcome and the composed opener.
+      const body = lead.slice(at + heading.length);
+      if (/^[^<>\n]+ \((?:done|failed|stopped|cancelled|error)\)\n[^<]*$/.test(body) &&
+        importedSteerText(lead.slice(0, at)) === DELEGATE_REPORT) return DELEGATE_REPORT;
+    }
   }
   if (UNTIL_FAILURE.test(t)) return t;
   return '';
@@ -599,15 +609,38 @@ export function stripWrappers(text: string): string {
 
 /** The words of a user message for lists, titles, search and summaries: plain, whatever wrote it. */
 export function userText(text: string): string {
-  const s = parseSynthetic(text);
-  return s ? syntheticLine(s) : stripWrappers(text);
+  return userItemText({ type: 'user', text });
 }
 
-/** `userText` of a user item, read once per item object. */
+/** A lone unmarked steer note has no block boundary to identify who wrote it. Preserve it. */
+function literalSteer(text: string) {
+  const trimmed = text.trim();
+  return trimmed === STEER_FIRST_BLOCK || trimmed === STEER_NOW_BLOCK;
+}
+
+/** In a native user block the bridge's own steer reminder would have had a separate boundary. */
+export function endsWithSteerNote(text: string) {
+  const trimmed = text.trimEnd();
+  return trimmed.endsWith(STEER_FIRST_BLOCK) || trimmed.endsWith(STEER_NOW_BLOCK);
+}
+
+/** Recover the legacy single SDK block. Unwrap only the suffixes the bridge appends, in reverse order. */
+export function importedSteerText(text: string): string {
+  let out = withoutHandover(text).replace(BROWSER_LINE, '');
+  // Codex buildInput can append inline files after all the bridge's decorations.
+  out = out.replace(/(?:\n\n<system-reminder>A background sub-agent reported\.\n[^<]*<\/system-reminder>)+(?=$|\n\n(?:\[Attached file: |<attachment name="))/, '');
+  out = out.replace(/\n\n<system-reminder>\nThis conversation moved to another account of the same person[.,][\s\S]*?\n<\/system-reminder>(?=$|\n\n(?:\[Attached file: |<attachment name="))/, '');
+  const lost = out.lastIndexOf(LOST_TASKS_HEAD);
+  return lost >= 0 && out.endsWith(LOST_TASKS_TAIL) ? out.slice(0, lost) : out.replace(LOST_TASKS, '');
+}
+
+/** The common projection for display, copy, reuse, export, search and handover. */
 export function userItemText(item: UserWords): string {
+  if (item.until?.check) return '';
   if (personal(item)) return item.text ?? '';
   const s = syntheticOf(item);
-  return s ? syntheticLine(s) : stripWrappers(item.text ?? '');
+  const text = item.text ?? '';
+  return s ? syntheticLine(s) : literalSteer(text) ? text : stripWrappers(text);
 }
 
 /**

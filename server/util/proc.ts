@@ -125,6 +125,20 @@ export function killTree(child: ChildProcess | undefined) {
   }
 }
 
+/** Retry even when an earlier close never answers. The final force is scoped to the owned process. */
+export async function terminateDelegateProcess(alive: () => boolean, exited: Promise<void>, close: (retry: boolean) => Promise<void>, force: () => Promise<void>) {
+  for (let attempt = 0; alive() && attempt < 4; attempt++) {
+    let timer: NodeJS.Timeout | undefined;
+    const request = attempt === 3 ? force() : close(attempt > 0);
+    // A close can return before exit, or reject while the child is still live.
+    const observed = request.catch(() => {}).then(() => alive() ? exited : undefined);
+    try {
+      await Promise.race([exited, observed, new Promise<void>(resolve => { timer = setTimeout(resolve, 1200); })]);
+    } finally { clearTimeout(timer); }
+  }
+  if (alive()) throw new Error('Delegate process exit was not confirmed after forced termination.');
+}
+
 /** A short-lived reader that still has not exited after its timeout and grace. */
 export async function retireReader(child: ChildProcess) {
   if (child.exitCode !== null || child.signalCode) return;

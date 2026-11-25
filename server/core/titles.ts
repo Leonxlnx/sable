@@ -8,7 +8,7 @@
  * model was asked. `AppSettings.chatTitles` (absent: on).
  */
 import { DEFAULT_ACCOUNT, type AppSettings, type ProviderId, type SessionMeta, type TextItem, type TimelineItem, type TurnItem, type UserItem } from '../../shared/protocol';
-import { parseSynthetic, userText } from '../../shared/synthetic';
+import { syntheticOf, userItemText } from '../../shared/synthetic';
 import type { SessionRuntime } from './runtime';
 
 /** What the small model gets: its instructions and one message. */
@@ -59,8 +59,8 @@ const COMMAND = /^\/[\w:.-]+(\s|$)/;
 /** A message of the person's that can name a chat: their own words at the root, sent, not a command, not what a harness or an until loop wrote. */
 export function titleMessage(it: TimelineItem | undefined): it is UserItem {
   if (!it || it.type !== 'user' || it.parentId || it.until || it.state === 'queued') return false;
-  if (parseSynthetic(it.text)) return false;
-  const text = userText(it.text).trim();
+  if (syntheticOf(it)) return false;
+  const text = userItemText(it).trim();
   return !!text && !COMMAND.test(text);
 }
 
@@ -86,7 +86,7 @@ export function titleAsk(items: readonly TimelineItem[], consumed?: readonly str
   } else at = items.findIndex((i) => titleMessage(i));
   if (at < 0) return null;
   const msg = items[at] as UserItem;
-  const message = userText(msg.text).trim();
+  const message = userItemText(msg).trim();
   const answer: string[] = [];
   const add = (it: TimelineItem) => {
     if (it.type === 'text' && (it as TextItem).text.trim()) answer.push((it as TextItem).text.trim());
@@ -112,7 +112,7 @@ export function titleAsk(items: readonly TimelineItem[], consumed?: readonly str
     if (it.parentId) continue;
     // The answer is this turn's: it ends at the turn's end or the next message of the person's.
     if (it.type === 'turn') break;
-    if (it.type === 'user' && !parseSynthetic((it as UserItem).text)) break;
+    if (it.type === 'user' && !syntheticOf(it)) break;
     if (add(it)) break;
   }
   return { message, answer: answer.join('\n\n'), itemId: msg.id };

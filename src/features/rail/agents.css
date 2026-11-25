@@ -458,6 +458,11 @@
   color: var(--text-2);
 }
 
+/* Where a handed-over task's report stands ("Report pending"): no outcome, so never the failure's step. */
+.agx-row .agx-outcome[data-report] {
+  color: var(--text-3);
+}
+
 /* A row that joins the list on screen rises into place, once. */
 :is(.agx-row, .agx-card, .agx-wave)[data-new] {
   animation: rise-in var(--d-3) var(--ease-out) backwards;

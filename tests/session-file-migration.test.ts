@@ -1,5 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { Worker } from 'node:worker_threads';
 import * as disk from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -11,6 +15,10 @@ import { isLight, snapshotEnd } from '../server/core/trim';
 import { DemoProvider } from '../server/providers/demo';
 import type { TimelineItem } from '../shared/protocol';
 
+vi.mock('node:fs', async original => {
+  const real = await original<typeof import('node:fs')>();
+  return { ...real, openSync: vi.fn(real.openSync), renameSync: vi.fn(real.renameSync) };
+});
 vi.mock('node:fs/promises', async original => {
   const real = await original<typeof disk>();
   return { ...real, statfs: vi.fn(real.statfs), rename: vi.fn(real.rename) };
@@ -96,19 +104,30 @@ it('recovers the folded tail after a hard exit between rename and unlink', async
   writeFileSync(file('a.tail'), tail);
   crashMigration(home, 'renamed');
   const committed = readFileSync(file('a'), 'utf8');
+  clock();
+  const verify = vi.spyOn(SessionFiles.prototype, 'verifyMigrations');
+  const finishPass = async () => {
+    const before = verify.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(verify).toHaveBeenCalledTimes(before + 1);
+    await verify.mock.results[before].value;
+  };
   expect(JSON.parse(committed).itemCount).toBe(rows.length + 1);
   expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
   expect(files.readEnd('a')).toBeUndefined();
   // Any one of these differences removes the authority to unlink.
   const extended = JSON.parse(tail);
   extended.items.push({ id: 'tail-only', type: 'text', ts: 6, text: 'Later' });
+  const wrongCount = committed.slice(0, -66).replace(`"itemCount":${rows.length + 1}`, `"itemCount":${rows.length + 2}`);
   for (const [base, suffix] of [[committed.replace('From the tail', 'Lost the data'), tail],
+    [wrongCount + createHash('sha256').update(wrongCount).digest('hex') + '"}', tail],
     [committed.replace('"itemCount":', '"otherCount":'), tail], [committed.slice(0, -16), tail],
     [committed, JSON.stringify(extended)], [committed, tail.replace('From the tail', 'Newer version')],
     [committed, tail.replace('42', String(JSON.parse(committed).gen))]]) {
     writeFileSync(file('a'), base);
     writeFileSync(file('a.tail'), suffix);
     const uncertain = new Store(home);
+    await finishPass();
     expect(readFileSync(file('a.tail'), 'utf8')).toBe(suffix);
     await uncertain.seal();
   }
@@ -117,15 +136,162 @@ it('recovers the folded tail after a hard exit between rename and unlink', async
   writeFileSync(file('a'), committed);
   writeFileSync(file('a.tail'), tail);
   const second = new Store(home);
+  await finishPass(); // The first verifier must re-enter admission after its scan.
   expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
   await second.seal();
   await first.seal();
   const store = new Store(home);
+  expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
+  await finishPass();
   expect(existsSync(file('a.tail'))).toBe(false);
   expect(store.readSessionEnd('a')?.items.at(-1)?.id).toBe('after');
   expect(store.loadSession('a').items).toStrictEqual([...rows, JSON.parse(tail).items[0]]);
   await store.seal();
 }, 30_000);
+
+async function foldedFixture() {
+  const f = fixture();
+  const tail = JSON.stringify({ baseGen: 42, from: f.rows.length, items: [{ id: 'folded', type: 'text', ts: 5, text: 'Folded row' }] });
+  writeFileSync(f.file('a.tail'), tail);
+  await f.files.loadAsync('a');
+  await f.files.migrate('a', () => true);
+  expect(existsSync(f.file('a.tail'))).toBe(false);
+  writeFileSync(f.file('a.tail'), tail);
+  return { ...f, tail };
+}
+
+it('starts one verifier after construction and finishes each chat before dispatching the next', async () => {
+  const { file, home, tail } = await foldedFixture();
+  writeFileSync(file('b'), readFileSync(file('a')));
+  writeFileSync(file('b.tail'), tail);
+  clock();
+  const verify = vi.spyOn(SessionFiles.prototype, 'verifyMigrations');
+  const post = Worker.prototype.postMessage;
+  const workers = new Set<Worker>(), dispatched: string[] = [], previousPresent: boolean[] = [];
+  vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function(this: Worker, message, transfer) {
+    workers.add(this);
+    if (dispatched.length) previousPresent.push(existsSync(dispatched.at(-1)!));
+    dispatched.push(message.tail);
+    return post.call(this, message, transfer);
+  });
+  const store = new Store(home);
+  try {
+    expect(dispatched).toEqual([]);
+    expect([file('a.tail'), file('b.tail')].every(existsSync)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await verify.mock.results[0].value).toBe(true);
+    expect(workers.size).toBe(1);
+    expect(dispatched.sort()).toEqual([file('a.tail'), file('b.tail')]);
+    expect(previousPresent).toEqual([false]);
+    expect(dispatched.some(existsSync)).toBe(false);
+  } finally { await store.seal(); }
+});
+
+it.each(['before pinning', 'before rename', 'after rename'])('keeps a second process’s tail published %s', async when => {
+  const { home, file, files } = await foldedFixture();
+  const real = await vi.importActual<typeof import('node:fs')>('node:fs');
+  clock();
+  const verify = vi.spyOn(SessionFiles.prototype, 'verifyMigrations');
+  const store = new Store(home);
+  let writerStatus: number | null = null;
+  const save = () => {
+    writerStatus = spawnSync(process.execPath, ['tests/fixtures/migration-crash.mjs', home, 'save-unlocked'],
+      { stdio: 'inherit', timeout: 15_000, windowsHide: true }).status;
+  };
+  if (when === 'before pinning') vi.mocked(openSync).mockImplementationOnce((...args) => {
+    expect(args[0]).toBe(file('a.tail'));
+    save();
+    return real.openSync(...args);
+  });
+  else vi.mocked(renameSync).mockImplementationOnce((from, held) => {
+    expect(from).toBe(file('a.tail'));
+    if (when === 'before rename') {
+      // Windows refuses replacement over an open destination. Move the old
+      // name aside first to exercise the changed-inode branch on this OS too.
+      if (process.platform === 'win32') real.renameSync(from, file('parked'));
+      save();
+    }
+    real.renameSync(from, held);
+    if (when === 'after rename') save();
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(1000);
+    await verify.mock.results[0].value;
+    expect(writerStatus).toBe(0);
+    expect(JSON.parse(readFileSync(file('a.tail'), 'utf8')).items.at(-1).id).toBe('peer-save');
+    expect(files.load('a').items.slice(-2).map(i => i.id)).toEqual(['folded', 'peer-save']);
+    expect(readdirSync(path.dirname(file('a'))).filter(n => n.includes('.recover.'))).toEqual([]);
+  } finally { await store.seal(); }
+}, 30_000);
+
+it('waits to publish a peer save while a released bridge holds its startup lock', async () => {
+  const { home, file, files, tail } = await foldedFixture();
+  const lock = new DatabaseSync(path.join(home, '.sable-store.lock'));
+  lock.exec('BEGIN EXCLUSIVE');
+  try {
+    const peer = spawn(process.execPath, ['tests/fixtures/migration-crash.mjs', home, 'save'], { stdio: 'inherit', windowsHide: true });
+    const exited = once(peer, 'exit');
+    try {
+      await vi.waitFor(() => expect(existsSync(path.join(home, 'waiting-to-publish'))).toBe(true), { timeout: 15_000 });
+      expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
+      rmSync(file('a.tail')); // Last operation in the released bridge's exclusive transaction.
+      lock.exec('ROLLBACK');
+      expect((await exited)[0]).toBe(0);
+      expect(files.load('a').items.slice(-2).map(i => i.id)).toEqual(['folded', 'peer-save']);
+    } finally {
+      if (peer.exitCode === null && peer.signalCode === null) peer.kill();
+      await exited;
+    }
+  } finally { lock.close(); }
+}, 30_000);
+
+it('retries a contended startup lock and reaps dead owners beside a live owner and a reused PID', async () => {
+  const { home, file, tail } = await foldedFixture();
+  const owner = (pid: number, i: number) => path.join(home, `.sable-store.${pid}.00000000-0000-4000-8000-00000000000${i}.owner`);
+  const live = owner(process.pid, 1), reused = owner(process.pid, 2), dead = owner(2147483646, 3);
+  for (const name of [live, reused, dead]) writeFileSync(name, '');
+  utimesSync(reused, new Date(0), new Date(0));
+  const lock = new DatabaseSync(path.join(home, '.sable-store.lock'));
+  lock.exec('BEGIN EXCLUSIVE');
+  clock();
+  const verify = vi.spyOn(SessionFiles.prototype, 'verifyMigrations');
+  const store = new Store(home);
+  try {
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(verify).not.toHaveBeenCalled();
+    expect(existsSync(dead)).toBe(true);
+    expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
+    lock.exec('ROLLBACK');
+    await vi.advanceTimersByTimeAsync(5000);
+    expect([live, reused, dead].map(existsSync)).toEqual([true, false, false]);
+    expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
+    rmSync(live);
+    await vi.advanceTimersByTimeAsync(6000);
+    await verify.mock.results[0].value;
+    expect(existsSync(file('a.tail'))).toBe(false);
+  } finally { lock.close(); await store.seal(); }
+});
+
+it('restores a tail claimed just before a hard exit and cancels the pending scan at seal', async () => {
+  const { home, file, tail } = await foldedFixture();
+  const held = file('a.tail') + '.recover.00000000-0000-4000-8000-000000000001';
+  renameSync(file('a.tail'), held);
+  clock();
+  const verify = vi.spyOn(SessionFiles.prototype, 'verifyMigrations');
+  const store = new Store(home);
+  expect(existsSync(held)).toBe(false);
+  expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
+  await store.seal();
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(verify).not.toHaveBeenCalled();
+  expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
+  const active = new Store(home);
+  vi.advanceTimersByTime(1000);
+  expect(verify).toHaveBeenCalledOnce();
+  await active.seal();
+  expect(await verify.mock.results[0].value).toBe(false);
+  expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
+});
 
 it('serves the identical end after one idle migration through the snapshot RPC', async () => {
   const { home, rows, old, file, files } = fixture();
@@ -213,6 +379,47 @@ it('leaves a large matching tail on disk without scheduling a private read', asy
   expect(readFileSync(file('a'), 'utf8')).toBe(old);
   expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
 });
+
+it('opens every row when a legacy base exceeds the optional migration index budget', async () => {
+  const { file, files } = fixture();
+  const count = 131_073;
+  const rows = Array.from({ length: count }, (_, id) => `{"id":"${id}","type":"turn","durationMs":1,"ts":1}`);
+  writeFileSync(file('a'), '{"gen":42,"items":[\n' + rows.join(',\n') + '\n],"todos":[]}');
+  const data = files.load('a');
+  expect(data.items).toHaveLength(count);
+  expect(data.items.at(-1)?.id).toBe(String(count - 1));
+  expect(files.needsMigration('a')).toBe(false);
+});
+
+it('keeps a large indexed picture readable while declining a second private parse of its row', async () => {
+  const { file, files, old, rows } = fixture();
+  READ.inWorkerAbove = 1;
+  const picture = 'P'.repeat(16 << 20);
+  writeFileSync(file('a'), old.replace('test-0', picture));
+  writeFileSync(file('a.tail'), JSON.stringify({ baseGen: 42, from: rows.length, items: [] }));
+  const data = await files.loadAsync('a');
+  expect(data.items).toHaveLength(rows.length);
+  const tool = files.wholeItem('a', data.items[1]);
+  expect(tool.type === 'tool' && tool.result?.images?.[0] === picture).toBe(true);
+  expect(files.needsMigration('a')).toBe(false);
+});
+
+it('declines a private migration when small uncut rows together exceed its payload budget', async () => {
+  const { file, files } = fixture();
+  const count = 2100, text = 't'.repeat(32 << 10);
+  const base = await disk.open(file('a'), 'w');
+  try {
+    await base.writeFile('{"gen":42,"items":[\n');
+    for (let i = 0; i < count; i++) await base.writeFile((i ? ',\n' : '') + JSON.stringify({ id: String(i), type: 'text', text, ts: 1 }));
+    await base.writeFile('\n],"todos":[]}');
+  } finally { await base.close(); }
+  writeFileSync(file('a.tail'), JSON.stringify({ baseGen: 42, from: count, items: [] }));
+  const data = await files.loadAsync('a');
+  expect(data.items).toHaveLength(count);
+  expect(data.items.at(-1)).toMatchObject({ id: String(count - 1), text });
+  expect(files.needsMigration('a')).toBe(false);
+  // 2,100 writes and a 67 MB read: beside the whole suite's other workers this takes more than the default 5 s.
+}, 60_000);
 
 it.each(['lines', 'compact', 'pretty', 'no generation'])('folds the old %s base and tail with the same rows, cut, todos and queue', async shape => {
   const { file, files, rows, old } = fixture();
@@ -310,6 +517,23 @@ it('rechecks the source pair after writing the complete temp and before its rena
   expect(readFileSync(file('a'), 'utf8')).toBe(old);
   expect(readFileSync(file('a.tail'), 'utf8')).toBe(newer);
   expect(migrationTemps(file('a'))).toEqual([]);
+});
+
+it('retains the folded tail if another base takes the same generation at commit', async () => {
+  const { file, files, rows } = fixture();
+  const tail = JSON.stringify({ baseGen: 42, from: rows.length, items: [{ id: 'fold', type: 'text', text: 'Fold me', ts: 1 }] });
+  writeFileSync(file('a.tail'), tail);
+  await files.loadAsync('a');
+  const real = await vi.importActual<typeof disk>('node:fs/promises');
+  vi.mocked(disk.rename).mockImplementationOnce(async (from, to) => {
+    await real.rename(from, to);
+    const gen = JSON.parse(readFileSync(file('a'), 'utf8')).gen;
+    writeFileSync(file('peer'), `{"gen":${gen},"items":[\n{"id":"peer","type":"text","text":"Peer","ts":2}\n],"todos":[]}`);
+    await real.rename(file('peer'), to);
+  });
+  await files.migrate('a', () => true);
+  expect(JSON.parse(readFileSync(file('a'), 'utf8')).items[0].id).toBe('peer');
+  expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
 });
 
 it('selects the descriptor’s own index on both sides of an in-flight migration rename', async () => {

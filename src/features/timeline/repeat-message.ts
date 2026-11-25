@@ -2,7 +2,7 @@ import type { UserItem } from '@shared/protocol';
 import { keepRecovery } from '../composer/drafts';
 import { holdSend, sendBack, sendDone } from '../composer/pending';
 import { rewindTo, sendMessage, wholeMessage } from '@/state/actions';
-import { syntheticOf, stripWrappers } from '@shared/synthetic';
+import { syntheticOf, userItemText } from '@shared/synthetic';
 import { sameOpenedRow, useStore, type SessionData } from '@/state/store';
 
 export function lastPrompt(d?: SessionData, includeCommand = false) {
@@ -31,7 +31,8 @@ export async function repeatMessage(sessionId: string, item: UserItem, text: str
     const current = useStore.getState().data[sessionId];
     if (start && (current?.roots.at(-1) !== expectedEnd || current?.items[item.id] !== whole ||
       !sameOpenedRow(sessionId, item, whole))) return moved();
-    if (item.more && (text === item.text || text === stripWrappers(item.text))) text = stripWrappers(whole.text);
+    // The row came cut: what goes out again is the whole message's words, read as the row's were.
+    if (item.more && (text === item.text || text === userItemText(item))) text = userItemText(whole);
     const rewind = mode === 'footer' ? undefined : { itemId: item.id, expectedEnd, expectedLast: confirmedOlder ? undefined : whole };
     const draft = { text, attachments: whole.attachments ?? [], recovery: { rewind } };
     const pending = holdSend(sessionId, draft, false);

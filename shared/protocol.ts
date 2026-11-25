@@ -839,7 +839,17 @@ interface BaseItem {
 /** Non-secret identity of an accepted phone submission. */
 export interface PhoneSender { deviceId: string; generation: number }
 
+/** Where to check an issued Claude input, even after the chat moves. */
+export interface SteerDestination {
+  provider: 'claude';
+  accountId?: string;
+  session?: string;
+  cwd: string;
+  stillQueued?: boolean;
+}
+
 export interface UserItem extends BaseItem {
+  issuedTo?: SteerDestination;
   /** Automatic report continuations spent by this personal input. */
   delegateContinuations?: number;
   authored?: true;
@@ -1088,6 +1098,12 @@ export interface WorkflowAgent {
 export interface ToolItem extends BaseItem {
   /** Stable across retries, including delivery with a personal message. */
   delegateDeliveryId?: string;
+  /** Root turn ended while the delegated Codex thread still owned live receivers. */
+  delegateReceiversPending?: true;
+  /** Receipt lookup for an issued report. Unknown requires an explicit retry. */
+  delegateReceiptState?: 'checking' | 'unknown' | null;
+  /** One decision token per uncertain attempt, consumed by the built-in /report-retry command. */
+  delegateRetryId?: string | null;
   /** Native destination whose transcript must be checked before reissuing this report. */
   delegateAttempt?: { provider: ProviderId; account?: string; session?: string; after?: string; tool?: string; budget?: string };
   /** Budget anchor for an imported conversation with no personal card. */
@@ -1095,7 +1111,7 @@ export interface ToolItem extends BaseItem {
   /** Foreground tool callback that has not yet produced a native tool-result receipt. */
   delegateCaller?: number;
   /** A completed report held for the next personal input. Null clears the hold in a patch. */
-  delegateWait?: 'budget' | 'stop' | null;
+  delegateWait?: 'budget' | 'stop' | 'retry' | null;
   delegateReport?: 'working' | 'stopping' | 'pending' | 'delivered' | 'stopped';
   type: 'tool';
   /** Raw provider tool name, e.g. "Bash", "mcp__github__create_issue". */
@@ -2155,6 +2171,7 @@ export const PHONE_METHODS = [
   'session.create',
   'session.snapshot',
   'session.send',
+  'session.submission',
   'session.interrupt',
   'session.setModel',
   'session.setEffort',
@@ -2529,6 +2546,10 @@ export interface SessionSnapshot {
  * timeline yet) and sends it when the turn ends normally, one per turn end.
  */
 export interface QueuedMessage {
+  until?: UntilMark;
+  issuedTo?: SteerDestination;
+  /** The original SDK payload when the waiting copy has since been edited. */
+  issuedPayload?: Pick<UserItem, 'text' | 'attachments'>;
   steerOrder?: number;
   phoneSender?: PhoneSender;
   issuedUuid?: string;
@@ -2577,7 +2598,7 @@ export interface RpcMethods {
    */
   'session.switchAccount': {
     params: {
-      sessionId: string; accountId: string; retry?: boolean;
+      sessionId: string; accountId: string; retry?: boolean; adoptPhoneMessage?: string;
       /** The particular refusal to continue when one turn reported several inputs. */
       refusalId?: string;
     };
@@ -2671,8 +2692,8 @@ export interface RpcMethods {
    * chat to the agent that has that model (`switched`); `error` when no model has that name.
    */
   /** Read the outcome of a saved send before using its draft for another action. */
-  'session.submission': { params: { sessionId: string; submitId: string; text: string; attachments?: Attachment[] }; result: { ok: boolean; queued?: boolean } };
-  'session.send': { params: { sessionId: string; text: string; attachments?: Attachment[]; steer?: boolean; submitId?: string }; result: { ok: boolean; queued?: boolean; model?: string; switched?: ProviderId; error?: string } };
+  'session.submission': { params: { sessionId: string; submitId: string; text?: string; attachments?: Attachment[] }; result: { ok: boolean; queued?: boolean; submitId?: string } };
+  'session.send': { params: { sessionId: string; text: string; attachments?: Attachment[]; steer?: boolean; submitId?: string }; result: { ok: boolean; submitId?: string; queued?: boolean; model?: string; switched?: ProviderId; error?: string } };
   /**
    * Switches the chat to another agent in place (same chat, same conversation shown): the next
    * message goes to `provider`, which starts from a compact handover of the conversation, or, when

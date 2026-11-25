@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { UserItem } from '@shared/protocol';
-import { stripWrappers } from '@shared/synthetic';
+import { userItemText } from '@shared/synthetic';
 import { lastPrompt, repeatMessage } from './repeat-message';
 import { useStore } from '@/state/store';
 import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger } from '@/ui';
@@ -34,8 +34,9 @@ export function MessageAgain({ item, turnId }: { item: UserItem; turnId: () => s
   const [busy, setBusy] = useState(false);
 
   if (!canRewind || !idle || item.state === 'queued' || !item.text) return null;
-  // The words as the person wrote them, without a reminder the harness added.
-  const text = stripWrappers(item.text);
+  // The words as the person wrote them, without a reminder the harness added; a card they sent
+  // themselves keeps every word, also a quoted note of Sable's.
+  const text = userItemText(item);
 
   const edit = async () => {
     if (busy) return;

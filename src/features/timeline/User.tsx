@@ -1,6 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import type { UserItem } from '@shared/protocol';
-import { stripWrappers } from '@shared/synthetic';
+import { userItemText } from '@shared/synthetic';
 import { CopyButton } from '@/components/CopyButton';
 import { ImageView } from '@/components/ImageView';
 import { Icon } from '@/icons';
@@ -161,8 +161,10 @@ export const UserMessage = memo(function UserMessage({ item, landingId = item.id
   const images = item.attachments?.filter((a) => hasThumbnail(a, item.more)) ?? [];
   const files = item.attachments?.filter((a) => !hasThumbnail(a, item.more)) ?? [];
   // A review sent from the review bar: what was typed, then the comments as a short list. Wrappers
-  // the agent's harness added to the words (a reminder) are not shown.
-  const text = useMemo(() => stripWrappers(item.text), [item.text]);
+  // the agent's harness added to the words (a reminder) are not shown; a card the person sent
+  // themselves keeps every word, also one that quotes a note of Sable's (`userItemText`). The same
+  // words are what Copy takes.
+  const text = useMemo(() => userItemText(item), [item]);
   const review = useMemo(() => parseReview(text), [text]);
   const words = review ? review.lead : text;
   const long = isLongMessage(words);

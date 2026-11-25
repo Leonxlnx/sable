@@ -4,6 +4,8 @@ import { packReviews, unpackReviews } from '@desk/features/review/persist';
 import { conn } from './conn';
 import { onForget } from './forget';
 import { epoch, still } from './epoch';
+import { isUncertain } from './errors';
+import { submissionDone, submissionFor, submissionUnsure } from './submit';
 import { notSentHere, sentHere } from './follow';
 
 /**
@@ -73,10 +75,17 @@ export async function sendReview(sid: string): Promise<{ queued: boolean }> {
   const lead = leadOf(sid).trim();
   const e = epoch();
   sentHere(sid);
-  const r = await conn.call('session.send', { sessionId: sid, text: reviewMessage(list, lead) }).catch((err) => {
+  // One id for this review (lib/submit.ts): sent again after a connection that cut its answer off, the
+  // same comments carry the same id, so the desktop answers without sending them twice.
+  const text = reviewMessage(list, lead);
+  const sub = submissionFor(sid, text, undefined);
+  const r = await conn.call('session.send', { sessionId: sid, text, submitId: sub.id }).catch((err) => {
     notSentHere(sid);
+    if (isUncertain(err)) submissionUnsure(sid, sub.id);
+    else submissionDone(sid, sub.id);
     throw err;
   });
+  submissionDone(sid, sub.id);
   if (r.queued || !r.ok) notSentHere(sid);
   // Forgotten while it went: nothing of that computer is written again.
   if (!still(e)) return { queued: !!r.queued };

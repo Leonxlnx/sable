@@ -62,14 +62,14 @@ import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoic
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { chatReplyInstruction, CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
-import { withoutHandover, HANDOVER_JOIN, STEER_NOW_BLOCK, isAuthFailure, isCompactOutput, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
+import { endsWithSteerNote, importedSteerText, syntheticOf, withoutHandover, HANDOVER_JOIN, STEER_NOW_BLOCK, isAuthFailure, isCompactOutput, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled, cleanToolInput, streamsInput } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
 import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from './widget-tool';
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
-import { anonymousDelegateStep } from '../core/delegate-result';
+import { toolReceipt, type WantedReceipts } from '../core/delegate-result';
 import { readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
 import { record, type AuthScope, type EndReason, type StartReason } from '../core/auth-journal';
@@ -246,7 +246,7 @@ function claudeEnv(configDir: string | undefined): NodeJS.ProcessEnv {
   return env;
 }
 
-let configLock: Promise<unknown> = Promise.resolve();
+let configLock: Promise<void> = Promise.resolve();
 
 /**
  * The SDK's history readers (listSessions, getSessionMessages) take no config option and read
@@ -266,7 +266,7 @@ function withConfigDir<T>(configDir: string | undefined, fn: () => Promise<T>): 
       else process.env.CLAUDE_CONFIG_DIR = prev;
     }
   });
-  configLock = run.catch(() => {});
+  configLock = run.then(() => {}, () => {});
   return run;
 }
 
@@ -1100,27 +1100,34 @@ export class ClaudeProvider implements Provider {
     return this.configDir ?? OWN_CONFIG_DIR ?? path.join(homedir(), '.claude');
   }
 
-  /** Copies the conversation's transcript files from another account's folder into this one (see accounts/handover). */
-  async delegateReceipts(session: string, cwd: string, after?: string) {
-    const messages = await this.withHistory(() => getSessionMessages(session, { dir: cwd, includeSystemMessages: true }));
-    if (!messages.length) throw new Error('The Claude conversation is unavailable for report reconciliation.');
-    const receipts = new Set<string>();
-    for (const row of messages) {
-      if (row.type !== 'user') continue;
-      const content = (row.message as Obj)?.content;
-      if (typeof content === 'string') readDelegateIds(content, receipts);
-      else if (Array.isArray(content)) for (const block of content) {
-        if (block.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, receipts);
-        if (block.type === 'tool_result') {
-          receipts.add('tool:' + block.tool_use_id);
-          const synthetic = anonymousDelegateStep(block.content);
-          if (synthetic) receipts.add('tool:' + synthetic);
+  /** Only a matching result or input is authoritative in the SDK's replayable history. */
+  async delegateReceipts(session: string, cwd: string, _after: string | undefined, wanted: WantedReceipts, signal = AbortSignal.timeout(3000)) {
+    return this.withHistory(async () => {
+      signal.throwIfAborted();
+      let abort!: () => void;
+      const deadline = new Promise<never>((_, reject) => {
+        abort = () => reject(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+      });
+      try {
+        const messages = await Promise.race([getSessionMessages(session, { dir: cwd, includeSystemMessages: true }), deadline]);
+        const ids = new Set<string>();
+        for (const row of messages) {
+          if (row.type !== 'user' || row.parent_tool_use_id) continue;
+          const content = (row.message as Obj)?.content;
+          if (typeof content === 'string') readDelegateIds(content, ids, wanted.ids);
+          else if (Array.isArray(content)) for (const block of content) {
+            if (block?.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, ids, wanted.ids);
+            if (block?.type === 'tool_result') {
+              const key = toolReceipt(block.tool_use_id, block.content, wanted.tools);
+              if (key) ids.add('tool:' + key);
+            }
+          }
         }
-      }
-    }
-    // A large transcript can start at a compact boundary. Its missing prefix proves no negative receipts.
-    const compact = messages.findLastIndex(row => (row as Obj).isCompactSummary || row.type === 'system' && ((row as Obj).subtype ?? (row.message as Obj)?.subtype) === 'compact_boundary');
-    return { ids: receipts, settled: compact < 0 || !!after && messages.slice(compact).some(row => row.uuid === after) };
+        const count = wanted.tools.size + wanted.ids.size;
+        return { ids, settled: count > 0 && ids.size === count };
+      } finally { signal.removeEventListener('abort', abort); }
+    });
   }
 
   async adoptConversation(fromHome: string, providerSessionId: string): Promise<boolean> {
@@ -1128,8 +1135,8 @@ export class ClaudeProvider implements Provider {
   }
 
   async steerReceipts(session: string, cwd: string, issued: Set<string>) {
-    const rows = await this.withHistory(() => getSessionMessages(session, { dir: cwd }));
-    return rows.filter(row => row.type === 'user' && !row.parent_tool_use_id && issued.has(row.uuid)).map(row => row.uuid);
+    return this.withHistory(async () => (await getSessionMessages(session, { dir: cwd }))
+      .filter(row => row.type === 'user' && !row.parent_tool_use_id && issued.has(row.uuid)).map(row => row.uuid));
   }
 
   async history(cwd?: string, limit = 40): Promise<HistoryEntry[]> {
@@ -1518,7 +1525,7 @@ class ClaudeSession implements ProviderSession {
    * is shown as it went, and its copy in the queue is taken out (never sent twice) unless the person
    * changed it there since; sent again from the queue meanwhile, the card that went is this one too.
    */
-  private withdrawn = new Map<string, { itemId: string; text: string; attachments?: UserItem['attachments']; steered?: boolean; at: number }>();
+  private withdrawn = new Map<string, { itemId: string; text: string; attachments?: UserItem['attachments']; steered?: boolean; until?: UserItem['until']; phoneSender?: UserItem['phoneSender']; submitPrint?: string; at: number }>();
   /** The CLI's own state (session_state_changed), as last reported. */
   private cliState?: 'idle' | 'running' | 'requires_action';
   private interrupted = false;
@@ -2093,6 +2100,7 @@ class ClaudeSession implements ProviderSession {
 
   /** Looks at a waiting restart once the event at hand is handled. */
   delegateEnded() {
+    this.rt.onWakeEligibilityChanged?.();
     this.release();
     this.freeLater();
   }
@@ -2419,9 +2427,9 @@ class ClaudeSession implements ProviderSession {
    * the process has really ended, or after `EXIT_WAIT_MS` (a move copies a transcript only once
    * `exited` says it ended).
    */
-  async terminateDelegate() {
-    await this.terminateDelegateProcesses();
-    await this.close();
+  private retiringDelegate?: Promise<void>;
+  terminateDelegate() {
+    return this.retiringDelegate ??= this.terminateDelegateProcesses().then(() => this.close());
   }
 
   private async terminateDelegateProcesses() {
@@ -2483,6 +2491,11 @@ class ClaudeSession implements ProviderSession {
     }
   }
 
+  private steerDestination(): NonNullable<UserItem['issuedTo']> {
+    const { accountId, cwd, providerSessionId } = this.rt.meta;
+    return { provider: 'claude', accountId, cwd, session: providerSessionId ?? this.owner?.nativeId };
+  }
+
   private async sendInput(item: UserItem, opts?: SendOptions) {
     // The sender's guard (review wave 6, #3): everything from here to the push into the stream runs at once.
     opts?.check?.();
@@ -2513,13 +2526,13 @@ class ClaudeSession implements ProviderSession {
       const batch = this.held;
       const query = this.q;
       const turn = this.turnSeq;
-      this.rt.patch<UserItem>(item.id, { state: 'queued', issuedUuid: batch ? undefined : uuid });
+      this.rt.patch<UserItem>(item.id, { state: 'queued', issuedUuid: batch ? undefined : uuid, issuedTo: batch ? undefined : this.steerDestination() });
       try {
         if (this.rt.persistInput) await this.rt.persistInput();
         opts?.check?.();
         if (this.held !== batch || this.q !== query || turn !== this.turnSeq || this.retired || (this.interrupted && this.rt.turnActive) || !this.rt.get(item.id)) throw new Error('The turn changed before delivery.');
       } catch (error) {
-        this.rt.patch<UserItem>(item.id, { issuedUuid: undefined });
+        this.rt.patch<UserItem>(item.id, { issuedUuid: undefined, issuedTo: undefined });
         throw error;
       }
     }
@@ -2542,8 +2555,13 @@ class ClaudeSession implements ProviderSession {
     // Steered into a running turn: the person waits for a reply, so the agent is told to answer first
     // (a block of its own after their words; the conversation shows only what they wrote). Not for a
     // slash command, which is not a question.
-    const steerFirst = !!item.steered && this.rt.turnActive && !/^\/[\w:-]+/.test(item.text.trim());
+    const steerFirst = !!item.steered && !item.until && this.rt.turnActive && !/^\/[\w:-]+/.test(item.text.trim());
     const reminder = opts?.steerNow ? STEER_NOW_BLOCK : steerFirst ? STEER_FIRST_BLOCK : undefined;
+    const start = opts?.personalOffset;
+    const split = reminder && card?.type === 'user' && start !== undefined && text !== card.text && text.startsWith(card.text, start);
+    const prefix = split ? text.slice(0, start) : '';
+    const suffix = split ? text.slice(start + card.text.length) : '';
+    const words = split ? [...(prefix ? [prefix] : []), card.text, ...(suffix ? [suffix] : [])] : [text];
     const content: unknown =
       images.length || reminder
         ? [
@@ -2551,7 +2569,7 @@ class ClaudeSession implements ProviderSession {
               const m = a.dataUrl!.match(/^data:([^;]+);base64,(.*)$/);
               return { type: 'image', source: { type: 'base64', media_type: m?.[1] ?? 'image/png', data: m?.[2] ?? '' } };
             }),
-            { type: 'text', text },
+            ...words.map(text => ({ type: 'text', text })),
             ...(reminder ? [{ type: 'text', text: reminder }] : []),
           ]
         : text;
@@ -2572,6 +2590,8 @@ class ClaudeSession implements ProviderSession {
       const oldest = this.own.keys().next().value!;
       this.releaseReceipt(this.own.get(oldest));
       this.own.delete(oldest);
+      this.cancelledInputs.delete(oldest);
+      this.interruptSurvivors.delete(oldest);
     }
     // Its result says what it came to (`retire`): until then it went ok for nobody (the bridge names a chat only from one that did).
     this.rt.expectOutcome(item.id);
@@ -2652,7 +2672,7 @@ class ClaudeSession implements ProviderSession {
         own?.heldCheck?.();
         const q = this.ensure();
         if (own && (own.heldCheck || own.steerNow || this.rt.get<UserItem>(own.itemId)?.steered)) {
-          this.rt.patch<UserItem>(own.itemId, { issuedUuid: uuid });
+          this.rt.patch<UserItem>(own.itemId, { issuedUuid: uuid, issuedTo: this.steerDestination() });
           if (this.rt.persistInput) await this.rt.persistInput();
           own.heldCheck?.();
           if (this.held !== held || this.q !== q || !this.awaiting.has(uuid) || !this.rt.turnActive || this.interrupted) throw new Error('The turn changed before delivery.');
@@ -2666,7 +2686,7 @@ class ClaudeSession implements ProviderSession {
         if (own) {
           const card = this.rt.get<UserItem>(own.itemId);
           if (card && (!card.issuedUuid || card.issuedUuid === uuid)) {
-            this.rt.patch<UserItem>(own.itemId, { issuedUuid: undefined });
+            this.rt.patch<UserItem>(own.itemId, { issuedUuid: undefined, issuedTo: undefined });
             missed.add(own.itemId);
           }
         }
@@ -2697,6 +2717,8 @@ class ClaudeSession implements ProviderSession {
 
   /** The SDK confirmed withdrawal, or this input never left Sable. Remember its UUID as ours. */
   private forgetRecalled(uuid: string) {
+    this.cancelledInputs.delete(uuid);
+    this.interruptSurvivors.delete(uuid);
     const own = this.own.get(uuid);
     if (own) {
       own.recalled = true;
@@ -2737,7 +2759,7 @@ class ClaudeSession implements ProviderSession {
     const waiting = [...this.pendingUsers].filter(([uuid, id]) => {
       const card = this.rt.get<UserItem>(id);
       if (automatic && (card?.steerAttempts ?? 0) >= 2) return false;
-      return card?.type === 'user' && !card.parentId && !card.remote && card.steered && card.state === 'queued' && this.awaiting.get(uuid)?.read === false && (card.authored || parseSynthetic(card.text)?.role !== 'hidden');
+      return card?.type === 'user' && !card.parentId && !card.remote && card.steered && card.state === 'queued' && this.awaiting.get(uuid)?.read === false && syntheticOf(card)?.role !== 'hidden';
     });
     const target = waiting.find(([, id]) => id === itemId);
     if (!target) return [];
@@ -2759,7 +2781,7 @@ class ClaudeSession implements ProviderSession {
         if (own?.read) continue;
         if (this.pendingUsers.has(uuid) && this.awaiting.get(uuid)?.read === false) {
           this.rt.clearSteerWaits(id);
-          this.rt.patch<UserItem>(id, { issuedUuid: undefined });
+          this.rt.patch<UserItem>(id, { issuedUuid: undefined, issuedTo: undefined });
         } else if (this.rt.queue.some(q => q.id === id && q.issuedUuid === uuid)) this.rt.confirmDropped(uuid);
         else continue;
         this.forgetRecalled(uuid);
@@ -2788,9 +2810,13 @@ class ClaudeSession implements ProviderSession {
       const receipt = await this.steerRequest(target.q, { subtype: 'interrupt', for_user_message_uuids: [target.uuid] }, signal);
       if (this.q !== target.q) throw new Error('Claude process changed.');
       for (const uuid of receipt?.still_queued ?? []) {
-        if (this.own.has(uuid)) this.interruptSurvivors.add(uuid);
+        const own = this.own.get(uuid);
+        if (!own || own.read || own.recalled) continue;
+        this.interruptSurvivors.add(uuid);
+        this.rt.markStillQueued(own.itemId, uuid);
         this.settleCancelled(uuid);
       }
+      if (receipt?.still_queued?.length) await this.rt.persistInput?.();
       if (receipt?.turn !== 'stopped') throw new Error('Claude did not confirm interruption of this turn.');
     } catch (err) {
       if (this.steerInterruptPending && this.turnSeq === target.turn) this.interrupted = false;
@@ -2820,7 +2846,7 @@ class ClaudeSession implements ProviderSession {
     if (!own || own.read) return;
     const card = this.rt.get<UserItem>(own.itemId);
     if (card?.issuedUuid === uuid) {
-      this.rt.patch<UserItem>(card.id, { issuedUuid: undefined });
+      this.rt.patch<UserItem>(card.id, { issuedUuid: undefined, issuedTo: undefined });
       this.rt.returnUntaken({ ids: new Set([card.id]) });
     } else this.rt.confirmDropped(uuid);
     this.forgetRecalled(uuid);
@@ -3169,9 +3195,17 @@ class ClaudeSession implements ProviderSession {
   private onMessage(m: SDKMessage) {
     const any = m as Obj;
     if (any.type === 'turn_handoff' || any.type === 'system' && any.subtype === 'turn_handoff') this.scopedInterrupt = false;
-    if (any.type === 'command_lifecycle' && any.state === 'cancelled' && this.own.has(any.command_uuid)) {
-      this.cancelledInputs.add(any.command_uuid);
-      this.settleCancelled(any.command_uuid);
+    if (any.type === 'command_lifecycle' && any.state === 'cancelled') {
+      const own = this.own.get(any.command_uuid);
+      if (!own) {
+        // The durable survivor may outlive the bounded recent-input cache.
+        if (this.rt.queue.some(q => q.issuedUuid === any.command_uuid && q.issuedTo?.stillQueued)) this.rt.confirmDropped(any.command_uuid);
+        return;
+      }
+      if (!own.recalled && !own.read) {
+        this.cancelledInputs.add(any.command_uuid);
+        this.settleCancelled(any.command_uuid);
+      }
       return;
     }
     const now = Date.now();
@@ -3571,7 +3605,7 @@ class ClaudeSession implements ProviderSession {
       if (b.type !== 'tool_result') continue;
       const item = rt.get<ToolItem>(b.tool_use_id);
       rt.delegateReceipt(b.tool_use_id, b.content);
-      if (!item || item.delegateReport) continue; // The detached child's end owns the row.
+      if (!item || item.delegateDeliveryId || item.delegateReport) continue; // The child owns its terminal answer.
       if (item.kind === 'edit' || item.kind === 'write') rt.promote?.(item);
       const result = mapResult(item.name, (item.input as Obj) ?? {}, m.tool_use_result, b.content, !!b.is_error);
       const status = item.status === 'denied' || item.status === 'cancelled' ? item.status : b.is_error ? 'error' : 'done';
@@ -3692,10 +3726,12 @@ class ClaudeSession implements ProviderSession {
   /** A withdrawn send was consumed after all. Preserve any edits to the copy waiting in the queue. */
   private reclaim(uuid: string, providerId: string, awaitsResult = true): boolean {
     const restored = this.rt.queue.find(q => q.issuedUuid === uuid);
-    const back = this.withdrawn.get(uuid) ?? (restored && { itemId: restored.id, text: restored.text, attachments: restored.attachments, steered: true, at: restored.createdAt });
+    const confirmed = restored && this.rt.confirmSteerReceipt(uuid);
+    const back = confirmed ? { itemId: confirmed.id, text: confirmed.text, attachments: confirmed.attachments, steered: confirmed.steered, until: confirmed.until, phoneSender: confirmed.phoneSender, submitPrint: confirmed.submitPrint, at: confirmed.ts } : this.withdrawn.get(uuid);
     if (!back) return false;
     this.withdrawn.delete(uuid);
     this.interruptSurvivors.delete(uuid);
+    this.cancelledInputs.delete(uuid);
     const rt = this.rt;
     const copy = rt.queue.find((q) => q.id === back.itemId);
     let id = back.itemId;
@@ -3706,7 +3742,7 @@ class ClaudeSession implements ProviderSession {
     if (card?.type === 'user' && samePayload(card, back)) rt.taken(id, { providerId });
     else {
       if (card) id = randomUUID();
-      rt.add<UserItem>({ id, type: 'user', text: back.text, attachments: back.attachments, steered: back.steered, authored: true, state: 'sent', providerId });
+      rt.add<UserItem>({ id, type: 'user', text: back.text, attachments: back.attachments, steered: back.steered, ...(back.until ? { until: back.until } : { authored: true }), phoneSender: back.phoneSender, submitPrint: back.submitPrint, state: 'sent', providerId });
     }
     const own = this.own.get(uuid);
     if (own) {
@@ -3817,7 +3853,7 @@ class ClaudeSession implements ProviderSession {
       // Taken back to the queue meanwhile (a stop, a failure): out of it again, never sent twice. A
       // message Sable sent with no card of its own (a carry-on) stays unseen.
       const copy = rt.queue.find((q) => q.id === o.itemId);
-      if (copy && rt.takeQueued(copy.id)) rt.add<UserItem>({ id: copy.id, type: 'user', text: copy.text, attachments: copy.attachments, state: 'sent', providerId: uuid });
+      if (copy && rt.takeQueued(copy.id)) rt.add<UserItem>({ id: copy.id, type: 'user', text: copy.text, attachments: copy.attachments, ...(copy.until ? { until: copy.until } : { authored: true }), phoneSender: copy.phoneSender, submitPrint: copy.submitPrint, state: 'sent', providerId: uuid });
     }
     this.awaiting.set(uuid, { read: true });
     this.sentItems.set(uuid, o.itemId);
@@ -4010,7 +4046,7 @@ class ClaudeSession implements ProviderSession {
       if (itemId) ids.add(itemId);
       const row = itemId ? this.rt.get<UserItem>(itemId) : undefined;
       if (row) this.rt.promote?.(row);
-      if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined, steered: row?.steered, at: Date.now() });
+      if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined, steered: row?.steered, until: row?.until, phoneSender: row?.phoneSender, submitPrint: row?.submitPrint, at: Date.now() });
     }
     while (this.withdrawn.size > 50) this.withdrawn.delete(this.withdrawn.keys().next().value!);
     return ids;
@@ -4566,6 +4602,7 @@ class ClaudeSession implements ProviderSession {
         // Claude Code's own word on its turns (asked for with CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).
         const prev = this.cliState;
         this.cliState = m.state;
+        if (prev !== m.state) this.rt.onWakeEligibilityChanged?.();
         // Idle: a turn's result comes before it, so what settled turns still owed is not coming (`owed`),
         // and messages held for it go now.
         if (m.state === 'idle') {
@@ -4727,11 +4764,16 @@ class ClaudeSession implements ProviderSession {
       } else if (m.type === 'user') {
         if (!parentId) this.chain.push(m.uuid);
         if (typeof content === 'string') {
-          if (!parentId) readUserText(content, m.uuid, !m.isSynthetic && (content === STEER_NOW_BLOCK || content === STEER_FIRST_BLOCK));
+          if (!parentId) readUserText(content, m.uuid, !m.isSynthetic && endsWithSteerNote(content));
         } else if (Array.isArray(content)) {
           const blocks = content.filter((b: Obj) => b.type === 'text');
-          const decorated = blocks.length === 2 && [STEER_FIRST_BLOCK, STEER_NOW_BLOCK].includes(blocks[1].text);
-          const text = decorated ? withoutHandover(blocks[0].text) : flattenContent(blocks).text;
+          const decorated = blocks.length >= 2 && [STEER_FIRST_BLOCK, STEER_NOW_BLOCK].includes(blocks.at(-1).text);
+          const body = decorated ? blocks.slice(0, -1) : blocks;
+          // In the split SDK shape the authored block is bounded on both sides. Old two-block
+          // steers put the decorations inside that one block and need the composer grammar.
+          const first = body[0]?.text ?? '';
+          const prefix = body.length > 1 && first.endsWith(HANDOVER_JOIN) && !withoutHandover(first);
+          const text = !decorated ? flattenContent(blocks).text : body.length === 1 ? importedSteerText(first) : body[prefix ? 1 : 0].text;
           for (const b of content as Obj[]) {
             if (b.type !== 'tool_result') continue;
             const t = tools.get(b.tool_use_id);
@@ -4742,7 +4784,7 @@ class ClaudeSession implements ProviderSession {
             // A step's time runs from its own start to its result: with either not known it shows none.
             if (real && !unstamped.has(t.id)) t.endedAt = real;
           }
-          if (text && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) readUserText(text, m.uuid, decorated || !m.isSynthetic && blocks.length === 1 && (text === STEER_NOW_BLOCK || text === STEER_FIRST_BLOCK));
+          if (text && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) readUserText(text, m.uuid, decorated || !m.isSynthetic && blocks.length === 1 && endsWithSteerNote(text));
         }
       }
     }

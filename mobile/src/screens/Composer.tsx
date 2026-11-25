@@ -3,12 +3,12 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { STANDARD_SPEED, type Attachment, type ProviderId, type ProviderInfo, type QueuedMessage, type SessionMeta } from '@shared/protocol';
 import { offeredSpeeds, speedFor } from '@shared/speed';
 import { effortName, modelName, modelNameById, visibleModels } from '@desk/lib/models';
+import { rowActs, rowDelivery } from '@desk/features/composer/queue-rows';
 import { conn } from '@m/lib/conn';
 import { claimFlight, dropFlight, inFlight, launchFlight } from '@m/lib/flight';
 import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
 import { onPutDraft } from '@m/lib/put-draft';
-import { onForget } from '@m/lib/forget';
 import { notSentHere, sentHere } from '@m/lib/follow';
 import { getDraft, onDraft, pendingTakes, setDraft, settleTaken, stageTaken } from '@m/lib/drafts';
 import { epoch, still } from '@m/lib/epoch';
@@ -16,6 +16,8 @@ import { confirmTake, STILL_QUEUED, takeBack, type TakeDeps } from '@m/lib/take'
 import { haptic } from '@m/lib/native';
 import { acceptIntent, closeGap, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, unsureIntent, useStore } from '@m/lib/store';
 import { isUncertain } from '@m/lib/errors';
+import { shownPermissions } from '@m/lib/shown';
+import { confirmKept, draftChanged, filesKey, submissionDone, submissionFor, submissionUnsure } from '@m/lib/submit';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
@@ -23,16 +25,13 @@ import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from '.
 
 /**
  * A message whose send was cut off by a lost connection may or may not have reached the desktop.
- * It goes back into the field; when the conversation reloads and shows it arrived, the field clears
- * again (so it is never lost and never sent twice). Unsent words per chat: lib/drafts.ts.
+ * It goes back into the field with the id it was sent under (lib/submit.ts): a retry carries the same
+ * id, so it is never sent twice, and the field clears again only on that id's receipt (the desktop's
+ * yes to a question under that id, asked once connected again), never because a message of the same
+ * words turned up. Unsent words per chat: lib/drafts.ts; the sends it cut off forget themselves with
+ * the computer (lib/submit.ts).
  */
-const unsure = new Map<string, { text: string; at: number }>();
 const LOST = /connection to the desktop was lost|did not answer in time/i;
-
-// Forgetting the computer forgets the sends it cut off (the drafts forget themselves: lib/drafts.ts).
-onForget(() => {
-  unsure.clear();
-});
 
 /** Words taken back from the queue: kept on the phone before the desktop lets the message go (lib/take.ts). */
 const takes: TakeDeps = {
@@ -77,36 +76,34 @@ export function Composer({ sid }: { sid: string }) {
   const sendWithEnter = useStore((st) => st.settings?.sendWithEnter !== false);
   const [text, setText] = useState(() => getDraft(sid));
   const online = useStore((st) => st.conn === 'open');
-  // The newest message of yours, to settle a send the connection cut off.
-  const lastUser = useStore((st) => {
-    const d = st.data[sid];
-    if (!d) return undefined;
-    for (let i = d.roots.length - 1; i >= 0; i--) {
-      const it = d.items[d.roots[i]];
-      if (it?.type === 'user') return it;
-    }
-    return undefined;
-  });
   const [files, setFiles] = useState<Attachment[]>([]);
+  const filesNow = useRef(files);
+  filesNow.current = files;
   const [sheet, setSheet] = useState<'model' | 'mode' | null>(null);
   const [focused, setFocused] = useState(false);
   const area = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const sendKey = useRef<HTMLButtonElement>(null);
+  // A send the connection cut off is asked about once connected again, by its own id (the desktop's
+  // `session.submission` sends nothing). Its yes is the receipt: the words put back in the field go
+  // again, when they are still exactly what was sent. A no leaves them for the retry.
   useEffect(() => {
-    const u = unsure.get(sid);
-    if (!u || !lastUser || lastUser.type !== 'user') return;
-    if (lastUser.text.trim() === u.text && lastUser.ts >= u.at - 15_000) {
-      unsure.delete(sid);
-      if (area.current && area.current.value.trim() === u.text) {
-        setText('');
-        setDraft(sid, '');
-        area.current.style.height = '';
-        fit(area.current, 168);
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lastUser, sid]);
+    if (!online) return;
+    const e = epoch();
+    void confirmKept(sid, (submitId) => conn.call('session.submission', { sessionId: sid, submitId })).then((got) => {
+      const el = area.current;
+      if (!still(e) || !el) return;
+      if (!got.some((sub) => el.value.trim() === sub.text && filesKey(filesNow.current) === sub.files)) return;
+      setText('');
+      setDraft(sid, '');
+      setFiles([]);
+      el.style.height = '';
+      fit(el, 168);
+    });
+  }, [online, sid]);
+
+  // A send kept for a retry belongs to the field's words as they were put back: edited, it is let go.
+  useEffect(() => draftChanged(sid, text, files), [sid, text, files]);
 
   useEffect(() => {
     if (!sessionCaps && !folderCaps && s && online) ensureFolderCaps(s.provider, s.cwd, s.accountId);
@@ -205,7 +202,9 @@ export function Composer({ sid }: { sid: string }) {
     onSpeed: (v) => choose('speed', v, () => conn.call('session.setSpeed', { sessionId: sid, speed: v })),
     modes: caps?.modes ?? [],
     mode: s.mode,
-    onMode: (id) => choose('mode', id, () => conn.call('session.setMode', { sessionId: sid, mode: id })),
+    // With the permission cards this phone showed (lib/shown.ts), read at the tap: a mode that never
+    // asks answers those and no other.
+    onMode: (id) => choose('mode', id, () => conn.call('session.setMode', { sessionId: sid, mode: id, shownPermissions: shownPermissions(sid, sessionData(getState(), sid).permissions) })),
     // The other agents' models: picking one switches this chat to that agent, in place.
     others: away.map((p) => {
       const c = allCaps[`${p}:${s.cwd}`];
@@ -300,8 +299,12 @@ export function Composer({ sid }: { sid: string }) {
     const e = epoch();
     // The conversation follows this message to the end (lib/follow.ts); not when the desktop queues it.
     sentHere(sid);
+    // Its id, made with the words and files before the first request; a retry of a send the connection
+    // cut off gets the id it was sent under (lib/submit.ts).
+    const sub = submissionFor(sid, t, attachments);
     try {
-      const r = await conn.call('session.send', { sessionId: sid, text: t, attachments });
+      const r = await conn.call('session.send', { sessionId: sid, text: t, attachments, submitId: sub.id });
+      submissionDone(sid, sub.id);
       if (r.queued || !r.ok) notSentHere(sid);
     } catch (err) {
       notSentHere(sid);
@@ -309,10 +312,12 @@ export function Composer({ sid }: { sid: string }) {
       dropFlight();
       // Forgotten (or replaced by another computer) while it went: its words are not put back.
       if (!still(e)) return;
+      // Cut off: kept with its id for the retry. Refused: the desktop forgot it too.
+      if (LOST.test(msg)) submissionUnsure(sid, sub.id);
+      else submissionDone(sid, sub.id);
       haptic('deny');
       update(t);
       setFiles(attachments ?? []);
-      if (LOST.test(msg)) unsure.set(sid, { text: t, at: Date.now() });
       setState({ toast: { text: LOST.test(msg) ? 'The connection dropped while sending' : msg, level: 'error', at: Date.now() } });
     }
   };
@@ -432,6 +437,8 @@ function QueueTray({ sid, queue }: { sid: string; queue: QueuedMessage[] }) {
  * One waiting message; a row its words are flying into lands as liquid instead of rising in. A tap on
  * its words takes it back into the field to edit (`queue.take`; one with pictures stays: the phone does
  * not hold their data). A take the desktop refuses (too long to send back) says so and leaves it queued.
+ * A message whose delivery is not known (the desktop's `rowDelivery`: it will not send it by itself)
+ * says the desktop's reason under its words, and its two keys are "Send again" and "Discard".
  */
 function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -442,6 +449,16 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const editable = !q.attachments?.length && !!q.text;
+  const delivery = rowDelivery(q);
+  const acts = rowActs(delivery, false);
+  const words = delivery.reason ? (
+    <>
+      <span>{q.text || 'Photo'}</span>
+      <span className="queued-why">{delivery.reason}</span>
+    </>
+  ) : (
+    q.text || 'Photo'
+  );
   const take = () => {
     if (taking) return;
     haptic('tap');
@@ -474,16 +491,16 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
             transition={SNAP}
           >
             {editable ? (
-              <button type="button" className="queued-text" aria-label={`Edit: ${q.text.slice(0, 80)}`} data-busy={taking || undefined} onClick={take}>
-                {q.text}
+              <button type="button" className="queued-text" aria-label={`Edit: ${q.text.slice(0, 80)}${delivery.reason ? `. ${delivery.reason}` : ''}`} data-why={delivery.reason ? '' : undefined} data-busy={taking || undefined} onClick={take}>
+                {words}
               </button>
             ) : (
-              <span className="queued-text">{q.text || 'Photo'}</span>
+              <span className="queued-text" data-why={delivery.reason ? '' : undefined}>{words}</span>
             )}
             <button
               type="button"
               className="icon-btn sm"
-              aria-label="Send now"
+              aria-label={acts.send}
               onClick={() => {
                 haptic('send');
                 sentHere(sid);
@@ -501,7 +518,7 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
             <button
               type="button"
               className="icon-btn sm"
-              aria-label="Remove"
+              aria-label={acts.remove}
               onClick={() => {
                 haptic('tap');
                 void conn.call('queue.remove', { sessionId: sid, id: q.id }).catch(() => {});

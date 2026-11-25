@@ -687,6 +687,38 @@ describe('review wave 17', { timeout: 25_000 }, () => {
     expect(h.rt.items.some((i) => i.type === 'user' && i.text === 'also this')).toBe(false);
   });
 
+  it('uses the durable pairing when a refused phone sleeps before continuation', async () => {
+    const h = await onForbiddenCredits();
+    const phoneSender = { deviceId: 'paired', generation: 7 };
+    h.app.phoneStillPaired = s => s.deviceId === phoneSender.deviceId && s.generation === 7;
+    let connected = true;
+    await h.app.call('session.send', { sessionId: h.rt.id, text: 'from the sleeping phone' }, { phoneSender, allowed: () => connected });
+    connected = false;
+    await until(() => h.rt.meta.accountId === h.ultra3.id, 'the move');
+    await until(() => h.sent.length > 0, 'the refused message');
+    expect(h.sent[0].text).toContain('from the sleeping phone');
+  });
+
+  it('keeps a revoked refusal blocked across continuations until the desktop adopts that card', async () => {
+    const h = await onForbiddenCredits();
+    let paired = true;
+    h.app.phoneStillPaired = () => paired;
+    const phoneSender = { deviceId: 'original', generation: 4 };
+    await h.app.call('session.send', { sessionId: h.rt.id, text: 'refused words' }, { phoneSender, allowed: () => true });
+    const refusal = cards(h.rt.items)[0];
+    const user = h.rt.items.find(i => i.type === 'user' && i.text === 'refused words')!;
+    paired = false;
+    await until(() => h.rt.meta.accountId === h.ultra3.id && !h.rt.meta.moving, 'the move');
+    const params = { sessionId: h.rt.id, accountId: h.ultra3.id, retry: true, refusalId: refusal.id };
+    await h.app.call('session.switchAccount', params);
+    await h.app.call('session.switchAccount', params);
+    expect(h.sent).toHaveLength(0);
+    await expect(h.app.call('session.switchAccount', { ...params, adoptPhoneMessage: user.id }, { allowed: () => true })).rejects.toThrow(/desktop/);
+    await h.app.call('session.switchAccount', { ...params, adoptPhoneMessage: user.id });
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].text).toContain('refused words');
+  });
+
   it("#3 a removed phone's refused message never goes on the next account", async () => {
     const h = await onForbiddenCredits();
     let paired = true;

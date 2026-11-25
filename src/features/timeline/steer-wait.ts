@@ -53,8 +53,10 @@ export function waitingOn(item: (id: string) => TimelineItem | undefined, roots:
 
 /**
  * The earliest time the bridge sends by itself among the steers that wait in the running turn. Its
- * send at that first time delivers every waiting message, oldest first, so each of their lines
- * counts down to it: a second message sent ten seconds later goes with the first, not ten seconds on.
+ * send at that first time delivers every waiting message it may still interrupt for, oldest first,
+ * so each of their lines counts down to it: a second message sent ten seconds later goes with the
+ * first, not ten seconds on. A card whose own tries are spent is left out of that send and does not
+ * count down to it (`steerWaitLine`, `capped`).
  */
 export function firstAutoAt(item: (id: string) => TimelineItem | undefined, roots: readonly string[]): number | undefined {
   let at: number | undefined;
@@ -170,8 +172,13 @@ export function steerWaitLine({ item, steps, agent, autoAt: first, now, sending 
   const cost = costOf(steps.length);
   if (sending) return { phase: 'sending', why: '', label: 'Sending', clock: '', room: '', action, disabled: true, cost };
   const why = waitReason(item.steerWait);
-  const autoAt = action ? (first ?? item.steerWait?.autoAt) : undefined;
-  // The countdown shows only while the bridge has a time of its own; a reason stands before it.
+  const own = item.steerWait?.autoAt;
+  // A card with a reason and no time of its own is one the bridge no longer interrupts for by itself
+  // (its tries are spent: "Automatic interruption limit reached."). Its sibling's automatic send
+  // leaves it out, so it never borrows that countdown (`first`); only its own press sends it.
+  const capped = !!why && !(typeof own === 'number' && Number.isFinite(own));
+  const autoAt = action && !capped ? (first ?? own) : undefined;
+  // The countdown shows only while the bridge has a time for this card; a reason stands before it.
   if (typeof autoAt === 'number' && Number.isFinite(autoAt)) {
     const left = autoAt - now;
     if (left > 0) {

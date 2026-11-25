@@ -38,7 +38,9 @@ export const StandInCards = memo(function StandInCards({ sessionId }: { sessionI
 });
 
 const StandInRow = memo(function StandInRow({ s }: { s: StandIn }) {
-  const item = useMemo(() => ({ id: s.id, type: 'user', text: s.text, ts: s.wall }) as UserItem, [s.id, s.text, s.wall]);
+  // The person's own words, just sent: `authored`, so the card shows every one of them as the row that
+  // takes its place will (`userItemText`: a message that quotes a note of Sable's is not cut).
+  const item = useMemo(() => ({ id: s.id, type: 'user', text: s.text, ts: s.wall, authored: true }) as UserItem, [s.id, s.text, s.wall]);
   return (
     <div className="tl-item" data-t="user" data-standin>
       <UserMessage item={item} landingId={s.submitId} />

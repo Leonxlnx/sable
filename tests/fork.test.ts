@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { TimelineItem } from '../shared/protocol';
+import type { TimelineItem, ToolItem, UserItem } from '../shared/protocol';
 import { App } from '../server/app';
 import { claudeForkPoint, codexForkTurn, cutAt } from '../server/core/fork';
 import { DemoProvider } from '../server/providers/demo';
@@ -34,7 +34,8 @@ const items: TimelineItem[] = [
 
 describe('fork points', () => {
   it('keeps the turn that holds the answer and drops the next message on', () => {
-    const cut = cutAt(items, 't1:a')!;
+    const queued: TimelineItem = { id: 'waiting', type: 'user', ts: 3, text: 'source only', state: 'queued', issuedUuid: 'source-uuid' };
+    const cut = cutAt([...items.slice(0, 3), queued, ...items.slice(3)], 't1:a')!;
     expect(cut.kept.map((i) => i.id)).toEqual(['u1', 't1:a', 't1:end']);
     expect(cut.next?.id).toBe('u2');
     expect(cutAt(items, 't2:a')!.next).toBeUndefined();
@@ -111,6 +112,26 @@ describe('session.fork', () => {
     const handovers = (app as unknown as { handovers: Map<string, string> }).handovers;
     expect(handovers.has(snap.session.id)).toBe(false);
     expect(JSON.stringify(src.items)).toBe(before);
+  });
+
+  it('writes a fork base without its source queue or issued steer', async () => {
+    const { app, src, firstAnswer } = await setup();
+    src.beginTurn(); // The source still owns its unread input while the disk base is copied.
+    const waiting = src.add<UserItem>({ type: 'user', text: 'only the source owns this', state: 'queued', issuedUuid: 'original-uuid' } as const);
+    const history = src.items.filter(row => row !== waiting);
+    const at = history.indexOf(firstAnswer);
+    // A historical delegate row selects the disk-backed copy path.
+    const step = src.add<ToolItem>({ type: 'tool', kind: 'agent', name: 'Agent', title: 'Review', detail: {}, status: 'done', delegateDeliveryId: 'completed-report' } as const);
+    history.splice(at + 1, 0, step, waiting);
+    src.reset(history);
+    src.enqueue('source queue');
+    const snap = await app.call('session.fork', { sessionId: src.id, itemId: firstAnswer.id });
+    await app.store.flush();
+    const file = app.store.loadSession(snap.session.id);
+    expect(file.items.some(i => i.id === firstAnswer.id)).toBe(true);
+    expect(file.items.some(i => i.id === waiting.id)).toBe(false);
+    expect(file.queue ?? []).toEqual([]);
+    expect(src.get(waiting.id)).toBe(waiting);
   });
 
   it('starts from a summary up to that point when the agent cannot fork', async () => {

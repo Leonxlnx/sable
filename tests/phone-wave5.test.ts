@@ -470,8 +470,10 @@ describe('a queued message taken back with a receipt (20)', () => {
     const q = rt.enqueue('first');
     rt.enqueue('second');
     const r = (await c.call('queue.take', { sessionId: rt.id, id: q.id, ack: true })) as { result: { take: string } };
+    await rt.persistInput!();
     const done = (await c.call('phone.takeDone', { take: r.result.take })) as { ok: boolean; result: { taken: boolean } };
     expect(done.result.taken).toBe(true);
+    expect(app.store.loadSession(rt.id).queue?.map(q => q.text)).toEqual(['second']);
     expect(rt.queue.map((m) => m.text)).toEqual(['second']);
     expect(((await c.call('phone.takeDone', { take: r.result.take })) as { result: { taken: boolean } }).result.taken).toBe(true);
     expect(rt.queue.map((m) => m.text)).toEqual(['second']);
@@ -498,6 +500,17 @@ describe('a queued message taken back with a receipt (20)', () => {
     await app.call('queue.update', { sessionId: rt.id, id: a.id, text: 'a, edited on the desktop' });
     expect(((await c.call('phone.takeDone', { take: rc.result.take })) as { result: { taken: boolean } }).result.taken).toBe(false);
     expect(rt.queue.map((m) => m.text)).toEqual(['a, edited on the desktop']);
+  });
+
+  it('does not acknowledge a phone take after the update snapshot is sealed', async () => {
+    const { app, port, home } = await setup();
+    const { c } = await pairSecure(app, port);
+    const rt = await chatOf(app, c, home);
+    const q = rt.enqueue('keep across the update');
+    const take = (await c.call('queue.take', { sessionId: rt.id, id: q.id, ack: true })) as { result: { take: string } };
+    await app.store.seal();
+    expect(await c.call('phone.takeDone', { take: take.result.take })).toMatchObject({ ok: false });
+    expect(app.store.loadSession(rt.id).queue?.map(q => q.text)).toEqual(['keep across the update']);
   });
 
   it("another phone's receipt takes nothing", async () => {

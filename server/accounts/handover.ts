@@ -117,6 +117,7 @@ export function handoverText(items: TimelineItem[], opts: { skip?: string; maxCh
   for (const it of items) {
     if (it.parentId || it.id === opts.skip) continue;
     if (it.type === 'user') {
+      if (it.until?.check) continue;
       // What Claude Code wrote in the person's place, in plain words: a task that finished, a
       // command they ran and what it printed. Reminders and caveats are left out.
       const syn = syntheticOf(it);
