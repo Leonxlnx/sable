@@ -2,7 +2,7 @@ import { syntheticOf } from '@shared/synthetic';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useIsPresent } from 'motion/react';
 import { Icon } from '@/icons';
-import { EASE_OUT, play, reducedMotion } from '@/lib/motion';
+import { EASE_OUT, play, reducedMotion, uiZoom } from '@/lib/motion';
 import { interrupt } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { EMPTY, TimelineCtx, type TimelineCtxValue } from './ctx';
@@ -15,7 +15,7 @@ import { StandInCards } from './StandIn';
 import { useStandIns } from './stand-in';
 import { keptAt } from './build-window';
 import { DOCK_GLIDE_EASE, DOCK_GLIDE_MS } from '@/features/session/dock-glide';
-import { glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
+import { endSnap, glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
 import { useStaged } from '@/features/session/staged';
 import './timeline.css';
 
@@ -231,6 +231,8 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     if (!el || !inner) return;
     let pad = -1;
     let wide = el.clientWidth;
+    // The padding below one device pixel that keeps the height whole (follow.ts `endSnap`).
+    let snap = 0;
     const ro = new ResizeObserver(() => {
       // The view itself got another width (the window resized, the side panel moving): every line
       // wraps again and the end moves by hundreds of pixels per frame. Gliding after it left the
@@ -244,7 +246,8 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       // card's height in one frame. It glides down instead: the drop is undone by a transform that
       // runs out on the compositor. The live line, held at the top of the view while the card was
       // there, stays put until its own place reaches it.
-      const padNow = parseFloat(getComputedStyle(inner).paddingBottom) || 0;
+      // The dock's padding, without the fraction that keeps the end on whole device pixels (below).
+      const padNow = (parseFloat(getComputedStyle(inner).paddingBottom) || 0) - snap;
       const less = pad - padNow;
       const taller = pad >= 0 && less < -0.5;
       const fell = lastTop.current - el.scrollTop;
@@ -267,6 +270,16 @@ export function Timeline({ sessionId }: { sessionId: string }) {
         }
       }
       pad = padNow;
+      // Kept at the end, the end stands on whole device pixels: read here, after the layout and before
+      // paint, and written as the content's own padding (no inherited property: nothing below restyles).
+      if (stuck.current) {
+        const z = uiZoom();
+        const e = endSnap(inner.getBoundingClientRect().height / z, snap, (window.devicePixelRatio || 1) * z);
+        if (Math.abs(e - snap) > 0.002) {
+          snap = e;
+          inner.style.paddingBottom = e ? `calc(var(--dock-h, 150px) - 4px + ${e.toFixed(3)}px)` : '';
+        }
+      }
       room.current = el.scrollHeight - el.clientHeight - el.scrollTop;
       glideTail();
       if (restoreTo.current !== null && restore()) return;

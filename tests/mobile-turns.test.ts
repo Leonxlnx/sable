@@ -70,8 +70,8 @@ describe('phone turns', () => {
     const s = onlyTurn('U1 l2 w3 T4').segments[0];
     expect(s).toMatchObject({ answer: '2', work: ['3'], steps: 1 });
     expect(flowOf(s.flow)).toBe('2 [3]');
-    expect(onlyTurn('U1 l2 w3 l4 w5 T6').segments[0]).toMatchObject({ answer: '4', work: ['2', '3', '5'] });
-    expect(onlyTurn('U1 l2 w3', true).segments[0]).toMatchObject({ answer: null, work: ['2', '3'] });
+    expect(onlyTurn('U1 l2 w3 l4 w5 T6').segments[0]).toMatchObject({ reply: '2', answer: '4', work: ['3', '5'] });
+    expect(onlyTurn('U1 l2 w3', true).segments[0]).toMatchObject({ reply: '2', answer: null, work: ['3'] });
     expect(onlyTurn('U1 t2 l3 w4 T5').segments[0]).toMatchObject({ answer: '2', work: ['3', '4'] });
     expect(onlyTurn('U1 l2 w3 F4').segments[0].answer).toBeNull();
   });
@@ -125,7 +125,7 @@ describe('phone turns as checkpoints (the desktop since f79fd71)', () => {
   it('only ever grows at its end while it runs: a run, then what closed it', () => {
     const steps = ['U1', 'U1 t2', 'U1 t2 h3', 'U1 t2 h3 w4', 'U1 t2 h3 w4 t5', 'U1 t2 h3 w4 t5 w6', 'U1 t2 h3 w4 t5 w6 t7'];
     expect(steps.map((s) => flowOf(onlyTurn(s, true).segments[0].flow))).toEqual(['', '2', '2 [3]', '2 [3 4]', '2 [3 4] 5', '2 [3 4] 5 [6]', '2 [3 4] 5 [6] 7']);
-    expect(onlyTurn('U1 t2 h3 w4 t5 w6 t7 T8').segments[0].notes).toEqual(['2', '5']);
+    expect(onlyTurn('U1 t2 h3 w4 t5 w6 t7 T8').segments[0]).toMatchObject({ reply: '2', notes: ['5'] });
   });
 
   it('stands the reply to a steered message right under it, whatever was still running', () => {
@@ -243,7 +243,7 @@ describe("phone turns with what Claude Code writes in the person's place", () =>
 
   it('reads them as the desktop does, a message the phone got cut short too', () => {
     expect(shapeOf(user(NOTE, { cut: true }))).toBe('N');
-    expect(shapeOf(user('<command-name>/model</command-name><command-args>opus</command-args>'))).toBe('U');
+    expect(shapeOf(user('<command-name>/model</command-name><command-args>opus</command-args>'))).toBe('M');
     // What a command printed is command output (in view in its place); a compaction's summary keeps its own path.
     expect(shapeOf(user('<local-command-stdout>Set model to Opus 5.5</local-command-stdout>'))).toBe('c');
     expect(shapeOf(user('<local-command-stderr>Migration failed</local-command-stderr>'))).toBe('c');

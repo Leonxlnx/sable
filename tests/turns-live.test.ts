@@ -1,15 +1,46 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { BridgeEvent, SessionMeta, TimelineItem, TurnLive, UserItem } from '../shared/protocol';
 import { turnLive, TurnLiveIndex } from '../shared/turn-live';
-import { groupTurns, shapeOf } from '../src/features/timeline/turns';
+import { groupTurns, runSpan, shapeOf, turnSpan } from '../src/features/timeline/turns';
 import { changesOf } from '../src/features/timeline/changes';
 import { SessionRuntime } from '../server/core/runtime';
 import { Script } from '../server/providers/demo-script';
 import { SCENARIOS } from '../server/providers/demo-scenarios';
 
+vi.mock('@desk/features/timeline/lead-in', async () => await import('../src/features/timeline/lead-in'));
+const MOBILE = '../mobile/src/lib/turns';
+const phone = await import(/* @vite-ignore */ MOBILE) as { groupTurns: typeof groupTurns; shapeOf: typeof shapeOf; turnSpan: typeof turnSpan; runSpan: typeof runSpan };
+
+function compareModels(roots: TimelineItem[], busy: boolean) {
+  const ids = roots.map(i => i.id);
+  // Both view stores publish fresh item objects. The bridge replay mutates its rows in place.
+  const snapshot = roots.map(item => ({ ...item }));
+  const desktop = groupTurns(ids, snapshot.map(shapeOf).join(''), busy);
+  const mobile = phone.groupTurns(ids, snapshot.map(phone.shapeOf).join(''), busy);
+  expect(mobile).toEqual(desktop);
+  const items = Object.fromEntries(snapshot.map(i => [i.id, i]));
+  desktop.groups.forEach((turn, index) => {
+    const other = mobile.groups[index];
+    if (turn.kind !== 'turn' || other.kind !== 'turn') return;
+    expect(phone.turnSpan(items, other)).toBe(turnSpan(items, turn));
+    for (const [si, seg] of turn.segments.entries()) {
+      for (const [i, chunk] of seg.flow.entries()) {
+        if (chunk.kind !== 'steps') continue;
+        const next = seg.flow[i + 1];
+        const from = i === 0 && seg.lead ? seg.lead : chunk.ids[0];
+        const until = next ? (next.kind === 'steps' ? next.ids[0] : next.id)
+          : turn.stops?.[si] ?? turn.segments[si + 1]?.lead ?? turn.end ?? turn.early ?? null;
+        const cap = turn.end ?? (si === turn.segments.length - 1 ? turn.next : undefined);
+        expect(phone.runSpan(items, chunk, from, until, cap)).toBe(runSpan(items, chunk, from, until, cap));
+      }
+    }
+  });
+  return desktop.groups;
+}
+
 function compare(items: TimelineItem[], indexed: TurnLive | undefined) {
   const roots = items.filter(i => !i.parentId);
-  const groups = groupTurns(roots.map(i => i.id), roots.map(shapeOf).join(''), true).groups;
+  const groups = compareModels(roots, true);
   const turn = groups.findLast(g => g.kind === 'turn' && g.state === 'running');
   const reading = turnLive(items);
   expect(indexed).toEqual(reading);
@@ -30,10 +61,29 @@ function compare(items: TimelineItem[], indexed: TurnLive | undefined) {
     checkpointSteps: tail?.kind === 'steps' ? tail.count : 0,
     files: changesOf(byId, children, turn.segments.flatMap(s => s.work)).files,
   });
-  if (tail) expect(reading?.checkpointAt).toBe(byId[tail.kind === 'steps' ? tail.ids[0] : tail.id].ts);
+  if (tail) {
+    const start = tail.kind === 'steps' ? tail.ids[0] : tail.id;
+    // The live reading times a checkpoint as the chat does: from its first step, never from an opening
+    // announcement above the run or from a text that has no words yet.
+    expect(reading?.checkpointAt).toBe(byId[start].ts);
+  }
 }
 
-describe('the bridge reads the running desktop turn at every prefix', () => {
+describe('desktop, phone and live notification at every replay prefix', () => {
+  it('attaches a trailing interrupt across an empty streaming text on both readers', () => {
+    const rows: TimelineItem[] = [
+      { id: 'u', type: 'user', ts: 1, text: 'Go' },
+      { id: 'a', type: 'text', ts: 2, text: 'Done.', streaming: false },
+      { id: 'r', type: 'turn', ts: 3, durationMs: 2 },
+      { id: 'empty', type: 'text', ts: 4, text: '', streaming: true },
+      { id: 'stop', type: 'notice', ts: 5, variant: 'interrupted', text: 'Interrupted' },
+    ];
+    for (const busy of [false, true]) {
+      const groups = compareModels(rows, busy);
+      expect(groups).toMatchObject([{ kind: 'turn', state: 'interrupted', end: 'r', ids: ['u', 'a', 'r', 'stop'] }]);
+    }
+  });
+
   it.each(['flagship', 'progress', 'agents', 'errors', 'chart', 'notifications', 'plan', 'questions', 'workflow', 'marathon'] as const)('records and replays Demo %s', async scenario => {
     const events: BridgeEvent[] = [];
     const rt = new SessionRuntime({ id: 's', provider: 'demo', cwd: '/demo', mode: 'bypassPermissions',
@@ -56,6 +106,7 @@ describe('the bridge reads the running desktop turn at every prefix', () => {
       compare(replay.items, replay.meta.live);
     }
     replay.endTurn();
+    compareModels(replay.items.filter(i => !i.parentId), false);
   }, 30_000);
 
   it('keeps the first reply above the work after a steer and ignores queued messages and checks', () => {

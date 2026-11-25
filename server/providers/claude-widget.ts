@@ -23,7 +23,7 @@ export function widgetServer(
     /** The device tools (the session's "Device" capability): they find the session the same way. */
     device?: () => SessionRuntime | undefined;
     /** Sub-agents from the other agent: the agents offered and how a call runs (see agent-tool.ts). */
-    delegate?: { agents: ProviderId[]; run: (call: AgentCall, signal?: AbortSignal) => Promise<{ ok: boolean; text: string }> };
+    delegate?: { agents: ProviderId[]; run: (call: AgentCall, signal?: AbortSignal, stepId?: string) => Promise<{ ok: boolean; text: string }> };
     /** remember_about_user (the user's profile is on): merges one fact into it. */
     profile?: (fact: unknown) => { ok: boolean; text: string };
   } = { widgets: true },
@@ -37,11 +37,13 @@ export function widgetServer(
       tool(
         name,
         agentToolDescription(agent),
-        { description: z.string().describe(AGENT_PARAMS.description.description), prompt: z.string().describe(AGENT_PARAMS.prompt.description), model: z.string().optional().describe(AGENT_PARAMS.model.description) },
+        { background: z.boolean().optional().describe(AGENT_PARAMS.background.description), description: z.string().describe(AGENT_PARAMS.description.description), prompt: z.string().describe(AGENT_PARAMS.prompt.description), model: z.string().optional().describe(AGENT_PARAMS.model.description) },
         async (args, extra: unknown) => {
           const call = readAgentCall(agent, args);
           if (!call) return { content: [{ type: 'text' as const, text: 'The task is empty: say what the sub-agent should do in `prompt`.' }], isError: true };
-          const r = await run(call, (extra as { signal?: AbortSignal } | undefined)?.signal);
+          const request = extra as { signal?: AbortSignal; _meta?: Record<string, unknown> } | undefined;
+          const id = request?._meta?.['claudecode/toolUseId'];
+          const r = await run(call, request?.signal, typeof id === 'string' ? id : undefined);
           return { content: [{ type: 'text' as const, text: r.text }], isError: !r.ok };
         },
         { annotations: { title: `Sub-agent: ${agent}`, readOnlyHint: false, destructiveHint: false, openWorldHint: false }, alwaysLoad: true },

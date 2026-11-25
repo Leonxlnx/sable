@@ -51,6 +51,10 @@ export interface ProviderContext {
 
 /** How a message goes to the agent (`ProviderSession.send`). */
 export interface SendOptions {
+  /** The person explicitly interrupted work to have this message answered. */
+  steerNow?: boolean;
+  /** A delegate reported to the parent. This input belongs to Sable. */
+  delegateReport?: boolean;
   /** Throws when the sender may no longer act: asked right before the message goes. */
   check?: () => void;
   /** Called once when the agent confirms delivery of this specific input. */
@@ -72,6 +76,21 @@ export interface ProviderSession {
    * meanwhile), and then nothing goes and `send` rejects with that error.
    */
   send(item: UserItem, opts?: SendOptions): Promise<void>;
+  /** Recheck held input and deferred process changes when the last delegate releases its handle. */
+  delegateEnded?(): void;
+  /** Native thread identifier before a report becomes this handle's first input. */
+  delegateDestination?(): string | undefined;
+  /** Latest native message preceding this report, to identify a partial transcript on restart. */
+  delegateCheckpoint?(): string | undefined;
+  /** Delegated native work can continue after its root turn ends. */
+  waitForReceivers?(): Promise<void> | undefined;
+  interruptReceivers?(): Promise<void>;
+  terminateDelegate?(): Promise<void>;
+  /** Recall still-unread steers from the provider queue. Only confirmed withdrawals may be sent again. */
+  recallSteers?(itemId: string, check: () => void, signal?: AbortSignal, automatic?: boolean): Promise<string[]>;
+  interruptSteer?(signal: AbortSignal): Promise<void>;
+  wasWithdrawn?(itemId: string): boolean;
+  stillQueued?(uuid: string): boolean;
   interrupt(): Promise<void>;
   setModel(model: string): Promise<void>;
   setEffort(effort: Effort): Promise<void>;
@@ -103,7 +122,7 @@ export interface ProviderSession {
    * the agent scheduled is due (only when it can be read for certain). Absent: nothing is known
    * (treat as none). Move guards include serving tasks. An update reads only working commands.
    */
-  liveWork?(purpose?: 'move' | 'update'): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; newestCommandAt?: number; wakeAt?: number; notificationUntil?: number };
+  liveWork?(purpose?: 'move' | 'update' | 'wake'): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; newestCommandAt?: number; wakeAt?: number; notificationUntil?: number };
   /**
    * Resolves when the agent's process has exited after `close()`; rejects when it has not within the
    * provider's bound (then its transcript may still be written).
@@ -111,9 +130,19 @@ export interface ProviderSession {
   exited?(): Promise<void>;
 }
 
+export interface DelegateReceipts {
+  ids: Set<string>;
+  /** An active native turn can still be committing an issued input. */
+  settled: boolean;
+}
+
 export interface Provider {
   readonly id: ProviderId;
   readonly name: string;
+  /** A dedicated process when its lifetime must be independent of other chats. */
+  forDelegate?(): Provider;
+  terminateOpeningDelegate?(): Promise<void>;
+  delegateReceipts?(session: string, cwd: string, after?: string): Promise<DelegateReceipts>;
   info(force?: boolean): Promise<ProviderInfo>;
   login(): Promise<void>;
   cancelLogin(): Promise<void>;
@@ -122,6 +151,8 @@ export interface Provider {
   logout(): Promise<void>;
   /** Capabilities before a session exists (used by the home composer). */
   caps(cwd?: string): Promise<Capabilities>;
+  /** Personal inputs already recorded in the native transcript, matched by their issued UUID. */
+  steerReceipts?(session: string, cwd: string, issued: Set<string>): Promise<string[]>;
   /**
    * Plan limits. Emits `limits.updated` with `meta` when it actually read them; returns the last
    * known ones otherwise. `force`: the user asked (the agent may start a short process to read them).

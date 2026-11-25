@@ -893,7 +893,8 @@ p {
 .arch-go,
 .computer-act,
 .rc-copy,
-.wait-go {
+.wait-go,
+.steer-now {
   position: relative;
 }
 
@@ -913,7 +914,8 @@ p {
 .switch-back::after,
 .arch-go::after,
 .computer-act::after,
-.rc-copy::after {
+.rc-copy::after,
+.steer-now::after {
   content: '';
   position: absolute;
   inset: var(--hit, -4px 0);
@@ -955,4 +957,9 @@ p {
 
 .rc-copy {
   --hit: -3px 0;
+}
+
+/* "Send now" under a waiting steer (chat.css): 32 px drawn, 48 px to the finger */
+.steer-now {
+  --hit: -8px 0;
 }

@@ -93,3 +93,19 @@ export function tailGlide(prev: { place: number; stuck: boolean } | null, place:
   const d = prev.place + drawnOffset - place;
   return Math.abs(d) < 2 || Math.abs(d) > 480 ? 0 : d;
 }
+
+/**
+ * The bottom padding to add, below one device pixel, so the conversation's height is a whole number of
+ * device pixels: `height` is its height now (layout pixels, `extra` included), `k` device pixels to the
+ * layout pixel. A view kept at the end stands on the scroller's largest offset, which the browser
+ * rounds to a whole device pixel; with a height of any fraction (the real heights of older turns built
+ * above as a long chat's pages arrive, a new line below) the end stood a quarter, a half or three
+ * quarters of a device pixel off from one change to the next at 125%, and its words shimmered by a
+ * device pixel (its last line read 757.33, 757.53, 757.93). Added at the bottom, it moves nothing above.
+ */
+export function endSnap(height: number, extra: number, k: number): number {
+  if (!(k > 0) || !Number.isFinite(k) || !Number.isFinite(height)) return extra;
+  const dev = (height - extra) * k;
+  const whole = Math.ceil(dev - 1e-3);
+  return Math.max(0, (whole - dev) / k);
+}

@@ -391,6 +391,23 @@ it('keeps markdown, exported bytes, phone pictures, phone detail and capture URL
   } finally { await app.dispose(); }
 });
 
+it('forks historical delegate rows without live work or report ownership', async () => {
+  const { home, file } = fixture();
+  const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
+  try {
+    await app.call('session.snapshot', { sessionId: 'src' });
+    const src = app.runtime('src');
+    src.patch<ToolItem>('s0', { delegateReport: 'pending' });
+    src.patch<ToolItem>('s1', { delegateReport: 'working', status: 'running', result: { agent: { background: 'running' } } });
+    const fork = await app.call('session.fork', { sessionId: 'src', itemId: 'a4' });
+    const rows = JSON.parse(readFileSync(file(fork.session.id), 'utf8')).items as ToolItem[];
+    expect(rows.find(r => r.id === 's0')?.delegateReport).toBeUndefined();
+    expect(rows.find(r => r.id === 's1')).toMatchObject({ status: 'cancelled', result: { agent: { background: 'stopped' } } });
+    expect(app.runtime(fork.session.id).pendingDelegateReports.size).toBe(0);
+    expect(src.get<ToolItem>('s1')?.delegateReport).toBe('working');
+  } finally { await app.dispose(); }
+});
+
 it('forks a whole independent base before the source is deleted', async () => {
   const { home, file, items } = fixture();
   const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });

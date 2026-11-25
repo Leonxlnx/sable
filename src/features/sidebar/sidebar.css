@@ -1065,10 +1065,12 @@
   box-shadow: 0 1px 0 var(--focus-field);
 }
 
-/* A section that arrives after the list was drawn (a folder moved into or out of a project). */
-/* Backwards only: once in, it holds nothing, so a drag's transform moves it. */
+/* A section that arrives after the list was drawn (a folder moved into or out of a project, Pinned
+   with its first chat). Like a new row it waits until what is below has mostly made room (Flip), so
+   its words never land on the ones sliding away under it.
+   Backwards only: once in, it holds nothing, so a drag's transform moves it. */
 .sgroup[data-enter] {
-  animation: srow-in var(--d-3) var(--ease-out) backwards;
+  animation: srow-in var(--d-3) var(--ease-out) 120ms backwards;
 }
 
 @media (prefers-reduced-motion: reduce) {

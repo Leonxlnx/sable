@@ -5,6 +5,8 @@ import { noticeLevel } from '@shared/notice';
 import { stripWrappers, syntheticOf } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
 import { leadTitle } from '@desk/features/timeline/lead-in';
+import { firstAutoAt, steerWaitLine, steerWaitSpoken, waitingOn, waitsAsSteer } from '@desk/features/timeline/steer-wait';
+import { epoch, still } from '@m/lib/epoch';
 import { useNow } from '@m/lib/useNow';
 import { onScreen } from '@m/lib/screen';
 import { cancelDownload, downloadKey, installable, openDownload, startDownload, useDownload } from '@m/lib/downloads';
@@ -22,7 +24,7 @@ import { claimFlight } from '@m/lib/flight';
 import { checkOpener, foldTarget, limitAction, limitProvider, showKind, turnChanges } from '@m/lib/chat-rules';
 import { foldKey, keepDetail, keepOpen, keptDetail, stepKey, wasOpen } from '@m/lib/folds';
 import { useChanges } from '@m/lib/changes';
-import { runSpan, turnSpan, type Segment, type StepsChunk, type TurnGroup } from '@m/lib/turns';
+import { checkpointStart, runSpan, turnSpan, type Segment, type StepsChunk, type TurnGroup } from '@m/lib/turns';
 import { hasWork } from '@shared/work-label';
 import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
 import { FileGlyph, kindName } from '@m/ui/FileGlyph';
@@ -90,7 +92,7 @@ function useSecond(active: boolean): number {
  * One turn, as the desktop reads it (src/features/timeline/TurnView.tsx), at hand size: a sequence
  * of checkpoints. While it runs, each closed checkpoint is two lines (its work, folded: "Worked 45s ·
  * 5 steps", and the note that closed it) and the live line stands under the newest; no step rows.
- * Once it has ended everything gathers into one line ("Worked 15m 52s · 36 steps", the change) with
+ * The opening reply keeps its keyed text row beside its message. Work gathers into one line with
  * what never folds after it, in order: things shown, a steered message with its reply, the answer.
  * The line opens the checkpoints one level in, each opening to its own steps; a turn with one run
  * opens straight to its steps.
@@ -264,7 +266,7 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
     const seg = segs[si];
     const place = headSeg < 0 || si < headSeg ? -1 : si === headSeg ? 0 : 1;
     // The last run ends at the turn's record, or at the bridge's word that it was cut.
-    const after = segs[si + 1]?.lead ?? turn.end ?? turn.early;
+    const after = turn.stops?.[si] ?? segs[si + 1]?.lead ?? turn.end ?? turn.early;
     // A notification taken up mid-turn is part of the work: it folds with it.
     if (seg.lead) out.push({ k: 'lead', key: seg.lead, id: seg.lead, steered: seg.steered, fold: si > 0 && !seg.steered && place === 1 });
     const flow = seg.flow;
@@ -278,7 +280,8 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
         continue;
       }
       if (c.kind === 'text') {
-        out.push({ k: 'text', key: c.id, id: c.id, note: seg.notes.includes(c.id), answer: c.id === seg.answer || c.id === seg.reply, tail: seg.tail.includes(c.id) });
+        const answerInk = c.id === seg.answer || c.id === seg.reply;
+        out.push({ k: 'text', key: c.id, id: c.id, note: seg.notes.includes(c.id), answer: answerInk, tail: seg.tail.includes(c.id) });
         continue;
       }
       const next = flow[i + 1];
@@ -289,7 +292,7 @@ function piecesOf(turn: TurnGroup): { pieces: Piece[]; multi: boolean; head: boo
         run: c,
         from: i === 0 && seg.lead ? seg.lead : c.ids[0],
         until: (next ? (next.kind === 'steps' ? next.ids[0] : next.id) : after) ?? null,
-        ...(!next && si === last && turn.next ? { cap: turn.next } : {}),
+        cap: turn.end ?? (si === last ? turn.next : undefined),
         head: i === headAt,
         live,
         ...(live ? { seg } : {}),
@@ -773,13 +776,13 @@ function useLinger(on: boolean, ms: number): boolean {
 function LiveLine({ sid, seg, run, from, open, onToggle }: { sid: string; seg: Segment; run: StepsChunk | null; from: string | null; open: boolean; onToggle?: () => void }) {
   const [last] = useState(() => ({ title: '' }));
   const info = useStore(useMemo(() => liveSelector(sid, seg, run, last), [sid, seg, run, last]));
-  const lead = useItem<TimelineItem>(sid, from);
+  const since = useStore(s => checkpointStart(sessionData(s, sid).items, run?.ids ?? [], from));
   const now = useSecond(true);
   const [w, q, ...rest] = info.split('|');
   const waiting = w === '1';
   const quiet = useLinger(q === '1', QUIET_LINGER_MS);
   const title = useHeld(rest.join('|'), TITLE_HOLD_MS);
-  const elapsed = lead ? now - lead.ts : 0;
+  const elapsed = since === undefined ? 0 : now - since;
   const steps = run?.count ?? 0;
   const tiles = useMemo(() => <Tiles size={13} />, []);
   return (
@@ -880,14 +883,99 @@ const UserBubble = memo(function UserBubble({ sid, id, steered, queued }: { sid:
         {long && !open && <div className="user-more">Show more</div>}
         {review && <ReviewList sid={sid} id={id} review={review} />}
       </div>
-      {(steered || queued) && (
-        <span className="user-note">
-          <Icon name="steer" size={12} /> {queued ? 'Queued' : waitingSteer ? 'Steering' : 'Steered'}
-        </span>
+      {waitingSteer && !queued ? (
+        <SteerNote sid={sid} it={it} />
+      ) : (
+        (steered || queued) && (
+          <span className="user-note">
+            <Icon name="steer" size={12} /> {queued ? 'Queued' : 'Steered'}
+          </span>
+        )
       )}
     </div>
   );
 });
+
+/**
+ * Under a steered message that still waits, the desktop's line (src/features/timeline/steer-wait.ts,
+ * one model for both): what the message waits on and for how long, or the time until the desktop
+ * sends it by itself, and "Send now" where the desktop can interrupt for it (`phone.steerNow`). The
+ * clock waits while the app is off screen (`useSecond`). A refusal says why in the desktop's words
+ * and the card is read again; the words are never sent a second time from here.
+ */
+function SteerNote({ sid, it }: { sid: string; it: UserItem }) {
+  const now = useSecond(true);
+  const agent = useStore((s) => {
+    const provider = s.sessions[sid]?.provider;
+    return provider ? PROVIDER_NAME[provider] : undefined;
+  });
+  const stepId = it.steerWait?.stepId;
+  // The step the desktop names, as its title or state changes; the rest is read with the clock.
+  useStore((s) => {
+    const step = stepId ? sessionData(s, sid).items[stepId] : undefined;
+    return step?.type === 'tool' ? `${step.status}|${step.title}` : '';
+  });
+  const [sending, setSending] = useState(false);
+  const here = useRef(true);
+  useEffect(() => {
+    here.current = true;
+    return () => {
+      here.current = false;
+    };
+  }, []);
+
+  const d = sessionData(getState(), sid);
+  const at = (id: string) => d.items[id];
+  const line = steerWaitLine({ item: it, steps: waitingOn(at, d.roots, stepId), agent, autoAt: firstAutoAt(at, d.roots), now, sending });
+
+  const send = () => {
+    if (line.disabled) return;
+    haptic('send');
+    setSending(true);
+    const e = epoch();
+    const say = (text: string, level: 'info' | 'error' = 'info') => still(e) && setState({ toast: { text, level, at: Date.now() } });
+    void conn
+      .call('phone.steerNow', { sessionId: sid, itemId: it.id })
+      .then(
+        (r: { ok: boolean; error?: string }) => {
+          // Taken meanwhile (the agent got to it first): the card already says so.
+          if (r.ok || !still(e) || !waitsAsSteer(sessionData(getState(), sid).items[it.id])) return;
+          say(r.error || 'Could not send it now. The message still waits.');
+          void fetchItem(sid, it.id).then((got) => still(e) && applyFull(sid, got.item), () => {});
+        },
+        (err) => {
+          haptic('deny');
+          say((err as Error).message, 'error');
+        },
+      )
+      .finally(() => here.current && setSending(false));
+  };
+
+  return (
+    <div className="steer-note" data-phase={line.phase}>
+      <span className="user-note steer-note-text" role="status" aria-live="off" aria-label={steerWaitSpoken(line)}>
+        <Icon name="steer" size={12} />
+        {/* Why it still waits, in the desktop's words: where the countdown stood, or before it. */}
+        {line.why && <span className="steer-note-label" data-why>{line.why}</span>}
+        {line.label && <span className="steer-note-label">{line.label}</span>}
+        {line.clock && (
+          <>
+            {line.phase === 'waiting' && <span aria-hidden>·</span>}
+            <span className="steer-note-clock num">
+              <span aria-hidden>{line.room}</span>
+              <span>{line.clock}</span>
+            </span>
+          </>
+        )}
+      </span>
+      {line.action && (
+        <button type="button" className="steer-now" aria-label={`Send now. ${line.cost}`} aria-disabled={line.disabled || undefined} onClick={send}>
+          Send now
+        </button>
+      )}
+    </div>
+  );
+}
 
 const upperFirst = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -1774,11 +1862,8 @@ function OfferKey({ sid, turn, checker, online }: { sid: string; turn: TurnGroup
  * asked, what the work was and which files it changed, and the answer, through Android's share sheet.
  */
 function ShareTurn({ sid, turn }: { sid: string; turn: TurnGroup }) {
-  const has = useStore((s) => {
-    const seg = turn.segments[turn.segments.length - 1];
-    const id = seg?.answer ?? seg?.reply;
-    return !!id && sessionData(s, sid).items[id]?.type === 'text';
-  });
+  const answerId = turn.segments.findLast(seg => seg.answer)?.answer;
+  const has = useStore(s => !!answerId && sessionData(s, sid).items[answerId]?.type === 'text');
   if (!has) return null;
   const share = () => {
     haptic('tap');
@@ -1787,8 +1872,6 @@ function ShareTurn({ sid, turn }: { sid: string; turn: TurnGroup }) {
     const d = sessionData(st, sid);
     const lead = turn.segments[0]?.lead;
     const leadItem = lead ? d.items[lead] : undefined;
-    const seg = turn.segments[turn.segments.length - 1];
-    const answerId = seg?.answer ?? seg?.reply;
     const answer = answerId ? d.items[answerId] : undefined;
     const span = turnSpan(d.items, turn);
     const text = turnSummary({

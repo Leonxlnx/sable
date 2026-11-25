@@ -1,5 +1,6 @@
 import type { TimelineItem } from '@shared/protocol';
 import { noticeLevel } from '@shared/notice';
+import { workedSpan } from '@shared/turn-span';
 import { isNobodysWords, syntheticOf } from '@shared/synthetic';
 import { isLeadIn } from '@desk/features/timeline/lead-in';
 
@@ -9,8 +10,8 @@ import { isLeadIn } from '@desk/features/timeline/lead-in';
  * task updates, lead-ins) closed by something in view (a note the agent wrote, a widget, files, a
  * plan, an error). While the turn runs each closed checkpoint reads as its work line and its note,
  * and the live line stands under the newest; once it has ended the turn is one line and what never
- * folds (things shown, a steered message with its reply, the answer). One-line lead-ins ("Let me run
- * the tests.") fold with the steps they announce and name the live line while those run.
+ * folds (the opening reply, things shown, a steered message with its reply, the answer). A lead-in
+ * that answers a message stays with it. Other lead-ins fold with the steps they announce.
  *
  * Each root item is one character (`shapeOf`):
  *   U a sent message that starts a turn   Q a queued one (floats to the end)
@@ -25,14 +26,15 @@ import { isLeadIn } from '@desk/features/timeline/lead-in';
  *   N a notification Claude Code wrote in the person's place (a task finished; shared/synthetic.ts):
  *     a line that opens a turn, or in a running one a segment of its own
  *   u such a message with nothing to show (a reminder): opens a turn between turns, left out when
- *     nothing comes in it (a slash command opens a turn as a message does, U; what it printed is n)
+ *     nothing comes in it
+ *   M a transcript command or Sable's own /until prompt: opens a turn without an opening reply
  *   ? an item of a type this phone does not know (a newer desktop's): one calm line in its place
  *   . nothing to show
  */
 
 /**
  * One piece of a segment, in the order it happened: `text` something the agent said (a note along
- * the way, the reply to a steered message, the answer), `show` what never folds (command output, a
+ * the way, the reply to a message, the answer), `show` what never folds (command output, a
  * widget, files, a plan, an error notice), `steps` a run of work between them: one checkpoint.
  */
 export type FlowChunk = { kind: 'text'; id: string } | { kind: 'show'; id: string } | StepsChunk;
@@ -57,7 +59,7 @@ export interface Segment {
   steps: number;
   /** The answer, never folded: the last thing said that is not a lead-in or a nod. */
   answer: string | null;
-  /** A steered segment's first words, when more followed: the direct reply, never folded. */
+  /** The direct reply to the person's opening or steered message, when distinct from the answer. */
   reply: string | null;
   /** The last words before a failure, when the segment has no answer: in view over the error. */
   last: string | null;
@@ -84,6 +86,8 @@ export interface TurnGroup {
   waiting?: string[];
   /** The segment still doing the work when only taken, unanswered cards follow it. */
   liveSegment?: number;
+  /** The Stop that closed each interrupted segment's final checkpoint. */
+  stops?: Record<number, string>;
   end: string | null;
   state: TurnState;
   ids: string[];
@@ -117,17 +121,17 @@ function shapeRaw(item: TimelineItem): string {
   switch (item.type) {
     case 'user': {
       if (item.state === 'queued') return item.steered ? 's' : 'Q';
-      if (item.steered) return 'S';
+      if (item.until) return 'M';
       const syn = syntheticOf(item);
-      if (!syn) return 'U';
+      if (!syn) return item.steered ? 'S' : 'U';
       // What a command printed is command output: in view in its place, never folded with the work
       // (a compaction's summary keeps its own path: a notice that folds).
-      return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'U' : syn.role === 'output' ? 'c' : 'n';
+      return syn.role === 'notification' ? 'N' : syn.role === 'hidden' ? 'u' : syn.role === 'command' ? 'M' : syn.role === 'output' ? 'c' : 'n';
     }
     case 'text':
       // Claude Code's stand-in where a cut turn has no answer ("No response requested.") and its own
       // sign-in failure line in a chat saved before 0.2.20: nobody's words.
-      if (!item.streaming && (!item.text.trim() || isNobodysWords(item.text))) return '.';
+      if (!item.text.trim() || isNobodysWords(item.text)) return '.';
       return isLeadIn(item.text, !!item.streaming) ? 'l' : 't';
     case 'thinking':
       return 'h';
@@ -198,6 +202,7 @@ const WORK_AFTER = new Set(['w', 'h', 'k', 'n', 'l']);
 const QUIET_AFTER = new Set(['.', 'n', 'k', 'h']);
 
 interface RawSeg {
+  opening?: boolean;
   lead: string | null;
   steered: boolean;
   ids: string[];
@@ -212,7 +217,7 @@ interface RawSeg {
  * nothing else said in it, its last lead-in is its answer after all ("Let me fix the typo." then
  * the edit), so the turn keeps an answer.
  */
-function settleLeads(chars: string[], live: boolean, steered: boolean, final = false): string[] {
+function settleLeads(chars: string[], live: boolean, steered: boolean, final: boolean, openingAt: number): string[] {
   if (!chars.includes('l')) return chars;
   const out = chars.slice();
   let replied = !steered;
@@ -240,11 +245,15 @@ function settleLeads(chars: string[], live: boolean, steered: boolean, final = f
     const last = out.lastIndexOf('l');
     if (last >= 0) out[last] = 't';
   }
+  // Preserve the opening reply after choosing the usual fallback when only lead-ins were said.
+  if (out[openingAt] === 'l') out[openingAt] = 't';
   return out;
 }
 
 function buildSegment(raw: RawSeg, index: number, turnKey: string, failed: boolean, live = false, cut = false): Segment {
-  const chars = settleLeads(raw.chars, live, raw.steered, !live && !failed && !cut);
+  // An opening message pairs only with immediate prose. A steer can arrive during earlier work.
+  const openingAt = raw.opening ? raw.chars.findIndex(c => c !== '.') : -1;
+  const chars = settleLeads(raw.chars, live, raw.steered, !live && !failed && !cut, openingAt);
   const errors: string[] = [];
   // A lead-in or a nod said in view after all (nothing followed it): never what the person waits for.
   const nod = (i: number) => chars[i] === 't' && raw.chars[i] === 'l';
@@ -286,11 +295,8 @@ function buildSegment(raw: RawSeg, index: number, turnKey: string, failed: boole
   const tail = !live && keptAt >= 0 ? raw.ids.filter((_, i) => i > keptAt && chars[i] === 't') : [];
   // Nothing but notices (a /compact, a model change on its own): they are the turn, so they show.
   const lone = !chars.some((c) => c !== 'n' && c !== '.' && c !== 'i' && c !== 'e' && c !== 'a');
-  let replyAt = -1;
-  if (raw.steered) {
-    const first = chars.indexOf('t');
-    if (first >= 0 && first !== answerAt) replyAt = first;
-  }
+  const first = raw.steered ? chars.indexOf('t') : openingAt;
+  const replyAt = chars[first] === 't' && first !== answerAt ? first : -1;
   const flow: FlowChunk[] = [];
   const work: string[] = [];
   let steps = 0;
@@ -422,6 +428,7 @@ interface Open {
   ids: string[];
   segs: RawSeg[];
   interrupted: boolean;
+  stops?: Record<number, string>;
   failed: boolean;
   /** Opened by a message with nothing to show (u): left out when nothing else comes in it. */
   quiet?: boolean;
@@ -492,7 +499,7 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
     // something arrives in the new segment, even across several takes at once.
     const running = state === 'running';
     let active = last;
-    while (running && active > 0 && o.segs[active].steered && o.segs[active].chars.every((c) => c === '.')) active--;
+    while (running && active > 0 && !o.stops?.[active - 1] && o.segs[active].steered && o.segs[active].chars.every((c) => c === '.')) active--;
     const segments = o.segs.map((s, i) => {
       // A trailing lead-in above a steer stays in its run throughout the running turn.
       const live = running && (i >= active || o.segs[i + 1]?.steered);
@@ -510,12 +517,14 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
       }
     }
     foldNotes(segments);
-    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(active < last ? { liveSegment: active } : {}), ...(opts.early ? { early: opts.early } : {}), ...(next ? { next } : {}) });
+    groups.push({ kind: 'turn', key, segments, end, state, ids: o.ids, ...(o.stops && { stops: o.stops }), ...(active < last ? { liveSegment: active } : {}), ...(opts.early ? { early: opts.early } : {}), ...(next ? { next } : {}) });
     for (const id of loose) groups.push({ kind: 'item', key: id, id });
   };
 
-  const start = (id: string, steered: boolean, quiet = false, byNote = quiet) => {
-    open = { ids: [id], segs: [{ lead: id, steered, ids: [], chars: [] }], interrupted: false, failed: false, ...(quiet ? { quiet } : {}), ...(byNote ? { byNote } : {}) };
+  const start = (id: string, head: 'U' | 'M' | 'S' | 'u' | 'N') => {
+    const quiet = head === 'u';
+    const byNote = quiet || head === 'N';
+    open = { ids: [id], segs: [{ lead: id, opening: head === 'U', steered: head === 'S', ids: [], chars: [] }], interrupted: false, failed: false, ...(quiet ? { quiet } : {}), ...(byNote ? { byNote } : {}) };
   };
 
   for (let i = 0; i < ids.length; i++) {
@@ -533,7 +542,7 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
     if (ch === 'u') {
       if (open) ch = '.';
       else {
-        start(id, false, true);
+        start(id, 'u');
         continue;
       }
     }
@@ -557,7 +566,7 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
         continue;
       }
       close(null, false, false, { next: id });
-      start(id, false, false, true);
+      start(id, 'N');
       continue;
     }
     // A check runs beside the conversation: it never joins (or ends) the turn around it.
@@ -565,9 +574,9 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
       checks.push({ id, at: groups.length });
       continue;
     }
-    if (ch === 'U' || (ch === 'S' && !open)) {
+    if (ch === 'U' || ch === 'M' || (ch === 'S' && !open)) {
       close(null, false, false, { next: id });
-      start(id, ch === 'S');
+      start(id, ch);
       continue;
     }
     if (ch === 'Z') {
@@ -614,6 +623,12 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
     }
     o.ids.push(id);
     if (ch === 'S') {
+      if (o.interrupted) {
+        const index = o.segs.length - 1;
+        const stopped = o.segs[index];
+        (o.stops ??= {})[index] = stopped.ids[stopped.chars.lastIndexOf('i')];
+        o.interrupted = false;
+      }
       o.segs.push({ lead: id, steered: true, ids: [], chars: [] });
       continue;
     }
@@ -651,7 +666,7 @@ export function groupTurns(ids: readonly string[], shape: string, busy: boolean,
 
 const chunkSig = (c: FlowChunk) => (c.kind === 'steps' ? `${c.key}+${c.ids.length}+${c.count}` : c.id);
 const segSig = (s: Segment) => `${s.lead}>${s.flow.map(chunkSig).join(',')}>${s.reply}>${s.answer}>${s.last}>${s.tail.join(',')}>${s.notes.length}>${s.errors.join(',')}>${s.narr.join(',')}`;
-const turnSig = (g: TurnGroup) => `${g.state}|${g.end}|${g.early ?? ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${g.waiting?.join(',') ?? ''}|${g.liveSegment ?? ''}|${g.segments.map(segSig).join(';')}`;
+const turnSig = (g: TurnGroup) => `${g.state}|${g.end}|${g.early ?? ''}|${g.stops ? JSON.stringify(g.stops) : ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${g.waiting?.join(',') ?? ''}|${g.liveSegment ?? ''}|${g.segments.map(segSig).join(';')}`;
 
 /**
  * Keeps the objects of turns, segments and runs of steps that did not change since the last
@@ -705,75 +720,14 @@ export function stabilize(next: TurnLayout, prev: Map<string, unknown>): TurnLay
 
 type ItemMap = Record<string, TimelineItem | undefined>;
 
-/**
- * Where one item's own time ends, for a turn's or a checkpoint's span, or null when it is no act of
- * the turn (the desktop's rule): steps, thinking, texts and things shown count, and the notices that
- * say how it ended; other notices (an account move, a mode change) never draw it out. A cancelled
- * step's end is left out: a settle stamped it with the moment it ran, which in a chat saved before
- * 0.2.23 may be hours after the step.
- */
-function actEnd(it: TimelineItem | undefined): number | null {
-  if (!it) return null;
-  switch (it.type) {
-    case 'tool':
-      if (it.check) return null;
-      return it.status === 'cancelled' ? it.ts : Math.max(it.ts, it.endedAt ?? 0);
-    case 'thinking':
-    case 'text':
-      return Math.max(it.ts, ('endedAt' in it && typeof it.endedAt === 'number' && it.endedAt) || 0);
-    case 'notice':
-      return it.early || it.variant === 'interrupted' || (it.variant === 'error' && noticeLevel(it) === 'error') ? it.ts : null;
-    default:
-      return null;
-  }
-}
+export { checkpointStart } from '@shared/turn-span';
 
-/** The latest end among `ids` (`actEnd`), never past `cap`'s time; `from` when none is later. */
-function lastAct(items: ItemMap, ids: readonly string[], from: number, cap?: string | null): number {
-  let last = from;
-  for (const id of ids) {
-    const at = actEnd(items[id]);
-    if (at !== null && at > last) last = at;
-  }
-  const bound = cap ? items[cap]?.ts : undefined;
-  return bound !== undefined && last > bound ? Math.max(from, bound) : last;
-}
-
-/**
- * How long a finished turn took (ms), as the desktop reads it: with the agent's record, the record's
- * own figure whenever it holds one (above 0), else from its message to the record; without one, from
- * its message (or first act) to the end of its last act, never past the next root.
- */
+/** The Worked total across all records and unrecorded stretches in the view turn. */
 export function turnSpan(items: ItemMap, turn: TurnGroup): number | null {
-  const lead = turn.segments[0]?.lead;
-  const leadTs = lead ? items[lead]?.ts : undefined;
-  const end = turn.end ? items[turn.end] : undefined;
-  if (end?.type === 'turn') {
-    // The agent's own figure whenever it gave one: the items' times count waits that were no work
-    // (a steered message that waited hours keeps the time it was sent; a turn the bridge ended
-    // without a record before this one began). OpenCode and some Codex history write 0: no figure.
-    if (Number.isFinite(end.durationMs) && end.durationMs > 0) return end.durationMs;
-    const start = leadTs ?? items[turn.ids[0]]?.ts;
-    if (!start) return null;
-    return Math.max(0, end.ts - start);
-  }
-  let start = leadTs;
-  if (!start) {
-    for (const id of turn.ids) {
-      if (actEnd(items[id]) === null) continue;
-      start = items[id]!.ts;
-      break;
-    }
-  }
-  if (!start) return null;
-  return lastAct(items, turn.ids, start, turn.next) - start;
+  return workedSpan(items, turn.ids, turn.segments[0]?.lead ?? null, turn.next);
 }
 
-/** How long one checkpoint's work took (ms): from what opened it to what closed it, or to the end of its last act, never past `cap`. */
+/** One checkpoint ends with its closer. A steer's send time cannot close the work before its take. */
 export function runSpan(items: ItemMap, run: { ids: readonly string[] }, from: string, until: string | null, cap?: string | null): number | null {
-  const start = items[from]?.ts ?? items[run.ids[0]]?.ts;
-  if (!start) return null;
-  const closer = until ? items[until] : undefined;
-  if (closer) return closer.ts - start;
-  return lastAct(items, run.ids, start, cap) - start;
+  return workedSpan(items, run.ids, from, cap, until);
 }

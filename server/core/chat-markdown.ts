@@ -1,7 +1,9 @@
 import path from 'node:path';
 import type { ProviderId, SessionMeta, TimelineItem, ToolItem, UserItem } from '../../shared/protocol';
-import { partOfTurn, stripWrappers, syntheticLine, syntheticOf } from '../../shared/synthetic';
+import { userItemText, syntheticLine, syntheticOf } from '../../shared/synthetic';
 import { noticeLevel } from '../../shared/notice';
+import { workedSpan } from '../../shared/turn-span';
+import { rootShape, turnBoundary, type Boundary, type TurnState } from '../../shared/turn-live-index';
 
 /**
  * A conversation as clean Markdown, for "Export chat" and "Copy as Markdown": the title and a line
@@ -103,15 +105,14 @@ interface Turn {
   files: Map<string, { add: number; del: number; created: boolean; deleted: boolean }>;
   counts: { read: number; search: number; fetch: number; browser: number; device: number; other: number };
   steps: number;
-  durationMs?: number;
+  ids: string[];
+  lead: string | null;
 }
 
-const newTurn = (): Turn => ({ lines: [], files: new Map(), counts: { read: 0, search: 0, fetch: 0, browser: 0, device: 0, other: 0 }, steps: 0 });
+const newTurn = (): Turn => ({ lines: [], files: new Map(), counts: { read: 0, search: 0, fetch: 0, browser: 0, device: 0, other: 0 }, steps: 0, ids: [], lead: null });
 
-/** A turn's steps as a compact list ('' when it took none). */
-function stepsBlock(t: Turn, cwd: string): string {
-  // Widgets, plans and questions are notes in the text, not steps.
-  if (!t.steps) return '';
+/** A turn's steps as a compact list. */
+function stepsBlock(t: Turn, cwd: string, ms: number | null): string {
   const out = [...t.lines];
   for (const [p, f] of t.files) {
     const counts = [f.add ? `+${f.add}` : '', f.del ? `−${f.del}` : ''].filter(Boolean).join(' ');
@@ -131,7 +132,7 @@ function stepsBlock(t: Turn, cwd: string): string {
     const words = also.length > 1 ? `${also.slice(0, -1).join(', ')} and ${also[also.length - 1]}` : also[0];
     out.push(`- ${out.length ? 'Also ' : ''}${out.length ? words : words[0].toUpperCase() + words.slice(1)}`);
   }
-  const head = `**Steps** (${t.steps}${t.durationMs && t.durationMs >= 1000 ? `, ${duration(t.durationMs)}` : ''})`;
+  const head = `**Steps** (${t.steps}${ms !== null && ms >= 1000 ? `, ${duration(ms)}` : ''})`;
   return [head, '', ...out].join('\n');
 }
 
@@ -144,7 +145,7 @@ function userWords(it: UserItem): { text: string; command?: boolean } | null {
     const line = syntheticLine(syn);
     return line ? { text: line, command: true } : null;
   }
-  const text = body(stripWrappers(it.text));
+  const text = body(userItemText(it));
   return text || it.attachments?.length ? { text } : null;
 }
 
@@ -155,6 +156,8 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
   const children = new Map<string, TimelineItem[]>();
   for (const it of items) if (it.parentId) (children.get(it.parentId) ?? children.set(it.parentId, []).get(it.parentId)!).push(it);
   const roots = items.filter((it) => !it.parentId);
+  // Times and settlement stamps are resident even when the body is on disk.
+  const byId = Object.fromEntries(roots.map(it => [it.id, it]));
 
   // The agent the chat started with: the first switch's `from`, else the chat's own.
   const firstSwitch = roots.find((it) => it.type === 'notice' && it.agentSwitch);
@@ -165,6 +168,7 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
   const blocks: string[] = [`# ${meta.title.replace(/\s+/g, ' ').trim() || 'Chat'}`, about];
 
   let turn = newTurn();
+  let state: TurnState = 'closed';
   // Whether the agent's heading is up since the person last wrote.
   let speaking = false;
   const speak = () => {
@@ -172,9 +176,8 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
     blocks.push(`## ${agentName(agent)}`);
     speaking = true;
   };
-  const endTurn = () => {
-    const b = stepsBlock(turn, cwd);
-    if (b) blocks.push(b);
+  const endTurn = (next?: string) => {
+    if (turn.steps) blocks.push(stepsBlock(turn, cwd, workedSpan(byId, turn.ids, turn.lead, next)));
     turn = newTurn();
   };
 
@@ -243,12 +246,22 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
       if (it.type === 'tool') step(it, depth, it !== row);
       continue;
     }
+    if (it.type === 'user' && it.state === 'queued') continue;
+    const shape = rootShape(it);
+    const closingRecord = it.type === 'turn' || (it.type === 'notice' && it.early);
+    if (shape) {
+      const boundary: Boundary<string> = turnBoundary(state, shape, it.id);
+      state = boundary.state;
+      if (boundary.pos !== undefined && !closingRecord) {
+        endTurn(it.id);
+        if (state !== 'closed' && it.type === 'user') turn.lead = it.id;
+      }
+    }
+    if (state !== 'closed' || closingRecord) turn.ids.push(it.id);
     if (it.type === 'user') {
-      if (it.state === 'queued' || it.until?.check) continue;
+      if (it.until?.check) continue;
       const said = userWords(it);
       if (!said) continue;
-      // A message sent into a running turn belongs to that turn; any other starts the next one.
-      if (!it.steered && !partOfTurn(syntheticOf(it))) endTurn();
       const lines = [`## You`];
       if (said.text) lines.push(said.command ? inlineCode(said.text) : said.text);
       const names = (it.attachments ?? []).map((a) => a.name).filter(Boolean);
@@ -284,10 +297,10 @@ export function chatMarkdown(meta: Pick<SessionMeta, 'title' | 'provider' | 'cwd
         speaking = false;
       } else if (it.variant === 'error') blocks.push(`> ${NOTICE_WORD[noticeLevel(it)]}: ${it.text.replace(/\s+/g, ' ').trim()}`);
       else if (it.variant === 'interrupted') blocks.push('> Stopped');
+      if (it.early) endTurn();
     } else if (it.type === 'turn') {
       // The turn ends here: its steps go under what it said.
       if (it.error) blocks.push(`> Error: ${it.error.replace(/\s+/g, ' ').trim()}`);
-      turn.durationMs = (turn.durationMs ?? 0) + (it.durationMs || 0);
       endTurn();
     }
   }

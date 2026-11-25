@@ -38,7 +38,7 @@ import { codexForkTurn, cutAt } from '../core/fork';
 import type { Provider, ProviderContext, ProviderSession, SendOptions } from './types';
 import { codexPlan } from './plans';
 import { windowForModel } from '../../shared/limit-windows';
-import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
+import { chatReplyInstruction, CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import { WIDGET_DESCRIPTION, WIDGET_FENCE_HINT, WIDGET_INPUT_SCHEMA, WIDGET_TOOL, dynamicToolAnswer, widgetsEnabled } from './widget-tool';
 import { BROWSER_CORE, BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOLS, browserDynamicAnswer, browserOp, browserTabEnabled, SABLE_BROWSER_NAMESPACE } from './browser-tool';
 import { DEVICE_CORE, DEVICE_DESCRIPTIONS, DEVICE_HINT, DEVICE_INPUT_SCHEMAS, DEVICE_NAMESPACE, DEVICE_NAMESPACE_DESCRIPTION, DEVICE_OPS, DEVICE_TOOLS, deviceDynamicAnswer, deviceEnabled, deviceOp } from './device-tool';
@@ -46,6 +46,8 @@ import { CodexRpc, RpcError, resolveCodexCommand, type ExitInfo } from './codex-
 import { serviceTierFor } from './codex-map';
 import { AGENT_INPUT_SCHEMA, AGENT_TOOLS, agentOfTool, agentToolDescription, readAgentCall } from './agent-tool';
 import { PROFILE_DESCRIPTION, PROFILE_INPUT_SCHEMA, PROFILE_TOOL, isProfileTool, profileDynamicAnswer } from './profile-tool';
+import { anonymousDelegateStep } from '../core/delegate-result';
+import { readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
 import { compactScope, fileLine, withScope } from '../core/permission-scope';
 import {
@@ -283,13 +285,41 @@ export class CodexProvider implements Provider {
   /** Threads a title is being asked in (`quickTitle`), by id: their notifications go to that call, never to a chat. */
   private titleThreads = new Map<string, (method: string, p: any) => void>();
 
-  constructor(readonly ctx: ProviderContext) {
+  private delegateProcesses = new Set<CodexProvider>();
+  private readonly rpcOwner: { account: symbol };
+
+  forDelegate() {
+    return new CodexProvider(this.ctx, this);
+  }
+
+  terminateOpeningDelegate() { return this.delegateOwner ? this.dispose(true) : Promise.resolve(); }
+
+  constructor(readonly ctx: ProviderContext, readonly delegateOwner?: CodexProvider) {
+    this.rpcOwner = { account: delegateOwner?.rpcOwner.account ?? Symbol() };
     if (ctx.account?.dir) this.env = { CODEX_HOME: ctx.account.dir };
   }
 
   /** The CODEX_HOME this account's Codex uses: its own, the user's CODEX_HOME, or ~/.codex. */
   configHome(): string {
     return this.env?.CODEX_HOME ?? process.env.CODEX_HOME ?? path.join(homedir(), '.codex');
+  }
+
+  async delegateReceipts(session: string) {
+    const rpc = await this.client();
+    const receipts = new Set<string>();
+    const response = await rpc.request<{ thread: Thread }>('thread/read', { threadId: session, includeTurns: true }, 60_000);
+    if (!response.thread?.turns?.length) throw new Error('The Codex conversation is unavailable for report reconciliation.');
+    for (const turn of response.thread.turns) for (const item of turn.items ?? []) {
+      if (item.type === 'userMessage') for (const block of item.content) {
+        if (block.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, receipts);
+      }
+      if (item.type === 'dynamicToolCall' && (item.status === 'completed' || item.status === 'failed')) {
+        receipts.add('tool:' + turn.id + ':' + item.id);
+        const synthetic = anonymousDelegateStep(item.contentItems);
+        if (synthetic) receipts.add('tool:' + synthetic);
+      }
+    }
+    return { ids: receipts, settled: response.thread.turns.every(turn => Array.isArray(turn.items) && ['completed', 'failed', 'interrupted'].includes(turn.status)) };
   }
 
   /** Copies the thread's rollout from another account's CODEX_HOME into this one (see accounts/handover). */
@@ -351,10 +381,11 @@ export class CodexProvider implements Provider {
     this.armIdle();
     if (!this.starting) {
       // Experimental API: remote control lives there (the rest of the protocol is unchanged).
-      this.starting = CodexRpc.start({ log: this.ctx.log, clientVersion: CLIENT_VERSION, env: this.env, experimental: true, folder: gateKey(this.id, this.configHome()), scope: this.scope(reason), closing: () => this.disposed || !!this.ctx.closing?.() })
+      this.starting = CodexRpc.start({ log: this.ctx.log, clientVersion: CLIENT_VERSION, env: this.env, experimental: true, folder: gateKey(this.id, this.configHome()), owner: this.rpcOwner, scope: this.scope(reason), closing: () => this.disposed || !!this.ctx.closing?.() })
         .then(async (rpc) => {
           if (this.disposed) {
-            await rpc.close();
+            await rpc.close(this.delegateOwner ? 0 : undefined, this.delegateOwner ? 'timeout' : 'quit');
+            if (this.delegateOwner) await rpc.ended;
             throw new Error('Codex provider is shut down');
           }
           rpc.onNotification = (m, p) => { if (this.rpc === rpc) this.onNotification(m, p); };
@@ -800,9 +831,9 @@ export class CodexProvider implements Provider {
    * generative UI hint when those settings are on. Undefined means "send nothing" (Codex then uses
    * the config as it is).
    */
-  async developerInstructions(cwd: string, meta?: Pick<SessionMeta, 'options' | 'custom'>): Promise<string | undefined> {
+  async developerInstructions(cwd: string, meta?: Pick<SessionMeta, 'options' | 'custom'> & { id?: string }): Promise<string | undefined> {
     const settings = this.ctx.settings?.();
-    const ours = [settings?.conciseReplies === false ? '' : CONCISE_REPLIES_PROMPT, widgetsEnabled(settings) ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText(), this.customText(meta)].filter(Boolean).join('\n\n');
+    const ours = [settings?.conciseReplies === false ? '' : CONCISE_REPLIES_PROMPT, widgetsEnabled(settings) ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText(), this.customText(meta), chatReplyInstruction(settings, meta)].filter(Boolean).join('\n\n');
     if (!ours) return undefined;
     let own: string | undefined;
     try {
@@ -821,16 +852,16 @@ export class CodexProvider implements Provider {
    * so the page-acting ones go in one (`sable_browser`); a call to them arrives as
    * `{ namespace: 'sable_browser', tool: 'browser_click' }`, and `browserOp` reads the plain tool name.
    */
-  dynamicTools(meta?: Pick<SessionMeta, 'options'>): CodexDynamicTool[] | undefined {
+  dynamicTools(meta?: Pick<SessionMeta, 'options'> & { id?: string }): CodexDynamicTool[] | undefined {
     const tools: CodexDynamicTool[] = [];
     if (widgetsEnabled(this.ctx.settings?.())) tools.push({ type: 'function', name: WIDGET_TOOL, description: WIDGET_DESCRIPTION, inputSchema: WIDGET_INPUT_SCHEMA });
     // The user's profile: one short fact at a time, merged by Sable (never secrets).
     if (this.profileOn()) tools.push({ type: 'function', name: PROFILE_TOOL, description: PROFILE_DESCRIPTION, inputSchema: PROFILE_INPUT_SCHEMA });
     // Sub-agents from the other agent (Claude Code), while it is installed and signed in.
-    if (meta && this.ctx.runAgent)
+    if (meta && !meta.id?.startsWith('sub-') && !meta.options?.readOnly && this.ctx.runAgent)
       for (const agent of this.ctx.otherAgents?.() ?? []) {
         const name = AGENT_TOOLS[agent];
-        if (agent !== 'codex' && name) tools.push({ type: 'function', name, description: agentToolDescription(agent), inputSchema: AGENT_INPUT_SCHEMA });
+        if (name) tools.push({ type: 'function', name, description: agentToolDescription(agent), inputSchema: AGENT_INPUT_SCHEMA });
       }
     // The Browser tab tools, while the session's capability is on (a thread keeps what it was started with).
     // Those that work an open page wait behind Codex's tool search until the agent looks for them.
@@ -1037,17 +1068,23 @@ export class CodexProvider implements Provider {
 
   async open(rt: SessionRuntime, opts: { loadTranscript?: boolean }): Promise<ProviderSession> {
     const session = new CodexSession(this, rt);
+    this.delegateOwner?.delegateProcesses.add(this);
     try {
       await session.attach(!!opts.loadTranscript);
     } catch (err) {
       this.attached.delete(session);
       if (this.sessions.get(session.threadId) === session) this.sessions.delete(session.threadId);
+      if (this.delegateOwner) await this.dispose();
       throw err;
     }
     return session;
   }
 
-  async dispose(): Promise<void> {
+  private disposal?: Promise<void>;
+
+  dispose(hard = false): Promise<void> { return this.disposal ??= this.closeProcesses(hard); }
+
+  private async closeProcesses(hard: boolean) {
     this.disposed = true;
     clearTimeout(this.idleTimer);
     if (this.pendingLogin) this.finishLogin(new Error('Codex provider is shut down'));
@@ -1056,7 +1093,10 @@ export class CodexProvider implements Provider {
     this.attached.clear();
     const rpc = this.rpc ?? (await this.starting?.catch(() => null)) ?? null;
     this.rpc = null;
-    await rpc?.close(undefined, 'quit');
+    await Promise.all([...this.delegateProcesses].map(child => child.dispose(true)));
+    await rpc?.close(hard ? 0 : undefined, hard ? 'timeout' : 'quit');
+    if (this.delegateOwner) await rpc?.ended;
+    this.delegateOwner?.delegateProcesses.delete(this);
     await this.closingRpc;
   }
 }
@@ -1354,7 +1394,7 @@ class CodexSession implements ProviderSession {
     const previous = rt.meta.lostReports?.length ?? 0;
     const commands = rt.tasksLost('process', 'death');
     const agents = rt.meta.lostReports?.slice(previous).map(r => r.name) ?? [];
-    rt.processGeneration++;
+    rt.endDelegateGeneration();
     this.loaded = false;
     this.dropReceivers(true);
     this.loadEpoch++;
@@ -1383,10 +1423,18 @@ class CodexSession implements ProviderSession {
     this.prompts.clear();
   }
 
-  async close() {
+  async terminateDelegate() {
+    if (this.provider.delegateOwner) await this.provider.dispose(true);
+    this.dropReceivers(true);
+    await this.close();
+  }
+
+  async close(reason?: Parameters<ProviderSession['close']>[0]) {
     if (this.closed) return;
+    this.rt.stopDelegates(this.rt.stopRequested || reason === 'close' || reason === 'quit');
     if (this.rt.turnActive) await this.interrupt().catch(() => {});
     this.closed = true;
+    this.rt.endDelegateGeneration();
     this.strayWake?.();
     this.loadEpoch++;
     void this.provider.setRemote(this, false).catch(() => {});
@@ -1395,18 +1443,28 @@ class CodexSession implements ProviderSession {
     clearTimeout(this.commandTimer);
     clearTimeout(this.idleTimer);
     for (const { item } of this.queue.splice(0)) this.finishInput(item, false);
-    this.dropReceivers();
     if (this.rt.meta.commands || this.rt.meta.serving) {
       const lost = this.rt.tasksLost('process');
       if (lost.length) this.rt.notice('info', 'The chat closed with background work still running', lost.join('\n'));
     }
     const rpc = this.provider.attached.get(this);
+    if (this.loaded && rpc && rpc.alive !== false) {
+      if (this.rt.id.startsWith('sub-')) {
+        const released = await Promise.all([...new Set([...this.receivers.keys(), this.threadId])].map(async threadId => {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try { await rpc.request('thread/unsubscribe', { threadId }, 1500); return true; }
+            catch (err) { this.log('delegate unsubscribe failed', threadId, errMsg(err)); }
+          }
+          return false;
+        }));
+        if (this.provider.delegateOwner && released.includes(false)) await this.provider.dispose(true);
+      } else await rpc.request('thread/unsubscribe', { threadId: this.threadId }, 10_000).catch(() => {});
+    }
+    this.dropReceivers();
     this.provider.attached.delete(this);
     if (this.provider.sessions.get(this.threadId) === this) this.provider.sessions.delete(this.threadId);
-    if (this.loaded && rpc && rpc.alive !== false) {
-      await rpc.request('thread/unsubscribe', { threadId: this.threadId }, 10_000).catch(() => {});
-    }
-    this.provider.sessionClosed();
+    if (this.provider.delegateOwner) await this.provider.dispose();
+    else this.provider.sessionClosed();
     this.loaded = false;
   }
 
@@ -1499,7 +1557,7 @@ class CodexSession implements ProviderSession {
     if (JSON.stringify(this.threadConfig() ?? null) !== before) {
       // Thread config applies when the thread is (re)loaded; never mid-turn.
       this.optionsDirty = true;
-      if (!this.rt.turnActive) await this.reloadForOptions();
+      if (!this.rt.turnActive && !this.rt.delegates.size) await this.reloadForOptions();
     }
     this.showCuaState();
     await this.provider.setRemote(this, !!options.remoteControl);
@@ -1507,7 +1565,7 @@ class CodexSession implements ProviderSession {
 
   /** Unloads the thread so the next resume carries the new config. */
   private async reloadForOptions() {
-    if (!this.optionsDirty || !this.loaded) return;
+    if (!this.optionsDirty || !this.loaded || this.rt.delegates.size) return;
     this.optionsDirty = false;
     const rpc = await this.provider.client().catch(() => null);
     await rpc?.request('thread/unsubscribe', { threadId: this.threadId }, 10_000).catch(() => {});
@@ -1534,7 +1592,7 @@ class CodexSession implements ProviderSession {
     const cmd = item.text.trim().match(/^\/(compact|review)(?:\s+([\s\S]*))?$/);
     if (cmd) return this.runCommand(item, cmd[1] as 'compact' | 'review', cmd[2]?.trim(), check);
     const input = buildInput(item.text, item.attachments, this.rt.caps?.skills ?? []);
-    if (this.rt.turnActive) return this.steerOrQueue(item, input, check);
+    if (this.rt.turnActive) return this.steerOrQueue(item, input, check, opts?.delegateReport);
     try {
       await this.startTurn([item], input, check);
     } catch (err) {
@@ -1878,7 +1936,7 @@ class CodexSession implements ProviderSession {
     this.reasoningSource.clear();
   }
 
-  private async steerOrQueue(item: UserItem, input: UserInput[], check?: () => void) {
+  private async steerOrQueue(item: UserItem, input: UserInput[], check?: () => void, report = false) {
     if (this.turnStarting) await this.turnStarting.catch(() => {});
     check?.();
     // A turn the user is stopping drops input steered into it: the message waits instead (the bridge
@@ -1891,8 +1949,9 @@ class CodexSession implements ProviderSession {
         // The person waits for a reply: the agent is told to answer first (after their words; the
         // conversation shows only what they wrote, and a transcript read back drops the note).
         if (this.turnId !== turn || !this.rt.turnActive || this.rt.stopRequested) throw new Error('The turn changed before the steer.');
-        await rpc.request('turn/steer', { threadId: this.threadId, input: [...input, { type: 'text', text: STEER_FIRST_BLOCK, text_elements: [] } as UserInput], expectedTurnId: turn }, 30_000);
-        if (this.turnId === turn && this.rt.turnActive) {
+        await rpc.request('turn/steer', { threadId: this.threadId, input: report ? input : [...input, { type: 'text', text: STEER_FIRST_BLOCK, text_elements: [] } as UserInput], expectedTurnId: turn }, 30_000);
+        if (!report && this.turnId === turn && this.rt.turnActive) {
+          this.rt.releaseDelegates();
           // Concurrent steers can be acknowledged out of order. Keep the latest accepted card.
           const latest = this.rt.items.findLast(i => i.id === item.id || i.id === this.turnUserId);
           this.turnUserId = latest?.id ?? item.id;
@@ -1908,6 +1967,7 @@ class CodexSession implements ProviderSession {
     }
     // The bridge took it back in the meantime (the turn ended first): it goes out from the queue.
     if (this.takenBack(item)) return this.finishInput(item, false);
+    if (report) { this.finishInput(item, false); return; }
     if (!this.rt.turnActive) return this.startTurn([item], input, check);
     this.queue.push({ item, input, ...(check ? { check } : {}) });
   }
@@ -2034,6 +2094,16 @@ class CodexSession implements ProviderSession {
     const stored = (await this.storedTurns())?.find((t) => t?.id === turnId);
     if (!ours()) return;
     if (stored?.status && stored.status !== 'inProgress') return this.completeTurn({ status: stored.status, error: stored.error?.message, durationMs: stored.durationMs });
+    // A delegate has no separate chat Stop button. Retry its exact turn once if the server still sees it working.
+    if (attempt === 0 && stored?.status === 'inProgress' && rt.id.startsWith('sub-')) {
+      try {
+        const rpc = await this.provider.client();
+        if (!ours()) return;
+        await rpc.request('turn/interrupt', { threadId: this.threadId, turnId }, 15_000);
+        why = undefined;
+      } catch (err) { why = errMsg(err); }
+      if (!ours()) return;
+    }
     if (why !== undefined) {
       rt.notice('error', stored ? 'Codex did not stop' : 'Codex did not confirm the stop', why);
       return;
@@ -2398,6 +2468,7 @@ class CodexSession implements ProviderSession {
       for (const tid of item.receiverThreadIds ?? []) {
         this.receivers.set(tid, id);
         this.provider.receivers.set(tid, this);
+        if (this.rt.id.startsWith('sub-') && !receiverStatus(item.agentsStates?.[tid]?.status)) this.receiverState(tid, 'running');
         const early = this.provider.earlyTurns.get(tid);
         if (early) {
           this.receiverTurns.set(tid, early);
@@ -2439,6 +2510,7 @@ class CodexSession implements ProviderSession {
     if (!spawn || !state) return;
     if (state === 'running') this.receiverLive.add(tid);
     else this.receiverLive.delete(tid);
+    if (!this.receiverLive.size) this.receiversDone?.();
     if (gone) {
       this.receivers.delete(tid);
       if (this.provider.receivers.get(tid) === this) this.provider.receivers.delete(tid);
@@ -2454,6 +2526,14 @@ class CodexSession implements ProviderSession {
     this.rt.patch<ToolItem>(spawn, { result: { ...item.result, agent: { ...item.result?.agent, background: shown } } });
   }
   private receiverLive = new Set<string>();
+  private receiversDone?: () => void;
+
+  waitForReceivers(): Promise<void> | undefined {
+    if (!this.receiverLive.size) return;
+    return new Promise<void>(resolve => { this.receiversDone = resolve; }).then(() => this.waitForReceivers());
+  }
+
+  async interruptReceivers() { await this.stopBackgroundWork(); }
   /** Each working receiver's running turn (thread id → turn id). */
   private receiverTurns = new Map<string, string>();
 
@@ -2506,6 +2586,7 @@ class CodexSession implements ProviderSession {
     for (const tid of this.receivers.keys()) if (this.provider.receivers.get(tid) === this) this.provider.receivers.delete(tid);
     this.receivers.clear();
     this.receiverLive.clear();
+    this.receiversDone?.();
     this.receiverTurns.clear();
     if (processEnded || spawns.size) this.rt.stopBackground(processEnded ? undefined : i => spawns.has(i.id));
   }
@@ -2516,6 +2597,8 @@ class CodexSession implements ProviderSession {
     if (!item || item.type === 'userMessage') return;
     const id = `${n.turnId}:${item.id}`;
     const existing = rt.get(id);
+    if (completed && item.type === 'dynamicToolCall') rt.delegateReceipt(id, item.contentItems);
+    if (existing?.type === 'tool' && existing.delegateReport) return;
     if (item.type === 'fileChange' && existing?.type === 'tool') rt.promote?.(existing);
     if (item.type === 'contextCompaction' && completed) {
       if (this.compactSeen) return;
@@ -2632,7 +2715,7 @@ class CodexSession implements ProviderSession {
           if (isProfileTool(typeof p?.tool === 'string' ? p.tool : undefined)) return profileDynamicAnswer(this.provider.rememberAboutUser(p?.arguments));
           // A sub-agent from the other agent (Claude Code): it runs nested under this call's step.
           const agent = agentOfTool(typeof p?.tool === 'string' ? p.tool : undefined);
-          if (agent) return await this.runDelegate(agent, p?.arguments, ac.signal);
+          if (agent) return await this.runDelegate(agent, p?.arguments, ac.signal, p.turnId && p.callId ? `${p.turnId}:${p.callId}` : undefined);
           // Client-defined tools (show_widget): the timeline already shows the call as the widget.
           return dynamicToolAnswer(p);
         }
@@ -2669,10 +2752,8 @@ class CodexSession implements ProviderSession {
     if (this.rt.turnActive) this.rt.update({ activity: allowed ? (it ? firstLine(`Running ${it.title}`, 70) : 'Working') : 'Thinking' });
   }
 
-  private claimedSteps = new Set<string>();
-
   /** Runs a sub-agent of `agent` for this session under the call's step; its final answer is the tool's result. */
-  private async runDelegate(agent: ProviderId, args: unknown, signal: AbortSignal) {
+  private async runDelegate(agent: ProviderId, args: unknown, signal: AbortSignal, stepId?: string) {
     const answer = (text: string, ok: boolean) => ({ contentItems: [{ type: 'inputText' as const, text }], success: ok });
     const call = readAgentCall(agent, args);
     if (!call) return answer('The task is empty: say what the sub-agent should do in `prompt`.', false);
@@ -2680,10 +2761,10 @@ class CodexSession implements ProviderSession {
     if (!run) return answer('Sub-agents are not available here.', false);
     const mine = (it: ToolItem) => agentOfTool(it.name) === agent;
     // The call's step usually exists already; give it a moment when the request came first.
-    let step = claimStep(this.rt, mine, this.claimedSteps);
+    let step = stepId ?? claimStep(this.rt, mine);
     if (!step) {
       await new Promise((r) => setTimeout(r, 250));
-      step = claimStep(this.rt, mine, this.claimedSteps);
+      step = claimStep(this.rt, mine);
     }
     const r = await run(this.rt, call, step, signal);
     return answer(r.text, r.ok);

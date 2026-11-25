@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import type { UserItem } from '@shared/protocol';
 import { stripWrappers } from '@shared/synthetic';
 import { CopyButton } from '@/components/CopyButton';
@@ -6,9 +6,10 @@ import { ImageView } from '@/components/ImageView';
 import { Icon } from '@/icons';
 import { formatBytes } from '@/lib/format';
 import { requestWhileCut } from './whole-request';
-import { rewindTo } from '@/state/actions';
+import { rewindTo, steerNow } from '@/state/actions';
 import { useStore } from '@/state/store';
-import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger, Switch } from '@/ui';
+import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger, Switch, Tip } from '@/ui';
+import { PROVIDER_NAME } from '@/art/Logo';
 import { fieldBeat } from '@/art/events';
 import { landInTimeline } from '@/features/composer/flight';
 import { parseReview } from '@/features/review/model';
@@ -18,14 +19,126 @@ import { EASE_OUT, play, uiZoom } from '@/lib/motion';
 import { MessageAgain } from './Again';
 import { useTimeline } from './ctx';
 import { Stamp } from './Stamp';
+import { firstAutoAt, steerWaitLine, steerWaitSpoken, waitingOn, waitsAsSteer } from './steer-wait';
 import { hasThumbnail } from './step-row';
-import { MOVE_GLIDE_MS, endShift, glideOffset, isLongMessage, rowLeft, rowMoved, watchMessage, willMove } from './user-card';
+import { MOVE_GLIDE_MS, endShift, glideOffset, isLongMessage, rowLeft, rowMoved, takenInPlace, watchMessage, willMove } from './user-card';
+import { useTick } from './util';
 
 /** How far the conversation will scroll this frame to keep its end (its own pixels; user-card.ts `endShift`). */
 function shiftOf(el: HTMLElement, stuck: boolean): number {
   const sc = el.closest<HTMLElement>('.tl-scroll');
   return sc ? endShift(stuck, sc.scrollHeight, sc.clientHeight, sc.scrollTop) : 0;
 }
+
+/**
+ * Whether the element can be seen now: within the view and the window not hidden. The waiting line's
+ * clock runs only then (one observer per waiting card, and there are one or two of those at most).
+ */
+function useSeen(ref: RefObject<Element | null>): boolean {
+  const [seen, setSeen] = useState(true);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let near = true;
+    const read = () => setSeen(near && document.visibilityState !== 'hidden');
+    const io = new IntersectionObserver((entries) => {
+      near = entries[entries.length - 1].isIntersecting;
+      read();
+    });
+    io.observe(el);
+    document.addEventListener('visibilitychange', read);
+    read();
+    return () => {
+      io.disconnect();
+      document.removeEventListener('visibilitychange', read);
+    };
+  }, [ref]);
+  return seen;
+}
+
+/**
+ * The one line under a steered message that still waits (steer-wait.ts): what it waits on and for
+ * how long, or the time left until the bridge sends it by itself, and "Send now" where the bridge
+ * can interrupt for it. It renders with its own card's changes and with the conversation's clock,
+ * which it follows only while it can be seen; the steps under way are read then, never per event.
+ */
+const SteerWait = memo(function SteerWait({ item }: { item: UserItem }) {
+  const { sessionId } = useTimeline();
+  const box = useRef<HTMLDivElement>(null);
+  const seen = useSeen(box);
+  const tick = useTick(seen);
+  // The shared clock stands still while nothing follows it: the line never reads a time older than its own.
+  const [floor, setFloor] = useState(Date.now);
+  useEffect(() => {
+    if (seen) setFloor(Date.now());
+  }, [seen]);
+  const now = Math.max(tick, floor);
+  const agent = useStore((s) => {
+    const provider = s.sessions[sessionId]?.provider;
+    return provider ? PROVIDER_NAME[provider] : undefined;
+  });
+  const stepId = item.steerWait?.stepId;
+  // The step the bridge names, as its title or state changes; everything else is read with the clock.
+  useStore((s) => {
+    const step = stepId ? s.data[sessionId]?.items[stepId] : undefined;
+    return step?.type === 'tool' ? `${step.status}|${step.title}` : '';
+  });
+  const [sending, setSending] = useState(false);
+  const here = useRef(true);
+  useEffect(() => {
+    here.current = true;
+    return () => {
+      here.current = false;
+    };
+  }, []);
+
+  const d = useStore.getState().data[sessionId];
+  const at = (id: string) => d?.items[id];
+  const roots = d?.roots ?? [];
+  const line = steerWaitLine({ item, steps: waitingOn(at, roots, stepId), agent, autoAt: firstAutoAt(at, roots), now, sending });
+
+  const send = async () => {
+    if (line.disabled) return;
+    setSending(true);
+    await steerNow(sessionId, item.id);
+    if (here.current) setSending(false);
+  };
+
+  return (
+    <div className="steer-wait" ref={box} data-phase={line.phase}>
+      <span className="steer-wait-text" role="status" aria-live="off" aria-label={steerWaitSpoken(line)}>
+        {/* Why it still waits, in the bridge's words: it stands where the countdown stood, or before it. */}
+        {line.why && (
+          <span className="steer-wait-why truncate" title={line.why}>
+            {line.why}
+          </span>
+        )}
+        {line.label && <span className="steer-wait-label truncate">{line.label}</span>}
+        {line.clock && (
+          <>
+            {line.phase === 'waiting' && (
+              <span className="steer-wait-dot" aria-hidden>
+                ·
+              </span>
+            )}
+            <span className="steer-wait-clock num">
+              <span aria-hidden>{line.room}</span>
+              <span>{line.clock}</span>
+            </span>
+          </>
+        )}
+      </span>
+      {line.action && (
+        <Tip label={line.cost}>
+          <button type="button" className="steer-now" aria-disabled={line.disabled || undefined} onClick={() => void send()}>
+            <Icon name="arrow-up" size={11} />
+            Send now
+          </button>
+        </Tip>
+      )}
+    </div>
+  );
+});
 
 /** The person's message: their words on the right in the composer's material, with its time, copy and rewind on hover. */
 export const UserMessage = memo(function UserMessage({ item, landingId = item.id }: { item: UserItem; landingId?: string }) {
@@ -103,7 +216,9 @@ export const UserMessage = memo(function UserMessage({ item, landingId = item.id
     return useStore.subscribe((s, prev) => {
       const roots = s.data[sessionId]?.roots;
       const before = prev.data[sessionId]?.roots;
-      if (!willMove(item.id, before, roots)) return;
+      // Or it is taken where it stands, with no move among the roots (user-card.ts `takenInPlace`):
+      // read once, while the row still shows it waiting.
+      if (!willMove(item.id, before, roots) && (stoodAt.current || !takenInPlace(queuedNow.current, s.data[sessionId]?.items[item.id]))) return;
       const r = root.current?.querySelector('.user-card')?.getBoundingClientRect();
       if (r?.width) stoodAt.current = { left: r.left, top: r.top };
     });
@@ -226,6 +341,7 @@ export const UserMessage = memo(function UserMessage({ item, landingId = item.id
           </div>
         )}
       </div>
+      {waitsAsSteer(item) && <SteerWait item={item} />}
     </div>
   );
 });

@@ -13,7 +13,7 @@ import { CodexProvider } from '../server/providers/codex';
 import { DemoProvider } from '../server/providers/demo';
 import { WIDGET_DESCRIPTION, WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_SHOWN, WIDGET_TOOL, WIDGET_TOOL_ID, dynamicToolAnswer, isWidgetTool, widgetResult } from '../server/providers/widget-tool';
 
-const ctx = (settings: Partial<AppSettings>) => ({ emit: () => {}, log: () => {}, settings: () => ({ ...DEFAULT_SETTINGS, ...settings }) });
+const ctx = (settings: Partial<AppSettings>) => ({ emit: () => {}, log: () => {}, settings: () => ({ ...DEFAULT_SETTINGS, replyFirst: false, ...settings }) });
 const meta = { cwd: process.cwd(), model: '', mode: 'default' };
 
 describe('Claude: the show_widget tool', () => {

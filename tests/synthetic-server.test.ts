@@ -8,6 +8,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { TimelineItem } from '@shared/protocol';
+import { DELEGATE_REPORT, delegateReport, HANDOVER_HEAD_ACCOUNT, HANDOVER_TAIL, HANDOVER_JOIN, STEER_NOW_BLOCK, userItemText } from '@shared/synthetic';
+import { chatMarkdown } from '../server/core/chat-markdown';
+import { saidOf } from '../server/services/search';
 import { handoverText } from '../server/accounts/handover';
 import { App } from '../server/app';
 import { turnSlice } from '../server/core/check';
@@ -26,6 +29,29 @@ const user = (id: string, text: string): TimelineItem => ({ id, ts: at(), type: 
 const text = (id: string, t: string): TimelineItem => ({ id, ts: at(), type: 'text', text: t, streaming: false });
 const tool = (id: string): TimelineItem => ({ id, ts: at(), type: 'tool', name: 'Edit', kind: 'edit', title: 'Edit a.ts', status: 'done', detail: { path: 'a.ts' } });
 const turn = (id: string): TimelineItem => ({ id, ts: at(), type: 'turn', durationMs: 1 });
+
+it('omits a hidden delegate report from export and search', () => {
+  const items = [user('u', 'Review the changes'), user('hidden', DELEGATE_REPORT + '\n\n' + delegateReport('Review', 'failed', 'Private child report')), text('t', 'I found the cause')];
+  expect(saidOf(items).map(i => i.id)).toEqual(['u', 't']);
+  const md = chatMarkdown({ title: 'Review', provider: 'claude', cwd: '.', createdAt: 1 }, items);
+  expect(md).toContain('Review the changes');
+  expect(md).not.toContain('Private child report');
+  expect(md).not.toContain(DELEGATE_REPORT);
+});
+
+it('keeps personal quotations and hides the handover report in transcript, export and search', () => {
+  const handover = HANDOVER_HEAD_ACCOUNT + '\nAgent: Done\n' + HANDOVER_TAIL + HANDOVER_JOIN;
+  const hidden = user('hidden', handover + DELEGATE_REPORT + '\n\n' + delegateReport('Review', 'done', 'Child finished'));
+  expect(saidOf([hidden])).toEqual([]);
+  for (const words of [STEER_NOW_BLOCK, 'before ' + STEER_NOW_BLOCK + ' after', 'words <system-reminder>unfinished']) {
+    const card = { ...user('quote', words), authored: true } as TimelineItem;
+    expect(userItemText(card)).toBe(words);
+    expect(saidOf([card])).toMatchObject([{ text: words }]);
+    const md = chatMarkdown({ title: 'Review', provider: 'claude', cwd: '.', createdAt: 1 }, [hidden, card]);
+    expect(md).toContain(words);
+    expect(md).not.toContain(DELEGATE_REPORT);
+  }
+});
 
 describe('titles', () => {
   it('titles a chat that opens with one of these in plain words', () => {

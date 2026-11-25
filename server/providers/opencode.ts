@@ -25,6 +25,7 @@ import type {
   TurnItem,
   UserItem,
 } from '../../shared/protocol';
+import { readDelegateIds } from '../../shared/synthetic';
 import { lostLine, type SessionRuntime } from '../core/runtime';
 import { runCli } from '../util/proc';
 import { openCodeConfig } from '../services/config';
@@ -337,6 +338,33 @@ export class OpenCodeProvider implements Provider {
   }
 
   // ── history ──
+
+  /** A report can reach OpenCode after a provider switch. Replay on a separate connection
+   * so loading its history never feeds old frames to the live chat. */
+  async delegateReceipts(session: string, cwd: string) {
+    const reader = await AcpClient.start({ log: this.ctx.log, clientVersion: VERSION });
+    const ids = new Set<string>();
+    let words = '', message: string | undefined, sawUser = false;
+    reader.onNotification = (method, p) => {
+      if (method !== 'session/update' || p.sessionId !== session) return;
+      const update = p.update;
+      if (update?.sessionUpdate !== 'user_message_chunk' || message !== update.messageId) {
+        readDelegateIds(words, ids);
+        words = '';
+      }
+      if (update?.sessionUpdate === 'user_message_chunk') {
+        message = update.messageId;
+        sawUser = true;
+        if (typeof update.content?.text === 'string') words += update.content.text;
+      }
+    };
+    try {
+      await reader.request('session/load', { sessionId: session, cwd, mcpServers: [] }, 60_000);
+      if (!sawUser) throw new Error('The OpenCode conversation is unavailable for report reconciliation.');
+      readDelegateIds(words, ids);
+      return { ids, settled: true };
+    } finally { await reader.close(); }
+  }
 
   async history(cwd?: string, limit?: number): Promise<HistoryEntry[]> {
     const acp = await this.client();

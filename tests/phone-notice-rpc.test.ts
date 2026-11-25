@@ -22,7 +22,11 @@ function endpoint() {
     if (!params.peek) unread = false;
     return { session: { id: params.sessionId, unread }, items: [], queue: [], todos: [], permissions: [], questions: [] };
   });
-  const app = { store: { dir }, sessions: new Map([['custom', { meta: { custom: true } }]]), call, emit: vi.fn(), subscribe: (f: typeof emit) => { emit = f; return () => {}; } };
+  const sessions = new Map<string, unknown>([
+    ['custom', { meta: { custom: true } }],
+    ['s', { meta: { cwd: path.join(tmpdir(), 'ordinary-chat') }, get: (id: string) => id === 'waiting' ? { type: 'user', id, state: 'queued', steered: true, text: 'answer?' } : undefined }],
+  ]);
+  const app = { store: { dir, state: { settings: {} } }, onDispose: vi.fn(), sessions, call, emit: vi.fn(), subscribe: (f: typeof emit) => { emit = f; return () => {}; } };
   const service = new PhoneService(app as unknown as App);
   const device = { id: 'test', tokenHash: '1'.repeat(64) };
   const host = service as unknown as { data: { enabled: boolean; devices: (typeof device)[] }; authenticated(link: Link, d: typeof device): void };
@@ -56,6 +60,22 @@ it('peeks without marking read or subscribing, preserves an existing watch, and 
   e.data.enabled = false;
   for (const peek of [true, false]) expect(await e.send('phone.tail', { sessionId: 's', peek })).toBeUndefined();
   expect(e.call).toHaveBeenCalledTimes(3);
+});
+
+it('allows steerNow for a visible card with the live pairing guard, including from a notification', async () => {
+  const e = endpoint();
+  const p = { sessionId: 's', itemId: 'waiting' };
+  expect(await e.send('session.steerNow', p)).toMatchObject({ ok: false });
+  expect(await e.send('phone.steerNow', { ...p, sessionId: 'other' })).toMatchObject({ ok: false });
+  await e.send('phone.tail', { sessionId: 's', peek: true });
+  expect(await e.send('phone.steerNow', { ...p, itemId: 'missing' })).toMatchObject({ ok: false });
+  expect(await e.send('phone.steerNow', { ...p, sessionId: 'custom' })).toMatchObject({ ok: false });
+  expect(await e.send('phone.steerNow', p)).toMatchObject({ ok: true });
+  const forwarded = e.call.mock.lastCall!;
+  expect(forwarded.slice(0, 2)).toEqual(['session.steerNow', p]);
+  expect(forwarded[2].allowed()).toBe(true);
+  e.data.devices.length = 0;
+  expect(forwarded[2].allowed()).toBe(false);
 });
 
 it('passes the selected refusal to either guarded handler and rejects malformed or unscoped reset requests', async () => {

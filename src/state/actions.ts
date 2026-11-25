@@ -319,6 +319,27 @@ export function reorderQueue(sessionId: string, ids: string[]) {
 /** Gives a queued message to the agent now (mid-turn when one is running). */
 export const sendQueuedNow = (sessionId: string, id: string) => bridge.call('queue.sendNow', { sessionId, id }).catch(fail);
 
+/**
+ * "Send now" on a steered message that still waits (its card in the conversation, `itemId`): the
+ * bridge interrupts the running step and delivers the waiting messages, oldest first. Answers whether
+ * it went. A refusal says why in the bridge's own words; the words of the message are never sent
+ * again from here (that would be a second message): the card shows what is true once the bridge
+ * has answered, since its events are applied before its answer.
+ */
+export async function steerNow(sessionId: string, itemId: string): Promise<boolean> {
+  try {
+    const r: { ok: boolean; error?: string } = await bridge.call('session.steerNow', { sessionId, itemId });
+    if (r.ok) return true;
+    // Taken meanwhile (the agent got to it first): the card already says so, nothing to add.
+    const card = useStore.getState().data[sessionId]?.items[itemId];
+    if (card?.type === 'user' && card.state === 'queued') useStore.getState().toast(r.error || 'Could not send it now. The message still waits.');
+    return false;
+  } catch (err) {
+    fail(err);
+    return false;
+  }
+}
+
 // ── review comments on diffs (features/review): kept per session in the window until sent ──
 
 export const addReviewComment = (sessionId: string, c: ReviewComment) => useStore.setState((s) => ({ reviews: addComment(s.reviews, sessionId, c) }));

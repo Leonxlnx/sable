@@ -2,6 +2,7 @@
  * The person's message card, as numbers shared by the card (timeline.css `.user-card`) and the
  * bubble that flies to it from the composer (composer/flight.ts): both must agree to the pixel.
  */
+import type { TimelineItem } from '@shared/protocol';
 
 /** The card's type: the answer's size and leading (components/markdown.css `.md`). */
 export const CARD_FONT = 14;
@@ -48,6 +49,19 @@ export function willMove(id: string, before: readonly string[] | undefined, afte
   for (let i = now + 1; i < after.length; i++) if (behind.has(after[i])) return false;
   for (let i = 0; i < now; i++) if (behind.has(after[i])) return true;
   return false;
+}
+
+/**
+ * A waiting steer the agent takes where it stands: nothing came after it, so the roots keep their
+ * order and `willMove` sees no move. Its row changes all the same in that write (the waiting line
+ * under the card goes, and the card stands a message's gap under what is above it, timeline.css
+ * `.steer-wait`): the card glides to its place from where it stood, as it does when it moves.
+ * `waits`: the row on screen still shows it waiting. `now`: the message as the store has it. (A chat's
+ * items are updated in place, store.ts, so the state before a write cannot be read back from the
+ * store: what the row last drew is the before.)
+ */
+export function takenInPlace(waits: boolean, now: TimelineItem | undefined): boolean {
+  return waits && now?.type === 'user' && now.state !== 'queued';
 }
 
 /**

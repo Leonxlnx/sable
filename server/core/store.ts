@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { writeFile, rename } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { homedir } from 'node:os';
@@ -83,6 +84,10 @@ export class Store {
   /** Frozen item versions shared by concurrent saves until the runtime marks the item dirty. */
   private savedItems = new WeakMap<TimelineItem, TimelineItem>();
   private activeSaves = new Map<string, SessionSave>();
+  private migrations = new Map<string, { after: number; atRest: () => boolean }>();
+  private migrationTimer?: NodeJS.Timeout;
+  private migrating = false;
+  private owner?: string;
 
   constructor(dir?: string, runtimeItem?: (session: string, id: string) => TimelineItem | undefined) {
     this.sessionFiles = new SessionFiles(id => this.sessionPath(id), runtimeItem && ((id, saved, preview) => {
@@ -93,6 +98,39 @@ export class Store {
     mkdirSync(path.join(this.dir, 'sessions'), { recursive: true });
     this.state = this.readState() ?? { projects: [], settings: { ...DEFAULT_SETTINGS }, sessions: [], accounts: [] };
     this.normalizeState();
+    this.recoverSessionFiles();
+  }
+
+  private recoverSessionFiles() {
+    // The OS releases the startup lock even on a hard exit. The closed owner
+    // files then distinguish a running Store from one that died after startup.
+    const claim = '.sable-store.' + process.pid + '.' + randomUUID() + '.owner';
+    const owner = path.join(this.dir, claim);
+    try { writeFileSync(owner, '', { flag: 'wx' }); }
+    catch { return; } // A read-only or full profile still opens.
+    this.owner = owner;
+    const sqlite = process.getBuiltinModule?.('node:sqlite') as typeof import('node:sqlite') | undefined;
+    if (!sqlite) return;
+    let lock;
+    try { lock = new sqlite.DatabaseSync(path.join(this.dir, '.sable-store.lock')); }
+    catch { return; }
+    try {
+      // This runs in the constructor, on the main thread, at every start: it never waits long for
+      // another start of Sable on the same profile, and it never keeps this one from opening.
+      lock.exec('PRAGMA busy_timeout=1500; BEGIN EXCLUSIVE');
+      for (const name of readdirSync(this.dir)) {
+        const other = /^\.sable-store\.([1-9]\d*)\.[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.owner$/.exec(name);
+        if (!other || name === claim) continue;
+        try { process.kill(Number(other[1]), 0); return; }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ESRCH') return; }
+        rmSync(path.join(this.dir, name), { force: true });
+      }
+      this.sessionFiles.recoverMigrations(readdirSync(path.join(this.dir, 'sessions'), { withFileTypes: true }));
+    } catch {
+      // A competing start that still holds the lock, a damaged lock file or any other failure only
+      // forfeits this optional cleanup. What it would have removed is superseded either way (a temp
+      // nobody finished, a tail its base already holds), so reading on without it is safe.
+    } finally { try { lock.close(); } catch { /* Already closed. */ } }
   }
 
   get registryUnavailable() { return this.unreadableState; }
@@ -204,6 +242,45 @@ export class Store {
     return this.sessionFiles.loadAsync(id);
   }
 
+  scheduleMigration(id: string, atRest: () => boolean, matchesRestore?: () => boolean) {
+    if (this.sealed || !this.sessionFiles.needsMigration(id)) return;
+    if (matchesRestore && !matchesRestore()) { this.sessionFiles.forgetMigration(id); return; }
+    this.migrations.set(id, { after: Date.now() + 20_000, atRest });
+    this.armMigration();
+  }
+
+  private armMigration(pause = 0) {
+    if (this.sealed || this.migrating || this.migrationTimer || !this.migrations.size) return;
+    const next = Math.min(...Array.from(this.migrations.values(), m => m.after));
+    this.migrationTimer = setTimeout(() => {
+      this.migrationTimer = undefined;
+      void this.runMigration();
+    }, Math.max(pause, next - Date.now()));
+    this.migrationTimer.unref();
+  }
+
+  private async runMigration() {
+    this.migrating = true;
+    try {
+      for (const [id, entry] of this.migrations) {
+        if (!this.sessionFiles.needsMigration(id)) { this.migrations.delete(id); continue; }
+        if (entry.after > Date.now()) continue;
+        const ready = () => {
+          if (this.sealed || this.migrations.get(id) !== entry || this.sessionPending.has(id)) return false;
+          try { return entry.atRest(); }
+          catch { this.migrations.delete(id); this.sessionFiles.forgetMigration(id); return false; }
+        };
+        if (!ready()) continue;
+        await this.sessionFiles.migrate(id, ready);
+        if (this.migrations.get(id) === entry && !this.sessionFiles.needsMigration(id)) this.migrations.delete(id);
+        break;
+      }
+    } finally {
+      this.migrating = false;
+      this.armMigration(5_000);
+    }
+  }
+
   wholeItem(id: string, item: TimelineItem): TimelineItem {
     return this.sessionFiles.wholeItem(id, item);
   }
@@ -260,6 +337,8 @@ export class Store {
   /** `data` is read when the write happens; its `dirty` names the items changed since the last save. */
   saveSession(id: string, data: () => SessionSave) {
     if (this.sealed) return;
+    this.sessionFiles.forgetMigration(id);
+    this.migrations.delete(id);
     this.sessionPending.set(id, data);
     if (this.sessionTimers.has(id)) return;
     this.sessionTimers.set(
@@ -291,6 +370,13 @@ export class Store {
     });
   }
 
+  /** Commit input ownership before the corresponding SDK write or RPC acknowledgement. */
+  async persistInput(id: string) {
+    await Promise.all([this.flushSession(id), this.flushFile(this.statePath)]);
+    await Promise.all([this.sessionFiles.idle(), this.writingState]);
+    if (this.sessionFiles.needsRetry(id)) throw new Error('Could not save the waiting message.');
+  }
+
   /** SessionFiles retries failed writes on the next save. Only acknowledge a restart notice seen on disk. */
   async savedRestartNotice(id: string, notice: string): Promise<boolean> {
     await this.flushSession(id);
@@ -299,6 +385,7 @@ export class Store {
 
   deleteSession(id: string) {
     if (this.sealed) return;
+    this.migrations.delete(id);
     const t = this.sessionTimers.get(id);
     if (t) clearTimeout(t);
     this.sessionTimers.delete(id);
@@ -333,6 +420,9 @@ export class Store {
   seal(): Promise<void> {
     if (this.sealed) return this.sealed;
     this.sealed = Promise.resolve(); // Freeze before reading the pending callbacks.
+    clearTimeout(this.migrationTimer);
+    for (const id of this.migrations.keys()) this.sessionFiles.forgetMigration(id);
+    this.migrations.clear();
     if (!this.unreadableState) this.pending.set(this.statePath, () => this.state);
     const retries = [...this.activeSaves]
       .filter(([id]) => !this.sessionPending.has(id))
@@ -340,6 +430,9 @@ export class Store {
     this.sealed = Promise.allSettled([this.flush(), ...retries]).then(results => {
       const failed = results.find(r => r.status === 'rejected');
       if (failed) throw failed.reason;
+    }).finally(() => {
+      try { if (this.owner) rmSync(this.owner, { force: true }); }
+      catch { /* A later startup can release the dead owner's claim. */ }
     });
     return this.sealed;
   }

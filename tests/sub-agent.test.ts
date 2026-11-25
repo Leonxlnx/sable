@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { BridgeEvent, ToolItem } from '@shared/protocol';
 import { App } from '../server/app';
 import { runSubAgent, claimStep } from '../server/core/sub-agent';
-import { agentOfTool, describeAgentCall, readAgentCall } from '../server/providers/agent-tool';
+import { AGENT_INPUT_SCHEMA, agentToolDescription, agentOfTool, describeAgentCall, readAgentCall } from '../server/providers/agent-tool';
 import { DemoProvider } from '../server/providers/demo';
 
 const homes: string[] = [];
@@ -32,6 +32,12 @@ describe('sub-agent tool', () => {
     expect(agentOfTool('mcp__sable__delegate_to_codex')).toBe('codex');
     expect(agentOfTool('delegate_to_claude')).toBe('claude');
     expect(agentOfTool('show_widget')).toBeUndefined();
+    for (const agent of ['claude', 'codex'] as const) {
+      expect(AGENT_INPUT_SCHEMA.properties.background.type).toBe('boolean');
+      expect(agentToolDescription(agent)).toContain('background: true');
+      expect(readAgentCall(agent, { prompt: 'review', background: true })?.background).toBe(true);
+      expect(readAgentCall(agent, { prompt: 'review', background: 'false' })?.background).toBeUndefined();
+    }
     expect(readAgentCall('codex', { prompt: '  ' })).toBeNull();
     expect(readAgentCall('codex', { prompt: 'Review src/app.ts', description: 'Review the app' })).toEqual({ agent: 'codex', description: 'Review the app', prompt: 'Review src/app.ts' });
     expect(describeAgentCall('codex', { description: 'Review the app', prompt: 'x' })).toMatchObject({ kind: 'agent', title: 'Review the app', detail: { subagent: 'Codex' } });
@@ -59,6 +65,28 @@ describe('sub-agent tool', () => {
     // The task is the step's prompt: no message of its own, and nothing outside the step.
     expect(parent.items.filter((i) => i.type === 'user')).toHaveLength(0);
     expect(nested.every((i) => i.id.startsWith('sub-'))).toBe(true);
+  });
+
+  it('keeps a Demo child waiting for permission after its foreground call is released', async () => {
+    const { app, home } = setup();
+    const snap = await app.call('session.create', { provider: 'demo', cwd: path.join(home, 'p') });
+    const rt = app.runtime(snap.session.id);
+    const step = rt.add<ToolItem>({ type: 'tool', name: 'delegate_to_codex', kind: 'agent', title: 'Refactor', status: 'running', detail: {} });
+    const running = runSubAgent({ provider: id => app.provider(id), accountFor: () => undefined, defaultModel: () => undefined, modeFor: () => 'default', log() {} },
+      rt, { agent: 'demo', description: 'Refactor', prompt: 'refactor the session module' }, step.id);
+    for (let i = 0; i < 200 && !rt.prompts().permissions.length; i++) await new Promise(r => setTimeout(r, 10));
+    const ask = rt.prompts().permissions[0];
+    expect(ask.sessionId).toBe(rt.id);
+    rt.releaseDelegates();
+    expect((await running).text).toContain('Answer the person now');
+    rt.endTurn();
+    expect(rt.prompts().permissions).toEqual([ask]);
+    expect(rt.meta.background).toBe(1);
+    await app.call('session.interrupt', { sessionId: rt.id });
+    for (let i = 0; i < 100 && rt.delegates.size; i++) await new Promise(r => setTimeout(r, 5));
+    expect(rt.delegates.size).toBe(0);
+    expect(rt.pendingDelegateReports.size).toBe(0);
+    expect(step.delegateReport).toBe('stopped');
   });
 
   it('asks its permission questions in the parent session, on the calling step', async () => {

@@ -1,5 +1,27 @@
 import type { TimelineItem, UserItem } from '../../shared/protocol';
 
+/** Freeze process-owned rows before the independent fork base is written. */
+export function forkHistory(items: TimelineItem[], whole: (row: TimelineItem) => TimelineItem): TimelineItem[] {
+  return items.map(row => {
+    if (row.type === 'user' && row.delegateContinuations !== undefined) {
+      const { delegateContinuations, ...historical } = whole(row) as UserItem;
+      return historical;
+    }
+    if ((row.type === 'text' || row.type === 'thinking') && row.streaming) return { ...whole(row) as typeof row, streaming: false };
+    if (row.type !== 'tool') return row;
+    const active = ['running', 'pending', 'awaiting'].includes(row.status);
+    if (!active && !row.delegateReport && !row.delegateDeliveryId && row.result?.agent?.background !== 'running'
+      && row.workflow?.status !== 'running' && row.task?.state !== 'running' && row.task?.state !== 'lost') return row;
+    const { delegateCaller, delegateReport, delegateAttempt, delegateDeliveryId, delegateContinuations, delegateWait, ...copy } = whole(row) as typeof row;
+    if (active) copy.status = 'cancelled';
+    if (copy.result?.agent?.background === 'running') copy.result = { ...copy.result, agent: { ...copy.result.agent, background: 'stopped' } };
+    if (copy.workflow?.status === 'running') copy.workflow = { ...copy.workflow, status: 'stopped' };
+    if (copy.task?.state === 'running') copy.task = { ...copy.task, state: 'stopped', lossTold: true };
+    else if (copy.task?.state === 'lost') copy.task = { ...copy.task, lossTold: true };
+    return copy;
+  });
+}
+
 /**
  * Forking a conversation at an answer: everything up to the end of the turn that holds the
  * answer stays, the next message the person sent (and all after it) does not.

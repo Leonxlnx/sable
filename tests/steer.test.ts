@@ -264,7 +264,7 @@ describe('ultracode', () => {
 // ──────────────────────────────── short answers ─────────────────────────────────
 
 describe('short answers', () => {
-  const ctx = (settings: Partial<AppSettings>): ProviderContext => ({ emit: () => {}, log: () => {}, settings: () => ({ ...DEFAULT_SETTINGS, ...settings }) });
+  const ctx = (settings: Partial<AppSettings>): ProviderContext => ({ emit: () => {}, log: () => {}, settings: () => ({ ...DEFAULT_SETTINGS, replyFirst: false, ...settings }) });
 
   it('is on by default', () => {
     expect(DEFAULT_SETTINGS.conciseReplies).toBe(true);

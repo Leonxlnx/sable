@@ -97,13 +97,44 @@
   border: 1px solid var(--line);
   border-radius: var(--r-xl);
   background-color: var(--sheet);
-  overflow: hidden;
+  /* No overflow here. A rounded clip over a scroller makes Chromium ask the main thread where every
+     wheel step lands (it cannot hit test through a round clip on the compositor), so the
+     conversation waited out every long task before it moved. The body clips as a rectangle, and
+     the two lower corners are drawn by the pieces below. */
 }
 
 .stage-body {
   position: relative;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
+}
+
+/* The stage's two lower corners: the window's body outside the arc and the arc's own hairline,
+   over whatever the body shows there. The ring is the stage's `--line` laid on its sheet, opaque. */
+.stage::before,
+.stage::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  z-index: 9;
+  width: var(--r-xl);
+  height: var(--r-xl);
+  box-sizing: border-box;
+  pointer-events: none;
+  border: 0 solid color-mix(in srgb, var(--sheet) 94%, white 6%);
+  box-shadow: 0 0 0 var(--r-xl) var(--shell);
+  clip-path: inset(0);
+}
+.stage::before {
+  left: -1px;
+  border-width: 0 0 1px 1px;
+  border-bottom-left-radius: var(--r-xl);
+}
+.stage::after {
+  right: -1px;
+  border-width: 0 1px 1px 0;
+  border-bottom-right-radius: var(--r-xl);
 }
 
 .stage-view {

@@ -30,7 +30,7 @@ export interface ChatWork {
   wakeAt?: number;
 }
 
-export function workOf(rt: WorkSession, waitable = false, now = Date.now(), purpose: 'move' | 'update' = 'move'): ChatWork {
+export function workOf(rt: WorkSession, waitable = false, now = Date.now(), purpose: 'move' | 'update' | 'wake' = 'move'): ChatWork {
   let live: LiveWork | undefined;
   try {
     live = rt.handle?.liveWork?.(purpose);

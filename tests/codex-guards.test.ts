@@ -7,9 +7,15 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { runSubAgent } from '../server/core/sub-agent';
 import type { SessionRuntime } from '../server/core/runtime';
+import type { Provider } from '../server/providers/types';
+import type { TextItem, ToolItem } from '../shared/protocol';
+import { delegateReport, parseSynthetic } from '../shared/synthetic';
 import { App } from '../server/app';
+import { REPLY_FIRST_PROMPT } from '../shared/protocol';
+import { CodexRpc } from '../server/providers/codex-rpc';
 import { CodexProvider } from '../server/providers/codex';
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -33,6 +39,9 @@ function gate() {
 }
 
 type Answer = {
+  interrupt?: () => void;
+  unsubscribe?: () => void;
+  threadRead?: () => unknown;
   /** turn/start's answer for the n-th start (may wait). */
   turnStart?: (n: number) => Promise<unknown> | unknown;
   /** thread/turns/list's answer for the n-th probe (may wait or fail). */
@@ -59,7 +68,10 @@ async function codexFake(answer: Answer = {}) {
         const n = ++starts;
         return answer.turnStart ? answer.turnStart(n) : { turn: { id: `turn${n}` } };
       }
+      if (method === 'thread/read' && answer.threadRead) return answer.threadRead();
       if (method === 'thread/turns/list') return answer.turnsList ? answer.turnsList(++probes) : {};
+      if (method === 'turn/interrupt') answer.interrupt?.();
+      if (method === 'thread/unsubscribe') answer.unsubscribe?.();
       if (method === 'account/read') return { account: { type: 'apiKey' }, requiresOpenaiAuth: true };
       return {};
     },
@@ -92,8 +104,157 @@ async function codexFake(answer: Answer = {}) {
   const serverDied = () => (provider as unknown as { onExit(rpc: unknown, info: unknown): void }).onExit(rpc, { code: 1, signal: null, stderr: '' });
   /** The chat's Codex session (to make its rechecks quick). */
   const session = () => provider.sessions.get('th1') as unknown as Record<string, unknown>;
-  return { app, id, rt, calls, notify, status, complete, count, serverDied, session, send: (text: string) => app.call('session.send', { sessionId: id, text }), stop: () => app.call('session.interrupt', { sessionId: id }) };
+  return { app, id, rt, provider, calls, notify, status, complete, count, serverDied, session, send: (text: string) => app.call('session.send', { sessionId: id, text }), stop: () => app.call('session.interrupt', { sessionId: id }) };
 }
+
+it('sends a native steer while a foreground command is still running', async () => {
+  const h = await codexFake();
+  await h.send('run the tests');
+  expect(h.calls.find(c => c.method === 'thread/start')?.params.developerInstructions).toEqual(expect.stringContaining(REPLY_FIRST_PROMPT));
+  h.notify('item/started', { threadId: 'th1', turnId: 'turn1', item: { id: 'long', type: 'commandExecution', command: 'test', cwd: h.rt.meta.cwd, status: 'inProgress' } });
+  const command = h.rt.items.find(i => i.type === 'tool' && i.kind === 'bash');
+  expect(command).toMatchObject({ status: 'running' });
+  await h.app.call('session.send', { sessionId: h.id, text: 'answer please', steer: true });
+  expect(h.calls.filter(c => c.method === 'turn/steer')).toMatchObject([{ params: { expectedTurnId: 'turn1' } }]);
+  expect(h.rt.items.find(i => i.type === 'user' && i.text === 'answer please')).toMatchObject({ state: 'sent' });
+  expect(command).toMatchObject({ status: 'running' });
+  expect(h.count('turn/interrupt')).toBe(0);
+  h.complete('turn1');
+});
+
+it.each([
+  ['codex', 'running'], ['claude', 'running'], ['codex', 'idle'], ['claude', 'idle'],
+] as const)('releases a native delegate_to_%s and receives one report while %s', async (agent, phase) => {
+  const h = await codexFake();
+  await h.send('review');
+  let child!: SessionRuntime;
+  const fake = { open: async (rt: SessionRuntime) => {
+    child = rt;
+    return { send: async () => rt.beginTurn(), interrupt: async () => rt.endTurn(), close: async () => {} };
+  } } as unknown as Provider;
+  const real = h.app.provider.bind(h.app);
+  h.app.provider = (p, a) => p === agent && !child ? fake : real(p, a);
+  const tool = 'delegate_to_' + agent;
+  const args = { description: 'Check this', prompt: 'Read this' };
+  const n = { threadId: 'th1', turnId: 'turn1', item: { id: 'call1', type: 'dynamicToolCall', tool, arguments: args, status: 'inProgress' } };
+  h.notify('item/started', n);
+  const s = h.session() as unknown as { onRequest(m: string, p: unknown, id: number): Promise<unknown> };
+  const result = s.onRequest('item/tool/call', { turnId: 'turn1', callId: 'call1', tool, arguments: args }, 2);
+  await h.app.call('session.send', { sessionId: h.id, text: 'answer please', steer: true });
+  expect(await result).toEqual({ success: true, contentItems: [{ type: 'inputText', text: 'The person sent a message, so this call returns early. The sub-agent keeps working in the background. Its report will be delivered to you when it finishes. Answer the person now, then carry on. Do not start the same task again.' }] });
+  h.notify('item/completed', { ...n, item: { ...n.item, status: 'completed' } });
+  if (phase === 'idle') h.complete('turn1');
+  expect(h.rt.meta.background).toBe(1);
+  child.add<TextItem>({ type: 'text', text: 'Checked the files', streaming: false });
+  child.endTurn();
+  const method = phase === 'idle' ? 'turn/start' : 'turn/steer';
+  await until(() => h.count(method) === 2, 'child report');
+  const report = h.calls.filter(c => c.method === method)[1].params.input as { text: string }[];
+  expect(report).toHaveLength(1);
+  expect(parseSynthetic(report[0].text)?.role).toBe('hidden');
+  expect(h.rt.get<ToolItem>('turn1:call1')).toMatchObject({ status: 'done', result: { text: 'Checked the files' }, delegateReport: 'delivered' });
+  expect(h.rt.items.find(i => i.type === 'text' && i.text === 'Checked the files')?.parentId).toBe('turn1:call1');
+  expect(h.rt.meta.background ?? 0).toBe(0);
+  h.complete(phase === 'idle' ? 'turn2' : 'turn1');
+  await tick();
+  expect(h.count('turn/start')).toBe(phase === 'idle' ? 2 : 1);
+  expect(h.count('turn/steer')).toBe(phase === 'idle' ? 1 : 2);
+});
+
+it.each([false, true])('Stop interrupts the exact child Codex turn and closes its thread after confirmation (detached %s)', async detached => {
+  const parent = await codexFake();
+  let attempts = 0;
+  const codex = await codexFake({
+    interrupt: () => { if (++attempts === 1 && detached) throw Error('temporary RPC failure'); },
+    turnsList: () => ({ data: [{ id: 'turn1', status: 'inProgress', items: [] }] }),
+  });
+  const step = parent.rt.add<ToolItem>({ type: 'tool', name: 'delegate_to_codex', kind: 'agent', title: 'Check', status: 'running', detail: {} });
+  const result = runSubAgent({ provider: () => codex.provider, accountFor: () => undefined, defaultModel: () => 'm', modeFor: () => 'default', log: () => {} },
+    parent.rt, { agent: 'codex', description: 'Check', prompt: 'inspect', background: detached }, step.id);
+  await until(() => codex.count('turn/start') === 1, 'child turn start');
+  await parent.stop();
+  await until(() => codex.count('turn/interrupt') === (detached ? 2 : 1), 'confirmed child interrupt request');
+  expect(codex.calls.find(c => c.method === 'turn/interrupt')?.params).toEqual({ threadId: 'th1', turnId: 'turn1' });
+  expect(codex.count('thread/unsubscribe')).toBe(0);
+  codex.complete('turn1', 'interrupted');
+  await until(() => !parent.rt.delegates.size, 'child thread close');
+  expect(codex.count('thread/unsubscribe')).toBe(1);
+  expect((await result).ok).toBe(detached);
+  expect(parent.rt.pendingDelegateReports.size).toBe(0);
+});
+
+it('keeps a delegated Codex root until its receiver ends and retries unsubscribe', async () => {
+  const parent = await codexFake();
+  let failed = false;
+  const codex = await codexFake({ unsubscribe: () => { if (!failed) { failed = true; throw Error('temporary'); } } });
+  const step = parent.rt.add<ToolItem>({ type: 'tool', name: 'delegate_to_codex', kind: 'agent', title: 'Review', status: 'running', detail: {} });
+  const result = runSubAgent({ provider: () => codex.provider, accountFor: () => undefined, defaultModel: () => 'm', modeFor: () => 'default', log() {} },
+    parent.rt, { agent: 'codex', description: 'Review', prompt: 'inspect', background: true }, step.id);
+  await result;
+  await until(() => codex.count('turn/start') === 1, 'child start');
+  codex.notify('item/completed', { threadId: 'th1', turnId: 'turn1', item: { id: 'spawn', type: 'collabAgentToolCall', tool: 'spawnAgent', status: 'completed',
+    receiverThreadIds: ['receiver'], agentsStates: { receiver: { status: 'running' } } } });
+  codex.notify('turn/started', { threadId: 'receiver', turn: { id: 'subturn' } });
+  codex.complete('turn1');
+  await tick();
+  expect(parent.rt.delegates.has(step.id)).toBe(true);
+  expect(step.delegateReport).toBe('working');
+  codex.notify('turn/completed', { threadId: 'receiver', turn: { id: 'subturn', status: 'completed' } });
+  await until(() => !parent.rt.delegates.size, 'receiver finish');
+  expect(codex.calls.filter(c => c.method === 'thread/unsubscribe').map(c => c.params.threadId)).toContain('th1');
+  expect(codex.count('thread/unsubscribe')).toBeGreaterThanOrEqual(2);
+});
+
+it('reconciles a Codex report by ID and waits for the native turn before retrying an absent one', async () => {
+  const id = 'fea5b259-ff81-4da5-9670-bf4f16ae95ce';
+  const words = delegateReport('Review', 'done', 'Findings', id);
+  let active = true;
+  const h = await codexFake({ threadRead: () => ({ thread: { turns: [{ id: 'old', status: active ? 'inProgress' : 'completed',
+    items: [{ type: 'userMessage', content: [{ type: 'text', text: words }] }] }] } }) });
+  h.rt.loadRestored([id, 'dfed6fdd-3fba-4c20-b5d6-25145a92a43f'].map((delivery, n) => ({
+    type: 'tool', ts: n, id: 'call' + n, title: 'Review', name: 'delegate_to_claude', kind: 'agent', detail: {}, status: 'done',
+    delegateReport: 'pending', delegateDeliveryId: delivery, delegateAttempt: { provider: 'codex', session: 'th1' }, result: { text: 'Findings' },
+  })));
+  h.rt.onDelegateReport!();
+  await until(() => h.rt.get<ToolItem>('call0')?.delegateReport === 'delivered', 'recorded report');
+  expect(h.rt.get<ToolItem>('call1')?.delegateReport).toBe('pending');
+  expect(h.count('turn/start')).toBe(0);
+  active = false;
+  await h.send('continue');
+  const input = h.calls.find(c => c.method === 'turn/start')?.params.input as { text: string }[];
+  expect(input[0].text).toContain('dfed6fdd-3fba-4c20-b5d6-25145a92a43f');
+  expect(input[0].text).not.toContain(id);
+  h.complete('turn1');
+});
+
+it('hard-closes the dedicated app-server after unconfirmed interrupts without closing its account peer', async () => {
+  const h = await codexFake();
+  const rpc = {
+    alive: true, ended: Promise.resolve(), close: vi.fn(async () => { rpc.alive = false; }),
+    request: vi.fn(async (method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'only-child' }, model: 'm' };
+      if (method === 'turn/start') return { turn: { id: 'only-turn' } };
+      if (method === 'thread/turns/list') return { data: [{ id: 'only-turn', status: 'inProgress' }] };
+      return {};
+    }),
+  };
+  const start = vi.spyOn(CodexRpc, 'start').mockResolvedValue(rpc as unknown as CodexRpc);
+  const scoped = h.provider.forDelegate.bind(h.provider);
+  vi.spyOn(h.provider, 'forDelegate').mockImplementation(() => {
+    const p = scoped();
+    p.caps = h.provider.caps;
+    return p;
+  });
+  try {
+    await h.provider.ctx.runAgent!(h.rt, { agent: 'codex', description: 'Hard close', prompt: 'inspect', background: true }, undefined);
+    await until(() => rpc.request.mock.calls.some(([method]) => method === 'turn/start'), 'isolated child started');
+    await h.app.call('session.close', { sessionId: h.id, remove: true });
+    expect(rpc.close).toHaveBeenCalledWith(0, 'timeout');
+    expect(rpc.request.mock.calls.filter(([method]) => method === 'turn/interrupt').length).toBeGreaterThan(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(h.count('turn/interrupt')).toBe(0);
+  } finally { vi.restoreAllMocks(); }
+});
 
 const lastTurn = (rt: SessionRuntime) => rt.items.findLast((i) => i.type === 'turn') as { stopReason?: string; error?: string } | undefined;
 

@@ -32,7 +32,7 @@ describe('shapeOf', () => {
       [{ ...base, type: 'user', text: 'hi', state: 'queued', steered: true }, 's'],
       [{ ...base, type: 'user', text: 'hi', state: 'sent', steered: true }, 'S'],
       [{ ...base, type: 'text', text: 'Hello', streaming: false }, 't'],
-      [{ ...base, type: 'text', text: '', streaming: true }, 'l'],
+      [{ ...base, type: 'text', text: '', streaming: true }, '.'],
       [{ ...base, type: 'text', text: 'Let me run the tests.', streaming: false }, 'l'],
       [{ ...base, type: 'text', text: 'The guard answers 403. Let me fix it.', streaming: false }, 't'],
       [{ ...base, type: 'text', text: '  ', streaming: false }, '.'],
@@ -109,10 +109,10 @@ describe('groupTurns', () => {
   it('only ever grows at its end as the turn goes on: a run, then what closed it', () => {
     const steps = ['U1', 'U1 t2', 'U1 t2 h3', 'U1 t2 h3 w4', 'U1 t2 h3 w4 t5', 'U1 t2 h3 w4 t5 w6', 'U1 t2 h3 w4 t5 w6 t7'];
     expect(steps.map((s) => flowOf(onlyTurn(s, true).segments[0].flow))).toEqual(['', '2', '2 [3]', '2 [3 4]', '2 [3 4] 5', '2 [3 4] 5 [6]', '2 [3 4] 5 [6] 7']);
-    // Settled the same way: what was said before the first step is a note too.
+    // Settled the same way: only the note between the checkpoints folds.
     const s = onlyTurn('U1 t2 h3 w4 t5 w6 t7 T8').segments[0];
     expect(flowOf(s.flow)).toBe('2 [3 4] 5 [6] 7');
-    expect(s.notes).toEqual(['2', '5']);
+    expect(s.notes).toEqual(['5']);
     // With no work at all there is nothing to fold behind: the texts simply stand.
     expect(onlyTurn('U1 t2 T3').segments[0]).toMatchObject({ notes: [], answer: '2' });
     expect(onlyTurn('U1 t2 t3 T4').segments[0]).toMatchObject({ notes: [], answer: '3' });
@@ -162,10 +162,10 @@ describe('groupTurns', () => {
     expect(t.segments[1].flow).toEqual([]);
   });
 
-  it('folds what any segment said along the way once the turn has work, also a segment with none of its own', () => {
+  it('keeps each reply with its message when a steer cuts the opening segment', () => {
     const t = onlyTurn('U1 t2 S3 t4 w5 t6 T7');
     expect(t.segments.map((s) => [s.notes, s.reply, s.answer])).toEqual([
-      [['2'], null, null],
+      [[], '2', null],
       [[], '4', '6'],
     ]);
   });
@@ -355,7 +355,7 @@ describe('the answer of a finished turn', () => {
 
   it('is the nod when the turn said nothing else, the last of several', () => {
     expect(onlyTurn('U1 w2 l3 T4').segments[0]).toMatchObject({ answer: '3', tail: [], notes: [] });
-    expect(onlyTurn('U1 l2 w3 l4 T5').segments[0]).toMatchObject({ answer: '4', tail: [], work: ['2', '3'] });
+    expect(onlyTurn('U1 l2 w3 l4 T5').segments[0]).toMatchObject({ reply: '2', answer: '4', tail: [], work: ['3'] });
   });
 
   it('is the last of two real reports: the earlier one folds as a note', () => {
@@ -429,7 +429,7 @@ describe('work no message opened (a turn the agent began by itself)', () => {
 
 describe('turnsIndex (groupTurns followed run by run)', () => {
   it('always equals groupTurns, through added steps, changed and removed items, checks and busy changes', () => {
-    const CHARS = 'UUUUUSSQxtttcpwwwwwwnhkkieeTTTFgZ..NNu';
+    const CHARS = 'UUUMMSSQxtttlcpwwwwwwnhkkieeTTTFgZ..NNu';
     let seed = 12345;
     const rnd = (n: number) => {
       seed = (seed * 1103515245 + 12345) % 2147483648;
@@ -495,8 +495,8 @@ describe('lead-ins', () => {
   it('folds a lead-in with the steps it announces, and keeps reports and the answer in view', () => {
     const t = onlyTurn('U1 l2 w3 l4 w5 w6 t7 l8 w9 t10 T11');
     const s = t.segments[0];
-    expect(flowOf(s.flow)).toBe('[2 3 4 5 6] 7 [8 9] 10');
-    expect(s.work).toEqual(['2', '3', '4', '5', '6', '8', '9']);
+    expect(flowOf(s.flow)).toBe('2 [3 4 5 6] 7 [8 9] 10');
+    expect(s.work).toEqual(['3', '4', '5', '6', '8', '9']);
     expect(s.steps).toBe(4);
     expect(s.answer).toBe('10');
     expect(s.narr).toEqual([]);
@@ -526,9 +526,9 @@ describe('lead-ins', () => {
     expect(s).toMatchObject({ answer: '2', work: ['3'], steps: 1 });
     expect(flowOf(s.flow)).toBe('2 [3]');
     // The newest of several.
-    expect(onlyTurn('U1 l2 w3 l4 w5 T6').segments[0]).toMatchObject({ answer: '4', work: ['2', '3', '5'] });
-    // While it runs it stays folded with its step.
-    expect(onlyTurn('U1 l2 w3', true).segments[0]).toMatchObject({ answer: null, work: ['2', '3'] });
+    expect(onlyTurn('U1 l2 w3 l4 w5 T6').segments[0]).toMatchObject({ reply: '2', answer: '4', work: ['3', '5'] });
+    // While it runs the first lead-in is the visible reply.
+    expect(onlyTurn('U1 l2 w3', true).segments[0]).toMatchObject({ reply: '2', answer: null, work: ['3'] });
     // A report said along the way stays the answer; the lead-ins after it fold.
     expect(onlyTurn('U1 t2 l3 w4 T5').segments[0]).toMatchObject({ answer: '2', work: ['3', '4'] });
     // A failed turn still answers with its error.
@@ -573,8 +573,8 @@ describe("what Claude Code writes in the person's place (shared/synthetic.ts)", 
   it('reads each kind as its own character', () => {
     expect(shapeOf(user(NOTE))).toBe('N');
     expect(shapeOf(user('<teammate-message teammate_id="r">hi</teammate-message>'))).toBe('N');
-    expect(shapeOf(user('<command-name>/model</command-name><command-message>model</command-message><command-args>opus</command-args>'))).toBe('U');
-    expect(shapeOf(user('<bash-input>ls</bash-input>'))).toBe('U');
+    expect(shapeOf(user('<command-name>/model</command-name><command-message>model</command-message><command-args>opus</command-args>'))).toBe('M');
+    expect(shapeOf(user('<bash-input>ls</bash-input>'))).toBe('M');
     expect(shapeOf(user('<local-command-stdout>Set model to Opus 5.5</local-command-stdout>'))).toBe('c');
     expect(shapeOf(user('This session is being continued from a previous conversation that ran out of context.'))).toBe('n');
     expect(shapeOf(user('<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>'))).toBe('u');

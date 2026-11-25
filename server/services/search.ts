@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { open as openFile, readFile as readFileAsync, stat as statFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { MessageHit, MessageSearch, TimelineItem } from '../../shared/protocol';
-import { stripWrappers, syntheticOf } from '../../shared/synthetic';
+import { userItemText, syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
 
 /**
@@ -73,7 +73,7 @@ function sayOf(it: TimelineItem): Said | null {
   if (it.parentId) return null;
   if (it.type === 'user') {
     if (it.until?.check || syntheticOf(it)) return null;
-    const text = stripWrappers(it.text).trim();
+    const text = userItemText(it).trim();
     return text ? { id: it.id, role: 'user', text: text.slice(0, SEARCH.text), ts: it.ts } : null;
   }
   if (it.type === 'text') {

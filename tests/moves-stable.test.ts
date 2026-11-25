@@ -1504,6 +1504,15 @@ describe('a move Sable makes by itself waits for work in the background (D1, E3)
     expect(h.ctl.sent).toHaveLength(1);
   });
 
+  it('delivers lost work at rest beside a serving command', async () => {
+    const h = start(), rt = await chat(h, DEFAULT_ACCOUNT);
+    command(rt, 'Collect reports', 'report');
+    rt.tasksLost('process', 'death');
+    rt.update({ serving: 1 });
+    await until(() => h.ctl.sent.length > 0, 'loss beside server', 800);
+    expect(h.ctl.sent[0].text).toContain('Collect reports');
+  });
+
   it.each(['Stop', 'close', 'manual move', 'held phone mode'])('leaves lost work for a personal message after %s', async action => {
     const h = start({ closeCuts: true }), { studio, work } = await twoAccounts(h);
     const rt = await chat(h, studio.id);

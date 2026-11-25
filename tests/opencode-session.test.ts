@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BridgeEvent, NoticeItem, PermissionRequest, SessionMeta, ToolItem, UserItem } from '@shared/protocol';
+import { delegateReport } from '@shared/synthetic';
 import { App } from '../server/app';
 import { SessionRuntime } from '../server/core/runtime';
 import { OpenCodeProvider } from '../server/providers/opencode';
@@ -44,6 +45,24 @@ function fakeAcp(holdResume = false) {
   };
   return { acp, calls, notes, prompts: () => calls.filter((c) => c.method === 'session/prompt') };
 }
+
+it('reads a switched delegate report from a chunked OpenCode history replay', async () => {
+  const fake = fakeAcp();
+  const reader = fake.acp as unknown as AcpClient;
+  const start = vi.spyOn(AcpClient, 'start').mockResolvedValue(reader);
+  try {
+    const provider = new OpenCodeProvider({ emit() {}, log() {} });
+    const id = 'c3445196-413b-464f-82df-5be423802949';
+    const text = delegateReport('Review', 'done', 'Findings', id);
+    const receipts = provider.delegateReceipts('thread', process.cwd());
+    await vi.waitFor(() => expect(fake.calls[0]?.method).toBe('session/load'));
+    for (const piece of [text.slice(0, 30), text.slice(30)]) {
+      reader.onNotification!('session/update', { sessionId: 'thread', update: { sessionUpdate: 'user_message_chunk', messageId: 'user', content: { text: piece } } });
+    }
+    fake.calls[0].resolve({});
+    expect((await receipts).ids).toEqual(new Set([id]));
+  } finally { start.mockRestore(); }
+});
 
 describe('OpenCode shared process exit', () => {
   let app: App;

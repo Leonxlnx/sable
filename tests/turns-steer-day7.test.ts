@@ -5,13 +5,22 @@
  * pure turn model of the desktop and the phone (shape strings: shape char + id).
  */
 import { describe, expect, it, vi } from 'vitest';
-import { groupTurns, type Segment, type TurnGroup } from '@/features/timeline/turns';
+import { DELEGATE_REPORT, delegateReport } from '@shared/synthetic';
+import type { UserItem } from '@shared/protocol';
+import { groupTurns, shapeOf, type Segment, type TurnGroup } from '@/features/timeline/turns';
 
 vi.mock('@desk/features/timeline/lead-in', async () => await import('../src/features/timeline/lead-in'));
 vi.mock('@desk/features/review/model', async () => await import('../src/features/review/model'));
 vi.mock('@desk/lib/word-diff', async () => await import('../src/lib/word-diff'));
 const MOBILE = '../mobile/src/lib/turns';
-const mobile = (await import(/* @vite-ignore */ MOBILE)) as { groupTurns: typeof groupTurns };
+const mobile = (await import(/* @vite-ignore */ MOBILE)) as { groupTurns: typeof groupTurns; shapeOf: typeof shapeOf };
+
+it('hides the delegate report as a user card on desktop and phone, including a cut phone page', () => {
+  const text = DELEGATE_REPORT + '\n\n' + delegateReport('Review', 'done', 'Result '.repeat(4000));
+  const item: UserItem = { type: 'user', state: 'sent', id: 'report', ts: 10, text };
+  expect(shapeOf(item)).toBe('u');
+  expect(mobile.shapeOf({ ...item, text: text.slice(0, 900) })).toBe('u');
+});
 
 function spec(s: string) {
   const parts = s.split(/\s+/).filter(Boolean);

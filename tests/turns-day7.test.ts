@@ -1,7 +1,7 @@
 /**
  * Day 7 (win): a cut turn opened by Sable's own hidden message keeps its "Ended early" line
- * (window-F1), a turn the bridge ended without a record is closed in the grouping (window-F3), and a
- * turn's "Worked" time is the record's own figure whenever it has one (C12). Desktop and phone read
+ * (window-F1), a turn the bridge ended without a record is closed in the grouping (window-F3), and
+ * recorded work uses the provider’s duration (C12), plus work outside its coverage. Desktop and phone read
  * the same: the pure turn model with item lists, no agent.
  */
 import { describe, expect, it, vi } from 'vitest';
@@ -96,7 +96,7 @@ for (const phone of [false, true]) {
     });
   });
 
-  describe(`C12: "Worked" is the record's own figure (${tag})`, () => {
+  describe(`C12: "Worked" respects the record’s coverage (${tag})`, () => {
     it('a steer that waited hours adds nothing', () => {
       const t0 = 50_000_000;
       // The person's turn ended; the steer sent four hours before, during it, was taken only now and
@@ -110,15 +110,16 @@ for (const phone of [false, true]) {
       const all = [u, r0, s, w, say, rec];
       const ts = turns(all);
       expect(ts[1].segments[0].lead).toBe(s.id);
-      expect(span(map(all), ts[1])).toBe(470_000);
+      // The one-second read finished eight seconds before coverage began.
+      expect(span(map(all), ts[1])).toBe(471_000);
     });
 
-    it('the record wins over the wall time both ways', () => {
+    it('adds only observed work outside the record’s wall-time coverage', () => {
       const t0 = 70_000_000;
       const u = mk({ type: 'user', state: 'sent', text: 'go', ts: t0 });
       const w = step(t0 + 1000);
       const rec = record(t0 + 125_000, 90_000);
-      expect(span(map([u, w, rec]), turns([u, w, rec])[0])).toBe(90_000);
+      expect(span(map([u, w, rec]), turns([u, w, rec])[0])).toBe(91_000);
       const late = record(t0 + 60_000, 100_000);
       expect(span(map([u, w, late]), turns([u, w, late])[0])).toBe(100_000);
     });

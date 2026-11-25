@@ -228,9 +228,9 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
           {/* The first chat ever: the empty state fades where it stood while the first row comes in after it. */}
           {leaving && <SideEmpty onGone={() => setLeaving(false)} />}
           <div className="side-shield" aria-hidden />
-          <Flip order={order} className="side-rows" beforeMeasure={releaseFolderDrag}>
+          <Flip order={order} className="side-rows" beforeMeasure={releaseFolderDrag} exit>
             {groups.pinned.length > 0 && (
-              <section className="sgroup" data-flip="pinned" aria-label="Pinned">
+              <PinnedSection>
                 <div className="sgroup-head sgroup-head-static">
                   <span className="sgroup-icon">
                     <Icon name="pin" size={15} />
@@ -238,7 +238,7 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
                   <span className="sgroup-name">Pinned</span>
                 </div>
                 <SessionList ids={idsOf(groups.pinned)} mix={groups.pinnedMix} />
-              </section>
+              </PinnedSection>
             )}
             {groups.top.map((e) =>
               e.kind === 'folder' ? (
@@ -253,6 +253,20 @@ function SidebarList(props: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDiv
         </MotionConfig>
       )}
     </div>
+  );
+}
+
+/**
+ * Pinned: there when a chat is pinned. Mounted after the list first drew (the first chat pinned), it
+ * comes in once the folders below have mostly made room (`.sgroup[data-enter]`), so its words never
+ * land on theirs; its rows are part of that entrance.
+ */
+function PinnedSection({ children }: { children: ReactNode }) {
+  const [enter] = useState(lateMount);
+  return (
+    <section className="sgroup" data-flip="pinned" data-enter={enter || undefined} aria-label="Pinned">
+      {children}
+    </section>
   );
 }
 
@@ -874,7 +888,7 @@ const SetSection = memo(function SetSection({ set, collapsed, onToggle, activeKe
       {open && (
         <FoldBody className="sgroup-body sset-body" enter={stood.current}>
           {set.folders.length ? (
-            <Flip order={inner} className="sset-folders" beforeMeasure={releaseFolderDrag}>
+            <Flip order={inner} className="sset-folders" beforeMeasure={releaseFolderDrag} exit>
               {set.folders.map((f) => (
                 <ProjectSection key={f.key} group={f} collapsed={collapsed.has(f.key)} onToggle={onToggle} current={activeKey === f.key} inSet={set.id} />
               ))}

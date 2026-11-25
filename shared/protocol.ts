@@ -509,6 +509,8 @@ export interface SessionMeta {
    * ended (`status` idle): lists and the conversation say that it still works.
    */
   background?: number;
+  /** Restore this chat eagerly after a restart to deliver outstanding delegate reports. */
+  delegateRecovery?: true;
   /**
    * Working background commands and monitors still running in the agent's process after the step that
    * started them returned (`ToolItem.task` with state `running`; counted by `SessionRuntime`). Apart
@@ -834,7 +836,20 @@ interface BaseItem {
   parentId?: string;
 }
 
+/** Non-secret identity of an accepted phone submission. */
+export interface PhoneSender { deviceId: string; generation: number }
+
 export interface UserItem extends BaseItem {
+  /** Automatic report continuations spent by this personal input. */
+  delegateContinuations?: number;
+  authored?: true;
+  phoneSender?: PhoneSender;
+  /** SDK input issued without a matching delivery receipt. */
+  issuedUuid?: string;
+  /** Stable original order across separate recall receipts. */
+  steerOrder?: number;
+  /** Number of urgent redeliveries of this card. */
+  steerAttempts?: number;
   type: 'user';
   submitPrint?: string;
   /** Attachment data is available through session.item. */
@@ -848,6 +863,8 @@ export interface UserItem extends BaseItem {
   state?: 'queued' | 'sent';
   /** Sent into a running turn (`session.send` with `steer`, or `queue.sendNow`): the agent takes it at its next step. */
   steered?: boolean;
+  /** Present while Claude has an unread steer. Times are Unix milliseconds. */
+  steerWait?: { stepId?: string; autoAt?: number; reason?: string } | null;
   /** Sent from elsewhere into this conversation (Remote Control in the Claude app or on claude.ai), not from Sable. */
   remote?: boolean;
   /** Provider message id, used for rewind. */
@@ -1069,6 +1086,17 @@ export interface WorkflowAgent {
 }
 
 export interface ToolItem extends BaseItem {
+  /** Stable across retries, including delivery with a personal message. */
+  delegateDeliveryId?: string;
+  /** Native destination whose transcript must be checked before reissuing this report. */
+  delegateAttempt?: { provider: ProviderId; account?: string; session?: string; after?: string; tool?: string; budget?: string };
+  /** Budget anchor for an imported conversation with no personal card. */
+  delegateContinuations?: number;
+  /** Foreground tool callback that has not yet produced a native tool-result receipt. */
+  delegateCaller?: number;
+  /** A completed report held for the next personal input. Null clears the hold in a patch. */
+  delegateWait?: 'budget' | 'stop' | null;
+  delegateReport?: 'working' | 'stopping' | 'pending' | 'delivered' | 'stopped';
   type: 'tool';
   /** Raw provider tool name, e.g. "Bash", "mcp__github__create_issue". */
   name: string;
@@ -1207,6 +1235,8 @@ export interface PermissionOption {
 export interface PermissionRequest {
   id: string;
   sessionId: string;
+  /** Owning delegate row, including before the requested step arrives. */
+  delegateId?: string;
   /** Tool item this request gates, if any. */
   itemId?: string;
   toolName: string;
@@ -1259,6 +1289,7 @@ export interface PermissionSave {
 export interface QuestionRequest {
   id: string;
   sessionId: string;
+  delegateId?: string;
   itemId?: string;
   questions: Question[];
   createdAt: number;
@@ -1640,6 +1671,10 @@ export interface AppSettings {
    * Appended to the agent's own system prompt; applies when an agent process starts.
    */
   conciseReplies: boolean;
+  /** Ask interactive agents to acknowledge messages before working. Absent means on. */
+  replyFirst?: boolean;
+  /** Zero disables automatic interruption of unread Claude steers. */
+  steerAfterMs?: number;
   /**
    * Generative UI: agents get a `show_widget` tool and answers render ```widget and ```mermaid
    * blocks. Absent means on; applies to the tool when an agent process starts.
@@ -2162,7 +2197,8 @@ export type PhoneItem = TimelineItem & {
 };
 
 /** A page of a conversation for the phone: the newest root items, or those before a cursor. */
-export interface PhoneTail extends Omit<SessionSnapshot, 'items'> {
+export interface PhoneTail extends Omit<SessionSnapshot, 'items' | 'permissions'> {
+  permissions: PhonePermission[];
   /** Root items in order (a sub-agent's steps come with `phone.item`). */
   items: PhoneItem[];
   /** Pass as `before` for the page before this one; absent at the conversation's start. */
@@ -2272,6 +2308,7 @@ export interface PhoneMethods {
    */
   'phone.migrate': { params: Record<string, never>; result: { fingerprint: string; ticket: string } };
   /** Queued messages from `from` on (a page; `phone.tail` holds the first). */
+  'phone.steerNow': RpcMethods['session.steerNow'];
   'phone.queue': { params: { sessionId: string; from: number }; result: { queue: QueuedMessage[]; from: number; total: number } };
   /**
    * A new, empty folder inside an existing one (a new chat's folder, from the folder browser): one
@@ -2328,7 +2365,7 @@ export interface PhoneMethods {
   'phone.prompts': { params: { cursor: string; sessionId?: string }; result: PhonePromptsPage };
 }
 
-export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.fileStart', 'phone.fileChunk', 'phone.fileEnd', 'phone.migrate', 'phone.queue', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image', 'phone.thumb', 'phone.answer', 'phone.takeDone', 'phone.sessions', 'phone.prompts'] as const satisfies readonly (keyof PhoneMethods)[];
+export const PHONE_OWN_METHODS = ['phone.tail', 'phone.item', 'phone.fileLink', 'phone.fileStart', 'phone.fileChunk', 'phone.fileEnd', 'phone.migrate', 'phone.queue', 'phone.mkdir', 'phone.changes', 'phone.diff', 'phone.search', 'phone.image', 'phone.thumb', 'phone.answer', 'phone.steerNow', 'phone.takeDone', 'phone.sessions', 'phone.prompts'] as const satisfies readonly (keyof PhoneMethods)[];
 
 /** A message that matched a search across chats (`search.messages` on the desktop, `phone.search` on the phone). */
 export interface MessageHit {
@@ -2419,7 +2456,7 @@ export interface PhoneStale {
  * for the phone (a command, a list of folders, a change's lines); the phone may decline it, only the
  * desktop allows it (`permission.respond` with any other option is refused from the phone).
  */
-export type PhonePermission = PermissionRequest & { incomplete?: true };
+export type PhonePermission = PermissionRequest & { incomplete?: true; revision?: string };
 
 /** An option as a phone gets it: `id` is what the phone answers with (`phone.answer`); the label is for display. */
 export interface PhoneQuestionOption extends QuestionOption {
@@ -2492,6 +2529,11 @@ export interface SessionSnapshot {
  * timeline yet) and sends it when the turn ends normally, one per turn end.
  */
 export interface QueuedMessage {
+  steerOrder?: number;
+  phoneSender?: PhoneSender;
+  issuedUuid?: string;
+  steerAttempts?: number;
+  steerWait?: UserItem['steerWait'];
   id: string;
   /** Original submission fingerprint, retained across queue edits. */
   submitPrint?: string;
@@ -2641,10 +2683,12 @@ export interface RpcMethods {
    */
   'session.switchAgent': { params: { sessionId: string; provider: ProviderId; model?: string; accountId?: string }; result: { ok: boolean; undone?: boolean } };
   'session.interrupt': { params: { sessionId: string }; result: { ok: boolean } };
+  /** Interrupt for this unread Claude steer. False when the selected card was not redelivered. */
+  'session.steerNow': { params: { sessionId: string; itemId: string }; result: { ok: boolean } };
   'session.setModel': { params: { sessionId: string; model: string }; result: { ok: boolean } };
   'session.setEffort': { params: { sessionId: string; effort: Effort }; result: { ok: boolean } };
   /** `answerWaiting: false`: a mode that never asks does not answer what already waits (the phone answers what it may itself). */
-  'session.setMode': { params: { sessionId: string; mode: string; answerWaiting?: boolean }; result: { ok: boolean } };
+  'session.setMode': { params: { sessionId: string; mode: string; answerWaiting?: boolean; shownPermissions?: { id: string; revision: string }[] }; result: { ok: boolean } };
   'session.setFast': { params: { sessionId: string; fast: boolean }; result: { ok: boolean } };
   /** The session's speed (`standard` or a `SpeedInfo` id of its model); an unsupported one falls back to standard. */
   'session.setSpeed': { params: { sessionId: string; speed: string }; result: { ok: boolean; speed: string } };
@@ -3032,6 +3076,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   onboarded: false,
   modelVisibility: {},
   conciseReplies: true,
+  replyFirst: true,
+  steerAfterMs: 30_000,
 };
 
 /**
@@ -3042,6 +3088,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
  */
 export const STEER_FIRST = 'The person sent this while you were working and is waiting for a reply. Answer it first: your next message starts with a direct answer to it in a sentence or two, before any further tool call. Then carry on, adjusted to what they said.';
 export const STEER_FIRST_BLOCK = `<system-reminder>\n${STEER_FIRST}\n</system-reminder>`;
+
+export const REPLY_FIRST_PROMPT = 'When the person messages you directly in the main chat, reply before any tool call. In one or two short sentences, say what you understood and what you will do, then work. Skip the acknowledgment for slash commands or when a one-line answer suffices. When delegating, use `background: true` for work that takes more than a minute or two. Run long commands and watchers in the background where possible so you can read new messages between steps. Say so first if a long foreground step is unavoidable. Report when the long work finishes.';
+
+export function chatReplyInstruction(settings?: Pick<AppSettings, 'replyFirst'>, session?: { id?: string; options?: SessionOptions }) {
+  return settings?.replyFirst === false || session?.options?.readOnly || session?.id?.startsWith('sub-') ? '' : REPLY_FIRST_PROMPT;
+}
 
 /**
  * Appended to the agent's own system prompt (Claude Code) or developer instructions (Codex)

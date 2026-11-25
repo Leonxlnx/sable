@@ -1,5 +1,5 @@
 import type { TimelineItem, Todo, ToolItem, UserItem } from '../../shared/protocol';
-import { parseSynthetic, stripWrappers } from '../../shared/synthetic';
+import { syntheticOf, userItemText } from '../../shared/synthetic';
 
 /**
  * What a chat's context does when it changes account (`session.switchAccount`, a move at a cap or
@@ -102,8 +102,8 @@ const clip = (s: string, n: number) => {
 /** The person's own words in a message (none for what a harness wrote in their place, or an /until round). */
 export function personWords(it: TimelineItem): string {
   if (it.type !== 'user' || it.parentId || (it as UserItem).until) return '';
-  if (parseSynthetic(it.text)) return '';
-  return stripWrappers(it.text).trim();
+  if (syntheticOf(it)) return '';
+  return userItemText(it).trim();
 }
 
 /** The person's last message that no reply of the agent's followed, or undefined. */

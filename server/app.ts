@@ -43,7 +43,7 @@ interface RefusalMark {
   stops: number;
   closes: number;
 }
-import { syntheticOf, lostTasksNote, RESUME_AFTER_SIGN_IN, RESUME_LOST, signInBackgroundNote } from '../shared/synthetic';
+import { DELEGATE_REPORT, delegateReport, syntheticOf, lostTasksNote, RESUME_AFTER_SIGN_IN, RESUME_LOST, signInBackgroundNote } from '../shared/synthetic';
 import { normalizeBackdrop } from '../shared/backdrop';
 import { HANDOVER_JOIN, readableTitle, RESUME_AFTER_RESET, RESUME_LIMIT_RESET, RESUME_SUMMARY_TRAILER, RESUME_UNDER_ANOTHER, resumeBackgroundNote } from '../shared/synthetic';
 import { Races, type Contender } from './core/race';
@@ -58,7 +58,7 @@ import { BACKGROUND_LIMIT_SETTLE_MS, backgroundLimitDue, capReached, capReason, 
 import { rankAccount } from '../shared/use-first';
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
 import { speedFor, startSpeedFor } from '../shared/speed';
-import type { Provider, ProviderContext, ProviderSession } from './providers/types';
+import type { DelegateReceipts, Provider, ProviderContext, ProviderSession } from './providers/types';
 import { atCap, findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
 import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, lostClause, moveNote, type MoveOutcome } from './core/move-context';
 import { handoverText } from './accounts/handover';
@@ -66,7 +66,7 @@ import { itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, wor
 import { runsTask, worksInBackground } from '../shared/background';
 import { runSubAgent } from './core/sub-agent';
 import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
-import { cutAt } from './core/fork';
+import { cutAt, forkHistory } from './core/fork';
 import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
 import { allowsEverything, withBrowserLine } from './providers/browser-tool';
@@ -94,6 +94,7 @@ import { cliPresentSoon } from './util/cli-present';
  * the caller may still act; a handler that waits asks it again right before what it does after the wait.
  */
 export interface CallContext {
+  phoneSender?: UserItem['phoneSender'];
   allowed?: () => boolean;
   /**
    * The caller knows a sign-in only as in or out and keeps what it read (a phone): `app.hello`
@@ -121,7 +122,7 @@ const still = (ctx?: CallContext) => {
  * move Sable makes by itself passes over it quietly; one the person asked for says it as any refusal.
  */
 export class NotNow extends Error {}
-type DeliveryFields = Partial<Pick<UserItem, 'until' | 'id' | 'submitPrint'>> & { submitId?: string };
+type DeliveryFields = Partial<Pick<UserItem, 'until' | 'id' | 'submitPrint' | 'ts' | 'steerAttempts' | 'steerOrder'>> & { submitId?: string; steerNow?: () => void };
 
 class DeliveryMissed extends Error {}
 class DeliveryUncertain extends Error {
@@ -234,6 +235,7 @@ const resetCommandOf = (p: Provider): { resetCommand?: string } => {
 export const DEFAULT_ACCOUNT_LABEL = 'Main';
 
 const WAKE_LOST = 'The scheduled wake-up ended with the old process. Schedule it again if still needed.';
+const DELEGATE_CONTINUATIONS = 2;
 const LOSS_WAKE_WINDOW_MS = 10 * 60_000;
 const LOSS_WAKE_CRASH_MS = 2 * 60_000;
 const recentLossWakes = (rt: SessionRuntime, now = Date.now()) => (rt.meta.lossWake?.attempts ?? []).filter(at => now - at < LOSS_WAKE_WINDOW_MS);
@@ -469,7 +471,7 @@ export class App {
     run: (parent, call, itemId, signal) =>
       runSubAgent(
         {
-          provider: (id, account) => this.provider(id, account),
+          provider: (id, account) => this.delegateProvider(id, account),
           accountFor: (id) => this.defaultAccountId(id),
           defaultModel: (id) => this.store.state.settings.defaultModels[id],
           modeFor: (id) => readOnlyMode(id),
@@ -560,7 +562,9 @@ export class App {
       // A chat titled from a message the agent's harness wrote (`<task-notification>`): its plain words.
       const plain = meta.titleSource === 'user' ? meta.title : readableTitle(meta.title);
       if (plain !== meta.title) meta.title = plain || 'New session';
-      this.sessions.set(meta.id, this.makeRuntime(meta, true));
+      const rt = this.makeRuntime(meta, true);
+      this.sessions.set(meta.id, rt);
+      if (meta.delegateRecovery) void this.hydrateAsync(rt).catch(err => this.log('delegate recovery failed', err));
     }
     bootMark('app:sessions');
     this.seedFolderOrder();
@@ -749,6 +753,11 @@ export class App {
 
   // ── accounts ──
 
+  private delegateProvider(id: ProviderId, account?: string) {
+    const provider = this.provider(id, account);
+    return provider.forDelegate?.() ?? provider;
+  }
+
   private contextFor(accountId: string, dir?: string): ProviderContext {
     return {
       log: this.log,
@@ -766,7 +775,7 @@ export class App {
         if (!rt || rt.meta !== session.meta) return Promise.resolve({ ok: false, text: 'No session is attached yet.' });
         return runSubAgent(
           {
-            provider: (id, account) => this.provider(id, account),
+            provider: (id, account) => this.delegateProvider(id, account),
             accountFor: (id) => this.defaultAccountId(id),
             defaultModel: (id) => this.store.state.settings.defaultModels[id],
             modeFor: subAgentMode,
@@ -1388,6 +1397,8 @@ export class App {
       } else this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue, dirty: rt.takeDirty() }));
     });
     this.pinCwd(rt);
+    rt.persistInput = () => this.store.persistInput(rt.id);
+    rt.persistDelegate = rt.persistInput;
     rt.promote = item => this.store.promote(rt.id, item);
     rt.canBeginTurn = () => !this.disposed && !this.updates?.installing;
     rt.onTurnEnd = (r, error, opts) => this.afterTurn(r, error, opts?.hold, opts?.backgroundLimit);
@@ -1397,6 +1408,42 @@ export class App {
     // At rest (the last background work ended): the moves that waited for it are looked at again.
     rt.onRest = (r) => { setTimeout(() => this.restMoves(r), 0); this.scheduleLossWake(r); };
     rt.onWorkLost = (r, cause, count) => this.workLost(r, cause, count);
+    rt.onDelegateReport = () => {
+      // A newly finished child has its own eligibility, even during a previous receipt recheck.
+      if (this.lossWakeTimers.has(rt)) {
+        clearTimeout(this.lossWakeTimers.get(rt));
+        this.lossWakeTimers.delete(rt);
+      }
+      this.scheduleLossWake(rt);
+    };
+    rt.onUnreadSteer = (id, fresh) => {
+      const card = rt.get<UserItem>(id);
+      if (!card) return;
+      const caller = this.senderGuard(card.phoneSender) ?? this.steerSenders.get(card);
+      const delay = this.store.state.settings.steerAfterMs ?? 30_000;
+      const exhausted = (card.steerAttempts ?? 0) >= 2;
+      const arm = (retry: boolean, reason?: string) => rt.waitForSteer(id, exhausted ? 0 : retry ? Math.max(delay * 2, 5000) : delay, () => {
+        const send = async () => {
+          if (!card.steerWait || rt.get(id) !== card) return;
+          try {
+            if ((await this.steerNow(rt, id, caller ?? {}, true)).ok) return;
+            if (!retry && rt.get(id) === card && card.state === 'queued') arm(true, card.steerWait?.reason ?? 'Claude did not confirm withdrawal.');
+          } catch (err) {
+            if (rt.get(id) !== card || card.state !== 'queued') return;
+            const reason = (err as Error).message;
+            if (!retry && !rt.stopRequested && !/timed out|stopped|closed|process changed/i.test(reason)) arm(true, reason);
+            else rt.patch<UserItem>(id, { steerWait: { ...card.steerWait, autoAt: undefined, reason } });
+          }
+        };
+        // A concurrent recall can claim several cards. Recheck the original if that recall missed it.
+        void Promise.resolve(this.steersSettled.get(rt)).then(send).catch(err => this.log('automatic steer', (err as Error).message));
+      }, fresh || retry ? Date.now() : undefined, reason);
+      arm(false, exhausted ? 'Automatic interruption limit reached.' : undefined);
+    };
+    rt.onReturnUntaken = item => {
+      const sender = this.steerSenders.get(item);
+      if (sender) this.queueGuards.set(item.id, sender);
+    };
     // A queued message a phone was taking back is released: the queue goes on if it waited for it.
     rt.onQueueReleased = (r) => {
       if (!this.drainWaiting.delete(r.id)) return;
@@ -1418,18 +1465,37 @@ export class App {
 
   /** Concurrent actions wait for the same indexed read before observing or editing the chat. */
   private hydrateAsync(rt: SessionRuntime): Promise<void> {
-    if (!this.lazy.has(rt.id)) return Promise.resolve();
+    if (!this.lazy.has(rt.id)) return this.reading.get(rt.id) ?? Promise.resolve();
     let run = this.reading.get(rt.id);
     if (!run) {
       run = this.store
         .loadSessionAsync(rt.id)
         .then((file) => {
-          if (this.lazy.delete(rt.id)) this.loadInto(rt, file);
+          if (!this.lazy.delete(rt.id)) return;
+          this.loadInto(rt, file);
+          if (!file.unreadable) return this.restoreSteerReceipts(rt);
         })
         .finally(() => this.reading.delete(rt.id));
       this.reading.set(rt.id, run);
     }
     return run;
+  }
+
+  private async restoreSteerReceipts(rt: SessionRuntime) {
+    const session = rt.meta.providerSessionId;
+    if (rt.meta.provider !== 'claude' || !session) return;
+    const waiting = new Map(rt.queue.flatMap(q => q.issuedUuid ? [[q.issuedUuid, q] as const] : []));
+    if (!waiting.size) return;
+    const read = Promise.resolve().then(() => this.provider('claude', rt.meta.accountId).steerReceipts?.(session, rt.meta.cwd, new Set(waiting.keys())) ?? []);
+    const receipts = await boundedBy(read.catch(() => []), 3000, []);
+    if (this.disposed || this.sessions.get(rt.id) !== rt) return;
+    for (const uuid of receipts) {
+      const q = waiting.get(uuid);
+      if (!q || q.issuedUuid !== uuid || !rt.queue.includes(q) || rt.get(q.id) || !rt.takeQueued(q.id)) continue;
+      rt.add<UserItem>({ type: 'user', id: q.id, ts: q.createdAt, text: q.text, attachments: q.attachments, submitPrint: q.submitPrint,
+        phoneSender: q.phoneSender, steered: true, authored: true, state: 'sent', providerId: uuid });
+    }
+    if (receipts.length) await rt.persistInput?.();
   }
 
   private loadInto(rt: SessionRuntime, file: ReturnType<Store['loadSession']>) {
@@ -1438,8 +1504,10 @@ export class App {
     // A queue entry and the card handed to the provider share one ID. At a crash the
     // RPC can still be outstanding. The card owns that delivery once it exists.
     const users = new Set(file.items.filter(i => i.type === 'user').map(i => i.id));
-    const queue = file.queue?.filter(q => !users.has(q.id));
+    const queue = file.queue?.filter(q => !users.has(q.id)).map(q => q.issuedUuid ? { ...q, byHand: true, steerWait: { reason: 'Issued to Claude. Receipt unknown.' } } : q);
     const lostNames = rt.loadRestored(file.items, file.todos, queue ?? []);
+    if (rt.stopRequested) rt.holdDelegateReports('stop');
+    if (rt.pendingDelegateReports.size) this.scheduleLossWake(rt);
     this.store.bindProviderInputs(rt.id, rt.items);
     // A message Sable sent that came back as one "From the Claude app" (D-own): merged into its own card,
     // only where the agent's own id for it proves they are one message.
@@ -1469,10 +1537,21 @@ export class App {
     rt.settle('cancelled', { endUnknown: true });
     // Messages still waiting for the agent when Sable closed (a steer not taken yet) would wait forever: back to the queue.
     const inFlight = new Set(file.queue?.filter(q => users.has(q.id)).map(q => q.id));
+    const legacy = rt.meta.provider === 'claude' ? rt.items.filter((i): i is UserItem =>
+      i.type === 'user' && i.state === 'queued' && !!i.steered && !i.steerOrder && !i.issuedUuid) : [];
+    for (const item of legacy) inFlight.add(item.id);
     rt.returnUntaken({ all: true, reason: 'closed', byHand: inFlight });
+    for (const item of legacy) rt.queueReason(item.id, 'Delivery before the update was not confirmed.');
     const lost = this.untilLost.get(rt.id);
     if (lost) this.untilLost.delete(rt.id), this.until.restored(rt, lost);
     if (rt.items.length > SNAPSHOT_THRESHOLD) this.snapshotEnds.set(rt.items, snapshotEnd(rt.items));
+    this.store.scheduleMigration(rt.id, () => {
+      const work = this.workOf(rt);
+      return !this.disposed && this.sessions.get(rt.id) === rt && !work.turn && !work.agents && !work.commands &&
+        !this.moveAttempts.has(rt) && !this.moving.has(rt.id) && !this.switching.has(rt.id) && !this.compacting.has(rt.id) &&
+        !this.opening.has(rt.id) && !this.delivering.has(rt.id) && !this.dispatching.has(rt.id) && !this.sending.has(rt.id) && !this.sendHolds.has(rt.id);
+    }, () => file.items.length === rt.items.length && file.items.every((row, i) => row === rt.items[i]) &&
+      (file.queue?.length ?? 0) === rt.queue.length && !file.queue?.some((row, i) => row !== rt.queue[i]));
     if (restartNotice) {
       void this.store.savedRestartNotice(rt.id, restartNotice).then((saved) => {
         if (saved && !this.disposed && this.sessions.get(rt.id) === rt) rt.update({ pendingRestart: undefined });
@@ -1574,10 +1653,15 @@ export class App {
       return rt.add<UserItem>({
         type: 'user',
         id: extra?.id ?? extra?.submitId,
+        ts: extra?.ts,
         ...(extra?.submitPrint && { submitPrint: extra.submitPrint }),
         text,
         attachments: attachments?.length ? attachments : undefined,
-        state: rt.turnActive ? 'queued' : 'sent',
+        state: rt.turnActive || extra?.steerNow || rt.meta.provider === 'claude' && extra?.steerAttempts ? 'queued' : 'sent',
+        ...((explicit || extra?.id) && !extra?.until && { authored: true }),
+        ...(ctx?.phoneSender && { phoneSender: ctx.phoneSender }),
+        ...(extra?.steerAttempts && { steerAttempts: extra.steerAttempts }),
+        ...((extra?.steerOrder || rt.turnActive && rt.meta.provider === 'claude') && { steerOrder: extra?.steerOrder ?? rt.nextSteerOrder() }),
         ...(rt.turnActive ? { steered: true } : {}),
         ...(extra?.until ? { until: extra.until } : {}),
       });
@@ -1627,6 +1711,7 @@ export class App {
     // Right before the dispatch, whatever came first (a first message while the agent opened, a queued
     // one, a steer): never on credits the account's own setting forbids (review wave 17, #2).
     if (await this.heldForCredits(rt)) {
+      extra?.steerNow?.();
       // Its sender is asked again before anything of it is recorded (#3).
       gone();
       if (rt.turnActive) {
@@ -1663,7 +1748,9 @@ export class App {
         }, 0);
       return this.deferSend(rt, text, attachments, ctx, extra?.id, extra?.submitId);
     }
+    extra?.steerNow?.();
     const item = early ?? addUser();
+    if ((item.steered || extra?.steerNow) && ctx?.allowed) this.steerSenders.set(item, this.senderGuard(item.phoneSender) ?? ctx);
     if (!rt.turnActive) this.retryOwners.delete(rt);
     const runningSince = item.steered ? rt.turnStartedAt : undefined;
     const unhand = this.handOver(rt, item.id);
@@ -1671,7 +1758,7 @@ export class App {
       // The guard goes along to the agent's own dispatch (review wave 6, #3): an adapter that waits
       // first (Codex loading its thread) asks it again right before the message goes.
       const stops = this.stopsOf(rt);
-      const accepted = explicit && rt.unreadQueueHeld ? (taken: boolean) => {
+      const accepted = explicit && !extra?.steerNow && rt.unreadQueueHeld ? (taken: boolean) => {
         if (!taken || this.stopsOf(rt) !== stops || !rt.unreadQueueHeld) return;
         rt.unreadQueueHeld = false;
         if (!rt.turnActive && rt.items.slice(rt.items.indexOf(item) + 1).some(i => i.type === 'turn' && !i.parentId)) {
@@ -1680,9 +1767,20 @@ export class App {
           }, 0);
         }
       } : undefined;
-      await this.sendWithHandover(rt, handle, item, () => still(ctx), true, accepted);
+      let sender = ctx;
+      await this.sendWithHandover(rt, handle, item, () => {
+        still(sender);
+        extra?.steerNow?.();
+      }, true, accepted, undefined, !!extra?.steerNow || !!extra?.steerAttempts);
+      // A held input outlives the RPC. Its eventual provider write checks the pairing again.
+      if (ctx?.phoneSender) sender = this.senderGuard(ctx.phoneSender);
     } catch (err) {
       unhand();
+      if (extra?.steerNow || extra?.steerAttempts) {
+        rt.remove(item.id);
+        rt.unreadQueueHeld = true;
+        throw err; // deliverQueued releases its reservation, leaving the original in the queue.
+      }
       if (err instanceof LaneUnavailable) {
         rt.remove(item.id);
         throw err;
@@ -1695,16 +1793,17 @@ export class App {
           rt.settle('cancelled');
           rt.endTurn();
         }
-        rt.notice('info', 'A message from a removed phone was not sent');
+        if (!extra?.id) rt.notice('info', 'A message from a removed phone was not sent');
         throw err;
       }
       // A steer the agent could not take: the turn it was meant for goes on, and the message waits in the queue.
-      if (item.steered && rt.turnActive && rt.turnStartedAt === runningSince && rt.get<UserItem>(item.id)?.state === 'queued') {
+      if (item.steered && rt.get<UserItem>(item.id)?.state === 'queued') {
         this.log('steer failed; back to the queue', (err as Error).message);
         rt.remove(item.id);
-        if (!extra?.id) rt.requeue([{ id: item.id, text: item.text, attachments: item.attachments, createdAt: item.ts, ...(extra?.submitId && { submitId: extra.submitId }) }]);
+        if (!extra?.id) rt.requeue([{ id: item.id, text: item.text, attachments: item.attachments, phoneSender: item.phoneSender, createdAt: item.ts, ...(extra?.submitId && { submitId: extra.submitId }) }]);
         return 'queued' as const;
       }
+      if (item.steered && rt.queue.some(q => q.id === item.id)) return 'queued' as const;
       // The turn this message began has ended since (its end stands after it): a failure of its send
       // that comes now is that turn's, and never ends the one running now (begun by a newer message).
       const at = item.steered ? -1 : rt.items.findIndex((i) => i.id === item.id);
@@ -1786,7 +1885,7 @@ export class App {
 
   /** Give a pending personal send or limit carry-on first claim on the batch. */
   private scheduleLossWake(rt: SessionRuntime, delay = 0) {
-    if (this.disposed || !this.pendingLossWake.has(rt) || this.lossWakeTimers.has(rt)) return;
+    if (this.disposed || (!rt.pendingDelegateReports.size && !this.pendingLossWake.has(rt)) || this.lossWakeTimers.has(rt)) return;
     const timer = setTimeout(() => {
       this.lossWakeTimers.delete(rt);
       void this.wakeAfterLoss(rt).catch(err => this.log('lost-work wake failed', (err as Error).message));
@@ -1809,13 +1908,22 @@ export class App {
 
   private async wakeAfterLoss(rt: SessionRuntime) {
     const batch = this.pendingLossWake.get(rt);
-    if (!batch || !rt.pendingLost().count || rt.meta.lossWake?.blocked) return;
+    const before = new Set(rt.pendingDelegateReports);
+    if ([...before].some(id => rt.get<ToolItem>(id)?.delegateAttempt)) await this.reconcileDelegateReports(rt);
+    if (before.size && (this.delegateBudget(rt)?.delegateContinuations ?? 0) >= DELEGATE_CONTINUATIONS) rt.holdDelegateReports('budget');
+    const reports = [...rt.pendingDelegateReports].some(id => {
+      const step = rt.get<ToolItem>(id);
+      return step?.delegateReport === 'pending' && !step.delegateAttempt && !step.delegateWait;
+    });
+    const running = reports && rt.turnActive;
+    const stops = this.stopsOf(rt);
+    if ((!reports && (!batch || !rt.pendingLost().count)) || (!running && rt.meta.lossWake?.blocked)) return;
     const account = rt.meta.accountId;
     const ready = (dispatches: number, ownTurn = false) => {
-      const w = this.workOf(rt);
+      const w = workOf(rt, false, Date.now(), 'wake');
       return !this.disposed && !this.updates?.installing && this.sessions.get(rt.id) === rt && rt.meta.accountId === account &&
-        this.pendingLossWake.get(rt) === batch && this.stopsOf(rt) === batch.stops && !rt.stopRequested && !rt.meta.lossWake?.blocked &&
-        !rt.dangerHeld && !rt.queue.length && !rt.meta.spare && (!w.turn || ownTurn) && !w.agents && !w.commands &&
+        this.pendingLossWake.get(rt) === batch && this.stopsOf(rt) === stops && !rt.stopRequested && (running || !rt.meta.lossWake?.blocked) &&
+        (!rt.dangerHeld || running) && !rt.queue.length && !rt.meta.spare && (running ? rt.turnActive : !w.turn || ownTurn) && (running || !w.agents && !w.commands) &&
         !this.limitPending(rt) && !this.refusalQueues.has(rt) && !this.limitHoldsWake(rt) && !this.sendHolds.has(rt.id) &&
         !this.moveAttempts.has(rt) && !this.moving.has(rt.id) && !this.switching.has(rt.id) && !this.sending.has(rt.id) && !this.delivering.has(rt.id) &&
         !this.opening.has(rt.id) && !this.capChecks.has(rt.id) && !this.returnRuns.has(rt.id) && (this.dispatching.get(rt.id)?.size ?? 0) === dispatches;
@@ -1823,13 +1931,13 @@ export class App {
     if (!ready(0)) return;
     const now = Date.now();
     const attempts = recentLossWakes(rt, now);
-    if (attempts.length >= 2) return this.scheduleLossWake(rt, attempts[0] + LOSS_WAKE_WINDOW_MS - now);
+    if (!reports && !running && attempts.length >= 2) return this.scheduleLossWake(rt, attempts[0] + LOSS_WAKE_WINDOW_MS - now);
     const release = this.beginDispatch(rt, false);
     const lossNotice = rt.lossNotice;
     const names = rt.pendingLost().names;
     let reported = false;
     const missed = () => {
-      if (reported || this.disposed || this.stopsOf(rt) !== batch.stops || this.sessions.get(rt.id) !== rt) return;
+      if (reported || reports || !batch || this.disposed || this.stopsOf(rt) !== stops || this.sessions.get(rt.id) !== rt) return;
       reported = true;
       const note = "Background work was lost. The agent hasn't confirmed the message.";
       if (lossNotice && rt.get(lossNotice)) rt.patch<NoticeItem>(lossNotice, { text: note });
@@ -1838,7 +1946,7 @@ export class App {
     try {
       const handle = await this.ensureHandle(rt);
       if (!ready(1) || await this.heldForCredits(rt) || !ready(1)) return;
-      await this.applyDue(rt, handle);
+      if (!running) await this.applyDue(rt, handle);
       if (!ready(1)) return;
       // Both RPC providers open their turn before the final sender check and guard its identity at dispatch.
       let admitted = false;
@@ -1846,7 +1954,7 @@ export class App {
         if (!ready(1, admitted && (rt.meta.provider === 'codex' || rt.meta.provider === 'opencode'))) throw new NotNow('The chat changed before the agent could carry on.');
         admitted = true;
       };
-      await this.sendWithHandover(rt, handle, { type: 'user', id: randomUUID(), ts: now, state: 'sent', text: RESUME_LOST }, check, false, read => {
+      await this.sendWithHandover(rt, handle, { type: 'user', id: randomUUID(), ts: now, state: 'sent', text: reports ? DELEGATE_REPORT : RESUME_LOST }, check, false, read => {
         if (read) reported = true;
         else missed();
       }, missed);
@@ -1858,6 +1966,7 @@ export class App {
       }
     } finally {
       release();
+      if ([...rt.pendingDelegateReports].some(id => !before.has(id))) this.scheduleLossWake(rt);
     }
   }
 
@@ -1885,10 +1994,56 @@ export class App {
     } finally { finish(false); }
   }
 
+  private delegateBudget(rt: SessionRuntime) {
+    return rt.items.findLast((i): i is UserItem => i.type === 'user' && !i.parentId && i.state !== 'queued' && !i.until && !syntheticOf(i))
+      ?? rt.items.find((i): i is ToolItem => i.type === 'tool' && !!(i.delegateDeliveryId || i.delegateReport));
+  }
+
+  /** Issued reports use the original account and thread even if this chat has since moved. */
+  private async reconcileDelegateReports(rt: SessionRuntime) {
+    const histories = new Map<string, Promise<DelegateReceipts | undefined>>();
+    for (const id of [...rt.pendingDelegateReports]) {
+      const row = rt.get<ToolItem>(id);
+      const attempt = row?.delegateAttempt;
+      if (!row || !attempt) continue;
+      const session = attempt.session;
+      if (!session) continue;
+      const key = JSON.stringify([attempt.provider, attempt.account, session, attempt.after]);
+      let read = histories.get(key);
+      if (!read) {
+        read = Promise.resolve().then(() => this.provider(attempt.provider, attempt.account).delegateReceipts?.(session, rt.meta.cwd, attempt.after))
+          .catch(err => { this.log('delegate receipt lookup failed', err); return undefined; });
+        histories.set(key, read);
+      }
+      const receipts = await read;
+      if (this.disposed || this.sessions.get(rt.id) !== rt || rt.get(id) !== row || row.delegateAttempt !== attempt || !rt.pendingDelegateReports.has(id)) continue;
+      const delivered = receipts?.ids.has(attempt.tool ? 'tool:' + attempt.tool : row.delegateDeliveryId!);
+      if (!delivered && !receipts?.settled) {
+        this.scheduleLossWake(rt, 60_000);
+        continue;
+      }
+      if (delivered) {
+        rt.pendingDelegateReports.delete(id);
+        if (!rt.meta.providerSessionId && !attempt.tool && rt.meta.provider === attempt.provider && rt.meta.accountId === attempt.account) {
+          rt.update({ providerSessionId: session });
+        }
+      } else if (attempt.budget) {
+        const anchor = rt.get<UserItem | ToolItem>(attempt.budget);
+        if (anchor?.delegateContinuations) rt.patch(anchor.id, { delegateContinuations: anchor.delegateContinuations - 1 });
+      }
+      rt.patch<ToolItem>(id, { delegateAttempt: undefined, delegateReport: delivered ? 'delivered' : 'pending' });
+      await rt.persistDelegate?.();
+    }
+  }
+
   /** Claude confirms input by UUID. Codex confirms turn/start or turn/steer by RPC. */
-  private async sendWithHandover(rt: SessionRuntime, handle: ProviderSession, item: UserItem, check?: () => void, browser = false, receipt?: (taken: boolean) => void, uncertain?: () => void) {
+  private async sendWithHandover(rt: SessionRuntime, handle: ProviderSession, item: UserItem, check?: () => void, browser = false, receipt?: (taken: boolean) => void, uncertain?: () => void, steerNow = false) {
     const stops = this.stopsOf(rt);
+    const reports: string[] = [];
+    const reservation = Symbol();
+    const ownsReports = () => reports.every(id => rt.reservedDelegateReports.get(id) === reservation);
     const maySend = () => {
+      if (!ownsReports()) throw new NotNow('The delegate report was removed before dispatch.');
       if (this.updates?.installing) throw new NotNow('Sable is restarting for an update.');
       check?.();
       if (this.disposed || this.sessions.get(rt.id) !== rt || rt.handle !== handle || this.stopsOf(rt) !== stops) throw new NotNow('The agent was stopped or closed before the message went out.');
@@ -1899,19 +2054,84 @@ export class App {
     // A refused message retried after a restore can have disk-backed attachments.
     const card = rt.get<UserItem>(item.id);
     if (card && card !== item && isLight(card)) this.store.promote(rt.id, card);
+    if ([...rt.pendingDelegateReports].some(id => rt.get<ToolItem>(id)?.delegateAttempt)) {
+      await this.reconcileDelegateReports(rt);
+      maySend();
+    }
     const out = this.withHandover(rt, this.store.promote(rt.id, item) as UserItem);
     const wake = !rt.get(item.id) && out.count ? this.pendingLossWake.get(rt) : undefined;
     if (item.text === RESUME_LOST && !rt.get(item.id) && !wake) { out.release?.(); return; }
-    const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex' || (rt.meta.provider === 'opencode' && !!out.count);
-    const taken = receipt ? () => { out.taken?.(); receipt(true); } : out.taken;
-    const release = receipt ? () => { out.release?.(); receipt(false); } : out.release;
+    const reportWake = item.text === DELEGATE_REPORT && !rt.get(item.id);
+    // Reserve before dispatch. A simultaneous personal send cannot claim the same reports.
+    const blocks: string[] = [];
+    let budget: UserItem | ToolItem | undefined;
+    if (rt.pendingDelegateReports.size && !isSlashCommand(item.text)) {
+      const personal = card?.type === 'user' && !card.until && !syntheticOf(card);
+      if (!personal) budget = this.delegateBudget(rt);
+      if ((budget?.delegateContinuations ?? 0) < DELEGATE_CONTINUATIONS) {
+        const prepared = new Map<ToolItem, string>();
+        try {
+          for (const id of rt.pendingDelegateReports) {
+            const step = rt.get<ToolItem>(id);
+            if (step?.delegateReport !== 'pending') { rt.pendingDelegateReports.delete(id); continue; }
+            if (step.delegateAttempt || (!personal && step.delegateWait)) continue;
+            rt.promote?.(step);
+            const deliveryId = step.delegateDeliveryId ?? randomUUID();
+            prepared.set(step, deliveryId);
+            blocks.push(delegateReport(step.title, step.result?.agent?.background ?? step.status, step.result?.text ?? '', deliveryId));
+          }
+          const session = prepared.size ? rt.meta.providerSessionId ?? handle.delegateDestination?.() : undefined;
+          const after = prepared.size ? handle.delegateCheckpoint?.() : undefined;
+          for (const [step, deliveryId] of prepared) {
+            rt.patch<ToolItem>(step.id, { delegateDeliveryId: deliveryId, ...(step.delegateWait ? { delegateWait: null } : {}), delegateAttempt: {
+              provider: rt.meta.provider, account: rt.meta.accountId, session, after, budget: reports.length ? undefined : budget?.id,
+            } });
+            rt.pendingDelegateReports.delete(step.id);
+            rt.reservedDelegateReports.set(step.id, reservation);
+            reports.push(step.id);
+          }
+        } catch (err) { out.release?.(); throw err; }
+      }
+    }
+    if (reportWake && !blocks.length) { out.release?.(); return; }
+    if (budget && blocks.length) rt.patch(budget.id, { delegateContinuations: (budget.delegateContinuations ?? 0) + 1 });
+    let settled = false;
+    let offered = false;
+    const settleReports = (read: boolean) => {
+      if (settled) return;
+      settled = true;
+      for (const id of reports) {
+        if (rt.reservedDelegateReports.get(id) !== reservation) continue;
+        rt.reservedDelegateReports.delete(id);
+        if (this.sessions.get(rt.id) !== rt) continue;
+        if (rt.get<ToolItem>(id)?.delegateReport !== 'pending') continue;
+        if (read) rt.patch<ToolItem>(id, { delegateReport: 'delivered', delegateAttempt: undefined });
+        else {
+          if (!offered) rt.patch<ToolItem>(id, { delegateAttempt: undefined });
+          rt.pendingDelegateReports.add(id);
+        }
+      }
+      if (!offered && budget?.delegateContinuations && reports.length && rt.get(budget.id) === budget) {
+        rt.patch(budget.id, { delegateContinuations: budget.delegateContinuations - 1 });
+      }
+      if (reports.length && this.sessions.get(rt.id) === rt) void rt.persistDelegate?.().catch(err => this.log('delegate receipt save failed', err));
+    };
+    if (blocks.length) out.item = { ...out.item, text: [out.item.text, ...blocks].join('\n\n') };
+    const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex' || (rt.meta.provider === 'opencode' && (!!out.count || reports.length > 0));
+    const taken = receipt || reports.length ? () => { settleReports(true); out.taken?.(); receipt?.(true); } : out.taken;
+    const release = receipt || reports.length ? () => { settleReports(false); out.release?.(); receipt?.(false); } : out.release;
     try {
-      if (wake) {
+      if (blocks.length) {
+        await rt.persistDelegate?.();
+        maySend();
+      }
+      if ((wake || reportWake) && !rt.turnActive) {
         const at = Date.now();
         this.wakeProcesses.set(rt, { handle, generation: rt.processGeneration, at });
         rt.update({ lossWake: { ...rt.meta.lossWake, attempts: [...recentLossWakes(rt, at), at] } });
       }
-      await handle.send(browser ? this.withBrowserPage(rt, out.item) : out.item, { check: maySend, taken: confirms ? taken : undefined, release, uncertain });
+      offered = true;
+      await handle.send(browser ? this.withBrowserPage(rt, out.item) : out.item, { steerNow, delegateReport: reportWake, check: maySend, taken: confirms ? taken : undefined, release, uncertain });
       if (!confirms) taken?.();
     } catch (err) {
       release?.();
@@ -2533,6 +2753,10 @@ export class App {
     const running = rt.items.filter((i) => worksInBackground(i) && !this.unstoppable.get(rt.id)?.has(i.id)).map((i) => i.id);
     if (!running.length) return;
     type Stop = boolean | { failed: string[] };
+    const delegates = [...rt.delegates.entries()].filter(([id]) => running.includes(id));
+    for (const [, call] of delegates) call.stop(false);
+    const confirmations = delegates.map(async ([id, call]) =>
+      await boundedBy(call.ended.then(() => true), MOVE_CLOSE_MS, false) ? undefined : id);
     const h = rt.handle as (ProviderSession & { stopBackgroundWork?: (automatic: boolean) => Promise<Stop> }) | undefined;
     const bounded = (p: Promise<Stop>) => Promise.race([p.catch((): Stop => false), new Promise<Stop>((r) => setTimeout(() => r(false), MOVE_CLOSE_MS))]);
     let result: Stop = true;
@@ -2545,6 +2769,7 @@ export class App {
     // stops nothing): none of them is taken for unstoppable, and a move waits for that turn (D2).
     if (result === false && rt.turnActive) return;
     const failed = new Set(result === true ? [] : result === false ? running : result.failed.filter((id) => running.includes(id)));
+    for (const id of await Promise.all(confirmations)) if (id) failed.add(id);
     const done = new Set(running.filter((id) => !failed.has(id)));
     if (done.size) {
       rt.stopAtLimit((i) => done.has(i.id), limit);
@@ -2568,7 +2793,7 @@ export class App {
     const names: string[] = [];
     for (const id of ids) {
       const item = rt.get<ToolItem>(id);
-      if (item && (item.result?.agent?.background === 'stopped' || item.workflow?.status === 'stopped')) names.push(backgroundAgentName(item));
+      if (item && !item.delegateReport && (item.result?.agent?.background === 'stopped' || item.workflow?.status === 'stopped')) names.push(backgroundAgentName(item));
     }
     if (names.length) rt.reportLoss(cause, names);
   }
@@ -2653,9 +2878,9 @@ export class App {
   private deferSend(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], ctx?: CallContext, reservedId?: string, submitId?: string) {
     if (submitId) this.enqueueSubmission = { rt, id: submitId };
     let id: string;
-    try { id = reservedId ?? rt.enqueue(text, attachments).id; }
+    try { id = reservedId ?? rt.enqueue(text, attachments, ctx?.phoneSender).id; }
     finally { this.enqueueSubmission = undefined; }
-    if (ctx?.allowed) this.queueGuards.set(id, ctx);
+    if (ctx?.allowed) this.queueGuards.set(id, this.senderGuard(ctx.phoneSender) ?? ctx);
     return 'queued' as const;
   }
 
@@ -3527,6 +3752,10 @@ export class App {
   }
 
   /** Messages a phone sent while its chat moved, queued: the guard of the pairing that sent each (by queue id). */
+  phoneStillPaired?: (sender: NonNullable<UserItem['phoneSender']>) => boolean;
+  private senderGuard(phoneSender?: UserItem['phoneSender']): CallContext | undefined {
+    return phoneSender && { phoneSender, allowed: () => !!this.phoneStillPaired?.(phoneSender) };
+  }
   private queueGuards = new Map<string, CallContext>();
   /** `session.send` by submission id: a retry of a send that went out is answered, not sent again. */
   private submissions = new Submissions<RpcMethods['session.send']['result']>();
@@ -3548,6 +3777,8 @@ export class App {
     this.lossWakeTimers.delete(rt);
   }
   private stopped(rt: SessionRuntime) {
+    this.steerControls.get(rt)?.abort(new NotNow('The chat was stopped or closed.'));
+    rt.stopDelegates(true);
     this.cancelLossWake(rt);
     this.stops.set(rt.id, this.stopsOf(rt) + 1);
     this.firstInputs.get(rt.id)?.missed();
@@ -4172,6 +4403,7 @@ export class App {
    * the agent could not say how the turn ended (`hold`).
    */
   private afterTurn(rt: SessionRuntime, error?: string, hold = false, backgroundLimit = false) {
+    this.steerEnds.get(rt)?.();
     this.scheduleLossWake(rt);
     // The compaction before a move ended: the move goes on (nothing is sent, nothing else follows).
     const compacted = this.compacting.get(rt.id);
@@ -4248,7 +4480,7 @@ export class App {
     if (error || rt.stopRequested || hold) {
       // Steered messages the agent never took go back to the queue, to send or edit again.
       const back = rt.returnUntaken({ reason: error ? 'failed' : 'stopped' });
-      if (hold && !back && rt.queue.length) rt.notice('info', 'Queued messages wait', 'The agent did not say how the last turn ended. Send them when you are ready.');
+      if (hold && !this.steerEnds.has(rt) && !back && rt.queue.length) rt.notice('info', 'Queued messages wait', 'The agent did not say how the last turn ended. Send them when you are ready.');
       // An until loop waits for the next turn, as the queue waits for the user.
       this.until.turnHeld(rt);
       return;
@@ -4283,19 +4515,19 @@ export class App {
 
   /** After a turn: the next queued message goes out, or (nothing waits) an until loop runs its check. */
   private sendNextQueued(rt: SessionRuntime): void {
-    if (rt.unreadQueueHeld || rt.stopRequested || this.refusalQueues.has(rt)) return;
+    if (this.steerEnds.has(rt) || rt.unreadQueueHeld || rt.stopRequested || this.refusalQueues.has(rt)) return;
     // Moving to another account: the queue goes on there once the move is done.
     if (this.moving.has(rt.id)) return void this.queuedWhileMoving.add(rt.id);
     // Messages held for Spare stay where they are: the chat starts them by itself.
     const held = this.spare.held(rt);
-    const nextId = rt.queue.find((q) => !held.has(q.id))?.id;
+    const next = rt.queue.find(q => !held.has(q.id) && this.senderGuard(q.phoneSender)?.allowed?.() !== false);
+    const nextId = next?.id;
     // A phone is taking it back right now: it neither goes nor is skipped; the queue goes on once that settles.
     if (rt.isReserved(nextId)) return void this.drainWaiting.add(rt.id);
-    const guard = nextId ? this.queueGuards.get(nextId) : undefined;
-    // Queued during a move by a phone removed since: it never goes out; the next one may.
-    if (nextId && guard?.allowed && !guard.allowed()) {
-      rt.takeQueued(nextId);
-      this.queueGuards.delete(nextId);
+    // Older in-process callers supply a transient guard only. Paired submissions carry phoneSender.
+    if (next && !next.phoneSender && this.queueGuards.get(next.id)?.allowed?.() === false) {
+      rt.takeQueued(next.id);
+      this.queueGuards.delete(next.id);
       rt.notice('info', 'A message from a removed phone was not sent');
       return this.sendNextQueued(rt);
     }
@@ -4306,26 +4538,120 @@ export class App {
     else this.until.turnEnded(rt);
   }
 
-  private async deliverQueued(rt: SessionRuntime, id: string, caller?: CallContext) {
+  private steerControls = new WeakMap<SessionRuntime, AbortController>();
+  private steerEnds = new WeakMap<SessionRuntime, () => void>();
+  private steersSettled = new WeakMap<SessionRuntime, Promise<void>>();
+  private steerSenders = new WeakMap<UserItem, CallContext>();
+
+  private async steerNow(rt: SessionRuntime, itemId: string, caller: CallContext, automatic = false) {
+    const handle = rt.handle;
+    const stops = this.stopsOf(rt);
+    const check = () => {
+      still(caller);
+      if (this.moving.has(rt.id) || this.moveAttempts.has(rt)) throw new NotNow('This chat is moving to another account.');
+      if (this.limitPending(rt) || this.sendHolds.has(rt.id)) throw new NotNow('A plan limit decision is in progress.');
+      if (this.switching.has(rt.id)) throw new NotNow('This chat is switching agent.');
+      if (rt.stopRequested || this.stopsOf(rt) !== stops || this.disposed || this.sessions.get(rt.id) !== rt || rt.handle !== handle) throw new NotNow('The chat was stopped or closed.');
+    };
+    check();
+    if (rt.meta.provider !== 'claude') throw new NotNow('Interrupt and send now is available for Claude Code chats.');
+    if (!handle?.recallSteers || !handle.interruptSteer) return { ok: false };
+    const card = rt.get<UserItem>(itemId);
+    if (!rt.turnActive || card?.type !== 'user' || card.parentId || !card.steered || card.state !== 'queued' || this.steerEnds.has(rt)) return { ok: false };
+    still(this.steerSenders.get(card));
+    // A returned phone message keeps the guard of the pairing that originally sent it.
+    const originals = new Map(rt.items.filter((it): it is UserItem => it.type === 'user' && !it.parentId && !!it.steered && it.state === 'queued').map(it => [it.id, it]));
+    let ended = false;
+    const boundary = new Promise<void>(resolve => this.steerEnds.set(rt, () => { ended = true; resolve(); }));
+    let settle!: () => void;
+    this.steersSettled.set(rt, new Promise<void>(resolve => { settle = resolve; }));
+    const release = this.beginDispatch(rt);
+    const control = new AbortController();
+    this.steerControls.set(rt, control);
+    try {
+      const ids = await handle.recallSteers(itemId, check, control.signal, automatic);
+      if (!ids.length) {
+        if (rt.get(itemId) === card && card.state === 'queued') rt.patch<UserItem>(itemId, { steerWait: { ...card.steerWait, reason: 'Claude did not confirm withdrawal.' } });
+        return { ok: false };
+      }
+      check();
+      if (!ended && rt.turnActive) {
+        await handle.interruptSteer(control.signal);
+        if (!ended) await new Promise<void>((resolve, reject) => {
+          const abort = () => reject(control.signal.reason);
+          if (control.signal.aborted) return abort();
+          control.signal.addEventListener('abort', abort, { once: true });
+          const timer = setTimeout(() => reject(new NotNow('Claude did not confirm the turn ended.')), 3500);
+          void boundary.then(resolve).finally(() => { clearTimeout(timer); control.signal.removeEventListener('abort', abort); });
+        });
+      }
+      const order = [...originals.keys()];
+      rt.reorderQueued(order.filter(id => rt.queue.some(q => q.id === id)));
+      let sent = false;
+      let selectedSent = false;
+      for (const id of order) {
+        const original = originals.get(id);
+        const entry = rt.queue.find(q => q.id === id);
+        if (!entry || entry.issuedUuid || !ids.includes(id) && !handle.wasWithdrawn?.(id)) continue;
+        if (!original || entry.text !== original.text || entry.attachments !== original.attachments) continue;
+        const beforeSend = () => {
+          check();
+          still(this.steerSenders.get(original));
+          if (!sent && rt.turnActive) throw new NotNow('Another turn has already started.');
+        };
+        beforeSend();
+        if (!await this.deliverQueued(rt, id, caller, beforeSend)) break;
+        if (rt.queue.some(q => q.id === id)) break;
+        sent = true;
+        if (id === itemId) selectedSent = true;
+      }
+      if (sent && !rt.queue.some(q => originals.has(q.id) && !q.byHand && this.senderGuard(q.phoneSender)?.allowed?.() !== false)) rt.unreadQueueHeld = false;
+      return { ok: selectedSent };
+    } catch (error) {
+      const reason = (error as Error).message;
+      if (rt.get(itemId) === card && card.state === 'queued') rt.patch<UserItem>(itemId, { steerWait: { ...card.steerWait, reason } });
+      else rt.queueReason(itemId, reason);
+      throw error;
+    } finally {
+      this.steerControls.delete(rt);
+      this.steerEnds.delete(rt);
+      this.steersSettled.delete(rt);
+      settle();
+      release();
+    }
+  }
+
+  private async deliverQueued(rt: SessionRuntime, id: string, caller?: CallContext, steerNow?: () => void) {
+    const recovery = this.reading.get(rt.id);
+    if (recovery) {
+      const stops = this.stopsOf(rt);
+      await recovery;
+      still(caller);
+      if (this.disposed || this.sessions.get(rt.id) !== rt || this.stopsOf(rt) !== stops) throw new NotNow('The chat was stopped or closed.');
+    }
     const reserved = rt.reserveQueued(id);
     if (!reserved) return false;
     const entry = reserved.message;
-    const sender = this.queueGuards.get(id);
-    const guard = sender?.allowed && caller?.allowed ? { allowed: () => sender.allowed!() && caller.allowed!() } : sender ?? caller;
+    if (entry.issuedUuid && !caller) {
+      rt.rollbackReserved(id);
+      return false;
+    }
+    if (entry.issuedUuid && rt.handle?.stillQueued?.(entry.issuedUuid)) {
+      rt.rollbackReserved(id);
+      rt.queueReason(id, 'Claude still has this input queued.');
+      return false;
+    }
+    const sender = entry.phoneSender && caller && !caller.allowed && !steerNow ? undefined : this.senderGuard(entry.phoneSender) ?? this.queueGuards.get(id);
+    const guard = sender?.allowed && caller?.allowed ? { ...sender, allowed: () => sender.allowed!() && caller.allowed!() } : sender ?? caller;
     try {
       still(guard);
-      if (await this.deliver(rt, entry.text, entry.attachments, { id, submitPrint: entry.submitPrint }, guard, !!caller) === 'queued') {
+      if (await this.deliver(rt, entry.text, entry.attachments, { id, submitPrint: entry.submitPrint, steerOrder: entry.steerOrder, ...(entry.issuedUuid || entry.steerAttempts ? { ts: entry.createdAt, steerAttempts: entry.steerAttempts ?? 1 } : {}), ...(steerNow && { steerNow, ts: entry.createdAt, steerAttempts: (entry.steerAttempts ?? 0) + 1 }) }, guard, !!caller) === 'queued') {
         rt.rollbackReserved(id);
         return true;
       }
     } catch (err) {
-      if (!caller && err instanceof CallerGone) {
-        this.queueGuards.delete(id);
-        this.takeReserved(rt, id, reserved.rev);
-      } else {
-        this.drainWaiting.delete(rt.id);
-        rt.rollbackReserved(id);
-      }
+      this.drainWaiting.delete(rt.id);
+      rt.rollbackReserved(id);
       throw err;
     }
     const delivered = this.takeReserved(rt, id, reserved.rev);
@@ -4764,6 +5090,7 @@ export class App {
     this.register('app.setSettings', ({ patch: raw }) => {
       // Backdrop images change only through backdrop.*; the config is always checked.
       const { backdropImages: _images, ...patch } = raw;
+      if (patch.steerAfterMs !== undefined && (!Number.isSafeInteger(patch.steerAfterMs) || patch.steerAfterMs < 0)) throw new Error('The steer delay must be a nonnegative whole number of milliseconds.');
       if (patch.backdropConfig) patch.backdropConfig = normalizeBackdrop(patch.backdropConfig, this.store.state.settings.backdropImages.map((i) => i.id));
       this.store.state.settings = { ...this.store.state.settings, ...patch };
       this.store.saveState();
@@ -5201,7 +5528,8 @@ export class App {
         if (this.unreadable.has(sessionId)) throw Error('This chat could not be read from disk');
         const slot = this.submissionSlot(rt, submitId, messagePrint(text, attachments));
         if (rt.queue.some(q => q.submitId === slot || q.id === slot)) return { ok: true, queued: true };
-        return { ok: rt.get(slot)?.type === 'user' };
+        const existing = rt.get<UserItem>(slot);
+        return { ok: existing?.type === 'user', ...(existing?.state === 'queued' && { queued: true }) };
       }, messagePrint(text, attachments)));
 
     // A retry of a submission the bridge already took (its window lost the answer) is answered, not sent again.
@@ -5220,23 +5548,25 @@ export class App {
       const identity = typeof submitId === 'string' && submitId.length > 0 && submitId.length <= 128
         ? this.submissionSlot(rt, submitId, print) : undefined;
       if (identity && rt.queue.some(q => q.submitId === identity || q.id === identity)) return { ok: true, queued: true };
-      if (identity && rt.get(identity)?.type === 'user') return { ok: true };
+      const existing = identity ? rt.get<UserItem>(identity) : undefined;
+      if (existing?.type === 'user') return { ok: true, ...(existing.state === 'queued' && { queued: true }) };
       if (identity && rt.get(identity)) throw Error('That submission ID is already in use');
       // `/model <name>` changes the model; it never goes to the agent (whose own /model restarts it).
       const model = typeof text === 'string' && !attachments?.length ? /^\/model(?:\s+([\s\S]*))?$/i.exec(text.trim()) : null;
       if (model) return this.modelCommand(rt, (model[1] ?? '').trim());
       // While the agent works the bridge holds the message until the turn ends, unless it is
       // steered into the running turn (and the agent can take one).
-      if (rt.turnActive && !(steer && rt.caps?.features.steer !== false)) {
+      if (this.steerEnds.has(rt) || (rt.turnActive && !(steer && rt.caps?.features.steer !== false))) {
         if (identity) this.enqueueSubmission = { rt, id: identity };
         try {
-          const q = rt.enqueue(text, attachments);
+          const q = rt.enqueue(text, attachments, ctx.phoneSender);
           // A phone's message keeps its pairing's guard in the queue.
-          if (ctx.allowed) this.queueGuards.set(q.id, ctx);
+          if (ctx.allowed) this.queueGuards.set(q.id, this.senderGuard(ctx.phoneSender) ?? ctx);
         } finally {
           this.enqueueSubmission = undefined;
         }
-        rt.unreadQueueHeld = false;
+        if (ctx.phoneSender || rt.meta.provider === 'claude') await rt.persistInput?.();
+        if (!this.steerEnds.has(rt)) rt.unreadQueueHeld = false;
         return { ok: true, queued: true };
       }
       let prints = this.pendingPrints.get(rt);
@@ -5244,6 +5574,7 @@ export class App {
       if (identity) prints.set(identity, print);
       try {
         const disposition = await this.deliver(rt, text, attachments, identity ? { submitId: identity, submitPrint: print } : undefined, ctx, true);
+        if (disposition === 'queued' && (ctx.phoneSender || rt.meta.provider === 'claude')) await rt.persistInput?.();
         return disposition === 'queued' ? { ok: true, queued: true } : { ok: true };
       } finally {
         if (identity) prints.delete(identity);
@@ -5292,16 +5623,20 @@ export class App {
       rt.reorderQueued(Array.isArray(ids) ? ids : []);
       return { ok: true };
     });
-    this.register('queue.remove', ({ sessionId, id }) => {
+    this.register('queue.remove', async ({ sessionId, id }) => {
       const rt = this.runtime(sessionId);
-      const ok = !!rt.takeQueued(id);
+      const entry = rt.takeQueued(id);
       this.spare.queueChanged(rt);
-      return { ok };
+      if (entry && (entry.byHand || entry.phoneSender || entry.steerOrder)) await rt.persistInput?.();
+      return { ok: !!entry };
     });
     this.register('queue.sendNow', async ({ sessionId, id }, ctx) => {
       const rt = this.runtime(sessionId);
+      if (this.steerEnds.has(rt)) throw new NotNow('Waiting for the interrupted turn to end.');
       return { ok: await this.deliverQueued(rt, id, ctx) };
     });
+
+    this.register('session.steerNow', ({ sessionId, itemId }, ctx) => this.steerNow(this.runtime(sessionId), itemId, ctx));
 
     this.register('session.interrupt', async ({ sessionId }, ctx) => {
       const rt = this.runtime(sessionId);
@@ -5474,6 +5809,7 @@ export class App {
     this.register('session.close', async ({ sessionId, remove }) => {
       const rt = this.runtime(sessionId);
       this.closed(rt);
+      const cleanup = remove ? rt.revokeDelegates([...rt.delegates.keys(), ...rt.reservedDelegateReports.keys(), ...rt.pendingDelegateReports]) : undefined;
       this.until.closed(rt);
       await this.checks.closed(rt);
       rt.stopRequested = true;
@@ -5499,6 +5835,7 @@ export class App {
         await this.lanes.closed(rt);
         // Its rival races no more.
         this.races.closed(rt);
+        await cleanup;
       } else this.persistSessions();
       return { ok: true };
     });
@@ -5581,7 +5918,7 @@ export class App {
         speed: m.speed,
         title: `${m.title} (fork)`,
         ...(resume ? { resume } : {}),
-      }, src.items.some(isLight) ? { fork: { source: src.id, items: cut.kept, chainFrom: resume && m.provider === 'claude' ? m.providerSessionId : undefined } } : {});
+      }, src.items.some(isLight) || cut.kept.some(row => row.type === 'tool' && (row.delegateReport || row.delegateDeliveryId)) ? { fork: { source: src.id, items: forkHistory(cut.kept, row => this.store.wholeItem(src.id, row)), chainFrom: resume && m.provider === 'claude' ? m.providerSessionId : undefined } } : {});
       const rt = this.runtime(snap.session.id);
       if (resume) rt.notice('info', `Forked from ${m.title}`);
       else {
@@ -5696,6 +6033,7 @@ export class App {
 
   async dispose(saved?: () => void) {
     this.disposed = true;
+    for (const rt of this.sessions.values()) this.steerControls.get(rt)?.abort(new NotNow('The chat was closed.'));
     for (const timer of this.lossWakeTimers.values()) clearTimeout(timer);
     this.lossWakeTimers.clear();
     clearTimeout(this.registryRetry);
@@ -5716,6 +6054,8 @@ export class App {
     this.titles.dispose();
     const services = [this.checks.dispose(), ...this.disposers.splice(0).map(fn => Promise.resolve().then(fn))];
     const handles = [...this.sessions.values()].map(rt => {
+      rt.clearSteerWaits();
+      rt.stopDelegates(true);
       rt.cancelPrompts();
       return rt.handle?.close('quit');
     });

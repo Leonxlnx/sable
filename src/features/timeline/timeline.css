@@ -1166,6 +1166,137 @@ button:hover > .row-caret {
    to reach). It stands one item's gap under what the turn shows last, not a new message's. */
 .tg > .tl-item[data-t='user']:has(> .user[data-steered][data-queued]) {
   padding-top: 8px;
+  padding-bottom: 6px;
+}
+
+/* Under the waiting card, on its right edge, one quiet line (User.tsx `SteerWait`, steer-wait.ts):
+   what the message waits on and for how long, or the time until the bridge sends it by itself, and
+   "Send now" where the bridge can interrupt for it. The row with the line is exactly as tall as the
+   row the card has once the agent took it (8 above, 4 and the line's 22, 6 under: a message's 26
+   and 14), so when the line goes with the take nothing above or below the row moves and the card
+   alone glides to its place (user-card.ts `takenInPlace`). */
+.user[data-steered][data-queued] {
+  flex-wrap: wrap;
+}
+
+.steer-wait {
+  display: flex;
+  flex: 0 0 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+  height: 22px;
+  margin-top: 4px;
+  font-size: 12.5px;
+  line-height: 22px;
+  letter-spacing: 0;
+  color: var(--text-3);
+}
+
+.steer-wait-text {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+
+.steer-wait-label {
+  min-width: 0;
+}
+
+/* Why it still waits, in the bridge's words (steer-wait.ts `waitReason`), in the line's own tone:
+   it is cut before the words and the clock after it are ("Sends in 0:58" stays whole). */
+.steer-wait-why {
+  min-width: 0;
+}
+
+.steer-wait-why + .steer-wait-label {
+  flex-shrink: 0;
+}
+
+.steer-wait-dot {
+  flex-shrink: 0;
+}
+
+/* The clock keeps the room of its widest form (steer-wait.ts `waitedRoom`, drawn unseen in the
+   same cell): the line stands on its right end, so a clock as wide as its own words would push
+   the label left and right as it ticks. Before the chip its words start at the room's left, so
+   "· 3s" reads as one and the spare character lies in the gap before the chip. With no chip they
+   stand at its right end: the line ends on the card's edge at every second. */
+.steer-wait-clock {
+  display: inline-grid;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.steer-wait-text:last-child .steer-wait-clock {
+  justify-items: end;
+}
+
+.steer-wait-clock > * {
+  grid-area: 1 / 1;
+}
+
+.steer-wait-clock > [aria-hidden] {
+  visibility: hidden;
+}
+
+/* "Send now": a bare chip of the line's height, in the line's tone a step up; its words end on the
+   card's edge (its padding hangs past it, as the first chip under an answer hangs into the margin). */
+.steer-now {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  margin-right: -7px;
+  padding: 0 7px 0 5px;
+  border-radius: var(--r-ctl-xs);
+  font-size: 12.5px;
+  line-height: 1;
+  color: var(--text-2);
+  transition:
+    background-color var(--d-1) var(--ease),
+    color var(--d-1) var(--ease),
+    scale var(--d-spring-soft) var(--spring-soft);
+}
+
+.steer-now svg {
+  flex-shrink: 0;
+  color: var(--text-3);
+  transition: color 90ms var(--ease);
+}
+
+.steer-now:hover {
+  color: var(--text);
+  background-color: var(--fill-1);
+}
+
+.steer-now:hover svg {
+  color: var(--text);
+}
+
+.steer-now:active {
+  background-color: var(--fill-2);
+  scale: var(--press);
+  transition-duration: var(--d-1), var(--d-1), 70ms;
+}
+
+.steer-now:focus-visible {
+  outline: var(--focus-w) solid var(--focus);
+  outline-offset: var(--focus-inset);
+}
+
+/* On its way: the chip keeps its place (and the focus it had) and takes no press. */
+.steer-now[aria-disabled='true'],
+.steer-now[aria-disabled='true'] svg {
+  color: var(--text-4);
+}
+
+.steer-now[aria-disabled='true'] {
+  background-color: transparent;
+  scale: none;
+  cursor: default;
 }
 
 .user-actions {

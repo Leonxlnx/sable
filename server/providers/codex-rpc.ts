@@ -34,7 +34,7 @@ export interface CodexCommand {
 // ── process bookkeeping ──
 
 const live = new Set<ChildProcess>();
-const servers = new Map<string, CodexRpc>();
+const servers = new Map<string, Set<CodexRpc>>();
 let exitHookInstalled = false;
 
 function installExitHook() {
@@ -157,6 +157,7 @@ export class CodexRpc {
   private constructor(
     private child: ChildProcess,
     private log: (...a: unknown[]) => void,
+    private readonly owner?: { account: symbol },
   ) {
     live.add(child);
     installExitHook();
@@ -199,6 +200,8 @@ export class CodexRpc {
     log: (...a: unknown[]) => void;
     clientVersion: string;
     folder?: string;
+    /** Separate delegate processes share their account's start gate and have distinct owners. */
+    owner?: { account: symbol };
     scope?: AuthScope;
     closing?: () => boolean;
     env?: Record<string, string>;
@@ -213,14 +216,15 @@ export class CodexRpc {
     let child: ChildProcess;
     try {
       if (opts.closing?.()) throw new Error('Codex provider is shut down');
-      const previous = servers.get(folder);
+      const blocking = () => [...servers.get(folder) ?? []].find(rpc => !opts.owner || rpc.owner?.account !== opts.owner.account || rpc.owner === opts.owner);
+      const previous = blocking();
       if (previous?.forced && previous.alive) {
         previous.child.kill('SIGKILL');
         await Promise.race([previous.ended, new Promise<void>(r => setTimeout(r, 1000).unref())]);
         if (previous.alive) throw new Error('This Codex folder is already in use by a process that has not exited. Try again.');
         if (opts.closing?.()) throw new Error('Codex provider is shut down');
       }
-      if (servers.has(folder)) throw new Error('This Codex folder is already in use by another Sable account.');
+      if (blocking()) throw new Error('This Codex folder is already in use by another Sable account.');
       opts.log('[codex] spawning', cmd.file, cmd.args.join(' '));
       child = spawn(cmd.file, cmd.args, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -232,10 +236,16 @@ export class CodexRpc {
       leave();
       throw err;
     }
-    const rpc = new CodexRpc(child, opts.log);
-    servers.set(folder, rpc);
+    const rpc = new CodexRpc(child, opts.log, opts.owner);
+    const active = servers.get(folder) ?? new Set<CodexRpc>();
+    servers.set(folder, active);
+    active.add(rpc);
     if (child.pid && opts.scope) rpc.endEvent = opts.scope.journal?.started(opts.scope, folder, child.pid, () => rpc.inFlight, rpc.born);
-    void rpc.exited.then(() => { servers.delete(folder); leave(); });
+    void rpc.exited.then(() => {
+      active.delete(rpc);
+      if (!active.size && servers.get(folder) === active) servers.delete(folder);
+      leave();
+    });
     const params: InitializeParams = {
       clientInfo: { name: 'sable', title: 'Sable', version: opts.clientVersion },
       capabilities: {

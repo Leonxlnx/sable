@@ -367,6 +367,15 @@ export class GatedProcess extends EventEmitter {
     return this._signal;
   }
 
+  /** The owner of a delegated query is gone. Bypass SDK drain and retire its process tree. */
+  async terminateDelegate() {
+    if (this.ended) return;
+    if (!this.child) return this.askClose('SIGKILL');
+    const exited = new Promise<void>(resolve => this.once('exit', () => resolve()));
+    await retireReader(this.child);
+    await exited;
+  }
+
   kill(signal: NodeJS.Signals = 'SIGTERM'): boolean {
     this._killed = true;
     this.askClose(signal);

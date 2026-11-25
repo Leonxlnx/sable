@@ -153,7 +153,8 @@ export function sessionTail<T>(baseGen: unknown, mtime: number, tail: { baseGen?
 
 /** Parse each member of the large root arrays independently, preserving its original byte range.
  * Also runs verbatim in the worker. JSON.parse validates each value, the cursor validates separators. */
-export function scanSession(io: typeof fs, fd: number, visit: (key: string, value: any, offset: number, length: number, chars: number) => void) {
+export function scanSession(io: typeof fs, fd: number, visit: (key: string, value: any, offset: number, length: number, chars: number) => void,
+  migration?: 'base' | 'tail') {
   const size = io.fstatSync(fd).size;
   const buf = Buffer.allocUnsafe(1 << 18);
   let pos = 0, start = 0, end = 0;
@@ -173,7 +174,7 @@ export function scanSession(io: typeof fs, fd: number, visit: (key: string, valu
     if (space() !== char) throw new Error('Invalid session JSON');
     pos++;
   }
-  function value() {
+  function value(verifyEncoding = false) {
     const offset = pos;
     let depth = 0, string = false, escape = false;
     let c = peek();
@@ -214,13 +215,16 @@ export function scanSession(io: typeof fs, fd: number, visit: (key: string, valu
       }
     }
     const json = bytes.toString('utf8');
-    return { parsed: JSON.parse(json), chars: json.length, offset, length };
+    const parsed = JSON.parse(json);
+    if (verifyEncoding && !bytes.equals(Buffer.from(JSON.stringify(parsed)))) throw Error('Lossy migration value');
+    return { parsed, chars: json.length, offset, length };
   }
   const meta: Record<string, any> = Object.create(null);
   take(123);
   if (space() !== 125) for (;;) {
     if (space() !== 34) throw new Error('Expected a session field');
     const key = value().parsed as string;
+    if (migration && Object.hasOwn(meta, key)) throw Error('Duplicate session field');
     take(58);
     if (space() === 91 && ['items', 'over', 'todos', 'queue'].includes(key)) {
       pos++;
@@ -228,13 +232,15 @@ export function scanSession(io: typeof fs, fd: number, visit: (key: string, valu
       meta[key] = [];
       if (space() !== 93) for (;;) {
         space();
-        const row = value();
+        // Indexed base rows are copied by offset. Everything else the migration
+        // re-encodes must reproduce the original value, including its number tokens.
+        const row = value(migration === 'tail' || migration === 'base' && key !== 'items');
         visit(key, row.parsed, row.offset, row.length, row.chars);
         if (space() === 93) break;
         take(44);
       }
       take(93);
-    } else meta[key] = value().parsed;
+    } else meta[key] = value(!!migration).parsed;
     if (space() === 125) break;
     take(44);
   }

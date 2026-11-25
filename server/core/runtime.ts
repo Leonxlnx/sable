@@ -19,11 +19,13 @@ import type {
   UserItem,
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
+import { agentOfTool } from '../providers/agent-tool';
 import { isCompactOutput, userText } from '../../shared/synthetic';
 import { runsTask, worksInBackground } from '../../shared/background';
 import { taskServing } from './task-serving';
 import { turnLive, TurnLiveIndex } from '../../shared/turn-live';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
+import { anonymousDelegateStep, restoreWorkingDelegate, savedDelegateEnds } from './delegate-result';
 import { backgroundAgentName } from './limit-policy';
 
 export type Emit = (event: BridgeEvent) => void;
@@ -137,6 +139,103 @@ export class SessionRuntime {
   answersAtOnce(danger: boolean): boolean {
     return danger && !this.dangerHeld;
   }
+  /** Sable owns these children independently of their provider's tool requests. */
+  readonly delegates = new Map<string, { detach(): void; stop(person: boolean): void; ended: Promise<unknown> }>();
+  onDelegateReport?: () => void;
+  readonly pendingDelegateReports = new Set<string>();
+  readonly reservedDelegateReports = new Map<string, symbol>();
+  private owedDelegateReports = new Set<string>();
+  private waitingSteers = new Map<string, ReturnType<typeof setTimeout> | undefined>();
+  private lastSteerOrder = 0;
+  nextSteerOrder() {
+    return this.lastSteerOrder = Math.max(Date.now(), this.lastSteerOrder + 1);
+  }
+  onUnreadSteer?: (id: string, fresh?: boolean) => void;
+  persistInput?: () => Promise<void>;
+  persistDelegate?: () => Promise<void>;
+
+  waitForSteer(id: string, delay: number, fire: () => void, since?: number, reason?: string) {
+    const item = this.get<UserItem>(id);
+    if (!this.turnActive || this.stopRequested || item?.state !== 'queued' || this.waitingSteers.has(id) && !reason) return;
+    const autoAt = delay > 0 ? (since ?? item.ts) + delay : undefined;
+    const arm = () => {
+      const remaining = autoAt === undefined ? 0 : autoAt - Date.now();
+      const timer = autoAt === undefined ? undefined : setTimeout(() => {
+        if (this.waitingSteers.get(id) !== timer) return;
+        if (Date.now() < autoAt) arm(); // Node limits a single timeout to a signed 32-bit interval.
+        else {
+          this.waitingSteers.set(id, undefined);
+          this.patch<UserItem>(id, { steerWait: { stepId: this.foregroundStep() } });
+          fire();
+        }
+      }, Math.max(0, Math.min(remaining, 2_147_483_647)));
+      timer?.unref?.();
+      this.waitingSteers.set(id, timer);
+    };
+    arm();
+    this.patch<UserItem>(id, { steerWait: { autoAt, stepId: this.foregroundStep(), ...(reason && { reason }) } });
+  }
+
+  get hasUnreadSteer() { return this.waitingSteers.size > 0; }
+
+  private foregroundStep() {
+    for (let n = this.items.length - 1; n >= 0; n--) {
+      const it = this.items[n];
+      if (it.parentId) continue;
+      if (it.type === 'turn' || it.type === 'user' && it.state !== 'queued') break;
+      if (it.type === 'tool' && !it.check && !worksInBackground(it) && !runsTask(it) &&
+        (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting')) return it.id;
+    }
+  }
+
+  private refreshSteerWaits(item: TimelineItem) {
+    if (item.parentId || item.type !== 'tool' || !this.waitingSteers.size) return;
+    const stepId = this.foregroundStep();
+    for (const id of this.waitingSteers.keys()) {
+      const wait = this.get<UserItem>(id)?.steerWait;
+      if (wait && wait.stepId !== stepId) this.patch<UserItem>(id, { steerWait: { ...wait, stepId } });
+    }
+  }
+
+  clearSteerWaits(id?: string) {
+    if (!this.waitingSteers.size) return;
+    for (const key of id === undefined ? this.waitingSteers.keys() : [id]) {
+      if (!this.waitingSteers.has(key)) continue;
+      clearTimeout(this.waitingSteers.get(key));
+      this.waitingSteers.delete(key);
+      this.patch<UserItem>(key, { steerWait: null });
+    }
+  }
+
+  /** Tool start frames can precede the request that supplies the child. */
+  readonly steeredDelegateSteps = new Set<string>();
+  releaseDelegates() {
+    for (let n = this.items.length - 1; n >= 0; n--) {
+      const it = this.items[n];
+      if (it.type === 'turn' && !it.parentId) break;
+      if (it.type === 'tool' && !it.parentId && !it.delegateReport && agentOfTool(it.name) && !this.delegates.has(it.id)
+        && (it.status === 'running' || it.status === 'pending')) this.steeredDelegateSteps.add(it.id);
+    }
+    for (const call of this.delegates.values()) call.detach();
+  }
+
+  stopDelegates(person: boolean) {
+    if (person) this.holdDelegateReports('stop');
+    for (const call of this.delegates.values()) call.stop(person);
+  }
+
+  holdDelegateReports(why: 'stop' | 'budget') {
+    const ids = why === 'stop' ? [...this.pendingDelegateReports, ...this.reservedDelegateReports.keys()] : this.pendingDelegateReports;
+    let changed = false;
+    for (const id of ids) {
+      const row = this.get<ToolItem>(id);
+      if (row?.delegateReport !== 'pending' || row.delegateWait === why || row.delegateWait === 'stop' || (why === 'budget' && row.delegateAttempt)) continue;
+      this.patch<ToolItem>(id, { delegateWait: why });
+      changed = true;
+    }
+    if (changed) void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the held delegate report', String(err)));
+  }
+
   /** Messages sent while a turn was running; the app sends them as turns end. */
   queue: QueuedMessage[] = [];
   /**
@@ -148,12 +247,15 @@ export class SessionRuntime {
     return this.stopped;
   }
   set stopRequested(v: boolean) {
+    if (v) this.clearSteerWaits();
     this.stopped = v;
     this.carried = false;
   }
   private stopped = false;
   /** Unread messages returned to the queue wait for the person's next send. */
   unreadQueueHeld = false;
+  /** Preserve a phone sender's guard when its unread timeline card returns to the queue. */
+  onReturnUntaken?: (item: UserItem) => void;
   /** The running turn carries a stop's hold it did not make (the agent began it by itself): the person's next message lifts it (`personSent`). */
   private carried = false;
   /**
@@ -175,6 +277,47 @@ export class SessionRuntime {
   onWorkLost?: (rt: SessionRuntime, trigger: LossTrigger, count: number) => void;
   /** Changes whenever Claude retires a process on this handle. */
   processGeneration = 0;
+  private foregroundResults = new Set<string>();
+
+  /** A completed tool result stays with its caller until the provider echoes the result. */
+  delegateReceipt(id: string, content?: unknown) {
+    if (!this.foregroundResults.has(id)) {
+      const synthetic = anonymousDelegateStep(content);
+      if (!synthetic || synthetic !== 'delegate-' + this.get<ToolItem>(synthetic)?.delegateDeliveryId) return;
+      id = synthetic;
+    }
+    const row = this.get<ToolItem>(id);
+    if (row?.delegateCaller !== this.processGeneration || !this.foregroundResults.has(id)) return;
+    this.patch<ToolItem>(id, { delegateCaller: undefined, delegateAttempt: undefined });
+    void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the delegate receipt', String(err)));
+  }
+
+  endDelegateGeneration() {
+    this.processGeneration++;
+    const hadResults = this.foregroundResults.size > 0;
+    for (const id of this.foregroundResults) {
+      this.patch<ToolItem>(id, { delegateCaller: undefined, delegateReport: this.stopRequested ? 'stopped' : 'pending' });
+      if (!this.stopRequested) this.pendingDelegateReports.add(id);
+    }
+    if (hadResults) void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the delegate report', String(err)));
+    if (this.pendingDelegateReports.size) this.onDelegateReport?.();
+  }
+
+  revokeDelegates(ids: Iterable<string>) {
+    const cleanup: Promise<unknown>[] = [];
+    for (const id of ids) {
+      const owner = this.delegates.get(id);
+      this.delegates.delete(id);
+      this.pendingDelegateReports.delete(id);
+      this.reservedDelegateReports.delete(id);
+      this.foregroundResults.delete(id);
+      if (owner) {
+        owner.stop(true);
+        cleanup.push(owner.ended);
+      }
+    }
+    return Promise.all(cleanup);
+  }
   /** The existing line for this loss can be updated when the agent confirms the wake. */
   lossNotice?: string;
   /** The limit notice the bridge wrote when work outside a turn met a limit: a turn refused at it says it there (one notice). */
@@ -242,8 +385,17 @@ export class SessionRuntime {
   loadRestored(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]): string[] {
     const changed: string[] = [];
     const names: string[] = [];
+    const ends = savedDelegateEnds(items);
     const out = items.map((i) => {
+      if (i.type === 'tool' && (i.delegateReport === 'working' || i.delegateCaller !== undefined) && i.result?.text) this.promote?.(i);
       let s = stoppedBackground(i);
+      if (s.type === 'tool' && s.delegateReport === 'stopping') s = { ...s, status: 'cancelled', delegateReport: 'stopped' };
+      if (s.type === 'tool' && s.delegateCaller !== undefined) {
+        s = { ...s, delegateCaller: undefined, delegateReport: s.delegateAttempt?.tool ? 'pending' : 'working' };
+      }
+      if (s.type === 'tool' && s.delegateReport === 'working') {
+        s = restoreWorkingDelegate(s, ends.get(i.id));
+      }
       if (runsTask(s)) {
         names.push(taskName(s));
         s = { ...s, task: { ...s.task, state: 'lost', why: 'restart' } };
@@ -279,7 +431,13 @@ export class SessionRuntime {
     this.serving.clear();
     this.lost.clear();
     this.taskSteps.clear();
+    this.pendingDelegateReports.clear();
+    this.owedDelegateReports.clear();
+    this.foregroundResults.clear();
     for (const i of items) {
+      if (i.type === 'tool' && i.delegateCaller !== undefined && i.delegateAttempt?.tool) this.foregroundResults.add(i.id);
+      if (i.type === 'tool' && (i.delegateCaller !== undefined || i.delegateReport === 'pending' || i.delegateReport === 'working')) this.owedDelegateReports.add(i.id);
+      if (i.type === 'tool' && i.delegateReport === 'pending' && !this.reservedDelegateReports.has(i.id)) this.pendingDelegateReports.add(i.id);
       if (worksInBackground(i)) this.working.add(i.id);
       this.trackTask(i);
       if (runsTask(i)) {
@@ -292,7 +450,7 @@ export class SessionRuntime {
       }
     }
     // As read: whoever loads gets the whole chat next (a snapshot), so nothing is announced here.
-    Object.assign(this.meta, this.taskCounts());
+    Object.assign(this.meta, this.taskCounts(), { delegateRecovery: this.owedDelegateReports.size ? true : undefined });
   }
 
   // ── background work ──
@@ -447,7 +605,10 @@ export class SessionRuntime {
       // A provider's confirmed process exit ends its agents too. A move may leave an
       // unstoppable remote agent alive, so the move records only confirmed stops.
       if (trigger === 'death' || trigger === 'capability') {
-        for (const id of this.working) reports.push(backgroundAgentName(this.get<ToolItem>(id)!));
+        for (const id of this.working) {
+          const step = this.get<ToolItem>(id)!;
+          if (!step.delegateReport) reports.push(backgroundAgentName(step));
+        }
       }
     }
     const ids = this.items.filter((i) => this.running.has(i.id)).map((i) => i.id);
@@ -592,10 +753,10 @@ export class SessionRuntime {
     this.onDirty(this, 'items');
   }
 
-  enqueue(text: string, attachments?: QueuedMessage['attachments']): QueuedMessage {
+  enqueue(text: string, attachments?: QueuedMessage['attachments'], phoneSender?: QueuedMessage['phoneSender']): QueuedMessage {
     // Nothing without words goes in (a page of the queue reads each one's).
     if (typeof text !== 'string') throw new Error('A message needs its words.');
-    const q: QueuedMessage = { id: randomUUID(), text, attachments: attachments?.length ? attachments : undefined, createdAt: Date.now() };
+    const q: QueuedMessage = { id: randomUUID(), text, attachments: attachments?.length ? attachments : undefined, createdAt: Date.now(), ...(phoneSender && { phoneSender }) };
     this.queue.push(q);
     this.queueChanged();
     return q;
@@ -615,6 +776,11 @@ export class SessionRuntime {
       this.queue.splice(at, 1);
     } else {
       this.queue[at] = { ...q, text, attachments: files };
+      // A later receipt for the original payload cannot acknowledge the edited words.
+      if (q.issuedUuid && (q.text !== text || attachments !== undefined)) {
+        delete this.queue[at].issuedUuid;
+        this.queue[at].steerWait = { reason: 'Edited after the previous delivery attempt.' };
+      }
     }
     this.queueRev.set(id, (this.queueRev.get(id) ?? 0) + 1);
     this.queueChanged();
@@ -686,6 +852,22 @@ export class SessionRuntime {
     return true;
   }
 
+  queueReason(id: string, reason: string) {
+    const entry = this.queue.find(q => q.id === id);
+    if (!entry) return;
+    entry.steerWait = { reason };
+    this.queueChanged();
+  }
+
+  confirmDropped(uuid: string) {
+    const entry = this.queue.find(q => q.issuedUuid === uuid);
+    if (!entry) return;
+    delete entry.issuedUuid;
+    delete entry.byHand;
+    entry.steerWait = { reason: 'Claude confirmed withdrawal.' };
+    this.queueChanged();
+  }
+
   /** Puts messages back at the front of the queue (steered messages the agent never took). */
   requeue(messages: QueuedMessage[]) {
     if (!messages.length) return;
@@ -703,18 +885,31 @@ export class SessionRuntime {
   returnUntaken(opts: { ids?: ReadonlySet<string>; all?: boolean; byHand?: ReadonlySet<string>; holdQueue?: boolean; reason?: 'stopped' | 'failed' | 'closed' } = {}): number {
     const candidates = opts.ids ? Array.from(opts.ids, id => this.index.get(id)) : this.items;
     const untaken = candidates.filter((i): i is UserItem => i?.type === 'user' && !i.parentId &&
-      (!!opts.ids || i.state === 'queued' && (opts.all || !!i.steered)));
+      (!!opts.ids || i.state === 'queued' && (opts.all || !!i.steered || !!i.steerAttempts || !!i.issuedUuid)));
     if (!untaken.length) return 0;
     if (opts.holdQueue) this.unreadQueueHeld = true;
     for (const u of untaken) {
+      this.onReturnUntaken?.(u);
       this.promote?.(u);
       this.remove(u.id);
     }
-    this.requeue(untaken.map((u) => ({ id: u.id, text: u.text, attachments: u.attachments, createdAt: u.ts, ...(opts.byHand?.has(u.id) ? { byHand: true } : {}) })));
+    const returned: QueuedMessage[] = untaken.map(u => ({
+      id: u.id, text: u.text, attachments: u.attachments, createdAt: u.ts,
+      ...(u.submitPrint && { submitPrint: u.submitPrint }), ...(u.phoneSender && { phoneSender: u.phoneSender }),
+      ...(u.steerOrder && { steerOrder: u.steerOrder }), ...(u.steerAttempts && { steerAttempts: u.steerAttempts }),
+      ...(u.issuedUuid && { issuedUuid: u.issuedUuid, steerWait: { reason: 'Issued to Claude. Receipt unknown.' } }),
+      ...(u.issuedUuid || opts.byHand?.has(u.id) ? { byHand: true } : {}),
+    }));
+    this.requeue(returned);
+    if (returned.some(q => q.steerOrder)) {
+      const ordered = this.queue.filter(q => q.steerOrder).sort((a, b) => a.steerOrder! - b.steerOrder!);
+      let index = 0;
+      this.reorderQueued(this.queue.map(q => q.steerOrder ? ordered[index++].id : q.id));
+    }
     if (opts.reason) {
       const one = untaken.length === 1;
       const it = one ? 'it' : 'them';
-      const why = opts.reason === 'closed' ? `Sable closed before the agent took ${it}.` : opts.reason === 'failed' ? `The turn failed before the agent took ${it}.` : `The turn stopped before the agent took ${it}.`;
+      const why = untaken.some(u => u.issuedUuid) ? 'Claude did not confirm delivery. Review the waiting messages before sending again.' : opts.reason === 'closed' ? `Sable closed before the agent took ${it}.` : opts.reason === 'failed' ? `The turn failed before the agent took ${it}.` : `The turn stopped before the agent took ${it}.`;
       this.notice('info', one ? 'Your message is back in the queue' : `${untaken.length} messages are back in the queue`, why);
     }
     return untaken.length;
@@ -744,6 +939,7 @@ export class SessionRuntime {
     this.emit({ type: 'item.added', sessionId: this.id, item: { ...full } });
     this.onDirty(this, 'items');
     this.trackBackground(full);
+    this.refreshSteerWaits(full);
     this.liveItem(full, true);
     return full;
   }
@@ -776,6 +972,7 @@ export class SessionRuntime {
   patch<T extends TimelineItem>(id: string, patch: Partial<T>) {
     const item = this.index.get(id);
     if (!item) return;
+    if (item.type === 'user' && (patch as Partial<UserItem>).state === 'sent') this.clearSteerWaits(id);
     // A step that ends: the time it spent waiting for the user does not count as its own.
     const endedAt = (patch as Partial<ToolItem>).endedAt;
     if (item.type === 'tool' && endedAt && !('waitedMs' in patch)) {
@@ -789,6 +986,14 @@ export class SessionRuntime {
     const previous = item.type === 'tool' ? item.task : undefined;
     const taken = item.type === 'user' && item.state === 'queued' && (patch as Partial<UserItem>).state === 'sent';
     Object.assign(item, patch);
+    if (item.type === 'tool' && ('delegateReport' in patch || 'delegateCaller' in patch)) {
+      if (item.delegateCaller !== undefined && item.delegateAttempt?.tool) this.foregroundResults.add(id);
+      else this.foregroundResults.delete(id);
+      if (item.delegateCaller !== undefined || item.delegateReport === 'working' || item.delegateReport === 'pending') this.owedDelegateReports.add(id);
+      else this.owedDelegateReports.delete(id);
+      const recovery = this.owedDelegateReports.size ? true : undefined;
+      if (recovery !== this.meta.delegateRecovery) this.update({ delegateRecovery: recovery });
+    }
     if (item.type === 'tool' && item.task && ('task' in patch || 'detail' in patch || 'output' in patch || 'result' in patch)) {
       const previousServing = previous?.id === item.task.id ? previous.serving : undefined;
       const mark = item.task;
@@ -803,6 +1008,7 @@ export class SessionRuntime {
     this.emit({ type: 'item.patch', sessionId: this.id, id, patch: patch as Partial<TimelineItem> });
     this.onDirty(this, 'items');
     this.trackBackground(item);
+    this.refreshSteerWaits(item);
     if (['status', 'kind', 'result', 'detail', 'check', 'streaming', 'text', 'variant', 'early', 'until',
       'agentSwitch', 'state', 'steered', 'parentId', 'ts', 'type'].some(key => key in patch)) {
       this.liveItem(item, taken);
@@ -912,12 +1118,16 @@ export class SessionRuntime {
   taken(id: string, patch: Partial<UserItem> = {}) {
     const item = this.index.get(id);
     if (item?.type !== 'user') return;
+    const issued = item.issuedUuid;
+    if (issued) patch = { ...patch, issuedUuid: undefined };
     if (item.state !== 'queued') this.patch<UserItem>(id, { state: 'sent', ...patch });
-    else this.move(id, { state: 'sent', ...patch } as Partial<TimelineItem>, !!item.steered);
+    else this.move(id, { state: 'sent', ...patch } as Partial<TimelineItem>, !!item.steered || !!item.steerAttempts);
+    if (issued) void this.persistInput?.().catch(err => this.notice('error', 'Could not save the delivery receipt', (err as Error).message));
   }
 
   /** Moves a root item to the end of the timeline (a message once the agent takes it); `keepTime`: its time stays. */
   move(id: string, patch: Partial<TimelineItem> = {}, keepTime = false) {
+    if ((patch as Partial<UserItem>).state === 'sent') this.clearSteerWaits(id);
     const item = this.index.get(id);
     if (!item) return;
     const at = this.items.indexOf(item);
@@ -941,7 +1151,9 @@ export class SessionRuntime {
 
   /** Removes an item and every item nested under it (children of a tool or agent, and theirs). */
   remove(id: string) {
-    if (!this.index.has(id)) return;
+    const removed = this.get(id);
+    if (!removed) return;
+    this.clearSteerWaits(id);
     const gone = new Set([id]);
     // Items are appended after their parent, but walk until stable so order never matters.
     for (let grew = true; grew; ) {
@@ -960,6 +1172,7 @@ export class SessionRuntime {
       this.refreshLive();
     }
     this.items = this.items.filter((i) => !gone.has(i.id));
+    this.refreshSteerWaits(removed);
     // One event for the root: clients drop its descendants themselves.
     this.emit({ type: 'item.removed', sessionId: this.id, id });
     this.onDirty(this, 'items');
@@ -982,6 +1195,9 @@ export class SessionRuntime {
     const commands = this.meta.commands ?? 0;
     const { serving, servingSince, servingAddress } = this.meta;
     this.load(items, this.todos);
+    for (const id of this.waitingSteers.keys()) {
+      if (this.get<UserItem>(id)?.state !== 'queued') this.clearSteerWaits(id);
+    }
     // Claude can also reorder a steer with a reset mid-turn. Retain the surviving
     // acts in their new order for the next live event. A rewind discards the rest.
     if (previous && this.turnActive) {
@@ -1135,7 +1351,9 @@ export class SessionRuntime {
     this.dropLive();
     this.turnActive = false;
     this.carried = false;
-    this.cancelPrompts();
+    this.clearSteerWaits();
+    this.steeredDelegateSteps.clear();
+    this.cancelPrompts(true);
     this.update({ status: error ? 'error' : 'idle', live: undefined, lastError: error, activity: undefined, updatedAt: Date.now() });
     this.onTurnEnd?.(this, error, this.unreadQueueHeld ? { ...opts, hold: true } : opts);
   }
@@ -1204,8 +1422,8 @@ export class SessionRuntime {
     return true;
   }
 
-  ask(questions: Question[], itemId?: string, signal?: AbortSignal): Promise<Record<string, string[]> | null> {
-    const request: QuestionRequest = { id: randomUUID(), sessionId: this.id, itemId, questions, createdAt: Date.now() };
+  ask(questions: Question[], itemId?: string, signal?: AbortSignal, delegateId?: string): Promise<Record<string, string[]> | null> {
+    const request: QuestionRequest = { id: randomUUID(), sessionId: this.id, itemId, ...(delegateId && { delegateId }), questions, createdAt: Date.now() };
     return new Promise((resolve) => {
       const done = (a: Record<string, string[]> | null) => {
         if (!this.questions.delete(request.id)) return;
@@ -1227,9 +1445,10 @@ export class SessionRuntime {
     return true;
   }
 
-  cancelPrompts() {
-    for (const p of [...this.permissions.values()]) p.resolve(null);
-    for (const q of [...this.questions.values()]) q.resolve(null);
+  cancelPrompts(keepDelegates = false) {
+    const keep = (delegateId?: string) => keepDelegates && delegateId !== undefined && this.delegates.has(delegateId);
+    for (const p of [...this.permissions.values()]) if (!keep(p.request.delegateId)) p.resolve(null);
+    for (const q of [...this.questions.values()]) if (!keep(q.request.delegateId)) q.resolve(null);
   }
 
   // ── the session's Browser tab (in the window, not here) ──
@@ -1309,8 +1528,10 @@ export class SessionRuntime {
    * (it ended, or Sable restarted): they died with it and their end will never be reported.
    */
   stopBackground(only?: (item: TimelineItem) => boolean) {
+    if (!only) this.stopDelegates(false);
     for (const item of this.items) {
       if (only && !only(item)) continue;
+      if (this.delegates.has(item.id)) continue;
       const stopped = stoppedBackground(item);
       if (stopped === item || stopped.type !== 'tool') continue;
       const was = item as ToolItem;
@@ -1335,6 +1556,8 @@ export class SessionRuntime {
   /** `settle`; `live`: what still works in the background is left alone (false: its process is gone too). */
   private settleSteps(reason: 'cancelled' | 'error', opts: { endUnknown?: boolean; at?: number }, live: boolean) {
     const roots = [...this.apart];
+    // A separate delegate process can still be confirming its interrupt after its parent died.
+    if (!live) for (const id of this.delegates.keys()) if (this.get<ToolItem>(id)?.delegateReport) roots.push(id);
     if (live) for (const i of this.items) if (worksInBackground(i) || runsTask(i)) roots.push(i.id);
     const keep = roots.length ? this.subtree(roots) : undefined;
     const from = this.turnStartedAt || this.lastTurnStart();

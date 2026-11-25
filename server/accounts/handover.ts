@@ -2,7 +2,7 @@ import { existsSync, statSync } from 'node:fs';
 import { copyFile, cp, mkdir, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { TimelineItem, Todo } from '../../shared/protocol';
-import { HANDOVER_HEAD_ACCOUNT, HANDOVER_TAIL, handoverHeadAgent, handoverHeadSince, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
+import { HANDOVER_HEAD_ACCOUNT, HANDOVER_TAIL, handoverHeadAgent, handoverHeadSince, syntheticOf, userItemText, syntheticLine } from '../../shared/synthetic';
 
 /**
  * Carrying a conversation from one account of an agent to another. Both agents keep their
@@ -119,13 +119,13 @@ export function handoverText(items: TimelineItem[], opts: { skip?: string; maxCh
     if (it.type === 'user') {
       // What Claude Code wrote in the person's place, in plain words: a task that finished, a
       // command they ran and what it printed. Reminders and caveats are left out.
-      const syn = parseSynthetic(it.text);
+      const syn = syntheticOf(it);
       const line = syn ? syntheticLine(syn) : '';
       if (syn && !line) continue;
       flushTools();
       if (!syn) {
         task = lines.length;
-        lines.push(`User: ${clip(stripWrappers(it.text), 700)}`);
+        lines.push(`User: ${clip(userItemText(it), 700)}`);
       }
       else if (syn.role === 'command') lines.push(`User ran: ${clip(line, 300)}`);
       else if (syn.role === 'output') lines.push(`Output: ${clip(line, 300)}`);

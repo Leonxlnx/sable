@@ -161,6 +161,11 @@ export function foldCue(trigger: Element) {
     // The body React let go of is the copy: only the rows that can be seen, out of the flow.
     const keep = Math.ceil(far / 30) + 2;
     body.querySelectorAll('.srow').forEach((r, i) => i >= keep && r.remove());
+    // Put back into the page, an element starts its CSS animations again: a row that had come in
+    // after the list was drawn (`.srow[data-enter]`, held at nothing for 120 ms) vanished from the
+    // copy in the fold's first frame while the rows under it stood (it was the open chat's, the
+    // newest row, with its pill).
+    for (const n of body.querySelectorAll('[data-enter]')) n.removeAttribute('data-enter');
     body.setAttribute('data-gone', '');
     body.setAttribute('aria-hidden', 'true');
     body.inert = true;

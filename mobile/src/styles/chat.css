@@ -424,6 +424,89 @@
   color: var(--text-3);
 }
 
+/* a steered message that still waits (screens/Timeline.tsx `SteerNote`; the desktop's line): what it
+   waits on and its clock as the note under the bubble, and "Send now" at the bubble's right edge. A
+   press interrupts the agent's step, so the key's finger-sized target (base.css) ends where the
+   bubble does: the row stands 8 px under it, the target reaches 8 px up */
+.steer-note {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+  max-width: 100%;
+  min-width: 0;
+  margin-top: 2px;
+}
+
+.steer-note-text {
+  min-width: 0;
+  padding-right: 0;
+}
+
+/* with no key the words end where "Steered" will: the note's own inset from the bubble's corner */
+.steer-note-text:last-child {
+  padding-right: 6px;
+}
+
+.steer-note-text > svg {
+  flex-shrink: 0;
+}
+
+.steer-note-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* the clock keeps the room of its widest form (drawn unseen in the same cell): the row stands on its
+   right end, so a clock as wide as its own words would push the label left and right as it ticks.
+   Before the key its words start at the room's left (the spare character lies in the gap before the
+   key); with no key they stand at its right end, so the row ends where the bubble does */
+.steer-note-clock {
+  display: inline-grid;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.steer-note-text:last-child .steer-note-clock {
+  justify-items: end;
+}
+
+.steer-note-clock > * {
+  grid-area: 1 / 1;
+}
+
+.steer-note-clock > [aria-hidden] {
+  visibility: hidden;
+}
+
+.steer-now {
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 var(--s-3);
+  border-radius: var(--r-pill);
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+  color: var(--text-2);
+  background: var(--fill-1);
+  box-shadow: inset 0 0 0 1px var(--line);
+  transition: background-color 100ms, color 100ms, transform 100ms;
+}
+
+.steer-now:active {
+  background: var(--fill-3);
+  color: var(--text);
+  transform: scale(0.96);
+}
+
+/* on its way: the key keeps its place and takes no press */
+.steer-now[aria-disabled='true'] {
+  color: var(--text-4);
+  background: transparent;
+  transform: none;
+}
+
 /* ── the work behind a segment: one quiet line (live: what it does now, held under the header; settled: the summary). No
    pill or capsule around it, as on the desktop: thinking and work read as dim words in the flow ── */
 .seg-work {

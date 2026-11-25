@@ -521,6 +521,22 @@ describe('a turn for all root work', () => {
 // ──────────────────────────────── D-hold: what the process holds ────────────────────────────────
 
 describe('what the process holds', () => {
+  it('keeps the parent process while Sable owns a detached child even when the CLI lists no tasks', async () => {
+    const h = await atRest();
+    await h.call('d', 'mcp__sable__delegate_to_codex', { prompt: 'Check this', description: 'Check' });
+    h.rt.delegates.set('d', { detach() {}, stop() {}, ended: Promise.resolve() });
+    h.rt.patch<ToolItem>('d', { delegateReport: 'working', result: { agent: { background: 'running' } } });
+    await h.done('d');
+    await h.message(result([h.first.uuid]));
+    await h.system({ subtype: 'background_tasks_changed', tasks: [] });
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.rt.meta.background).toBe(1);
+    expect(h.session.holdsWork()).toBe(true);
+    h.rt.delegates.delete('d');
+    h.rt.patch<ToolItem>('d', { delegateReport: 'pending', status: 'done', result: { agent: { background: 'done' } } });
+    expect(h.session.holdsWork()).toBe(false);
+  });
+
   it("tasks as a list and as edges: a foreground wait survives the list, an ambient task holds nothing, a task ends by its state or its call's result (A4)", async () => {
     vi.useFakeTimers({ now: new Date('2026-01-26T09:00:00Z') });
     const h = await atRest();
@@ -1204,6 +1220,23 @@ describe('a process that goes away', () => {
       expect(sdk.procs.every(proc => !proc.closed)).toBe(true);
       expect(h.rt.turnActive).toBe(true);
     } finally { await h.p.discardWarm(); }
+  });
+
+  it('waits for the owned Claude child to exit after hard termination', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      terminateDelegate: vi.fn(() => new Promise<void>(resolve => child.once('exit', () => resolve()))),
+    });
+    vi.spyOn(authGate, 'spawner').mockReturnValue(() => child as unknown as ReturnType<ReturnType<typeof authGate.spawner>>);
+    sdk.child.use = true;
+    const h = await atRest({ live: true });
+    let closed = false;
+    const closing = h.session.terminateDelegate!().then(() => { closed = true; });
+    await tick();
+    expect(child.terminateDelegate).toHaveBeenCalledTimes(1);
+    expect(closed).toBe(false);
+    child.emit('exit', 0, null);
+    await closing;
+    expect(closed).toBe(true);
   });
 
   it('a failed spawn leaves no writer after the replacement exits', async () => {

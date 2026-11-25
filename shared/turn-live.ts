@@ -1,7 +1,6 @@
 import type { FileDiff, TimelineItem, ToolKind, TurnLive } from './protocol';
-import { isNobodysWords, parseSynthetic } from './synthetic';
 import { isLeadIn } from '../src/features/timeline/lead-in';
-import { PositionIndex } from './turn-live-index';
+import { PositionIndex, rootShape, turnBoundary, type Boundary, type RootShape, type TurnState } from './turn-live-index';
 
 // A fold of adjacent pieces of a running segment. 'open' is the position of the first
 // folded item in its last run. Times are read from those positions only at publication.
@@ -36,16 +35,18 @@ interface Piece {
   substantial?: boolean;
   last?: number;
   anchor?: number;
+  stopped?: boolean;
 }
 function pieces(a: Piece, b: Piece): Piece {
   if (b.closer === undefined) return a;
   const lead = a.lead === undefined ? undefined : b.closer ? shown(a.lead) : work(a.lead);
   return {
-    anchor: a.anchor, closer: a.closer ?? b.closer, lead: b.lead, reply: a.reply ?? b.reply,
+    anchor: a.anchor, stopped: a.stopped || b.stopped, closer: a.closer ?? b.closer, lead: b.lead, reply: a.reply ?? b.reply,
     substantial: a.substantial || b.substantial, last: b.last, body: flow(flow(a.body, lead), b.body),
   };
 }
-interface Runs { runs: number; steps: number; active?: Flow }
+// An empty taken segment inherits the previous active run. A Stop explicitly clears it.
+interface Runs { runs: number; steps: number; active?: Flow | null }
 const empty: Runs = { runs: 0, steps: 0 };
 function finish(p: Piece): Runs {
   // A segment that only contains notices shows each one. A taken steer with no
@@ -55,10 +56,10 @@ function finish(p: Piece): Runs {
   const active = p.substantial
     ? flow(p.reply === undefined ? undefined : shown(p.reply), flow(p.body, p.lead === undefined ? undefined : work(p.lead)))!
     : shown(last);
-  return { runs: active.runs, steps: active.steps, active };
+  return { runs: active.runs, steps: active.steps, active: p.stopped ? null : active };
 }
 function runs(a: Runs, b: Runs): Runs {
-  return { runs: a.runs + b.runs, steps: a.steps + b.steps, active: b.active ?? a.active };
+  return { runs: a.runs + b.runs, steps: a.steps + b.steps, active: b.active === undefined ? a.active : b.active };
 }
 
 // Only the segments on either edge can still join their neighbours. Keep the
@@ -81,36 +82,17 @@ function join(a: Range, b: Range): Range {
   };
   return [append(a[0]), append(a[1])];
 }
-type Shape = 'head' | 'steer' | 'notification' | 'hidden' | 'step' | 'work' | 'notice' | 'card' | 'visible' | 'output' | 'text' | 'lead' | 'interrupt' | 'end';
+type Shape = RootShape | 'lead';
 function shape(i: TimelineItem): Shape | undefined {
-  switch (i.type) {
-    case 'user': {
-      if (i.state === 'queued') return;
-      if (i.steered) return 'steer';
-      const role = parseSynthetic(i.text)?.role;
-      if (role === 'output') return 'output';
-      if (role === 'summary') return 'notice';
-      return role === 'notification' ? 'notification' : role === 'hidden' ? 'hidden' : 'head';
-    }
-    case 'text':
-      if (!i.streaming && (!i.text.trim() || isNobodysWords(i.text))) return;
-      return isLeadIn(i.text, !!i.streaming) ? 'lead' : 'text';
-    case 'thinking': return 'work';
-    case 'tool':
-      if (i.check) return;
-      if (i.kind === 'todo') return 'work';
-      return ['plan', 'share', 'widget'].includes(i.kind) ? 'visible' : 'step';
-    case 'notice':
-      if (i.early || i.until || i.agentSwitch || i.variant === 'rewind') return 'end';
-      if (i.variant === 'interrupted') return 'interrupt';
-      return i.variant === 'error' ? 'card' : i.variant === 'command' ? 'output' : 'notice';
-    case 'turn': return 'end';
-  }
+  const kind = rootShape(i);
+  return kind === 'text' && i.type === 'text' && isLeadIn(i.text, !!i.streaming) ? 'lead' : kind;
 }
 function atom(kind: Shape, pos: number): Range {
   const boundary = (steer: boolean): Part => ({ segments: { first: {}, last: steer ? {} : { anchor: pos } }, owesReply: steer });
   const word = kind === 'text' || kind === 'lead';
   const part = (owesReply: boolean): Part => {
+    // A Stop settles an unfinished announcement and contributes no work of its own.
+    if (kind === 'interrupt') return { segments: { first: { stopped: true, closer: true, last: pos } }, owesReply };
     if (kind === 'steer') return boundary(true);
     if (kind === 'notification' && !owesReply) return boundary(false);
     const closer = kind === 'text' || kind === 'visible' || kind === 'output' || kind === 'card';
@@ -123,25 +105,9 @@ function atom(kind: Shape, pos: number): Range {
   return [part(false), part(true)];
 }
 
-// Where the desktop would open the running turn. A notification can replace a
-// quiet wake that did nothing. An interrupted turn stays cut until a new opener,
-// an end record, or an informational notice sets the next work outside it.
-type State = 'closed' | 'quiet' | 'open' | 'cut';
-interface Boundary { state: State; pos?: number }
-type Boundaries = Record<State, Boundary>;
+type Boundaries = Record<TurnState, Boundary>;
 function boundaries(kind: Shape, pos: number): Boundaries {
-  const after = (state: State): Boundary => {
-    if (kind === 'head') return { state: 'open', pos };
-    if (kind === 'end' || (state === 'cut' && kind === 'notice')) return { state: 'closed', pos };
-    if (kind === 'interrupt') return { state: state === 'closed' ? 'closed' : 'cut', pos };
-    if (kind === 'notification' && state !== 'open') return { state: 'quiet', pos };
-    if (state === 'closed') {
-      if (kind === 'hidden') return { state: 'quiet', pos };
-      if (kind !== 'notice' && kind !== 'card' && kind !== 'output') return { state: 'open', pos };
-    }
-    if (state === 'quiet' && kind !== 'hidden' && kind !== 'steer') return { state: 'open' };
-    return { state };
-  };
+  const after = (state: TurnState) => turnBoundary(state, kind === 'lead' ? 'text' : kind, pos);
   return { closed: after('closed'), quiet: after('quiet'), open: after('open'), cut: after('cut') };
 }
 function joinBoundaries(a: Boundaries, b: Boundaries): Boundaries {
@@ -235,7 +201,7 @@ export class TurnLiveIndex {
     if (k !== e.shape) {
       e.shape = k;
       this.bounds.set(pos, k && boundaries(k, pos));
-      const part = k && k !== 'head' && k !== 'hidden' && k !== 'end' && k !== 'interrupt';
+      const part = k && k !== 'head' && k !== 'command' && k !== 'hidden' && k !== 'end';
       this.flow.set(pos, part ? atom(k, pos) : undefined);
     }
     const t = item.type === 'tool' && !item.check ? item : undefined;
@@ -325,10 +291,19 @@ export class TurnLiveIndex {
     // A notification opening a turn is its head. Inside one it opens a segment.
     const fromWork = start === undefined ? this.order.length
       : this.order[start].shape === 'notification' ? start + 1 : start;
-    const seg = this.flow.range(fromWork)?.[0].segments;
+    // Only immediate words answer the opening message. Read past empty/queued rows
+    // and checks without walking the turn or consuming a later lead-in after work.
+    const first = start !== undefined && this.order[start].shape === 'head' ? this.flow.firstFrom(fromWork) : undefined;
+    let range: Range | undefined;
+    if (first !== undefined && this.order[first].shape === 'lead') {
+      const reply = atom('text', first);
+      const rest = this.flow.range(first + 1);
+      range = rest ? join(reply, rest) : reply;
+    } else range = this.flow.range(fromWork);
+    const seg = range?.[0].segments;
     const total = seg ? runs(runs(finish(seg.first), seg.middle ?? empty), seg.last ? finish(seg.last) : empty) : empty;
     const active = total.active;
-    const checkpointAt = active && this.order[active.at].ts;
+    const checkpointAt = active ? this.order[active.at].ts : undefined;
     const last = this.flow.last;
     const newest = last !== undefined && last >= fromWork ? this.order[last].doing : undefined;
     const doing = waiting ? 'waiting' : newest ?? 'other';

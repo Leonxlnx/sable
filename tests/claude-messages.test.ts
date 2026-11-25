@@ -15,21 +15,25 @@
  * The adapter is driven with fake SDK messages (no real agent turns): a stand-in process that records
  * what is pushed, or (where its own start and reading loop matter) a fake SDK `query`.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_SETTINGS, STEER_FIRST_BLOCK, type NoticeItem, type SessionMeta, type TextItem, type TimelineItem, type ToolItem, type TurnItem, type UserItem } from '@shared/protocol';
-import { HANDOVER_HEAD_ACCOUNT, HANDOVER_JOIN, HANDOVER_TAIL, lostTasksNote, stripWrappers } from '@shared/synthetic';
+import { DEFAULT_SETTINGS, REPLY_FIRST_PROMPT, STEER_FIRST_BLOCK, type NoticeItem, type SessionMeta, type TextItem, type TimelineItem, type ToolItem, type TurnItem, type UserItem } from '@shared/protocol';
+import { HANDOVER_HEAD_ACCOUNT, HANDOVER_JOIN, STEER_NOW_BLOCK, parseSynthetic, HANDOVER_TAIL, lostTasksNote, stripWrappers } from '@shared/synthetic';
 import { App } from '../server/app';
 import { claudeFolderKey } from '../server/core/lanes';
 import { SessionRuntime } from '../server/core/runtime';
-import { READ } from '../server/core/session-file';
+import { READ, SessionFiles } from '../server/core/session-file';
+import { phoneItem, phoneQuestion } from '../server/services/phone';
 import { isLight, resultForWindow } from '../server/core/trim';
-import { ClaudeProvider } from '../server/providers/claude';
+import { ClaudeProvider, titleOptions } from '../server/providers/claude';
+import { CodexProvider, titleThreadParams } from '../server/providers/codex';
+import { titlePrompt } from '../server/core/titles';
+import { commitPrompt } from '../server/core/commit-draft';
 import { DemoProvider } from '../server/providers/demo';
 import { appPictures, ownReplays, plainWords } from '../server/providers/claude-tools';
-import type { ProviderSession } from '../server/providers/types';
+import type { Provider, ProviderSession } from '../server/providers/types';
 
 /** A fake SDK `query`: a stream a test writes to (`out`) and ends (`end`), ended too by `close()`. */
 const sdk = vi.hoisted(() => {
@@ -1192,11 +1196,15 @@ describe('a limit card the bridge decided (D4)', () => {
 
 // ───────────────────────────── C5: a steer read after it was sent again ─────────────────────────────
 
-async function claudeApp() {
+async function claudeApp(saved?: { home: string; id: string }) {
   const home = mkdtempSync(path.join(tmpdir(), 'sable-claude-msg-'));
   cleanups.push(() => rmSync(home, { recursive: true, force: true }));
   const cwd = path.join(home, 'proj');
   mkdirSync(cwd);
+  if (saved) {
+    cpSync(path.join(saved.home, 'sessions'), path.join(home, 'sessions'), { recursive: true });
+    cpSync(path.join(saved.home, 'state.json'), path.join(home, 'state.json'));
+  }
   const pushed: { uuid: string; message: { content: unknown } }[] = [];
   const sessions: Session[] = [];
   const app = new App({
@@ -1228,9 +1236,8 @@ async function claudeApp() {
     ],
   });
   cleanups.push(() => app.dispose());
-  const snap = await app.call('session.create', { provider: 'claude', cwd, mode: 'default' });
-  const id = snap.session.id;
-  const rt = app.runtime(id);
+  const id = saved?.id ?? (await app.call('session.create', { provider: 'claude', cwd, mode: 'default' })).session.id;
+  const rt = saved ? app.sessions.get(id)! : app.runtime(id);
   const message = (m: Obj) => (sessions[0].onMessage as (m: unknown) => void).call(sessions[0], { session_id: 'cc1', ...m });
   const send = async (text: string, steer = false) => {
     const n = pushed.length;
@@ -1241,8 +1248,835 @@ async function claudeApp() {
   const replay = (uuid: string, content: string) => message({ type: 'user', isReplay: true, uuid, parent_tool_use_id: null, message: { role: 'user', content } });
   const result = (uuids: string[], interrupted = false) =>
     message({ type: 'result', subtype: interrupted ? 'error_during_execution' : 'success', is_error: interrupted, duration_ms: 10, usage: {}, total_cost_usd: 0, user_message_uuids: uuids, user_message_uuid: uuids.at(-1) });
-  return { app, id, rt, pushed, send, replay, result, message, stop: () => app.call('session.interrupt', { sessionId: id }) };
+  return { app, home, id, rt, pushed, send, replay, result, message, stop: () => app.call('session.interrupt', { sessionId: id }) };
 }
+
+describe('reply first', () => {
+  it('appends the instruction to the chat process after the Customize brief and respects opt-out and helper scopes', async () => {
+    const h = await claude({ live: true });
+    await h.send('begin');
+    expect(REPLY_FIRST_PROMPT).toContain('use `background: true` for work that takes more than a minute or two');
+    expect(h.proc().options).toMatchObject({ systemPrompt: { append: expect.stringContaining(REPLY_FIRST_PROMPT) } });
+    const brief = 'Customize this desktop.';
+    let enabled: boolean | undefined;
+    const ctx = { emit() {}, log() {}, customBrief: () => brief, settings: () => ({ ...DEFAULT_SETTINGS, replyFirst: enabled }) };
+    const cc = new ClaudeProvider(ctx);
+    const codex = new CodexProvider(ctx);
+    (codex as unknown as Obj).client = async () => ({ request: async () => ({ config: { developer_instructions: 'Use German.' } }) });
+    const options = async (meta: { id: string; options?: { readOnly?: boolean }; custom?: boolean }) => [
+      (cc.agentOptions({ cwd: process.cwd(), model: '', mode: 'default', ...meta }, {}).systemPrompt as { append: string }).append,
+      await codex.developerInstructions(process.cwd(), meta),
+    ];
+    for (const value of await options({ id: 'chat', custom: true })) expect(value).toContain(brief + '\n\n' + REPLY_FIRST_PROMPT);
+    for (const meta of [{ id: 'sub-delegated' }, { id: 'check', options: { readOnly: true } }]) {
+      for (const value of await options(meta)) expect(value).not.toContain(REPLY_FIRST_PROMPT);
+    }
+    for (const prompt of [titlePrompt({ message: 'hello', answer: 'hi' }, process.cwd()), commitPrompt({ files: [], subjects: [], patch: '' }, process.cwd())]) {
+      expect(titleOptions(prompt, {}, new AbortController()).systemPrompt).toBe(prompt.system);
+      expect(titleThreadParams(prompt, 'm').baseInstructions).toBe(prompt.system);
+      expect(prompt.system).not.toContain(REPLY_FIRST_PROMPT);
+    }
+    enabled = false;
+    for (const value of await options({ id: 'chat' })) expect(value).not.toContain(REPLY_FIRST_PROMPT);
+  });
+});
+
+async function waitingSteer(delay?: number) {
+  const h = await claudeApp();
+  if (delay !== undefined) await h.app.call('app.setSettings', { patch: { steerAfterMs: delay } });
+  const first = await h.send('do the work');
+  h.replay(first, 'do the work');
+  h.message({ type: 'assistant', uuid: 'tool-call', message: { id: 'working', content: [{ type: 'tool_use', id: 'foreground', name: 'Agent', input: { description: 'Read the code' } }] } });
+  const tool = h.rt.get<ToolItem>('foreground')!;
+  expect(tool).toMatchObject({ type: 'tool', kind: 'agent', status: 'running' });
+  h.message({ type: 'system', subtype: 'init', claude_code_version: '2.1.325' });
+  const uuid = await h.send('answer me', true);
+  const card = users(h.rt).at(-1)!;
+  const interrupt = vi.fn(async (_scope?: unknown) => ({ response: { turn: 'stopped', still_queued: [] as string[] } }));
+  const request = vi.fn(async (_request: Obj) => ({ response: { cancelled: true } }));
+  Object.assign((h.rt.handle as unknown as Session).q as Obj, { request: (r: Obj) => r.subtype === 'interrupt' ? interrupt(r.for_user_message_uuids) : request(r), interrupt });
+  const now = (itemId = card.id, allowed?: () => boolean) => h.app.call('session.steerNow', { sessionId: h.id, itemId }, { allowed });
+  return { ...h, first, tool, uuid, card, now, interrupt, request };
+}
+
+describe('unread steer deadlines', () => {
+  it('sends at the first deadline, through the manual interrupt path, including a second waiting steer', async () => {
+    const h = await waitingSteer(30_000);
+    expect(h.card.steerWait).toEqual({ stepId: h.tool.id, autoAt: h.card.ts + 30_000 });
+    expect(phoneItem(h.card)).toMatchObject({ steerWait: h.card.steerWait });
+    // Arm timers under the fake clock. The first card was deliberately taken under the real one.
+    h.replay(h.uuid, h.card.text);
+    expect(h.card.steerWait).toBeNull();
+    vi.useFakeTimers();
+    const uuid = await h.send('first unread', true);
+    const first = users(h.rt).at(-1)!;
+    h.rt.dangerHeld = true;
+    h.rt.heldMode = 'default';
+    await vi.advanceTimersByTimeAsync(29_000);
+    const later = await h.send('second unread', true);
+    expect(h.interrupt).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(h.request).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(h.interrupt).toHaveBeenCalledTimes(1)); // Withdrawal is committed to disk before interrupt.
+    expect(h.request.mock.calls.map(([r]) => r.message_uuid)).toEqual([uuid, later]);
+    expect(h.interrupt).toHaveBeenCalledTimes(1);
+    h.result([h.first, h.uuid], true);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(h.pushed).toHaveLength(6));
+    expect(h.pushed.at(-2)?.message.content).toEqual([{ type: 'text', text: first.text }, { type: 'text', text: STEER_NOW_BLOCK }]);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.interrupt).toHaveBeenCalledTimes(1);
+  });
+
+  it('updates the waiting step without moving the deadline, and clears the fields on replay', async () => {
+    const h = await waitingSteer();
+    const autoAt = h.card.steerWait!.autoAt;
+    h.rt.patch<ToolItem>(h.tool.id, { status: 'done' });
+    expect(h.card.steerWait).toEqual({ autoAt, stepId: undefined });
+    const next = h.rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', status: 'awaiting', title: 'Build', detail: {} });
+    expect(phoneItem(h.card)).toMatchObject({ steerWait: { autoAt, stepId: next.id } });
+    h.replay(h.uuid, h.card.text);
+    expect(h.card.steerWait).toBeNull();
+  });
+
+  it.each(['taken', 'withdrawn', 'zero', 'stop'] as const)('does not interrupt after %s', async reason => {
+    const h = await waitingSteer(reason === 'zero' ? 0 : 30_000);
+    h.replay(h.uuid, h.card.text);
+    vi.useFakeTimers();
+    const uuid = await h.send('one more', true);
+    const card = users(h.rt).at(-1)!;
+    if (reason === 'taken') h.replay(uuid, card.text);
+    if (reason === 'withdrawn') {
+      await h.rt.handle!.recallSteers!(card.id, () => {});
+      expect(h.rt.takeQueued(card.id)?.text).toBe(card.text);
+      h.request.mockClear();
+    }
+    if (reason === 'zero') expect(card.steerWait?.autoAt).toBeUndefined();
+    if (reason === 'stop') await h.stop();
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.interrupt).toHaveBeenCalledTimes(reason === 'stop' ? 1 : 0);
+  });
+});
+
+describe('Sable delegates in a Claude turn', () => {
+  const early = 'The person sent a message, so this call returns early. The sub-agent keeps working in the background. Its report will be delivered to you when it finishes. Answer the person now, then carry on. Do not start the same task again.';
+  const background = 'The sub-agent is working in the background. Its report will be delivered to you when it finishes. Carry on. Do not start the same task again.';
+  async function setup() {
+    const h = await claudeApp();
+    const first = await h.send('delegate the review');
+    h.replay(first, 'delegate the review');
+    function start(agent: 'codex' | 'claude', id: string, inBackground = false, anonymous = false) {
+      let child!: SessionRuntime;
+      const interrupt = vi.fn(async () => child.endTurn());
+      const close = vi.fn(async () => {});
+      const provider = { open: async (r: SessionRuntime) => {
+        child = r;
+        return { send: async () => r.beginTurn(), interrupt, close };
+      } } as unknown as Provider;
+      const name = 'mcp__sable__delegate_to_' + agent;
+      if (!anonymous) h.message({ type: 'assistant', uuid: 'call-' + id, message: { id: 'msg-' + id, content: [{ type: 'tool_use', id, name, input: { description: id, prompt: id } }] } });
+      const parent = h.app.provider('claude') as ClaudeProvider;
+      parent.ctx.otherAgents = () => ['claude', 'codex'];
+      const options = parent.agentOptions(h.rt.meta, { session: h.rt.handle as Parameters<typeof parent.agentOptions>[1]['session'] });
+      type RegisteredTool = { handler(args: unknown, extra: unknown): Promise<{ content: { text: string }[]; isError?: boolean }> };
+      const server = options.mcpServers!.sable as unknown as { instance: { _registeredTools: Record<string, RegisteredTool> } };
+      vi.spyOn(h.app, 'provider').mockImplementationOnce(() => provider);
+      const result = server.instance._registeredTools['delegate_to_' + agent].handler(
+        { description: id, prompt: id, background: inBackground }, { _meta: anonymous ? {} : { 'claudecode/toolUseId': id }, signal: new AbortController().signal },
+      ).then(r => ({ ok: !r.isError, text: r.content[0].text }));
+      const finish = (error?: string) => {
+        child.add<TextItem>({ type: 'text', text: 'Report for ' + id, streaming: false });
+        child.endTurn(error);
+      };
+      const receipt = (text: string) => h.message({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content: text }] } });
+      return { result, finish, child: () => child, interrupt, close, receipt, row: () => h.rt.get<ToolItem>(id)! };
+    }
+    return { ...h, first, start };
+  }
+
+  it.each(['codex', 'claude'] as const)('releases delegate_to_%s immediately, then wakes once at rest', async agent => {
+    const h = await setup();
+    const c = h.start(agent, 'review');
+    const steer = await h.send('what did you find?', true);
+    expect(await c.result).toEqual({ ok: true, text: early });
+    c.receipt(early);
+    h.replay(steer, 'what did you find?');
+    h.result([h.first, steer]);
+    expect(h.rt.turnActive).toBe(false);
+    expect(c.row()).toMatchObject({ status: 'running' });
+    expect(h.rt.meta.background).toBe(1);
+    c.finish();
+    await until(() => h.pushed.length >= 3, 'report wake');
+    const report = h.pushed[2];
+    expect(report.message.content).toContain('Report for review');
+    expect(parseSynthetic(report.message.content as string)?.role).toBe('hidden');
+    h.replay(report.uuid, report.message.content as string);
+    expect(c.row()).toMatchObject({ status: 'done', delegateReport: 'delivered', result: { text: 'Report for review' } });
+    expect(h.rt.meta.background ?? 0).toBe(0);
+    expect(h.rt.items.find(i => i.type === 'text' && i.text === 'Report for review')?.parentId).toBe('review');
+    h.result([report.uuid]);
+    await tick();
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.pushed).toHaveLength(3);
+  });
+
+  it('keeps two reports, including failure, through same-tick releases and late SDK tool results', async () => {
+    const h = await setup();
+    const a = h.start('claude', 'one', true);
+    const b = h.start('codex', 'two', true);
+    expect(await a.result).toEqual({ ok: true, text: background });
+    expect(await b.result).toEqual({ ok: true, text: background });
+    expect(h.rt.meta.background).toBe(2);
+    a.finish();
+    b.finish('failed');
+    await until(() => h.pushed.length === 2, 'reports in the running turn');
+    a.receipt(background);
+    b.receipt(background);
+    const report = h.pushed[1];
+    expect(report.message.content).toContain('Report for one');
+    expect(report.message.content).toContain('two (failed)');
+    expect(report.message.content).not.toContain(STEER_FIRST_BLOCK);
+    h.replay(report.uuid, report.message.content as string);
+    expect(a.row()).toMatchObject({ status: 'done', delegateReport: 'delivered' });
+    expect(b.row()).toMatchObject({ status: 'error', delegateReport: 'delivered' });
+    expect(h.rt.meta.background ?? 0).toBe(0);
+    h.result([h.first, report.uuid]);
+    await tick();
+    expect(h.pushed).toHaveLength(2);
+  });
+
+  it('preserves a child permission through release and turn end, then Stop reaches the child at rest', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'child');
+    const permission = c.child().requestPermission({ toolName: 'Read', kind: 'read', detail: {}, title: 'Read files', options: [{ id: 'yes', label: 'Allow', tone: 'allow' }] });
+    const steer = await h.send('hello', true);
+    expect(await c.result).toEqual({ ok: true, text: early });
+    h.replay(steer, 'hello');
+    h.result([h.first, steer]);
+    const ask = h.rt.prompts().permissions[0];
+    expect(ask).toMatchObject({ sessionId: h.id, itemId: 'child' });
+    h.rt.answerPermission(ask.id, { optionId: 'yes' });
+    expect(await permission).toMatchObject({ optionId: 'yes' });
+    await h.stop();
+    await until(() => c.row().delegateReport === 'stopped', 'stopped child');
+    expect(c.interrupt).toHaveBeenCalledTimes(1);
+    expect(h.rt.meta.background ?? 0).toBe(0);
+    expect(h.pushed).toHaveLength(2);
+  });
+
+  it('retries and closes a deleted delegate whose turn never confirms Stop', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'stuck', true);
+    await c.result;
+    c.interrupt.mockImplementation(async () => {});
+    await h.app.call('session.close', { sessionId: h.id, remove: true });
+    await until(() => c.close.mock.calls.length > 0, 'deleted child closed', 4000);
+    expect(c.interrupt.mock.calls.length).toBeGreaterThan(1);
+    expect(h.rt.pendingDelegateReports.size).toBe(0);
+  });
+
+  it('ignores late child frames after the person deletes the chat while its interrupt is in flight', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'late', true);
+    await c.result;
+    c.interrupt.mockImplementation(async () => {});
+    await h.app.call('session.close', { sessionId: h.id, remove: true });
+    expect(c.interrupt).toHaveBeenCalled();
+    c.finish();
+    await tick();
+    expect(h.rt.items.some(i => i.type === 'text' && i.text === 'Report for late')).toBe(false);
+    expect(h.rt.pendingDelegateReports.size).toBe(0);
+    expect(h.pushed).toHaveLength(1);
+  });
+
+  it('delivers a finished delegate to the idle parent beside a serving command', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'review', true);
+    await c.result;
+    h.result([h.first]);
+    h.rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: 'Preview', detail: { command: 'npm run dev' }, status: 'done',
+      task: { id: 'serve', kind: 'command', state: 'running', since: Date.now(), serving: true } });
+    expect(h.rt.meta.serving).toBe(1);
+    c.finish();
+    await until(() => h.pushed.length === 2, 'report beside server');
+    expect(h.pushed[1].message.content).toContain('Report for review');
+  });
+
+  it('holds a failed child report across a move, limit decision and send, then attaches it to the next message once', async () => {
+    const h = await setup();
+    const locks = h.app as unknown as { moving: Set<string>; limitDecisions: Map<string, Set<string>>; sending: Map<string, number> };
+    const c = h.start('codex', 'lost', true);
+    await c.result;
+    h.result([h.first]);
+    locks.moving.add(h.id);
+    c.child().cutTurn('died');
+    await until(() => c.row().delegateReport === 'pending', 'process loss');
+    await tick();
+    expect(h.pushed).toHaveLength(1);
+    locks.moving.delete(h.id);
+    locks.limitDecisions.set(h.id, new Set(['limit']));
+    h.rt.onDelegateReport!();
+    await tick();
+    expect(h.pushed).toHaveLength(1);
+    locks.limitDecisions.delete(h.id);
+    locks.sending.set(h.id, 1);
+    h.rt.onDelegateReport!();
+    await tick();
+    expect(h.pushed).toHaveLength(1);
+    locks.sending.delete(h.id);
+    const uuid = await h.send('carry on');
+    const words = h.pushed.at(-1)!.message.content as string;
+    expect(words).toContain('The sub-agent lost its process');
+    expect(stripWrappers(words)).toBe('carry on');
+    h.rt.reset([...h.rt.items]);
+    h.rt.onDelegateReport!();
+    await tick();
+    expect(h.pushed).toHaveLength(2);
+    h.replay(uuid, words);
+    expect(c.row().delegateReport).toBe('delivered');
+    expect(h.rt.meta.delegateRecovery).toBeUndefined();
+  });
+
+  it('restores a lost delegate with its restart report and keeps a stopped one quiet', async () => {
+    const h = await setup();
+    const row = (id: string, delegateReport: 'working' | 'stopping'): ToolItem => ({
+      type: 'tool', id, ts: 1, name: 'delegate_to_codex', kind: 'agent', status: 'running', title: id, detail: {},
+      delegateReport, result: { agent: { background: 'running' } },
+    });
+    h.result([h.first]);
+    h.rt.loadRestored([row('review', 'working'), row('old', 'stopping')]);
+    h.rt.onDelegateReport!();
+    await until(() => h.pushed.length === 2, 'restart report');
+    const words = h.pushed[1].message.content as string;
+    expect(words).toContain('Sable restarted before the sub-agent reported.');
+    expect(words).not.toContain('old (');
+    h.replay(h.pushed[1].uuid, words);
+    expect(h.rt.get<ToolItem>('review')?.delegateReport).toBe('delivered');
+    expect(h.rt.get<ToolItem>('old')?.delegateReport).toBe('stopped');
+  });
+
+  it('keeps two anonymous calls on distinct delegate rows', async () => {
+    const h = await setup();
+    const a = h.start('codex', 'one', true, true);
+    const b = h.start('codex', 'two', true, true);
+    await Promise.all([a.result, b.result]);
+    expect(h.rt.delegates.size).toBe(2);
+    a.finish();
+    b.finish();
+    await until(() => h.pushed.length > 1, 'two anonymous reports');
+    expect(h.pushed[1].message.content).toContain('Report for one');
+    expect(h.pushed[1].message.content).toContain('Report for two');
+  });
+
+  it('declines a repeated explicit claim and only removes its own registration', async () => {
+    const h = await setup();
+    const a = h.start('codex', 'same', true);
+    await a.result;
+    const owner = h.rt.delegates.get('same')!;
+    const duplicate = h.start('codex', 'same', true);
+    expect(await duplicate.result).toMatchObject({ ok: false });
+    expect(h.rt.delegates.get('same')).toBe(owner);
+    const successor = { detach() {}, stop() {}, ended: Promise.resolve() };
+    h.rt.delegates.set('same', successor);
+    a.finish();
+    await owner.ended;
+    expect(h.rt.delegates.get('same')).toBe(successor);
+    expect(h.rt.pendingDelegateReports.has('same')).toBe(false);
+    expect(h.rt.items.some(i => i.type === 'text' && i.text === 'Report for same')).toBe(false);
+  });
+
+  it.each([true, false])('recovers the foreground answer only without a tool receipt (receipt %s)', async read => {
+    const h = await setup();
+    const c = h.start('codex', 'foreground');
+    await tick();
+    c.finish();
+    const answer = await c.result;
+    if (read) c.receipt(answer.text);
+    await h.rt.handle!.close('move');
+    expect(h.rt.pendingDelegateReports.has('foreground')).toBe(!read);
+    expect(c.row().result?.text).toBe(answer.text);
+  });
+
+  it('recognizes the foreground receipt when the call arrived before its native tool ID', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'late-native', false, true);
+    await tick();
+    c.finish();
+    const answer = await c.result;
+    c.receipt(answer.text);
+    await h.rt.handle!.close('move');
+    expect(h.rt.pendingDelegateReports.size).toBe(0);
+    expect(h.rt.meta.delegateRecovery).toBeUndefined();
+  });
+
+  it('recovers an in-flight foreground call when the entire bridge restarts', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'in-flight');
+    await tick();
+    await h.app.store.flush();
+    const restarted = await claudeApp(h);
+    await until(() => restarted.pushed.length > 0, 'restored foreground call');
+    expect(restarted.pushed[0].message.content).toContain('Sable restarted before the sub-agent reported.');
+    c.finish();
+    await c.result;
+  });
+
+  it('recovers a saved terminal child answer and leaves partial text unconfirmed', async () => {
+    const h = await setup();
+    h.result([h.first]);
+    const rows = ['finished', 'partial'].flatMap((id): TimelineItem[] => [
+      { type: 'tool', id, name: 'delegate_to_codex', kind: 'agent', status: 'running', title: id, detail: {}, ts: 1,
+        delegateReport: 'working', result: { agent: { background: 'running' } } },
+      { type: 'text', parentId: id, id: 'sub-123:' + id, ts: 2, text: id + ' answer', streaming: false },
+      ...(id === 'finished' ? [{ type: 'turn' as const, parentId: id, id: 'sub-123:end', ts: 3, durationMs: 1 }] : []),
+    ]);
+    h.rt.loadRestored(rows);
+    expect(h.rt.get<ToolItem>('finished')).toMatchObject({ status: 'done', delegateReport: 'pending', result: { text: 'finished answer' } });
+    expect(h.rt.get<ToolItem>('partial')?.result?.text).toBe('Sable restarted before the sub-agent reported.');
+  });
+
+  it('retains the completed foreground answer when its caller exits in the same tick', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'boundary');
+    await tick();
+    c.finish();
+    await h.rt.handle!.close('move');
+    expect(await c.result).toMatchObject({ ok: true, text: 'Report for boundary' });
+    expect(c.row()).toMatchObject({ delegateReport: 'pending', result: { text: 'Report for boundary' } });
+  });
+
+  it('preserves the child question before its display row arrives', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'review', true);
+    await c.result;
+    const answer = c.child().ask([], 'missing-nested-step');
+    const req = h.rt.prompts().questions[0];
+    expect(phoneQuestion(req)).toMatchObject({ delegateId: 'review', itemId: expect.stringContaining('missing-nested-step') });
+    h.result([h.first]);
+    expect(h.rt.answerQuestion(req.id, { choice: ['continue'] })).toBe(true);
+    expect(await answer).toEqual({ choice: ['continue'] });
+    c.finish();
+  });
+
+  it('keeps an owed report behind the person’s Stop across restart', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'stopped-wake', true);
+    await c.result;
+    h.result([h.first]);
+    const locks = h.app as unknown as { moving: Set<string> };
+    locks.moving.add(h.id);
+    c.finish();
+    await until(() => !h.rt.delegates.size, 'saved report');
+    await h.stop();
+    await h.app.store.flush();
+    const restored = await claudeApp(h);
+    await until(() => !!restored.rt.get('stopped-wake'), 'restored report');
+    await tick(100);
+    expect(restored.pushed).toHaveLength(0);
+    await restored.send('now continue');
+    expect(restored.pushed[0].message.content).toContain('Report for stopped-wake');
+  });
+
+  it('revokes a rewound delegate before its late frames and drops an empty wake', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'pruned', true);
+    await c.result;
+    c.interrupt.mockImplementation(async () => {});
+    h.result([h.first]);
+    const head = users(h.rt)[0];
+    expect(await h.app.call('session.rewind', { sessionId: h.id, itemId: head.id, restoreFiles: false })).toMatchObject({ ok: true });
+    c.finish();
+    await tick(40);
+    expect(h.rt.items.some(i => i.parentId === 'pruned')).toBe(false);
+    h.rt.pendingDelegateReports.add('missing');
+    h.rt.onDelegateReport!();
+    await tick(40);
+    expect(h.pushed).toHaveLength(1);
+  });
+
+  it('holds the third report continuation until the next personal message', async () => {
+    const h = await setup();
+    for (let n = 1; n <= 3; n++) {
+      const c = h.start('codex', 'chain-' + n, true);
+      await c.result;
+      c.finish();
+      if (n < 3) {
+        await until(() => h.pushed.length === n + 1, 'report in running turn');
+        const m = h.pushed[n];
+        h.replay(m.uuid, m.message.content as string);
+      } else {
+        await tick(100);
+        expect(c.row().delegateReport).toBe('pending');
+        expect(phoneItem(c.row())).toMatchObject({ delegateReport: 'pending', delegateWait: 'budget', status: 'done' });
+        expect(h.pushed).toHaveLength(3);
+      }
+    }
+    h.result(h.pushed.map(m => m.uuid));
+    await tick(40);
+    expect(h.pushed).toHaveLength(3);
+    await h.send('now continue');
+    expect(h.pushed.at(-1)!.message.content).toContain('Report for chain-3');
+  });
+
+  it('keeps a missing receipt uncertain when Claude history starts after compaction', async () => {
+    const h = await setup();
+    const messages = [{ type: 'user', uuid: 'summary', isCompactSummary: true, message: { content: 'Earlier conversation summarized' } },
+      { type: 'assistant', uuid: 'after', message: { content: [] } }];
+    sdk.history.mockResolvedValueOnce(messages).mockResolvedValueOnce(messages);
+    const provider = h.app.provider('claude') as ClaudeProvider;
+    expect((await provider.delegateReceipts('compacted', h.rt.meta.cwd, 'before')).settled).toBe(false);
+    expect((await provider.delegateReceipts('compacted', h.rt.meta.cwd, 'after')).settled).toBe(true);
+  });
+
+  it('knows the native report destination before Claude reads its first input', async () => {
+    const h = await claude({ live: true });
+    const destination = h.session.delegateDestination!();
+    expect(destination).toMatch(/^[a-f0-9-]{36}$/);
+    expect(h.proc().options).toMatchObject({ sessionId: destination });
+    expect(h.proc().pushed).toHaveLength(0);
+  });
+
+  it.each([true, false])('reconciles the on-disk report against native input after a crash (recorded %s)', async recorded => {
+    const h = await setup();
+    const c = h.start('codex', 'durable', true);
+    await c.result;
+    await h.app.store.flush();
+    c.finish();
+    await until(() => h.pushed.length === 2, 'report on the wire');
+    const disk = new SessionFiles(id => path.join(h.home, 'sessions', id + '.json')).load(h.id);
+    const saved = disk.items.find(i => i.id === 'durable') as ToolItem;
+    expect(saved.result?.text).toBe('Report for durable');
+    const m = h.pushed[1];
+    sdk.history.mockResolvedValueOnce([{ type: 'user', uuid: h.first, message: { content: 'delegate the review' } },
+      ...(recorded ? [{ type: 'user', uuid: m.uuid, message: m.message }] : [])]);
+    const restarted = await claudeApp(h);
+    await until(() => recorded ? restarted.rt.get<ToolItem>('durable')?.delegateReport === 'delivered' : restarted.pushed.length === 1, 'restart reconciliation');
+    expect(restarted.pushed).toHaveLength(recorded ? 0 : 1);
+    if (!recorded) expect(restarted.pushed[0].message.content).toEqual(m.message.content);
+  });
+
+  it('leaves a completed foreground result alone when the steer arrives afterwards', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'first');
+    await tick();
+    c.finish();
+    expect(await c.result).toEqual({ ok: true, text: 'Report for first' });
+    await h.send('how did it go?', true);
+    expect(c.row().delegateReport).toBeUndefined();
+    expect(h.rt.meta.background ?? 0).toBe(0);
+    expect(h.rt.pendingDelegateReports.size).toBe(0);
+  });
+});
+
+describe('interrupt and send now', () => {
+  it('preserves the authored SDK block and hides a composed report when importing a transcript', async () => {
+    const h = await claude({ meta: { providerSessionId: 'imported' } });
+    const note = '<system-reminder>A background sub-agent reported.\nReview (done)\nReady</system-reminder>';
+    const report = HANDOVER_HEAD_ACCOUNT + '\nAgent: Done\n' + HANDOVER_TAIL + HANDOVER_JOIN + 'A background sub-agent reported.\n\n' + note;
+    const words = 'I saw this ' + STEER_NOW_BLOCK + ' yesterday.';
+    sdk.history.mockReset().mockResolvedValueOnce([
+      { type: 'user', uuid: 'report', message: { content: report } },
+      { type: 'user', uuid: 'quote', message: { content: [{ type: 'text', text: words }, { type: 'text', text: STEER_NOW_BLOCK }] } },
+      { type: 'user', uuid: 'literal', message: { content: [{ type: 'text', text: STEER_NOW_BLOCK }, { type: 'text', text: STEER_FIRST_BLOCK }] } },
+      { type: 'user', uuid: 'standalone', message: { content: STEER_NOW_BLOCK } },
+      { type: 'user', uuid: 'unclosed', message: { content: '<system-reminder>' } },
+    ]);
+    await (h.session.loadTranscript as () => Promise<void>)();
+    expect(users(h.rt).map(u => u.text)).toEqual([words, STEER_NOW_BLOCK, STEER_NOW_BLOCK, '<system-reminder>']);
+    expect(users(h.rt).slice(0, 3).every(u => u.authored)).toBe(true);
+  });
+
+  it('caps automatic redelivery of a replacement after two interruptions', async () => {
+    const h = await waitingSteer();
+    await h.send('second', true);
+    const second = users(h.rt).at(-1)!;
+    await h.send('third', true);
+    const third = users(h.rt).at(-1)!;
+    const firstBatch = h.now();
+    await until(() => h.interrupt.mock.calls.length === 1, 'first scoped interrupt');
+    h.result([h.first], true);
+    await firstBatch;
+    const replacement = h.pushed.at(-3)!;
+    h.replay(replacement.uuid, h.card.text);
+    const secondBatch = h.now(second.id);
+    await until(() => h.interrupt.mock.calls.length === 2, 'second scoped interrupt');
+    h.result([replacement.uuid], true);
+    await secondBatch;
+    const waiting = h.rt.get<UserItem>(third.id)!;
+    expect(waiting.steerAttempts).toBe(2);
+    expect(waiting.steerWait?.autoAt).toBeUndefined();
+    expect(waiting.steerWait?.reason).toMatch(/limit/i);
+  });
+
+  it('rearms one refused deadline, then leaves the reason without an expired time', async () => {
+    const h = await waitingSteer(100);
+    h.replay(h.uuid, h.card.text);
+    vi.useFakeTimers();
+    h.request.mockResolvedValue({ response: { cancelled: false } });
+    await h.send('check again', true);
+    const card = users(h.rt).at(-1)!;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(card.steerWait?.autoAt).toBeGreaterThan(Date.now() + 100);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.request).toHaveBeenCalledTimes(2);
+    expect(card.steerWait?.autoAt).toBeUndefined();
+    expect(card.steerWait?.reason).toMatch(/withdrawal/);
+  });
+  it('targets the opening UUID and gives the second replacement a fresh deadline', async () => {
+    const h = await waitingSteer();
+    await h.send('one more', true);
+    const last = users(h.rt).at(-1)!;
+    const answer = h.now();
+    await until(() => !!h.interrupt.mock.calls.length, 'scoped interrupt');
+    h.result([h.first], true);
+    expect(await answer).toEqual({ ok: true });
+    expect(h.interrupt.mock.calls).toEqual([[[h.first]]]);
+    expect(h.rt.get<UserItem>(last.id)?.steerWait?.autoAt).toBeGreaterThanOrEqual(last.ts + 30_000);
+  });
+
+  it('keeps an unconfirmed survivor manual until its matching cancellation arrives', async () => {
+    const h = await waitingSteer();
+    const c = await h.send('one more', true);
+    const last = users(h.rt).at(-1)!;
+    h.request.mockResolvedValueOnce({ response: { cancelled: true } }).mockResolvedValueOnce({ response: { cancelled: false } });
+    h.interrupt.mockResolvedValueOnce({ response: { turn: 'stopped', still_queued: [c] } });
+    const answer = h.now();
+    await until(() => !!h.interrupt.mock.calls.length, 'scoped interrupt');
+    h.result([h.first], true);
+    await answer;
+    expect(h.rt.queue.find(q => q.id === last.id)).toMatchObject({ byHand: true, issuedUuid: c });
+    expect(await h.app.call('queue.sendNow', { sessionId: h.id, id: last.id })).toEqual({ ok: false });
+    expect(h.pushed).toHaveLength(4);
+    h.message({ type: 'command_lifecycle', command_uuid: c, state: 'cancelled' });
+    expect(h.rt.queue.find(q => q.id === last.id)?.issuedUuid).toBeUndefined();
+  });
+
+  it.each(['Stop', 'close'] as const)('aborts a silent recall on %s and releases its reservation', async action => {
+    const h = await waitingSteer();
+    h.request.mockImplementationOnce(() => new Promise(() => {}));
+    const pending = h.now();
+    const result = expect(pending).rejects.toThrow(/stopped|closed|changed/i);
+    await until(() => !!h.request.mock.calls.length, 'recall request');
+    if (action === 'Stop') await h.stop();
+    else await h.rt.handle!.close();
+    await result;
+    expect((h.app as unknown as { steerEnds: WeakMap<SessionRuntime, unknown> }).steerEnds.has(h.rt)).toBe(false);
+  });
+
+  it('declines without touching a CLI that cannot target the old turn', async () => {
+    const h = await waitingSteer();
+    h.message({ type: 'system', subtype: 'init', claude_code_version: '1.0' });
+    await expect(h.now()).rejects.toThrow(/target/);
+    expect(h.card.steerWait?.reason).toMatch(/target/);
+    expect(h.interrupt).not.toHaveBeenCalled();
+    expect(h.request).not.toHaveBeenCalled();
+  });
+
+  it('releases a silent recall and shows its timeout on the card', async () => {
+    const h = await waitingSteer();
+    vi.useFakeTimers();
+    h.request.mockImplementationOnce(() => new Promise(() => {}));
+    const answer = h.now().catch(() => ({ ok: false }));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(h.card.steerWait?.reason).toMatch(/timed out/i);
+    expect(await answer).toEqual({ ok: false });
+    expect(h.interrupt).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the pairing of an accepted locally held steer after its socket closes', async () => {
+    const h = await waitingSteer();
+    const session = h.rt.handle as unknown as Session;
+    session.held = [];
+    let connected = true;
+    h.app.phoneStillPaired = sender => sender.deviceId === 'pair' && sender.generation === 2;
+    await h.app.call('session.send', { sessionId: h.id, text: 'after sleep', steer: true }, {
+      phoneSender: { deviceId: 'pair', generation: 2 }, allowed: () => connected,
+    });
+    expect(h.pushed).toHaveLength(2);
+    connected = false;
+    await (session.release as () => Promise<void>)();
+    expect(h.pushed).toHaveLength(3);
+    expect(h.pushed[2].message.content).toContainEqual({ type: 'text', text: 'after sleep' });
+  });
+
+  it('restores a locally held replacement with its attachment after the interrupt fallback', async () => {
+    const h = await waitingSteer();
+    const session = h.rt.handle as unknown as Session;
+    const picture = { id: 'pic', name: 'pic.png', kind: 'image' as const, dataUrl: 'data:image/png;base64,AAAA' };
+    await h.app.call('session.send', { sessionId: h.id, text: 'see this', attachments: [picture], steer: true });
+    const last = users(h.rt).at(-1)!;
+    Object.defineProperty(session, 'namesMessages', { value: false });
+    session.worksNow = () => true;
+    const answer = h.now();
+    await until(() => !!h.interrupt.mock.calls.length, 'scoped interrupt');
+    await answer; // The old CLI never sends its result. Its background work keeps the query alive.
+    expect(h.pushed).toHaveLength(3);
+    await h.app.store.flush();
+    const file = h.app.store.loadSession(h.id);
+    for (const id of [h.card.id, last.id]) {
+      expect(file.items.find(i => i.id === id)).toMatchObject({ state: 'queued' });
+      expect((file.items.find(i => i.id === id) as UserItem).issuedUuid).toBeUndefined();
+    }
+    await h.app.dispose();
+    const restored = new App({ home: h.app.store.dir, quiet: true, providers: [() => h.app.providers.get('claude')!] });
+    cleanups.push(() => restored.dispose());
+    const snap = await restored.call('session.snapshot', { sessionId: h.id });
+    expect(snap.queue.map(q => q.id)).toEqual([h.card.id, last.id]);
+    expect(snap.queue[1].attachments).toEqual([picture]);
+  });
+
+  it('reconciles a recovered steer with its native transcript UUID before retry', async () => {
+    const h = await waitingSteer();
+    await h.app.dispose();
+    sdk.history.mockReset().mockResolvedValueOnce([{ type: 'user', uuid: h.uuid, message: { content: h.card.text } }]);
+    const app = new App({ home: h.home, quiet: true, providers: [() => h.app.providers.get('claude')!] });
+    cleanups.push(() => app.dispose());
+    await app.call('session.snapshot', { sessionId: h.id });
+    const rt = app.runtime(h.id);
+    await until(() => rt.get<UserItem>(h.card.id)?.providerId === h.uuid, 'native steer receipt');
+    expect(rt.queue.some(q => q.id === h.card.id)).toBe(false);
+    expect(rt.get<UserItem>(h.card.id)).toMatchObject({ text: h.card.text, ts: h.card.ts, state: 'sent' });
+    expect(h.pushed).toHaveLength(2);
+  });
+
+  it('commits the discard of an uncertain steer before acknowledging it', async () => {
+    const h = await waitingSteer();
+    await h.app.dispose();
+    sdk.history.mockReset().mockResolvedValueOnce([]);
+    const app = new App({ home: h.home, quiet: true, providers: [() => h.app.providers.get('claude')!] });
+    cleanups.push(() => app.dispose());
+    const snap = await app.call('session.snapshot', { sessionId: h.id });
+    expect(snap.queue).toMatchObject([{ id: h.card.id, issuedUuid: h.uuid, byHand: true }]);
+    await app.store.flush();
+    expect(await app.call('queue.remove', { sessionId: h.id, id: h.card.id })).toEqual({ ok: true });
+    expect(app.store.loadSession(h.id).queue?.some(q => q.id === h.card.id)).toBeFalsy();
+  });
+
+  it('keeps an issued steer uncertain when an older CLI sends unnamed results', async () => {
+    const h = await claude();
+    const opening = await h.send('begin');
+    await h.replay(opening.uuid, 'begin');
+    const next = await h.send('please answer first', [picture]);
+    await h.message(result());
+    await h.message(result());
+    expect(h.rt.get<UserItem>(next.item.id)).toMatchObject({ state: 'queued', issuedUuid: next.uuid });
+    await h.replay(next.uuid, next.content);
+    expect(h.rt.get<UserItem>(next.item.id)).toMatchObject({ state: 'sent', providerId: next.uuid });
+  });
+
+  it('stores an issued UUID before accepting a steer and restores it for explicit retry', async () => {
+    const h = await waitingSteer();
+    const saved = h.app.store.loadSession(h.id);
+    expect(saved.items.find(i => i.id === h.card.id)).toMatchObject({ state: 'queued', issuedUuid: h.uuid });
+    const rt = new SessionRuntime({ ...h.rt.meta }, () => {}, () => {});
+    rt.loadRestored(saved.items, saved.todos, saved.queue ?? []);
+    rt.returnUntaken({ all: true, reason: 'closed' });
+    expect(rt.queue).toMatchObject([{ id: h.card.id, text: h.card.text, byHand: true, issuedUuid: h.uuid }]);
+  });
+  it('recalls two steers, interrupts once and starts the person’s turn oldest first with a hidden note', async () => {
+    const h = await waitingSteer();
+    const later = await h.send('and the tests?', true);
+    const last = users(h.rt).at(-1)!;
+    const background = h.rt.add<ToolItem>({ type: 'tool', name: 'Agent', kind: 'agent', title: 'Other work', status: 'running', detail: {}, result: { agent: { background: 'running' } } });
+    const answer = h.now(last.id);
+    await until(() => h.interrupt.mock.calls.length === 1, 'the foreground interrupt');
+    expect(await h.now()).toEqual({ ok: false });
+    expect(h.request.mock.calls.map(([r]) => r.message_uuid)).toEqual([later, h.uuid]);
+    h.result([h.first], true);
+    expect(await answer).toEqual({ ok: true });
+    expect(h.interrupt).toHaveBeenCalledTimes(1);
+    expect(h.rt.get<ToolItem>(h.tool.id)?.status).toBe('cancelled');
+    expect(h.rt.get<ToolItem>(background.id)?.status).toBe('running');
+    expect(h.pushed).toHaveLength(5);
+    for (const [i, card] of [h.card, last].entries()) {
+      const send = h.pushed[3 + i];
+      expect(send.message.content).toEqual([{ type: 'text', text: card.text }, { type: 'text', text: STEER_NOW_BLOCK }]);
+      h.message({ type: 'user', isReplay: true, uuid: send.uuid, message: { content: send.message.content } });
+    }
+    expect(parseSynthetic(STEER_NOW_BLOCK)?.role).toBe('hidden');
+    expect(stripWrappers('answer me\n' + STEER_NOW_BLOCK)).toBe('answer me');
+    expect(h.rt.turnActive).toBe(true);
+    expect(h.rt.get<UserItem>(h.card.id)).toMatchObject({ state: 'sent', ts: h.card.ts });
+    expect(h.rt.get<UserItem>(h.card.id)?.steered).toBeUndefined();
+    expect(users(h.rt).map(u => u.text)).toEqual(['do the work', 'answer me', 'and the tests?']);
+    h.result(h.pushed.slice(3).map(m => m.uuid));
+    expect(h.rt.turnActive).toBe(false);
+    expect(h.rt.queue).toEqual([]);
+  });
+
+  it('leaves a steer already taken by the SDK alone, even if its replay arrives late', async () => {
+    const h = await waitingSteer();
+    h.request.mockResolvedValueOnce({ response: { cancelled: false } });
+    expect(await h.now()).toEqual({ ok: false });
+    h.replay(h.uuid, h.card.text);
+    expect(await h.now()).toEqual({ ok: false });
+    expect(h.request).toHaveBeenCalledTimes(1);
+    expect(h.interrupt).not.toHaveBeenCalled();
+    expect(h.pushed).toHaveLength(2);
+  });
+
+  it('honors Stop after the old result and before the replacement reaches the SDK', async () => {
+    const h = await waitingSteer();
+    let release!: () => void;
+    h.app.beforeFirstInput = () => new Promise(resolve => { release = resolve; });
+    const answer = h.now();
+    await until(() => h.interrupt.mock.calls.length === 1, 'interrupt');
+    h.result([h.first], true);
+    await until(() => !!release, 'replacement waiting for dispatch');
+    await h.stop();
+    release();
+    await expect(answer).rejects.toThrow(/stopped/i);
+    expect(h.pushed).toHaveLength(2);
+    expect(h.rt.queue.map(q => q.id)).toEqual([h.card.id]);
+    expect(h.rt.get(h.card.id)).toBeUndefined();
+  });
+
+  it('returns the unread replacement if the new process dies before its replay', async () => {
+    const h = await claude({ live: true });
+    const item = h.rt.add<UserItem>({ type: 'user', text: 'answer me', state: 'sent' });
+    await h.session.send(item, { steerNow: true });
+    h.proc().end(new Error('Process ended before replay'));
+    await until(() => !h.rt.turnActive, 'process exit');
+    expect(h.rt.get(item.id)).toBeUndefined();
+    expect(h.rt.queue.map(q => [q.id, q.text])).toEqual([[item.id, item.text]]);
+    expect(h.rt.unreadQueueHeld).toBe(true);
+  });
+
+  it('refuses before touching the SDK while a move, limit decision or switch is in progress', async () => {
+    const h = await waitingSteer();
+    const locks = h.app as unknown as { moving: Set<string>; switching: Set<string>; limitDecisions: Map<string, Set<string>> };
+    locks.moving.add(h.id);
+    await expect(h.now()).rejects.toThrow(/moving/);
+    locks.moving.delete(h.id);
+    locks.limitDecisions.set(h.id, new Set());
+    await expect(h.now()).rejects.toThrow(/limit/);
+    locks.limitDecisions.delete(h.id);
+    locks.switching.add(h.id);
+    await expect(h.now()).rejects.toThrow(/switching/);
+    locks.switching.delete(h.id);
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.interrupt).not.toHaveBeenCalled();
+  });
+
+  it.each(['stop', 'unpair', 'send failure'])('keeps the message in the queue after %s', async cause => {
+    const h = await waitingSteer();
+    let paired = true;
+    const answer = h.now(h.card.id, () => paired);
+    await until(() => h.interrupt.mock.calls.length === 1, 'interrupt before competing action');
+    if (cause === 'stop') await h.stop();
+    if (cause === 'unpair') paired = false;
+    if (cause === 'send failure') vi.spyOn(h.rt.handle!, 'send').mockRejectedValueOnce(new Error('failed'));
+    h.result([h.first], true);
+    await expect(answer).rejects.toThrow();
+    expect(h.interrupt).toHaveBeenCalledTimes(1);
+    expect(h.pushed).toHaveLength(2);
+    expect(h.rt.queue.map(q => [q.id, q.text])).toEqual([[h.card.id, h.card.text]]);
+    expect(h.rt.get(h.card.id)).toBeUndefined();
+    expect(h.rt.turnActive).toBe(false);
+  });
+});
 
 it('keeps the personal retry and the Fable window together at the app handoff', async () => {
   const h = await claudeApp();

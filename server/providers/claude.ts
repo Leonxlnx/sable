@@ -61,14 +61,16 @@ import { agentLimitOf, appPictures, backgroundTaskOf, baseName, describeTool, fl
 import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoice } from './types';
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
-import { CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
-import { HANDOVER_JOIN, isAuthFailure, isCompactOutput, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
+import { chatReplyInstruction, CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
+import { withoutHandover, HANDOVER_JOIN, STEER_NOW_BLOCK, isAuthFailure, isCompactOutput, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled, cleanToolInput, streamsInput } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
 import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from './widget-tool';
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
+import { anonymousDelegateStep } from '../core/delegate-result';
+import { readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
 import { record, type AuthScope, type EndReason, type StartReason } from '../core/auth-journal';
 import { GATE, type GatedProcess, authFailurePending, authGate, gateKey, noteAuthFailure, refusedForSignIn } from '../core/auth-gate';
@@ -277,8 +279,6 @@ export class ClaudeProvider implements Provider {
   private infoCache?: { at: number; info: ProviderInfo };
   private capsCache = new Map<string, { at: number; caps: Capabilities }>();
   private capsInflight = new Map<string, Promise<Capabilities>>();
-  /** Tool steps a sub-agent call has already nested under (see `claimStep`). */
-  private claimedSteps = new Set<string>();
   private loginProc?: ChildProcess;
   /** The sign-in in progress, run through Claude Code's own SDK flow (see `login`). */
   private auth?: { q: AuthQuery; input: PushQueue<SDKUserMessage> };
@@ -596,8 +596,8 @@ export class ClaudeProvider implements Provider {
    * generative UI on, one line that reminds the model the widget tool exists (a tool description
    * alone is rarely enough for a model to reach for an optional tool unprompted).
    */
-  appendix(meta?: Pick<SessionMeta, 'options' | 'custom'>): string {
-    return [this.concise() ? CONCISE_REPLIES_PROMPT : '', this.widgets() ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText(), this.customText(meta)].filter(Boolean).join('\n\n');
+  appendix(meta?: Pick<SessionMeta, 'options' | 'custom'> & { id?: string }): string {
+    return [this.concise() ? CONCISE_REPLIES_PROMPT : '', this.widgets() ? WIDGET_FENCE_HINT : '', meta && browserTabEnabled(meta) ? BROWSER_HINT : '', meta && deviceEnabled(meta) ? DEVICE_HINT : '', this.profileText(), this.customText(meta), chatReplyInstruction(this.ctx.settings?.(), meta)].filter(Boolean).join('\n\n');
   }
 
   /** The Customize chat's brief: only for that chat (`SessionMeta.custom`). */
@@ -626,7 +626,7 @@ export class ClaudeProvider implements Provider {
     }
   }
 
-  agentOptions(meta: Pick<SessionMeta, 'cwd' | 'model' | 'effort' | 'mode' | 'options' | 'providerSessionId' | 'ultracode' | 'custom'>, owner: WarmOwner, resumeAt?: string): Options {
+  agentOptions(meta: Pick<SessionMeta, 'cwd' | 'model' | 'effort' | 'mode' | 'options' | 'providerSessionId' | 'ultracode' | 'custom'> & { id?: string }, owner: WarmOwner, resumeAt?: string): Options {
     const extraArgs: Record<string, string | null> = { 'replay-user-messages': null };
     // Claude in Chrome is a start-up flag; without it the CLI follows the machine's /chrome setting.
     if (meta.options?.browser) extraArgs.chrome = null;
@@ -637,7 +637,7 @@ export class ClaudeProvider implements Provider {
     // allowed without the CLI's prompt (the browser tools ask for pages that are not local themselves).
     const browser = browserTabEnabled(meta);
     // Sub-agents from the other agent (Codex), while it is installed and signed in.
-    const delegates = (this.ctx.otherAgents?.() ?? []).filter((a) => a !== 'claude' && AGENT_TOOLS[a]);
+    const delegates = meta.id?.startsWith('sub-') || meta.options?.readOnly ? [] : (this.ctx.otherAgents?.() ?? []).filter(a => AGENT_TOOLS[a]);
     // The Android device tools (the session's "Device" capability) ask for real phones themselves.
     const device = deviceEnabled(meta);
     // The user's profile: remember_about_user merges one fact into it (never secrets).
@@ -649,10 +649,11 @@ export class ClaudeProvider implements Provider {
       delegates.length && runAgent
         ? {
             agents: delegates,
-            run: (call: AgentCall, signal?: AbortSignal) => {
+            run: (call: AgentCall, signal?: AbortSignal, stepId?: string) => {
               const rt = owner.session?.runtime();
               if (!rt) return Promise.resolve({ ok: false, text: 'No session is attached yet.' });
-              const step = claimStep(rt, (it) => agentOfTool(it.name) === call.agent, this.claimedSteps);
+              const mine = (it: ToolItem) => agentOfTool(it.name) === call.agent;
+              const step = stepId ?? claimStep(rt, it => mine(it) && it.detail.prompt === call.prompt) ?? claimStep(rt, mine);
               return runAgent(rt, call, step, signal);
             },
           }
@@ -737,7 +738,7 @@ export class ClaudeProvider implements Provider {
   private warm?: { key: string; q: Query; input: PushQueue<SDKUserMessage>; owner: WarmOwner; timer: NodeJS.Timeout };
 
   async prewarm(choice: WarmChoice) {
-    const key = warmKey(choice, this.concise(), this.widgets(), this.profileText());
+    const key = warmKey(choice, this.concise(), this.widgets(), this.profileText(), chatReplyInstruction(this.ctx.settings?.(), choice));
     if (this.warm?.key === key) {
       this.warm.timer.refresh();
       return;
@@ -1100,8 +1101,35 @@ export class ClaudeProvider implements Provider {
   }
 
   /** Copies the conversation's transcript files from another account's folder into this one (see accounts/handover). */
+  async delegateReceipts(session: string, cwd: string, after?: string) {
+    const messages = await this.withHistory(() => getSessionMessages(session, { dir: cwd, includeSystemMessages: true }));
+    if (!messages.length) throw new Error('The Claude conversation is unavailable for report reconciliation.');
+    const receipts = new Set<string>();
+    for (const row of messages) {
+      if (row.type !== 'user') continue;
+      const content = (row.message as Obj)?.content;
+      if (typeof content === 'string') readDelegateIds(content, receipts);
+      else if (Array.isArray(content)) for (const block of content) {
+        if (block.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, receipts);
+        if (block.type === 'tool_result') {
+          receipts.add('tool:' + block.tool_use_id);
+          const synthetic = anonymousDelegateStep(block.content);
+          if (synthetic) receipts.add('tool:' + synthetic);
+        }
+      }
+    }
+    // A large transcript can start at a compact boundary. Its missing prefix proves no negative receipts.
+    const compact = messages.findLastIndex(row => (row as Obj).isCompactSummary || row.type === 'system' && ((row as Obj).subtype ?? (row.message as Obj)?.subtype) === 'compact_boundary');
+    return { ids: receipts, settled: compact < 0 || !!after && messages.slice(compact).some(row => row.uuid === after) };
+  }
+
   async adoptConversation(fromHome: string, providerSessionId: string): Promise<boolean> {
     return carryClaudeConversation(fromHome, this.configHome(), providerSessionId);
+  }
+
+  async steerReceipts(session: string, cwd: string, issued: Set<string>) {
+    const rows = await this.withHistory(() => getSessionMessages(session, { dir: cwd }));
+    return rows.filter(row => row.type === 'user' && !row.parent_tool_use_id && issued.has(row.uuid)).map(row => row.uuid);
   }
 
   async history(cwd?: string, limit = 40): Promise<HistoryEntry[]> {
@@ -1315,6 +1343,7 @@ const COMPUTER_USE_SERVER = 'computer-use';
 /** Who answers permission prompts for an agent process (set when a session adopts a warm one). */
 interface WarmOwner {
   session?: ClaudeSession;
+  nativeId?: string;
   scope?: AuthScope;
   child?: GatedProcess;
   childExited?: Promise<void>;
@@ -1323,6 +1352,9 @@ interface WarmOwner {
 
 /** Capture the actual process even when it starts asynchronously or is adopted from the warm pool. */
 function sessionQuery(prompt: PushQueue<SDKUserMessage>, options: Options, owner: WarmOwner): Query {
+  // A report can be the very first input after a switch. Its outbox needs the
+  // conversation UUID before the CLI emits its first session_id frame.
+  owner.nativeId = options.resume ?? options.sessionId ?? randomUUID();
   const spawnProcess = authGate.spawner(options.stderr, undefined, owner.scope);
   let spawned = false;
   let exit!: () => void;
@@ -1333,6 +1365,7 @@ function sessionQuery(prompt: PushQueue<SDKUserMessage>, options: Options, owner
     prompt,
     options: {
       ...options,
+      ...(options.resume ? {} : { sessionId: owner.nativeId }),
       spawnClaudeCodeProcess(request) {
         const child = owner.child = spawnProcess(request);
         spawned = true;
@@ -1378,17 +1411,17 @@ export function titleOptions(prompt: TitlePrompt, env: NodeJS.ProcessEnv, abortC
   };
 }
 
-function warmKey(c: { cwd: string; model?: string; mode?: string; effort?: Effort; options?: SessionOptions; ultracode?: boolean; custom?: boolean }, concise: boolean, widgets = true, profile = '') {
+function warmKey(c: { cwd: string; model?: string; mode?: string; effort?: Effort; options?: SessionOptions; ultracode?: boolean; custom?: boolean }, concise: boolean, widgets = true, profile = '', reply = '') {
   const o = c.options ?? {};
   // A process warmed for an ordinary chat never serves the Customize chat (its prompt carries the brief).
-  return JSON.stringify([path.resolve(c.cwd).toLowerCase(), c.model && c.model !== 'default' ? c.model : '', c.mode || 'default', sdkEffort(c.effort) ?? '', o.browser ?? null, !!c.ultracode, concise, widgets, o.browserTab !== false, deviceEnabled(c), profile, !!c.custom]);
+  return JSON.stringify([path.resolve(c.cwd).toLowerCase(), c.model && c.model !== 'default' ? c.model : '', c.mode || 'default', sdkEffort(c.effort) ?? '', o.browser ?? null, !!c.ultracode, concise, widgets, o.browserTab !== false, deviceEnabled(c), profile, !!c.custom, reply]);
 }
 
 /** Control requests the SDK does not wrap (remote_control, mcp_call): the CLI answers them on stdio. */
-function controlRequest(q: Query, request: Obj): Promise<unknown> {
-  const send = (q as unknown as { request?: (r: Obj) => Promise<{ response?: unknown }> }).request;
+function controlRequest(q: Query, request: Obj, signal?: AbortSignal): Promise<unknown> {
+  const send = (q as unknown as { request?: (r: Obj, options?: { signal?: AbortSignal }) => Promise<{ response?: unknown }> }).request;
   if (typeof send !== 'function') return Promise.reject(new Error('This Claude Code version does not support it.'));
-  return send.call(q, request).then((r) => r?.response);
+  return send.call(q, request, signal ? { signal } : undefined).then((r) => r?.response);
 }
 
 function mapMcp(s: Obj): McpServerInfo {
@@ -1426,6 +1459,11 @@ interface OwnSend {
   /** Claude Code took it (replayed, stamped on a reply, or found by its words); and replayed it under its own uuid. */
   read: boolean;
   replayed: boolean;
+  recalled?: boolean;
+  recallPending?: boolean;
+  steerNow?: boolean;
+  /** Recheck the sender if this input was held for an older turn's outstanding result. */
+  heldCheck?: () => void;
   answered?: boolean;
   guessed?: boolean;
   onTaken?: () => void;
@@ -1502,6 +1540,14 @@ class ClaudeSession implements ProviderSession {
    * them back to the queue.
    */
   private held?: SDKUserMessage[];
+  private heldDeadline?: ReturnType<typeof setTimeout>;
+  private releasingHeld = false;
+  private scopedInterrupt = false;
+  private steerInterruptPending = false;
+  private steerTarget?: { q: Query; turn: number; uuid: string };
+  private steerGeneration = new AbortController();
+  private interruptSurvivors = new Set<string>();
+  private cancelledInputs = new Set<string>();
   /** A new agent process has not said hello yet (system/init): the live line says "Starting", not "Thinking". */
   private booting = false;
   private idleTimer?: NodeJS.Timeout;
@@ -1552,7 +1598,7 @@ class ClaudeSession implements ProviderSession {
   /** Let go by the bridge (`close`): it never starts a process again, so a message meant for it never reaches the account the chat left. */
   private retired = false;
   /** Children which may still be writing this session's transcript, including after SDK cleanup. */
-  private exits = new Set<Promise<void>>();
+  private exits = new Map<Promise<void>, WarmOwner>();
   /**
    * The CLI's running total (`total_cost_usd`) as last seen in this process, which each result's cost
    * is counted from (review of 23 Nov, D-cost). A process that resumes a conversation starts from the
@@ -1683,7 +1729,7 @@ class ClaudeSession implements ProviderSession {
 
   /** Work running in the process now, a turn aside: a prompt open, the CLI's own word that it works, a live task. */
   private worksNow(): boolean {
-    return this.promptsOpen() || this.cliBusy() || this.liveIds().size > 0;
+    return this.rt.delegates.size > 0 || this.promptsOpen() || this.cliBusy() || this.liveIds().size > 0;
   }
 
   private promptsOpen(): boolean {
@@ -1732,14 +1778,14 @@ class ClaudeSession implements ProviderSession {
    * and workflows, background commands and monitors (and any other task that is not ambient), when the
    * oldest of those commands began, and its next scheduled wake-up. Nothing without a process.
    */
-  liveWork(purpose: 'move' | 'update' = 'move'): ReturnType<NonNullable<ProviderSession['liveWork']>> {
+  liveWork(purpose: 'move' | 'update' | 'wake' = 'move'): ReturnType<NonNullable<ProviderSession['liveWork']>> {
     if (!this.q) return { turn: false, agents: 0, commands: 0 };
     let agents = 0;
     let commands = 0;
     let oldest: number | undefined;
     let newest: number | undefined;
     for (const task of this.backgroundTasks()) {
-      if (purpose === 'update' && this.rt.taskServes(task.id)) continue;
+      if (purpose !== 'move' && this.rt.taskServes(task.id)) continue;
       if (task.agent) agents++;
       else {
         commands++;
@@ -1770,7 +1816,7 @@ class ClaudeSession implements ProviderSession {
    */
   exited(): Promise<void> {
     if (!this.exits.size) return Promise.resolve();
-    const p = Promise.all(this.exits);
+    const p = Promise.all(this.exits.keys());
     return new Promise<void>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('The agent process has not ended yet.')), EXIT_WAIT_MS);
       void p.then(() => {
@@ -1787,6 +1833,13 @@ class ClaudeSession implements ProviderSession {
 
   /** Tasks, wakes, pending option changes and unmatched frames belong to one query. */
   private resetProcessState() {
+    this.steerGeneration.abort(new Error('Claude process changed.'));
+    this.steerGeneration = new AbortController();
+    this.scopedInterrupt = false;
+    this.steerInterruptPending = false;
+    this.steerTarget = undefined;
+    this.interruptSurvivors.clear();
+    this.cancelledInputs.clear();
     this.wakeLimit = undefined;
     this.limitResultOwed = false;
     this.limitHit = undefined;
@@ -1838,7 +1891,7 @@ class ClaudeSession implements ProviderSession {
     const rt = this.rt;
     const meta = rt.workMode === rt.meta.mode ? rt.meta : { ...rt.meta, mode: rt.workMode };
     // A process started while the user was typing on the home screen, for exactly this choice.
-    const warm = !meta.providerSessionId && !this.resumeAt ? this.provider.takeWarm(warmKey(meta, this.provider.concise(), this.provider.widgets(), this.provider.profileText())) : undefined;
+    const warm = !meta.options?.readOnly && !meta.id.startsWith('sub-') && !meta.providerSessionId && !this.resumeAt ? this.provider.takeWarm(warmKey(meta, this.provider.concise(), this.provider.widgets(), this.provider.profileText(), chatReplyInstruction(this.provider.ctx.settings?.(), meta))) : undefined;
     let q: Query;
     let input: PushQueue<SDKUserMessage>;
     const owner: WarmOwner = warm?.owner ?? { scope: this.provider.scope(meta.options?.readOnly ? 'check' : meta.id.startsWith('sub-') ? 'sub-agent' : 'chat') };
@@ -1869,7 +1922,7 @@ class ClaudeSession implements ProviderSession {
     this.resetProcessState();
     this.heardAt = Date.now();
     const exit = owner.childExited!; // Installed when this query was created, including for a warm process.
-    this.exits.add(exit);
+    this.exits.set(exit, owner);
     void exit.then(() => this.exits.delete(exit));
     void this.pump(q).catch((err) => this.log('claude: reading the agent process failed:', (err as Error).message)).finally(owner.streamEnded);
     void q
@@ -2031,7 +2084,19 @@ class ClaudeSession implements ProviderSession {
     this.restart();
   }
 
+  delegateCheckpoint() { return this.chain.at(-1); }
+
+  delegateDestination() {
+    if (!this.rt.meta.providerSessionId) this.ensure();
+    return this.rt.meta.providerSessionId ?? this.owner?.nativeId;
+  }
+
   /** Looks at a waiting restart once the event at hand is handled. */
+  delegateEnded() {
+    this.release();
+    this.freeLater();
+  }
+
   private freeLater(ms = 0) {
     if (!this.restartPending) return;
     clearTimeout(this.restartTimer);
@@ -2089,11 +2154,20 @@ class ClaudeSession implements ProviderSession {
     }
     // Let go by Sable: what it held was settled then (`shutdown`).
     if (this.q !== q) return;
-    // The process ended by itself.
+    // The process ended by itself. Its unread urgent replacements are still the person's to send.
+    const missed = new Set<string>();
+    for (const [uuid, id] of this.pendingUsers) {
+      const own = this.own.get(uuid);
+      if (own?.steerNow && own.q === q && this.awaiting.get(uuid)?.read === false) {
+        missed.add(id);
+        this.forgetRecalled(uuid);
+      }
+    }
+    this.rt.returnUntaken({ ids: missed, holdQueue: true, reason: 'failed' });
     const wakeLimit = this.takeWakeLimit();
     this.releaseQueryReceipts(q);
     const lost = this.rt.tasksLost('process', 'death');
-    this.rt.processGeneration++;
+    this.rt.endDelegateGeneration();
     this.q = undefined;
     this.input = undefined;
     this.resetProcessState();
@@ -2320,7 +2394,7 @@ class ClaudeSession implements ProviderSession {
       this.clearLiveState();
       // Its pump, which settles all this when the process ends by itself, skips a process let go here (review wave 7, #5).
       lost = this.rt.tasksLost(why, trigger);
-      this.rt.processGeneration++;
+      this.rt.endDelegateGeneration();
       this.resetProcessState();
       this.rt.stopBackground();
       if (!this.rt.turnActive) this.rt.cutTurn('closed');
@@ -2345,9 +2419,20 @@ class ClaudeSession implements ProviderSession {
    * the process has really ended, or after `EXIT_WAIT_MS` (a move copies a transcript only once
    * `exited` says it ended).
    */
+  async terminateDelegate() {
+    await this.terminateDelegateProcesses();
+    await this.close();
+  }
+
+  private async terminateDelegateProcesses() {
+    await Promise.all([...this.exits.values()].map(owner => owner.child?.terminateDelegate()));
+  }
+
   async close(reason?: EndReason) {
     this.retired = true;
     this.closed = true;
+    clearTimeout(this.heldDeadline);
+    this.heldDeadline = undefined;
     this.held = undefined;
     clearTimeout(this.interruptTimer);
     clearTimeout(this.releaseTimer);
@@ -2370,7 +2455,7 @@ class ClaudeSession implements ProviderSession {
     this.tellLost(lost, 'process');
     this.provider.sessions.delete(this);
     // Bounded: a process that does not end in time is not waited for here (`exited` says so to a move).
-    await this.exited().catch(() => {});
+    await this.exited().catch(() => this.rt.id.startsWith('sub-') ? this.terminateDelegateProcesses() : undefined);
   }
 
   /**
@@ -2391,18 +2476,19 @@ class ClaudeSession implements ProviderSession {
 
   async send(item: UserItem, opts?: SendOptions) {
     try {
-      this.sendInput(item, opts);
+      await this.sendInput(item, opts);
     } catch (error) {
       opts?.release?.();
       throw error;
     }
   }
 
-  private sendInput(item: UserItem, opts?: SendOptions) {
+  private async sendInput(item: UserItem, opts?: SendOptions) {
     // The sender's guard (review wave 6, #3): everything from here to the push into the stream runs at once.
     opts?.check?.();
     // Let go by the bridge (the chat moved, or closed): never a process on the account it left (review of 23 Nov, D6).
     if (this.retired) throw new Error(RETIRED);
+    if (this.interrupted && this.rt.turnActive) throw new Error('The running turn is stopping.');
     // Otherwise the SDK reports a missing cwd as a binary that "failed to launch".
     if (!existsSync(this.rt.meta.cwd)) throw new Error(`The folder ${this.rt.meta.cwd} does not exist.`);
     this.closed = false;
@@ -2422,6 +2508,21 @@ class ClaudeSession implements ProviderSession {
     this.ensure();
     clearTimeout(this.idleTimer);
     const uuid = randomUUID();
+    const durable = item.steered || opts?.steerNow || !!item.steerAttempts;
+    if (durable) {
+      const batch = this.held;
+      const query = this.q;
+      const turn = this.turnSeq;
+      this.rt.patch<UserItem>(item.id, { state: 'queued', issuedUuid: batch ? undefined : uuid });
+      try {
+        if (this.rt.persistInput) await this.rt.persistInput();
+        opts?.check?.();
+        if (this.held !== batch || this.q !== query || turn !== this.turnSeq || this.retired || (this.interrupted && this.rt.turnActive) || !this.rt.get(item.id)) throw new Error('The turn changed before delivery.');
+      } catch (error) {
+        this.rt.patch<UserItem>(item.id, { issuedUuid: undefined });
+        throw error;
+      }
+    }
     this.pendingUsers.set(uuid, item.id);
     const images = (item.attachments ?? []).filter((a) => a.kind === 'image' && a.dataUrl);
     const files = (item.attachments ?? []).filter((a) => a.kind !== 'image' && a.path);
@@ -2442,15 +2543,16 @@ class ClaudeSession implements ProviderSession {
     // (a block of its own after their words; the conversation shows only what they wrote). Not for a
     // slash command, which is not a question.
     const steerFirst = !!item.steered && this.rt.turnActive && !/^\/[\w:-]+/.test(item.text.trim());
+    const reminder = opts?.steerNow ? STEER_NOW_BLOCK : steerFirst ? STEER_FIRST_BLOCK : undefined;
     const content: unknown =
-      images.length || steerFirst
+      images.length || reminder
         ? [
             ...images.map((a) => {
               const m = a.dataUrl!.match(/^data:([^;]+);base64,(.*)$/);
               return { type: 'image', source: { type: 'base64', media_type: m?.[1] ?? 'image/png', data: m?.[2] ?? '' } };
             }),
             { type: 'text', text },
-            ...(steerFirst ? [{ type: 'text', text: STEER_FIRST_BLOCK }] : []),
+            ...(reminder ? [{ type: 'text', text: reminder }] : []),
           ]
         : text;
     this.awaiting.set(uuid, { read: false });
@@ -2459,8 +2561,10 @@ class ClaudeSession implements ProviderSession {
     this.own.set(uuid, {
       itemId: item.id, words: plainWords(card?.type === 'user' ? card.text : item.text), sent: plainWords(text),
       at: Date.now(), q: this.held ? undefined : this.q, read: false, replayed: false, onTaken: opts?.taken, release: opts?.release, uncertain: opts?.uncertain,
+      steerNow: opts?.steerNow,
+      heldCheck: this.held && durable ? opts?.check : undefined,
       proofBlocks: [
-        ...(steerFirst ? [STEER_FIRST_BLOCK] : []),
+        ...(reminder ? [reminder] : []),
         ...(card?.type === 'user' && item.text !== card.text ? [text] : []),
       ],
     });
@@ -2491,14 +2595,36 @@ class ClaudeSession implements ProviderSession {
       message: { role: 'user', content },
       // Steered: taken at the agent's next step (between tool calls) and nothing it did is discarded.
       // "now" would abort the step in flight; "later" would wait for the turn to end.
-      ...(item.steered && this.rt.turnActive ? { priority: 'next' } : {}),
+      ...((item.steered || opts?.delegateReport) && this.rt.turnActive ? { priority: 'next' } : {}),
     } as unknown as SDKUserMessage;
+
     if (this.held) {
       this.held.push(msg);
+      if (durable && !this.heldDeadline) {
+        const batch = this.held;
+        this.heldDeadline = setTimeout(() => {
+          this.heldDeadline = undefined;
+          if (this.held !== batch || this.releasingHeld) return;
+          const ids = new Set<string>();
+          for (const input of batch) {
+            const uuid = input.uuid!;
+            const id = this.pendingUsers.get(uuid);
+            if (id) ids.add(id);
+            this.forgetRecalled(uuid);
+          }
+          this.held = undefined;
+          this.rt.returnUntaken({ ids, byHand: ids, holdQueue: true });
+          for (const id of ids) this.rt.queueReason(id, 'Held locally. Claude did not finish the previous turn.');
+          this.finishTurn(undefined, false, true);
+        }, 10_000);
+        this.heldDeadline.unref?.();
+      }
       this.rt.update({ activity: HELD_LINE });
       return;
     }
     this.input!.push(msg);
+    if (item.steered && card?.state === 'queued') this.rt.onUnreadSteer?.(item.id, !!opts?.steerNow);
+    if (item.steered) this.rt.releaseDelegates();
   }
 
   /**
@@ -2506,21 +2632,54 @@ class ClaudeSession implements ProviderSession {
    * the process went idle or ended (none is coming any more), or its last background task ended (then
    * the process, which still owes it, is let go and they go to a new one). Otherwise they wait on.
    */
-  private release() {
+  private async release() {
     const held = this.held;
-    if (!held) return;
+    if (!held || this.releasingHeld) return;
     if (this.q && this.owed.length && !this.namesMessages) {
       if (this.worksNow() || Date.now() < this.taskEndUntil) return this.recheckHeld();
       this.setAside();
     }
     clearTimeout(this.releaseTimer);
-    this.held = undefined;
-    this.ensure();
+    clearTimeout(this.heldDeadline);
+    this.heldDeadline = undefined;
+    this.releasingHeld = true;
+    const missed = new Set<string>();
     for (const m of held) {
-      // It goes to this process now (a late take is looked for only from the process a message went to).
-      const o = this.own.get((m as { uuid?: string }).uuid ?? '');
-      if (o) o.q = this.q;
-      this.input!.push(m);
+      const uuid = m.uuid ?? '';
+      const own = this.own.get(uuid);
+      if (this.held !== held) break;
+      try {
+        own?.heldCheck?.();
+        const q = this.ensure();
+        if (own && (own.heldCheck || own.steerNow || this.rt.get<UserItem>(own.itemId)?.steered)) {
+          this.rt.patch<UserItem>(own.itemId, { issuedUuid: uuid });
+          if (this.rt.persistInput) await this.rt.persistInput();
+          own.heldCheck?.();
+          if (this.held !== held || this.q !== q || !this.awaiting.has(uuid) || !this.rt.turnActive || this.interrupted) throw new Error('The turn changed before delivery.');
+        }
+        if (own) {
+          own.heldCheck = undefined;
+          own.q = q;
+        }
+        this.input!.push(m);
+      } catch {
+        if (own) {
+          const card = this.rt.get<UserItem>(own.itemId);
+          if (card && (!card.issuedUuid || card.issuedUuid === uuid)) {
+            this.rt.patch<UserItem>(own.itemId, { issuedUuid: undefined });
+            missed.add(own.itemId);
+          }
+        }
+        this.forgetRecalled(uuid);
+        continue;
+      }
+      if (own && this.rt.get<UserItem>(own.itemId)?.steered) this.rt.onUnreadSteer?.(own.itemId, true);
+    }
+    this.releasingHeld = false;
+    if (this.held === held) this.held = undefined;
+    if (missed.size) {
+      this.rt.returnUntaken({ ids: missed, holdQueue: true, reason: 'failed' });
+      if (!this.awaiting.size) return this.finishTurn(undefined, false, true);
     }
     if (this.rt.turnActive && this.rt.meta.activity === HELD_LINE) this.rt.update({ activity: this.booting ? 'Starting' : 'Thinking' });
   }
@@ -2536,10 +2695,145 @@ class ClaudeSession implements ProviderSession {
     this.releaseTimer.unref?.();
   }
 
+  /** The SDK confirmed withdrawal, or this input never left Sable. Remember its UUID as ours. */
+  private forgetRecalled(uuid: string) {
+    const own = this.own.get(uuid);
+    if (own) {
+      own.recalled = true;
+      own.onTaken = undefined;
+      own.heldCheck = undefined;
+      this.releaseReceipt(own);
+    }
+    this.awaiting.delete(uuid);
+    this.pendingUsers.delete(uuid);
+    this.sentItems.delete(uuid);
+    this.withdrawn.delete(uuid);
+  }
+
+  private async steerRequest(q: Query, request: Obj, signal?: AbortSignal) {
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new Error('Claude control request timed out.')), 3000);
+    const stop = AbortSignal.any([this.steerGeneration.signal, timeout.signal, ...(signal ? [signal] : [])]);
+    let abort: (() => void) | undefined;
+    try {
+      stop.throwIfAborted();
+      return await Promise.race([
+        new Promise<never>((_, reject) => { abort = () => reject(stop.reason); stop.addEventListener('abort', abort, { once: true }); }),
+        controlRequest(q, request, stop),
+      ]) as Obj | undefined;
+    } finally {
+      clearTimeout(timer);
+      if (abort) stop.removeEventListener('abort', abort);
+    }
+  }
+
+  async recallSteers(itemId: string, check: () => void, signal?: AbortSignal, automatic = false): Promise<string[]> {
+    const q = this.q;
+    if (!q || this.interrupted || !this.rt.turnActive) return [];
+    const turn = this.turnSeq;
+    const opener = [...this.awaiting].find(([, input]) => input.read)?.[0];
+    if (!this.scopedInterrupt || !opener) throw new Error('Claude cannot target this turn for interruption.');
+    this.steerTarget = { q, turn, uuid: opener };
+    const waiting = [...this.pendingUsers].filter(([uuid, id]) => {
+      const card = this.rt.get<UserItem>(id);
+      if (automatic && (card?.steerAttempts ?? 0) >= 2) return false;
+      return card?.type === 'user' && !card.parentId && !card.remote && card.steered && card.state === 'queued' && this.awaiting.get(uuid)?.read === false && (card.authored || parseSynthetic(card.text)?.role !== 'hidden');
+    });
+    const target = waiting.find(([, id]) => id === itemId);
+    if (!target) return [];
+    const recalled = new Set<string>();
+    // Claim the selected card first. A CLI that already took it refuses the withdrawal:
+    // its work goes on, even if its replay has not reached the bridge yet.
+    try {
+      for (const [uuid, id] of [target, ...waiting.filter(entry => entry !== target)]) {
+        check();
+        if (this.q !== q || this.turnSeq !== turn || this.interrupted) break;
+        if (!this.pendingUsers.has(uuid)) continue;
+        const own = this.own.get(uuid);
+        if (own) own.recallPending = true;
+        const receipt = await this.steerRequest(q, { subtype: 'cancel_async_message', message_uuid: uuid }, signal);
+        if (receipt?.cancelled !== true) {
+          if (id === itemId) break;
+          continue;
+        }
+        if (own?.read) continue;
+        if (this.pendingUsers.has(uuid) && this.awaiting.get(uuid)?.read === false) {
+          this.rt.clearSteerWaits(id);
+          this.rt.patch<UserItem>(id, { issuedUuid: undefined });
+        } else if (this.rt.queue.some(q => q.id === id && q.issuedUuid === uuid)) this.rt.confirmDropped(uuid);
+        else continue;
+        this.forgetRecalled(uuid);
+        recalled.add(id);
+      }
+    } finally {
+      // Keep the originals even when Stop, disconnection or a failed control request cut a batch short.
+      if (recalled.size) {
+        const ids = new Set(waiting.map(([, id]) => id).filter(id => recalled.has(id)));
+        this.rt.unreadQueueHeld = true;
+        this.rt.returnUntaken({ ids });
+        await this.rt.persistInput?.();
+      }
+    }
+    return waiting.map(([, id]) => id).filter(id => recalled.has(id));
+  }
+
+  async interruptSteer(signal: AbortSignal) {
+    const target = this.steerTarget;
+    this.steerTarget = undefined;
+    if (!target || !this.scopedInterrupt || this.awaiting.get(target.uuid)?.read !== true || this.q !== target.q || this.turnSeq !== target.turn || !this.rt.turnActive || this.interrupted)
+      throw new Error('The original Claude turn ended.');
+    this.interrupted = true;
+    this.steerInterruptPending = true;
+    try {
+      const receipt = await this.steerRequest(target.q, { subtype: 'interrupt', for_user_message_uuids: [target.uuid] }, signal);
+      if (this.q !== target.q) throw new Error('Claude process changed.');
+      for (const uuid of receipt?.still_queued ?? []) {
+        if (this.own.has(uuid)) this.interruptSurvivors.add(uuid);
+        this.settleCancelled(uuid);
+      }
+      if (receipt?.turn !== 'stopped') throw new Error('Claude did not confirm interruption of this turn.');
+    } catch (err) {
+      if (this.steerInterruptPending && this.turnSeq === target.turn) this.interrupted = false;
+      throw err;
+    } finally {
+      this.steerInterruptPending = false;
+    }
+    if (this.turnSeq !== target.turn || !this.rt.turnActive) return;
+    this.interruptTimer = setTimeout(() => {
+      if (this.turnSeq !== target.turn || !this.interrupted) return;
+      this.owe();
+      this.finishTurn(undefined, true);
+    }, 2500);
+  }
+
+  wasWithdrawn(itemId: string) {
+    return [...this.own.values()].findLast(o => o.itemId === itemId)?.recalled === true;
+  }
+
+  stillQueued(uuid: string) { return this.interruptSurvivors.has(uuid); }
+
+  private settleCancelled(uuid: string) {
+    if (!this.interruptSurvivors.has(uuid) || !this.cancelledInputs.has(uuid)) return;
+    this.interruptSurvivors.delete(uuid);
+    this.cancelledInputs.delete(uuid);
+    const own = this.own.get(uuid);
+    if (!own || own.read) return;
+    const card = this.rt.get<UserItem>(own.itemId);
+    if (card?.issuedUuid === uuid) {
+      this.rt.patch<UserItem>(card.id, { issuedUuid: undefined });
+      this.rt.returnUntaken({ ids: new Set([card.id]) });
+    } else this.rt.confirmDropped(uuid);
+    this.forgetRecalled(uuid);
+  }
+
   async interrupt() {
+    if (this.interrupted && !this.steerInterruptPending) return;
+    this.steerInterruptPending = false;
     if (this.held && this.rt.turnActive) {
       // Nothing of this turn reached Claude Code: what was held goes back to the queue (finishTurn), and
       // the process keeps the background tasks it runs, and the result it owes.
+      clearTimeout(this.heldDeadline);
+      this.heldDeadline = undefined;
       this.held = undefined;
       this.interrupted = true;
       this.finishTurn(undefined, true);
@@ -2710,12 +3004,13 @@ class ClaudeSession implements ProviderSession {
     if (this.rt.get(itemId) !== item || (at >= 0 && this.chain[at] !== item.providerId)) {
       return { ok: false, message: 'The conversation changed before it could be rewound.' };
     }
+    const idx = this.rt.items.indexOf(item);
+    this.rt.revokeDelegates(this.rt.items.slice(idx).map(row => row.id));
     const lost = this.shutdown();
     if (at > 0) this.resumeAt = this.chain[at - 1];
     else this.rt.update({ providerSessionId: undefined });
     this.chain = at > 0 ? this.chain.slice(0, at) : [];
-    const idx = this.rt.items.findIndex((i) => i.id === itemId);
-    if (idx >= 0) this.rt.reset(this.rt.items.slice(0, idx));
+    this.rt.reset(this.rt.items.slice(0, idx));
     this.rt.notice('rewind', 'Rewound the conversation', note || undefined);
     this.tellLost(lost, 'process');
     return { ok: true, message: note || undefined };
@@ -2873,6 +3168,12 @@ class ClaudeSession implements ProviderSession {
    */
   private onMessage(m: SDKMessage) {
     const any = m as Obj;
+    if (any.type === 'turn_handoff' || any.type === 'system' && any.subtype === 'turn_handoff') this.scopedInterrupt = false;
+    if (any.type === 'command_lifecycle' && any.state === 'cancelled' && this.own.has(any.command_uuid)) {
+      this.cancelledInputs.add(any.command_uuid);
+      this.settleCancelled(any.command_uuid);
+      return;
+    }
     const now = Date.now();
     this.heardAt = now;
     if (!any.parent_tool_use_id && !(m.type === 'system' && TASK_FRAMES.has(any.subtype)) && m.type !== 'rate_limit_event' && m.type !== 'prompt_suggestion') this.rootHeardAt = now;
@@ -3199,14 +3500,15 @@ class ClaudeSession implements ProviderSession {
       if (this.compacted && isCompactOutput(text)) return;
       // Written by Claude Code in the person's place (a task finished, a command and its output):
       // shown as a line (shared/synthetic.ts), never as a message from the Claude app.
-      const syn = text ? parseSynthetic(text) : null;
+      const literal = !m.isSynthetic && (text === STEER_NOW_BLOCK || text === STEER_FIRST_BLOCK) && (!Array.isArray(content) || content.length === 1);
+      const syn = text && !literal ? parseSynthetic(text) : null;
       // A slash command Sable sent comes back in the CLI's own tags (`<command-name>/compact</command-name>…`).
       const echo = syn?.role === 'command' ? syntheticLine(syn) : '';
       // One of ours under another uuid (a steer the CLI folded in): only one it has not read yet, and only
       // by its very words. A message from the app that merely holds them stays the app's; one with the
       // same words is the app's again once ours comes back under its own uuid (`unalias`).
       const mine = this.ownByWords(text, echo, content);
-      if (mine) {
+      if (mine && (!mine[1].recallPending || mine[2])) {
         const [uuid, o, identified] = mine;
         if (o.guessed) this.takeOwn(uuid, 'match');
         this.reclaim(uuid, m.uuid ?? uuid, !this.unmatchedResults.get(m.uuid)?.pending.has(uuid));
@@ -3264,11 +3566,12 @@ class ClaudeSession implements ProviderSession {
     const content = m.message?.content;
     if (!Array.isArray(content)) return;
     // A call's result at the root while no turn is open: Claude Code works on, in a turn of its own.
-    if (!m.parent_tool_use_id && (content as Obj[]).some((b) => b?.type === 'tool_result')) this.wake();
+    if (!m.parent_tool_use_id && (content as Obj[]).some(b => b?.type === 'tool_result' && !rt.get<ToolItem>(b.tool_use_id)?.delegateReport)) this.wake();
     for (const b of content as Obj[]) {
       if (b.type !== 'tool_result') continue;
       const item = rt.get<ToolItem>(b.tool_use_id);
-      if (!item) continue;
+      rt.delegateReceipt(b.tool_use_id, b.content);
+      if (!item || item.delegateReport) continue; // The detached child's end owns the row.
       if (item.kind === 'edit' || item.kind === 'write') rt.promote?.(item);
       const result = mapResult(item.name, (item.input as Obj) ?? {}, m.tool_use_result, b.content, !!b.is_error);
       const status = item.status === 'denied' || item.status === 'cancelled' ? item.status : b.is_error ? 'error' : 'done';
@@ -3343,7 +3646,7 @@ class ClaudeSession implements ProviderSession {
   }
 
   /**
-   * Messages still pending at a normal turn end are taken, even when no replay said so.
+   * An issued steer needs its own receipt. Other legacy inputs keep their normal end-of-turn accounting.
    * Each card gets the uuid it went with (D-own): a replay of it that comes after all is a repeat of a
    * message of Sable's own, also once the chat is read again.
    */
@@ -3351,7 +3654,9 @@ class ClaudeSession implements ProviderSession {
     for (const [uuid, itemId] of this.pendingUsers) {
       this.pendingUsers.delete(uuid);
       const card = this.rt.get<UserItem>(itemId);
-      if (card?.type === 'user' && (card.state === 'queued' || !card.providerId)) this.rt.taken(itemId, { providerId: uuid });
+      if (card?.issuedUuid === uuid) {
+        this.rt.returnUntaken({ ids: new Set([itemId]) });
+      } else if (card?.type === 'user' && (card.state === 'queued' || !card.providerId)) this.rt.taken(itemId, { providerId: uuid });
     }
   }
 
@@ -3386,9 +3691,11 @@ class ClaudeSession implements ProviderSession {
 
   /** A withdrawn send was consumed after all. Preserve any edits to the copy waiting in the queue. */
   private reclaim(uuid: string, providerId: string, awaitsResult = true): boolean {
-    const back = this.withdrawn.get(uuid);
+    const restored = this.rt.queue.find(q => q.issuedUuid === uuid);
+    const back = this.withdrawn.get(uuid) ?? (restored && { itemId: restored.id, text: restored.text, attachments: restored.attachments, steered: true, at: restored.createdAt });
     if (!back) return false;
     this.withdrawn.delete(uuid);
+    this.interruptSurvivors.delete(uuid);
     const rt = this.rt;
     const copy = rt.queue.find((q) => q.id === back.itemId);
     let id = back.itemId;
@@ -3399,7 +3706,7 @@ class ClaudeSession implements ProviderSession {
     if (card?.type === 'user' && samePayload(card, back)) rt.taken(id, { providerId });
     else {
       if (card) id = randomUUID();
-      rt.add<UserItem>({ id, type: 'user', text: back.text, attachments: back.attachments, steered: back.steered, state: 'sent', providerId });
+      rt.add<UserItem>({ id, type: 'user', text: back.text, attachments: back.attachments, steered: back.steered, authored: true, state: 'sent', providerId });
     }
     const own = this.own.get(uuid);
     if (own) {
@@ -3437,6 +3744,10 @@ class ClaudeSession implements ProviderSession {
 
   /** Claude Code read a message of ours (it replayed it). */
   private markRead(uuid: string) {
+    this.interruptSurvivors.delete(uuid);
+    this.cancelledInputs.delete(uuid);
+    const id = this.sentItems.get(uuid);
+    if (id) this.rt.clearSteerWaits(id);
     const a = this.awaiting.get(uuid);
     if (a) a.read = true;
   }
@@ -3473,6 +3784,7 @@ class ClaudeSession implements ProviderSession {
   private takeOwn(uuid: string, via: 'replay' | 'stamp' | 'match', reply?: Set<string>): boolean {
     const o = this.own.get(uuid);
     if (!o) return this.reclaim(uuid, uuid);
+    if (o.recalled) return true;
     if (via !== 'match') this.confirmDelivery(o);
     const rt = this.rt;
     // Its canonical identity distinguishes this send from a provisional match with the same content.
@@ -3563,8 +3875,9 @@ class ClaudeSession implements ProviderSession {
     const textBlocks = new Set(blocks.filter(b => b?.type === 'text').map(b => b.text));
     let late: [string, OwnSend, boolean] | undefined;
     for (const [uuid, o] of this.own) {
+      if (o.recalled) continue;
       const decorated = o.proofBlocks.some(block => textBlocks.has(block));
-      if (!decorated && (o.alias || textBlocks.has(STEER_FIRST_BLOCK))) continue;
+      if (!decorated && (o.alias || textBlocks.has(STEER_FIRST_BLOCK) || textBlocks.has(STEER_NOW_BLOCK))) continue;
       const withdrawn = this.withdrawn.get(uuid);
       const pending = o.q === this.q && (this.pendingUsers.has(uuid) || !!withdrawn);
 
@@ -3655,6 +3968,11 @@ class ClaudeSession implements ProviderSession {
     // A CLI never seen to name what its results answer (an older one): each result answers one, the oldest.
     const oldest = this.awaiting.keys().next().value;
     if (oldest === undefined) return [];
+    const input = this.own.get(oldest);
+    if (input?.recallPending || input?.steerNow || this.interrupted && this.pendingUsers.has(oldest)) return [];
+    // A process that replays our inputs can identify the steer itself. Only a legacy
+    // stream with neither names nor replays needs FIFO accounting for an uninterrupted turn.
+    if (input && this.rt.get<UserItem>(input.itemId)?.issuedUuid === oldest && [...this.own.values()].some(o => o.q === this.q && o.replayed)) return [];
     this.awaiting.delete(oldest);
     return [oldest];
   }
@@ -3945,12 +4263,6 @@ class ClaudeSession implements ProviderSession {
     }
     // A stop holds through the turn's end: steers it has not read go back to the queue (finishTurn), and
     // one it read but did not answer yet is stopped too.
-    if (wasInterrupted && [...this.awaiting.values()].some((a) => a.read) && this.q) {
-      const q = this.q;
-      void Promise.resolve()
-        .then(() => q.interrupt())
-        .catch(() => {});
-    }
     this.finishTurn(wakeResult && this.wakeLimit ? undefined : error, wasInterrupted);
     this.limitResultOwed = false;
   }
@@ -4085,6 +4397,8 @@ class ClaudeSession implements ProviderSession {
     if (m.task_id && !this.currentTaskRun(m)) return;
     switch (m.subtype) {
       case 'init': {
+        // This bundled CLI implements for_user_message_uuids. Older ones ignore unknown fields.
+        this.scopedInterrupt = m.claude_code_version === '2.1.325';
         if (Array.isArray(m.skills)) this.skillNames = m.skills.map(String);
         if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         if (rt.caps && this.skillNames.length) {
@@ -4353,12 +4667,17 @@ class ClaudeSession implements ProviderSession {
       const last = items.at(-1);
       return last?.type === 'notice' && last.variant === 'compact';
     };
-    const readUserText = (text: string, uuid: string) => {
+    const readUserText = (text: string, uuid: string, authored = false) => {
+      if (authored) {
+        firstPrompt ??= text;
+        push({ type: 'user', text, state: 'sent', providerId: uuid, authored: true });
+        return;
+      }
       const role = parseSynthetic(text)?.role;
       if (role === 'output') {
         if (afterCompact() && isCompactOutput(text)) return;
       } else {
-        if (role === 'hidden' || !isHumanText(text)) return;
+        if (role === 'hidden' || !text.trim() || role && !isHumanText(text)) return;
         firstPrompt ??= text;
       }
       push({ type: 'user', text, state: 'sent', providerId: uuid });
@@ -4408,9 +4727,11 @@ class ClaudeSession implements ProviderSession {
       } else if (m.type === 'user') {
         if (!parentId) this.chain.push(m.uuid);
         if (typeof content === 'string') {
-          if (!parentId) readUserText(content, m.uuid);
+          if (!parentId) readUserText(content, m.uuid, !m.isSynthetic && (content === STEER_NOW_BLOCK || content === STEER_FIRST_BLOCK));
         } else if (Array.isArray(content)) {
-          const text = flattenContent(content.filter((b: Obj) => b.type === 'text')).text;
+          const blocks = content.filter((b: Obj) => b.type === 'text');
+          const decorated = blocks.length === 2 && [STEER_FIRST_BLOCK, STEER_NOW_BLOCK].includes(blocks[1].text);
+          const text = decorated ? withoutHandover(blocks[0].text) : flattenContent(blocks).text;
           for (const b of content as Obj[]) {
             if (b.type !== 'tool_result') continue;
             const t = tools.get(b.tool_use_id);
@@ -4421,7 +4742,7 @@ class ClaudeSession implements ProviderSession {
             // A step's time runs from its own start to its result: with either not known it shows none.
             if (real && !unstamped.has(t.id)) t.endedAt = real;
           }
-          if (text && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) readUserText(text, m.uuid);
+          if (text && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) readUserText(text, m.uuid, decorated || !m.isSynthetic && blocks.length === 1 && (text === STEER_NOW_BLOCK || text === STEER_FIRST_BLOCK));
         }
       }
     }

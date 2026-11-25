@@ -23,11 +23,18 @@ export function launchKey(card: HTMLElement | null) {
   if (!key || !glyph) return;
   const z = uiZoom();
   const r = key.getBoundingClientRect();
-  if (!r.width) return;
+  const w = key.offsetWidth;
+  const h = key.offsetHeight;
+  if (!r.width || !w || !h) return;
+  // The copy is the key's own size, centred where the key is drawn, and its give starts where the key
+  // stands: a send by the pointer comes while the key still gives under it (`:active`, 0.94). Sized
+  // from the drawn box, the copy was 37.6 px for a 40 px key, sank to 0.846 and popped 2.4 px when
+  // the real key came back at the end.
+  const at = keyScale(r.width / z, w);
   const disc = document.createElement('div');
   disc.className = 'sk-launch';
   disc.setAttribute('aria-hidden', 'true');
-  disc.style.cssText = `left:${r.left / z}px;top:${r.top / z}px;width:${r.width / z}px;height:${r.height / z}px;`;
+  disc.style.cssText = `left:${(r.left + r.width / 2) / z - w / 2}px;top:${(r.top + r.height / 2) / z - h / 2}px;width:${w}px;height:${h}px;`;
   card.setAttribute('data-launching', '');
   const show = () => card.removeAttribute('data-launching');
   const arrow = glyph.cloneNode(true) as SVGElement;
@@ -51,7 +58,7 @@ export function launchKey(card: HTMLElement | null) {
     if (a) clock?.(a);
     return a;
   };
-  on(play(disc, KEY_GIVE, { duration: KEY_GIVE_MS, easing: 'linear' }));
+  on(play(disc, keyGive(at), { duration: KEY_GIVE_MS, easing: 'linear' }));
   on(play(arrow, ARROW_OUT, { duration: ARROW_OUT_MS, delay: ARROW_OUT_AT, easing: ARROW_OUT_EASE, fill: 'both' }));
   const grow = on(play(sq, SQUARE_IN, { duration: SQUARE_IN_MS, delay: SQUARE_IN_AT, easing: SQUARE_IN_EASE, fill: 'both' }));
   const done = () => {
@@ -82,6 +89,17 @@ export const KEY_GIVE: Keyframe[] = [
   { scale: '0.91', offset: 0.44, easing: 'cubic-bezier(0.3, 0, 0.2, 1)' },
   { scale: '1' },
 ];
+
+/** How far a key drawn `drawn` px wide is scaled from its layout width `width` (1 when it cannot be read). */
+export function keyScale(drawn: number, width: number): number {
+  const s = width > 0 ? drawn / width : 1;
+  return Number.isFinite(s) && s > 0.5 && s <= 1.2 ? Math.round(s * 1000) / 1000 : 1;
+}
+
+/** The give, from a key that already stands at `from` (a key still held under the pointer). */
+export function keyGive(from = 1): Keyframe[] {
+  return from === 1 ? KEY_GIVE : [{ ...KEY_GIVE[0], scale: String(from) }, ...KEY_GIVE.slice(1)];
+}
 
 /**
  * The arrow's way out, from `ARROW_OUT_AT` on: up through the disc's top, gathering speed, as the

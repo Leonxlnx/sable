@@ -20,7 +20,7 @@ import { pairLink, phoneEvent, QUEUE_PAGE, registerPhone, type PhoneService } fr
 import { FILE_CHUNK } from '../server/services/phone-files';
 import { answerHello, loadIdentity, readSecHello, transcript } from '../server/services/phone-secure';
 import { pskOfKey, startHandshake } from '../mobile/src/lib/secure';
-import { beside, fetchSecure, fingerprintIn, handshake, helloPlain, keyOf, legacyPairing, pairSecure, wireClient, type WireClient } from './phone-wire';
+import { beside, fetchSecure, fingerprintIn, handshake, helloPlain, helloSecure, keyOf, legacyPairing, pairSecure, wireClient, type WireClient } from './phone-wire';
 import { CONTAIN } from '../server/core/contain';
 
 // These tests are about the endpoint after review wave 4, not containment. Where no handle names its file (Windows), the
@@ -165,7 +165,67 @@ describe('a removed phone (8)', () => {
   });
 });
 
+it.each([false, true])('retains accepted queued input when the socket sleeps (revoked %s)', async revoked => {
+  const { app, phone, port, home } = await setup();
+  const pair = await pairSecure(app, port);
+  const { c, deviceId } = pair;
+  const rt = await chatOf(app, c, home);
+  rt.beginTurn();
+  const submission = { sessionId: rt.id, text: 'after sleep', submitId: 'phone-reconnect' };
+  expect((await c.call('session.send', submission)).ok).toBe(true);
+  expect(rt.queue[0].phoneSender).toMatchObject({ deviceId });
+  c.ws.close();
+  await c.closed;
+  const { c: next } = await helloSecure(port, pair);
+  await next.next(f => 'welcome' in f);
+  expect((await next.call('session.send', submission)).ok).toBe(true);
+  expect(rt.queue).toHaveLength(1);
+  if (revoked) phone.revoke(deviceId);
+  rt.endTurn();
+  await wait(200);
+  if (revoked) {
+    expect(rt.queue.map(q => q.text)).toEqual(['after sleep']);
+    expect(await app.call('queue.sendNow', { sessionId: rt.id, id: rt.queue[0].id })).toEqual({ ok: true });
+  }
+  expect(rt.items.some(i => i.type === 'user' && i.text === 'after sleep')).toBe(true);
+});
+
+it('checks the saved pairing generation after a bridge restart and lets the desktop adopt the message', async () => {
+  const { app, port, home } = await setup();
+  const { c } = await pairSecure(app, port);
+  const rt = await chatOf(app, c, home);
+  rt.beginTurn();
+  expect((await c.call('session.send', { sessionId: rt.id, text: 'keep this across restart' })).ok).toBe(true);
+  const queued = structuredClone(rt.queue[0]);
+  await app.call('phone.setEnabled', { on: false });
+  await app.dispose();
+  apps.splice(apps.indexOf(app), 1);
+  const restored = new App({ home, quiet: true, providers: [ctx => new DemoProvider(ctx, { speed: 0 })] });
+  apps.push(restored);
+  registerPhone(restored, { port: 0, host: '127.0.0.1' });
+  await restored.call('phone.setEnabled', { on: true });
+  await restored.call('session.snapshot', { sessionId: rt.id });
+  const r = restored.runtime(rt.id);
+  r.beginTurn();
+  r.endTurn();
+  await wait(150);
+  expect(r.queue).toMatchObject([{ id: queued.id, phoneSender: queued.phoneSender }]);
+  expect(await restored.call('queue.sendNow', { sessionId: r.id, id: queued.id })).toEqual({ ok: true });
+  expect(r.items.filter(i => i.type === 'user' && i.text === queued.text)).toHaveLength(1);
+});
+
 describe("a phone's mode change (9)", () => {
+  it('leaves a permission that arrived during the mode RPC waiting', async () => {
+    const { app, port, home } = await setup();
+    const { c } = await pairSecure(app, port);
+    const rt = await chatOf(app, c, home);
+    rt.caps = { ...rt.caps, modes: [{ id: 'bypassPermissions', name: 'Bypass', tone: 'danger' }] } as never;
+    rt.handle!.setMode = async () => {
+      void rt.requestPermission({ toolName: 'Bash', kind: 'bash', title: 'Run?', detail: { command: 'npm test' }, options: [{ id: 'allow', label: 'Allow', tone: 'allow' }] });
+    };
+    expect((await c.call('session.setMode', { sessionId: rt.id, mode: 'bypassPermissions' })).ok).toBe(true);
+    expect(rt.prompts().permissions.map(p => p.title)).toEqual(['Run?']);
+  });
   it('to a mode that never asks answers only what the phone could allow; what only the desktop may answer keeps waiting', async () => {
     const { app, port, home } = await setup();
     const { c } = await pairSecure(app, port);
@@ -178,9 +238,11 @@ describe("a phone's mode change (9)", () => {
     const short = rt.requestPermission({ toolName: 'Bash', kind: 'bash', title: 'Run this command?', detail: { command: 'npm test', cwd: home }, options });
     // A command longer than the phone shows: only the desktop may allow it.
     const long = rt.requestPermission({ toolName: 'Bash', kind: 'bash', title: 'Run this command?', detail: { command: `echo ${'x'.repeat(6000)}`, cwd: home }, options });
+    const page = await c.call('phone.tail', { sessionId: rt.id });
+    const shownPermissions = (page.result as PhoneTail).permissions.map(({ id, revision }) => ({ id, revision }));
     let longAnswer: unknown = 'waiting';
     void long.then((a) => (longAnswer = a));
-    expect((await c.call('session.setMode', { sessionId: rt.id, mode: 'bypassPermissions' })).ok).toBe(true);
+    expect((await c.call('session.setMode', { sessionId: rt.id, mode: 'bypassPermissions', shownPermissions })).ok).toBe(true);
     expect(await short).toEqual({ optionId: 'allow' });
     await wait(50);
     expect(longAnswer).toBe('waiting');

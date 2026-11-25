@@ -314,6 +314,32 @@ it('the installed SDK can close its query while the CLI finishes a usage request
   await read;
 });
 
+it('admits two dedicated Codex delegates beside their account and keeps other accounts out of the folder', async () => {
+  vi.useFakeTimers();
+  vi.stubEnv('SABLE_CODEX_BIN', process.execPath);
+  const ctx = { account: { id: 'owner', dir: home }, log() {}, emit() {}, journal };
+  const account = new CodexProvider(ctx);
+  const delegates = [account.forDelegate(), account.forDelegate()];
+  const foreign = new CodexProvider({ ...ctx, account: { id: 'another', dir: home } });
+  for (const [i, provider] of [account, ...delegates].entries()) {
+    const start = provider.client().catch(err => err as Error);
+    await vi.advanceTimersByTimeAsync(GATE.settleMs + 50);
+    expect(children).toHaveLength(i + 1);
+    children[i].reply({ id: 1, result: {} });
+    expect(await start).not.toBeInstanceOf(Error);
+  }
+  const denied = foreign.client().catch(err => err as Error);
+  await vi.advanceTimersByTimeAsync(GATE.settleMs + 50);
+  expect(await denied).toBeInstanceOf(Error);
+  expect(children).toHaveLength(3);
+  children[1].exit();
+  expect(children[0].exitCode).toBeNull();
+  expect(children[2].exitCode).toBeNull();
+  children[0].exit();
+  children[2].exit();
+  await Promise.all([account, ...delegates, foreign].map(p => p.dispose()));
+});
+
 it('coalesces Codex clients, drains a pending RPC before EOF and waits through real exit before replacement', async () => {
   vi.stubEnv('SABLE_CODEX_BIN', process.execPath);
   const p = new CodexProvider({ account: { id: 'bada55', dir: home }, log() {}, emit() {}, journal });

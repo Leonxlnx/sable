@@ -100,6 +100,7 @@ interface StoredPhone {
 }
 
 interface PhoneFile {
+  generation?: number;
   enabled: boolean;
   devices: StoredPhone[];
 }
@@ -335,11 +336,14 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
         kind: it.kind,
         title: cap(it.title, 300),
         status: it.status,
+        ...(it.delegateReport ? { delegateReport: it.delegateReport } : {}),
+        ...(it.delegateWait ? { delegateWait: it.delegateWait } : {}),
         detail,
         ...(it.endedAt ? { endedAt: it.endedAt } : {}),
         ...(it.waitedMs ? { waitedMs: it.waitedMs } : {}),
         ...(it.result ? { result: trimResult(it.result, full) } : {}),
         ...(it.workflow ? { workflow: trimWorkflow(it.workflow) } : {}),
+        ...(it.task ? { task: { ...it.task, id: cap(it.task.id, 200), ...(typeof it.task.serving === 'string' && { serving: cap(it.task.serving, 300) }) } } : {}),
         // A check of a turn by the other agent: which turn and who, and its findings (they are its answer).
         ...(it.check ? { check: it.check } : {}),
         ...(opts.kids ? { kids: opts.kids } : {}),
@@ -371,6 +375,10 @@ export function phonePatch(patch: Partial<TimelineItem>, kind?: string): Partial
   delete p.output;
   // What a share handed over (real paths, file ids, grants) stays on the desktop, as in a page.
   delete p.handed;
+  delete p.delegateAttempt;
+  delete p.delegateCaller;
+  delete p.delegateContinuations;
+  delete p.delegateDeliveryId;
   if (p.detail) p.detail = trimDetail(p.detail as ToolDetail, LIMITS.field);
   if (p.result) p.result = trimResult(p.result as ToolResult);
   if (p.workflow) p.workflow = trimWorkflow(p.workflow as WorkflowRun);
@@ -462,6 +470,7 @@ export function phonePermission(p: PermissionRequest): PhonePermission {
     id: p.id,
     sessionId: p.sessionId,
     ...(typeof p.itemId === 'string' && p.itemId.length <= ASK_TEXT.id ? { itemId: p.itemId } : {}),
+    ...(typeof p.delegateId === 'string' && p.delegateId.length <= ASK_TEXT.id ? { delegateId: p.delegateId } : {}),
     toolName: cap(text(p.toolName), ASK_TEXT.label),
     kind: p.kind,
     title: c(text(p.title), ASK_TEXT.title),
@@ -476,7 +485,7 @@ export function phonePermission(p: PermissionRequest): PhonePermission {
   if (!scopeShown(p.scope, out)) cut = true;
   // What "always" saves, all of it in words, or that answer is the desktop's alone.
   if (p.scope && !savesShown(p.scope, out)) out.options = out.options.filter((o) => o.tone !== 'always');
-  return cut ? { ...out, incomplete: true } : out;
+  return cut ? { ...out, incomplete: true } : { ...out, revision: sha256(JSON.stringify(out)) };
 }
 
 /** Whether every save of an "always" answer shows whole as a line of the description or reason (and none is unnamed). */
@@ -535,6 +544,7 @@ export function phoneQuestion(q: QuestionRequest): PhoneQuestionRequest {
     id: q.id,
     sessionId: q.sessionId,
     ...(typeof q.itemId === 'string' && q.itemId.length <= ASK_TEXT.id ? { itemId: q.itemId } : {}),
+    ...(typeof q.delegateId === 'string' && q.delegateId.length <= ASK_TEXT.id ? { delegateId: q.delegateId } : {}),
     createdAt: q.createdAt,
     questions: q.questions.slice(0, ASK_Q.questions).map((x, i): PhoneQuestion => {
       const cut = x.question.length > ASK_Q.question || (x.header?.length ?? 0) > ASK_Q.header || x.options.some((o) => o.label.length > ASK_Q.label || (o.description?.length ?? 0) > ASK_Q.description);
@@ -1068,8 +1078,7 @@ function narrow(method: string, params: Record<string, unknown>, queued?: (sessi
     if (method === 'spare.atReset') return { sessionId: p.sessionId, refusalId: p.refusalId };
   }
   // Pictures as data, never a path on the computer: a message from the phone carries nothing of the desktop's.
-  // A submission id is the desktop window's own (it retries a message it put back): a phone's send
-  // never carries one, so it cannot be answered with another message's result.
+  // The authenticated handler namespaces a phone's submission ID to its own pairing.
   if (method === 'session.send') delete p.submitId;
   if (method === 'session.send' || method === 'queue.update') {
     // Words first: nothing is queued, edited or sent for a message without them.
@@ -1145,6 +1154,7 @@ export class PhoneService {
     this.port = opts.port ?? PHONE_PORT;
     this.host = opts.host ?? process.env.SABLE_PHONE_HOST ?? '0.0.0.0';
     this.data = this.read();
+    app.phoneStillPaired = sender => this.data.enabled && sender.generation === (this.data.generation ?? 0) && this.data.devices.some(d => d.id === sender.deviceId);
   }
 
   get enabled() {
@@ -1164,7 +1174,7 @@ export class PhoneService {
             .filter((d) => d && typeof d.id === 'string' && typeof d.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(d.tokenHash))
             .map((d) => ({ id: d.id, name: String(d.name ?? 'Phone'), tokenHash: d.tokenHash, pairedAt: Number(d.pairedAt) || 0, ...(typeof d.lastSeen === 'number' ? { lastSeen: d.lastSeen } : {}), ...(d.secure === true ? { secure: true as const } : {}) }))
         : [];
-      return { enabled: !!raw.enabled, devices };
+      return { enabled: !!raw.enabled, generation: raw.generation ?? 0, devices };
     } catch {
       return { enabled: false, devices: [] };
     }
@@ -1227,6 +1237,7 @@ export class PhoneService {
   }
 
   async setEnabled(on: boolean) {
+    if (this.data.enabled && !on) this.data.generation = (this.data.generation ?? 0) + 1;
     this.data.enabled = on;
     this.save(true);
     if (on) await this.start();
@@ -1692,7 +1703,9 @@ export class PhoneService {
     }
     let json = JSON.stringify(frame);
     const f = frame as { id?: unknown; event?: BridgeEvent };
+    let replaced = false;
     if (f.event && overBytes(json, FRAME_MAX.event)) {
+      replaced = true;
       const page = this.pageFor(f.event);
       json = page ? JSON.stringify({ event: page }) : '';
       if (!json || overBytes(json, FRAME_MAX.event)) {
@@ -1702,9 +1715,13 @@ export class PhoneService {
         json = JSON.stringify({ event: stale });
       }
     } else if (typeof f.id === 'number' && overBytes(json, FRAME_MAX.result)) {
+      replaced = true;
       json = JSON.stringify({ id: f.id, ok: false, error: 'That is too big to send to the phone.' });
     }
-    link.send(json, sent);
+    if (sent && replaced) {
+      link.send(json);
+      sent(new Error('Frame was replaced'));
+    } else link.send(json, sent);
   }
 
   /** The reply as it would go to this phone, or why it cannot go now (closed, behind, over its budget). */
@@ -2009,11 +2026,19 @@ export class PhoneService {
       watching.push(id);
       if (watching.length > WATCH_MAX) watching.shift();
     };
+    const displayed = new Map<string, string>();
+    const remember = (p: PhonePermission) => {
+      if (!p.incomplete && p.revision) displayed.set(p.id, p.revision);
+    };
     const unsubscribe = this.app.subscribe((event) => {
       if (!PHONE_EVENTS.has(event.type)) return;
       if (ITEM_EVENTS.has(event.type) && !watching.includes((event as { sessionId: string }).sessionId)) return;
       const e = phoneEvent(event, this.kindOf);
-      if (e) this.sendFrame(link, { event: e as BridgeEvent });
+      if (e?.type === 'permission.removed') displayed.delete(e.id);
+      if (e?.type === 'permission.added') {
+        const p = e.request;
+        this.sendFrame(link, { event: e }, error => { if (!error) remember(p); });
+      } else if (e) this.sendFrame(link, { event: e as BridgeEvent });
     });
     let alive = true;
     link.onPong(() => (alive = true));
@@ -2027,6 +2052,7 @@ export class PhoneService {
     // phone still paired with this token. Asked before every request and again before anything a
     // request does after a wait.
     let attached = true;
+    const phoneSender = { deviceId: device.id, generation: this.data.generation ?? 0 };
     const allowed = () => attached && this.data.enabled && this.data.devices.some((d) => d.id === device.id && d.tokenHash === device.tokenHash);
     const act = () => {
       if (!allowed()) throw new Error('This phone was removed on the desktop');
@@ -2141,6 +2167,15 @@ export class PhoneService {
             const limit = typeof raw.limit === 'number' ? raw.limit : undefined;
             result = phoneTail(snap, { before: str('before'), limit, to: str('to'), around: str('around'), after: str('after') });
           } else result = phoneDetail(snap.items, String(raw.itemId ?? ''), item => this.app.store.wholeItem(sessionId, item));
+        } else if (own === 'phone.steerNow') {
+          const { sessionId, itemId } = raw;
+          if (typeof sessionId !== 'string' || typeof itemId !== 'string') throw new Error('Select a message in its conversation.');
+          const card = this.app.sessions.get(sessionId)?.get(itemId);
+          if (card?.type !== 'user' || card.parentId || card.remote || syntheticOf(card)?.role === 'hidden') throw new Error('That message is unavailable.');
+          act();
+          result = await this.app.call('session.steerNow', { sessionId, itemId }, {
+            phoneSender, allowed: () => !!this.app.phoneStillPaired?.(phoneSender) && !phoneRefusal(this.app, own, { sessionId }),
+          });
         } else if (own === 'phone.answer') {
           // By the ids the phone got, into the agent's own keys (the original question and option words).
           const sessionId = String(raw.sessionId ?? '');
@@ -2159,17 +2194,25 @@ export class PhoneService {
           // A mode that never asks answers only what the phone could allow itself; what only the desktop may answer keeps waiting there.
           const sessionId = String(raw.sessionId ?? '');
           act();
+          const shown = new Map<string, string>();
+          if (Array.isArray(raw.shownPermissions)) for (const seen of raw.shownPermissions) {
+            if (typeof seen?.revision === 'string' && displayed.get(seen.id) === seen.revision) shown.set(seen.id, seen.revision);
+          }
           result = await this.app.call('session.setMode', { sessionId, mode: String(raw.mode ?? ''), answerWaiting: false }, { allowed });
           const rt = this.app.sessions.get(sessionId);
           if (rt && allowed() && rt.caps?.modes.find((m) => m.id === rt.meta.mode)?.tone === 'danger') {
             for (const p of rt.prompts().permissions) {
-              if (p.toolName === 'ExitPlanMode' || phonePermission(p).incomplete) continue;
+              const view = phonePermission(p);
+              if (p.toolName === 'ExitPlanMode' || view.incomplete || !view.revision || shown.get(p.id) !== view.revision) continue;
               const ok = p.options.find((o) => o.tone === 'allow');
               if (ok) rt.answerPermission(p.id, { optionId: ok.id });
             }
           }
         } else {
           const params = narrow(req.method, raw, (sessionId, id) => this.app.sessions.get(sessionId)?.queue.find((q) => q.id === id)?.attachments);
+          if (own === 'session.send' && typeof raw.submitId === 'string' && raw.submitId.length > 0 && raw.submitId.length <= 128) {
+            params.submitId = 'phone-' + sha256(JSON.stringify([device.id, raw.submitId]));
+          }
           // An answer from the phone allows only what the phone was shown, and answers questions it got whole.
           const prompts = own === 'permission.respond' || own === 'question.respond' ? this.app.sessions.get(String(params.sessionId ?? ''))?.prompts() : undefined;
           if (own === 'permission.respond') phoneAllowed(prompts?.permissions.find((p) => p.id === params.requestId), params.optionId);
@@ -2180,7 +2223,7 @@ export class PhoneService {
           act();
           // The guard goes along: a handler that waits (a send for the agent to start, a model change to apply) asks it again before it acts.
           // (`settled`: a phone knows a sign-in only as in or out, so its hello never says "not known yet".)
-          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed, settled: true }));
+          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed, settled: true, ...((own === 'session.send' || own === 'queue.sendNow') && { phoneSender }) }));
           // Folder browsing for a new chat: folders only, never file names.
           if (req.method === 'fs.list' && result && typeof result === 'object') {
             const r = result as { entries?: { dir: boolean }[] };
@@ -2192,7 +2235,9 @@ export class PhoneService {
             result = phoneTail(result);
           }
         }
-        this.sendFrame(link, { id: req.id, ok: true, result });
+        const page = result as { permissions?: PhonePermission[]; prompts?: { permissions?: PhonePermission[] } } | undefined;
+        const prompts = page?.permissions ?? page?.prompts?.permissions;
+        this.sendFrame(link, { id: req.id, ok: true, result }, Array.isArray(prompts) ? err => { if (!err) prompts.forEach(remember); } : undefined);
       } catch (err) {
         this.sendFrame(link, { id: req.id, ok: false, error: (err as Error).message ?? String(err) });
       }

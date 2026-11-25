@@ -1,7 +1,6 @@
-import type { ProviderId, SessionMeta, TimelineItem, ToolItem } from '@shared/protocol';
+import type { ProviderId, SessionMeta, TimelineItem, TurnLive as BridgeTurnLive } from '@shared/protocol';
 import { syntheticOf } from '@shared/synthetic';
-import { isLeadIn } from '../../../src/features/timeline/lead-in';
-import { turnChanges } from './chat-rules';
+import { turnLive as readTurn } from '@shared/turn-live';
 
 /**
  * The live notification of a chat at work, free of Android (KeepAliveService.java draws it; lib/notes.ts
@@ -57,147 +56,71 @@ const opensTurn = (it: TimelineItem) => {
   return !syn || syn.role === 'command' || !!it.until;
 };
 
-/** Floats to the end and is no part of the turn's work (a queued message, a steer still waiting). */
-const floats = (it: TimelineItem) => it.type === 'user' && it.state === 'queued';
-
-const running = (t: ToolItem) => t.status === 'running' || t.status === 'pending' || t.status === 'awaiting';
-
-/** Work that folds into a checkpoint (steps, thinking, task updates, lead-ins, notices that inform). */
-function folds(it: TimelineItem): boolean {
-  switch (it.type) {
-    case 'tool':
-      return !it.check && it.kind !== 'plan' && it.kind !== 'widget' && it.kind !== 'share';
-    case 'thinking':
-      return true;
-    case 'text':
-      return !it.text.trim() || isLeadIn(it.text, !!it.streaming);
-    case 'notice':
-      return it.variant !== 'error' && it.variant !== 'command' && !it.early;
-    default:
-      return false;
-  }
-}
-
-/** A key a path is counted by (files are named by their path, never shown). */
-const pathOf = (t: ToolItem) => (typeof t.detail?.path === 'string' && t.detail.path.trim() ? t.detail.path.trim() : undefined);
-
-function doingOf(last: TimelineItem | undefined, run: readonly TimelineItem[]): Doing {
-  if (!last) return { kind: 'working' };
-  if (last.type === 'text' && last.streaming) return { kind: 'writing' };
-  if (last.type === 'thinking' && last.streaming) return { kind: 'thinking' };
-  if (last.type !== 'tool' || !running(last)) return { kind: 'working' };
-  if (last.status === 'awaiting') return { kind: 'waiting' };
-  const same = (kinds: readonly string[]) => run.filter((it): it is ToolItem => it.type === 'tool' && kinds.includes(it.kind));
-  const files = (kinds: readonly string[]) => {
-    const paths = new Set(same(kinds).map(pathOf).filter(Boolean));
-    return Math.max(1, paths.size);
-  };
-  switch (last.kind) {
-    case 'edit':
+function doingOf({ doing, doingCount = 1 }: BridgeTurnLive): Doing {
+  switch (doing) {
     case 'write':
-      return { kind: 'edit', files: files(['edit', 'write']) };
+    case 'edit':
+      return { kind: 'edit', files: doingCount };
     case 'read':
-      return { kind: 'read', files: files(['read']) };
-    case 'bash': {
-      const n = same(['bash']).filter(running).length;
-      return n > 1 ? { kind: 'commands', count: n } : { kind: 'command' };
-    }
+      return { kind: 'read', files: doingCount };
+    case 'bash':
+      return doingCount > 1 ? { kind: 'commands', count: doingCount } : { kind: 'command' };
     case 'agent':
-      return { kind: 'agents', count: Math.max(1, same(['agent']).filter(running).length) };
+      return { kind: 'agents', count: doingCount };
     case 'search':
     case 'glob':
       return { kind: 'search' };
     case 'fetch':
     case 'websearch':
       return { kind: 'web' };
-    case 'browser':
-      return { kind: 'browser' };
-    case 'device':
-      return { kind: 'device' };
-    case 'plan':
-      return { kind: 'plan' };
     case 'todo':
       return { kind: 'tasks' };
-    case 'share':
-      return { kind: 'share' };
-    case 'widget':
-      return { kind: 'widget' };
     case 'mcp':
     case 'skill':
       return { kind: 'tool' };
+    case 'browser':
+    case 'device':
+    case 'plan':
+    case 'share':
+    case 'widget':
+    case 'waiting':
+    case 'thinking':
+    case 'writing':
+      return { kind: doing };
     default:
       return { kind: 'working' };
   }
 }
 
-/**
- * The running turn read from the newest roots back to the message that began it (the same boundary
- * as lib/notes.ts `turnSteps`): undefined when the page does not reach that message (older pages not
- * loaded), so a count is never a guess.
- */
+/** Read just the current turn. A partial page without its boundary has no reliable count. */
 export function turnLive(page: Page): TurnLive | undefined {
-  const { roots, items } = page;
-  let start = -1;
-  let head: TimelineItem | undefined;
-  let newest = true;
-  for (let i = roots.length - 1; i >= 0; i--) {
-    const it = items[roots[i]];
-    if (!it || floats(it)) continue;
-    if (it.type === 'turn') {
-      // The page ends with a turn's end: it has not seen the turn that runs now (a chat the socket no
-      // longer follows); the card goes by the chat's own line rather than an old turn's count.
-      if (newest) return undefined;
-      start = i + 1;
-      break;
-    }
-    newest = false;
-    if (opensTurn(it)) {
-      start = i + 1;
-      head = it;
-      break;
+  const { roots, items, children } = page;
+  let start = roots.length - 1;
+  while (start >= 0) {
+    const it = items[roots[start]];
+    if (it && (it.type === 'turn' || opensTurn(it))) break;
+    start--;
+  }
+  if (start < 0 && page.cursor) return;
+
+  // Include nested edits for the file count, in the same four agent levels as Changes.
+  function* rows(ids: readonly string[], from: number, depth: number): Generator<TimelineItem> {
+    for (let i = from; i < ids.length; i++) {
+      const it = items[ids[i]];
+      if (!it) continue;
+      yield it;
+      const kids = children?.[it.id];
+      if (kids?.length && depth < 4 && it.type === 'tool' && it.kind === 'agent' && !it.check) {
+        yield* rows(kids, 0, depth + 1);
+      }
     }
   }
-  if (start < 0) {
-    if (page.cursor) return undefined;
-    start = 0;
-  }
-  let steps = 0;
-  let done = 0;
-  let run: TimelineItem[] = [];
-  let runWork = false;
-  let closedAt: number | undefined;
-  let first: TimelineItem | undefined;
-  let last: TimelineItem | undefined;
-  const ids: string[] = [];
-  for (let i = start; i < roots.length; i++) {
-    const it = items[roots[i]];
-    if (!it || floats(it)) continue;
-    ids.push(it.id);
-    first ??= it;
-    last = it;
-    if (it.type === 'tool' && !it.check && it.kind !== 'plan' && it.kind !== 'widget' && it.kind !== 'share') steps++;
-    if (folds(it)) {
-      run.push(it);
-      if (it.type === 'tool' || it.type === 'thinking') runWork = true;
-      continue;
-    }
-    // Something in view closes the run before it (a checkpoint, when the run held work).
-    if (runWork) done++;
-    run = [];
-    runWork = false;
-    closedAt = it.ts;
-  }
-  const changes = turnChanges(items, page.children ?? {}, ids);
-  const at = run[0]?.ts ?? closedAt;
-  const startedAt = head?.ts ?? first?.ts;
+  const live = readTurn(rows(roots, Math.max(start, 0), 0));
+  if (!live) return;
   return {
-    steps,
-    done,
-    cpSteps: run.filter((it) => it.type === 'tool').length,
-    ...(at ? { at } : {}),
-    ...(startedAt ? { startedAt } : {}),
-    files: changes.files,
-    doing: doingOf(last, run),
+    steps: live.steps, done: live.checkpoints, cpSteps: live.checkpointSteps,
+    ...(live.checkpointAt !== undefined && { at: live.checkpointAt }),
+    startedAt: live.startedAt, files: live.files, doing: doingOf(live),
   };
 }
 

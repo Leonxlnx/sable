@@ -16,7 +16,7 @@ import { REVEAL_EVENT, rootOf, type RevealDetail } from './reveal';
 import { foldedTurn } from './changes';
 import { Tail } from './Tail';
 import { TurnFoot } from './Turn';
-import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnsIndex, type Group, type Segment, type StepsChunk, type TurnGroup } from './turns';
+import { checkpointStart, earlyWords, liveBelowCards, runSpan, shapeIndex, turnsIndex, type Group, type Segment, type StepsChunk, type TurnGroup } from './turns';
 import { stabilize, type Kept } from './stabilize';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
@@ -488,8 +488,8 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
         key={`seg:${seg.key}`}
         seg={seg}
         turn={i === headSeg ? turn : undefined}
-        after={turn.segments[i + 1]?.lead ?? turn.end ?? turn.early}
-        cap={i === last ? turn.next : undefined}
+        after={turn.stops?.[i] ?? turn.segments[i + 1]?.lead ?? turn.end ?? turn.early}
+        cap={turn.end ?? (i === last ? turn.next : undefined)}
         index={i}
         place={headSeg < 0 || i < headSeg ? -1 : i === headSeg ? 0 : 1}
         running={running}
@@ -618,7 +618,7 @@ interface SegmentProps {
   turn?: TurnGroup;
   /** What follows the segment: the next segment's message, else the turn's end (it closes the last run). */
   after: string | null | undefined;
-  /** The root after the turn, for its last segment: the last run's time never reaches past it. */
+  /** The turn record covering the checkpoint, or the next root bounding unrecorded work. */
   cap?: string;
   index: number;
   /** Where the segment stands to the turn's line: before it (-1), holding it (0), after it (1). */
@@ -660,11 +660,9 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, cap, index, pl
     }
     if (c.kind === 'text') {
       const note = seg.notes.includes(c.id);
-      // Opened, everything between the turn's line and its answer stands on one inset: the reply to
-      // a steered message too (it stood back on the column's edge between nested checkpoints, the
-      // left edge stepping in and out four times in 400 px). Closed, the reply stays on the edge.
-      const reply = c.id === seg.reply && open && place >= 0;
-      out.push(<TextPiece key={c.id} id={c.id} open={!note || shown} nest={(note && nest) || reply} answer={c.id === seg.answer || c.id === seg.reply} tail={seg.tail.includes(c.id)} />);
+      // A steered reply inside the open fold shares its inset. The opening reply stays on the message's edge.
+      const insetReply = seg.steered && c.id === seg.reply && open && place >= 0;
+      out.push(<TextPiece key={c.id} id={c.id} open={!note || shown} nest={(note && nest) || insetReply} answer={c.id === seg.answer || c.id === seg.reply} tail={seg.tail.includes(c.id)} />);
       continue;
     }
     const head = i === headAt;
@@ -676,7 +674,7 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, cap, index, pl
         run={c}
         from={i === 0 && seg.lead ? seg.lead : c.ids[0]}
         until={(next ? (next.kind === 'steps' ? next.ids[0] : next.id) : after) ?? null}
-        cap={next ? undefined : cap}
+        cap={cap}
         head={head}
         live={isLive}
         first={i === 0}
@@ -698,7 +696,7 @@ const SegmentView = memo(function SegmentView({ seg, turn, after, cap, index, pl
 
 /**
  * Something the agent said, in a wrapper that folds it away with the work: a note along the way is
- * in view while the turn runs and inside the turn's line after; the answer, the reply to a steered
+ * in view while the turn runs and inside the turn's line after; the answer, the reply to a person's
  * message and the words of a turn with no work behind them never fold. One element through all of
  * it, so a note that turns out the answer is not made again. `tail`: a nod said after the answer
  * ("Committed."), in view under it as a quiet last line.
@@ -1086,7 +1084,7 @@ function LiveLine({ seg, run, from, open, onToggle }: { seg: Segment; run: Steps
   const { sessionId } = useTimeline();
   const [last] = useState(() => ({ title: '' }));
   const info = useStore(useMemo(() => liveSelector(sessionId, seg, run, last), [sessionId, seg, run, last]));
-  const lead = useItem(from ?? '');
+  const since = useStore(s => checkpointStart(s.data[sessionId]?.items ?? emptyIndex, run?.ids ?? [], from));
   const now = useTick();
   const [w, st, q, ...rest] = info.split('|');
   const waiting = w === '1';
@@ -1101,7 +1099,7 @@ function LiveLine({ seg, run, from, open, onToggle }: { seg: Segment; run: Steps
   // Quick steps in a row: each title holds a moment instead of flickering past (waiting shows at once).
   const held = useHeld(rest.join('|'), TITLE_HOLD_MS);
   const [title, out] = useSwap(held);
-  const elapsed = lead ? now - lead.ts : 0;
+  const elapsed = since === undefined ? 0 : now - since;
   const steps = run?.count ?? 0;
   // The working tiles keep their own animation: the line's ticks and title changes leave them alone.
   const tiles = useMemo(() => <Tiles size={12} />, []);

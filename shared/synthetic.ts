@@ -71,6 +71,21 @@ export interface Synthetic {
 
 // ───────────────────────────────── the tags ─────────────────────────────────
 
+export const DELEGATE_REPORT = 'A background sub-agent reported.';
+/** Collect receipts only from the provider's stored user inputs. */
+export function readDelegateIds(text: string, into: Set<string>) {
+  for (const match of text.matchAll(/<system-reminder>A background sub-agent reported\.\n[^<]*?\nDelivery ID: ([\da-f-]{36})\n/g)) into.add(match[1]);
+}
+export function delegateReport(title: string, outcome: string, report: string, deliveryId?: string) {
+  // A report can quote markup, including the reminder's own closing tag.
+  const escape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const body = escape(report.slice(0, 40_000));
+  const bounded = report.length > 40_000 || body.length > 40_000 ? body.slice(0, 40_000) + '\n\n(cut off)' : body;
+  return `<system-reminder>${DELEGATE_REPORT}\n${escape(title.slice(0, 160))} (${outcome})\n${deliveryId ? 'Delivery ID: ' + deliveryId + '\n' : ''}${bounded}</system-reminder>`;
+}
+
+export const STEER_NOW_BLOCK = '<system-reminder>Work was interrupted because the person asked for an answer now. Answer their message first, then continue the interrupted work if it still makes sense. Tell them what was lost, including any unfinished foreground sub-agent progress.</system-reminder>';
+
 const COMMAND_TAGS = new Set(['command-name', 'command-message', 'command-args', 'command-contents']);
 const OUTPUT_TAGS = new Set(['local-command-stdout', 'local-command-stderr', 'bash-stdout', 'bash-stderr']);
 const HIDDEN_TAGS = new Set(['local-command-caveat', 'system-reminder', 'system_reminder', 'user-prompt-submit-hook', 'tick', 'total_tokens', 'bash-exit-code']);
@@ -86,7 +101,7 @@ const CONTINUED = /^This session is being continued from a previous conversation
 const OPEN_TAG = /<([a-zA-Z][\w-]*)((?:\s[^<>]*?)?)(\/?)>/y;
 // eslint-disable-next-line no-control-regex
 const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
-const OUTPUT_TRAILER = /Read the output file to retrieve the result:\s*(\S[^\n]*)/i;
+const OUTPUT_TRAILER = /^Read the output file to retrieve the result:\s*(\S[^\n]*)$/i;
 
 interface Block {
   tag: string;
@@ -156,6 +171,7 @@ const TASK_CHILD = /<(task-id|task_id|tool-use-id|output-file|status|summary|tas
 
 /** Whether an unclosed block is one cut short: nothing after it, or (a notification, a command) its inside. */
 function cutBlock(tag: string, rest: string): boolean {
+  if (STRIP_TAGS.includes(tag)) return false;
   if (!rest.trim()) return true;
   if (tag === 'task-notification') return TASK_CHILD.test(rest);
   return COMMAND_TAGS.has(tag) || OUTPUT_TAGS.has(tag) || tag === 'bash-input';
@@ -324,7 +340,7 @@ export function parseSynthetic(text: string): Synthetic | null {
   const has = (k: SyntheticPart['kind']) => parts.some((p) => p.kind === k);
   const role: SyntheticRole = has('task') || has('message') ? 'notification' : has('command') || has('bash') ? 'command' : has('output') ? 'output' : 'hidden';
   // Only wrappers around words of the person's own: their message, shown without the wrappers (`userText`).
-  if (role === 'hidden' && free) return null;
+  if (free && !(has('task') && OUTPUT_TRAILER.test(free))) return null;
   const out: Synthetic = { role, parts };
   if (free) {
     out.extra = free;
@@ -345,9 +361,12 @@ export function maybeSynthetic(text: string): boolean {
 
 const cache = new WeakMap<object, Synthetic | null>();
 
-/** `parseSynthetic` of a user item's text, read once per item object (items are replaced, never changed). */
-export function syntheticOf(item: { type: string; text?: string } | undefined | null): Synthetic | null {
-  if (!item || item.type !== 'user' || typeof item.text !== 'string') return null;
+type UserWords = { type: string; text?: string; authored?: boolean; submitPrint?: string; steered?: boolean; remote?: boolean };
+const personal = (item: UserWords) => item.authored || item.submitPrint || item.steered || item.remote;
+
+/** Classify imported text only when the card carries no personal origin. */
+export function syntheticOf(item: UserWords | undefined | null): Synthetic | null {
+  if (!item || personal(item) || item.type !== 'user' || typeof item.text !== 'string') return null;
   if (!maybeSynthetic(item.text)) return null;
   let s = cache.get(item);
   if (s === undefined) {
@@ -524,7 +543,7 @@ const LOST_TASKS_TAIL = '. They may have ended with it or may still be running, 
 const LOST_TASKS = /(?:^|\n\n)Sable lost track of these background tasks when the agent process that ran them went away: [^\n]{1,4000}\. They may have ended with it or may still be running, and no notification will come for them\. Check what they left \(their output, ports, files\) before you start any of them again\.\s*(?=$|\n\n(?:@\S|\[Attached file: |<attachment[\s>]))/;
 export const lostTasksNote = (names: string[]) => (names.length ? `${LOST_TASKS_HEAD}${names.join('; ')}${LOST_TASKS_TAIL}` : '');
 
-const SABLE_OPENERS = ['This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, RESUME_LOST, 'The check `'];
+const SABLE_OPENERS = [DELEGATE_REPORT, 'This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, RESUME_LOST, 'The check `'];
 const HANDOVER_HEAD = /^(?:This continues a conversation (?:that started under another account|the user had with [^\n]{1,200} in this folder)|Since your last reply here, the user went on with [^\n]{1,200} in this conversation)\. Here is what happened (?:so far|since), oldest first:\n/;
 /** The whole of an `/until` round's failure (server/core/until.ts `failureMessage`): its head, then the output fenced or "It printed nothing.", and nothing after: the output ends at the first line that is the closing fence, so words and a fenced block of the person's own after a pasted failure stay theirs. */
 const UNTIL_FAILURE = /^The check `[^`\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n(?:(?!\1[ \t]*(?:\n|$))[^\n]*\n)*\1)$/;
@@ -534,19 +553,24 @@ const BROWSER_LINE = /\n\n\[Sable: the user's Browser tab shows \S+?(?: titled "
 function sableMessage(lead: string): string {
   // Known outer wrappers come off first: a continuation after a move carries its note (a trailing
   // `<system-reminder>`), and read back from a transcript it must still be known as Sable's.
+  const payload = withoutHandover(lead);
+  if (payload !== lead) return !payload.trim() || sableMessage(payload) ? lead : '';
   let bare = lead;
-  for (const tag of STRIP_TAGS) bare = bare.replace(new RegExp(`\\s*<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?(?:</${tag}>|$)`, 'g'), '');
+  for (const tag of STRIP_TAGS) bare = bare.replace(new RegExp(`\\s*<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?</${tag}>`, 'g'), '');
   const t = bare.replace(BROWSER_LINE, '').trimEnd().replace(LOST_TASKS, '').replace(RESUME_BACKGROUND, '').replace(SIGN_IN_BACKGROUND, '').trim();
   if (t === RESUME_AFTER_RESET || t === RESUME_UNDER_ANOTHER || t === RESUME_LIMIT_RESET || t === RESUME_AFTER_SIGN_IN || t === RESUME_LOST) return t;
+  const reportStart = DELEGATE_REPORT + '\n\n<system-reminder>' + DELEGATE_REPORT + '\n';
+  if (lead.startsWith(reportStart)) {
+    // Legacy phone previews can end inside an escaped report body. The two Sable
+    // headings and a complete outcome line identify that envelope.
+    if (t === DELEGATE_REPORT || /^[^<>\n]+ \((?:done|failed|stopped|cancelled|error)\)\n[^<]*$/.test(lead.slice(reportStart.length))) return DELEGATE_REPORT;
+  }
   if (UNTIL_FAILURE.test(t)) return t;
-  // A handover with nothing of the person's after it.
-  const words = withoutHandover(t);
-  if (words !== t && (!words.trim() || sableMessage(words))) return t;
   return '';
 }
 
 /** The person's words without a handover Sable put before them. */
-function withoutHandover(text: string): string {
+export function withoutHandover(text: string): string {
   if (!HANDOVER_HEAD.test(text)) return text;
   const tail = text.indexOf(`${HANDOVER_TAIL}${HANDOVER_JOIN}`);
   if (tail >= 0) return text.slice(tail + HANDOVER_TAIL.length + HANDOVER_JOIN.length);
@@ -563,7 +587,11 @@ export function stripWrappers(text: string): string {
   const src = text.replace(/\r\n?/g, '\n');
   let out = HANDOVER_HEAD.test(src.trimStart()) ? withoutHandover(src.trimStart()) : src;
   if (out.includes('<')) {
-    for (const tag of STRIP_TAGS) out = out.replace(new RegExp(`<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?(?:</${tag}>|$)`, 'g'), '');
+    for (const tag of STRIP_TAGS) {
+      const block = new RegExp(`<${tag}(?:\\s[^<>]*)?>[\\s\\S]*?</${tag}>`, 'g');
+      out = out.replace(block, (match, offset: number, source: string) =>
+        source.slice(0, offset).trim() && !/^\s*(?:$|@|\[Attached file: |<attachment[\s>]|<(?:system-reminder|user-prompt-submit-hook)>)/.test(source.slice(offset + match.length)) ? match : '');
+    }
   }
   out = out.replace(BROWSER_LINE, '').replace(LOST_TASKS, '').replace(RESUME_BACKGROUND, '').replace(RESUME_SUMMARY_TRAILER, '');
   return out === src ? text : out.trim();
@@ -576,7 +604,8 @@ export function userText(text: string): string {
 }
 
 /** `userText` of a user item, read once per item object. */
-export function userItemText(item: { type: string; text?: string }): string {
+export function userItemText(item: UserWords): string {
+  if (personal(item)) return item.text ?? '';
   const s = syntheticOf(item);
   return s ? syntheticLine(s) : stripWrappers(item.text ?? '');
 }
@@ -586,6 +615,7 @@ export function userItemText(item: { type: string; text?: string }): string {
  * `<task-notification>`): its plain words, '' when nothing readable is left.
  */
 export function readableTitle(title: string): string {
+  if (/^<local-command-caveat>Caveat: The messages below were generated[^<]*…$/.test(title)) return '';
   const line = userText(title);
   if (line === title) return title;
   const one = line.replace(/\s+/g, ' ').trim();

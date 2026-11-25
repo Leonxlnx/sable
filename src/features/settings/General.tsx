@@ -6,6 +6,7 @@ import { tildePath } from '@/lib/format';
 import { setChatsFolder, setDefaultSessionOptions, setSettings, setWorktreesFolder } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { Kbd, PathLabel, Segmented, Switch } from '@/ui';
+import { STEER_AFTER, steerAfterChoice, steerAfterMs, type SteerAfter } from '@/features/timeline/steer-wait';
 import { Card, ProviderLabel, Row, useInstalled } from './parts';
 
 export function General() {
@@ -62,6 +63,17 @@ export function General() {
         </Row>
         <Row label="Short answers" help="The outcome first, and a localhost link when there is something to preview.">
           <Switch label="Short answers" checked={settings.conciseReplies !== false} onChange={(conciseReplies) => setSettings({ conciseReplies })} />
+        </Row>
+        <Row label="Reply before working">
+          <Switch label="Reply before working" checked={settings.replyFirst !== false} onChange={(replyFirst) => setSettings({ replyFirst })} />
+        </Row>
+        <Row label="Interrupt for a waiting message">
+          <Segmented<SteerAfter>
+            id="set-steer-after"
+            value={steerAfterChoice(settings.steerAfterMs)}
+            onChange={(choice) => setSettings({ steerAfterMs: steerAfterMs(choice) })}
+            options={STEER_AFTER.map((o) => ({ value: o.id, label: o.label }))}
+          />
         </Row>
         <Row label="Generative UI">
           <Switch label="Generative UI" checked={settings.generativeUi !== false} onChange={(generativeUi) => setSettings({ generativeUi })} />

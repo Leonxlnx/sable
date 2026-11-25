@@ -57,7 +57,7 @@ for (const platform of ['desktop', 'phone']) {
       const waiting = [prompt, scanned, queued, steer];
       expect(checkWaiting(waiting)).toEqual(before.segments[0]);
       const note = words('note', 4, '', true);
-      expect(checkWaiting([...waiting, note]).work).toEqual(['scan', 'note']);
+      expect(checkWaiting([...waiting, note]).work).toEqual(['scan']);
       const streamed = { ...note, text: 'The migration passed.' };
       expect(checkWaiting([...waiting, streamed]).answer).toBe('note');
       const finished = { ...streamed, streaming: false };
@@ -95,7 +95,7 @@ for (const platform of ['desktop', 'phone']) {
       expect(working.segments[1].work).toEqual(['lookup']);
       const direct = { kind: 'text', id: 'reply' };
       const emptyReply = words('reply', 8, '', true);
-      expect(read([...roots, work, emptyReply]).turn.segments[1].flow[0]).toEqual(direct);
+      expect(read([...roots, work, emptyReply]).turn.segments[1].flow).toEqual(working.segments[1].flow);
       const reply = { ...emptyReply, text: 'The users table.' };
       const answering = read([...roots, work, reply]).turn.segments[1];
       expect(answering.flow[0]).toEqual(direct);
