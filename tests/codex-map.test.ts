@@ -287,9 +287,16 @@ describe('draftItem and transcript', () => {
     }
   });
 
+  it('preserves a quoted report in an ambiguous legacy steer block', () => {
+    const words = 'I copied this:\n\n' + delegateReport('Review', 'done', 'Ready');
+    const content = [words, STEER_FIRST_BLOCK].map(text => ({ type: 'text', text }));
+    const [row] = transcript(X([{ id: 't', items: [{ type: 'userMessage', id: 'u', content }] }]));
+    expect(userItemText(row)).toBe(words);
+  });
+
   it('removes a carried report before the file suffix that Codex builds', () => {
     const text = 'review this' + lostTasksNote(['Build']) + '\n\n' + delegateReport('Review', 'done', 'private receipt');
-    const content = [...buildInput(text, [{ id: 'f', name: 'notes.txt', kind: 'text', text: 'my notes' }], []), { type: 'text', text: STEER_FIRST_BLOCK }];
+    const content = [...buildInput(text, [{ id: 'f', name: 'notes.txt', kind: 'text', text: 'my notes' }], [], { words: 'review this', start: 0 }), { type: 'text', text: STEER_FIRST_BLOCK }];
     const [row] = transcript(X([{ id: 't', items: [{ type: 'userMessage', id: 'u', content }] }]));
     expect(userItemText(row)).toBe('review this\n\n<attachment name="notes.txt">\nmy notes\n</attachment>');
   });

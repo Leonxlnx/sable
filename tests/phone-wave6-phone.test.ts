@@ -80,42 +80,30 @@ const reset = () => {
 };
 
 describe('words taken back are in one observable, committed draft (9)', () => {
-  it('the field has them the moment they are staged; typing during a slow commit goes on from them; the copy follows the edits', async () => {
+  it('keeps the reservation separate from newer typing until confirmation', async () => {
     reset();
     const { drafts } = await phone();
-    await drafts.pendingTakes();
-    drafts.setDraft('s', 'had');
-    const seen: [string, string][] = [];
-    const stop = drafts.onDraft('s', (t, why) => void seen.push([t, why]));
+    drafts.setDraft('s', 'had', { now: true });
     const slow = gate();
     prefs.writeGate = slow.p;
-    const staging = drafts.stageTaken('s', 'fix the tests', 'R1');
+    const staging = drafts.stageTaken('s', 'fix the tests', 'R1', 'q');
     await tick();
-    // Before Android has answered for the commit, the field already shows the words.
-    expect(seen).toEqual([['had\nfix the tests', 'taken']]);
-    expect(drafts.getDraft('s')).toBe('had\nfix the tests');
-    // Typed on top meanwhile: nothing older is written over it.
-    drafts.setDraft('s', 'had\nfix the tests and the docs');
+    expect(drafts.getDraft('s')).toBe('had');
+    expect(await drafts.pendingTakes()).toEqual([]);
+    drafts.setDraft('s', 'newer', { now: true });
     slow.open();
-    prefs.writeGate = null;
-    const rev = await staging;
-    expect(rev).toBeGreaterThan(0);
-    expect(takenNow()!.kept.s.t).toBe('had\nfix the tests');
-    // The desktop answered: the receipt goes, the committed copy stays with the draft and follows its edits.
-    drafts.settleTaken('R1');
-    drafts.flushDrafts();
-    await drafts.drained();
+    await staging;
+    await drafts.settleTaken('R1', true);
+    expect(drafts.getDraft('s')).toBe('newer\nfix the tests');
     expect(takenNow()!.takes).toEqual([]);
-    expect(takenNow()!.kept.s.t).toBe('had\nfix the tests and the docs');
-    expect(drafts.getDraft('s')).toBe('had\nfix the tests and the docs');
-    stop();
+    expect(takenNow()!.kept.s.t).toBe('newer\nfix the tests');
   });
 
   it('a chat left before the desktop answers loses nothing: the next field opens on the words', async () => {
     reset();
     const { drafts } = await phone();
-    await drafts.stageTaken('s', 'the words', 'R2');
-    drafts.settleTaken('R2');
+    await drafts.stageTaken('s', 'the words', 'R2', 'q');
+    await drafts.settleTaken('R2', true);
     await drafts.drained();
     // No field was listening: the draft itself has them, and so does its committed copy.
     expect(drafts.getDraft('s')).toBe('the words');
@@ -127,14 +115,16 @@ describe('words taken back are in one observable, committed draft (9)', () => {
     const a = await phone();
     a.drafts.setDraft('s', 'older', { now: true });
     const older = mem.get('sable.drafts')!;
-    await a.drafts.stageTaken('s', 'taken words', 'R3');
+    await a.drafts.stageTaken('s', 'taken words', 'R3', 'q');
     await a.drafts.drained();
     // The page's storage as it was before the take (its write never reached the disk).
     mem.set('sable.drafts', older);
     const b = await phone();
     await b.drafts.pendingTakes();
-    expect(b.drafts.getDraft('s')).toBe('older\ntaken words');
+    expect(b.drafts.getDraft('s')).toBe('older');
     expect(await b.drafts.pendingTakes()).toEqual(['R3']);
+    await b.drafts.settleTaken('R3', true);
+    expect(b.drafts.getDraft('s')).toBe('older\ntaken words');
     // Sent: the draft empties and its committed copy goes now, so the words never come back.
     b.drafts.setDraft('s', '');
     await b.drafts.drained();
@@ -149,7 +139,7 @@ describe('words taken back are in one observable, committed draft (9)', () => {
     const { drafts } = await phone();
     drafts.setDraft('s', 'mine', { now: true });
     prefs.failWrite = true;
-    await expect(drafts.stageTaken('s', 'queued words', 'R4')).rejects.toThrow('Not kept');
+    await expect(drafts.stageTaken('s', 'queued words', 'R4', 'q')).rejects.toThrow('full');
     expect(drafts.getDraft('s')).toBe('mine');
     expect(await drafts.pendingTakes()).toEqual([]);
   });
@@ -223,10 +213,11 @@ describe('Forget lets go of everything first (10)', () => {
     await drafts.pendingTakes();
     const slow = gate();
     prefs.writeGate = slow.p;
-    const staging = drafts.stageTaken('s', 'words', 'R1').catch(() => {});
+    const staging = drafts.stageTaken('s', 'words', 'R1', 'q').catch(() => {});
     await tick();
-    // A second write is due behind the first.
-    drafts.settleTaken('R1');
+    // A second reservation is queued behind the first.
+    const second = drafts.stageTaken('s', 'later', 'R2', 'q2').catch(() => {});
+    await tick();
     const erased = erase.eraseAll({
       storage: localStorage as never,
       native: async () => {
@@ -239,7 +230,7 @@ describe('Forget lets go of everything first (10)', () => {
     slow.open();
     prefs.writeGate = null;
     await erased;
-    await staging;
+    await Promise.all([staging, second]);
     await drafts.drained();
     expect(prefs.log).toEqual([`write ${TAKEN}`, 'erase native']);
     expect(prefs.map.has(TAKEN)).toBe(false);

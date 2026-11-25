@@ -16,6 +16,7 @@ import { CheckBlock } from './Check';
 import { EMPTY, useItem, useTimeline, useWhole } from './ctx';
 import { foldKey, useFold } from './fold';
 import { ItemList } from './items';
+import { ReportAgain } from './ReportAgain';
 import { Elapsed, ToolView } from './Tool';
 import { shortDuration } from './util';
 
@@ -101,6 +102,8 @@ const SubAgentBlock = memo(function SubAgentBlock({ item, tail = TAIL, extra, sc
                   <span>{line.report}</span>
                 </>
               )}
+              {/* Its delivery is unknown: the person decides whether it goes again (nothing where there is no decision). */}
+              <ReportAgain sessionId={sessionId} item={item} className="agent-again" />
               {line.parts.map((p) => (
                 <Fragment key={p}>
                   <span className="agent-dot" aria-hidden>

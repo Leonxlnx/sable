@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Backdrop } from '@/art/Backdrop';
 import { Composer } from '@/features/composer/Composer';
 import { PromptDock } from '@/features/prompts/PromptDock';
@@ -107,6 +107,19 @@ export function SessionDock({ sessionId }: { sessionId: string }) {
       host.style.removeProperty('--dock-cut');
     };
   }, [exists]);
+
+  // The first layout of a window that starts into a chat: no `--dock-h` is set yet, and the observer
+  // above first answers a frame after the dock is in the page. The conversation was laid out and kept
+  // at its end over the stylesheet's stand-in height (150 px) and stepped by the difference (42 px with
+  // the plain composer) a frame later, right as the launch began to open onto it. Measured here, in
+  // the commit that mounts the composer, the first frame drawn is already right.
+  useLayoutEffect(() => {
+    const el = dock.current;
+    const host = el?.closest<HTMLElement>('.stage-body');
+    if (!el || !host || !composer) return;
+    host.style.setProperty('--dock-h', `${el.offsetHeight}px`);
+    host.style.setProperty('--dock-cut', `${coveTop(el)}px`);
+  }, [exists, composer]);
 
   if (!exists) return null;
   return (

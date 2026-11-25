@@ -260,8 +260,11 @@ describe('what goes back to a phone', () => {
     const got = (await c.next((f) => (f.event as { type?: string } | undefined)?.type === 'permission.added')) as { event: { request: PermissionRequest } };
     expect(JSON.stringify(got).length).toBeLessThan(120_000);
     const q = rt.enqueue('look', [{ id: 'a1', kind: 'image', name: 'shot.png', dataUrl: `data:image/png;base64,${big(3_000_000)}` }]);
-    const taken = (await c.call('queue.take', { sessionId: rt.id, id: q.id })) as { result: { message: QueuedMessage } };
-    expect(taken.result.message.attachments?.[0].dataUrl).toBeUndefined();
+    const taken = await c.call('queue.take', { sessionId: rt.id, id: q.id });
+    expect(taken).toMatchObject({ ok: false, error: expect.stringMatching(/attachments/) });
+    expect(taken.result).toBeUndefined();
+    expect(JSON.stringify(taken)).not.toContain('data:image');
+    expect(rt.queue[0].attachments?.[0].dataUrl).toBe(q.attachments![0].dataUrl);
     // An event too big for a phone is left out; the next one comes.
     app.emit({ type: 'toast', level: 'info', text: big(FRAME_MAX.event + 10) });
     app.emit({ type: 'toast', level: 'info', text: 'small' });

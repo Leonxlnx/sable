@@ -92,6 +92,8 @@ const sdk = vi.hoisted(() => {
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => ({ ...(await importOriginal<object>()), getSessionMessages: sdk.history, query: (p: { prompt: AsyncIterable<unknown> }) => sdk.fakeQuery(p) }));
 
+vi.mock('../server/providers/claude-history', () => ({ claudeHistory: (_method: string, args: unknown[]) => sdk.history(...args) }));
+
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
   vi.useRealTimers();

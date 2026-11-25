@@ -463,6 +463,30 @@
   color: var(--text-3);
 }
 
+/* "Send report again" under a row whose report's delivery is unknown: one quiet action on the
+   title's edge (the row is a button itself, so the action stands on a line of its own). */
+.agx-again {
+  display: flex;
+  height: var(--rail-row-h);
+  align-items: center;
+  padding-left: calc(var(--agx-inset) + 1px + var(--agx-indent));
+}
+
+.agx-again > .agx-goto {
+  margin-top: 0;
+}
+
+.agx-again > .agx-goto:focus-visible {
+  outline-offset: var(--focus-inset);
+}
+
+/* On its way to the bridge: it keeps its place and takes no second press. */
+.agx-again > .agx-goto[aria-disabled='true'] {
+  color: var(--text-4);
+  background-color: transparent;
+  cursor: default;
+}
+
 /* A row that joins the list on screen rises into place, once. */
 :is(.agx-row, .agx-card, .agx-wave)[data-new] {
   animation: rise-in var(--d-3) var(--ease-out) backwards;

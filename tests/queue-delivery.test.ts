@@ -95,7 +95,7 @@ describe('the phone’s queue row', () => {
 
   it('reads the desktop’s model and says the reason under the words', () => {
     expect(screen).toMatch(/import \{ rowActs, rowDelivery \} from '@desk\/features\/composer\/queue-rows';/);
-    expect(row).toMatch(/const delivery = rowDelivery\(q\);/);
+    expect(row).toContain('q ? rowDelivery(q)');
     expect(row).toMatch(/<span className="queued-why">\{delivery\.reason\}<\/span>/);
     const css = read('mobile/src/styles/chat.css');
     expect(css).toMatch(/\n\.queued-text\[data-why\] \{[^}]*flex-direction: column;/);

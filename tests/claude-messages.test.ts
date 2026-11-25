@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, REPLY_FIRST_PROMPT, STEER_FIRST_BLOCK, type NoticeItem, type SessionMeta, type TextItem, type TimelineItem, type ToolItem, type TurnItem, type UserItem } from '@shared/protocol';
-import { HANDOVER_HEAD_ACCOUNT, HANDOVER_JOIN, STEER_NOW_BLOCK, parseSynthetic, HANDOVER_TAIL, lostTasksNote, stripWrappers } from '@shared/synthetic';
+import { HANDOVER_HEAD_ACCOUNT, HANDOVER_JOIN, STEER_NOW_BLOCK, delegateReport, nativePersonalPrompt, parseSynthetic, HANDOVER_TAIL, lostTasksNote, stripWrappers } from '@shared/synthetic';
 import { App } from '../server/app';
 import { claudeFolderKey } from '../server/core/lanes';
 import { resultDigest } from '../server/core/delegate-result';
@@ -86,6 +86,19 @@ const sdk = vi.hoisted(() => {
 });
 
 vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => ({ ...(await importOriginal<object>()), getSessionMessages: sdk.history, forkSession: sdk.fork, query: (p: { prompt: AsyncIterable<unknown> }) => sdk.fakeQuery(p) }));
+
+vi.mock('../server/providers/claude-history', () => ({
+  claudeHistory: async (method: string, args: unknown[], _env: unknown, signal: AbortSignal) => {
+    const read = method === 'forkSession' ? sdk.fork : sdk.history;
+    let abort!: () => void;
+    try {
+      return await Promise.race([read(...args), new Promise<never>((_, reject) => {
+        abort = () => reject(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+      })]);
+    } finally { signal.removeEventListener('abort', abort); }
+  },
+}));
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -1699,6 +1712,34 @@ describe('Sable delegates in a Claude turn', () => {
     }
   });
 
+  it('expires a second receipt lookup on the same chat without launching another SDK reader', async () => {
+    const h = await setup();
+    const p = h.app.provider('claude') as ClaudeProvider;
+    let finish!: (rows: never[]) => void;
+    sdk.history.mockReset().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue([]);
+    const slow = p.steerReceipts('same-chat', h.rt.meta.cwd, new Set(['first']));
+    try {
+      await until(() => !!finish, 'first SDK reader');
+      await expect(p.delegateReceipts('same-chat', h.rt.meta.cwd, undefined, { tools: new Map(), ids: new Set(['second']) },
+        AbortSignal.timeout(50))).rejects.toThrow();
+      expect(sdk.history).toHaveBeenCalledTimes(1);
+    } finally { finish([]); await slow; }
+  });
+
+  it('reads another chat while a steer history read is stalled', async () => {
+    const h = await setup();
+    const p = h.app.provider('claude') as ClaudeProvider;
+    let finish!: (rows: never[]) => void;
+    sdk.history.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }))
+      .mockResolvedValueOnce([{ type: 'user', uuid: 'other' }]);
+    const slow = p.steerReceipts('cc1', h.rt.meta.cwd, new Set(['first']));
+    try {
+      await until(() => !!finish, 'first lookup');
+      const fast = p.steerReceipts('cc2', h.rt.meta.cwd, new Set(['other']));
+      expect(await Promise.race([fast, tick(250).then(() => [])])).toEqual(['other']);
+    } finally { finish([]); await slow; }
+  });
+
   it('releases the Claude history lock when a report read times out', async () => {
     const h = await setup();
     const p = h.app.provider('claude') as ClaudeProvider;
@@ -1707,7 +1748,8 @@ describe('Sable delegates in a Claude turn', () => {
     try {
       const read = p.delegateReceipts('cc1', h.rt.meta.cwd, undefined, { ids: new Set(['id']), tools: new Map() }, AbortSignal.timeout(80));
       await expect(read).rejects.toThrow();
-      expect(await p.withHistory(async () => 'free')).toBe('free');
+      sdk.history.mockResolvedValueOnce([{ type: 'user', uuid: 'free' }]);
+      expect(await p.steerReceipts('cc2', h.rt.meta.cwd, new Set(['free']))).toEqual(['free']);
     } finally { finish?.([]); }
   });
 
@@ -1724,20 +1766,70 @@ describe('Sable delegates in a Claude turn', () => {
       active--;
       return { items: [], todos: [] };
     });
+    vi.useFakeTimers();
     const app = new App({ home, userHome: home, quiet: true, providers: [() => h.app.provider('claude')] });
+    const delayed: string[] = [];
+    app.subscribe(e => { if (e.type === 'toast' && e.text.includes('Delegate recovery')) delayed.push(e.text); });
     try {
       expect(gates).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(90_010);
+      expect(delayed).toHaveLength(2);
+      expect(gates).toHaveLength(2);
+      vi.useRealTimers();
       for (let n = 0; n < 5; n++) {
         await until(() => !!gates[n], 'next recovery read');
         gates[n]();
       }
       expect(peak).toBe(2);
     } finally {
+      vi.useRealTimers();
       for (const resolve of gates) resolve();
       files.mockRestore();
       await app.dispose();
       rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  it('accepts the native Claude result after the quit interrupt grace expires', async () => {
+    const h = await claude({ meta: { id: 'sub-quitting' } });
+    const { uuid } = await h.send('finish the review');
+    await h.replay(uuid, 'finish the review');
+    Object.assign(h.rt, { awaitingQuitResult: true });
+    vi.useFakeTimers();
+    try {
+      await h.session.interrupt();
+      await vi.advanceTimersByTimeAsync(7900);
+      expect(h.rt.turnActive).toBe(true);
+      await h.text('Definitive review');
+      await h.message(result([uuid]));
+      expect(h.rt.turnActive).toBe(false);
+      expect(h.rt.items.some(i => i.type === 'notice' && i.variant === 'interrupted')).toBe(false);
+      expect(h.rt.items.some(i => i.type === 'text' && i.text === 'Definitive review')).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('recovers a definitive child answer received after the quit seal', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'after-seal', true);
+    await c.result;
+    await until(() => c.child().turnActive, 'started');
+    c.interrupt.mockImplementation(async () => {});
+    let close!: () => void;
+    c.close.mockImplementation(async () => new Promise(resolve => { close = resolve; }));
+    await h.rt.persistDelegate!();
+    vi.useFakeTimers();
+    let sealed = false;
+    const quitting = h.app.dispose(() => { sealed = true; });
+    await vi.advanceTimersByTimeAsync(7900);
+    vi.useRealTimers();
+    try {
+      await until(() => sealed, 'sealed snapshot');
+      c.finish();
+      await tick();
+      const restarted = await claudeApp(h);
+      await until(() => !!restarted.rt.get('after-seal'), 'recovered row');
+      expect(restarted.rt.get<ToolItem>('after-seal')).toMatchObject({ status: 'done', result: { text: 'Report for after-seal' } });
+    } finally { close?.(); await quitting; }
   });
 
   it('saves a final delegate answer received during quit before acknowledging the store', async () => {
@@ -1793,6 +1885,38 @@ describe('Sable delegates in a Claude turn', () => {
     expect(retained.row().result?.text).toBe('Report for retained');
   });
 
+  it.each([true, false])('settles an unacknowledged report reservation at its deadline (issued %s)', async issued => {
+    const h = await setup();
+    let wire!: NonNullable<Parameters<ProviderSession['send']>[1]>;
+    const send = vi.spyOn(h.rt.handle!, 'send').mockImplementationOnce(async (_item, opts) => {
+      wire = opts!;
+      if (issued) wire.issueReport?.();
+    });
+    const c = h.start('codex', 'no-ack', true);
+    await c.result;
+    vi.useFakeTimers();
+    try {
+      c.finish();
+      await vi.waitFor(() => expect(wire).toBeDefined());
+      if (issued) sdk.history.mockResolvedValueOnce([]);
+      await vi.advanceTimersByTimeAsync(90_010);
+      expect(h.rt.reservedDelegateReports.has('no-ack')).toBe(false);
+      expect(c.row().delegateReport).toBe('pending');
+      if (issued) {
+        expect(c.row().delegateReceiptState).toBe('unknown');
+        const retry = c.row().delegateRetryId!;
+        wire.taken?.();
+        expect(h.rt.items.some(i => i.type === 'notice' && i.detail?.endsWith('/report-retry ' + retry))).toBe(false);
+        expect(c.row().delegateReport).toBe('delivered');
+        expect(c.row().delegateRetryId).toBeFalsy();
+      } else {
+        expect(c.row().delegateReceiptState).toBeFalsy();
+        expect(users(h.rt)[0].delegateContinuations ?? 0).toBe(0);
+        expect(() => wire.issueReport?.()).toThrow();
+      }
+    } finally { vi.useRealTimers(); send.mockRestore(); }
+  });
+
   it('sends personal words while the report history read is stalled', async () => {
     const h = await setup();
     let resume!: () => void;
@@ -1810,6 +1934,39 @@ describe('Sable delegates in a Claude turn', () => {
       await until(() => h.pushed.some(m => m.message.content === 'my words'), 'personal input');
       await sending;
     } finally { resume?.(); }
+  });
+
+  it('recovers a foreground answer prepared before the SDK tool returned', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'before-return');
+    await tick();
+    let close!: () => void;
+    c.close.mockImplementationOnce(() => new Promise(resolve => { close = resolve; }));
+    c.finish();
+    await until(() => !!close, 'terminal save before close');
+    try {
+      const restarted = await claudeApp(h);
+      await until(() => restarted.pushed.length > 0, 'unissued foreground answer recovered');
+      expect(restarted.pushed[0].message.content).toContain('Report for before-return');
+      expect(restarted.rt.get<ToolItem>('before-return')?.delegateReceiptState).toBeFalsy();
+    } finally { close(); await c.result; }
+  });
+
+  it('gives a foreground tool result with no echo a visible receipt decision', async () => {
+    const h = await setup();
+    const c = h.start('codex', 'silent-caller');
+    await tick();
+    vi.useFakeTimers();
+    try {
+      c.finish();
+      await vi.waitFor(() => expect(c.row().delegateAttempt?.tool).toBe('silent-caller'));
+      sdk.history.mockResolvedValueOnce([]);
+      await vi.advanceTimersByTimeAsync(90_010);
+      expect(c.row()).toMatchObject({ delegateReport: 'pending', delegateReceiptState: 'unknown', result: { text: 'Report for silent-caller' } });
+      c.receipt('Report for silent-caller');
+      expect(c.row().delegateReport).toBe('delivered');
+      expect(c.row().delegateRetryId).toBeFalsy();
+    } finally { vi.useRealTimers(); await c.result; }
   });
 
   it('recognizes the foreground receipt when the call arrived before its native tool ID', async () => {
@@ -1909,6 +2066,67 @@ describe('Sable delegates in a Claude turn', () => {
     expect(h.pushed).toHaveLength(1);
   });
 
+  it.each([false, true])('reclaims a locally rejected report offer before the next chat save (issued checkpoint %s)', async checkpoint => {
+    const h = await setup();
+    const c = h.start('codex', 'local-rejection', true);
+    await c.result;
+    await h.app.store.flush();
+    let copied: ReturnType<typeof claudeApp> | undefined;
+    const send = vi.spyOn(h.rt.handle!, 'send').mockImplementationOnce(async (_item, opts) => {
+      opts!.issueReport!();
+      expect(users(h.rt)[0].delegateContinuations).toBe(1);
+      if (checkpoint) await h.rt.persistDelegate!();
+      opts!.release!(true);
+      expect(users(h.rt)[0].delegateContinuations).toBe(0);
+      copied = claudeApp(h);
+    });
+    try {
+      c.finish();
+      await until(() => !!copied, 'copied at the local refusal');
+      const restarted = await copied!;
+      const row = () => restarted.rt.get<ToolItem>('local-rejection');
+      await until(() => !!restarted.pushed.length || !!row()?.delegateRetryId, 'recovered report');
+      expect(row()?.delegateReceiptState).toBeFalsy();
+      expect(restarted.pushed[0].message.content).toContain('Report for local-rejection');
+      expect(users(restarted.rt)[0].delegateContinuations).toBe(1);
+    } finally { send.mockRestore(); }
+  });
+
+  it('carries a prepared budget-held report after a crash without charging it', async () => {
+    const h = await setup();
+    h.rt.patch<UserItem>(users(h.rt)[0].id, { delegateContinuations: 2 });
+    const c = h.start('codex', 'prepared', true);
+    await c.result;
+    c.finish();
+    await until(() => c.row().delegateWait === 'budget', 'held for next message');
+    await h.rt.persistDelegate!();
+    const restarted = await claudeApp(h);
+    await until(() => !!restarted.rt.get('prepared'), 'restored hold');
+    await tick(50);
+    expect(restarted.rt.get<ToolItem>('prepared')?.delegateReceiptState).toBeFalsy();
+    expect(users(restarted.rt)[0].delegateContinuations).toBe(2);
+    await restarted.send('carry it');
+    expect(restarted.pushed[0].message.content).toContain('Report for prepared');
+  });
+
+  it.each([false, true])('keeps a superseded limit from blocking reports after restart (legacy %s)', async legacy => {
+    const h = await setup();
+    h.result([h.first]);
+    h.rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'Earlier limit', limit: { window: '5-hour limit' } });
+    const words = await h.send('new personal turn');
+    h.replay(words, 'new personal turn');
+    h.result([words]);
+    const holds = (a: App, r: SessionRuntime) => (a as unknown as { limitHoldsWake(rt: SessionRuntime): boolean }).limitHoldsWake(r);
+    expect(holds(h.app, h.rt)).toBe(false);
+    if (legacy) for (const row of users(h.rt)) h.rt.patch<UserItem>(row.id, { completedPersonalTurn: undefined });
+    await h.rt.persistDelegate!();
+    const restarted = await claudeApp(h);
+    await restarted.app.call('session.snapshot', { sessionId: h.id });
+    expect(holds(restarted.app, restarted.rt)).toBe(false);
+    restarted.rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'New limit', limit: { window: '5-hour limit' } });
+    expect(holds(restarted.app, restarted.rt)).toBe(true);
+  });
+
   it('holds the third report continuation until the next personal message', async () => {
     const h = await setup();
     for (let n = 1; n <= 3; n++) {
@@ -1994,6 +2212,34 @@ describe('Sable delegates in a Claude turn', () => {
 });
 
 describe('interrupt and send now', () => {
+  it('round trips quoted reports and file references on import and unmatched replay', async () => {
+    const source = await claude();
+    await source.send('begin');
+    const words = 'I copied this:\n\n<system-reminder>A background sub-agent reported.\nReview (done)\nReady</system-reminder>';
+    const file = { id: 'f', name: 'log.txt', path: 'C:/fixture/log.txt', kind: 'file' as const };
+    const user = source.rt.add<UserItem>({ type: 'user', state: 'queued', authored: true, steered: true, text: words, attachments: [file] });
+    const extra = '\n\n<system-reminder>A background sub-agent reported.\nAnother (done)\nPrivate</system-reminder>';
+    await source.session.send({ ...user, text: words + extra }, { personalOffset: 0 });
+    const content = source.pushed.at(-1)!.message.content;
+    const h = await claude({ meta: { providerSessionId: 'imported' } });
+    sdk.history.mockReset().mockResolvedValueOnce([{ type: 'user', uuid: 'old', message: { content } }]);
+    await (h.session.loadTranscript as () => Promise<void>)();
+    await h.replay('unmatched', content);
+    expect(users(h.rt).map(u => u.text)).toEqual([words + '\n\n@' + file.path, words + '\n\n@' + file.path]);
+  });
+
+  it('recovers the file references in a legacy split steer on import and replay', async () => {
+    const h = await claude({ meta: { providerSessionId: 'imported' } });
+    const note = '\n\n' + delegateReport('Private child', 'done', 'not in the quotation');
+    const refs = '\n\n@C:/work/first file.txt @C:/work/second.md';
+    const content = ['my words', refs + note, STEER_FIRST_BLOCK].map(text => ({ type: 'text', text }));
+    sdk.history.mockReset().mockResolvedValueOnce([{ type: 'user', uuid: 'old', message: { content } }]);
+    await (h.session.loadTranscript as () => Promise<void>)();
+    await h.replay('new', content);
+    expect(users(h.rt).map(u => u.text)).toEqual(['my words' + refs, 'my words' + refs]);
+  });
+
+
   it('preserves the authored SDK block and hides a composed report when importing a transcript', async () => {
     const h = await claude({ meta: { providerSessionId: 'imported' } });
     const note = '<system-reminder>A background sub-agent reported.\nReview (done)\nReady</system-reminder>';
@@ -2001,7 +2247,7 @@ describe('interrupt and send now', () => {
     const words = 'I saw this ' + STEER_NOW_BLOCK + ' yesterday.';
     sdk.history.mockReset().mockResolvedValueOnce([
       { type: 'user', uuid: 'report', message: { content: report } },
-      { type: 'user', uuid: 'with-report', message: { content: [{ type: 'text', text: words + '\n\n' + note }, { type: 'text', text: STEER_NOW_BLOCK }] } },
+      { type: 'user', uuid: 'with-report', message: { content: [{ type: 'text', text: nativePersonalPrompt(words + '\n\n' + note, words, 0) }, { type: 'text', text: STEER_NOW_BLOCK }] } },
       { type: 'user', uuid: 'quote', message: { content: [{ type: 'text', text: words }, { type: 'text', text: STEER_NOW_BLOCK }] } },
       { type: 'user', uuid: 'literal', message: { content: [{ type: 'text', text: STEER_NOW_BLOCK }, { type: 'text', text: STEER_FIRST_BLOCK }] } },
       { type: 'user', uuid: 'split', message: { content: [{ type: 'text', text: words }, { type: 'text', text: '\n\n' + note }, { type: 'text', text: STEER_NOW_BLOCK }] } },
@@ -2127,6 +2373,158 @@ describe('interrupt and send now', () => {
     expect(h.card.steerWait?.reason).toMatch(/timed out/i);
     expect(await answer).toEqual({ ok: false });
     expect(h.interrupt).not.toHaveBeenCalled();
+  });
+
+  it('keeps the issued UUID when an unmarked replay has identical personal words', async () => {
+    const h = await claudeApp();
+    const first = await h.send('begin');
+    h.replay(first, 'begin');
+    const uuid = await h.send('identical', true);
+    const card = users(h.rt).at(-1)!;
+    h.replay('other-app', 'identical');
+    expect(card).toMatchObject({ state: 'queued', issuedUuid: uuid });
+    h.replay(uuid, 'identical');
+    expect(card).toMatchObject({ state: 'sent', providerId: uuid });
+  });
+
+  it('checkpoints an ordinary held phone send and refuses its release after unpairing', async () => {
+    const h = await claudeApp();
+    const first = await h.send('begin');
+    h.result([first]);
+    const session = h.rt.handle as unknown as Session;
+    session.held = [];
+    let paired = true;
+    h.app.phoneStillPaired = () => paired;
+    await h.app.call('session.send', { sessionId: h.id, text: 'keep these words', submitId: 'phone-held' }, {
+      phoneSender: { deviceId: 'pair', generation: 2 }, allowed: () => true,
+    });
+    const saved = h.app.store.loadSession(h.id);
+    expect(saved.items.find(i => i.id === 'phone-held')).toMatchObject({ state: 'queued', text: 'keep these words' });
+    expect(h.pushed).toHaveLength(1);
+    const cold = await claudeApp({ home: h.home, id: h.id });
+    const snap = await cold.app.call('session.snapshot', { sessionId: h.id });
+    expect(snap.queue.filter(q => q.id === 'phone-held')).toMatchObject([{ text: 'keep these words' }]);
+    await cold.app.call('session.send', { sessionId: h.id, text: 'keep these words', submitId: 'phone-held' },
+      { phoneSender: { deviceId: 'pair', generation: 2 }, allowed: () => true });
+    expect(cold.pushed).toHaveLength(0);
+    paired = false;
+    await (session.release as () => Promise<void>)();
+    expect(h.pushed).toHaveLength(1);
+    expect(h.rt.queue.find(q => q.id === 'phone-held')?.text).toBe('keep these words');
+  });
+
+  it.each(['spare', 'race'])('checkpoints the %s input before acknowledging admission', async route => {
+    const h = await claudeApp();
+    const persist = h.rt.persistInput!;
+    let resume!: () => void;
+    const barrier = new Promise<void>(resolve => { resume = resolve; });
+    h.rt.persistInput = async () => { await barrier; await persist(); };
+    const host = (h.app as unknown as { races: { host: { send(rt: SessionRuntime, text: string): Promise<void> } } }).races.host;
+    const input = route === 'spare' ? h.app.call('spare.send', { sessionId: h.id, text: 'durable work' }) : host.send(h.rt, 'durable work');
+    let accepted = false;
+    void input.then(() => { accepted = true; });
+    await new Promise(resolve => setTimeout(resolve, 15));
+    expect(accepted).toBe(false);
+    expect(h.pushed).toHaveLength(0);
+    resume();
+    await input;
+    const snapshot = h.app.store.loadSession(h.id);
+    expect([...snapshot.queue ?? [], ...snapshot.items].some(i => 'text' in i && i.text === 'durable work')).toBe(true);
+    if (route === 'race') await until(() => h.pushed.length === 1, 'admitted race input went once');
+  });
+
+
+  it('retains an authored compact quotation through restore', async () => {
+    const h = await claudeApp();
+    const text = '<local-command-stdout>Compacted</local-command-stdout>';
+    h.rt.loadRestored([{ type: 'notice', variant: 'compact', id: 'c', ts: 1, text: 'Conversation compacted' },
+      { type: 'user', id: 'u', ts: 2, text, state: 'sent', authored: true }]);
+    expect(h.rt.get('u')).toMatchObject({ text });
+  });
+
+  it('resumes the idle drain when a phone admission releases the unread hold', async () => {
+    const h = await claudeApp();
+    const first = await h.send('first');
+    h.rt.unreadQueueHeld = true;
+    h.app.phoneStillPaired = () => true;
+    const persist = h.rt.persistInput!;
+    let release!: () => void;
+    let checkpoint = false;
+    h.rt.persistInput = async () => {
+      if (!checkpoint) {
+        checkpoint = true;
+        await new Promise<void>(resolve => { release = resolve; });
+      }
+      await persist();
+    };
+    const send = h.app.call('session.send', { sessionId: h.id, text: 'after admission', submitId: 'phone-a' },
+      { phoneSender: { deviceId: 'pair', generation: 1 }, allowed: () => true });
+    await until(() => checkpoint, 'phone admission');
+    h.result([first]);
+    expect(h.pushed).toHaveLength(1);
+    release();
+    await send;
+    await until(() => h.pushed.length === 2, 'unread hold lifted');
+  });
+
+  it('drains a cancelled survivor when its replacement has already ended', async () => {
+    const h = await claudeApp();
+    const q = h.rt.enqueue('cancelled survivor');
+    q.issuedUuid = 'old';
+    q.byHand = true;
+    h.rt.confirmDropped('old');
+    await until(() => h.pushed.length === 1, 'cancelled survivor sent');
+  });
+
+  it('allows an explicit resend after the issuing process disappeared', async () => {
+    const h = await claudeApp();
+    const q = h.rt.enqueue('survivor');
+    q.byHand = true;
+    q.issuedUuid = 'old';
+    q.issuedTo = { provider: 'claude', cwd: h.rt.meta.cwd, session: 'original-session', stillQueued: true };
+    const lookup = vi.spyOn(h.app.providers.get('claude')!, 'steerReceipts').mockResolvedValueOnce([]);
+    expect(await h.app.call('queue.sendNow', { sessionId: h.id, id: q.id })).toEqual({ ok: true });
+    expect(lookup).toHaveBeenCalledWith('original-session', h.rt.meta.cwd, new Set(['old']));
+    expect(h.pushed).toHaveLength(1);
+    expect(h.pushed[0].uuid).not.toBe('old');
+  });
+
+  it('drains waiting words when an idle Stop hold is explicitly released', async () => {
+    const h = await claudeApp();
+    h.rt.stopRequested = true;
+    h.rt.enqueue('wait until resumed');
+    h.rt.onQueueRunnable?.();
+    await new Promise(resolve => setTimeout(resolve, 15));
+    expect(h.pushed).toHaveLength(0);
+    h.rt.stopRequested = false;
+    await until(() => h.pushed.length === 1, 'explicit resume');
+  });
+
+  it('recovers an ordinary Claude receipt as an ordinary personal card', async () => {
+    const h = await claudeApp();
+    const uuid = await h.send('ordinary input');
+    h.rt.returnUntaken({ all: true });
+    const received = h.rt.confirmSteerReceipt(uuid);
+    expect(received).toMatchObject({ state: 'sent', text: 'ordinary input', authored: true });
+    expect(received?.steered).toBeFalsy();
+  });
+
+
+  it('finishes chat deletion and retries failed receipt cleanup', async () => {
+    const h = await claudeApp();
+    const receipts = (h.app as unknown as { phoneReceipts: { remove(id: string): void } }).phoneReceipts;
+    const removed: string[] = [];
+    h.app.subscribe(e => { if (e.type === 'session.removed') removed.push(e.id); });
+    const cleanup = h.app as unknown as { lanes: { closed(rt: SessionRuntime): Promise<void> }; races: { closed(rt: SessionRuntime): void } };
+    const lane = vi.spyOn(cleanup.lanes, 'closed');
+    const rival = vi.spyOn(cleanup.races, 'closed');
+    const remove = vi.spyOn(receipts, 'remove').mockImplementationOnce(() => { throw Error('SQLITE_BUSY'); });
+    expect(await h.app.call('session.close', { sessionId: h.id, remove: true })).toEqual({ ok: true });
+    expect(h.app.sessions.has(h.id)).toBe(false);
+    expect(removed).toEqual([h.id]);
+    expect(lane).toHaveBeenCalledWith(h.rt);
+    expect(rival).toHaveBeenCalledWith(h.rt);
+    await until(() => remove.mock.calls.length === 2, 'receipt cleanup retry');
   });
 
   it('rechecks the pairing of an accepted locally held steer after its socket closes', async () => {
@@ -2298,6 +2696,8 @@ describe('interrupt and send now', () => {
     sdk.history.mockReset().mockResolvedValue([{ type: 'user', uuid: h.uuid, message: { content: h.card.text } }]);
     const app = new App({ home: h.home, quiet: true, providers: [() => h.app.providers.get('claude')!, ctx => new CodexProvider(ctx)] });
     cleanups.push(() => app.dispose());
+    await app.call('session.snapshot', { sessionId: h.id });
+    await until(() => app.runtime(h.id).items.some(row => row.type === 'user' && row.providerId === h.uuid), 'background steer receipt');
     const snap = await app.call('session.snapshot', { sessionId: h.id });
     expect(sdk.history).toHaveBeenCalledWith('cc1', expect.objectContaining({ dir: h.rt.meta.cwd }));
     expect(snap.items).toContainEqual(expect.objectContaining({ type: 'user', providerId: h.uuid, text: h.card.text }));

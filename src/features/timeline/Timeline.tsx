@@ -14,7 +14,8 @@ import { TurnList } from './TurnView';
 import { StandInCards } from './StandIn';
 import { useStandIns } from './stand-in';
 import { keptAt } from './build-window';
-import { DOCK_GLIDE_EASE, DOCK_GLIDE_MS } from '@/features/session/dock-glide';
+import { DOCK_GLIDE_EASE, DOCK_GLIDE_MS, takeCardLeft } from '@/features/session/dock-glide';
+import { drawnY, glideY } from '@/features/composer/stack-glide';
 import { endSnap, glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
 import { useStaged } from '@/features/session/staged';
 import './timeline.css';
@@ -231,7 +232,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     if (!el || !inner) return;
     let pad = -1;
     let wide = el.clientWidth;
-    // The padding below one device pixel that keeps the height whole (follow.ts `endSnap`).
+    // The room above the conversation, below one device pixel, that keeps its end on whole device pixels (follow.ts `endSnap`).
     let snap = 0;
     const ro = new ResizeObserver(() => {
       // The view itself got another width (the window resized, the side panel moving): every line
@@ -246,38 +247,55 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       // card's height in one frame. It glides down instead: the drop is undone by a transform that
       // runs out on the compositor. The live line, held at the top of the view while the card was
       // there, stays put until its own place reaches it.
-      // The dock's padding, without the fraction that keeps the end on whole device pixels (below).
-      const padNow = (parseFloat(getComputedStyle(inner).paddingBottom) || 0) - snap;
+      const padNow = parseFloat(getComputedStyle(inner).paddingBottom) || 0;
       const less = pad - padNow;
       const taller = pad >= 0 && less < -0.5;
       const fell = lastTop.current - el.scrollTop;
-      if (pad >= 0 && less > 24 && fell > 8 && stuck.current && live.current) {
-        const d = Math.min(less, fell);
-        const head = inner.querySelector<HTMLElement>('.tl-work[data-live]');
-        const headTop = head?.getBoundingClientRect().top ?? 0;
-        const held = head ? el.getBoundingClientRect().top + (parseFloat(getComputedStyle(head).top) || 0) : 0;
-        const timing = { duration: DOCK_GLIDE_MS, easing: DOCK_GLIDE_EASE };
-        if (play(inner, [{ translate: `0 ${-d}px` }, { translate: '0 0' }], timing) && head && headTop - d < held - 0.5) {
-          const reach = Math.min(1, Math.max(0, 1 - (headTop - held) / d));
-          const hold = play(head, [{ translate: `0 ${held - headTop + d}px`, offset: 0 }, { translate: '0 0', offset: reach }, { translate: '0 0', offset: 1 }], timing);
-          // Held by a transform, not by the layout: it keeps the ground it has while stuck, so the
-          // lines coming down pass under it.
-          if (hold) {
-            head.setAttribute('data-held', '');
-            const free = () => head.removeAttribute('data-held');
-            hold.finished.then(free, free);
-          }
+      if (pad >= 0 && less > 24) {
+        // A prompt card left (cued by the prompts): the page is busy for some 100 ms right now (the
+        // card's copy is drawn, the bridge's answer brings the working line and the step), and a glide
+        // on the compositor that starts into that loses its first, fastest frames: the conversation
+        // stood 58 px above its end in one frame and 5 px above it in the next. It waits, drawn where
+        // it stood, until frames come on time again (`glideY` with `hold`). A queue row that left has
+        // no such cue: the tray, the strips and the conversation's end keep one clock.
+        const byCard = takeCardLeft();
+        if (fell > 8 && stuck.current && live.current) {
+          const d = Math.min(less, fell);
+          const head = inner.querySelector<HTMLElement>('.tl-work[data-live]');
+          const headTop = head?.getBoundingClientRect().top ?? 0;
+          const held = head ? el.getBoundingClientRect().top + (parseFloat(getComputedStyle(head).top) || 0) : 0;
+          // A glide of the dock still under way (a card came and was answered at once) carries on from where it stands.
+          const fresh = Math.abs(drawnY(inner)) < 0.5;
+          glideY(inner, -d, undefined, {
+            hold: byCard,
+            beside: () => {
+              if (!head || !fresh || headTop - d >= held - 0.5) return [];
+              const reach = Math.min(1, Math.max(0, 1 - (headTop - held) / d));
+              const hold = play(head, [{ translate: `0 ${held - headTop + d}px`, offset: 0 }, { translate: '0 0', offset: reach }, { translate: '0 0', offset: 1 }], { duration: DOCK_GLIDE_MS, easing: DOCK_GLIDE_EASE });
+              // Held by a transform, not by the layout: it keeps the ground it has while stuck, so the
+              // lines coming down pass under it.
+              if (hold) {
+                head.setAttribute('data-held', '');
+                const free = () => head.removeAttribute('data-held');
+                hold.finished.then(free, free);
+              }
+              return [hold];
+            },
+          });
         }
       }
       pad = padNow;
       // Kept at the end, the end stands on whole device pixels: read here, after the layout and before
-      // paint, and written as the content's own padding (no inherited property: nothing below restyles).
+      // paint, and written as a margin above the conversation (no inherited property: nothing below
+      // restyles; not part of the observed box: no second round). A conversation shorter than the view
+      // has no scroll to round: it starts at the top as it is.
       if (stuck.current) {
         const z = uiZoom();
-        const e = endSnap(inner.getBoundingClientRect().height / z, snap, (window.devicePixelRatio || 1) * z);
+        const scrolls = el.scrollHeight - el.clientHeight > 1;
+        const e = scrolls ? endSnap(inner.getBoundingClientRect().height / z - padNow, (window.devicePixelRatio || 1) * z, snap) : 0;
         if (Math.abs(e - snap) > 0.002) {
           snap = e;
-          inner.style.paddingBottom = e ? `calc(var(--dock-h, 150px) - 4px + ${e.toFixed(3)}px)` : '';
+          inner.style.marginTop = e ? `${e.toFixed(3)}px` : '';
         }
       }
       room.current = el.scrollHeight - el.clientHeight - el.scrollTop;
@@ -294,7 +312,9 @@ export function Timeline({ sessionId }: { sessionId: string }) {
           const top = el.scrollTop;
           pin();
           const moved = el.scrollTop - top;
-          if (moved > 0.5) play(inner, [{ translate: `0 ${moved}px` }, { translate: '0 0' }], { duration: DOCK_GLIDE_MS, easing: DOCK_GLIDE_EASE });
+          // From where the conversation is drawn: a glide that still waits or runs (the card before was
+          // just answered) is taken into this one, never played over it.
+          if (moved > 0.5) glideY(inner, moved);
         } else if (taller) follow();
         else keepEnd();
       } else setAway(el.scrollHeight - el.scrollTop - el.clientHeight > AWAY);

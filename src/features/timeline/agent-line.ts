@@ -3,7 +3,7 @@ import { worksInBackground } from '@shared/background';
 import { clock } from '@/features/usage/format';
 import { limitTitle } from '@/features/usage/scope';
 import { formatTokens, plural } from '@/lib/format';
-import { delegateEnded, delegateWord, type DelegateWord } from './delegate-word';
+import { DELEGATE_RETRY_LABEL, delegateEnded, delegateRetry, delegateWord, type DelegateWord } from './delegate-word';
 import { shortDuration } from './util';
 
 /**
@@ -36,7 +36,7 @@ export function agentType(item: ToolItem): string {
 export const agentTask = (item: ToolItem): string => item.detail.description || item.title;
 
 // Where a handed-over task's report stands (delegate-word.ts, which the phone reads too).
-export { delegateWord, type DelegateWord };
+export { DELEGATE_RETRY_LABEL, delegateRetry, delegateWord, type DelegateWord };
 
 /** Working now: its call runs, or it works on in the background (a background agent, a workflow). */
 export const isAgentLive = (item: ToolItem | undefined): boolean => {
@@ -61,7 +61,7 @@ export interface AgentLine {
   tone?: 'error';
   /** Why it stopped, after the state ("Fable weekly limit reached · resets Sat 00:00"). */
   why?: string;
-  /** Where a handed-over task's report stands, after the state ("Report pending", "With your next message"). */
+  /** Where a handed-over task's report stands, after the state ("Report pending", "With your next message", "Delivery unknown"). */
   report?: string;
   /** Steps, tokens and time, each only when known. */
   parts: string[];

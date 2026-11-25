@@ -103,6 +103,22 @@ describe('titles', () => {
     return app;
   };
 
+  it.each([true, false])('preserves an automatic title from an authored quotation at startup (saved provenance %s)', async marked => {
+    const home = mkdtempSync(path.join(tmpdir(), 'sable-synth-'));
+    homes.push(home);
+    const app = start(home);
+    const id = (await app.call('session.create', { provider: 'demo', cwd: home })).session.id;
+    const quote = '<system-reminder>sample quote</system-reminder>';
+    await app.call('session.send', { sessionId: id, text: quote });
+    expect(app.sessions.get(id)!.meta.title).toBe(quote);
+    if (!marked) app.sessions.get(id)!.update({ titleAuthored: undefined });
+    await app.dispose();
+    apps.splice(0);
+    const restored = start(home);
+    expect(restored.sessions.get(id)!.meta.title).toBe(quote);
+    expect((await restored.call('session.snapshot', { sessionId: id })).session).toMatchObject({ title: quote, titleAuthored: true });
+  });
+
   it('gives an old chat titled with tags its plain words when Sable starts, and leaves names people gave alone', async () => {
     const home = mkdtempSync(path.join(tmpdir(), 'sable-synth-'));
     homes.push(home);

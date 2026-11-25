@@ -26,11 +26,13 @@ type Call = { method: string; params: any; resolve: (v: unknown) => void; reject
 function fakeAcp(holdResume = false) {
   const calls: Call[] = [];
   const notes: { method: string; params: any }[] = [];
+  let promptWritten: (() => void) | undefined;
   let sessions = 0;
   const acp = {
     alive: true,
     init: { agentCapabilities: {} },
-    request(method: string, params: any) {
+    request(method: string, params: any, _timeout?: number, written?: () => void) {
+      if (method === 'session/prompt') promptWritten = written;
       return new Promise((resolve, reject) => {
         calls.push({ method, params, resolve, reject });
         if (method === 'session/new') resolve({ sessionId: `oc-${++sessions}`, configOptions: [] });
@@ -43,7 +45,7 @@ function fakeAcp(holdResume = false) {
     },
     close: async () => {},
   };
-  return { acp, calls, notes, prompts: () => calls.filter((c) => c.method === 'session/prompt') };
+  return { acp, calls, notes, writePrompt: () => promptWritten?.(), prompts: () => calls.filter((c) => c.method === 'session/prompt') };
 }
 
 it('reads a switched delegate report from a chunked OpenCode history replay', async () => {
@@ -295,6 +297,74 @@ async function chat(opts: { slowClient?: Promise<void> } = {}) {
 }
 
 describe('OpenCode turns', () => {
+  it('round trips an authored quotation through chunked OpenCode import', async () => {
+    const { session, rt, fake, user } = await chat();
+    const quote = '<local-command-stdout>Compacted</local-command-stdout>';
+    const item = user(quote);
+    item.authored = true;
+    await session.send(item, { personalOffset: 0 });
+    const prompt = fake.prompts()[0].params.prompt as { text: string }[];
+    const wire = prompt.map(p => p.text).join('');
+    const reader = session as unknown as { replaying: object; onUpdate(u: object): void; endReplay(): void };
+    reader.replaying = {};
+    for (const text of [wire.slice(0, 4), wire.slice(4)]) reader.onUpdate({ sessionUpdate: 'user_message_chunk', messageId: 'native', content: { text } });
+    reader.endReplay();
+    expect(rt.items.find(i => i.type === 'user' && i.providerId === 'native')).toMatchObject({ text: quote, authored: true });
+  });
+
+
+  it('imports the personal parts of a queued OpenCode batch with an internal check', async () => {
+    const { session, rt, fake, user } = await chat();
+    await session.send(user('open turn'));
+    const quote = '<system-reminder>quoted by the person</system-reminder>';
+    const first = user(quote);
+    first.authored = true;
+    await session.send({ ...first, text: quote + '\n\n' + delegateReport('A', 'done', 'internal') }, { personalOffset: 0 });
+    const second = user('next personal message');
+    second.authored = true;
+    await session.send(second, { personalOffset: 0 });
+    const check = user('generated check');
+    check.until = { check: { command: 'test', round: 1, rounds: 2, durationMs: 1, passed: false } };
+    await session.send(check);
+    fake.prompts()[0].resolve({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(fake.prompts()).toHaveLength(2));
+    const wire = fake.prompts()[1].params.prompt.map((p: { text: string }) => p.text).join('');
+    const reader = session as unknown as { replaying: object; onUpdate(u: object): void; endReplay(): void };
+    reader.replaying = {};
+    reader.onUpdate({ sessionUpdate: 'user_message_chunk', messageId: 'batch', content: { text: wire } });
+    reader.endReplay();
+    expect(rt.items.find(i => i.type === 'user' && i.providerId === 'batch')).toMatchObject({ authored: true, text: quote + '\n\n' + second.text });
+  });
+
+
+  it('keeps an ordinary unwritten OpenCode input actionable when its process dies during setup', async () => {
+    let ready!: () => void;
+    const { rt, session, fake } = await chat({ slowClient: new Promise<void>(r => { ready = r; }) });
+    const item = rt.add<UserItem>({ type: 'user', text: 'hold on to this', authored: true, state: 'queued' });
+    const sending = session.send(item);
+    (session as unknown as { onServerDied(reason: string, detail: string): void }).onServerDied('died', 'process exited');
+    ready();
+    await sending;
+    expect(fake.prompts()).toHaveLength(0);
+    expect(rt.queue.find(q => q.id === item.id)).toMatchObject({ text: item.text, byHand: true });
+  });
+
+
+  it('keeps a card waiting while OpenCode prepares its prompt', async () => {
+    let ready!: () => void;
+    const { rt, session, fake } = await chat({ slowClient: new Promise<void>(r => { ready = r; }) });
+    const item = rt.add<UserItem>({ type: 'user', text: 'keep this', authored: true, state: 'queued' });
+    const sent = session.send(item);
+    const state = item.state;
+    ready();
+    await sent;
+    expect(state).toBe('queued');
+    fake.writePrompt();
+    expect(item.state).toBe('queued');
+    fake.prompts()[0].resolve({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(item.state).toBe('sent'));
+  });
+
   it('sends a prompt and ends the turn when OpenCode answers', async () => {
     const { rt, session, fake, user } = await chat();
     await session.send(user('hi'));

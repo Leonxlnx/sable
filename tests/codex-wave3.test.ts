@@ -51,8 +51,9 @@ async function codexFake(answers: Answers = {}) {
   const seen = new Map<string, number>();
   let threads = 0;
   const rpc = {
-    request: async (method: string, params: Record<string, unknown>) => {
+    request: async (method: string, params: Record<string, unknown>, _timeout?: number, written?: () => void) => {
       calls.push({ method, params });
+      written?.();
       const n = (seen.get(method) ?? 0) + 1;
       seen.set(method, n);
       const own = answers[method];
@@ -264,13 +265,17 @@ describe('Codex native process exit', () => {
   });
 });
 
-it('restores the queued instruction once when quit interrupts turn/start', async () => {
+it.each([false, true])('restores the queued instruction once when quit interrupts turn/start (native receipt %s)', async received => {
   const reply = gate();
   const h = await codexFake({ 'turn/start': async () => { await reply.wait(); return { turn: { id: 'turn1' } }; } });
   const entry = h.rt.enqueue('Only explain the change');
   const sending = h.app.call('queue.sendNow', { sessionId: h.id, id: entry.id });
   try {
     await until(() => h.count('turn/start') === 1, 'pending turn/start');
+    if (received) {
+      h.started('turn1');
+      h.notify('item/started', { turnId: 'turn1', item: { type: 'userMessage', id: 'written', content: h.calls.find(c => c.method === 'turn/start')!.params.input } });
+    } else expect(h.rt.get(entry.id)).toMatchObject({ state: 'queued' });
     let saved!: () => void;
     const durable = new Promise<void>(resolve => { saved = resolve; });
     const quitting = h.app.dispose(saved);
@@ -278,8 +283,13 @@ it('restores the queued instruction once when quit interrupts turn/start', async
     const restored = new App({ home: h.app.store.dir, userHome: h.app.store.dir, providers: [() => h.provider], quiet: true });
     try {
       const snap = await restored.call('session.snapshot', { sessionId: h.id });
-      expect(snap.queue).toEqual([]);
-      expect(snap.items.filter(i => i.type === 'user' && i.text === entry.text)).toMatchObject([{ id: entry.id }]);
+      if (received) {
+        expect(snap.queue).toEqual([]);
+        expect(snap.items.filter(i => i.type === 'user' && i.text === entry.text)).toMatchObject([{ id: entry.id, state: 'sent' }]);
+      } else {
+        expect(snap.queue.filter(q => q.text === entry.text)).toMatchObject([{ id: entry.id, byHand: true }]);
+        expect(snap.items.some(i => i.id === entry.id)).toBe(false);
+      }
       expect(h.count('turn/start')).toBe(1);
     } finally {
       reply.open(undefined);

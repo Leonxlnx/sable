@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { withDeadline } from '../util/deadline';
 import type { BridgeEvent, PermissionRequest, ProviderId, Question, SessionMeta, TimelineItem, ToolItem, UserItem } from '../../shared/protocol';
 import { agentToolId, AGENT_TOOLS, describeAgentCall, type AgentCall } from '../providers/agent-tool';
 import type { Provider } from '../providers/types';
@@ -19,6 +20,7 @@ class ChildRuntime extends SessionRuntime {
   private under?: string;
   private readOnly = false;
   ownsRow = () => true;
+  acceptingFrames = true;
   readonly promptLifetime = new AbortController();
 
   constructor(meta: SessionMeta, parent: SessionRuntime, under: string | undefined, readOnly = false) {
@@ -34,7 +36,7 @@ class ChildRuntime extends SessionRuntime {
 
   private forward(e: BridgeEvent) {
     const p = this.parent;
-    if (this.under && !this.readOnly && !this.ownsRow()) return;
+    if (!this.acceptingFrames || this.under && !this.readOnly && !this.ownsRow()) return;
     switch (e.type) {
       case 'item.added': {
         const it = e.item;
@@ -154,13 +156,17 @@ export async function runSubAgent(
   let finished!: (error?: string) => void;
   const ended = new Promise<string | undefined>((resolve) => (finished = resolve));
   let workEnded = false;
+  let hardStop = false;
   let rootEnded = false;
   let receivers: Promise<void> | undefined;
   let receiverFailure: string | undefined;
+  let endReceiverWait: ((error: Error) => void) | undefined;
   child.onTurnEnd = (_rt, error) => {
-    if (rootEnded) return;
+    if (rootEnded || workEnded) return;
     rootEnded = true;
-    receivers = child.handle?.waitForReceivers?.()?.then(() => {
+    const waiting = child.handle?.waitForReceivers?.();
+    const cancelled = waiting && new Promise<never>((_, reject) => { endReceiverWait = reject; });
+    receivers = waiting && withDeadline(Promise.race([waiting, cancelled!]), 10 * 60_000, 'Sub-agent receiver confirmation').then(() => {
       if (itemId && !opts.readOnly && child.ownsRow()) parent.patch<ToolItem>(itemId, { delegateReceiversPending: undefined });
     }, err => { receiverFailure = (err as Error).message; });
     if (receivers && itemId && !opts.readOnly && child.ownsRow()) {
@@ -176,44 +182,49 @@ export async function runSubAgent(
   let stopped = false;
   let byPerson = false;
   let quitting = false;
-  let saved!: () => void;
-  const resultSaved = new Promise<void>(resolve => { saved = resolve; });
+  let saved!: (error?: Error) => void;
+  const resultSaved = new Promise<Error | undefined>(resolve => { saved = resolve; });
   let retry: NodeJS.Timeout | undefined;
-  let hardClose: Promise<void> | undefined;
-  let retirement: NodeJS.Timeout | undefined;
-  let retireRetry: NodeJS.Timeout | undefined;
-  let abandoned = false;
+  let closing: Promise<void> | undefined;
+  let closed = false;
   let revoked = false;
+  let opening = false;
+  let stopDeadline: NodeJS.Timeout | undefined;
   let cleanupDone!: () => void;
   const cleanup = new Promise<void>(resolve => { cleanupDone = resolve; });
   const interrupt = () => {
     const handle = child.handle;
     if (!handle) return;
-    void handle.interrupt().catch(err => deps.log('sub-agent interrupt failed', err));
-    void handle.interruptReceivers?.().catch(err => deps.log('sub-agent receiver interrupt failed', err));
+    void withDeadline(handle.interrupt(), 3000, 'Delegate interrupt').catch(err => deps.log('sub-agent interrupt failed', err));
+    const nested = handle.interruptReceivers?.();
+    if (nested) void withDeadline(nested, 3000, 'Receiver interrupt').catch(err => deps.log('sub-agent receiver interrupt failed', err));
   };
-  const escalate = () => {
-    const handle = child.handle;
-    if (!handle) {
-      // Closing an isolated app-server also breaks a stuck thread/start or attach.
-      void provider.terminateOpeningDelegate?.().catch(err => deps.log('sub-agent open cancellation failed', err));
-      return;
-    }
-    hardClose = Promise.resolve().then(async () => {
-      if (handle.terminateDelegate) await handle.terminateDelegate();
-      else await handle.close();
-      finished();
-      if (revoked) {
-        clearTimeout(retirement);
-        clearInterval(retireRetry);
-        clearTimeout(retry);
-        release({ ok: false, text: 'The delegate was removed from the conversation.' });
-        cleanupDone();
+  const retire = (hard: boolean): Promise<void> => {
+    if (closed) return Promise.resolve();
+    if (closing) return closing;
+    const attempt = async () => {
+      const handle = child.handle;
+      if (handle) {
+        if (hard && handle.terminateDelegate) await handle.terminateDelegate();
+        else await handle.close();
+      } else {
+        await provider.terminateOpeningDelegate?.();
+        if (opening || child.handle) throw Error('Waiting for delegate open to settle.');
       }
+    };
+    closing = withDeadline(attempt(), 6000, 'Delegate close').then(() => {
+      closed = true;
+      endReceiverWait?.(Error('The delegate closed before receiver completion was confirmed.'));
+      clearTimeout(retry);
+      finished();
+      if (workEnded) cleanupDone();
     }).catch(err => {
-      deps.log('sub-agent termination failed', err);
-      if (!abandoned && !workEnded) retry = setTimeout(escalate, 1500);
-    });
+      deps.log('sub-agent close unconfirmed', err);
+      clearTimeout(retry);
+      retry = setTimeout(() => { void retire(true); }, 1500);
+      retry.unref?.();
+    }).finally(() => { closing = undefined; });
+    return closing;
   };
   const stop = (person: boolean) => {
     if (workEnded) return;
@@ -231,8 +242,16 @@ export async function runSubAgent(
     interrupt();
     retry = setTimeout(() => {
       interrupt();
-      retry = setTimeout(escalate, 1500);
+      retry = setTimeout(() => { void retire(true); }, 1500);
     }, 1500);
+    // The row and caller settle independently of a surviving transport. During quit its
+    // result listener remains live through process exit so a definitive answer can be journalled.
+    stopDeadline = setTimeout(() => {
+      if (!quitting) {
+        endReceiverWait?.(Error('Receiver stop deadline reached. Process cleanup continues.'));
+        finished('Delegate stop deadline reached. Process cleanup continues.');
+      }
+    }, 8500);
   };
   const aborted = () => {
     if (opts.readOnly || parent.stopRequested) stop(parent.stopRequested);
@@ -248,27 +267,18 @@ export async function runSubAgent(
   };
   const quit = () => {
     quitting = true;
+    child.awaitingQuitResult = !byPerson;
     if (itemId && !workEnded && !byPerson && child.ownsRow()) {
       parent.patch<ToolItem>(itemId, { delegateReport: 'working', delegateCaller: undefined });
     }
     stop(false);
-    return resultSaved;
+    return resultSaved.then(error => { if (error) throw error; });
   };
   const revoke = () => {
     revoked = true;
     stop(true);
-    if (workEnded) escalate(); // Its result may be saved while the transport is still closing.
-    // A handle can be stuck opening or inside close itself. Keep a timer after its row is gone.
-    retireRetry = setInterval(escalate, 4500);
-    retirement = setTimeout(() => {
-      abandoned = true;
-      clearInterval(retireRetry);
-      clearTimeout(retry);
-      deps.log('deleted delegate cleanup deadline; exit unconfirmed', meta.id);
-      finished();
-      release({ ok: false, text: 'The chat was deleted. Delegate process exit could not be confirmed.' });
-      cleanupDone();
-    }, 8500);
+    if (workEnded) void retire(true);
+    release({ ok: false, text: 'The delegate was removed from the conversation.' });
   };
   const owner = { detach, callerGone: () => detach(false), stop, revoke, quit, ended: cleanup };
   if (itemId && !opts.readOnly) {
@@ -286,34 +296,54 @@ export async function runSubAgent(
   async function run(): Promise<Result> {
     try {
       if (stopped) return { ok: false, text: 'Stopped before the sub-agent started.' };
-      child.handle = await provider.open(child, { loadTranscript: false });
-      if (stopped) return { ok: false, text: 'Stopped before the sub-agent started.' };
-      const task: UserItem = child.add<UserItem>({ type: 'user', text: call.prompt, state: 'sent' });
-      await child.handle.send(task);
-      const error = await ended;
+      opening = true;
+      let sent = false;
+      const start = provider.open(child, { loadTranscript: false }).then(handle => {
+        opening = false;
+        child.handle = handle;
+        if (stopped || workEnded) return;
+        const task = child.add<UserItem>({ type: 'user', text: call.prompt, state: 'sent' });
+        sent = true;
+        return handle.send(task);
+      }, err => { opening = false; throw err; });
+      await withDeadline(Promise.race([start, ended]), 90_000, 'Opening and sending the sub-agent task');
+      if (!sent) return { ok: false, text: 'Stopped before the sub-agent started.' };
+      const error = await withDeadline(ended, 24 * 60 * 60_000, 'The sub-agent root turn');
       if (receivers) await receivers;
       const answer = [...child.items].reverse().find((i): i is Extract<TimelineItem, { type: 'text' }> => i.type === 'text' && !i.parentId && !!i.text.trim());
       const quitResult = quitting && rootEnded && (error || answer && !answer.streaming || child.items.some(i => i.type === 'turn' && !i.parentId && i.stopReason !== 'interrupted'));
-      if ((stopped && !quitResult) || child.items.some(i => i.type === 'notice' && i.variant === 'interrupted')) {
+      if ((stopped && !quitResult) || child.items.some(i => !i.parentId && i.type === 'notice' && i.variant === 'interrupted')) {
         stopped = true;
         return { ok: false, text: 'The sub-agent stopped before it finished.' };
       }
-      if (child.items.some(i => i.type === 'notice' && i.early)) return { ok: false, text: 'The sub-agent lost its process before it finished.' };
+      if (child.items.some(i => !i.parentId && i.type === 'notice' && i.early)) return { ok: false, text: 'The sub-agent lost its process before it finished.' };
       if (quitting) stopped = false;
-      if (receiverFailure) return { ok: false, text: receiverFailure };
+      if (receiverFailure) {
+        hardStop = true;
+        return { ok: false, text: [receiverFailure, answer?.text].filter(Boolean).join('\n\n') };
+      }
       return delegateAnswer(answer?.text, error);
     } catch (err) {
+      hardStop = true;
       deps.log('sub-agent failed', (err as Error).message);
       return { ok: false, text: `The sub-agent could not run: ${(err as Error).message}` };
     } finally {
       signal?.removeEventListener('abort', aborted);
       child.promptLifetime.abort();
       child.cancelPrompts();
+      if (hardStop) {
+        child.stopRequested = true;
+        child.stopBackground();
+        child.tasksLost('process');
+        child.settle('cancelled');
+        child.acceptingFrames = false;
+      }
       workEnded = true;
     }
   }
   void run().then(async result => {
-    clearTimeout(retry);
+    clearTimeout(stopDeadline);
+    let saveError: Error | undefined;
     if (result.text.length > MAX_DELEGATE_RESULT + 11) result.text = result.text.slice(0, MAX_DELEGATE_RESULT) + '\n\n(cut off)';
     try {
       if (itemId && !opts.readOnly && child.ownsRow() && (!quitting || rootEnded)) {
@@ -324,30 +354,49 @@ export async function runSubAgent(
           status: stopped ? 'cancelled' : result.ok ? 'done' : 'error', endedAt: Date.now(),
           delegateReport: byPerson ? 'stopped' : pending ? 'pending' : undefined,
           delegateCaller: !byPerson && !pending ? generation : undefined,
-          delegateAttempt: !byPerson && !pending ? { provider: parent.meta.provider, account: parent.meta.accountId, session: callerSession, after: callerCheckpoint, tool: itemId } : undefined,
+          delegateAttempt: !byPerson && !pending ? { prepared: parent.offerToolResult ? randomUUID() : undefined,
+            provider: parent.meta.provider, account: parent.meta.accountId, session: callerSession, after: callerCheckpoint, tool: itemId } : undefined,
           result: { text: result.text, isError: !result.ok, ...(pending ? { agent: { background: outcome } } : {}) },
         });
         if (pending && !byPerson) parent.pendingDelegateReports.add(itemId);
         const prepared = pending && !byPerson ? parent.stageDelegateReports?.() : undefined;
-        await parent.persistDelegate?.();
+        let folded: (() => void) | undefined;
+        if (quitting && parent.saveQuitResult) {
+          try { folded = parent.saveQuitResult(parent.get<ToolItem>(itemId)!); }
+          catch (err) { deps.log('delegate quit journal failed', err); }
+        }
+        try {
+          if (parent.persistDelegate) {
+            await withDeadline(parent.persistDelegate(), 5000, 'Saving the delegate result');
+            folded?.();
+          }
+        } catch (err) { if (!folded) throw err; }
         prepared?.();
         if (pending && !byPerson && child.ownsRow()) parent.onDelegateReport?.();
       }
     } catch (err) {
+      saveError = err instanceof Error ? err : Error(String(err));
       if (child.ownsRow()) parent.notice('error', 'Could not save the sub-agent result', String(err));
     } finally {
-      saved();
-      try {
-        if (hardClose) await hardClose;
-        else await child.handle?.close();
-      } catch (err) { deps.log('sub-agent close failed', err); }
+      saved(saveError);
+      await retire(hardStop || stopped || opening);
       if (itemId && parent.delegates.get(itemId) === owner) {
+        const row = parent.get<ToolItem>(itemId);
+        if (row?.delegateCaller === generation && row.delegateAttempt?.prepared && row.delegateAttempt.tool) {
+          try { parent.offerToolResult?.(row); }
+          catch (err) {
+            parent.patch<ToolItem>(itemId, { delegateCaller: undefined, delegateAttempt: undefined, delegateReport: 'pending' });
+            parent.pendingDelegateReports.add(itemId);
+            parent.onDelegateReport?.();
+            deps.log('foreground result deferred', err);
+            release({ ok: false, text: 'The result is on the delegate step and its report is pending.' });
+          }
+        }
         parent.delegates.delete(itemId);
         parent.handle?.delegateEnded?.();
       }
-      clearTimeout(retirement);
-      clearInterval(retireRetry);
-      cleanupDone();
+      if (closed) cleanupDone();
+      else if (!revoked) parent.reapDelegate?.(cleanup);
       release(anonymous && !detached ? { ...result, text: `${result.text}\n\n[Sable delegate receipt ${deliveryId}]` } : result);
     }
   });

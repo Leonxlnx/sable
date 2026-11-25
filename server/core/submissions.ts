@@ -2,13 +2,36 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import type { QueuedMessage } from '../../shared/protocol';
 
 /** Phone retries may arrive after a take, rewind or discard. Keep just their keys for the life of the chat. */
 export class PhoneReceipts {
   private db?: DatabaseSync;
   private readonly file: string;
+  private repairs = new Map<string, Set<string>>();
 
   constructor(dir: string) { this.file = path.join(dir, 'phone-submissions.sqlite'); }
+
+  // A crash can land between committing a phone input and indexing its receipt.
+  // A desktop save carries these keys even if it takes or clears the queue.
+  remember(chat: string, saved?: string[], queue?: QueuedMessage[]) {
+    const ids = new Set(Array.isArray(saved) ? saved.filter(id => typeof id === 'string') : []);
+    for (const row of queue ?? []) if (row.phoneSender && row.submitId) ids.add(row.submitId);
+    if (ids.size) this.repairs.set(chat, ids);
+  }
+
+  pending(chat: string) {
+    const ids = this.repairs.get(chat);
+    return ids && [...ids];
+  }
+
+  private repair(chat: string) {
+    const ids = this.repairs.get(chat);
+    if (!ids) return;
+    const insert = this.open().prepare('INSERT OR IGNORE INTO receipts VALUES (?, ?)');
+    for (const id of ids) { insert.run(chat, id); ids.delete(id); }
+    this.repairs.delete(chat);
+  }
 
   private open() {
     if (!this.db) {
@@ -23,14 +46,17 @@ export class PhoneReceipts {
   }
 
   has(chat: string, submission: string) {
+    this.repair(chat);
     return !!this.open().prepare('SELECT 1 FROM receipts WHERE chat = ? AND submission = ?').get(chat, submission);
   }
 
   record(chat: string, submission: string) {
+    this.repair(chat);
     this.open().prepare('INSERT OR IGNORE INTO receipts VALUES (?, ?)').run(chat, submission);
   }
 
   remove(chat: string) {
+    this.repairs.delete(chat);
     if (this.db || existsSync(this.file)) this.open().prepare('DELETE FROM receipts WHERE chat = ?').run(chat);
   }
 

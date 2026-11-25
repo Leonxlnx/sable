@@ -129,7 +129,10 @@ describe('a slow agent start', () => {
     await app.call('session.send', { sessionId: snap.session.id, text: 'hi again' });
     for (let i = 0; i < 100 && !rt.items.some((x) => x.type === 'turn'); i++) await sleep(50);
     expect(rt.items.some((x) => x.type === 'turn')).toBe(true);
-    expect(rt.items.filter((x) => x.type === 'user').map((u) => (u as { text: string }).text)).toEqual(['hi', 'hi again']);
+    // The stopped message was never written to the agent, so it is not a sent card: it waits in the queue by
+    // hand with the reason (0.2.37: "sent" means the provider wrote it), and nothing of it is lost.
+    expect(rt.items.filter((x) => x.type === 'user').map((u) => (u as { text: string }).text)).toEqual(['hi again']);
+    expect(rt.queue).toMatchObject([{ text: 'hi', byHand: true, steerWait: { reason: 'Stopped before the provider opened.' } }]);
     await app.dispose();
   });
 });

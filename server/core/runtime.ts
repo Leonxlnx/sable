@@ -21,7 +21,7 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { agentOfTool } from '../providers/agent-tool';
-import { isCompactOutput, userItemText } from '../../shared/synthetic';
+import { isCompactOutput, personalOrigin, userItemText } from '../../shared/synthetic';
 import { runsTask, worksInBackground } from '../../shared/background';
 import { taskServing } from './task-serving';
 import { turnLive, TurnLiveIndex } from '../../shared/turn-live';
@@ -156,6 +156,11 @@ export class SessionRuntime {
   onUnreadSteer?: (id: string, fresh?: boolean) => void;
   persistInput?: () => Promise<void>;
   persistDelegate?: () => Promise<void>;
+  /** Keep the closing child's native result listener until a terminal frame or confirmed exit. */
+  awaitingQuitResult = false;
+  saveQuitResult?: (row: ToolItem) => () => void;
+  reapDelegate?: (confirmed: Promise<void>) => void;
+  offerToolResult?: (row: ToolItem) => void;
 
   waitForSteer(id: string, delay: number, fire: () => void, since?: number, reason?: string) {
     const item = this.get<UserItem>(id);
@@ -251,10 +256,12 @@ export class SessionRuntime {
     return this.stopped;
   }
   set stopRequested(v: boolean) {
+    const resumed = this.stopped && !v;
     if (v) this.clearSteerWaits();
     this.stopped = v;
     this.carried = false;
     if (!v) this.onWakeEligibilityChanged?.();
+    if (resumed && !this.turnActive && this.queue.length) this.onQueueRunnable?.();
   }
   private stopped = false;
   /** Unread messages returned to the queue wait for the person's next send. */
@@ -264,6 +271,7 @@ export class SessionRuntime {
     if (this.unreadHeld === value) return;
     this.unreadHeld = value;
     this.onWakeEligibilityChanged?.();
+    if (!value && this.queue.length) this.onQueueRunnable?.();
   }
   /** Preserve a phone sender's guard when its unread timeline card returns to the queue. */
   onReturnUntaken?: (item: UserItem) => void;
@@ -290,21 +298,64 @@ export class SessionRuntime {
   onWorkLost?: (rt: SessionRuntime, trigger: LossTrigger, count: number) => void;
   /** Changes whenever Claude retires a process on this handle. */
   processGeneration = 0;
-  private foregroundResults = new Set<string>();
+  private foregroundResults = new Map<string, NodeJS.Timeout>();
+  private expiredToolResults = new WeakMap<NonNullable<ToolItem['delegateAttempt']>, number>();
+
+  private trackToolReceipt(row: ToolItem) {
+    if (row.delegateCaller === undefined || !row.delegateAttempt?.tool) {
+      clearTimeout(this.foregroundResults.get(row.id));
+      this.foregroundResults.delete(row.id);
+    } else if (!this.foregroundResults.has(row.id)) {
+      const timer = setTimeout(() => {
+        if (row.delegateAttempt && !row.delegateAttempt.prepared) this.expiredToolResults.set(row.delegateAttempt, this.processGeneration);
+        this.releaseToolResult(row.id);
+        this.onDelegateReport?.();
+      }, Math.max(1, Math.min(90_000, (row.endedAt ?? Date.now()) + 90_000 - Date.now())));
+      timer.unref?.();
+      this.foregroundResults.set(row.id, timer);
+    }
+  }
+
+  private releaseToolResult(id: string) {
+    const row = this.get<ToolItem>(id);
+    if (!row) return;
+    this.patch<ToolItem>(id, { delegateCaller: undefined, delegateReport: this.stopRequested ? 'stopped' : 'pending',
+      ...(row.delegateAttempt?.prepared ? { delegateAttempt: undefined } : {}) });
+    if (!this.stopRequested) this.pendingDelegateReports.add(id);
+  }
+
+  /** A late acknowledgement can only settle the very attempt that was released. */
+  confirmLateDelegate(id: string, attempt: NonNullable<ToolItem['delegateAttempt']>) {
+    const row = this.get<ToolItem>(id);
+    if (row?.delegateReport !== 'pending' || row.delegateAttempt !== attempt) return false;
+    if (row.delegateRetryId) {
+      const token = '/report-retry ' + row.delegateRetryId;
+      const notice = this.items.findLast(i => i.type === 'notice' && i.detail?.endsWith(token));
+      if (notice) this.patch<NoticeItem>(notice.id, { text: 'Delivery confirmed for ' + row.title, detail: 'The agent acknowledged the saved answer.' });
+    }
+    this.pendingDelegateReports.delete(id);
+    this.patch<ToolItem>(id, { delegateReport: 'delivered', delegateWait: null, delegateAttempt: undefined, delegateReceiptState: null, delegateRetryId: null });
+    return true;
+  }
 
   /** A completed tool result stays with its caller until the provider echoes the result. */
   delegateReceipt(id: string, content?: unknown) {
-    if (!this.foregroundResults.has(id)) {
+    if (!this.get<ToolItem>(id)?.delegateAttempt?.tool) {
       const synthetic = anonymousDelegateStep(content);
       if (!synthetic || synthetic !== 'delegate-' + this.get<ToolItem>(synthetic)?.delegateDeliveryId) return;
       id = synthetic;
     }
     const row = this.get<ToolItem>(id);
-    if (row?.delegateCaller !== this.processGeneration || !this.foregroundResults.has(id)) return;
+    const attempt = row?.delegateAttempt;
+    if (!row || !attempt?.tool) return;
+    const late = this.expiredToolResults.get(attempt) === this.processGeneration;
+    if (!late && (row.delegateCaller !== this.processGeneration || !this.foregroundResults.has(id))) return;
     this.promote?.(row);
     const digest = resultDigest(row.result?.text);
     if (anonymousDelegateStep(content) !== 'delegate-' + row.delegateDeliveryId && (!digest || digest !== resultDigest(content))) return;
-    this.patch<ToolItem>(id, { delegateCaller: undefined, delegateAttempt: undefined });
+    if (late) {
+      if (!this.confirmLateDelegate(id, attempt)) return;
+    } else this.patch<ToolItem>(id, { delegateCaller: undefined, delegateAttempt: undefined });
     void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the delegate receipt', String(err)));
   }
 
@@ -312,12 +363,14 @@ export class SessionRuntime {
     this.processGeneration++;
     for (const owner of this.delegates.values()) owner.callerGone?.();
     const hadResults = this.foregroundResults.size > 0;
-    for (const id of this.foregroundResults) {
-      this.patch<ToolItem>(id, { delegateCaller: undefined, delegateReport: this.stopRequested ? 'stopped' : 'pending' });
-      if (!this.stopRequested) this.pendingDelegateReports.add(id);
-    }
+    for (const id of this.foregroundResults.keys()) this.releaseToolResult(id);
     if (hadResults) void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the delegate report', String(err)));
     if (this.pendingDelegateReports.size) this.onDelegateReport?.();
+  }
+
+  revokeAllDelegates() {
+    return this.revokeDelegates(new Set([...this.delegates.keys(), ...this.pendingDelegateReports,
+      ...this.reservedDelegateReports.keys(), ...this.foregroundResults.keys()]));
   }
 
   revokeDelegates(ids: Iterable<string>) {
@@ -327,6 +380,7 @@ export class SessionRuntime {
       this.delegates.delete(id);
       this.pendingDelegateReports.delete(id);
       this.reservedDelegateReports.delete(id);
+      clearTimeout(this.foregroundResults.get(id));
       this.foregroundResults.delete(id);
       if (owner) {
         if (owner.revoke) owner.revoke();
@@ -425,7 +479,7 @@ export class SessionRuntime {
     this.load(this.meta.provider === 'claude' ? out.filter(item => {
       if (afterCompact && !item.parentId && (
         (item.type === 'text' && isCompactOutput(item.text, true)) ||
-        (item.type === 'user' && isCompactOutput(item.text)) ||
+        (item.type === 'user' && !personalOrigin(item) && isCompactOutput(item.text)) ||
         (item.type === 'notice' && item.variant === 'command' && item.detail && isCompactOutput(item.detail, true))
       )) return false;
       afterCompact = !item.parentId && item.type === 'notice' && item.variant === 'compact';
@@ -451,9 +505,10 @@ export class SessionRuntime {
     this.taskSteps.clear();
     this.pendingDelegateReports.clear();
     this.owedDelegateReports.clear();
+    for (const timer of this.foregroundResults.values()) clearTimeout(timer);
     this.foregroundResults.clear();
     for (const i of items) {
-      if (i.type === 'tool' && i.delegateCaller !== undefined && i.delegateAttempt?.tool) this.foregroundResults.add(i.id);
+      if (i.type === 'tool' && i.delegateCaller !== undefined && i.delegateAttempt?.tool) this.trackToolReceipt(i);
       if (i.type === 'tool' && (i.delegateCaller !== undefined || i.delegateReport === 'pending' || i.delegateReport === 'working')) this.owedDelegateReports.add(i.id);
       if (i.type === 'tool' && i.delegateReport === 'pending' && !this.reservedDelegateReports.has(i.id)) this.pendingDelegateReports.add(i.id);
       if (worksInBackground(i)) this.working.add(i.id);
@@ -828,6 +883,7 @@ export class SessionRuntime {
   private queueRev = new Map<string, number>();
   /** A reservation ended (committed or rolled back): what waited for it may go now. */
   onQueueReleased?: (rt: SessionRuntime) => void;
+  onQueueRunnable?: () => void;
 
   /** Reserves a queued message for a take: a copy of it as it is and its revision, or undefined (not there, or already reserved). */
   reserveQueued(id: string): { message: QueuedMessage; rev: number } | undefined {
@@ -923,9 +979,22 @@ export class SessionRuntime {
     return this.add<UserItem>({
       type: 'user', id: edited ? undefined : row.id, ts: row.createdAt,
       text: (edited ?? row).text, attachments: (edited ?? row).attachments,
-      ...(row.until ? { until: row.until } : { steered: true, authored: true }), phoneSender: row.phoneSender,
+      ...(row.until ? { until: row.until } : { ...(!row.issuedAtRest && { steered: true }), authored: true }), phoneSender: row.phoneSender,
       submitPrint: row.submitPrint, state: 'sent', providerId: uuid,
     });
+  }
+
+  /** A survivor belongs to one live SDK queue. Losing that process leaves only receipt uncertainty. */
+  forgetLiveQueue(uuid: string) {
+    const row = this.queue.find(q => q.issuedUuid === uuid);
+    const reason = 'The Claude process ended. Check the conversation before sending again.';
+    if (row?.issuedTo?.stillQueued) {
+      delete row.issuedTo.stillQueued;
+      row.steerWait = { reason };
+      this.queueChanged();
+    }
+    const card = this.items.find((i): i is UserItem => i.type === 'user' && i.issuedUuid === uuid);
+    if (card?.issuedTo?.stillQueued) this.patch<UserItem>(card.id, { issuedTo: { ...card.issuedTo, stillQueued: undefined }, steerWait: { reason } });
   }
 
   confirmDropped(uuid: string) {
@@ -937,7 +1006,18 @@ export class SessionRuntime {
     delete entry.issuedPayload;
     entry.steerWait = { reason: 'Claude confirmed withdrawal.' };
     this.queueChanged();
+    if (!entry.byHand) this.onQueueRunnable?.();
   }
+
+  /** Keep a failed offer actionable, including an idle card whose provider never wrote it. */
+  returnUnwritten(ids: readonly string[], why: string) {
+    const waiting = new Set(ids.filter(id => this.get<UserItem>(id)?.state === 'queued'));
+    this.returnUntaken({ ids: waiting, byHand: waiting });
+    for (const id of waiting) this.queueReason(id, why);
+  }
+
+  /** An outstanding native request owns its waiting cards until its receipt settles. */
+  readonly pendingNativeInputs = new WeakSet<UserItem>();
 
   /** Puts messages back at the front of the queue (steered messages the agent never took). */
   requeue(messages: QueuedMessage[]) {
@@ -953,10 +1033,10 @@ export class SessionRuntime {
    * left waiting, as after a restart) go back to the front of the queue in the order they were
    * sent, so none is lost. With `reason`, one quiet line in the timeline says so. Returns how many.
    */
-  returnUntaken(opts: { ids?: ReadonlySet<string>; all?: boolean; byHand?: ReadonlySet<string>; holdQueue?: boolean; reason?: 'stopped' | 'failed' | 'closed' } = {}): number {
-    const candidates = opts.ids ? Array.from(opts.ids, id => this.index.get(id)) : this.items;
+  returnUntaken(opts: { ids?: ReadonlySet<string>; from?: UserItem[]; all?: boolean; byHand?: ReadonlySet<string>; holdQueue?: boolean; reason?: 'stopped' | 'failed' | 'closed' } = {}): number {
+    const candidates = opts.ids ? Array.from(opts.ids, id => this.index.get(id)) : opts.from?.filter(i => this.get(i.id) === i) ?? this.items;
     const untaken = candidates.filter((i): i is UserItem => i?.type === 'user' && !i.parentId &&
-      (!!opts.ids || i.state === 'queued' && (opts.all || !!i.steered || !!i.steerAttempts || !!i.issuedUuid)));
+      (!!opts.ids || i.state === 'queued' && !i.heldAtLimit && (opts.all || !this.pendingNativeInputs.has(i)) && (opts.all || !!i.steered || !!i.steerAttempts || !!i.issuedUuid)));
     if (!untaken.length) return 0;
     if (opts.holdQueue) this.unreadQueueHeld = true;
     for (const u of untaken) {
@@ -969,8 +1049,9 @@ export class SessionRuntime {
       ...(u.submitPrint && { submitPrint: u.submitPrint }), ...(u.phoneSender && { phoneSender: u.phoneSender }),
       ...(u.steerOrder && { steerOrder: u.steerOrder }), ...(u.steerAttempts && { steerAttempts: u.steerAttempts }),
       ...(u.until && { until: u.until }),
-      ...(u.issuedUuid && { issuedUuid: u.issuedUuid, issuedTo: u.issuedTo, steerWait: { reason: u.issuedTo?.stillQueued ? 'Claude still has this input queued.' : 'Issued to Claude. Receipt unknown.' } }),
-      ...(u.issuedUuid || opts.byHand?.has(u.id) ? { byHand: true } : {}),
+      ...(u.issuedUuid && { issuedUuid: u.issuedUuid, ...(!u.steered && { issuedAtRest: true as const }), issuedTo: u.issuedTo, steerWait: { reason: u.issuedTo?.stillQueued ? 'Claude still has this input queued.' : 'Issued to Claude. Receipt unknown.' } }),
+      ...(opts.all && u.awaitingNativeReceipt && { steerWait: { reason: 'The provider receipt was not saved. Check the conversation before sending again.' } }),
+      ...(u.issuedUuid || opts.all && u.awaitingNativeReceipt || opts.byHand?.has(u.id) ? { byHand: true } : {}),
     }));
     this.requeue(returned);
     if (returned.some(q => q.steerOrder)) {
@@ -1061,8 +1142,7 @@ export class SessionRuntime {
     Object.assign(item, patch);
     if (item.type === 'notice' && 'limit' in patch) this.onWakeEligibilityChanged?.();
     if (item.type === 'tool' && ('delegateReport' in patch || 'delegateCaller' in patch)) {
-      if (item.delegateCaller !== undefined && item.delegateAttempt?.tool) this.foregroundResults.add(id);
-      else this.foregroundResults.delete(id);
+      this.trackToolReceipt(item);
       if (item.delegateCaller !== undefined || item.delegateReport === 'working' || item.delegateReport === 'pending') this.owedDelegateReports.add(id);
       else this.owedDelegateReports.delete(id);
       const recovery = this.owedDelegateReports.size ? true : undefined;
@@ -1193,6 +1273,8 @@ export class SessionRuntime {
     const item = this.index.get(id);
     if (item?.type !== 'user') return;
     const issued = item.issuedUuid;
+    const native = item.awaitingNativeReceipt;
+    if (native) patch = { ...patch, awaitingNativeReceipt: undefined };
     if (issued) patch = { ...patch, issuedUuid: undefined, issuedTo: undefined };
     if (item.state !== 'queued') this.patch<UserItem>(id, { state: 'sent', ...patch });
     else this.move(id, { state: 'sent', ...patch } as Partial<TimelineItem>, !!item.steered || !!item.steerAttempts);
@@ -1297,6 +1379,7 @@ export class SessionRuntime {
   // ── metadata ──
 
   update(patch: Partial<SessionMeta>) {
+    if (patch.title !== undefined && patch.title !== this.meta.title && this.meta.titleAuthored && !('titleAuthored' in patch)) patch = { ...patch, titleAuthored: undefined };
     const changed: Partial<SessionMeta> = {};
     for (const [k, v] of Object.entries(patch) as [keyof SessionMeta, never][]) {
       if (JSON.stringify(this.meta[k]) !== JSON.stringify(v)) {

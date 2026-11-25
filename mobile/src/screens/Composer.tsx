@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { STANDARD_SPEED, type Attachment, type ProviderId, type ProviderInfo, type QueuedMessage, type SessionMeta } from '@shared/protocol';
 import { offeredSpeeds, speedFor } from '@shared/speed';
 import { effortName, modelName, modelNameById, visibleModels } from '@desk/lib/models';
@@ -10,38 +10,43 @@ import { autoSized, fit } from '@m/lib/fit';
 import { onKeyboard } from '@m/lib/keyboard';
 import { onPutDraft } from '@m/lib/put-draft';
 import { notSentHere, sentHere } from '@m/lib/follow';
-import { getDraft, onDraft, pendingTakes, setDraft, settleTaken, stageTaken } from '@m/lib/drafts';
+import { composition, onDraft, pendingTakes, setDraft, settleTaken, stageTaken, takeReceipt } from '@m/lib/drafts';
 import { epoch, still } from '@m/lib/epoch';
-import { confirmTake, STILL_QUEUED, takeBack, type TakeDeps } from '@m/lib/take';
+import { confirmTake, STILL_QUEUED, stillQueued, takeBack, type TakeDeps } from '@m/lib/take';
 import { haptic } from '@m/lib/native';
 import { acceptIntent, closeGap, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, unsureIntent, useStore } from '@m/lib/store';
 import { isUncertain } from '@m/lib/errors';
 import { shownPermissions } from '@m/lib/shown';
-import { confirmKept, draftChanged, filesKey, submissionDone, submissionFor, submissionUnsure } from '@m/lib/submit';
+import { offers, pressFrom, type Submission } from '@m/lib/submit';
+import { discardPress, onOutgoing, outgoing, retryPress, sendPress } from '@m/lib/phone-send';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
 import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
-
-/**
- * A message whose send was cut off by a lost connection may or may not have reached the desktop.
- * It goes back into the field with the id it was sent under (lib/submit.ts): a retry carries the same
- * id, so it is never sent twice, and the field clears again only on that id's receipt (the desktop's
- * yes to a question under that id, asked once connected again), never because a message of the same
- * words turned up. Unsent words per chat: lib/drafts.ts; the sends it cut off forget themselves with
- * the computer (lib/submit.ts).
- */
-const LOST = /connection to the desktop was lost|did not answer in time/i;
 
 /** Words taken back from the queue: kept on the phone before the desktop lets the message go (lib/take.ts). */
 const takes: TakeDeps = {
   take: (sid, id) => conn.call('queue.take', { sessionId: sid, id, ack: true }),
   done: (take, kept) => conn.call('phone.takeDone', { take, kept }),
   stage: stageTaken,
-  settle: settleTaken,
+  settle: async (take, taken) => {
+    const e = epoch();
+    const record = takeReceipt(take);
+    if (!record) return;
+    const present = !taken && record.staged && await stillQueued(record.staged.row, record.staged.text,
+      from => conn.call('phone.queue', { sessionId: record.sid, from }));
+    if (still(e)) await settleTaken(take, !present);
+  },
 };
 // Receipts a cut connection left unanswered: confirmed once connected again (the desktop answers each the same however often).
-const confirmPending = () => void pendingTakes().then((list) => list.forEach((t) => void confirmTake(takes, t)));
+const confirmPending = () => {
+  const e = epoch();
+  void pendingTakes().then(list => list.forEach(t => {
+    if (still(e)) void confirmTake(takes, t).then(taken => {
+      if (taken === false && still(e)) toast(STILL_QUEUED);
+    }).catch(err => { if (still(e)) toast(err.message, 'error'); });
+  })).catch(err => { if (still(e)) toast(err.message, 'error'); });
+};
 conn.onOpen(confirmPending);
 if (conn.state === 'open') confirmPending();
 
@@ -74,37 +79,17 @@ export function Composer({ sid }: { sid: string }) {
   const providers = useStore((st) => st.providers);
   const allCaps = useStore((st) => st.caps);
   const sendWithEnter = useStore((st) => st.settings?.sendWithEnter !== false);
-  const [text, setText] = useState(() => getDraft(sid));
+  const draft = useSyncExternalStore(fn => onDraft(sid, fn), () => composition(sid));
+  const entries = useSyncExternalStore(onOutgoing, outgoing);
+  const { field, rows } = offers(entries, sid, draft);
+  const text = field?.packet.text ?? draft.t;
+  const files = field?.packet.attachments ?? draft.files ?? [];
   const online = useStore((st) => st.conn === 'open');
-  const [files, setFiles] = useState<Attachment[]>([]);
-  const filesNow = useRef(files);
-  filesNow.current = files;
   const [sheet, setSheet] = useState<'model' | 'mode' | null>(null);
   const [focused, setFocused] = useState(false);
   const area = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const sendKey = useRef<HTMLButtonElement>(null);
-  // A send the connection cut off is asked about once connected again, by its own id (the desktop's
-  // `session.submission` sends nothing). Its yes is the receipt: the words put back in the field go
-  // again, when they are still exactly what was sent. A no leaves them for the retry.
-  useEffect(() => {
-    if (!online) return;
-    const e = epoch();
-    void confirmKept(sid, (submitId) => conn.call('session.submission', { sessionId: sid, submitId })).then((got) => {
-      const el = area.current;
-      if (!still(e) || !el) return;
-      if (!got.some((sub) => el.value.trim() === sub.text && filesKey(filesNow.current) === sub.files)) return;
-      setText('');
-      setDraft(sid, '');
-      setFiles([]);
-      el.style.height = '';
-      fit(el, 168);
-    });
-  }, [online, sid]);
-
-  // A send kept for a retry belongs to the field's words as they were put back: edited, it is let go.
-  useEffect(() => draftChanged(sid, text, files), [sid, text, files]);
-
   useEffect(() => {
     if (!sessionCaps && !folderCaps && s && online) ensureFolderCaps(s.provider, s.cwd, s.accountId);
   }, [sessionCaps, folderCaps, s?.provider, s?.cwd, s?.accountId, online]);
@@ -125,8 +110,9 @@ export function Composer({ sid }: { sid: string }) {
       onPutDraft(sid, (words, append) => {
         const had = area.current?.value ?? '';
         const t = append && had.trim() ? `${had.trimEnd()}\n${words}` : words;
-        setText(t);
-        setDraft(sid, t);
+        const d = composition(sid);
+        const shown = offers(outgoing(), sid, d).field;
+        setDraft(sid, t, { files: shown?.packet.attachments ?? d.files, touch: !!shown, now: true });
         const el = area.current;
         if (!el) return;
         el.value = t;
@@ -136,26 +122,14 @@ export function Composer({ sid }: { sid: string }) {
     [sid],
   );
 
-  // The draft changed from elsewhere (words taken back from the queue, recovered at a start): the field
-  // shows it at once, so what is typed next goes on from it and never writes an older text over it.
-  useEffect(
-    () =>
-      onDraft(sid, (t, why) => {
-        setText(t);
-        const el = area.current;
-        if (!el) return;
-        el.value = t;
-        fit(el, 168);
-        if (why === 'taken') el.focus();
-      }),
-    [sid],
-  );
-
-  // The field takes the height of a draft that came back from storage.
-  useEffect(() => {
-    if (area.current?.value) fit(area.current, 168);
-  }, []);
-
+  useEffect(() => onDraft(sid, (_, why) => {
+    if (why === 'taken') area.current?.focus();
+  }), [sid]);
+  const lastText = useRef(text);
+  useLayoutEffect(() => {
+    if (area.current) sizeField(area.current, !!lastText.current && !text);
+    lastText.current = text;
+  }, [sid, text]);
   if (!s) return null;
 
   const running = s.status === 'running' || s.status === 'starting' || s.status === 'awaiting';
@@ -220,107 +194,47 @@ export function Composer({ sid }: { sid: string }) {
     },
   };
 
-  const update = (v: string, hold = false) => {
-    setText(v);
-    setDraft(sid, v);
-    const el = area.current;
-    if (!el) return;
-    if (hold) {
-      // The bar holds still while the bead forms on its edge, then gathers to one line.
-      const h = el.offsetHeight;
-      el.style.height = `${h}px`;
-      window.setTimeout(() => {
-        if (el.value) return void ((el.style.height = ''), fit(el, 168));
-        // Its height with nothing in it (measured once, here), then it glides there.
-        el.style.height = autoSized ? '' : 'auto';
-        const to = autoSized ? el.offsetHeight : Math.min(el.scrollHeight, 168);
-        if (Math.abs(to - h) < 2) return void (el.style.height = autoSized ? '' : `${to}px`);
-        el.style.height = `${h}px`;
-        void el.offsetHeight;
-        el.style.transition = 'height 240ms cubic-bezier(0.2, 0.8, 0.2, 1)';
-        el.style.height = `${to}px`;
-        window.setTimeout(() => {
-          el.style.transition = '';
-          if (autoSized) el.style.height = '';
-        }, 260);
-      }, 290);
-      return;
-    }
-    fit(el, 168);
-  };
+  const edit = (value: string, attachments = files) =>
+    setDraft(sid, value, { files: attachments, touch: !!field, now: true });
 
-  /** `/model <name>`: the bridge picks the model, or switches the chat to the agent that has it; nothing is sent. Bare `/model` opens the sheet. */
-  const modelCommand = async (t: string, name: string) => {
-    update('');
-    if (!name) {
+  const submit = async (retry?: Submission) => {
+    const e = epoch();
+    if (!online || (!retry && !text.trim() && !files.length)) return;
+    const cmd = !files.length && MODEL_CMD.exec(text.trim());
+    if (!retry && cmd && !cmd[1]?.trim()) {
+      edit('', []);
       haptic('tap');
       area.current?.blur();
       setSheet('model');
       return;
     }
-    haptic('select');
-    const e = epoch();
+    const words = retry?.packet.text ?? text;
+    const el = area.current;
+    const bar = el?.closest<HTMLElement>('.composer');
+    if (el && bar && words && !cmd && (!retry || retry === field)) launchFlight(words, el, bar);
+    else haptic('tap');
+    void closeGap(sid).catch(() => {});
+    sentHere(sid);
     try {
-      const r = await conn.call('session.send', { sessionId: sid, text: t });
-      if (!r.ok) {
-        haptic('deny');
-        update(t);
-        return toast(r.error ?? 'No such model', 'error');
-      }
-      const st = getState();
-      const p = r.switched ?? st.sessions[sid]?.provider ?? s.provider;
-      const list = sessionData(st, sid).caps?.models ?? st.caps[`${p}:${s.cwd}`]?.models;
-      const name2 = (r.model && modelNameById(r.model, list)) ?? r.model ?? '';
-      toast(r.switched ? `Switched to ${PROVIDER_NAME[r.switched]}${name2 ? `, ${name2}` : ''}` : `Model set to ${name2}`, 'success');
-    } catch (err) {
-      // Forgotten meanwhile: the words belonged to that computer; nothing goes back.
+      const r = retry ? await retryPress(retry) : await sendPress(pressFrom(sid, draft)(), e);
       if (!still(e)) return;
+      if (!r || r.queued) notSentHere(sid);
+      if (r?.model || r?.switched) {
+        const st = getState();
+        const p = r.switched ?? st.sessions[sid]?.provider ?? s.provider;
+        const list = sessionData(st, sid).caps?.models ?? st.caps[`${p}:${s.cwd}`]?.models;
+        const name = (r.model && modelNameById(r.model, list)) ?? r.model ?? '';
+        toast(r.switched ? `Switched to ${PROVIDER_NAME[r.switched]}${name ? `, ${name}` : ''}` : `Model set to ${name}`, 'success');
+      }
+    } catch (err) {
+      if (!still(e)) return;
+      notSentHere(sid);
+      dropFlight();
       haptic('deny');
-      update(t);
       toast((err as Error).message, 'error');
     }
   };
-
-  const send = async () => {
-    const t = text.trim();
-    if ((!t && !files.length) || !online) return;
-    const cmd = files.length ? null : MODEL_CMD.exec(t);
-    if (cmd) return modelCommand(t, (cmd[1] ?? '').trim());
-    const el = area.current;
-    const bar = el?.closest<HTMLElement>('.composer');
-    // The words drain into the bar's corner and leave as a drop (lib/flight.ts: the tick comes at the break).
-    if (el && bar && t) launchFlight(t, el, bar);
-    else haptic('tap');
-    const attachments = files.length ? files : undefined;
-    update('', true);
-    setFiles([]);
-    // Opened far back (a search hit): the chat goes to its newest, where the message lands.
-    void closeGap(sid).catch(() => {});
-    const e = epoch();
-    // The conversation follows this message to the end (lib/follow.ts); not when the desktop queues it.
-    sentHere(sid);
-    // Its id, made with the words and files before the first request; a retry of a send the connection
-    // cut off gets the id it was sent under (lib/submit.ts).
-    const sub = submissionFor(sid, t, attachments);
-    try {
-      const r = await conn.call('session.send', { sessionId: sid, text: t, attachments, submitId: sub.id });
-      submissionDone(sid, sub.id);
-      if (r.queued || !r.ok) notSentHere(sid);
-    } catch (err) {
-      notSentHere(sid);
-      const msg = (err as Error).message;
-      dropFlight();
-      // Forgotten (or replaced by another computer) while it went: its words are not put back.
-      if (!still(e)) return;
-      // Cut off: kept with its id for the retry. Refused: the desktop forgot it too.
-      if (LOST.test(msg)) submissionUnsure(sid, sub.id);
-      else submissionDone(sid, sub.id);
-      haptic('deny');
-      update(t);
-      setFiles(attachments ?? []);
-      setState({ toast: { text: LOST.test(msg) ? 'The connection dropped while sending' : msg, level: 'error', at: Date.now() } });
-    }
-  };
+  const send = () => submit(field);
 
   const stop = () => {
     haptic('warning');
@@ -329,18 +243,25 @@ export function Composer({ sid }: { sid: string }) {
 
   const pick = async (list: FileList | null) => {
     if (!list) return;
+    const e = epoch();
     const next: Attachment[] = [];
     for (const f of Array.from(list).slice(0, 6)) {
       if (f.size > 8 * 1024 * 1024) continue;
       const dataUrl = await shrink(f);
       next.push({ id: crypto.randomUUID(), kind: 'image', name: f.name || 'Photo', dataUrl, mime: dataUrl.slice(5, dataUrl.indexOf(';')), size: Math.round((dataUrl.length * 3) / 4) });
     }
-    setFiles((cur) => [...cur, ...next]);
+    if (!still(e) || !next.length) return;
+    const d = composition(sid);
+    const shown = offers(outgoing(), sid, d).field;
+    setDraft(sid, shown?.packet.text ?? d.t, { files: [...(shown?.packet.attachments ?? d.files ?? []), ...next], now: true });
   };
 
   return (
     <div className="composer-dock">
       <QueueTray sid={sid} queue={queue} />
+      {!!rows.length && <div className="queue">{rows.map(row => (
+        <QueueRow key={row.packet.submitId} sid={sid} entry={row} retry={() => void submit(row)} online={online} />
+      ))}</div>}
       <div className="composer" data-focus={focused || undefined} onClick={(e) => e.target === e.currentTarget && area.current?.focus()}>
         <AnimatePresence initial={false}>
           {files.length > 0 && (
@@ -348,7 +269,7 @@ export function Composer({ sid }: { sid: string }) {
               {files.map((f) => (
                 <motion.span key={f.id} className="attach" layout initial={{ scale: 0.6, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.6, opacity: 0 }} transition={SNAP}>
                   <img src={f.dataUrl} alt={f.name} />
-                  <button type="button" aria-label={`Remove ${f.name}`} onClick={() => (haptic('tap'), setFiles((cur) => cur.filter((x) => x.id !== f.id)))}>
+                  <button type="button" aria-label={`Remove ${f.name}`} onClick={() => (haptic('tap'), edit(text, files.filter(x => x.id !== f.id)))}>
                     <Icon name="x" size={12} weight="bold" />
                   </button>
                 </motion.span>
@@ -362,7 +283,7 @@ export function Composer({ sid }: { sid: string }) {
           rows={1}
           value={text}
           placeholder={running ? 'Queue a follow-up' : 'Message'}
-          onChange={(e) => update(e.target.value)}
+          onChange={(e) => edit(e.target.value)}
           onKeyDown={(e) => {
             // Enter sends (the keyboard shows a send key); Shift+Enter, or Enter with "Send with Enter" off on the desktop, is a new line.
             if (e.key === 'Enter' && !e.shiftKey && sendWithEnter && !e.nativeEvent.isComposing) {
@@ -393,7 +314,7 @@ export function Composer({ sid }: { sid: string }) {
             type="button"
             className="send"
             data-stop={stopping || undefined}
-            aria-label={stopping ? 'Stop' : running ? 'Queue' : 'Send'}
+            aria-label={stopping ? 'Stop' : field ? 'Send again' : running ? 'Queue' : 'Send'}
             disabled={!stopping && (empty || !online)}
             onPointerDown={(e) => !stopping && e.preventDefault()}
             onClick={stopping ? stop : () => void send()}
@@ -440,32 +361,34 @@ function QueueTray({ sid, queue }: { sid: string; queue: QueuedMessage[] }) {
  * A message whose delivery is not known (the desktop's `rowDelivery`: it will not send it by itself)
  * says the desktop's reason under its words, and its two keys are "Send again" and "Discard".
  */
-function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
+function QueueRow(props: { sid: string } & ({ q: QueuedMessage } | { entry: Submission; retry(): void; online: boolean })) {
+  const { sid } = props;
+  const q = 'q' in props ? props.q : undefined;
+  const local = 'entry' in props ? props : undefined;
+  const text = q?.text || local?.entry.packet.text || local?.entry.packet.attachments?.map(f => f.name).join(', ') || 'Photo';
   const ref = useRef<HTMLDivElement>(null);
-  const [liquid] = useState(() => inFlight(q.text));
+  const [liquid] = useState(() => !!q && inFlight(text));
   const [taking, setTaking] = useState(false);
   useLayoutEffect(() => {
-    if (liquid && ref.current) claimFlight(q.text, ref.current, 'row');
+    if (liquid && ref.current) claimFlight(text, ref.current, 'row');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const editable = !q.attachments?.length && !!q.text;
-  const delivery = rowDelivery(q);
+  const editable = !!q && !q.attachments?.length && !!q.text;
+  const delivery = q ? rowDelivery(q) : { reason: 'Not sent', again: true };
   const acts = rowActs(delivery, false);
   const words = delivery.reason ? (
     <>
-      <span>{q.text || 'Photo'}</span>
+      <span>{text}</span>
       <span className="queued-why">{delivery.reason}</span>
     </>
   ) : (
-    q.text || 'Photo'
+    text
   );
   const take = () => {
-    if (taking) return;
+    if (!q || taking) return;
     haptic('tap');
     setTaking(true);
     const e = epoch();
-    // The words go into the chat's draft (and its field) as they are kept on the phone, before the
-    // desktop lets the message go (lib/take.ts, lib/drafts.ts): nothing more to put here once it answers.
     void takeBack(takes, sid, q.id)
       .then(
         (r) => {
@@ -491,7 +414,7 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
             transition={SNAP}
           >
             {editable ? (
-              <button type="button" className="queued-text" aria-label={`Edit: ${q.text.slice(0, 80)}${delivery.reason ? `. ${delivery.reason}` : ''}`} data-why={delivery.reason ? '' : undefined} data-busy={taking || undefined} onClick={take}>
+              <button type="button" className="queued-text" aria-label={`Edit: ${text.slice(0, 80)}${delivery.reason ? `. ${delivery.reason}` : ''}`} data-why={delivery.reason ? '' : undefined} data-busy={taking || undefined} onClick={take}>
                 {words}
               </button>
             ) : (
@@ -501,7 +424,9 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
               type="button"
               className="icon-btn sm"
               aria-label={acts.send}
+              disabled={local && !local.online}
               onClick={() => {
+                if (!q) return local?.retry();
                 haptic('send');
                 sentHere(sid);
                 // Refused (the desktop took the entry meanwhile) or failed: no message of this phone's is coming.
@@ -520,6 +445,12 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
               className="icon-btn sm"
               aria-label={acts.remove}
               onClick={() => {
+                if (!q && local) {
+                  const e = epoch();
+                  void discardPress(local.entry).catch(err => { if (still(e)) toast(err.message, 'error'); });
+                  return;
+                }
+                if (!q) return;
                 haptic('tap');
                 void conn.call('queue.remove', { sessionId: sid, id: q.id }).catch(() => {});
               }}
@@ -528,6 +459,31 @@ function QueueRow({ sid, q }: { sid: string; q: QueuedMessage }) {
             </button>
           </motion.div>
   );
+}
+
+function sizeField(el: HTMLTextAreaElement, hold: boolean) {
+  if (hold) {
+    // The bar holds still while the bead forms on its edge, then gathers to one line.
+    const h = el.offsetHeight;
+    el.style.height = `${h}px`;
+    window.setTimeout(() => {
+      if (el.value) return void ((el.style.height = ''), fit(el, 168));
+      // Its height with nothing in it (measured once, here), then it glides there.
+      el.style.height = autoSized ? '' : 'auto';
+      const to = autoSized ? el.offsetHeight : Math.min(el.scrollHeight, 168);
+      if (Math.abs(to - h) < 2) return void (el.style.height = autoSized ? '' : `${to}px`);
+      el.style.height = `${h}px`;
+      void el.offsetHeight;
+      el.style.transition = 'height 240ms cubic-bezier(0.2, 0.8, 0.2, 1)';
+      el.style.height = `${to}px`;
+      window.setTimeout(() => {
+        el.style.transition = '';
+        if (autoSized) el.style.height = '';
+      }, 260);
+    }, 290);
+    return;
+  }
+  fit(el, 168);
 }
 
 /** Photos go to the desktop as data URLs: at most 1600 px on the long side, JPEG. */

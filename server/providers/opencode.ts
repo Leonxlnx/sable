@@ -25,7 +25,7 @@ import type {
   TurnItem,
   UserItem,
 } from '../../shared/protocol';
-import { readDelegateIds } from '../../shared/synthetic';
+import { nativeBatchPrompt, nativePersonalWords, UNTIL_INPUT_END, readDelegateIds } from '../../shared/synthetic';
 import { lostLine, type SessionRuntime } from '../core/runtime';
 import { runCli } from '../util/proc';
 import { openCodeConfig } from '../services/config';
@@ -440,6 +440,7 @@ interface Turn {
   stop?: NodeJS.Timeout;
   done: boolean;
   sent?: boolean;
+  received?: () => void;
   /** A loss note is received with this prompt's first output or its successful answer. */
   receipts?: Queued[];
   /** Its `session/prompt` request, settled when OpenCode answers it. */
@@ -561,6 +562,7 @@ class OpenCodeSession implements ProviderSession {
     this.prompts.abort();
     const turn = this.turn;
     if (turn) {
+      rt.returnUnwritten((turn.receipts ?? []).map(entry => entry.item.id), 'The OpenCode process ended before confirming the prompt.');
       this.finishReceipts(turn, false);
       turn.done = true;
       clearTimeout(turn.stop);
@@ -576,7 +578,11 @@ class OpenCodeSession implements ProviderSession {
     rt.cutTurn(reason, { detail });
     if (commands.length) rt.lossNotice = rt.notice('info', lostLine(commands.length, 'process'), commands.join('\n')).id;
     if (waiting) this.drainQueue();
-    else for (const entry of this.queue.splice(0)) entry.release?.(true);
+    else {
+      const queued = this.queue.splice(0);
+      rt.returnUnwritten(queued.map(entry => entry.item.id), 'The OpenCode process ended before sending the waiting input.');
+      for (const entry of queued) entry.release?.(true);
+    }
   }
 
   /** A dead handle opens its conversation again on a new process (`session/resume`, or a new one with a notice). */
@@ -676,7 +682,6 @@ class OpenCodeSession implements ProviderSession {
     const turn: Turn = { done: false, receipts: entries };
     this.turn = turn;
     rt.beginTurn('Thinking');
-    for (const { item } of entries) if (item.state === 'queued') rt.taken(item.id);
     this.text = this.thinking = undefined;
     const started = Date.now();
     let acp: AcpClient;
@@ -709,7 +714,7 @@ class OpenCodeSession implements ProviderSession {
         if (!x.check || passes(x.check)) return true;
         x.release?.(true);
         if (!x.delegateReport) {
-          rt.remove(x.item.id);
+          this.returnRefused(x.item);
           rt.notice('info', 'A message from a removed phone was not sent');
         }
         return false;
@@ -723,10 +728,36 @@ class OpenCodeSession implements ProviderSession {
       turn.receipts = live;
     }
     const items = live.map((x) => x.item);
-    const blocks = items.length === 1 ? promptBlocks(items[0].text, items[0].attachments) : items.flatMap((it, i) => promptBlocks(i ? `\n\n${it.text}` : it.text, it.attachments));
+    const ranges: Parameters<typeof nativeBatchPrompt>[1] = [];
+    let body = '';
+    const blocks = live.flatMap(({ item, personalOffset }, i) => {
+      const prefix = i ? '\n\n' : '';
+      const text = item.until?.check ? item.text + UNTIL_INPUT_END : item.text;
+      const parts = promptBlocks(prefix + text, item.attachments);
+      const offset = body.length + prefix.length;
+      body += parts[0].text;
+      const card = rt.get<UserItem>(item.id);
+      if (card && personalOffset !== undefined && text.startsWith(card.text, personalOffset)) {
+        ranges.push([offset + personalOffset, offset + personalOffset + card.text.length, offset + text.length, body.length]);
+      }
+      return parts;
+    });
+    const marked = nativeBatchPrompt(body, ranges);
+    if (marked.length > body.length) blocks.push({ type: 'text', text: marked.slice(body.length) });
+    try {
+      for (const entry of live) entry.issueReport?.();
+    } catch (err) {
+      this.completeTurn(turn, started, undefined, errMsg(err));
+      return;
+    }
     turn.sent = true;
     // One prompt runs for as long as the agent works: it is answered when the turn ends.
+    const cards = items.map(item => rt.get<UserItem>(item.id));
+    turn.received = () => {
+      for (const card of cards) if (card?.state === 'queued' && rt.get(card.id) === card) rt.taken(card.id);
+    };
     turn.prompt = acp.request('session/prompt', { sessionId: this.sessionId, prompt: mergeText(blocks) }, 0);
+    void turn.prompt.then(() => turn.received?.(), () => {});
     void turn.prompt.then((r) => this.completeTurn(turn, started, r as Obj, undefined, items)).catch((err) => this.completeTurn(turn, started, undefined, errMsg(err), items));
   }
 
@@ -740,6 +771,7 @@ class OpenCodeSession implements ProviderSession {
     const reason = String(result?.stopReason ?? (error ? 'error' : 'end_turn'));
     const compacting = items.length === 1 && /^\/compact(\s|$)/.test(items[0].text.trim());
     const cancelled = reason === 'cancelled';
+    if (!turn.sent || error || cancelled) rt.returnUnwritten((turn.receipts ?? []).map(entry => entry.item.id), error ?? 'The turn ended before OpenCode wrote the prompt.');
     this.finishReceipts(turn, !!result && turn.sent === true && !cancelled);
     if (this.closed && !rt.turnActive) return;
     rt.cancelPrompts();
@@ -762,12 +794,21 @@ class OpenCodeSession implements ProviderSession {
   }
 
   private finishReceipts(turn: Turn, taken: boolean) {
+    if (taken) turn.received?.();
+    turn.received = undefined;
     const entries = turn.receipts;
     turn.receipts = undefined;
     for (const entry of entries ?? []) {
       if (entry.taken && taken) entry.taken();
       else if (entry.taken) entry.release?.(turn.sent ? undefined : true);
     }
+  }
+
+  private returnRefused(item: UserItem) {
+    if (!item.phoneSender) return this.rt.remove(item.id);
+    const ids = new Set([item.id]);
+    this.rt.returnUntaken({ ids, byHand: ids });
+    this.rt.queueReason(item.id, 'This phone is no longer paired. Send again from the desktop.');
   }
 
   private drainQueue() {
@@ -782,7 +823,7 @@ class OpenCodeSession implements ProviderSession {
       if (!x.check || passes(x.check)) return true;
       x.release?.(true);
       if (!x.delegateReport) {
-        this.rt.remove(x.item.id);
+        this.returnRefused(x.item);
         this.rt.notice('info', 'A message from a removed phone was not sent');
       }
       return false;
@@ -911,6 +952,10 @@ class OpenCodeSession implements ProviderSession {
     const rt = this.rt;
     this.closeText();
     if (rt.items.length) this.endExchange();
+    for (const card of rt.items) if (card.type === 'user') {
+      const words = nativePersonalWords(card.text);
+      if (words !== undefined) rt.patch<UserItem>(card.id, { text: words, authored: true });
+    }
     rt.settle('cancelled');
     this.replaying = undefined;
     this.tools.clear();

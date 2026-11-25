@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import {
@@ -45,7 +45,7 @@ interface RefusalMark {
 }
 import { DELEGATE_REPORT, delegateReport, syntheticOf, lostTasksNote, RESUME_AFTER_SIGN_IN, RESUME_LOST, signInBackgroundNote } from '../shared/synthetic';
 import { normalizeBackdrop } from '../shared/backdrop';
-import { HANDOVER_JOIN, readableTitle, RESUME_AFTER_RESET, RESUME_LIMIT_RESET, RESUME_SUMMARY_TRAILER, RESUME_UNDER_ANOTHER, resumeBackgroundNote } from '../shared/synthetic';
+import { HANDOVER_JOIN, personalOrigin, readableTitle, RESUME_AFTER_RESET, RESUME_LIMIT_RESET, RESUME_SUMMARY_TRAILER, RESUME_UNDER_ANOTHER, resumeBackgroundNote } from '../shared/synthetic';
 import { Races, type Contender } from './core/race';
 import { laneSlug } from './services/git-lanes';
 import { gitDraftInput, gitWorktrees } from './services/git';
@@ -59,6 +59,7 @@ import { rankAccount } from '../shared/use-first';
 import { defaultChatsRoot, makeChatFolder, removeEmptyChatFolder } from './core/chats';
 import { speedFor, startSpeedFor } from '../shared/speed';
 import { resultDigest, type WantedReceipts } from './core/delegate-result';
+import { DelegateJournal, type DelegateRecord } from './core/delegate-journal';
 import type { DelegateReceipts, Provider, ProviderContext, ProviderSession } from './providers/types';
 import { atCap, findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
 import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, lostClause, moveNote, type MoveOutcome } from './core/move-context';
@@ -88,6 +89,7 @@ import { PhoneReceipts, Submissions, messagePrint } from './core/submissions';
 import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
+import { DeadlineExceeded, withDeadline } from './util/deadline';
 import { cliPresentSoon } from './util/cli-present';
 
 /**
@@ -454,7 +456,11 @@ export class App {
     remove: async (rt) => {
       await this.call('session.close', { sessionId: rt.id, remove: true });
     },
-    send: async (rt, text) => { await this.deliver(rt, text); },
+    send: async (rt, text) => {
+      const entry = rt.enqueue(text);
+      await rt.persistInput?.();
+      void this.deliverQueued(rt, entry.id).catch(err => rt.queueReason(entry.id, String(err)));
+    },
     stop: (rt) => this.stopForGood(rt),
     forecast: (rt) => this.lanes.forecast(rt),
     land: (rt, message) => this.lanes.land(rt, message),
@@ -523,6 +529,7 @@ export class App {
     this.compactTimeoutMs = opts.compactTimeoutMs ?? COMPACT_TIMEOUT_MS;
     this.backgroundLimitMs = opts.backgroundLimitMs;
     this.store = new Store(opts.home, (session, id) => this.sessions.get(session)?.get(id));
+    this.delegateJournal = new DelegateJournal(this.store.dir);
     this.phoneReceipts = new PhoneReceipts(this.store.dir);
     this.onDispose(() => this.phoneReceipts.close());
     this.cache = new DiskCache(this.store.dir);
@@ -564,8 +571,9 @@ export class App {
       // An until loop does not outlive Sable: the session says so when it is opened.
       if (meta.until) this.untilLost.set(meta.id, meta.until), (meta.until = undefined);
       // A chat titled from a message the agent's harness wrote (`<task-notification>`): its plain words.
-      const plain = meta.titleSource === 'user' ? meta.title : readableTitle(meta.title);
-      if (plain !== meta.title) meta.title = plain || 'New session';
+      const plain = meta.titleSource === 'user' || meta.titleAuthored ? meta.title : readableTitle(meta.title);
+      // Existing timelines can prove this was a quotation once opened. Until then keep the title.
+      if (plain !== meta.title && !existsSync(path.join(this.store.dir, 'sessions', meta.id + '.json'))) meta.title = plain || 'New session';
       const rt = this.makeRuntime(meta, true);
       this.sessions.set(meta.id, rt);
       if (meta.delegateRecovery) recovery.push(rt);
@@ -574,7 +582,17 @@ export class App {
     const hydrate = async () => {
       for (const rt of pending) {
         if (this.disposed) return;
-        if (this.sessions.get(rt.id) === rt) await this.hydrateAsync(rt).catch(err => this.log('delegate recovery failed', err));
+        if (this.sessions.get(rt.id) !== rt) continue;
+        const read = this.hydrateAsync(rt);
+        try { await withDeadline(read, 90_000, 'Reading the saved delegate chat'); }
+        catch (err) {
+          if (!(err instanceof DeadlineExceeded)) { this.log('delegate recovery failed', err); continue; }
+          if (!this.disposed) this.emit({ type: 'toast', level: 'error', text: 'Delegate recovery is delayed for ' + rt.meta.title + '. Its saved chat is still on disk.' });
+          // Keep the two-reader limit even for stalled storage. Opening another chat is independent.
+          const resume = () => { void hydrate(); };
+          void read.then(resume, resume);
+          return;
+        }
       }
     };
     void Promise.all([hydrate(), hydrate()]);
@@ -621,7 +639,10 @@ export class App {
   private enqueueSubmission?: { rt: SessionRuntime; id: string };
   emit = (event: BridgeEvent) => {
     if (event.type === 'phone.updated' || event.type === 'update.state' || event.type === 'limits.updated' || event.type === 'limits.report' || event.type === 'settings.updated') {
-      for (const rt of this.sessions.values()) this.scheduleLossWake(rt);
+      for (const rt of this.sessions.values()) {
+        this.scheduleLossWake(rt);
+        if (event.type === 'update.state' && !this.updates?.installing && this.updateDrains.delete(rt)) rt.onQueueRunnable?.();
+      }
     }
     if (event.type === 'timeline.reset' || event.type === 'item.added' || event.type === 'item.removed' ||
         event.type === 'item.patch' || event.type === 'item.delta') {
@@ -742,9 +763,8 @@ export class App {
     const h = this.handlers.get(method);
     if (!h) throw new Error(`Unknown method: ${method}`);
     const id = (params as { sessionId?: string } | undefined)?.sessionId;
-    const wantsEnd = method === 'session.snapshot' && (params as RpcMethods['session.snapshot']['params']).page === 'end';
     // Send and Stop record their order before joining the same cold read.
-    if (id && this.lazy.has(id) && !wantsEnd && method !== 'session.send' && method !== 'session.interrupt') {
+    if (id && this.lazy.has(id) && method !== 'session.snapshot' && method !== 'session.send' && method !== 'session.interrupt') {
       await this.hydrateAsync(this.runtime(id));
       still(ctx);
     }
@@ -1408,14 +1428,41 @@ export class App {
   private makeRuntime(meta: SessionMeta, lazy = false): SessionRuntime {
     if (lazy) this.lazy.add(meta.id);
     const rt = new SessionRuntime(meta, this.emit, (rt, what) => {
-      if (what === 'meta') {
+      const restoring = this.installingTimeline.get(rt);
+      if (restoring) restoring[what] = true;
+      else if (what === 'meta') {
         this.pinCwd(rt);
         this.store.saveState();
-      } else this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue, dirty: rt.takeDirty() }));
+      } else if (lazy && !this.installed.has(rt)) {
+        this.log('Refused a timeline save before successful hydration', rt.id);
+        this.lazy.add(rt.id);
+        if (!this.unreadable.has(rt.id)) {
+          this.unreadable.add(rt.id);
+          this.emit({ type: 'toast', level: 'error', text: 'This chat could not be read from disk. Its saved history is protected. Open it again to retry.' });
+        }
+      } else this.saveTimeline(rt);
     });
     this.pinCwd(rt);
-    rt.persistInput = () => this.store.persistInput(rt.id);
-    rt.persistDelegate = () => this.store.persistInput(rt.id, true);
+    const persist = (requireOpen = false) => lazy && !this.installed.has(rt)
+      ? Promise.reject(Error('This chat could not be read from disk'))
+      : this.store.persistInput(rt.id, requireOpen);
+    rt.persistInput = () => persist();
+    rt.persistDelegate = () => withDeadline(persist(true), 5000, 'Saving the delegate');
+    rt.reapDelegate = confirmed => {
+      this.retiredDelegates.add(confirmed);
+      void confirmed.then(() => this.retiredDelegates.delete(confirmed));
+    };
+    rt.offerToolResult = row => {
+      const keys = this.offerDelegateReports(rt, [row]).map(record => record.key);
+      void rt.persistDelegate?.().then(() => this.delegateJournal.forget(rt.id, keys))
+        .catch(err => this.log('foreground receipt journal retained', err));
+    };
+    rt.saveQuitResult = row => {
+      const delivery = row.delegateDeliveryId!;
+      this.delegateJournal.save(rt.id, [{ key: delivery, delivery, row: row.id,
+        terminal: { status: row.status, delegateReport: row.delegateReport, endedAt: row.endedAt, result: row.result } }]);
+      return () => this.delegateJournal.forget(rt.id, [delivery]);
+    };
     rt.promote = item => this.store.promote(rt.id, item);
     rt.canBeginTurn = () => !this.disposed && !this.updates?.installing;
     rt.onTurnEnd = (r, error, opts) => this.afterTurn(r, error, opts?.hold, opts?.backgroundLimit);
@@ -1457,6 +1504,10 @@ export class App {
       if (!item.phoneSender && sender?.allowed) rt.transientQueueGuards.set(item.id, sender.allowed);
     };
     // A queued message a phone was taking back is released: the queue goes on if it waited for it.
+    rt.onQueueRunnable = () => {
+      const stops = this.stopsOf(rt);
+      setTimeout(() => { if (stops === this.stopsOf(rt) && (rt.queue.length || rt.meta.until)) this.sendNextQueued(rt); }, 0);
+    };
     rt.onQueueReleased = (r) => {
       this.scheduleLossWake(r);
       if (!this.drainWaiting.delete(r.id)) return;
@@ -1475,19 +1526,52 @@ export class App {
   }
 
   private reading = new Map<string, Promise<void>>();
+  private installed = new WeakSet<SessionRuntime>();
+  private installingTimeline = new WeakMap<SessionRuntime, { meta: boolean; items: boolean }>();
+
+  private saveTimeline(rt: SessionRuntime) {
+    this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue,
+      receiptRepair: this.phoneReceipts.pending(rt.id), dirty: rt.takeDirty() }));
+  }
 
   /** Concurrent actions wait for the same indexed read before observing or editing the chat. */
   private hydrateAsync(rt: SessionRuntime): Promise<void> {
     if (!this.lazy.has(rt.id)) return this.reading.get(rt.id) ?? Promise.resolve();
     let run = this.reading.get(rt.id);
     if (!run) {
-      run = this.store
-        .loadSessionAsync(rt.id)
-        .then((file) => {
-          if (!this.lazy.delete(rt.id)) return;
-          this.loadInto(rt, file);
-          if (!file.unreadable) return this.restoreSteerReceipts(rt);
-        })
+      run = (async () => {
+        let file: Awaited<ReturnType<Store['loadSessionAsync']>>;
+        let restartNotice: string | undefined;
+        const changes = { meta: false, items: false };
+        let meta: SessionMeta | undefined;
+        try {
+          file = await this.store.loadSessionAsync(rt.id);
+          if (this.sessions.get(rt.id) !== rt || this.disposed) return;
+          if (file.unreadable) throw Error('Unreadable session file');
+          meta = { ...rt.meta };
+          this.installingTimeline.set(rt, changes);
+          restartNotice = this.loadInto(rt, file);
+        } catch (err) {
+          if (this.sessions.get(rt.id) !== rt || this.disposed) return;
+          this.log('This chat could not be read from disk', rt.id, String(err));
+          this.unreadable.add(rt.id);
+          this.installingTimeline.set(rt, changes);
+          rt.load([], [], []);
+          rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Open the chat again to retry.');
+          if (meta) Object.assign(rt.meta, meta);
+          return;
+        } finally { this.installingTimeline.delete(rt); }
+        this.installed.add(rt);
+        this.lazy.delete(rt.id);
+        this.unreadable.delete(rt.id);
+        try { this.phoneReceipts.remember(rt.id, file.receiptRepair, file.queue); }
+        catch (err) { this.log('Could not stage phone receipt repairs', rt.id, String(err)); }
+        if (changes.meta) this.store.saveState();
+        if (changes.items) this.saveTimeline(rt);
+        try { this.afterRestore(rt, file, restartNotice); }
+        catch (err) { this.log('Session maintenance failed', rt.id, String(err)); }
+        void this.restoreSteerReceipts(rt).catch(err => this.log('Could not check steer receipts', String(err)));
+      })()
         .finally(() => this.reading.delete(rt.id));
       this.reading.set(rt.id, run);
     }
@@ -1505,13 +1589,14 @@ export class App {
     for (const row of rt.queue) {
       const uuid = row.issuedUuid;
       if (!uuid || only && uuid !== only) continue;
+      if (row.issuedTo?.stillQueued && !rt.handle?.stillQueued?.(uuid)) rt.forgetLiveQueue(uuid);
       const to = row.issuedTo;
       const elsewhere = !to?.session || rt.meta.provider !== to.provider || (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== (to.accountId ?? DEFAULT_ACCOUNT) || rt.meta.providerSessionId !== to.session;
       rt.queueReason(row.id, elsewhere ? (to?.stillQueued ? 'Claude reported this input still queued. This chat cannot receive its original receipt.' : 'This chat cannot receive the original Claude receipt. Check the original conversation before sending again.')
         : to.stillQueued ? 'Claude still has this input queued.' : 'Issued to Claude. Receipt unknown.');
       if (!to?.session) continue;
       const existing = reads.get(uuid);
-      if (existing) { pending.add(existing); continue; }
+      if (existing) continue; // One observer owns this UUID. A concurrent retry sees the registered read.
       const key = JSON.stringify([to.accountId, to.session, to.cwd]);
       let group = groups.get(key);
       if (!group) groups.set(key, group = { to, ids: new Set() });
@@ -1549,12 +1634,12 @@ export class App {
     // RPC can still be outstanding. The card owns that delivery once it exists.
     const users = new Set(file.items.filter(i => i.type === 'user').map(i => i.id));
     const queue = file.queue?.filter(q => !users.has(q.id)).map(q => q.issuedUuid ? { ...q, byHand: true, steerWait: { reason: 'Issued to Claude. Receipt unknown.' } } : q);
-    // A crash can land between the chat commit and indexing its submission receipt.
-    for (const q of queue ?? []) if (q.phoneSender && q.submitId && !this.phoneReceipts.has(rt.id, q.submitId))
-      this.phoneReceipts.record(rt.id, q.submitId);
+    const journal = file.items.some(i => i.type === 'tool' && (i.delegateDeliveryId || i.delegateAttempt))
+      ? this.delegateJournal.read(rt.id) : [];
     const lostNames = rt.loadRestored(file.items, file.todos, queue ?? []);
+    this.restoreDelegateJournal(rt, file.items, journal);
+    this.restorePersonalLimitBoundary(rt);
     if (rt.stopRequested) rt.holdDelegateReports('stop');
-    if (rt.pendingDelegateReports.size) this.scheduleLossWake(rt);
     this.store.bindProviderInputs(rt.id, rt.items);
     // A message Sable sent that came back as one "From the Claude app" (D-own): merged into its own card,
     // only where the agent's own id for it proves they are one message.
@@ -1562,15 +1647,10 @@ export class App {
     for (const item of rt.items) {
       if (item.type === 'notice' && item.limit?.moving) rt.patch<NoticeItem>(item.id, { limit: { ...item.limit, moving: undefined } });
     }
-    // A file that is there but cannot be read is left exactly as it is (nothing is written to it).
-    if (file.unreadable) {
-      this.unreadable.add(rt.id);
-      rt.notice('error', 'This chat could not be read from disk', 'Nothing is written to it. Restart Sable to try again.');
-    }
     // Its turn ran when Sable closed: the bridge knows it was cut, and says so once ("Ended early"),
     // at the time of the turn's last item, never now (the chat may be read hours later).
     let restartNotice: string | undefined;
-    if (rt.meta.pendingRestart && !file.unreadable) {
+    if (rt.meta.pendingRestart) {
       const cutAt = lastAct(rt.items);
       const before = rt.items.length;
       if (cutAt !== undefined) rt.cutTurn('restart', { at: cutAt });
@@ -1579,7 +1659,7 @@ export class App {
     }
     // Background commands still running when Sable closed were lost with it (D-lost): said once, where the
     // chat stopped, their names on demand (the agent hears it with its next message, `takeLost`).
-    if (lostNames.length && !file.unreadable) rt.add<NoticeItem>({ type: 'notice', variant: 'info', text: lostLine(lostNames.length, 'restart'), detail: lostNames.join('\n'), ts: lastAct(rt.items) });
+    if (lostNames.length) rt.add<NoticeItem>({ type: 'notice', variant: 'info', text: lostLine(lostNames.length, 'restart'), detail: lostNames.join('\n'), ts: lastAct(rt.items) });
     // What was in flight when Sable closed ended then, not now (the chat may be opened much later).
     rt.settle('cancelled', { endUnknown: true });
     // Messages still waiting for the agent when Sable closed (a steer not taken yet) would wait forever: back to the queue.
@@ -1595,7 +1675,24 @@ export class App {
       rt.queueReason(q.id, 'Checking the original Claude receipt.');
     }
     const lost = this.untilLost.get(rt.id);
-    if (lost) this.untilLost.delete(rt.id), this.until.restored(rt, lost);
+    if (lost) this.until.restored(rt, lost), this.untilLost.delete(rt.id);
+    return restartNotice;
+  }
+
+  private afterRestore(rt: SessionRuntime, file: ReturnType<Store['loadSession']>, restartNotice?: string) {
+    if (rt.meta.titleSource === 'auto' && !rt.meta.titleAuthored) {
+      const plain = readableTitle(rt.meta.title);
+      if (plain !== rt.meta.title) {
+        const first = rt.items.find((i): i is UserItem => i.type === 'user' && !i.parentId);
+        const source = first && personalOrigin(first) ? first : !first ? rt.queue.find(q => !q.until) : undefined;
+        if (source && autoTitle(source.text, true) === rt.meta.title) rt.update({ titleAuthored: true });
+        else rt.update({ title: plain || 'New session' });
+      }
+    }
+    const recovered = this.recoveredDelegateKeys.get(rt);
+    if (recovered?.length) void rt.persistDelegate?.().then(() => this.delegateJournal.forget(rt.id, recovered))
+      .catch(err => this.log('delegate journal retained', err));
+    if (rt.pendingDelegateReports.size) this.scheduleLossWake(rt);
     if (rt.items.length > SNAPSHOT_THRESHOLD) this.snapshotEnds.set(rt.items, snapshotEnd(rt.items));
     this.store.scheduleMigration(rt.id, () => {
       const work = this.workOf(rt);
@@ -1683,7 +1780,7 @@ export class App {
       if (this.sessions.get(rt.id) === rt) {
         return this.deferSend(rt, text, attachments, ctx, extra);
       }
-      return;
+      throw new NotNow('The chat was closed before delivery.');
     }
     // From here to the agent's own dispatch the message is on its way: no move or agent switch begins
     // under it (D6). One asked for meanwhile waits for it, and then finds the chat working.
@@ -1699,7 +1796,7 @@ export class App {
   private async dispatchNow(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: DeliveryFields, ctx?: CallContext, explicit = false) {
     const addUser = () => {
       if (rt.meta.titleSource === 'auto' && !rt.items.some((i) => i.type === 'user')) {
-        rt.update({ title: extra?.until?.check ? autoTitle(`Until ${extra.until.check.command} passes`) : autoTitle(text, !!(explicit || extra?.id)) });
+        rt.update({ title: extra?.until?.check ? autoTitle(`Until ${extra.until.check.command} passes`) : autoTitle(text, !!(explicit || extra?.id)), titleAuthored: !extra?.until && (explicit || extra?.id) ? true : undefined });
       }
       // The chat just used goes to the top of its folder at once.
       rt.touch();
@@ -1710,7 +1807,7 @@ export class App {
         ...(extra?.submitPrint && { submitPrint: extra.submitPrint }),
         text,
         attachments: attachments?.length ? attachments : undefined,
-        state: rt.turnActive || extra?.steerNow || rt.meta.provider === 'claude' && extra?.steerAttempts ? 'queued' : 'sent',
+        state: 'queued',
         ...((explicit || extra?.id) && !extra?.until && { authored: true }),
         ...(ctx?.phoneSender && { phoneSender: ctx.phoneSender }),
         ...(extra?.steerAttempts && { steerAttempts: extra.steerAttempts }),
@@ -1737,17 +1834,24 @@ export class App {
     } catch (err) {
       if (err instanceof LaneUnavailable && early) rt.remove(early.id);
       if (!early || err instanceof LaneUnavailable) throw err;
-      if (this.stoppedEarly.delete(early.id)) return;
+      const stopped = this.stoppedEarly.delete(early.id);
+      rt.returnUntaken({ ids: new Set([early.id]), byHand: new Set([early.id]) });
+      rt.queueReason(early.id, stopped ? 'Stopped before the provider opened.' : (err as Error).message);
+      if (stopped) return 'queued' as const;
       rt.update({ status: 'error', lastError: (err as Error).message });
       rt.notice('error', 'Could not send the message', (err as Error).message);
-      return;
+      return 'queued' as const;
     } finally {
       this.delivering.delete(rt.id);
       this.scheduleLossWake(rt);
       if (early) this.earlyWaiting.set(rt.id, (this.earlyWaiting.get(rt.id) ?? []).filter((id) => id !== early.id));
     }
     // Stopped while the agent was starting: the message stays where it was sent, and is not sent later.
-    if (early && this.stoppedEarly.delete(early.id)) return;
+    if (early && this.stoppedEarly.delete(early.id)) {
+      rt.returnUntaken({ ids: new Set([early.id]), byHand: new Set([early.id]) });
+      rt.queueReason(early.id, 'Stopped before the provider opened.');
+      return 'queued' as const;
+    }
     // Its phone was removed while it waited: it never goes out (one shown early leaves the chat, said in a line).
     const gone = () => {
       if (!ctx?.allowed || ctx.allowed()) return;
@@ -1778,10 +1882,12 @@ export class App {
       // notice follows, and the turn's end decides as for any refusal (`onLimitHit`: the next account
       // carries the same message on, with its sender's guard, or "Continue with" / "Continue at reset").
       const refused = early ?? addUser();
+      rt.patch<UserItem>(refused.id, { heldAtLimit: true });
       if (!refused.phoneSender && ctx?.allowed) this.refusedGuards.set(refused, ctx);
       rt.beginTurn('Thinking');
-      rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'You have reached your usage limit.', limit: { ...this.creditsWindow(rt) } });
+      rt.add<NoticeItem>({ type: 'notice', variant: 'error', text: 'You have reached your usage limit.', limit: { ...this.creditsWindow(rt), origin: 'user', userItemId: refused.id } });
       rt.endTurn('You have reached your usage limit.');
+      await rt.persistInput?.();
       return;
     }
     gone();
@@ -1859,11 +1965,15 @@ export class App {
       // that comes now is that turn's, and never ends the one running now (begun by a newer message).
       const at = item.steered ? -1 : rt.items.findIndex((i) => i.id === item.id);
       if (at >= 0 && rt.items.slice(at + 1).some((i) => i.type === 'turn' && !i.parentId)) {
+        rt.returnUnwritten([item.id], (err as Error).message);
+        await rt.persistInput?.();
         this.log('a send failed after its turn ended; nothing else ends', (err as Error).message);
         return;
       }
       rt.notice('error', 'Could not send the message', (err as Error).message);
+      rt.returnUnwritten([item.id], (err as Error).message);
       rt.endTurn((err as Error).message);
+      return 'queued' as const;
     }
   }
 
@@ -1951,13 +2061,92 @@ export class App {
     this.lossWakeTimers.set(rt, timer);
   }
 
-  private lastPersonalTurn = new WeakMap<SessionRuntime, string>();
+  private delegateJournal: DelegateJournal;
+  private recoveredDelegateKeys = new WeakMap<SessionRuntime, string[]>();
+
+  private offerDelegateReports(rt: SessionRuntime, rows: ToolItem[]) {
+    const records = rows.map(row => {
+      const { prepared, ...attempt } = row.delegateAttempt!;
+      return { key: prepared!, row: row.id, delivery: row.delegateDeliveryId!, attempt: { ...attempt, issued: prepared } };
+    });
+    this.delegateJournal.save(rt.id, records);
+    for (const record of records) rt.patch<ToolItem>(record.row, { delegateAttempt: record.attempt });
+    return records;
+  }
+
+  private restoreDelegateJournal(rt: SessionRuntime, original: TimelineItem[], records: DelegateRecord[]) {
+    const keys: string[] = [];
+    for (const record of records) {
+      const row = rt.get<ToolItem>(record.row);
+      if (row?.type !== 'tool' || row.delegateDeliveryId !== record.delivery) continue;
+      if ('terminal' in record) {
+        const prior = original.find(i => i.id === row.id) as ToolItem | undefined;
+        if (prior?.delegateReport === 'working' || prior?.delegateCaller !== undefined || prior?.delegateReport === 'stopping' ||
+            prior?.result?.isError && prior.result.text === 'Sable restarted before the sub-agent reported.') {
+          rt.patch<ToolItem>(row.id, { ...record.terminal, delegateCaller: undefined, delegateReceiversPending: undefined });
+          if (record.terminal.delegateReport === 'pending') rt.pendingDelegateReports.add(row.id);
+          else rt.pendingDelegateReports.delete(row.id);
+          keys.push(record.key);
+        }
+      } else if (record.unissued) {
+        const attempt = row.delegateAttempt;
+        if (row.delegateReport === 'pending' && (attempt?.prepared === record.key || attempt?.issued === record.key)) {
+          if (attempt.issued) this.refundDelegate(rt, attempt);
+          rt.patch<ToolItem>(row.id, { delegateAttempt: undefined, delegateReceiptState: null, delegateRetryId: null });
+        }
+        keys.push(record.key);
+      } else if (row.delegateReport === 'pending' && row.delegateAttempt?.prepared === record.key) {
+        rt.patch<ToolItem>(row.id, { delegateAttempt: record.attempt, delegateWait: null });
+        const anchor = record.attempt.budget && rt.get<UserItem | ToolItem>(record.attempt.budget);
+        if (anchor) rt.patch(anchor.id, { delegateContinuations: (anchor.delegateContinuations ?? 0) + 1 });
+        keys.push(record.key);
+      }
+    }
+    this.recoveredDelegateKeys.set(rt, keys);
+    for (const id of rt.pendingDelegateReports) {
+      const row = rt.get<ToolItem>(id);
+      if (!row?.delegateAttempt?.prepared) continue;
+      if (row.delegateAttempt.tool) {
+        rt.patch<ToolItem>(row.id, { delegateAttempt: undefined });
+        continue;
+      }
+      // The native write never began. Reuse the already-durable checkpoint for a personal send.
+      rt.promote?.(row);
+      this.personalReports.set(row.delegateAttempt, { saved: true, block: delegateReport(row.title,
+        row.result?.agent?.background ?? row.status, row.result?.text ?? '', row.delegateDeliveryId) });
+      if (row.delegateAttempt.provider !== rt.meta.provider || row.delegateAttempt.account !== rt.meta.accountId ||
+          row.delegateAttempt.session !== rt.meta.providerSessionId) rt.patch<ToolItem>(id, { delegateAttempt: undefined });
+    }
+  }
+
+  /** Earlier versions did not mark consumed personal input. Only infer a boundary from a
+   * sent personal card and its own successful top-level turn after the outstanding refusal. */
+  private restorePersonalLimitBoundary(rt: SessionRuntime) {
+    const at = rt.items.findLastIndex(i => i.type === 'notice' && !i.parentId && i.limit && !i.limit.continuedWith);
+    if (at < 0) return;
+    let personal: UserItem | undefined;
+    for (let i = at + 1; i < rt.items.length; i++) {
+      const row = rt.items[i];
+      if (row.parentId) continue;
+      if (row.type === 'user') {
+        if (row.completedPersonalTurn) return;
+        personal = row.state === 'sent' && !row.heldAtLimit && !row.awaitingNativeReceipt && !row.until && !row.steered && !syntheticOf(row) ? row : undefined;
+      } else if (row.type === 'notice' && (row.limit || row.early || row.variant === 'interrupted' || row.variant === 'error')) {
+        personal = undefined;
+      } else if (row.type === 'turn') {
+        if (personal && !row.error && (!row.stopReason || ['completed', 'end_turn', 'stop'].includes(row.stopReason))) {
+          rt.patch<UserItem>(personal.id, { completedPersonalTurn: true });
+          return;
+        }
+        personal = undefined;
+      }
+    }
+  }
 
   private limitHoldsWake(rt: SessionRuntime) {
-    const last = this.lastPersonalTurn.get(rt);
     for (let i = rt.items.length - 1; i >= 0; i--) {
       const item = rt.items[i];
-      if (item.id === last) break;
+      if (item.type === 'user' && !item.parentId && item.completedPersonalTurn) break;
       if (item.type === 'notice' && !item.parentId && item.limit && !item.limit.continuedWith) return true;
     }
     return false;
@@ -1999,6 +2188,8 @@ export class App {
     const attempts = recentLossWakes(rt, now);
     if (!reports && !running && attempts.length >= 2) return this.scheduleLossWake(rt, attempts[0] + LOSS_WAKE_WINDOW_MS - now);
     const release = this.beginDispatch(rt, false);
+    const deadline = now + 90_000;
+    const within = <T>(work: Promise<T>) => reports ? withDeadline(work, Math.max(1, deadline - Date.now()), 'Report dispatch') : work;
     const recheck = () => { throw new NotNow('The chat changed before the agent could carry on.'); };
     let changed = false;
     const lossNotice = rt.lossNotice;
@@ -2012,30 +2203,38 @@ export class App {
       else batch.notice = rt.notice('info', note, names.join('\n')).id;
     };
     try {
-      const handle = await this.ensureHandle(rt);
+      const handle = await within(this.ensureHandle(rt, false, reports ? deadline : undefined));
       if (!ready(1)) recheck();
-      if (await this.heldForCredits(rt)) {
+      if (await within(this.heldForCredits(rt))) {
         const reset = this.creditsWindow(rt).resetsAt;
         if (reset) this.scheduleLossWake(rt, Math.max(1, reset - Date.now()));
         return;
       }
       if (!ready(1)) recheck();
-      if (!running) await this.applyDue(rt, handle);
+      if (!running) await within(this.applyDue(rt, handle));
       if (!ready(1)) recheck();
       // Both RPC providers open their turn before the final sender check and guard its identity at dispatch.
       let admitted = false;
       let offered = true;
       const check = () => {
+        if (reports && Date.now() >= deadline) recheck();
         const draining = !offered && running && rt.meta.provider === 'opencode';
         if (!ready(draining ? 0 : 1, admitted && (rt.meta.provider === 'codex' || rt.meta.provider === 'opencode'), draining)) recheck();
         admitted = true;
       };
-      await this.sendWithHandover(rt, handle, { type: 'user', id: randomUUID(), ts: now, state: 'sent', text: reports ? DELEGATE_REPORT : RESUME_LOST }, check, false, read => {
+      await within(this.sendWithHandover(rt, handle, { type: 'user', id: randomUUID(), ts: now, state: 'sent', text: reports ? DELEGATE_REPORT : RESUME_LOST }, check, false, read => {
         if (read) reported = true;
         else missed();
-      }, missed);
+      }, missed));
       offered = false;
     } catch (err) {
+      if (reports && err instanceof DeadlineExceeded) {
+        for (const id of before) if (rt.pendingDelegateReports.has(id) && !rt.get<ToolItem>(id)?.delegateReceiptState) {
+          rt.patch<ToolItem>(id, { delegateWait: 'provider' });
+        }
+        rt.notice('info', 'Report pending', 'The provider did not become ready. The saved report can go with your next message.');
+        this.preparePersonalReports(rt);
+      }
       if (!(err instanceof NotNow)) {
         if (this.pendingLossWake.get(rt) === batch) this.pendingLossWake.delete(rt);
         missed();
@@ -2077,8 +2276,7 @@ export class App {
       ?? rt.items.find((i): i is ToolItem => i.type === 'tool' && !!(i.delegateDeliveryId || i.delegateReport));
   }
 
-  // A blocked report can checkpoint its possible destination in advance. Only this runtime
-  // knows it has not actually been offered yet. After a crash it goes through receipt recovery.
+  // Prepare the next personal send without waiting for a transcript or disk commit at the composer.
   private personalReports = new WeakMap<NonNullable<ToolItem['delegateAttempt']>, { saved: boolean; block: string }>();
 
   private preparePersonalReports(rt: SessionRuntime) {
@@ -2094,7 +2292,7 @@ export class App {
     for (const id of rt.pendingDelegateReports) {
       const row = rt.get<ToolItem>(id);
       if (row?.delegateReport !== 'pending' || row.delegateAttempt) continue;
-      const attempt = { provider: rt.meta.provider, account: rt.meta.accountId, session, after: rt.handle?.delegateCheckpoint?.() };
+      const attempt = { prepared: randomUUID(), provider: rt.meta.provider, account: rt.meta.accountId, session, after: rt.handle?.delegateCheckpoint?.() };
       rt.promote?.(row);
       const deliveryId = row.delegateDeliveryId ?? randomUUID();
       const block = delegateReport(row.title, row.result?.agent?.background ?? row.status, row.result?.text ?? '', deliveryId);
@@ -2146,7 +2344,7 @@ export class App {
             const delivered = receipts?.ids.has(attempt.tool ? 'tool:' + attempt.tool : row.delegateDeliveryId!);
             if (!delivered && !receipts?.settled) {
               const decision = randomUUID();
-              rt.patch<ToolItem>(row.id, { delegateReceiptState: 'unknown', delegateRetryId: decision });
+              rt.patch<ToolItem>(row.id, { delegateWait: null, delegateReceiptState: 'unknown', delegateRetryId: decision });
               rt.notice('info', 'Delivery unconfirmed for ' + row.title,
                 'The answer is saved on the delegate step. The agent may already have it. To send it again, enter /report-retry ' + decision);
               continue;
@@ -2188,6 +2386,12 @@ export class App {
     // A refused message retried after a restore can have disk-backed attachments.
     const card = rt.get<UserItem>(item.id);
     if (card && card !== item && isLight(card)) this.store.promote(rt.id, card);
+    if (card?.heldAtLimit && card.text === item.text) rt.patch<UserItem>(card.id, { heldAtLimit: undefined });
+    if (card?.type === 'user' && card.text === item.text && !card.until && (rt.meta.provider === 'opencode' || rt.meta.provider === 'codex')) {
+      rt.patch<UserItem>(card.id, { state: 'queued', awaitingNativeReceipt: true });
+      await rt.persistInput?.();
+      maySend();
+    }
     const out = this.withHandover(rt, this.store.promote(rt.id, item) as UserItem);
     const wake = !rt.get(item.id) && out.count ? this.pendingLossWake.get(rt) : undefined;
     if (item.text === RESUME_LOST && !rt.get(item.id) && !wake) { out.release?.(); return; }
@@ -2225,7 +2429,8 @@ export class App {
           for (const [step, deliveryId] of prepared) {
             if (step.delegateAttempt) this.personalReports.delete(step.delegateAttempt);
             rt.patch<ToolItem>(step.id, { delegateDeliveryId: deliveryId, ...(step.delegateWait ? { delegateWait: null } : {}), delegateAttempt: {
-              provider: rt.meta.provider, account: rt.meta.accountId, session, after, budget: reports.length ? undefined : budget?.id,
+              prepared: step.delegateAttempt?.prepared ?? randomUUID(), provider: rt.meta.provider, account: rt.meta.accountId, session, after,
+              budget: reports.length ? undefined : budget?.id,
             } });
             rt.pendingDelegateReports.delete(step.id);
             rt.reservedDelegateReports.set(step.id, reservation);
@@ -2235,12 +2440,35 @@ export class App {
       }
     }
     if (reportWake && !blocks.length) { out.release?.(); return; }
-    if (budget && blocks.length) rt.patch(budget.id, { delegateContinuations: (budget.delegateContinuations ?? 0) + 1 });
     let settled = false;
     let offered = false;
+    let charged = false;
+    let receiptTimer: NodeJS.Timeout | undefined;
+    const offers: Extract<DelegateRecord, { attempt: unknown }>[] = [];
+    const releasedOffers = new Map<string, NonNullable<ToolItem['delegateAttempt']>>();
+    const issueReport = reports.length ? () => {
+      if (settled || !ownsReports() || this.disposed || this.stopsOf(rt) !== stops || rt.handle !== handle) throw new NotNow('The report was withdrawn before dispatch.');
+      if (offered) return;
+      if (budget && (budget.delegateContinuations ?? 0) >= DELEGATE_CONTINUATIONS) throw new NotNow('The report waits for the next personal message.');
+      offers.push(...this.offerDelegateReports(rt, reports.map(id => rt.get<ToolItem>(id)!)));
+      offered = true;
+      if (budget) {
+        charged = true;
+        rt.patch(budget.id, { delegateContinuations: (budget.delegateContinuations ?? 0) + 1 });
+      }
+    } : undefined;
     const settleReports = (read: boolean) => {
-      if (settled) return;
+      if (settled) {
+        if (read && this.sessions.get(rt.id) === rt) {
+          let changed = false;
+          for (const [id, attempt] of releasedOffers) if (rt.confirmLateDelegate(id, attempt)) changed = true;
+          releasedOffers.clear();
+          if (changed) void rt.persistDelegate?.().catch(err => this.log('late delegate receipt save failed', err));
+        }
+        return;
+      }
       settled = true;
+      clearTimeout(receiptTimer);
       for (const id of reports) {
         if (rt.reservedDelegateReports.get(id) !== reservation) continue;
         rt.reservedDelegateReports.delete(id);
@@ -2250,24 +2478,43 @@ export class App {
         else {
           if (!offered) rt.patch<ToolItem>(id, { delegateAttempt: undefined });
           rt.pendingDelegateReports.add(id);
-          if (offered) this.scheduleLossWake(rt);
+          if (offered) {
+            const attempt = rt.get<ToolItem>(id)?.delegateAttempt;
+            if (attempt) releasedOffers.set(id, attempt);
+            this.scheduleLossWake(rt);
+          }
         }
       }
-      if (!offered && budget?.delegateContinuations && reports.length && rt.get(budget.id) === budget) {
+      if (!offered && charged && budget?.delegateContinuations && rt.get(budget.id) === budget) {
         rt.patch(budget.id, { delegateContinuations: budget.delegateContinuations - 1 });
       }
-      if (reports.length && this.sessions.get(rt.id) === rt) void rt.persistDelegate?.().catch(err => this.log('delegate receipt save failed', err));
+      if (reports.length && this.sessions.get(rt.id) === rt) void rt.persistDelegate?.().then(() => this.delegateJournal.forget(rt.id, offers.map(record => record.key)))
+        .catch(err => this.log('delegate receipt save failed', err));
     };
     if (blocks.length) out.item = { ...out.item, text: [out.item.text, ...blocks].join('\n\n') };
     const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex' || (rt.meta.provider === 'opencode' && (!!out.count || reports.length > 0));
     const taken = receipt || reports.length ? () => { settleReports(true); out.taken?.(); receipt?.(true); } : out.taken;
     const release = receipt || reports.length ? (unissued?: true) => {
+      if (unissued && offered && !settled) {
+        try { this.delegateJournal.save(rt.id, offers.map(record => ({ ...record, unissued: true }))); }
+        catch (err) { this.log('could not journal the local report refusal', err); }
+      }
       if (unissued) offered = false;
       settleReports(false);
       out.release?.();
       receipt?.(false);
-      if (unissued && reports.length) this.scheduleLossWake(rt);
+      if (unissued && reports.length) this.scheduleLossWake(rt, 1500);
     } : out.release;
+    if (reports.length) {
+      receiptTimer = setTimeout(() => {
+        if (!offered && this.sessions.get(rt.id) === rt && ownsReports()) {
+          for (const id of reports) rt.patch<ToolItem>(id, { delegateWait: 'provider' });
+          rt.notice('info', 'Report pending', 'The provider did not take the report. It can go with your next message.');
+        }
+        release?.(offered ? undefined : true);
+      }, 90_000);
+      receiptTimer.unref?.();
+    }
     try {
       if (blocks.length && !personal) {
         await rt.persistDelegate?.();
@@ -2278,8 +2525,9 @@ export class App {
         this.wakeProcesses.set(rt, { handle, generation: rt.processGeneration, at });
         rt.update({ lossWake: { ...rt.meta.lossWake, attempts: [...recentLossWakes(rt, at), at] } });
       }
-      offered = true;
-      await handle.send(browser ? this.withBrowserPage(rt, out.item) : out.item, { steerNow, personalOffset: item.authored && !item.until ? out.personalOffset ?? 0 : undefined, delegateReport: reportWake, check: maySend, taken: confirms ? taken : undefined, release, uncertain });
+      if (!confirms) issueReport?.();
+      const sending = handle.send(browser ? this.withBrowserPage(rt, out.item) : out.item, { issueReport, steerNow, personalOffset: personal && card.text === item.text ? out.personalOffset ?? 0 : undefined, delegateReport: reportWake, check: maySend, taken: confirms ? taken : undefined, release, uncertain });
+      await (reports.length ? withDeadline(sending, 90_000, 'Report offer') : sending);
       if (!confirms) taken?.();
     } catch (err) {
       release?.();
@@ -3914,6 +4162,14 @@ export class App {
   }
   /** `session.send` by submission id: a retry of a send that went out is answered, not sent again. */
   private phoneReceipts: PhoneReceipts;
+
+  private removePhoneReceipts(id: string, delay = 1000) {
+    try { this.phoneReceipts.remove(id); }
+    catch (err) {
+      this.log('Receipt cleanup deferred', id, String(err));
+      setTimeout(() => { if (!this.disposed) this.removePhoneReceipts(id, Math.min(delay * 2, 60_000)); }, delay).unref();
+    }
+  }
   private submissions = new Submissions<RpcMethods['session.send']['result']>();
   /** Chats switching agent right now (`switchAgent`): no account move meanwhile. */
   private switching = new Set<string>();
@@ -4627,7 +4883,7 @@ export class App {
     this.until.turnOver(rt);
     // What the turn took (nothing of a failed or stopped one, nor of one whose end is not known).
     const consumed = this.consumed(rt, !error && !rt.stopRequested && !hold);
-    if (consumed.length) this.lastPersonalTurn.set(rt, consumed[consumed.length - 1]);
+    if (consumed.length) rt.patch<UserItem>(consumed[consumed.length - 1], { completedPersonalTurn: true });
     const heldCard = this.refusalQueues.get(rt);
     if (!hit && heldCard && consumed.length) {
       const at = rt.items.findIndex(i => i.id === heldCard);
@@ -4649,12 +4905,13 @@ export class App {
     }
     // The chat's first turn settled: a small model names it from the message it took, in the background.
     this.titles.turnEnded(rt, consumed);
+    const waiting = rt.items.filter((i): i is UserItem => i.type === 'user' && i.state === 'queued');
     // Let the adapter finish its own bookkeeping (it may start a turn of its own first, with a
     // steered message the turn ended before taking).
     setTimeout(() => {
       if (rt.turnActive || rt.stopRequested || this.sessions.get(rt.id) !== rt) return;
       // A steered message no turn took and no adapter carried on is never left waiting: it goes out first.
-      rt.returnUntaken();
+      rt.returnUntaken({ from: waiting });
       const rest = !rt.queue.length && !rt.meta.until;
       this.sendNextQueued(rt);
       // Nothing more to do: a chat a limit moved away goes back once that account takes work again.
@@ -4665,6 +4922,7 @@ export class App {
   /** Sessions whose next queued message is being taken back by a phone: the queue goes on when that take settles. */
   private drainWaiting = new Set<string>();
   private pendingDrains = new WeakSet<SessionRuntime>();
+  private updateDrains = new WeakSet<SessionRuntime>();
 
   private resumeDrain(rt: SessionRuntime) {
     if (!this.pendingDrains.delete(rt)) return;
@@ -4694,6 +4952,7 @@ export class App {
 
   /** After a turn: the next queued message goes out, or (nothing waits) an until loop runs its check. */
   private sendNextQueued(rt: SessionRuntime): void {
+    if (this.updates?.installing) return void this.updateDrains.add(rt);
     if (this.disposed || this.sessions.get(rt.id) !== rt || rt.turnActive || rt.unreadQueueHeld || rt.stopRequested || this.refusalQueues.has(rt)) return;
     if (this.steerEnds.has(rt) || this.sending.has(rt.id) || this.switching.has(rt.id)) return void this.pendingDrains.add(rt);
     if (this.sendHolds.has(rt.id)) return void this.heldSends.add(rt.id);
@@ -4711,7 +4970,8 @@ export class App {
       return this.sendNextQueued(rt);
     }
     if (nextId) void this.deliverQueued(rt, nextId).catch((err) => {
-      if (!(err instanceof CallerGone)) rt.notice('error', 'Could not send the queued message', (err as Error).message);
+      if (err instanceof CallerGone) rt.onQueueRunnable?.();
+      else rt.notice('error', 'Could not send the queued message', (err as Error).message);
     });
     // Nothing waits: an until loop runs its check (the user's messages always go first).
     else this.until.turnEnded(rt);
@@ -4816,17 +5076,35 @@ export class App {
     }
     const waiting = rt.queue.find(q => q.id === id);
     if (waiting?.issuedUuid && caller) {
+      if (rt.handle?.stillQueued?.(waiting.issuedUuid)) {
+        rt.queueReason(id, 'Claude still has this input queued.');
+        return false;
+      }
       const { provider, accountId, providerSessionId } = rt.meta;
       const uuid = waiting.issuedUuid;
       const stops = this.stopsOf(rt);
       await this.restoreSteerReceipts(rt, uuid);
       still(caller);
       if (this.disposed || this.sessions.get(rt.id) !== rt || this.stopsOf(rt) !== stops) throw new NotNow('The chat was stopped or closed.');
-      if (rt.meta.provider !== provider || rt.meta.accountId !== accountId || rt.meta.providerSessionId !== providerSessionId) return false;
-      if (this.steerReads.get(rt)?.has(uuid) || rt.queue.find(q => q.id === id) !== waiting || waiting.issuedUuid !== uuid) return false;
+      if (rt.meta.provider !== provider || rt.meta.accountId !== accountId || rt.meta.providerSessionId !== providerSessionId) {
+        rt.queueReason(id, 'The destination changed. Review the message and send again.');
+        return false;
+      }
+      if (this.steerReads.get(rt)?.has(uuid)) {
+        rt.queueReason(id, 'Still checking the original Claude receipt. Try again when the check finishes.');
+        return false;
+      }
+      if (rt.queue.find(q => q.id === id) !== waiting || waiting.issuedUuid !== uuid) {
+        const current = rt.queue.find(q => q.id === id);
+        if (current && current !== waiting) rt.queueReason(id, 'The message changed during the receipt check. Review it and send again.');
+        return !current && rt.get<UserItem>(id)?.state === 'sent';
+      }
     }
     const reserved = rt.reserveQueued(id);
-    if (!reserved) return false;
+    if (!reserved) {
+      if (caller) rt.queueReason(id, 'Another action holds this message. Try again when it finishes.');
+      return false;
+    }
     const entry = reserved.message;
     if (entry.issuedUuid && !caller) {
       rt.rollbackReserved(id);
@@ -4834,7 +5112,7 @@ export class App {
     }
     if (entry.issuedUuid && (entry.issuedTo?.stillQueued || rt.handle?.stillQueued?.(entry.issuedUuid))) {
       rt.rollbackReserved(id);
-      if (!entry.steerWait?.reason) rt.queueReason(id, 'Claude still has this input queued.');
+      rt.queueReason(id, 'Claude still has this input queued.');
       return false;
     }
     const sender = entry.phoneSender && caller && !caller.allowed && !steerNow ? undefined : this.senderGuard(entry.phoneSender) ?? (rt.transientQueueGuards.has(id) ? { allowed: rt.transientQueueGuards.get(id) } : undefined);
@@ -4886,6 +5164,7 @@ export class App {
           delete entry.byHand;
           delete entry.steerWait;
           rt.updateQueued(id, entry.text);
+          rt.onQueueRunnable?.();
         }
       } catch (err) {
         rt.queueReason(id, (err as Error).message);
@@ -4940,9 +5219,10 @@ export class App {
       this.moving.size || this.firstInputs.size || this.limitDecisions.size || this.bgLimits.size);
   }
 
-  private async ensureHandle(rt: SessionRuntime, forMove = false) {
+  private async ensureHandle(rt: SessionRuntime, forMove = false, reportDeadline?: number) {
     const closes = this.closesOf(rt);
-    const closed = () => this.disposed || this.sessions.get(rt.id) !== rt || this.closesOf(rt) !== closes;
+    const closed = () => this.disposed || this.sessions.get(rt.id) !== rt || this.closesOf(rt) !== closes ||
+      reportDeadline !== undefined && Date.now() >= reportDeadline;
     if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
     for (let tries = 0; ; tries++) {
       if (closed()) throw new NotNow('The chat was closed.');
@@ -4978,11 +5258,12 @@ export class App {
           rt.handle = handle;
           this.seedCaps(rt);
         });
-      this.opening.set(rt.id, opened);
+      const openingWait = reportDeadline === undefined ? opened : withDeadline(opened, Math.max(1, reportDeadline - Date.now()), 'Opening the report destination');
+      this.opening.set(rt.id, openingWait);
       try {
-        await opened;
+        await openingWait;
       } finally {
-        if (this.opening.get(rt.id) === opened) this.opening.delete(rt.id);
+        if (this.opening.get(rt.id) === openingWait) this.opening.delete(rt.id);
         this.scheduleLossWake(rt);
       }
       if (rt.handle) return rt.handle;
@@ -5687,7 +5968,7 @@ export class App {
 
     this.register('session.snapshot', async ({ sessionId, peek, page, keepFrom }) => {
       const rt = this.runtime(sessionId);
-      if (page === 'end' && this.lazy.has(sessionId) && !rt.meta.pendingRestart && !this.untilLost.has(sessionId)) {
+      if (page === 'end' && this.lazy.has(sessionId) && !this.unreadable.has(sessionId) && !rt.meta.pendingRestart && !this.untilLost.has(sessionId)) {
         const preview = this.store.readSessionEnd(sessionId);
         if (preview) {
           setImmediate(() => {
@@ -5698,6 +5979,7 @@ export class App {
         }
       }
       await this.hydrateAsync(rt);
+      if (this.unreadable.has(sessionId)) return rt.snapshot();
       // Fetched ahead of an open (`peek`): not read yet.
       if (rt.meta.unread && !peek) rt.update({ unread: false });
       const snap = rt.snapshot();
@@ -5842,7 +6124,7 @@ export class App {
         } finally {
           this.enqueueSubmission = undefined;
         }
-        if (ctx.phoneSender || rt.meta.provider === 'claude') await rt.persistInput?.();
+        await rt.persistInput?.();
         if (!this.steerEnds.has(rt)) rt.unreadQueueHeld = false;
         return { ok: true, queued: true };
       }
@@ -5851,7 +6133,7 @@ export class App {
       if (identity) prints.set(identity, print);
       try {
         const disposition = await this.deliver(rt, text, attachments, identity ? { submitId: identity, submitPrint: print } : undefined, ctx, true);
-        if (disposition === 'queued' && (ctx.phoneSender || rt.meta.provider === 'claude')) await rt.persistInput?.();
+        if (disposition === 'queued') await rt.persistInput?.();
         return disposition === 'queued' ? { ok: true, queued: true } : { ok: true };
       } finally {
         if (identity) prints.delete(identity);
@@ -5926,8 +6208,18 @@ export class App {
     });
     this.register('queue.sendNow', async ({ sessionId, id }, ctx) => {
       const rt = this.runtime(sessionId);
-      if (this.steerEnds.has(rt)) throw new NotNow('Waiting for the interrupted turn to end.');
-      return { ok: await this.deliverQueued(rt, id, ctx) };
+      try {
+        if (this.steerEnds.has(rt)) throw new NotNow('Waiting for the interrupted turn to end.');
+        const ok = await this.deliverQueued(rt, id, ctx);
+        if (ok && rt.queue.some(q => q.id === id && q.byHand)) {
+          rt.queueReason(id, 'Delivery is on hold. Try again after the current send or account change finishes.');
+          return { ok: false };
+        }
+        return { ok };
+      } catch (err) {
+        rt.queueReason(id, (err as Error).message);
+        throw err;
+      }
     });
 
     this.register('session.steerNow', ({ sessionId, itemId }, ctx) => this.steerNow(this.runtime(sessionId), itemId, ctx));
@@ -6049,13 +6341,15 @@ export class App {
     this.register('turn.checkStop', ({ sessionId, itemId }) => ({ ok: this.checks.stop(this.runtime(sessionId), String(itemId ?? '')) }));
 
     // Spare (server/core/spare.ts): `/spare <message>` and "Continue at reset".
-    this.register('spare.send', ({ sessionId, text, attachments }) => {
+    this.register('spare.send', async ({ sessionId, text, attachments }) => {
       const rt = this.runtime(sessionId);
       const body = typeof text === 'string' ? text.trim() : '';
       if (!body && !attachments?.length) return { ok: false, error: 'Add a message after /spare' };
       // A new chat is named by the message it waits with, not "New session" for hours.
-      if (rt.meta.titleSource === 'auto' && !rt.items.some((i) => i.type === 'user') && !rt.meta.spare) rt.update({ title: autoTitle(body, true) });
-      return { ok: true, spare: this.spare.hold(rt, body, attachments) };
+      if (rt.meta.titleSource === 'auto' && !rt.items.some((i) => i.type === 'user') && !rt.meta.spare) rt.update({ title: autoTitle(body, true), titleAuthored: true });
+      const spare = this.spare.hold(rt, body, attachments);
+      await rt.persistInput?.();
+      return { ok: true, spare };
     });
     this.register('spare.atReset', ({ sessionId, refusalId }) => this.spare.atReset(this.runtime(sessionId), refusalId));
     this.register('spare.cancel', ({ sessionId }) => ({ ok: this.spare.cancel(this.runtime(sessionId)) }));
@@ -6104,7 +6398,7 @@ export class App {
     this.register('session.close', async ({ sessionId, remove }) => {
       const rt = this.runtime(sessionId);
       this.closed(rt);
-      const cleanup = remove ? rt.revokeDelegates([...rt.delegates.keys(), ...rt.reservedDelegateReports.keys(), ...rt.pendingDelegateReports]) : undefined;
+      const cleanup = remove ? rt.revokeAllDelegates() : undefined;
       if (cleanup) {
         this.retiredDelegates.add(cleanup);
         void cleanup.finally(() => this.retiredDelegates.delete(cleanup)).catch(err => this.log('deleted delegate cleanup failed', err));
@@ -6128,7 +6422,8 @@ export class App {
         this.unstoppableNotes.delete(sessionId);
         this.persistSessions();
         this.store.deleteSession(sessionId);
-        this.phoneReceipts.remove(sessionId);
+        try { this.delegateJournal.remove(sessionId); } catch (err) { this.log('deleted delegate journal cleanup failed', err); }
+        this.removePhoneReceipts(sessionId);
         this.emit({ type: 'session.removed', id: sessionId });
         // A deleted chat takes its folder along when nothing was ever put in it.
         if (rt.meta.chat) removeEmptyChatFolder(this.chatsRoot(), rt.meta.cwd);
@@ -6352,14 +6647,16 @@ export class App {
     }
     // Reserve the rest of Electron's save window for sealing. Unconfirmed children stay working on disk.
     for (const rt of this.sessions.values()) this.clearPreparedReports(rt);
-    const children = [...this.sessions.values()].flatMap(rt => [...rt.delegates.values()].map(owner => owner.quit?.() ?? owner.ended));
+    let childSaveError: unknown;
+    const children = [...this.sessions.values()].flatMap(rt => [...rt.delegates.values()].map(owner =>
+      (owner.quit?.() ?? owner.ended).catch(err => { childSaveError = err; })));
     if (children.length) {
       void this.store.flush().catch(err => this.log('delegate quit checkpoint failed', err));
       await boundedBy(Promise.allSettled(children), Math.max(1, deadline - Date.now() - 2000), undefined);
     }
     const durable = await boundedBy(this.store.seal().then(() => true, (err: Error) => err), Math.max(1, deadline - Date.now()), false);
     const drainAgents = this.journal.active;
-    if (durable === true && !drainAgents) saved?.();
+    if (durable === true && !childSaveError && !drainAgents) saved?.();
     clearTimeout(this.resetTimer);
     this.updates?.dispose();
     this.until.dispose();
@@ -6380,10 +6677,11 @@ export class App {
       // pre-acknowledgement budget for agent exits, concurrently across all accounts.
       await boundedBy(this.journal.whenDrained(), Math.max(1, deadline - Date.now()), undefined);
       if (this.journal.active) this.journal.noteQuitDeadline();
-      if (durable === true) saved?.();
+      if (durable === true && !childSaveError) saved?.();
     }
     await boundedBy(Promise.allSettled([...services, agents, ...this.retiredDelegates, this.cache.flush(), this.journal.flush()]), drainAgents ? Math.max(1, deadline - Date.now()) : 3000, undefined);
     this.instances.clear();
+    if (childSaveError) throw childSaveError;
     if (durable !== true) throw durable || new Error('Timed out saving the conversations.');
   }
 }

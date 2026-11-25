@@ -119,6 +119,7 @@ function fakeAgent(opts: { failSteer?: boolean } = {}) {
         if (opts.failSteer) throw new Error('steer refused');
         return;
       }
+      rt.taken(item.id);
       rt.beginTurn('Thinking');
     },
     async interrupt() {

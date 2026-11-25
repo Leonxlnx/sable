@@ -94,7 +94,6 @@ export class Store {
   private verifying?: Promise<void>;
   private recoveryOwed = false;
   private startupBusy = false;
-  private writerAdmission?: Promise<void>;
 
   constructor(dir?: string, runtimeItem?: (session: string, id: string) => TimelineItem | undefined) {
     this.sessionFiles = new SessionFiles(id => this.sessionPath(id), runtimeItem && ((id, saved, preview) => {
@@ -104,9 +103,7 @@ export class Store {
       const admitted = this.withRecoveryLock(action);
       if (!admitted) this.retryRecovery();
       return admitted;
-    }, () => {
-      if (this.startupBusy) return this.writerAdmission ??= this.waitForStartup().finally(() => { this.writerAdmission = undefined; });
-    });
+    }, () => this.startupBusy);
     this.dir = dir ?? process.env.SABLE_HOME ?? path.join(homedir(), '.sable');
     mkdirSync(path.join(this.dir, 'sessions'), { recursive: true });
     this.state = this.readState() ?? { projects: [], settings: { ...DEFAULT_SETTINGS }, sessions: [], accounts: [] };
@@ -128,29 +125,18 @@ export class Store {
   }
 
   private startupLock() {
-    const sqlite = process.getBuiltinModule?.('node:sqlite') as typeof import('node:sqlite') | undefined;
-    if (!sqlite) return;
     let lock;
     try {
+      const sqlite = process.getBuiltinModule?.('node:sqlite') as typeof import('node:sqlite') | undefined;
+      if (!sqlite) return;
       lock = new sqlite.DatabaseSync(path.join(this.dir, '.sable-store.lock'));
       lock.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE');
       this.startupBusy = false;
       return lock;
     } catch (err) {
-      lock?.close();
+      try { lock?.close(); } catch { /* An unavailable cleanup database is optional. */ }
       const code = (err as { errcode?: number }).errcode;
       this.startupBusy = code === 5 || code === 6; // SQLITE_BUSY / SQLITE_LOCKED.
-    }
-  }
-
-  // A released 0.2.35 peer may still be checking and unlinking by pathname under
-  // this lock. A save can be staged in memory, but must not publish until it exits.
-  private async waitForStartup() {
-    while (this.startupBusy) {
-      const lock = this.startupLock();
-      if (lock) { lock.close(); return; }
-      if (!this.startupBusy) throw Error('Session writer could not enter the profile');
-      await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
 
@@ -161,22 +147,26 @@ export class Store {
     try {
       // Renew (or reclaim after system sleep) only under the admission lock.
       writeFileSync(this.owner, '');
-      let alone = true;
-      for (const name of readdirSync(this.dir)) {
-        const other = /^\.sable-store\.([1-9]\d*)\.[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.owner$/.exec(name);
-        const peer = path.join(this.dir, name);
-        if (!other || peer === this.owner) continue;
-        let live = true;
-        try { process.kill(Number(other[1]), 0); }
-        catch (err) { live = (err as NodeJS.ErrnoException).code !== 'ESRCH'; }
-        if (live && Date.now() - statSync(peer).mtimeMs < 86_400_000) alone = false;
-        else rmSync(peer, { force: true });
-      }
-      if (!alone) return false;
+      if (!this.alone(true)) return false;
       action();
       return true;
     } catch { return false; }
     finally { try { lock?.close(); } catch { /* Already closed. */ } }
+  }
+
+  private alone(sweep: boolean) {
+    let alone = true;
+    for (const name of readdirSync(this.dir)) {
+      const other = /^\.sable-store\.([1-9]\d*)\.[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.owner$/.exec(name);
+      const peer = path.join(this.dir, name);
+      if (!other || peer === this.owner) continue;
+      let live = true;
+      try { process.kill(Number(other[1]), 0); }
+      catch (err) { live = (err as NodeJS.ErrnoException).code !== 'ESRCH'; }
+      if (live && Date.now() - statSync(peer).mtimeMs < 86_400_000) alone = false;
+      else if (sweep) rmSync(peer, { force: true });
+    }
+    return alone;
   }
 
   private retryRecovery() {
@@ -197,7 +187,14 @@ export class Store {
       const pass = this.sessionFiles.recoverMigrations(readdirSync(path.join(this.dir, 'sessions'), { withFileTypes: true }));
       ids = pass.ids;
       this.recoveryOwed = pass.retry;
-    })) { this.retryRecovery(); return; }
+    })) {
+      // A complete abandoned save is an input to the next read even when another
+      // owner prevents renaming or deleting anything in the sessions directory.
+      try { this.sessionFiles.recoverWriterTemps(readdirSync(path.join(this.dir, 'sessions'), { withFileTypes: true }), this.alone(false)); }
+      catch { /* A transient directory error gets another pass. */ }
+      this.retryRecovery();
+      return;
+    }
     if (ids.length) {
       this.recoveryTimer = setTimeout(() => {
         this.recoveryTimer = undefined;
@@ -415,7 +412,7 @@ export class Store {
 
   /** `data` is read when the write happens; its `dirty` names the items changed since the last save. */
   saveSession(id: string, data: () => SessionSave) {
-    if (this.sealed) return;
+    if (this.sealed || !this.sessionPending.has(id) && this.sessionFiles.refuseUnreadSave(id)) return;
     this.sessionFiles.forgetMigration(id);
     this.migrations.delete(id);
     this.sessionPending.set(id, data);
@@ -442,7 +439,8 @@ export class Store {
       }
       return copy;
     });
-    const snapshot = { items, dirty: save.dirty === 'all' ? 'all' as const : new Set(save.dirty), todos: structuredClone(save.todos), queue: structuredClone(save.queue) };
+    const snapshot = { items, dirty: save.dirty === 'all' ? 'all' as const : new Set(save.dirty), todos: structuredClone(save.todos),
+      queue: structuredClone(save.queue), receiptRepair: save.receiptRepair?.slice() };
     this.activeSaves.set(id, snapshot);
     return this.sessionFiles.save(id, () => snapshot, !!this.sealed).finally(() => {
       if (this.activeSaves.get(id) === snapshot && !this.sessionFiles.needsRetry(id)) this.activeSaves.delete(id);
@@ -456,7 +454,7 @@ export class Store {
       return this.sealed;
     }
     await Promise.all([this.flushSession(id), this.sessionFiles.idle(id), this.flushFile(this.statePath), this.writingState]);
-    if (this.sessionFiles.needsRetry(id)) throw new Error('Could not save the waiting message.');
+    if (this.sessionFiles.saveFailed(id)) throw new Error('Could not save the waiting message.');
   }
 
   /** SessionFiles retries failed writes on the next save. Only acknowledge a restart notice seen on disk. */
@@ -514,6 +512,7 @@ export class Store {
     this.sealed = Promise.allSettled([this.flush(), this.verifying, ...retries]).then(results => {
       const failed = results.find(r => r.status === 'rejected');
       if (failed) throw failed.reason;
+      if (this.sessionFiles.saveFailed()) throw new Error('Could not save all chat changes.');
     }).finally(() => {
       clearInterval(this.ownerTimer);
       try { if (this.owner) rmSync(this.owner, { force: true }); }

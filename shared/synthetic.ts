@@ -73,6 +73,7 @@ export interface Synthetic {
 
 // ───────────────────────────────── the tags ─────────────────────────────────
 
+export const UNTIL_INPUT_END = '\n\n<system-reminder>This is a Sable /until check result.</system-reminder>';
 export const DELEGATE_REPORT = 'A background sub-agent reported.';
 /** Collect receipts only from the provider's stored user inputs. */
 export function readDelegateIds(text: string, into: Set<string>, wanted?: ReadonlySet<string>) {
@@ -365,13 +366,13 @@ export function maybeSynthetic(text: string): boolean {
 const cache = new WeakMap<object, Synthetic | null>();
 
 type UserWords = { type: string; text?: string; authored?: boolean; submitPrint?: string; steered?: boolean; remote?: boolean; until?: { check?: unknown } };
-const personal = (item: UserWords) => item.authored || item.submitPrint || item.steered || item.remote;
+export const personalOrigin = (item: UserWords) => item.authored || item.submitPrint || item.steered || item.remote;
 
 /** Classify imported text only when the card carries no personal origin. */
 export function syntheticOf(item: UserWords | undefined | null): Synthetic | null {
   if (!item || item.type !== 'user' || typeof item.text !== 'string') return null;
   if (item.until?.check) return { role: 'hidden', parts: [{ kind: 'hidden', tag: 'until', text: '' }] };
-  if (personal(item) || literalSteer(item.text)) return null;
+  if (personalOrigin(item) || literalSteer(item.text)) return null;
   if (!maybeSynthetic(item.text)) return null;
   let s = cache.get(item);
   if (s === undefined) {
@@ -551,11 +552,16 @@ export const lostTasksNote = (names: string[]) => (names.length ? `${LOST_TASKS_
 const SABLE_OPENERS = [DELEGATE_REPORT, 'This continues a conversation ', 'Since your last reply here, the user went on with ', 'The last turn was cut off by a usage limit', 'The last turn was cut off because the sign-in failed', RESUME_LIMIT_RESET, RESUME_LOST, 'The check `'];
 const HANDOVER_HEAD = /^(?:This continues a conversation (?:that started under another account|the user had with [^\n]{1,200} in this folder)|Since your last reply here, the user went on with [^\n]{1,200} in this conversation)\. Here is what happened (?:so far|since), oldest first:\n/;
 /** The whole of an `/until` round's failure (server/core/until.ts `failureMessage`): its head, then the output fenced or "It printed nothing.", and nothing after: the output ends at the first line that is the closing fence, so words and a fenced block of the person's own after a pasted failure stay theirs. */
-const UNTIL_FAILURE = /^The check `[^`\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n(?:(?!\1[ \t]*(?:\n|$))[^\n]*\n)*\1)$/;
+const UNTIL_FAILURE = /^The check `[^\n]*` failed[^\n]*\. Fix the cause, not the check\. When your turn ends, Sable runs it again \(round \d+ of \d+\)\.\n\n(?:It printed nothing\.|(`{3,})text\n(?:(?!\1[ \t]*(?:\n|$))[^\n]*\n)*\1)$/;
 const BROWSER_LINE = /\n\n\[Sable: the user's Browser tab shows \S+?(?: titled "[^"\n]*")?\. browser_read reads it\.\]\s*(?=$|\n\n(?:@\S|\[Attached file: |<attachment[\s>]))/;
+
+export function isUntilFailure(text: string): boolean {
+  return UNTIL_FAILURE.test(text.replace(/\r\n/g, '\n'));
+}
 
 /** A whole message of Sable's own (a turn carried on, an /until round): the message, else ''. */
 function sableMessage(lead: string): string {
+  if (lead.endsWith(UNTIL_INPUT_END)) return lead;
   // Known outer wrappers come off first: a continuation after a move carries its note (a trailing
   // `<system-reminder>`), and read back from a transcript it must still be known as Sable's.
   const payload = withoutHandover(lead);
@@ -624,6 +630,48 @@ export function endsWithSteerNote(text: string) {
   return trimmed.endsWith(STEER_FIRST_BLOCK) || trimmed.endsWith(STEER_NOW_BLOCK);
 }
 
+/** Native transcripts have no Sable card. Record the exact span when a prompt needs unwrapping.
+ * Offsets count UTF-16 units in the stored text, including file references added by the adapter. */
+const SOURCE_SPAN = /\n\n<system-reminder>Sable transcript boundary: (\d+),(\d+),(\d+)<\/system-reminder>$/;
+
+type PromptRange = [start: number, end: number, files: number, until: number];
+const BATCH_SPAN = /\n\n<system-reminder>Sable transcript ranges: (\[[\d,\[\]]+\])<\/system-reminder>$/;
+
+/** ACP flattens adjacent prompts. Keep each personal span and its file suffix in that same coordinate space. */
+export function nativeBatchPrompt(body: string, ranges: PromptRange[]): string {
+  if (!ranges.length) return body;
+  if (ranges.length === 1 && ranges[0][3] === body.length) {
+    const [start, end, files] = ranges[0];
+    return nativePersonalPrompt(body, body.slice(start, end), start, files);
+  }
+  const plain = ranges.map(([start, end, files, until]) => body.slice(start, end) + body.slice(files, until)).join('\n\n');
+  if (plain === body && nativePersonalPrompt(plain, plain, 0) === plain) return body;
+  return body + '\n\n<system-reminder>Sable transcript ranges: ' + JSON.stringify(ranges) + '</system-reminder>';
+}
+
+export function nativePersonalPrompt(body: string, words: string, start: number, filesAt = body.length): string {
+  if (!body.startsWith(words, start)) return body;
+  if (body === words && !SOURCE_SPAN.test(body) && !BATCH_SPAN.test(body) && importedSteerText(words) === words && userText(words) === words && !maybeSynthetic(words)) return body;
+  return body + '\n\n<system-reminder>Sable transcript boundary: ' + [start, start + words.length, filesAt].join(',') + '</system-reminder>';
+}
+
+export function nativePersonalWords(text: string): string | undefined {
+  const batch = BATCH_SPAN.exec(text);
+  if (batch) {
+    try {
+      const ranges: PromptRange[] = JSON.parse(batch[1]);
+      if (ranges.every((r, i) => Array.isArray(r) && r.length === 4 && r.every(Number.isSafeInteger) &&
+          (i ? ranges[i - 1][3] : 0) <= r[0] && r[0] <= r[1] && r[1] <= r[2] && r[2] <= r[3] && r[3] <= batch.index)) {
+        return ranges.map(([start, end, files, until]) => text.slice(start, end) + text.slice(files, until)).join('\n\n');
+      }
+    } catch { /* An unmarked quotation can contain invalid offsets. */ }
+  }
+  const span = SOURCE_SPAN.exec(text);
+  if (!span) return;
+  const [start, end, files] = span.slice(1).map(Number);
+  if (start <= end && end <= files && files <= span.index) return text.slice(start, end) + text.slice(files, span.index);
+}
+
 /** Recover the legacy single SDK block. Unwrap only the suffixes the bridge appends, in reverse order. */
 export function importedSteerText(text: string): string {
   let out = withoutHandover(text).replace(BROWSER_LINE, '');
@@ -637,7 +685,7 @@ export function importedSteerText(text: string): string {
 /** The common projection for display, copy, reuse, export, search and handover. */
 export function userItemText(item: UserWords): string {
   if (item.until?.check) return '';
-  if (personal(item)) return item.text ?? '';
+  if (personalOrigin(item)) return item.text ?? '';
   const s = syntheticOf(item);
   const text = item.text ?? '';
   return s ? syntheticLine(s) : literalSteer(text) ? text : stripWrappers(text);

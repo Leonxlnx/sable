@@ -3,6 +3,7 @@ import { VERSION } from '../version';
 import { record, type AuthScope, type StartReason } from '../core/auth-journal';
 import { authGate, gateKey, noteAuthFailure } from '../core/auth-gate';
 import { execFile } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -43,12 +44,13 @@ import { chatReplyInstruction, CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from 
 import { WIDGET_DESCRIPTION, WIDGET_FENCE_HINT, WIDGET_INPUT_SCHEMA, WIDGET_TOOL, dynamicToolAnswer, widgetsEnabled } from './widget-tool';
 import { BROWSER_CORE, BROWSER_DESCRIPTIONS, BROWSER_HINT, BROWSER_INPUT_SCHEMAS, BROWSER_OPS, BROWSER_TOOLS, browserDynamicAnswer, browserOp, browserTabEnabled, SABLE_BROWSER_NAMESPACE } from './browser-tool';
 import { DEVICE_CORE, DEVICE_DESCRIPTIONS, DEVICE_HINT, DEVICE_INPUT_SCHEMAS, DEVICE_NAMESPACE, DEVICE_NAMESPACE_DESCRIPTION, DEVICE_OPS, DEVICE_TOOLS, deviceDynamicAnswer, deviceEnabled, deviceOp } from './device-tool';
-import { CodexRpc, RpcError, resolveCodexCommand, type ExitInfo } from './codex-rpc';
+import { CodexRpc, RpcError, UnissuedRpcError, resolveCodexCommand, type ExitInfo } from './codex-rpc';
+import { withDeadline } from '../util/deadline';
 import { serviceTierFor } from './codex-map';
 import { AGENT_INPUT_SCHEMA, AGENT_TOOLS, agentOfTool, agentToolDescription, readAgentCall } from './agent-tool';
 import { PROFILE_DESCRIPTION, PROFILE_INPUT_SCHEMA, PROFILE_TOOL, isProfileTool, profileDynamicAnswer } from './profile-tool';
 import { toolReceipt, type WantedReceipts } from '../core/delegate-result';
-import { readDelegateIds } from '../../shared/synthetic';
+import { UNTIL_INPUT_END, readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
 import { compactScope, fileLine, withScope } from '../core/permission-scope';
 import {
@@ -1087,12 +1089,29 @@ export class CodexProvider implements Provider {
   private disposal?: Promise<void>;
   private spawnedDelegate?: CodexRpc;
   private retiringDelegate?: Promise<void>;
+  private forceOnly = false;
 
-  dispose(hard = false): Promise<void> { return this.disposal ??= this.closeProcesses(hard); }
+  dispose(hard = false): Promise<void> {
+    return this.disposal ??= this.closeProcesses(hard).catch(err => {
+      this.disposal = undefined;
+      throw err;
+    });
+  }
 
   private stopDelegateRpc(rpc: CodexRpc, hard: boolean) {
-    return this.retiringDelegate ??= terminateDelegateProcess(() => rpc.alive, rpc.ended,
-      retry => hard || retry ? rpc.close(0, 'timeout') : rpc.close(undefined, 'quit'), () => rpc.forceDelegate());
+    if (!rpc.alive) return Promise.resolve();
+    const stop = async () => {
+      if (this.forceOnly) {
+        await withDeadline(rpc.forceDelegate(), 1200, 'Forcing the Codex delegate to exit');
+        if (rpc.alive) throw Error('Codex delegate exit is still unconfirmed.');
+        return;
+      }
+      try {
+        await terminateDelegateProcess(() => rpc.alive, rpc.ended,
+          retry => hard || retry ? rpc.close(0, 'timeout') : rpc.close(undefined, 'quit'), () => rpc.forceDelegate());
+      } catch (err) { this.forceOnly = true; throw err; }
+    };
+    return this.retiringDelegate ??= stop().finally(() => { this.retiringDelegate = undefined; });
   }
 
   private async closeProcesses(hard: boolean) {
@@ -1100,18 +1119,17 @@ export class CodexProvider implements Provider {
     clearTimeout(this.idleTimer);
     if (this.pendingLogin) this.finishLogin(new Error('Codex provider is shut down'));
     for (const s of this.sessions.values()) s.abortPrompts();
+    const starting = this.starting;
+    const rpc = this.rpc ?? this.spawnedDelegate ?? (starting && await withDeadline(starting.catch(() => null), 3000, 'Closing a starting Codex process')) ?? this.spawnedDelegate;
+    await Promise.all([...this.delegateProcesses].map(child => child.dispose(true)));
+    // Continue routing stdout until exit. A terminal answer can arrive during hard close.
+    if (rpc && this.delegateOwner) await this.stopDelegateRpc(rpc, hard);
+    else await rpc?.close(hard ? 0 : undefined, hard ? 'timeout' : 'quit');
     this.sessions.clear();
     this.attached.clear();
-    const rpc = this.rpc ?? this.spawnedDelegate ?? (await this.starting?.catch(() => null)) ?? null;
     this.rpc = null;
-    await Promise.all([...this.delegateProcesses].map(child => child.dispose(true)));
-    try {
-      if (rpc && this.delegateOwner) await this.stopDelegateRpc(rpc, hard);
-      else await rpc?.close(hard ? 0 : undefined, hard ? 'timeout' : 'quit');
-    } finally {
-      this.spawnedDelegate = undefined;
-      this.delegateOwner?.delegateProcesses.delete(this);
-    }
+    this.spawnedDelegate = undefined;
+    this.delegateOwner?.delegateProcesses.delete(this);
     await this.closingRpc;
   }
 }
@@ -1205,6 +1223,7 @@ class CodexSession implements ProviderSession {
   private uncertainTold = false;
   /** The generation whose start request went out last (turn/start, review/start, thread/compact/start). */
   private dispatched = -1;
+  private startInput?: { gen: number; input: UserInput[]; received: () => void };
   /**
    * A start stopped after it went out, before its turn's id was known (a command's answer names none):
    * when that turn shows itself (turn/started) it is interrupted, never taken for a turn here. When it
@@ -1592,10 +1611,11 @@ class CodexSession implements ProviderSession {
 
   private receipts = new WeakMap<UserItem, SendOptions>();
 
-  private finishInput(item: UserItem, taken: boolean) {
+  private finishInput(item: UserItem, taken: boolean, unissued?: true) {
     const receipt = this.receipts.get(item);
     this.receipts.delete(item);
-    if (receipt) (taken ? receipt.taken : receipt.release)?.();
+    if (taken) receipt?.taken?.();
+    else receipt?.release?.(unissued);
   }
 
   async send(item: UserItem, opts?: SendOptions) {
@@ -1606,7 +1626,9 @@ class CodexSession implements ProviderSession {
     check?.();
     const cmd = item.text.trim().match(/^\/(compact|review)(?:\s+([\s\S]*))?$/);
     if (cmd) return this.runCommand(item, cmd[1] as 'compact' | 'review', cmd[2]?.trim(), check);
-    const input = buildInput(item.text, item.attachments, this.rt.caps?.skills ?? []);
+    const card = this.rt.get<UserItem>(item.id);
+    const source = card && opts?.personalOffset !== undefined ? { words: card.text, start: opts.personalOffset } : undefined;
+    const input = buildInput(item.until?.check ? item.text + UNTIL_INPUT_END : item.text, item.attachments, this.rt.caps?.skills ?? [], source);
     if (this.rt.turnActive) return this.steerOrQueue(item, input, check, opts?.delegateReport);
     try {
       await this.startTurn([item], input, check);
@@ -1624,14 +1646,18 @@ class CodexSession implements ProviderSession {
     const rt = this.rt;
     rt.beginTurn('Thinking');
     // Queued messages move down to where the agent picks them up (steered ones stay where they were sent).
-    for (const it of items) if (it.state === 'queued') rt.taken(it.id);
+    const cards = items.map(it => rt.get<UserItem>(it.id));
+    const received = () => {
+      for (const card of cards) if (card?.state === 'queued' && rt.get(card.id) === card) rt.taken(card.id);
+    };
     this.resetTurnState(items.at(-1)?.id);
     // This turn's generation, before the first await: a Stop (or anything that ends or replaces the
     // turn) while the thread reloads changes it, and then nothing is sent.
     const gen = this.gen;
     if (this.optionsDirty) await this.reloadForOptions();
     if (!(await this.loadedFor(gen))) {
-      for (const item of items) this.finishInput(item, false);
+      for (const item of items) this.finishInput(item, false, true);
+      rt.returnUnwritten(items.map(it => it.id), 'The turn ended before Codex loaded this input.');
       return;
     }
     const params: TurnStartParams = { threadId: this.threadId, input };
@@ -1647,8 +1673,26 @@ class CodexSession implements ProviderSession {
       params.approvalPolicy = p.approval;
       params.sandboxPolicy = sandboxPolicy(p.sandbox);
     }
-    const sent = await this.dispatchStart(gen, 'turn/start', params, check);
-    for (const item of items) this.finishInput(item, sent);
+    for (const card of cards) if (card) rt.pendingNativeInputs.add(card);
+    this.startInput = { gen, input, received };
+    let sent: boolean;
+    let attempted = false;
+    try {
+      sent = await this.dispatchStart(gen, 'turn/start', params, () => {
+        check?.();
+        for (const item of items) this.receipts.get(item)?.issueReport?.();
+        attempted = true;
+      }, () => { attempted = false; });
+    } catch (err) {
+      for (const item of items) this.finishInput(item, false, !attempted || err instanceof UnissuedRpcError ? true : undefined);
+      throw err;
+    } finally {
+      if (this.startInput?.gen === gen) this.startInput = undefined;
+      for (const card of cards) if (card) rt.pendingNativeInputs.delete(card);
+    }
+    if (sent) received();
+    else rt.returnUnwritten(items.map(it => it.id), 'Codex did not confirm the turn started.');
+    for (const item of items) this.finishInput(item, sent, attempted ? undefined : true);
     if (sent && rev === this.policyRev) this.policyDirty = false;
   }
 
@@ -1658,7 +1702,7 @@ class CodexSession implements ProviderSession {
    * the turn it names (or, when it names none, the one it shows next: `strayStart`). The id it names
    * is this generation's only, never a newer turn's. False when it did not go (stopped or replaced first).
    */
-  private async dispatchStart(gen: number, method: 'turn/start' | 'review/start' | 'thread/compact/start', params: object, check?: () => void): Promise<boolean> {
+  private async dispatchStart(gen: number, method: 'turn/start' | 'review/start' | 'thread/compact/start', params: object, check?: () => void, unissued?: () => void): Promise<boolean> {
     const started = (this.turnStarting = (async () => {
       const rpc = await this.provider.client();
       // A start stopped before its turn was told apart, or whose turn is stopping, goes first
@@ -1678,6 +1722,7 @@ class CodexSession implements ProviderSession {
     } catch (err) {
       // Its turn is over here already (ended by Codex's word, stopped, or replaced): the failure is that
       // turn's, which has ended, never the turn running now (the bridge would end whatever runs).
+      if (err instanceof UnissuedRpcError) unissued?.();
       if (this.ownsTurn(gen)) throw err;
       this.log(`${method} failed after its turn was over; it ends nothing`, errMsg(err));
       return false;
@@ -1957,14 +2002,21 @@ class CodexSession implements ProviderSession {
     // A turn the user is stopping drops input steered into it: the message waits instead (the bridge
     // hands it back to the queue when the turn ends).
     const turn = this.turnId;
+    let wrote = false;
+    let attempted = false;
     if (turn && this.rt.turnActive && this.loaded && !this.rt.stopRequested) {
+      const card = this.rt.get<UserItem>(item.id);
       try {
         const rpc = await this.provider.client();
         check?.();
         // The person waits for a reply: the agent is told to answer first (after their words; the
         // conversation shows only what they wrote, and a transcript read back drops the note).
         if (this.turnId !== turn || !this.rt.turnActive || this.rt.stopRequested) throw new Error('The turn changed before the steer.');
-        await rpc.request('turn/steer', { threadId: this.threadId, input: report ? input : [...input, { type: 'text', text: STEER_FIRST_BLOCK, text_elements: [] } as UserInput], expectedTurnId: turn }, 30_000);
+        if (card && this.rt.get(item.id) !== card) return this.finishInput(item, false);
+        if (card) this.rt.pendingNativeInputs.add(card);
+        this.receipts.get(item)?.issueReport?.();
+        attempted = true;
+        await rpc.request('turn/steer', { threadId: this.threadId, input: report || item.until ? input : [...input, { type: 'text', text: STEER_FIRST_BLOCK, text_elements: [] } as UserInput], expectedTurnId: turn }, 30_000, () => { wrote = true; });
         if (!report && this.turnId === turn && this.rt.turnActive) {
           this.rt.releaseDelegates();
           // Concurrent steers can be acknowledged out of order. Keep the latest accepted card.
@@ -1972,17 +2024,32 @@ class CodexSession implements ProviderSession {
           this.turnUserId = latest?.id ?? item.id;
         }
         this.finishInput(item, true);
-        this.rt.patch<UserItem>(item.id, { state: 'sent' });
+        if (card && this.rt.get(item.id) === card) this.rt.patch<UserItem>(item.id, { state: 'sent', awaitingNativeReceipt: undefined });
         return;
       } catch (err) {
+        if (report) {
+          this.finishInput(item, false, !attempted || err instanceof UnissuedRpcError ? true : undefined);
+          return;
+        }
+        if (card && wrote && !(err instanceof RpcError && typeof err.code === 'number')) {
+          this.finishInput(item, false);
+          this.rt.returnUnwritten([item.id], 'Codex wrote the steer but its receipt is unknown. Check the conversation before sending again.');
+          return;
+        }
         // Its sender may no longer act: that is the answer (the guard's own error), never a wait in the queue.
         if (check && !passes(check)) check();
         this.log('turn/steer failed; queueing', errMsg(err));
+      } finally {
+        if (card) this.rt.pendingNativeInputs.delete(card);
       }
     }
     // The bridge took it back in the meantime (the turn ended first): it goes out from the queue.
     if (this.takenBack(item)) return this.finishInput(item, false);
-    if (report) { this.finishInput(item, false); return; }
+    if (report) { this.finishInput(item, false, true); return; }
+    if (!this.rt.turnActive && this.rt.stopRequested) {
+      this.finishInput(item, false);
+      return this.rt.returnUnwritten([item.id], 'Stopped before Codex could take the steer.');
+    }
     if (!this.rt.turnActive) return this.startTurn([item], input, check);
     this.queue.push({ item, input, ...(check ? { check } : {}) });
   }
@@ -2003,7 +2070,10 @@ class CodexSession implements ProviderSession {
       }
       if (!x.check || passes(x.check)) return true;
       this.finishInput(x.item, false);
-      this.rt.remove(x.item.id);
+      if (x.item.phoneSender) {
+        this.rt.returnUntaken({ ids: new Set([x.item.id]), byHand: new Set([x.item.id]) });
+        this.rt.queueReason(x.item.id, 'This phone is no longer paired. Send again from the desktop.');
+      } else this.rt.remove(x.item.id);
       this.rt.notice('info', 'A message from a removed phone was not sent');
       return false;
     });
@@ -2011,8 +2081,10 @@ class CodexSession implements ProviderSession {
     void this.startTurn(
       q.map((x) => x.item),
       q.flatMap((x) => x.input),
+      () => { for (const entry of q) entry.check?.(); },
     ).catch((err) => {
       for (const { item } of q) this.finishInput(item, false);
+      this.rt.returnUnwritten(q.map(entry => entry.item.id), errMsg(err));
       this.rt.notice('error', 'Could not send the queued message', errMsg(err));
       if (this.rt.turnActive) this.completeTurn({ status: 'failed', error: errMsg(err) });
     });
@@ -2021,7 +2093,7 @@ class CodexSession implements ProviderSession {
   private async runCommand(item: UserItem, name: 'compact' | 'review', args?: string, check?: () => void) {
     const rt = this.rt;
     if (rt.turnActive) {
-      rt.patch<UserItem>(item.id, { state: 'sent' });
+      rt.returnUnwritten([item.id], `/${name} can only run while Codex is idle.`);
       rt.notice('info', `/${name} can only run while Codex is idle`);
       return;
     }
@@ -2030,13 +2102,18 @@ class CodexSession implements ProviderSession {
     // As for a message: the command's generation before the first await, checked right before it goes.
     const gen = this.gen;
     if (this.optionsDirty) await this.reloadForOptions();
-    if (!(await this.loadedFor(gen))) return;
+    if (!(await this.loadedFor(gen))) {
+      rt.returnUnwritten([item.id], 'The turn ended before Codex loaded the command.');
+      return;
+    }
     // Started as a message is (`dispatchStart`): a Stop meanwhile waits for the answer and stops the real command.
     const target: ReviewTarget = args ? { type: 'custom', instructions: args } : { type: 'uncommittedChanges' };
     const sent =
       name === 'compact'
         ? await this.dispatchStart(gen, 'thread/compact/start', { threadId: this.threadId }, check)
         : await this.dispatchStart(gen, 'review/start', { threadId: this.threadId, target, delivery: 'inline' }, check);
+    if (sent) rt.taken(item.id);
+    else rt.returnUnwritten([item.id], 'Codex did not confirm the command started.');
     // The server named no turn for this command and none showed itself in a while: how it went is not
     // known, so nothing is recorded (this command's turn only). It stays open and says so, the queue
     // held, until its turn shows itself and ends, or the person stops it.
@@ -2070,7 +2147,7 @@ class CodexSession implements ProviderSession {
         this.strayStart = Date.now();
         this.strayBefore = new Set(this.doneTurns);
       }
-      this.completeTurn({ status: 'interrupted' });
+      if (!rt.awaitingQuitResult) this.completeTurn({ status: 'interrupted' });
       return;
     }
     const turnId = this.turnId;
@@ -2084,7 +2161,7 @@ class CodexSession implements ProviderSession {
     }
     // turn/completed (status "interrupted") often lands before the request returns; then a safety net
     // armed now would end the person's next turn, and the one that turn's own stop armed is its own.
-    if (!ours() || this.turnId !== turnId) return;
+    if (!ours() || this.turnId !== turnId || rt.awaitingQuitResult) return;
     clearTimeout(this.interruptTimer);
     // Whether it stopped is not known: what the thread has of exactly this turn says, never a timer.
     if (failed !== undefined) return this.stopUnconfirmed(gen, turnId, failed);
@@ -2213,12 +2290,12 @@ class CodexSession implements ProviderSession {
   private async idleEnd(gen: number, turnId: string, seen: number, attempt: number) {
     const rt = this.rt;
     const current = () => rt.turnActive && this.gen === gen && this.turnId === turnId && !this.turnStarting && !this.closed && this.statusSeen === seen;
-    if (!current()) return;
+    if (!current() || rt.awaitingQuitResult) return;
     const failed = this.errorOf(turnId);
     if (failed) return this.completeTurn({ status: 'failed', error: failed });
     if (this.interrupting || rt.stopRequested) return this.completeTurn({ status: 'interrupted' });
     const stored = (await this.storedTurns())?.find(t => t.id === turnId);
-    if (!current()) return;
+    if (!current() || rt.awaitingQuitResult) return;
     // Known by now (an error or a stop came while the thread was asked).
     const late = this.errorOf(turnId);
     if (late) return this.completeTurn({ status: 'failed', error: late });
@@ -2314,6 +2391,9 @@ class CodexSession implements ProviderSession {
             this.strayWake?.();
           }
           return;
+        }
+        if (rt.awaitingQuitResult && rt.turnActive && turn?.id) {
+          for (const item of turn.items ?? []) if (item.type === 'agentMessage') this.onItem({ threadId: this.threadId, turnId: turn.id, item }, true);
         }
         return this.completeTurn({ ...end, id: turn?.id });
       }
@@ -2498,14 +2578,14 @@ class CodexSession implements ProviderSession {
       return;
     }
     if (method === 'thread/status/changed' && p?.status?.type === 'idle' && this.receiverLive.has(tid)) {
+      this.receiverIdle.add(tid);
       if (!this.receiverProbes.has(tid)) this.probeReceiverIdle(tid);
       return;
     }
     const currentTurn = this.receiverTurns.get(tid);
     if (method === 'turn/completed' && currentTurn && p?.turn?.id && p.turn.id !== currentTurn) return;
-    if (method.startsWith('item/') && (!currentTurn || p?.turnId === currentTurn)) {
-      clearTimeout(this.receiverProbes.get(tid));
-      this.receiverProbes.delete(tid);
+    if (this.receiverIdle.has(tid) && method.startsWith('item/') && (!currentTurn || p?.turnId === currentTurn)) {
+      this.probeReceiverIdle(tid);
     }
     // The receiver's running turn, so a limit can stop it for real (`stopBackgroundWork`).
     if (method === 'turn/started' && typeof p?.turn?.id === 'string') this.receiverTurns.set(tid, p.turn.id);
@@ -2515,13 +2595,18 @@ class CodexSession implements ProviderSession {
     else if (method === 'thread/closed') this.receiverState(tid, 'stopped', true);
     else if (method === 'thread/status/changed' && p?.status?.type === 'systemError') this.receiverState(tid, 'failed');
     else if (method === 'thread/status/changed' && p?.status?.type === 'notLoaded') this.receiverState(tid, 'stopped', true);
-    else if (method === 'thread/status/changed' && p?.status?.type === 'active') this.receiverState(tid, 'running');
+    else if (method === 'thread/status/changed' && p?.status?.type === 'active') {
+      // Activity after idle can be a new run whose turn/started never reached us.
+      if (this.receiverIdle.has(tid)) this.receiverTurns.delete(tid);
+      this.receiverState(tid, 'running');
+    }
   }
 
   /** `gone`: the receiver's thread closed or unloaded; nothing more comes of it. */
   private receiverState(tid: string, state: AgentBackground | undefined, gone = false) {
     const spawn = this.receivers.get(tid);
     if (!spawn || !state) return;
+    this.receiverIdle.delete(tid);
     clearTimeout(this.receiverProbes.get(tid));
     this.receiverProbes.delete(tid);
     if (state !== 'running') this.receiverTurns.delete(tid);
@@ -2542,6 +2627,7 @@ class CodexSession implements ProviderSession {
     if (was === shown || (shown !== 'running' && was !== 'running')) return;
     this.rt.patch<ToolItem>(spawn, { result: { ...item.result, agent: { ...item.result?.agent, background: shown } } });
   }
+  private receiverIdle = new Set<string>();
   private receiverProbes = new Map<string, NodeJS.Timeout>();
   private probeReceiverIdle(tid: string, wait = THREAD_IDLE_GRACE_MS, attempt = 0) {
     clearTimeout(this.receiverProbes.get(tid));
@@ -2549,14 +2635,14 @@ class CodexSession implements ProviderSession {
     const timer = setTimeout(async () => {
       const turns = await this.storedTurns(tid);
       if (this.receiverProbes.get(tid) !== timer) return;
-      const stored = turn ? turns?.find(t => t.id === turn) : turns?.[0];
+      const stored = turn ? turns?.find(t => t.id === turn) : undefined;
       if (stored?.status === 'completed' || stored?.status === 'failed' || stored?.status === 'interrupted') {
         this.receiverState(tid, stored.status === 'completed' ? 'done' : stored.status === 'failed' ? 'failed' : 'stopped');
       } else if (this.idleRecheckMs[attempt] !== undefined) {
         this.probeReceiverIdle(tid, this.idleRecheckMs[attempt], attempt + 1);
       } else {
         this.receiverProbes.delete(tid);
-        this.rt.notice('info', 'Codex has not confirmed the receiver’s last turn', 'The delegate waits for confirmation or Stop.');
+        this.rt.notice('info', 'Codex has not confirmed the receiver’s last turn');
       }
     }, wait);
     this.receiverProbes.set(tid, timer);
@@ -2564,11 +2650,21 @@ class CodexSession implements ProviderSession {
   private receiverLive = new Set<string>();
   private receiversDone?: (lost?: boolean) => void;
 
+  private receiverWaitMs = 10 * 60_000;
   waitForReceivers(): Promise<void> | undefined {
     if (!this.receiverLive.size) return;
-    return new Promise<boolean | undefined>(resolve => { this.receiversDone = resolve; }).then(lost => {
-      if (lost) throw new Error('The Codex process ended while its receivers were working.');
-      return this.waitForReceivers();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.receiversDone = undefined;
+        reject(new Error('Codex receiver completion was not confirmed before the deadline.'));
+      }, this.receiverWaitMs);
+      this.receiversDone = lost => queueMicrotask(() => {
+        if (!lost && this.receiverLive.size) return;
+        clearTimeout(timer);
+        this.receiversDone = undefined;
+        if (lost) reject(new Error('The Codex process ended while its receivers were working.'));
+        else resolve();
+      });
     });
   }
 
@@ -2626,6 +2722,7 @@ class CodexSession implements ProviderSession {
     this.receivers.clear();
     for (const timer of this.receiverProbes.values()) clearTimeout(timer);
     this.receiverProbes.clear();
+    this.receiverIdle.clear();
     const lost = processEnded && this.receiverLive.size > 0;
     this.receiverLive.clear();
     this.receiversDone?.(lost);
@@ -2637,7 +2734,12 @@ class CodexSession implements ProviderSession {
   private onItem(n: ItemNotification, completed: boolean) {
     const rt = this.rt;
     const item = n.item;
-    if (!item || item.type === 'userMessage') return;
+    if (!item) return;
+    if (item.type === 'userMessage') {
+      const start = this.startInput;
+      if (start && start.gen === this.gen && this.dispatched === start.gen && n.turnId === this.turnId && isDeepStrictEqual(item.content, start.input)) start.received();
+      return;
+    }
     const id = `${n.turnId}:${item.id}`;
     const existing = rt.get(id);
     if (completed && item.type === 'dynamicToolCall') rt.delegateReceipt(id, item.contentItems);

@@ -76,25 +76,111 @@ export function rowMoves(before: ReadonlyMap<string, number>, after: ReadonlyMap
   return { tray, rows };
 }
 
-const runs = new WeakMap<Element, { from: number; t0: number; anim: Animation }>();
+/**
+ * Whether frames come on time again (pure; fed the time of every animation frame). A glide on the
+ * compositor keeps the wall clock: frames the window cannot present are motion nobody sees, and the
+ * dock's curve does most of its way in its first 80 ms. Right after a prompt card is answered the
+ * window is busy for about that long (the card's copy is drawn, then the bridge's answer brings the
+ * working line, the step and the task strip, each a burst of new tiles for the GPU): measured in the
+ * packaged app, two frames came, then none for 75 ms, and the conversation stood 58 px from its end in
+ * one frame and 5 px from it in the next. So a glide that follows a card waits, drawn where it stood,
+ * until `need` frames in a row came no more than `late` ms after the one before, and never longer
+ * than `max` ms.
+ */
+export function frameGate(need = 2, late = 24, max = 240): (now: number) => boolean {
+  let first = -1;
+  let last = -1;
+  let ok = 0;
+  return (now) => {
+    if (first < 0) {
+      first = last = now;
+      return false;
+    }
+    const gap = now - last;
+    last = now;
+    ok = gap <= late ? ok + 1 : 0;
+    return ok >= need || now - first >= max;
+  };
+}
+
+/** Calls `go` once frames flow again (`frameGate`), or after `cap` ms whatever happens (a hidden window draws no frame). */
+export function whenFlowing(go: () => void, cap = 400): void {
+  const flows = frameGate();
+  let done = false;
+  const run = () => {
+    if (done) return;
+    done = true;
+    window.clearTimeout(timer);
+    go();
+  };
+  const timer = window.setTimeout(run, cap);
+  const tick = (now: number) => {
+    if (done) return;
+    if (flows(now)) run();
+    else requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+interface Run {
+  from: number;
+  t0: number;
+  anim: Animation;
+  /** Drawn where it stood and not started yet (it waits for the page, `whenFlowing`). */
+  held: boolean;
+  /** What is held and let go with it (the live line's hold while the conversation comes down). */
+  beside: Animation[];
+}
+
+const runs = new WeakMap<Element, Run>();
+
+const alive = (r: Run | undefined): r is Run => !!r && (r.anim.playState === 'running' || r.anim.playState === 'paused');
+
+/** How far from its place a glide on `el` is drawn right now (0: none, or it is over). Worked out from its own start. */
+export function drawnY(el: Element | null | undefined, now = performance.now()): number {
+  const r = el ? runs.get(el) : undefined;
+  if (!alive(r)) return 0;
+  return r.held ? r.from : glideLeft(r.from, now - r.t0);
+}
+
+export interface GlideOpts {
+  /** Wait, drawn where it stood, until frames flow again (`whenFlowing`): for a glide that follows a prompt card leaving. */
+  hold?: boolean;
+  /** Animations that share the glide's start: held with it, let go with it, cancelled with it. */
+  beside?: () => (Animation | null)[];
+}
 
 /**
  * Draws `el` `d` px lower than its place (negative: higher) and glides it home on the dock's
- * clock. A glide still under way on it carries on from where it stands, worked out from its own
- * start (never read from a computed style).
+ * clock. A glide still under way on it (or one that still waits) carries on from where it stands,
+ * worked out from its own start (never read from a computed style).
  */
-export function glideY(el: Element | null | undefined, d: number, now = performance.now()): Animation | null {
+export function glideY(el: Element | null | undefined, d: number, now = performance.now(), opts: GlideOpts = {}): Animation | null {
   if (!el || reducedMotion()) return null;
   const prev = runs.get(el);
   let from = d;
-  if (prev && prev.anim.playState === 'running') {
-    from += glideLeft(prev.from, now - prev.t0);
+  if (alive(prev)) {
+    from += prev.held ? prev.from : glideLeft(prev.from, now - prev.t0);
     prev.anim.cancel();
+    for (const a of prev.beside) a.cancel();
   }
   runs.delete(el);
   if (Math.abs(from) < 0.5) return null;
   const anim = play(el, [{ translate: `0 ${from.toFixed(2)}px` }, { translate: '0 0' }], { duration: STACK_MS, easing: STACK_EASE });
-  if (anim) runs.set(el, { from, t0: now, anim });
+  if (!anim) return null;
+  const run: Run = { from, t0: now, anim, held: !!opts.hold, beside: (opts.beside?.() ?? []).filter((a): a is Animation => !!a) };
+  runs.set(el, run);
+  if (run.held) {
+    // Paused at its first frame: the thing is drawn where it stood, on its own layer already.
+    const all = [anim, ...run.beside];
+    for (const a of all) a.pause();
+    whenFlowing(() => {
+      if (runs.get(el) !== run || !run.held) return;
+      run.held = false;
+      run.t0 = performance.now();
+      for (const a of all) if (a.playState === 'paused') a.play();
+    });
+  }
   return anim;
 }
 

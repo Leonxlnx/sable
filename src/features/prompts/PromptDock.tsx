@@ -1,6 +1,9 @@
+import { useEffect, useRef } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import type { PermissionRequest, QuestionRequest } from '@shared/protocol';
+import { cueCardLeft } from '@/features/session/dock-glide';
 import { useStore } from '@/state/store';
+import { leftByAnswer } from './leave';
 import { CardWarmup, PermissionCard } from './PermissionCard';
 import { QuestionCard } from './QuestionCard';
 import './prompts.css';
@@ -32,11 +35,26 @@ export function PromptDock({ sessionId }: { sessionId: string }) {
   ].sort((a, b) => a.req.createdAt - b.req.createdAt);
   const head = queue[0];
   const more = queue.length - 1;
+  // The card that stood last, for the moment it has gone.
+  const headId = head?.req.id;
+  const last = useRef<string | undefined>(undefined);
+  useEffect(
+    () => () => {
+      last.current = headId;
+    },
+    [headId],
+  );
+  // A card the bridge took away (answered on the phone or in the deck, a stopped turn) has faded
+  // where it stood and gives its room back now: the conversation's end is told, as it is when the
+  // person answers here (leave.ts), and follows once the window draws on time again.
+  const gone = () => {
+    if (last.current && !leftByAnswer(last.current)) cueCardLeft();
+  };
 
   return (
     <>
       <CardWarmup active={running} />
-      <AnimatePresence initial={false} mode="wait">
+      <AnimatePresence initial={false} mode="wait" onExitComplete={gone}>
         {head && (
           <motion.div key={head.req.id} className="pd-slot" data-req={head.req.id} {...rise}>
             {head.kind === 'permission' ? (

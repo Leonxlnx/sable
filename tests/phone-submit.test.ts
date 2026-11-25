@@ -1,125 +1,281 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
-import { PHONE_METHODS, type PermissionRequest, type PhonePermission } from '@shared/protocol';
-import { confirmKept, draftChanged, forgetSubmissions, submissionDone, submissionFor, submissionUnsure, unsureOf } from '../mobile/src/lib/submit';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { type PermissionRequest, type PhonePermission } from '@shared/protocol';
+import { offers, pressFrom, receipt, transition, type Press, type SendEvent, type Submission } from '../mobile/src/lib/submit';
 import { forgetShown, permissionShown, shownPermissions } from '../mobile/src/lib/shown';
-import { runForget } from '../mobile/src/lib/forget';
-
 const read = (file: string) => readFileSync(path.join(__dirname, '..', file), 'utf8').replace(/\r\n/g, '\n');
-const pic = (id: string) => ({ id });
-let n = 0;
-const next = () => `id-${++n}`;
-
-beforeEach(() => {
-  n = 0;
-  forgetSubmissions();
-  forgetShown();
+const file = { id: 'photo', kind: 'image' as const, name: 'photo.jpg', dataUrl: 'data:image/jpeg;base64,YQ==' };
+const packet = { sessionId: 'chat', text: ' A ', submitId: 'ID', attachments: [file], steer: true };
+const press: Press = { source: 'chat', revision: 1, returnRevision: 2, packet };
+const events: SendEvent[] = [{ type: 'press', press }, { type: 'retry' }, { type: 'lost' }, { type: 'refused' }, { type: 'accepted' }, { type: 'discard' }];
+type State = Submission['state'] | undefined;
+const cases: [State, State[]][] = [
+  [undefined, ['sending', undefined, undefined, undefined, undefined, undefined]],
+  ['sending', ['sending', 'sending', 'unsure', 'refused', undefined, 'sending']],
+  ['unsure', ['unsure', 'sending', 'unsure', 'refused', undefined, undefined]],
+  ['refused', ['refused', 'sending', 'refused', 'refused', undefined, undefined]],
+];
+describe('one phone press', () => {
+  for (const [state, expected] of cases) {
+    it.each(events.map((event, i) => [event.type, event, expected[i]] as const))(`${state ?? 'absent'} + %s`, (_, event, next) => {
+      const before = state && { ...press, state };
+      const after = transition(before, event);
+      expect(after?.state).toBe(next);
+      if (after) expect(after.packet).toBe(packet);
+      expect(before?.state).toBe(state);
+    });
+  }
+  it('requires the original echoed ID on a positive receipt', () => {
+    expect(receipt('ID', { ok: true })).toBe('lost');
+    expect(receipt('ID', { ok: true, submitId: 'other' })).toBe('lost');
+    expect(receipt('ID', { ok: true, submitId: 'ID' })).toBe('accepted');
+  });
 });
 
-describe('a send from the phone has one id (review 0235b, finding 4)', () => {
-  it('is made with the words and files before the first request, and a retry after a cut connection carries it again', () => {
-    const first = submissionFor('chat', 'ship it', [pic('a')], next);
-    expect(first).toMatchObject({ id: 'id-1', text: 'ship it' });
-    // The connection cut the answer off: the words are back in the field, the send is kept.
-    submissionUnsure('chat', first.id);
-    expect(unsureOf('chat').map((s) => s.id)).toEqual(['id-1']);
-    // Send again, the same words and files: the same id, so the desktop answers without sending twice.
-    expect(submissionFor('chat', 'ship it', [pic('a')], next).id).toBe('id-1');
-    // Other words, other files or another chat are other messages.
-    expect(submissionFor('chat', 'ship it now', [pic('a')], next).id).toBe('id-2');
-    expect(submissionFor('chat', 'ship it', [pic('b')], next).id).toBe('id-3');
-    expect(submissionFor('other', 'ship it', [pic('a')], next).id).toBe('id-4');
+const disk = vi.hoisted(() => new Map<string, string>());
+const desktop = vi.hoisted(() => ({ state: 'closed', call: vi.fn(), onOpen: vi.fn() }));
+vi.mock('../mobile/src/lib/conn', () => ({ conn: desktop }));
+const keep = vi.hoisted(() => vi.fn(async (k: string, v: string | null) => {
+  if (v === null) disk.delete(k);
+  else disk.set(k, v);
+}));
+vi.mock('../mobile/src/lib/native', () => ({ readPref: async (key: string) => disk.get(key) ?? null, durable: keep }));
+const page = new Map<string, string>();
+vi.stubGlobal('localStorage', {
+  getItem: (k: string) => page.get(k) ?? null, setItem: (k: string, v: string) => page.set(k, v),
+  removeItem: (k: string) => page.delete(k), key: (i: number) => [...page.keys()][i], get length() { return page.size; },
+});
+vi.stubGlobal('window', globalThis);
+
+async function boot() {
+  vi.resetModules();
+  desktop.state = 'closed';
+  const send = await import('../mobile/src/lib/phone-send');
+  const drafts = await import('../mobile/src/lib/drafts');
+  const { epoch } = await import('../mobile/src/lib/epoch');
+  await send.recoverOutgoing();
+  desktop.state = 'open';
+  const field = () => offers(send.outgoing(), 'chat', drafts.composition('chat'));
+  const type = (text: string, files = [file]) => drafts.setDraft('chat', text, { files, now: true });
+  const tap = () => send.sendPress(pressFrom('chat', drafts.composition('chat'), true)(), epoch());
+  return { ...send, ...drafts, field, type, tap };
+}
+beforeEach(() => {
+  forgetShown();
+  disk.clear();
+  page.clear();
+  desktop.call.mockReset();
+  keep.mockClear();
+});
+
+describe('phone outbox over committed storage and bridge replies', () => {
+  it('keeps B and its files when A loses its reply, and discards only A', async () => {
+    const app = await boot();
+    let lose!: () => void;
+    desktop.call.mockImplementation((method: string) => method === 'session.send'
+      ? new Promise((_, reject) => { lose = () => reject(new Error('connection lost')); })
+      : Promise.reject(new Error('offline')));
+    app.type(' A ');
+    const sent = app.tap();
+    await vi.waitFor(() => expect(lose).toBeDefined());
+    const saved = JSON.parse(disk.get('sable.outgoing')!).entries[0];
+    expect(saved.packet).toMatchObject({ text: ' A ', attachments: [file], steer: true });
+    expect(app.getDraft('chat')).toBe('');
+    app.type('B', [{ ...file, id: 'new' }]);
+    lose();
+    await expect(sent).rejects.toThrow();
+    expect(app.field().field).toBeUndefined();
+    expect(app.field().rows[0]).toMatchObject({ packet: saved.packet, state: 'unsure' });
+    await app.discardPress(app.field().rows[0]);
+    expect(app.composition('chat')).toMatchObject({ t: 'B', files: [{ id: 'new' }] });
+    expect(app.outgoing()).toEqual([]);
   });
 
-  it('is done with once the desktop answered: the same words sent later are a new message', () => {
-    const a = submissionFor('chat', 'ok', undefined, next);
-    submissionDone('chat', a.id);
-    expect(unsureOf('chat')).toEqual([]);
-    expect(submissionFor('chat', 'ok', undefined, next).id).toBe('id-2');
+  it.each([false, true])('recovers after clear and before the answer (bridge accepted %s)', async accepted => {
+    let app = await boot();
+    desktop.call.mockImplementation(() => new Promise(() => {}));
+    app.type(' A ');
+    void app.tap();
+    await vi.waitFor(() => expect(desktop.call).toHaveBeenCalledTimes(1));
+    const original = desktop.call.mock.calls[0][1];
+    expect(app.getDraft('chat')).toBe('');
+    app = await boot();
+    desktop.call.mockResolvedValue({ ok: accepted, submitId: original.submitId });
+    await app.recoverOutgoing();
+    expect(desktop.call.mock.calls.slice(1)).toEqual([['session.submission', { sessionId: 'chat', submitId: original.submitId }]]);
+    if (accepted) expect(app.outgoing()).toEqual([]);
+    else expect(app.field().field?.packet).toEqual(original);
   });
 
-  it('belongs to the field’s words as they were put back: edited or typed anew, it is let go', () => {
-    const a = submissionFor('chat', 'ok', undefined, next);
-    submissionUnsure('chat', a.id);
-    // The field still holds exactly them (as restored): kept.
-    draftChanged('chat', 'ok', []);
-    draftChanged('chat', ' ok ', undefined);
-    expect(unsureOf('chat')).toHaveLength(1);
-    // One more letter, then the same words again: a new message with a new id.
-    draftChanged('chat', 'ok!', []);
-    expect(unsureOf('chat')).toEqual([]);
-    expect(submissionFor('chat', 'ok', undefined, next).id).toBe('id-2');
-    // Its pictures gone from the field (the chat was left and opened again): no longer that send.
-    const b = submissionFor('chat', 'look', [pic('p')], next);
-    submissionUnsure('chat', b.id);
-    draftChanged('chat', 'look', []);
-    expect(unsureOf('chat').map((s) => s.id)).not.toContain(b.id);
-  });
-
-  it('a send still on its way is not let go by the field clearing at the press', () => {
-    const a = submissionFor('chat', 'ok', undefined, next);
-    draftChanged('chat', '', []);
-    submissionUnsure('chat', a.id);
-    expect(unsureOf('chat').map((s) => s.id)).toEqual(['id-1']);
-  });
-
-  it('is settled by the desktop’s yes under its own id, and by nothing else', async () => {
-    const sub = submissionFor('chat', 'ship it', undefined, next);
-    submissionUnsure('chat', sub.id);
-    const asked: string[] = [];
-    const ask = (answer: { ok?: boolean; submitId?: string } | undefined) => (id: string) => (asked.push(id), Promise.resolve(answer));
-    // It never arrived: kept, so the retry carries its id.
-    expect(await confirmKept('chat', ask({ ok: false, submitId: sub.id }))).toEqual([]);
-    // A yes that names no id (an older desktop) or another id is no receipt of this send.
-    expect(await confirmKept('chat', ask({ ok: true }))).toEqual([]);
-    expect(await confirmKept('chat', ask({ ok: true, submitId: 'someone-else' }))).toEqual([]);
-    // The question got no answer: still not known.
-    expect(await confirmKept('chat', () => Promise.reject(new Error('The connection to the desktop was lost')))).toEqual([]);
-    expect(unsureOf('chat').map((s) => s.id)).toEqual([sub.id]);
-    // The desktop has it, under this very id: done with.
-    expect((await confirmKept('chat', ask({ ok: true, submitId: sub.id }))).map((s) => s.id)).toEqual([sub.id]);
-    expect(unsureOf('chat')).toEqual([]);
-    expect(asked.every((id) => id === sub.id)).toBe(true);
-    // Only a kept send is asked about, in its own chat.
-    asked.length = 0;
-    submissionFor('chat', 'on its way', undefined, next);
-    await confirmKept('chat', ask({ ok: true }));
-    await confirmKept('elsewhere', ask({ ok: true }));
-    expect(asked).toEqual([]);
-  });
-
-  it('a yes that comes after the words were edited settles nothing', async () => {
-    const sub = submissionFor('chat', 'ship it', undefined, next);
-    submissionUnsure('chat', sub.id);
-    const got = confirmKept('chat', async (id) => {
-      draftChanged('chat', 'ship it tomorrow', []);
-      return { ok: true, submitId: id };
+  it('loses two replies and retries twice with one id and one admission', async () => {
+    const app = await boot();
+    let attempts = 0;
+    const admissions = new Set<string>();
+    const packets: unknown[] = [];
+    desktop.call.mockImplementation(async (method: string, p: typeof packet) => {
+      if (method === 'session.submission') return { ok: admissions.has(p.submitId), submitId: p.submitId };
+      packets.push(p);
+      if (++attempts < 3) throw new Error('lost');
+      admissions.add(p.submitId);
+      return { ok: true, submitId: p.submitId };
     });
-    expect(await got).toEqual([]);
+    app.type(' A ');
+    await expect(app.tap()).rejects.toThrow('lost');
+    await expect(app.retryPress(app.field().field!)).rejects.toThrow('lost');
+    await app.retryPress(app.field().field!);
+    expect(packets).toEqual([packets[0], packets[0], packets[0]]);
+    expect(admissions.size).toBe(1);
+    expect(app.outgoing()).toEqual([]);
   });
 
-  it('is forgotten with the computer', async () => {
-    submissionUnsure('chat', submissionFor('chat', 'ok', undefined, next).id);
-    await runForget();
-    expect(unsureOf('chat')).toEqual([]);
+  it('admits identical deliberate presses independently while the first is outstanding', async () => {
+    const app = await boot();
+    const admissions = new Set<string>();
+    let accept!: () => void;
+    desktop.call.mockImplementation(async (_: string, p: typeof packet) => {
+      admissions.add(p.submitId);
+      if (admissions.size === 1) await new Promise<void>(resolve => { accept = resolve; });
+      return { ok: true, submitId: p.submitId };
+    });
+    app.type(' A ');
+    const first = app.tap();
+    await vi.waitFor(() => expect(accept).toBeDefined());
+    app.type(' A ');
+    await app.tap();
+    accept();
+    await first;
+    expect(admissions.size).toBe(2);
+    expect(app.outgoing()).toEqual([]);
   });
 
-  it('the composer sends it, keeps it on a cut connection and clears the field on its receipt alone', () => {
-    const screen = read('mobile/src/screens/Composer.tsx');
-    expect(screen).toMatch(/const sub = submissionFor\(sid, t, attachments\);\s*try \{\s*const r = await conn\.call\('session\.send', \{ sessionId: sid, text: t, attachments, submitId: sub\.id \}\);\s*submissionDone\(sid, sub\.id\);/);
-    expect(screen).toMatch(/if \(LOST\.test\(msg\)\) submissionUnsure\(sid, sub\.id\);\s*else submissionDone\(sid, sub\.id\);/);
-    // Asked once connected, by id, with the question that sends nothing; the field goes only when it still holds that send.
-    expect(screen).toMatch(/if \(!online\) return;\s*const e = epoch\(\);\s*void confirmKept\(sid, \(submitId\) => conn\.call\('session\.submission', \{ sessionId: sid, submitId \}\)\)/);
-    expect(screen).toMatch(/if \(!got\.some\(\(sub\) => el\.value\.trim\(\) === sub\.text && filesKey\(filesNow\.current\) === sub\.files\)\) return;/);
-    expect(screen).toMatch(/useEffect\(\(\) => draftChanged\(sid, text, files\), \[sid, text, files\]\);/);
-    // The old rule (the newest message of the same words within 15 s) is gone.
-    expect(screen).not.toMatch(/lastUser|u\.at - 15_000|const unsure = new Map/);
-    // The phone may ask it.
-    expect(PHONE_METHODS).toContain('session.submission');
-    // A review and the "Continue" of an ended turn carry one id each too.
-    expect(read('mobile/src/lib/comments.ts')).toMatch(/const sub = submissionFor\(sid, text, undefined\);\s*const r = await conn\.call\('session\.send', \{ sessionId: sid, text, submitId: sub\.id \}\)/);
-    expect(read('mobile/src/screens/Timeline.tsx')).toMatch(/submitId\.current \?\?= crypto\.randomUUID\(\);\s*void conn\.call\('session\.send', \{ sessionId: sid, text: 'Continue', submitId: submitId\.current \}\)/);
+  it('keeps an unanswered acceptance pending, and retries only after a negative query', async () => {
+    const app = await boot();
+    app.type(' A ');
+    desktop.call.mockResolvedValue({ ok: true, submitId: 'wrong' });
+    await expect(app.tap()).rejects.toThrow();
+    await expect(app.retryPress(app.field().field!)).rejects.toThrow();
+    const id = app.field().field!.packet.submitId;
+    desktop.call.mockResolvedValue({ ok: true, submitId: id });
+    await app.retryPress(app.field().field!);
+    expect(desktop.call.mock.calls.filter(([method]) => method === 'session.send')).toHaveLength(1);
+    expect(app.outgoing()).toEqual([]);
+  });
+
+  it('keeps the entire field when the first native commit fails', async () => {
+    const app = await boot();
+    app.type(' A ');
+    keep.mockRejectedValueOnce(new Error('full'));
+    await expect(app.tap()).rejects.toThrow('full');
+    expect(app.composition('chat')).toMatchObject({ t: ' A ', files: [file] });
+    expect(desktop.call).not.toHaveBeenCalled();
+  });
+
+  it('keeps the newer draft and its photo across restart when page storage is full', async () => {
+    let app = await boot();
+    const full = vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    try {
+      app.type('A');
+      desktop.call.mockImplementation(async (method: string) => {
+        if (method === 'session.send') app.type('B', [{ ...file, id: 'new-photo' }]);
+        throw new Error('offline');
+      });
+      await expect(app.tap()).rejects.toThrow();
+      await app.drained();
+      app = await boot();
+      expect(app.composition('chat')).toMatchObject({ t: 'B', files: [{ id: 'new-photo', dataUrl: file.dataUrl }] });
+      expect(app.field().rows[0].packet.text).toBe('A');
+    } finally {
+      full.mockRestore();
+    }
+  });
+
+  it.each([false, true])('preserves an intentional empty field during commit (typed B first %s)', async typed => {
+    const app = await boot();
+    let commit!: () => void;
+    keep.mockImplementationOnce((key, value) => new Promise<void>(resolve => {
+      commit = () => { disk.set(key, value!); resolve(); };
+    }));
+    desktop.call.mockResolvedValue({ ok: false });
+    app.type('A');
+    const pending = app.tap();
+    await vi.waitFor(() => expect(commit).toBeDefined());
+    expect(app.getDraft('chat')).toBe('A');
+    expect(desktop.call).not.toHaveBeenCalled();
+    if (typed) app.type('B');
+    app.type('', []);
+    commit();
+    await expect(pending).rejects.toThrow();
+    expect(app.field().field).toBeUndefined();
+    expect(app.field().rows.map(s => s.packet.text)).toEqual(['A']);
+  });
+
+  it('replays a native clear after Android loses the page write, even after acceptance', async () => {
+    let app = await boot();
+    app.type('A');
+    const beforeClear = page.get('sable.drafts')!;
+    desktop.call.mockImplementation(async (_, p) => ({ ok: true, submitId: p.submitId }));
+    await app.tap();
+    page.set('sable.drafts', beforeClear);
+    app = await boot();
+    expect(app.composition('chat')).toMatchObject({ t: '', r: 2 });
+    expect(app.outgoing()).toEqual([]);
+  });
+
+  it('drains the interrupted native write before erasure and never transmits it', async () => {
+    const app = await boot();
+    let commit!: () => void;
+    keep.mockImplementationOnce((key, value) => new Promise<void>(resolve => {
+      commit = () => { disk.set(key, value!); resolve(); };
+    }));
+    app.type('A');
+    const pending = app.tap();
+    await vi.waitFor(() => expect(commit).toBeDefined());
+    const { eraseAll } = await import('../mobile/src/lib/erase');
+    const erased = eraseAll({ storage: localStorage, native: async () => { disk.clear(); return []; } });
+    commit();
+    await expect(pending).rejects.toThrow('forgotten');
+    await erased;
+    expect(app.outgoing()).toEqual([]);
+    expect(disk.size).toBe(0);
+    expect(desktop.call).not.toHaveBeenCalled();
+  });
+
+  it('returns a refused first home message in the created chat', async () => {
+    const app = await boot();
+    app.setDraft(app.HOME_DRAFT, 'first', { now: true });
+    const first = pressFrom(app.HOME_DRAFT, app.composition(app.HOME_DRAFT));
+    desktop.call.mockResolvedValue({ ok: false, error: 'refused' });
+    await expect(app.sendPress(first('chat', 0), 0)).rejects.toThrow('refused');
+    expect(app.getDraft(app.HOME_DRAFT)).toBe('');
+    expect(app.field().field).toMatchObject({ state: 'refused', packet: { submitId: expect.any(String), text: 'first', sessionId: 'chat' } });
+  });
+
+  it('recovers home words if Android kills the phone before createChat supplies a destination', async () => {
+    let app = await boot();
+    app.setDraft(app.HOME_DRAFT, 'start here', { now: true });
+    await app.keepOpeningDraft(app.composition(app.HOME_DRAFT), 0);
+    page.clear();
+    app = await boot();
+    expect(app.getDraft(app.HOME_DRAFT)).toBe('start here');
+    expect(desktop.call).not.toHaveBeenCalled();
+  });
+
+  it('ignores a lost send reply after Forget and a new pairing', async () => {
+    const app = await boot();
+    let lose!: () => void;
+    desktop.call.mockImplementation(() => new Promise((_, reject) => { lose = () => reject(new Error('old')); }));
+    app.type('old');
+    const sent = app.tap();
+    await vi.waitFor(() => expect(lose).toBeDefined());
+    const { eraseAll } = await import('../mobile/src/lib/erase');
+    await eraseAll({ storage: localStorage, native: async () => { disk.clear(); return []; } });
+    app.type('new', []);
+    lose();
+    await expect(sent).rejects.toThrow('forgotten');
+    expect(app.getDraft('chat')).toBe('new');
+    expect(app.outgoing()).toEqual([]);
+    expect(disk.size).toBe(0);
   });
 });
 

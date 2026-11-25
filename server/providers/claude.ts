@@ -9,9 +9,6 @@ import { isDeepStrictEqual } from 'node:util';
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
   query as sdkQuery,
-  listSessions,
-  getSessionMessages,
-  forkSession,
   type Options,
   type PermissionMode,
   type PermissionResult,
@@ -20,6 +17,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
+import { claudeHistory } from './claude-history';
 import type {
   Attachment,
   Capabilities,
@@ -62,7 +60,7 @@ import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoic
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { chatReplyInstruction, CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
-import { endsWithSteerNote, importedSteerText, syntheticOf, withoutHandover, HANDOVER_JOIN, STEER_NOW_BLOCK, isAuthFailure, isCompactOutput, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
+import { UNTIL_INPUT_END, nativePersonalPrompt, nativePersonalWords, endsWithSteerNote, syntheticOf, withoutHandover, HANDOVER_JOIN, STEER_NOW_BLOCK, isAuthFailure, isCompactOutput, isStandIn, parseSynthetic, stripWrappers, syntheticLine } from '../../shared/synthetic';
 import { widgetServer } from './claude-widget';
 import { BROWSER_HINT, BROWSER_TOOL_IDS, browserTabEnabled, cleanToolInput, streamsInput } from './browser-tool';
 import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
@@ -217,6 +215,17 @@ const sdkEffort = (e?: Effort) => (e === 'minimal' ? 'low' : e);
  */
 const claudeBinary = () => process.env.SABLE_CLAUDE_BIN || undefined;
 
+/** Whether a version the CLI reports ("2.1.325", "2.2.0-beta.1") is at least `min`; anything unreadable is not. */
+export function atLeast(version: unknown, min: readonly number[]): boolean {
+  const m = typeof version === 'string' ? /^(\d+)\.(\d+)\.(\d+)/.exec(version.trim()) : null;
+  if (!m) return false;
+  for (let i = 0; i < 3; i++) {
+    const n = Number(m[i + 1]);
+    if (n !== min[i]) return n > min[i];
+  }
+  return true;
+}
+
 /** The user's own CLAUDE_CONFIG_DIR (usually unset): what the built-in default account uses. */
 const OWN_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
 
@@ -246,29 +255,6 @@ function claudeEnv(configDir: string | undefined): NodeJS.ProcessEnv {
   return env;
 }
 
-let configLock: Promise<void> = Promise.resolve();
-
-/**
- * The SDK's history readers (listSessions, getSessionMessages) take no config option and read
- * process.env.CLAUDE_CONFIG_DIR. Point it at the account for one call at a time, then restore it.
- * Agent processes get an explicit env, so they never see the temporary value.
- */
-function withConfigDir<T>(configDir: string | undefined, fn: () => Promise<T>): Promise<T> {
-  const run = configLock.then(async () => {
-    const prev = process.env.CLAUDE_CONFIG_DIR;
-    const dir = configDir ?? OWN_CONFIG_DIR;
-    if (dir) process.env.CLAUDE_CONFIG_DIR = dir;
-    else delete process.env.CLAUDE_CONFIG_DIR;
-    try {
-      return await fn();
-    } finally {
-      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
-      else process.env.CLAUDE_CONFIG_DIR = prev;
-    }
-  });
-  configLock = run.then(() => {}, () => {});
-  return run;
-}
 
 /** Tools a read-only agent (a turn check) never gets, whatever the user's allow rules say. */
 const READ_ONLY_BLOCKED = ['Bash', 'BashOutput', 'KillShell', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit'];
@@ -321,9 +307,31 @@ export class ClaudeProvider implements Provider {
     return { bin, args: ['/limit-reset'], env: this.env(), line: resetLine(bin, this.configDir) };
   }
 
-  /** Runs an SDK history read against this account's config folder. */
-  withHistory<T>(fn: () => Promise<T>): Promise<T> {
-    return withConfigDir(this.configDir, fn);
+  private historyWaiters = new Map<string, Set<() => void>>();
+
+  /** Each native conversation has its own SDK reader. A queued read consumes its own deadline. */
+  async withHistory<M extends Parameters<typeof claudeHistory>[0]>(method: M, args: Parameters<typeof claudeHistory<M>>[1],
+    signal = AbortSignal.timeout(90_000), filter?: Parameters<typeof claudeHistory>[4]) {
+    const session = args[0];
+    if (typeof session !== 'string') return claudeHistory(method, args, this.env(), signal, filter);
+    signal.throwIfAborted();
+    const queue = this.historyWaiters.get(session) ?? new Set<() => void>();
+    if (this.historyWaiters.has(session)) {
+      await new Promise<void>((resolve, reject) => {
+        const next = () => { signal.removeEventListener('abort', cancel); resolve(); };
+        const cancel = () => { queue.delete(next); reject(signal.reason); };
+        queue.add(next);
+        signal.addEventListener('abort', cancel, { once: true });
+      });
+    } else this.historyWaiters.set(session, queue);
+    try {
+      signal.throwIfAborted();
+      return await claudeHistory(method, args, this.env(), signal, filter);
+    } finally {
+      const next = queue.values().next().value;
+      if (next) { queue.delete(next); next(); }
+      else this.historyWaiters.delete(session);
+    }
   }
 
   scope(reason: StartReason): AuthScope {
@@ -1102,32 +1110,23 @@ export class ClaudeProvider implements Provider {
 
   /** Only a matching result or input is authoritative in the SDK's replayable history. */
   async delegateReceipts(session: string, cwd: string, _after: string | undefined, wanted: WantedReceipts, signal = AbortSignal.timeout(3000)) {
-    return this.withHistory(async () => {
-      signal.throwIfAborted();
-      let abort!: () => void;
-      const deadline = new Promise<never>((_, reject) => {
-        abort = () => reject(signal.reason);
-        signal.addEventListener('abort', abort, { once: true });
-      });
-      try {
-        const messages = await Promise.race([getSessionMessages(session, { dir: cwd, includeSystemMessages: true }), deadline]);
-        const ids = new Set<string>();
-        for (const row of messages) {
-          if (row.type !== 'user' || row.parent_tool_use_id) continue;
-          const content = (row.message as Obj)?.content;
-          if (typeof content === 'string') readDelegateIds(content, ids, wanted.ids);
-          else if (Array.isArray(content)) for (const block of content) {
-            if (block?.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, ids, wanted.ids);
-            if (block?.type === 'tool_result') {
-              const key = toolReceipt(block.tool_use_id, block.content, wanted.tools);
-              if (key) ids.add('tool:' + key);
-            }
-          }
+    const messages = await this.withHistory('getSessionMessages', [session, { dir: cwd, includeSystemMessages: true }],
+      signal, { deliveries: wanted.ids, tools: new Set(wanted.tools.keys()) });
+    const ids = new Set<string>();
+    for (const row of messages) {
+      if (row.type !== 'user' || row.parent_tool_use_id) continue;
+      const content = (row.message as Obj)?.content;
+      if (typeof content === 'string') readDelegateIds(content, ids, wanted.ids);
+      else if (Array.isArray(content)) for (const block of content) {
+        if (block?.type === 'text' && typeof block.text === 'string') readDelegateIds(block.text, ids, wanted.ids);
+        if (block?.type === 'tool_result') {
+          const key = toolReceipt(block.tool_use_id, block.content, wanted.tools);
+          if (key) ids.add('tool:' + key);
         }
-        const count = wanted.tools.size + wanted.ids.size;
-        return { ids, settled: count > 0 && ids.size === count };
-      } finally { signal.removeEventListener('abort', abort); }
-    });
+      }
+    }
+    const count = wanted.tools.size + wanted.ids.size;
+    return { ids, settled: count > 0 && ids.size === count };
   }
 
   async adoptConversation(fromHome: string, providerSessionId: string): Promise<boolean> {
@@ -1135,12 +1134,12 @@ export class ClaudeProvider implements Provider {
   }
 
   async steerReceipts(session: string, cwd: string, issued: Set<string>) {
-    return this.withHistory(async () => (await getSessionMessages(session, { dir: cwd }))
-      .filter(row => row.type === 'user' && !row.parent_tool_use_id && issued.has(row.uuid)).map(row => row.uuid));
+    const rows = await this.withHistory('getSessionMessages', [session, { dir: cwd }], AbortSignal.timeout(3000), { issued });
+    return rows.filter(row => row.type === 'user' && !row.parent_tool_use_id && issued.has(row.uuid)).map(row => row.uuid);
   }
 
   async history(cwd?: string, limit = 40): Promise<HistoryEntry[]> {
-    const list = await this.withHistory(() => listSessions({ dir: cwd, limit }));
+    const list = await this.withHistory('listSessions', [{ dir: cwd, limit }]);
     return list.map((s) => ({
       provider: 'claude' as const,
       providerSessionId: s.sessionId,
@@ -1471,8 +1470,11 @@ interface OwnSend {
   steerNow?: boolean;
   /** Recheck the sender if this input was held for an older turn's outstanding result. */
   heldCheck?: () => void;
+  issueReport?: () => void;
+  heldCard?: UserItem;
   answered?: boolean;
   guessed?: boolean;
+  confirmed?: true;
   onTaken?: () => void;
   uncertain?: () => void;
   release?: () => void;
@@ -1845,6 +1847,7 @@ class ClaudeSession implements ProviderSession {
     this.scopedInterrupt = false;
     this.steerInterruptPending = false;
     this.steerTarget = undefined;
+    for (const uuid of this.interruptSurvivors) this.rt.forgetLiveQueue(uuid);
     this.interruptSurvivors.clear();
     this.cancelledInputs.clear();
     this.wakeLimit = undefined;
@@ -2429,7 +2432,8 @@ class ClaudeSession implements ProviderSession {
    */
   private retiringDelegate?: Promise<void>;
   terminateDelegate() {
-    return this.retiringDelegate ??= this.terminateDelegateProcesses().then(() => this.close());
+    return this.retiringDelegate ??= this.terminateDelegateProcesses().then(() => this.close())
+      .finally(() => { this.retiringDelegate = undefined; });
   }
 
   private async terminateDelegateProcesses() {
@@ -2521,7 +2525,9 @@ class ClaudeSession implements ProviderSession {
     this.ensure();
     clearTimeout(this.idleTimer);
     const uuid = randomUUID();
-    const durable = item.steered || opts?.steerNow || !!item.steerAttempts;
+    const inputCard = this.rt.get<UserItem>(item.id);
+    const durable = inputCard?.type === 'user' && (inputCard.state === 'queued' || opts?.personalOffset !== undefined ||
+      inputCard.text === item.text && (this.rt.persistInput || this.held) || opts?.steerNow);
     if (durable) {
       const batch = this.held;
       const query = this.q;
@@ -2541,6 +2547,7 @@ class ClaudeSession implements ProviderSession {
     const files = (item.attachments ?? []).filter((a) => a.kind !== 'image' && a.path);
     const card = this.rt.get<UserItem>(item.id);
     let text = item.text;
+    let personalWords = card?.text ?? item.text;
     if (files.length) {
       // The app adds notes after the person's words, sometimes with a handover before them.
       // File references belong with the words, so the transcript reader can strip the trailing notes.
@@ -2551,6 +2558,7 @@ class ClaudeSession implements ProviderSession {
       else if (text.startsWith(words)) end = words.length;
       const references = files.map((f) => `@${f.path}`).join(' ');
       text = text.slice(0, end) + '\n\n' + references + text.slice(end);
+      personalWords += '\n\n' + references;
     }
     // Steered into a running turn: the person waits for a reply, so the agent is told to answer first
     // (a block of its own after their words; the conversation shows only what they wrote). Not for a
@@ -2558,10 +2566,8 @@ class ClaudeSession implements ProviderSession {
     const steerFirst = !!item.steered && !item.until && this.rt.turnActive && !/^\/[\w:-]+/.test(item.text.trim());
     const reminder = opts?.steerNow ? STEER_NOW_BLOCK : steerFirst ? STEER_FIRST_BLOCK : undefined;
     const start = opts?.personalOffset;
-    const split = reminder && card?.type === 'user' && start !== undefined && text !== card.text && text.startsWith(card.text, start);
-    const prefix = split ? text.slice(0, start) : '';
-    const suffix = split ? text.slice(start + card.text.length) : '';
-    const words = split ? [...(prefix ? [prefix] : []), card.text, ...(suffix ? [suffix] : [])] : [text];
+    if (start !== undefined && card) text = nativePersonalPrompt(text, personalWords, start);
+    else if (item.until?.check) text += UNTIL_INPUT_END;
     const content: unknown =
       images.length || reminder
         ? [
@@ -2569,7 +2575,7 @@ class ClaudeSession implements ProviderSession {
               const m = a.dataUrl!.match(/^data:([^;]+);base64,(.*)$/);
               return { type: 'image', source: { type: 'base64', media_type: m?.[1] ?? 'image/png', data: m?.[2] ?? '' } };
             }),
-            ...words.map(text => ({ type: 'text', text })),
+            { type: 'text', text },
             ...(reminder ? [{ type: 'text', text: reminder }] : []),
           ]
         : text;
@@ -2580,7 +2586,9 @@ class ClaudeSession implements ProviderSession {
       itemId: item.id, words: plainWords(card?.type === 'user' ? card.text : item.text), sent: plainWords(text),
       at: Date.now(), q: this.held ? undefined : this.q, read: false, replayed: false, onTaken: opts?.taken, release: opts?.release, uncertain: opts?.uncertain,
       steerNow: opts?.steerNow,
-      heldCheck: this.held && durable ? opts?.check : undefined,
+      heldCheck: this.held ? opts?.check : undefined,
+      issueReport: this.held ? opts?.issueReport : undefined,
+      heldCard: this.held && durable ? card : undefined,
       proofBlocks: [
         ...(reminder ? [reminder] : []),
         ...(card?.type === 'user' && item.text !== card.text ? [text] : []),
@@ -2591,7 +2599,7 @@ class ClaudeSession implements ProviderSession {
       this.releaseReceipt(this.own.get(oldest));
       this.own.delete(oldest);
       this.cancelledInputs.delete(oldest);
-      this.interruptSurvivors.delete(oldest);
+      // A live SDK survivor outlasts the payload cache, until cancellation or process exit.
     }
     // Its result says what it came to (`retire`): until then it went ok for nobody (the bridge names a chat only from one that did).
     this.rt.expectOutcome(item.id);
@@ -2642,6 +2650,7 @@ class ClaudeSession implements ProviderSession {
       this.rt.update({ activity: HELD_LINE });
       return;
     }
+    opts?.issueReport?.();
     this.input!.push(msg);
     if (item.steered && card?.state === 'queued') this.rt.onUnreadSteer?.(item.id, !!opts?.steerNow);
     if (item.steered) this.rt.releaseDelegates();
@@ -2668,10 +2677,17 @@ class ClaudeSession implements ProviderSession {
       const uuid = m.uuid ?? '';
       const own = this.own.get(uuid);
       if (this.held !== held) break;
+      if (!own) {
+        const id = this.pendingUsers.get(uuid);
+        if (id) missed.add(id);
+        this.forgetRecalled(uuid);
+        continue;
+      }
       try {
-        own?.heldCheck?.();
+        own.heldCheck?.();
         const q = this.ensure();
-        if (own && (own.heldCheck || own.steerNow || this.rt.get<UserItem>(own.itemId)?.steered)) {
+        if (own.heldCard) {
+          if (this.rt.get(own.itemId) !== own.heldCard) throw new Error('The waiting message changed.');
           this.rt.patch<UserItem>(own.itemId, { issuedUuid: uuid, issuedTo: this.steerDestination() });
           if (this.rt.persistInput) await this.rt.persistInput();
           own.heldCheck?.();
@@ -2679,13 +2695,15 @@ class ClaudeSession implements ProviderSession {
         }
         if (own) {
           own.heldCheck = undefined;
+          own.heldCard = undefined;
           own.q = q;
         }
+        own.issueReport?.();
         this.input!.push(m);
       } catch {
         if (own) {
           const card = this.rt.get<UserItem>(own.itemId);
-          if (card && (!card.issuedUuid || card.issuedUuid === uuid)) {
+          if (card && own.heldCard === card && (!card.issuedUuid || card.issuedUuid === uuid)) {
             this.rt.patch<UserItem>(own.itemId, { issuedUuid: undefined, issuedTo: undefined });
             missed.add(own.itemId);
           }
@@ -2724,6 +2742,7 @@ class ClaudeSession implements ProviderSession {
       own.recalled = true;
       own.onTaken = undefined;
       own.heldCheck = undefined;
+      own.heldCard = undefined;
       this.releaseReceipt(own);
     }
     this.awaiting.delete(uuid);
@@ -2881,7 +2900,7 @@ class ClaudeSession implements ProviderSession {
     // The CLI answers with a result message; if it does not, close the turn ourselves.
     clearTimeout(this.interruptTimer);
     this.interruptTimer = setTimeout(() => {
-      if (!this.interrupted || !ours()) return;
+      if (!this.interrupted || !ours() || this.rt.awaitingQuitResult) return;
       // Claude Code never said it took the stop, and no end came: it may still be at work.
       if (!taken) return this.terminate();
       // Settled without its result: should that come after all, it is this turn's, never a newer one's.
@@ -3054,7 +3073,7 @@ class ClaudeSession implements ProviderSession {
     if (cut.next && this.restoredChain) await this.findNativePoint(cut.next);
     const upTo = cut.next ? claudeForkPoint(this.chain, cut.next) : this.resumeAt;
     if (upTo === null) return null;
-    const r = await this.provider.withHistory(() => forkSession(id, { dir: this.rt.meta.cwd, ...(upTo ? { upToMessageId: upTo } : {}) }));
+    const r = await this.provider.withHistory('forkSession', [id, { dir: this.rt.meta.cwd, ...(upTo ? { upToMessageId: upTo } : {}) }]);
     return r.sessionId || null;
   }
 
@@ -3199,7 +3218,7 @@ class ClaudeSession implements ProviderSession {
       const own = this.own.get(any.command_uuid);
       if (!own) {
         // The durable survivor may outlive the bounded recent-input cache.
-        if (this.rt.queue.some(q => q.issuedUuid === any.command_uuid && q.issuedTo?.stillQueued)) this.rt.confirmDropped(any.command_uuid);
+        if (this.interruptSurvivors.delete(any.command_uuid)) this.rt.confirmDropped(any.command_uuid);
         return;
       }
       if (!own.recalled && !own.read) {
@@ -3530,25 +3549,30 @@ class ClaudeSession implements ProviderSession {
       // The same message replayed again (a reconnect, a repeat) is already in the conversation.
       if (m.uuid && (this.chain.includes(m.uuid) || rt.items.some((i) => i.type === 'user' && i.providerId === m.uuid))) return;
       const content = m.message?.content;
-      const text = replayText(content);
-      if (this.compacted && isCompactOutput(text)) return;
+      const raw = replayText(content);
+      const recovered = !m.isSynthetic ? nativeUserWords(content) : undefined;
+      const text = recovered ?? raw;
       // Written by Claude Code in the person's place (a task finished, a command and its output):
       // shown as a line (shared/synthetic.ts), never as a message from the Claude app.
       const literal = !m.isSynthetic && (text === STEER_NOW_BLOCK || text === STEER_FIRST_BLOCK) && (!Array.isArray(content) || content.length === 1);
-      const syn = text && !literal ? parseSynthetic(text) : null;
+      const syn = recovered === undefined && text && !literal ? parseSynthetic(text) : null;
       // A slash command Sable sent comes back in the CLI's own tags (`<command-name>/compact</command-name>…`).
       const echo = syn?.role === 'command' ? syntheticLine(syn) : '';
       // One of ours under another uuid (a steer the CLI folded in): only one it has not read yet, and only
       // by its very words. A message from the app that merely holds them stays the app's; one with the
       // same words is the app's again once ours comes back under its own uuid (`unalias`).
-      const mine = this.ownByWords(text, echo, content);
+      const mine = this.ownByWords(raw, echo, content);
       if (mine && (!mine[1].recallPending || mine[2])) {
         const [uuid, o, identified] = mine;
-        if (o.guessed) this.takeOwn(uuid, 'match');
-        this.reclaim(uuid, m.uuid ?? uuid, !this.unmatchedResults.get(m.uuid)?.pending.has(uuid));
-        this.pendingUsers.delete(uuid);
-        this.markRead(uuid);
-        o.read = true;
+        const card = rt.get<UserItem>(o.itemId);
+        const provisional = !identified && (card?.authored && card.issuedUuid === uuid || rt.persistInput && rt.queue.some(q => q.issuedUuid === uuid));
+        if (!provisional) {
+          if (o.guessed) this.takeOwn(uuid, 'match');
+          this.reclaim(uuid, m.uuid ?? uuid, !this.unmatchedResults.get(m.uuid)?.pending.has(uuid));
+          this.pendingUsers.delete(uuid);
+          this.markRead(uuid);
+          o.read = true;
+        }
         if (m.uuid && m.uuid !== uuid) {
           // A result may name it by either uuid.
           this.aliases.set(m.uuid, uuid);
@@ -3559,10 +3583,11 @@ class ClaudeSession implements ProviderSession {
           }
         }
         if (m.uuid) this.chain.push(m.uuid);
-        if (!o.answered || identified) this.takeCard(o, m.uuid);
+        if (!provisional && (!o.answered || identified)) this.takeCard(o, m.uuid);
         this.bindEarlierResult(uuid, o, m.uuid);
         return;
       }
+      if (recovered === undefined && this.compacted && isCompactOutput(text)) return;
       const synthetic = !!syn || m.isSynthetic === true;
       const pictures = synthetic ? undefined : appPictures(content, APP_PICTURES);
       if (!text && !pictures) return;
@@ -3688,7 +3713,7 @@ class ClaudeSession implements ProviderSession {
     for (const [uuid, itemId] of this.pendingUsers) {
       this.pendingUsers.delete(uuid);
       const card = this.rt.get<UserItem>(itemId);
-      if (card?.issuedUuid === uuid) {
+      if (card && (card.issuedUuid === uuid || this.own.get(uuid)?.heldCard === card)) {
         this.rt.returnUntaken({ ids: new Set([itemId]) });
       } else if (card?.type === 'user' && (card.state === 'queued' || !card.providerId)) this.rt.taken(itemId, { providerId: uuid });
     }
@@ -3702,6 +3727,7 @@ class ClaudeSession implements ProviderSession {
   private takeCard(own: OwnSend, providerId: string, reply?: Set<string> | 'result') {
     const rt = this.rt;
     const card = rt.get<UserItem>(own.itemId);
+    if (own.heldCard) return;
     if (card?.state !== 'queued') {
       rt.taken(own.itemId, { providerId });
       return;
@@ -3911,7 +3937,7 @@ class ClaudeSession implements ProviderSession {
     const textBlocks = new Set(blocks.filter(b => b?.type === 'text').map(b => b.text));
     let late: [string, OwnSend, boolean] | undefined;
     for (const [uuid, o] of this.own) {
-      if (o.recalled) continue;
+      if (o.recalled || !o.q) continue;
       const decorated = o.proofBlocks.some(block => textBlocks.has(block));
       if (!decorated && (o.alias || textBlocks.has(STEER_FIRST_BLOCK) || textBlocks.has(STEER_NOW_BLOCK))) continue;
       const withdrawn = this.withdrawn.get(uuid);
@@ -4090,7 +4116,9 @@ class ClaudeSession implements ProviderSession {
   }
 
   private confirmDelivery(own: OwnSend | undefined) {
-    if (!own?.onTaken || own.q !== this.q) return;
+    if (!own?.q || own.q !== this.q) return;
+    own.confirmed = true;
+    if (!own.onTaken) return;
     const taken = own.onTaken;
     own.onTaken = undefined;
     own.release = undefined;
@@ -4168,7 +4196,8 @@ class ClaudeSession implements ProviderSession {
         else own.uncertain?.();
         own.uncertain = undefined;
       }
-      if (this.pendingUsers.delete(uuid)) this.takeCard(own, uuid, 'result');
+      const card = rt.get<UserItem>(own.itemId);
+      if ((!card?.authored || card.issuedUuid !== uuid || own.confirmed) && this.pendingUsers.delete(uuid)) this.takeCard(own, uuid, 'result');
       if (!m.is_error && m.subtype === 'success' && rt.get<UserItem>(own.itemId)?.steered) this.finishSteerReply(own, m.result);
       own.crossed = undefined;
     }
@@ -4192,7 +4221,7 @@ class ClaudeSession implements ProviderSession {
     if (window) usage.contextWindow = window;
     rt.update({ usage });
     const failed = m.subtype !== 'success' || m.is_error;
-    const wasInterrupted = this.interrupted;
+    const wasInterrupted = this.interrupted && (!rt.awaitingQuitResult || failed);
     let failure: string | undefined;
     if (failed) {
       failure =
@@ -4288,7 +4317,10 @@ class ClaudeSession implements ProviderSession {
         stopReason: m.stop_reason ?? undefined,
         error: shownError,
       });
-      for (const id of ahead) if (rt.get<UserItem>(id)?.state === 'sent') rt.move(id, {}, true);
+      for (const id of ahead) {
+        const card = rt.get<UserItem>(id);
+        if (card && (card.state === 'sent' || !card.steered)) rt.move(id, {}, true);
+      }
     }
     if (this.awaiting.size > 0 && !wasInterrupted) {
       // Messages it has not answered yet are still coming (a steer it has not read): their turn starts
@@ -4433,8 +4465,10 @@ class ClaudeSession implements ProviderSession {
     if (m.task_id && !this.currentTaskRun(m)) return;
     switch (m.subtype) {
       case 'init': {
-        // This bundled CLI implements for_user_message_uuids. Older ones ignore unknown fields.
-        this.scopedInterrupt = m.claude_code_version === '2.1.325';
+        // The bundled CLI (2.1.325) implements for_user_message_uuids; older ones ignore unknown
+        // fields. From that version on, not that version alone: the next SDK update would otherwise
+        // turn "Send now" and the deadline off without a word.
+        this.scopedInterrupt = atLeast(m.claude_code_version, [2, 1, 325]);
         if (Array.isArray(m.skills)) this.skillNames = m.skills.map(String);
         if (m.permissionMode && m.permissionMode !== rt.workMode && !rt.dangerHeld) rt.update({ mode: m.permissionMode });
         if (rt.caps && this.skillNames.length) {
@@ -4614,6 +4648,7 @@ class ClaudeSession implements ProviderSession {
         // app folded into the turn, a background task's notification that woke no model turn) is over.
         // A message of ours it has not read yet keeps the turn: its own turn is still to come (bounded,
         // `armUnreadNet`). After a stop, idle is the end whatever it has not read (that goes back to the queue).
+        if (m.state === 'idle' && rt.awaitingQuitResult) break;
         if (m.state === 'idle' && rt.turnActive && (this.interrupted || !this.unread())) this.finishTurn(undefined, this.interrupted);
         else if (m.state === 'idle' && rt.turnActive) this.unreadNetDue(rt.turnStartedAt);
         // Work it started on its own, with no message to replay (a scheduled wake-up): a turn like any other
@@ -4683,7 +4718,7 @@ class ClaudeSession implements ProviderSession {
     const rt = this.rt;
     const id = rt.meta.providerSessionId;
     if (!id) return;
-    const messages = (await this.provider.withHistory(() => getSessionMessages(id, { dir: rt.meta.cwd, includeSystemMessages: true }))) as Obj[];
+    const messages = (await this.provider.withHistory('getSessionMessages', [id, { dir: rt.meta.cwd, includeSystemMessages: true }])) as Obj[];
     const items: TimelineItem[] = [];
     const tools = new Map<string, ToolItem>();
     const unstamped = new Set<string>();
@@ -4699,6 +4734,7 @@ class ClaudeSession implements ProviderSession {
       return full;
     };
     let firstPrompt: string | undefined;
+    let titleAuthored: true | undefined;
     let planDraft: string | undefined;
     const afterCompact = () => {
       const last = items.at(-1);
@@ -4706,6 +4742,7 @@ class ClaudeSession implements ProviderSession {
     };
     const readUserText = (text: string, uuid: string, authored = false) => {
       if (authored) {
+        if (firstPrompt === undefined) titleAuthored = true;
         firstPrompt ??= text;
         push({ type: 'user', text, state: 'sent', providerId: uuid, authored: true });
         return;
@@ -4764,16 +4801,17 @@ class ClaudeSession implements ProviderSession {
       } else if (m.type === 'user') {
         if (!parentId) this.chain.push(m.uuid);
         if (typeof content === 'string') {
-          if (!parentId) readUserText(content, m.uuid, !m.isSynthetic && endsWithSteerNote(content));
+          const words = !m.isSynthetic ? nativePersonalWords(content) : undefined;
+          if (!parentId) readUserText(words ?? content, m.uuid, words !== undefined || !m.isSynthetic && endsWithSteerNote(content));
         } else if (Array.isArray(content)) {
           const blocks = content.filter((b: Obj) => b.type === 'text');
           const decorated = blocks.length >= 2 && [STEER_FIRST_BLOCK, STEER_NOW_BLOCK].includes(blocks.at(-1).text);
           const body = decorated ? blocks.slice(0, -1) : blocks;
-          // In the split SDK shape the authored block is bounded on both sides. Old two-block
-          // steers put the decorations inside that one block and need the composer grammar.
+          // The split native shape bounds the authored block. An unmarked, unsplit block can itself quote a report.
           const first = body[0]?.text ?? '';
           const prefix = body.length > 1 && first.endsWith(HANDOVER_JOIN) && !withoutHandover(first);
-          const text = !decorated ? flattenContent(blocks).text : body.length === 1 ? importedSteerText(first) : body[prefix ? 1 : 0].text;
+          const words = !m.isSynthetic ? nativeUserWords(content) : undefined;
+          const text = words ?? (!decorated ? flattenContent(blocks).text : body.length === 1 ? first : body[prefix ? 1 : 0].text);
           for (const b of content as Obj[]) {
             if (b.type !== 'tool_result') continue;
             const t = tools.get(b.tool_use_id);
@@ -4784,13 +4822,13 @@ class ClaudeSession implements ProviderSession {
             // A step's time runs from its own start to its result: with either not known it shows none.
             if (real && !unstamped.has(t.id)) t.endedAt = real;
           }
-          if (text && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) readUserText(text, m.uuid, decorated || !m.isSynthetic && blocks.length === 1 && endsWithSteerNote(text));
+          if (text && !parentId && !content.some((b: Obj) => b.type === 'tool_result')) readUserText(text, m.uuid, words !== undefined || decorated || !m.isSynthetic && blocks.length === 1 && endsWithSteerNote(text));
         }
       }
     }
     rt.reset(items);
     if (rt.meta.titleSource === 'auto' && rt.meta.title === 'New session' && firstPrompt) {
-      rt.update({ title: firstPrompt.split('\n')[0].slice(0, 56) });
+      rt.update({ title: firstPrompt.split('\n')[0].slice(0, 56), titleAuthored });
     }
   }
 }
@@ -4933,6 +4971,22 @@ export function startSettings(meta: Pick<SessionMeta, 'ultracode' | 'speed'>): O
   if (meta.ultracode) out.ultracode = true;
   out.fastMode = meta.speed === 'fast';
   return Object.keys(out).length ? (out as Options['settings']) : undefined;
+}
+
+/** Recover a marked prompt, including a legacy steer with separate authored and suffix blocks. */
+function nativeUserWords(content: unknown): string | undefined {
+  if (typeof content === 'string') return nativePersonalWords(content);
+  if (!Array.isArray(content)) return;
+  const blocks = content.filter(b => b?.type === 'text').map(b => b.text);
+  const decorated = blocks.length > 1 && [STEER_FIRST_BLOCK, STEER_NOW_BLOCK].includes(blocks.at(-1));
+  if (decorated) blocks.pop();
+  if (blocks.length === 1) return nativePersonalWords(blocks[0]) ?? (decorated ? blocks[0] : undefined);
+  if (decorated) {
+    const at = blocks[0].endsWith(HANDOVER_JOIN) && !withoutHandover(blocks[0]) ? 1 : 0;
+    // The old writer put all @file references on the first line of its suffix block.
+    const files = /^\n\n@[^\r\n]+/.exec(blocks[at + 1] ?? '')?.[0] ?? '';
+    return blocks[at] + files;
+  }
 }
 
 /** The words of a replayed user message (a string, or its text blocks); empty for tool results and images only. */

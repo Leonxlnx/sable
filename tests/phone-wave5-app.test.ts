@@ -11,7 +11,7 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { PhoneFileStart, SessionMeta, TimelineItem } from '@shared/protocol';
-import { confirmTake, KEEP_FAILED_TAKE, takeBack, TAKE_RETRY, type TakeDeps } from '../mobile/src/lib/take';
+import { confirmTake, KEEP_FAILED_TAKE, stillQueued, takeBack, TAKE_RETRY, type TakeDeps } from '../mobile/src/lib/take';
 import { eraseAll, pairingKeys, sweep, type KeyList } from '../mobile/src/lib/erase';
 import { epoch } from '../mobile/src/lib/epoch';
 import { onForget } from '../mobile/src/lib/forget';
@@ -95,6 +95,22 @@ describe('a queued message taken back (20)', () => {
     expect(log).not.toContain('done R1 true');
   });
 
+  it('declines the reserved revision when a desktop edit added a file', async () => {
+    const message = { text: 'fix the tests', attachments: [{ id: 'file', name: 'notes.txt' }] };
+    const { d, log } = deps({ take: async () => ({ message, take: 'new-revision' }) });
+    await expect(takeBack(d, 's', 'q')).rejects.toThrow(/attachments/i);
+    expect(log).toEqual(['done new-revision false']);
+  });
+
+  it('releases a staged copy only when its complete row still exists after a negative confirmation', async () => {
+    const row = { id: 'q', text: 'staged' };
+    const first = { id: 'other', text: 'staged' };
+    await expect(stillQueued('q', 'staged', async from => ({ queue: [from ? row : first], total: 2 }))).resolves.toBe(true);
+    for (const queue of [[], [first], [{ ...row, text: 'edited' }], [{ ...row, attachments: ['file'] }]]) {
+      await expect(stillQueued('q', 'staged', async () => ({ queue, total: queue.length }))).resolves.toBe(false);
+    }
+  });
+
   it('a confirmation the connection cut is sent again (the receipt answers the same), and left for later past a few tries', async () => {
     let n = 0;
     const { d, log } = deps({ done: async (take, kept) => (log.push(`done ${take} ${kept}`), ++n < 2 ? Promise.reject(transportError('The connection to the desktop was lost', 'lost')) : { taken: true }) });
@@ -106,23 +122,22 @@ describe('a queued message taken back (20)', () => {
     expect(TAKE_RETRY.length).toBeGreaterThan(0);
   });
 
-  it('a desktop that kept it queued (changed meanwhile) says so; one from before receipts takes it as it did', async () => {
+  it('reconciles a negative confirmation and requires a reservation token', async () => {
     const kept = deps({ done: async () => ({ taken: false }) });
     await expect(takeBack(kept.d, 's', 'q')).resolves.toEqual({ text: 'fix the tests', stillQueued: true });
     const old = deps({ take: async () => ({ message: { text: 'old' } }) });
-    await expect(takeBack(old.d, 's', 'q')).resolves.toEqual({ text: 'old' });
-    expect(old.log.some((l) => l.startsWith('done'))).toBe(false);
+    await expect(takeBack(old.d, 's', 'q')).rejects.toThrow('did not reserve');
+    expect(old.log).toEqual([]);
   });
-
-  it('the staged words go into the draft and a committed copy; after Forget nothing is staged', async () => {
+  it('commits the reservation separately, then releases it into the draft', async () => {
     const drafts = await import('../mobile/src/lib/drafts');
-    drafts.setDraft('s', 'had');
-    await drafts.stageTaken('s', 'taken', 'R9');
-    expect(JSON.parse(mem.get('sable.drafts')!)).toMatchObject({ s: { t: 'had\ntaken' } });
-    expect(JSON.parse(fake.prefs.get(drafts.TAKEN)!)).toMatchObject({ kept: { s: { t: 'had\ntaken' } }, takes: [{ id: 'R9', sid: 's' }] });
+    drafts.setDraft('s', 'had', { now: true });
+    await drafts.stageTaken('s', 'taken', 'R9', 'q');
+    expect(drafts.getDraft('s')).toBe('had');
+    expect(JSON.parse(fake.prefs.get(drafts.TAKEN)!)).toMatchObject({ takes: [{ id: 'R9', sid: 's', staged: { text: 'taken', row: 'q', revision: drafts.draftRev('s') } }] });
     expect(await drafts.pendingTakes()).toEqual(['R9']);
-    // Answered: the receipt goes; the committed copy stays with the draft (review wave 6, #9) until it is sent.
-    drafts.settleTaken('R9');
+    await drafts.settleTaken('R9', true);
+    expect(drafts.getDraft('s')).toBe('had\ntaken');
     await until(() => JSON.parse(fake.prefs.get(drafts.TAKEN)!).takes.length === 0);
     drafts.setDraft('s', '');
     await until(() => !fake.prefs.has(drafts.TAKEN));

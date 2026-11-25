@@ -1,7 +1,7 @@
 import { barLeaving, HOLD_MS, launchRead, RELEASE } from '@/features/composer/flight';
 import { BAR_LEAVES, COLLAPSE, collapseEase, GLIDE, linearEasing } from '@/features/composer/signal-shape';
 import { holdSend } from '@/features/composer/settle';
-import { ARROW_OUT, ARROW_OUT_AT, ARROW_OUT_EASE, ARROW_OUT_MS, KEY_GIVE, KEY_GIVE_MS, SQUARE_IN, SQUARE_IN_AT, SQUARE_IN_EASE, SQUARE_IN_MS } from '@/features/composer/launch';
+import { ARROW_OUT, ARROW_OUT_AT, ARROW_OUT_EASE, ARROW_OUT_MS, KEY_GIVE_MS, SQUARE_IN, SQUARE_IN_AT, SQUARE_IN_EASE, SQUARE_IN_MS, keyGive, keyScale } from '@/features/composer/launch';
 import { reducedMotion, uiZoom } from '@/lib/motion';
 
 /**
@@ -265,6 +265,12 @@ export function beginHandoff(card: HTMLElement | null) {
   }
   const landH = start.height - Math.max(0, taH - LINE);
   const target = predictDock(landH, known) ?? { left: start.left, top: start.top, width: start.width };
+  // Where the real key stands: a send by the pointer comes while the key still gives under it
+  // (`.cmp-send:active`, 0.94). The copy's key is a new element at its full size, so its give began
+  // at 1: the key grew 2.4 px in the frame of the press and only then sank. Read only with the pointer
+  // on the key, and before anything is written here (a send by Enter reads nothing).
+  const pressed = card.querySelector<HTMLElement>('.cmp-send');
+  const keyAt = pressed?.matches(':hover') ? keyScale(pressed.getBoundingClientRect().width / uiZoom(), pressed.offsetWidth) : 1;
 
   const ghost = document.createElement('div');
   ghost.className = 'composer handoff-ghost';
@@ -293,6 +299,10 @@ export function beginHandoff(card: HTMLElement | null) {
   const arrow = key?.querySelector('.sk-glyph');
   // The key's part runs on the message's clock, like the glide (below).
   const keyAnims: Animation[] = [];
+  // The copy's key is a new element with something to send: it would light up again (composer.css
+  // `key-lit`, from 45 %), a grey disc under the send for some 90 ms. The stylesheet's rule against it
+  // (`.handoff-ghost .cmp-send`) is lighter than the rule that lights the key, so it is said here.
+  if (key) key.style.animation = 'none';
   if (key && arrow) {
     key.style.overflow = 'hidden';
     key.style.position = 'relative';
@@ -301,7 +311,7 @@ export function beginHandoff(card: HTMLElement | null) {
     key.appendChild(sq);
     keyAnims.push(
       arrow.animate(ARROW_OUT, { duration: ARROW_OUT_MS, delay: ARROW_OUT_AT, easing: ARROW_OUT_EASE, fill: 'forwards' }),
-      key.animate(KEY_GIVE, { duration: KEY_GIVE_MS, easing: 'linear' }),
+      key.animate(keyGive(keyAt), { duration: KEY_GIVE_MS, easing: 'linear' }),
       sq.animate(SQUARE_IN, { duration: SQUARE_IN_MS, delay: SQUARE_IN_AT, easing: SQUARE_IN_EASE, fill: 'both' }),
     );
   }

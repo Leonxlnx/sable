@@ -109,7 +109,7 @@ export class Races {
     const folder = made[0].meta.lane?.folder ?? p.cwd;
     made.forEach((rt, i) => rt.update({ race: { id, rival: made[1 - i].id, side: i as 0 | 1, task, folder, startedAt: now } }));
     this.host.persist();
-    for (const rt of made) void this.host.send(rt, task).catch((err) => this.host.log('race: could not send the task', (err as Error).message));
+    await Promise.all(made.map(rt => this.host.send(rt, task)));
     return { ok: true, raceId: id, sessions: made.map((rt) => rt.snapshot()) };
   }
 

@@ -40,6 +40,7 @@ function gate() {
 }
 
 type Answer = {
+  steer?: (written?: () => void) => Promise<unknown>;
   interrupt?: () => void;
   unsubscribe?: () => void;
   threadRead?: () => unknown;
@@ -61,7 +62,7 @@ async function codexFake(answer: Answer = {}) {
   let starts = 0;
   let probes = 0;
   const rpc = {
-    request: async (method: string, params: Record<string, unknown>) => {
+    request: async (method: string, params: Record<string, unknown>, _timeout?: number, written?: () => void) => {
       calls.push({ method, params });
       if (method === 'thread/start') return { thread: { id: 'th1', model: 'm' }, model: 'm' };
       if (method === 'thread/resume') return answer.resume ? answer.resume() : { thread: { id: 'th1', model: 'm' }, model: 'm' };
@@ -69,6 +70,7 @@ async function codexFake(answer: Answer = {}) {
         const n = ++starts;
         return answer.turnStart ? answer.turnStart(n) : { turn: { id: `turn${n}` } };
       }
+      if (method === 'turn/steer' && answer.steer) return answer.steer(written);
       if (method === 'thread/read' && answer.threadRead) return answer.threadRead();
       if (method === 'thread/turns/list') return answer.turnsList ? answer.turnsList(++probes) : {};
       if (method === 'turn/interrupt') answer.interrupt?.();
@@ -107,6 +109,66 @@ async function codexFake(answer: Answer = {}) {
   const session = () => provider.sessions.get('th1') as unknown as Record<string, unknown>;
   return { app, id, rt, provider, calls, notify, status, complete, count, serverDied, session, send: (text: string) => app.call('session.send', { sessionId: id, text }), stop: () => app.call('session.interrupt', { sessionId: id }) };
 }
+
+it('holds a Codex card through turn/start and checks every queued sender after resume', async () => {
+  const g = gate();
+  const h = await codexFake({ resume: () => g.wait().then(() => ({ thread: { id: 'th1' } })) });
+  await h.send('first');
+  const session = h.session();
+  session.loaded = false;
+  let paired = true;
+  h.app.phoneStillPaired = () => paired;
+  await h.app.call('session.send', { sessionId: h.id, text: 'queued phone', submitId: 'phone-c', steer: true },
+    { allowed: () => true, phoneSender: { deviceId: 'd', generation: 1 } });
+  h.complete('turn1');
+  await until(() => !!h.count('thread/resume'), 'queued thread resume');
+  const card = h.rt.get('phone-c');
+  paired = false;
+  g.open();
+  await tick(50);
+  expect(h.count('turn/start')).toBe(1);
+  expect(card).toMatchObject({ state: 'queued' });
+});
+
+it.each([true, false])('keeps ownership of a written steer across turn completion (acknowledged %s)', async accepted => {
+  const g = gate();
+  const h = await codexFake({ steer: async written => {
+    written?.();
+    await g.wait();
+    if (!accepted) throw new Error('reply lost');
+    return {};
+  } });
+  await h.send('first');
+  const send = h.app.call('session.send', { sessionId: h.id, text: 'once only', steer: true });
+  await until(() => h.count('turn/steer') === 1, 'steer');
+  h.complete('turn1');
+  await tick();
+  g.open();
+  await send;
+  await tick();
+  expect(h.count('turn/start')).toBe(1);
+  if (accepted) expect(h.rt.items.find(i => i.type === 'user' && i.text === 'once only')).toMatchObject({ state: 'sent' });
+  else expect(h.rt.queue.find(q => q.text === 'once only')).toMatchObject({ byHand: true, steerWait: { reason: expect.stringContaining('receipt') } });
+});
+
+
+it('distinguishes quoted reports and an internal until steer on the native wire', async () => {
+  const { transcript } = await import('../server/providers/codex-map');
+  const { userItemText } = await import('../shared/synthetic');
+  const { failureMessage } = await import('../server/core/until');
+  const h = await codexFake();
+  await h.send('first');
+  const quote = 'I copied this:\n\n' + delegateReport('Review', 'done', 'exactly this');
+  await h.app.call('session.send', { sessionId: h.id, text: quote, steer: true });
+  const check = { command: 'echo `date`', round: 1, rounds: 3, output: '', exitCode: 1 } as Parameters<typeof failureMessage>[0];
+  const failure = failureMessage(check);
+  const deliver = h.app as unknown as { deliver(rt: SessionRuntime, text: string, files: undefined, extra: object): Promise<unknown> };
+  await deliver.deliver(h.rt, failure, undefined, { until: { check } });
+  const content = h.calls.filter(c => c.method === 'turn/steer').map(c => c.params.input);
+  const imported = content.map((input, i) => transcript([{ id: 't', items: [{ id: String(i), type: 'userMessage', content: input }] }] as never)[0]);
+  expect(imported.map(userItemText)).toEqual([quote, '']);
+  expect(userItemText({ type: 'user', text: failure })).toBe('');
+});
 
 it('sends a native steer while a foreground command is still running', async () => {
   const h = await codexFake();
@@ -184,7 +246,7 @@ it.each([false, true])('Stop interrupts the exact child Codex turn and closes it
   expect(parent.rt.pendingDelegateReports.size).toBe(0);
 });
 
-it.each(['completed','idle'])('keeps a delegated Codex root until its receiver ends and retries unsubscribe (%s)', async end => {
+it.each(['completed', 'idle', 'trailing item', 'unrelated stored turn', 'unidentified follow-up'])('keeps a delegated Codex root until its receiver ends and retries unsubscribe (%s)', async end => {
   const parent = await codexFake();
   let failed = false;
   const codex = await codexFake({ turnsList: () => ({ data: [{ id: 'subturn', status: 'completed' }] }), unsubscribe: () => { if (!failed) { failed = true; throw Error('temporary'); } } });
@@ -195,12 +257,15 @@ it.each(['completed','idle'])('keeps a delegated Codex root until its receiver e
   await until(() => codex.count('turn/start') === 1, 'child start');
   codex.notify('item/completed', { threadId: 'th1', turnId: 'turn1', item: { id: 'spawn', type: 'collabAgentToolCall', tool: 'spawnAgent', status: 'completed',
     receiverThreadIds: ['receiver'], agentsStates: { receiver: { status: 'running' } } } });
-  codex.notify('turn/started', { threadId: 'receiver', turn: { id: 'subturn' } });
+  const unlinked = end === 'unrelated stored turn' || end === 'unidentified follow-up';
+  if (end !== 'unrelated stored turn') codex.notify('turn/started', { threadId: 'receiver', turn: { id: 'subturn' } });
+  codex.session().receiverWaitMs = unlinked ? 1800 : 60_000;
+  codex.notify('item/completed', { threadId: 'th1', turnId: 'turn1', item: { type: 'agentMessage', id: 'words', text: 'Root findings' } });
   codex.complete('turn1');
   await tick();
   expect(parent.rt.delegates.has(step.id)).toBe(true);
   expect(step.delegateReport).toBe('working');
-  if (end === 'idle') {
+  if (end !== 'completed') {
     await parent.rt.persistDelegate!();
     const disk = parent.app.store.loadSession(parent.id).items;
     expect(disk.find(i => i.id === step.id)).toMatchObject({ delegateReceiversPending: true });
@@ -213,10 +278,35 @@ it.each(['completed','idle'])('keeps a delegated Codex root until its receiver e
     restored.loadRestored(older);
     expect(restored.get<ToolItem>(step.id)?.result?.text).toContain('Sable restarted');
     codex.notify('thread/status/changed', { threadId: 'receiver', status: { type: 'idle' } });
+    if (end === 'trailing item') codex.notify('item/completed', { threadId: 'receiver', turnId: 'subturn', item: { id: 'tail' } });
+    if (end === 'unidentified follow-up') {
+      codex.notify('thread/status/changed', { threadId: 'receiver', status: { type: 'active' } });
+      codex.notify('thread/status/changed', { threadId: 'receiver', status: { type: 'idle' } });
+    }
   } else codex.notify('turn/completed', { threadId: 'receiver', turn: { id: 'subturn', status: 'completed' } });
   await until(() => !parent.rt.delegates.size, 'receiver finish');
+  expect(step.result?.text).toContain('Root findings');
+  if (unlinked) {
+    expect(step.result?.text).toContain('receiver completion was not confirmed');
+    expect(step.status).toBe('error');
+  } else expect(step.status).toBe('done');
   expect(codex.calls.filter(c => c.method === 'thread/unsubscribe').map(c => c.params.threadId)).toContain('th1');
   expect(codex.count('thread/unsubscribe')).toBeGreaterThanOrEqual(2);
+});
+
+it('keeps an idle quit interrupt open for the definitive Codex completion', async () => {
+  const h = await codexFake({ turnsList: () => ({ data: [{ id: 'turn1', status: 'inProgress' }] }) });
+  await h.send('review');
+  Object.assign(h.rt, { awaitingQuitResult: true });
+  await h.rt.handle!.interrupt();
+  h.status('idle');
+  await tick(1700);
+  expect(h.rt.turnActive).toBe(true);
+  h.notify('turn/completed', { threadId: 'th1', turn: { id: 'turn1', status: 'completed', items: [
+    { id: 'final', type: 'agentMessage', text: 'Definitive review' },
+  ] } });
+  expect(h.rt.items.findLast(i => i.type === 'turn')).toMatchObject({ stopReason: 'completed' });
+  expect(h.rt.get<TextItem>('turn1:final')?.text).toBe('Definitive review');
 });
 
 it('checks the recorded Codex dynamic result instead of trusting the call ID or status', async () => {
@@ -254,14 +344,31 @@ it('reconciles a Codex report by ID and waits for a personal retry decision for 
   h.complete('turn1');
 });
 
-it.each(['immediate', 'retry', 'force'])('hard-closes the dedicated app-server after unconfirmed interrupts without closing its account peer (exit delayed %s)', async delayed => {
+it('releases a report as unissued when an active Codex turn has no id', async () => {
+  const h = await codexFake({ turnStart: () => ({}) });
+  await h.send('begin');
+  const release = vi.fn();
+  await h.rt.handle!.send({ type: 'user', id: 'report', ts: Date.now(), text: 'report', state: 'sent' },
+    { delegateReport: true, taken: vi.fn(), release });
+  expect(h.count('turn/steer')).toBe(0);
+  expect(release).toHaveBeenCalledWith(true);
+});
+
+it.each(['immediate', 'retry', 'force', 'second force'])('hard-closes the dedicated app-server after unconfirmed interrupts without closing its account peer (exit delayed %s)', async delayed => {
   const h = await codexFake();
+  const confirmExit = gate();
   const rpc = {
     alive: true, ended: new Promise<void>(() => {}), close: vi.fn(async () => {
-      if (delayed === 'force' || delayed === 'retry' && rpc.close.mock.calls.length === 1) return new Promise<void>(() => {});
+      if (delayed.includes('force') || delayed === 'retry' && rpc.close.mock.calls.length === 1) return new Promise<void>(() => {});
       rpc.alive = false;
     }),
-    forceDelegate: vi.fn(async () => { rpc.alive = false; }),
+    forceDelegate: vi.fn(async () => {
+      if (delayed === 'second force') {
+        if (rpc.forceDelegate.mock.calls.length === 1) return;
+        await confirmExit.wait();
+      }
+      rpc.alive = false;
+    }),
     request: vi.fn(async (method: string) => {
       if (method === 'thread/start') return { thread: { id: 'only-child' }, model: 'm' };
       if (method === 'turn/start') return { turn: { id: 'only-turn' } };
@@ -282,15 +389,21 @@ it.each(['immediate', 'retry', 'force'])('hard-closes the dedicated app-server a
     await h.app.call('session.close', { sessionId: h.id, remove: true });
     expect(h.app.sessions.has(h.id)).toBe(false);
     expect(rpc.alive).toBe(true);
+    if (delayed === 'second force') {
+      await tick(8600);
+      expect((h.app as unknown as { retiredDelegates: Set<unknown> }).retiredDelegates.size).toBe(1);
+      confirmExit.open();
+    }
     await until(() => !rpc.alive, 'deleted process retired', 9000);
-    expect(rpc.forceDelegate).toHaveBeenCalledTimes(delayed === 'force' ? 1 : 0);
+    await until(() => !(h.app as unknown as { retiredDelegates: Set<unknown> }).retiredDelegates.size, 'confirmed process released');
+    expect(rpc.forceDelegate).toHaveBeenCalledTimes(delayed === 'second force' ? 2 : delayed === 'force' ? 1 : 0);
     expect(rpc.close).toHaveBeenCalledWith(0, 'timeout');
     expect(rpc.request.mock.calls.filter(([method]) => method === 'turn/interrupt').length).toBeGreaterThan(1);
     expect(rpc.close.mock.calls.length).toBeGreaterThanOrEqual(delayed === 'immediate' ? 1 : 2);
     expect(start).toHaveBeenCalledTimes(1);
     expect(h.count('turn/interrupt')).toBe(0);
   } finally { vi.restoreAllMocks(); }
-}, 12_000);
+}, 20_000);
 
 const lastTurn = (rt: SessionRuntime) => rt.items.findLast((i) => i.type === 'turn') as { stopReason?: string; error?: string } | undefined;
 
@@ -381,7 +494,7 @@ describe('#13: an idle probe gives way to newer news, and a stale answer is aske
     await h.send('second');
     h.status('idle');
     await until(() => !h.rt.turnActive || h.count('turn/start') === 2, 'the turn closed', 3000);
-    await tick(50);
+    await until(() => h.count('turn/start') === 2, 'the queued input checkpointed and sent');
     expect(h.count('thread/turns/list')).toBe(2);
     expect(lastTurn(h.rt)?.stopReason).toBe('completed');
     // It ended as the thread stored it: the queued message went out.

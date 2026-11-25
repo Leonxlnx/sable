@@ -182,11 +182,15 @@ describe('#11: a Claude Code result that cannot be told apart', () => {
       await h.stop();
       await vi.advanceTimersByTimeAsync(2_500);
       expect(h.rt.queue.map(q => q.text)).toEqual(['first']);
+      expect(h.rt.queue[0]).toMatchObject({ byHand: true, issuedUuid: first });
+      // This test drains a confirmed withdrawal. A missing receipt alone leaves it manual.
+      h.rt.confirmDropped(first);
       await h.send('second');
 
       const activeAfterFrame = h.result().then(() => h.rt.turnActive);
       // Run the queue dispatch before inspecting the chat, as in the failing order.
       await vi.advanceTimersByTimeAsync(5);
+      await vi.waitFor(() => expect(h.pushed).toHaveLength(3));
       expect(h.pushed.map(m => m.message.content)).toEqual(['first', 'second', 'first']);
       expect(h.pushed[2].uuid).not.toBe(first);
       expect(await activeAfterFrame).toBe(false);
@@ -219,6 +223,7 @@ describe('#11: a Claude Code result that cannot be told apart', () => {
   it('with a background task running, the next message waits; the process going idle sends it there', async () => {
     const h = await settledWithTask();
     await h.system({ subtype: 'session_state_changed', state: 'idle' });
+    await until(() => h.pushed.length === 2, 'checkpoint and release');
     expect(h.pushed).toHaveLength(2);
     expect(h.procs).toHaveLength(1);
     expect(h.rt.meta.activity).toBe('Thinking');
@@ -232,6 +237,7 @@ describe('#11: a Claude Code result that cannot be told apart', () => {
     const h = await settledWithTask();
     // The first turn's late result.
     await h.result(true);
+    await until(() => h.pushed.length === 2, 'checkpoint and release');
     expect(h.pushed).toHaveLength(2);
     expect(h.rt.turnActive).toBe(true);
     expect(h.turns()).toHaveLength(0);
@@ -256,6 +262,7 @@ describe('#11: a Claude Code result that cannot be told apart', () => {
     }
     expect(h.procs).toHaveLength(2);
     expect(h.procs[0].closed()).toBe(true);
+    await until(() => h.pushed.length === 2, 'checkpoint on replacement process');
     expect(h.pushed).toHaveLength(2);
     // What the old process still writes reaches nothing.
     await h.result(true, h.procs[0]);

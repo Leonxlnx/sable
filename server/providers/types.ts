@@ -59,6 +59,8 @@ export interface SendOptions {
   delegateReport?: boolean;
   /** Throws when the sender may no longer act: asked right before the message goes. */
   check?: () => void;
+  /** Synchronous durable transition immediately before offering this report to the native transport. */
+  issueReport?: () => void;
   /** Called once when the agent confirms delivery of this specific input. */
   taken?: () => void;
   /** A legacy result ended the input without enough evidence to retry it safely. */
@@ -70,8 +72,8 @@ export interface SendOptions {
 /** A live connection between one SessionRuntime and the provider's agent process. */
 export interface ProviderSession {
   /**
-   * Delivers a user message. The UserItem is already on the timeline; when a turn is
-   * running its `state` is "queued" and the adapter flips it to "sent" once consumed
+   * Delivers a user message. A personal timeline card starts queued. The adapter marks it
+   * sent when the provider confirms the input
    * (`rt.taken`). A `steered` item goes to the running agent now, to be taken at its next step.
    * `opts.check`: called right before the message goes to the agent (after any wait of the adapter's
    * own, as Codex loading its thread); it throws when the sender may no longer act (a phone removed

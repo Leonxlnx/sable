@@ -165,6 +165,17 @@ describe('a removed phone (8)', () => {
   });
 });
 
+it('joins repeated phone retries by ID and accepts identical words under a fresh ID', async () => {
+  const { app, port, home } = await setup();
+  const { c } = await pairSecure(app, port);
+  const rt = await chatOf(app, c, home);
+  rt.beginTurn();
+  const send = (submitId: string) => c.call('session.send', { sessionId: rt.id, text: 'same words', submitId });
+  const replies = await Promise.all(['one', 'one', 'one', 'two'].map(send));
+  expect(replies.map(reply => (reply.result as { submitId: string }).submitId)).toEqual(['one', 'one', 'one', 'two']);
+  expect(rt.queue.map(q => q.text)).toEqual(['same words', 'same words']);
+});
+
 it.each([false, true])('retains accepted queued input when the socket sleeps (revoked %s)', async revoked => {
   const { app, phone, port, home } = await setup();
   const pair = await pairSecure(app, port);
@@ -263,6 +274,18 @@ describe('a queued message the phone takes back (17)', () => {
     const send = ws.send.bind(ws) as (d: unknown, o: unknown, cb?: (e?: Error) => void) => void;
     (ws as unknown as { send: typeof send }).send = (d, o, cb) => send(d, o, (e) => void setTimeout(() => cb?.(fail ? new Error('cut off') : e), ms));
   }
+
+  it('rejects a text-only phone take after a desktop attachment edit', async () => {
+    const { app, port, home } = await setup();
+    const { c } = await pairSecure(app, port);
+    const rt = await chatOf(app, c, home);
+    const q = rt.enqueue('first words');
+    rt.updateQueued(q.id, q.text, [{ kind: 'text', id: 'f', name: 'notes', text: 'keep me' }]);
+    const reply = await c.call('queue.take', { sessionId: rt.id, id: q.id, ack: true });
+    expect(reply.ok).toBe(false);
+    expect(rt.isReserved(q.id)).toBe(false);
+    expect(rt.queue[0].attachments?.[0].text).toBe('keep me');
+  });
 
   it('is reserved while the reply goes: an edit on the desktop is refused (not lost), the queue does not send it, then it is taken', async () => {
     const { app, phone, port, home } = await setup();

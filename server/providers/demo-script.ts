@@ -172,6 +172,7 @@ export class Script {
   private sinceFlush = 0;
   /** Messages steered into this turn, answered at the next step. */
   private steers: UserItem[] = [];
+  private steerReady = new WeakMap<UserItem, Promise<boolean>>();
   private answering = false;
 
   constructor(private env: ScriptEnv) {
@@ -351,6 +352,12 @@ export class Script {
   /** A message sent into the running turn: answered at the next step, then the work goes on. */
   steer(item: UserItem) {
     this.steers.push(item);
+    const committed = this.rt.persistInput?.();
+    if (committed) {
+      // The simulated next step follows admission, just as a native replay follows the write.
+      this.steerReady.set(item, committed.then(() => new Promise<boolean>(resolve => setImmediate(resolve, true)), () => false));
+    }
+    return committed;
   }
 
   /** Steered messages the turn ended before taking (the session sends them next). */
@@ -366,6 +373,10 @@ export class Script {
       while (this.steers.length) {
         this.check();
         const item = this.steers.shift()!;
+        const ready = this.steerReady.get(item);
+        if (ready && !await ready) continue;
+        this.check();
+        if (!this.rt.get(item.id)) continue;
         this.rt.taken(item.id);
         this.step();
         await this.sayNow(steerReply(item.text));

@@ -95,17 +95,27 @@ export function tailGlide(prev: { place: number; stuck: boolean } | null, place:
 }
 
 /**
- * The bottom padding to add, below one device pixel, so the conversation's height is a whole number of
- * device pixels: `height` is its height now (layout pixels, `extra` included), `k` device pixels to the
- * layout pixel. A view kept at the end stands on the scroller's largest offset, which the browser
- * rounds to a whole device pixel; with a height of any fraction (the real heights of older turns built
- * above as a long chat's pages arrive, a new line below) the end stood a quarter, a half or three
- * quarters of a device pixel off from one change to the next at 125%, and its words shimmered by a
- * device pixel (its last line read 757.33, 757.53, 757.93). Added at the bottom, it moves nothing above.
+ * The room to add ABOVE the conversation, below one device pixel, so that its end (the lower edge of
+ * its last row, `end` layout pixels from the top of what scrolls, this room not counted) stands on a
+ * whole number of device pixels; `k` is device pixels to the layout pixel. `keep` is returned when the
+ * scale cannot be read.
+ *
+ * A view kept at the end stands on the scroller's largest offset, which the browser rounds to a whole
+ * device pixel. The end is drawn at its own offset less that scroll: whenever the height of what
+ * stands above it changes by a fraction (the real heights of older turns built above as a long chat's
+ * pages arrive), the end lands on another fraction of a device pixel and its words shimmer by one
+ * (at 125% its lower edge read 757.33, 757.53, 757.93 from page to page). With the end's own offset
+ * whole, the scroll is whole too and the end is drawn at the view's height less the dock's padding,
+ * whatever is built above.
+ *
+ * The first version of this added the room BELOW the end (a bottom padding that made the whole height
+ * a whole number): the scroll was whole then, but the end itself stood that padding higher, a
+ * different fraction after every page, and measured in the packaged app it took seven values
+ * (756.72 to 757.93) where it had taken six.
  */
-export function endSnap(height: number, extra: number, k: number): number {
-  if (!(k > 0) || !Number.isFinite(k) || !Number.isFinite(height)) return extra;
-  const dev = (height - extra) * k;
+export function endSnap(end: number, k: number, keep = 0): number {
+  if (!(k > 0) || !Number.isFinite(k) || !Number.isFinite(end)) return keep;
+  const dev = end * k;
   const whole = Math.ceil(dev - 1e-3);
   return Math.max(0, (whole - dev) / k);
 }

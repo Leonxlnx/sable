@@ -213,7 +213,10 @@ describe('move and quit races', { timeout: 20000 }, () => {
     } else {
       await expect(h.app.call('queue.sendNow', { sessionId: rt.id, id: queued.id })).rejects.toThrow(/lane/i);
     }
-    expect(rt.queue).toEqual([queued]);
+    // The entry and its attachment are kept as they were; a refused Send now also says why on the row (0.2.37).
+    expect(rt.queue).toMatchObject([queued]);
+    expect(rt.queue).toHaveLength(1);
+    if (mode === 'send now') expect(rt.queue[0].steerWait?.reason).toMatch(/lane folder is gone/);
     expect(h.ctl.sent).toHaveLength(0);
     rt.update({ cwd: h.home, lane: null });
     paired = false;
@@ -248,8 +251,11 @@ describe('move and quit races', { timeout: 20000 }, () => {
       apps.splice(apps.indexOf(h.app), 1);
       const back = start({}, { home: h.home });
       const snap = await back.app.call('session.snapshot', { sessionId: rt.id });
-      expect(snap.queue).toEqual([]);
-      expect(snap.items.filter(i => i.type === 'user' && i.text === entry.text)).toMatchObject([{ id: entry.id }]);
+      // One instruction, and where it truly stands (0.2.37): the provider never confirmed the write before the
+      // quit, so it is back in the queue for the person to send again, and no card claims it was sent.
+      expect(snap.queue).toMatchObject([{ text: entry.text, byHand: true }]);
+      expect(snap.queue).toHaveLength(1);
+      expect(snap.items.filter(i => i.type === 'user' && i.text === entry.text)).toEqual([]);
     } finally { wait.release(); await delivery; }
   });
 

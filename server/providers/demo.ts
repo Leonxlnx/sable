@@ -358,12 +358,12 @@ class DemoSession implements ProviderSession {
 
   async send(item: UserItem): Promise<void> {
     if (this.current && item.steered && this.script) {
-      this.script.steer(item);
-      return;
+      return this.script.steer(item);
     }
     if (this.current) {
       this.queue.push(item);
       if (item.state !== 'queued') this.rt.patch<UserItem>(item.id, { state: 'queued' });
+      await this.rt.persistInput?.();
       return;
     }
     this.start(item);

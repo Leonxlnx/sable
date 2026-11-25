@@ -1505,6 +1505,48 @@ button:hover > .row-caret {
   white-space: nowrap;
 }
 
+/* "Send report again" on the line of a handed-over task whose report's delivery is unknown: a bare
+   chip of the line's height in the line's size, a step up in tone (it is the one thing to do here). */
+.agent-again {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  height: 22px;
+  margin: 0 -3px;
+  padding: 0 6px;
+  border-radius: var(--r-ctl-xs);
+  font-size: 12px;
+  color: var(--text-2);
+  transition:
+    background-color var(--d-1) var(--ease),
+    color var(--d-1) var(--ease),
+    scale var(--d-spring-soft) var(--spring-soft);
+}
+
+.agent-again:hover {
+  color: var(--text);
+  background-color: var(--fill-1);
+}
+
+.agent-again:active {
+  background-color: var(--fill-2);
+  scale: var(--press);
+  transition-duration: var(--d-1), var(--d-1), 70ms;
+}
+
+.agent-again:focus-visible {
+  outline: var(--focus-w) solid var(--focus);
+  outline-offset: var(--focus-inset);
+}
+
+/* On its way to the bridge: the chip keeps its place and takes no second press. */
+.agent-again[aria-disabled='true'] {
+  color: var(--text-4);
+  background-color: transparent;
+  scale: none;
+  cursor: default;
+}
+
 .agent-error {
   margin: 2px 0 6px;
 }

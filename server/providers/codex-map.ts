@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { endsWithSteerNote, importedSteerText } from '../../shared/synthetic';
+import { endsWithSteerNote, nativePersonalPrompt, nativePersonalWords, isUntilFailure, UNTIL_INPUT_END } from '../../shared/synthetic';
 import { speedFor } from '../../shared/speed';
 import { STANDARD_SPEED, STEER_FIRST_BLOCK } from '../../shared/protocol';
 import type {
@@ -358,7 +358,7 @@ export function matchSkill(token: string, skills: SkillInfo[]): SkillInfo | unde
   );
 }
 
-export function buildInput(text: string, attachments: Attachment[] | undefined, skills: SkillInfo[]): UserInput[] {
+export function buildInput(text: string, attachments: Attachment[] | undefined, skills: SkillInfo[], personal?: { words: string; start: number }): UserInput[] {
   let body = text;
   const extra: UserInput[] = [];
   for (const a of attachments ?? []) {
@@ -380,6 +380,7 @@ export function buildInput(text: string, attachments: Attachment[] | undefined, 
       extra.push({ type: 'skill', name: s.name, path: s.path });
     }
   }
+  if (personal) body = nativePersonalPrompt(body, personal.words, personal.start, text.length);
   return [{ type: 'text', text: body, text_elements: [] }, ...extra];
 }
 
@@ -819,9 +820,13 @@ function userFromItem(item: Extract<ThreadItem, { type: 'userMessage' }>, ts: nu
     else if (x.type === 'image' && x.url) attachments.push({ id: `${item.id}:${attachments.length}`, kind: 'image', name: 'image', dataUrl: x.url });
     else if (x.type === 'localImage' && x.path) attachments.push({ id: `${item.id}:${attachments.length}`, kind: 'image', name: base(x.path), path: x.path });
   }
-  const text = texts.join('\n');
-  return { type: 'user', ts, text: steered ? importedSteerText(text) : text,
-    ...(steered || texts.some(endsWithSteerNote) ? { authored: true } : {}), attachments: attachments.length ? attachments : undefined, state: 'sent', providerId: item.id };
+  // A drained turn can contain several prompts. Each source span is local to one text block.
+  const parts = texts.map(text => ({ text, words: nativePersonalWords(text) }));
+  const visible = parts.filter(p => p.words !== undefined || !p.text.endsWith(UNTIL_INPUT_END));
+  const body = visible.length ? visible.map(p => p.words ?? p.text).join('\n') : texts.join('\n');
+  const authored = visible.some(p => p.words !== undefined) || !isUntilFailure(body) && !body.endsWith(UNTIL_INPUT_END) && (steered || texts.some(endsWithSteerNote));
+  return { type: 'user', ts, text: body,
+    ...(authored ? { authored: true } : {}), attachments: attachments.length ? attachments : undefined, state: 'sent', providerId: item.id };
 }
 
 /** Rebuilds a timeline from stored turns (thread/read or thread/resume with turns). */

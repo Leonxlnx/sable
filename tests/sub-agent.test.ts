@@ -8,6 +8,8 @@ import type { BridgeEvent, ToolItem } from '@shared/protocol';
 import { App } from '../server/app';
 import { GatedProcess } from '../server/core/auth-gate';
 import { runSubAgent, claimStep } from '../server/core/sub-agent';
+import { SessionRuntime } from '../server/core/runtime';
+import type { Provider, ProviderSession } from '../server/providers/types';
 import { AGENT_INPUT_SCHEMA, agentToolDescription, agentOfTool, describeAgentCall, readAgentCall } from '../server/providers/agent-tool';
 import { DemoProvider } from '../server/providers/demo';
 
@@ -41,6 +43,42 @@ describe('sub-agent tool', () => {
       await termination;
       expect(kill.mock.calls.filter(([signal]) => signal === 'SIGKILL')).toHaveLength(4);
       expect(process.listenerCount('exit')).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['open', 'send', 'root', 'receiver', 'save', 'close'])('ends the delegate wait when %s never answers', async phase => {
+    const rt = new SessionRuntime({ id: 'parent', provider: 'codex', cwd: process.cwd(), title: 'test', titleSource: 'user',
+      model: 'm', mode: 'default', status: 'idle', createdAt: 1, updatedAt: 1, usage: { turns: 0, inputTokens: 0, outputTokens: 0 } }, () => {}, () => {});
+    const never = new Promise<void>(() => {});
+    let finishOpen!: () => void;
+    let child!: SessionRuntime;
+    const hard = vi.fn(async () => {});
+    const handle = { send: async () => {
+      child.beginTurn();
+      if (phase === 'send') return never;
+      if (phase !== 'root') child.endTurn();
+    }, waitForReceivers: () => phase === 'receiver' ? never : undefined,
+      close: () => phase === 'close' ? never : Promise.resolve(), terminateDelegate: hard } as unknown as ProviderSession;
+    const provider = { open: async (r: SessionRuntime) => {
+      child = r;
+      if (phase === 'open') await new Promise<void>(resolve => { finishOpen = resolve; });
+      return handle;
+    } } as unknown as Provider;
+    if (phase === 'save') rt.persistDelegate = () => never;
+    vi.useFakeTimers();
+    try {
+      let result: { ok: boolean; text: string } | undefined;
+      void runSubAgent({ provider: () => provider, accountFor: () => undefined, defaultModel: () => 'm', modeFor: () => 'default', log() {} },
+        rt, { agent: 'codex', prompt: 'test', description: 'deadline' }, 'step').then(r => { result = r; });
+      const bound = { open: 90_000, send: 90_000, root: 86_400_000, receiver: 600_000, save: 5000, close: 6000 }[phase]!;
+      await vi.advanceTimersByTimeAsync(bound + 10);
+      expect(result).toBeDefined();
+      expect(rt.get<ToolItem>('step')?.status).not.toBe('running');
+      expect(rt.delegates.size).toBe(0);
+      if (phase === 'save') expect(rt.items.some(i => i.type === 'notice' && i.text.includes('Could not save'))).toBe(true);
+      if (phase === 'open') finishOpen();
+      await vi.advanceTimersByTimeAsync(1510);
+      if (phase === 'open' || phase === 'close') expect(hard).toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
   });
 

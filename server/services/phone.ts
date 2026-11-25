@@ -1755,6 +1755,10 @@ export class PhoneService {
     // Reserved: neither edited nor sent while the reply goes (core/runtime.ts `reserveQueued`).
     const held = rt.reserveQueued(qid);
     if (!held) return this.sendFrame(link, { id, ok: true, result: {} });
+    if (held.message.attachments?.length) {
+      rt.rollbackReserved(qid);
+      return this.sendFrame(link, { id, ok: false, error: 'This message has attachments. Take it back on the desktop.' });
+    }
     // A phone that confirms (`ack`) gets a receipt: the message stays reserved until it says it kept
     // the words (`phone.takeDone`), never on the reply's way out alone.
     const take = params.ack === true ? randomBytes(18).toString('base64url') : undefined;

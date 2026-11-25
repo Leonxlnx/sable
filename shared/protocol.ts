@@ -456,6 +456,8 @@ export interface SessionMeta {
   cwd: string;
   title: string;
   titleSource: 'auto' | 'user';
+  /** The automatic title was derived from a personal card. */
+  titleAuthored?: true;
   /** A small model was asked for this chat's title after its first turn (once per chat, whatever came of it; `server/core/titles.ts`). */
   titleAsked?: boolean;
   model: string;
@@ -849,7 +851,13 @@ export interface SteerDestination {
 }
 
 export interface UserItem extends BaseItem {
+  /** A native RPC may have received this input. A restart without a receipt requires a decision. */
+  awaitingNativeReceipt?: true;
+  /** Held before dispatch by the account's credit policy. The limit card owns its continuation. */
+  heldAtLimit?: true;
   issuedTo?: SteerDestination;
+  /** This personal turn completed and supersedes earlier report-blocking limits. */
+  completedPersonalTurn?: true;
   /** Automatic report continuations spent by this personal input. */
   delegateContinuations?: number;
   authored?: true;
@@ -1104,14 +1112,14 @@ export interface ToolItem extends BaseItem {
   delegateReceiptState?: 'checking' | 'unknown' | null;
   /** One decision token per uncertain attempt, consumed by the built-in /report-retry command. */
   delegateRetryId?: string | null;
-  /** Native destination whose transcript must be checked before reissuing this report. */
-  delegateAttempt?: { provider: ProviderId; account?: string; session?: string; after?: string; tool?: string; budget?: string };
+  /** The prepared ID moves to issued at the native offer. Older issued attempts have neither field. */
+  delegateAttempt?: { provider: ProviderId; account?: string; session?: string; after?: string; tool?: string; budget?: string; prepared?: string; issued?: string };
   /** Budget anchor for an imported conversation with no personal card. */
   delegateContinuations?: number;
   /** Foreground tool callback that has not yet produced a native tool-result receipt. */
   delegateCaller?: number;
   /** A completed report held for the next personal input. Null clears the hold in a patch. */
-  delegateWait?: 'budget' | 'stop' | 'retry' | null;
+  delegateWait?: 'budget' | 'stop' | 'provider' | 'retry' | null;
   delegateReport?: 'working' | 'stopping' | 'pending' | 'delivered' | 'stopped';
   type: 'tool';
   /** Raw provider tool name, e.g. "Bash", "mcp__github__create_issue". */
@@ -2546,6 +2554,8 @@ export interface SessionSnapshot {
  * timeline yet) and sends it when the turn ends normally, one per turn end.
  */
 export interface QueuedMessage {
+  /** A positive receipt restores an ordinary send in its original role. Older UUIDs were steers. */
+  issuedAtRest?: true;
   until?: UntilMark;
   issuedTo?: SteerDestination;
   /** The original SDK payload when the waiting copy has since been edited. */

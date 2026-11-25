@@ -1,15 +1,16 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { matchModel, type ModelInfo } from '@shared/protocol';
 import { baseName } from '@desk/lib/format';
 import { pushBack } from '@m/lib/back';
-import { conn } from '@m/lib/conn';
+import { composition, HOME_DRAFT, keepOpeningDraft, onDraft, setDraft } from '@m/lib/drafts';
+import { sendPress } from '@m/lib/phone-send';
+import { pressFrom } from '@m/lib/submit';
 import { dropFlight, launchFlight } from '@m/lib/flight';
 import { onKeyboard } from '@m/lib/keyboard';
 import { fit } from '@m/lib/fit';
 import { haptic, isNative } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
-import { onForget } from '@m/lib/forget';
 import { notSentHere, sentHere } from '@m/lib/follow';
 import { epoch, still } from '@m/lib/epoch';
 import { openFrom } from '@m/lib/open';
@@ -21,16 +22,6 @@ import { effortName } from '@desk/lib/models';
 import { AgentSheet, createChat, FolderSheet, useNewChat } from './NewChat';
 import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
 
-const DRAFT = 'sable.newdraft';
-// Forgetting the computer forgets the words written for a new chat on it.
-onForget(() => {
-  try {
-    localStorage.removeItem(DRAFT);
-  } catch {
-    /* private mode */
-  }
-});
-
 /**
  * New chat, as on the desktop's home: the prompt bar itself. At rest one line of frosted glass over
  * the field; touched, it opens (the agent, the folder and the model as chips over the words) and
@@ -39,13 +30,8 @@ onForget(() => {
  */
 export function HomeDock({ covered }: { covered: boolean }) {
   const online = useStore((s) => s.conn === 'open');
-  const [text, setText] = useState(() => {
-    try {
-      return localStorage.getItem(DRAFT) ?? '';
-    } catch {
-      return '';
-    }
-  });
+  const draft = useSyncExternalStore(fn => onDraft(HOME_DRAFT, fn), () => composition(HOME_DRAFT));
+  const text = draft.t;
   const [focused, setFocused] = useState(false);
   const [sheet, setSheet] = useState<'agent' | 'folder' | 'model' | 'mode' | null>(null);
   const [busy, setBusy] = useState(false);
@@ -56,16 +42,9 @@ export function HomeDock({ covered }: { covered: boolean }) {
   const open = focused || !!text.trim() || !!sheet;
 
   const size = () => fit(area.current, 150);
-  useEffect(size, []);
+  useEffect(size, [text]);
   const update = (v: string) => {
-    setText(v);
-    try {
-      if (v.trim()) localStorage.setItem(DRAFT, v);
-      else localStorage.removeItem(DRAFT);
-    } catch {
-      /* private mode */
-    }
-    requestAnimationFrame(size);
+    setDraft(HOME_DRAFT, v, { now: true });
   };
 
   // "New chat" from the app icon's shortcuts: the bar opens, focused, with the keyboard up.
@@ -110,27 +89,28 @@ export function HomeDock({ covered }: { covered: boolean }) {
     const at = performance.now();
     if (el && dock.current) launchFlight(t, el, dock.current);
     else haptic('tap');
-    update('');
     const e = epoch();
+    const firstMessage = pressFrom(HOME_DRAFT, draft);
     let sid = '';
     try {
-      const snap = await createChat(c, t);
-      applySnapshot(snap);
-      openFrom(snap.session.id, dock.current, 26);
-      // The bar holds still until the drop has left its edge.
-      window.setTimeout(() => area.current?.blur(), Math.max(0, 200 - (performance.now() - at)));
-      nav.chat(snap.session.id);
-      // The message goes once the chat is there (it may have opened in a fresh folder named after it).
-      sentHere(snap.session.id);
+      await keepOpeningDraft(draft, e);
+      if (!still(e)) return;
+      const snap = await createChat(c, text);
+      if (!still(e)) return;
       sid = snap.session.id;
-      await conn.call('session.send', { sessionId: snap.session.id, text: t });
+      const r = await sendPress(firstMessage(sid, composition(sid).r), e, () => {
+        applySnapshot(snap);
+        openFrom(sid, dock.current, 26);
+        window.setTimeout(() => area.current?.blur(), Math.max(0, 200 - (performance.now() - at)));
+        nav.chat(sid);
+        sentHere(sid);
+      });
+      if (still(e) && r.queued) notSentHere(sid);
     } catch (err) {
+      if (!still(e)) return;
       if (sid) notSentHere(sid);
       dropFlight();
-      // Forgotten (or replaced by another computer) while the chat was being made: its words are not put back.
-      if (!still(e)) return;
       haptic('deny');
-      if (!area.current?.value) update(t);
       setState({ toast: { text: (err as Error).message, level: 'error', at: Date.now() } });
     } finally {
       setBusy(false);
@@ -199,6 +179,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
             className="dock-input"
             rows={1}
             value={text}
+            readOnly={busy}
             placeholder={open && c.agent ? `Ask ${SHORT_NAME[c.agent]}` : 'New chat'}
             disabled={!online && !text}
             onChange={(e) => update(e.target.value)}

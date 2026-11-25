@@ -160,6 +160,277 @@ async function foldedFixture() {
   return { ...f, tail };
 }
 
+it('repairs phone receipts after a desktop read, take and restart through a locked index', async () => {
+  const { home, file, rows } = fixture();
+  const phoneSender = { deviceId: 'paired', generation: 1 };
+  const q = { id: 'p', submitId: 'p', text: 'phone words', phoneSender, createdAt: 1 };
+  writeFileSync(file('a'), JSON.stringify({ gen: 42, items: rows, todos: [], queue: [q] }));
+  const db = new DatabaseSync(path.join(home, 'phone-submissions.sqlite'));
+  db.exec('BEGIN EXCLUSIVE');
+  const app = restoredApp(home);
+  try {
+    expect((await app.call('session.snapshot', { sessionId: 'a' })).items).toEqual(rows);
+    await expect(app.call('session.submission', { sessionId: 'a', submitId: 'p' }, { phoneSender })).rejects.toThrow();
+    await app.call('queue.take', { sessionId: 'a', id: 'p' });
+    const disk = app.store.loadSession('a');
+    expect(disk.items).toEqual(rows);
+    expect(disk.queue).toEqual([]);
+    expect(disk.receiptRepair).toEqual(['p']);
+  } finally { await app.dispose(); db.close(); }
+  const restart = restoredApp(home);
+  try {
+    expect(await restart.call('session.submission', { sessionId: 'a', submitId: 'p' }, { phoneSender })).toMatchObject({ ok: true });
+    expect(restart.runtime('a').items).toEqual(rows);
+  } finally { await restart.dispose(); }
+});
+
+it.each(['read', 'install', 'normalize'])('retries a failed %s without publishing its partial runtime', async phase => {
+  const { home, file, old, rows } = fixture();
+  const app = restoredApp(home), rt = app.runtime('a');
+  const read = vi.spyOn(app.store, 'loadSessionAsync');
+  rt.meta.unread = true;
+  if (phase === 'read') read.mockRejectedValueOnce(Error('transient read failure'));
+  else if (phase === 'install') vi.spyOn(rt, 'loadRestored').mockImplementationOnce(() => { throw Error('failed restore'); });
+  else vi.spyOn(app.store, 'bindProviderInputs').mockImplementationOnce(() => {
+    rt.notice('info', 'partial edit'); throw Error('failed binding');
+  });
+  try {
+    const first = await app.call('session.snapshot', { sessionId: 'a' });
+    expect(first.items).toMatchObject([{ text: 'This chat could not be read from disk' }]);
+    expect(rt.meta.unread).toBe(true);
+    rt.notice('info', 'edit before successful restore');
+    await app.store.flush();
+    expect(readFileSync(file('a'), 'utf8')).toBe(old);
+    expect(existsSync(file('a.tail'))).toBe(false);
+    const preview = vi.spyOn(app.store, 'readSessionEnd');
+    await app.call('session.snapshot', { sessionId: 'a', page: 'end' });
+    expect(preview).not.toHaveBeenCalled();
+    expect((await app.call('session.snapshot', { sessionId: 'a' })).items).toEqual(rows);
+    expect(read).toHaveBeenCalledTimes(2);
+  } finally { await app.dispose(); }
+});
+
+it('keeps the disk history through a failed phone lookup and the next desktop send', async () => {
+  const { home, file, rows } = fixture();
+  const phoneSender = { deviceId: 'paired', generation: 1 };
+  writeFileSync(file('a'), JSON.stringify({ gen: 42, items: rows, todos: [], queue: [
+    { id: 'q', submitId: 'q', text: 'from phone', phoneSender, byHand: true, createdAt: 1 }] }));
+  const app = restoredApp(home);
+  const db = new DatabaseSync(path.join(home, 'phone-submissions.sqlite'));
+  db.exec('BEGIN EXCLUSIVE');
+  try {
+    await expect(app.call('session.submission', { sessionId: 'a', submitId: 'q' }, { phoneSender })).rejects.toThrow();
+    expect(await app.call('session.send', { sessionId: 'a', text: 'desktop after restart' })).toMatchObject({ ok: true });
+    await app.store.persistInput('a');
+    const saved = app.store.loadSession('a');
+    expect(saved.items.slice(0, rows.length)).toEqual(rows);
+    expect(saved.items.some(row => row.type === 'user' && row.text === 'desktop after restart') ||
+      saved.queue?.some(row => row.text === 'desktop after restart')).toBe(true);
+  } finally { await app.dispose(); db.close(); }
+});
+
+it('keeps the published base intact if a newer staged document has a damaged middle', async () => {
+  const { home, file, old } = fixture();
+  const tmp = file('a') + '.2147483646.tmp';
+  writeFileSync(tmp, '{"gen":43,"items":[\n{"id":broken}\n],"todos":[]}');
+  utimesSync(tmp, new Date(), new Date(Date.now() + 10_000));
+  const store = new Store(home);
+  try {
+    expect(store.loadSession('a').unreadable).toBe(true);
+    expect(readFileSync(file('a'), 'utf8')).toBe(old);
+    expect(existsSync(tmp)).toBe(true);
+  } finally { await store.seal(); }
+});
+
+it('refuses a partial runtime even if its lazy flag was cleared after the disk read', async () => {
+  const { home, file, old, rows } = fixture();
+  const app = restoredApp(home), rt = app.runtime('a');
+  try {
+    expect(app.store.loadSession('a').items).toEqual(rows);
+    (app as unknown as { lazy: Set<string> }).lazy.delete('a');
+    rt.notice('info', 'only row in the partial runtime');
+    await expect(rt.persistInput!()).rejects.toThrow('could not be read');
+    await app.store.flush();
+    expect(readFileSync(file('a'), 'utf8')).toBe(old);
+    expect(existsSync(file('a.tail'))).toBe(false);
+    expect((await app.call('session.snapshot', { sessionId: 'a' })).items).toEqual(rows);
+  } finally { await app.dispose(); }
+});
+
+it('never retries a refused partial snapshot at quit after a later successful read', async () => {
+  const { file, home, old, rows } = fixture();
+  const store = new Store(home);
+  try {
+    store.saveSession('a', () => ({ items: [], todos: [], dirty: 'all' }));
+    const writing = store.persistInput('a');
+    expect(store.loadSession('a').items).toEqual(rows);
+    await expect(writing).rejects.toThrow('Could not save');
+    await expect(store.seal()).rejects.toThrow('Could not save');
+    expect(readFileSync(file('a'), 'utf8')).toBe(old);
+    expect(existsSync(file('a.tail'))).toBe(false);
+  } finally { await store.seal().catch(() => {}); }
+});
+
+it('refuses a cold replacement and permits a hydrated rewind and clear', async () => {
+  const { file, files, old, rows } = fixture();
+  const save = (items: TimelineItem[]) => files.save('a', () => ({ items, todos: [], dirty: 'all' }), true);
+  for (const cut of [[], rows.slice(0, 1)]) {
+    await expect(save(cut)).rejects.toThrow(/before reading/);
+    expect(readFileSync(file('a'), 'utf8')).toBe(old);
+  }
+  expect(files.load('a').items).toEqual(rows);
+  await save(rows.slice(0, 1));
+  expect(files.load('a').items).toEqual(rows.slice(0, 1));
+  await save([]);
+  expect(files.load('a').items).toEqual([]);
+});
+
+it.each(['base', 'tail'])('adopts a complete ordinary %s temp left at the rename and discards obsolete or partial stages', async kind => {
+  const { file, home, rows } = fixture();
+  const crash = () => {
+    const child = spawnSync(process.execPath, ['tests/fixtures/migration-crash.mjs', home, 'staged-' + kind],
+      { stdio: 'inherit', windowsHide: true, timeout: 15_000 });
+    expect(child.status).toBe(91);
+  };
+  const temps = () => readdirSync(path.dirname(file('a'))).filter(n => n.endsWith('.tmp'));
+  crash();
+  expect(temps()).toHaveLength(1);
+  const first = new Store(home);
+  try {
+    expect(first.loadSession('a').items.map(r => r.id)).toEqual([...rows.map(r => r.id), 'peer-save']);
+    await vi.waitFor(() => expect(temps()).toEqual([]));
+  } finally { await first.seal(); }
+  crash();
+  const [stage] = temps();
+  writeFileSync(file('a'), JSON.stringify({ gen: Date.now() + 99, items: [rows[0]], todos: [] }));
+  const partial = file('a') + '.2147483646.tmp';
+  writeFileSync(partial, '{"gen":3,"items":[\n{"id":"cut"}');
+  // Even a misleadingly late timestamp cannot authorize an obsolete staged snapshot.
+  utimesSync(path.join(path.dirname(file('a')), stage), new Date(), new Date(Date.now() + 60_000));
+  const next = new Store(home);
+  try {
+    expect(next.loadSession('a').items).toEqual([rows[0]]);
+    expect(temps()).toEqual([]);
+  } finally { await next.seal(); }
+}, 30_000);
+
+it.each(['base', 'tail'])('preserves both edits when a legacy %s temp ties the public timestamp', async kind => {
+  const { home, file, rows } = fixture();
+  const publicTail = file('a.tail'), temp = (kind === 'base' ? file('a') : publicTail) + '.2147483646.tmp';
+  const staged = { ...rows[0], id: 'staged' }, published = { ...rows[0], id: 'published' };
+  writeFileSync(file('a'), '{"gen":42,"items":[' + JSON.stringify(rows[0]) + '],"todos":[]}');
+  writeFileSync(publicTail, JSON.stringify({ baseGen: 42, from: 1, items: [published] }));
+  writeFileSync(temp, (kind === 'base' ? '{"gen":43,"items":[\n' + JSON.stringify(rows[0]) + ',\n' :
+    '{"baseGen":42,"from":1,"items":[\n') + JSON.stringify(staged) + '\n],"todos":[]}');
+  const stamp = new Date(1_700_000_000_000);
+  for (const f of [file('a'), publicTail, temp]) utimesSync(f, stamp, stamp);
+  const store = new Store(home);
+  try {
+    const data = store.loadSession('a');
+    expect(new Set(data.items.map(row => row.id))).toEqual(new Set([rows[0].id, 'published', 'staged']));
+    expect(existsSync(temp)).toBe(false);
+    store.saveSession('a', () => ({ ...data, dirty: 'all' }));
+    await store.persistInput('a');
+    expect(new SessionFiles(file).load('a').items).toEqual(data.items);
+  } finally { await store.seal(); }
+});
+
+it('collects an ordinary full save’s superseded tail on the next solo start', async () => {
+  const { home, file, rows } = fixture();
+  writeFileSync(file('a.tail'), JSON.stringify({ baseGen: 42, from: rows.length, items: [{ ...rows[0], id: 'fold-me' }] }));
+  const writer = new Store(home), peer = new Store(home);
+  const data = writer.loadSession('a');
+  writer.saveSession('a', () => ({ ...data, dirty: 'all' }));
+  await writer.persistInput('a');
+  expect(existsSync(file('a.tail'))).toBe(true);
+  const reopened = peer.loadSession('a');
+  peer.saveSession('a', () => ({ ...reopened, dirty: 'all' }));
+  await peer.persistInput('a');
+  expect(existsSync(file('a.tail'))).toBe(true);
+  await peer.seal();
+  await writer.seal();
+  clock();
+  const verify = vi.spyOn(SessionFiles.prototype, 'verifyMigrations');
+  const next = new Store(home);
+  try {
+    await vi.advanceTimersByTimeAsync(1000);
+    await verify.mock.results[0].value;
+    expect(existsSync(file('a.tail'))).toBe(false);
+    expect(next.readSessionEnd('a')?.items.at(-1)?.id).toBe('fold-me');
+  } finally { await next.seal(); }
+});
+
+it('does not certify or delete a peer tail the full writer never read', async () => {
+  const { files, file, rows } = fixture();
+  const data = files.load('a');
+  const peer = JSON.stringify({ baseGen: 42, from: rows.length, items: [{ ...rows[0], id: 'unseen-peer-edit' }] });
+  writeFileSync(file('a.tail'), peer);
+  await files.save('a', () => ({ ...data, dirty: 'all' }));
+  expect(JSON.parse(readFileSync(file('a'), 'utf8')).supersededTail).toBeUndefined();
+  expect(readFileSync(file('a.tail'), 'utf8')).toBe(peer);
+});
+
+it('reads the displaced peer edit after a hard exit inside the verifier rename', async () => {
+  const { home, file } = await foldedFixture();
+  const child = spawnSync(process.execPath, ['tests/fixtures/migration-crash.mjs', home, 'displaced'],
+    { timeout: 25_000, windowsHide: true, stdio: 'inherit' });
+  expect(child.status).toBe(91);
+  expect(existsSync(file('a.tail'))).toBe(false);
+  expect(readdirSync(path.dirname(file('a'))).filter(n => n.includes('.recover.'))).toHaveLength(1);
+  const lock = new DatabaseSync(path.join(home, '.sable-store.lock'));
+  lock.exec('BEGIN EXCLUSIVE');
+  const reader = new Store(home);
+  try {
+    expect(reader.readSessionEnd('a')).toBeUndefined();
+    const data = await reader.loadSessionAsync('a');
+    expect(data.items.slice(-2).map(i => i.id)).toEqual(['folded', 'peer-save']);
+    expect(JSON.parse(readFileSync(file('a.tail'), 'utf8')).items.at(-1).id).toBe('peer-save');
+  } finally { await reader.seal(); lock.close(); }
+}, 30_000);
+
+it.each(['base', 'tail'])('uses a complete staged %s while a peer prevents its cleanup', async kind => {
+  const { home, file, rows } = fixture();
+  const bridge = new Store(home);
+  const child = spawnSync(process.execPath, ['tests/fixtures/migration-crash.mjs', home, 'staged-' + kind],
+    { timeout: 15_000, windowsHide: true, stdio: 'inherit' });
+  expect(child.status).toBe(91);
+  READ.inWorkerAbove = 1;
+  const next = new Store(home);
+  try {
+    const data = await next.loadSessionAsync('a');
+    expect(data.items.at(-1)?.id).toBe('peer-save');
+    data.items.push({ ...rows[0], id: 'desktop' });
+    next.saveSession('a', () => ({ ...data, dirty: new Set(['desktop']) }));
+    await next.seal();
+    expect(new SessionFiles(file).load('a').items.slice(-2).map(i => i.id)).toEqual(['peer-save', 'desktop']);
+  } finally { await next.seal(); await bridge.seal(); }
+}, 30_000);
+
+it.each([false, true].flatMap(peer => [false, true].flatMap(noSql => [false, true].map(publicTail => ({ peer, noSql, publicTail })))))
+('recovers private rows with peer=$peer unavailableSQLite=$noSql publicTail=$publicTail', async ({ peer, noSql, publicTail }) => {
+  const { home, rows, file } = fixture();
+  const bridge = peer ? new Store(home) : undefined;
+  if (noSql) {
+    const get = process.getBuiltinModule;
+    vi.spyOn(process, 'getBuiltinModule').mockImplementation(name => name === 'node:sqlite' ? undefined : get(name));
+  }
+  const writeTail = (dest: string, id: string) => writeFileSync(dest,
+    JSON.stringify({ baseGen: 42, from: rows.length, items: [{ ...rows[0], id }] }));
+  const held = file('a.tail') + '.recover.00000000-0000-4000-8000-000000000001';
+  writeTail(held, 'private-row');
+  if (publicTail) writeTail(file('a.tail'), 'public-row');
+  const reader = new Store(home);
+  try {
+    const data = await reader.loadSessionAsync('a');
+    expect(data.items.map(r => r.id)).toContain('private-row');
+    if (publicTail) expect(data.items.slice(-2).map(r => r.id)).toEqual(['private-row', 'public-row']);
+    data.items.push({ ...rows[0], id: 'local-edit' });
+    reader.saveSession('a', () => ({ ...data, dirty: 'all' }));
+    await reader.persistInput('a');
+    expect(new SessionFiles(file).load('a').items).toEqual(data.items);
+  } finally { await reader.seal(); await bridge?.seal(); }
+});
+
 it('starts one verifier after construction and finishes each chat before dispatching the next', async () => {
   const { file, home, tail } = await foldedFixture();
   writeFileSync(file('b'), readFileSync(file('a')));
@@ -224,7 +495,7 @@ it.each(['before pinning', 'before rename', 'after rename'])('keeps a second pro
   } finally { await store.seal(); }
 }, 30_000);
 
-it('waits to publish a peer save while a released bridge holds its startup lock', async () => {
+it('publishes and seals while a released bridge still holds its startup lock', async () => {
   const { home, file, files, tail } = await foldedFixture();
   const lock = new DatabaseSync(path.join(home, '.sable-store.lock'));
   lock.exec('BEGIN EXCLUSIVE');
@@ -232,11 +503,12 @@ it('waits to publish a peer save while a released bridge holds its startup lock'
     const peer = spawn(process.execPath, ['tests/fixtures/migration-crash.mjs', home, 'save'], { stdio: 'inherit', windowsHide: true });
     const exited = once(peer, 'exit');
     try {
-      await vi.waitFor(() => expect(existsSync(path.join(home, 'waiting-to-publish'))).toBe(true), { timeout: 15_000 });
+      await vi.waitFor(() => expect(existsSync(path.join(home, 'published'))).toBe(true), { timeout: 9_000 });
+      expect((await exited)[0]).toBe(0);
+      expect(files.load('a').items.at(-1)?.id).toBe('peer-save');
       expect(readFileSync(file('a.tail'), 'utf8')).toBe(tail);
       rmSync(file('a.tail')); // Last operation in the released bridge's exclusive transaction.
       lock.exec('ROLLBACK');
-      expect((await exited)[0]).toBe(0);
       expect(files.load('a').items.slice(-2).map(i => i.id)).toEqual(['folded', 'peer-save']);
     } finally {
       if (peer.exitCode === null && peer.signalCode === null) peer.kill();
@@ -565,6 +837,27 @@ it('selects the descriptor’s own index on both sides of an in-flight migration
     expect(files.wholeItem('a', files.recut('a', step, true))).toStrictEqual(whole);
   } finally { rename.open(); notify.open(); await write; }
   expect(files.wholeItem('a', step)).toStrictEqual(whole);
+});
+
+it('publishes a chat edit while a migration space check is stalled', async () => {
+  const { files, file } = fixture();
+  const data = await files.loadAsync('a');
+  const entered = gate(), release = gate();
+  const real = await vi.importActual<typeof disk>('node:fs/promises');
+  vi.mocked(disk.statfs).mockImplementationOnce(async (...args) => {
+    entered.open();
+    await release.promise;
+    return real.statfs(...args);
+  });
+  const migration = files.migrate('a', () => true);
+  try {
+    await entered.promise;
+    data.items.push({ id: 'during-check', type: 'user', text: 'New edit', ts: 1 });
+    const save = files.save('a', () => ({ ...data, dirty: 'all' }));
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(file('a'), 'utf8')).items.at(-1).id).toBe('during-check'));
+    await save;
+  } finally { release.open(); await migration; }
+  expect(files.load('a').items.at(-1)?.id).toBe('during-check');
 });
 
 it('drops the owed rewrite at seal and accepts an ordinary base write in its place', async () => {

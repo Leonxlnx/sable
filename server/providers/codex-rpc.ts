@@ -24,6 +24,9 @@ export class RpcError extends Error {
   }
 }
 
+/** Rejected locally before stdin accepted a request. A missing RPC response is different. */
+export class UnissuedRpcError extends RpcError {}
+
 export interface CodexCommand {
   file: string;
   args: string[];
@@ -272,13 +275,13 @@ export class CodexRpc {
     return this.stderrTail;
   }
 
-  private write(msg: unknown) {
-    if (!this.alive || !this.child.stdin?.writable) throw new RpcError('codex app-server is not running');
-    this.child.stdin.write(JSON.stringify(msg) + '\n');
+  private write(msg: unknown, written?: () => void) {
+    if (!this.alive || !this.child.stdin?.writable) throw new UnissuedRpcError('codex app-server is not running');
+    this.child.stdin.write(JSON.stringify(msg) + '\n', written && (err => { if (!err) written(); }));
   }
 
-  request<T = unknown>(method: string, params?: unknown, timeoutMs = 30_000): Promise<T> {
-    if (this.endReason) return Promise.reject(new RpcError('Codex app-server is closing'));
+  request<T = unknown>(method: string, params?: unknown, timeoutMs = 30_000, written?: () => void): Promise<T> {
+    if (this.endReason) return Promise.reject(new UnissuedRpcError('Codex app-server is closing'));
     return new Promise<T>((resolve, reject) => {
       const id = this.nextId++;
       const timer = setTimeout(() => {
@@ -288,11 +291,11 @@ export class CodexRpc {
       }, timeoutMs);
       this.pending.set(id, { method, resolve: resolve as (v: unknown) => void, reject, timer });
       try {
-        this.write(params === undefined ? { id, method } : { id, method, params });
+        this.write(params === undefined ? { id, method } : { id, method, params }, written);
       } catch (err) {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(err as Error);
+        reject(new UnissuedRpcError((err as Error).message));
       }
     });
   }

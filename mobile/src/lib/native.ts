@@ -395,7 +395,7 @@ export function setLive(spec: LiveSpec | null, stop = false) {
 
 const FilesNative = registerPlugin<{ forgetAll(): Promise<void> }>('Files');
 /** Preferences kept for the desktop (the pairing itself and the erasure's mark are conn.ts's). */
-const PAIRING_PREFS = ['sable.taken'];
+const PAIRING_PREFS = ['sable.taken', 'sable.outgoing'];
 
 /**
  * Android's side of an erasure, each step awaited: every private file (downloads under way, verified

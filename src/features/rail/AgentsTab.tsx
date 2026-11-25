@@ -6,9 +6,10 @@ import { userItemText } from '@shared/synthetic';
 import { worksInBackground } from '@shared/background';
 import { ProviderMark, Ring } from '@/art/Logo';
 import { Collapse } from '@/components/Collapse';
-import { agentProvider, agentTask, delegateWord, isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
+import { agentProvider, agentTask, delegateRetry, delegateWord, isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
 import { TimelineCtx, type TimelineCtxValue } from '@/features/timeline/ctx';
 import { foldKey, getFold, setFold, useFold } from '@/features/timeline/fold';
+import { ReportAgain } from '@/features/timeline/ReportAgain';
 import { revealItem } from '@/features/timeline/reveal';
 import { shortDuration, useHeld } from '@/features/timeline/util';
 import { clock } from '@/features/usage/format';
@@ -408,7 +409,8 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
   const f = figuresOf(item);
   const provider = agentProvider(item) ?? item.check?.agent ?? null;
   // A handed-over task whose report the chat's agent has not read yet says where the report stands
-  // ("Report pending", "With your next message"); how it ended is the row's mark.
+  // ("Report pending", "With your next message"; "Checking delivery" or "Delivery unknown" for one
+  // that went out); how it ended is the row's mark.
   const report = delegateWord(item);
   const word = report || (outcome === 'done' ? '' : OUTCOME_WORD[outcome]);
   const launched = !!item.result?.agent?.background || !!item.detail.background;
@@ -425,6 +427,13 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh }: { sessionId: str
           {!word && f.ms >= 1000 && <span className="agx-dur">{shortDuration(f.ms)}</span>}
         </span>
       </button>
+      {/* A report whose delivery is unknown: the person decides, on a line of its own under the row
+          (the row itself is one button). */}
+      {delegateRetry(item) && (
+        <div className="agx-again">
+          <ReportAgain sessionId={sessionId} item={item} className="agx-goto" />
+        </div>
+      )}
       <Collapse open={open}>
         <AgentDetail sessionId={sessionId} item={item} live={false} endedAt={endedAt} />
       </Collapse>

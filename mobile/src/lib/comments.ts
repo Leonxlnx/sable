@@ -5,7 +5,6 @@ import { conn } from './conn';
 import { onForget } from './forget';
 import { epoch, still } from './epoch';
 import { isUncertain } from './errors';
-import { submissionDone, submissionFor, submissionUnsure } from './submit';
 import { notSentHere, sentHere } from './follow';
 
 /**
@@ -28,6 +27,8 @@ let reviews: Reviews = (() => {
 })();
 /** What was typed above the comments in the review sheet, per chat (this run only). */
 const leads = new Map<string, string>();
+// The review sheet owns its own retry. It never borrows a message ID from the composer.
+let reviewIds = new WeakMap<ReviewComment[], { text: string; id: string }>();
 const listeners = new Set<() => void>();
 
 function set(next: Reviews) {
@@ -75,20 +76,22 @@ export async function sendReview(sid: string): Promise<{ queued: boolean }> {
   const lead = leadOf(sid).trim();
   const e = epoch();
   sentHere(sid);
-  // One id for this review (lib/submit.ts): sent again after a connection that cut its answer off, the
-  // same comments carry the same id, so the desktop answers without sending them twice.
   const text = reviewMessage(list, lead);
-  const sub = submissionFor(sid, text, undefined);
+  const prior = reviewIds.get(list);
+  const sub = prior?.text === text ? prior : { text, id: crypto.randomUUID() };
+  reviewIds.set(list, sub);
   const r = await conn.call('session.send', { sessionId: sid, text, submitId: sub.id }).catch((err) => {
-    notSentHere(sid);
-    if (isUncertain(err)) submissionUnsure(sid, sub.id);
-    else submissionDone(sid, sub.id);
+    if (still(e)) {
+      notSentHere(sid);
+      if (!isUncertain(err) && reviewIds.get(list) === sub) reviewIds.delete(list);
+    }
     throw err;
   });
-  submissionDone(sid, sub.id);
-  if (r.queued || !r.ok) notSentHere(sid);
   // Forgotten while it went: nothing of that computer is written again.
   if (!still(e)) return { queued: !!r.queued };
+  if (r.queued || !r.ok) notSentHere(sid);
+  if (r.ok && r.submitId !== sub.id) throw new Error('The desktop did not confirm this review.');
+  if (reviewIds.get(list) === sub) reviewIds.delete(list);
   if (!r.ok) throw new Error(r.error ?? 'The review was not sent');
   leads.delete(sid);
   set(clearReview(reviews, sid, new Set(list.map((c) => c.id))));
@@ -98,6 +101,7 @@ export async function sendReview(sid: string): Promise<{ queued: boolean }> {
 // Forgetting the computer forgets what was written for it.
 const forgetAll = () => {
   leads.clear();
+  reviewIds = new WeakMap();
   set({});
   try {
     localStorage.removeItem(KEY);
