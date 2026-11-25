@@ -29,6 +29,7 @@ import {
   type SpareWait,
   type TimelineItem,
   type ToolItem,
+  type QueuedMessage,
   type UserItem,
 } from '../shared/protocol';
 import { AuthJournal } from './core/auth-journal';
@@ -42,7 +43,7 @@ interface RefusalMark {
   stops: number;
   closes: number;
 }
-import { lostTasksNote, RESUME_AFTER_SIGN_IN, RESUME_LOST, signInBackgroundNote } from '../shared/synthetic';
+import { syntheticOf, lostTasksNote, RESUME_AFTER_SIGN_IN, RESUME_LOST, signInBackgroundNote } from '../shared/synthetic';
 import { normalizeBackdrop } from '../shared/backdrop';
 import { HANDOVER_JOIN, readableTitle, RESUME_AFTER_RESET, RESUME_LIMIT_RESET, RESUME_SUMMARY_TRAILER, RESUME_UNDER_ANOTHER, resumeBackgroundNote } from '../shared/synthetic';
 import { Races, type Contender } from './core/race';
@@ -120,6 +121,8 @@ const still = (ctx?: CallContext) => {
  * move Sable makes by itself passes over it quietly; one the person asked for says it as any refusal.
  */
 export class NotNow extends Error {}
+type DeliveryFields = Partial<Pick<UserItem, 'until' | 'id' | 'submitPrint'>> & { submitId?: string };
+
 class DeliveryMissed extends Error {}
 class DeliveryUncertain extends Error {
   constructor() { super('The agent did not confirm this message. Check its reply before continuing by hand.'); }
@@ -575,20 +578,51 @@ export class App {
     if (!this.quiet) console.log('[sable]', ...args);
   };
 
-  // enqueue publishes a row copy synchronously. Tag both copies before any subscriber sees it.
+  private rewindReceipts = new WeakMap<SessionRuntime, Map<string, Promise<{ ok: boolean; message?: string }>>>();
+  private queueReceipts = new WeakMap<SessionRuntime, Map<string, QueuedMessage>>();
+  private receiptsFor(rt: SessionRuntime) {
+    let receipts = this.queueReceipts.get(rt);
+    if (!receipts) this.queueReceipts.set(rt, receipts = new Map());
+    return receipts;
+  }
+  /** Only displace the words and files that the requesting window has saved in full. */
+  private revisedQueueRow(rt: SessionRuntime, id: string, expected?: QueuedMessage) {
+    if (!expected) return;
+    const row = rt.queue.find(q => q.id === id);
+    if (row && (row.text !== expected.text || JSON.stringify(row.attachments ?? []) !== JSON.stringify(expected.attachments ?? []))) return row;
+  }
+  private pendingPrints = new WeakMap<SessionRuntime, Map<string, string>>();
+  private submissionSlot(rt: SessionRuntime, id: string, print: string) {
+    const queued = rt.queue.find(q => q.id === id || q.submitId === id);
+    const user = rt.get(id);
+    const original = queued ?? (user?.type === 'user' ? user : undefined);
+    const first = original ? original.submitPrint ?? messagePrint(original.text, original.attachments) : this.pendingPrints.get(rt)?.get(id);
+    return !first || first === print ? id : id + '/' + print;
+  }
+
+  private itemSequence = 0;
+  private partVersions = new WeakMap<TimelineItem[], Map<string, number>>();
   private enqueueSubmission?: { rt: SessionRuntime; id: string };
   emit = (event: BridgeEvent) => {
     if (event.type === 'timeline.reset' || event.type === 'item.added' || event.type === 'item.removed' ||
         event.type === 'item.patch' || event.type === 'item.delta') {
       const rt = this.sessions.get(event.sessionId);
-      if (rt) this.snapshotEnds.delete(rt.items);
+      if (rt) {
+        this.snapshotEnds.delete(rt.items);
+        if (event.type === 'timeline.reset') this.partVersions.delete(rt.items);
+        else if (event.type !== 'item.added') this.partVersions.get(rt.items)?.delete(event.id);
+      }
     }
+    // enqueue publishes a row copy synchronously. Tag both copies before any subscriber sees it.
     const submission = this.enqueueSubmission;
     if (submission && event.type === 'queue.updated' && event.sessionId === submission.rt.id) {
       this.enqueueSubmission = undefined;
       const row = submission.rt.queue.at(-1);
       const published = event.queue.at(-1);
-      if (row && published?.id === row.id) row.submitId = published.submitId = submission.id;
+      if (row && published?.id === row.id) {
+        row.id = published.id = row.submitId = published.submitId = submission.id;
+        row.submitPrint = published.submitPrint = messagePrint(row.text, row.attachments);
+      }
     }
     // A rewind can move a disk-backed step into the recent turns. A late patch/delta can
     // restart one. Restore that item in place before subscribers or the provider use it again.
@@ -624,6 +658,7 @@ export class App {
         }
       }
     }
+    if (event.type === 'item.patch' || event.type === 'item.delta' || event.type === 'item.removed') event = { ...event, seq: ++this.itemSequence };
     // Subscribers in this process still see native values. Socket frames carry explicit clears.
     if (event.type === 'session.updated') {
       const { patch } = event;
@@ -688,10 +723,12 @@ export class App {
     if (!h) throw new Error(`Unknown method: ${method}`);
     const id = (params as { sessionId?: string } | undefined)?.sessionId;
     const wantsEnd = method === 'session.snapshot' && (params as RpcMethods['session.snapshot']['params']).page === 'end';
-    if (id && this.lazy.has(id) && !wantsEnd) {
+    // Send and Stop record their order before joining the same cold read.
+    if (id && this.lazy.has(id) && !wantsEnd && method !== 'session.send' && method !== 'session.interrupt') {
       await this.hydrateAsync(this.runtime(id));
       still(ctx);
     }
+    if (id && method.startsWith('queue.') && this.unreadable.has(id)) throw new Error('This chat could not be read from disk');
     return (await h(params as never, ctx)) as RpcMethods[M]['result'];
   }
 
@@ -1447,7 +1484,7 @@ export class App {
    * Puts a message in the timeline and hands it to the agent. Mid-turn it is steered: the agent
    * takes it at its next step; it waits where it was sent and then stands where the agent took it.
    */
-  private async deliver(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: Partial<Pick<UserItem, 'until' | 'id'>>, ctx?: CallContext, explicit = false) {
+  private async deliver(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: DeliveryFields, ctx?: CallContext, explicit = false) {
     // From here to its dispatch no return to another account begins (review wave 16, #11): a message
     // goes to exactly one account, never while a move is half done.
     this.sending.set(rt.id, (this.sending.get(rt.id) ?? 0) + 1);
@@ -1464,18 +1501,18 @@ export class App {
     }
   }
 
-  private async deliverNow(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: Partial<Pick<UserItem, 'until' | 'id'>>, ctx?: CallContext, explicit = false) {
+  private async deliverNow(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: DeliveryFields, ctx?: CallContext, explicit = false) {
     // Past its account's cap, the session moves to the next account before the message goes out.
     // The first message names the session's lane, or moves it into one when its folder got busy.
     // A caller that may no longer act (a phone removed meanwhile) is asked again after every wait.
     // Moving to another account (compacting first): the message waits in the queue and goes there.
     if (this.moving.has(rt.id)) {
       this.queuedWhileMoving.add(rt.id);
-      return this.deferSend(rt, text, attachments, ctx, extra?.id);
+      return this.deferSend(rt, text, attachments, ctx, extra?.id, extra?.submitId);
     }
     // A limit's transition runs (background work being stopped, the move after it): the message waits
     // in the queue, with its sender's guard, and goes once that is over (review wave 17, #5).
-    if (this.sendHolds.has(rt.id) || (this.refusalQueues.has(rt) && this.limitPending(rt))) return this.queueBehindHold(rt, text, attachments, ctx, extra?.id);
+    if (this.sendHolds.has(rt.id) || (this.refusalQueues.has(rt) && this.limitPending(rt))) return this.queueBehindHold(rt, text, attachments, ctx, extra?.id, extra?.submitId);
     const stops = this.stopsOf(rt);
     await this.lanes.ready(rt);
     if (this.stopsOf(rt) === stops && !rt.items.some((i) => i.type === 'user')) {
@@ -1499,12 +1536,12 @@ export class App {
       // whichever account the chat is on then (review wave 17, #8).
       if (waited === 'timeout' && this.returnRuns.has(rt.id)) {
         this.holdSends(rt, back);
-        return this.queueBehindHold(rt, text, attachments, ctx, extra?.id);
+        return this.queueBehindHold(rt, text, attachments, ctx, extra?.id, extra?.submitId);
       }
       // The return is still moving the chat (compacting first): the message goes there once it is done.
       if (this.moving.has(rt.id)) {
         this.queuedWhileMoving.add(rt.id);
-        return this.deferSend(rt, text, attachments, ctx, extra?.id);
+        return this.deferSend(rt, text, attachments, ctx, extra?.id, extra?.submitId);
       }
       await this.checkCap(rt);
     }
@@ -1512,7 +1549,7 @@ export class App {
     // Stop or Close during lane validation or the cap check leaves the message with its sender's guard.
     if (this.stopsOf(rt) !== stops) {
       if (this.sessions.get(rt.id) === rt) {
-        return this.deferSend(rt, text, attachments, ctx, extra?.id);
+        return this.deferSend(rt, text, attachments, ctx, extra?.id, extra?.submitId);
       }
       return;
     }
@@ -1527,7 +1564,7 @@ export class App {
   }
 
   /** The message goes to the agent: shown in the timeline (steered into a running turn) and sent. */
-  private async dispatchNow(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: Partial<Pick<UserItem, 'until' | 'id'>>, ctx?: CallContext, explicit = false) {
+  private async dispatchNow(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: DeliveryFields, ctx?: CallContext, explicit = false) {
     const addUser = () => {
       if (rt.meta.titleSource === 'auto' && !rt.items.some((i) => i.type === 'user')) {
         rt.update({ title: extra?.until?.check ? autoTitle(`Until ${extra.until.check.command} passes`) : autoTitle(text) });
@@ -1536,7 +1573,8 @@ export class App {
       rt.touch();
       return rt.add<UserItem>({
         type: 'user',
-        id: extra?.id,
+        id: extra?.id ?? extra?.submitId,
+        ...(extra?.submitPrint && { submitPrint: extra.submitPrint }),
         text,
         attachments: attachments?.length ? attachments : undefined,
         state: rt.turnActive ? 'queued' : 'sent',
@@ -1595,7 +1633,7 @@ export class App {
         // A steer: held in the queue with its guard; the running turn goes on, and at its end the
         // message is looked at again like any other.
         if (early) rt.remove(early.id);
-        return this.deferSend(rt, text, attachments, ctx, extra?.id);
+        return this.deferSend(rt, text, attachments, ctx, extra?.id, extra?.submitId);
       }
       // As if the agent refused it at the limit, without asking it: the message stands, the limit's
       // notice follows, and the turn's end decides as for any refusal (`onLimitHit`: the next account
@@ -1617,13 +1655,13 @@ export class App {
     if (this.moving.has(rt.id) || holding || rt.handle !== handle) {
       if (early) rt.remove(early.id);
       if (early && !rt.turnActive && rt.meta.status === 'starting') rt.update({ status: 'idle' });
-      if (holding && !this.moving.has(rt.id)) return this.queueBehindHold(rt, text, attachments, ctx, extra?.id);
+      if (holding && !this.moving.has(rt.id)) return this.queueBehindHold(rt, text, attachments, ctx, extra?.id, extra?.submitId);
       if (this.moving.has(rt.id)) this.queuedWhileMoving.add(rt.id);
       else
         setTimeout(() => {
           if (!rt.turnActive && !rt.stopRequested && !this.moving.has(rt.id) && this.sessions.get(rt.id) === rt) this.sendNextQueued(rt);
         }, 0);
-      return this.deferSend(rt, text, attachments, ctx, extra?.id);
+      return this.deferSend(rt, text, attachments, ctx, extra?.id, extra?.submitId);
     }
     const item = early ?? addUser();
     if (!rt.turnActive) this.retryOwners.delete(rt);
@@ -1664,7 +1702,7 @@ export class App {
       if (item.steered && rt.turnActive && rt.turnStartedAt === runningSince && rt.get<UserItem>(item.id)?.state === 'queued') {
         this.log('steer failed; back to the queue', (err as Error).message);
         rt.remove(item.id);
-        if (!extra?.id) rt.requeue([{ id: item.id, text: item.text, attachments: item.attachments, createdAt: item.ts }]);
+        if (!extra?.id) rt.requeue([{ id: item.id, text: item.text, attachments: item.attachments, createdAt: item.ts, ...(extra?.submitId && { submitId: extra.submitId }) }]);
         return 'queued' as const;
       }
       // The turn this message began has ended since (its end stands after it): a failure of its send
@@ -2612,15 +2650,18 @@ export class App {
     return p;
   }
 
-  private deferSend(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], ctx?: CallContext, reservedId?: string) {
-    const id = reservedId ?? rt.enqueue(text, attachments).id;
+  private deferSend(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], ctx?: CallContext, reservedId?: string, submitId?: string) {
+    if (submitId) this.enqueueSubmission = { rt, id: submitId };
+    let id: string;
+    try { id = reservedId ?? rt.enqueue(text, attachments).id; }
+    finally { this.enqueueSubmission = undefined; }
     if (ctx?.allowed) this.queueGuards.set(id, ctx);
     return 'queued' as const;
   }
 
-  private queueBehindHold(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], ctx?: CallContext, reservedId?: string) {
+  private queueBehindHold(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], ctx?: CallContext, reservedId?: string, submitId?: string) {
     this.heldSends.add(rt.id);
-    return this.deferSend(rt, text, attachments, ctx, reservedId);
+    return this.deferSend(rt, text, attachments, ctx, reservedId, submitId);
   }
 
   /** The refused message's sender may still act (a phone not removed meanwhile); said once when not. */
@@ -4273,7 +4314,7 @@ export class App {
     const guard = sender?.allowed && caller?.allowed ? { allowed: () => sender.allowed!() && caller.allowed!() } : sender ?? caller;
     try {
       still(guard);
-      if (await this.deliver(rt, entry.text, entry.attachments, { id }, guard, !!caller) === 'queued') {
+      if (await this.deliver(rt, entry.text, entry.attachments, { id, submitPrint: entry.submitPrint }, guard, !!caller) === 'queued') {
         rt.rollbackReserved(id);
         return true;
       }
@@ -5080,7 +5121,7 @@ export class App {
 
     this.register('session.snapshot', async ({ sessionId, peek, page, keepFrom }) => {
       const rt = this.runtime(sessionId);
-      if (page === 'end' && this.lazy.has(sessionId)) {
+      if (page === 'end' && this.lazy.has(sessionId) && !rt.meta.pendingRestart && !this.untilLost.has(sessionId)) {
         const preview = this.store.readSessionEnd(sessionId);
         if (preview) {
           setImmediate(() => {
@@ -5095,7 +5136,13 @@ export class App {
       if (rt.meta.unread && !peek) rt.update({ unread: false });
       const snap = rt.snapshot();
       if (!page || snap.items.length <= SNAPSHOT_THRESHOLD && typeof page === 'string') return snap;
-      if (typeof page !== 'string') return snapshotPage(snap, page);
+      if (typeof page !== 'string') {
+        const older = snapshotPage(snap, page);
+        if (!older.page) return older;
+        // Runtime patches and deltas mutate the row in place. Freeze its fields at the sequence
+        // boundary, before the socket's async caller resumes and projects the bounded page.
+        return { ...older, items: older.items.map(item => ({ ...item })), seq: this.itemSequence };
+      }
       let end = this.snapshotEnds.get(rt.items);
       if (!end) this.snapshotEnds.set(rt.items, end = snapshotEnd(rt.items));
       // Restore can settle an old running turn. Keep its displayed rows in the
@@ -5118,6 +5165,44 @@ export class App {
       if (!item) throw new Error('That part of the conversation is no longer there');
       return { item: { ...this.store.wholeItem(sessionId, item) } };
     });
+    this.register('session.itemPart', ({ sessionId, itemId, path, offset = 0, seq }) => {
+      const rt = this.runtime(sessionId);
+      const item = rt.get(itemId);
+      if (!item) throw new Error('That part of the conversation is no longer there');
+      let versions = this.partVersions.get(rt.items);
+      if (seq !== undefined && seq !== versions?.get(itemId)) throw new Error('The conversation changed while reading this item.');
+      if (!versions) this.partVersions.set(rt.items, versions = new Map());
+      const version = versions.get(itemId) ?? ++this.itemSequence;
+      versions.set(itemId, version);
+      let value: unknown = this.store.wholeItem(sessionId, item);
+      if (!Array.isArray(path) || !Number.isSafeInteger(offset) || offset < 0) throw new Error('Invalid item range');
+      for (const key of path) {
+        if (!value || typeof value !== 'object' || !Object.prototype.propertyIsEnumerable.call(value, key)) throw new Error('Unknown item field');
+        value = (value as Record<string, unknown>)[key];
+      }
+      if (typeof value === 'string') {
+        const end = offset + 65536;
+        return { seq: version, kind: 'value', value: value.slice(offset, end), next: end < value.length ? end : undefined };
+      }
+      if (Array.isArray(value)) return { seq: version, kind: 'array', length: value.length };
+      if (value && typeof value === 'object') {
+        const keys = Object.keys(value).filter(k => (value as Record<string, unknown>)[k] !== undefined);
+        const end = offset + 256;
+        return { seq: version, kind: 'object', keys: keys.slice(offset, end), next: end < keys.length ? end : undefined };
+      }
+      return { seq: version, kind: 'value', value: typeof value === 'number' || typeof value === 'boolean' ? value : null };
+    });
+
+    // A recovered field may be about to edit a queue row. Join the original send if it is
+    // still running, or ask the saved row before allowing its words into a second action.
+    this.register('session.submission', ({ sessionId, submitId, text, attachments }) =>
+      this.submissions.run(sessionId, submitId, async () => {
+        const rt = this.runtime(sessionId);
+        if (this.unreadable.has(sessionId)) throw Error('This chat could not be read from disk');
+        const slot = this.submissionSlot(rt, submitId, messagePrint(text, attachments));
+        if (rt.queue.some(q => q.submitId === slot || q.id === slot)) return { ok: true, queued: true };
+        return { ok: rt.get(slot)?.type === 'user' };
+      }, messagePrint(text, attachments)));
 
     // A retry of a submission the bridge already took (its window lost the answer) is answered, not sent again.
     this.register('session.send', ({ sessionId, text, attachments, steer, submitId }, ctx) => this.submissions.run(sessionId, submitId, async () => {
@@ -5126,14 +5211,24 @@ export class App {
       const rt = this.runtime(sessionId);
       // A chat not read yet (a phone's message after a restart): read off the main thread, as a snapshot is;
       // a big one read here synchronously held the window for most of a second.
+      const stops = this.lazy.has(sessionId) ? this.stopsOf(rt) : undefined;
       await this.hydrateAsync(rt);
+      still(ctx);
+      if (this.unreadable.has(sessionId)) throw new Error('This chat could not be read from disk');
+      if (stops !== undefined && this.stopsOf(rt) !== stops) throw new NotNow('The agent was stopped or closed before the message went out.');
+      const print = messagePrint(text, attachments);
+      const identity = typeof submitId === 'string' && submitId.length > 0 && submitId.length <= 128
+        ? this.submissionSlot(rt, submitId, print) : undefined;
+      if (identity && rt.queue.some(q => q.submitId === identity || q.id === identity)) return { ok: true, queued: true };
+      if (identity && rt.get(identity)?.type === 'user') return { ok: true };
+      if (identity && rt.get(identity)) throw Error('That submission ID is already in use');
       // `/model <name>` changes the model; it never goes to the agent (whose own /model restarts it).
       const model = typeof text === 'string' && !attachments?.length ? /^\/model(?:\s+([\s\S]*))?$/i.exec(text.trim()) : null;
       if (model) return this.modelCommand(rt, (model[1] ?? '').trim());
       // While the agent works the bridge holds the message until the turn ends, unless it is
       // steered into the running turn (and the agent can take one).
       if (rt.turnActive && !(steer && rt.caps?.features.steer !== false)) {
-        if (typeof submitId === 'string' && submitId.length <= 128) this.enqueueSubmission = { rt, id: submitId };
+        if (identity) this.enqueueSubmission = { rt, id: identity };
         try {
           const q = rt.enqueue(text, attachments);
           // A phone's message keeps its pairing's guard in the queue.
@@ -5144,27 +5239,51 @@ export class App {
         rt.unreadQueueHeld = false;
         return { ok: true, queued: true };
       }
-      await this.deliver(rt, text, attachments, undefined, ctx, true);
-      return { ok: true };
+      let prints = this.pendingPrints.get(rt);
+      if (!prints) this.pendingPrints.set(rt, prints = new Map());
+      if (identity) prints.set(identity, print);
+      try {
+        const disposition = await this.deliver(rt, text, attachments, identity ? { submitId: identity, submitPrint: print } : undefined, ctx, true);
+        return disposition === 'queued' ? { ok: true, queued: true } : { ok: true };
+      } finally {
+        if (identity) prints.delete(identity);
+      }
     }, messagePrint(text, attachments)));
 
-    this.register('queue.update', ({ sessionId, id, text, attachments }, ctx) => {
+    this.register('queue.update', ({ sessionId, id, text, attachments, operationId, expected }, ctx) => {
       // Omitted attachments keep the message's; an empty list removes them.
       validMessage(text, attachments);
       const rt = this.runtime(sessionId);
       // The message as this edit finds it, in the same step: the desktop's swap takes it into its
       // field, so an edit another window made just before is never lost (review wave 10, #8).
+      const key = !ctx.allowed && operationId ? JSON.stringify([id, operationId]) : undefined;
+      const receipt = key && this.receiptsFor(rt).get(key);
+      if (receipt) return { ok: true, previous: receipt };
+      const current = key && this.revisedQueueRow(rt, id, expected);
+      if (current) return { ok: false, current };
       const found = rt.queue.find((q) => q.id === id);
       const previous = found ? { ...found, ...(found.attachments ? { attachments: [...found.attachments] } : {}) } : undefined;
       const ok = rt.updateQueued(id, text, attachments ?? undefined);
+      if (ok && key && previous) this.receiptsFor(rt).set(key, previous);
       this.spare.queueChanged(rt);
       // Only for an edit that kept the message (one that emptied it removed it), and never to a phone.
       return ok && previous && !ctx.allowed && rt.queue.some((q) => q.id === id) ? { ok, previous } : { ok };
     });
-    this.register('queue.take', ({ sessionId, id }) => {
+    this.register('queue.take', ({ sessionId, id, operationId, expected, releaseReceipt, receiptOnly }, ctx) => {
       const rt = this.runtime(sessionId);
+      const key = !ctx.allowed && operationId ? JSON.stringify([id, operationId]) : undefined;
+      if (releaseReceipt) {
+        if (key) this.receiptsFor(rt).delete(key);
+        return {};
+      }
+      const receipt = key && this.receiptsFor(rt).get(key);
+      if (receipt) return { message: receipt };
+      if (receiptOnly) return rt.get(id)?.type === 'user' && !rt.isReserved(id) ? { taken: true } : {};
+      const current = key && this.revisedQueueRow(rt, id, expected);
+      if (current) return { current };
       const message = rt.takeQueued(id);
       this.spare.queueChanged(rt);
+      if (message && key) this.receiptsFor(rt).set(key, message);
       if (message) return { message };
       return !rt.isReserved(id) && rt.get(id)?.type === 'user' ? { taken: true } : {};
     });
@@ -5184,10 +5303,14 @@ export class App {
       return { ok: await this.deliverQueued(rt, id, ctx) };
     });
 
-    this.register('session.interrupt', async ({ sessionId }) => {
+    this.register('session.interrupt', async ({ sessionId }, ctx) => {
       const rt = this.runtime(sessionId);
       rt.stopRequested = true;
       this.stopped(rt);
+      if (this.lazy.has(sessionId)) {
+        await this.hydrateAsync(rt);
+        still(ctx);
+      }
       rt.cancelPrompts();
       // Stopped while the agent is still starting: what waits for it is not sent once it is there,
       // and the session is idle again (the message stays in the conversation, stopped, as after any stop).
@@ -5380,11 +5503,43 @@ export class App {
       return { ok: true };
     });
 
-    this.register('session.rewind', async ({ sessionId, itemId, restoreFiles }) => {
+    this.register('session.rewind', async ({ sessionId, itemId, restoreFiles, expectedLast, expectedEnd, operationId }) => {
       const rt = this.runtime(sessionId);
+      let receipts = this.rewindReceipts.get(rt);
+      if (!receipts) this.rewindReceipts.set(rt, receipts = new Map());
+      const previous = operationId && receipts.get(operationId);
+      if (previous) return previous;
       const handle = await this.ensureHandle(rt);
+      // A restored Claude handle can yield inside rewind while finding the native point.
+      // Finish that read first. Once restoredChain is clear, a message-only rewind cuts
+      // synchronously. Never enter the asynchronous file-restore branch with a comparison.
+      const guarded = !!(expectedLast || expectedEnd);
+      if (guarded && restoreFiles) return { ok: false, message: 'A conditional rewind cannot restore files.' };
+      if (guarded && 'restoredChain' in handle && handle.restoredChain) {
+        if ('loadChain' in handle && typeof handle.loadChain === 'function') {
+          try { await handle.loadChain(); } catch { /* The chain remains unverified. */ }
+        }
+        if (handle.restoredChain) return { ok: false, message: 'Could not verify the saved conversation before rewind.' };
+      }
+      const joined = operationId && receipts.get(operationId);
+      if (joined) return joined;
+      if (guarded && (rt.handle !== handle || rt.turnActive)) return { ok: false, message: 'The conversation moved on' };
       if (!handle.rewind) return { ok: false, message: 'This provider cannot rewind.' };
-      const done = await handle.rewind(itemId, restoreFiles);
+      if (expectedEnd && rt.items.findLast(i => !i.parentId)?.id !== expectedEnd)
+        return { ok: false, message: 'The conversation moved on' };
+      if (expectedLast) {
+        const last = rt.items.findLast(i => i.type === 'user' && !i.parentId && i.state !== 'queued' && !syntheticOf(i));
+        if (last?.id !== itemId || expectedLast.id !== itemId || !last)
+          return { ok: false, message: 'The conversation moved on' };
+        const current = this.store.wholeItem(sessionId, last) as UserItem;
+        const same = current.ts === expectedLast.ts && current.text === expectedLast.text &&
+          current.providerId === expectedLast.providerId && current.state === expectedLast.state &&
+          JSON.stringify(current.attachments ?? []) === JSON.stringify(expectedLast.attachments ?? []);
+        if (!same) return { ok: false, message: 'The conversation moved on' };
+      }
+      const pending = handle.rewind(itemId, restoreFiles);
+      if (operationId) receipts.set(operationId, pending);
+      const done = await pending;
       // A check of a turn the rewind took away stops with it.
       this.checks.pruned(rt);
       return done;

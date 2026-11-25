@@ -34,7 +34,7 @@ export interface CodexCommand {
 // ── process bookkeeping ──
 
 const live = new Set<ChildProcess>();
-const servers = new Set<string>();
+const servers = new Map<string, CodexRpc>();
 let exitHookInstalled = false;
 
 function installExitHook() {
@@ -140,6 +140,7 @@ export class CodexRpc {
   initInfo?: InitializeResponse;
   private born = Date.now();
   private endReason?: EndReason;
+  private forced = false;
   private endEvent?: (reason: EndReason, inFlight: boolean) => void;
   private turns = new Set<string>();
   private overdue = new Set<RequestId>();
@@ -212,6 +213,13 @@ export class CodexRpc {
     let child: ChildProcess;
     try {
       if (opts.closing?.()) throw new Error('Codex provider is shut down');
+      const previous = servers.get(folder);
+      if (previous?.forced && previous.alive) {
+        previous.child.kill('SIGKILL');
+        await Promise.race([previous.ended, new Promise<void>(r => setTimeout(r, 1000).unref())]);
+        if (previous.alive) throw new Error('This Codex folder is already in use by a process that has not exited. Try again.');
+        if (opts.closing?.()) throw new Error('Codex provider is shut down');
+      }
       if (servers.has(folder)) throw new Error('This Codex folder is already in use by another Sable account.');
       opts.log('[codex] spawning', cmd.file, cmd.args.join(' '));
       child = spawn(cmd.file, cmd.args, {
@@ -224,8 +232,8 @@ export class CodexRpc {
       leave();
       throw err;
     }
-    servers.add(folder);
     const rpc = new CodexRpc(child, opts.log);
+    servers.set(folder, rpc);
     if (child.pid && opts.scope) rpc.endEvent = opts.scope.journal?.started(opts.scope, folder, child.pid, () => rpc.inFlight, rpc.born);
     void rpc.exited.then(() => { servers.delete(folder); leave(); });
     const params: InitializeParams = {
@@ -241,7 +249,7 @@ export class CodexRpc {
       rpc.notify('initialized');
       setTimeout(leave, GATE.settleMs).unref();
     } catch (err) {
-      void rpc.close().catch(() => {});
+      await rpc.close(undefined, rpc.overdue.size ? 'timeout' : 'error');
       const tail = rpc.stderrTail.trim().split('\n').slice(-3).join('\n');
       throw new Error(`Could not start codex app-server: ${(err as Error).message}${tail ? `\n${tail}` : ''}`);
     }
@@ -353,7 +361,8 @@ export class CodexRpc {
   /** Graceful stop: close stdin (app-server exits on EOF), then force-kill the tree. */
   async close(graceMs = 1500, reason: EndReason = 'close') {
     this.endReason = reason;
-    while (this.alive && (this.inFlight || Date.now() - this.born < GATE.minLifeMs)) {
+    const drainUntil = reason === 'timeout' || reason === 'error' ? 0 : Date.now() + GATE.lingerMs;
+    while (this.alive && (this.inFlight && Date.now() < drainUntil || Date.now() - this.born < GATE.minLifeMs)) {
       await new Promise<void>(resolve => setTimeout(resolve, 50).unref());
     }
     if (!this.alive) return;
@@ -364,7 +373,14 @@ export class CodexRpc {
     }
     const timer = new Promise<void>((r) => setTimeout(r, graceMs).unref());
     await Promise.race([this.exited, timer]);
-    if (this.alive) stopTree(this.child);
+    if (this.alive) {
+      this.forced = true;
+      stopTree(this.child);
+    }
     await Promise.race([this.exited, new Promise<void>((r) => setTimeout(r, 1000).unref())]);
+    if (this.alive) {
+      this.child.kill('SIGKILL');
+      await Promise.race([this.exited, new Promise<void>((r) => setTimeout(r, 1000).unref())]);
+    }
   }
 }

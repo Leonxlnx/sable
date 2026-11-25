@@ -1,3 +1,5 @@
+import { emptyIndex } from '@/state/revision';
+import { HistoryStatus } from '@/features/session/HistoryStatus';
 import { memo, useCallback, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type { TaskMark, ToolItem, WorkflowRun } from '@shared/protocol';
 import { userItemText } from '@shared/synthetic';
@@ -60,7 +62,7 @@ const COMMANDS = '\u0000commands';
  */
 export function AgentsTab({ sessionId, active = true }: { sessionId: string; active?: boolean }) {
   const reading = useStore(s => !!s.data[sessionId]?.incomplete);
-  if (reading) return <div className="rail-col" role="status">Reading conversation…</div>;
+  if (reading) return <div className="rail-col" role="status"><HistoryStatus sessionId={sessionId} /></div>;
   return (
     <ShownCtx.Provider value={active}>
       <AgentsList sessionId={sessionId} />
@@ -82,7 +84,7 @@ function AgentsList({ sessionId }: { sessionId: string }) {
 
   const view = useMemo(() => {
     const d = useStore.getState().data[sessionId];
-    return overview(ids, live, d?.items ?? {}, asked, d?.roots);
+    return overview(ids, live, d?.items ?? emptyIndex, asked, d?.roots);
   }, [ids, live, asked, sessionId]);
 
   // What the person opened or closed (waves, the commands) and where they asked for every row.

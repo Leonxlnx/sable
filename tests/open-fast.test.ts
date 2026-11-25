@@ -344,9 +344,11 @@ it('a reloaded queue edit keeps its picture and checks whether the agent took it
   for (const delivered of [false, true]) {
     useStore.getState().setDraft('a', restored.a);
     const attempt = recoverTake('a');
-    const snapshot = snap('a', 0);
-    if (delivered) snapshot.items.push({ type: 'user', id: 'row', ts: 0, text: preview.text });
-    snapCalls().at(-1)!.resolve(snapshot);
+    await flush();
+    const request = calls.at(-1)!;
+    expect(request.method).toBe('queue.take');
+    expect(request.params.operationId).toBe(preview.recovery?.operationId);
+    request.resolve(delivered ? { taken: true } : { message: { id: 'row', text: preview.text, attachments: [attachment], createdAt: 0 } });
     expect(await attempt).toBe(!delivered);
     const draft = useStore.getState().drafts.a;
     expect(draft.text).toBe(delivered ? '' : preview.text);
@@ -500,4 +502,47 @@ it('replaces a display-only tail after a restart, retaining identical rows and s
   expect(d.roots).toEqual(['u', 'w', 'n']);
   expect(d.items.u).toBe(kept);
   expect(d.items.w).toBe(stopped);
+});
+
+it('orders promoted output and later deltas against the page cut', async () => {
+  const tool: TimelineItem = { type: 'tool', ts: 1, id: 'tool', name: 'Bash', title: 'Work', kind: 'bash', status: 'running', detail: {}, output: 'ABC', more: true };
+  store.applySnapshot({ ...snap('a'), page: { kind: 'end', before: 1, rootsBefore: 1, recentAt: 0 } });
+  store.applyEvent({ type: 'item.patch', sessionId: 'a', id: 'tool', seq: 4, patch: { output: 'AB', more: false } });
+  vi.stubGlobal('requestAnimationFrame', () => 1);
+  store.applyEvent({ type: 'item.delta', sessionId: 'a', id: 'tool', seq: 5, field: 'output', delta: 'C' });
+  store.applyEvent({ type: 'item.delta', sessionId: 'a', id: 'tool', seq: 6, field: 'output', delta: 'D' });
+  await flush();
+  snapCalls()[0].resolve({ ...snap('a'), items: [tool], seq: 5, page: { kind: 'older', before: 0, rootsBefore: 0, recentAt: 0 } });
+  await flush();
+  vi.unstubAllGlobals();
+  expect(useStore.getState().data.a.items.tool).toMatchObject({ output: 'ABCD', more: true });
+});
+it('prepends inherited property names as real roots and parents', async () => {
+  store.applySnapshot({ ...snap('a'), page: { kind: 'end', before: 2, rootsBefore: 1, recentAt: 0 } });
+  await flush();
+  snapCalls()[0].resolve({ ...snap('a'), items: [{ ...items('x',1)[0], id: 'toString' }, { ...items('x',1)[0], id: '__proto__', parentId: 'toString' }], page: { kind: 'older', before: 0, rootsBefore: 0, recentAt: 0 } });
+  await flush();
+  const d = useStore.getState().data.a;
+  expect(d.roots[0]).toBe('toString');
+  expect(d.children.toString).toEqual(['__proto__']);
+});
+it('releases whole rows when deleting an open chat', () => {
+  const row = { id: 'picture', type: 'user' as const, ts: 1, text: 'look', more: true };
+  store.applySnapshot({ ...snap('a'), items: [row] });
+  store.applyWholeItem('a', { ...row, more: false }, row);
+  store.applyEvent({ type: 'session.removed', id: 'a' });
+  expect(store.wholeRowsHeld('a')).toBe(0);
+});
+it('suppresses a provisional queue row whose card already stands', () => {
+  store.applySnapshot({ ...snap('a'), page: { kind: 'provisional', before: -1, rootsBefore: -1, recentAt: 0 }, items: [{ type: 'user', id: 'q', ts: 1, text: 'go' }], queue: [{ id: 'q', createdAt: 0, text: 'go' }] });
+  expect(useStore.getState().data.a.queue).toEqual([]);
+});
+
+it('keeps a provisional queue reconciled when its card or queue arrives live', () => {
+  const q = { id: 'reserved', submitId: 'message', text: 'go', createdAt: 1 };
+  store.applySnapshot({ ...snap('a'), items: [], queue: [q], page: { kind: 'provisional', before: -1, rootsBefore: -1, recentAt: 0 } });
+  store.applyEvent({ type: 'item.added', sessionId: 'a', item: { id: 'message', ts: 2, type: 'user', text: 'go' } });
+  expect(useStore.getState().data.a.queue).toEqual([]);
+  store.applyEvent({ type: 'queue.updated', sessionId: 'a', queue: [q] });
+  expect(useStore.getState().data.a.queue).toEqual([]);
 });

@@ -1,3 +1,4 @@
+import { emptyIndex } from '@/state/revision';
 import type { TaskMark, TimelineItem, ToolItem, WorkflowRun } from '@shared/protocol';
 import { syntheticOf, type TaskOutcome } from '@shared/synthetic';
 import { isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
@@ -316,7 +317,7 @@ export function commandsView(commands: (t: Timeline | undefined) => readonly str
     ids = started;
     ended = seen;
     key = k;
-    out = commandRows(started, t?.items ?? {}, seen);
+    out = commandRows(started, t?.items ?? emptyIndex, seen);
     return out;
   };
 }

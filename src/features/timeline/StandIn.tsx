@@ -18,7 +18,7 @@ export const StandInCards = memo(function StandInCards({ sessionId }: { sessionI
       (s: Store) => {
         if (!mine.length) return '';
         const d = s.data[sessionId];
-        return d ? [...standInRows(mine, sessionId, d.roots, d.items).keys()].join('\n') : '';
+        return d ? [...standInRows(mine, sessionId, d.roots, d.items, d.queue).keys()].join('\n') : '';
       },
       [mine, sessionId],
     ),
@@ -41,7 +41,7 @@ const StandInRow = memo(function StandInRow({ s }: { s: StandIn }) {
   const item = useMemo(() => ({ id: s.id, type: 'user', text: s.text, ts: s.wall }) as UserItem, [s.id, s.text, s.wall]);
   return (
     <div className="tl-item" data-t="user" data-standin>
-      <UserMessage item={item} />
+      <UserMessage item={item} landingId={s.submitId} />
     </div>
   );
 });

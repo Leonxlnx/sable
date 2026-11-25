@@ -6,6 +6,7 @@ import { createDownloads, PLAIN_OFF, START_BUDGET, type Download, type FilesPlug
 import { isTransport, transportError, whileBusy } from './errors';
 import { onForget } from './forget';
 import { isNative, openExternal } from './native';
+import { onScreen, onScreenChange } from './screen';
 import { memorySink } from './sink';
 
 /**
@@ -75,12 +76,12 @@ const core = createDownloads({
     get: () => localStorage.getItem(KEY),
     set: (v) => localStorage.setItem(KEY, v),
   },
-  hidden: () => typeof document !== 'undefined' && document.visibilityState === 'hidden',
+  hidden: () => !onScreen(),
   actMs: () => Number(localStorage.getItem('sable.debug.downloadMs') ?? 2200),
 });
 
-// Progress is read only while the app is on screen; back on screen, it is read again.
-if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && core.resume());
+// Progress is read only while the app is on screen (lib/screen.ts); back on screen, it is read again.
+onScreenChange((on) => on && core.resume());
 // Downloads still running when the app was closed: read again.
 if (isNative && core.hasActive()) setTimeout(core.resume, 600);
 // Connected again: what paused with the connection goes on from its bytes. This module loads with

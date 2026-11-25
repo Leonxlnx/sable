@@ -1,4 +1,4 @@
-import { isUtf8 } from 'node:buffer';
+import { constants as bufferLimits, isUtf8 } from 'node:buffer';
 import { largeRowReader, scanSession, sessionTail } from './session-json';
 import * as fs from 'node:fs';
 import { closeSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -101,10 +101,10 @@ function project(item: TimelineItem, recent: boolean, cut: typeof cutItem, optio
     pictures: result?.images?.length ?? 0, hunks: !!result?.diff?.some(f => f.hunks.length),
     ...(item.type === 'tool' && item.input !== undefined ? { input: true } : {}),
     ...(item.type === 'tool' && view.type === 'tool' && view.detail.background && !item.detail.background ? { legacyBackground: true } : {}) };
-  // Detach substrings from the full strings backing the parsed line.
-  const marked = { ...view, [options.mark]: mark } as TimelineItem;
-  // The worker message already copies the strings across heaps.
-  return detach ? structuredClone(marked) : marked;
+  // A cut already owns its outer object. Only local reads need to detach
+  // substrings from the parsed line; crossing heaps does that for the worker.
+  Object.assign(view, { [options.mark]: mark });
+  return detach ? structuredClone(view) : view;
 }
 
 type Row = { tail: boolean; key: string; value: any; line?: Line };
@@ -144,13 +144,19 @@ function baseEnd(io: typeof fs, fd: number, size: number, limit: number, bytes: 
       const length = end - begin;
       const inBlock = end <= at + block.length ? block.subarray(prev + 1, end - at) : undefined;
       const last = end === offset + nl;
-      yield { offset: begin, after: end + 1, length, parse() {
-        const line = inBlock ?? bytes(io, fd, begin, length);
-        if (!last && line.at(-1) !== 44) throw new Error('Invalid session separator');
-        const item = JSON.parse(line.toString('utf8', 0, length - Number(!last))) as TimelineItem;
-        if (!item || typeof item.id !== 'string' || Object.hasOwn(item, '\0sable.baseStep')) throw new Error('Invalid session item');
-        return item;
-      } };
+      yield {
+        offset: begin, after: end + 1, length,
+        // JSON can spell a turn with Unicode escapes. Everything else is
+        // validated on the forward pass even when the reverse lookup skips it.
+        couldBeTurn: () => !inBlock || inBlock.includes('"turn"') || inBlock.includes('\\u'),
+        parse() {
+          const line = inBlock ?? bytes(io, fd, begin, length);
+          if (!last && line.at(-1) !== 44) throw new Error('Invalid session separator');
+          const item = JSON.parse(line.toString('utf8', 0, length - Number(!last))) as TimelineItem;
+          if (!item || typeof item.id !== 'string' || Object.hasOwn(item, '\0sable.baseStep')) throw new Error('Invalid session item');
+          return item;
+        },
+      };
       if (prev < 0) break;
       end = at + prev;
       cursor = prev;
@@ -200,7 +206,7 @@ function scanLines(io: typeof fs, fd: number, tailFd: number | undefined, projec
       if (skip-- > 0) continue;
       // Turn records are small. Validate this assumption below on the forward
       // pass, including tail overrides, before accepting the projection.
-      if (row.length > maxTurnBytes) continue;
+      if (row.length > maxTurnBytes || !over.size && !row.couldBeTurn()) continue;
       const item = row.parse();
       if ((over.get(item.id) ?? item).type === 'turn' && ++turns > options.turns) { recent = row.after; break; }
     }
@@ -229,7 +235,7 @@ function scanLines(io: typeof fs, fd: number, tailFd: number | undefined, projec
       const length = stop - begin - Number(!last);
       const isRecent = offset >= recent;
       let compact;
-      if (length >= 32 << 10 && projectItems && ordinal < from) {
+      if (length >= (isRecent ? 32 << 10 : 4 << 10) && projectItems && ordinal < from) {
         try { compact = large(buffer.subarray(begin, begin + length), isRecent, isRecent ? projectRecent : projectOld); }
         catch { /* An ambiguous candidate still gets one ordinary parse of its full record. */ }
       }
@@ -351,8 +357,20 @@ function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, 
  * string, and parsing it creates the separately mutable runtime row. */
 function packRow(row: Row, mark: string) {
   if (row.line && Object.hasOwn(row.value, mark)) {
-    row.line.json = JSON.stringify(row.value);
-    row.value = { id: row.value.id };
+    // A replacer forces even ordinary rows through the slow JSON encoder.
+    // Check the cut value and leave the normal pack on the native fast path.
+    function losesNumber(value: unknown): boolean {
+      if (typeof value === 'number') return !Number.isFinite(value) || Object.is(value, -0);
+      if (value && typeof value === 'object') {
+        const fields = value as Record<string, unknown>;
+        for (const key in fields) if (losesNumber(fields[key])) return true;
+      }
+      return false;
+    }
+    if (!losesNumber(row.value)) {
+      row.line.json = JSON.stringify(row.value);
+      row.value = { id: row.value.id };
+    } else row.line.preview = structuredClone(row.value);
   }
   return row;
 }
@@ -381,7 +399,7 @@ function collectRead() {
 
 function readIndexed(file: string, tailFile?: string) {
   const rows = collectRead();
-  return rows.finish(scanIndexed(fs, file, tailFile, cutItem, workerCut, scanSession, project, sessionTail, turnPositions(workerCut.turns), scanLines, readBytes, baseEnd, largeRowReader(isUtf8, workerCut), rows.reset, row => rows.add(packRow(row, LIGHT))));
+  return rows.finish(scanIndexed(fs, file, tailFile, cutItem, workerCut, scanSession, project, sessionTail, turnPositions(workerCut.turns), scanLines, readBytes, baseEnd, largeRowReader(isUtf8, workerCut, bufferLimits.MAX_STRING_LENGTH), rows.reset, row => rows.add(packRow(row, LIGHT))));
 }
 
 const WORKER = `
@@ -392,9 +410,10 @@ const pack = (${packRow});
 const { cutItem } = (${workerCut.factory})(options.recent, options.keepFiles, (${workerCut.task}));
 let rows = [], bytes = 0, positions = [];
 function send(message) {
+  // At most one batch in flight while the worker builds the next one.
+  Atomics.wait(ack, 0, 0);
   Atomics.store(ack, 0, 0);
   parentPort.postMessage(message);
-  Atomics.wait(ack, 0, 0);
 }
 function flush() {
   if (rows.length) send({ rows });
@@ -412,6 +431,7 @@ const layout = {
   },
   start(active, suffix, count) {
     send({ positions, boundary: { active, suffix, count } });
+    Atomics.wait(ack, 0, 0);
     positions = [];
     bytes = 0;
     return workerData.start[0];
@@ -419,9 +439,12 @@ const layout = {
 };
 try {
   const header = (${scanIndexed})(require('node:fs'), workerData.file, workerData.tail, cutItem, options,
-    (${scanSession}), (${project}), (${sessionTail}), layout, (${scanLines}), (${readBytes}), (${baseEnd}), (${largeRowReader})(require('node:buffer').isUtf8, options), () => { rows = []; bytes = 0; send({ reset: true }); }, (row, length) => {
+    (${scanSession}), (${project}), (${sessionTail}), layout, (${scanLines}), (${readBytes}), (${baseEnd}), (${largeRowReader})(require('node:buffer').isUtf8, options, require('node:buffer').constants.MAX_STRING_LENGTH), () => { rows = []; bytes = 0; send({ reset: true }); }, (row, length) => {
       rows.push(pack(row, options.mark));
-      if ((bytes += length) >= part) flush();
+      // A cut image crosses heaps as a small packed row. Budget that payload
+      // and cap the row count so the main thread only installs a short batch.
+      bytes += row.line?.json ? 2 * row.line.json.length + 128 : length;
+      if (bytes >= part || rows.length >= 128) flush();
     });
   flush();
   parentPort.postMessage({ header });
@@ -431,6 +454,7 @@ try {
 function readInWorker(file: string, tail: string): Promise<Read<IndexedRead>> {
   return new Promise(resolve => {
     const ack = new Int32Array(new SharedArrayBuffer(4));
+    ack[0] = 1;
     const collected = collectRead();
     const layout = turnPositions(workerCut.turns);
     const start = new Float64Array(new SharedArrayBuffer(8));
@@ -578,10 +602,12 @@ export class SessionFiles {
       const limit = 2 << 20;
       if (size < 64 << 10) return;
       const end = baseEnd(fs, fd, size, limit, readBytes);
-      if (!end || size < limit && end.footer.itemCount === undefined) return;
-      let count = end.footer.itemCount, roots = end.footer.rootCount;
-      if (count !== undefined && (!Number.isSafeInteger(count) || count <= SNAPSHOT_THRESHOLD ||
-        !Number.isSafeInteger(roots) || roots < 0 || roots > count)) return;
+      // Only the counted writer identifies the array that just ended. Its
+      // hasOver footer is rejected by baseEnd, even beyond the byte window.
+      if (!end) return;
+      const count = end.footer.itemCount, roots = end.footer.rootCount;
+      if (!Number.isSafeInteger(count) || count <= SNAPSHOT_THRESHOLD ||
+        !Number.isSafeInteger(roots) || roots < 0 || roots > count) return;
       try { tailFd = openSync(this.tailOf(id), 'r'); }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
       let tail: Tail | null = null, from = count;
@@ -590,12 +616,7 @@ export class SessionFiles {
         const length = fs.fstatSync(tailFd).size;
         if (length > limit) return;
         tail = JSON.parse(readBytes(fs, tailFd, 0, length).toString());
-        if (tail?.baseCount !== undefined) {
-          if (count !== undefined && (count !== tail.baseCount || roots !== tail.baseRoots)) return;
-          count = tail.baseCount;
-          roots = tail.baseRoots;
-        }
-        if (!Number.isSafeInteger(count) || !Number.isSafeInteger(roots) || roots < 0 || roots > count) return;
+        if (tail?.baseCount !== undefined && (count !== tail.baseCount || roots !== tail.baseRoots)) return;
         if (!tail || tail.baseGen !== end.gen || !Number.isSafeInteger(tail.from) || tail.from! < 0 || tail.from! > count ||
             !Array.isArray(tail.items) || !tail.items.every(valid) ||
             tail.over !== undefined && (!Array.isArray(tail.over) || !tail.over.every(valid)) ||
@@ -606,9 +627,10 @@ export class SessionFiles {
       const suffix = tail?.items ?? [];
       const reverse: TimelineItem[] = [];
       const endId = tail ? tail.endId : end.footer.endId;
-      let found = !endId || suffix.some(i => i.id === endId);
+      if (typeof endId !== 'string') return;
+      let found = suffix.some(i => i.id === endId);
       let prompts = suffix.filter(turnBoundary).length;
-      let skip = count === undefined ? 0 : count - from;
+      let skip = count - from;
       let omittedRoots = roots;
       for (const record of end.backwards()) {
         const item = record.parse();
@@ -626,13 +648,13 @@ export class SessionFiles {
       const rows = reverse.reverse().concat(suffix);
       if (new Set(rows.map(i => i.id)).size !== rows.length) return;
       const start = snapshotEnd(rows).start;
-      if (!turnBoundary(rows[start]) || endId && rows[start].id !== endId) return;
-      const before = count === undefined ? -1 : from - reverse.length + start;
-      if (count !== undefined && (before < 0 || omittedRoots < 0 || from + suffix.length <= SNAPSHOT_THRESHOLD)) return;
+      if (!turnBoundary(rows[start]) || rows[start].id !== endId) return;
+      const before = from - reverse.length + start;
+      if (before < 0 || omittedRoots < 0 || from + suffix.length <= SNAPSHOT_THRESHOLD) return;
       for (let i = 0; i < start; i++) if (!rows[i].parentId) omittedRoots++;
       return { items: rows.slice(start), todos: tail?.todos ?? end.footer.todos as Todo[],
         queue: (tail?.queue ?? end.footer.queue ?? []) as QueuedMessage[],
-        page: { kind: 'provisional' as const, before, rootsBefore: count === undefined ? -1 : omittedRoots,
+        page: { kind: 'provisional' as const, before, rootsBefore: omittedRoots,
           recentAt: Math.max(0, recentStart(rows, workerCut.turns) - start) } };
     } catch { return; }
     finally { if (tailFd !== undefined) closeSync(tailFd); if (fd !== undefined) closeSync(fd); }
@@ -914,7 +936,7 @@ export class SessionFiles {
     if (!whole && base && over) {
       const tmp = `${this.tailOf(id)}.${process.pid}.tmp`;
       const head = `{"baseGen":${base.gen},"from":${from},"items":[\n`;
-      const endId = final && items.length > SNAPSHOT_THRESHOLD ? items[snapshotEnd(items).start].id : undefined;
+      const endId = items.length > SNAPSHOT_THRESHOLD ? items[snapshotEnd(items).start].id : undefined;
       const end = `\n],"baseCount":${base.count},"baseRoots":${base.roots}${endId ? ',"endId":' + JSON.stringify(endId) : ''},"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
       const source = new BaseReader(this.pathOf(id), base);
       let written;

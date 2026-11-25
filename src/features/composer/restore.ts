@@ -1,4 +1,4 @@
-import type { Attachment, QueuedMessage } from '@shared/protocol';
+import type { Attachment, QueuedMessage, UserItem } from '@shared/protocol';
 
 /**
  * Words and files leave the composer's field only for good: what is sent is taken out of the
@@ -10,7 +10,18 @@ import type { Attachment, QueuedMessage } from '@shared/protocol';
 
 export interface FieldDraft {
   /** Preserve the entire field on reload while recovering a queue edit or rewind. */
-  recovery?: { retry?: { id: string; text: string; files: string }; queueId?: string; preview?: { text: string; files: string[] } };
+  recovery?: {
+    operationId?: string;
+    queueId?: string;
+    /** Full row saved before a take or swap may displace it. */
+    expected?: QueuedMessage;
+    preview?: { text: string; files: string[] };
+    swap?: { text: string; attachments: Attachment[] };
+    rewind?: { itemId: string; expectedEnd?: string; expectedLast?: UserItem };
+    checkSend?: boolean;
+    retry?: { id: string; text: string; files: string };
+    payload?: { text: string; attachments: Attachment[] };
+  };
   text: string;
   attachments: Attachment[];
 }
@@ -60,7 +71,7 @@ export function carryOver(now: FieldDraft | undefined, extra: FieldDraft): Field
  * field once the bridge answered. Words typed or files attached during the request stay, after the
  * message's own.
  */
-export function swapIn(now: FieldDraft | undefined, before: FieldDraft, got: FieldDraft): FieldDraft {
+export function swapIn(now: FieldDraft | undefined, before: { text: string; attachments: readonly { id: string }[] }, got: FieldDraft): FieldDraft {
   const cur = now?.text ?? '';
   const typed = cur === before.text ? '' : cur;
   const had = idsOf(before.attachments);
@@ -88,11 +99,15 @@ export const shownUltra = (stored: boolean, pick: UltraPick | null): boolean => 
 /** The request `seq` was answered: its pick ends (a newer pick stays). */
 export const ultraAnswered = (pick: UltraPick | null, seq: number): UltraPick | null => (pick?.seq === seq ? null : pick);
 
-export type TakeResult = { kind: 'message'; message: QueuedMessage } | { kind: 'taken' } | { kind: 'unknown' };
+export type TakeResult = { kind: 'message'; message: QueuedMessage } | { kind: 'taken' } | { kind: 'unknown' } | { kind: 'revised'; current: QueuedMessage };
 
 export function settleTake(now: FieldDraft, preview: { text: string; attachments: readonly { id: string }[] }, result: TakeResult): FieldDraft {
-  if (result.kind === 'unknown') return now;
+  if (result.kind === 'unknown' || result.kind === 'revised') return now;
   if (result.kind === 'taken') {
+    if (now.recovery?.queueId) {
+      const delivered = idsOf(preview.attachments);
+      return { text: now.text === preview.text ? '' : now.text, attachments: now.attachments.filter(a => !delivered.has(a.id)), recovery: undefined };
+    }
     const untouched = now.text === preview.text && now.attachments.length === preview.attachments.length
       && now.attachments.every((a, i) => a.id === preview.attachments[i].id);
     return untouched ? { text: '', attachments: [], recovery: undefined } : { ...now, recovery: now.recovery ? {} : undefined };

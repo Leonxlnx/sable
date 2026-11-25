@@ -20,6 +20,8 @@
  * high), and never counted twice: when the system made the page itself shorter for the keyboard
  * (the window resized, or the WebView's visual viewport shrank), only what is left is lifted.
  */
+import { onScreenChange } from './screen';
+
 type Sub = (lift: number, prev: number, ms: number) => void;
 
 /** Each edge's bars in CSS px: top, right, bottom, left. */
@@ -142,7 +144,7 @@ document.addEventListener?.('focusin', recheck);
 document.addEventListener?.('focusout', recheck);
 // Back on screen, or the page's size changed under it (a turn, a system that resized the window):
 // what is lifted is worked out again.
-document.addEventListener?.('visibilitychange', () => !document.hidden && applyLift(0));
+onScreenChange((on) => on && applyLift(0));
 window.addEventListener?.('resize', () => applyLift(0));
 window.visualViewport?.addEventListener('resize', () => applyLift(0));
 

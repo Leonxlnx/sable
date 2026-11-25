@@ -325,7 +325,7 @@ export class CodexProvider implements Provider {
     this.ctx.log('[codex] stopping idle app-server');
     this.rpc = null;
     this.stopping = rpc;
-    this.closingRpc = rpc.close(undefined, 'idle').then(() => rpc.ended).finally(() => { this.closingRpc = undefined; });
+    this.closingRpc = rpc.close(undefined, 'idle').finally(() => { this.closingRpc = undefined; });
     void this.closingRpc.catch(() => {});
   }
 
@@ -341,6 +341,9 @@ export class CodexProvider implements Provider {
   }
 
   async client(reason: StartReason = 'chat'): Promise<CodexRpc> {
+    // An auxiliary launch may sleep after wake. A chat arriving during that
+    // time must still be able to start the shared app-server itself.
+    if (!this.rpc?.alive && ['caps', 'limits', 'status', 'history'].includes(reason)) await authGate.beforeRead();
     if (this.closingRpc) await this.closingRpc;
     if (this.disposed) throw new Error('Codex provider is shut down');
     this.lastUse = Date.now();
@@ -1224,16 +1227,17 @@ class CodexSession implements ProviderSession {
       model: rt.meta.model || resp.model || resp.thread.model || '',
       effort: rt.meta.effort ?? toEffort(resp.reasoningEffort ?? resp.thread.reasoningEffort),
     });
-    try {
-      const caps = await this.provider.caps(rt.meta.cwd);
+    const epoch = this.loadEpoch;
+    const capsReady = this.provider.caps(rt.meta.cwd).then(caps => {
+      if (this.closed || epoch !== this.loadEpoch) return;
       rt.setCaps(caps);
       if (!rt.meta.model) {
         const def = caps.models.find((m) => m.isDefault) ?? caps.models[0];
         if (def) rt.update({ model: def.id });
       }
-    } catch (err) {
-      this.log('caps failed', errMsg(err));
-    }
+    }).catch(err => this.log('caps failed', errMsg(err)));
+    // The thread is ready. A reader sleeping after wake may fill in its picker later.
+    if (!authGate.readsPaused()) await capsReady;
     this.showCuaState();
     if (rt.meta.options?.remoteControl) void this.provider.setRemote(this, true).catch(() => {});
   }

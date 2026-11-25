@@ -1540,10 +1540,34 @@
   color: var(--text-inverse);
   background-color: var(--text);
   box-shadow: var(--cove-contact), var(--key-up);
+  transition: scale 80ms var(--ease-out);
+}
+
+/* Pointed at and held, the face eases. The swap between the glass key and the ivory one (there is
+   something to send now, or no longer) is the state's own frame: eased from the glass's
+   translucent fill, the disc went darker than either for a frame before it lit (filmed at 125%:
+   the glass, a dark disc without rim, grey, ivory). The ivory face comes up in 90 ms by opacity
+   instead (`key-lit`), from the frame of the keystroke. */
+.cmp-send:is(:hover, :active) {
   transition:
     background-color var(--d-1) var(--ease),
-    color var(--d-1) var(--ease),
     scale 80ms var(--ease-out);
+}
+
+.cmp-send[data-on][data-ready] {
+  animation: key-lit 90ms var(--ease-out);
+}
+
+@keyframes key-lit {
+  from {
+    opacity: 0.45;
+  }
+}
+
+/* The card copy that flies to the dock (home/handoff.ts) is a new element: its key would light
+   again, a dip under the send. */
+.handoff-ghost .cmp-send {
+  animation: none;
 }
 
 /* The glass key's rim: the pane's hairline, the same all round (off on the ivory face), at the
@@ -1623,17 +1647,19 @@
 }
 
 /* One arrow in every state: straight up to send (and to queue while a turn runs), leaning into the
-   turn to steer. The lean is the only move between states: a short turn about the arrow's centre. */
+   turn to steer. The lean is the only move between states: a short turn about the arrow's centre.
+   About 12 px tall in the 40 px disc, its stroke 2.1 px: at 18 px (10 px tall) it read small and
+   timid beside the bar's 13 px words. */
 .sk-glyph {
   display: block;
-  width: 18px;
-  height: 18px;
+  width: 21px;
+  height: 21px;
   overflow: visible;
 }
 
 .sk-glyph path {
   stroke: currentColor;
-  stroke-width: 1.8;
+  stroke-width: 1.6;
   stroke-linecap: round;
   stroke-linejoin: round;
   transform-box: view-box;

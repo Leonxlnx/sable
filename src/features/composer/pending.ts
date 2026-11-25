@@ -20,14 +20,19 @@ export interface PendingSend {
   /** The submission's id: the same for a retry of the same words and files. */
   id: string;
   draft: FieldDraft;
+  payload?: Pick<FieldDraft, 'text' | 'attachments'>;
+  /** Delivery was not confirmed; keep it separate from newer typing until reconciled. */
+  uncertain?: boolean;
+  fromField: boolean;
 }
 
 let seq = 0;
 const out = new Map<string, PendingSend[]>();
 /** What a field holds at its start from refused messages put back (still unedited there). */
+const deferred: PendingSend[] = [];
+export const takeDeferred = () => deferred.splice(0);
+
 const back = new Map<string, { parts: PendingSend[]; text: string }>();
-/** The id a retry of exactly this message reuses. */
-const retry = new Map<string, { id: string; text: string; files: string }>();
 const subs = new Set<() => void>();
 
 const filesKey = (d: FieldDraft) => d.attachments.map((a) => a.id).join('\u0000');
@@ -52,7 +57,7 @@ export function onPending(fn: () => void): () => void {
 const prepared = new WeakMap<FieldDraft, string>();
 
 export function submissionId(key: string, draft: FieldDraft): string {
-  const r = retry.get(key) ?? draft.recovery?.retry;
+  const r = draft.recovery?.retry;
   const id = prepared.get(draft) ?? (r && r.text === draft.text && r.files === filesKey(draft) ? r.id : newId());
   prepared.set(draft, id);
   return id;
@@ -62,14 +67,21 @@ export function holdSend(key: string, draft: FieldDraft, fromField = true): Pend
   const id = fromField ? submissionId(key, draft) : newId();
   prepared.delete(draft);
   if (fromField) {
-    retry.delete(key);
     back.delete(key);
   }
-  const kept = draft.recovery ? { ...draft, recovery: { ...draft.recovery, retry: { id, text: draft.text, files: filesKey(draft) } } } : draft;
-  const p: PendingSend = { key, seq: ++seq, id, draft: kept };
+  const kept = draft.recovery ? { ...draft, recovery: { ...draft.recovery, operationId: id, retry: { id, text: draft.text, files: filesKey(draft) } } } : draft;
+  const p: PendingSend = { key, seq: ++seq, id, draft: kept, fromField };
   out.set(key, [...(out.get(key) ?? []), p]);
   changed();
   return p;
+}
+
+/** Each pending action has its own durable entry, separate from subsequent typing. */
+export function pendingDrafts() {
+  return [...out.values()].flat().sort((a,b) => a.seq - b.seq).map(p => ({
+    key: p.key, id: p.id, draft: { ...p.draft, recovery: { ...p.draft.recovery, operationId: p.id, checkSend: true, payload: p.payload,
+      retry: { id: p.id, text: p.draft.text, files: filesKey(p.draft) } } },
+  }));
 }
 
 function drop(p: PendingSend) {
@@ -121,6 +133,13 @@ function merged(parts: PendingSend[], now: FieldDraft | undefined, rest: string)
 export function sendBack(p: PendingSend, now: FieldDraft | undefined, into: string = p.key): FieldDraft {
   drop(p);
   const cur = now?.text ?? '';
+  if (now && (cur || now.attachments.length || now.recovery?.queueId) &&
+      (p.uncertain || p.draft.recovery?.rewind || now.recovery?.queueId || now.recovery?.rewind || !p.fromField && now.recovery)) {
+    p.key = into;
+    deferred.push(p);
+    changed();
+    return now;
+  }
   const prev = back.get(into);
   const holds = !!prev && (cur === prev.text || cur.startsWith(`${prev.text}\n`) || !prev.text);
   const parts = holds ? [...prev!.parts, p].sort((a, b) => a.seq - b.seq) : [p];
@@ -132,8 +151,12 @@ export function sendBack(p: PendingSend, now: FieldDraft | undefined, into: stri
     .join('\n');
   back.set(into, { parts, text: head });
   // The field is exactly this one message again: a retry is the same submission.
-  if (parts.length === 1 && next.text === p.draft.text && next.attachments.length === p.draft.attachments.length) retry.set(into, { id: p.id, text: p.draft.text, files: filesKey(p.draft) });
-  else retry.delete(into);
+  if (parts.length === 1 && next.text === p.draft.text && next.attachments.length === p.draft.attachments.length) {
+    const receipt = { id: p.id, text: next.text, files: filesKey(next) };
+    next.recovery = { ...next.recovery, operationId: p.id, checkSend: p.uncertain, payload: p.payload, retry: receipt };
+  } else {
+    if (parts.length > 1 && !next.recovery?.queueId && !next.recovery?.rewind) delete next.recovery;
+  }
   changed();
   return next;
 }
@@ -159,9 +182,9 @@ export function draftsWithPending<T extends FieldDraft>(drafts: Record<string, T
 /** Tests: forget everything. */
 export function resetPending() {
   takes.clear();
+  deferred.length = 0;
   out.clear();
   back.clear();
-  retry.clear();
   seq = 0;
 }
 
@@ -169,7 +192,7 @@ export function resetPending() {
 export function queueDraft(q: QueuedMessage): FieldDraft {
   const attachments = q.attachments ?? [];
   const preview = { text: q.text, files: attachments.map(a => a.id) };
-  return { text: q.text, attachments, recovery: { queueId: q.id, preview } };
+  return { text: q.text, attachments, recovery: { operationId: newId(), queueId: q.id, expected: q, preview } };
 }
 
 // The bridge call has its own socket deadline. Only the first waiting press may resume.

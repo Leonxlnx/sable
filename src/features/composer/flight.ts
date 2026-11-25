@@ -63,6 +63,7 @@ export interface Sample {
 }
 
 interface Flight {
+  submitId?: string;
   key: string;
   dest: FlightDest;
   /** The chat it was sent in (null from home until the chat exists, see `scope`): only that chat's rows claim it. */
@@ -142,7 +143,7 @@ export interface FlightHandle {
    * lets go) or refused it (`false`: the message goes back into the field; resolves once it has,
    * for the words to be put back).
    */
-  settle(ok: boolean): Promise<void>;
+  settle(ok: boolean, queued?: boolean): Promise<void>;
   /** The chat the message went to, once known (a first message from home). */
   scope(sessionId: string): void;
   /** The view it left from is gone (or the message goes back elsewhere): what is in the air fades where it is. */
@@ -154,7 +155,7 @@ const pending: Flight[] = [];
  * Messages that mounted in the conversation with no message in the air yet (a tray row may still
  * leave): claimed within `UNCLAIMED_MS`, forgotten after (so no old conversation is held).
  */
-const unclaimed: { key: string; root: HTMLElement; at: number; session: string | null; ts: number | null }[] = [];
+const unclaimed: { key: string; root: HTMLElement; at: number; session: string | null; ts: number | null; submitId?: string }[] = [];
 const UNCLAIMED_MS = 400;
 const pruneUnclaimed = (now: number) => {
   for (let i = unclaimed.length - 1; i >= 0; i--) if (now - unclaimed[i].at >= UNCLAIMED_MS || !unclaimed[i].root.isConnected) unclaimed.splice(i, 1);
@@ -183,6 +184,7 @@ export const FRESH_SLACK_MS = 2000;
 
 /** Where a row (or a tray row) that might take a message in the air belongs. */
 export interface LandingSite {
+  submitId?: string;
   /** The chat it is shown in. */
   session?: string | null;
   /** Its message's time (`UserItem.ts`): a message from before the launch is history. */
@@ -195,11 +197,11 @@ export interface LandingSite {
  * chat switched to never takes another chat's message, and an old row with the same words ("Continue")
  * mounting in view never takes a new one. Pure, for tests.
  */
-export function claimable(f: Pick<Flight, 'dest' | 'key' | 'session' | 'wall'> & { target?: unknown; ending?: boolean }, dest: FlightDest, text: string, site: LandingSite = {}): boolean {
-  if (f.dest !== dest || f.target || f.ending || !matches(f.key, text)) return false;
+export function claimable(f: Pick<Flight, 'dest' | 'key' | 'session' | 'wall' | 'submitId'> & { target?: unknown; ending?: boolean }, dest: FlightDest, text: string, site: LandingSite = {}): boolean {
+  if (f.dest !== dest || f.target || f.ending) return false;
   if (f.session && site.session && f.session !== site.session) return false;
-  if (site.ts != null && site.ts < f.wall - FRESH_SLACK_MS) return false;
-  return true;
+  if (f.submitId) return f.submitId === site.submitId;
+  return matches(f.key, text) && (site.ts == null || site.ts >= f.wall - FRESH_SLACK_MS);
 }
 
 /** A flight's matching fields, for `claimable` (and the tests). */
@@ -603,7 +605,7 @@ const FIELD_CLOSES = 56;
  * time. What is no layer (the timers, the backdrop's beats) follows right after
  * that frame (`after`).
  */
-export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: boolean; first?: boolean; session?: string | null }): FlightHandle | null {
+export function launchFlight(source: Source, opts: { dest: FlightDest; submitId?: string; represented?: boolean; steer?: boolean; first?: boolean; session?: string | null }): FlightHandle | null {
   if (reducedMotion() || !source.text.trim()) return null;
   const t0 = performance.now();
   const bubble = opts.dest === 'timeline';
@@ -673,6 +675,7 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   const signal = pour(spec, first ? 150 : 0);
   const f: Flight = {
     key: norm(source.text),
+    submitId: opts.submitId,
     dest: opts.dest,
     session: opts.session ?? null,
     wall: Date.now(),
@@ -749,16 +752,16 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   // first frame, it shows on time even while the main thread is busy mounting the row it waits for.
   if (bubble) waitFrom(f, waitStart(f.plan.end));
   begin(f, g, lead);
-  if (early) landInTimeline(early, source.text, { steer, late: true, session: f.session });
+  if (early) landInTimeline(early, source.text, { steer, late: true, session: f.session, submitId: f.submitId });
   // Whatever happens on the way, nothing outlives this: the real message always shows.
   window.setTimeout(() => abort(f), bubble ? HOLD_MS + 2000 : MAX_LIFE_MS);
   if (import.meta.env.DEV) devHook();
   // The message stands in the conversation from now on (timeline/stand-in.ts): the card lands on
   // that stand-in at once, in the timeline's own layout, however late the bridge adds the row.
-  const stand = bubble && !steer ? addStandIn(source.text, f.session, f.wall) : null;
+  const stand = bubble && !steer && opts.submitId ? addStandIn(source.text, f.session, opts.submitId, f.wall, opts.represented) : null;
   return {
-    settle: (ok) => {
-      if (ok) standInTaken(stand);
+    settle: (ok, queued) => {
+      if (ok && !queued) standInTaken(stand);
       else dropStandIn(stand);
       return settle(f, ok);
     },
@@ -1371,7 +1374,7 @@ function drop(f: Flight) {
 }
 
 /** A message in the air whose landing was a stand-in that has just left the page for its real row. */
-function fromStandIn(text: string, site: LandingSite): Flight | null {
+function fromStandIn(site: LandingSite): Flight | null {
   return (
     pending.find(
       (f) =>
@@ -1380,7 +1383,7 @@ function fromStandIn(text: string, site: LandingSite): Flight | null {
         !!f.target &&
         !f.target.isConnected &&
         !!f.row?.closest('[data-standin]') &&
-        matches(f.key, text) &&
+        !!f.submitId && f.submitId === site.submitId &&
         (!f.session || !site.session || f.session === site.session),
     ) ?? null
   );
@@ -1462,12 +1465,12 @@ export function landInTimeline(root: HTMLElement, text: string, opts: { steer?: 
   if (reducedMotion()) return false;
   // A message that landed (or was landing) on its stand-in goes on to the real row that takes the
   // stand-in's place in the same commit: the same place, so nothing moves (timeline/stand-in.ts).
-  const f = claim('timeline', text, opts) ?? fromStandIn(text, opts);
+  const f = claim('timeline', text, opts) ?? fromStandIn(opts);
   if (!f) {
     if (!opts.late) {
       const now = performance.now();
       pruneUnclaimed(now);
-      unclaimed.push({ key: text, root, at: now, session: opts.session ?? null, ts: opts.ts ?? null });
+      unclaimed.push({ key: text, root, at: now, session: opts.session ?? null, ts: opts.ts ?? null, submitId: opts.submitId });
       if (unclaimed.length > 4) unclaimed.shift();
       // Forgotten once it can no longer be claimed, so a conversation left behind is not held.
       window.setTimeout(() => pruneUnclaimed(performance.now()), UNCLAIMED_MS + 20);
@@ -1528,9 +1531,9 @@ function watch(f: Flight) {
 }
 
 /** A queued message's row appeared in the tray: the words land on it. */
-export function landInTray(textEl: HTMLElement, text: string, session?: string | null): boolean {
+export function landInTray(textEl: HTMLElement, text: string, session?: string | null, submitId?: string): boolean {
   if (reducedMotion()) return false;
-  const f = claim('tray', text, { session });
+  const f = claim('tray', text, { session, submitId });
   if (!f) return false;
   // The words take the row's type and stand where its text starts.
   const row = textEl.closest<HTMLElement>('[data-qrow]');
@@ -1549,9 +1552,9 @@ export function landInTray(textEl: HTMLElement, text: string, session?: string |
 }
 
 /** A queued message left the tray for the conversation: it gathers at the row's end and rises from there. */
-export function launchFromTray(textEl: HTMLElement, text: string, session?: string | null) {
+export function launchFromTray(textEl: HTMLElement, text: string, session?: string | null, submitId?: string) {
   if (reducedMotion()) return;
-  launchFlight({ el: textEl, text, oneLine: true }, { dest: 'timeline', session });
+  launchFlight({ el: textEl, text, oneLine: true }, { dest: 'timeline', session, submitId, represented: true });
 }
 
 /** For tests and the dev console: messages in the air. */

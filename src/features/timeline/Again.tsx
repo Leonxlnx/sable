@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { UserItem } from '@shared/protocol';
-import { stripWrappers, syntheticOf } from '@shared/synthetic';
-import { repeatMessage } from './repeat-message';
+import { stripWrappers } from '@shared/synthetic';
+import { lastPrompt, repeatMessage } from './repeat-message';
 import { useStore } from '@/state/store';
 import { IconButton, Popover, PopoverClose, PopoverContent, PopoverTrigger } from '@/ui';
 import { useTimeline } from './ctx';
@@ -10,13 +10,7 @@ import { useTimeline } from './ctx';
 function useIsLast(sessionId: string, id: string): boolean {
   return useStore((s) => {
     const data = s.data[sessionId];
-    if (!data) return false;
-    for (let i = data.roots.length - 1; i >= 0; i--) {
-      const it = data.items[data.roots[i]];
-      // What the agent's harness wrote in the person's place (a task finished) is not theirs.
-      if (it?.type === 'user' && it.state !== 'queued' && !syntheticOf(it)) return it.id === id;
-    }
-    return false;
+    return lastPrompt(data)?.id === id;
   });
 }
 
@@ -46,7 +40,7 @@ export function MessageAgain({ item, turnId }: { item: UserItem; turnId: () => s
   const edit = async () => {
     if (busy) return;
     setBusy(true);
-    const ok = await repeatMessage(sessionId, item, text, 'edit', turnId());
+    const ok = await repeatMessage(sessionId, item, text, 'edit', turnId(), !last);
     setBusy(false);
     if (!ok) return;
     setOpen(false);

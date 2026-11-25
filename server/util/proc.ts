@@ -124,3 +124,15 @@ export function killTree(child: ChildProcess | undefined) {
     }
   }
 }
+
+/** A short-lived reader that still has not exited after its timeout and grace. */
+export async function retireReader(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode) return;
+  killTree(child);
+  // Give Windows taskkill time to enumerate the children of a CLI shim before
+  // forcing its root down. The grace is bounded even if no exit event arrives.
+  if (process.platform === 'win32' && child.exitCode === null && !child.signalCode) {
+    await new Promise<void>(resolve => setTimeout(resolve, 500).unref());
+  }
+  if (child.exitCode === null && !child.signalCode) child.kill('SIGKILL');
+}

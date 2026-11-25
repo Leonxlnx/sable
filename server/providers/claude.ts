@@ -56,7 +56,7 @@ import { lostLine, type BackgroundLimit, type LossTrigger, type LostWhy, type Me
 import type { TitlePrompt } from '../core/titles';
 import { dropRemote, holdRemote, idleSince, type RemoteHolder } from '../core/remote-keep';
 import { claudeForkPoint, cutAt } from '../core/fork';
-import { killTree, runCli, spawnCli } from '../util/proc';
+import { killTree, retireReader, runCli, spawnCli } from '../util/proc';
 import { agentLimitOf, appPictures, backgroundTaskOf, baseName, describeTool, flattenContent, mapResult, mergeWorkflow, normalizeTodos, peekPartialInput, plainWords, previewDiff, taskKindOf, wakeOf, workflowStart, type TaskKind } from './claude-tools';
 import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoice } from './types';
 import { claudePlan } from './plans';
@@ -339,17 +339,32 @@ export class ClaudeProvider implements Provider {
       if (this.ctx.closing?.()) throw new Error('Sable is closing');
       if (reader && !authGate.canReadAlone(key)) return;
       let timedOut = false;
+      let retire: (() => void) | undefined, grace: NodeJS.Timeout | undefined;
       return await runCli(claudeBinary() ?? 'claude', args, {
         env: this.env(), timeoutMs, keepAliveOnTimeout: reason !== 'version',
-        timedOut: () => { timedOut = true; },
+        timedOut: () => {
+          timedOut = true;
+          if (retire) grace = setTimeout(retire, 1500).unref();
+        },
         started: child => {
           if (!child.pid) return;
           if (!reader) child.stdout?.once('data', () => setTimeout(leave, GATE.settleMs).unref?.());
           const untrack = authGate.trackProcess(key);
           onStart?.(child.pid);
           const end = scope.journal?.started(scope, key, child.pid);
+          if (reader) retire = async () => {
+            try {
+              await retireReader(child);
+            } catch {
+              this.ctx.log('[claude] status reader cleanup failed');
+            } finally {
+              untrack();
+              end?.('timeout', true);
+            }
+          };
           child.once('close', code => {
-            const terminated = timedOut && reason === 'version';
+            clearTimeout(grace);
+            const terminated = timedOut && reader;
             end?.(terminated ? 'timeout' : code === 0 ? 'exit' : 'error', terminated);
             untrack();
           });

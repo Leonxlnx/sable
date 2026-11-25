@@ -880,6 +880,7 @@ export function phoneDetail(items: TimelineItem[], itemId: string, whole: (item:
 // Installed phones shallow-merge updates. Send clears for fields they read as optional or
 // already accept as null. In particular, keep required strings and the usage object intact.
 const PHONE_CLEARABLE = new Set<string>([
+  'live',
   'accountId', 'movedFrom', 'returnAt', 'activity', 'lastError', 'remote', 'capState', 'moving',
   'pendingRestart', 'providerSessionId', 'until', 'spare', 'race', 'lane', 'agentHandover', 'moveNote',
   'background', 'commands', 'serving', 'servingSince', 'servingAddress', 'options', 'effort', 'speed', 'fast', 'ultracode', 'pinned', 'archived', 'unread', 'branch',

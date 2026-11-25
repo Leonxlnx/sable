@@ -1,3 +1,4 @@
+import { HistoryStatus } from '@/features/session/HistoryStatus';
 import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import type { ContextBreakdown, ProviderId } from '@shared/protocol';
 import { Icon } from '@/icons';
@@ -78,7 +79,7 @@ export function ContextTab({ sessionId, active }: { sessionId: string; active: b
     return null;
   }, [ctx, usage?.contextTokens, usage?.contextWindow, session?.model]);
 
-  if (reading) return <div className="rail-col" role="status">Reading conversation…</div>;
+  if (reading) return <div className="rail-col" role="status"><HistoryStatus sessionId={sessionId} /></div>;
   if (!session) return null;
   const pct = view ? Math.min(100, (view.total / view.max) * 100) : 0;
 

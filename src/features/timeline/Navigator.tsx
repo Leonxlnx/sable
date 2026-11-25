@@ -1,3 +1,4 @@
+import { emptyIndex } from '@/state/revision';
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import type { TimelineItem } from '@shared/protocol';
@@ -137,10 +138,10 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   const marks = useMemo(() => {
     if (!layout) return lastMarks.current;
     const d = useStore.getState().data[sessionId];
-    return (lastMarks.current = marksOf(layout.groups, d?.items ?? {}, undefined, lastMarks.current));
+    return (lastMarks.current = marksOf(layout.groups, d?.items ?? emptyIndex, undefined, lastMarks.current));
   }, [layout, sessionId]);
 
-  const shape = useCallback((g: Group) => navigatorShape(g, useStore.getState().data[sessionId]?.items ?? {}, estimate), [sessionId]);
+  const shape = useCallback((g: Group) => navigatorShape(g, useStore.getState().data[sessionId]?.items ?? emptyIndex, estimate), [sessionId]);
 
   const track = useRef<HTMLDivElement>(null);
   const [geo, setGeo] = useState<Geo>(NO_GEO);
@@ -549,7 +550,7 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   const hits = useMemo(() => {
     const { boxes, layout: lay } = last.current;
     if (!show || !find?.ids.length || !boxes || !lay) return null;
-    const items = (useStore.getState().data[sessionId]?.items ?? {}) as Record<string, TimelineItem | undefined>;
+    const items = (useStore.getState().data[sessionId]?.items ?? emptyIndex) as Record<string, TimelineItem | undefined>;
     const groupOf = new Map<string, number>();
     lay.groups.forEach((g, i) => {
       if (g.kind === 'item') groupOf.set(g.id, i);
@@ -914,7 +915,7 @@ const Index = memo(function Index({ sessionId, marks, runs, here, waitAt, asked,
   const uid = useId();
   const rowId = (i: number) => `${uid}r${i}`;
   const rows = useMemo(() => {
-    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
     return marks.map((m) => wordsOf(items[m.id]));
   }, [marks, sessionId]);
 

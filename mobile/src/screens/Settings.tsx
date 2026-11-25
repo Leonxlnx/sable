@@ -6,6 +6,7 @@ import { conn } from '@m/lib/conn';
 import { appVersion, askNotifications, haptic, hapticsEnabled, isNative, noteStatus, notificationsAllowed, openNoteSettings, savePref, setHaptics, type NoteStatus } from '@m/lib/native';
 import { homeFolder } from '@m/lib/race';
 import { nav } from '@m/lib/nav';
+import { onScreenChange } from '@m/lib/screen';
 import { setState, useStore } from '@m/lib/store';
 import { AutoHeight } from '@m/ui/AutoHeight';
 import { Field, paletteFor } from '@m/ui/Field';
@@ -46,9 +47,7 @@ export function Settings() {
     read();
     void appVersion().then(setMine);
     // Back from Android's settings: read again.
-    const again = () => document.visibilityState === 'visible' && read();
-    document.addEventListener('visibilitychange', again);
-    return () => document.removeEventListener('visibilitychange', again);
+    return onScreenChange((on) => on && read());
   }, []);
 
   const toggleNotify = async () => {

@@ -11,7 +11,7 @@ import { chatOf, nav, routeKey, useNav, type Route } from '@m/lib/nav';
 import { rowOf, takeOrigin, type Origin } from '@m/lib/open';
 import { pruneComments } from '@m/lib/comments';
 import { takeSwap } from '@m/lib/race';
-import { closeSessionData, getState, hasCachedHome, loadCachedHome, refresh, setState, subscribeStore, useStore, watchLive } from '@m/lib/store';
+import { closeSessionData, getState, hasCachedHome, loadCachedHome, openSession, refresh, setState, subscribeStore, useStore, watchLive } from '@m/lib/store';
 import '@m/lib/keyboard';
 import { fieldBeat } from '@m/ui/Field';
 import { Launch } from '@m/ui/Launch';
@@ -168,6 +168,7 @@ export function App() {
   const [lookedUp, setLookedUp] = useState(false);
 
   useEffect(() => {
+    let beat = 0;
     const offs = [
       conn.onOpen(() => {
         const open = nav.stack.filter((r) => r.name === 'chat').map((r) => (r as { id: string }).id);
@@ -181,12 +182,21 @@ export function App() {
           .catch(() => {});
       }),
       onAppState((active) => {
+        clearInterval(beat);
         if (active) {
           forgetNotificationLines();
           const id = chatOf(nav.stack[nav.stack.length - 1]);
           if (id) clearNotification(id);
           conn.wake();
-        } else conn.sleep();
+          // A chat opened while nobody looked was only peeked at (lib/store.ts openSession): read now, and followed.
+          if (conn.state === 'open') for (const r of nav.stack) if (r.name === 'chat' && getState().data[r.id]?.cached) void openSession(r.id).catch(() => {});
+        } else {
+          conn.sleep();
+          // Off screen the page runs only while a chat works (android/…/PageLife.java): once a minute the
+          // connection is asked whether it still answers, so a socket that died silently is replaced and
+          // the live cards never stand on a stale "Working".
+          beat = window.setInterval(() => conn.check(), 60_000);
+        }
       }),
       onBackButton(goBack),
       pushBack(() => nav.pop()),
@@ -224,6 +234,7 @@ export function App() {
       setLookedUp(true);
     });
     return () => {
+      clearInterval(beat);
       offs.forEach((f) => f());
       stopWatch();
       stopLive?.();

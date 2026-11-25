@@ -12,7 +12,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
-import type { Attachment } from '@shared/protocol';
+import type { Attachment, UserItem } from '@shared/protocol';
 
 const bridgeCalls: { method: string; params: unknown }[] = [];
 let answer: (method: string, params: unknown) => unknown = () => ({});
@@ -56,7 +56,7 @@ describe('a send not yet taken survives a reload (finding 2)', () => {
 
   it('the drafts writer writes again when a send is held or taken', () => {
     const src = read('src/features/composer/drafts.ts');
-    expect(src).toContain('packDrafts(draftsWithPending(useStore.getState().drafts))');
+    expect(src).toContain('for (const p of pendingDrafts()) put(p.id, p.key, p.draft)');
     expect(src).toContain('onPending(soon)');
   });
 });
@@ -231,7 +231,143 @@ describe('a queue edit never overwrites another window’s (finding 8)', () => {
       await app.dispose();
       rmSync(home, { recursive: true, force: true });
     }
-    const src = read('src/features/composer/Composer.tsx');
-    expect(src).toContain('got = res.previous ?? q;');
+    const src = read('src/features/composer/queue-edit.ts');
+    expect(src).toContain('const got = result?.previous ?? (swap && take?.kind');
+    expect(src).toContain('got ? swapIn(now, preview, { text: got.text, attachments: got.attachments');
   });
+});
+
+it('returns the original displaced row to the same swap after a lost reply', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-swap-'));
+  const app = new App({ home, providers: [c => new DemoProvider(c)], quiet: true });
+  try {
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: home });
+    const rt = app.runtime(session.id);
+    const q = rt.enqueue('edited elsewhere', [att('A')]);
+    const swap = { sessionId: session.id, id: q.id, text: 'replacement', operationId: 'swap-A' };
+    await app.call('queue.update', swap);
+    await app.call('queue.update', { sessionId: session.id, id: q.id, text: 'later' });
+    expect((await app.call('queue.update', swap)).previous).toEqual(q);
+    expect(rt.queue[0].text).toBe('later');
+  } finally { await app.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+it('only the acquiring take can recover the exact committed row', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-take-'));
+  const app = new App({ home, providers: [c => new DemoProvider(c)], quiet: true });
+  try {
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: home });
+    const rt = app.runtime(session.id);
+    const q = rt.enqueue('changed', [att('Q')]);
+    const take = { sessionId: session.id, id: q.id, operationId: 'A' };
+    await app.call('queue.take', take);
+    expect((await app.call('queue.take', { ...take, operationId: 'B' })).message).toBeUndefined();
+    expect((await app.call('queue.take', take)).message).toEqual(q);
+  } finally { await app.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+it('refuses a compare-and-rewind when a later user message has arrived', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-end-'));
+  const app = new App({ home, providers: [c => new DemoProvider(c)], quiet: true });
+  try {
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: home });
+    const rt = app.runtime(session.id);
+    const u = rt.add<UserItem>({ type: 'user', text: 'one' });
+    const v = rt.add({ type: 'user', text: 'two' });
+    expect(await app.call('session.rewind', { sessionId: session.id, itemId: u.id, restoreFiles: false, expectedLast: u })).toEqual({ ok: false, message: 'The conversation moved on' });
+    expect(rt.get(v.id)).toBe(v);
+    rt.reset([u]);
+    const expected = { ...u };
+    rt.patch<UserItem>(u.id, { text: 'edited in place' });
+    expect(await app.call('session.rewind', { sessionId: session.id, itemId: u.id, restoreFiles: false,
+      expectedLast: expected })).toEqual({ ok: false, message: 'The conversation moved on' });
+    expect(rt.get(u.id)).toMatchObject({ text: 'edited in place' });
+  } finally { await app.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+it('replays a persisted queue or user acceptance after a bridge restart', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-send-restart-'));
+  const open = () => new App({ home, providers: [c => new DemoProvider(c, { speed: 0 })], quiet: true });
+  let app = open();
+  try {
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: home });
+    const sessionId = session.id;
+    const sent = { sessionId, text: 'hi', submitId: 'submitted-hi' };
+    await app.call('session.send', sent);
+    const queued = { sessionId, text: 'waiting', submitId: 'submitted-queue' };
+    (app as unknown as { moving: Set<string> }).moving.add(sessionId);
+    const deferred = await app.call('session.send', queued);
+    expect(deferred).toEqual({ ok: true, queued: true });
+    expect(app.runtime(sessionId).queue[0]).toMatchObject({ submitId: queued.submitId });
+    await app.dispose();
+    app = open();
+    await app.call('session.send', sent);
+    await app.call('session.send', queued);
+    const rt = app.runtime(sessionId);
+    expect(rt.items.filter(i => i.type === 'user' && i.text === sent.text).map(i => i.id)).toEqual([sent.submitId]);
+    expect(rt.queue.filter(q => q.submitId === queued.submitId).length +
+      rt.items.filter(i => i.id === queued.submitId).length).toBe(1);
+  } finally { await app.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+it('compares after the restored native chain finishes loading, immediately before the cut', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-native-end-'));
+  const app = new App({ home, providers: [c => new DemoProvider(c)], quiet: true });
+  try {
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: home });
+    const rt = app.runtime(session.id);
+    const u = rt.add<UserItem>({ type: 'user', text: 'one' });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const cut = vi.fn();
+    const handle = Object.assign(rt.handle!, {
+      restoredChain: true,
+      loadChain: async () => { await gate; handle.restoredChain = false; },
+      rewind: async () => {
+        if (handle.restoredChain) await handle.loadChain();
+        cut(); return { ok: true };
+      },
+    });
+    const pending = app.call('session.rewind', { sessionId: session.id, itemId: u.id,
+      expectedLast: u, expectedEnd: u.id, restoreFiles: false });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    rt.add({ type: 'user', text: 'sent while loading' });
+    release();
+    expect(await pending).toEqual({ ok: false, message: 'The conversation moved on' });
+    expect(cut).not.toHaveBeenCalled();
+  } finally { await app.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+it('retains separate acceptances when a caller reuses an ID for different words', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-distinct-send-'));
+  const app = new App({ home, providers: [c => new DemoProvider(c)], quiet: true });
+  try {
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: home });
+    const rt = app.runtime(session.id);
+    (app as unknown as { moving: Set<string> }).moving.add(rt.id);
+    for (const text of ['first','second','first','second']) {
+      await app.call('session.send', { sessionId: rt.id, submitId: 'same', text });
+    }
+    expect(rt.queue.map(q => q.text)).toEqual(['first','second']);
+    expect(new Set(rt.queue.map(q => q.id)).size).toBe(2);
+  } finally { await app.dispose(); rmSync(home, { recursive: true, force: true }); }
+});
+
+it('keeps the current words and files on the bridge until the swap checkpoints that version', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-swap-version-'));
+  const app = new App({ home, providers: [c => new DemoProvider(c)], quiet: true });
+  try {
+    const { session } = await app.call('session.create', { provider: 'demo', cwd: home });
+    const rt = app.runtime(session.id);
+    const preview = rt.enqueue('old', [att('old')]);
+    rt.updateQueued(preview.id, 'edited', [att('new')]);
+    const swap = { sessionId: rt.id, id: preview.id, text: 'replacement', operationId: 'swap', expected: preview };
+    const fresh = await app.call('queue.update', swap);
+    expect(fresh).toMatchObject({ ok: false, current: { text: 'edited', attachments: [att('new')] } });
+    expect(rt.queue[0].text).toBe('edited');
+    const take = await app.call('queue.take', { sessionId: rt.id, id: preview.id, operationId: 'take', expected: preview });
+    expect(take.current).toEqual(fresh.current);
+    expect(rt.queue).toHaveLength(1);
+    expect((await app.call('queue.update', { ...swap, expected: fresh.current })).previous).toEqual(fresh.current);
+  } finally { await app.dispose(); rmSync(home, { recursive: true, force: true }); }
 });

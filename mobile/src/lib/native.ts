@@ -9,6 +9,8 @@ import { removeChecked } from './credential';
 import { NoteBook } from './note-book';
 import { NotePoster, type ChatNote } from './note-post';
 import type { LiveSpec, NoteAction } from './notes';
+import { onScreen, onScreenChange } from './screen';
+import { System } from './system-plugin';
 
 /** Thin wrappers over the Capacitor plugins, quiet when a plugin is missing (the web preview). */
 
@@ -331,13 +333,7 @@ export function onNoteAction(fn: (a: NoteAction) => void) {
   };
 }
 
-// ── the system: share a text, the app icon's shortcuts (android/…/SystemPlugin.java) ──
-
-const System = registerPlugin<{
-  share(o: { text: string; title?: string }): Promise<void>;
-  shortcuts(o: { chats: { id: string; title: string }[] }): Promise<void>;
-  keep(o: { key: string; value?: string }): Promise<void>;
-}>('System');
+// ── the system: share a text, the app icon's shortcuts (android/…/SystemPlugin.java, lib/system-plugin.ts) ──
 
 /** Android's share sheet for a text (a message); a browser's own where there is one. False when nothing could share it. */
 export async function shareText(text: string, title?: string): Promise<boolean> {
@@ -429,26 +425,18 @@ export async function eraseNative(): Promise<string[]> {
 
 // ── app lifecycle ──
 
-let foreground = typeof document === 'undefined' || document.visibilityState !== 'hidden';
-export const inForeground = () => foreground;
+/**
+ * The person can see the app (lib/screen.ts: Android's word on the phone, never the page's
+ * visibility, which PageLife.java holds at visible while a chat works off screen).
+ */
+export const inForeground = onScreen;
 
+/** On screen (true) or not, once per change; the live payload goes to Android again with it. */
 export function onAppState(fn: (active: boolean) => void) {
-  const changed = (active: boolean) => {
-    if (foreground !== active && isNative) publishLive();
-    foreground = active;
+  return onScreenChange((active) => {
+    if (isNative) publishLive();
     fn(active);
-  };
-  const onVis = () => changed(document.visibilityState === 'visible');
-  document.addEventListener('visibilitychange', onVis);
-  let remove: (() => void) | undefined;
-  if (isNative) {
-    const h = App.addListener('appStateChange', ({ isActive }) => changed(isActive));
-    remove = () => void h.then((x) => x.remove());
-  }
-  return () => {
-    document.removeEventListener('visibilitychange', onVis);
-    remove?.();
-  };
+  });
 }
 
 export function onBackButton(fn: () => boolean) {

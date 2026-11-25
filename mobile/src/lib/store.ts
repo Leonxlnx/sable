@@ -24,12 +24,13 @@ import { partOfTurn, syntheticOf } from '@shared/synthetic';
 import { conn, type ConnState } from './conn';
 import { reshape, shapeString } from './turns';
 import { Intents, type Field } from './intents';
-import { liveEnabled, liveOf, livePayload, type LiveChat, type LiveSpec } from './notes';
+import { liveEnabled, liveOf, liveStep, type LiveChat, type LiveSpec, type LiveTrack } from './notes';
 import { turnLive } from './note-live';
 import { clearChatNotifications, clearShortcuts } from './native';
 import { reconciler, staleFetch } from './stale';
 import { onForget } from './forget';
 import { epoch, still } from './epoch';
+import { onScreen } from './screen';
 
 /**
  * The phone's view of the desktop: sessions, folders, accounts and the open conversations, kept
@@ -176,6 +177,8 @@ export const subscribeStore = subscribe;
 /** Android needs the committed state even while WebView frames and timers are suspended. */
 export function watchLive(send: (spec: LiveSpec | null, stop: boolean) => void) {
   let previous: LiveChat[] = [];
+  // Across a lost connection the live notification says it reconnects for a while (lib/notes.ts `liveStep`).
+  let track: LiveTrack = { worked: false, lostAt: 0 };
   const sync = (before?: State) => {
     const { sessions, data, fresh, notify, conn } = state;
     if (before && before.sessions === sessions && before.fresh === fresh && before.notify === notify && before.conn === conn && before.listAt === state.listAt) {
@@ -188,8 +191,11 @@ export function watchLive(send: (spec: LiveSpec | null, stop: boolean) => void) 
       // The running turn as the live card reads it (checkpoints, files, the kind of step): lib/note-live.ts.
       return d && !d.cached && !d.next ? turnLive(d) : undefined;
     });
-    previous = live.chats;
-    send(livePayload(state, live), !enabled);
+    const step = liveStep(state, live, track, Date.now());
+    track = step.track;
+    // While the connection is lost the chats keep their clocks for its return.
+    if (!step.spec?.lost) previous = live.chats;
+    send(step.spec, step.stop);
   };
   liveListeners.add(sync);
   sync();
@@ -749,23 +755,29 @@ let pages = true;
 /**
  * Opens a conversation on its newest page (from the cache at once when the phone has it, then from
  * the desktop); `to`: a root item the page reaches back to (a search hit).
+ *
+ * Off screen (lib/screen.ts: a reconnect, a stale page fetched again while a chat works and nobody
+ * looks) it only peeks: the desktop keeps the chat unread and streams nothing more of it, and the
+ * page is kept as one from the cache (`cached`: not the truth for the live card, read again back on
+ * screen, App.tsx).
  */
 export async function openSession(id: string, to?: string) {
   const e0 = epoch();
   showCached(id);
+  const peek = !onScreen();
   let snap: Tail | undefined;
   if (pages) {
     try {
-      snap = await conn.call('phone.tail', { sessionId: id, ...(to ? { to } : {}) });
+      snap = await conn.call('phone.tail', { sessionId: id, ...(to ? { to } : {}), ...(peek ? { peek: true } : {}) });
     } catch (err) {
       if (!/Not available from the phone/.test((err as Error).message)) throw err;
       pages = false;
     }
   }
-  snap ??= await conn.call('session.snapshot', { sessionId: id });
+  snap ??= await conn.call('session.snapshot', peek ? { sessionId: id, peek: true } : { sessionId: id });
   // Forgotten meanwhile: nothing of that desktop comes back.
   if (!still(e0)) return;
-  applySnapshot(snap);
+  applySnapshot(snap, peek);
   // More waits in this chat than its page holds: the rest is read on and added.
   void morePrompts(id, snap as Partial<PhoneTail>, e0);
 }

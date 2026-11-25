@@ -1,6 +1,7 @@
 import { DEFAULT_ACCOUNT, type BridgeEvent, type SessionMeta, type SessionSnapshot, type SnapshotCursor, type TimelineItem, type ToolItem, type ToolKind, type ToolResult, type ToolStatus } from '../../shared/protocol';
 import { syntheticOf } from '../../shared/synthetic';
 import { runsTask, worksInBackground } from '../../shared/background';
+import { constants as bufferLimits } from 'node:buffer';
 
 // ── what a window gets of an existing conversation ──
 //
@@ -236,16 +237,17 @@ export const workerCut = {
 
 /** The old disk-backed steps already have exactly the window's cut. */
 export function cutItems(items: TimelineItem[], whole?: (item: TimelineItem) => TimelineItem, from = recentStart(items, RECENT_TURNS)): TimelineItem[] {
-  return items.map((item, i) => {
-    if (isLight(item)) {
-      if (whole && (!settled(item) || (i >= from) !== !!item[LIGHT].recent)) return cutItem(whole(item), i < from ? OLD : RECENT);
-      const { [LIGHT]: _count, ...view } = item;
-      return view;
-    }
-    return cutItem(item, i < from ? OLD : RECENT);
-  });
+  return items.map((item, i) => windowItem(item, i >= from, whole));
 }
 
+function windowItem(item: TimelineItem, recent: boolean, whole?: (item: TimelineItem) => TimelineItem): TimelineItem {
+  if (isLight(item)) {
+    if (whole && (!settled(item) || recent !== !!item[LIGHT].recent)) return cutItem(whole(item), recent ? RECENT : OLD);
+    const { [LIGHT]: _count, ...view } = item;
+    return view;
+  }
+  return cutItem(item, recent ? RECENT : OLD);
+}
 
 export const SNAPSHOT_THRESHOLD = 2048;
 
@@ -313,8 +315,88 @@ export const isSnapshot = (r: unknown): r is SessionSnapshot => !!r && typeof r 
 
 /** An RPC result as a window gets it: a conversation (opened, created, forked, carried over) with its items cut. */
 type ResolveItem = (sessionId: string, item: TimelineItem) => TimelineItem;
-export function resultForWindow<T>(result: T, resolve?: ResolveItem): T {
-  if (isSnapshot(result)) return { ...result, items: cutItems(result.items, resolve && (i => resolve(result.session.id, i)), result.page?.recentAt) };
+export const PAGE_LIMIT = { bytes: 4 << 20, chars: bufferLimits.MAX_STRING_LENGTH };
+
+/** Count JSON as it will be encoded, without ever building an enormous row string. */
+function wireSize(value: unknown) {
+  let bytes = 0, chars = 0;
+  const literal = (s: string) => { chars += s.length; bytes += Buffer.byteLength(s); };
+  function visit(v: unknown) {
+    if (typeof v === 'string') {
+      if (v.length <= 65536) { literal(JSON.stringify(v)); return; }
+      literal('""');
+      for (let at = 0; at < v.length;) {
+        let end = Math.min(at + 65536, v.length);
+        if (end < v.length && /[\uD800-\uDBFF]/.test(v[end - 1])) end--;
+        literal(JSON.stringify(v.slice(at, end)).slice(1, -1));
+        at = end;
+      }
+    } else if (Array.isArray(v)) {
+      literal('[]');
+      for (let i = 0; i < v.length; i++) {
+        if (i) literal(',');
+        visit(v[i]);
+      }
+    } else if (v && typeof v === 'object') {
+      literal('{}');
+      let first = true;
+      for (const [key, val] of Object.entries(v)) {
+        if (val === undefined) continue;
+        if (!first) literal(',');
+        first = false;
+        visit(key); literal(':');
+        visit(val);
+      }
+    } else literal(JSON.stringify(v) ?? 'null');
+  }
+  visit(value);
+  return { bytes, chars };
+}
+
+function oversizedRow(item: TimelineItem): TimelineItem {
+  const base = { id: item.id, ts: item.ts, parentId: item.parentId, more: true, byParts: true as const };
+  switch (item.type) {
+    case 'tool': return { ...base, type: item.type, kind: item.kind, status: item.status,
+      name: item.name.slice(0, 120), title: item.title.slice(0, 256), detail: {} };
+    case 'user': return { ...base, type: item.type, text: item.text.slice(0, 256), state: item.state, steered: item.steered };
+    case 'text': case 'thinking': return { ...base, type: item.type, text: item.text.slice(0, 256), streaming: item.streaming };
+    case 'notice': return { ...base, type: item.type, variant: item.variant, text: item.text.slice(0, 256) };
+    case 'turn': return { ...base, type: item.type, durationMs: item.durationMs };
+  }
+}
+
+function boundedWindowPage(snap: SessionSnapshot, whole?: (i: TimelineItem) => TimelineItem): SessionSnapshot {
+  const recent = snap.page?.recentAt ?? recentStart(snap.items, RECENT_TURNS);
+  // Reserve the frame and cursor as well as the live metadata on the first answer.
+  const header = wireSize({ ...snap, items: [] });
+  let bytes = header.bytes + 256, chars = header.chars + 256, start = snap.items.length;
+  const items: TimelineItem[] = [];
+  while (start && items.length < 576) {
+    const at = start - 1;
+    let row = windowItem(snap.items[at], at >= recent, whole);
+    const size = wireSize(row);
+    if (items.length && (bytes + size.bytes + 1 > PAGE_LIMIT.bytes || chars + size.chars + 1 > PAGE_LIMIT.chars)) break;
+    if (chars + size.chars + 1 > PAGE_LIMIT.chars) row = oversizedRow(row);
+    items.push(row);
+    start = at;
+    bytes += size.bytes + 1;
+    chars += size.chars + 1;
+    if (bytes >= PAGE_LIMIT.bytes || chars >= PAGE_LIMIT.chars) break;
+  }
+  items.reverse();
+  if (!start) return { ...snap, items };
+  let roots = snap.page?.rootsBefore ?? 0;
+  for (let i = 0; i < start; i++) if (!snap.items[i].parentId) roots++;
+  return { ...snap, items, page: { kind: snap.page?.kind ?? 'end', before: (snap.page?.before ?? 0) + start,
+    rootsBefore: roots, recentAt: Math.max(0, recent - start) } };
+}
+
+export function resultForWindow<T>(result: T, resolve?: ResolveItem, bounded = false): T {
+  if (isSnapshot(result)) {
+    const whole = resolve && ((i: TimelineItem) => resolve(result.session.id, i));
+    if (bounded || result.page) return boundedWindowPage(result, whole) as T;
+    return { ...result, items: cutItems(result.items, whole) };
+  }
   // race.start returns its new conversations together.
   const sessions = (result as { sessions?: unknown[] } | null)?.sessions;
   if (Array.isArray(sessions) && sessions.some(isSnapshot)) return { ...result, sessions: sessions.map(s => resultForWindow(s, resolve)) };

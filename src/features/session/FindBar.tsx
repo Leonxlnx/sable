@@ -1,3 +1,4 @@
+import { HistoryStatus } from '@/features/session/HistoryStatus';
 import { syntheticOf, userItemText } from '@shared/synthetic';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
@@ -267,7 +268,7 @@ export function ConversationFind({ sessionId }: { sessionId: string }) {
               autoComplete="off"
             />
             <span className="cfind-count num" aria-live="polite" data-none={(!!q && !total) || undefined}>
-              {reading ? 'Reading conversation…' : q ? (total ? `${place} of ${total}` : 'No matches') : ''}
+              {reading ? <HistoryStatus sessionId={sessionId} /> : q ? (total ? `${place} of ${total}` : 'No matches') : ''}
             </span>
           </label>
           <IconButton icon="arrow-up" label="Previous match" keys="shift+enter" size={14} disabled={!total} onClick={() => move(-1)} />

@@ -1,3 +1,4 @@
+import { emptyIndex } from '@/state/revision';
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { TimelineItem, TurnItem, UserItem } from '@shared/protocol';
 import { syntheticLine, syntheticOf } from '@shared/synthetic';
@@ -63,7 +64,7 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
   const { sessionId } = useTimeline();
   const end = useItem<TurnItem>(turn.end ?? '');
   const settled = turn.state !== 'running';
-  const previews = useMemo(() => (settled ? previewsOf(useStore.getState().data[sessionId]?.items ?? {}, turn) : []), [settled, sessionId, turn]);
+  const previews = useMemo(() => (settled ? previewsOf(useStore.getState().data[sessionId]?.items ?? emptyIndex, turn) : []), [settled, sessionId, turn]);
   const [forking, setForking] = useState(false);
   // "Check with Codex": a settled turn that changed files, while the other agent can check.
   const checker = useStore((s) => checkerOf(s.sessions[sessionId]?.provider));
@@ -72,7 +73,7 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
   const changed = useMemo(() => {
     if (!settled) return false;
     const d = useStore.getState().data[sessionId];
-    return changesOf(d?.items ?? {}, d?.children ?? {}, turn.ids).files > 0;
+    return changesOf(d?.items ?? emptyIndex, d?.children ?? emptyIndex, turn.ids).files > 0;
   }, [settled, sessionId, turn]);
   const [checking, setChecking] = useState(false);
   const limitHolds = useLimitHolds(sessionId, turn.ids, turn.state === 'failed');
@@ -95,7 +96,7 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
     setForking(false);
   };
 
-  const items = () => useStore.getState().data[sessionId]?.items ?? {};
+  const items = () => useStore.getState().data[sessionId]?.items ?? emptyIndex;
   const failed = turn.state === 'failed';
   const errorShown = turn.segments.some((s) => s.errors.length > 0);
   const hasAnswer = turn.segments.some((s) => s.answer);
@@ -112,7 +113,8 @@ export const TurnFoot = memo(function TurnFoot({ turn }: { turn: TurnGroup }) {
   const retry = async () => {
     const user = again();
     if (!user) return;
-    await repeatMessage(sessionId, user, user.text, 'footer', turn.key);
+    const original = useStore.getState().data[sessionId]?.items[user.id];
+    if (original?.type === 'user') await repeatMessage(sessionId, original, user.text, 'footer', turn.key);
   };
 
   const parts: string[] = [];

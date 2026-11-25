@@ -70,6 +70,18 @@ public class SystemPlugin extends Plugin {
         else call.reject("This phone could not keep it.");
     }
 
+    /**
+     * Whether the app is on screen (the activity started), for the page's start (lib/screen.ts); later
+     * changes come as `window.__sableScreen(bool)` (PageLife). Never the page's visibility, which
+     * PageLife holds at visible while a chat works off screen.
+     */
+    @PluginMethod
+    public void screen(PluginCall call) {
+        com.getcapacitor.JSObject r = new com.getcapacitor.JSObject();
+        r.put("shown", PageLife.isShown());
+        call.resolve(r);
+    }
+
     private static String cut(String s, int n) {
         return s.length() > n ? s.substring(0, n - 1).trim() + "…" : s;
     }

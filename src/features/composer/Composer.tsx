@@ -12,7 +12,7 @@ import { holdFlights, launchFlight } from './flight';
 import { launchKey } from './launch';
 import { fieldBeat } from '@/art/events';
 import { searchFiles, type FileHit } from '@/lib/workspace';
-import { homeChoice, interrupt, sendMessage, setHomeUltracode, setUltracode, startFromHome, takeQueued, updateQueued } from '@/state/actions';
+import { homeChoice, interrupt, sendMessage, setHomeUltracode, setUltracode, startFromHome } from '@/state/actions';
 import { useHotkey } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { Tip } from '@/ui';
@@ -22,9 +22,9 @@ import { useChoice } from './choice';
 import { paidAsk, paidConfirmed } from './paid-speed';
 import { usePixelSnap } from './pixel-snap';
 import { APP_COMMANDS, appCommandsFor, commandRows, expandCommand, mentionRows, skillRows, type CommandCtx, type SuggestRow } from './commands';
-import { recoverTake } from './queue-edit';
+import { recoverRewind, recoverSubmission, recoverTake } from './queue-edit';
 import { keepDrafts, keepRecovery } from './drafts';
-import { carryOver, leaveField, putBack, settleTake, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
+import { carryOver, leaveField, putBack, shownUltra, ultraAnswered, type UltraPick } from './restore';
 import { holdSend, holdTake, queueDraft, takingDraft, waitForTake, submissionId, moveSend, sendBack, sendDone } from './pending';
 import { watchWidth } from './width-watch';
 import { HomeChips, ModeMenu, openComposerMenu, useHomeSignedOut, useMenuPlace } from './Controls';
@@ -662,8 +662,14 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const submit = async (steer = false) => {
     // A second press before the store has followed the first: that message is already on its way.
     if (sent.current) return;
+    if (sessionId && !takingDraft(key) && useStore.getState().drafts[key]?.recovery?.rewind) {
+      holdTake(key, recoverRewind(sessionId), afterFrame);
+    }
     if (sessionId && !takingDraft(key) && useStore.getState().drafts[key]?.recovery?.queueId) {
       holdTake(key, recoverTake(sessionId), afterFrame);
+    }
+    if (sessionId && !takingDraft(key) && useStore.getState().drafts[key]?.recovery?.checkSend) {
+      holdTake(key, recoverSubmission(sessionId), afterFrame);
     }
     const waiting = waitForTake(key);
     if (waiting) {
@@ -708,15 +714,18 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     const draft = { text, attachments, recovery: useStore.getState().drafts[key]?.recovery };
     // A command picked by its short name goes out under the full one the agent knows it by.
     const body = expandCommand(trimmed, caps);
-    const out = parcel(body, attachments);
+    const id = submissionId(key, draft);
+    const out = draft.recovery?.retry?.id === id && draft.recovery.payload ? draft.recovery.payload : parcel(body, attachments);
     // The words leave the field for where they land: the conversation, or the queue tray while a
     // turn runs (a steer goes into the turn). Measured once here, before the field empties.
     const steering = steer && busy && steerable;
     const ta = ref.current;
     const flew = !!ta && !!body && !reducedMotion();
-    const flight = flew ? launchFlight({ el: ta, text: body }, { dest: sessionId && busy && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId, session: sessionId }) : null;
+    const live = sessionId ? useStore.getState().data[sessionId] : undefined;
+    const represented = live?.items[id]?.type === 'user' || live?.queue.some(q => q.submitId === id || q.id === id);
+    const flight = flew ? launchFlight({ el: ta, text: body }, { submitId: id, represented, dest: sessionId && busy && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId, session: sessionId }) : null;
     // Queued: its row is in the tray in this frame, the words fly into it (QueueTray `expectQueued`).
-    const expect = sessionId && busy && !steering && body ? expectQueued(sessionId, body, submissionId(key, draft)) : null;
+    const expect = sessionId && busy && !steering && body ? expectQueued(sessionId, body, id) : null;
     if (variant === 'session') launchKey(card.current);
     // In a session the next placeholder is always the queueing one: the turn is running (or about to).
     // A queued message's words rise through the field into the tray: the placeholder waits for them.
@@ -739,6 +748,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     // a reload brings it back, a refusal puts it back in the order it was sent.
     const left = leaveField(now, draft, typed);
     const pending = holdSend(key, draft);
+    pending.payload = out;
     setDraft(key, left);
     if (!left.text) pendingCaret.current = 0;
     setRecall(null);
@@ -752,12 +762,19 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       setDraft(key, sendBack(pending, useStore.getState().drafts[key]));
       pendingCaret.current = draft.text.length;
     };
+    if (!await keepRecovery()) {
+      expect?.(false);
+      if (choice) cancelHandoff();
+      await giveBack();
+      return;
+    }
     if (sessionId) {
       const res = await sendMessage(sessionId, out.text, out.attachments, { submitId: pending.id, ...(steer && busy ? { steer: true } : {}) });
+      pending.uncertain = res.unknown;
       expect?.(res.ok);
       if (res.ok) {
         sendDone(pending);
-        void flight?.settle(true);
+        void flight?.settle(true, res.queued);
       } else await giveBack();
       return;
     }
@@ -765,6 +782,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       submitId: pending.id,
       choice,
       // The chat exists and is about to open: the drop in the air and what home holds now are its.
+      checkpoint: keepRecovery,
       onCreated: (id) => {
         flight?.scope(id);
         bindHandoff(id);
@@ -773,10 +791,11 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     });
     if (res.ok) {
       sendDone(pending);
-      void flight?.settle(true);
+      void flight?.settle(true, res.queued);
       return;
     }
     cancelHandoff();
+    pending.uncertain = res.unknown;
     if (!res.sessionId) {
       await giveBack();
       return;
@@ -801,27 +820,24 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const editQueued = useCallback(
     async (q: QueuedMessage) => {
       if (!sessionId || sent.current || takingDraft(key)) return;
+      if (useStore.getState().drafts[key]?.recovery?.checkSend) {
+        const checked = recoverSubmission(sessionId);
+        holdTake(key, checked.then(() => false), afterFrame);
+        if (!await checked) return;
+      }
       const d = useStore.getState().drafts[key];
+      if (d?.recovery?.queueId || d?.recovery?.rewind) return;
       const before = { text: d?.text ?? '', attachments: d?.attachments ?? EMPTY };
       if (before.text.trim() || before.attachments.length) {
-        const swap = async () => {
-          const out = parcel(before.text.trim(), before.attachments);
-          // The agent may have taken the message meanwhile: then nothing swaps and the draft stays.
-          const res = await updateQueued(sessionId, q.id, out.text, out.attachments);
-          if (!res.ok) return;
-          // The message as the bridge had it when the draft took its place: another window may have
-          // edited it after this one showed it, and that edit is what comes into the field.
-          const got = res.previous ?? q;
-          const next = swapIn(useStore.getState().drafts[key], before, { text: got.text, attachments: got.attachments ?? EMPTY });
-          setDraft(key, { ...next, recovery: {} });
-          setText(next.text, got.text.length);
+        const recovery = { ...queueDraft(q).recovery!, swap: parcel(before.text.trim(), before.attachments),
+          preview: { text: before.text, files: before.attachments.map(a => a.id) } };
+        setDraft(key, { ...before, recovery });
+        const taking = recoverTake(sessionId, true);
+        holdTake(key, taking, afterFrame);
+        if (await taking) {
           setRecall(null);
           window.requestAnimationFrame(focus);
-          return true;
-        };
-        const taking = swap().then(Boolean);
-        holdTake(key, taking, afterFrame);
-        await taking;
+        }
       } else {
         // An empty field: the words leave the row and stand in the field in the frame of the click
         // (the row breaks up or the tray folds, QueueTray `takeBackRow`; the field's words come in on
@@ -833,15 +849,10 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
         setRecall(null);
         play(ref.current, [{ opacity: 0 }, { opacity: 1 }], { duration: 140, easing: 'ease-out' });
         window.requestAnimationFrame(focus);
-        const taking = keepRecovery().then(saved => saved
-          ? takeQueued(sessionId, q.id)
-          : { kind: 'unknown' as const }).then(result => {
-          const now = useStore.getState().drafts[key] ?? before;
-          const next = settleTake(now, preview, result);
-          setDraft(key, next);
-          if (result.kind === 'message') window.setTimeout(release, 600);
+        const taking = recoverTake(sessionId, true).then(owned => {
+          if (owned) window.setTimeout(release, 600);
           else release();
-          return result.kind === 'message';
+          return owned;
         });
         holdTake(key, taking, afterFrame);
         await taking;

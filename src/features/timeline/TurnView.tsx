@@ -1,3 +1,4 @@
+import { emptyIndex } from '@/state/revision';
 import { memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type { NoticeItem, ThinkingItem, TimelineItem, ToolItem } from '@shared/protocol';
 import { hasWork } from '@shared/work-label';
@@ -15,7 +16,8 @@ import { REVEAL_EVENT, rootOf, type RevealDetail } from './reveal';
 import { foldedTurn } from './changes';
 import { Tail } from './Tail';
 import { TurnFoot } from './Turn';
-import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnsIndex, type FlowChunk, type Group, type Segment, type StepsChunk, type TurnGroup, type TurnLayout } from './turns';
+import { earlyWords, liveBelowCards, runSpan, shapeIndex, turnsIndex, type Group, type Segment, type StepsChunk, type TurnGroup } from './turns';
+import { stabilize, type Kept } from './stabilize';
 import { leadTitle } from './lead-in';
 import { groupHeight } from './nav-model';
 import { forgetLists, holdList, keptAt, listFor, rememberTurnSize, tailStart, TAIL, turnSizes, VIEWS } from './build-window';
@@ -67,65 +69,6 @@ function settle(b: BuiltState): BuiltState {
   return b;
 }
 
-const chunkSig = (c: FlowChunk) => (c.kind === 'steps' ? `${c.key}+${c.ids.length}+${c.count}` : c.id);
-const segSig = (s: Segment) => `${s.lead}>${s.flow.map(chunkSig).join(',')}>${s.reply}>${s.answer}>${s.last}>${s.tail.join(',')}>${s.notes.length}>${s.errors.join(',')}`;
-
-/** A turn `turnsIndex` handed back again, the same object (nothing in it changed): its stable object and its cache entries. */
-interface Kept {
-  turn: TurnGroup;
-  entries: [string, unknown][];
-}
-
-/**
- * Keeps the objects of turns and segments that did not change, so their memoized views skip
- * rendering: a new step in the running turn re-renders that turn alone. A turn the grouping kept
- * (`kept`) is not read again: its stable object and cache entries carry over as they are.
- */
-function stabilize(layout: TurnLayout, cache: Map<string, unknown>, kept: WeakMap<TurnGroup, Kept>): TurnLayout {
-  const next = new Map<string, unknown>();
-  const groups = layout.groups.map((g): Group => {
-    if (g.kind !== 'turn') return g;
-    const known = kept.get(g);
-    if (known) {
-      for (const [k, v] of known.entries) next.set(k, v);
-      return known.turn;
-    }
-    const entries: [string, unknown][] = [];
-    const put = (k: string, v: unknown) => {
-      next.set(k, v);
-      entries.push([k, v]);
-    };
-    const segments = g.segments.map((s) => {
-      const k = `s|${segSig(s)}`;
-      const prev = (next.get(k) ?? cache.get(k)) as Segment | undefined;
-      const seg = prev ?? { ...s, flow: s.flow.map((c) => keepChunk(c, cache, next, put)) };
-      if (prev) for (const c of prev.flow) if (c.kind === 'steps') put(`c|${c.key}`, c);
-      put(k, seg);
-      return seg;
-    });
-    const k = `t|${g.state}|${g.end}|${g.early ?? ''}|${g.next ?? ''}|${g.ids.length}|${g.checks?.join(',') ?? ''}|${g.waiting?.join(',') ?? ''}|${g.liveSegment ?? ''}|${segments.map(segSig).join(';')}`;
-    const prev = (next.get(k) ?? cache.get(k)) as TurnGroup | undefined;
-    const turn = prev ?? { ...g, segments };
-    put(k, turn);
-    kept.set(g, { turn, entries });
-    return turn;
-  });
-  cache.clear();
-  for (const [k, v] of next) cache.set(k, v);
-  return { groups, queued: layout.queued };
-}
-
-/** A run of steps keeps its object while nothing joined it (ids only ever append), so its list skips rendering. */
-function keepChunk(c: FlowChunk, cache: Map<string, unknown>, next: Map<string, unknown>, put: (k: string, v: unknown) => void): FlowChunk {
-  if (c.kind !== 'steps') return c;
-  const k = `c|${c.key}`;
-  const old = (next.get(k) ?? cache.get(k)) as FlowChunk | undefined;
-  const same = old?.kind === 'steps' && old.count === c.count && old.ids.length === c.ids.length && old.ids[old.ids.length - 1] === c.ids[c.ids.length - 1];
-  const chunk = same ? old : c;
-  put(k, chunk);
-  return chunk;
-}
-
 /**
  * The estimated height of groups [from, to), as their spacer stands for them. A turn's estimate is
  * kept by its object in `known` (a turn that changes is a new object; a single item is read each
@@ -134,7 +77,7 @@ function keepChunk(c: FlowChunk, cache: Map<string, unknown>, next: Map<string, 
  */
 function spanHeight(groups: readonly Group[], from: number, to: number, sessionId: string, known?: WeakMap<object, number>): number {
   if (from >= to) return 0;
-  const items = useStore.getState().data[sessionId]?.items ?? {};
+  const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
   let h = 0;
   for (let i = from; i < to; i++) {
     const g = groups[i];
@@ -210,7 +153,7 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
   // their estimated height, and reach a kept reading place (build-window.ts).
   const first = useRef(0);
   if (built.hidden === null) {
-    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
     const view = typeof window === 'undefined' ? 900 : window.innerHeight;
     const from = Math.max(0, groups.length - TAIL);
     const heights = groups.slice(from).map((g) => turnSizes.get(`${sessionId}|${g.key}`) ?? groupHeight(g, items, estimate));
@@ -374,7 +317,7 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
     const onReveal = (e: Event) => {
       const d = (e as CustomEvent<RevealDetail>).detail;
       if (!d || d.sessionId !== sessionId) return;
-      const root = rootOf(useStore.getState().data[sessionId]?.items ?? {}, d.itemId);
+      const root = rootOf(useStore.getState().data[sessionId]?.items ?? emptyIndex, d.itemId);
       const idx = groups.findIndex((g) => (g.kind === 'item' ? g.id === root : g.ids.includes(root) || !!g.checks?.includes(root)));
       if (idx < 0) return;
       const g = groups[idx];
@@ -572,7 +515,7 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
   // thousands of lines off once the turn was laid out.
   const sizeKey = `${sessionId}|${turn.key}`;
   const standIn = useMemo(
-    () => (running ? undefined : (turnSizes.get(sizeKey) ?? Math.max(34, Math.round(groupHeight(turn, useStore.getState().data[sessionId]?.items ?? {}, estimate))))),
+    () => (running ? undefined : (turnSizes.get(sizeKey) ?? Math.max(34, Math.round(groupHeight(turn, useStore.getState().data[sessionId]?.items ?? emptyIndex, estimate))))),
     [running, turn, sessionId, sizeKey],
   );
   const box = useRef<HTMLElement>(null);
@@ -912,7 +855,7 @@ function WorkHead({ mode, run, from, until, cap, first, seg, turn, open, onToggl
 function RunLine({ run, from, until, cap, open, onToggle, landed }: { run: StepsChunk; from: string | null; until: string | null; cap?: string; open: boolean; onToggle?: () => void; landed: boolean }) {
   const { sessionId } = useTimeline();
   const { span, thought } = useMemo(() => {
-    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
     return {
       span: runSpan(items, run, from ?? run.ids[0], until, cap),
       // Work that was only thinking says so ("Thought for 6s"), with no count of steps.
@@ -936,7 +879,7 @@ function TotalLine({ turn, open, onToggle, landed }: { turn: TurnGroup; open: bo
   const { sessionId } = useTimeline();
   const { span, changes, steps, thought } = useMemo(() => {
     const d = useStore.getState().data[sessionId];
-    return foldedTurn(d?.items ?? {}, d?.children ?? {}, turn);
+    return foldedTurn(d?.items ?? emptyIndex, d?.children ?? emptyIndex, turn);
   }, [sessionId, turn]);
   const took = span && span >= 1000 ? shortDuration(span) : '';
   return (

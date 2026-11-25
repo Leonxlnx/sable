@@ -157,6 +157,20 @@ describe('one card per chat at work', () => {
     expect(p.cards![1].line).toBe('2 sub-agents working');
   });
 
+  it('keeps the last reading through the moment the turn has ended but the chat is not idle yet', () => {
+    const list = [user('u'), edit('a', 'a.ts'), edit('b', 'b.ts'), edit('c', 'c.ts', { status: 'running', result: undefined })];
+    const first = liveOf([meta('a', { status: 'running' })], [], 1, () => turnLive(page(list)));
+    expect(first.chats[0].turn?.files).toBe(2);
+    // The last edit settles, then the turn's end lands while the chat still says it runs.
+    const settled = [...list.slice(0, 3), edit('c', 'c.ts'), end('t')];
+    const after = liveOf([meta('a', { status: 'running' })], first.chats, 2, () => turnLive(page(settled)));
+    expect(turnLive(page(settled))).toBeUndefined();
+    expect(livePayload(settings, after)!.cards![0].result.done).toBe('Finished · 2 files changed');
+    // A chat that left the live set starts its next turn with no reading of the last one.
+    const next = liveOf([meta('a', { status: 'running' })], [], 3, () => undefined);
+    expect(next.chats[0].turn).toBeUndefined();
+  });
+
   it('puts up no card for a chat that only serves a local address', () => {
     expect(livePayload(settings, liveOf([meta('a', { serving: 1, servingAddress: 'http://localhost:5173' })], [], 1))).toBeNull();
     const both = livePayload(settings, liveOf([meta('a', { serving: 1, commands: 1 }), meta('b', { status: 'running' })], [], 1))!;

@@ -48,7 +48,7 @@ const ui = () => useStore.getState().setUi;
 
 async function copyLastAnswer(sessionId: string) {
   if (useStore.getState().data[sessionId]?.incomplete) {
-    try { await completeSession(sessionId); } catch { return useStore.getState().toast('Could not read the conversation', 'error'); }
+    try { await completeSession(sessionId); } catch (err) { return useStore.getState().toast((err as Error).message, 'error'); }
   }
   const s = useStore.getState();
   const d = s.data[sessionId];

@@ -7,6 +7,7 @@ import { baseName, timeAgo } from '@desk/lib/format';
 import { pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
 import { haptic } from '@m/lib/native';
+import { onScreen } from '@m/lib/screen';
 import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
 import { homeFolder, openRace } from '@m/lib/race';
@@ -559,7 +560,8 @@ function useSecond(on: boolean): number {
   useEffect(() => {
     if (!on) return;
     setT(Date.now());
-    const id = window.setInterval(() => !document.hidden && setT(Date.now()), 1000);
+    // Off screen (lib/screen.ts: the page may be held visible there) nothing draws.
+    const id = window.setInterval(() => onScreen() && setT(Date.now()), 1000);
     return () => clearInterval(id);
   }, [on]);
   return t;

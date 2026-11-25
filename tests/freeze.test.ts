@@ -55,20 +55,41 @@ describe('nothing holds the bridge for long', () => {
       const items = Array.from({ length: n }, (_, i) => ({ id: `i${i}`, ts: i, type: 'tool', name: 'Bash', kind: 'bash', title: 'Run', status: 'done', detail: {}, result: { text: 'ok' } }) as TimelineItem);
       const rt = new SessionRuntime(meta('s', 'C:/w'), () => {}, () => {});
       rt.load(items);
+      rt.beginTurn();
       const live = rt.add({ type: 'text', text: '', streaming: true } as never).id;
       const t0 = performance.now();
       for (let k = 0; k < 3000; k++) {
         rt.delta(live, 'text', 'word ');
-        if (k % 10 === 0) rt.add({ type: 'tool', name: 'Read', kind: 'read', title: 'Read', status: 'running', detail: {}, parentId: `i${n - 1}` } as never);
+        if (k % 10 === 0) rt.add({ type: 'tool', name: 'Read', kind: 'read', title: 'Read', status: 'running', detail: {} } as never);
         if (k % 10 === 5) rt.patch(`i${n - 1 - (k % 50)}`, { title: `Run ${k}` } as never);
       }
-      return performance.now() - t0;
+      const elapsed = performance.now() - t0;
+      expect(rt.meta.live?.steps).toBe(300);
+      rt.endTurn();
+      return elapsed;
     };
     cost(200);
     const small = Math.min(cost(200), cost(200));
     const large = Math.min(cost(60_000), cost(60_000));
     // Proportional work would make the long chat 300 times slower; allow noise, not growth.
     expect(large).toBeLessThan(small * 4 + 20);
+  });
+
+  it('a late shape change in a long running turn never reads the words of its other checkpoints', () => {
+    const rt = new SessionRuntime(meta('s', 'C:/w'), () => {}, () => {});
+    rt.beginTurn();
+    let reads = 0;
+    for (let i = 0; i < 3000; i++) {
+      rt.add({ id: String(i), type: 'tool', name: 'Read', kind: 'read', title: 'Read', status: 'done', detail: {} });
+      const note = rt.add({ type: 'text', text: 'The check passed.', streaming: false });
+      Object.defineProperty(note, 'text', { get() { reads++; return 'The check passed.'; } });
+    }
+    const live = rt.add({ type: 'text', text: 'Let me check.', streaming: true });
+    rt.delta(live.id, 'text', ' The suite failed.');
+    rt.patch('0', { kind: 'plan' });
+    expect(rt.meta.live).toMatchObject({ steps: 2999, checkpoints: 2999, checkpointSteps: 0 });
+    expect(reads).toBe(0);
+    rt.endTurn();
   });
 
   it('the side panel does not force a layout of the window for every sub-agent that finishes', () => {

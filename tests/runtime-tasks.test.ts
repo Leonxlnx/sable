@@ -52,6 +52,25 @@ it('holds returned unread inputs through an automatic continuation while the lim
 });
 
 describe('background commands', () => {
+  it.each([
+    ['node integration-tests.js', 'Testing local URL http://localhost:3311', false],
+    ['npm start', 'import finished', false],
+    ['node job.js', 'http://localhost:3311', false],
+    ['node job.js', 'listening on another machine\nTesting http://localhost:3311', false],
+    ['node job.js', 'Finished serving fixtures. Testing local URL http://localhost:3311', false],
+    ['node job.js', 'Testing http://localhost:3311 to find a process listening on it', false],
+    ...['Local:', 'listening on', 'ready on', 'running at', 'started server on', '➜', 'HTTP server at', 'Serving'].map(s => ['node app.js', s + ' http://localhost:3311', true]),
+  ] as [string, string, boolean][])('classifies %s printing %s as serving=%s only while running', (command, output, serves) => {
+    const { rt } = make();
+    const step = rt.add<ToolItem>(bash({ detail: { command }, output }));
+    rt.taskStarted(step.id, { id: 'job', kind: 'command' });
+    expect(rt.meta.commands).toBe(serves ? 0 : 1);
+    expect(rt.meta.serving ?? 0).toBe(serves ? 1 : 0);
+    rt.taskEnded('job', 'done');
+    expect(step.task?.serving).toBeUndefined();
+    expect(rt.meta.serving ?? 0).toBe(0);
+    expect(rt.meta.commands ?? 0).toBe(0);
+  });
   it('reserves each lost-task note for one in-flight send and releases an abandoned batch', () => {
     const { rt } = make();
     rt.taskStarted(rt.add<ToolItem>(bash()).id, { id: 'first', kind: 'command' });

@@ -1,8 +1,8 @@
 import type { IncomingMessage, Server } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { BRIDGE_PATH, type RpcRequest, type ServerFrame } from '../shared/protocol';
+import { BRIDGE_PATH, type RpcMethods, type RpcRequest, type ServerFrame } from '../shared/protocol';
 import { App, type AppOptions } from './app';
-import { eventForWindow, resultForWindow } from './core/trim';
+import { eventForWindow, isSnapshot, resultForWindow } from './core/trim';
 import { registerServices } from './services/index';
 import { defaultProviders } from './providers/index';
 import { bootMark } from './util/boot';
@@ -48,11 +48,17 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
   const wholeItem = app.store.wholeItem.bind(app.store);
   wss.on('connection', (ws: WebSocket) => {
     bootMark('bridge:connected');
+    type PageRequest = RpcMethods['session.snapshot']['params'];
+    type PageAttempt = { request: PageRequest; key: string; retry: boolean };
+    const pages = new Map<string, PageAttempt>();
     const send = (frame: ServerFrame) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(frame));
     };
     // Whole timelines reach a window with finished steps' bulk cut (`session.item` has the rest).
-    const unsubscribe = app.subscribe((event) => send({ event: eventForWindow(event, wholeItem) }));
+    const unsubscribe = app.subscribe((event) => {
+      if (event.type === 'session.removed') pages.delete(event.id);
+      send({ event: eventForWindow(event, wholeItem) });
+    });
     ws.on('message', async (raw) => {
       let req: RpcRequest;
       try {
@@ -60,14 +66,38 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
       } catch {
         return;
       }
+      let pageRequest: PageRequest | undefined;
+      let attempt: PageAttempt | undefined;
       try {
         const t = trace ? performance.now() : 0;
-        const result = await app.call(req.method, req.params as never);
-        const frame = JSON.stringify({ id: req.id, ok: true, result: resultForWindow(result, wholeItem) });
+        if (req.method === 'session.snapshot') {
+          pageRequest = req.params as PageRequest;
+          const previous = pages.get(pageRequest.sessionId);
+          pages.delete(pageRequest.sessionId);
+          if (pageRequest.page && app.sessions.has(pageRequest.sessionId)) {
+            // Retrying the same cursor can mean the window timed out although
+            // the server finished. Its fallback must stay on that cursor too.
+            const key = JSON.stringify([pageRequest.page, pageRequest.keepFrom]);
+            attempt = { request: pageRequest, key, retry: pageRequest.page !== 'end' && previous?.key === key };
+            pages.set(pageRequest.sessionId, attempt);
+          } else if (pageRequest.peek && previous?.retry) {
+            pageRequest = previous.request;
+          }
+        }
+        const result = await app.call(req.method, (pageRequest ?? req.params) as never);
+        let view = resultForWindow(result, wholeItem, !!(pageRequest?.page || pageRequest?.peek));
+        // A byte cut must never silently remove an unresolved decision from a
+        // provisional end. In that case the first answer comes from restore.
+        if (pageRequest && isSnapshot(result) && result.page?.kind === 'provisional' && isSnapshot(view) && result.items.length !== view.items.length) {
+          const real = await app.call('session.snapshot', { ...pageRequest, page: 'real', keepFrom: result.items[0]?.id });
+          view = resultForWindow(real, wholeItem, true);
+        }
+        const frame = JSON.stringify({ id: req.id, ok: true, result: view });
         // Measuring runs (SABLE_BOOT_TRACE=1): each call, when it came, how long it took, how big its answer was.
         if (trace) console.log(`[rpc] ${req.method} ${(performance.timeOrigin + t).toFixed(1)} ${(performance.now() - t).toFixed(1)}ms ${frame.length}B`);
         if (ws.readyState === ws.OPEN) ws.send(frame);
       } catch (err) {
+        if (attempt) attempt.retry = true;
         send({ id: req.id, ok: false, error: (err as Error).message ?? String(err) });
       }
     });

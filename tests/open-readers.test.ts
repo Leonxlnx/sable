@@ -59,3 +59,37 @@ it('find, the two history tabs and copy wait for the prefix; palette search foll
   expect(useStore.getState().data.s.incomplete).toBe(false);
 });
 
+
+it('finishes every reader after backed-off pages and one failed whole retry', async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal('window', { setTimeout, clearTimeout });
+  try {
+    call.mockRejectedValue(Error('page unavailable'));
+    applySnapshot({ ...snap, page: { kind: 'end', before: 2, rootsBefore: 2, recentAt: 0 } });
+    const results = Promise.allSettled([completeSession('s'), completeSession('s')]);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect((await results).map(r => r.status === 'rejected' && r.reason.message)).toEqual(Array(2).fill('Could not read the whole conversation'));
+    expect(call.mock.calls.filter(([, p]) => p.page)).toHaveLength(3);
+    expect(call.mock.calls.filter(([, p]) => !p.page)).toHaveLength(1);
+    for (const Tab of [AgentsTab, ContextTab]) {
+      const ui = renderToStaticMarkup(createElement(Tab, { sessionId: 's', active: false }));
+      expect(ui).toContain('Could not read the whole conversation');
+      expect(ui).toContain('Try again');
+    }
+  } finally { vi.useRealTimers(); }
+});
+
+it('Try again shares a successful replacement between the waiting readers', async () => {
+  const { retryHistory } = await import('@/state/store');
+  vi.stubGlobal('window', { clearTimeout, setTimeout });
+  applySnapshot(snap);
+  useStore.setState(s => ({ data: { ...s.data, s: { ...s.data.s, incomplete: true, historyFailed: true } } }));
+  let resolve!: (value: SessionSnapshot) => void;
+  call.mockImplementation(() => new Promise(r => { resolve = r; }));
+  const retry = retryHistory('s');
+  const joined = Promise.all([completeSession('s'), completeSession('s'), retryHistory('s')]);
+  expect(call).toHaveBeenCalledTimes(1);
+  resolve(snap);
+  await Promise.all([retry, joined]);
+  expect(useStore.getState().data.s.incomplete).toBe(false);
+});

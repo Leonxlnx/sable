@@ -28,7 +28,7 @@ function shiftOf(el: HTMLElement, stuck: boolean): number {
 }
 
 /** The person's message: their words on the right in the composer's material, with its time, copy and rewind on hover. */
-export const UserMessage = memo(function UserMessage({ item }: { item: UserItem }) {
+export const UserMessage = memo(function UserMessage({ item, landingId = item.id }: { item: UserItem; landingId?: string }) {
   const { sessionId, stuck } = useTimeline();
   const canRewind = useStore((s) => !!s.data[sessionId]?.caps?.features.rewind);
   const idle = useStore((s) => {
@@ -82,7 +82,7 @@ export const UserMessage = memo(function UserMessage({ item }: { item: UserItem 
       // The whole row travels (its mark beside the card with it), from where the card stood.
       if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) play(el, [{ transform: `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)` }, { transform: 'translate(0px, 0px)' }], { duration: MOVE_GLIDE_MS, easing: EASE_OUT });
       if (was.queued && !queued) fieldBeat('pulse', card, 0.6);
-    } else if (item.text) landInTimeline(el, item.text, { steer: item.steered, session: sessionId, ts: item.ts });
+    } else if (item.text) landInTimeline(el, item.text, { steer: item.steered, session: sessionId, ts: item.ts, submitId: landingId });
     if (!item.steered) return;
     // Only a steered message ever moves: where its card stands is read as its row leaves.
     return () => {

@@ -22,3 +22,6 @@ export function changedSince(d: ItemsRevision, rev: number): readonly string[] |
   if (d.rev === rev) return NO_IDS;
   return d.changed?.since === rev ? d.changed.ids : null;
 }
+
+/** Safe empty index while the chat is unloaded. */
+export const emptyIndex: Record<string, never> = Object.freeze(Object.create(null));

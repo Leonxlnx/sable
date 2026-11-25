@@ -228,6 +228,7 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
   // A row that comes back is a new element (its key counts its returns): the one that left may still
   // be in the page, hidden and folding away, and would have come back unseen.
   const lives = useRef(new Map<string, number>());
+  const provisional = useStore(s => s.data[sessionId]?.provisional);
   const held = useRef(queue);
   held.current = queue;
   const leave = useCallback((id: string, on: boolean) => {
@@ -280,14 +281,14 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
     for (const q of shown) {
       if (wasKeys.has(keyOf(q))) continue;
       const el = textOf(q.id);
-      if (el) landInTray(el, q.text, sessionId);
+      if (el) landInTray(el, q.text, sessionId, q.submitId ?? q.id);
     }
     if (prev !== queue) {
       const now = new Set(queue.map((q) => q.id));
       for (const q of prev) {
         if (now.has(q.id) || gone.delete(q.id)) continue;
         const el = textOf(q.id);
-        if (el) launchFromTray(el, q.text, sessionId);
+        if (el) launchFromTray(el, q.text, sessionId, q.submitId ?? q.id);
       }
     }
     const was = geo.current;
@@ -315,7 +316,7 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
     geo.current = now;
   }, [queue, shownKey, sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
-    <div className="cq-clip" ref={clip}>
+    <div className="cq-clip" ref={clip} inert={provisional}>
       <AnimatePresence initial={false}>
         {shown.length > 0 && (
           <motion.section

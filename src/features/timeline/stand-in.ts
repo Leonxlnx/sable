@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import type { TimelineItem } from '@shared/protocol';
+import type { TimelineItem, QueuedMessage } from '@shared/protocol';
 
 /**
  * A sent message stands in the conversation from the press, in the timeline's own layout, until its
@@ -17,15 +17,14 @@ import type { TimelineItem } from '@shared/protocol';
  */
 export interface StandIn {
   id: string;
+  submitId: string;
   /** The chat (null from home until the chat exists). */
   session: string | null;
   text: string;
-  /** When it was sent, on the bridge's clock: its row's message is no older than this (less a little skew). */
+  /** Time shown on the temporary card. */
   wall: number;
 }
 
-/** How much older than the send a row's message may be and still be this one (flight.ts `FRESH_SLACK_MS`). */
-export const STAND_SLACK_MS = 2000;
 /** The bridge took the message but no row came (it is in a view no longer on screen): the card goes after this. */
 export const TAKEN_MS = 3000;
 /** Nothing at all came: the card goes after this (flight.ts `HOLD_MS` and a little). */
@@ -36,8 +35,9 @@ const subs = new Set<() => void>();
 const changed = () => subs.forEach((f) => f());
 let n = 0;
 
-export function addStandIn(text: string, session: string | null, wall = Date.now()): StandIn {
-  const s: StandIn = { id: `standin:${++n}`, session, text, wall };
+export function addStandIn(text: string, session: string | null, submitId: string, wall = Date.now(), represented = false): StandIn | null {
+  if (represented || list.some(s => s.submitId === submitId && s.session === session)) return null;
+  const s: StandIn = { id: `standin:${++n}`, session, submitId, text, wall };
   list = [...list, s];
   // Rendered once the press's first frame is out (the key's handler only touches the page: the
   // send's own layers must reach the compositor before React renders anything for it).
@@ -76,38 +76,23 @@ export function useStandIns(): readonly StandIn[] {
   return useSyncExternalStore(subscribe, read, read);
 }
 
-const norm = (t: string) => t.trim().replace(/\s+/g, ' ').slice(0, 160);
-/** The same words: a pasted text file goes out appended to them (Composer `parcel`), so one may begin the other. */
-const same = (a: string, b: string) => !!a && !!b && (a === b || a.startsWith(b) || b.startsWith(a));
-
-/**
- * Which stand-ins of `session` have their row now (pure): a message of the person's with the same
- * words, no older than the send, each row taken by one stand-in at most, newest rows first.
- */
-export function standInRows(stand: readonly StandIn[], session: string, roots: readonly string[], items: Record<string, TimelineItem | undefined>): Map<string, string> {
+/** A user row and a queue receipt both retire the card for that exact submission. */
+export function standInRows(stand: readonly StandIn[], session: string, _roots: readonly string[], items: Record<string, TimelineItem | undefined>, queue: readonly QueuedMessage[] = []): Map<string, string> {
   const out = new Map<string, string>();
-  const mine = stand.filter((s) => s.session === session);
-  if (!mine.length) return out;
-  const used = new Set<string>();
-  // Only the conversation's end can hold a message sent a moment ago.
-  for (let i = roots.length - 1, seen = 0; i >= 0 && seen < 60; i--, seen++) {
-    const it = items[roots[i]];
-    if (it?.type !== 'user') continue;
-    const k = norm(it.text);
-    const s = mine.find((x) => !out.has(x.id) && same(norm(x.text), k) && it.ts >= x.wall - STAND_SLACK_MS);
-    if (s && !used.has(it.id)) {
-      out.set(s.id, it.id);
-      used.add(it.id);
+  for (const s of stand) {
+    if (s.session !== session) continue;
+    const user = items[s.submitId];
+    if (user?.type === 'user') out.set(s.id, user.id);
+    else {
+      const row = queue.find(q => q.submitId === s.submitId || q.id === s.submitId);
+      if (row) out.set(s.id, row.id);
     }
   }
   return out;
 }
 
-/** Whether the real row `item` of `session` takes the place of a stand-in on screen (it then makes no entrance). */
 export function takesStandIn(session: string, item: TimelineItem | undefined): boolean {
-  if (item?.type !== 'user') return false;
-  const k = norm(item.text);
-  return list.some((s) => s.session === session && same(norm(s.text), k) && item.ts >= s.wall - STAND_SLACK_MS);
+  return item?.type === 'user' && list.some(s => s.session === session && s.submitId === item.id);
 }
 
 /** Tests. */

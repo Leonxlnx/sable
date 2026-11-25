@@ -8,6 +8,7 @@ import { busyError, transportError } from './errors';
 import { eraseAll, pageStorage } from './erase';
 import { FORGET_FAILED } from './credential';
 import { IdentityError, pskOfKey, pskOfToken, startHandshake, type Channel } from './secure';
+import { onScreen } from './screen';
 
 /** What the phone keeps after pairing: where the desktop is and the token it gave this phone. */
 export interface Pairing {
@@ -609,19 +610,7 @@ class Conn {
     this.hiddenAt = 0;
     // Said to be open with no live wire under it (one closed for a pairing given up): it reconnects.
     if (this.state === 'open' && this.live() && away < 15_000) {
-      const w = this.wire;
-      void this.call('usage.limits', {}, 3000).catch(() => {
-        if (this.wire !== w) return;
-        // A socket that died while the app was frozen may never say so (its close waits on a network
-        // that is gone): it is let go now and a fresh connection starts, not after its close event.
-        this.dropWire();
-        if (this.state === 'denied' || this.holdOld) return;
-        this.setState('offline', 'Reconnecting');
-        this.cancelAttempt();
-        clearTimeout(this.retryTimer);
-        this.retry = 0;
-        void this.connect();
-      });
+      this.check(3000);
       return;
     }
     // An attempt begun a moment ago (the same wake heard twice) is left to finish.
@@ -630,6 +619,30 @@ class Conn {
     clearTimeout(this.retryTimer);
     this.retry = 0;
     void this.connect();
+  }
+
+  /**
+   * Asks the desktop a small question on the wire in use; no answer within `timeoutMs` and the wire
+   * is let go and a fresh connection starts. A socket that died silently (the desktop slept, the
+   * phone changed networks, a frozen page) may never say so: its close waits on a network that is
+   * gone, and the desktop's pings are answered by the network stack whatever the page does. Called
+   * back on screen after a short absence, and once a minute off screen while a chat works (App.tsx),
+   * so a lost connection reads as lost and the live cards never show a stale "Working".
+   */
+  check(timeoutMs = 10_000) {
+    if (this.state !== 'open' || !this.live()) return;
+    const w = this.wire;
+    void this.call('usage.limits', {}, timeoutMs).catch(() => {
+      if (this.wire !== w) return;
+      // It is let go now and a fresh connection starts, not after its close event.
+      this.dropWire();
+      if (this.state === 'denied' || this.holdOld) return;
+      this.setState('offline', 'Reconnecting');
+      this.cancelAttempt();
+      clearTimeout(this.retryTimer);
+      this.retry = 0;
+      void this.connect();
+    });
   }
 
   private attemptAt = 0;
@@ -774,13 +787,13 @@ class Conn {
   }
 
   /**
-   * Backoff with a little jitter: 0.6, 1.2, 2.4, 4.8 s, then every 8 s while the app is in front
-   * (30 s in the background, where Android throttles timers anyway). Coming back to the front, a
-   * network change or a tap on "Try again" reconnects at once (`wake`).
+   * Backoff with a little jitter: 0.6, 1.2, 2.4, 4.8 s, then every 8 s while the app is on screen
+   * (15 s off screen: kept awake there only while a chat works, lib/screen.ts). Coming back to the
+   * front, a network change or a tap on "Try again" reconnects at once (`wake`).
    */
   private scheduleRetry() {
     clearTimeout(this.retryTimer);
-    const cap = document.hidden ? 30_000 : 8000;
+    const cap = onScreen() ? 8000 : 15_000;
     const delay = Math.min(cap, 600 * 2 ** this.retry++) * (0.85 + Math.random() * 0.3);
     this.retryTimer = window.setTimeout(() => void this.connect(), delay);
   }

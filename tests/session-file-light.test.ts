@@ -14,6 +14,9 @@ import { chatMarkdown } from '../server/core/chat-markdown';
 import { Store } from '../server/core/store';
 import { cutItems, isLight, LIGHT, resultForWindow } from '../server/core/trim';
 import { DemoProvider } from '../server/providers/demo';
+import { isUtf8 } from 'node:buffer';
+import { largeRowReader } from '../server/core/session-json';
+import { cutItem, PAGE_LIMIT, workerCut } from '../server/core/trim';
 import { namedInTurn } from '../server/services/capture';
 import { registerExport } from '../server/services/export';
 import { phoneDetail, phoneItem, registerPhone } from '../server/services/phone';
@@ -67,6 +70,108 @@ function fixture(padding = 0) {
   READ.inWorkerAbove = 1;
   return { home, file, meta, items, picture };
 }
+
+it('keeps negative zero and overflowing exponents in an indexed preview and its baseline', async () => {
+  const { file } = fixture();
+  const original = readFileSync(file('src'), 'utf8').replace('"id":"s0","ts":0', '"id":"s0","ts":-0,"metrics":{"x":1e400,"y":-1e400}');
+  writeFileSync(file('src'), original);
+  const files = new SessionFiles(file);
+  const data = await files.loadAsync('src');
+  const item = data.items.find(i => i.id === 's0')!;
+  expect(isLight(item)).toBe(true);
+  expect(Object.is(item.ts, -0)).toBe(true);
+  expect(item).toHaveProperty('metrics', { x: Infinity, y: -Infinity });
+  const whole = JSON.parse(original).items[1];
+  expect(files.wholeItem('src', item)).toStrictEqual(whole);
+  (item as ToolItem & { metrics: { x: number } }).metrics.x = 7;
+  whole.metrics.x = 7;
+  expect(files.wholeItem('src', item)).toStrictEqual(whole);
+});
+
+it('only projects an image line that fits the whole-row string reader', () => {
+  const line = Buffer.from(JSON.stringify({ type: 'tool', id: 'im', ts: 1, name: 'Read', kind: 'read', title: 'Image', detail: {},
+    status: 'done', result: { images: ['a'.repeat(360_000)] } }));
+  const project = (it: ToolItem) => cutItem(it, workerCut.old);
+  expect(largeRowReader(isUtf8, workerCut, line.length)(line, false, project)?.value).toEqual(project(JSON.parse(line.toString())));
+  expect(largeRowReader(isUtf8, workerCut, line.length - 1)(line, false, project)).toBeUndefined();
+});
+
+it('validates every byte lane before projecting an ASCII image', () => {
+  const row = Buffer.from(JSON.stringify({ type: 'tool', id: 'i', kind: 'read', name: 'Read', title: 'Image', status: 'done',
+    detail: {}, result: { images: ['A'.repeat(32000)] } }));
+  const start = row.indexOf('A'.repeat(16));
+  const read = largeRowReader(isUtf8, workerCut, row.length);
+  for (const byte of [0, 31, 32, 34, 92, 127, 128, 255]) {
+    for (let lane = 0; lane < 16; lane++) {
+      row[start + lane] = byte;
+      expect(!!read(row, false, it => cutItem(it, workerCut.old)), `byte ${byte} lane ${lane}`)
+        .toBe(byte === 32 || byte === 127);
+      row[start + lane] = 65;
+    }
+  }
+});
+
+it('sends an unencodable answer as a row, serves its parts, and retries only the failed page', async () => {
+  const { home, file, items } = fixture();
+  const text = 'a\n界'.repeat(350000);
+  items.push({ id: 'long', ts: 9, type: 'text', streaming: false, text });
+  writeFileSync(file('src'), JSON.stringify({ gen: 42, items, todos: [] }));
+  const server = createServer();
+  const bridge = attachBridge(server, { home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
+  const originalLimit = PAGE_LIMIT.chars;
+  PAGE_LIMIT.chars = 1 << 20;
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const ws = new WebSocket('ws://127.0.0.1:' + (server.address() as AddressInfo).port + BRIDGE_PATH);
+  let key = 0;
+  async function call(method: string, params: object) {
+    const id = ++key;
+    const answer = new Promise<{ ok: boolean; result: any }>(resolve => {
+      const receive = (raw: WebSocket.RawData) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.id !== id) return;
+        ws.off('message', receive);
+        resolve(msg);
+      };
+      ws.on('message', receive);
+    });
+    ws.send(JSON.stringify({ id, method, params: { sessionId: 'src', ...params } }));
+    return answer;
+  }
+  try {
+    await once(ws, 'open');
+    const end = (await call('session.snapshot', { page: 'end' })).result;
+    const compact = end.items.at(-1);
+    expect(compact).toMatchObject({ id: 'long', more: true, byParts: true, type: 'text' });
+    expect(compact.text.length).toBeLessThan(text.length);
+    let content = '', offset = 0, seq: number | undefined;
+    do {
+      const part = (await call('session.itemPart', { itemId: 'long', path: ['text'], offset, seq })).result;
+      expect(part.kind).toBe('value');
+      content += part.value;
+      offset = part.next;
+      if (seq === undefined) bridge.app.runtime('src').add({ type: 'text', text: 'another answer', streaming: true });
+      seq = part.seq;
+    } while (offset);
+    expect(content === text).toBe(true);
+    bridge.app.runtime('src').patch('long', { streaming: true });
+    expect((await call('session.itemPart', { itemId: 'long', path: ['text'], offset: 65536, seq })).ok).toBe(false);
+    const cursor = { at: 4, roots: 4, id: items[4].id };
+    vi.spyOn(bridge.app, 'call').mockRejectedValueOnce(new Error('page failed'));
+    expect((await call('session.snapshot', { peek: true, page: cursor })).ok).toBe(false);
+    const retry = (await call('session.snapshot', { peek: true })).result;
+    expect(retry.page.kind).toBe('older');
+    expect(retry.items.map((i: TimelineItem) => i.id)).toEqual(items.slice(0, 4).map(i => i.id));
+    // A timeout in the window need not have raised an error on this socket.
+    for (let n = 0; n < 3; n++) await call('session.snapshot', { peek: true, page: cursor });
+    const afterTimeout = (await call('session.snapshot', { peek: true })).result;
+    expect(afterTimeout.page.kind).toBe('older');
+    expect(afterTimeout.items).toEqual(retry.items);
+  } finally {
+    PAGE_LIMIT.chars = originalLimit;
+    ws.terminate(); await bridge.dispose(); await new Promise<void>(r => server.close(() => r()));
+  }
+});
 
 it('sends identical window snapshots and serves the whole step over session.item', async () => {
   const { home, items } = fixture();

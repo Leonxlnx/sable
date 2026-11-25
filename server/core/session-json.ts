@@ -2,100 +2,140 @@ import type * as fs from 'node:fs';
 import type { TimelineItem, ToolItem } from '../../shared/protocol';
 import type { workerCut } from './trim';
 
-/** The normal parser and cut still handle every field outside one bulky result value.
- * This shortcut only accepts an ordinary JSON string or array which the shared cut
- * actually shortens. Live steps, unusual encodings and ambiguous paths fall back. */
-export function largeRowReader(isUtf8: (s: Buffer) => boolean, options: typeof workerCut) {
+/** Validate the omitted JSON token and parse its surroundings with the native parser.
+ * The original byte span must fit the same whole-row reader used for indexed seeks. */
+export function largeRowReader(isUtf8: (s: Buffer) => boolean, options: typeof workerCut, maxStringLength: number) {
   const placeholder = ' '.repeat(Math.max(options.old.at, options.recent.at) + 1);
-  // Six bytes cover even a JSON escape for one JS code unit.
-  const edge = 6 * Math.max(options.old.at, options.old.head + options.old.tail) + 8;
+  const url = /(?::|\\u003a)(?:\/|\\\/|\\u002f){2}/i;
+
+  // Tag just the replaced token. A NUL in JSON has only one spelling, so
+  // finding this key at the expected path proves which occurrence survived
+  // JSON.parse, including duplicate keys. Probe twice only on a potential collision.
+  function parseAt(head: string, sample: string, tail: string, key: 'images' | 'text' | 'content') {
+    const owner = (item: any) => key === 'content' ? item?.result?.file : item?.result;
+    const item = JSON.parse(head + '{"\\u0000":' + sample + '}' + tail);
+    const target = owner(item), tag = target?.[key];
+    if (item?.type !== 'tool' || Object.hasOwn(item, options.mark) || !tag || !Object.hasOwn(tag, '\0')) return;
+    if ((head.includes('\\u0000') || tail.includes('\\u0000')) && owner(JSON.parse(head + 'null' + tail))?.[key] !== null) return;
+    target[key] = tag['\0'];
+    return item as ToolItem;
+  }
+
   return function read(line: Buffer, recent: boolean, project: (it: ToolItem) => TimelineItem) {
     const length = line.length;
+    if (length > maxStringLength) return;
+    const cut = recent ? options.recent : options.old;
     const prefix = line.subarray(0, 8192);
-    const words = new DataView(line.buffer, line.byteOffset, length);
 
-    // Count the original UTF-16 source units, validating the skipped string body.
-    // Four printable ASCII bytes can pass together. Quotes delimit the supplied span.
-    function stringChars(start: number, end: number, plain: boolean) {
-      let chars = end - start, wide = false;
-      for (let i = start; i < end;) {
-        if (i + 4 <= end) {
-          const word = words.getUint32(i);
-          // High bits test for ASCII and controls. XOR turns a backslash into
-          // zero, so the standard zero-byte test finds escapes in any lane.
-          const slash = word ^ 0x5c5c5c5c;
-          if (!(word & 0x80808080) && !((word - 0x20202020) & 0x80808080) &&
-              !((slash - 0x01010101) & ~slash & 0x80808080)) { i += 4; continue; }
+    // Walk JSON tokens once. The two most recent tail checkpoints bound the
+    // suffix we copy. Both edges fall between tokens, including UTF-8 and \u escapes.
+    function stringBody(start: number, head: number, tail: number) {
+      let at = start, units = 0, excess = 0, left = start, right = start, checkpoint = start, next = tail + 1;
+      while (at < length) {
+        const before = units;
+        const c = line[at++];
+        if (c === 34) {
+          const end = at - 1;
+          if (excess && !isUtf8(line.subarray(start, end))) return;
+          return { end, units, excess, left, right: tail ? right : end };
         }
-        const c = line[i++];
-        if (c < 32) return -1;
+        if (c < 32) return;
         if (c === 92) {
-          const esc = line[i++];
-          if (plain || i > end || (esc !== 110 && esc !== 114 && esc !== 116)) return -1;
+          const esc = line[at++];
+          if (esc === 117) {
+            for (let i = 0; i < 4; i++) {
+              const hex = line[at++];
+              if (!(hex >= 48 && hex <= 57 || (hex | 32) >= 97 && (hex | 32) <= 102)) return;
+            }
+          } else if (!(esc === 34 || esc === 47 || esc === 92 || esc === 98 || esc === 102 ||
+                       esc === 110 || esc === 114 || esc === 116)) return;
         } else if (c >= 128) {
-          if (plain) return -1;
-          wide = true;
-          if (c < 192) chars--;
-          else if (c >= 240) chars++; // a supplementary code point takes two JS units
+          if (c < 194 || c > 244) return;
+          const width = c < 224 ? 2 : c < 240 ? 3 : 4;
+          at += width - 1;
+          if (width === 4) units++;
+          excess += width === 2 ? 1 : 2;
+        }
+        units++;
+        if (before <= head) left = at;
+        if (tail && units >= next) {
+          right = checkpoint;
+          checkpoint = at;
+          next = units + tail + 1;
         }
       }
-      return wide && !isUtf8(line.subarray(start, end)) ? -1 : chars;
     }
 
     const images = prefix.indexOf('"images":[');
     if (images >= 0) {
       const begin = images + 9;
-      let pos = begin + 1, count = 0;
+      const words = new DataView(line.buffer, line.byteOffset, length);
+      function plain(start: number, end: number) {
+        if (line.subarray(start, end).includes(92)) return false;
+        let at = start;
+        for (; at + 16 <= end; at += 16) {
+          const a = words.getUint32(at), b = words.getUint32(at + 4);
+          const c = words.getUint32(at + 8), d = words.getUint32(at + 12);
+          if ((a | b | c | d | (a - 0x20202020) | (b - 0x20202020) |
+              (c - 0x20202020) | (d - 0x20202020)) & 0x80808080) return false;
+        }
+        for (; at < end; at++) if (line[at] < 32 || line[at] >= 128) return false;
+        return true;
+      }
+      let pos = begin + 1, count = 0, excessBytes = 0, size = 0;
       for (;;) {
         if (line[pos++] !== 34) return;
-        const end = line.indexOf(34, pos);
-        if (end < 0 || end >= length || stringChars(pos, end, true) < 0) return;
+        let end = line.indexOf(34, pos);
+        if (end < 0) return;
+        if (plain(pos, end)) size += end - pos + 3;
+        else {
+          const body = stringBody(pos, 0, 0);
+          if (!body) return;
+          end = body.end;
+          size += body.units + 3;
+          excessBytes += body.excess;
+        }
         count++;
         pos = end + 1;
         if (line[pos++] !== 44) break;
       }
-      if (line[pos - 1] !== 93 || length - pos > 8192 || pos - begin <= placeholder.length + 2) return;
+      if (line[pos - 1] !== 93 || length - pos > 8192 || size <= cut.at) return;
       const head = line.toString('utf8', 0, begin), tail = line.toString('utf8', pos, length);
-      const item = JSON.parse(head + '0' + tail);
-      // Changing just this span must change result.images. This rules out nested
-      // namesakes and duplicate keys without implementing a second object parser.
-      if (item?.type !== 'tool' || Object.hasOwn(item, options.mark) || item.result?.images !== 0 ||
-          JSON.parse(head + '1' + tail).result?.images !== 1) return;
+      const item = parseAt(head, 'null', tail, 'images');
+      if (!item?.result) return;
       item.result.images = Array(count).fill('');
       item.result.images[0] = placeholder;
       const view = project(item);
       if (view.type === 'tool' && view.result && !Object.hasOwn(view.result, 'images'))
-        return { value: view, chars: head.length + pos - begin + tail.length };
+        return { value: view, chars: head.length + pos - begin - excessBytes + tail.length };
       return;
     }
 
-    if (recent) return;
-    const file = prefix.indexOf('"content":"');
-    const key = file >= 0 ? file : prefix.indexOf('"text":"');
+    const result = prefix.indexOf('"result":{');
+    if (result < 0) return;
+    const file = prefix.indexOf('"content":"', result);
+    const key = file >= 0 ? file : prefix.indexOf('"text":"', result);
     if (key < 0) return;
     const start = key + (file >= 0 ? 11 : 8);
-    const end = line.indexOf(34, start);
-    if (end - start <= 2 * edge || length - end > 8192) return;
-    const bodyChars = stringChars(start, end, false);
-    if (bodyChars < 0) return;
-    const head = line.toString('utf8', 0, start - 1), tail = line.toString('utf8', end + 1, length);
-    const item = JSON.parse(head + 'null' + tail);
-    if (item?.type !== 'tool' || item.status !== 'done' || Object.hasOwn(item, options.mark)) return;
+    const body = stringBody(start, file >= 0 ? cut.head + cut.tail : cut.head, file >= 0 ? 0 : cut.tail);
+    if (!body || body.units <= cut.at || body.left >= body.right) return;
+    const end = body.end;
+    if (length - end > 8192) return;
+    const head = line.toString('utf8', 0, start - 1), tail = line.toString('utf8', end + 1);
     const field = (it: ToolItem) => file >= 0 ? it.result?.file?.content : it.result?.text;
-    if (field(item) !== null) return;
-    // A folded command can show announcement lines from its middle. Escaped
-    // colons were already refused by stringChars. Leave all possible URLs to cut.
-    if (file < 0 && item.kind === 'bash' && line.subarray(start, end).includes(58)) return;
-    let left = start + edge, right = end - edge;
-    while (line[left] >= 128 || line[left - 1] === 92) left++;
-    while (line[right] >= 128 || line[right - 1] === 92) right--;
-    if (left >= right) return;
-    const sample = line.toString('utf8', start - 1, left) + line.toString('utf8', right, end + 1);
-    const short = JSON.parse(head + sample + tail);
-    if (typeof field(short) !== 'string') return;
+    const sample = line.toString('utf8', start - 1, body.left) + placeholder.slice(0, cut.at + 1) +
+      line.toString('utf8', body.right, end + 1);
+    const short = parseAt(head, sample, tail, file >= 0 ? 'content' : 'text');
+    if (short?.status !== 'done') return;
+    // A bash preview (including its private reread flag) can depend on a URL in
+    // the discarded middle. Include escaped colons and slashes in that check.
+    if (file < 0 && short.kind === 'bash') {
+      const raw = line.subarray(start, end);
+      if ((raw.includes(58) || raw.includes('\\u003')) && url.test(raw.toString())) return;
+    }
     const view = project(short);
     if (view.type === 'tool' && field(view) !== field(short))
-      return { value: view, chars: head.length + bodyChars + 2 + tail.length };
+      return { value: view, chars: head.length + end - start - body.excess + 2 + tail.length };
   };
 }
 

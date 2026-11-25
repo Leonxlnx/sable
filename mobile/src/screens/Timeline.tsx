@@ -6,6 +6,7 @@ import { stripWrappers, syntheticOf } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
 import { leadTitle } from '@desk/features/timeline/lead-in';
 import { useNow } from '@m/lib/useNow';
+import { onScreen } from '@m/lib/screen';
 import { cancelDownload, downloadKey, installable, openDownload, startDownload, useDownload } from '@m/lib/downloads';
 import { PLAIN_OFF } from '@m/lib/download-core';
 import { canonicalName, isPackageName } from '@shared/file-name';
@@ -78,7 +79,8 @@ function useSecond(active: boolean): number {
   useEffect(() => {
     if (!active) return;
     setNow(Date.now());
-    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    // Off screen (lib/screen.ts: the page may be held visible there) the clock waits.
+    const t = window.setInterval(() => onScreen() && setNow(Date.now()), 1000);
     return () => window.clearInterval(t);
   }, [active]);
   return now;

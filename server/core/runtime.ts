@@ -20,7 +20,9 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { isCompactOutput, userText } from '../../shared/synthetic';
-import { runsTask, taskServing, worksInBackground } from '../../shared/background';
+import { runsTask, worksInBackground } from '../../shared/background';
+import { taskServing } from './task-serving';
+import { turnLive, TurnLiveIndex } from '../../shared/turn-live';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
 import { backgroundAgentName } from './limit-policy';
 
@@ -185,12 +187,20 @@ export class SessionRuntime {
   /** Spans in which a prompt waited for the user ([start, end] ms), and the start of the open one. */
   private waits: [number, number][] = [];
   private waitSince?: number;
+  private liveTurn?: TurnLiveIndex;
+  private nextHead?: UserItem;
+  private liveTimer?: ReturnType<typeof setTimeout>;
+  private publishedLive?: SessionMeta['live'];
+  private livePublishedAt = 0;
 
   constructor(
     public meta: SessionMeta,
     private emit: Emit,
     private onDirty: (rt: SessionRuntime, what: 'meta' | 'items') => void,
-  ) {}
+  ) {
+    // Even a lazy restored chat is listed before anyone reads its timeline.
+    delete meta.live;
+  }
 
   get id() {
     return this.meta.id;
@@ -257,6 +267,8 @@ export class SessionRuntime {
   }
 
   load(items: TimelineItem[], todos: Todo[] = [], queue?: QueuedMessage[]) {
+    this.dropLive();
+    delete this.meta.live;
     this.dirty = 'all';
     this.items = items;
     this.todos = todos;
@@ -416,7 +428,7 @@ export class SessionRuntime {
     if (item?.type !== 'tool' || item.task?.id !== taskId) return;
     const t = item.task;
     if (t.state !== 'running' && t.state !== 'lost') return;
-    this.patch<ToolItem>(item.id, { task: { id: t.id, kind: t.kind, state, since: t.since, ...(t.serving && { serving: t.serving }), endedAt: Math.max(at ?? Date.now(), t.since) } });
+    this.patch<ToolItem>(item.id, { task: { id: t.id, kind: t.kind, state, since: t.since, ...(state === 'stopped' && t.serving && { serving: t.serving }), endedAt: Math.max(at ?? Date.now(), t.since) } });
   }
 
   /**
@@ -732,6 +744,7 @@ export class SessionRuntime {
     this.emit({ type: 'item.added', sessionId: this.id, item: { ...full } });
     this.onDirty(this, 'items');
     this.trackBackground(full);
+    this.liveItem(full, true);
     return full;
   }
 
@@ -750,6 +763,7 @@ export class SessionRuntime {
     this.emit({ type: 'item.delta', sessionId: this.id, id, field, delta });
     this.onDirty(this, 'items');
     const step = this.index.get(id);
+    if (field === 'text' && step?.type === 'text' && this.liveTurn?.textChanged(step)) this.refreshLive();
     if (field === 'output' && runsTask(step) && step.task.kind === 'command') {
       // Include the preceding partial line when a banner crosses a stream boundary.
       const output = step.output ?? '';
@@ -773,11 +787,12 @@ export class SessionRuntime {
       patch = { ...patch, handed: this.hand({ ...item, ...(patch as Partial<ToolItem>) }) };
     }
     const previous = item.type === 'tool' ? item.task : undefined;
+    const taken = item.type === 'user' && item.state === 'queued' && (patch as Partial<UserItem>).state === 'sent';
     Object.assign(item, patch);
     if (item.type === 'tool' && item.task && ('task' in patch || 'detail' in patch || 'output' in patch || 'result' in patch)) {
       const previousServing = previous?.id === item.task.id ? previous.serving : undefined;
       const mark = item.task;
-      if (previousServing && !mark.serving) item.task = { ...mark, serving: previousServing };
+      if (previousServing && !mark.serving && mark.state !== 'done' && mark.state !== 'failed') item.task = { ...mark, serving: previousServing };
       if (mark.state === 'running' && (!item.task.serving || 'output' in patch || 'result' in patch)) {
         const serving = taskServing(item);
         if (serving && serving !== item.task.serving) item.task = { ...item.task, serving };
@@ -788,6 +803,10 @@ export class SessionRuntime {
     this.emit({ type: 'item.patch', sessionId: this.id, id, patch: patch as Partial<TimelineItem> });
     this.onDirty(this, 'items');
     this.trackBackground(item);
+    if (['status', 'kind', 'result', 'detail', 'check', 'streaming', 'text', 'variant', 'early', 'until',
+      'agentSwitch', 'state', 'steered', 'parentId', 'ts', 'type'].some(key => key in patch)) {
+      this.liveItem(item, taken);
+    }
   }
 
   /** Share steps the person allowed themselves (a permission they answered with an allow), by item id: the files as they were shown. */
@@ -916,6 +935,8 @@ export class SessionRuntime {
     this.emit({ type: 'item.removed', sessionId: this.id, id, moving: true });
     this.emit({ type: 'item.added', sessionId: this.id, item: { ...item }, moved: true });
     this.onDirty(this, 'items');
+    this.liveTurn?.remove(id);
+    this.liveItem(item, true);
   }
 
   /** Removes an item and every item nested under it (children of a tool or agent, and theirs). */
@@ -933,6 +954,11 @@ export class SessionRuntime {
       }
     }
     for (const g of gone) this.index.delete(g);
+    if (this.nextHead && gone.has(this.nextHead.id)) this.nextHead = undefined;
+    if (this.liveTurn) {
+      for (const g of gone) this.liveTurn.remove(g);
+      this.refreshLive();
+    }
     this.items = this.items.filter((i) => !gone.has(i.id));
     // One event for the root: clients drop its descendants themselves.
     this.emit({ type: 'item.removed', sessionId: this.id, id });
@@ -950,10 +976,18 @@ export class SessionRuntime {
   }
 
   reset(items: TimelineItem[]) {
+    const previous = this.liveTurn;
+    this.update({ live: undefined });
     const before = this.meta.background ?? 0;
     const commands = this.meta.commands ?? 0;
     const { serving, servingSince, servingAddress } = this.meta;
     this.load(items, this.todos);
+    // Claude can also reorder a steer with a reset mid-turn. Retain the surviving
+    // acts in their new order for the next live event. A rewind discards the rest.
+    if (previous && this.turnActive) {
+      this.liveTurn = new TurnLiveIndex();
+      for (const item of items) if (previous.has(item.id)) this.liveTurn.put(item);
+    }
     this.emit({ type: 'timeline.reset', sessionId: this.id, items: items.map((i) => ({ ...i })) });
     this.onDirty(this, 'items');
     // Re-publish the effective counts after the silent load.
@@ -1004,6 +1038,65 @@ export class SessionRuntime {
 
   // ── turn state ──
 
+  private dropLive() {
+    clearTimeout(this.liveTimer);
+    this.liveTimer = undefined;
+    this.liveTurn = undefined;
+    this.publishedLive = undefined;
+    this.nextHead = undefined;
+  }
+
+  private liveItem(item: TimelineItem, added: boolean) {
+    if (!this.liveTurn) {
+      // Providers may add/take the message immediately before beginTurn.
+      if (added && item.type === 'user' && !item.parentId && item.state !== 'queued') this.nextHead = item;
+      else if (SessionRuntime.endsTurn(item)) this.nextHead = undefined;
+      return;
+    }
+    if (!added && !this.liveTurn.has(item.id)) return;
+    this.liveTurn.put(item);
+    this.refreshLive();
+  }
+
+  private refreshLive() {
+    if (!this.liveTurn) return;
+    const live = turnLive(this.liveTurn, this.turnStartedAt, this.permissions.size + this.questions.size > 0);
+    if (!live) {
+      this.finishLive();
+      this.update({ live: undefined });
+      return;
+    }
+    this.meta.live = live; // hello/snapshot always sees the current counts, even between broadcasts.
+    const previous = this.publishedLive;
+    if (previous && previous.doing === live.doing && previous.checkpoints === live.checkpoints && previous.startedAt === live.startedAt) {
+      if (previous.files === live.files && previous.steps === live.steps && previous.checkpointSteps === live.checkpointSteps &&
+          previous.checkpointAt === live.checkpointAt && previous.doingCount === live.doingCount) return;
+      const delay = this.livePublishedAt + 1000 - Date.now();
+      if (delay > 0) {
+        this.liveTimer ??= setTimeout(() => { this.liveTimer = undefined; this.refreshLive(); }, delay);
+        return;
+      }
+    }
+    this.publishLive();
+  }
+
+  private publishLive() {
+    clearTimeout(this.liveTimer);
+    this.liveTimer = undefined;
+    this.livePublishedAt = Date.now();
+    this.publishedLive = this.meta.live;
+    this.emit({ type: 'session.updated', id: this.id, patch: { live: this.meta.live } });
+  }
+
+  private finishLive() {
+    // The result notification reads the final file count, even if the last edit
+    // settled inside the coalescing interval.
+    if (this.liveTimer && this.meta.live?.files !== this.publishedLive?.files) this.publishLive();
+    clearTimeout(this.liveTimer);
+    this.liveTimer = undefined;
+    this.publishedLive = undefined;
+  }
+
   /**
    * `keepHold`: the agent begins this turn by itself (it read a message withdrawn at a stop after all,
    * a background task woke it): a stop's hold on the queue stays through it, so its end sends nothing
@@ -1014,6 +1107,9 @@ export class SessionRuntime {
     const hold = !!opts.keepHold && this.stopped && !this.turnActive;
     this.turnActive = true;
     this.turnStartedAt = Date.now();
+    this.liveTurn ??= new TurnLiveIndex();
+    if (this.nextHead) this.liveTurn.put(this.nextHead);
+    this.nextHead = undefined;
     this.stopped = hold;
     this.carried = hold;
     // An undecided background card can be taken over by the person's refusal in this turn.
@@ -1023,6 +1119,7 @@ export class SessionRuntime {
     }
     this.setSuggestion(undefined);
     this.update({ status: 'running', lastError: undefined, activity, updatedAt: Date.now() });
+    this.refreshLive();
     this.onTurnStart?.(this);
   }
 
@@ -1034,10 +1131,12 @@ export class SessionRuntime {
   }
 
   endTurn(error?: string, opts?: { hold?: boolean; backgroundLimit?: boolean }) {
+    this.finishLive();
+    this.dropLive();
     this.turnActive = false;
     this.carried = false;
     this.cancelPrompts();
-    this.update({ status: error ? 'error' : 'idle', lastError: error, activity: undefined, updatedAt: Date.now() });
+    this.update({ status: error ? 'error' : 'idle', live: undefined, lastError: error, activity: undefined, updatedAt: Date.now() });
     this.onTurnEnd?.(this, error, this.unreadQueueHeld ? { ...opts, hold: true } : opts);
   }
 
@@ -1065,6 +1164,7 @@ export class SessionRuntime {
     if (!this.turnActive) return;
     const waiting = this.permissions.size + this.questions.size > 0;
     this.update({ status: waiting ? 'awaiting' : 'running' });
+    this.refreshLive();
   }
 
   // ── prompts ──

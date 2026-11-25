@@ -1,3 +1,4 @@
+import { emptyIndex } from '@/state/revision';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { FileDiff, GitFileStatus, SeenFile, ToolItem } from '@shared/protocol';
 import { Collapse } from '@/components/Collapse';
@@ -41,7 +42,7 @@ function useEditedCount(sessionId: string, cwd: string, on: boolean): number {
   const ids = useToolIds(sessionId, isDoneEdit, true);
   return useMemo(() => {
     if (!on) return 0;
-    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
     const seen = new Set<string>();
     for (const id of ids) {
       const it = items[id] as ToolItem | undefined;
@@ -709,7 +710,7 @@ interface EditedFile extends FileDiff {
 function useSessionEdits(sessionId: string, cwd: string): EditedFile[] {
   const ids = useToolIds(sessionId, isDoneEdit, true);
   return useMemo(() => {
-    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
     const byPath = new Map<string, EditedFile>();
     for (const id of ids) {
       const it = items[id] as ToolItem | undefined;
@@ -744,7 +745,7 @@ function SessionEdits({ sessionId, cwd }: { sessionId: string; cwd: string }) {
   // An open file's diff needs its edits whole: the ones that came as rows are asked for (once each).
   useEffect(() => {
     if (!visible || !open.size) return;
-    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
     const needed = new Set<string>();
     for (const f of files) {
       if (!open.has(f.path)) continue;

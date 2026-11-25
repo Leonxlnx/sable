@@ -5,6 +5,7 @@ import { PromptDock } from '@/features/prompts/PromptDock';
 import { Timeline } from '@/features/timeline/Timeline';
 import { afterSend } from '@/features/composer/settle';
 import { useStore } from '@/state/store';
+import { HistoryStatus } from './HistoryStatus';
 import { ConversationFind } from './FindBar';
 import { useStaged } from './staged';
 import './session.css';
@@ -18,10 +19,12 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   // Only what the view needs: usage ticks while streaming must not re-render the whole view.
   const status = useStore((s) => s.sessions[sessionId]?.status);
   // Under a first message in the air only the conversation mounts; the find bar follows the landing.
+  const historyFailed = useStore(s => s.data[sessionId]?.historyFailed);
   const extras = useStaged('landed');
   if (!status) return null;
   return (
     <div className="session" data-status={status}>
+      {historyFailed && <div role="status"><HistoryStatus sessionId={sessionId} /></div>}
       <Timeline sessionId={sessionId} />
       {extras && <ConversationFind sessionId={sessionId} />}
     </div>

@@ -211,6 +211,7 @@ export function liveOf(
   const chats: LiveChat[] = [];
   const metas: Record<string, Pick<SessionMeta, 'status' | 'provider'>> = {};
   const seen = new Map(previous.map((chat) => [chat.id, chat.since]));
+  const lastTurn = new Map(previous.flatMap((chat) => (chat.turn ? [[chat.id, chat.turn] as const] : [])));
   let waiting = 0;
   for (const s of sessions) {
     if (s.archived) continue;
@@ -221,7 +222,9 @@ export function liveOf(
     if (!own && !hasWork(s) && !between) continue;
     const work = workLabel(s);
     const got = own ? steps(s.id) : undefined;
-    const turn = typeof got === 'object' ? got : undefined;
+    // A reading that is gone keeps the last one: the turn's end item lands a moment before the chat
+    // says it is idle, and that moment's card is the one the result ("Finished · 3 files changed") reads.
+    const turn = typeof got === 'object' ? got : got === undefined && own ? lastTurn.get(s.id) : undefined;
     const n = typeof got === 'number' ? got : turn?.steps;
     // What it does: the kind of step, never its content (a file name, a command or a search term).
     const fromItems = turn && turn.doing.kind !== 'working' ? doingLine(turn.doing) : undefined;
@@ -257,6 +260,12 @@ export interface LiveSpec {
   chat?: string;
   /** One card per chat at work, oldest work first (lib/note-live.ts `liveCard`): Android draws each as a notification of its own. */
   cards?: LiveCard[];
+  /**
+   * The connection was lost at this time (ms) while chats worked or waited: no cards (what they said
+   * may no longer be so), the line says it reconnects, and Android keeps the connection and the page
+   * awake to hear the end, for `LIVE_LOST_MS` at most (KeepAliveService).
+   */
+  lost?: number;
 }
 
 type LiveSettings = { notify?: boolean; fresh?: boolean; conn: string; listAt?: number };
@@ -277,6 +286,39 @@ export function livePayload(settings: LiveSettings, live: Live): LiveSpec | null
 
 /** At most this many chats get a card of their own (the summary names them all). */
 export const CARDS_MAX = 6;
+
+/** How long a connection lost while chats worked is tried again with the app off screen (KeepAliveService's LOST_MS, the same). */
+export const LIVE_LOST_MS = 10 * 60_000;
+
+/** What the live notification was last told, across a lost connection (lib/store.ts `watchLive`). */
+export interface LiveTrack {
+  /** The last word with the connection open had work or a chat waiting. */
+  worked: boolean;
+  /** When the connection went while it had (0: it has not). */
+  lostAt: number;
+}
+
+/**
+ * What Android is told now. With the connection open and the list read: the work (`livePayload`).
+ * With it lost while something worked or waited (the socket died, the desktop slept, the moment
+ * between a new socket and its list): `{ lost }`, the time it went: the cards go (never a stale
+ * "Working"), and Android keeps the connection and the page awake to hear how it ended, for
+ * `LIVE_LOST_MS` from that time (its own clock: KeepAliveService then leaves one quiet line saying
+ * it is not connected). Otherwise (nothing worked, notifications off, the phone removed or
+ * forgotten): nothing, and a stop.
+ */
+export function liveStep(settings: LiveSettings, live: Live, track: LiveTrack, now: number): { spec: LiveSpec | null; stop: boolean; track: LiveTrack } {
+  if (liveEnabled(settings)) {
+    const spec = livePayload(settings, live);
+    return { spec, stop: false, track: { worked: !!spec, lostAt: 0 } };
+  }
+  const trying = !!settings.notify && settings.conn !== 'unpaired' && settings.conn !== 'denied';
+  if (track.worked && trying) {
+    const lostAt = track.lostAt || now;
+    return { spec: { chats: 0, waiting: 0, lost: lostAt }, stop: false, track: { worked: true, lostAt } };
+  }
+  return { spec: null, stop: true, track: { worked: false, lostAt: 0 } };
+}
 
 /** Done only when the turn and the work it left running have both ended. */
 export function workEnded(previous: SessionMeta, current: SessionMeta): boolean {

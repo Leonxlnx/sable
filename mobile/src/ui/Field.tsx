@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { ProviderId } from '@shared/protocol';
+import { onScreen, onScreenChange } from '@m/lib/screen';
 
 /**
  * The dither field behind home and chats, as on the desktop: light that gathers at the lower edge,
@@ -379,7 +380,8 @@ export function Field({
 
     const loop = () => {
       raf = 0;
-      if (document.hidden) return;
+      // Off screen nothing is drawn (lib/screen.ts: the page may be held visible there while a chat works).
+      if (!onScreen()) return;
       const onStage = !!live.current.stage;
       const host = canvas.parentElement;
       // The stage holds its frame while the page under it scrolls, a finger is down or the keyboard is
@@ -451,8 +453,7 @@ export function Field({
     host?.addEventListener('pointerup', onUp, { passive: true });
     host?.addEventListener('pointercancel', onUp, { passive: true });
     if (live.current.stage) awakeUntil = performance.now() + AWAKE_MS;
-    const onVis = () => !document.hidden && kick();
-    document.addEventListener('visibilitychange', onVis);
+    const offScreen = onScreenChange((on) => on && kick());
     return () => {
       ro.disconnect();
       beats.delete(onBeat);
@@ -460,7 +461,7 @@ export function Field({
       host?.removeEventListener('pointerdown', onDown);
       host?.removeEventListener('pointerup', onUp);
       host?.removeEventListener('pointercancel', onUp);
-      document.removeEventListener('visibilitychange', onVis);
+      offScreen();
       clearTimeout(timer);
       cancelAnimationFrame(raf);
       api.current = null;

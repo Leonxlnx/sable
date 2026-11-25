@@ -1,3 +1,4 @@
+import { emptyIndex } from '@/state/revision';
 import { useEffect, useRef } from 'react';
 import { foldKey, setFold } from '@/features/timeline/fold';
 import { revealItem } from '@/features/timeline/reveal';
@@ -31,7 +32,7 @@ export function jumpToComment(sessionId: string, c: ReviewComment) {
   const step = stepOf(c.scope);
   if (step) {
     // An edit made by a sub-agent: the agents it sits under open too.
-    const items = useStore.getState().data[sessionId]?.items ?? {};
+    const items = useStore.getState().data[sessionId]?.items ?? emptyIndex;
     for (let p = items[step]?.parentId, guard = 0; p && guard < 8; p = items[p]?.parentId, guard++) setFold(foldKey(sessionId, p, 'agent'), true);
     revealItem(sessionId, step);
   } else showRailTab('changes');

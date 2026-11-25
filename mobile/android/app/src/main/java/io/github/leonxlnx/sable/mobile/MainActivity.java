@@ -21,6 +21,8 @@ public class MainActivity extends BridgeActivity {
         if (bridge == null) return;
         // The page's edges and the keyboard, one path on every phone (PageInsets).
         insets.install(this, bridge.getWebView());
+        // Awake off screen while a chat works (PageLife), and the page told whether it is on screen.
+        PageLife.install(bridge.getWebView());
         bridge.addWebViewListener(new WebViewListener() {
             @Override
             public void onPageCommitVisible(WebView view, String url) {
@@ -34,6 +36,20 @@ public class MainActivity extends BridgeActivity {
     public void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
         insets.again(this);
+    }
+
+    // On screen or not, as the page reads it (lib/screen.ts): the activity's own word, never the page's
+    // visibility, which PageLife holds at visible while a chat works off screen.
+    @Override
+    public void onStart() {
+        super.onStart();
+        PageLife.shown(true);
+    }
+
+    @Override
+    public void onStop() {
+        super.onStop();
+        PageLife.shown(false);
     }
 
     // Leaving the screen with a chat at work: the connection stays (KeepAliveService); back on screen, it is not needed.

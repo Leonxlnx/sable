@@ -62,6 +62,10 @@ public class KeepAliveService extends Service {
     private static final long REFRESH_MS = 2 * 60_000L;
     private static final long ASK_MS = 8_000L;
     private static final long RESULT_KEEP_MS = 10 * 60_000L;
+    /** How long a connection lost while chats worked is tried again (lib/notes.ts LIVE_LOST_MS, the same). */
+    private static final long LOST_MS = 10 * 60_000L;
+    /** The line left when the connection never came back (the cards are gone by then). */
+    static final int LOST_ID = 7002;
 
     /** What the page said last (null: nothing yet), and when it said it. */
     private static JSONObject live;
@@ -115,10 +119,21 @@ public class KeepAliveService extends Service {
         return a == null ? new JSONArray() : a;
     }
 
-    /** Something to keep the connection for: work, a chat waiting, or the minute after. */
+    /** When the connection was lost while chats worked (ms, the page's clock), or 0. */
+    private static long lost(JSONObject l) {
+        return l == null ? 0 : l.optLong("lost", 0);
+    }
+
+    /** The connection was lost a moment ago while chats worked: it is tried again for LOST_MS. */
+    private static boolean reconnecting(JSONObject l) {
+        long t = lost(l);
+        return t > 0 && System.currentTimeMillis() - t < LOST_MS;
+    }
+
+    /** Something to keep the connection for: work, a chat waiting, a lost connection tried again, or the minute after. */
     private static boolean wanted() {
         JSONObject l = live;
-        if (chats(l) > 0 || waiting(l) > 0) return true;
+        if (chats(l) > 0 || waiting(l) > 0 || reconnecting(l)) return true;
         return idleSince > 0 && SystemClock.elapsedRealtime() - idleSince < LINGER_MS;
     }
 
@@ -131,23 +146,29 @@ public class KeepAliveService extends Service {
     }
 
     static void setLive(Context context, JSONObject next) {
-        boolean busy = chats(next) > 0 || waiting(next) > 0;
-        boolean was = chats(live) > 0 || waiting(live) > 0;
+        boolean lostNow = lost(next) > 0;
+        boolean busy = chats(next) > 0 || waiting(next) > 0 || lostNow;
+        boolean was = chats(live) > 0 || waiting(live) > 0 || lost(live) > 0;
         remember(next);
         live = next;
         liveAt = System.currentTimeMillis();
         if (busy || next.optBoolean("stop")) idleSince = 0;
         else if (was) idleSince = SystemClock.elapsedRealtime();
-        // A chat that left the live set may come back with its next turn: its swipe and its Stop are spent.
-        Set<String> now = new HashSet<>();
-        JSONArray cs = cards(next);
-        for (int i = 0; i < cs.length(); i++) {
-            JSONObject c = cs.optJSONObject(i);
-            if (c != null) now.add(c.optString("id"));
+        // Connected and working again: a line left by a connection that never came back goes.
+        if (chats(next) > 0 || waiting(next) > 0) clearLost(context);
+        // A chat that left the live set may come back with its next turn: its swipe and its Stop are
+        // spent. Not while the connection is lost: the chats are not known then, not gone.
+        if (!lostNow) {
+            Set<String> now = new HashSet<>();
+            JSONArray cs = cards(next);
+            for (int i = 0; i < cs.length(); i++) {
+                JSONObject c = cs.optJSONObject(i);
+                if (c != null) now.add(c.optString("id"));
+            }
+            dismissed.retainAll(now);
+            asking.keySet().retainAll(now);
+            stoppingChats.retainAll(now);
         }
-        dismissed.retainAll(now);
-        asking.keySet().retainAll(now);
-        stoppingChats.retainAll(now);
         if (self != null) self.changed();
         else if (hidden) startIfWanted(context);
         else if (!drawn.isEmpty()) clearCards(context);
@@ -223,6 +244,7 @@ public class KeepAliveService extends Service {
 
     static void onAppVisible(Context context) {
         hidden = false;
+        clearLost(context);
         // Also clears cards left by a previous WebView process (fallback clears them when nothing works).
         if (self == null && !startPending) fallback(context);
         startDenied = false;
@@ -286,6 +308,8 @@ public class KeepAliveService extends Service {
             finish();
             return START_NOT_STICKY;
         }
+        // Off screen the page is kept from being frozen while this service runs (Chromium freezes a hidden page).
+        PageLife.keep(true);
         changed();
         return START_NOT_STICKY;
     }
@@ -310,15 +334,42 @@ public class KeepAliveService extends Service {
     private void checkStop() {
         handler.removeCallbacks(check);
         if (!hidden || !wanted()) {
+            // The connection never came back: said once, quietly, so nobody waits for a "Finished" that cannot come.
+            if (hidden && lost(live) > 0) lostLine(this);
             finish();
             return;
         }
         JSONObject l = live;
-        if (chats(l) == 0 && waiting(l) == 0 && idleSince > 0) handler.postDelayed(check, Math.max(500, LINGER_MS - (SystemClock.elapsedRealtime() - idleSince)));
+        if (chats(l) > 0 || waiting(l) > 0) return;
+        if (lost(l) > 0) handler.postDelayed(check, Math.max(500, LOST_MS - (System.currentTimeMillis() - lost(l))));
+        else if (idleSince > 0) handler.postDelayed(check, Math.max(500, LINGER_MS - (SystemClock.elapsedRealtime() - idleSince)));
+    }
+
+    /** One quiet line (the connection channel, no sound) once a lost connection is given up off screen; a tap opens home. */
+    private static void lostLine(Context c) {
+        try {
+            Notification n = Notes.base(c, Notes.CH_LINK, "Not connected to your computer", "Open Sable to connect again. It cannot tell you when a chat finishes until then.")
+                .setSilent(true)
+                .setShowWhen(true)
+                .setAutoCancel(true)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setContentIntent(Notes.open(c, "sable://home", LOST_ID))
+                .build();
+            NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.notify(LOST_ID, n);
+        } catch (RuntimeException ignored) {
+            // notifications off: nothing to say it with
+        }
+    }
+
+    private static void clearLost(Context c) {
+        NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm != null) nm.cancel(LOST_ID);
     }
 
     private void finish() {
         stopping = true;
+        PageLife.keep(false);
         handler.removeCallbacksAndMessages(null);
         clearCards(getApplicationContext());
         stopSelf();
@@ -386,7 +437,7 @@ public class KeepAliveService extends Service {
         int n = chats(l);
         int w = waiting(l);
         if (n == 0) {
-            String line = w > 1 ? w + " chats waiting for you" : w == 1 ? "A chat is waiting for you" : "Connected to your computer";
+            String line = reconnecting(l) ? "Reconnecting to your computer" : w > 1 ? w + " chats waiting for you" : w == 1 ? "A chat is waiting for you" : "Connected to your computer";
             return new NotificationCompat.Builder(this, Notes.CH_LINK)
                 .setSmallIcon(R.drawable.ic_stat_sable)
                 .setColor(Notes.IVORY)
@@ -490,7 +541,10 @@ public class KeepAliveService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacksAndMessages(null);
-        if (self == this) self = null;
+        if (self == this) {
+            self = null;
+            PageLife.keep(false);
+        }
         super.onDestroy();
         // Home again during a stop: the newer visibility and work win once this instance has gone.
         if (stopping && hidden && wanted()) startIfWanted(getApplicationContext());

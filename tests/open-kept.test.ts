@@ -107,3 +107,15 @@ it('keeps the settled suffix and its waiting steer when an older page starts ins
     expect(index(ids, shape, busy, checkOf)).toEqual(groupTurns(ids, shape, busy, checkOf));
   }
 });
+
+it('replaces only the turn whose thinking root changed off screen', async () => {
+  const { stabilize } = await import('../src/features/timeline/stabilize');
+  const index = turnsIndex(), cache = new Map(), kept = new WeakMap();
+  const ids = ['u0','t0','e0','u1','tool','reason0'];
+  const first = stabilize(index(ids, 'UtTUww', true), cache, kept);
+  const fresh = index([...ids.slice(0,-1), 'reason1'], 'UtTUww', true);
+  const next = stabilize(fresh, cache, kept);
+  expect(next).toEqual(fresh);
+  expect(next.groups[0]).toBe(first.groups[0]);
+  expect(next.groups[1]).not.toBe(first.groups[1]);
+});

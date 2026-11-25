@@ -242,8 +242,8 @@ export const setHomeUltracode = (on: boolean) => useStore.getState().setUi({ hom
 export async function startFromHome(
   text: string,
   attachments: Attachment[] = [],
-  opts: { onCreated?: (sessionId: string) => void; submitId?: string; /** What home showed when Send was pressed (read then, not now). */ choice?: ReturnType<typeof homeChoice> } = {},
-): Promise<{ ok: boolean; sessionId?: string }> {
+  opts: { onCreated?: (sessionId: string) => void; checkpoint?: () => Promise<boolean>; submitId?: string; /** What home showed when Send was pressed (read then, not now). */ choice?: ReturnType<typeof homeChoice> } = {},
+): Promise<{ ok: boolean; sessionId?: string; queued?: boolean; unknown?: boolean }> {
   const choice = opts.choice ?? homeChoice();
   if (!choice) {
     useStore.getState().setUi({ projectPicker: true });
@@ -253,8 +253,9 @@ export async function startFromHome(
   // meanwhile) is bound to it before its view mounts.
   const session = await createSession(choice.chat ? { ...choice, chat: { text } } : choice, opts.onCreated);
   if (!session) return { ok: false };
+  if (opts.checkpoint && !await opts.checkpoint()) return { ok: false, sessionId: session.id };
   const res = await sendMessage(session.id, text, attachments, opts.submitId ? { submitId: opts.submitId } : {});
-  return { ok: res.ok, sessionId: session.id };
+  return { ok: res.ok, sessionId: session.id, ...(res.queued && { queued: true }), ...(res.unknown && { unknown: true }) };
 }
 
 /**
@@ -262,14 +263,17 @@ export async function startFromHome(
  * set: then the running agent takes it at its next step and it shows where it was sent
  * (`UserItem.steered`). Resolves `queued: true` when it went to the queue.
  */
-export async function sendMessage(sessionId: string, text: string, attachments: Attachment[] = [], opts: { steer?: boolean; submitId?: string } = {}): Promise<{ ok: boolean; queued?: boolean }> {
+export async function sendMessage(sessionId: string, text: string, attachments: Attachment[] = [], opts: { steer?: boolean; submitId?: string } = {}): Promise<{ ok: boolean; queued?: boolean; unknown?: boolean }> {
   try {
     return await bridge.call('session.send', { sessionId, text, attachments, ...(opts.steer ? { steer: true } : {}), ...(opts.submitId ? { submitId: opts.submitId } : {}) });
   } catch (err) {
     fail(err);
-    return { ok: false };
+    return { ok: false, unknown: true };
   }
 }
+
+export const checkSubmission = (sessionId: string, submitId: string, text: string, attachments: Attachment[]) =>
+  bridge.call('session.submission', { sessionId, submitId, text, attachments });
 
 export const interrupt = (sessionId: string) => bridge.call('session.interrupt', { sessionId }).catch(fail);
 
@@ -281,16 +285,18 @@ export const interrupt = (sessionId: string) => bridge.call('session.interrupt',
  * bridge could not be reached. `previous`: the message as the edit found it (another window may
  * have changed it since this one showed it).
  */
-export const updateQueued = (sessionId: string, id: string, text: string, attachments?: Attachment[]): Promise<{ ok: boolean; previous?: QueuedMessage }> =>
-  bridge.call('queue.update', { sessionId, id, text, ...(attachments ? { attachments } : {}) }).catch((err) => {
+export const updateQueued = (sessionId: string, id: string, text: string, attachments?: Attachment[], operationId?: string, expected?: QueuedMessage): Promise<{ ok: boolean; previous?: QueuedMessage; current?: QueuedMessage; unknown?: boolean }> =>
+  bridge.call('queue.update', { sessionId, id, text, ...(expected && { expected }), ...(operationId && { operationId }), ...(attachments ? { attachments } : {}) }).catch((err) => {
     fail(err);
-    return { ok: false };
+    return operationId ? { ok: false, unknown: true } : { ok: false };
   });
+export const releaseQueueReceipt = (sessionId: string, id: string, operationId: string) => bridge.call('queue.take', { sessionId, id, operationId, releaseReceipt: true }).catch(() => {});
 export const removeQueued = (sessionId: string, id: string) => bridge.call('queue.remove', { sessionId, id }).catch(fail);
 /** A missing reply or reservation cannot establish who owns the draft. */
-export async function takeQueued(sessionId: string, id: string): Promise<import('@/features/composer/restore').TakeResult> {
+export async function takeQueued(sessionId: string, id: string, operationId?: string, receiptOnly = false, expected?: QueuedMessage): Promise<import('@/features/composer/restore').TakeResult> {
   try {
-    const { message, taken } = await bridge.call('queue.take', { sessionId, id });
+    const { message, taken, current } = await bridge.call('queue.take', { sessionId, id, ...(expected && { expected }), ...(operationId && { operationId }), ...(receiptOnly && { receiptOnly }) });
+    if (current) return { kind: 'revised', current };
     if (message) return { kind: 'message', message };
     return { kind: taken ? 'taken' : 'unknown' };
   } catch (err) {
@@ -407,10 +413,10 @@ export const respondPermission = (sessionId: string, requestId: string, optionId
 export const respondQuestion = (sessionId: string, requestId: string, answers: Record<string, string[]> | null) =>
   bridge.call('question.respond', { sessionId, requestId, answers }).catch(fail);
 
-export async function rewindTo(sessionId: string, itemId: string, restoreFiles: boolean) {
+export async function rewindTo(sessionId: string, itemId: string, restoreFiles: boolean, guard?: { expectedLast?: UserItem; expectedEnd?: string; operationId?: string }) {
   try {
     if (useStore.getState().data[sessionId]?.incomplete) await completeSession(sessionId);
-    const r = await bridge.call('session.rewind', { sessionId, itemId, restoreFiles });
+    const r = await bridge.call('session.rewind', { sessionId, itemId, restoreFiles, ...guard });
     if (!r.ok && r.message) useStore.getState().toast(r.message, 'error');
     return r.ok;
   } catch (err) {

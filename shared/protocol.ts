@@ -428,6 +428,26 @@ export interface SessionUsage {
   cliCost?: { session: string; total: number };
 }
 
+/** The chat's own running turn, safe to display on a lock screen. */
+export interface TurnLive {
+  /** Time of the opening message or first act, in milliseconds since the epoch. */
+  startedAt: number;
+  /** Root tool calls counted by the turn's Worked line. */
+  steps: number;
+  /** Runs of folded work already closed in the conversation. */
+  checkpoints: number;
+  /** First item of the open run, or the last item in view when no run is open (epoch ms). */
+  checkpointAt?: number;
+  /** Counted steps in the open run. */
+  checkpointSteps: number;
+  /** Distinct files changed by settled edits, including sub-agent edits. */
+  files: number;
+  /** The newest act by kind. Between acts, other is the generic Working line. */
+  doing: ToolKind | 'thinking' | 'writing' | 'waiting';
+  /** In the open run, distinct paths for reads or edits/writes, or active bash/agent calls. */
+  doingCount?: number;
+}
+
 export interface SessionMeta {
   id: string;
   provider: ProviderId;
@@ -481,6 +501,8 @@ export interface SessionMeta {
   lastError?: string;
   /** One line describing what the agent is doing right now. */
   activity?: string;
+  /** Present only during the chat's own turn. Cleared on the wire with null. */
+  live?: TurnLive;
   /**
    * Sub-agents and workflows of this chat still working in the background, counted by the bridge
    * from its steps (`SessionRuntime`). Above 0 the chat is not at rest even when its own turn has
@@ -798,6 +820,10 @@ export interface Attachment {
 
 interface BaseItem {
   id: string;
+  /** The window received a preview because the full item exceeded the wire limit. */
+  more?: boolean;
+  /** Read this oversized row through session.itemPart on demand. */
+  byParts?: true;
   /**
    * When the item was created (ms since epoch): when a message was sent (or taken from the
    * queue), when a text or thinking block started streaming, when a tool call began. Items
@@ -810,6 +836,7 @@ interface BaseItem {
 
 export interface UserItem extends BaseItem {
   type: 'user';
+  submitPrint?: string;
   /** Attachment data is available through session.item. */
   more?: boolean;
   text: string;
@@ -1863,10 +1890,10 @@ export type BridgeEvent =
   | { type: 'session.caps'; id: string; caps: Capabilities }
   /** `moved`: a root item the timeline already holds now stands at its end (the `item.removed` before it said `moving`). */
   | { type: 'item.added'; sessionId: string; item: TimelineItem; moved?: boolean }
-  | { type: 'item.delta'; sessionId: string; id: string; field: 'text' | 'inputText' | 'output'; delta: string }
-  | { type: 'item.patch'; sessionId: string; id: string; patch: Partial<TimelineItem> }
+  | { type: 'item.delta'; seq?: number; sessionId: string; id: string; field: 'text' | 'inputText' | 'output'; delta: string }
+  | { type: 'item.patch'; seq?: number; sessionId: string; id: string; patch: Partial<TimelineItem> }
   /** `moving`: the item is not gone, the `item.added` right behind carries it to its new place (a reader may treat the pair as one move). */
-  | { type: 'item.removed'; sessionId: string; id: string; moving?: boolean }
+  | { type: 'item.removed'; seq?: number; sessionId: string; id: string; moving?: boolean }
   | { type: 'timeline.reset'; sessionId: string; items: TimelineItem[] }
   | { type: 'permission.added'; request: PermissionRequest }
   | { type: 'permission.removed'; sessionId: string; id: string }
@@ -2444,6 +2471,8 @@ export interface ProjectScripts {
 export interface SnapshotCursor { at: number; id: string; roots: number }
 
 export interface SessionSnapshot {
+  /** Last ordered item mutation included in this page. */
+  seq?: number;
   /** Absent on whole answers. Counts are -1 on a provisional view of an uncounted base.
    * recentAt is the page-relative cut boundary in the complete timeline. */
   page?: { kind: 'end' | 'older' | 'provisional'; before: number; rootsBefore: number; recentAt: number };
@@ -2464,6 +2493,8 @@ export interface SessionSnapshot {
  */
 export interface QueuedMessage {
   id: string;
+  /** Original submission fingerprint, retained across queue edits. */
+  submitPrint?: string;
   submitId?: string;
   text: string;
   attachments?: Attachment[];
@@ -2578,6 +2609,15 @@ export interface RpcMethods {
   'session.snapshot': { params: { sessionId: string; peek?: boolean; page?: 'end' | 'real' | SnapshotCursor; keepFrom?: string }; result: SessionSnapshot };
   /** One item whole, as the bridge holds it (a step a window got cut, `ToolItem.more`). */
   'session.item': { params: { sessionId: string; itemId: string }; result: { item: TimelineItem } };
+  /** Read a member of an item too large for one JSON message. Strings and object keys are paged. */
+  'session.itemPart': {
+    params: { sessionId: string; itemId: string; path: (string | number)[]; offset?: number; seq?: number };
+    result: { seq: number } & (
+      { kind: 'value'; value: string | number | boolean | null; next?: number }
+      | { kind: 'array'; length: number }
+      | { kind: 'object'; keys: string[]; next?: number }
+    );
+  };
   /**
    * Sends a message. While a turn runs it is held in the queue (sent when the turn ends), or with
    * `steer` handed to the running agent now: it shows in the timeline where it was sent
@@ -2588,7 +2628,8 @@ export interface RpcMethods {
    * `/model <name>` is never sent: it sets the session's model (`model`, its id), or switches the
    * chat to the agent that has that model (`switched`); `error` when no model has that name.
    */
-  /** `submitId`: one submission (a retry of it keeps it); the bridge answers a second send with an id it took in the last minutes as accepted, without sending it again. */
+  /** Read the outcome of a saved send before using its draft for another action. */
+  'session.submission': { params: { sessionId: string; submitId: string; text: string; attachments?: Attachment[] }; result: { ok: boolean; queued?: boolean } };
   'session.send': { params: { sessionId: string; text: string; attachments?: Attachment[]; steer?: boolean; submitId?: string }; result: { ok: boolean; queued?: boolean; model?: string; switched?: ProviderId; error?: string } };
   /**
    * Switches the chat to another agent in place (same chat, same conversation shown): the next
@@ -2612,7 +2653,7 @@ export interface RpcMethods {
   'session.rename': { params: { sessionId: string; title: string }; result: { ok: boolean } };
   'session.update': { params: { sessionId: string; patch: Pick<Partial<SessionMeta>, 'pinned' | 'archived' | 'unread' | 'muted'> }; result: { ok: boolean } };
   'session.close': { params: { sessionId: string; remove?: boolean }; result: { ok: boolean } };
-  'session.rewind': { params: { sessionId: string; itemId: string; restoreFiles: boolean }; result: { ok: boolean; message?: string } };
+  'session.rewind': { params: { sessionId: string; itemId: string; restoreFiles: boolean; expectedLast?: UserItem; expectedEnd?: string; operationId?: string }; result: { ok: boolean; message?: string } };
   /** Fork: a new session (same agent, account and settings) that continues from the end of the turn holding `itemId`, with the conversation up to there: the agent's own fork where it has one, otherwise a summary. The original is left as it is. */
   'session.fork': { params: { sessionId: string; itemId: string }; result: SessionSnapshot };
   'session.context': { params: { sessionId: string }; result: ContextBreakdown | null };
@@ -2678,7 +2719,7 @@ export interface RpcMethods {
    * array clears them). A message left with no text and no attachments is removed.
    */
   /** `previous`: the message as it was just before this edit replaced it (to the desktop only), so an edit made meanwhile elsewhere is never lost. */
-  'queue.update': { params: { sessionId: string; id: string; text: string; attachments?: Attachment[] }; result: { ok: boolean; previous?: QueuedMessage } };
+  'queue.update': { params: { sessionId: string; id: string; operationId?: string; expected?: QueuedMessage; text: string; attachments?: Attachment[] }; result: { ok: boolean; previous?: QueuedMessage; current?: QueuedMessage } };
   'queue.remove': { params: { sessionId: string; id: string }; result: { ok: boolean } };
   /**
    * Removes a queued message and returns it, atomically (for "edit": put it back in the composer).
@@ -2688,7 +2729,7 @@ export interface RpcMethods {
    * From a phone with `ack: true`: the message stays reserved in the queue and the answer carries a
    * receipt (`take`); it leaves the queue only on `phone.takeDone` with that receipt.
    */
-  'queue.take': { params: { sessionId: string; id: string; ack?: boolean }; result: { message?: QueuedMessage; taken?: boolean; take?: string } };
+  'queue.take': { params: { sessionId: string; id: string; operationId?: string; expected?: QueuedMessage; releaseReceipt?: boolean; receiptOnly?: boolean; ack?: boolean }; result: { current?: QueuedMessage; message?: QueuedMessage; taken?: boolean; take?: string } };
   /** Reorders the queue: `ids` first in that order, any message not named keeps its place after them. */
   'queue.reorder': { params: { sessionId: string; ids: string[] }; result: { ok: boolean } };
   /** Takes a queued message out of the queue and gives it to the agent now (steered into the running turn, if any). */

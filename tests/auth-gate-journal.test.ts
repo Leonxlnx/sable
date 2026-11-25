@@ -352,6 +352,131 @@ it('coalesces Codex clients, drains a pending RPC before EOF and waits through r
   await p.dispose();
 }, 8000);
 
+it('retires an unanswered Codex initialize and reopens the same folder', async () => {
+  vi.useFakeTimers();
+  vi.stubEnv('SABLE_CODEX_BIN', process.execPath);
+  const p = new CodexProvider({ account: { id: 'test', dir: home }, log() {}, emit() {}, journal });
+  const failed = p.client().catch(err => err as Error);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(children).toHaveLength(1);
+  // Ignore EOF as well. On Windows the mocked taskkill launcher also gets no reply.
+  const hung = children[0];
+  const kill = vi.spyOn(hung, 'kill');
+  await vi.advanceTimersByTimeAsync(34_000);
+  expect(await failed).toBeInstanceOf(Error);
+  expect(hung.exitCode).toBe(0);
+  expect(kill).toHaveBeenCalled();
+  const count = children.length;
+  const next = p.client();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(children).toHaveLength(count + 1);
+  children[count].reply({ id: 1, result: {} });
+  expect((await next).alive).toBe(true);
+  children[count].exit();
+  await p.dispose();
+});
+
+it('bounds a replacement wait when the retiring Codex process has not exited', async () => {
+  vi.useFakeTimers();
+  vi.stubEnv('SABLE_CODEX_BIN', process.execPath);
+  const provider = new CodexProvider({ account: { id: 'owner', dir: home }, log() {}, emit() {}, journal });
+  const starting = provider.client();
+  await vi.advanceTimersByTimeAsync(0);
+  const child = children[0];
+  child.reply({ id: 1, result: {} });
+  await starting;
+  await vi.advanceTimersByTimeAsync(GATE.minLifeMs);
+  const kill = vi.spyOn(child, 'kill').mockReturnValue(false);
+  (provider as unknown as { stopIfIdle(ms: number): void }).stopIfIdle(0);
+  const refused = provider.client().catch(err => err);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect((await refused).message).toContain('already in use');
+  expect(child.exitCode).toBeNull();
+  kill.mockRestore();
+  const replacement = provider.client();
+  await vi.advanceTimersByTimeAsync(0);
+  children.at(-1)!.reply({ id: 1, result: {} });
+  expect((await replacement).alive).toBe(true);
+  children.at(-1)!.exit();
+  await provider.dispose();
+});
+
+it('starts a Codex chat while a cold capability reader waits after wake', async () => {
+  vi.useFakeTimers();
+  vi.stubEnv('SABLE_CODEX_BIN', process.execPath);
+  const p = new CodexProvider({ account: { id: 'test', dir: home }, log() {}, emit() {}, journal });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const before = vi.spyOn(authGate, 'beforeRead').mockImplementation(() => gate);
+  const paused = vi.spyOn(authGate, 'readsPaused').mockReturnValue(true);
+  try {
+    const reader = p.caps(home);
+    await vi.advanceTimersByTimeAsync(0);
+    const rt = new SessionRuntime({ id: 'wake', provider: 'codex', cwd: home, title: 'Wake', titleSource: 'user', model: 'm',
+      mode: 'default', status: 'idle', createdAt: 1, updatedAt: 1, usage: { inputTokens: 0, outputTokens: 0, turns: 0 } }, () => {}, () => {});
+    let attached = false;
+    const chat = p.open(rt, {}).then(() => { attached = true; });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(children).toHaveLength(1);
+    children[0].stdin.on('data', chunk => {
+      for (const line of String(chunk).trim().split('\n')) {
+        const request = JSON.parse(line);
+        if (!request.id) continue;
+        const result = request.method === 'thread/start' ? { thread: { id: 'wake' }, model: 'm' } : { data: [] };
+        children[0].reply({ id: request.id, result });
+      }
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(attached).toBe(true);
+    await chat;
+    release();
+    expect((await reader).models).toEqual([]);
+    expect(children).toHaveLength(1);
+    children[0].exit();
+    await p.dispose();
+  } finally { release(); before.mockRestore(); paused.mockRestore(); }
+});
+
+it('releases a timed-out status reader after its grace even without a close event', async () => {
+  vi.stubEnv('SABLE_CLAUDE_BIN', process.execPath);
+  const p = new ClaudeProvider({ account: { id: 'test', dir: home }, log() {}, emit() {}, journal });
+  const reading = p.info(true);
+  await vi.waitFor(() => expect(children).toHaveLength(1));
+  vi.useFakeTimers();
+  children[0].stdout.write('9.9.9');
+  children[0].exit();
+  await vi.advanceTimersByTimeAsync(0);
+  const kill = vi.spyOn(children[1], 'kill').mockReturnValue(true);
+  await vi.advanceTimersByTimeAsync(12_000);
+  expect((await reading).auth.checking).toBe(true);
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(kill).toHaveBeenCalledWith('SIGKILL');
+  expect(authGate.canReadAlone(gateKey('claude', home))).toBe(true);
+  expect(journal.busy).toBe(false);
+  const again = p.info(true);
+  await vi.advanceTimersByTimeAsync(0);
+  children.at(-1)!.stdout.write('{"loggedIn":false}');
+  children.at(-1)!.exit();
+  expect((await again).auth.checking).toBeFalsy();
+});
+
+it('retires a standalone SDK reader that still owes a reply when its probe closes', async () => {
+  vi.useFakeTimers();
+  const key = gateKey('claude', home);
+  const proc = authGate.spawner(undefined, undefined, { ...scope(), reason: 'limits' })({
+    command: 'fake', args: [], env: { CLAUDE_CONFIG_DIR: home },
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  children[0].reply({ type: 'system' });
+  frame(proc.stdin, { type: 'control_request', request_id: 'usage' });
+  await vi.advanceTimersByTimeAsync(GATE.auxLeaseMs);
+  proc.kill();
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(children[0].exitCode).toBe(0);
+  expect(authGate.canReadAlone(key)).toBe(true);
+  expect(journal.busy).toBe(false);
+});
+
 it('holds actual auxiliary starts for thirty seconds after wake and spaces a later burst', async () => {
   vi.useFakeTimers();
   const gate = new AuthGate({ ...GATE, spreadMs: 1000, jitterMs: 0 });

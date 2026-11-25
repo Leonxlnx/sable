@@ -72,12 +72,27 @@ describe('Edit on a queued message (finding 3)', () => {
     expect(swapIn({ text: 'typed', attachments: [] }, { text: '', attachments: [] }, { text: 'queued', attachments: [] })).toEqual({ text: 'queued\ntyped', attachments: [] });
   });
 
-  it('the composer swaps only after the bridge said yes', () => {
-    const src = read('src/features/composer/Composer.tsx');
-    const edit = src.slice(src.indexOf('const editQueued'), src.indexOf('// ── ultracode'));
-    expect(edit).toMatch(/const res = await updateQueued\([^)]*\);\s*if \(!res\.ok\) return;/);
-    expect(edit.indexOf('updateQueued')).toBeLessThan(edit.indexOf('setDraft'));
-    expect(edit).toContain('swapIn(useStore.getState().drafts[key], before');
+  it('the composer swaps only after the bridge said yes', async () => {
+    vi.stubGlobal('window', { setTimeout: () => 0, clearTimeout() {} });
+    try {
+      const { recoverTake } = await import('../src/features/composer/queue-edit');
+      const { useStore } = await import('../src/state/store');
+      const before = { text: 'B', attachments: [att('b')] };
+      const recovery = { operationId: 'swap-A', queueId: 'q', preview: { text: 'B', files: ['b'] }, swap: before };
+      useStore.getState().setDraft('s', { ...before, recovery });
+      answer = () => Error('lost after commit');
+      expect(await recoverTake('s', true)).toBe(false);
+      expect(useStore.getState().drafts.s).toEqual({ ...before, recovery });
+      let reply!: (value: unknown) => void;
+      answer = (m, p) => m === 'queue.take' && (p as { receiptOnly?: boolean }).receiptOnly ? new Promise(r => { reply = r; }) : {};
+      const retry = recoverTake('s');
+      await vi.waitFor(() => expect(reply).toBeDefined());
+      expect(useStore.getState().drafts.s).toEqual({ ...before, recovery });
+      useStore.getState().setDraft('s', { attachments: [...before.attachments, att('added')] });
+      reply({ message: { id: 'q', text: 'A revised', attachments: [att('current')] } });
+      expect(await retry).toBe(true);
+      expect(useStore.getState().drafts.s).toMatchObject({ text: 'A revised', attachments: [att('current'), att('added')] });
+    } finally { answer = () => ({}); vi.unstubAllGlobals(); }
   });
 });
 
@@ -159,7 +174,7 @@ describe('a message in the air lands only in its own chat (finding 19)', () => {
   });
 
   it('the tray and the composer pass the chat; leaving a chat releases its flights', () => {
-    expect(read('src/features/composer/QueueTray.tsx')).toContain('landInTray(el, q.text, sessionId)');
+    expect(read('src/features/composer/QueueTray.tsx')).toContain('landInTray(el, q.text, sessionId, q.submitId ?? q.id)');
     expect(read('src/features/timeline/User.tsx')).toContain('session: sessionId, ts: item.ts');
     expect(read('src/features/composer/Composer.tsx')).toContain('holdFlights(sessionId)');
   });
@@ -366,4 +381,84 @@ it('rewind and edit recovers whole files beside typing and never sends on its ow
     expect(useStore.getState().drafts[key]).toMatchObject({ text: 'revise\nmy draft', attachments: [att('original'), att('new')] });
     expect(bridgeCalls.slice(before).map(c => c.method)).toEqual(['session.rewind']);
   } finally { answer = () => ({}); }
+});
+
+it('cannot submit an unknown preview when another operation took the absent row', async () => {
+  const { recoverTake } = await import('../src/features/composer/queue-edit');
+  const { useStore } = await import('../src/state/store');
+  vi.stubGlobal('window', { setTimeout: () => 0, clearTimeout() {} });
+  const draft = { text: 'keep the file', attachments: [att('pic')], recovery: { operationId: 'B', queueId: 'row', preview: { text: 'keep the file', files: ['pic'] } } };
+  try {
+    useStore.getState().setDraft('other-taker', draft);
+    answer = (method, params) => {
+      expect(method).toBe('queue.take');
+      expect(params).toMatchObject({ operationId: 'B', receiptOnly: true });
+      return {};
+    };
+    expect(await recoverTake('other-taker')).toBe(false);
+    expect(useStore.getState().drafts['other-taker']).toEqual(draft);
+  } finally { answer = () => ({}); vi.unstubAllGlobals(); }
+});
+
+it('checks the original wire submission before a recovered draft can replace a queued row', async () => {
+  vi.stubGlobal('window', { setTimeout: () => 0, clearTimeout() {} });
+  try {
+    const { recoverSubmission } = await import('../src/features/composer/queue-edit');
+    const { useStore } = await import('../src/state/store');
+    const retry = { id: 'sent', text: 'look', files: 'picture' };
+    const recovery = { operationId: 'sent', checkSend: true, retry, payload: { text: 'look', attachments: [att('picture')] } };
+    useStore.getState().setDraft('q', { text: 'look', attachments: [att('picture'), att('new')], recovery });
+    answer = (method, params) => {
+      expect(method).toBe('session.submission');
+      expect(params).toEqual({ sessionId: 'q', submitId: 'sent', ...recovery.payload });
+      return { ok: true, queued: true };
+    };
+    expect(await recoverSubmission('q')).toBe(false);
+    expect(useStore.getState().drafts.q).toEqual({ text: '', attachments: [att('new')], recovery: undefined });
+  } finally { answer = () => ({}); vi.unstubAllGlobals(); }
+});
+
+it('keeps a retry with a lost send reply separate from newer typing', async () => {
+  const { repeatMessage } = await import('../src/features/timeline/repeat-message');
+  const { useStore } = await import('../src/state/store');
+  const { takeDeferred } = await import('../src/features/composer/pending');
+  const key = 'lost-retry';
+  const toast = vi.spyOn(useStore.getState(), 'toast').mockImplementation(() => {});
+  const item = { id: 'u', type: 'user' as const, text: 'the original', ts: 1 };
+  answer = (method) => {
+    if (method === 'session.rewind') return { ok: true };
+    useStore.getState().setDraft(key, { text: 'new words', attachments: [] });
+    throw new Error('Connection closed');
+  };
+  try {
+    await repeatMessage(key, item, item.text, 'retry');
+    expect(useStore.getState().drafts[key].text).toBe('new words');
+    expect(takeDeferred()).toEqual(expect.arrayContaining([expect.objectContaining({ key, uncertain: true })]));
+  } finally { toast.mockRestore(); answer = () => ({}); }
+});
+
+it('checkpoints an intervening queue edit before sending the replacement', async () => {
+  const { queueDraft } = await import('../src/features/composer/pending');
+  const { recoverTake } = await import('../src/features/composer/queue-edit');
+  const { useStore } = await import('../src/state/store');
+  const key = 'displaced-version';
+  const first = { id: 'q', text: 'old', createdAt: 0 };
+  const edited = { ...first, text: 'elsewhere', attachments: [att('elsewhere')] };
+  const draft = { text: 'mine', attachments: [att('mine')] };
+  useStore.getState().setDraft(key, { ...draft, recovery: { ...queueDraft(first).recovery, swap: draft } });
+  let requests = 0;
+  const toast = vi.spyOn(useStore.getState(), 'toast').mockImplementation(() => {});
+  answer = (method, params) => {
+    expect(method).toBe('queue.update');
+    const expected = (params as { expected: unknown }).expected;
+    expect(useStore.getState().drafts[key].recovery?.expected).toEqual(expected);
+    if (!requests++) { expect(expected).toEqual(first); return { ok: false, current: edited }; }
+    expect(expected).toEqual(edited);
+    throw Error('Reply lost after commit');
+  };
+  try {
+    expect(await recoverTake(key, true)).toBe(false);
+    expect(requests).toBe(2);
+    expect(useStore.getState().drafts[key]).toMatchObject({ ...draft, recovery: { expected: edited } });
+  } finally { toast.mockRestore(); answer = () => ({}); }
 });

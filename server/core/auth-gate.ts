@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline';
 import { record, type AuthScope, type EndReason } from './auth-journal';
 import { PassThrough } from 'node:stream';
 import { isAuthFailure } from '../../shared/synthetic';
+import { retireReader } from '../util/proc';
 
 /**
  * Schedules Sable-owned starts per config folder. Refreshes inside a CLI and processes
@@ -415,6 +416,7 @@ export class GatedProcess extends EventEmitter {
     this.once('exit', () => { requests.close(); replies.close(); });
     child.stdin?.on('error', () => {});
     child.stdout?.on('data', (d: Buffer) => {
+      if (this.ended) return;
       if (!this.answered) {
         this.answered = true;
         if (!reader) setTimeout(leave, this.gate.n.settleMs).unref?.();
@@ -459,11 +461,20 @@ export class GatedProcess extends EventEmitter {
     if (signal) this.endReason ??= 'abort';
     this.closing = { at: this.closing?.at ?? Date.now(), signal: signal ?? this.closing?.signal };
     if (first) {
-      const t = setTimeout(() => {
+      const reader = this.scope?.reason === 'limits' || this.scope?.reason === 'caps';
+      const t = setTimeout(async () => {
+        if (this.ended) return;
+        if (reader) {
+          this.endReason = 'timeout';
+          try { await retireReader(this.child!); } catch { /* the child may already be gone */ }
+          this.leave?.();
+          this.exited(null, 'SIGKILL');
+          return;
+        }
         // A silent startup still has a deadline. A known request on a responding
         // process owns the transport until its reply, including after SDK abort.
         if (!this.answered || !this.pending || this.scope?.closing?.()) this.closeNow();
-      }, this.gate.n.lingerMs);
+      }, reader ? Math.max(1500, this.gate.n.minLifeMs - (Date.now() - this.bornAt)) : this.gate.n.lingerMs);
       t.unref?.();
     }
     this.closeIfDue();

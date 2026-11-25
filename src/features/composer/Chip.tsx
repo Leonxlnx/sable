@@ -2,6 +2,7 @@ import { forwardRef, useCallback, useEffect, useLayoutEffect, useRef, useState, 
 import { EASE_OUT, EASE_STD, play, uiZoom } from '@/lib/motion';
 import { toDevicePixel } from './pixel-snap';
 import { inPose, reel, reelFrom, ROLL_EASE, ROLL_MS } from './reel';
+import { easeOf, standsAt, type Ease } from './glide-from';
 
 /**
  * A chip whose label changes as one calm motion (the model's name, the effort's word, ultracode's
@@ -22,7 +23,8 @@ import { inPose, reel, reelFrom, ROLL_EASE, ROLL_MS } from './reel';
  *   line apart (reel.ts), so the two are never on the same pixels and the place is never empty.
  *   The chip cuts them at its own top and bottom (composer.css `.ph`, `.ux`).
  * All of it is transforms and opacity on the compositor (Web Animations, started in the layout
- * effect of that same commit), about 140 ms: nothing is laid out per frame, so the popover that
+ * effect of that same commit; no glide is additive, which Chromium keeps on the main thread:
+ * glide-from.ts), about 140 ms: nothing is laid out per frame, so the popover that
  * hangs off the chip is not measured again on every frame (that, with a width animated by layout
  * and a word laid out at its new width inside it, was the lag and the word outside the pill).
  *
@@ -151,6 +153,34 @@ export function capOn(end: number, dir: 1 | -1, k: number): string | null {
   return best === null ? null : best.toFixed(6);
 }
 
+interface Glide {
+  anim: Animation;
+  from: number;
+  delay: number;
+  duration: number;
+  ease: Ease;
+}
+/** The glide each element does now, to start the next one from where it stands. */
+const glides = new WeakMap<Element, Glide>();
+
+/**
+ * Glides `el` from `px` (plus where a glide still running on it stands, worked out from that
+ * glide's own clock) to its place. One animation per element that replaces the last, so it runs
+ * on the compositor beside the rolled words and the fades (glide-from.ts).
+ */
+function glideBy(el: Element | null, px: number, opts: { duration: number; delay?: number; easing: string }): Animation | null {
+  if (!el) return null;
+  let start = px;
+  const g = glides.get(el);
+  if (g && (g.anim.playState === 'running' || g.anim.pending)) {
+    start += standsAt(g.from, (Number(g.anim.currentTime) || 0) - g.delay, g.duration, g.ease);
+    g.anim.cancel();
+  }
+  const anim = play(el, [{ transform: `translateX(${start.toFixed(2)}px)` }, { transform: 'translateX(0px)' }], { ...opts, fill: 'backwards' });
+  if (anim) glides.set(el, { anim, from: start, delay: opts.delay ?? 0, duration: opts.duration, ease: easeOf(opts.easing) });
+  return anim;
+}
+
 /** The moving end's glide and what rides with it; the words' fades around it. */
 function morph(el: HTMLElement, anchor: 'left' | 'right', was: Measure, now: Measure) {
   const d = now.width - was.width;
@@ -174,18 +204,17 @@ function morph(el: HTMLElement, anchor: 'left' | 'right', was: Measure, now: Mea
   // both land within half a pixel in the same frame or two as the word. Else a chip that
   // shrinks holds its edge until the old word has gone.
   const onReel = !!roll && el.dataset.glide === 'reel';
-  // Additive: a step while the last glide still runs adds its offset to where that one stands, so
-  // quick steps never jump (each glide's offset is from the layout it was measured against).
-  const glide: KeyframeAnimationOptions = onReel
-    ? { duration: grows ? ROLL_MS + GROW_WAIT : ROLL_MS - 30, easing: grows ? EASE_OUT : EASE_STD, fill: 'backwards', composite: 'add' }
-    : { duration: dur, delay: grows ? 0 : 36, easing: grows ? EASE_OUT : EASE_STD, fill: 'backwards', composite: 'add' };
-  const from = (px: number): Keyframe[] => [{ transform: `translateX(${px.toFixed(2)}px)` }, { transform: 'translateX(0px)' }];
+  // A step while the last glide still runs starts from where that one stands (glideBy), so quick
+  // steps never jump (each glide's offset is from the layout it was measured against).
+  const glide = onReel
+    ? { duration: grows ? ROLL_MS + GROW_WAIT : ROLL_MS - 30, easing: grows ? EASE_OUT : EASE_STD }
+    : { duration: dur, delay: grows ? 0 : 36, easing: grows ? EASE_OUT : EASE_STD };
   if (Math.abs(d) > 0.5) {
     seat(el, anchor);
     const before = rooms.get(el);
     // The room a glide still under way needs goes on being needed: its offset is added to this one.
     const still = before?.edge && (before.edge.playState === 'running' || before.edge.pending) ? before.px : 0;
-    const edge = play(el.querySelector('.cs-move > i'), from(sign * d), glide);
+    const edge = glideBy(el.querySelector('.cs-move > i'), sign * d, glide);
     const px = edge ? Math.ceil(Math.max(0, -d) + still) : 0;
     rooms.set(el, { edge, px });
     if (!px || !edge) el.style.removeProperty('--chip-room');
@@ -200,7 +229,7 @@ function morph(el: HTMLElement, anchor: 'left' | 'right', was: Measure, now: Mea
     // of its own (`data-chip-slot`: the phrase and the copy that sizes it) has its neighbours
     // beside the slot.
     const holder = el.closest<HTMLElement>('[data-chip-slot]') ?? el;
-    for (let s = anchor === 'right' ? holder.previousElementSibling : holder.nextElementSibling; s; s = anchor === 'right' ? s.previousElementSibling : s.nextElementSibling) play(s, from(sign * d), glide);
+    for (let s = anchor === 'right' ? holder.previousElementSibling : holder.nextElementSibling; s; s = anchor === 'right' ? s.previousElementSibling : s.nextElementSibling) glideBy(s, sign * d, glide);
   }
   for (const c of el.children) {
     const part = c as HTMLElement;
@@ -227,7 +256,7 @@ function morph(el: HTMLElement, anchor: 'left' | 'right', was: Measure, now: Mea
       // Arrived: in once what stood there has gone, and behind the moving edge (a growing chip's
       // edge is nearly home by then).
       play(part, [{ opacity: 0 }, { opacity: 1 }], { duration: 80, delay: Math.max(OUT, grows ? Math.round(dur * 0.4) : 0), easing: 'linear', fill: 'backwards' });
-    } else if (Math.abs(here - before) > 0.5) play(part, from(sign * (here - before)), glide);
+    } else if (Math.abs(here - before) > 0.5) glideBy(part, sign * (here - before), glide);
   }
 }
 
