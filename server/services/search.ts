@@ -1,3 +1,4 @@
+import { sessionTail } from '../core/session-json';
 import { randomBytes } from 'node:crypto';
 import { open as openFile, readFile as readFileAsync, stat as statFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -190,7 +191,7 @@ export class FieldScan {
   /** Where the key or capture in progress starts in the current piece. */
   private from = 0;
   private item: Fields | null = null;
-  private inItems = false;
+  private list?: 'items' | 'over';
   /** The next quote and backslash in the current piece (Infinity: none). */
   private nq = -1;
   private nb = -1;
@@ -208,6 +209,7 @@ export class FieldScan {
   constructor(
     private readonly doc: boolean,
     private readonly onItem: (fields: Fields, index: number) => void,
+    private readonly onOverride?: (fields: Fields) => void,
   ) {}
 
   /** Whether the object at depth `d` is one whose fields are read: a doc's root, an item. */
@@ -248,7 +250,7 @@ export class FieldScan {
     this.cap = null;
     const f: Field = { kind: c.kind, raw: Buffer.concat(c.parts).toString('utf8'), over: c.over };
     if (c.root) {
-      if (!f.over) this.root[c.name] = f.raw;
+      if (!f.over) this.root[c.name] = f.kind === 'str' ? '"' + f.raw + '"' : f.raw;
     } else if (this.item) this.item[c.name] = f;
   }
 
@@ -329,13 +331,13 @@ export class FieldScan {
         }
         this.depth = d + 1;
         if (c === 0x7b) {
-          if ((!this.doc && d === 0) || (this.doc && d === 2 && this.inItems)) {
+          if ((!this.doc && d === 0) || (this.doc && d === 2 && this.list)) {
             this.item = {};
             this.next[d + 1] = Next.Key;
           } else if (this.doc && d === 0) this.next[1] = Next.Key;
-        } else if (this.doc && d === 1 && this.keyOf[1] === 'items') {
-          this.inItems = true;
-          this.hasItems = true;
+        } else if (this.doc && d === 1 && (this.keyOf[1] === 'items' || this.keyOf[1] === 'over' && this.onOverride)) {
+          this.list = this.keyOf[1] as 'items' | 'over';
+          if (this.list === 'items') this.hasItems = true;
         }
       } else if (c === 0x7d /* } */ || c === 0x5d /* ] */) {
         if (this.primAt(d)) this.endCap(b, i);
@@ -349,8 +351,9 @@ export class FieldScan {
             const it = this.item;
             this.item = null;
             if (!this.doc) this.closed = true;
-            this.onItem(it, this.count++);
-          } else if (c === 0x5d && this.doc && nd === 1) this.inItems = false;
+            if (this.list === 'over') this.onOverride?.(it);
+            else this.onItem(it, this.count++);
+          } else if (c === 0x5d && this.doc && nd === 1) this.list = undefined;
           else if (c === 0x7d && this.doc && nd === 0) this.closed = true;
         }
       } else if (c === 0x3a /* : */) {
@@ -423,8 +426,7 @@ function sayFields(f: Fields): Said | null {
 
 // ───────────────────────────── searching ─────────────────────────────
 
-const MARKS = ['"type":"user"', '"type":"text"'];
-const HEAD = /^\{"gen":(\d+),"items":\[$/;
+
 
 export interface SearchOptions {
   /** At most this many hits (1 to `SEARCH.hits`). */
@@ -472,19 +474,10 @@ interface FileCursor {
   kind: 'file';
   id: string;
   key: string;
-  tail: { done: boolean; off: number; scan?: FieldScan; ok: boolean; gen?: number; from?: number; hits: MessageHit[]; said: Said[] };
+  tail: { over: Map<string, Said | null>; done: boolean; off: number; scan?: FieldScan; ok: boolean; gen?: number; from?: number; hits: MessageHit[]; said: Said[] };
   base: {
     off: number;
-    /** The item the next line holds (-1: the head line). */
-    k: number;
-    head?: 'new' | 'old';
-    gen?: number;
-    /** Items from here on are the tail's (Infinity: none). */
-    cut: number;
-    pending: Buffer[];
-    pendingLen: number;
-    /** A line too long to hold: streamed, or skipped (the foot). */
-    long?: FieldScan | 'skip';
+    merge?: ReturnType<typeof sessionTail<Said | null>>;
     doc?: FieldScan;
     hits: MessageHit[];
     said: Said[];
@@ -680,8 +673,8 @@ export class ChatSearch {
         kind: 'file',
         id,
         key,
-        tail: { done: false, off: 0, ok: false, hits: [], said: [] },
-        base: { off: 0, k: -1, cut: Infinity, pending: [], pendingLen: 0, hits: [], said: [] },
+        tail: { over: new Map(), done: false, off: 0, ok: false, hits: [], said: [] },
+        base: { off: 0, hits: [], said: [] },
         chars: 0,
         keepable: true,
         bad: false,
@@ -703,8 +696,13 @@ export class ChatSearch {
       collect(cur.tail.said, s);
       if (matches(s.text, run.words)) ring(cur.tail.hits, hitOf(id, s, run.words), run.perChat);
     };
-    const onBase = (k: number, s: Said | null) => {
-      if (!s || k >= cur.base.cut) return;
+    const onBase = (k: number, f: Fields) => {
+      const merge = cur.base.merge;
+      if (merge && k >= merge.from) return;
+      const itemId = valueOf(f.id);
+      const original = sayFields(f);
+      const s = merge && typeof itemId === 'string' ? merge.item(itemId, original) : original;
+      if (!s) return;
       collect(cur.base.said, s);
       if (matches(s.text, run.words)) ring(cur.base.hits, hitOf(id, s, run.words), run.perChat);
     };
@@ -712,7 +710,7 @@ export class ChatSearch {
     if (!cur.tail.done && !(await this.readTail(cur, tail, budget, onTail))) return undefined;
     const r = await this.readBase(cur, base, budget, onBase);
     if (r === 'paused') return undefined;
-    const tailOn = cur.base.head === 'new' && cur.tail.ok && cur.tail.gen === cur.base.gen;
+    const tailOn = !!cur.base.merge;
     const hits = [...(tailOn ? cur.tail.hits : [])].reverse().concat([...cur.base.hits].reverse()).slice(0, run.perChat);
     if (cur.bad) run.skipped.add(id);
     else if (cur.keepable && r === 'done') this.keep(id, key, tailOn ? cur.base.said.concat(cur.tail.said) : cur.base.said);
@@ -720,8 +718,8 @@ export class ChatSearch {
   }
 
   /**
-   * The tail, as `session-file.ts` reads it (whole, any size: read in pieces here when big or when
-   * more than what is left of the call). False when the budget ran out. A tail that is not there is
+   * Read a tail within the search budget, streaming its message fields when large.
+   * False when the budget ran out. A tail that is not there is
    * none; one that is there but cannot be read or parsed is a part of the chat not searched (`bad`:
    * said in `skipped`, and nothing of the chat is kept), never taken for none.
    */
@@ -742,11 +740,12 @@ export class ChatSearch {
     if (size <= SEARCH.tailWhole && !t.scan && (budget.fresh || size <= budget.bytes)) {
       if (this.out(budget, true)) return false;
       try {
-        const v = JSON.parse(await readFileAsync(file, 'utf8')) as { baseGen?: number; from?: number; items?: TimelineItem[] };
+        const v = JSON.parse(await readFileAsync(file, 'utf8')) as { baseGen?: number; from?: number; items?: TimelineItem[]; over?: TimelineItem[] };
         if (v && Array.isArray(v.items)) {
           t.ok = true;
           t.gen = v.baseGen;
           t.from = v.from;
+          for (const it of v.over ?? []) t.over.set(it.id, sayOf(it));
           for (const it of v.items) onTail(it && typeof it === 'object' ? sayOf(it) : null);
         } else c.bad = true;
       } catch (err) {
@@ -758,7 +757,10 @@ export class ChatSearch {
       t.done = true;
       return true;
     }
-    t.scan ??= new FieldScan(true, (f) => onTail(sayFields(f)));
+    t.scan ??= new FieldScan(true, (f) => onTail(sayFields(f)), f => {
+      const id = valueOf(f.id);
+      if (typeof id === 'string') t.over.set(id, sayFields(f));
+    });
     let fh: Awaited<ReturnType<typeof openFile>> | undefined;
     try {
       fh = await openFile(file, 'r');
@@ -798,128 +800,40 @@ export class ChatSearch {
     return true;
   }
 
-  /** The base from where the cursor stopped, a piece at a time. */
-  private async readBase(c: FileCursor, file: string, budget: Budget, onBase: (k: number, s: Said | null) => void): Promise<'done' | 'paused' | 'gone'> {
+  /** Search streams only the fields it needs. When a tail exists the first pass locates its
+   * generation and retained prefix, even if the generation follows the items in compact JSON. */
+  private async readBase(c: FileCursor, file: string, budget: Budget, onBase: (k: number, f: Fields) => void): Promise<'done' | 'paused' | 'gone'> {
     const b = c.base;
     let fh: Awaited<ReturnType<typeof openFile>> | undefined;
     try {
-      try {
-        fh = await openFile(file, 'r');
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'gone';
-        c.bad = true;
-        return 'gone';
-      }
-      const size = (await fh.stat()).size;
+      fh = await openFile(file, 'r');
+      const { size, mtimeMs } = await fh.stat();
       const buf = Buffer.allocUnsafe(SEARCH.chunk);
-      while (b.off < size) {
-        if (this.out(budget, true)) return 'paused';
-        const { bytesRead: n } = await fh.read(buf, 0, this.want(budget, buf.length), b.off);
-        if (n <= 0) break;
-        b.off += n;
-        budget.bytes -= n;
-        budget.read += n;
-        budget.fresh = false;
-        this.feedBase(c, buf, n, onBase);
+      for (;;) {
+        const measuring = c.tail.ok && b.merge === undefined;
+        b.doc ??= new FieldScan(true, measuring ? () => {} : (f, k) => onBase(k, f));
+        while (b.off < size) {
+          if (this.out(budget, true)) return 'paused';
+          const { bytesRead: n } = await fh.read(buf, 0, this.want(budget, buf.length), b.off);
+          if (!n) throw new Error('Incomplete session file');
+          b.off += n;
+          budget.bytes -= n;
+          budget.read += n;
+          budget.fresh = false;
+          b.doc.push(buf, 0, n);
+        }
+        b.doc.end();
+        if (!b.doc.closed || b.doc.broken || !b.doc.hasItems) c.bad = true;
+        if (!measuring || c.bad) return 'done';
+        const field = b.doc.root.gen === undefined ? undefined : JSON.parse(b.doc.root.gen);
+        b.merge = sessionTail(field, mtimeMs, { baseGen: c.tail.gen, from: c.tail.from }, b.doc.count, c.tail.over);
+        b.off = 0;
+        b.doc = undefined;
       }
-    } catch {
-      c.bad = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT' || c.tail.ok) c.bad = true;
       return 'gone';
-    } finally {
-      await fh?.close().catch(() => {});
-    }
-    // The end: a base of this version ends on its foot (`],"todos":...`); an older one is one JSON
-    // (a short one is all on its first line).
-    if (b.head === undefined && b.pendingLen) {
-      const parts = b.pending;
-      b.pending = [];
-      b.pendingLen = 0;
-      this.toOld(c, onBase, parts);
-    }
-    if (b.head === 'old') {
-      b.doc?.end();
-      if (!b.doc || !b.doc.closed || b.doc.broken) c.bad = true;
-    } else if (b.head !== 'new' || b.last !== 93 /* ] */) c.bad = true;
-    return 'done';
-  }
-
-  /** One piece of the base: its complete lines, and the start of the line that goes on in the next piece. */
-  private feedBase(c: FileCursor, buf: Buffer, n: number, onBase: (k: number, s: Said | null) => void) {
-    const b = c.base;
-    if (b.head === 'old') {
-      b.doc!.push(buf, 0, n);
-      return;
-    }
-    let from = 0;
-    for (let nl = buf.indexOf(10, from); nl >= 0 && nl < n; nl = buf.indexOf(10, from)) {
-      if (b.long instanceof FieldScan) {
-        b.long.push(buf, from, nl);
-        b.long.end();
-        if (!b.long.closed || b.long.broken) c.bad = true;
-        b.long = undefined;
-      } else if (b.long === 'skip') b.long = undefined;
-      else {
-        b.pending.push(buf.subarray(from, nl));
-        const line = b.pending.length > 1 ? Buffer.concat(b.pending) : b.pending[0];
-        b.pending = [];
-        b.pendingLen = 0;
-        if (b.k === -1) {
-          const m = HEAD.exec(line.toString('utf8'));
-          if (!m) {
-            // An older file whose JSON spans lines: read it whole as one document from its start.
-            this.toOld(c, onBase, [Buffer.from(line), Buffer.from([10]), Buffer.from(buf.subarray(nl + 1, n))]);
-            return;
-          }
-          b.head = 'new';
-          b.gen = Number(m[1]);
-          const t = c.tail;
-          b.cut = t.ok && t.gen === b.gen && typeof t.from === 'number' && t.from >= 0 ? t.from : Infinity;
-        } else if (line[0] !== 93 /* ] */ && MARKS.some((mk) => line.includes(mk))) {
-          const k = b.k;
-          try {
-            const t = line.toString('utf8');
-            onBase(k, sayOf(JSON.parse(t.endsWith(',') ? t.slice(0, -1) : t) as TimelineItem));
-          } catch {
-            c.bad = true;
-          }
-        }
-      }
-      b.k++;
-      b.last = undefined;
-      from = nl + 1;
-    }
-    if (from >= n) return;
-    // The rest of a line: held for the next piece while short, else streamed (or skipped: the foot).
-    if (b.long === undefined && b.pendingLen === 0) b.last = buf[from];
-    if (b.long instanceof FieldScan) {
-      b.long.push(buf, from, n);
-      if (b.long.notMessage()) b.long = 'skip';
-    } else if (b.long !== 'skip') {
-      b.pending.push(Buffer.from(buf.subarray(from, n)));
-      b.pendingLen += n - from;
-      if (b.pendingLen > SEARCH.line) {
-        const parts = b.pending;
-        b.pending = [];
-        b.pendingLen = 0;
-        if (b.k === -1) this.toOld(c, onBase, parts);
-        else if (parts[0][0] === 93 /* ] */) b.long = 'skip';
-        else {
-          const k = b.k;
-          const scan = new FieldScan(false, (f) => onBase(k, sayFields(f)));
-          for (const p of parts) scan.push(p, 0, p.length);
-          b.long = scan.notMessage() ? 'skip' : scan;
-        }
-      }
-    }
-  }
-
-  /** The base is of an older version (one JSON, no generation; no tail applies): read as a document from its start. */
-  private toOld(c: FileCursor, onBase: (k: number, s: Said | null) => void, start: Buffer[]) {
-    const b = c.base;
-    b.head = 'old';
-    b.cut = Infinity;
-    b.doc = new FieldScan(true, (f, index) => onBase(index, sayFields(f)));
-    for (const p of start) b.doc.push(p, 0, p.length);
+    } finally { await fh?.close().catch(() => {}); }
   }
 }
 

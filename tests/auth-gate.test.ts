@@ -338,6 +338,16 @@ describe('a refusal for the sign-in is not believed at once', () => {
     expect(notices(rt.items).filter((n) => n.variant === 'error')).toEqual([]);
   });
 
+  it('an unavailable status after a refusal leaves sign-in unconfirmed', async () => {
+    const { app, log, rt, account } = await setup();
+    vi.spyOn(app.provider('demo', account.id), 'info').mockRejectedValue(new Error('status unavailable'));
+    log.refuse = 1;
+    await app.call('session.send', { sessionId: rt.id, text: 'hi there' });
+    await until(() => notices(rt.items).some(n => n.text === 'Could not confirm the sign-in'), 'unknown status');
+    expect(notices(rt.items).some(n => n.auth)).toBe(false);
+    expect(log.sent).toHaveLength(1);
+  });
+
   it('a second refusal of the same message, still "signed in", is not retried again', async () => {
     const { app, log, rt } = await setup();
     log.refuse = 2;

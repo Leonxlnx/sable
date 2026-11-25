@@ -83,8 +83,8 @@ export function editedFiles(rt: SessionRuntime): string[] {
   return [...out];
 }
 
-/** Whether a session is working right now (its turn runs, or it waits on the user mid-turn). */
-const working = (rt: SessionRuntime) => rt.turnActive || rt.meta.status === 'running' || rt.meta.status === 'awaiting' || !!rt.meta.background || !!rt.meta.commands;
+/** Keep the checkout while a turn, background task or local server depends on it. */
+const working = (rt: SessionRuntime) => rt.turnActive || rt.meta.status === 'running' || rt.meta.status === 'awaiting' || !!rt.meta.background || !!rt.meta.commands || !!rt.meta.serving;
 
 /** Claude Code's folder key for its transcripts: every character other than a letter or digit becomes `-`. */
 export const claudeFolderKey = (cwd: string) => path.resolve(cwd).replace(/[^a-zA-Z0-9]/g, '-');

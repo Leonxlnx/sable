@@ -120,6 +120,43 @@ describe('background commands', () => {
     expect(rests()).toBe(1);
   });
 
+  it('a split server announcement moves a running command into serving and keeps its loss receipt', () => {
+    const { rt } = make();
+    const item = rt.add<ToolItem>(bash({ detail: { command: 'node app.js' } }));
+    rt.taskStarted(item.id, { id: 'b', kind: 'command' });
+    expect(rt.meta.commands).toBe(1);
+    rt.delta(item.id, 'output', 'Local: http://local');
+    rt.delta(item.id, 'output', 'host:3311/\n');
+    expect(rt.meta).toMatchObject({ commands: 0, serving: 1 });
+    rt.setReportedTasks([{ id: 'b', agent: false, since: 1 }]);
+    rt.patch<ToolItem>(item.id, { output: '' });
+    expect(item.task?.serving).toBe('localhost:3311');
+    expect(rt.meta).toMatchObject({ commands: 0, serving: 1 });
+    expect(rt.tasksLost('process')).toEqual(['Run app tests']);
+    expect(rt.meta).toMatchObject({ commands: 0, serving: 0 });
+    rt.setReportedTasks([]);
+    expect(rt.takeLost()).toHaveLength(1);
+    rt.taskEnded('b', 'stopped');
+    expect(item.task).toMatchObject({ state: 'stopped', serving: 'localhost:3311' });
+  });
+
+  it('counts and times a working monitor alongside a younger watcher, including after reload', () => {
+    const { rt } = make();
+    const monitor = rt.add<ToolItem>(bash({ detail: { command: 'npm run dev' }, output: 'Ready: http://localhost:3311/', task: { id: 'm', kind: 'monitor', since: 10, state: 'running' } }));
+    const watcher = rt.add<ToolItem>(bash({ detail: { command: 'tsc -w' }, task: { id: 'w', kind: 'command', since: 90, state: 'running' } }));
+    expect(monitor.task?.serving).toBeUndefined();
+    expect(watcher.task?.serving).toBe(true);
+    rt.load(structuredClone(rt.items));
+    expect(rt.meta).toMatchObject({ commands: 1, serving: 1, servingSince: 90 });
+    expect(rt.newestCommandAt).toBe(10);
+    expect(rt.newestProcessCommandAt).toBe(90);
+    rt.taskEnded('m', 'done');
+    expect(rt.meta).toMatchObject({ commands: 0, serving: 1 });
+    rt.taskEnded('w', 'stopped');
+    expect(rt.meta).toMatchObject({ commands: 0, serving: 0 });
+    expect(rt.meta.servingSince).toBeUndefined();
+  });
+
   it('a step removed with its command takes it out of the count', () => {
     const { rt } = make();
     const step = rt.add<ToolItem>(bash());

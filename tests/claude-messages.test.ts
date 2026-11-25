@@ -22,6 +22,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, STEER_FIRST_BLOCK, type NoticeItem, type SessionMeta, type TextItem, type TimelineItem, type ToolItem, type TurnItem, type UserItem } from '@shared/protocol';
 import { HANDOVER_HEAD_ACCOUNT, HANDOVER_JOIN, HANDOVER_TAIL, lostTasksNote, stripWrappers } from '@shared/synthetic';
 import { App } from '../server/app';
+import { claudeFolderKey } from '../server/core/lanes';
 import { SessionRuntime } from '../server/core/runtime';
 import { READ } from '../server/core/session-file';
 import { isLight, resultForWindow } from '../server/core/trim';
@@ -75,10 +76,10 @@ const sdk = vi.hoisted(() => {
     procs.push(proc);
     return proc.q;
   }
-  return { procs, fakeQuery };
+  return { procs, fakeQuery, history: vi.fn(), fork: vi.fn() };
 });
 
-vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => ({ ...(await importOriginal<object>()), query: (p: { prompt: AsyncIterable<unknown> }) => sdk.fakeQuery(p) }));
+vi.mock('@anthropic-ai/claude-agent-sdk', async (importOriginal) => ({ ...(await importOriginal<object>()), getSessionMessages: sdk.history, forkSession: sdk.fork, query: (p: { prompt: AsyncIterable<unknown> }) => sdk.fakeQuery(p) }));
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -1406,4 +1407,43 @@ describe('the readers', () => {
     expect(appPictures([imageBlock('not base64!')], limits)).toBeUndefined();
     expect(appPictures([imageBlock(one), imageBlock('B'.repeat(150))], { count: 4, each: 200, total: 250 })).toHaveLength(1);
   });
+});
+
+it('refuses an unresolved interior rewind before touching the conversation or files', async () => {
+  const h = await claude({ meta: { providerSessionId: 'native' } });
+  h.rt.add<UserItem>({ type: 'user', text: 'first', providerId: 'old-1' });
+  const second = h.rt.add<UserItem>({ type: 'user', text: 'second', providerId: 'old-2' });
+  const before = structuredClone(h.rt.items);
+  const result = await h.session.rewind!(second.id, true);
+  expect(result).toMatchObject({ ok: false, message: expect.stringMatching(/summary/) });
+  expect(h.q()).toBeFalsy();
+  expect(h.rt.items).toEqual(before);
+  expect(h.rt.meta.providerSessionId).toBe('native');
+});
+
+it('uses the copied Claude history for inherited interior forks and rewinds', async () => {
+  const h = await claude({ meta: { providerSessionId: 'native-copy' } });
+  const first = h.rt.add<UserItem>({ type: 'user', text: 'first', providerId: 'native-1' });
+  const reply = h.rt.add<TextItem>({ type: 'text', text: 'answer', streaming: false });
+  h.rt.add<TurnItem>({ type: 'turn', durationMs: 1 });
+  const second = h.rt.add<UserItem>({ type: 'user', text: 'second', providerId: 'native-2' });
+  const home = mkdtempSync(path.join(tmpdir(), 'sable-copied-chain-'));
+  cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+  vi.spyOn(h.p, 'configHome').mockReturnValue(home);
+  const dir = path.join(home, 'projects', claudeFolderKey(h.rt.meta.cwd));
+  mkdirSync(dir, { recursive: true });
+  const entries = ['native-1', 'reply-1', 'native-2'].map((original, i) => ({
+    type: i === 1 ? 'assistant' : 'user', uuid: 'copy-' + i, parentUuid: i ? 'copy-' + (i - 1) : null,
+    sessionId: 'native-copy', forkedFrom: { sessionId: 'native-source', messageUuid: original },
+  }));
+  writeFileSync(path.join(dir, 'native-copy.jsonl'), entries.map(i => JSON.stringify(i)).join('\n') + '\n');
+  sdk.fork.mockResolvedValueOnce({ sessionId: 'next-copy' });
+  const copied = await h.p.open(h.rt, { chainFrom: 'native-source' });
+  cleanups.push(() => copied.close());
+  expect(await copied.fork!(reply.id)).toBe('next-copy');
+  expect(sdk.fork).toHaveBeenCalledWith('native-copy', { dir: h.rt.meta.cwd, upToMessageId: 'copy-1' });
+  expect(await copied.rewind!(second.id, false)).toMatchObject({ ok: true });
+  expect(h.rt.get(first.id)).toBe(first);
+  expect(h.rt.get(second.id)).toBeUndefined();
+  expect(h.rt.meta.providerSessionId).toBe('native-copy');
 });

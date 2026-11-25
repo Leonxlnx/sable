@@ -23,6 +23,7 @@ export interface ConsoleSpec {
  * (`start /wait` hands it on), and rejects when it could not be started; `close` closes it.
  */
 export interface ConsoleWindow {
+  pid?: number;
   closed: Promise<number | null | void>;
   close(): void;
 }
@@ -93,5 +94,5 @@ export const openConsole: OpenConsole = (spec) => {
     child.once('error', reject);
     child.once('exit', (code) => resolve(code));
   });
-  return { closed, close: () => killTree(child) };
+  return { pid: child.pid, closed, close: () => killTree(child) };
 };

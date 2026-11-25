@@ -252,6 +252,27 @@ describe('what a closed chat’s files give search', () => {
     ]);
   });
 
+  it.each([false, true])('cold search follows overrides and the quit prefix (legacy %s)', async legacy => {
+    const { app, base } = await closed((a, sid) => {
+      a.sessions.get(sid)!.add({ type: 'user', text: 'original narwhal' } as never);
+    });
+    const data = JSON.parse(readFileSync(base, 'utf8'));
+    if (legacy) {
+      delete data.gen;
+      writeFileSync(base, JSON.stringify(data));
+    }
+    const gen = data.gen ?? -(await import('node:fs')).statSync(base).mtimeMs;
+    writeFileSync(base.replace(/\.json$/, '.tail.json'), JSON.stringify({ baseGen: gen, from: 1,
+      items: [{ id: 'late', ts: 2, type: 'text', text: 'late narwhal' }],
+      over: [{ ...data.items[0], text: 'replacement narwhal' }] }));
+    const threshold = SEARCH.tailWhole;
+    if (legacy) SEARCH.tailWhole = 1;
+    try {
+      const r = await searchOf(app).search('narwhal');
+      expect(r.hits.map(h => h.text)).toEqual(['late narwhal', 'replacement narwhal']);
+    } finally { SEARCH.tailWhole = threshold; }
+  });
+
   it('reads a tail of any size the session reader reads, as the reader does', async () => {
     const { app, id, base } = await closed((a, sid) => {
       const rt = a.sessions.get(sid)!;

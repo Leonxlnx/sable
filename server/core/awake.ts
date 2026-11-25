@@ -10,7 +10,7 @@ import type { AppSettings, BridgeEvent, PhoneStatus, SessionMeta } from '../../s
  * work changes, and once when a background command grows too old to keep the computer awake.
  */
 
-/** A session as keep awake reads it: `newestCommandAt`, when its youngest background command still running began. */
+/** A session as keep awake reads it: `newestCommandAt`, when its youngest working command (including monitors) began. */
 export type AwakeSession = { meta: SessionMeta; turnActive: boolean; readonly newestCommandAt?: number };
 
 export interface AwakeSource {
@@ -20,7 +20,7 @@ export interface AwakeSource {
 
 /**
  * How long a background command keeps the computer awake: a test run or a build the agent waits on
- * does, a dev server left running for the evening does not keep the laptop up all night.
+ * does, up to this bound. Serving tasks have their own count and clock.
  */
 export const COMMAND_AWAKE_MS = 2 * 60 * 60_000;
 

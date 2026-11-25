@@ -3,7 +3,10 @@ import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import type { InitializeParams, InitializeResponse, RequestId } from './codex-types';
-import { cliCommand } from '../util/proc';
+import { homedir } from 'node:os';
+import { authGate, gateKey, GATE } from '../core/auth-gate';
+import type { AuthScope, EndReason } from '../core/auth-journal';
+import { cliCommand, killTree as stopTree } from '../util/proc';
 import { trustedPathDirs } from '../util/which';
 
 /**
@@ -31,6 +34,7 @@ export interface CodexCommand {
 // ── process bookkeeping ──
 
 const live = new Set<ChildProcess>();
+const servers = new Set<string>();
 let exitHookInstalled = false;
 
 function installExitHook() {
@@ -38,7 +42,13 @@ function installExitHook() {
   exitHookInstalled = true;
   // 'exit' handlers must be synchronous: taskkill via spawnSync / kill() both are.
   process.once('exit', () => {
-    for (const c of live) killTree(c);
+    const children = [...live].filter(c => c.pid && c.exitCode === null && c.signalCode === null);
+    if (process.platform === 'win32' && children.length) {
+      // One bounded cleanup for every remaining tree, even with many accounts.
+      try { spawnSync('taskkill', [...children.flatMap(c => ['/pid', String(c.pid)]), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 1000 }); }
+      catch { /* fall back to each root below */ }
+    }
+    for (const c of children) { try { c.kill(); } catch { /* already gone */ } }
   });
 }
 
@@ -128,6 +138,16 @@ export class CodexRpc {
 
   alive = true;
   initInfo?: InitializeResponse;
+  private born = Date.now();
+  private endReason?: EndReason;
+  private endEvent?: (reason: EndReason, inFlight: boolean) => void;
+  private turns = new Set<string>();
+  private overdue = new Set<RequestId>();
+  private answering = 0;
+  get hasTurn() { return this.turns.size > 0; }
+  get inFlight() { return this.pending.size > 0 || this.overdue.size > 0 || this.answering > 0 || this.hasTurn; }
+  get ended() { return this.exited; }
+  get pid() { return this.child.pid; }
   private nextId = 1;
   private pending = new Map<RequestId, Pending>();
   private stderrTail = '';
@@ -163,6 +183,7 @@ export class CodexRpc {
     if (!this.alive) return done();
     this.alive = false;
     live.delete(this.child);
+    this.endEvent?.(this.endReason ?? (code === 0 ? 'exit' : 'error'), this.inFlight);
     const err = new RpcError(`codex app-server exited${code !== null ? ` (code ${code})` : signal ? ` (${signal})` : ''}${error ? `: ${error}` : ''}`);
     for (const p of this.pending.values()) {
       clearTimeout(p.timer);
@@ -176,6 +197,9 @@ export class CodexRpc {
   static async start(opts: {
     log: (...a: unknown[]) => void;
     clientVersion: string;
+    folder?: string;
+    scope?: AuthScope;
+    closing?: () => boolean;
     env?: Record<string, string>;
     /** Opt into experimental methods (remote control lives there). */
     experimental?: boolean;
@@ -183,14 +207,27 @@ export class CodexRpc {
     config?: string[];
   }): Promise<CodexRpc> {
     const cmd = resolveCodexCommand(['app-server', ...(opts.config ?? []).flatMap((c) => ['-c', c])], opts.env);
-    opts.log('[codex] spawning', cmd.file, cmd.args.join(' '));
-    const child = spawn(cmd.file, cmd.args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-      shell: cmd.shell,
-      env: cmd.env,
-    });
+    const folder = opts.folder ?? gateKey('codex', cmd.env.CODEX_HOME || path.join(homedir(), '.codex'));
+    const leave = await authGate.enter(folder, 'start', opts.scope);
+    let child: ChildProcess;
+    try {
+      if (opts.closing?.()) throw new Error('Codex provider is shut down');
+      if (servers.has(folder)) throw new Error('This Codex folder is already in use by another Sable account.');
+      opts.log('[codex] spawning', cmd.file, cmd.args.join(' '));
+      child = spawn(cmd.file, cmd.args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: cmd.shell,
+        env: cmd.env,
+      });
+    } catch (err) {
+      leave();
+      throw err;
+    }
+    servers.add(folder);
     const rpc = new CodexRpc(child, opts.log);
+    if (child.pid && opts.scope) rpc.endEvent = opts.scope.journal?.started(opts.scope, folder, child.pid, () => rpc.inFlight, rpc.born);
+    void rpc.exited.then(() => { servers.delete(folder); leave(); });
     const params: InitializeParams = {
       clientInfo: { name: 'sable', title: 'Sable', version: opts.clientVersion },
       capabilities: {
@@ -202,8 +239,9 @@ export class CodexRpc {
     try {
       rpc.initInfo = await rpc.request<InitializeResponse>('initialize', params, 30_000);
       rpc.notify('initialized');
+      setTimeout(leave, GATE.settleMs).unref();
     } catch (err) {
-      await rpc.close();
+      void rpc.close().catch(() => {});
       const tail = rpc.stderrTail.trim().split('\n').slice(-3).join('\n');
       throw new Error(`Could not start codex app-server: ${(err as Error).message}${tail ? `\n${tail}` : ''}`);
     }
@@ -220,10 +258,12 @@ export class CodexRpc {
   }
 
   request<T = unknown>(method: string, params?: unknown, timeoutMs = 30_000): Promise<T> {
+    if (this.endReason) return Promise.reject(new RpcError('Codex app-server is closing'));
     return new Promise<T>((resolve, reject) => {
       const id = this.nextId++;
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.overdue.add(id);
         reject(new RpcError(`codex ${method} timed out after ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
       this.pending.set(id, { method, resolve: resolve as (v: unknown) => void, reject, timer });
@@ -276,6 +316,11 @@ export class CodexRpc {
       if (hasId) void this.handleRequest(msg.id, msg.method, msg.params);
       else {
         try {
+          const id = msg.params?.turn?.id;
+          if (typeof id === 'string') {
+            if (msg.method === 'turn/started') this.turns.add(id);
+            if (msg.method === 'turn/completed') this.turns.delete(id);
+          }
           this.onNotification?.(msg.method, msg.params ?? {});
         } catch (err) {
           this.log('[codex] notification handler failed', msg.method, err);
@@ -284,6 +329,7 @@ export class CodexRpc {
       return;
     }
     if (!hasId) return;
+    this.overdue.delete(msg.id);
     const p = this.pending.get(msg.id);
     if (!p) return;
     this.pending.delete(msg.id);
@@ -294,17 +340,22 @@ export class CodexRpc {
 
   private async handleRequest(id: RequestId, method: string, params: unknown) {
     if (!this.onRequest) return this.respondError(id, -32601, `Unsupported: ${method}`);
+    this.answering++;
     try {
       const result = await this.onRequest(method, params ?? {}, id);
       this.respond(id, result);
     } catch (err) {
       const e = err as RpcError;
       this.respondError(id, typeof e.code === 'number' ? e.code : -32603, e.message || 'client error');
-    }
+    } finally { this.answering--; }
   }
 
   /** Graceful stop: close stdin (app-server exits on EOF), then force-kill the tree. */
-  async close(graceMs = 1500) {
+  async close(graceMs = 1500, reason: EndReason = 'close') {
+    this.endReason = reason;
+    while (this.alive && (this.inFlight || Date.now() - this.born < GATE.minLifeMs)) {
+      await new Promise<void>(resolve => setTimeout(resolve, 50).unref());
+    }
     if (!this.alive) return;
     try {
       this.child.stdin?.end();
@@ -313,7 +364,7 @@ export class CodexRpc {
     }
     const timer = new Promise<void>((r) => setTimeout(r, graceMs).unref());
     await Promise.race([this.exited, timer]);
-    if (this.alive) killTree(this.child);
+    if (this.alive) stopTree(this.child);
     await Promise.race([this.exited, new Promise<void>((r) => setTimeout(r, 1000).unref())]);
   }
 }

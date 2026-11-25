@@ -1,12 +1,8 @@
-// Child of the opt-in memory test. The parent owns the scratch lock and the temporary directory.
+// The opt-in memory test supplies an isolated temporary directory and holds the scratch lock.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { Store } = require('../../server/core/store.ts');
-const { isLight } = require('../../server/core/trim.ts');
-
-async function run() {
-  const home = process.argv[2];
+async function run(home, mode, Store, isLight) {
   const store = new Store(home);
   const file = path.join(home, 'sessions', 'long.json');
   const image = 'data:image/png;base64,' + 'iVBORw0KGgo'.repeat(32728);
@@ -20,7 +16,12 @@ async function run() {
   };
   try {
     put('{"gen":1,"items":[\n');
-    while (size < (200 << 20)) {
+    if (mode === 'pictures') {
+      item({ type: 'user', text: 'Read the pictures' });
+      turns++;
+      while (size < (400 << 20)) item({ type: 'tool', name: 'Read', kind: 'read', status: 'done', title: 'Check', detail: {}, result: { images: [image] } });
+      item({ type: 'turn', durationMs: 500 });
+    } else while (size < (200 << 20)) {
       item({ type: 'user', text: 'Please continue ' + ++turns });
       for (let k = 0; k < 12; k++) {
         const result = k % 3 === 0 ? { images: [image] } : k % 3 === 1 ? { text: output, exitCode: 0 } : { file: { path: 'src/a.ts', content } };
@@ -56,6 +57,7 @@ async function run() {
     rssAtLoadMiB: mib(rssAtLoad), peakRssMiB: mib(peak), loadMs: Math.round(loaded - start),
     rewriteMs: Math.round(rewritten - loaded), totalMs: Math.round(rewritten - start) };
   fs.writeFileSync(path.join(home, 'metrics.json'), JSON.stringify(metrics));
-  assert.ok(peak > 0 && peak - rssAtLoad < size, JSON.stringify(metrics));
+  process.stdout.write(JSON.stringify(metrics) + '\n');
+  assert.ok(peak > 0 && peak - rssAtLoad < Math.min(size, 201 << 20), JSON.stringify(metrics));
 }
-run().catch(err => { console.error(err); process.exitCode = 1; });
+module.exports = run;

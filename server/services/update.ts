@@ -345,7 +345,7 @@ export type UpdateSession = WorkSession;
 
 /**
  * Whether an update's restart waits for work now: a turn, a session starting, sub-agents still
- * working in the background (an update would end them), a background command younger than
+ * working in the background (an update would end them), a working command younger than
  * `COMMAND_UPDATE_WAIT_MS`. `recheckAt`: when the youngest such command stops holding it, if only
  * commands do.
  */
@@ -353,7 +353,7 @@ export function updateWaits(sessions: Iterable<UpdateSession>, now = Date.now())
   let busy = false;
   let recheckAt: number | undefined;
   for (const rt of sessions) {
-    const work = workOf(rt, true, now);
+    const work = workOf(rt, true, now, 'update');
     if (rt.meta.moving || work.turn || work.agents || rt.meta.status === 'running' || rt.meta.status === 'starting' || rt.meta.status === 'awaiting') return { busy: true };
     if (work.holds !== undefined) {
       busy = true;

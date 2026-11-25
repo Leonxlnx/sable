@@ -1,4 +1,4 @@
-import type { FileDiff, LimitHit, NoticeItem, ProviderId, TextItem, TimelineItem, ToolItem, ToolResult, UserItem } from '../../shared/protocol';
+import type { LimitHit, NoticeItem, ProviderId, TextItem, TimelineItem, ToolItem, ToolResult, UserItem } from '../../shared/protocol';
 import { partOfTurn, syntheticOf, userText } from '../../shared/synthetic';
 import type { AgentCall } from '../providers/agent-tool';
 import type { SessionRuntime } from './runtime';
@@ -116,27 +116,53 @@ export function relTo(cwd: string, p: string): string {
   return n;
 }
 
-function fileDiffText(d: FileDiff, cwd: string): string {
-  const path = relTo(cwd, d.path);
-  const a = d.status === 'added' ? '/dev/null' : `a/${d.oldPath ? relTo(cwd, d.oldPath) : path}`;
-  const b = d.status === 'deleted' ? '/dev/null' : `b/${path}`;
-  if (d.binary) return `--- ${a}\n+++ ${b}\n(a binary file)`;
-  const hunks = d.hunks.flatMap((h) => [`@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@`, ...h.lines]);
-  return [`--- ${a}`, `+++ ${b}`, ...hunks].join('\n');
+/** Yield the original unified diff one line at a time, including edits described by tool input. */
+function* diffLines(t: ToolItem, cwd: string): Generator<string> {
+  const diffs = t.result?.diff;
+  if (diffs?.length) {
+    for (const d of diffs) {
+      const path = relTo(cwd, d.path);
+      yield '--- ' + (d.status === 'added' ? '/dev/null' : 'a/' + (d.oldPath ? relTo(cwd, d.oldPath) : path));
+      yield '+++ ' + (d.status === 'deleted' ? '/dev/null' : 'b/' + path);
+      if (d.binary) yield '(a binary file)';
+      else for (const h of d.hunks) {
+        yield `@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@`;
+        yield* h.lines;
+      }
+    }
+    return;
+  }
+  const path = t.detail.path && relTo(cwd, t.detail.path);
+  if (!path) return;
+  const write = t.kind === 'write' && typeof t.detail.content === 'string';
+  if (!write && typeof t.detail.oldText !== 'string' && typeof t.detail.newText !== 'string') return;
+  yield write ? '--- /dev/null' : '--- a/' + path;
+  yield '+++ b/' + path;
+  yield '@@ @@';
+  function* marked(text: string, sign: string) {
+    for (let at = 0; ; ) {
+      const end = text.indexOf('\n', at);
+      yield sign + text.slice(at, end < 0 ? undefined : end);
+      if (end < 0 || end === text.length - 1) break;
+      at = end + 1;
+    }
+  }
+  if (write) yield* marked(t.detail.content!, '+');
+  else {
+    yield* marked(t.detail.oldText ?? '', '-');
+    yield* marked(t.detail.newText ?? '', '+');
+  }
 }
 
-/** One edit as a unified diff: its own diff when the agent reported one, else what its input says. */
-export function editText(t: ToolItem, cwd: string): string {
-  const diffs = t.result?.diff;
-  if (diffs?.length) return diffs.map((d) => fileDiffText(d, cwd)).join('\n');
-  const path = t.detail.path ? relTo(cwd, t.detail.path) : '';
-  if (!path) return '';
-  const lines = (s: string, mark: string) => s.replace(/\n$/, '').split('\n').map((l) => mark + l);
-  if (t.kind === 'write' && typeof t.detail.content === 'string') return [`--- /dev/null`, `+++ b/${path}`, '@@ @@', ...lines(t.detail.content, '+')].join('\n');
-  if (typeof t.detail.oldText === 'string' || typeof t.detail.newText === 'string') {
-    return [`--- a/${path}`, `+++ b/${path}`, '@@ @@', ...lines(t.detail.oldText ?? '', '-'), ...lines(t.detail.newText ?? '', '+')].join('\n');
+export function editText(t: ToolItem, cwd: string, limit = Infinity): string {
+  let out = '';
+  for (const line of diffLines(t, cwd)) {
+    if (out) out += '\n';
+    const room = limit - out.length;
+    out += line.slice(0, room);
+    if (line.length >= room) break;
   }
-  return '';
+  return out;
 }
 
 export interface BriefFile {
@@ -189,10 +215,10 @@ const fileLine = (f: BriefFile) => {
  * The checker's task: what the user asked, what the agent said when it finished, which files
  * changed and how. Compact: the request and the answer are capped, the diffs too (said when cut).
  */
-export function buildBrief(items: TimelineItem[], turnId: string, cwd: string, caps = BRIEF_CAPS): Brief | null {
+export function buildBrief(items: TimelineItem[], turnId: string, cwd: string, caps = BRIEF_CAPS, resolve = (edit: ToolItem) => edit): Brief | null {
   const slice = turnSlice(items, turnId);
   if (!slice) return null;
-  const edits = editsOf(items, slice.roots);
+  const edits = editsOf(items, slice.roots).filter(edit => edit.result?.diff?.length || edit.detail.path);
   const files = filesOf(edits, cwd);
   const request = slice.asks.map((u, i) => (i === 0 ? userText(u.text) : `(Added while it worked) ${userText(u.text)}`)).join('\n\n');
   const answer = [...slice.roots].reverse().find((i): i is TextItem => i.type === 'text' && !!i.text.trim())?.text ?? '';
@@ -202,13 +228,14 @@ export function buildBrief(items: TimelineItem[], turnId: string, cwd: string, c
   let cut = false;
   let left = 0;
   for (let i = 0; i < edits.length; i++) {
-    const text = editText(edits[i], cwd);
-    if (!text) continue;
-    if (cut) {
-      left++;
-      continue;
-    }
     const room = caps.diff - used;
+    if (cut || room <= 0) {
+      cut = true;
+      left += edits.length - i;
+      break;
+    }
+    const text = editText(resolve(edits[i]), cwd, room + 1);
+    if (!text) continue;
     if (text.length + 1 <= room) {
       parts.push(text);
       used += text.length + 1;
@@ -290,7 +317,7 @@ export class TurnChecks {
   constructor(private deps: CheckDeps) {}
 
   /** Starts a check of the turn `turnId` of `rt`; answers its step, or why it cannot. One at a time per turn. */
-  start(rt: SessionRuntime, turnId: string): { ok: boolean; itemId?: string; error?: string } {
+  start(rt: SessionRuntime, turnId: string, resolve?: (edit: ToolItem) => ToolItem): { ok: boolean; itemId?: string; error?: string } {
     const agent = checkerOf(rt.meta.provider);
     if (!agent) return { ok: false, error: 'This chat has no other agent to check with.' };
     const who = agentName(agent);
@@ -299,7 +326,7 @@ export class TurnChecks {
     const slice = turnSlice(rt.items, turnId);
     if (!slice) return { ok: false, error: 'That turn is no longer in the conversation.' };
     if (!slice.ended && this.deps.busy(rt)) return { ok: false, error: 'The turn is still running.' };
-    const brief = buildBrief(rt.items, turnId, rt.meta.cwd);
+    const brief = buildBrief(rt.items, turnId, rt.meta.cwd, BRIEF_CAPS, resolve);
     if (!brief?.files.length) return { ok: false, error: 'This turn changed no files.' };
 
     const root = rt.add<ToolItem>({

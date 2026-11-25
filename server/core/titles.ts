@@ -13,6 +13,7 @@ import type { SessionRuntime } from './runtime';
 
 /** What the small model gets: its instructions and one message. */
 export interface TitlePrompt {
+  purpose?: 'draft';
   system: string;
   user: string;
   /** The chat's folder (a one-shot agent runs there; it reads nothing of it). */

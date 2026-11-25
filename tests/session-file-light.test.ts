@@ -19,12 +19,13 @@ import { registerExport } from '../server/services/export';
 import { phoneDetail, phoneItem, registerPhone } from '../server/services/phone';
 import { beside, pairSecure } from './phone-wire';
 
-const workerFault = vi.hoisted(() => ({ enabled: false }));
+const workerFault = vi.hoisted(() => ({ enabled: false, pieces: 0 }));
 vi.mock('node:worker_threads', async importOriginal => {
   const threads = await importOriginal<typeof import('node:worker_threads')>();
   return { ...threads, Worker: class extends threads.Worker {
     constructor(script: string, options: import('node:worker_threads').WorkerOptions) {
       super(workerFault.enabled ? "throw new Error('reading worker stopped')" : script, options);
+      this.on('message', msg => { if (Array.isArray(msg?.rows)) workerFault.pieces++; });
     }
   } };
 });
@@ -34,6 +35,7 @@ const original = { ...READ };
 const marker = JSON.stringify(LIGHT).slice(1, -1);
 afterEach(() => {
   workerFault.enabled = false;
+  workerFault.pieces = 0;
   Object.assign(READ, original);
   vi.restoreAllMocks();
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true, maxRetries: 3 });
@@ -143,7 +145,9 @@ it('shares old-turn eligibility and uses the matching tail to find recent steps'
   const baseItems = [...alwaysWhole, ...items];
   writeFileSync(file('src'), '{"gen":42,"items":[\n' + baseItems.map(i => JSON.stringify(i)).join(',\n') + '\n],"todos":[]}');
   const files = new SessionFiles(file);
+  READ.part = 4096;
   const loaded = await files.loadAsync('src');
+  expect(workerFault.pieces).toBeGreaterThan(2);
   expect(loaded.items.slice(0, alwaysWhole.length)).toEqual(alwaysWhole);
   expect(loaded.items.filter(isLight).map(i => i.id)).toEqual(['u0', 's0', 's1', 'a1', 's2']);
   // A final tail truncates the base after the first turn. s0 is now recent.
@@ -217,7 +221,11 @@ it('sends the original attachment when the bridge retries an indexed message', a
     const send = vi.spyOn(handle, 'send').mockResolvedValue();
     await app['sendWithHandover'](rt, handle, item);
     expect(send.mock.calls[0][0]).toEqual(items[0]);
-    expect(isLight(rt.get('u0')!)).toBe(true);
+    expect(rt.get('u0')).toEqual(items[0]);
+    expect(rt.returnUntaken({ ids: new Set(['u0']) })).toBe(1);
+    expect(rt.queue[0].attachments).toEqual((items[0] as typeof item).attachments);
+    await app.store.flush();
+    expect(new Store(home).loadSession('src').queue?.[0].attachments).toEqual(rt.queue[0].attachments);
   } finally { await app.dispose(); }
 });
 
@@ -311,8 +319,12 @@ it('reads old edit hunks for a phone diff and the turn check brief', async () =>
     } finally { c.ws.close(); }
     const rt = app.runtime('src');
     expect(isLight(rt.get(edit.id)!)).toBe(true);
+    const read = vi.spyOn(app.store, 'wholeItem');
+    expect((await app.call('turn.check', { sessionId: 'src', turnId: 'missing' })).ok).toBe(false);
+    expect(read).not.toHaveBeenCalled();
     const check = await app.call('turn.check', { sessionId: 'src', turnId: 'u0' });
     expect(rt.get<ToolItem>(check.itemId!)?.detail.prompt).toContain('+new line for review');
+    expect(isLight(rt.get(edit.id)!)).toBe(true);
   } finally { await app.dispose(); }
 });
 
@@ -403,4 +415,63 @@ it('leaves malformed worker input unreadable without a synchronous retry', async
   await files.save('src', () => ({ items: [], todos: [], dirty: 'all' }));
   expect(readFileSync(file('src'), 'utf8')).toBe('{"gen":42,"items":[\n{"id":"bad"},\n');
   expect(sync).not.toHaveBeenCalled();
+});
+
+it.each([false, true])('keeps settled pictures in the last turn indexed, including after the turn ages (compact %s)', async compact => {
+  const { home, file, items } = fixture();
+  const last = items.find(i => i.id === 's5') as ToolItem;
+  last.result!.images = ['X'.repeat(64000)];
+  if (compact) writeFileSync(file('src'), JSON.stringify({ items, todos: [] }));
+  else writeFileSync(file('src'), '{"gen":42,"items":[\n' + items.map(i => JSON.stringify(i)).join(',\n') + '\n],"todos":[]}');
+  const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
+  try {
+    await app.call('session.snapshot', { sessionId: 'src' });
+    const rt = app.runtime('src');
+    expect(isLight(rt.get(last.id)!)).toBe(true);
+    expect(rt.get<ToolItem>(last.id)!.result?.images).toBeUndefined();
+    for (let n = 0; n < 3; n++) rt.add({ type: 'turn', durationMs: 1 });
+    expect(rt.get<ToolItem>(last.id)!.detail.command?.length).toBeLessThanOrEqual(400);
+    expect(app.store.wholeItem(rt.id, rt.get(last.id)!)).toEqual(last);
+  } finally { await app.dispose(); }
+});
+
+it('loads a cold queue.take through the asynchronous reader', async () => {
+  const { home, file } = fixture();
+  writeFileSync(file('src.tail'), JSON.stringify({ baseGen: 42, items: [], queue: [{ id: 'q', text: 'keep', createdAt: 1 }] }));
+  const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
+  const sync = vi.spyOn(app.store, 'loadSession');
+  try {
+    expect(await app.call('queue.take', { sessionId: 'src', id: 'q' })).toMatchObject({ message: { text: 'keep' } });
+    expect(sync).not.toHaveBeenCalled();
+  } finally { await app.dispose(); }
+});
+
+it('streams an existing oversized tail beside a small base in a worker', async () => {
+  const { file } = fixture();
+  READ.inWorkerAbove = 512 * 1024;
+  READ.tailStream = 1024;
+  const files = new SessionFiles(file);
+  const sync = vi.spyOn(files, 'load');
+  const suffix = { type: 'text', id: 'suffix', ts: 100, text: 'end'.repeat(200000) };
+  writeFileSync(file('src'), '{"gen":42,"items":[\n],"todos":[]}');
+  writeFileSync(file('src.tail'), JSON.stringify({ baseGen: 42, from: 0, items: [suffix] }));
+  expect((await files.loadAsync('src')).items).toEqual([suffix]);
+  expect(sync).not.toHaveBeenCalled();
+});
+
+it('releases a settled live picture once its own base commits', async () => {
+  const { home, items } = fixture();
+  READ.inWorkerAbove = Infinity;
+  const app = new App({ home, providers: [ctx => new DemoProvider(ctx)], quiet: true });
+  try {
+    await app.call('session.snapshot', { sessionId: 'src' });
+    const rt = app.runtime('src');
+    const step = rt.add<ToolItem>({ ...items[1] as ToolItem, id: 'new-picture', result: { images: ['B'.repeat(64000)] } });
+    rt.add({ type: 'turn', durationMs: 1 });
+    READ.inWorkerAbove = 1;
+    await app.store.flush();
+    expect(isLight(step)).toBe(true);
+    expect(step.result?.images).toBeUndefined();
+    expect((app.store.wholeItem(rt.id, step) as ToolItem).result?.images).toEqual(['B'.repeat(64000)]);
+  } finally { await app.dispose(); }
 });

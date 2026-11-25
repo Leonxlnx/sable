@@ -216,7 +216,7 @@ export const { cutItem, settled, headTail, headOnly } = timelineCut(RECENT, KEEP
 
 /** Private indexed-row metadata for phone summaries and provider input lookups. */
 export const LIGHT = '\0sable.baseStep';
-type LightItem = Extract<TimelineItem, { type: 'tool' | 'thinking' | 'user' }> & { [LIGHT]: { pictures: number; hunks: boolean; input?: true; legacyBackground?: true } };
+type LightItem = Extract<TimelineItem, { type: 'tool' | 'thinking' | 'user' }> & { [LIGHT]: { recent?: true; reread?: true; pictures: number; hunks: boolean; input?: true; legacyBackground?: true } };
 export function isLight(item: Partial<TimelineItem>): item is LightItem {
   return Object.hasOwn(item, LIGHT);
 }
@@ -229,7 +229,7 @@ export function recentStart(items: TimelineItem[], turns: number): number {
 }
 
 export const workerCut = {
-  factory: timelineCut.toString(), task: runsTask.toString(), boundary: recentStart.toString(),
+  factory: timelineCut.toString(), task: runsTask.toString(),
   recent: RECENT, old: OLD, keepFiles: KEEP_FILES, turns: RECENT_TURNS, mark: LIGHT,
 };
 
@@ -238,7 +238,7 @@ export function cutItems(items: TimelineItem[], whole?: (item: TimelineItem) => 
   const from = recentStart(items, RECENT_TURNS);
   return items.map((item, i) => {
     if (isLight(item)) {
-      if (whole && (i >= from || !settled(item))) return cutItem(whole(item), i < from ? OLD : RECENT);
+      if (whole && (!settled(item) || (i >= from) !== !!item[LIGHT].recent)) return cutItem(whole(item), i < from ? OLD : RECENT);
       const { [LIGHT]: _count, ...view } = item;
       return view;
     }

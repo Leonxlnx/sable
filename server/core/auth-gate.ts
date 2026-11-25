@@ -1,30 +1,32 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
+import { record, type AuthScope, type EndReason } from './auth-journal';
 import { PassThrough } from 'node:stream';
 import { isAuthFailure } from '../../shared/synthetic';
 
 /**
- * One gate per account, so Sable never makes two processes of one sign-in renew it at the same
- * moment, and never closes a process while it may be renewing it.
+ * Schedules Sable-owned starts per config folder. Refreshes inside a CLI and processes
+ * started outside the bridge are invisible to this gate.
  *
  * Why: Claude Code and Codex sign in with OAuth, and each renewal of the access token spends the
  * refresh token and hands out a new one. A process that renews and exits (or is killed) before it
- * wrote the new pair leaves the spent token on disk; the next process is refused (`invalid_grant`),
- * and Claude Code then blanks the stored sign-in, so every chat of that account reads "Not signed
- * in" at once. Claude Code serializes renewals across its processes with a lock, but the gap
- * between a renewal and its write stays, and bursts make it likely: Sable starts many processes
+ * wrote the new pair can leave a spent token in the folder and the next renewal can be refused.
+ * The bridge cannot observe how the CLI locks, persists or recovers a renewal. It starts processes
  * per account (one per chat, kept for Remote Control; prewarm; the capabilities and limits probes;
- * `auth status`; chat titles; commit drafts; checks) and after a wake from sleep every token has
- * expired and every timer fires at once.
+ * `auth status`; chat titles; commit drafts; checks). After a sleep, tokens may have expired and
+ * many timers can become due together.
  *
  * The rules (`GATE` has the numbers):
  * - Process starts of one config folder go one at a time: a start holds the gate until its process
  *   first answers on stdout and a short settle after it (its first request may renew the sign-in),
  *   at most `holdMs`. Two accounts never wait for each other.
  * - Auxiliary requests (a limits read, a sign-in status, a title or draft, which are starts too)
- *   take the same gate, so they never overlap each other nor a start of that account.
+ *   take the same gate. Established chats run independently. A standalone account reader
+ *   takes an auxiliary lease only on a quiet folder. Interactive dialogs serialize with each other.
  * - The gate is exclusive: a waiter never goes in beside what holds it (review wave 16, #9: a waiter's
  *   own deadline once let two starts in together). Waiters go in order, except that a chat's start
  *   goes ahead of auxiliary requests still waiting. What is bounded is the hold: a start gives the
@@ -33,8 +35,8 @@ import { isAuthFailure } from '../../shared/synthetic';
  *   hangs loses the gate when its lease ends, so no start waits for ever: a chat's start waits at
  *   most for the holder's remaining lease plus the starts ahead of it (usually a second or two).
  * - A process asked to close before it answered, or in its first seconds, is let go only once it
- *   answered and is `minLifeMs` old (at most `lingerMs` after the ask): its stdin closes then, and a
- *   kill waits for the same moment.
+ *   answered and is `minLifeMs` old. A responding process drains observable requests before kill.
+ *   Unresponsive startup and application quit have bounded waits.
  * - A timer that fires more than a minute late (the laptop slept) is a wake: for a while after it,
  *   work routed through `afterWake` is spread out (`spreadMs` apart, with jitter) instead of all at
  *   once.
@@ -69,7 +71,10 @@ const sleep = (ms: number) =>
 
 /** The gate's key for an agent's config folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`): one per sign-in store. */
 export function gateKey(provider: string, configDir: string): string {
-  return `${provider}:${path.resolve(configDir).replace(/[\\/]+$/, '').toLowerCase()}`;
+  let folder = path.resolve(configDir);
+  // Resolve directory junctions too. Only the directory name is resolved.
+  try { folder = realpathSync.native(folder); } catch { /* first launch may create it */ }
+  return `${provider}:${folder.replace(/[\\/]+$/, '').toLowerCase()}`;
 }
 
 /** The Claude Code config folder a process environment points at (the CLI's own default without one). */
@@ -91,6 +96,41 @@ export class AuthGate {
     private log: (...a: unknown[]) => void = () => {},
   ) {}
 
+  // A pending or live process prevents standalone reads. It never prevents a chat start.
+  private processes = new Map<string, number>();
+  private dialogs = new Map<string, () => void>();
+
+  canReadAlone(key: string) { return !this.processes.has(key); }
+
+  trackProcess(key: string) {
+    this.processes.set(key, (this.processes.get(key) ?? 0) + 1);
+    let tracked = true;
+    return () => {
+      if (!tracked) return;
+      tracked = false;
+      const remaining = this.processes.get(key)! - 1;
+      if (remaining) this.processes.set(key, remaining);
+      else this.processes.delete(key);
+    };
+  }
+
+  async claimDialog(key: string, scope: AuthScope, cancelled: () => boolean) {
+    if (this.dialogs.has(key)) record(scope, { event: 'wait', reason: scope.reason });
+    while (this.dialogs.has(key) && !cancelled()) await sleep(200);
+    if (cancelled()) return () => {};
+    // The reset console is the longest dialog (30 minutes). A lost exit must not
+    // retain this dialog slot indefinitely. A late close cannot release a newer slot.
+    const freeSlot = () => {
+      if (this.dialogs.get(key) === freeSlot) this.dialogs.delete(key);
+    };
+    const deadline = setTimeout(freeSlot, 30 * 60_000);
+    deadline.unref?.();
+    this.dialogs.set(key, freeSlot);
+    // A reset wrapper can outlive its dialog lease. Readers still defer until it exits.
+    const untrack = this.trackProcess(key);
+    return () => { clearTimeout(deadline); freeSlot(); untrack(); };
+  }
+
   /** Whether anything holds the gate of `key` now. */
   busy(key: string): boolean {
     return !!this.keys.get(key)?.held;
@@ -101,11 +141,14 @@ export class AuthGate {
    * returned release is called or the lease (`holdMs` for a start, `auxLeaseMs` otherwise) ends,
    * whichever is first. Never beside another holder. The release can be called any number of times.
    */
-  async enter(key: string, kind: 'start' | 'aux'): Promise<() => void> {
+  async enter(key: string, kind: 'start' | 'aux', scope?: AuthScope): Promise<() => void> {
+    this.checkClock();
+    if (scope && ['limits', 'status', 'caps', 'history'].includes(scope.reason)) await this.beforeRead();
     const st = this.keys.get(key) ?? { held: false, waiting: [] };
     this.keys.set(key, st);
     const asked = Date.now();
     if (st.held || st.waiting.length) {
+      if (scope) record(scope, { event: 'wait', reason: scope.reason });
       await new Promise<void>((go) => {
         const w = { kind, go };
         // A chat's start goes ahead of auxiliary requests that wait, behind starts that wait.
@@ -115,6 +158,11 @@ export class AuthGate {
       });
     }
     st.held = true;
+    this.checkClock();
+    // Reserve the wake slot when this folder can actually dispatch. Slots spent
+    // while waiting for other holders could all turn into starts in the same instant.
+    if (this.waking()) await this.pace(scope);
+    if (scope) record(scope, { event: 'enter', reason: scope.reason });
     const waitedMs = Date.now() - asked;
     this.trace.push({ key, kind, at: Date.now(), waitedMs });
     if (this.trace.length > 200) this.trace.splice(0, this.trace.length - 200);
@@ -122,6 +170,7 @@ export class AuthGate {
     const leave = () => {
       if (left) return;
       left = true;
+      if (scope) record(scope, { event: 'leave', reason: scope.reason });
       clearTimeout(lease);
       const next = st.waiting.shift();
       if (next) return next.go();
@@ -138,8 +187,8 @@ export class AuthGate {
   }
 
   /** Runs an auxiliary request with the gate of `key` held (in turn; see `enter`). */
-  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const leave = await this.enter(key, 'aux');
+  async run<T>(key: string, fn: () => Promise<T>, scope?: AuthScope): Promise<T> {
+    const leave = await this.enter(key, 'aux', scope);
     try {
       return await fn();
     } finally {
@@ -150,14 +199,40 @@ export class AuthGate {
   // ── wakes ──
 
   private wokeAt = 0;
-  private slots = 0;
+  private nextSlot = 0;
+  private wakeQueue: (() => void)[] = [];
+  private slotTimer?: NodeJS.Timeout;
+  private expected = 0;
+  private watchers = new Set<() => void>();
+  private heartbeat?: NodeJS.Timeout;
+
+  watchWake(fn: () => void) {
+    this.watchers.add(fn);
+    if (!this.heartbeat) {
+      this.expected = Date.now() + 5000;
+      this.heartbeat = setInterval(() => { this.checkClock(); this.expected = Date.now() + 5000; }, 5000);
+      this.heartbeat.unref?.();
+    }
+    return () => {
+      this.watchers.delete(fn);
+      if (!this.watchers.size) { clearInterval(this.heartbeat); this.heartbeat = undefined; this.expected = 0; }
+    };
+  }
+  private checkClock() {
+    if (this.expected && this.noteTimer(this.expected)) this.expected = Date.now() + 5000;
+  }
+  readsPaused() { this.checkClock(); return this.wokeAt > 0 && Date.now() - this.wokeAt < 30_000; }
+  async beforeRead() {
+    while (this.readsPaused()) await sleep(this.wokeAt + 30_000 - Date.now());
+  }
 
   /** A timer meant for `expectedAt` fired now: more than `lateMs` late is a wake. Returns whether it was. */
   noteTimer(expectedAt: number, now = Date.now()): boolean {
     if (now - expectedAt <= this.n.lateMs) return false;
-    if (now - this.wokeAt > this.n.wakeWindowMs) {
+    if (!this.wokeAt || expectedAt > this.wokeAt || now - this.wokeAt > this.n.wakeWindowMs) {
       this.wokeAt = now;
-      this.slots = 0;
+      this.nextSlot = now;
+      for (const watch of this.watchers) watch();
       this.log(`auth gate: a timer fired ${Math.round((now - expectedAt) / 1000)} s late; spreading the catch-up`);
     }
     return true;
@@ -176,10 +251,33 @@ export class AuthGate {
   afterWake(fn: () => void, expectedAt?: number, now = Date.now()): void {
     if (expectedAt !== undefined) this.noteTimer(expectedAt, now);
     if (!this.waking(now)) return fn();
-    const slot = this.slots++;
-    const at = this.wokeAt + slot * this.n.spreadMs + Math.random() * this.n.jitterMs;
-    const t = setTimeout(fn, Math.max(0, at - now));
-    t.unref?.();
+    this.wakeQueue.push(fn);
+    this.scheduleSlot(now);
+  }
+
+  private async pace(scope?: AuthScope) {
+    // A second sleep can interrupt either wait. Recheck before starting the lease.
+    let wake: number;
+    do {
+      wake = this.wokeAt;
+      if (scope && ['limits', 'status', 'caps', 'history'].includes(scope.reason)) await this.beforeRead();
+      await new Promise<void>(resolve => this.afterWake(resolve));
+      this.checkClock();
+    } while (this.wokeAt !== wake);
+  }
+
+  private scheduleSlot(now: number) {
+    if (this.slotTimer || !this.wakeQueue.length) return;
+    const at = Math.max(now, this.nextSlot) + Math.random() * this.n.jitterMs;
+    this.slotTimer = setTimeout(() => {
+      this.slotTimer = undefined;
+      const fired = Date.now();
+      this.noteTimer(at, fired);
+      this.nextSlot = fired + this.n.spreadMs;
+      try { this.wakeQueue.shift()?.(); }
+      finally { this.scheduleSlot(fired); }
+    }, Math.max(0, at - now));
+    this.slotTimer.unref?.();
   }
 
   /** A small offset per key, the same every time, so timers of different accounts do not line up. */
@@ -197,8 +295,8 @@ export class AuthGate {
    * only by the linger rule above. `stderr`: what the SDK's own spawner would hand the options'
    * callback.
    */
-  spawner(stderr?: (data: string) => void, keyOf: (env: SpawnRequest['env']) => string = (env) => gateKey('claude', claudeHomeOf(env))) {
-    return (o: SpawnRequest): GatedProcess => new GatedProcess(this, keyOf(o.env), o, stderr);
+  spawner(stderr?: (data: string) => void, keyOf: (env: SpawnRequest['env']) => string = (env) => gateKey('claude', claudeHomeOf(env)), scope?: AuthScope) {
+    return (o: SpawnRequest): GatedProcess => new GatedProcess(this, keyOf(o.env), o, stderr, scope);
   }
 }
 
@@ -225,25 +323,37 @@ export class GatedProcess extends EventEmitter {
   private answered = false;
   private bornAt = 0;
   private leave?: () => void;
+  private untrack?: () => void;
   private closing?: { at: number; signal?: NodeJS.Signals };
   private _exitCode: number | null = null;
   private _signal: NodeJS.Signals | null = null;
   private _killed = false;
+
+  private controls = new Set<string>();
+  private callbacks = new Set<string>();
+  private inputs = 0;
+  private endEvent?: (reason: EndReason, inFlight: boolean) => void;
+  endReason?: EndReason;
+  get pending() { return !!(this.controls.size || this.callbacks.size || this.inputs); }
+  get pid() { return this.child?.pid; }
 
   constructor(
     private gate: AuthGate,
     readonly key: string,
     private o: SpawnRequest,
     private stderr?: (data: string) => void,
+    private scope?: AuthScope,
   ) {
     super();
+    if (scope) this.scope = { ...scope }; // Each physical launch gets its own PID.
     // Errors are reported through 'error' listeners the SDK adds; none must throw meanwhile.
     this.on('error', () => {});
     // Closed before the start: nothing to carry over. After it: once all that was written reached the process.
     this.stdin.on('finish', () => !this.child && this.askClose());
     this.stdin.on('end', () => this.askClose());
     o.signal?.addEventListener('abort', () => this.askClose('SIGTERM'), { once: true });
-    void this.start();
+    if (o.signal?.aborted) { queueMicrotask(() => this.askClose('SIGTERM')); return; }
+    void this.start().catch(err => { this.emit('error', err); this.exited(1, null); });
   }
 
   get killed() {
@@ -263,42 +373,62 @@ export class GatedProcess extends EventEmitter {
   }
 
   private async start() {
-    const leave = await this.gate.enter(this.key, 'start');
+    const reader = this.scope?.reason === 'limits' || this.scope?.reason === 'caps';
+    if (!reader) this.untrack = this.gate.trackProcess(this.key);
+    const leave = await this.gate.enter(this.key, reader ? 'aux' : 'start', this.scope);
     this.leave = leave;
-    if (this.cancelled) return leave();
-    // Held until the first answer and a settle; the gate's lease ends it at holdMs whatever happens.
-    const hold = setTimeout(leave, this.gate.n.holdMs);
-    hold.unref?.();
+    if (this.cancelled || this.scope?.closing?.()) { leave(); return this.exited(null, null); }
+    if (reader) {
+      if (!this.gate.canReadAlone(this.key)) { leave(); throw new Error('Standalone read deferred'); }
+      this.untrack = this.gate.trackProcess(this.key);
+    }
     let child: ChildProcess;
     try {
       child = spawn(this.o.command, this.o.args, { cwd: this.o.cwd, env: this.o.env as NodeJS.ProcessEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     } catch (err) {
-      clearTimeout(hold);
       leave();
       this.emit('error', err as Error);
       return this.exited(1, null);
     }
     this.child = child;
     this.bornAt = Date.now();
+    if (this.scope && child.pid) this.endEvent = this.scope.journal?.started(this.scope, this.key, child.pid, () => this.pending, this.bornAt);
     this.stdin.pipe(child.stdin!, { end: false });
+    // Keep protocol IDs and a count. Never put frame contents into the journal.
+    const requests = createInterface({ input: this.stdin });
+    const replies = createInterface({ input: child.stdout! });
+    const frame = (line: string, incoming: boolean) => {
+      if (!/"(?:control_request|control_response|control_cancel_request|user|result|session_state_changed)"/.test(line)) return;
+      try {
+        const m = JSON.parse(line);
+        if (m.type === 'control_request' && typeof m.request_id === 'string') (incoming ? this.callbacks : this.controls).add(m.request_id);
+        if (m.type === 'control_response') (incoming ? this.controls : this.callbacks).delete(m.response?.request_id);
+        if (incoming && m.type === 'control_cancel_request') this.callbacks.delete(m.request_id);
+        if (!incoming && m.type === 'user') this.inputs++;
+        if (incoming && m.type === 'result') this.inputs = Math.max(0, this.inputs - 1);
+        if (incoming && m.subtype === 'session_state_changed' && m.state === 'idle') this.inputs = 0;
+        if (!this.pending) this.closeIfDue();
+      } catch { /* a CLI can write plain text */ }
+    };
+    requests.on('line', line => frame(line, false));
+    replies.on('line', line => frame(line, true));
+    this.once('exit', () => { requests.close(); replies.close(); });
     child.stdin?.on('error', () => {});
     child.stdout?.on('data', (d: Buffer) => {
       if (!this.answered) {
         this.answered = true;
-        const settle = setTimeout(() => (clearTimeout(hold), leave()), this.gate.n.settleMs);
-        settle.unref?.();
+        if (!reader) setTimeout(leave, this.gate.n.settleMs).unref?.();
         this.closeIfDue();
       }
       this.stdout.write(d);
     });
     child.stderr?.on('data', (d: Buffer) => this.stderr?.(d.toString()));
     child.on('error', (err) => {
-      clearTimeout(hold);
       leave();
       this.emit('error', err);
+      if (child.pid === undefined) this.exited(1, null);
     });
     child.on('exit', (code, signal) => {
-      clearTimeout(hold);
       leave();
       this.exited(code, signal);
     });
@@ -308,6 +438,8 @@ export class GatedProcess extends EventEmitter {
   private exited(code: number | null, signal: NodeJS.Signals | null) {
     if (this.ended) return;
     this.ended = true;
+    this.endEvent?.(this.endReason ?? (this.closing ? this._killed || this.closing.signal ? 'abort' : 'eof' : code === 0 ? 'exit' : 'error'), this.pending);
+    this.untrack?.();
     this._exitCode = code;
     this._signal = signal;
     this.stdout.end();
@@ -324,9 +456,14 @@ export class GatedProcess extends EventEmitter {
       return this.exited(null, signal ?? null);
     }
     const first = !this.closing;
+    if (signal) this.endReason ??= 'abort';
     this.closing = { at: this.closing?.at ?? Date.now(), signal: signal ?? this.closing?.signal };
     if (first) {
-      const t = setTimeout(() => this.closeNow(), this.gate.n.lingerMs);
+      const t = setTimeout(() => {
+        // A silent startup still has a deadline. A known request on a responding
+        // process owns the transport until its reply, including after SDK abort.
+        if (!this.answered || !this.pending || this.scope?.closing?.()) this.closeNow();
+      }, this.gate.n.lingerMs);
       t.unref?.();
     }
     this.closeIfDue();
@@ -335,7 +472,13 @@ export class GatedProcess extends EventEmitter {
   private closeIfDue() {
     if (!this.closing || !this.child || this.ended) return;
     const age = Date.now() - this.bornAt;
-    if (this.answered && age >= this.gate.n.minLifeMs) return this.closeNow();
+    if (this.answered && age >= this.gate.n.minLifeMs) {
+      if (!this.pending) return this.closeNow();
+      // For string prompts EOF is the end of the prompt. The CLI still returns its
+      // result on stdout. Never forward a kill here while it owes that result.
+      if ((this.scope?.reason === 'title' || this.scope?.reason === 'draft') && !this.controls.size && !this.callbacks.size && !this.child.stdin?.writableEnded) this.child.stdin?.end();
+      return;
+    }
     if (this.answered) {
       const t = setTimeout(() => this.closeIfDue(), this.gate.n.minLifeMs - age);
       t.unref?.();
@@ -379,6 +522,7 @@ export function refusedForSignIn(error?: string, texts: readonly (string | undef
 
 interface Refusal {
   at: number;
+  observed?: boolean;
   /** The person's message whose turn was running when it happened (the chat's last one then). */
   turn?: string;
   /** Steps of the chat's sub-agents and background tasks that were refused with it (their titles). */
@@ -392,9 +536,13 @@ const refusals = new Map<string, Refusal>();
  * `turn`: the message whose turn it happened in). A refusal noted in an earlier turn does not count for
  * a later one: it starts over.
  */
-export function noteAuthFailure(chatId: string, step?: string, turn?: string) {
+export function noteAuthFailure(chatId: string, step?: string, turn?: string, scope?: AuthScope, pid?: number) {
   const known = refusals.get(chatId);
   const r: Refusal = known && known.turn === turn ? known : { at: Date.now(), turn, background: [] };
+  if (scope?.journal) {
+    record(scope, { event: 'refused', pid });
+    r.observed = true;
+  }
   if (step && !r.background.includes(step) && r.background.length < 12) r.background.push(step.slice(0, 120));
   refusals.set(chatId, r);
 }
@@ -419,14 +567,14 @@ export function resetAuthFailures() {
 
 export interface SignInCheckOptions {
   /** Asks the agent's CLI whether the account is signed in now (fresh: not a cached answer). */
-  ask: (provider: string, accountId: string) => Promise<boolean>;
+  ask: (provider: string, accountId: string) => Promise<boolean | undefined>;
   /** The moment waited before asking (a sibling process may still be writing the renewed sign-in). */
   delayMs?: number | (() => number);
 }
 
 /** The checks after a refusal and the chats that wait for an account's sign-in. */
 export class SignInChecks {
-  private inflight = new Map<string, Promise<boolean>>();
+  private inflight = new Map<string, Promise<boolean | undefined>>();
   private waits = new Map<string, Map<string, string[]>>();
   /** Chats sent once more after a refusal, by the message sent (never twice for one message). */
   private retried = new Set<string>();
@@ -434,14 +582,14 @@ export class SignInChecks {
   constructor(private o: SignInCheckOptions) {}
 
   /** Whether the account is signed in, asked once for every chat refused meanwhile. */
-  check(provider: string, accountId: string): Promise<boolean> {
+  check(provider: string, accountId: string): Promise<boolean | undefined> {
     const key = `${provider}:${accountId}`;
     const running = this.inflight.get(key);
     if (running) return running;
     const delay = typeof this.o.delayMs === 'function' ? this.o.delayMs() : this.o.delayMs;
     const run = sleep(delay ?? 1500)
       .then(() => this.o.ask(provider, accountId))
-      .catch(() => false)
+      .catch(() => undefined)
       .finally(() => this.inflight.delete(key));
     this.inflight.set(key, run);
     return run;

@@ -66,6 +66,21 @@ describe('keep awake', () => {
 });
 
 describe('keep awake for background commands', () => {
+  it('releases sleep after a command starts serving and stays quiet as another server starts', () => {
+    vi.useFakeTimers();
+    const { src, add, set } = source();
+    const chat = add('idle');
+    const calls: boolean[] = [];
+    const stop = watchAwake(src, busy => calls.push(busy));
+    chat.newestCommandAt = Date.now();
+    set(chat, { commands: 1 });
+    set(chat, { commands: 0, serving: 1 });
+    vi.advanceTimersByTime(60_000);
+    set(chat, { serving: 2 });
+    expect(calls).toEqual([true, false]);
+    stop();
+  });
+
   it('a command the agent waits on keeps the computer up, until it is two hours old', () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);

@@ -185,9 +185,11 @@ describe('a Claude process let go (5)', () => {
     const h = await claudeChat();
     h.rt.add({ type: 'user', text: 'first', state: 'sent', id: 'u1', ts: Date.now() } as never);
     h.rt.add<ToolItem>(agent('a1'));
-    h.rt.add({ type: 'user', text: 'second', state: 'sent', id: 'u2', ts: Date.now() } as never);
+    // This is a native rewind with a known predecessor in the conversation being kept.
+    h.session.chain = ['native-first', 'native-second'];
+    h.rt.add({ type: 'user', text: 'second', state: 'sent', id: 'u2', providerId: 'native-second', ts: Date.now() } as never);
     expect(h.rt.meta.background).toBe(1);
-    await h.app.call('session.rewind', { sessionId: h.rt.id, itemId: 'u2', restoreFiles: false });
+    expect(await h.app.call('session.rewind', { sessionId: h.rt.id, itemId: 'u2', restoreFiles: false })).toMatchObject({ ok: true });
     expect(h.rt.get<ToolItem>('a1')?.result?.agent?.background).toBe('stopped');
     expect(h.rt.meta.background).toBe(0);
   });

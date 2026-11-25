@@ -2006,6 +2006,7 @@ const outlive: Scenario = async ({ s }) => {
     return t;
   };
   const server = await command('b7dev01', 'pnpm dev', 'Start the dev server');
+  s.patchTool(server, { output: 'Local: http://localhost:3311/\n' });
   const watcher = await command('b7tst02', 'pnpm test --watch', 'Watch the tests');
   const monitor = await s.tool({ name: 'Monitor', kind: 'other', title: 'Watch the build', detail: { description: 'Watch the build' }, input: { description: 'Watch the build' } });
   s.start(monitor);
@@ -2063,7 +2064,7 @@ const outlive: Scenario = async ({ s }) => {
     if (wake) rt.beginTurn('Reading the test results', { keepHold: true });
     rt.add<UserItem>({ type: 'user', state: 'sent', text: taskNote({ id: 'b7tst02', toolUseId: watcher, status: 'completed', summary: 'Background command "Watch the tests" completed (exit code 0)', outputFile: path.join(tasks, 'b7tst02.output') }) });
     at(1_400, () => {
-      rt.add<TextItem>({ type: 'text', text: 'The test watcher is done: 214 passed. The workflow, the build monitor and the dev server are still at work.', streaming: false });
+      rt.add<TextItem>({ type: 'text', text: 'The test watcher is done: 214 passed. The workflow and build monitor are still working. The dev server is serving localhost:3311.', streaming: false });
       if (wake) {
         rt.add<TurnItem>({ type: 'turn', durationMs: 1_400, stopReason: 'end_turn' });
         rt.endTurn();

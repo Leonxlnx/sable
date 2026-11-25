@@ -60,7 +60,7 @@ export interface CliResult {
 export function runCli(
   cmd: string,
   args: string[],
-  opts: { cwd?: string; timeoutMs?: number; input?: string; maxBytes?: number; env?: NodeJS.ProcessEnv } = {},
+  opts: { cwd?: string; timeoutMs?: number; input?: string; maxBytes?: number; env?: NodeJS.ProcessEnv; keepAliveOnTimeout?: boolean; started?: (child: ChildProcess) => void; timedOut?: () => void } = {},
 ): Promise<CliResult> {
   return new Promise((resolve) => {
     let stdout = '';
@@ -70,6 +70,7 @@ export function runCli(
     let child: ChildProcess;
     try {
       child = spawnCli(cmd, args, { cwd: opts.cwd, env: opts.env });
+      opts.started?.(child);
     } catch {
       resolve({ code: null, stdout, stderr, missing: true });
       return;
@@ -81,7 +82,8 @@ export function runCli(
       resolve({ code, stdout, stderr, missing });
     };
     const timer = setTimeout(() => {
-      killTree(child);
+      opts.timedOut?.();
+      if (!opts.keepAliveOnTimeout) killTree(child);
       finish(null);
     }, opts.timeoutMs ?? 15_000);
     child.stdout?.on('data', (d) => {

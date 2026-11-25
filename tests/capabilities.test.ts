@@ -97,6 +97,8 @@ describe('start-up cache', () => {
     expect(info1 && info1.type === 'provider.updated' && info1.provider.version).toBe('2.1');
     const caps1 = await first.app.call('provider.caps', { provider: 'claude', cwd: home });
     expect(caps1.models.map((m) => m.id)).toEqual(['opus', 'haiku']);
+    // A recently used account is eligible for the passive refresh on the next start.
+    await first.app.call('session.create', { provider: 'claude', cwd: home });
     await first.app.dispose();
 
     // Second start: answers from disk without waiting for the agent, which is slow (far slower here

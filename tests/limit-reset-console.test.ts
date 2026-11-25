@@ -7,7 +7,7 @@
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_ACCOUNT, type BridgeEvent, type NoticeItem, type RateLimit, type ResetRun, type TimelineItem } from '@shared/protocol';
 import { App } from '../server/app';
 import { clearedWindows, fullWindows, ResetConsoles, type ResetConsoleHost, type ResetReading } from '../server/core/reset-console';
@@ -418,6 +418,35 @@ describe('a reset: only a fresh reading after the dialog counts (review wave 8, 
 });
 
 describe('a reset: Cancel, closing Sable and a window that does not close (review wave 8, #20)', () => {
+  it('a known reset wrapper gets its minimum lifetime and its folder stays reserved through exit', async () => {
+    vi.useFakeTimers();
+    let exit!: () => void;
+    let asked = 0;
+    const opened = () => ({ pid: 1234, closed: new Promise<void>(resolve => { exit = resolve; }), close: () => { asked++; } });
+    const first = controller({ open: opened, closeGraceMs: 20 });
+    const next = controller({ open: opened });
+    try {
+      expect(await first.c.start('claude', 'w')).toEqual({ ok: true });
+      first.c.cancel('claude', 'w');
+      const waiting = next.c.start('claude', 'w');
+      let ready = false;
+      void waiting.then(() => { ready = true; });
+      await vi.advanceTimersByTimeAsync(2999);
+      expect(asked).toBe(0);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(asked).toBe(1);
+      expect(ready).toBe(false);
+      exit();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(await waiting).toEqual({ ok: true });
+      exit();
+    } finally {
+      first.c.dispose();
+      next.c.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it('Cancel while the limits are read first opens no window', async () => {
     let release!: (r: ResetReading) => void;
     const h = controller({ known: () => ({ limits: [], signIn: 0 }), read: () => new Promise((r) => (release = r)) });

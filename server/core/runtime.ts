@@ -12,6 +12,7 @@ import type {
   QuestionRequest,
   SessionMeta,
   SessionSnapshot,
+  TaskMark,
   TimelineItem,
   Todo,
   ToolItem,
@@ -19,7 +20,7 @@ import type {
 } from '../../shared/protocol';
 import type { ProviderSession } from '../providers/types';
 import { isCompactOutput, userText } from '../../shared/synthetic';
-import { runsTask, worksInBackground } from '../../shared/background';
+import { runsTask, taskServing, worksInBackground } from '../../shared/background';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
 import { backgroundAgentName } from './limit-policy';
 
@@ -263,12 +264,20 @@ export class SessionRuntime {
     this.index = new Map(items.map((i) => [i.id, i]));
     this.working.clear();
     this.running.clear();
+    this.serving.clear();
     this.lost.clear();
     this.taskSteps.clear();
     for (const i of items) {
       if (worksInBackground(i)) this.working.add(i.id);
       this.trackTask(i);
-      if (runsTask(i)) this.running.add(i.id);
+      if (runsTask(i)) {
+        const serving = taskServing(i);
+        if (serving) {
+          i.task = { ...i.task, serving };
+          this.serving.set(i.id, i.task);
+        }
+        this.running.add(i.id);
+      }
     }
     // As read: whoever loads gets the whole chat next (a snapshot), so nothing is announced here.
     Object.assign(this.meta, this.taskCounts());
@@ -278,8 +287,9 @@ export class SessionRuntime {
 
   /** Steps whose sub-agent or workflow still works in the background (`SessionMeta.background` is their count). */
   private working = new Set<string>();
-  /** Steps whose background command or monitor still runs (`SessionMeta.commands` is their count). */
+  /** All live command steps, including the subset that serves. */
   private running = new Set<string>();
+  private serving = new Map<string, TaskMark>();
   /** The step of each task the chat has seen, by the agent's own task id. */
   private taskSteps = new Map<string, string>();
   /** Steps whose lost-task note has yet to reach the agent. */
@@ -303,7 +313,10 @@ export class SessionRuntime {
     this.trackTask(item);
     const works = worksInBackground(item);
     const runs = runsTask(item);
-    if (works === this.working.has(item.id) && runs === this.running.has(item.id)) return;
+    const serves = runs && item.task.serving ? item.task : undefined;
+    if (works === this.working.has(item.id) && runs === this.running.has(item.id) && serves === this.serving.get(item.id)) return;
+    if (serves) this.serving.set(item.id, serves);
+    else this.serving.delete(item.id);
     if (works) this.working.add(item.id);
     else this.working.delete(item.id);
     if (runs) this.running.add(item.id);
@@ -319,33 +332,60 @@ export class SessionRuntime {
     this.publishTaskCounts();
   }
 
+  /** SDK task lists can arrive before the step or once more after its end. */
+  private reportedMark(task: ReportedTask) {
+    const id = this.taskSteps.get(task.id) ?? task.itemId;
+    return id ? this.get<ToolItem>(id)?.task : undefined;
+  }
+
   private taskCounts() {
     let background = this.working.size;
-    let commands = this.running.size;
+    const serving = this.serving.size;
+    let commands = this.running.size - serving;
     for (const task of this.reportedTasks) {
       if (task.agent) {
         if (!task.itemId || !this.working.has(task.itemId)) background++;
-      } else if (!this.running.has(this.taskSteps.get(task.id) ?? task.itemId ?? '')) commands++;
+      } else if (!this.reportedMark(task)) commands++;
     }
-    return { background, commands };
+    let servingSince: number | undefined;
+    let servingAddress: string | undefined;
+    for (const task of this.serving.values()) {
+      servingSince = Math.min(servingSince ?? task.since, task.since);
+      if (serving === 1 && typeof task.serving === 'string') servingAddress = task.serving;
+    }
+    return { background, commands, serving, servingSince, servingAddress };
   }
 
   private publishTaskCounts() {
-    const { background, commands } = this.taskCounts();
+    const counts = this.taskCounts();
+    const { background, commands, serving } = counts;
     const agentsDone = !!this.meta.background && !background;
-    const commandsDone = !!this.meta.commands && !commands;
-    this.update({ background, commands });
+    const commandsDone = !!(this.meta.commands || this.meta.serving) && !commands && !serving;
+    this.update(counts);
     if (!this.turnActive && !background && (agentsDone || commandsDone)) this.onRest?.(this);
   }
 
-  /** When the youngest background command or monitor still running began; undefined when none runs. */
-  get newestCommandAt(): number | undefined {
+  /** The most recent start used for sleep and updates excludes serving. Moves protect every process. */
+  get newestCommandAt() { return this.commandTime(false); }
+  get newestProcessCommandAt() { return this.commandTime(true); }
+
+  taskServes(id: string): boolean {
+    const step = this.taskSteps.get(id);
+    return step !== undefined && this.serving.has(step);
+  }
+
+  private commandTime(includeServing: boolean): number | undefined {
     let at: number | undefined;
     for (const id of this.running) {
       const i = this.index.get(id);
-      if (runsTask(i)) at = Math.max(at ?? 0, i.task.since);
+      if (runsTask(i) && (includeServing || !i.task.serving)) at = Math.max(at ?? 0, i.task.since);
     }
-    for (const t of this.reportedTasks) if (!t.agent && t.since !== undefined) at = Math.max(at ?? 0, t.since);
+    for (const t of this.reportedTasks) {
+      if (t.agent || t.since === undefined) continue;
+      const mark = this.reportedMark(t);
+      if (mark && (mark.state !== 'running' || (!includeServing && mark.serving))) continue;
+      at = Math.max(at ?? 0, t.since);
+    }
     return at;
   }
 
@@ -376,7 +416,7 @@ export class SessionRuntime {
     if (item?.type !== 'tool' || item.task?.id !== taskId) return;
     const t = item.task;
     if (t.state !== 'running' && t.state !== 'lost') return;
-    this.patch<ToolItem>(item.id, { task: { id: t.id, kind: t.kind, state, since: t.since, endedAt: Math.max(at ?? Date.now(), t.since) } });
+    this.patch<ToolItem>(item.id, { task: { id: t.id, kind: t.kind, state, since: t.since, ...(t.serving && { serving: t.serving }), endedAt: Math.max(at ?? Date.now(), t.since) } });
   }
 
   /**
@@ -654,7 +694,10 @@ export class SessionRuntime {
       (!!opts.ids || i.state === 'queued' && (opts.all || !!i.steered)));
     if (!untaken.length) return 0;
     if (opts.holdQueue) this.unreadQueueHeld = true;
-    for (const u of untaken) this.remove(u.id);
+    for (const u of untaken) {
+      this.promote?.(u);
+      this.remove(u.id);
+    }
     this.requeue(untaken.map((u) => ({ id: u.id, text: u.text, attachments: u.attachments, createdAt: u.ts, ...(opts.byHand?.has(u.id) ? { byHand: true } : {}) })));
     if (opts.reason) {
       const one = untaken.length === 1;
@@ -678,6 +721,10 @@ export class SessionRuntime {
   add<T extends TimelineItem>(item: NewItem<T>): T {
     const full = { ...item, id: item.id ?? randomUUID(), ts: item.ts ?? Date.now() } as unknown as T;
     if (full.type === 'tool' && full.kind === 'share' && full.status === 'done' && !full.handed) full.handed = this.hand(full);
+    if (runsTask(full)) {
+      const serving = taskServing(full);
+      if (serving) full.task = { ...full.task, serving };
+    }
     this.items.push(full);
     this.index.set(full.id, full);
     this.markDirty(full.id);
@@ -687,6 +734,9 @@ export class SessionRuntime {
     this.trackBackground(full);
     return full;
   }
+
+  /** Restore a disk-backed row in place before interpreting an authoritative provider replacement. */
+  promote?: (item: TimelineItem) => TimelineItem;
 
   get<T extends TimelineItem = TimelineItem>(id: string): T | undefined {
     return this.index.get(id) as T | undefined;
@@ -699,6 +749,14 @@ export class SessionRuntime {
     this.markDirty(id);
     this.emit({ type: 'item.delta', sessionId: this.id, id, field, delta });
     this.onDirty(this, 'items');
+    const step = this.index.get(id);
+    if (field === 'output' && runsTask(step) && step.task.kind === 'command') {
+      // Include the preceding partial line when a banner crosses a stream boundary.
+      const output = step.output ?? '';
+      const from = Math.max(0, output.length - delta.length - 4096);
+      const serving = taskServing(step, output.slice(from), {});
+      if (serving && serving !== step.task.serving) this.patch<ToolItem>(id, { task: { ...step.task, serving } });
+    }
   }
 
   patch<T extends TimelineItem>(id: string, patch: Partial<T>) {
@@ -714,7 +772,18 @@ export class SessionRuntime {
     if (item.type === 'tool' && item.kind === 'share' && (patch as Partial<ToolItem>).status === 'done' && item.status !== 'done' && !item.handed) {
       patch = { ...patch, handed: this.hand({ ...item, ...(patch as Partial<ToolItem>) }) };
     }
+    const previous = item.type === 'tool' ? item.task : undefined;
     Object.assign(item, patch);
+    if (item.type === 'tool' && item.task && ('task' in patch || 'detail' in patch || 'output' in patch || 'result' in patch)) {
+      const previousServing = previous?.id === item.task.id ? previous.serving : undefined;
+      const mark = item.task;
+      if (previousServing && !mark.serving) item.task = { ...mark, serving: previousServing };
+      if (mark.state === 'running' && (!item.task.serving || 'output' in patch || 'result' in patch)) {
+        const serving = taskServing(item);
+        if (serving && serving !== item.task.serving) item.task = { ...item.task, serving };
+      }
+      if (item.task !== mark) patch = { ...patch, task: item.task };
+    }
     this.markDirty(id);
     this.emit({ type: 'item.patch', sessionId: this.id, id, patch: patch as Partial<TimelineItem> });
     this.onDirty(this, 'items');
@@ -873,6 +942,7 @@ export class SessionRuntime {
     for (const g of gone) {
       had = this.working.delete(g) || had;
       ran = this.running.delete(g) || ran;
+      this.serving.delete(g);
       this.lost.delete(g);
     }
     for (const [task, step] of [...this.taskSteps]) if (gone.has(step)) this.taskSteps.delete(task);
@@ -882,12 +952,14 @@ export class SessionRuntime {
   reset(items: TimelineItem[]) {
     const before = this.meta.background ?? 0;
     const commands = this.meta.commands ?? 0;
+    const { serving, servingSince, servingAddress } = this.meta;
     this.load(items, this.todos);
     this.emit({ type: 'timeline.reset', sessionId: this.id, items: items.map((i) => ({ ...i })) });
     this.onDirty(this, 'items');
     // Re-publish the effective counts after the silent load.
     this.meta.background = before;
     this.meta.commands = commands;
+    Object.assign(this.meta, { serving, servingSince, servingAddress });
     this.publishTaskCounts();
   }
 

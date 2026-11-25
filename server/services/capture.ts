@@ -19,6 +19,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { BridgeEvent, CaptureView, TimelineItem, ToolItem, TurnCapture } from '../../shared/protocol';
+import { localPages } from '../../shared/dev-url';
 import { syntheticOf } from '../../shared/synthetic';
 import type { App } from '../app';
 import { BrowserCapturer, CELL, findBrowser, type Capturer, type Picture } from './capture-browser';
@@ -27,27 +28,7 @@ import { anyPageHeld } from './sign-ins';
 
 // ───────────────────────────── local pages in text ─────────────────────────────
 
-// eslint-disable-next-line no-control-regex
-const ANSI = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
-const LOCAL_URL = /https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|(?:[a-z0-9-]+\.)+localhost)(?::\d{2,5})?(?:[/?#][^\s'"`<>)\]}]*)?/gi;
-
-/** Local http(s) pages in `text`, first mention first (the rule of the timeline's Preview: a bare host needs a port). */
-export function localPages(text: string | undefined): string[] {
-  if (!text || !text.includes('://')) return [];
-  const out: string[] = [];
-  for (const m of text.replace(ANSI, '').matchAll(LOCAL_URL)) {
-    const raw = m[0].replace(/[.,;:!?*_]+$/, '').replace(/^(https?:\/\/)0\.0\.0\.0/i, '$1localhost');
-    let u: URL;
-    try {
-      u = new URL(raw);
-    } catch {
-      continue;
-    }
-    if (!u.port && !u.hostname.endsWith('.localhost')) continue;
-    if (!out.includes(u.href)) out.push(u.href);
-  }
-  return out;
-}
+export { localPages } from '../../shared/dev-url';
 
 /** Only pages on this machine are ever captured. */
 export function isLocalPage(url: string | undefined): url is string {

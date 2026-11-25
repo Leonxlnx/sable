@@ -31,6 +31,13 @@ function fresh(...metas: SessionMeta[]) {
 }
 
 describe('the rule: what a chat says', () => {
+  it('serving is quiet and does not hold a finished turn notification', () => {
+    const a = fresh(meta('c', { status: 'running' }));
+    expect(a.feed({ type: 'session.updated', id: 'c', patch: { serving: 1 } })).toEqual([]);
+    expect(a.feed(status('c', 'idle'))).toMatchObject([{ kind: 'finished' }]);
+    expect(a.feed({ type: 'session.updated', id: 'c', patch: { serving: 0 } })).toEqual([]);
+  });
+
   it('a turn the person began says it finished, with the answer s first sentence', () => {
     const a = fresh();
     const out = run(a, [user('c', 1), status('c', 'running'), text('c', 2, 'Let me run the tests.'), tool('c', 3, 'bash'), text('c', 4, 'The **login** now keeps the session. I also added a test.'), status('c', 'idle')]);

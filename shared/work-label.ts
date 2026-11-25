@@ -7,7 +7,7 @@ import type { SessionMeta } from './protocol';
  * (`SessionMeta.commands`), and a check between /until rounds.
  */
 
-type Work = Pick<SessionMeta, 'background' | 'commands' | 'until'>;
+type Work = Pick<SessionMeta, 'background' | 'commands' | 'serving' | 'until'>;
 
 /** A count as the bridge sent it, read safely: anything that is not a whole positive number is none. */
 const count = (n: number | undefined) => (typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0);
@@ -32,6 +32,21 @@ export function workLabel(s: Work): string | null {
   if (agents) return `${a} working`;
   if (commands) return `${c} running`;
   return null;
+}
+
+/** Quiet text inside a chat whose only live commands serve. */
+export function servingLabel(s: Pick<SessionMeta, 'serving' | 'servingAddress'>): string | null {
+  const n = count(s.serving);
+  if (n === 1) return s.servingAddress ? `Serving ${s.servingAddress}` : 'Serving 1 local server';
+  return n ? `Serving ${n} local servers` : null;
+}
+
+/** "45s", "4m", "1h 5m": how long a background command has run, to the minute once past one. */
+export function waited(ms: number): string {
+  const s = Math.max(1, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
 /**

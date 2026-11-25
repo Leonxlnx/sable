@@ -488,12 +488,17 @@ export interface SessionMeta {
    */
   background?: number;
   /**
-   * Background commands and monitors still running in the agent's process after the step that
+   * Working background commands and monitors still running in the agent's process after the step that
    * started them returned (`ToolItem.task` with state `running`; counted by `SessionRuntime`). Apart
    * from `background`, which stays the count of sub-agents and workflows: phones already installed
    * read that one as "sub-agents working". Above 0 the chat is not at rest either.
    */
   commands?: number;
+  /** Live commands serving a local address or watching for changes. */
+  serving?: number;
+  /** The oldest serving task and the sole server’s address, also available when its step is paged out. */
+  servingSince?: number;
+  servingAddress?: string;
   /** The chat is moving to another account right now (set and cleared by `session.switchAccount`). */
   moving?: boolean;
   /** The account the session runs under; absent means `default`. */
@@ -1135,6 +1140,8 @@ export interface TaskMark {
   /** The agent's own id for the task. */
   id: string;
   kind: 'command' | 'monitor';
+  /** Once recognized, true for a server or watcher, or its announced address label. */
+  serving?: true | string;
   /**
    * `lost`: the process that held it went away while it ran, and no word of its end ever came. It
    * usually ended with the process, but a child process can outlive it: never say "ended".
@@ -2450,6 +2457,7 @@ export interface SessionSnapshot {
  */
 export interface QueuedMessage {
   id: string;
+  submitId?: string;
   text: string;
   attachments?: Attachment[];
   createdAt: number;
@@ -2461,6 +2469,7 @@ export interface RpcMethods {
   'app.hello': { params: Record<string, never>; result: AppState };
   'app.setSettings': { params: { patch: Partial<AppSettings> }; result: AppSettings };
 
+  'auth.journal': { params: { limit?: number }; result: string[] };
   'auth.refresh': { params: { provider: ProviderId; accountId?: string }; result: ProviderInfo };
   'auth.login': { params: { provider: ProviderId; accountId?: string }; result: { started: boolean } };
   /** The code the browser showed instead of returning to Sable ("code#state"): finishes the sign-in in progress. */
@@ -2666,13 +2675,13 @@ export interface RpcMethods {
   'queue.remove': { params: { sessionId: string; id: string }; result: { ok: boolean } };
   /**
    * Removes a queued message and returns it, atomically (for "edit": put it back in the composer).
-   * `message` is absent when it already went out or was removed.
+   * `taken` confirms the queue row is now a user item. With neither field the outcome is unknown.
    */
   /**
    * From a phone with `ack: true`: the message stays reserved in the queue and the answer carries a
    * receipt (`take`); it leaves the queue only on `phone.takeDone` with that receipt.
    */
-  'queue.take': { params: { sessionId: string; id: string; ack?: boolean }; result: { message?: QueuedMessage; take?: string } };
+  'queue.take': { params: { sessionId: string; id: string; ack?: boolean }; result: { message?: QueuedMessage; taken?: boolean; take?: string } };
   /** Reorders the queue: `ids` first in that order, any message not named keeps its place after them. */
   'queue.reorder': { params: { sessionId: string; ids: string[] }; result: { ok: boolean } };
   /** Takes a queued message out of the queue and gives it to the agent now (steered into the running turn, if any). */

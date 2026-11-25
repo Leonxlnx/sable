@@ -1,5 +1,6 @@
 import { VERSION } from '../version';
-import { authGate, noteAuthFailure } from '../core/auth-gate';
+import { record, type AuthScope, type StartReason } from '../core/auth-journal';
+import { authGate, gateKey, noteAuthFailure } from '../core/auth-gate';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -313,16 +314,19 @@ export class CodexProvider implements Provider {
     this.idleTimer.unref?.();
   }
 
+  private closingRpc?: Promise<void>;
+
   private stopIfIdle(ms: number) {
     const rpc = this.rpc;
     if (!rpc || this.disposed) return;
-    const busy = this.attached.size > 0 || this.titleThreads.size > 0 || this.remoteWanted.size > 0 || !!this.pendingLogin || !!this.mcpLoading || !!this.starting;
+    const busy = rpc.inFlight || this.limitsRun || this.attached.size > 0 || this.titleThreads.size > 0 || this.remoteWanted.size > 0 || !!this.pendingLogin || !!this.mcpLoading || !!this.starting;
     const quietFor = Date.now() - this.lastUse;
     if (busy || quietFor < ms) return this.armIdle(busy ? IDLE_STOP_MS : Math.max(1000, ms - quietFor));
     this.ctx.log('[codex] stopping idle app-server');
     this.rpc = null;
     this.stopping = rpc;
-    void rpc.close().catch(() => {});
+    this.closingRpc = rpc.close(undefined, 'idle').then(() => rpc.ended).finally(() => { this.closingRpc = undefined; });
+    void this.closingRpc.catch(() => {});
   }
 
   /** Called by a session when it closes: the last one lets the app-server go soon. */
@@ -332,14 +336,19 @@ export class CodexProvider implements Provider {
 
   // ── process ──
 
-  async client(): Promise<CodexRpc> {
+  scope(reason: StartReason): AuthScope {
+    return { agent: this.id, accountId: this.ctx.account?.id ?? 'default', reason, journal: this.ctx.journal };
+  }
+
+  async client(reason: StartReason = 'chat'): Promise<CodexRpc> {
+    if (this.closingRpc) await this.closingRpc;
     if (this.disposed) throw new Error('Codex provider is shut down');
     this.lastUse = Date.now();
     if (this.rpc?.alive) return this.rpc;
     this.armIdle();
     if (!this.starting) {
       // Experimental API: remote control lives there (the rest of the protocol is unchanged).
-      this.starting = CodexRpc.start({ log: this.ctx.log, clientVersion: CLIENT_VERSION, env: this.env, experimental: true })
+      this.starting = CodexRpc.start({ log: this.ctx.log, clientVersion: CLIENT_VERSION, env: this.env, experimental: true, folder: gateKey(this.id, this.configHome()), scope: this.scope(reason), closing: () => this.disposed || !!this.ctx.closing?.() })
         .then(async (rpc) => {
           if (this.disposed) {
             await rpc.close();
@@ -451,10 +460,10 @@ export class CodexProvider implements Provider {
   async quickTitle(prompt: TitlePrompt, signal: AbortSignal, holds?: () => boolean): Promise<string | null> {
     const wanted = () => !signal.aborted && (holds?.() ?? true);
     if (!wanted()) return null;
-    const caps = await this.caps().catch(() => undefined);
+    const caps = await this.caps(undefined, prompt.purpose ?? 'title').catch(() => undefined);
     const pick = titleModelOf(caps?.models ?? []);
     if (!pick || !wanted()) return null;
-    const rpc = await this.client();
+    const rpc = await this.client(prompt.purpose ?? 'title');
     if (!wanted()) return null;
     const plugins = (this.mcpCache ?? []).flatMap((s) => (s.scope ? [s.scope] : []));
     const started = await rpc.request<ThreadStartResponse>('thread/start', titleThreadParams(prompt, pick.id, plugins), THREAD_TIMEOUT);
@@ -552,10 +561,13 @@ export class CodexProvider implements Provider {
   // ── info & auth ──
 
   private version(force: boolean): Promise<{ installed: boolean; version?: string; problem?: string }> {
-    if (this.versionCache && !force) return Promise.resolve(this.versionCache);
+    if (this.versionCache?.installed || (this.versionCache && !force)) return Promise.resolve(this.versionCache);
     const cmd = resolveCodexCommand(['--version'], this.env);
-    return new Promise((resolve) => {
-      execFile(cmd.file, cmd.args, { shell: cmd.shell, windowsHide: true, timeout: 15_000, env: cmd.env }, (err, stdout, stderr) => {
+    const scope = this.scope('version');
+    const key = gateKey(this.id, this.configHome());
+    return authGate.run(key, () => new Promise<NonNullable<typeof this.versionCache>>((resolve) => {
+      if (this.ctx.closing?.()) throw new Error('Sable is closing');
+      const child = execFile(cmd.file, cmd.args, { shell: cmd.shell, windowsHide: true, timeout: 15_000, env: cmd.env }, (err, stdout, stderr) => {
         const out = `${stdout ?? ''}`.trim();
         const m = out.match(/(\d+\.\d+\.\d+[\w.-]*)/);
         this.versionCache =
@@ -564,33 +576,46 @@ export class CodexProvider implements Provider {
             : { installed: true, version: m?.[1] ?? out };
         resolve(this.versionCache);
       });
-    });
+      if (child.pid) {
+        const end = scope.journal?.started(scope, key, child.pid);
+        child.once('close', code => end?.(child.killed ? 'timeout' : code === 0 ? 'exit' : 'error', child.killed));
+      }
+    }), scope);
   }
 
   async info(force = false): Promise<ProviderInfo> {
+    await authGate.beforeRead();
+    const scope = this.scope('status');
+    let pid = this.rpc?.pid;
+    record(scope, { event: 'status', pid });
     const v = await this.version(force);
     const base = { id: this.id, name: this.name, installed: v.installed, version: v.version };
-    if (!v.installed) return { ...base, auth: { loggedIn: false }, problem: v.problem };
+    if (!v.installed) { record(scope, { event: 'status-answer', answer: 'unknown' }); return { ...base, auth: { loggedIn: false }, problem: v.problem }; }
     try {
-      const rpc = await this.client();
+      const rpc = await this.client('status');
+      pid = rpc.pid;
+      await authGate.beforeRead();
       const r = await rpc.request<GetAccountResponse>('account/read', { refreshToken: false }, 20_000);
+      if (!r || typeof r.requiresOpenaiAuth !== 'boolean' && !r.account) throw new Error('Unknown Codex account status');
       const a = r.account;
       let auth: AuthState = { loggedIn: false };
       const plan = codexPlan(a, !a && !r.requiresOpenaiAuth);
       if (a?.type === 'chatgpt') auth = { loggedIn: true, method: 'chatgpt', email: a.email ?? undefined, ...plan, org: a.workspaceName ?? undefined };
       else if (a) auth = { loggedIn: true, method: a.type, ...plan };
       else if (!r.requiresOpenaiAuth) auth = { loggedIn: true, method: 'custom provider', ...plan };
+      record(scope, { event: 'status-answer', answer: auth.loggedIn ? 'in' : 'out', pid });
       this.lastAuth = JSON.stringify(auth);
       // The app-server is up and signed in: read the limits now (free, about half a second), so a
       // first launch has them when the app is ready instead of asking only once the UI is up and
       // waiting another round trip. A view that asks meanwhile shares this read.
-      if (auth.loggedIn && !this.limitsPrimed) {
+      if (auth.loggedIn && !this.limitsPrimed && !this.ctx.dormant?.(this.id)) {
         this.limitsPrimed = true;
         void this.limits().catch(() => {});
       }
       return { ...base, auth, ...(setupWarnings.length ? { warnings: setupWarnings.map((w) => ({ ...w })) } : {}) };
     } catch (err) {
-      return { ...base, auth: { loggedIn: false }, problem: errMsg(err) };
+      record(scope, { event: 'status-answer', answer: 'unknown', pid });
+      return { ...base, auth: { loggedIn: false, checking: true }, problem: errMsg(err) };
     }
   }
 
@@ -608,7 +633,7 @@ export class CodexProvider implements Provider {
   }
 
   async login(): Promise<void> {
-    const rpc = await this.client();
+    const rpc = await this.client('login');
     if (this.pendingLogin) await this.cancelLogin();
     const r = await rpc.request<LoginAccountResponse>('account/login/start', { type: 'chatgpt' }, 30_000);
     if (r.type !== 'chatgpt' && r.type !== 'chatgptDeviceCode') return;
@@ -660,7 +685,7 @@ export class CodexProvider implements Provider {
   }
 
   async logout(): Promise<void> {
-    const rpc = await this.client();
+    const rpc = await this.client('logout');
     await rpc.request('account/logout', undefined, 20_000);
     this.capsCache.clear();
   }
@@ -686,7 +711,7 @@ export class CodexProvider implements Provider {
     const run = (this.remoteSync ?? Promise.resolve()).then(async () => {
       const want = this.remoteWanted.size > 0;
       if (want === this.remoteOn && (!want || this.pairing)) return this.broadcastRemote();
-      const rpc = await this.client();
+      const rpc = await this.client('remote');
       if (want) {
         const r = await rpc.request<{ status: string }>('remoteControl/enable', { ephemeral: true }, 20_000);
         this.remoteOn = true;
@@ -830,18 +855,19 @@ export class CodexProvider implements Provider {
 
   // ── capabilities ──
 
-  caps(cwd?: string): Promise<Capabilities> {
+  caps(cwd?: string, reason: StartReason = 'caps'): Promise<Capabilities> {
     const key = cwd ? path.resolve(cwd) : '';
     const hit = this.capsCache.get(key);
     if (hit && Date.now() - hit.at < CAPS_TTL) return hit.caps;
-    const caps = this.loadCaps(key || undefined);
+    const caps = this.loadCaps(key || undefined, reason);
     this.capsCache.set(key, { at: Date.now(), caps });
     caps.catch(() => this.capsCache.delete(key));
     return caps;
   }
 
-  private async loadCaps(cwd?: string): Promise<Capabilities> {
-    const rpc = await this.client();
+  private async loadCaps(cwd: string | undefined, reason: StartReason): Promise<Capabilities> {
+    const rpc = await this.client(reason);
+    await authGate.beforeRead();
     const models = async (): Promise<ModelInfo[]> => {
       const out: ModelInfo[] = [];
       let cursor: string | null = null;
@@ -894,7 +920,8 @@ export class CodexProvider implements Provider {
   refreshMcp(threadId?: string): Promise<McpServerInfo[]> {
     if (this.mcpLoading) return this.mcpLoading;
     const run = (async () => {
-      const rpc = await this.client();
+      await authGate.beforeRead();
+      const rpc = await this.client('caps');
       const r = await rpc.request<ListMcpServerStatusResponse>(
         'mcpServerStatus/list',
         { detail: 'toolsAndAuthOnly', limit: 100, ...(threadId ? { threadId } : {}) },
@@ -932,10 +959,16 @@ export class CodexProvider implements Provider {
   /** The first sign-in seen in this run started a limits read. */
   private limitsPrimed = false;
 
-  limits(): Promise<RateLimit[]> {
-    if (this.limitsRun) return this.limitsRun;
+  limits(force: boolean | 'fresh' = false): Promise<RateLimit[]> {
+    const cached = () => mapLimits([...this.snapshots.values()]);
+    const busy = () => this.disposed || this.ctx.closing?.() || authGate.readsPaused() || this.rpc?.hasTurn || [...this.attached.keys()].some(s => s.turnActive);
+    if (busy()) return Promise.resolve(cached());
+    if (this.limitsRun) return force === 'fresh' ? this.limitsRun.then(() => this.limits('fresh')) : this.limitsRun;
+    if (force !== 'fresh' && Date.now() - this.limitsAt < 60_000) return Promise.resolve(cached());
+    this.limitsAt = Date.now();
     const run = (async () => {
-      const rpc = await this.client();
+      const rpc = await this.client('limits');
+      if (busy()) return cached();
       const r = await rpc.request<GetAccountRateLimitsResponse>('account/rateLimits/read', { excludeResetCreditDetails: true }, 20_000);
       this.snapshots.clear();
       const byId = r.rateLimitsByLimitId ? Object.values(r.rateLimitsByLimitId).filter((x): x is RateLimitSnapshot => !!x) : [];
@@ -957,30 +990,30 @@ export class CodexProvider implements Provider {
    * limits again. Only ever called from the user's confirmed click (`provider.useReset`).
    */
   async useReset(key: string): Promise<ResetOutcome> {
-    const rpc = await this.client();
+    const rpc = await this.client('reset-credit');
     const r = await rpc.request<ConsumeAccountRateLimitResetCreditResponse>('account/rateLimitResetCredit/consume', { idempotencyKey: key }, 30_000);
     await this.limitsRun?.catch(() => {}); // a read started before the reset would show the old state
-    await this.limits().catch(() => {});
+    await this.limits('fresh').catch(() => {});
     return r.outcome;
   }
 
   private limitsTimer?: NodeJS.Timeout;
   private limitsAt = 0;
 
-  /** One limits read shortly after a turn ends, at most every 20 seconds. */
+  /** One limits read after a turn ends, at most once a minute. */
   private refreshLimitsSoon() {
-    if (this.limitsTimer || this.disposed) return;
-    const wait = Math.max(1500, 20_000 - (Date.now() - this.limitsAt));
+    if (this.limitsTimer || this.disposed || this.ctx.dormant?.(this.id)) return;
+    const wait = Math.max(1500, 60_000 - (Date.now() - this.limitsAt));
     this.limitsTimer = setTimeout(() => {
       this.limitsTimer = undefined;
-      this.limitsAt = Date.now();
       if (!this.disposed && this.rpc) void this.limits().catch(() => {});
     }, wait);
     this.limitsTimer.unref?.();
   }
 
   async history(cwd?: string, limit = 50): Promise<HistoryEntry[]> {
-    const rpc = await this.client();
+    await authGate.beforeRead();
+    const rpc = await this.client('history');
     limit = Math.max(1, Math.min(limit, 100)); // the server caps pages at 100
     // useStateDbOnly: without it the server re-scans every JSONL rollout (~60s on a big history).
     const list = (extra: object) =>
@@ -1020,7 +1053,8 @@ export class CodexProvider implements Provider {
     this.attached.clear();
     const rpc = this.rpc ?? (await this.starting?.catch(() => null)) ?? null;
     this.rpc = null;
-    await rpc?.close();
+    await rpc?.close(undefined, 'quit');
+    await this.closingRpc;
   }
 }
 
@@ -1167,6 +1201,8 @@ class CodexSession implements ProviderSession {
     private rt: SessionRuntime,
   ) {}
 
+  get turnActive() { return this.rt.turnActive; }
+
   private log(...a: unknown[]) {
     this.provider.ctx.log('[codex]', ...a);
   }
@@ -1255,7 +1291,7 @@ class CodexSession implements ProviderSession {
    */
   private async resumeOrStart(threadId: string | undefined, epoch?: number): Promise<{ resp: ThreadStartResponse; resumed: boolean }> {
     const rt = this.rt;
-    const rpc = await this.provider.client();
+    const rpc = await this.provider.client(rt.meta.options?.readOnly ? 'check' : rt.id.startsWith('sub-') ? 'sub-agent' : 'chat');
     if (this.closed) throw new Error('Session is closed');
     this.provider.attached.set(this, rpc);
     // A reload mid-turn keeps the mode the work runs under (a phone's switch is held: `workMode`).
@@ -1356,15 +1392,15 @@ class CodexSession implements ProviderSession {
     clearTimeout(this.idleTimer);
     for (const { item } of this.queue.splice(0)) this.finishInput(item, false);
     this.dropReceivers();
-    if (this.rt.meta.commands) {
+    if (this.rt.meta.commands || this.rt.meta.serving) {
       const lost = this.rt.tasksLost('process');
       if (lost.length) this.rt.notice('info', 'The chat closed with background work still running', lost.join('\n'));
     }
+    const rpc = this.provider.attached.get(this);
     this.provider.attached.delete(this);
     if (this.provider.sessions.get(this.threadId) === this) this.provider.sessions.delete(this.threadId);
-    if (this.loaded) {
-      const rpc = await this.provider.client().catch(() => null);
-      await rpc?.request('thread/unsubscribe', { threadId: this.threadId }, 10_000).catch(() => {});
+    if (this.loaded && rpc && rpc.alive !== false) {
+      await rpc.request('thread/unsubscribe', { threadId: this.threadId }, 10_000).catch(() => {});
     }
     this.provider.sessionClosed();
     this.loaded = false;
@@ -2266,7 +2302,13 @@ class CodexSession implements ProviderSession {
         this.alive(d?.turnId);
         const id = `${d.turnId}:${d.itemId}`;
         const it = rt.get<ToolItem>(id);
-        if (it?.type === 'tool') rt.patch<ToolItem>(id, { detail: { ...it.detail, path: d.changes?.[0]?.path ?? it.detail.path }, input: { changes: changeRecords(d.changes) }, result: { ...it.result, diff: changesToDiffs(d.changes) } });
+        if (it?.type !== 'tool') return;
+        rt.promote?.(it);
+        rt.patch<ToolItem>(id, {
+          detail: { ...it.detail, path: d.changes?.[0]?.path ?? it.detail.path },
+          input: { changes: changeRecords(d.changes) },
+          result: { ...it.result, diff: changesToDiffs(d.changes) },
+        });
         return;
       }
       case 'turn/plan/updated':
@@ -2314,7 +2356,7 @@ class CodexSession implements ProviderSession {
         }
         if (!e.willRetry) this.turnErrors.set(tid, msg);
         // Refused for the sign-in: no notice per request; the bridge asks again and says it once (auth-gate.ts).
-        if (!e.willRetry && codexSignInRefused((e.error as { codexErrorInfo?: unknown } | undefined)?.codexErrorInfo, msg)) return void noteAuthFailure(rt.id);
+        if (!e.willRetry && codexSignInRefused((e.error as { codexErrorInfo?: unknown } | undefined)?.codexErrorInfo, msg)) return void noteAuthFailure(rt.id, undefined, undefined, this.provider.scope('chat'), this.provider.attached.get(this)?.pid);
         // Refused at a plan limit ("You've hit your usage limit…"): a limit notice the bridge can act on.
         const info = (e.error as { codexErrorInfo?: unknown } | undefined)?.codexErrorInfo;
         if (!e.willRetry && (info === 'usageLimitExceeded' || /usage limit/i.test(msg))) {
@@ -2470,6 +2512,7 @@ class CodexSession implements ProviderSession {
     if (!item || item.type === 'userMessage') return;
     const id = `${n.turnId}:${item.id}`;
     const existing = rt.get(id);
+    if (item.type === 'fileChange' && existing?.type === 'tool') rt.promote?.(existing);
     if (item.type === 'contextCompaction' && completed) {
       if (this.compactSeen) return;
       this.compactSeen = true;

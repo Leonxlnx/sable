@@ -527,12 +527,14 @@ describe('queueing', () => {
   it('holds a message sent during a turn on the bridge and sends it when the turn ends', async () => {
     const h = await setup();
     await h.send(REFACTOR);
-    await h.send('hi');
+    await h.app.call('session.send', { sessionId: h.id, text: 'hi', submitId: 'queued-hi' });
     // Not in the timeline yet: the bridge holds it.
     expect(users(h).map((u) => u.text)).toEqual([REFACTOR]);
     expect(h.rt.queue.map((q) => q.text)).toEqual(['hi']);
     const upd = h.events.filter((e) => e.type === 'queue.updated');
-    expect(upd.at(-1)).toMatchObject({ type: 'queue.updated', sessionId: h.id, queue: [{ text: 'hi' }] });
+    expect(upd.at(-1)).toMatchObject({ type: 'queue.updated', sessionId: h.id, queue: [{ text: 'hi', submitId: 'queued-hi' }] });
+    expect(upd.filter(e => e.queue.some(q => q.text === 'hi'))).toHaveLength(1);
+    expect(h.rt.queue[0].submitId).toBe('queued-hi');
 
     await until(() => h.turns().length === 2, 'two turns');
     await h.idle();
@@ -541,6 +543,7 @@ describe('queueing', () => {
 
     const second = users(h).find((u) => u.text === 'hi')!;
     expect(second.state).toBe('sent');
+    expect(await h.app.call('queue.take', { sessionId: h.id, id: second.id })).toEqual({ taken: true });
     const firstTurnAt = addedAt(h, (e) => e.type === 'item.added' && e.item.type === 'turn');
     const sentAt = addedAt(h, (e) => e.type === 'item.added' && e.item.id === second.id);
     expect(sentAt).toBeGreaterThan(firstTurnAt);
@@ -636,6 +639,17 @@ describe('queueing', () => {
 // ─────────────────────────────────── scenarios ──────────────────────────────────
 
 describe('other scenarios', () => {
+  it('outlive leaves two serving tasks, a monitor and a workflow when the turn ends', async () => {
+    const h = await setup();
+    await h.send('outlive');
+    await h.idle();
+    expect(h.rt.meta).toMatchObject({ serving: 2, commands: 1, background: 1 });
+    const mark = (id: string) => h.tools().find(step => step.task?.id === id)?.task;
+    expect(mark('b7dev01')?.serving).toBe('localhost:3311');
+    expect(mark('b7tst02')?.serving).toBe(true);
+    expect(mark('m7bld03')?.serving).toBeUndefined();
+  });
+
   it('every scenario settles and reconstructs from deltas', async () => {
     const h = await setup();
     h.autoApprove();

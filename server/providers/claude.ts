@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { claudeFolderKey } from '../core/lanes';
+import { createReadStream, existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -68,7 +70,8 @@ import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
 import { claimStep } from '../core/sub-agent';
-import { authFailurePending, authGate, gateKey, noteAuthFailure, refusedForSignIn } from '../core/auth-gate';
+import { record, type AuthScope, type EndReason, type StartReason } from '../core/auth-journal';
+import { GATE, type GatedProcess, authFailurePending, authGate, gateKey, noteAuthFailure, refusedForSignIn } from '../core/auth-gate';
 import { compactScope, WHERE, withScope } from '../core/permission-scope';
 
 type Obj = Record<string, any>;
@@ -323,27 +326,96 @@ export class ClaudeProvider implements Provider {
     return withConfigDir(this.configDir, fn);
   }
 
-  async info(force = false): Promise<ProviderInfo> {
+  scope(reason: StartReason): AuthScope {
+    return { agent: this.id, accountId: this.ctx.account?.id ?? 'default', reason, journal: this.ctx.journal, closing: this.ctx.closing };
+  }
+
+  private async cli(reason: 'logout' | 'version' | 'status', args: string[], timeoutMs: number, onStart?: (pid: number) => void) {
+    const key = gateKey(this.id, this.configHome());
+    const scope = this.scope(reason);
+    const reader = reason !== 'logout';
+    const leave = await authGate.enter(key, reader ? 'aux' : 'start', scope);
+    try {
+      if (this.ctx.closing?.()) throw new Error('Sable is closing');
+      if (reader && !authGate.canReadAlone(key)) return;
+      let timedOut = false;
+      return await runCli(claudeBinary() ?? 'claude', args, {
+        env: this.env(), timeoutMs, keepAliveOnTimeout: reason !== 'version',
+        timedOut: () => { timedOut = true; },
+        started: child => {
+          if (!child.pid) return;
+          if (!reader) child.stdout?.once('data', () => setTimeout(leave, GATE.settleMs).unref?.());
+          const untrack = authGate.trackProcess(key);
+          onStart?.(child.pid);
+          const end = scope.journal?.started(scope, key, child.pid);
+          child.once('close', code => {
+            const terminated = timedOut && reason === 'version';
+            end?.(terminated ? 'timeout' : code === 0 ? 'exit' : 'error', terminated);
+            untrack();
+          });
+        },
+      });
+    } finally { leave(); }
+  }
+
+  private infoRun?: { force: boolean; result: Promise<ProviderInfo> };
+  info(force = false): Promise<ProviderInfo> {
+    if (this.infoRun) {
+      if (force && !this.infoRun.force) return this.infoRun.result.then(() => this.info(true));
+      return this.infoRun.result;
+    }
+    const result = this.readInfo(force).finally(() => { this.infoRun = undefined; });
+    this.infoRun = { result, force };
+    return result;
+  }
+
+  private async readInfo(force: boolean): Promise<ProviderInfo> {
     if (!force && this.infoCache && Date.now() - this.infoCache.at < 30_000) return this.infoCache.info;
     // The same binary the SDK runs (SABLE_CLAUDE_BIN, set by the desktop shell), so the check does
     // not depend on what PATH the app was started with.
-    const bin = claudeBinary() ?? 'claude';
-    // `auth status` may renew the sign-in: one at a time per account, never beside a start of it
-    // (server/core/auth-gate.ts); both end inside the gate's lease for it (`auxLeaseMs`, 20 s).
-    const [ver, [status, text]] = await Promise.all([
-      runCli(bin, ['--version'], { timeoutMs: 12_000, env: this.env() }),
-      authGate.run(gateKey('claude', this.configHome()), async () => {
-        const json = await runCli(bin, ['auth', 'status', '--json'], { timeoutMs: 12_000, env: this.env() });
-        // The CLI's own name for the plan ("Login method: Claude Max account"); JSON has only a raw id.
-        return [json, await runCli(bin, ['auth', 'status', '--text'], { timeoutMs: 6_000, env: this.env() })] as const;
-      }),
-    ]);
+    await authGate.beforeRead();
+    const scope = this.scope('status');
+    const sessions = [...this.sessions].filter(s => s.liveQuery());
+    const session = sessions.find(s => !s.holdsWork()) ?? (this.warm ? undefined : sessions[0]);
+    const live = session?.liveQuery() ?? this.warm?.q;
+    let pid = session ? session.processPid() : this.warm?.owner.child?.pid;
+    scope.pid = pid;
+    record(scope, { event: 'status', pid });
+    if (live) {
+      // The SDK account info describes initialization. A refusal needs a fresh CLI answer.
+      const a = await authGate.run(gateKey(this.id, this.configHome()), async () => {
+        if (this.ctx.closing?.() || (session ? session.liveQuery() : this.warm?.q) !== live) return;
+        if (!force && live.accountInfo) return withTimeout(live.accountInfo(), 6000, 'account info');
+        // Reinitializing can cancel hook callbacks. Only ask an idle process.
+        if (!session?.holdsWork() && live.reinitialize) return (await withTimeout(live.reinitialize(), 6000, 'account status')).account;
+      }, scope).catch(() => undefined);
+      const apiKey = !!a?.apiKeySource && a.apiKeySource !== 'none';
+      if (a && (a.email || a.subscriptionType || apiKey || (a.apiProvider && a.apiProvider !== 'firstParty'))) {
+        record(scope, { event: 'status-answer', answer: 'in', pid });
+        const method = apiKey ? 'apiKey' : a.tokenSource;
+        return { id: this.id, name: this.name, installed: true, version: this.infoCache?.info.version,
+          auth: { loggedIn: true, email: a.email, org: a.organization, method, ...claudePlan({ ...a, authMethod: method }) } };
+      }
+      record(scope, { event: 'status-answer', answer: 'unknown', pid });
+      return { id: this.id, name: this.name, installed: true, auth: { loggedIn: false, checking: true } };
+    }
+    const ver = this.infoCache?.info.installed ? { missing: false, code: 0, stdout: this.infoCache.info.version ?? '' }
+      : await this.cli('version', ['--version'], 12_000);
+    if (!ver) {
+      record(scope, { event: 'status-answer', answer: 'unknown' });
+      return { id: this.id, name: this.name, installed: true, auth: { loggedIn: false, checking: true } };
+    }
+    pid = undefined;
+    const status = ver.missing ? { code: null, stdout: '' } : await this.cli('status', ['auth', 'status', '--json'], 12_000, started => { pid = started; });
     const info: ProviderInfo = { id: 'claude', name: this.name, installed: !ver.missing && ver.code === 0, auth: { loggedIn: false } };
     if (info.installed) info.version = ver.stdout.trim().split(/\s+/)[0];
     else info.problem = 'Claude Code CLI was not found on PATH';
     try {
+      if (!status || status.code === null) throw new Error('Unknown status');
       const s = JSON.parse(status.stdout.slice(status.stdout.indexOf('{')));
-      const plan = s.loggedIn ? claudePlan(s, text.code === 0 ? text.stdout : undefined) : {};
+      if (typeof s.loggedIn !== 'boolean') throw new Error('Unknown status');
+      const text = s.loggedIn && !s.subscriptionType ? await this.cli('status', ['auth', 'status', '--text'], 6000) : undefined;
+      const plan = s.loggedIn ? claudePlan(s, text?.code === 0 ? text.stdout : undefined) : {};
       info.auth = {
         loggedIn: !!s.loggedIn,
         method: s.authMethod,
@@ -353,8 +425,9 @@ export class ClaudeProvider implements Provider {
         org: s.orgName,
       };
     } catch {
-      /* not logged in or old CLI */
+      info.auth.checking = true;
     }
+    record(scope, { event: 'status-answer', answer: info.auth.checking ? 'unknown' : info.auth.loggedIn ? 'in' : 'out', pid });
     this.infoCache = { at: Date.now(), info };
     return info;
   }
@@ -366,11 +439,20 @@ export class ClaudeProvider implements Provider {
    * CLIs without the flow fall back to `claude auth login`.
    */
   async login(): Promise<void> {
-    await this.cancelLogin();
+    const generation = this.loginGeneration;
+    const cancelled = () => generation !== this.loginGeneration || !!this.ctx.closing?.();
+    const release = await authGate.claimDialog(gateKey(this.id, this.configHome()), this.scope('login'), cancelled);
+    try {
+      if (cancelled()) throw new Error('Sign-in cancelled');
+      await this.loginDialog();
+    } finally { release(); }
+  }
+
+  private async loginDialog(): Promise<void> {
     // SABLE_LOGIN=cli: the CLI's own `claude auth login` (the tests drive a fake CLI that way).
     if (process.env.SABLE_LOGIN === 'cli') return this.loginWithCli();
     const input = new PushQueue<SDKUserMessage>();
-    const q = query({ prompt: input, options: { ...this.baseOptions(homedir()), settingSources: [], strictMcpConfig: true, persistSession: false } }) as AuthQuery;
+    const q = query({ prompt: input, options: { ...this.baseOptions(homedir(), 'login'), settingSources: [], strictMcpConfig: true, persistSession: false } }) as AuthQuery;
     if (typeof q.claudeAuthenticate !== 'function') {
       input.end();
       q.close();
@@ -403,9 +485,20 @@ export class ClaudeProvider implements Provider {
     await auth.q.claudeOAuthCallback(authorizationCode, state);
   }
 
-  private loginWithCli(): Promise<void> {
-    return new Promise((resolve, reject) => {
+  private loginGeneration = 0;
+  private loginBorn = 0;
+  private async loginWithCli(): Promise<void> {
+    const generation = this.loginGeneration;
+    const scope = this.scope('login');
+    const key = gateKey(this.id, this.configHome());
+    const leave = await authGate.enter(key, 'start', scope);
+    return new Promise<void>((resolve, reject) => {
+      if (this.ctx.closing?.() || generation !== this.loginGeneration) return reject(new Error('Sign-in cancelled'));
       const child = spawnCli('claude', ['auth', 'login', '--claudeai'], { env: this.env() });
+      child.stdout?.once('data', () => setTimeout(leave, GATE.settleMs).unref?.());
+      const untrack = authGate.trackProcess(key);
+      const end = child.pid && scope.journal?.started(scope, key, child.pid);
+      this.loginBorn = Date.now();
       this.loginProc = child;
       let out = '';
       let announced = false;
@@ -421,17 +514,24 @@ export class ClaudeProvider implements Provider {
       child.stderr?.on('data', scan);
       child.on('error', (e) => reject(e));
       child.on('close', (code) => {
+        untrack();
+        if (end) end(generation !== this.loginGeneration ? 'abort' : code === 0 ? 'exit' : 'error', generation !== this.loginGeneration);
         if (this.loginProc === child) this.loginProc = undefined;
         this.infoCache = undefined;
         if (code === 0) resolve();
         else reject(new Error(out.trim().split('\n').pop() || 'Sign-in was not completed'));
       });
-    });
+    }).finally(leave);
   }
 
   async cancelLogin() {
-    killTree(this.loginProc);
+    this.loginGeneration++;
+    const login = this.loginProc;
     this.loginProc = undefined;
+    if (login) {
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, this.loginBorn + GATE.minLifeMs - Date.now())));
+      killTree(login);
+    }
     const auth = this.auth;
     this.auth = undefined;
     if (auth) {
@@ -445,12 +545,16 @@ export class ClaudeProvider implements Provider {
   }
 
   async logout() {
-    await runCli('claude', ['auth', 'logout'], { timeoutMs: 15_000, env: this.env() });
-    this.infoCache = undefined;
+    const release = await authGate.claimDialog(gateKey(this.id, this.configHome()), this.scope('logout'), () => !!this.ctx.closing?.());
+    try {
+      await this.cli('logout', ['auth', 'logout'], 15_000);
+      this.infoCache = undefined;
+    } finally { release(); }
   }
 
-  baseOptions(cwd: string): Options {
+  baseOptions(cwd: string, reason: StartReason = 'chat'): Options {
     return {
+      spawnClaudeCodeProcess: authGate.spawner(undefined, undefined, this.scope(reason)),
       cwd,
       settingSources: ['user', 'project', 'local'],
       systemPrompt: { type: 'preset', preset: 'claude_code' },
@@ -584,7 +688,7 @@ export class ClaudeProvider implements Provider {
     const stop = () => ctrl.abort();
     if (signal.aborted) return null;
     signal.addEventListener('abort', stop, { once: true });
-    const q = query({ prompt: prompt.user, options: titleOptions(prompt, this.env(), ctrl) });
+    const q = query({ prompt: prompt.user, options: { ...titleOptions(prompt, this.env(), ctrl), spawnClaudeCodeProcess: authGate.spawner(undefined, undefined, this.scope(prompt.purpose ?? 'title')) } });
     let text = '';
     try {
       for await (const m of q) {
@@ -624,9 +728,9 @@ export class ClaudeProvider implements Provider {
       return;
     }
     await this.discardWarm();
-    if (!existsSync(choice.cwd)) return;
+    if (this.warm || this.ctx.closing?.() || !existsSync(choice.cwd)) return;
     const input = new PushQueue<SDKUserMessage>();
-    const owner: WarmOwner = {};
+    const owner: WarmOwner = { scope: this.scope('prewarm') };
     const q = sessionQuery(input, this.agentOptions({ ...choice, model: choice.model ?? '', mode: choice.mode ?? 'default' }, owner), owner);
     const timer = setTimeout(() => void this.discardWarm(), WARM_TTL_MS);
     timer.unref?.();
@@ -657,6 +761,8 @@ export class ClaudeProvider implements Provider {
       w.q.close();
     } catch {
       /* already gone */
+    } finally {
+      w.owner.streamEnded?.();
     }
   }
 
@@ -665,10 +771,28 @@ export class ClaudeProvider implements Provider {
     if (hit && Date.now() - hit.at < 5 * 60_000) return Promise.resolve(hit.caps);
     const running = this.capsInflight.get(cwd);
     if (running) return running;
-    const p = this.probe(cwd)
+    const session = [...this.sessions].find(s => s.liveQuery() && s.runtime().meta.cwd === cwd);
+    const current = session?.runtime().caps;
+    const probe = async () => {
+      if (!session) {
+        if ([...this.sessions].some(s => s.runtime().turnActive)) return hit?.caps ?? this.buildCaps(undefined, []);
+        return this.probe(cwd);
+      }
+      const q = session.liveQuery();
+      if (!q || !q.reinitialize || session.holdsWork()) return current ?? this.buildCaps(undefined, []);
+      return authGate.run(gateKey(this.id, this.configHome()), async () => {
+        if (session.liveQuery() !== q || session.holdsWork() || this.ctx.closing?.()) return current ?? this.buildCaps(undefined, []);
+        const init = await withTimeout(q.reinitialize(), 8000, 'model list');
+        const mcp = await withTimeout(q.mcpServerStatus(), 8000, 'MCP status');
+        const caps = this.buildCaps(init, mcp, current?.skills.map(s => s.name));
+        this.capsCache.set(cwd, { at: Date.now(), caps });
+        return caps;
+      }, this.scope('caps'));
+    };
+    const p = probe()
       .catch((err) => {
         this.ctx.log('claude caps probe failed:', (err as Error).message);
-        return this.buildCaps(undefined, []);
+        return current ?? this.buildCaps(undefined, []);
       })
       .finally(() => this.capsInflight.delete(cwd));
     this.capsInflight.set(cwd, p);
@@ -677,18 +801,23 @@ export class ClaudeProvider implements Provider {
 
   /** Starts a throwaway CLI process just to read what this project offers. Costs no tokens. */
   private async probe(cwd: string): Promise<Capabilities> {
+    await authGate.beforeRead();
+    if (this.ctx.closing?.()) return this.buildCaps(undefined, []);
     const input = new PushQueue<SDKUserMessage>();
-    const q = query({ prompt: input, options: { ...this.baseOptions(cwd), persistSession: false } });
-    try {
-      const init = await withTimeout(q.initializationResult(), 25_000, 'Claude Code startup');
+    const q = query({ prompt: input, options: { ...this.baseOptions(cwd, 'caps'), persistSession: false } });
+    const read = async () => {
+      const init = await q.initializationResult();
       const mcp = await withTimeout(q.mcpServerStatus(), 8_000, 'MCP status').catch(() => []);
       // Which commands are skills: a live session learns this from system/init, the probe asks.
       const skills = await withTimeout(q.reloadSkills(), 8_000, 'Skill list')
         .then((r) => r.skills.map((s) => s.name))
         .catch(() => undefined);
       // Read plan limits while this process is alive: there is no other cheap moment to ask.
-      await this.readLimits(q);
-      const caps = this.buildCaps(init, mcp, skills);
+      if (!this.ctx.dormant?.(this.id)) await this.readLimits(q, 60_000, true);
+      return this.buildCaps(init, mcp, skills);
+    };
+    try {
+      const caps = await withTimeout(read(), GATE.auxLeaseMs, 'capabilities probe');
       this.capsCache.set(cwd, { at: Date.now(), caps });
       return caps;
     } finally {
@@ -754,25 +883,30 @@ export class ClaudeProvider implements Provider {
    * Reads plan limits through a live agent process (the SDK's usage request; no tokens). Reads
    * closer together than `minGapMs` share the last answer.
    */
-  readLimits(q: Query, minGapMs = 15_000): Promise<RateLimit[]> {
+  readLimits(q: Query, minGapMs = 60_000, standalone = false): Promise<RateLimit[]> {
+    const busy = () => authGate.readsPaused() || this.ctx.closing?.() || [...this.sessions].some(s => s.runtime().turnActive);
+    if (busy()) return Promise.resolve(this.limitsCache);
     if (this.limitsRun) return this.limitsRun;
     if (Date.now() - this.limitsAt < minGapMs) return Promise.resolve(this.limitsCache);
     // The usage endpoint refused lately (the CLI remembers that for up to an hour): asking again
     // only adds load. Turns keep the windows current through rate_limit_event meanwhile.
     if (minGapMs > 0 && Date.now() < this.limitsRefusedUntil) return Promise.resolve(this.limitsCache);
     // An auxiliary request: never beside another one of this account, nor beside a start of it (auth-gate.ts).
-    const run = authGate.run(gateKey('claude', this.configHome()), () => this.readLimitsNow(q)).finally(() => {
+    const scope = this.scope('limits');
+    scope.pid = [...this.sessions].find(s => s.liveQuery() === q)?.processPid() ?? (this.warm?.q === q ? this.warm.owner.child?.pid : undefined);
+    const read = () => busy() ? Promise.resolve(this.limitsCache) : this.readLimitsNow(q);
+    // A cold probe already holds the auxiliary lease at its physical spawn.
+    const run = (standalone ? read() : authGate.run(gateKey('claude', this.configHome()), read, scope)).finally(() => {
       if (this.limitsRun === run) this.limitsRun = undefined;
     });
     this.limitsRun = run;
     return run;
   }
 
-  private async readLimitsNow(q: Query, retried = false): Promise<RateLimit[]> {
+  private async readLimitsNow(q: Query): Promise<RateLimit[]> {
+    this.limitsAt = Date.now(); // A failed request also consumes this polling interval.
     try {
       const u = (await withTimeout(q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }), 10_000, 'usage')) as Obj;
-      void retried;
-      this.limitsAt = Date.now();
       const rl = u?.rate_limits as Obj | null;
       // Available but empty: the usage endpoint refused (HTTP 429, remembered by the CLI per
       // sign-in for up to an hour) and the process has no reply headers to fall back on yet. A
@@ -895,12 +1029,23 @@ export class ClaudeProvider implements Provider {
    * `force` (the user asked) and none running, a short process starts just to read them: no
    * settings, plugins or MCP servers, no tokens, at most once a minute.
    */
+  private probeRun?: Promise<RateLimit[]>;
   async limits(force: boolean | 'fresh' = false): Promise<RateLimit[]> {
+    if (this.probeRun) {
+      if (force !== 'fresh') return this.probeRun;
+      await this.probeRun;
+      return this.limits(force);
+    }
+    if (authGate.readsPaused() || this.ctx.closing?.() || [...this.sessions].some(s => s.runtime().turnActive)) return this.limitsCache;
     const fresh = force === 'fresh';
     // A read already under way began before this call: a fresh one waits for it and asks again.
     const read = async (q: Query) => {
       if (fresh) while (this.limitsRun) await this.limitsRun.catch(() => undefined);
-      return this.readLimits(q, force ? 0 : 15_000);
+      if (q.initializationResult) {
+        try { await withTimeout(q.initializationResult(), 25_000, 'Claude Code startup'); }
+        catch { return this.limitsCache; }
+      }
+      return this.readLimits(q, fresh ? 0 : 60_000);
     };
     for (const s of this.sessions) {
       const q = s.liveQuery();
@@ -911,11 +1056,16 @@ export class ClaudeProvider implements Provider {
     // dialog: that one must be taken after the dialog closed (review wave 8, #17).
     if (!force || (!fresh && Date.now() - this.limitsProbeAt < 60_000)) return this.limitsCache;
     this.limitsProbeAt = Date.now();
+    this.probeRun = this.probeLimits().finally(() => { this.probeRun = undefined; });
+    return this.probeRun;
+  }
+
+  private async probeLimits() {
     const input = new PushQueue<SDKUserMessage>();
-    const q = query({ prompt: input, options: { ...this.baseOptions(homedir()), settingSources: [], strictMcpConfig: true, persistSession: false } });
+    const q = query({ prompt: input, options: { ...this.baseOptions(homedir(), 'limits'), settingSources: [], strictMcpConfig: true, persistSession: false } });
     try {
-      await withTimeout(q.initializationResult(), 25_000, 'Claude Code startup');
-      return await this.readLimits(q, 0);
+      const read = q.initializationResult().then(() => this.readLimits(q, 0, true));
+      return await withTimeout(read, GATE.auxLeaseMs, 'limits probe');
     } catch (err) {
       this.ctx.log('claude: the limits probe failed:', (err as Error).message);
       return this.limitsCache;
@@ -952,7 +1102,7 @@ export class ClaudeProvider implements Provider {
     }));
   }
 
-  async open(rt: SessionRuntime, opts: { loadTranscript?: boolean }): Promise<ProviderSession> {
+  async open(rt: SessionRuntime, opts: { loadTranscript?: boolean; chainFrom?: string }): Promise<ProviderSession> {
     const session = new ClaudeSession(rt, this);
     this.sessions.add(session);
     void this.caps(rt.meta.cwd).then((caps) => {
@@ -960,7 +1110,11 @@ export class ClaudeProvider implements Provider {
       if (!rt.caps || !session.liveCaps) rt.setCaps(caps);
       if (!rt.meta.model) rt.update({ model: caps.models.find((m) => m.isDefault)?.id ?? caps.models[0]?.id ?? 'default' });
     });
-    if (opts.loadTranscript && rt.meta.providerSessionId) await session.loadTranscript().catch((e) => this.ctx.log('transcript load failed', e));
+    if (opts.chainFrom) {
+      session.restoredChain = true;
+      await session.loadChain(opts.chainFrom).catch(e => this.ctx.log('fork chain load failed', e));
+    } else if (opts.loadTranscript && rt.meta.providerSessionId) await session.loadTranscript().catch(e => this.ctx.log('transcript load failed', e));
+    else session.restoredChain = opts.loadTranscript === false && !!rt.meta.providerSessionId && rt.items.length > 0;
     return session;
   }
 
@@ -1146,13 +1300,15 @@ const COMPUTER_USE_SERVER = 'computer-use';
 /** Who answers permission prompts for an agent process (set when a session adopts a warm one). */
 interface WarmOwner {
   session?: ClaudeSession;
+  scope?: AuthScope;
+  child?: GatedProcess;
   childExited?: Promise<void>;
   streamEnded?: () => void;
 }
 
 /** Capture the actual process even when it starts asynchronously or is adopted from the warm pool. */
 function sessionQuery(prompt: PushQueue<SDKUserMessage>, options: Options, owner: WarmOwner): Query {
-  const spawnProcess = options.spawnClaudeCodeProcess ?? authGate.spawner(options.stderr);
+  const spawnProcess = authGate.spawner(options.stderr, undefined, owner.scope);
   let spawned = false;
   let exit!: () => void;
   owner.childExited = new Promise<void>((resolve) => { exit = resolve; });
@@ -1163,7 +1319,7 @@ function sessionQuery(prompt: PushQueue<SDKUserMessage>, options: Options, owner
     options: {
       ...options,
       spawnClaudeCodeProcess(request) {
-        const child = spawnProcess(request);
+        const child = owner.child = spawnProcess(request);
         spawned = true;
         child.once('exit', exit);
         child.once('error', (err) => {
@@ -1394,6 +1550,13 @@ class ClaudeSession implements ProviderSession {
   private retryNotice?: string;
   private tasks = new Map<string, Todo>();
   private chain: string[] = [];
+  restoredChain = false;
+
+  private async findNativePoint(item: UserItem) {
+    if (this.restoredChain && item.providerId && !this.chain.includes(item.providerId)) {
+      await this.loadChain().catch(e => this.log('native chain load failed', e));
+    }
+  }
   private resumeAt?: string;
   private skillNames: string[] = [];
   private closed = false;
@@ -1483,7 +1646,7 @@ class ClaudeSession implements ProviderSession {
         if (this.holdsWork()) return false;
         this.log('claude: Remote Control process released (not used recently)');
         // As the idle close: the remote status says it reconnects when the chat is used again.
-        this.tellLost(this.shutdown(), 'process');
+        this.tellLost(this.shutdown('process', undefined, 'remote'), 'process');
       },
     };
   }
@@ -1500,7 +1663,7 @@ class ClaudeSession implements ProviderSession {
   holdsWork(): boolean {
     if (this.rt.turnActive) return true;
     if (!this.q) return false;
-    return this.worksNow() || this.wakeDue() || Date.now() < this.taskEndUntil;
+    return !!this.owner?.child?.pending || this.worksNow() || this.wakeDue() || Date.now() < this.taskEndUntil;
   }
 
   /** Work running in the process now, a turn aside: a prompt open, the CLI's own word that it works, a live task. */
@@ -1554,13 +1717,14 @@ class ClaudeSession implements ProviderSession {
    * and workflows, background commands and monitors (and any other task that is not ambient), when the
    * oldest of those commands began, and its next scheduled wake-up. Nothing without a process.
    */
-  liveWork(): ReturnType<NonNullable<ProviderSession['liveWork']>> {
+  liveWork(purpose: 'move' | 'update' = 'move'): ReturnType<NonNullable<ProviderSession['liveWork']>> {
     if (!this.q) return { turn: false, agents: 0, commands: 0 };
     let agents = 0;
     let commands = 0;
     let oldest: number | undefined;
     let newest: number | undefined;
     for (const task of this.backgroundTasks()) {
+      if (purpose === 'update' && this.rt.taskServes(task.id)) continue;
       if (task.agent) agents++;
       else {
         commands++;
@@ -1574,7 +1738,7 @@ class ClaudeSession implements ProviderSession {
     // The CLI says it runs for as long as its background agents run (its idle comes once they are
     // done, sdk.d.ts): that is their work, counted as agents, not a turn. Read as a turn it would hold
     // a move at a limit off the very agents that move stops, and a send after a sign-in for minutes.
-    const turn = this.rt.turnActive || this.promptsOpen() || this.foreground.size > 0 || (this.cliBusy() && !agents);
+    const turn = this.rt.turnActive || !!this.owner?.child?.pending || this.promptsOpen() || this.foreground.size > 0 || (this.cliBusy() && !agents);
     return { turn, agents, commands, ...(oldest !== undefined ? { oldestCommandAt: oldest, newestCommandAt: newest } : {}), ...(wakeAt !== undefined ? { wakeAt } : {}),
       ...(Date.now() < this.taskEndUntil ? { notificationUntil: this.taskEndUntil } : {}) };
   }
@@ -1633,6 +1797,10 @@ class ClaudeSession implements ProviderSession {
     clearTimeout(this.releaseTimer);
   }
 
+  private owner?: WarmOwner;
+
+  processPid() { return this.owner?.child?.pid; }
+
   liveQuery() {
     return this.q;
   }
@@ -1658,7 +1826,8 @@ class ClaudeSession implements ProviderSession {
     const warm = !meta.providerSessionId && !this.resumeAt ? this.provider.takeWarm(warmKey(meta, this.provider.concise(), this.provider.widgets(), this.provider.profileText())) : undefined;
     let q: Query;
     let input: PushQueue<SDKUserMessage>;
-    const owner: WarmOwner = warm?.owner ?? {};
+    const owner: WarmOwner = warm?.owner ?? { scope: this.provider.scope(meta.options?.readOnly ? 'check' : meta.id.startsWith('sub-') ? 'sub-agent' : 'chat') };
+    this.owner = owner;
     owner.session = this;
     if (warm) {
       ({ q, input } = warm);
@@ -1836,7 +2005,8 @@ class ClaudeSession implements ProviderSession {
     if (!this.restartPending || this.retired || this.rt.turnActive) return;
     if (Date.now() < this.taskEndUntil) return;
     if (this.holdsWork()) {
-      if (!this.worksNow() && this.wakeDue()) this.freeLater(this.wakeAt()! + WAKE_GRACE_MS + 1 - Date.now());
+      if (this.owner?.child?.pending) this.freeLater(1000);
+      else if (!this.worksNow() && this.wakeDue()) this.freeLater(this.wakeAt()! + WAKE_GRACE_MS + 1 - Date.now());
       if (!this.restartTold && (this.liveIds().size || this.promptsOpen() || this.wakeDue())) {
         this.restartTold = true;
         this.rt.notice('info', `${this.restartPending} ${this.whenFree()}`);
@@ -2101,7 +2271,7 @@ class ClaudeSession implements ProviderSession {
       // After a sleep every chat's close falls due at once, while each process renews its sign-in:
       // spread out (server/core/auth-gate.ts), and only when the chat still holds no work then.
       authGate.afterWake(() => {
-        if (this.q && !this.rt.meta.options?.remoteControl && !this.holdsWork()) this.tellLost(this.shutdown(), 'process');
+        if (this.q && !this.rt.meta.options?.remoteControl && !this.holdsWork()) this.tellLost(this.shutdown('process', undefined, 'idle'), 'process');
       });
     }, ms);
     this.idleTimer.unref?.();
@@ -2121,7 +2291,9 @@ class ClaudeSession implements ProviderSession {
    * of the cut (an open turn is its caller's to end). Returns the names of the commands lost, for the
    * caller to tell (`tellLost`).
    */
-  private shutdown(why: LostWhy = 'process', trigger?: LossTrigger): string[] {
+  private shutdown(why: LostWhy = 'process', trigger?: LossTrigger, end?: EndReason): string[] {
+    if (this.owner?.child) this.owner.child.endReason = end ?? (this.provider.ctx.closing?.() ? 'quit' : trigger === 'capability' ? 'capability' : why === 'limit' ? 'limit' : this.rt.stopRequested ? 'stop' : 'close');
+    this.owner = undefined;
     clearTimeout(this.idleTimer);
     clearTimeout(this.wakeNet);
     clearTimeout(this.unreadNet);
@@ -2158,7 +2330,7 @@ class ClaudeSession implements ProviderSession {
    * the process has really ended, or after `EXIT_WAIT_MS` (a move copies a transcript only once
    * `exited` says it ended).
    */
-  async close() {
+  async close(reason?: EndReason) {
     this.retired = true;
     this.closed = true;
     this.held = undefined;
@@ -2170,7 +2342,7 @@ class ClaudeSession implements ProviderSession {
     this.own.clear();
     const owned = this.ownsTurn();
     const wakeLimit = this.takeWakeLimit();
-    const lost = this.shutdown();
+    const lost = this.shutdown('process', undefined, reason);
     if (owned) {
       this.turnSeq++;
       this.interrupted = false;
@@ -2498,6 +2670,11 @@ class ClaudeSession implements ProviderSession {
     const item = this.rt.get<UserItem>(itemId);
     if (!item || item.type !== 'user') return { ok: false, message: 'Pick one of your own messages to rewind to.' };
     if (this.rt.turnActive) return { ok: false, message: 'Stop the current turn first.' };
+    if (this.restoredChain) await this.findNativePoint(item);
+    if (this.rt.turnActive || this.rt.get(itemId) !== item) return { ok: false, message: 'The conversation changed before it could be rewound.' };
+    const at = item.providerId ? this.chain.indexOf(item.providerId) : -1;
+    const first = this.rt.items.find(i => !i.parentId && i.type === 'user');
+    if (at <= 0 && item !== first) return { ok: false, message: 'This point cannot be resumed. Continue from a summary of the conversation up to there.' };
     let note = '';
     if (restoreFiles && item.providerId) {
       try {
@@ -2515,7 +2692,9 @@ class ClaudeSession implements ProviderSession {
     }
     // The agent may have begun a turn by itself meanwhile: a rewind never cuts one (what the files came to is still said).
     if (this.rt.turnActive) return { ok: false, message: note ? `${note} The conversation was not rewound: the agent began working meanwhile.` : 'Stop the current turn first.' };
-    const at = item.providerId ? this.chain.indexOf(item.providerId) : -1;
+    if (this.rt.get(itemId) !== item || (at >= 0 && this.chain[at] !== item.providerId)) {
+      return { ok: false, message: 'The conversation changed before it could be rewound.' };
+    }
     const lost = this.shutdown();
     if (at > 0) this.resumeAt = this.chain[at - 1];
     else this.rt.update({ providerSessionId: undefined });
@@ -2536,6 +2715,7 @@ class ClaudeSession implements ProviderSession {
     const cut = cutAt(this.rt.items, itemId);
     if (!id || !cut) return null;
     // A rewound session that has not resumed yet ends at its rewind point.
+    if (cut.next && this.restoredChain) await this.findNativePoint(cut.next);
     const upTo = cut.next ? claudeForkPoint(this.chain, cut.next) : this.resumeAt;
     if (upTo === null) return null;
     const r = await this.provider.withHistory(() => forkSession(id, { dir: this.rt.meta.cwd, ...(upTo ? { upToMessageId: upTo } : {}) }));
@@ -2970,7 +3150,7 @@ class ClaudeSession implements ProviderSession {
       // Refused for the sign-in (its words are Claude Code's, never an answer): no red box per request.
       // When the turn ends the bridge asks the CLI whether the account is signed in, sends once more
       // when it is, and says it once for the chat when it is not (server/core/auth-gate.ts).
-      noteAuthFailure(rt.id, parentId ? rt.get<ToolItem>(parentId)?.title : undefined, turnOf(rt));
+      noteAuthFailure(rt.id, parentId ? rt.get<ToolItem>(parentId)?.title : undefined, turnOf(rt), this.provider.scope('chat'), this.owner?.child?.pid);
     } else if (m.error) {
       const words = failedWords ? texts.join('\n').trim() : '';
       rt.notice('error', errorLabel(m.error), words && !isStandIn(words) && words !== errorLabel(m.error) ? words : undefined);
@@ -3074,6 +3254,7 @@ class ClaudeSession implements ProviderSession {
       if (b.type !== 'tool_result') continue;
       const item = rt.get<ToolItem>(b.tool_use_id);
       if (!item) continue;
+      if (item.kind === 'edit' || item.kind === 'write') rt.promote?.(item);
       const result = mapResult(item.name, (item.input as Obj) ?? {}, m.tool_use_result, b.content, !!b.is_error);
       const status = item.status === 'denied' || item.status === 'cancelled' ? item.status : b.is_error ? 'error' : 'done';
       // Keep answers / preview diff when the result itself carries less.
@@ -3495,6 +3676,7 @@ class ClaudeSession implements ProviderSession {
       this.sentItems.delete(uuid);
       if (itemId) ids.add(itemId);
       const row = itemId ? this.rt.get<UserItem>(itemId) : undefined;
+      if (row) this.rt.promote?.(row);
       if (itemId) this.withdrawn.set(uuid, { itemId, text: row?.type === 'user' ? row.text : '', attachments: row?.type === 'user' ? row.attachments : undefined, steered: row?.steered, at: Date.now() });
     }
     while (this.withdrawn.size > 50) this.withdrawn.delete(this.withdrawn.keys().next().value!);
@@ -3651,8 +3833,10 @@ class ClaudeSession implements ProviderSession {
     }
     const error = wasInterrupted ? undefined : failure;
     // Refused for the sign-in: the bridge says it once for the chat (or sends once more), never the CLI's words on the turn's line.
-    const signIn = !!error && (refusedForSignIn(undefined, [error]) || authFailurePending(rt.id, turnOf(rt)));
-    if (!late && signIn && error) noteAuthFailure(rt.id, undefined, turnOf(rt));
+    const observed = authFailurePending(rt.id, turnOf(rt));
+    const signIn = !!error && (observed || refusedForSignIn(undefined, [error]));
+    // The result may repeat an assistant refusal the journal already captured at arrival.
+    if (!late && signIn && !observed) noteAuthFailure(rt.id, undefined, turnOf(rt), this.provider.scope('chat'), this.owner?.child?.pid);
     // Cut off at a plan limit while it worked ("You've hit your 5-hour limit · resets 6pm (Europe/Berlin)",
     // a 429): a limit like one met at the start, said by the chat's one limit notice (the bridge moves
     // it at the turn's end), never as "The turn ended with an error" with "Try again".
@@ -3737,8 +3921,6 @@ class ClaudeSession implements ProviderSession {
       });
       for (const id of ahead) if (rt.get<UserItem>(id)?.state === 'sent') rt.move(id, {}, true);
     }
-    // Fresh plan limits after every turn (shared with any read in the last few seconds).
-    if (this.q) void this.provider.readLimits(this.q);
     if (this.awaiting.size > 0 && !wasInterrupted) {
       // Messages it has not answered yet are still coming (a steer it has not read): their turn starts
       // right away. One that never comes back does not keep it for ever (`armUnreadNet`).
@@ -3804,6 +3986,7 @@ class ClaudeSession implements ProviderSession {
       rt.limitInBackground(wakeLimit);
     }
     this.scheduleIdleClose();
+    if (this.q && !error) void this.provider.readLimits(this.q, 60_000);
     // A changed option restarts the process once nothing holds it any more (`restartWhenFree`).
     if (this.restartPending) this.freeLater();
     else if (this.q && rt.meta.options?.browser) void this.checkBrowser(this.q);
@@ -4084,6 +4267,51 @@ class ClaudeSession implements ProviderSession {
   }
 
   // ── stored transcripts ──
+
+  /** The SDK fork gives each message a new UUID and records its original in forkedFrom.
+   * Walk only the active parent chain, keeping identifiers while the JSONL bodies stream past. */
+  async loadChain(source?: string) {
+    const rt = this.rt;
+    const id = rt.meta.providerSessionId;
+    if (!id || !/^[\w-]{1,128}$/.test(id)) return;
+    const file = path.join(this.provider.configHome(), 'projects', claudeFolderKey(rt.meta.cwd), id + '.jsonl');
+    const input = createReadStream(file, { encoding: 'utf8' });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    const entries = new Map<string, { parent?: string; original?: string; message: boolean }>();
+    let leaf: string | undefined;
+    try {
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        const row = JSON.parse(line);
+        if (row.sessionId !== id || row.isSidechain || typeof row.uuid !== 'string') continue;
+        // Detach parsed UUID substrings from potentially large message bodies.
+        const [uuid, parent, original] = JSON.parse(JSON.stringify([row.uuid, row.parentUuid,
+          (!source || row.forkedFrom?.sessionId === source) ? row.forkedFrom?.messageUuid : null]));
+        const message = row.type === 'assistant' || row.type === 'user';
+        entries.set(uuid, { parent, original, message });
+        if (message) leaf = uuid;
+      }
+    } finally { lines.close(); input.destroy(); }
+    const chain: string[] = [], copies = new Map<string, string>();
+    while (leaf) {
+      const entry = entries.get(leaf);
+      if (!entry) break;
+      entries.delete(leaf);
+      if (entry.message) {
+        chain.push(leaf);
+        if (entry.original) copies.set(entry.original, leaf);
+      }
+      leaf = entry.parent;
+    }
+    if (rt.meta.providerSessionId !== id || this.closed || rt.turnActive || !chain.length) return;
+    this.chain = chain.reverse();
+    for (const item of rt.items) {
+      if (item.type !== 'user' || !item.providerId) continue;
+      const copied = copies.get(item.providerId);
+      if (copied) rt.patch<UserItem>(item.id, { providerId: copied });
+    }
+    this.restoredChain = false;
+  }
 
   async loadTranscript() {
     const rt = this.rt;

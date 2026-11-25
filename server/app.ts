@@ -31,7 +31,8 @@ import {
   type ToolItem,
   type UserItem,
 } from '../shared/protocol';
-import { authGate, SignInChecks, takeAuthFailure } from './core/auth-gate';
+import { AuthJournal } from './core/auth-journal';
+import { authGate, gateKey, SignInChecks, takeAuthFailure } from './core/auth-gate';
 /** A refusal for the sign-in as it was noted (`refusalMark`). */
 interface RefusalMark {
   refusedId?: string;
@@ -63,7 +64,7 @@ import { handoverText } from './accounts/handover';
 import { itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
 import { runsTask, worksInBackground } from '../shared/background';
 import { runSubAgent } from './core/sub-agent';
-import { editsOf, readOnlyMode, turnSlice, TurnChecks, withoutChecks } from './core/check';
+import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
 import { cutAt } from './core/fork';
 import { pinFolder } from './core/contain';
 import { orderAccounts } from './accounts/order';
@@ -241,6 +242,7 @@ export class App {
   readonly store: Store;
   /** Last known provider info and capabilities, so start-up never waits for the CLIs. */
   readonly cache: DiskCache;
+  readonly journal: AuthJournal;
   /** The built-in default account's instance of each provider. */
   readonly providers = new Map<ProviderId, Provider>();
   /** Instances for extra accounts, created on first use: `provider:accountId` → instance. */
@@ -318,7 +320,9 @@ export class App {
   private retryOwners = new WeakMap<SessionRuntime, string>();
 
   /** `itemId` goes to the agent now (recorded first: a fast turn can end before the send returns). */
+  private accountUse = new Map<string, number>();
   private handOver(rt: SessionRuntime, itemId: string) {
+    this.accountUse.set(accountKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT), Date.now());
     const list = this.handed.get(rt.id) ?? [];
     if (!list.includes(itemId)) list.push(itemId);
     this.handed.set(rt.id, list);
@@ -371,7 +375,7 @@ export class App {
   /** Spare: chats that start by themselves on quota that would expire, or at a limit's reset (server/core/spare.ts). */
   private spare = new SpareWaits({
     sessions: () => this.sessions.values(),
-    hydrate: (rt) => this.hydrate(rt),
+    hydrate: rt => this.lazy.has(rt.id) ? this.hydrateAsync(rt) : undefined,
     busy: (rt) => rt.turnActive || this.opening.has(rt.id) || this.delivering.has(rt.id) || this.dispatching.has(rt.id) || this.moving.has(rt.id) || this.switching.has(rt.id),
     model: (rt) => this.chatModel(rt),
     resetModels: rt => {
@@ -381,6 +385,7 @@ export class App {
     },
     accounts: (provider) => this.spareAccounts(provider),
     refresh: async (provider, accountId) => {
+      if (this.dormant(provider, accountId)) return false;
       const key = accountKey(provider, accountId);
       const seq = this.limitsSeq.get(key) ?? 0;
       await this.call('provider.limits', { provider, accountId, force: true });
@@ -434,11 +439,7 @@ export class App {
 
   /** Race: one task to two agents at once, each in a lane of its own (server/core/race.ts). */
   private races = new Races({
-    get: (id) => {
-      const rt = this.sessions.get(id);
-      if (rt) this.hydrate(rt);
-      return rt;
-    },
+    get: id => this.sessions.get(id),
     contenders: (cwd, hint) => this.raceContenders(cwd, hint),
     create: async (c, cwd, opts) => {
       const snap = await this.createSession({ provider: c.provider, cwd, ...(c.model ? { model: c.model } : {}), accountId: c.accountId, ...(opts.mode ? { mode: opts.mode } : {}) }, { lane: { slug: opts.slug, detail: opts.detail } });
@@ -451,7 +452,10 @@ export class App {
     stop: (rt) => this.stopForGood(rt),
     forecast: (rt) => this.lanes.forecast(rt),
     land: (rt, message) => this.lanes.land(rt, message),
-    discard: (rt) => this.lanes.discard(rt),
+    discard: async rt => {
+      if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
+      return this.lanes.discard(rt);
+    },
     persist: () => this.persistSessions(),
     log: (...args) => this.log(...args),
   });
@@ -487,6 +491,7 @@ export class App {
     this.consoles = !!opts.openConsole || process.platform === 'win32';
     this.resets = new ResetConsoles({
       open: opts.openConsole ?? realConsole,
+      journal: () => this.journal,
       command: (provider, accountId) => this.provider(provider, accountId).limitResetCommand?.(),
       cwd: () => {
         // A neutral folder of Sable's own, never a project.
@@ -511,8 +516,10 @@ export class App {
     this.loginTimeoutMs = opts.loginTimeoutMs ?? LOGIN_TIMEOUT_MS;
     this.compactTimeoutMs = opts.compactTimeoutMs ?? COMPACT_TIMEOUT_MS;
     this.backgroundLimitMs = opts.backgroundLimitMs;
-    this.store = new Store(opts.home);
+    this.store = new Store(opts.home, (session, id) => this.sessions.get(session)?.get(id));
     this.cache = new DiskCache(this.store.dir);
+    this.journal = new AuthJournal(this.store.dir);
+    this.onDispose(authGate.watchWake(() => this.journal.record(undefined, { event: 'wake' })));
     bootMark('app:store');
     for (const make of opts.providers) {
       const p = make(this.contextFor(DEFAULT_ACCOUNT));
@@ -541,6 +548,9 @@ export class App {
       // lost, as the chat is read: `loadRestored`); so did a move that was under way.
       meta.background = undefined;
       meta.commands = undefined;
+      meta.serving = undefined;
+      meta.servingSince = undefined;
+      meta.servingAddress = undefined;
       meta.moving = undefined;
       // An until loop does not outlive Sable: the session says so when it is opened.
       if (meta.until) this.untilLost.set(meta.id, meta.until), (meta.until = undefined);
@@ -565,14 +575,28 @@ export class App {
     if (!this.quiet) console.log('[sable]', ...args);
   };
 
+  // enqueue publishes a row copy synchronously. Tag both copies before any subscriber sees it.
+  private enqueueSubmission?: { rt: SessionRuntime; id: string };
   emit = (event: BridgeEvent) => {
+    const submission = this.enqueueSubmission;
+    if (submission && event.type === 'queue.updated' && event.sessionId === submission.rt.id) {
+      this.enqueueSubmission = undefined;
+      const row = submission.rt.queue.at(-1);
+      const published = event.queue.at(-1);
+      if (row && published?.id === row.id) row.submitId = published.submitId = submission.id;
+    }
     // A rewind can move a disk-backed step into the recent turns. A late patch/delta can
     // restart one. Restore that item in place before subscribers or the provider use it again.
     if (event.type === 'timeline.reset') {
       const rt = this.sessions.get(event.sessionId);
       if (rt) this.store.bindProviderInputs(rt.id, rt.items);
-      for (let i = recentStart(event.items, RECENT_TURNS); rt && i < event.items.length; i++) {
-        if (isLight(event.items[i])) event.items[i] = { ...this.store.promote(rt.id, rt.items[i]) };
+      const recent = recentStart(event.items, RECENT_TURNS);
+      for (let i = 0; rt && i < event.items.length; i++) event.items[i] = { ...this.store.recut(rt.id, rt.items[i], i >= recent) };
+    } else if (event.type === 'item.added' && event.item.type === 'turn') {
+      const rt = this.sessions.get(event.sessionId);
+      if (rt) {
+        const end = recentStart(rt.items, RECENT_TURNS);
+        for (let i = recentStart(rt.items, RECENT_TURNS + 1); i < end; i++) this.store.recut(rt.id, rt.items[i], false);
       }
     } else if (event.type === 'item.added' && isLight(event.item)) {
       event = { ...event, item: this.store.wholeItem(event.sessionId, event.item) };
@@ -589,7 +613,7 @@ export class App {
           this.store.promote(event.sessionId, item);
           values[field] = (values[field] ?? '') + event.delta;
           event = { type: 'item.patch', sessionId: event.sessionId, id: item.id, patch: { ...item, more: false } };
-        } else {
+        } else if (!(item.type === 'user' && Object.keys(event.patch).every(k => k === 'providerId'))) {
           this.store.promote(event.sessionId, item);
           event = { ...event, patch: { ...item, more: false } };
         }
@@ -657,6 +681,11 @@ export class App {
     }
     const h = this.handlers.get(method);
     if (!h) throw new Error(`Unknown method: ${method}`);
+    const id = (params as { sessionId?: string } | undefined)?.sessionId;
+    if (id && this.lazy.has(id)) {
+      await this.hydrateAsync(this.runtime(id));
+      still(ctx);
+    }
     return (await h(params as never, ctx)) as RpcMethods[M]['result'];
   }
 
@@ -681,6 +710,9 @@ export class App {
     return {
       log: this.log,
       emit: (e) => this.fromProvider(accountId, e),
+      journal: this.journal,
+      closing: () => this.disposed,
+      dormant: provider => this.dormant(provider, accountId),
       account: accountId === DEFAULT_ACCOUNT ? undefined : { id: accountId, dir },
       settings: () => this.store.state.settings,
       otherAgents: () => this.otherAgents(),
@@ -861,7 +893,7 @@ export class App {
   private limitsCleared(provider: ProviderId, accountId: string, windows: RateLimit[]) {
     // Chats that waited go on only where every window holding their model has room now (the planner
     // checks the fresh reading); the windows that cleared say whose wait this was.
-    this.spare.resetCleared(provider, accountId, windows);
+    void this.spare.resetCleared(provider, accountId, windows).catch(err => this.log('Could not resume reset wait', err));
     const fb = this.fallbacks.get(provider);
     const now = Date.now();
     if (fb && fb.from === accountId && fb.until && fb.until > now) {
@@ -888,6 +920,17 @@ export class App {
     this.scheduleResetAlert();
   }
 
+  /** A passive refresh can use the last answer for accounts untouched for two hours. */
+  private dormant(provider: ProviderId, accountId: string) {
+    if (provider !== 'claude' && provider !== 'codex') return false;
+    const since = Date.now() - 2 * 3600_000;
+    if ((this.accountUse.get(accountKey(provider, accountId)) ?? 0) >= since || (this.findAccount(provider, accountId)?.createdAt ?? 0) >= since) return false;
+    for (const rt of this.sessions.values()) {
+      if (rt.meta.provider === provider && (rt.meta.accountId ?? DEFAULT_ACCOUNT) === accountId && (rt.turnActive || rt.meta.updatedAt >= since)) return false;
+    }
+    return true;
+  }
+
   private accountAuth(provider: ProviderId, accountId: string, force: boolean): Promise<ProviderInfo> {
     const key = accountKey(provider, accountId);
     const hit = this.infoCache.get(key);
@@ -903,21 +946,25 @@ export class App {
   /** The provider as the UI sees it: the default account's CLI state plus every account. `force` re-reads one account. */
   async providerInfo(provider: ProviderId, force?: string): Promise<ProviderInfo> {
     const p = this.provider(provider);
-    const base = await p.info(force === DEFAULT_ACCOUNT).catch(() => fallbackInfo(p));
+    const previous = this.cache.get<ProviderInfo>(`info:${provider}`);
+    const coldBase = force !== DEFAULT_ACCOUNT && previous?.installed && this.dormant(provider, DEFAULT_ACCOUNT);
+    const base = coldBase ? previous : await p.info(force === DEFAULT_ACCOUNT).catch(() => fallbackInfo(p));
     const defaultId = this.defaultAccountId(provider);
     const signIns = await Promise.all(
       this.accountList(provider).map(async (a) => {
         const own = a.id === DEFAULT_ACCOUNT;
         // A missing CLI has no accounts to ask about.
-        const info = own ? base : base.installed ? await this.accountAuth(provider, a.id, force === a.id) : undefined;
-        return { a, own, info, auth: info?.auth ?? { loggedIn: false } };
+        const cached = previous?.accounts?.find(row => row.id === a.id);
+        const cold = own ? coldBase : force !== a.id && this.dormant(provider, a.id);
+        const info = own ? base : cold ? cached : base.installed ? await this.accountAuth(provider, a.id, force === a.id) : undefined;
+        return { a, own, info, cold, auth: info?.auth ?? { loggedIn: false, ...(cold && { checking: true }) } };
       }),
     );
     // The sign-ins first: one that changed forgets the old person's limits before any snapshot copies
     // them (review wave 8, #26).
     this.noteSignIns(
       provider,
-      signIns.map((s) => ({ id: s.a.id, auth: s.auth })),
+      signIns.filter(s => !s.cold).map((s) => ({ id: s.a.id, auth: s.auth })),
     );
     const accounts = signIns.map(
       ({ a, own, info, auth }): AccountInfo => ({
@@ -973,10 +1020,17 @@ export class App {
    * this one ran (a throttled or refused read hands back the last known rows and says nothing).
    * `force: 'fresh'` goes past the agent's own throttles (a reset's reading after its dialog).
    */
-  private async readLimits(provider: ProviderId, accountId: string, force: boolean | 'fresh'): Promise<{ limits: RateLimit[]; fresh: boolean; signIn: number }> {
+  private async readLimits(provider: ProviderId, accountId: string, force: boolean | 'fresh', requested = !!force): Promise<{ limits: RateLimit[]; fresh: boolean; signIn: number }> {
     const key = accountKey(provider, accountId);
     const seq = this.limitsSeq.get(key) ?? 0;
     const signIn = this.signInGen.get(key) ?? 0;
+    if (provider === 'claude' || provider === 'codex') {
+      const chats = [...this.sessions.values()].filter(s => s.meta.provider === provider && (s.meta.accountId ?? DEFAULT_ACCOUNT) === accountId);
+      const dormant = this.dormant(provider, accountId);
+      if (authGate.readsPaused() || chats.some(s => s.turnActive) || (!requested && dormant)) {
+        return { limits: this.limitsCache.get(key) ?? [], fresh: false, signIn };
+      }
+    }
     const limits = await this.provider(provider, accountId).limits(force);
     const fresh = (this.limitsSeq.get(key) ?? 0) > seq;
     // A sign-in that changed meanwhile: this reading may be the previous person's; it is not kept.
@@ -1253,13 +1307,6 @@ export class App {
     }
   }
 
-  /** The session with its timeline read from disk (for actions that add to it). */
-  private loaded(id: string): SessionRuntime {
-    const rt = this.runtime(id);
-    this.hydrate(rt);
-    return rt;
-  }
-
   runtime(id: string): SessionRuntime {
     const rt = this.sessions.get(id);
     if (!rt) throw new Error('Session not found');
@@ -1296,6 +1343,7 @@ export class App {
       } else this.store.saveSession(rt.id, () => ({ items: rt.items, todos: rt.todos, queue: rt.queue, dirty: rt.takeDirty() }));
     });
     this.pinCwd(rt);
+    rt.promote = item => this.store.promote(rt.id, item);
     rt.canBeginTurn = () => !this.disposed && !this.updates?.installing;
     rt.onTurnEnd = (r, error, opts) => this.afterTurn(r, error, opts?.hold, opts?.backgroundLimit);
     // Background work met a plan limit with no turn running: the chat's limit, decided once (limit-policy.ts).
@@ -1321,18 +1369,9 @@ export class App {
     return rt;
   }
 
-  /** Loads a restored session's timeline from disk the first time it is needed. */
-  private hydrate(rt: SessionRuntime) {
-    if (!this.lazy.delete(rt.id)) return;
-    this.loadInto(rt, this.store.loadSession(rt.id));
-  }
-
   private reading = new Map<string, Promise<void>>();
 
-  /**
-   * As `hydrate`, with a big file read in a worker thread, so opening a chat of hundreds of megabytes
-   * does not hold the app up. A sync `hydrate` meanwhile (a message sent to it) simply wins.
-   */
+  /** Concurrent actions wait for the same indexed read before observing or editing the chat. */
   private hydrateAsync(rt: SessionRuntime): Promise<void> {
     if (!this.lazy.has(rt.id)) return Promise.resolve();
     let run = this.reading.get(rt.id);
@@ -1808,7 +1847,9 @@ export class App {
     if (this.beforeFirstInput) await this.beforeFirstInput(rt.id);
     maySend();
     // A refused message retried after a restore can have disk-backed attachments.
-    const out = this.withHandover(rt, this.store.wholeItem(rt.id, item) as UserItem);
+    const card = rt.get<UserItem>(item.id);
+    if (card && card !== item && isLight(card)) this.store.promote(rt.id, card);
+    const out = this.withHandover(rt, this.store.promote(rt.id, item) as UserItem);
     const wake = !rt.get(item.id) && out.count ? this.pendingLossWake.get(rt) : undefined;
     if (item.text === RESUME_LOST && !rt.get(item.id) && !wake) { out.release?.(); return; }
     const confirms = rt.meta.provider === 'claude' || rt.meta.provider === 'codex' || (rt.meta.provider === 'opencode' && !!out.count);
@@ -2448,7 +2489,7 @@ export class App {
     if (h?.stopBackgroundWork) result = await bounded(h.stopBackgroundWork(automatic));
     else if (h) {
       rt.handle = undefined;
-      result = await this.closeWriter(rt, rt.meta.accountId ?? DEFAULT_ACCOUNT, h).then(() => true, () => false);
+      result = await this.closeWriter(rt, rt.meta.accountId ?? DEFAULT_ACCOUNT, h, rt.meta.provider, 'limit').then(() => true, () => false);
     }
     // A turn began while they were being stopped (a notification woke the agent; Claude Code then
     // stops nothing): none of them is taken for unstoppable, and a move waits for that turn (D2).
@@ -2752,7 +2793,7 @@ export class App {
     };
     let reading: { limits: RateLimit[]; fresh: boolean };
     try {
-      reading = await this.readLimits(provider, from, 'fresh');
+      reading = await this.readLimits(provider, from, 'fresh', false);
     } catch {
       if (still()) inconclusive();
       return;
@@ -2967,7 +3008,7 @@ export class App {
    * Nothing is sent when no limit notice is open any more (carried on by hand meanwhile).
    */
   private async resumeRefused(rt: SessionRuntime, carried: 'conversation' | 'summary' | 'none' | 'reset', refusalId?: string, automatic = false) {
-    this.hydrate(rt);
+    if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
     const accountId = rt.meta.accountId ?? DEFAULT_ACCOUNT;
     const open = this.openLimit(rt, refusalId);
     if (!open || (automatic && rt.dangerHeld) || rt.turnActive || this.moving.has(rt.id) || this.switching.has(rt.id) || this.dispatching.has(rt.id)) return;
@@ -3020,7 +3061,10 @@ export class App {
 
   /** One ask of the CLI per account after a refusal, and the chats that wait for a sign-in. */
   private signIns = new SignInChecks({
-    ask: async (provider, accountId) => !!(await this.accountAuth(provider as ProviderId, accountId, true)).auth?.loggedIn,
+    ask: async (provider, accountId) => {
+      const info = await this.accountAuth(provider as ProviderId, accountId, true);
+      return info.problem || !info.installed || info.auth.checking ? undefined : info.auth.loggedIn;
+    },
     delayMs: () => this.delays.signIn ?? 1500,
   });
 
@@ -3051,22 +3095,34 @@ export class App {
    * (once per account, however many chats were refused): then the message goes once more, silently.
    * When the CLI says signed out, the chat says it once and waits for the account (`resumeSignedIn`).
    */
-  private async onSignInRefused(rt: SessionRuntime, refusal: { background: string[] }, mark: RefusalMark) {
+  private async onSignInRefused(rt: SessionRuntime, refusal: { background: string[]; observed?: boolean }, mark: RefusalMark) {
     const { provider, accountId } = mark;
+    if (!refusal.observed) this.journal.record({ agent: provider, accountId }, { event: 'refused' });
     const signedIn = await this.signIns.check(provider, accountId);
     // Anything changed meanwhile (stopped, closed, moved, another agent or account, a message sent or a
     // turn ended since): the person decides what happens next; nothing is retried, nothing is said.
     if (!this.sameRefusal(rt, mark)) return;
     const refused = mark.refusedId ? rt.get<UserItem>(mark.refusedId) : undefined;
-    if (signedIn && refused && this.signIns.mayRetry(rt.id, refused.id)) return void (await this.sendAfterSignIn(rt, refused, refusal.background, mark));
-    void this.emitProvider(provider).catch(() => {});
+    if (signedIn === undefined) return void rt.notice('error', 'Could not confirm the sign-in', 'Try the message again when the account is available.');
+    if (signedIn && refused && this.signIns.mayRetry(rt.id, refused.id)) {
+      return void (await this.sendAfterSignIn(rt, refused, refusal.background, mark));
+    }
     if (signedIn) return void rt.notice('error', 'The sign-in was refused again');
+    const known = this.cache.get<ProviderInfo>(`info:${provider}`);
+    if (known) {
+      const out = { loggedIn: false };
+      const info = { ...known, ...(accountId === DEFAULT_ACCOUNT && { auth: out }),
+        accounts: known.accounts?.map(a => a.id === accountId ? { ...a, auth: out } : a) };
+      this.cache.set(`info:${provider}`, info);
+      this.emit({ type: 'provider.updated', provider: info });
+    }
     this.signIns.wait(provider, accountId, rt.id, refusal.background);
     // What the chat was when it began to wait: closed or stopped meanwhile, it is not started again.
     this.signInWaits.set(rt.id, { stops: mark.stops, closes: mark.closes });
     // One notice for the chat, however many requests and sub-agents were refused.
     if (rt.items.some((i) => i.type === 'notice' && !!i.auth)) return;
     const label = this.accountList(provider).length > 1 ? this.accountLabel(provider, accountId) : undefined;
+    this.journal.record({ agent: provider, accountId }, { event: 'signed-out' });
     const notice = { type: 'notice' as const, variant: 'error' as const, text: `Signed out of ${label ?? this.provider(provider, accountId).name}`, auth: { state: 'signedOut' as const, provider, accountId, ...(label ? { label } : {}) } };
     // Inside the refused turn, before its closing line.
     const end = rt.items.at(-1);
@@ -3104,7 +3160,7 @@ export class App {
    * goes (the retry is the same turn), and nothing new shows in the conversation.
    */
   private async sendAfterSignIn(rt: SessionRuntime, refused: UserItem, background: string[], mark: RefusalMark) {
-    this.hydrate(rt);
+    if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
     if (!this.sameRefusal(rt, mark) || this.limitPending(rt) || this.sendHolds.has(rt.id)) return;
     const handle = await this.ensureHandle(rt);
     await this.applyDue(rt, handle);
@@ -3131,6 +3187,7 @@ export class App {
       await this.sendWithHandover(rt, handle, item, () => {
         if (this.stopsOf(rt) !== mark.stops || this.closesOf(rt) !== mark.closes || this.moving.has(rt.id) || this.limitPending(rt)) throw new NotNow('The sign-in retry was interrupted.');
       });
+      this.journal.record({ agent: mark.provider, accountId: mark.accountId }, { event: 'retry' });
       if (mark.endId && after.some(i => i.id === mark.endId && i.type === 'turn' && !i.parentId)) rt.remove(mark.endId);
     } catch (err) {
       unhand();
@@ -3203,7 +3260,7 @@ export class App {
   }
 
   private async switchIdleAccount(rt: SessionRuntime, accountId: string, opts: MoveOptions, ctx: CallContext | undefined, stops: number, closes: number): Promise<RpcMethods['session.switchAccount']['result']> {
-    this.hydrate(rt);
+    if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
     const live = () => {
       if (this.disposed || this.sessions.get(rt.id) !== rt || this.closesOf(rt) !== closes) throw new NotNow('The chat was closed during the move.');
       still(ctx);
@@ -3680,7 +3737,7 @@ export class App {
     const wakeLost = wakeAt !== undefined && wakeAt + WAKE_DELIVERY_GRACE_MS > Date.now();
     rt.cancelPrompts();
     const working = rt.items.filter((i) => worksInBackground(i)).map((i) => i.id);
-    if (rt.meta.commands) attempt.lostSteps = rt.items.filter(runsTask).map((i) => i.id);
+    if (rt.meta.commands || rt.meta.serving) attempt.lostSteps = rt.items.filter(runsTask).map((i) => i.id);
     const lost = rt.tasksLost('move', auto ? 'move' : undefined);
     const old = rt.handle;
     rt.handle = undefined;
@@ -3688,7 +3745,7 @@ export class App {
     attempt.remote = !!old && !!rt.meta.options?.remoteControl && (!!rt.meta.remote?.url || rt.meta.remote?.tone === 'ok');
     if (old) {
       try {
-        await this.closeWriter(rt, fromId, old);
+        await this.closeWriter(rt, fromId, old, rt.meta.provider, 'move');
         attempt.sourceClosed = true;
         rt.setReportedTasks([]);
         if (old.exited) stable = true;
@@ -3932,7 +3989,7 @@ export class App {
    * (the switch line goes). Refused while the agent works or background work runs in its process.
    */
   async switchAgent(rt: SessionRuntime, provider: ProviderId, opts: { model?: string; accountId?: string } = {}): Promise<RpcMethods['session.switchAgent']['result']> {
-    this.hydrate(rt);
+    if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
     const from = rt.meta.provider;
     if (provider === from) {
       if (opts.model) this.setSessionModel(rt, opts.model);
@@ -3976,7 +4033,7 @@ export class App {
     const lost = rt.tasksLost('process');
     this.switching.add(rt.id);
     try {
-      await this.detachWriter(rt);
+      await this.detachWriter(rt, 'switch');
     } finally {
       this.switching.delete(rt.id);
     }
@@ -4233,20 +4290,20 @@ export class App {
   /** A child that missed the move deadline may still own its account's transcript. */
   private writers = new WeakMap<SessionRuntime, Map<string, () => Promise<void>>>();
 
-  private detachWriter(rt: SessionRuntime) {
+  private detachWriter(rt: SessionRuntime, reason: 'switch' | 'close' = 'close') {
     const handle = rt.handle;
     rt.handle = undefined;
     const account = rt.meta.accountId ?? DEFAULT_ACCOUNT;
-    return handle ? this.closeWriter(rt, account, handle) : this.confirmWriter(rt, account);
+    return handle ? this.closeWriter(rt, account, handle, rt.meta.provider, reason) : this.confirmWriter(rt, account);
   }
 
-  private closeWriter(rt: SessionRuntime, account: string, handle: ProviderSession, provider = rt.meta.provider) {
+  private closeWriter(rt: SessionRuntime, account: string, handle: ProviderSession, provider = rt.meta.provider, reason: 'close' | 'switch' | 'limit' | 'move' = 'close') {
     const writers = this.writers.get(rt) ?? new Map<string, () => Promise<void>>();
     this.writers.set(rt, writers);
     let closing: Promise<void> | undefined;
     writers.set(accountKey(provider, account), async () => {
       // Share an in-flight close. A rejected close or exit check can be retried on the same handle.
-      closing ??= handle.close().catch(err => { closing = undefined; throw err; });
+      closing ??= handle.close(reason).catch(err => { closing = undefined; throw err; });
       await closing;
       await handle.exited?.();
     });
@@ -4264,14 +4321,14 @@ export class App {
 
   /** Includes work admitted before a provider has published its first turn or task. */
   get preparingWork() {
-    return !!(this.sending.size || this.dispatching.size || this.opening.size || this.switching.size ||
+    return !!(this.journal.busy || this.sending.size || this.dispatching.size || this.opening.size || this.switching.size ||
       this.moving.size || this.firstInputs.size || this.limitDecisions.size || this.bgLimits.size);
   }
 
   private async ensureHandle(rt: SessionRuntime, forMove = false) {
     const closes = this.closesOf(rt);
     const closed = () => this.disposed || this.sessions.get(rt.id) !== rt || this.closesOf(rt) !== closes;
-    this.hydrate(rt);
+    if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
     for (let tries = 0; ; tries++) {
       if (closed()) throw new NotNow('The chat was closed.');
       if (rt.handle) return rt.handle;
@@ -4457,6 +4514,7 @@ export class App {
    * a message still waiting for the agent to start, an until loop, a turn check. The chat stays.
    */
   private async stopForGood(rt: SessionRuntime) {
+    if (this.lazy.has(rt.id)) await this.hydrateAsync(rt);
     this.closed(rt);
     this.until.closed(rt);
     await this.checks.closed(rt);
@@ -4513,7 +4571,7 @@ export class App {
     return this.createSession(p, extra);
   }
 
-  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string }; custom?: boolean; fork?: { source: string; items: TimelineItem[] } } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
+  private async createSession(p: RpcMethods['session.create']['params'], extra: { lane?: { slug: string; detail?: string }; custom?: boolean; fork?: { source: string; items: TimelineItem[]; chainFrom?: string } } = {}, ctx?: CallContext): Promise<SessionSnapshot> {
     if (!this.registryReady()) throw new Error('Sable could not read your saved chats and settings.');
     const settings = this.store.state.settings;
     let accountId = p.accountId ?? this.defaultAccountId(p.provider);
@@ -4603,7 +4661,7 @@ export class App {
     const closes = this.closesOf(rt);
     const opened = this.lanes.atStart(rt, p.title ?? p.chat?.text).then(() => {
       if (this.disposed || this.closesOf(rt) !== closes) throw new NotNow('The chat was closed.');
-      return provider.open(rt, { loadTranscript: !!p.resume && !extra.fork });
+      return provider.open(rt, { loadTranscript: !!p.resume && !extra.fork, chainFrom: extra.fork?.chainFrom });
     }).then(
       (handle) => {
         // Closed while it was starting: let the agent go.
@@ -4655,7 +4713,12 @@ export class App {
     });
 
     // ── auth ──
-    this.register('auth.refresh', ({ provider, accountId }) => this.emitProvider(provider, accountId ?? DEFAULT_ACCOUNT));
+    this.register('auth.journal', ({ limit }) => this.journal.lines(limit));
+    this.register('auth.refresh', ({ provider, accountId = DEFAULT_ACCOUNT }) => {
+      this.provider(provider, accountId);
+      this.accountUse.set(accountKey(provider, accountId), Date.now());
+      return this.emitProvider(provider, accountId);
+    });
     // The code a browser showed instead of returning to Sable: it finishes the sign-in in progress.
     this.register('auth.code', async ({ provider, accountId = DEFAULT_ACCOUNT, code }) => {
       const p = this.provider(provider, accountId);
@@ -4697,6 +4760,7 @@ export class App {
               this.store.saveState();
               await this.emitProvider(provider);
             }
+            this.journal.record({ agent: provider, accountId }, { event: 'signed-in' });
             this.emit({ type: 'auth.progress', provider, accountId, state: 'done' });
           } else if (!this.loginCancelled.has(key)) this.emit({ type: 'auth.progress', provider, accountId, state: 'cancelled' });
         })
@@ -4738,9 +4802,11 @@ export class App {
       this.provider(provider);
       const abs = path.resolve(dir.trim().replace(/^~(?=$|[\\/])/, this.userHome));
       if (!isDir(abs)) throw new Error(`Folder not found: ${abs}`);
-      const taken = this.accountList(provider).find((a) => a.id !== DEFAULT_ACCOUNT && sameDir(this.accountDir(provider, a.id), abs));
+      const folder = gateKey(provider, abs);
+      const taken = this.accountList(provider).find((a) => a.id !== DEFAULT_ACCOUNT && gateKey(provider, this.accountDir(provider, a.id)) === folder);
       if (taken) throw new Error(`That folder is already the account ${taken.label}.`);
-      if (sameDir(abs, path.join(this.userHome, provider === 'codex' ? '.codex' : '.claude'))) throw new Error('That folder is the built-in account.');
+      const standard = path.join(this.userHome, provider === 'codex' ? '.codex' : '.claude');
+      if (folder === gateKey(provider, this.provider(provider).configHome?.() ?? standard) || folder === gateKey(provider, standard)) throw new Error('That folder is the built-in account.');
       const id = randomUUID().replace(/-/g, '').slice(0, 10);
       this.store.state.accounts.push({ id, provider, label: label?.trim().slice(0, 60) || folderLabel(provider, abs), createdAt: Date.now(), dir: abs });
       this.store.saveState();
@@ -4819,7 +4885,13 @@ export class App {
 
     this.register('provider.caps', ({ provider, cwd, accountId, refresh }) => this.capsFast(provider, cwd, accountId, refresh));
     this.register('provider.prewarm', (p) => this.prewarm(p));
-    this.register('provider.limits', async ({ provider, accountId = DEFAULT_ACCOUNT, force }) => (await this.readLimits(provider, accountId, !!force)).limits);
+    this.register('provider.limits', async ({ provider, accountId = DEFAULT_ACCOUNT, force }) => {
+      if (force) {
+        this.provider(provider, accountId);
+        this.accountUse.set(accountKey(provider, accountId), Date.now());
+      }
+      return (await this.readLimits(provider, accountId, !!force)).limits;
+    });
     // Spends a reset credit: only the confirmed click in the UI calls this, never anything automatic.
     this.register('provider.useReset', async ({ provider, accountId = DEFAULT_ACCOUNT, key }) => {
       const p = this.provider(provider, accountId);
@@ -5014,10 +5086,14 @@ export class App {
       // While the agent works the bridge holds the message until the turn ends, unless it is
       // steered into the running turn (and the agent can take one).
       if (rt.turnActive && !(steer && rt.caps?.features.steer !== false)) {
-        const q = rt.enqueue(text, attachments);
-        // A phone's message keeps its pairing's guard in the queue: once that phone is removed it
-        // never goes out by itself (review wave 8, #21; a move's compaction is such a turn).
-        if (ctx.allowed) this.queueGuards.set(q.id, ctx);
+        if (typeof submitId === 'string' && submitId.length <= 128) this.enqueueSubmission = { rt, id: submitId };
+        try {
+          const q = rt.enqueue(text, attachments);
+          // A phone's message keeps its pairing's guard in the queue.
+          if (ctx.allowed) this.queueGuards.set(q.id, ctx);
+        } finally {
+          this.enqueueSubmission = undefined;
+        }
         rt.unreadQueueHeld = false;
         return { ok: true, queued: true };
       }
@@ -5029,7 +5105,6 @@ export class App {
       // Omitted attachments keep the message's; an empty list removes them.
       validMessage(text, attachments);
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
       // The message as this edit finds it, in the same step: the desktop's swap takes it into its
       // field, so an edit another window made just before is never lost (review wave 10, #8).
       const found = rt.queue.find((q) => q.id === id);
@@ -5041,27 +5116,24 @@ export class App {
     });
     this.register('queue.take', ({ sessionId, id }) => {
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
       const message = rt.takeQueued(id);
       this.spare.queueChanged(rt);
-      return message ? { message } : {};
+      if (message) return { message };
+      return !rt.isReserved(id) && rt.get(id)?.type === 'user' ? { taken: true } : {};
     });
     this.register('queue.reorder', ({ sessionId, ids }) => {
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
       rt.reorderQueued(Array.isArray(ids) ? ids : []);
       return { ok: true };
     });
     this.register('queue.remove', ({ sessionId, id }) => {
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
       const ok = !!rt.takeQueued(id);
       this.spare.queueChanged(rt);
       return { ok };
     });
     this.register('queue.sendNow', async ({ sessionId, id }, ctx) => {
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
       return { ok: await this.deliverQueued(rt, id, ctx) };
     });
 
@@ -5161,7 +5233,6 @@ export class App {
     // Until green: `/until <check>` arms a loop on the session (server/core/until.ts).
     this.register('until.set', ({ sessionId, text }) => {
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
       const parsed = parseUntil(text ?? '');
       if ('error' in parsed) return { ok: false, error: parsed.error };
       if ('off' in parsed) return { ok: this.until.stop(rt) };
@@ -5173,18 +5244,13 @@ export class App {
     // "Check with Codex" (server/core/check.ts): the other agent reviews a finished turn, read-only.
     this.register('turn.check', ({ sessionId, turnId }) => {
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
-      // The check builds its brief synchronously from the requested turn, including child edits.
-      const slice = turnSlice(rt.items, turnId);
-      if (slice) for (const edit of editsOf(rt.items, slice.roots)) if (isLight(edit)) this.store.promote(sessionId, edit);
-      return this.checks.start(rt, String(turnId ?? ''));
+      return this.checks.start(rt, String(turnId ?? ''), edit => this.store.wholeItem(sessionId, edit) as ToolItem);
     });
     this.register('turn.checkStop', ({ sessionId, itemId }) => ({ ok: this.checks.stop(this.runtime(sessionId), String(itemId ?? '')) }));
 
     // Spare (server/core/spare.ts): `/spare <message>` and "Continue at reset".
     this.register('spare.send', ({ sessionId, text, attachments }) => {
       const rt = this.runtime(sessionId);
-      this.hydrate(rt);
       const body = typeof text === 'string' ? text.trim() : '';
       if (!body && !attachments?.length) return { ok: false, error: 'Add a message after /spare' };
       // A new chat is named by the message it waits with, not "New session" for hours.
@@ -5207,9 +5273,9 @@ export class App {
     this.register('git.worktrees', ({ cwd }) => gitWorktrees(cwd));
     this.register('git.draft', ({ sessionId, cwd }) => this.draftCommit(String(sessionId ?? ''), String(cwd ?? '')));
     this.register('lane.forecast', ({ sessionId }) => this.lanes.forecast(this.runtime(sessionId)));
-    this.register('lane.land', ({ sessionId, message }) => this.lanes.land(this.loaded(sessionId), typeof message === 'string' ? message : undefined));
-    this.register('lane.discard', ({ sessionId }) => this.lanes.discard(this.loaded(sessionId)));
-    this.register('lane.create', ({ sessionId }) => this.lanes.create(this.loaded(sessionId)));
+    this.register('lane.land', ({ sessionId, message }) => this.lanes.land(this.runtime(sessionId), typeof message === 'string' ? message : undefined));
+    this.register('lane.discard', ({ sessionId }) => this.lanes.discard(this.runtime(sessionId)));
+    this.register('lane.create', ({ sessionId }) => this.lanes.create(this.runtime(sessionId)));
     this.register('lane.open', ({ sessionId }) => this.lanes.open(this.runtime(sessionId)));
     this.register('lane.diff', ({ sessionId }) => this.lanes.diff(this.runtime(sessionId)));
 
@@ -5217,8 +5283,8 @@ export class App {
     this.register('race.start', ({ cwd, task, provider, modes }) =>
       this.races.start({ cwd: String(cwd ?? ''), task: typeof task === 'string' ? task : '', provider, modes: modes && typeof modes === 'object' ? modes : undefined }),
     );
-    this.register('race.keep', ({ sessionId, message }) => this.races.keep(this.loaded(sessionId), typeof message === 'string' ? message : undefined));
-    this.register('race.discard', ({ sessionId }) => this.races.discardBoth(this.loaded(sessionId)));
+    this.register('race.keep', ({ sessionId, message }) => this.races.keep(this.runtime(sessionId), typeof message === 'string' ? message : undefined));
+    this.register('race.discard', ({ sessionId }) => this.races.discardBoth(this.runtime(sessionId)));
 
     this.register('session.rename', ({ sessionId, title }) => {
       this.runtime(sessionId).update({ title: title.trim() || 'Untitled', titleSource: 'user' });
@@ -5277,8 +5343,8 @@ export class App {
       return done;
     });
     // Fork at an answer: a new session with the same agent and settings that continues from the
-    // end of that turn. The agent's own fork carries the real transcript; without one (or when it
-    // fails) the new session starts from a summary up to there. The source is never changed.
+    // end of that turn. An unresolved native point is reported before creating a session.
+    // Providers that continue from a summary announce it before the fork appears.
     this.register('session.fork', async ({ sessionId, itemId }) => {
       const src = this.runtime(sessionId);
       await this.hydrateAsync(src);
@@ -5294,6 +5360,13 @@ export class App {
           resume = null;
         }
       }
+      if (!resume) {
+        const detail = 'It starts with a summary of the conversation up to there';
+        if ((m.provider === 'claude' || m.provider === 'codex') && m.providerSessionId) {
+          throw new Error('This fork cannot keep the agent conversation. Continue from a summary of the conversation up to there.');
+        }
+        this.emit({ type: 'toast', level: 'info', text: detail });
+      }
       const snap = await this.createSession({
         provider: m.provider,
         cwd: m.cwd,
@@ -5306,7 +5379,7 @@ export class App {
         speed: m.speed,
         title: `${m.title} (fork)`,
         ...(resume ? { resume } : {}),
-      }, src.items.some(isLight) ? { fork: { source: src.id, items: cut.kept } } : {});
+      }, src.items.some(isLight) ? { fork: { source: src.id, items: cut.kept, chainFrom: resume && m.provider === 'claude' ? m.providerSessionId : undefined } } : {});
       const rt = this.runtime(snap.session.id);
       if (resume) rt.notice('info', `Forked from ${m.title}`);
       else {
@@ -5428,9 +5501,11 @@ export class App {
       pending.missed();
       pending.rollback();
     }
+    const deadline = Date.now() + 9800;
     // Freeze before any await or disposer. A quit restores exactly like a crash.
     const durable = await boundedBy(this.store.seal().then(() => true, (err: Error) => err), 10_000, false);
-    if (durable === true) saved?.();
+    const drainAgents = this.journal.active;
+    if (durable === true && !drainAgents) saved?.();
     clearTimeout(this.resetTimer);
     this.updates?.dispose();
     this.until.dispose();
@@ -5440,12 +5515,19 @@ export class App {
     const services = [this.checks.dispose(), ...this.disposers.splice(0).map(fn => Promise.resolve().then(fn))];
     const handles = [...this.sessions.values()].map(rt => {
       rt.cancelPrompts();
-      return rt.handle?.close();
+      return rt.handle?.close('quit');
     });
     const providers = [...this.providers.values(), ...this.instances.values()];
     const agents = boundedBy(Promise.allSettled(handles), 1500, undefined)
       .then(() => Promise.allSettled(providers.map(p => p.dispose())));
-    await boundedBy(Promise.allSettled([...services, agents, this.cache.flush()]), 3000, undefined);
+    if (drainAgents) {
+      // Electron allows three seconds after the save acknowledgement. Use the remaining
+      // pre-acknowledgement budget for agent exits, concurrently across all accounts.
+      await boundedBy(this.journal.whenDrained(), Math.max(1, deadline - Date.now()), undefined);
+      if (this.journal.active) this.journal.noteQuitDeadline();
+      if (durable === true) saved?.();
+    }
+    await boundedBy(Promise.allSettled([...services, agents, this.cache.flush(), this.journal.flush()]), drainAgents ? Math.max(1, deadline - Date.now()) : 3000, undefined);
     this.instances.clear();
     if (durable !== true) throw durable || new Error('Timed out saving the conversations.');
   }

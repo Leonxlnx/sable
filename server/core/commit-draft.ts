@@ -51,7 +51,7 @@ export function commitPrompt(input: CommitDraftInput, cwd: string): TitlePrompt 
   const subjects = fit(input.subjects.slice(0, MAX_SUBJECTS), SUBJECT_CHARS, MAX_SUBJECTS * (SUBJECT_CHARS + 2));
   if (subjects.length) parts.push('', 'Recent commit subjects, for style:', ...subjects);
   parts.push('', 'Diff against HEAD (new files are only listed above):', '<diff>', patch || '(none)', '</diff>', '', 'The commit message:');
-  return { system: COMMIT_SYSTEM, user: parts.join('\n'), cwd, maxTokens: COMMIT_MAX_TOKENS };
+  return { purpose: 'draft', system: COMMIT_SYSTEM, user: parts.join('\n'), cwd, maxTokens: COMMIT_MAX_TOKENS };
 }
 
 /**

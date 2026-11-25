@@ -306,7 +306,7 @@ export interface SpareHost {
   now?: () => number;
   sessions: () => Iterable<SessionRuntime>;
   /** Loads a restored session's timeline and queue (where its held messages are). */
-  hydrate: (rt: SessionRuntime) => void;
+  hydrate: (rt: SessionRuntime) => void | Promise<void>;
   /** The session is working, starting or sending. */
   busy: (rt: SessionRuntime) => boolean;
   /** The model its turns run on (`effectiveModel`); undefined when that cannot be told. */
@@ -397,7 +397,6 @@ export class SpareWaits {
 
   /** `/spare`: the message joins the queue, held back until the planner starts it. */
   hold(rt: SessionRuntime, text: string, attachments?: Attachment[]): SpareWait {
-    this.host.hydrate(rt);
     const q = rt.enqueue(text, attachments);
     const cur = rt.meta.spare;
     const wait: SpareWait = cur ? { ...cur, held: [...(cur.held ?? []), q.id] } : { reason: 'spare', since: this.now(), held: [q.id] };
@@ -408,7 +407,6 @@ export class SpareWaits {
 
   /** "Continue at reset": the chat's last open limit notice continues on its account at its reset. */
   atReset(rt: SessionRuntime, refusalId?: string): { ok: boolean; spare?: SpareWait; error?: string } {
-    this.host.hydrate(rt);
     const notice = rt.items.findLast((i): i is NoticeItem => i.type === 'notice' && !!i.limit && !i.limit.continuedWith && !i.parentId && (!refusalId || i.id === refusalId));
     if (!notice) return { ok: false, error: 'There is no limit to wait for' };
     const at = notice.limit!.resetsAt;
@@ -423,7 +421,6 @@ export class SpareWaits {
   /** Cancel: the chat stops waiting. What it held stays in the queue to go out only by hand, and one line says so. */
   cancel(rt: SessionRuntime): boolean {
     if (!rt.meta.spare) return false;
-    this.host.hydrate(rt);
     this.release(rt);
     return true;
   }
@@ -446,7 +443,8 @@ export class SpareWaits {
   async startNow(rt: SessionRuntime): Promise<boolean> {
     const wait = rt.meta.spare;
     if (!wait) return false;
-    this.host.hydrate(rt);
+    await this.host.hydrate(rt);
+    if (rt.meta.spare !== wait) return false;
     const [first, ...rest] = this.pending(rt);
     if (!first) return false;
     if (wait.reason === 'spare' && !rest.length) rt.update({ spare: null });
@@ -550,7 +548,7 @@ export class SpareWaits {
    * confirmed by a fresh read): chats waiting for its reset are due now. The planner then starts
    * them exactly as at a reset by time, checking the account's limits once more first.
    */
-  resetCleared(provider: ProviderId, accountId: string, windows?: RateLimit[]) {
+  async resetCleared(provider: ProviderId, accountId: string, windows?: RateLimit[]) {
     const now = this.now();
     let due = false;
     for (const rt of this.waiting()) {
@@ -559,7 +557,9 @@ export class SpareWaits {
       // Only a chat that one of the cleared windows held (another model's week is not its wait); the
       // planner then checks every window that holds it, against the fresh reading (review wave 8, #18).
       const model = this.host.model(rt);
-      this.host.hydrate(rt);
+      const reading = this.host.hydrate(rt);
+      if (reading) await reading;
+      if (rt.meta.spare !== wait) continue;
       const models = [model, ...(this.host.resetModels?.(rt) ?? [])];
       if (windows && !windows.some(l => models.some(m => forModel(l, m)))) continue;
       if (wait.at !== undefined && wait.at > now) rt.update({ spare: { ...wait, at: now } });
@@ -596,7 +596,7 @@ export class SpareWaits {
     this.planning = true;
     try {
       for (const rt of this.waiting()) {
-        this.host.hydrate(rt);
+        await this.host.hydrate(rt);
         this.queueChanged(rt);
       }
       const waits = this.waiting();

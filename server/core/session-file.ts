@@ -1,4 +1,4 @@
-import { constants as bufferLimits } from 'node:buffer';
+import { scanSession, sessionTail } from './session-json';
 import * as fs from 'node:fs';
 import { closeSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
@@ -8,8 +8,8 @@ import type { QueuedMessage, TimelineItem, Todo } from '../../shared/protocol';
 import { cutItem, isLight, LIGHT, recentStart, workerCut } from './trim';
 
 /**
- * A session's timeline on disk, as a base file and a small tail. For a large line-format base
- * the reader keeps settled old steps as socket previews plus a generation-bound byte index.
+ * A session's timeline on disk, as a base file and a small tail. For a large base the reader
+ * keeps settled steps at their window density, with the original bytes indexed on disk.
  * The stored preview is the baseline for late changes. Only the original line supplies hidden fields.
  *
  * A long chat holds hundreds of megabytes (images in tool output, long outputs). Writing all of it
@@ -64,13 +64,13 @@ export const OVER_MAX = { items: 512, chars: 4 * 1024 * 1024 };
 /** Items at the end of the chat a new base leaves to the tail (where streaming happens). */
 export const TAIL_KEEP = 24;
 /** Above this size a base is read line by line (one string cannot hold much more than 512 MB). */
-export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024 };
+export const READ = { byLineAbove: 256 * 1024 * 1024, inWorkerAbove: 16 * 1024 * 1024, part: 1 << 20, tailStream: 1 << 20, tailLimit: 32 << 20 };
 
 type Line = { offset: number; length: number; chars: number; preview?: TimelineItem };
 type LineIndex = Map<string, Line>;
 type Tail = SessionData & { baseGen?: number; from?: number; over?: TimelineItem[] };
-type BaseFile = { gen?: number; items: TimelineItem[]; todos?: Todo[]; queue?: QueuedMessage[] };
-type IndexedRead = { base: BaseFile; index?: LineIndex; tail: Tail | null };
+type BaseFile = { over?: TimelineItem[]; gen?: number; items: TimelineItem[]; todos?: Todo[]; queue?: QueuedMessage[] };
+type IndexedRead = { stamp?: number; base: BaseFile; index?: LineIndex; tail: Tail | null };
 
 function readBytes(io: typeof fs, fd: number, offset: number, length: number): Buffer {
   const bytes = Buffer.allocUnsafe(length);
@@ -82,104 +82,201 @@ function readBytes(io: typeof fs, fd: number, offset: number, length: number): B
   return bytes;
 }
 
-/** One implementation for synchronous callers and the standalone worker. Pass its dependencies explicitly. */
-function readIndexed(io: typeof fs, file: string, tailFile: string | undefined, cut: typeof cutItem,
-  boundary: typeof recentStart, bytes: typeof readBytes, options: typeof workerCut, maxLegacy: number): IndexedRead {
+/** A recent cut can lose a localhost announcement or the first lines of an error.
+ * Flag the exceptional rows whose later old preview must come from disk. */
+function project(item: TimelineItem, recent: boolean, cut: typeof cutItem, options: typeof workerCut) {
+  const view = cut(item, recent ? options.recent : options.old);
+  if (view === item) return item;
+  const result = item.type === 'tool' ? item.result : undefined;
+  const reread = recent && item.type === 'tool' && (
+    item.kind === 'bash' && ((item.input as { run_in_background?: boolean } | undefined)?.run_in_background ||
+      [item.output, result?.text].some(s => s && s.length > options.recent.at && s.includes('://'))) ||
+    item.status === 'error' && [result?.text, result?.stderr].some(s => s && s.length > options.recent.at)
+  );
+  const mark = { ...(recent && { recent: true }), ...(reread && { reread: true }),
+    pictures: result?.images?.length ?? 0, hunks: !!result?.diff?.some(f => f.hunks.length),
+    ...(item.type === 'tool' && item.input !== undefined ? { input: true } : {}),
+    ...(item.type === 'tool' && view.type === 'tool' && view.detail.background && !item.detail.background ? { legacyBackground: true } : {}) };
+  // Detach substrings from the full strings backing the parsed line.
+  return JSON.parse(JSON.stringify({ ...view, [options.mark]: mark })) as TimelineItem;
+}
+
+type Row = { tail: boolean; key: string; value: any; line?: Line };
+type Header = { base: BaseFile; tail: Tail | null; stamp?: number };
+
+type TurnPosition = { id: string; turn: boolean; at?: number; retained?: boolean };
+
+function turnPositions(turns: number) {
+  const over = new Map<string, boolean>();
+  const all: number[] = [], head: number[] = [];
+  function remember(list: number[], index: number) {
+    list.push(index);
+    if (list.length > turns + 1) list.shift();
+  }
+  return {
+    add(pos: TurnPosition) {
+      if (pos.at === undefined) over.set(pos.id, pos.turn);
+      else {
+        if (pos.turn) remember(all, pos.at);
+        if (pos.retained && (over.get(pos.id) ?? pos.turn)) remember(head, pos.at);
+      }
+    },
+    start(active: boolean, suffix: number, count: number) {
+      over.clear();
+      const needed = turns - (active ? suffix : 0);
+      return needed < 0 ? count : ((active ? head : all).at(-needed - 1) ?? -1) + 1;
+    },
+  };
+}
+
+/** The first pass locates the last few turns in both possible prefixes. Only their ordinals
+ * and the override types are retained. The second pass sends the actual projection of each row. */
+function scanIndexed(io: typeof fs, file: string, tailFile: string | undefined, cut: typeof cutItem,
+  options: typeof workerCut, scan: typeof scanSession, projectRow: typeof project, merge: typeof sessionTail,
+  positions: ReturnType<typeof turnPositions>, emit: (row: Row, bytes: number) => void): Header {
   const fd = io.openSync(file, 'r');
+  let tailFd: number | undefined;
   try {
+    const stat = io.fstatSync(fd);
+    let hasOverrides = false;
+    let suffixTurns = 0;
     let tail: Tail | null = null;
     if (tailFile) {
-      try {
-        tail = JSON.parse(io.readFileSync(tailFile, 'utf8'));
-        if (!Array.isArray(tail?.items)) throw new Error('Invalid session tail');
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      try { tailFd = io.openSync(tailFile, 'r'); }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+      if (tailFd !== undefined) tail = scan(io, tailFd, (key, item) => {
+        if (key === 'over' && item) {
+          hasOverrides = true;
+          positions.add({ id: item.id, turn: item.type === 'turn' });
+        }
+        if (key === 'items' && item?.type === 'turn') suffixTurns++;
+      }) as Tail;
+    }
+    const limit = tail && Number.isInteger(tail.from) && tail.from! >= 0 ? tail.from! : Infinity;
+    let count = 0;
+    const base = scan(io, fd, (key, item) => {
+      if (key !== 'items') return;
+      if (!item || typeof item.id !== 'string' || Object.hasOwn(item, options.mark)) throw new Error('Invalid session item');
+      if (item.type === 'turn' || hasOverrides && count < limit) {
+        positions.add({ id: item.id, at: count, turn: item.type === 'turn', retained: count < limit });
       }
-    }
-    const size = io.fstatSync(fd).size;
-    const prefix = bytes(io, fd, 0, Math.min(80, size)).toString();
-    const head = /^\{"gen":(\d+),"items":\[\n/.exec(prefix);
-    if (!head) {
-      if (!tailFile || size > maxLegacy || prefix.startsWith('{"gen":') && prefix.includes('\n')) throw new Error('Invalid session header');
-      const base = JSON.parse(io.readFileSync(fd, 'utf8'));
-      if (!Array.isArray(base?.items)) throw new Error('Invalid legacy session');
-      return { base, tail };
-    }
-    const gen = Number(head[1]);
-    const index: LineIndex = new Map();
-    const items: TimelineItem[] = [];
-    const chunk = Buffer.allocUnsafe(1 << 20);
-    let parts: Buffer[] = [];
-    let pos = head[0].length, offset = pos, comma = true;
-    while (pos < size) {
-      const n = io.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
-      if (!n) throw new Error('Incomplete session file');
-      let from = 0;
-      for (let nl = chunk.indexOf(10); nl >= 0 && nl < n; nl = chunk.indexOf(10, from)) {
-        const part = chunk.subarray(from, nl);
-        const line = parts.length ? Buffer.concat([...parts, part]) : part;
-        if (!comma) throw new Error('Missing item separator');
-        comma = line.at(-1) === 44;
-        const length = line.length - Number(comma);
-        const json = line.toString('utf8', 0, length);
-        const item = JSON.parse(json) as TimelineItem;
-        if (typeof item.id !== 'string' || index.has(item.id) || Object.hasOwn(item, options.mark)) throw new Error('Invalid session item');
-        const range: Line = { offset, length, chars: json.length };
-        const view = tailFile ? cut(item, options.old) : item;
-        if (view !== item) {
-          // Round-trip the preview: a V8 substring can otherwise pin the entire output it came from.
-          const result = item.type === 'tool' ? item.result : undefined;
-          const mark = { pictures: result?.images?.length ?? 0, hunks: !!result?.diff?.some(f => f.hunks.length),
-            ...(item.type === 'tool' && item.input !== undefined ? { input: true } : {}),
-            ...(item.type === 'tool' && view.type === 'tool' && view.detail.background && !item.detail.background ? { legacyBackground: true } : {}) };
-          range.preview = JSON.parse(JSON.stringify({ ...view, [options.mark]: mark })) as TimelineItem;
-          items.push(structuredClone(range.preview));
-        } else items.push(item);
-        index.set(items[items.length - 1].id, range);
-        from = nl + 1;
-        offset = pos + from;
-        parts = [];
+      count++;
+    }) as BaseFile;
+    const from = merge(base.gen, stat.mtimeMs, tail, count, new Map())?.from ?? null;
+    const recent = positions.start(from !== null, suffixTurns, count);
+    count = 0;
+    scan(io, fd, (key, value, offset, length, chars) => {
+      const line = key === 'items' ? { offset, length, chars } : undefined;
+      if (line && tailFile) {
+        // The suffix is validated, but its obsolete bodies never travel beside the quit tail.
+        if (from !== null && count >= from) value = { id: value.id, type: value.type };
+        else value = projectRow(value, count >= recent, cut, options);
+        count++;
       }
-      if (from < n) parts.push(Buffer.from(chunk.subarray(from, n)));
-      pos += n;
-    }
-    const foot = Buffer.concat(parts).toString('utf8');
-    if (!foot.startsWith(']') || items.length && comma) throw new Error('Invalid session footer');
-    const rest = JSON.parse('{"items":[' + foot);
-    // A quit tail can rewind the base or add turns. Promote only steps recent in the actual chat.
-    const active = tail?.baseGen === gen && Array.isArray(tail.items) ? tail : undefined;
-    const from = active && Number.isInteger(active.from) && active.from! >= 0 && active.from! <= items.length ? active.from! : items.length;
-    const newer = new Map(active?.over?.map(i => [i.id, i]));
-    const visible = active ? items.slice(0, from).map(i => newer.get(i.id) ?? i).concat(active.items) : items;
-    for (let i = boundary(visible, options.turns); i < from; i++) {
-      const item = items[i], range = index.get(item.id)!;
-      if (range.preview && !newer.has(item.id)) {
-        items[i] = JSON.parse(bytes(io, fd, range.offset, range.length).toString('utf8'));
-        delete range.preview;
+      emit({ key, tail: false, value, line }, length);
+    });
+    if (tailFd !== undefined && from !== null) scan(io, tailFd, (key, value, _offset, length) => emit({ key, tail: true, value }, length));
+    // Legacy and compact files have no canonical generation header to verify at seek time.
+    const head = Buffer.alloc(80);
+    const n = io.readSync(fd, head, 0, head.length, 0);
+    const canonical = head.toString('utf8', 0, n).startsWith(`{"gen":${base.gen},"items":[\n`);
+    return { base, tail: from === null ? null : tail, ...(!canonical && { stamp: stat.mtimeMs }) };
+  } finally { if (tailFd !== undefined) io.closeSync(tailFd); io.closeSync(fd); }
+}
+
+function collectRead() {
+  const base: Record<string, any[]> = Object.create(null), tail: Record<string, any[]> = Object.create(null);
+  const index: LineIndex = new Map();
+  return {
+    add({ key, tail: suffix, value, line }: Row) {
+      ((suffix ? tail : base)[key] ??= []).push(value);
+      if (line) {
+        if (index.has(value.id)) throw new Error('Duplicate session item');
+        if (isLight(value)) line.preview = structuredClone(value);
+        index.set(value.id, line);
       }
-    }
-    return { base: { gen, items, todos: rest.todos, queue: rest.queue }, index, tail };
-  } finally { io.closeSync(fd); }
+    },
+    finish(header: Header): IndexedRead {
+      return { ...header, base: Object.assign(header.base, base), tail: header.tail && Object.assign(header.tail, tail), index };
+    },
+  };
+}
+
+function readIndexed(file: string, tailFile?: string) {
+  const rows = collectRead();
+  return rows.finish(scanIndexed(fs, file, tailFile, cutItem, workerCut, scanSession, project, sessionTail, turnPositions(workerCut.turns), rows.add));
 }
 
 const WORKER = `
 const { parentPort, workerData } = require('node:worker_threads');
-// tsx annotates nested functions with __name when the server runs from source.
 const __name = f => f;
-const opts = workerData.options;
-const { cutItem } = (${workerCut.factory})(opts.recent, opts.keepFiles, (${workerCut.task}));
+const { options, ack, part } = workerData;
+const { cutItem } = (${workerCut.factory})(options.recent, options.keepFiles, (${workerCut.task}));
+let rows = [], bytes = 0, positions = [];
+function send(message) {
+  Atomics.store(ack, 0, 0);
+  parentPort.postMessage(message);
+  Atomics.wait(ack, 0, 0);
+}
+function flush() {
+  if (rows.length) send({ rows });
+  rows = [];
+  bytes = 0;
+}
+const layout = {
+  add(position) {
+    positions.push(position);
+    if ((bytes += 40 + 2 * position.id.length) >= part) {
+      send({ positions });
+      positions = [];
+      bytes = 0;
+    }
+  },
+  start(active, suffix, count) {
+    send({ positions, boundary: { active, suffix, count } });
+    positions = [];
+    bytes = 0;
+    return workerData.start[0];
+  }
+};
 try {
-  const value = (${readIndexed})(require('node:fs'), workerData.file, workerData.tail, cutItem,
-    (${workerCut.boundary}), (${readBytes}), opts, workerData.maxLegacy);
-  parentPort.postMessage({ ok: true, value });
-} catch { parentPort.postMessage({ ok: false }); }
+  const header = (${scanIndexed})(require('node:fs'), workerData.file, workerData.tail, cutItem, options,
+    (${scanSession}), (${project}), (${sessionTail}), layout, (row, length) => {
+      rows.push(row);
+      if ((bytes += length) >= part) flush();
+    });
+  flush();
+  parentPort.postMessage({ header });
+} catch { parentPort.postMessage({ failed: true }); }
 `;
 
 function readInWorker(file: string, tail: string): Promise<Read<IndexedRead>> {
   return new Promise(resolve => {
-    const w = new Worker(WORKER, { eval: true, workerData: { file, tail, options: workerCut, maxLegacy: bufferLimits.MAX_STRING_LENGTH },
+    const ack = new Int32Array(new SharedArrayBuffer(4));
+    const collected = collectRead();
+    const layout = turnPositions(workerCut.turns);
+    const start = new Float64Array(new SharedArrayBuffer(8));
+    const w = new Worker(WORKER, { eval: true, workerData: { file, tail, options: workerCut, ack, start, part: READ.part },
       resourceLimits: { maxOldGenerationSizeMb: 384, maxYoungGenerationSizeMb: 24 } });
-    w.once('message', resolve);
+    w.on('message', (msg: { positions?: TurnPosition[]; boundary?: { active: boolean; suffix: number; count: number }; rows?: Row[]; header?: Header }) => {
+      try {
+        if (msg.positions) {
+          for (const pos of msg.positions) layout.add(pos);
+          const b = msg.boundary;
+          if (b) start[0] = layout.start(b.active, b.suffix, b.count);
+        } else if (msg.rows) {
+          for (const row of msg.rows) collected.add(row);
+        } else {
+          resolve(msg.header ? { ok: true, value: collected.finish(msg.header) } : { ok: false });
+          return;
+        }
+        Atomics.store(ack, 0, 1);
+        Atomics.notify(ack, 0);
+      } catch {
+        resolve({ ok: false });
+        void w.terminate();
+      }
+    });
     w.once('error', () => resolve({ ok: false }));
     w.once('exit', () => resolve({ ok: false }));
   });
@@ -189,6 +286,8 @@ const CHUNK = 1 << 20;
 
 interface Base {
   index?: LineIndex;
+  stamp?: number;
+  orphans?: TimelineItem[];
   /** Byte ranges of restart notices in the last successful write, generation-bound. */
   notices?: { file: string; prefix: string; rows: Map<string, { line: Line; json: string }> };
   gen: number;
@@ -220,7 +319,7 @@ function readJson<T>(file: string): Read<T> {
 /** A big base, one item per line (as `writeBase` writes it), parsed piece by piece. */
 export function readBaseByLine(file: string): Read<BaseFile> {
   try {
-    return { ok: true, value: readIndexed(fs, file, undefined, cutItem, recentStart, readBytes, workerCut, 0).base };
+    return { ok: true, value: readIndexed(file).base };
   } catch { return { ok: false }; }
 }
 
@@ -252,6 +351,7 @@ let lastGen = 0;
 const nextGen = () => (lastGen = Math.max(Date.now(), lastGen + 1));
 
 export class SessionFiles {
+  private warned = new Set<string>();
   private bases = new Map<string, Base>();
   /** The write in progress per session: the next waits for it (two writes never share a temporary file). */
   private writing = new Map<string, Promise<void>>();
@@ -264,7 +364,8 @@ export class SessionFiles {
   /** Deleted sessions: a write still in flight must not bring their file back. */
   private deleted = new Set<string>();
 
-  constructor(private readonly pathOf: (id: string) => string) {}
+  constructor(private readonly pathOf: (id: string) => string,
+    private readonly compactLive?: (id: string, saved: TimelineItem, preview: TimelineItem) => void) {}
 
   private trackRead<T>(id: string, work: Promise<T>): Promise<T> {
     const reads = this.reading.get(id) ?? new Set();
@@ -280,6 +381,12 @@ export class SessionFiles {
     return this.pathOf(id).replace(/\.json$/, '.tail.json');
   }
 
+  private large(fileSize: number, id: string) {
+    let tailSize = 0;
+    try { tailSize = statSync(this.tailOf(id)).size; } catch { /* The reader handles missing and unreadable files. */ }
+    return fileSize + tailSize >= READ.inWorkerAbove || fileSize > READ.byLineAbove || tailSize > READ.tailStream;
+  }
+
   load(id: string): SessionData {
     const file = this.pathOf(id);
     let size: number, mtime: number;
@@ -287,9 +394,9 @@ export class SessionFiles {
     catch (err) {
       return this.finish(id, (err as NodeJS.ErrnoException).code === 'ENOENT' ? { ok: true, value: null } : { ok: false }, 0, 0);
     }
-    if (size >= READ.inWorkerAbove || size > READ.byLineAbove) {
+    if (this.large(size, id)) {
       try {
-        const loaded = readIndexed(fs, file, this.tailOf(id), cutItem, recentStart, readBytes, workerCut, bufferLimits.MAX_STRING_LENGTH);
+        const loaded = readIndexed(file, this.tailOf(id));
         return this.finish(id, { ok: true, value: loaded.base }, size, mtime, loaded);
       } catch { return this.finish(id, { ok: false }, size, mtime); }
     }
@@ -303,7 +410,7 @@ export class SessionFiles {
     catch (err) {
       return this.finish(id, (err as NodeJS.ErrnoException).code === 'ENOENT' ? { ok: true, value: null } : { ok: false }, 0, 0);
     }
-    if (stat.size < READ.inWorkerAbove) return this.load(id);
+    if (!this.large(stat.size, id)) return this.load(id);
     const previous = this.bases.get(id);
     const read = await this.trackRead(id, readInWorker(file, this.tailOf(id))).catch(() => ({ ok: false as const }));
     // A synchronous hydrate that won the race owns the installed index.
@@ -350,32 +457,65 @@ export class SessionFiles {
     }
     const tail = tailRead.value;
     const invalid = (item: TimelineItem) => !item || typeof item.id !== 'string' || isLight(item);
-    if ((!loaded?.index && items.some(invalid)) ||
-      (tail?.baseGen === gen && (tail.items.some(invalid) || (Array.isArray(tail.over) && tail.over.some(invalid))))) {
+    const invalidOverrides = (over?: TimelineItem[]) => over !== undefined && (!Array.isArray(over) || over.some(invalid));
+    if (!Array.isArray(base.items) || invalidOverrides(base.over) || (!loaded?.index && items.some(invalid)) ||
+      (tail?.baseGen === gen && (!Array.isArray(tail.items) || tail.items.some(invalid) || invalidOverrides(tail.over)))) {
       this.unreadable.add(id);
       return { items: [], todos: [], unreadable: true };
     }
     let from = items.length;
     let data: SessionData = { items, todos: base.todos ?? [], queue: base.queue };
     const over = new Set<string>();
-    if (tail && tail.baseGen === gen && Array.isArray(tail.items)) {
-      from = typeof tail.from === 'number' && Number.isInteger(tail.from) && tail.from >= 0 && tail.from <= items.length ? tail.from : items.length;
+    let orphans = base.over ?? [];
+    const newer = new Map(tail?.baseGen === gen && Array.isArray(tail.over) ? tail.over.map(i => [i.id, i]) : []);
+    const merge = sessionTail(base.gen, mtime, tail, items.length, newer);
+    if (tail && merge) {
+      from = merge.from;
       let head = items.slice(0, from);
       // Settled items changed since the base was written: their newest form, in their place.
-      if (Array.isArray(tail.over) && tail.over.length) {
-        const newer = new Map(tail.over.filter((i) => i && typeof i.id === 'string').map((i) => [i.id, i]));
+      if (newer.size) {
         head = head.map((i) => {
-          const n = newer.get(i.id);
-          if (!n) return i;
-          over.add(i.id);
+          const n = merge.item(i.id, i);
+          if (newer.delete(i.id)) over.add(i.id);
           return n;
         });
+        orphans = [...new Map([...orphans, ...newer.values()].map(item => [item.id, item])).values()];
       }
       data = { items: head.concat(tail.items), todos: tail.todos ?? base.todos ?? [], queue: tail.queue ?? base.queue };
     }
     const settled = items.slice(0, from).map((i) => i.id);
-    this.bases.set(id, { gen, index: loaded?.index, ids: settled, settled: from, idSet: new Set(settled), size, old, over });
+    if (orphans.length && !this.warned.has(id)) {
+      this.warned.add(id);
+      console.warn('Preserving unmatched session overrides', id, orphans.length);
+    }
+    this.bases.set(id, { gen, orphans, stamp: loaded?.stamp, index: loaded?.index, ids: settled, settled: from, idSet: new Set(settled), size, old, over });
     return data;
+  }
+
+  /** Re-cut only rows backed by this generation. Tail replacements have their own whole data. */
+  recut(id: string, item: TimelineItem, recent: boolean): TimelineItem {
+    const base = this.bases.get(id);
+    const line = base?.index?.get(item.id);
+    if (!line || base?.over.has(item.id)) return item;
+    if (isLight(item) && !!item[LIGHT].recent === recent) return item;
+    const source = new BaseReader(this.pathOf(id), base);
+    try {
+      const clean = line.preview && isDeepStrictEqual(item, line.preview);
+      let view: TimelineItem;
+      if (isLight(item) && !recent && !item[LIGHT].reread) {
+        const { [LIGHT]: mark, ...row } = item;
+        const { recent: _recent, reread: _reread, ...meta } = mark;
+        view = Object.assign(cutItem(row, workerCut.old), { [LIGHT]: meta });
+      } else {
+        const whole = source.whole(item);
+        view = project(whole, recent, cutItem, workerCut);
+        if (view === item) return item;
+        if (!isLight(item) && !isDeepStrictEqual(item, source.original(line))) return item;
+      }
+      // A frozen save may still have the other cut. BaseReader reconstructs that baseline from disk.
+      if (clean || !isLight(item)) line.preview = isLight(view) ? structuredClone(view) : undefined;
+      return view;
+    } finally { source.close(); }
   }
 
   wholeItem(id: string, item: TimelineItem): TimelineItem {
@@ -393,7 +533,7 @@ export class SessionFiles {
       await this.trackRead(sourceId, this.writeBase(destId, { items, todos: [] }, source));
     } finally { source.close(); }
     const recent = recentStart(items, workerCut.turns);
-    return { items: items.map((item, i) => i < recent ? item : this.wholeItem(destId, item)), todos: [] };
+    return { items: items.map((item, i) => this.recut(destId, item, i >= recent)), todos: [] };
   }
 
   async savedRestartNotice(id: string, notice: string): Promise<boolean> {
@@ -483,7 +623,7 @@ export class SessionFiles {
     const base = this.bases.get(id);
     // The order as of now: an item moved during a long base write must not appear twice or not at all.
     const items = save.items.slice();
-    // At quit keep the existing generation. A rewind can shorten the matching prefix.
+    // Prefer the existing generation at quit when the suffix fits. A rewind can shorten the matching prefix.
     let from = base?.settled ?? 0;
     let whole = !base || base.old || this.force.has(id) || save.dirty === 'all' || base.size < SMALL_BASE || items.length < from;
     if (final && base) {
@@ -500,6 +640,11 @@ export class SessionFiles {
     }
     // Settled items changed since the base was written travel in the tail (`over`), up to a bound.
     let over: Set<string> | undefined;
+    if (!whole && base?.orphans?.length) {
+      const ids = new Set(base.orphans.map(item => item.id));
+      const conflict = items.findIndex(item => ids.has(item.id));
+      if (conflict >= 0) from = Math.min(from, conflict);
+    }
     const overItems: TimelineItem[] = [];
     if (!whole && base) {
       over = new Set(base.over);
@@ -519,13 +664,15 @@ export class SessionFiles {
       const source = new BaseReader(this.pathOf(id), base);
       let written;
       try {
-        written = await writeLines(tmp, [{ head, items: items.slice(from) }, { head: '\n],"over":[\n', items: overItems }], end, source);
+        written = await writeLines(tmp, [{ head, items: items.slice(from) }, { head: '\n],"over":[\n', items: overItems.concat(base.orphans ?? []) }], end, source, READ.tailLimit);
+      } catch (err) {
+        if (!(err instanceof TailTooLarge)) throw err;
       } finally { source.close(); }
-      const [tailSize, overSize] = written.sizes;
+      const [tailSize, overSize] = written?.sizes ?? [];
       // A big tail folds into the base only when that moves the boundary well on: otherwise a few
       // huge items at the end would have the whole base written again on every save. Changed
       // settled items past their bound go into the base too.
-      if (final || (overSize <= OVER_MAX.chars && (tailSize <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP))) {
+      if (written && (final || (overSize <= OVER_MAX.chars && (tailSize <= TAIL_MAX || settledEnd(items) < from + TAIL_KEEP)))) {
         await renameRetry(tmp, this.tailOf(id), () => {
           base.notices = { file: this.tailOf(id), prefix: head, rows: written.notices };
           base.over = over!;
@@ -540,7 +687,8 @@ export class SessionFiles {
       }
     }
     const source = new BaseReader(this.pathOf(id), base);
-    try { await this.writeBase(id, { ...save, items }, source); }
+    let committed: Base;
+    try { committed = await this.writeBase(id, { ...save, items }, source, base?.orphans); }
     finally { source.close(); }
     this.force.delete(id);
     // The new base holds everything: the old tail no longer matches it (and is ignored if this fails).
@@ -549,22 +697,43 @@ export class SessionFiles {
     } catch {
       /* ignored on the next read: its baseGen is another */
     }
+    if (!final && this.compactLive && committed.size >= READ.inWorkerAbove) {
+      const recent = recentStart(items, workerCut.turns);
+      let since = performance.now();
+      for (let i = 0; i < items.length; i++) {
+        if (performance.now() - since > 8) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          since = performance.now();
+        }
+        if (this.bases.get(id) !== committed) break;
+        const item = items[i];
+        if (isLight(item)) continue;
+        const view = project(item, i >= recent, cutItem, workerCut);
+        if (view !== item) {
+          committed.index!.get(item.id)!.preview = structuredClone(view);
+          this.compactLive(id, item, view);
+        }
+      }
+    }
   }
 
-  private async writeBase(id: string, save: SessionData, source: BaseReader) {
+  private async writeBase(id: string, save: SessionData, source: BaseReader, orphans?: TimelineItem[]) {
     const gen = nextGen();
     const file = this.pathOf(id), tmp = `${file}.${process.pid}.tmp`;
     const head = `{"gen":${gen},"items":[\n`;
     const foot = `${save.items.length ? '\n' : ''}],"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}}`;
-    const written = await writeLines(tmp, [{ head, items: save.items }], foot, source);
+    const sections = [{ head, items: save.items }];
+    if (orphans?.length) sections.push({ head: '\n],"over":[\n', items: orphans });
+    const written = await writeLines(tmp, sections, foot, source);
     // Windows cannot replace an open destination. Its old index stays live until the rename.
     source.close();
     const readers = this.reading.get(id);
     if (readers?.size) await Promise.allSettled(readers);
     const ids = save.items.map(i => i.id);
-    const base: Base = { gen, ids, settled: settledEnd(save.items), idSet: new Set(ids), size: written.size,
+    const base: Base = { gen, orphans, ids, settled: settledEnd(save.items), idSet: new Set(ids), size: written.size,
       index: written.index, over: new Set(), notices: { file, prefix: head, rows: written.notices } };
     await renameRetry(tmp, file, () => { if (!this.deleted.has(id)) this.bases.set(id, base); });
+    return base;
   }
 }
 
@@ -628,7 +797,7 @@ class BaseReader {
       if (!this.base?.index) throw new Error('Missing session base index');
       this.fd = openSync(this.file, 'r');
       const header = `{"gen":${this.base.gen},"items":[\n`;
-      if (readBytes(fs, this.fd, 0, header.length).toString() !== header) throw new Error('Session base generation changed');
+      if (this.base.stamp !== undefined ? fs.fstatSync(this.fd).mtimeMs !== this.base.stamp : readBytes(fs, this.fd, 0, header.length).toString() !== header) throw new Error('Session base generation changed');
     }
     return this.fd;
   }
@@ -639,31 +808,47 @@ class BaseReader {
   }
 
   encode(item: TimelineItem): { bytes: Buffer; chars: number } {
+    let whole: TimelineItem = item;
     if (isLight(item)) {
       const line = this.base?.index?.get(item.id);
-      if (line?.preview && isDeepStrictEqual(item, line.preview)) {
-        return { bytes: readBytes(fs, this.open(), line.offset, line.length), chars: line.chars };
-      }
+      if (!line) throw new Error('Missing original step');
+      const bytes = readBytes(fs, this.open(), line.offset, line.length);
+      if (line.preview && isDeepStrictEqual(item, line.preview)) return { bytes, chars: line.chars };
+      const disk = JSON.parse(bytes.toString());
+      whole = this.merge(item, line, disk);
+      if (whole === disk) return { bytes, chars: line.chars };
     }
-    const json = JSON.stringify(this.whole(item));
+    const json = JSON.stringify(whole);
     return { bytes: Buffer.from(json), chars: json.length };
+  }
+
+  original(line: Line): TimelineItem {
+    return JSON.parse(readBytes(fs, this.open(), line.offset, line.length).toString());
   }
 
   whole(item: TimelineItem): TimelineItem {
     if (!isLight(item)) return item;
     const line = this.base?.index?.get(item.id);
-    if (!line?.preview) throw new Error('Missing original step');
-    const disk = JSON.parse(readBytes(fs, this.open(), line.offset, line.length).toString());
+    if (!line) throw new Error('Missing original step');
+    return this.merge(item, line, this.original(line));
+  }
+
+  private merge(item: TimelineItem, line: Line, disk: TimelineItem) {
+    if (!isLight(item)) return item;
     if (disk.id !== item.id) throw new Error('Session item offset changed');
     const { [LIGHT]: _pictures, more: _more, ...view } = item;
-    if (!isLight(line.preview)) throw new Error('Missing original preview');
-    const { [LIGHT]: _originalPictures, more: _originalMore, ...before } = line.preview;
+    const baseline = line.preview && isLight(line.preview) && !!line.preview[LIGHT].recent === !!item[LIGHT].recent
+      ? line.preview : project(disk, !!item[LIGHT].recent, cutItem, workerCut);
+    if (!isLight(baseline)) return overlay(disk, baseline, view) as TimelineItem;
+    const { [LIGHT]: _originalPictures, more: _originalMore, ...before } = baseline;
     return overlay(disk, before, view) as TimelineItem;
   }
 }
 
+class TailTooLarge extends Error {}
+
 /** Write bounded batches. A projected item's opaque bytes pass straight from one base to the next. */
-async function writeLines(file: string, sections: { head: string; items: TimelineItem[] }[], foot: string, source: BaseReader) {
+async function writeLines(file: string, sections: { head: string; items: TimelineItem[] }[], foot: string, source: BaseReader, limit = Infinity) {
   const fh = await open(file, 'w');
   const index: LineIndex = new Map();
   const notices = new Map<string, { line: Line; json: string }>();
@@ -671,6 +856,7 @@ async function writeLines(file: string, sections: { head: string; items: Timelin
   let size = 0, chars = 0, pending = 0;
   let buffers: Buffer[] = [];
   const append = (bytes: Buffer) => {
+    if (size + bytes.length > limit) throw new TailTooLarge();
     buffers.push(bytes);
     pending += bytes.length;
     size += bytes.length;
@@ -696,7 +882,7 @@ async function writeLines(file: string, sections: { head: string; items: Timelin
         const line: Line = { offset: size, length: bytes.length, chars: encoded.chars };
         chars += line.chars;
         if (isLight(item)) line.preview = structuredClone(item);
-        index.set(item.id, line);
+        if (section === sections[0]) index.set(item.id, line);
         if (item.type === 'notice' && item.early === 'restart') notices.set(item.id, { line, json: bytes.toString() });
         append(bytes);
         if (pending >= CHUNK) await flush();

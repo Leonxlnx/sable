@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { App } from '../server/app';
 import { detectScripts, findLockfiles, makeTargets, packageScripts, pickManager, registerScripts, tomlTable } from '../server/services/scripts';
+import { servingCommand } from '@shared/dev-url';
 import { devServerUrls, devUrl, devUrlLabel, lastDevUrl } from '@/lib/dev-url';
 import { scriptForCommand } from '@/features/rail/scripts-store';
 
@@ -225,6 +226,15 @@ describe('project.scripts', () => {
 describe('dev server addresses', () => {
   const ESC = '\u001b';
 
+  it('recognizes plain server and watcher commands without reading script arguments as commands', () => {
+    for (const cmd of ['npm run dev', 'pnpm serve', 'yarn start', 'bun run preview', 'npm run watch', 'vite', 'npx vite --host', 'cd web && npm run dev', 'next dev', 'astro dev', 'nuxt dev', 'webpack serve', 'http-server .', 'python -m http.server 3311', 'php -S localhost:8080', 'tsc --watch', 'tsc -p . -w', 'nodemon index.js', 'tail -f log', 'pnpm test --watch']) {
+      expect(servingCommand(cmd), cmd).toBe(true);
+    }
+    for (const cmd of ['pnpm test', 'npm install', 'vite build', 'vite --debug build', 'next build', 'npm run devtools', 'echo vite', 'npm install nodemon', 'node dev.js', 'vite --version', 'tsc -p watch', 'tail -n 2 log']) {
+      expect(servingCommand(cmd), cmd).toBe(false);
+    }
+  });
+
   it('reads the usual banners', () => {
     const vite = `\n  ${ESC}[32m${ESC}[1mVITE${ESC}[22m v5.2.0${ESC}[39m  ready in 312 ms\n\n  ${ESC}[32m➜${ESC}[39m  ${ESC}[1mLocal${ESC}[22m:   ${ESC}[36mhttp://localhost:${ESC}[1m5173${ESC}[22m/${ESC}[39m\n  ➜  Network: use --host to expose\n  ➜  Inspect: http://localhost:5173/__inspect/\n`;
     expect(devServerUrls(vite)).toEqual([{ url: 'http://localhost:5173/', label: 'localhost:5173' }]);
@@ -252,6 +262,9 @@ describe('dev server addresses', () => {
     expect(devServerUrls('GET http://localhost:3000/api/users 200 in 12ms\n')).toEqual([]);
     expect(devServerUrls('Server running at http://localhost:3000\n', 'curl -s http://localhost:3000')).toEqual([]);
     expect(devServerUrls('Local: http://localhost/\nSee https://vitejs.dev/guide\n')).toEqual([]);
+    expect(lastDevUrl('Local: http://shop.localhost.example.com:3311')).toBeNull();
+    expect(lastDevUrl('Local: http://localhost:123456')).toBeNull();
+    expect(lastDevUrl('Local: http://localhost:80/')?.label).toBe('localhost:80');
     expect(lastDevUrl(undefined)).toBeNull();
     expect(lastDevUrl('nothing to see')).toBeNull();
   });

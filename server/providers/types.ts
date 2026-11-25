@@ -29,6 +29,9 @@ export interface AccountContext {
 }
 
 export interface ProviderContext {
+  journal?: import('../core/auth-journal').AuthJournal;
+  closing?: () => boolean;
+  dormant?: (provider: ProviderId) => boolean;
   /** Events from this instance; the app tags auth and limit events with the account id. */
   emit: (event: BridgeEvent) => void;
   log: (...args: unknown[]) => void;
@@ -92,15 +95,15 @@ export interface ProviderSession {
    */
   setOptions?(options: SessionOptions): Promise<void>;
   /** Releases the agent process. The session can be re-opened (resumed) later. */
-  close(): Promise<void>;
+  close(reason?: 'move' | 'switch' | 'limit' | 'close' | 'quit'): Promise<void>;
   /**
    * What still runs in the agent's process, as the agent says it: a turn (one Sable began or one the
    * agent began by itself), background sub-agents, background commands and monitors (ambient tasks are
    * nobody's work and never counted), when the oldest of those commands began, and when a wake-up
    * the agent scheduled is due (only when it can be read for certain). Absent: nothing is known
-   * (treat as none).
+   * (treat as none). Move guards include serving tasks. An update reads only working commands.
    */
-  liveWork?(): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; newestCommandAt?: number; wakeAt?: number; notificationUntil?: number };
+  liveWork?(purpose?: 'move' | 'update'): { turn: boolean; agents: number; commands: number; oldestCommandAt?: number; newestCommandAt?: number; wakeAt?: number; notificationUntil?: number };
   /**
    * Resolves when the agent's process has exited after `close()`; rejects when it has not within the
    * provider's bound (then its transcript may still be written).
@@ -144,7 +147,7 @@ export interface Provider {
    * provider resumes that conversation; if `loadTranscript` is true it must also
    * fill the runtime's timeline from the provider's stored history.
    */
-  open(rt: SessionRuntime, opts: { loadTranscript?: boolean }): Promise<ProviderSession>;
+  open(rt: SessionRuntime, opts: { loadTranscript?: boolean; chainFrom?: string }): Promise<ProviderSession>;
   /**
    * Starts an agent process for a session that is about to be created (no prompt is sent, so
    * no tokens). The first session opened with the same choice adopts it. One at a time.

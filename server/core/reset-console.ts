@@ -8,6 +8,8 @@
  *
  * One attempt per account at a time. Nothing is offered while nothing is at a limit.
  */
+import { authGate, claudeHomeOf, gateKey, GATE } from './auth-gate';
+import type { AuthJournal, AuthScope } from './auth-journal';
 import type { ProviderId, RateLimit, ResetRun } from '../../shared/protocol';
 import { closedNormally, type OpenConsole } from '../util/console';
 
@@ -38,6 +40,7 @@ export interface ResetReading {
 
 export interface ResetConsoleHost {
   open: OpenConsole;
+  journal?: () => AuthJournal;
   /** The agent's command for its reset dialog on this account; undefined when it has none. */
   command: (provider: ProviderId, accountId: string) => { bin: string; args: string[]; env: NodeJS.ProcessEnv } | undefined;
   /** The neutral folder the window starts in (never a project). */
@@ -125,27 +128,50 @@ export class ResetConsoles {
       }
     }
     let window: ReturnType<OpenConsole>;
+    const folder = gateKey(provider, claudeHomeOf(command.env));
+    const scope: AuthScope = { agent: provider, accountId, reason: 'reset', journal: this.host.journal?.() };
+    const release = provider === 'claude' ? await authGate.claimDialog(folder, scope, () => this.disposed || attempt.cancelled) : undefined;
+    const leave = provider === 'claude' ? await authGate.enter(folder, 'start', scope) : undefined;
+    if (this.disposed || attempt.cancelled || attempt.over) {
+      release?.();
+      leave?.();
+      this.attempts.delete(key);
+      return { ok: false };
+    }
     try {
       window = this.host.open({ title: this.host.title(provider, accountId), bin: command.bin, args: command.args, env: command.env, cwd: this.host.cwd() });
     } catch (err) {
       this.attempts.delete(key);
+      leave?.();
+      release?.();
       this.host.log('reset console failed to open', (err as Error).message);
       return { ok: false, error: 'Claude Code could not be opened' };
     }
+    // An embedder may supply a console without a process handle. Only a known
+    // physical wrapper can own the folder after a launch that never reports exit.
+    if (!window.pid) { leave?.(); release?.(); }
+    const born = Date.now();
+    const end = scope.journal?.started(scope, folder, window.pid);
+    void window.closed.then(
+      code => end?.(attempt.closedByUs ? 'abort' : closedNormally(code) ? 'exit' : 'error', null),
+      () => end?.('error', null),
+    ).finally(() => { leave?.(); release?.(); });
     attempt.close = () => {
       if (attempt.closedByUs) return;
       attempt.closedByUs = true;
-      try {
-        window.close();
-      } catch (err) {
-        this.host.log('reset console close failed', (err as Error).message);
-      }
-      // A window that does not go when asked never holds the account: given up after a grace.
+      const wait = provider === 'claude' && window.pid ? Math.max(0, GATE.minLifeMs - (Date.now() - born)) : 0;
+      const close = () => {
+        try { window.close(); }
+        catch (err) { this.host.log('reset console close failed', (err as Error).message); }
+      };
+      if (wait) attempt.timers.push(setTimeout(close, wait));
+      else close();
+      // Start the grace at the actual close request. A known live PID still owns the folder.
       const grace = setTimeout(() => {
         if (attempt.over) return;
         this.host.log('reset console did not close');
         this.finish(key, provider, accountId, attempt, attempt.cancelled ? null : { state: 'failed', startedAt: attempt.run.startedAt, message: 'Claude Code did not close' });
-      }, this.host.closeGraceMs ?? CLOSE_GRACE_MS);
+      }, wait + (this.host.closeGraceMs ?? CLOSE_GRACE_MS));
       grace.unref?.();
       attempt.timers.push(grace);
     };

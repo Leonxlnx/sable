@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { isBackdropImageId, migrateBackdrop, migrateQuietDefault, normalizeBackdrop } from '../../shared/backdrop';
@@ -72,7 +73,7 @@ export class Store {
   private timers = new Map<string, NodeJS.Timeout>();
   private pending = new Map<string, () => unknown>();
   /** Session timelines: a base and a small tail, so a long chat is not written whole after every word (session-file.ts). */
-  private sessionFiles = new SessionFiles((id) => this.sessionPath(id));
+  private sessionFiles: SessionFiles;
   private sessionTimers = new Map<string, NodeJS.Timeout>();
   private sessionPending = new Map<string, () => SessionSave>();
   /** Sable is going down: nothing more is written (`seal`). */
@@ -83,7 +84,11 @@ export class Store {
   private savedItems = new WeakMap<TimelineItem, TimelineItem>();
   private activeSaves = new Map<string, SessionSave>();
 
-  constructor(dir?: string) {
+  constructor(dir?: string, runtimeItem?: (session: string, id: string) => TimelineItem | undefined) {
+    this.sessionFiles = new SessionFiles(id => this.sessionPath(id), runtimeItem && ((id, saved, preview) => {
+      const current = runtimeItem(id, saved.id);
+      if (current && isDeepStrictEqual(current, saved)) this.replaceView(id, current, preview);
+    }));
     this.dir = dir ?? process.env.SABLE_HOME ?? path.join(homedir(), '.sable');
     mkdirSync(path.join(this.dir, 'sessions'), { recursive: true });
     this.state = this.readState() ?? { projects: [], settings: { ...DEFAULT_SETTINGS }, sessions: [], accounts: [] };
@@ -214,6 +219,19 @@ export class Store {
     for (const item of items) {
       if (isLight(item) && item[LIGHT].input && !Object.hasOwn(item, 'input')) Object.defineProperty(item, 'input', input);
     }
+  }
+
+  recut(id: string, item: TimelineItem, recent: boolean) {
+    const view = this.sessionFiles.recut(id, item, recent);
+    if (view !== item) this.replaceView(id, item, view);
+    return item;
+  }
+
+  private replaceView(id: string, item: TimelineItem, view: TimelineItem) {
+    this.savedItems.delete(item);
+    for (const key of Object.getOwnPropertyNames(item)) Reflect.deleteProperty(item, key);
+    Object.assign(item, view);
+    this.bindProviderInputs(id, [item]);
   }
 
   /** Keep runtime references valid when a rewind or a late event makes an old step live again. */

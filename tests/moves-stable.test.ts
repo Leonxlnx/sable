@@ -144,8 +144,8 @@ async function chat(h: H, accountId: string, opts: { tokens?: number; options?: 
 }
 
 /** A Bash step that left a command running in the agent's process (as Claude Code's task events say), begun `ageMs` ago. */
-function command(rt: SessionRuntime, name: string, task: string, ageMs = 0) {
-  const step = rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: name, status: 'done', detail: { command: 'pnpm test', description: name, background: true } } as Omit<ToolItem, 'id' | 'ts'>);
+function command(rt: SessionRuntime, name: string, task: string, ageMs = 0, cmd = 'pnpm test') {
+  const step = rt.add<ToolItem>({ type: 'tool', name: 'Bash', kind: 'bash', title: name, status: 'done', detail: { command: cmd, description: name, background: true } } as Omit<ToolItem, 'id' | 'ts'>);
   rt.taskStarted(step.id, { id: task, kind: 'command' });
   if (ageMs) rt.patch<ToolItem>(step.id, { task: { ...rt.get<ToolItem>(step.id)!.task!, since: Date.now() - ageMs } });
   return step;
@@ -1659,11 +1659,11 @@ describe('a move Sable makes by itself waits for work in the background (D1, E3)
       }
     } finally { vi.useRealTimers(); }
   });
-  it('the return to the account a limit left waits for a young background command, and goes once it ended', async () => {
+  it.each(['pnpm test', 'pnpm dev'])('the return waits for a young %s process and goes once it ends', async cmd => {
     const h = start();
     const { rt, studio, work } = await owingReturn(h);
-    command(rt, 'Run app tests', 'b1');
-    expect(rt.meta.commands).toBe(1);
+    command(rt, cmd, 'b1', 0, cmd);
+    expect(rt.meta).toMatchObject(cmd === 'pnpm dev' ? { commands: 0, serving: 1 } : { commands: 1, serving: 0 });
     await h.app.returnAfterLimit(rt);
     // Nothing moved, nothing closed: the tests the agent waits on run on.
     expect(rt.meta.accountId).toBe(work.id);
@@ -1679,7 +1679,7 @@ describe('a move Sable makes by itself waits for work in the background (D1, E3)
   it('an older command (a server) does not hold it: the chat goes back, the command is lost and said so, and the agent hears it once', async () => {
     const h = start();
     const { rt, studio } = await owingReturn(h);
-    const step = command(rt, 'Serve the app', 'b2', 31 * 60_000);
+    const step = command(rt, 'Serve the app', 'b2', 31 * 60_000, 'npm start');
     await h.app.returnAfterLimit(rt);
     expect(rt.meta.accountId).toBe(studio.id);
     // Lost with the process the move closed, never "ended": it may still run.
@@ -1989,7 +1989,7 @@ describe('the switch of agent', { timeout: 20_000 }, () => {
     };
   }
 
-  it('goes ahead beside a background command, which is lost with the process and said so; a turn the agent says it runs holds it', async () => {
+  it.each(['pnpm test', 'pnpm dev'])('switches beside %s and reports its loss, while an active turn holds the switch', async cmd => {
     const home = temp('sable-moves-switch-');
     const cwd = temp('sable-moves-switch-cwd-');
     const sent: { provider: ProviderId; text: string }[] = [];
@@ -2003,15 +2003,15 @@ describe('the switch of agent', { timeout: 20_000 }, () => {
     await expect(app.call('session.switchAgent', { sessionId: rt.id, provider: 'codex' })).rejects.toThrow(/still working/);
     expect(rt.meta.provider).toBe('demo');
     (rt.handle as ProviderSession).liveWork = () => ({ turn: false, agents: 0, commands: 1 });
-    const step = command(rt, 'Run app tests', 'b1');
+    const step = command(rt, cmd, 'b1', 0, cmd);
     expect(await app.call('session.switchAgent', { sessionId: rt.id, provider: 'codex' })).toMatchObject({ ok: true });
     expect(rt.get<ToolItem>(step.id)!.task).toMatchObject({ state: 'lost', why: 'process' });
-    expect(lastNotice(rt)).toMatchObject({ text: "1 background command was lost with the agent's process", detail: 'Run app tests' });
+    expect(lastNotice(rt)).toMatchObject({ text: "1 background command was lost with the agent's process", detail: cmd });
     sent.length = 0;
     await app.call('session.send', { sessionId: rt.id, text: 'hey there' });
     await until(() => sent.length === 1, 'the message');
     expect(sent[0].provider).toBe('codex');
-    expect(sent[0].text).toContain('"Run app tests" (command, task b1)');
+    expect(sent[0].text).toContain(`"${cmd}" (command, task b1)`);
   });
 });
 
@@ -2112,6 +2112,16 @@ describe('the silent second send after a refused sign-in (C5)', { timeout: 20_00
     await until(() => log.sent.length === 2, 'the second send');
     expect(log.sent).toEqual(['hi there', 'hi there']);
   });
+});
+
+it('identifies the old process as a move when it asks the writer to exit', async () => {
+  const h = start();
+  const { studio, work } = await twoAccounts(h);
+  const rt = await chat(h, studio.id);
+  const close = vi.spyOn(rt.handle!, 'close');
+  await h.app.switchAccount(rt, work.id);
+  expect(close).toHaveBeenCalledWith('move');
+  expect(rt.meta.accountId).toBe(work.id);
 });
 
 describe('a turn Sable closed under', { timeout: 20_000 }, () => {

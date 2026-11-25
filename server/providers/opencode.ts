@@ -992,7 +992,7 @@ class OpenCodeSession implements ProviderSession {
       this.turn = undefined;
     }
     for (const entry of this.queue.splice(0)) entry.release?.();
-    if (this.rt.meta.commands) {
+    if (this.rt.meta.commands || this.rt.meta.serving) {
       const lost = this.rt.tasksLost('process');
       if (lost.length) this.rt.notice('info', 'The chat closed with background work still running', lost.join('\n'));
     }

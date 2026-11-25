@@ -10,6 +10,8 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { App } from '../server/app';
+import { DemoProvider } from '../server/providers/demo';
 import type { Attachment } from '@shared/protocol';
 
 const bridgeCalls: { method: string; params: unknown }[] = [];
@@ -200,8 +202,6 @@ describe('/spare, /until, /rename and /model hand back their outcome (finding 5)
 
 describe('a queue edit never overwrites another window’s (finding 8)', () => {
   it('the bridge answers the message as the edit found it; the composer takes that one', async () => {
-    const { App } = await import('../server/app');
-    const { DemoProvider } = await import('../server/providers/demo');
     const home = mkdtempSync(path.join(tmpdir(), 'sable-w10-'));
     const app = new App({ home, providers: [(c) => new DemoProvider(c, { speed: 0 })], quiet: true });
     try {

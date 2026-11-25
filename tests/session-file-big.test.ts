@@ -5,6 +5,8 @@
  * is confirmed without reading the chat again. (How little of a long chat is held at all:
  * session-file-light.test.ts.)
  */
+import { createRequire } from 'node:module';
+import { isLight } from '../server/core/trim';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -98,3 +100,8 @@ describe('a very long chat is held once', () => {
     expect(await store.savedRestartNotice('s', 'n1')).toBe(false);
   });
 });
+
+it.runIf(process.env.SABLE_BIG === '1').each(['mixed', 'pictures'])('bounds peak memory loading and rewriting %s', async mode => {
+  const measure = createRequire(import.meta.url)('./fixtures/session-file-big.cjs');
+  await measure(tmp(), mode, Store, isLight);
+}, 125000);

@@ -325,7 +325,10 @@ describe('the updater', () => {
     expect(updateWaits([idle()], now)).toEqual({ busy: false });
     expect(updateWaits([idle({ turnActive: true })], now)).toEqual({ busy: true });
     expect(updateWaits([idle({ meta: { status: 'idle', background: 1 } })], now)).toEqual({ busy: true });
-    // A dev server running for hours does not hold the update.
+    // The process clock protects a young server on moves. It has no say in an update.
+    expect(updateWaits([idle({ meta: { status: 'idle', serving: 1 }, newestProcessCommandAt: now })], now)).toEqual({ busy: false });
+    expect(updateWaits([idle({ meta: { status: 'idle', serving: 1, commands: 1 }, newestProcessCommandAt: now, newestCommandAt: now - COMMAND_UPDATE_WAIT_MS })], now)).toEqual({ busy: false });
+    // A working command ages out on its own clock.
     expect(updateWaits([idle({ meta: { status: 'idle', commands: 1 }, newestCommandAt: now - COMMAND_UPDATE_WAIT_MS })], now)).toEqual({ busy: false });
     expect(updateWaits([idle({ meta: { status: 'idle', commands: 1 }, newestCommandAt: now - 60_000 }), idle({ meta: { status: 'idle', commands: 2 }, newestCommandAt: now - 120_000 })], now)).toEqual({
       busy: true,

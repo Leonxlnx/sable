@@ -38,6 +38,9 @@ function turns(items: TimelineItem[]) {
 
 export function expectSameRows(items: TimelineItem[]) {
   const rows = items.map(it => cutItem(it, OLD));
-  rows.forEach((it, i) => expect(row(it), it.id).toEqual(row(items[i])));
+  rows.forEach((it, i) => {
+    expect(row(it), it.id).toEqual(row(items[i]));
+    expect(cutItem(cutItem(items[i]), OLD), it.id).toEqual(it);
+  });
   expect(turns(rows)).toEqual(turns(items));
 }

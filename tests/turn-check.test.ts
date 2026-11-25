@@ -89,7 +89,12 @@ describe('turn check brief', () => {
     const items: TimelineItem[] = [user('u', 'Rewrite everything')];
     for (let i = 0; i < 6; i++) items.push(edit(`e${i}`, `src/f${i}.ts`, null, Array.from({ length: 400 }, (_, j) => `export const v${j} = ${j};`).join('\n') + '\n'));
     items.push(text('a', 'Done.'), turnEnd('end'));
-    const brief = buildBrief(items, 'u', CWD, { ...BRIEF_CAPS, diff: 20_000 })!;
+    const reads: string[] = [];
+    const brief = buildBrief(items, 'u', CWD, { ...BRIEF_CAPS, diff: 20_000 }, item => {
+      reads.push(item.id);
+      return item;
+    })!;
+    expect(reads).toEqual(['e0', 'e1']);
     expect(brief.cut).toBe(true);
     expect(brief.files).toHaveLength(6);
     expect(brief.text).toMatch(/The changes are cut here \(\d+ more edits left out\)\. Read the changed files for the rest\./);

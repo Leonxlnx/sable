@@ -78,7 +78,8 @@ describe('timeline', () => {
     expect(rt.items.map((i) => i.id)).toEqual(['x']);
     expect(rt.get('x')).toBeDefined();
     expect(rt.snapshot().todos).toHaveLength(1);
-    expect(events.at(-1)).toMatchObject({ type: 'timeline.reset', items: [{ id: 'x' }] });
+    // The counts of what works and serves are published again after a reset, so the reset is not the last event.
+    expect(events.findLast((e) => e.type === 'timeline.reset')).toMatchObject({ type: 'timeline.reset', items: [{ id: 'x' }] });
   });
 });
 

@@ -1,9 +1,10 @@
 import type { ProviderSession } from '../providers/types';
 
 export type WorkSession = {
-  meta: { status: string; background?: number; commands?: number; moving?: boolean };
+  meta: { status: string; background?: number; commands?: number; serving?: number; moving?: boolean };
   turnActive: boolean;
   readonly newestCommandAt?: number;
+  readonly newestProcessCommandAt?: number;
   handle?: Pick<ProviderSession, 'liveWork'>;
 };
 
@@ -29,16 +30,19 @@ export interface ChatWork {
   wakeAt?: number;
 }
 
-export function workOf(rt: WorkSession, waitable = false, now = Date.now()): ChatWork {
+export function workOf(rt: WorkSession, waitable = false, now = Date.now(), purpose: 'move' | 'update' = 'move'): ChatWork {
   let live: LiveWork | undefined;
   try {
-    live = rt.handle?.liveWork?.();
+    live = rt.handle?.liveWork?.(purpose);
   } catch {
     live = undefined;
   }
   let holds: number | undefined;
-  const newest = rt.meta.commands ? rt.newestCommandAt : undefined;
-  if (newest !== undefined) holds = newest + COMMAND_HOLDS_MS;
+  const commands = (rt.meta.commands ?? 0) + (purpose === 'move' ? rt.meta.serving ?? 0 : 0);
+  if (commands) {
+    const newest = purpose === 'move' ? rt.newestProcessCommandAt ?? rt.newestCommandAt : rt.newestCommandAt;
+    if (newest !== undefined) holds = newest + COMMAND_HOLDS_MS;
+  }
   const commandAt = live?.newestCommandAt ?? live?.oldestCommandAt;
   if (live?.commands && commandAt !== undefined) holds = Math.max(holds ?? 0, commandAt + COMMAND_HOLDS_MS);
   if (waitable && live?.notificationUntil) holds = Math.max(holds ?? 0, live.notificationUntil);
@@ -54,7 +58,7 @@ export function workOf(rt: WorkSession, waitable = false, now = Date.now()): Cha
   }
   return {
     turn, agents, wakeAt,
-    commands: Math.max(rt.meta.commands ?? 0, live?.commands ?? 0),
+    commands: Math.max(commands, live?.commands ?? 0),
     ...(holds !== undefined && holds > now ? { holds } : {}),
   };
 }

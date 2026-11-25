@@ -9,13 +9,16 @@
  *   wanted commits nothing and leaves no thread subscribed.
  * A fake app-server only: no real agent turns.
  */
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NoticeItem, ToolItem } from '@shared/protocol';
 import { App } from '../server/app';
 import { CodexProvider } from '../server/providers/codex';
+import { READ } from '../server/core/session-file';
+import { Store } from '../server/core/store';
+import { isLight } from '../server/core/trim';
 import { CodexRpc } from '../server/providers/codex-rpc';
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -444,4 +447,38 @@ describe('#13: reloads after an app-server restart', () => {
     expect(h.provider.sessions.has('th2')).toBe(false);
     expect(h.count('turn/start')).toBe(1);
   });
+});
+
+it('accepts an empty patchUpdated diff over a settled indexed edit', async () => {
+  const h = await codexFake();
+  await h.send('edit a');
+  const edit: ToolItem = { type: 'tool', id: 'turn1:e', ts: 1, name: 'Edit', kind: 'edit', title: 'Edit', status: 'done', detail: { path: 'a' },
+    result: { diff: [{ path: 'a', status: 'modified', additions: 1, deletions: 0, hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+old'] }] }] } };
+  const rows = [edit, ...Array.from({ length: 4 }, (_, ts) => ({ id: 'end'+ts, ts, type: 'turn', durationMs: 1 }))];
+  writeFileSync(path.join(h.app.store.dir, 'sessions', h.id + '.json'), '{"gen":1,"items":[\n' + rows.map(i => JSON.stringify(i)).join(',\n') + '\n],"todos":[]}');
+  const threshold = READ.inWorkerAbove;
+  READ.inWorkerAbove = 1;
+  try {
+    h.rt.load((await h.app.store.loadSessionAsync(h.id)).items);
+    expect(isLight(h.rt.get(edit.id)!)).toBe(true);
+    h.notify('item/fileChange/patchUpdated', { turnId: 'turn1', itemId: 'e', changes: [{ path: 'a', kind: { type: 'update' }, diff: '' }] });
+    const replacement = [{ additions: 0, deletions: 0, hunks: [] }];
+    expect(h.rt.get<ToolItem>(edit.id)?.result?.diff).toMatchObject(replacement);
+    await h.app.store.flush();
+    const reopened = new Store(h.app.store.dir);
+    const data = await reopened.loadSessionAsync(h.id);
+    const saved = data.items.find(item => item.id === edit.id)!;
+    expect((reopened.wholeItem(h.id, saved) as ToolItem).result?.diff).toMatchObject(replacement);
+  } finally { READ.inWorkerAbove = threshold; }
+});
+
+it('reports an unavailable native fork before creating a chat', async () => {
+  const h = await codexFake({ 'thread/fork': () => ({}) });
+  await h.send('keep this conversation');
+  const answer = h.rt.add({ type: 'text', id: 'turn1:reply', text: 'Done', streaming: false });
+  h.complete('turn1');
+  const before = [...h.app.sessions.keys()];
+  await expect(h.app.call('session.fork', { sessionId: h.id, itemId: answer.id })).rejects.toThrow(/summary/);
+  expect(h.count('thread/fork')).toBe(1);
+  expect([...h.app.sessions.keys()]).toEqual(before);
 });

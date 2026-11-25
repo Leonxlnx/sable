@@ -18,7 +18,7 @@ let stopping = false;
 const stop = async () => {
   if (stopping) return;
   stopping = true;
-  setTimeout(() => process.exit(0), 5000).unref();
+  setTimeout(() => process.exit(0), 10_000).unref();
   await server.close();
   process.exit(0);
 };

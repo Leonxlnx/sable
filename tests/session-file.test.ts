@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -314,4 +314,43 @@ describe('session files: a base and a small tail', () => {
     rt.reset([text('r', 'r')]);
     expect(rt.takeDirty()).toBe('all');
   });
+});
+
+it('carries an unmatched override through a base rewrite and a later quit', async () => {
+  const { pathOf, files, tail } = setup();
+  await files.save('s', save(big(), 'all'));
+  const orphan = text('only surviving copy', 'lost');
+  writeFileSync(tail('s'), JSON.stringify({ baseGen: raw(pathOf('s')).gen, from: 2, items: [], over: [orphan] }));
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  let data;
+  try {
+    data = files.load('s');
+    expect(ids(files.load('s').items)).toEqual(['big', 'a']);
+    expect(warn).toHaveBeenCalledTimes(1);
+  } finally { warn.mockRestore(); }
+  await files.save('s', save(data.items, 'all'));
+  const reopened = new SessionFiles(pathOf);
+  await reopened.save('s', save(reopened.load('s').items, new Set()), true);
+  expect(raw(tail('s')).over).toContainEqual(orphan);
+});
+
+it('folds a final suffix that exceeds the hard tail byte limit', async () => {
+  const { pathOf, files, tail } = setup();
+  await files.save('s', save(big(), 'all'));
+  const items = [text('é'.repeat(1024 * 1024), 'new')];
+  const prior = READ.tailLimit;
+  READ.tailLimit = 1500000;
+  try {
+    await files.save('s', save(items, 'all'), true);
+    expect(existsSync(tail('s'))).toBe(false);
+    expect(raw(pathOf('s')).items).toEqual(items);
+  } finally { READ.tailLimit = prior; }
+});
+
+it('appends a matching suffix to the full prefix when from is out of range', async () => {
+  const { pathOf, tail, files } = setup();
+  const prefix = [text('base', 'b')], suffix = text('tail', 't');
+  await files.save('s', save(prefix, 'all'));
+  writeFileSync(tail('s'), JSON.stringify({ baseGen: raw(pathOf('s')).gen, from: 100, items: [suffix] }));
+  expect((await files.loadAsync('s')).items).toEqual([...prefix, suffix]);
 });

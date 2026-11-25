@@ -15,6 +15,8 @@
  */
 import { EventEmitter } from 'node:events';
 import { authGate } from '../server/core/auth-gate';
+import { workOf } from '../server/core/work';
+import { updateWaits } from '../server/services/update';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, type NoticeItem, type SessionMeta, type ToolItem, type TurnItem, type UserItem } from '@shared/protocol';
 import { SessionRuntime, type BackgroundLimit } from '../server/core/runtime';
@@ -754,6 +756,22 @@ describe('what the process holds', () => {
 // ─────────────────────────────── D-tasks: background commands ───────────────────────────────
 
 describe('background commands', () => {
+  it('an SDK progress banner releases the update while a server still holds its process and a move', async () => {
+    const h = await atRest();
+    h.rt.handle = h.session;
+    await h.call('server', 'Bash', { command: 'node app.js', run_in_background: true });
+    await h.done('server', { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg' });
+    await h.message(result([h.first.uuid]));
+    await h.system({ subtype: 'task_progress', task_id: 'bg', tool_use_id: 'server', summary: 'Local: http://localhost:3311/' });
+    expect(h.rt.meta).toMatchObject({ commands: 0, serving: 1, servingAddress: 'localhost:3311' });
+    expect(h.session.holdsWork()).toBe(true);
+    expect(h.session.liveWork().commands).toBe(1);
+    expect(updateWaits([h.rt]).busy).toBe(false);
+    expect(workOf(h.rt, true)).toMatchObject({ commands: 1, holds: expect.any(Number) });
+    await h.system({ subtype: 'task_notification', task_id: 'bg', tool_use_id: 'server', status: 'completed' });
+    expect(h.rt.meta).toMatchObject({ commands: 0, serving: 0 });
+  });
+
   it.each(['idle close', 'Remote Control keeper'])('keeps a SendMessage resume working through the %s until its own run ends', async (keeper) => {
     vi.useFakeTimers();
     const h = await atRest({ options: { remoteControl: keeper === 'Remote Control keeper' } });
@@ -1148,6 +1166,44 @@ describe('a process that goes away', () => {
     expect(over).toBe(true);
     expect(ended).toBe(false);
     g.proc().end();
+  });
+
+  it('asks the resting SDK process for fresh account status and leaves an active turn alone', async () => {
+    const h = await claude({ live: true });
+    const sent = await h.send('work');
+    const reinitialize = vi.fn(async () => ({ account: { email: 'fixture@example.invalid', subscriptionType: 'max' } }));
+    h.proc().q.reinitialize = reinitialize;
+    const usage = vi.spyOn(h.p, 'readLimits');
+    expect(await h.p.limits(true)).toEqual([]);
+    expect(usage).not.toHaveBeenCalled();
+    expect((await h.p.info(true)).auth.checking).toBe(true);
+    expect(reinitialize).not.toHaveBeenCalled();
+    await h.message(result([sent.uuid]));
+    expect((await h.p.info(true)).auth).toMatchObject({ loggedIn: true, plan: 'Max' });
+    expect(reinitialize).toHaveBeenCalledOnce();
+    expect(sdk.procs).toHaveLength(1);
+    expect(h.proc().closed).toBe(false);
+  });
+
+  it('keeps an idle chat open when a live status answer is unknown', async () => {
+    const h = await claude({ live: true });
+    const sent = await h.send('work');
+    await h.message(result([sent.uuid]));
+    h.proc().q.reinitialize = vi.fn(async () => ({ account: {} }));
+    expect((await h.p.info(true)).auth.checking).toBe(true);
+    expect(sdk.procs).toHaveLength(1);
+    expect(h.proc().closed).toBe(false);
+  });
+
+  it('prewarms beside an active chat on the same account', async () => {
+    const h = await claude({ live: true });
+    await h.send('work');
+    await h.p.prewarm({ cwd: h.rt.meta.cwd });
+    try {
+      expect(sdk.procs).toHaveLength(2);
+      expect(sdk.procs.every(proc => !proc.closed)).toBe(true);
+      expect(h.rt.turnActive).toBe(true);
+    } finally { await h.p.discardWarm(); }
   });
 
   it('a failed spawn leaves no writer after the replacement exits', async () => {
