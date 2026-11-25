@@ -1,6 +1,6 @@
 import { bridge } from '@/lib/bridge';
 import { baseName } from '@/lib/format';
-import { useStore } from '@/state/store';
+import { completeSession, useStore } from '@/state/store';
 
 /**
  * "Export chat" and "Copy as Markdown" (the session header's menu, the palette). The bridge writes
@@ -34,6 +34,7 @@ export async function exportChat(sessionId: string): Promise<void> {
 
 export async function copyChatMarkdown(sessionId: string): Promise<void> {
   try {
+    if (useStore.getState().data[sessionId]?.incomplete) await completeSession(sessionId);
     const { markdown } = await bridge.call('session.markdown', { sessionId });
     await navigator.clipboard.writeText(markdown);
     toast('Copied the chat as Markdown', 'success');

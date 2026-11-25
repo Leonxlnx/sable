@@ -2,7 +2,7 @@ import { DEFAULT_ACCOUNT, type AccountCap, type AccountInfo, type Attachment, ty
 import { DEFAULT_BACKDROP, normalizeBackdrop } from '@shared/backdrop';
 import { bridge } from '@/lib/bridge';
 import { addComment, clearReview, editComment, removeComment, reviewMessage, type ReviewComment } from '@/features/review/model';
-import { accountLiveCaps, applySnapshot, applyWholeItem, capsKey, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
+import { accountLiveCaps, applySnapshot, applyWholeItem, capsKey, completeSession, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
 import { seenCaps } from '@/features/composer/caps-seen';
 import { ultraOffered } from '@/features/composer/effort-track';
 import type { PullFailures, PullStatus, UserItem } from '@shared/protocol';
@@ -28,7 +28,10 @@ export function openSession(id: string) {
     useStore.getState().setUi({ activeSessionId: id, race: null });
     trimKept();
   };
-  if (s.data[id]?.loaded || !s.sessions[id]) return show();
+  if (s.data[id]?.loaded || !s.sessions[id]) {
+    if (s.data[id]?.incomplete) void loadSession(id).catch(fail);
+    return show();
+  }
   // Not here yet: the view switches when it is, or after the hold. Anything else opened meanwhile
   // (another chat, home, a race) wins and this switch never happens; the answer stays as a kept chat.
   const nav = navigationCount();
@@ -80,6 +83,12 @@ export function loadWholeItem(sessionId: string, itemId: string): Promise<void> 
 
 /** Read attachments before a destructive rewind or retry. A failed fetch leaves the message in place. */
 export async function wholeMessage(sessionId: string, item: UserItem) {
+  if (useStore.getState().data[sessionId]?.incomplete) {
+    try { await completeSession(sessionId); } catch (err) { fail(err); return; }
+    const current = useStore.getState().data[sessionId]?.items[item.id];
+    if (current?.type !== 'user') return;
+    item = current;
+  }
   if (!item.more) return item;
   await loadWholeItem(sessionId, item.id);
   const current = useStore.getState().data[sessionId]?.items[item.id];
@@ -400,6 +409,7 @@ export const respondQuestion = (sessionId: string, requestId: string, answers: R
 
 export async function rewindTo(sessionId: string, itemId: string, restoreFiles: boolean) {
   try {
+    if (useStore.getState().data[sessionId]?.incomplete) await completeSession(sessionId);
     const r = await bridge.call('session.rewind', { sessionId, itemId, restoreFiles });
     if (!r.ok && r.message) useStore.getState().toast(r.message, 'error');
     return r.ok;
@@ -430,6 +440,7 @@ export const stopCheck = (sessionId: string, itemId: string) => bridge.call('tur
 /** Fork at an answer: a new session that continues from the end of that turn, opened at once. The original stays as it is. */
 export async function forkAt(sessionId: string, itemId: string): Promise<SessionMeta | null> {
   try {
+    if (useStore.getState().data[sessionId]?.incomplete) await completeSession(sessionId);
     const snap = await bridge.call('session.fork', { sessionId, itemId });
     applySnapshot(snap);
     useStore.getState().setUi({ activeSessionId: snap.session.id, race: null });

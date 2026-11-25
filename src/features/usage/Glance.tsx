@@ -10,6 +10,7 @@ import { cx } from '@/ui';
 import { isApiKey, STALE_MS } from './format';
 import { AsOf, LimitsBody, useAccountWindows } from './Limits';
 import { planShort } from './plans';
+import { planBeside } from '@/features/connect/plan';
 import { modelLimits } from './scope';
 import { useLimitsTicker } from './ticker';
 
@@ -47,6 +48,7 @@ export function LimitsGlance({ provider, accountId = DEFAULT_ACCOUNT, read = tru
   useLimitsTicker(read && signedIn, () => void refreshLimits(provider, accountId));
 
   const plan = signedIn ? planShort(account?.auth) : undefined;
+  const name = account && several ? accountName(account) : PROVIDER_NAME[provider];
   const shows = signedIn && report?.planLimits !== false && limits.length > 0 && !isApiKey(account?.auth);
   const stale = !!report?.readAt && now - report.readAt > STALE_MS;
 
@@ -54,8 +56,8 @@ export function LimitsGlance({ provider, accountId = DEFAULT_ACCOUNT, read = tru
     <div className="ul-glance">
       <div className="ul-glance-head">
         <ProviderMark provider={provider} size={14} className="ul-glance-mark" />
-        <span className="ul-glance-name truncate">{account && several ? accountName(account) : PROVIDER_NAME[provider]}</span>
-        {plan && <span className="ul-glance-plan">{plan}</span>}
+        <span className="ul-glance-name truncate">{name}</span>
+        {planBeside(name, plan) && <span className="ul-glance-plan">{plan}</span>}
         {shows && <span className="ul-glance-col">Resets in</span>}
       </div>
       {account ? (

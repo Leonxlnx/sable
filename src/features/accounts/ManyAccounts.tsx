@@ -12,6 +12,7 @@ import { accountName } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { Tip } from '@/ui';
 import { accountMark, accountsOf, markWords, planWord, type AccountMark } from './model';
+import { planBeside } from '@/features/connect/plan';
 import { rankWords, shortUntil, useFirstRanks } from './order';
 import type { UseFirstRank } from '@shared/use-first';
 import { appliesTo } from '@/features/usage/scope';
@@ -233,7 +234,7 @@ export const planOf = (a: AccountInfo) => (a.auth.loggedIn ? (planWord(a) ?? pla
 
 function ManyRow({ row, now, rank, inUse, single, onPeek, onSelect }: { row: RoomRow<Entry>; now: number; rank?: UseFirstRank; inUse: boolean; single?: boolean; onPeek: () => void; onSelect: () => void }) {
   const { account, provider } = row.input;
-  const plan = planOf(account);
+  const plan = planBeside(single ? PROVIDER_NAME[provider] : row.input.name, planOf(account));
   const used = row.tight ? usedPercent(row.tight, now) : undefined;
   const words = rankWords(rank, now);
   const mark = accountMark(account, inUse ? account.id : undefined);

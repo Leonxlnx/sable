@@ -387,12 +387,13 @@
 /* The meter carries the level (its tone); the figure stays in the text's tone, so a used-up window
    is one red in view, not two. */
 
+/* The plus's ink on the name's edge: its box starts 2px before the name, the glyph's own inset. */
 .acc-add {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   height: 28px;
-  margin: 0 0 8px 26px;
+  margin: 0 0 8px 24px;
   padding: 0 10px;
   border-radius: var(--r-sm);
   font-size: var(--t-small);
@@ -431,7 +432,7 @@
     padding-left: 0;
   }
   .acc-add {
-    margin-left: -10px;
+    margin-left: -12px;
   }
 }
 

@@ -69,7 +69,20 @@ interface TipHooks {
  * reaches it, the tooltip mounts beside it and takes the control itself as its trigger (`TipAnchor`),
  * so the control is never remounted and the tooltip behaves exactly as Radix's own.
  */
-export function Tip({ label, keys, side = 'bottom', children }: { label: ReactNode; keys?: string; side?: TipSide; children: ReactNode }) {
+export function Tip({
+  label,
+  keys,
+  side = 'bottom',
+  offset = 7,
+  children,
+}: {
+  label: ReactNode;
+  keys?: string;
+  side?: TipSide;
+  /** How far from the control the tip stands (a control in a corner of a pane keeps its tip off the pane's rim). */
+  offset?: number;
+  children: ReactNode;
+}) {
   const [woken, setWoken] = useState<Woken | null>(null);
   if (!isValidElement<TipHooks>(children)) return <>{children}</>;
   const own = children.props;
@@ -92,7 +105,7 @@ export function Tip({ label, keys, side = 'bottom', children }: { label: ReactNo
             <TipAnchor el={woken.el} by={woken.by} />
           </RT.Trigger>
           <RT.Portal>
-            <RT.Content className="tooltip" side={side} sideOffset={7} collisionPadding={8}>
+            <RT.Content className="tooltip" side={side} sideOffset={offset} collisionPadding={8}>
               {label}
               {keys && <Kbd combo={keys} />}
             </RT.Content>

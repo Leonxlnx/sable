@@ -62,6 +62,12 @@ function sourcesOf(sessionId: string): { sources: FindSource[]; users: string[] 
   return { sources, users };
 }
 
+/** Null while the source is partial, including when none of the loaded rows match. */
+export function conversationHits(sessionId: string, query: string) {
+  if (useStore.getState().data[sessionId]?.incomplete) return null;
+  return findHits(sourcesOf(sessionId).sources, query);
+}
+
 const inOtherSurface = (t: EventTarget | null) => !!(t as HTMLElement | null)?.closest?.('.app-rail, [role="dialog"], [role="menu"], [role="listbox"]');
 
 /**
@@ -80,8 +86,9 @@ export function ConversationFind({ sessionId }: { sessionId: string }) {
   const size = useStore((s) => (open ? (s.data[sessionId]?.roots.length ?? 0) : 0));
   const settled = useStore((s) => (open ? s.sessions[sessionId]?.status : undefined));
 
+  const reading = useStore(s => open && !!s.data[sessionId]?.incomplete);
   const q = query.trim();
-  const hits = useMemo(() => (open && q ? findHits(sourcesOf(sessionId).sources, q) : []), [open, q, sessionId, size, settled]); // eslint-disable-line react-hooks/exhaustive-deps
+  const hits = useMemo(() => (open && q ? conversationHits(sessionId, q) ?? [] : []), [open, q, sessionId, size, settled, reading]); // eslint-disable-line react-hooks/exhaustive-deps
   const hitsRef = useRef(hits);
   hitsRef.current = hits;
 
@@ -89,7 +96,7 @@ export function ConversationFind({ sessionId }: { sessionId: string }) {
   const at = useRef<string | undefined>(undefined);
   useEffect(() => {
     setCursor(startAt(hitsRef.current, at.current));
-  }, [q, sessionId]);
+  }, [q, sessionId, reading]);
 
   const current = cursor && hits[cursor.hit] ? hits[cursor.hit] : undefined;
   at.current = current?.itemId ?? at.current;
@@ -260,7 +267,7 @@ export function ConversationFind({ sessionId }: { sessionId: string }) {
               autoComplete="off"
             />
             <span className="cfind-count num" aria-live="polite" data-none={(!!q && !total) || undefined}>
-              {q ? (total ? `${place} of ${total}` : 'No matches') : ''}
+              {reading ? 'Reading conversation…' : q ? (total ? `${place} of ${total}` : 'No matches') : ''}
             </span>
           </label>
           <IconButton icon="arrow-up" label="Previous match" keys="shift+enter" size={14} disabled={!total} onClick={() => move(-1)} />

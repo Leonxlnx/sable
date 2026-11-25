@@ -193,6 +193,17 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
   const running = busy && groups.some((g) => g.kind === 'turn' && g.state === 'running');
 
   const [built, setBuilt] = useState<BuiltState>({ hidden: null, win: null });
+  // React retries this render before committing. Newly arrived groups belong
+  // above both built ranges, including a separate window around a jump.
+  const [previousFirst, setPreviousFirst] = useState(groups[0]?.key);
+  const builtAnchor = useRef<{ key: string; at: number } | null>(null);
+  if (groups[0]?.key !== previousFirst) {
+    setPreviousFirst(groups[0]?.key);
+    const anchor = builtAnchor.current;
+    const shift = anchor ? groups.findIndex(g => g.key === anchor.key) - anchor.at : 0;
+    if (shift > 0 && built.hidden !== null) setBuilt({ hidden: built.hidden + shift,
+      win: built.win && { from: built.win.from + shift, to: built.win.to + shift } });
+  }
   const size = useRef(groups.length);
   size.current = groups.length;
   // Until it is decided (the first commit with groups), the newest groups that fill a few views by
@@ -208,6 +219,9 @@ export const TurnList = memo(function TurnList({ ids }: { ids: string[] }) {
   /** A state's first built group of the newest turns: decided, and within the groups there are. */
   const hiddenOf = (b: BuiltState) => Math.min(size.current, b.hidden ?? first.current);
   const hidden = hiddenOf(built);
+  useLayoutEffect(() => {
+    builtAnchor.current = groups[hidden] ? { key: groups[hidden].key, at: hidden } : null;
+  }, [groups, hidden]);
   const win = built.win && built.win.from < built.win.to ? built.win : null;
   // Groups before `lead` wait behind the first spacer, groups [gapFrom, hidden) behind the second
   // (between a run built around a message far up and the newest turns); the rest are built.

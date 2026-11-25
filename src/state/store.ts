@@ -41,6 +41,10 @@ export const accountKey = (provider: ProviderId, accountId?: string | null) =>
 /** Per-session view state, rebuilt from a snapshot and kept current by events. */
 export interface SessionData {
   loaded: boolean;
+  incomplete?: boolean;
+  rootsBefore?: number;
+  itemsBefore?: number;
+  provisional?: boolean;
   /**
    * Items by id. The container is changed in place: a streamed word or a patch replaces one item
    * without copying the others (a long chat holds thousands; a copy per frame cost milliseconds).
@@ -444,16 +448,124 @@ function restoreRows(sessionId: string) {
   });
 }
 
+
+type PageRead = { promise: Promise<void>; wake?: () => void; patches: Map<string, Partial<TimelineItem> | null> };
+const pages = new Map<string, PageRead>();
+let snapshotThreshold: number | undefined;
+
+function afterPaint(wake: (go: () => void) => void) {
+  return new Promise<void>(resolve => {
+    let frame = 0;
+    const timer = setTimeout(go, 100);
+    function go() {
+      clearTimeout(timer);
+      if (frame) cancelAnimationFrame(frame);
+      resolve();
+    }
+    wake(go);
+    if (typeof requestAnimationFrame === 'function') frame = requestAnimationFrame(() => setTimeout(go, 0));
+    else setTimeout(go, 0);
+  });
+}
+
+function dropTree(id: string, items: SessionData['items'], children: SessionData['children'], ids: string[]) {
+  delete items[id];
+  ids.push(id);
+  const nested = children[id];
+  if (nested) {
+    delete children[id];
+    for (const child of nested) dropTree(child, items, children, ids);
+  }
+}
+
+/** A page contains current rows from the bridge. Live events on visible items
+ * win, and live metadata stays in place throughout the prepend. */
+function prependPage(snap: SessionSnapshot, read: PageRead) {
+  const id = snap.session.id, page = snap.page!;
+  editItems(id, d => {
+    const prefix: TimelineItem[] = [];
+    const children = { ...d.children };
+    const removed: string[] = [];
+    for (const item of snap.items) {
+      const patch = read.patches.get(item.id);
+      if (patch === null || item.parentId && read.patches.get(item.parentId) === null) {
+        // A later page can reveal that a child already on screen belonged to
+        // this removed subtree. Keep the tombstone through the last page.
+        read.patches.set(item.id, null);
+        if (children[item.id]) dropTree(item.id, d.items, children, removed);
+        continue;
+      }
+      read.patches.delete(item.id);
+      if (!d.items[item.id]) prefix.push(patch ? { ...item, ...patch } as TimelineItem : item);
+    }
+    const indexed = indexItems(prefix);
+    Object.assign(d.items, indexed.items);
+    for (const [parent, ids] of Object.entries(indexed.children)) children[parent] = ids.concat(children[parent] ?? []);
+    return { ids: removed.concat(prefix.map(i => i.id)), patch: { roots: indexed.roots.concat(d.roots), children,
+      incomplete: page.before > 0, rootsBefore: page.rootsBefore, itemsBefore: page.before } };
+  });
+  trimOffscreenSoon(id);
+}
+
+function readOlder(snap: SessionSnapshot) {
+  const id = snap.session.id;
+  const read: PageRead = { promise: Promise.resolve(), patches: new Map() };
+  pages.set(id, read);
+  const current = () => pages.get(id) === read && useStore.getState().data[id]?.incomplete;
+  read.promise = (async () => {
+    await afterPaint(go => { read.wake = go; });
+    while (current()) {
+      const page = snap.page!;
+      const next = await bridge.call('session.snapshot', { sessionId: id, peek: true,
+        ...(page.kind === 'provisional' ? { page: 'real' as const, keepFrom: snap.items[0]?.id } :
+          { page: { at: page.before, roots: page.rootsBefore, id: snap.items[0].id } }) });
+      if (!current()) return;
+      if (next.page?.kind !== 'older') { applySnapshot(next); return; }
+      prependPage(next, read);
+      snap = next;
+    }
+  })().catch(async () => {
+    if (!current() || bridge.status === 'closed') return;
+    // A timed-out page gets one authoritative full read. Reconnect also asks whole.
+    await loadSession(id, { fresh: true });
+  }).finally(() => { if (pages.get(id) === read) pages.delete(id); });
+  void read.promise.catch(err => {
+    if (useStore.getState().ui.activeSessionId === id) useStore.getState().toast(String(err.message ?? err), 'error');
+  });
+}
+
+/** Readers that act on the whole timeline share the ongoing read. */
+export async function completeSession(id: string) {
+  while (useStore.getState().data[id]?.incomplete) {
+    const read = pages.get(id);
+    if (read) { read.wake?.(); await read.promise; }
+    else await loadSession(id, { fresh: true });
+    if (bridge.status === 'closed' && useStore.getState().data[id]?.incomplete) throw Error('Connection to the bridge was lost');
+  }
+  if (!useStore.getState().data[id]?.loaded) throw Error('The conversation is no longer open');
+}
+
 export function applySnapshot(snap: SessionSnapshot) {
+  pages.delete(snap.session.id);
+  rowsOf.delete(snap.session.id);
+  // The provisional view is about to be replaced. Only keep identical rows
+  // after comparing their actual wire fields, including nested tool results.
+  const old = useStore.getState().data[snap.session.id];
+  const items = old?.provisional ? snap.items.map(row => {
+    const prior = old.items[row.id];
+    return prior && JSON.stringify(prior) === JSON.stringify(row) ? prior : row;
+  }) : snap.items;
   // A limit card that owes a decision is known once the chat's items are (lib/attention.ts).
-  attention.feed({ type: 'timeline.reset', sessionId: snap.session.id, items: snap.items });
+  if (snap.page?.kind !== 'provisional') attention.feed({ type: 'timeline.reset', sessionId: snap.session.id, items: snap.items });
   useStore.setState((s) => ({
     sessions: { ...s.sessions, [snap.session.id]: snap.session },
     data: {
       ...s.data,
       [snap.session.id]: {
         loaded: true,
-        ...indexItems(snap.items),
+        ...indexItems(items),
+        incomplete: !!snap.page && (snap.page.before !== 0 || snap.page.kind === 'provisional'),
+        provisional: snap.page?.kind === 'provisional', rootsBefore: snap.page?.rootsBefore ?? 0, itemsBefore: snap.page?.before ?? 0,
         permissions: snap.permissions,
         questions: snap.questions,
         todos: snap.todos,
@@ -464,6 +576,7 @@ export function applySnapshot(snap: SessionSnapshot) {
     },
   }));
   // A click sharing this snapshot can put its chat on screen before the budget is applied.
+  if (useStore.getState().data[snap.session.id]?.incomplete) readOlder(snap);
   trimOffscreenSoon(snap.session.id);
 }
 
@@ -523,6 +636,7 @@ export function applyEvent(e: BridgeEvent) {
     case 'item.added':
       // Deltas first: they came before this event (the same for a patch).
       flushDeltas();
+      pages.get(e.sessionId)?.patches.delete(e.item.id);
       editItems(e.sessionId, (d) => {
         const known = !!d.items[e.item.id];
         d.items[e.item.id] = e.item;
@@ -538,6 +652,13 @@ export function applyEvent(e: BridgeEvent) {
       return;
     case 'item.patch':
       flushDeltas();
+      {
+        const read = pages.get(e.sessionId);
+        if (read && read.patches.get(e.id) !== null && !useStore.getState().data[e.sessionId]?.items[e.id]) {
+          read.patches.set(e.id, { ...read.patches.get(e.id), ...e.patch } as Partial<TimelineItem>);
+          read.wake?.();
+        }
+      }
       editItems(e.sessionId, (d) => {
         const item = d.items[e.id];
         if (!item) return null;
@@ -548,32 +669,30 @@ export function applyEvent(e: BridgeEvent) {
     case 'item.removed':
       // The bridge is moving it: the `item.added` right behind carries it to its place, so no frame is painted without it.
       if (e.moving) return;
+      {
+        const read = pages.get(e.sessionId);
+        if (read) { read.patches.set(e.id, null); read.wake?.(); }
+      }
       editItems(e.sessionId, (d) => {
         const item = d.items[e.id];
-        if (!item) return null;
+        if (!item && !d.children[e.id]) return null;
         const children = { ...d.children };
         const ids: string[] = [];
         // The item goes with everything nested under it, as on the bridge.
-        const drop = (id: string) => {
-          delete d.items[id];
-          ids.push(id);
-          const kids = children[id];
-          if (kids) {
-            delete children[id];
-            kids.forEach(drop);
-          }
-        };
-        drop(e.id);
+        dropTree(e.id, d.items, children, ids);
+        const read = pages.get(e.sessionId);
+        if (read) for (const id of ids) read.patches.set(id, null);
         const patch: Partial<SessionData> = { children };
-        if (item.parentId) children[item.parentId] = (children[item.parentId] ?? []).filter((x) => x !== e.id);
+        if (item?.parentId) children[item.parentId] = (children[item.parentId] ?? []).filter((x) => x !== e.id);
         else patch.roots = d.roots.filter((x) => x !== e.id);
         return { ids, patch };
       });
       return;
     case 'timeline.reset':
+      if (!useStore.getState().data[e.sessionId]?.provisional) pages.delete(e.sessionId);
       deltaBuffer.clear();
       rowsOf.delete(e.sessionId);
-      patchData(e.sessionId, () => ({ ...indexItems(e.items), hydrated: false }));
+      patchData(e.sessionId, d => ({ ...indexItems(e.items), incomplete: !!d.provisional, rootsBefore: 0, itemsBefore: 0, hydrated: false }));
       trimOffscreenSoon(e.sessionId);
       return;
     case 'session.added':
@@ -594,6 +713,7 @@ export function applyEvent(e: BridgeEvent) {
       return;
     }
     case 'session.removed':
+      pages.delete(e.id);
       useStore.setState((s) => {
         const sessions = { ...s.sessions };
         const data = { ...s.data };
@@ -716,6 +836,7 @@ async function hello() {
   bootMark('hello-sent');
   const app = await bridge.call('app.hello', {});
   bootMark('hello');
+  snapshotThreshold = app.snapshotThreshold;
   const again = useStore.getState().ready;
   useStore.setState((s) => {
     const sessions = Object.fromEntries(app.sessions.map((m) => [m.id, m]));
@@ -870,6 +991,7 @@ export function startBridge() {
   bridge.beforeAnswer = flushEvents;
   startNotify();
   bridge.onStatus((conn) => {
+    if (conn === 'closed') pages.clear();
     useStore.setState({ conn });
     if (conn === 'open') bootMark('ws-open');
     if (conn === 'open') void hello().catch((err) => useStore.getState().toast(String(err.message ?? err), 'error'));
@@ -908,6 +1030,8 @@ const fetching = new Map<string, Promise<void>>();
 export function resetKept() {
   used.clear();
   fetching.clear();
+  pages.clear();
+  snapshotThreshold = undefined;
   rowsOf.clear();
   clearTimeout(trimTimer);
   trimTimer = undefined;
@@ -937,6 +1061,7 @@ function forgetKept(data: Record<string, SessionData>, keep: string[]): Record<s
   for (const [id, d] of Object.entries(data)) {
     if (!d.loaded || keep.includes(id)) continue;
     if (next === data) next = { ...data };
+    pages.delete(id);
     next[id] = unloaded(d);
     used.delete(id);
   }
@@ -963,7 +1088,7 @@ export function trimKept() {
   let items = 0;
   let chats = 0;
   for (const [id, d] of kept) {
-    const count = d.roots.length + Object.values(d.children).reduce((n, children) => n + children.length, 0);
+    const count = (d.itemsBefore === -1 ? KEEP.items : d.itemsBefore ?? 0) + d.roots.length + Object.values(d.children).reduce((n, children) => n + children.length, 0);
     if (chats >= KEEP.chats || items + count > KEEP.items) drop.push(id);
     else { chats++; items += count; }
   }
@@ -975,6 +1100,7 @@ export function trimKept() {
   });
   for (const id of drop) {
     used.delete(id);
+    pages.delete(id);
     rowsOf.delete(id);
   }
 }
@@ -988,8 +1114,11 @@ export function trimKept() {
 export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: boolean } = {}): Promise<void> {
   const inFlight = fetching.get(sessionId);
   if (inFlight && !opts.fresh) return inFlight;
+  if (pages.has(sessionId) && !opts.fresh) return Promise.resolve();
+  if (opts.fresh) pages.delete(sessionId);
+  const end = !opts.fresh && !useStore.getState().data[sessionId]?.incomplete && (snapshotThreshold !== undefined || !useStore.getState().ready);
   const p: Promise<void> = bridge
-    .call('session.snapshot', opts.peek ? { sessionId, peek: true } : { sessionId })
+    .call('session.snapshot', { sessionId, ...(opts.peek && { peek: true }), ...(end && { page: 'end' as const }) })
     .then((snap) => {
       // A newer request replaced this one: its answer wins.
       if (fetching.get(sessionId) !== p) return;

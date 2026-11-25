@@ -9,6 +9,7 @@ import { cx, IconButton, Switch, Tip } from '@/ui';
 import { clock, duration, exactTime, isApiKey, NUMBER_LOCALE, orderWindows, STALE_MS, windowLevel, windowNote } from './format';
 import { LimitsOverview, LimitsTotals } from './Overview';
 import { planShort } from './plans';
+import { planBeside } from '@/features/connect/plan';
 import { resetsText, usedPercent, usedText } from './words';
 import { fullTarget, LimitReset, resetTarget } from './LimitReset';
 import { useResetInAgent } from './ResetInAgent';
@@ -288,7 +289,7 @@ export function AccountLimits({ refs, pending, inline }: { refs: AccountRef; pen
         <ProviderMark provider={provider} size={15} className="ul-account-mark" />
         <span className="ul-account-who">
           <span className="ul-account-name truncate">{name}</span>
-          {plan && <span className="ul-account-plan truncate">{plan}</span>}
+          {planBeside(name, plan) && <span className="ul-account-plan truncate">{plan}</span>}
           <span className="ul-account-asof">
             <AsOf report={report} now={now} pending={pending} />
           </span>
@@ -367,7 +368,7 @@ function CreditsList({ refs }: { refs: AccountRef[] }) {
               <ProviderMark provider={r.provider} size={14} className="ulo-mark" />
               <span className="ulo-who">
                 <span className="ulo-name truncate">{name}</span>
-                {plan && <span className="ulo-plan truncate">{plan}</span>}
+                {planBeside(name, plan) && <span className="ulo-plan truncate">{plan}</span>}
               </span>
               <Switch checked={!!chosen?.[key]} onChange={(v) => void setSettings({ creditsAtLimit: { ...useStore.getState().settings.creditsAtLimit, [key]: v } })} label={`Use credits at a limit: ${PROVIDER_NAME[r.provider]}, ${name}`} />
             </label>

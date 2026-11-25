@@ -12,9 +12,9 @@ import { Kbd } from '@/ui';
 import { useTimeline } from './ctx';
 import { estimate } from './items';
 import { findMarks, onFindMarks, takeConversation, takeSteps, type NavFeed, type NavLayout } from './nav-bus';
-import { firstLine, groupAt, groupBoxes, groupHeight, indexLines, indexWindow, isBuilt, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, railShown, RAIL_HIDE, RAIL_SHOW, rowsMoved, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
+import { firstLine, groupAt, groupBoxes, navigatorShape, indexLines, indexWindow, isBuilt, markAt, marksOf, markY, matchPrompt, placeMarks, railAt, railOf, railShown, RAIL_HIDE, RAIL_SHOW, rowsMoved, runOf, runsOf, stackHeight, stepTarget, type NavMark, type NavRun, type Rail } from './nav-model';
 import { revealItem, rootOf } from './reveal';
-import type { Group, TurnGroup } from './turns';
+import type { Group } from './turns';
 import { stampParts } from './util';
 import './navigator.css';
 
@@ -133,30 +133,14 @@ export const Navigator = memo(function Navigator({ sessionId, feed, scroller, co
   });
 
   // The marks: one per message, kept per turn object, the same array while nothing changed.
-  const [turnCache] = useState(() => new WeakMap<TurnGroup, Omit<NavMark, 'group'>[]>());
   const lastMarks = useRef<NavMark[]>([]);
   const marks = useMemo(() => {
     if (!layout) return lastMarks.current;
     const d = useStore.getState().data[sessionId];
-    return (lastMarks.current = marksOf(layout.groups, d?.items ?? {}, turnCache, lastMarks.current));
-  }, [layout, sessionId, turnCache]);
+    return (lastMarks.current = marksOf(layout.groups, d?.items ?? {}, undefined, lastMarks.current));
+  }, [layout, sessionId]);
 
-  // Estimated heights and offsets inside groups, kept per group object (a settled group never changes).
-  const [shapes] = useState(() => new WeakMap<Group, { h: number; at: Map<string, number> }>());
-  const shape = useCallback(
-    (g: Group) => {
-      let s = shapes.get(g);
-      if (!s) {
-        const items = useStore.getState().data[sessionId]?.items ?? {};
-        const at = new Map<string, number>();
-        const h = groupHeight(g, items, estimate, (id, y) => at.set(id, y));
-        s = { h, at };
-        shapes.set(g, s);
-      }
-      return s;
-    },
-    [shapes, sessionId],
-  );
+  const shape = useCallback((g: Group) => navigatorShape(g, useStore.getState().data[sessionId]?.items ?? {}, estimate), [sessionId]);
 
   const track = useRef<HTMLDivElement>(null);
   const [geo, setGeo] = useState<Geo>(NO_GEO);

@@ -24,6 +24,7 @@ interface Segment {
 export function ContextTab({ sessionId, active }: { sessionId: string; active: boolean }) {
   const session = useStore((s) => s.sessions[sessionId]);
   const caps = useStore((s) => s.data[sessionId]?.caps);
+  const reading = useStore(s => !!s.data[sessionId]?.incomplete);
   const provider = session?.provider;
   const [ctx, setCtx] = useState<ContextBreakdown | null | undefined>(undefined);
   const [loading, setLoading] = useState(false);
@@ -43,10 +44,10 @@ export function ContextTab({ sessionId, active }: { sessionId: string; active: b
   // Refresh when shown, when a turn settles and when the reported context size moves.
   const haveCtx = ctx !== undefined;
   useEffect(() => {
-    if (!active || (busy && haveCtx)) return;
+    if (reading || !active || (busy && haveCtx)) return;
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, busy, usedTokens, sessionId]);
+  }, [active, busy, usedTokens, sessionId, reading]);
 
   useEffect(() => {
     if (active && provider) void refreshLimits(provider, session?.accountId);
@@ -77,6 +78,7 @@ export function ContextTab({ sessionId, active }: { sessionId: string; active: b
     return null;
   }, [ctx, usage?.contextTokens, usage?.contextWindow, session?.model]);
 
+  if (reading) return <div className="rail-col" role="status">Reading conversation…</div>;
   if (!session) return null;
   const pct = view ? Math.min(100, (view.total / view.max) * 100) : 0;
 

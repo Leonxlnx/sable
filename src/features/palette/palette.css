@@ -260,12 +260,14 @@
   animation: var(--empty-in);
 }
 
-/* Matched characters, quietly: the text's own bright tone and the medium weight, no line, no colour
-   (only an unbroken match is marked at all, `quietMarks`). */
+/* Matched characters, quietly: the text's own bright tone and the semibold weight, no line, no
+   colour (only an unbroken match is marked at all, `quietMarks`). The weight carries it on the
+   highlighted row, whose words are all ivory: at the medium weight the mark vanished there. One
+   weight in every state, so the highlight moving never changes a word's width. */
 .hl {
   background: none;
   color: var(--text);
-  font-weight: var(--w-medium);
+  font-weight: var(--w-semi);
 }
 
 /* ── messages across chats ── */

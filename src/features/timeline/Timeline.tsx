@@ -43,6 +43,7 @@ function heldLive(inner: HTMLElement, el: HTMLElement): boolean {
  */
 export function Timeline({ sessionId }: { sessionId: string }) {
   const loaded = useStore((s) => s.data[sessionId]?.loaded ?? false);
+  const before = useStore(s => s.data[sessionId]?.provisional ? -1 : s.data[sessionId]?.itemsBefore ?? 0);
   const roots = useStore((s) => s.data[sessionId]?.roots) ?? EMPTY;
   const cwd = useStore((s) => s.sessions[sessionId]?.cwd ?? '');
   const home = useStore((s) => s.home);
@@ -80,6 +81,12 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     glide.current.wrote = el.scrollTop;
     glide.current.v = 0;
   }, []);
+
+  const previousBefore = useRef(before);
+  useLayoutEffect(() => {
+    if (before !== previousBefore.current && (before < previousBefore.current || previousBefore.current === -1) && stuck.current) pin();
+    previousBefore.current = before;
+  }, [before, pin]);
 
   /**
    * Travels to the end with a critically damped motion: a sent message is scrolled to smoothly

@@ -1,6 +1,6 @@
 import { revealItem } from '@/features/timeline/reveal';
 import { openSession } from '@/state/actions';
-import { useStore } from '@/state/store';
+import { navigationCount, useStore } from '@/state/store';
 
 /**
  * Opens a chat at a message found by the palette's search: the chat opens (loading it when it was
@@ -79,8 +79,9 @@ export function openMessage(sessionId: string, itemId: string, words: string[]) 
   const mine = ++current;
   window.clearTimeout(clearTimer);
   registry()?.delete(MARK);
+  const navigating = navigationCount();
   openSession(sessionId);
-  const until = performance.now() + PATIENCE_MS;
+  let until = performance.now() + PATIENCE_MS;
   let asked = 0;
   const smooth = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -88,8 +89,12 @@ export function openMessage(sessionId: string, itemId: string, words: string[]) 
     if (mine !== current) return;
     const s = useStore.getState();
     // The person went somewhere else meanwhile.
-    if (s.ui.activeSessionId !== sessionId) return;
+    if (s.ui.activeSessionId !== sessionId) {
+      if (navigationCount() === navigating && performance.now() < until) requestAnimationFrame(tick);
+      return;
+    }
     const d = s.data[sessionId];
+    if (d?.incomplete && !d.items[itemId]) { until = performance.now() + PATIENCE_MS; requestAnimationFrame(tick); return; }
     if (d?.loaded && !d.items[itemId]) return; // no longer in the chat (rewound)
     const row = d?.loaded ? builtRow(itemId) : undefined;
     // Lit by the timeline: it is in view; mark the words.

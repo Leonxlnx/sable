@@ -213,6 +213,7 @@ export function shapeIndex() {
   let ids: readonly string[] = [];
   let items: object | null = null;
   let rev = -1;
+  let origin = 0;
   let chars: string[] = [];
   let pos = new Map<string, number>();
   let out = '';
@@ -224,6 +225,22 @@ export function shapeIndex() {
     if (d.items === items && d.rev === rev && roots === ids) return out;
     const changed = d.items === items ? changedSince(d, rev) : null;
     const n = ids.length;
+
+    const added = roots.length - n;
+    const prepend = changed && n && added > 0 && roots[added] === ids[0] &&
+      ids.every((id, i) => roots[added + i] === id) && changed.every(id => !pos.has(id));
+    if (prepend) {
+      const prefix = roots.slice(0, added).map((id, i) => {
+        pos.set(id, origin - added + i);
+        return shapeOfKept(d.items[id]);
+      });
+      origin -= added;
+      chars = prefix.concat(chars);
+      out = prefix.join('') + out;
+      ids = roots;
+      rev = d.rev;
+      return out;
+    }
     // Roots change only by joining at the end or leaving: the old last root still in its place
     // means nothing before it left (as `grow` in the Agents tab reads it).
     const grew = roots === ids || (roots.length >= n && (n === 0 || (roots[0] === ids[0] && roots[n - 1] === ids[n - 1])));
@@ -234,9 +251,10 @@ export function shapeIndex() {
       roots !== ids &&
       changed.some((id) => {
         const i = pos.get(id);
-        return i !== undefined && roots[i] !== id;
+        return i !== undefined && roots[i - origin] !== id;
       });
     if (!changed || !grew || moved) {
+      origin = 0;
       chars = new Array<string>(roots.length);
       pos = new Map();
       for (let i = 0; i < roots.length; i++) {
@@ -250,15 +268,15 @@ export function shapeIndex() {
         const i = pos.get(id);
         if (i === undefined) continue;
         const c = shapeOf(d.items[id]);
-        if (c === chars[i]) continue;
-        chars[i] = c;
+        if (c === chars[i - origin]) continue;
+        chars[i - origin] = c;
         edited = true;
       }
       let tail = '';
       for (let i = n; i < roots.length; i++) {
         const c = shapeOfKept(d.items[roots[i]]);
         chars.push(c);
-        pos.set(roots[i], i);
+        pos.set(roots[i], origin + i);
         tail += c;
       }
       if (edited) out = chars.join('');
@@ -986,7 +1004,32 @@ export function turnsIndex() {
   let shape = '';
   let g: Grouping = { groups: [], queued: [], waiting: [], checks: [] };
   let cuts: Cut[] = [];
+  let lastBusy = false;
   return (nextIds: readonly string[], nextShape: string, busy: boolean, checkOf?: (id: string) => string | undefined): TurnLayout => {
+    const extra = nextIds.length - ids.length;
+    // A sent message is a known grouping boundary. Group through the first
+    // such message in the old suffix, then splice its saved work back in.
+    const seam = cuts[0];
+    if (extra > 0 && seam && busy === lastBusy && nextIds[extra] === ids[0] &&
+        nextShape.endsWith(shape) && ids.every((id, i) => nextIds[i + extra] === id) &&
+        !seam.waiting && !nextShape.slice(0, extra).includes('s')) {
+      const at = extra + seam.at;
+      const head: Grouping = { groups: [], queued: [], waiting: [], checks: [] };
+      const before: Cut[] = [];
+      groupFrom(head, nextIds.slice(0, at + 1), nextShape.slice(0, at + 1), false, 0, before);
+      const join = before.pop()!;
+      head.groups.length = join.groups;
+      const groups = join.groups - seam.groups, queued = join.queued - seam.queued, checks = join.checks - seam.checks;
+      g = { groups: head.groups.concat(g.groups.slice(seam.groups)), queued: head.queued.concat(g.queued.slice(seam.queued)),
+        checks: head.checks.concat(g.checks.slice(seam.checks).map(c => ({ ...c, at: c.at + groups }))), waiting: g.waiting };
+      cuts = before.concat(cuts.map(c => ({ ...c, at: c.at + extra, groups: c.groups + groups, queued: c.queued + queued, checks: c.checks + checks })));
+      ids = nextIds;
+      shape = nextShape;
+      const last = g.groups.at(-1);
+      const waitingOnTurn = last?.kind === 'turn' && last.state === 'running';
+      return { groups: withChecks(g.groups, g.checks, checkOf), queued: waitingOnTurn ? g.queued.slice() : g.waiting.concat(g.queued) };
+    }
+    lastBusy = busy;
     // The first place this timeline differs from the last one grouped.
     const n = Math.min(ids.length, nextIds.length);
     let d = 0;

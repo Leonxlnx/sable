@@ -1,5 +1,4 @@
 import { useEffect } from 'react';
-import { signedOut } from '@/lib/sign-in';
 import type { ProviderId } from '@shared/protocol';
 import { ConnectCard } from '@/features/connect/Connect';
 import { connectableAgents } from '@/features/connect/plan';
@@ -32,14 +31,12 @@ export function Accounts() {
     }
   }, [ready, signedIn]);
 
-  // Only one bright button per view: the first agent waiting for a sign-in gets it.
-  const firstOut = order.find((id) => providers[id]?.installed && signedOut(providers[id]?.auth) && !providers[id]?.accounts?.some((a) => a.auth.loggedIn));
-
+  // A page of equals: every agent's "Sign in" has one look (no bright button for whichever comes first).
   return (
     <div className="set-stack">
       <div className="acct-list">
         {order.map((id) => (
-          <ConnectCard key={id} provider={id} primary={id === firstOut} />
+          <ConnectCard key={id} provider={id} />
         ))}
       </div>
       <AccountCaps agents={order} />

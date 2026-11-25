@@ -59,6 +59,8 @@ const COMMANDS = '\u0000commands';
  * `active`: the pane is on screen. Hidden (another tab, the panel closed) it holds still.
  */
 export function AgentsTab({ sessionId, active = true }: { sessionId: string; active?: boolean }) {
+  const reading = useStore(s => !!s.data[sessionId]?.incomplete);
+  if (reading) return <div className="rail-col" role="status">Reading conversation…</div>;
   return (
     <ShownCtx.Provider value={active}>
       <AgentsList sessionId={sessionId} />

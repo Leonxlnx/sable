@@ -81,3 +81,29 @@ describe('a long chat opened again reads nothing it has read', () => {
     release();
   });
 });
+
+it('a remounted navigator reuses both the marks and the local heights of kept turns', async () => {
+  const { marksOf, navigatorShape } = await import('../src/features/timeline/nav-model');
+  const { items, roots } = chat(5);
+  const groups = turnsIndex()(roots, shapeIndex()({ items, rev: 1 }, roots), false).groups;
+  const marks = marksOf(groups, items);
+  const shape = navigatorShape(groups[0], items, () => 100);
+  const unread = new Proxy(items, { get() { throw Error('reread a kept item'); } });
+  expect(marksOf(groups, unread)).toEqual(marks);
+  expect(navigatorShape(groups[0], unread, () => { throw Error('estimated twice'); })).toBe(shape);
+});
+
+it('keeps the settled suffix and its waiting steer when an older page starts inside a turn', async () => {
+  const { groupTurns } = await import('../src/features/timeline/turns');
+  const shape = 'UwtTUxwtTUtTUwws';
+  const ids = [...shape].map((_, i) => String(i));
+  const checkOf = () => ids[0];
+  for (const busy of [false, true]) {
+    const index = turnsIndex();
+    const end = index(ids.slice(9), shape.slice(9), busy, checkOf);
+    const part = index(ids.slice(2), shape.slice(2), busy, checkOf);
+    expect(part).toEqual(groupTurns(ids.slice(2), shape.slice(2), busy, checkOf));
+    expect(part.groups.at(-1)).toBe(end.groups.at(-1));
+    expect(index(ids, shape, busy, checkOf)).toEqual(groupTurns(ids, shape, busy, checkOf));
+  }
+});

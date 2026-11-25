@@ -47,9 +47,43 @@ export const holdFocus = (fn: () => void) => () => {
   fn();
 };
 
+/**
+ * What opened the menu that is closing: the last press or key outside the sidebar's menus (keys
+ * inside one, its arrows and the Escape that closes it, say nothing about how it opened).
+ */
+let byPointer = false;
+let watching = false;
+function watchInput() {
+  if (watching || typeof document === 'undefined') return;
+  watching = true;
+  const outside = (t: EventTarget | null) => !(t instanceof Element && t.closest('.side-pop'));
+  document.addEventListener('pointerdown', (e) => outside(e.target) && (byPointer = true), true);
+  document.addEventListener('keydown', (e) => outside(e.target) && (byPointer = false), true);
+}
+watchInput();
+
+/**
+ * Focus a menu opened by the pointer hands back as it closes (to its trigger, or to the row a
+ * context menu opened on) is no keyboard focus, even when Escape closed it: the row shows no ring,
+ * which read as a second selection beside the open chat. Radix focuses with the browser's own
+ * judgement (the last input was a key), so the element is focused again without the ring, in the
+ * same task: nothing is painted in between. A menu opened by a key gives focus back as it was.
+ */
+export function quietReturn() {
+  if (!byPointer) return;
+  const el = document.activeElement;
+  if (!(el instanceof HTMLElement) || !el.matches(':focus-visible') || !el.closest('.side')) return;
+  el.blur();
+  el.focus({ preventScroll: true, focusVisible: false } as FocusOptions);
+}
+
 /** For every sidebar menu's `onCloseAutoFocus`. */
 export function onCloseAutoFocus(e: { preventDefault(): void }) {
-  if (!fromMenu) return;
+  if (!fromMenu) {
+    // Radix focuses after this handler, in the same task.
+    queueMicrotask(quietReturn);
+    return;
+  }
   e.preventDefault();
   fromMenu = false;
   const keep = pending;

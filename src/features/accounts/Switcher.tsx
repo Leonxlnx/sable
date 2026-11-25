@@ -16,6 +16,7 @@ import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, MarkCell, planOf, S
 import { useAccountOrder } from './order';
 import type { UseFirstRank } from '@shared/use-first';
 import { poolUsedPercent } from '@/features/usage/plans';
+import { planBeside } from '@/features/connect/plan';
 import { accountUsed, resetsText, usedPercent, usedText } from '@/features/usage/words';
 import { accountAgents, accountInUse, accountMark, accountsOf, markWords, openAddAccount, planWord } from './model';
 import { signedOut } from '@/lib/sign-in';
@@ -230,9 +231,9 @@ function Rows({ provider, info, inUse, ends, onPeek, onSelect }: { provider: Pro
 }
 
 function Row({ provider, account, single, inUse, ends, rank, now, onPeek, onSelect }: { provider: ProviderId; account: AccountInfo; single: boolean; inUse: boolean; ends: boolean; rank?: UseFirstRank; now: number; onPeek: () => void; onSelect: () => void }) {
-  const plan = planOf(account);
   // An agent's only account goes by the agent's name, and there is no choice to check.
   const label = single ? PROVIDER_NAME[provider] : accountName(account);
+  const plan = planBeside(label, planOf(account));
   const mark = accountMark(account, inUse ? account.id : undefined);
   return (
     <RM.Item

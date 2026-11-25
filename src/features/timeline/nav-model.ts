@@ -79,6 +79,21 @@ export interface NavMark {
 
 type TurnMarks = Omit<NavMark, 'group'>[];
 
+// listFor owns the strong references to kept turns. A remount shares their
+// navigator work, and dropping a list also releases its marks and estimates.
+const turnCache = new WeakMap<TurnGroup, TurnMarks>();
+const shapes = new WeakMap<Group, { h: number; at: Map<string, number> }>();
+
+export function navigatorShape(g: Group, items: Record<string, TimelineItem | undefined>, estimate: Estimate) {
+  let shape = shapes.get(g);
+  if (!shape) {
+    const at = new Map<string, number>();
+    const h = groupHeight(g, items, estimate, (id, y) => at.set(id, y));
+    shapes.set(g, shape = { h, at });
+  }
+  return shape;
+}
+
 /**
  * A message the person sent (or one steered into a turn), taken by the agent: not one Sable sent
  * for an until check, nor one the agent's harness wrote in their place (its shape is not a message's).
@@ -94,7 +109,7 @@ const isMessage = (it: TimelineItem | undefined): it is UserItem => {
  * keeps the objects of turns that did not change, so a new step re-reads the running turn alone.
  * Returns `prev` itself when nothing changed, so a view can skip its work.
  */
-export function marksOf(groups: readonly Group[], items: Record<string, TimelineItem | undefined>, cache: WeakMap<TurnGroup, TurnMarks>, prev?: NavMark[]): NavMark[] {
+export function marksOf(groups: readonly Group[], items: Record<string, TimelineItem | undefined>, cache: WeakMap<TurnGroup, TurnMarks> = turnCache, prev?: NavMark[]): NavMark[] {
   const out: NavMark[] = [];
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];

@@ -9,6 +9,7 @@ import { accountKey, useStore } from '@/state/store';
 import { Segmented, Tip } from '@/ui';
 import { duration, exactTime, isApiKey, isScopedWindow } from './format';
 import { AccountLimits, type AccountRef } from './Limits';
+import { planBeside } from '@/features/connect/plan';
 import { planShort, poolTotals, poolWeeksText, poolWeeksUsed, units, type PoolInput, type PoolPart, type PoolTotal } from './plans';
 import { livePercent, NEAR_AT, overview, type RoomInput, type RoomRow, type SortBy } from './room';
 import { usedPercent, usedText } from './words';
@@ -145,7 +146,7 @@ export function LimitsOverview({ refs, pending }: { refs: AccountRef[]; pending:
 const OverviewRow = memo(function OverviewRow({ row, now, best, open, pending, onToggle }: { row: RoomRow<Entry>; now: number; best: boolean; open: boolean; pending: boolean; onToggle: () => void }) {
   const { input, state, resetsAt } = row;
   const { ref } = input;
-  const plan = planShort(ref.account.auth);
+  const plan = planBeside(input.name, planShort(ref.account.auth));
   const [short, week] = cells(input.limits, now);
   const label = `${PROVIDER_NAME[input.provider as ProviderId]}, ${input.name}${row.tight ? `, ${usedText(usedPercent(row.tight, now))}` : ''}${best ? ', least used right now' : ''}`;
   return (

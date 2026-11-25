@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ProviderInfo } from '../shared/protocol';
-import { connectableAgents, planLabel } from '../src/features/connect/plan';
+import { connectableAgents, planBeside, planLabel } from '../src/features/connect/plan';
 
 const auth = (plan?: string, method?: string) => ({ loggedIn: true, plan, method });
 
@@ -36,5 +36,18 @@ describe('connectableAgents', () => {
     const p = (id: string, method?: string) => ({ id, name: id, installed: true, auth: { loggedIn: true, method } }) as unknown as ProviderInfo;
     expect(connectableAgents({ demo: p('demo', 'local') })).toEqual(['claude', 'codex']);
     expect(connectableAgents({ codex: p('codex'), claude: p('claude') })).toEqual(['claude', 'codex']);
+  });
+});
+
+describe('planBeside', () => {
+  it('says the plan beside a name only when it adds something', () => {
+    // The Demo agent's only account goes by the agent's name and its plan is called the same.
+    expect(planBeside('Demo', 'Demo')).toBeUndefined();
+    expect(planBeside('Demo', 'Demo plan')).toBeUndefined();
+    expect(planBeside('Max', 'Max plan')).toBeUndefined();
+    expect(planBeside('Claude Code', 'Max')).toBe('Max');
+    expect(planBeside('Work', 'Max plan')).toBe('Max plan');
+    expect(planBeside(undefined, 'Pro')).toBe('Pro');
+    expect(planBeside('Demo', undefined)).toBeUndefined();
   });
 });

@@ -9,6 +9,7 @@ import { accountName } from '@/state/hooks';
 import { useStore } from '@/state/store';
 import { Spinner, Tip } from '@/ui';
 import { AccountUsed, planOf } from './ManyAccounts';
+import { planBeside } from '@/features/connect/plan';
 
 /**
  * The account a session runs under, quietly in the session's header, only when its agent has more
@@ -37,7 +38,7 @@ export function SessionAccount({ sessionId }: { sessionId: string }) {
   const goesOn = !!lim?.model && lim.level !== 'cap' && lim.other.some((l) => l.percent >= 100);
   const said = rows.map((l) => `${limitTitle(l.label)} ${windowState(l, lim!.now)}`).join(', ');
   // The tooltip says what the crumb is (never only its own label again): the account and its plan.
-  const plan = current?.auth.loggedIn ? planOf(current) : undefined;
+  const plan = current?.auth.loggedIn ? planBeside(name, planOf(current)) : undefined;
   const who = `Account: ${name}${plan ? ` · ${plan}` : ''}`;
   const tip = said ? `${who}. ${said}${goesOn ? `. ${lim!.model} is not limited` : ''}` : who;
   // A word or nothing: a limit of this chat's own model says so in a word beside its dot; another
@@ -128,7 +129,7 @@ function SessionAccountMenu({ sessionId, provider, accountId, accounts, lim, row
           {accounts.map((a) => {
             const here = a.id === accountId;
             // (A sign-in not known yet says nothing: it is not signed out.)
-            const plan = a.auth.loggedIn ? planOf(a) : a.auth.checking ? '' : 'Signed out';
+            const plan = a.auth.loggedIn ? planBeside(accountName(a), planOf(a)) : a.auth.checking ? '' : 'Signed out';
             return (
               <RM.Item
                 key={a.id}

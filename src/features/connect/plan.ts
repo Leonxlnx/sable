@@ -21,6 +21,17 @@ export function planLabel(auth: AuthState | undefined): string | undefined {
   return undefined;
 }
 
+/**
+ * The plan beside a name, or nothing when it would only say the name again: an agent's only
+ * account goes by the agent's name, and the Demo's plan is called "Demo" ("Demo Demo"); an account
+ * labelled after its plan ("Max" on the Max plan) is the same. Compared without a closing "plan".
+ */
+export function planBeside(name: string | undefined, plan: string | undefined): string | undefined {
+  if (!plan) return undefined;
+  const bare = (s: string) => s.replace(/\s+plan$/i, '').trim().toLowerCase();
+  return name && bare(name) === bare(plan) ? undefined : plan;
+}
+
 const NAMES: Record<string, string> = {
   free: 'Free',
   pro: 'Pro',

@@ -15,7 +15,7 @@ import { useAccounts } from '@/state/hooks';
 import { accountKey, useStore, type AuthFlow } from '@/state/store';
 import { cx, IconButton, Menu, MenuContent, MenuItem, MenuSep, MenuTrigger, Spinner } from '@/ui';
 import { anyChecking } from '@/lib/sign-in';
-import { INSTALL, connectableAgents, isSignedIn, planLabel } from './plan';
+import { INSTALL, connectableAgents, isSignedIn, planBeside, planLabel } from './plan';
 import './connect.css';
 
 export { planLabel } from './plan';
@@ -218,7 +218,8 @@ function AccountRow({
     void cancelLogin(provider, accountId);
   };
 
-  const plan = planLabel(account.auth);
+  // Beside the agent's name (one account) or the account's label (several), never repeating it.
+  const plan = planBeside(multi ? account.label : heading, planLabel(account.auth));
   const email = signedIn ? account.auth.email : undefined;
   const showLimits = !compact && signedIn && !!limits?.length && phase === 'in' && !confirm;
   const folder = account.dir ? tildePath(account.dir, home) : '';
