@@ -272,3 +272,102 @@ describe('a message the agent has taken moves in one update', () => {
     expect(useStore.getState().data.a.roots).toEqual(['a-2', 'a-0']);
   });
 });
+
+it('an open detail retries a failed whole request and reads the replacement row', async () => {
+  const { requestWhileCut } = await import('../src/features/timeline/whole-request');
+  vi.useFakeTimers();
+  const row = { id: 'old', type: 'thinking' as const, ts: 0, text: 'cut', streaming: false, more: true };
+  const snapA = { ...snap('a'), items: [row] };
+  store.applySnapshot(snapA);
+  actions.openSession('a');
+  const stop = requestWhileCut('a', row.id);
+  try {
+    calls.at(-1)!.reject(new Error('lost'));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(calls.filter(c => c.method === 'session.item')).toHaveLength(2);
+    store.applySnapshot({ ...snapA, items: [{ ...row }] });
+    calls.at(-1)!.resolve({ item: { ...row, text: 'stale', more: false } });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(calls.filter(c => c.method === 'session.item')).toHaveLength(3);
+    calls.at(-1)!.resolve({ item: { ...row, text: 'current', more: false } });
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(useStore.getState().data.a.items.old).toMatchObject({ text: 'current', more: false });
+    expect(calls).toHaveLength(3);
+  } finally { stop(); vi.useRealTimers(); }
+});
+
+it('charges live children to the first off-screen chat; a chat with an opened step stays loaded and goes back to rows on leaving', async () => {
+  const budget = KEEP.items;
+  try {
+    KEEP.items = 3;
+    actions.openSession('a');
+    await answer('a', 2);
+    for (const id of ['child1', 'child2']) store.applyEvent({ type: 'item.added', sessionId: 'a',
+      item: { ...items(id, 1)[0], parentId: 'a-0' } });
+    useStore.getState().setUi({ activeSessionId: null });
+    store.trimKept();
+    expect(useStore.getState().data.a.loaded).toBe(false);
+    const cut = { type: 'thinking' as const, id: 't', ts: 1, text: 'cut', more: true, streaming: false };
+    store.applySnapshot({ ...snap('b'), items: [cut] });
+    actions.openSession('b');
+    store.applyWholeItem('b', { ...cut, text: 'whole', more: false }, cut);
+    expect(useStore.getState().data.b.items.t).toMatchObject({ text: 'whole' });
+    const asked = snapCalls().length;
+    useStore.getState().setUi({ activeSessionId: null });
+    store.trimKept();
+    // Off screen it is rows again (the very row it arrived as), still loaded: coming back asks for nothing.
+    expect(useStore.getState().data.b.loaded).toBe(true);
+    expect(useStore.getState().data.b.items.t).toBe(cut);
+    expect(useStore.getState().data.b.hydrated).toBe(false);
+    actions.openSession('b');
+    await flush();
+    expect(snapCalls().length).toBe(asked);
+    expect(useStore.getState().data.b.items.t).toBe(cut);
+    // A whole item that changed since it was fetched is not put back over the change.
+    store.applyWholeItem('b', { ...cut, text: 'whole', more: false }, cut);
+    store.applyEvent({ type: 'item.patch', sessionId: 'b', id: 't', patch: { text: 'whole, then changed' } } as never);
+    await flush();
+    useStore.getState().setUi({ activeSessionId: null });
+    store.trimKept();
+    expect(useStore.getState().data.b.items.t).toMatchObject({ text: 'whole, then changed' });
+  } finally { KEEP.items = budget; }
+});
+
+it('a reloaded queue edit keeps its picture and checks whether the agent took it before sending', async () => {
+  const { packDrafts, unpackDrafts } = await import('../src/features/composer/drafts');
+  const { recoverTake } = await import('../src/features/composer/queue-edit');
+  const attachment = { id: 'pic', kind: 'image' as const, name: 'pic.png', dataUrl: 'data:image/png;base64,abcd' };
+  const { queueDraft } = await import('../src/features/composer/pending');
+  const preview = queueDraft({ id: 'row', text: 'inspect this', attachments: [attachment], createdAt: 0 });
+  const restored = unpackDrafts(JSON.stringify(packDrafts({ a: preview })));
+  expect(restored.a).toEqual(preview);
+  for (const delivered of [false, true]) {
+    useStore.getState().setDraft('a', restored.a);
+    const attempt = recoverTake('a');
+    const snapshot = snap('a', 0);
+    if (delivered) snapshot.items.push({ type: 'user', id: 'row', ts: 0, text: preview.text });
+    snapCalls().at(-1)!.resolve(snapshot);
+    expect(await attempt).toBe(!delivered);
+    const draft = useStore.getState().drafts.a;
+    expect(draft.text).toBe(delivered ? '' : preview.text);
+    expect(draft.attachments).toEqual(delivered ? [] : [attachment]);
+  }
+});
+
+it('opens an oversized snapshot once and trims a growing off-screen chat', async () => {
+  const budget = KEEP.items;
+  try {
+    KEEP.items = 2;
+    actions.prefetchSession('a');
+    actions.openSession('a');
+    await answer('a', 3);
+    expect(snapCalls()).toHaveLength(1);
+    expect(useStore.getState().data.a.loaded).toBe(true);
+    actions.prefetchSession('b');
+    await answer('b', 2);
+    store.applyEvent({ type: 'item.added', sessionId: 'b', item: items('extra', 1)[0] });
+    await flush();
+    expect(useStore.getState().data.b.loaded).toBe(false);
+    expect(useStore.getState().data.a.loaded).toBe(true);
+  } finally { KEEP.items = budget; }
+});

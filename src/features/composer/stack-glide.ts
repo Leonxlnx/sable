@@ -22,6 +22,26 @@ export function glideLeft(from: number, elapsed: number, ms = STACK_MS): number 
   return from * (1 - curve(elapsed / ms));
 }
 
+/**
+ * How long (ms) a row gliding down `travel` px on the dock's clock keeps `ink` px of clear space
+ * above the place it comes to: after that its words begin to cover the words that stood there. A
+ * removed row's words (its dead copy, QueueTray `glideTray`) must be gone by then, or the two lines
+ * read over each other (rows have no fill of their own): with 80 ms they did for two or three frames.
+ */
+export function clearFor(travel: number, ink: number, ms = STACK_MS): number {
+  const reach = travel - ink;
+  if (reach <= 0) return 0;
+  if (reach >= travel) return ms;
+  let lo = 0;
+  let hi = ms;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (travel - glideLeft(travel, mid, ms) < reach) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
 /** How deep the tray is tucked behind the pane's top edge (composer.css `.cq-clip`, `.cq`). */
 export const TUCK = 20;
 

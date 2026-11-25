@@ -5,8 +5,9 @@ import { Icon } from '@/icons';
 import { Tip } from '@/ui';
 import { dissolve, ghostOf } from '@/lib/dissolve';
 import { play, reducedMotion } from '@/lib/motion';
+import { acknowledgedOrder, bindRow, keyOf, withExpected, type ExpectedRow } from './queue-rows';
 import { landInTray, launchFromTray } from './flight';
-import { STACK_EASE, STACK_MS, aboveTray, glideY, rowMoves, trayShare } from './stack-glide';
+import { STACK_EASE, STACK_MS, aboveTray, clearFor, glideY, rowMoves, trayShare } from './stack-glide';
 import { removeQueued, reorderQueue, sendQueuedNow } from '@/state/actions';
 import { useStore } from '@/state/store';
 
@@ -22,26 +23,23 @@ const firstLine = (t: string) => t.split('\n').find((l) => l.trim())?.trim() ?? 
 // A message queued from the composer has its row in the tray in the frame of the press, before
 // the bridge has it: the dock takes its final layout at once and the words fly into a row that is
 // there (they stood over the last row, or over nothing, for the bridge's round trip). When the
-// bridge's row comes it takes the same element (`alias`); a refusal takes the row away again.
+// bridge's row comes it takes the same element (keyed by submission); a refusal takes the row away again.
 
-interface Expected {
-  pid: string;
-  /** The words the row shows (and the message in the air is known by). */
-  text: string;
-  /** The words the bridge will hold (with text attachments written in). */
-  match: string;
-  /** The queue's ids when it was sent: its own row is the first new one with its words. */
-  before: ReadonlySet<string>;
-  /** Its bridge row was shown: once that row goes (the agent took it), this one never stands in again. */
-  matched?: boolean;
-}
-const expected = new Map<string, Expected[]>();
+const expected = new Map<string, ExpectedRow[]>();
 const expectWatch = new Set<() => void>();
-/** A bridge row's id -> the provisional row it took over (bounded: ids only, dropped with the row). */
-const alias = new Map<string, string>();
-let expectSeq = 0;
-const NO_EXPECT: Expected[] = [];
-const sameWords = (a: string, b: string) => a.trim() === b.trim();
+const NO_EXPECT: ExpectedRow[] = [];
+const deferredOrders = new Map<string, QueuedMessage[]>();
+
+function commitOrder(sessionId: string, order: QueuedMessage[], queue: QueuedMessage[]) {
+  const ids = acknowledgedOrder(order, queue);
+  if (!ids) {
+    deferredOrders.set(sessionId, order);
+    return;
+  }
+  deferredOrders.delete(sessionId);
+  if (ids.some((id, i) => id !== queue[i]?.id)) void reorderQueue(sessionId, ids);
+}
+
 const expectChanged = () => {
   for (const f of expectWatch) f();
 };
@@ -63,20 +61,23 @@ const dropExpected = (sessionId: string, pid: string) => {
  * returned function with the bridge's answer: taken, the bridge's row takes this one's place (or,
  * not in the queue at all, it simply goes); refused, the row goes.
  */
-export function expectQueued(sessionId: string, text: string, match = text): (ok: boolean) => void {
-  const before = new Set((useStore.getState().data[sessionId]?.queue ?? NONE).map((q) => q.id));
-  const e: Expected = { pid: `expect:${++expectSeq}`, text, match, before };
+export function expectQueued(sessionId: string, text: string, submitId: string): (ok: boolean) => void {
+  const e: ExpectedRow = { pid: 'expect:' + submitId, text, submitId };
   expected.set(sessionId, [...(expected.get(sessionId) ?? NO_EXPECT), e]);
   expectChanged();
-  // Never outlives a bridge that did not answer.
-  window.setTimeout(() => dropExpected(sessionId, e.pid), 20_000);
-  return (ok) => {
-    // The bridge's events are in the store before its answer: the queue says whether its row is there.
+  const stop = useStore.subscribe((s, prev) => {
+    const queue = s.data[sessionId]?.queue;
+    if (!e.bound && queue && queue !== prev.data[sessionId]?.queue) e.bound = bindRow(e, queue);
+  });
+  return () => {
+    stop();
+    dropExpected(sessionId, e.pid);
+    const order = deferredOrders.get(sessionId);
+    if (!order) return;
     const queue = useStore.getState().data[sessionId]?.queue ?? NONE;
-    const there = ok && queue.some((q) => !e.before.has(q.id) && sameWords(q.text, e.match));
-    // There: it is shown in its place already (`withExpected`); kept a moment for a render still to come.
-    if (there) window.setTimeout(() => dropExpected(sessionId, e.pid), 1500);
-    else dropExpected(sessionId, e.pid);
+    // A refused or already delivered submission no longer participates in the reorder.
+    const real = queue.find(q => q.submitId === submitId);
+    commitOrder(sessionId, order.flatMap(q => q.id === e.pid ? real ?? [] : q), queue);
   };
 }
 
@@ -105,32 +106,18 @@ export function takeBackRow(sessionId: string, id: string): () => void {
   };
 }
 
-/** The queue as shown: the bridge's rows, the provisional ones taken over, and those still waiting at the end. */
-function withExpected(queue: QueuedMessage[], waiting: Expected[]): QueuedMessage[] {
-  if (!waiting.length) return queue;
-  const taken = new Set<string>();
-  const out = queue;
-  const extra: QueuedMessage[] = [];
-  for (const e of waiting) {
-    const q = queue.find((x) => !taken.has(x.id) && !e.before.has(x.id) && sameWords(x.text, e.match));
-    if (q) {
-      taken.add(q.id);
-      if (!alias.has(q.id)) alias.set(q.id, e.pid);
-      e.matched = true;
-    } else if (!e.matched) extra.push({ id: e.pid, text: e.text, createdAt: 0 });
-  }
-  return extra.length ? [...out, ...extra] : out;
-}
 const isProvisional = (id: string) => id.startsWith('expect:');
-/** The element a row keeps: a bridge row keeps the provisional row's. */
-const keyOf = (id: string) => alias.get(id) ?? id;
 
 /** Rows settling after a drag or a move by keys (motion's own layout slide). */
 const ROW = { type: 'spring' as const, stiffness: 520, damping: 38 };
 /** How long the words of a row that leaves with the tray take to go (ms). */
 const WORDS_OUT = 140;
-/** How long a removed row's words take to go while the row above comes down into its place (ms). */
-const WORDS_GONE = 80;
+/**
+ * How long a removed row's words take to go while the row above comes down into its place (ms):
+ * gone before that row's words reach them (`clearFor`: a 28 px row, 13 px of ink at 13 px type,
+ * about 43 ms). At 80 ms the two lines read over each other for two or three frames.
+ */
+const WORDS_GONE = Math.max(16, Math.round(clearFor(28, 13)));
 
 /** The tray's section (an exiting one may still stand beside a new one for a frame). */
 const trayOf = (clip: HTMLElement) => [...clip.querySelectorAll<HTMLElement>(':scope > .cq')].find((el) => el.style.display !== 'none') ?? null;
@@ -279,7 +266,7 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
     const same = beforeSession.current === sessionId;
     beforeSession.current = sessionId;
     if (!host) return;
-    const keys = new Set(shown.map((q) => keyOf(q.id)));
+    const keys = new Set(shown.map((q) => keyOf(q)));
     const wasKeys = landed.current;
     landed.current = keys;
     if (!same) {
@@ -291,7 +278,7 @@ export const QueueTray = memo(function QueueTray({ sessionId, queue, running, st
     const textOf = (id: string) => [...host.querySelectorAll<HTMLElement>(`[data-qid="${CSS.escape(id)}"]`)].find((el) => el.style.display !== 'none')?.querySelector<HTMLElement>('.cq-text') ?? null;
     // A row that is new on screen (a provisional row at the press, or one from elsewhere): words in the air land in it.
     for (const q of shown) {
-      if (wasKeys.has(keyOf(q.id))) continue;
+      if (wasKeys.has(keyOf(q))) continue;
       const el = textOf(q.id);
       if (el) landInTray(el, q.text, sessionId);
     }
@@ -371,12 +358,7 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
   if (set !== measured.current.set) measured.current = { set, measure: measured.current.measure };
   else measured.current.measure = ids.join();
   const measure = measured.current.measure;
-  void held;
-
-  const commit = (next: QueuedMessage[]) => {
-    const ids = next.map((q) => q.id);
-    if (ids.join() !== queue.map((q) => q.id).join()) void reorderQueue(sessionId, ids);
-  };
+  const commit = (next: QueuedMessage[]) => commitOrder(sessionId, next, held);
 
   const focusRow = (i: number) => {
     window.requestAnimationFrame(() => {
@@ -436,7 +418,7 @@ function TrayBody({ sessionId, queue, held, lives, running, steerable, onEdit, o
         <AnimatePresence initial={false}>
           {rows.map((q, i) => (
             <Row
-              key={`${keyOf(q.id)}/${lives.get(q.id) ?? 0}`}
+              key={`${keyOf(q)}/${lives.get(q.id) ?? 0}`}
               q={q}
               i={i}
               count={rows.length}

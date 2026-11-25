@@ -1,4 +1,4 @@
-import type { Attachment } from '@shared/protocol';
+import type { Attachment, QueuedMessage } from '@shared/protocol';
 
 /**
  * Words and files leave the composer's field only for good: what is sent is taken out of the
@@ -9,12 +9,14 @@ import type { Attachment } from '@shared/protocol';
  */
 
 export interface FieldDraft {
+  /** Preserve the entire field on reload while recovering a queue edit or rewind. */
+  recovery?: { retry?: { id: string; text: string; files: string }; queueId?: string; preview?: { text: string; files: string[] } };
   text: string;
   attachments: Attachment[];
 }
 
 const NONE: Attachment[] = [];
-const idsOf = (list: readonly Attachment[]) => new Set(list.map((a) => a.id));
+const idsOf = (list: readonly { id: string }[]) => new Set(list.map((a) => a.id));
 
 /**
  * The field once `sent` has left it: words typed since stay (typing after a send replaces the
@@ -25,7 +27,7 @@ const idsOf = (list: readonly Attachment[]) => new Set(list.map((a) => a.id));
 export function leaveField(now: FieldDraft | undefined, sent: FieldDraft, typed?: boolean): FieldDraft {
   const text = now?.text ?? '';
   const gone = idsOf(sent.attachments);
-  return { text: text === sent.text && !typed ? '' : text, attachments: (now?.attachments ?? NONE).filter((a) => !gone.has(a.id)) };
+  return { recovery: undefined, text: text === sent.text && !typed ? '' : text, attachments: (now?.attachments ?? NONE).filter((a) => !gone.has(a.id)) };
 }
 
 /**
@@ -85,3 +87,25 @@ export const shownUltra = (stored: boolean, pick: UltraPick | null): boolean => 
 
 /** The request `seq` was answered: its pick ends (a newer pick stays). */
 export const ultraAnswered = (pick: UltraPick | null, seq: number): UltraPick | null => (pick?.seq === seq ? null : pick);
+
+export type TakeResult = { kind: 'message'; message: QueuedMessage } | { kind: 'taken' } | { kind: 'unknown' };
+
+export function settleTake(now: FieldDraft, preview: { text: string; attachments: readonly { id: string }[] }, result: TakeResult): FieldDraft {
+  if (result.kind === 'unknown') return now;
+  if (result.kind === 'taken') {
+    const untouched = now.text === preview.text && now.attachments.length === preview.attachments.length
+      && now.attachments.every((a, i) => a.id === preview.attachments[i].id);
+    return untouched ? { text: '', attachments: [], recovery: undefined } : { ...now, recovery: now.recovery ? {} : undefined };
+  }
+  const original = idsOf(preview.attachments);
+  const current = idsOf(now.attachments);
+  const files = (result.message.attachments ?? []).filter(a => !original.has(a.id) || current.has(a.id));
+  const got = idsOf(files);
+  return {
+    text: now.text === preview.text ? result.message.text
+      : result.message.text === preview.text || result.message.text === now.text ? now.text
+      : [result.message.text, now.text].filter(Boolean).join('\n'),
+    attachments: [...files, ...now.attachments.filter(a => !original.has(a.id) && !got.has(a.id))],
+    recovery: now.recovery ? {} : undefined,
+  };
+}

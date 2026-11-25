@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { glideLeft, rowMoves, trayShare, STACK_MS, TUCK } from '../src/features/composer/stack-glide';
+import { clearFor, glideLeft, rowMoves, trayShare, STACK_MS, TUCK } from '../src/features/composer/stack-glide';
 
 const map = (o: Record<string, number>) => new Map(Object.entries(o));
 
@@ -61,4 +61,33 @@ describe('the dock glide (composer/stack-glide.ts)', () => {
       expect(-d + m.tray + (m.rows.get(id) ?? 0)).toBeCloseTo(-was);
     }
   });
+});
+
+describe('a removed middle row (QueueTray glideTray)', () => {
+  it("its words are gone before the row coming down reaches them", () => {
+    const t = clearFor(28, 13);
+    // Until then the row above has come less than a row's height less the ink: no overlap.
+    expect(28 - glideLeft(28, t)).toBeLessThanOrEqual(15.01);
+    expect(28 - glideLeft(28, t + 4)).toBeGreaterThan(15);
+    // A few frames, never the 80 ms that overlapped.
+    expect(t).toBeGreaterThan(30);
+    expect(t).toBeLessThan(60);
+    expect(clearFor(28, 30)).toBe(0);
+    expect(clearFor(28, 0)).toBe(STACK_MS);
+  });
+});
+
+it('binds each identical queue expectation once and defers its reorder until the row arrives', async () => {
+  const { bindRow, keyOf, withExpected, acknowledgedOrder } = await import('../src/features/composer/queue-rows');
+  const make = (id: string) => ({ id, submitId: id, text: 'same', createdAt: 0 });
+  const waiting: import('../src/features/composer/queue-rows').ExpectedRow[] = ['a', 'b'].map(id => ({ pid: 'expect:' + id, submitId: id, text: 'same' }));
+  const a = make('a'), b = make('b');
+  expect(withExpected([a], waiting.slice(0, 1))).toEqual([a]);
+  waiting[0].bound = bindRow(waiting[0], [a]);
+  const provisional = withExpected([a], waiting)[1];
+  expect(withExpected([b], waiting)).toEqual([b]);
+  expect(keyOf(provisional)).toBe(keyOf(b));
+  expect(keyOf(a)).not.toBe(keyOf(b));
+  expect(acknowledgedOrder([provisional, a], [a])).toBeNull();
+  expect(acknowledgedOrder([provisional, a], [a, b])).toEqual(['b', 'a']);
 });

@@ -2496,7 +2496,9 @@
   align-items: center;
   gap: 2px;
   margin-top: 10px;
-  padding: 0 4px;
+  /* 7 + the chip's 8: the first chip's mark stands on the field's text edge (16 px in), not 3 px
+     short of it. */
+  padding: 0 4px 0 7px;
   min-width: 0;
 }
 

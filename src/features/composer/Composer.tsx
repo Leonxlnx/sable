@@ -22,9 +22,10 @@ import { useChoice } from './choice';
 import { paidAsk, paidConfirmed } from './paid-speed';
 import { usePixelSnap } from './pixel-snap';
 import { APP_COMMANDS, appCommandsFor, commandRows, expandCommand, mentionRows, skillRows, type CommandCtx, type SuggestRow } from './commands';
-import { keepDrafts } from './drafts';
-import { carryOver, leaveField, putBack, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
-import { holdSend, moveSend, sendBack, sendDone } from './pending';
+import { recoverTake } from './queue-edit';
+import { keepDrafts, keepRecovery } from './drafts';
+import { carryOver, leaveField, putBack, settleTake, shownUltra, swapIn, ultraAnswered, type UltraPick } from './restore';
+import { holdSend, holdTake, queueDraft, takingDraft, waitForTake, submissionId, moveSend, sendBack, sendDone } from './pending';
 import { watchWidth } from './width-watch';
 import { HomeChips, ModeMenu, openComposerMenu, useHomeSignedOut, useMenuPlace } from './Controls';
 import { CoveSkin } from './Cove';
@@ -661,6 +662,17 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const submit = async (steer = false) => {
     // A second press before the store has followed the first: that message is already on its way.
     if (sent.current) return;
+    if (sessionId && !takingDraft(key) && useStore.getState().drafts[key]?.recovery?.queueId) {
+      holdTake(key, recoverTake(sessionId), afterFrame);
+    }
+    const waiting = waitForTake(key);
+    if (waiting) {
+      const field = ref.current;
+      if (await waiting) {
+        if (field && ref.current === field && useStore.getState().ui.activeSessionId === key) void submitRef.current(steer);
+      }
+      return;
+    }
     if (shell) {
       const command = text.slice(1).trim();
       if (!command || !sessionId) return;
@@ -693,7 +705,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       openComposerMenu('folder');
       return;
     }
-    const draft = { text, attachments };
+    const draft = { text, attachments, recovery: useStore.getState().drafts[key]?.recovery };
     // A command picked by its short name goes out under the full one the agent knows it by.
     const body = expandCommand(trimmed, caps);
     const out = parcel(body, attachments);
@@ -704,7 +716,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     const flew = !!ta && !!body && !reducedMotion();
     const flight = flew ? launchFlight({ el: ta, text: body }, { dest: sessionId && busy && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId, session: sessionId }) : null;
     // Queued: its row is in the tray in this frame, the words fly into it (QueueTray `expectQueued`).
-    const expect = sessionId && busy && !steering && body ? expectQueued(sessionId, body, out.text) : null;
+    const expect = sessionId && busy && !steering && body ? expectQueued(sessionId, body, submissionId(key, draft)) : null;
     if (variant === 'session') launchKey(card.current);
     // In a session the next placeholder is always the queueing one: the turn is running (or about to).
     // A queued message's words rise through the field into the tray: the placeholder waits for them.
@@ -788,54 +800,53 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
    */
   const editQueued = useCallback(
     async (q: QueuedMessage) => {
-      if (!sessionId) return;
+      if (!sessionId || sent.current || takingDraft(key)) return;
       const d = useStore.getState().drafts[key];
       const before = { text: d?.text ?? '', attachments: d?.attachments ?? EMPTY };
-      let got: QueuedMessage | null = q;
       if (before.text.trim() || before.attachments.length) {
-        const out = parcel(before.text.trim(), before.attachments);
-        // The agent may have taken the message meanwhile: then nothing swaps and the draft stays.
-        const res = await updateQueued(sessionId, q.id, out.text, out.attachments);
-        if (!res.ok) return;
-        // The message as the bridge had it when the draft took its place: another window may have
-        // edited it after this one showed it, and that edit is what comes into the field.
-        got = res.previous ?? q;
+        const swap = async () => {
+          const out = parcel(before.text.trim(), before.attachments);
+          // The agent may have taken the message meanwhile: then nothing swaps and the draft stays.
+          const res = await updateQueued(sessionId, q.id, out.text, out.attachments);
+          if (!res.ok) return;
+          // The message as the bridge had it when the draft took its place: another window may have
+          // edited it after this one showed it, and that edit is what comes into the field.
+          const got = res.previous ?? q;
+          const next = swapIn(useStore.getState().drafts[key], before, { text: got.text, attachments: got.attachments ?? EMPTY });
+          setDraft(key, { ...next, recovery: {} });
+          setText(next.text, got.text.length);
+          setRecall(null);
+          window.requestAnimationFrame(focus);
+          return true;
+        };
+        const taking = swap().then(Boolean);
+        holdTake(key, taking, afterFrame);
+        await taking;
       } else {
         // An empty field: the words leave the row and stand in the field in the frame of the click
         // (the row breaks up or the tray folds, QueueTray `takeBackRow`; the field's words come in on
         // the same 140 ms), and the bridge gives the message back meanwhile.
         const release = takeBackRow(sessionId, q.id);
-        setDraft(key, { attachments: q.attachments ?? EMPTY });
+        const preview = queueDraft(q);
+        setDraft(key, preview);
         setText(q.text, q.text.length);
         setRecall(null);
         play(ref.current, [{ opacity: 0 }, { opacity: 1 }], { duration: 140, easing: 'ease-out' });
         window.requestAnimationFrame(focus);
-        got = await takeQueued(sessionId, q.id);
-        const now = useStore.getState().drafts[key];
-        const untouched = (now?.text ?? '') === q.text;
-        if (!got) {
-          // Not given back (the agent took it meanwhile): the field lets go of the words it showed, and the row is as the queue has it.
-          if (untouched) {
-            setDraft(key, { attachments: EMPTY });
-            setText('', 0);
-          }
-          release();
-          return;
-        }
-        // The rows' list catches up with the bridge's answer before the row may show again.
-        window.setTimeout(release, 600);
-        // Edited in another window after this one showed it: that edit is what the field holds.
-        if (untouched && got.text !== q.text) setText(got.text, got.text.length);
-        if (untouched) setDraft(key, { attachments: got.attachments ?? EMPTY });
+        const taking = keepRecovery().then(saved => saved
+          ? takeQueued(sessionId, q.id)
+          : { kind: 'unknown' as const }).then(result => {
+          const now = useStore.getState().drafts[key] ?? before;
+          const next = settleTake(now, preview, result);
+          setDraft(key, next);
+          if (result.kind === 'message') window.setTimeout(release, 600);
+          else release();
+          return result.kind === 'message';
+        });
+        holdTake(key, taking, afterFrame);
+        await taking;
         return;
       }
-      if (!got) return;
-      // What was typed or attached while the bridge answered stays, after the message.
-      const next = swapIn(useStore.getState().drafts[key], before, { text: got.text, attachments: got.attachments ?? EMPTY });
-      setDraft(key, { attachments: next.attachments });
-      setText(next.text, got.text.length);
-      setRecall(null);
-      window.requestAnimationFrame(focus);
     },
     [sessionId, key, setDraft, setText, focus],
   );

@@ -4,6 +4,7 @@ import { holdSend } from './settle';
 import { freezeSignal, pour, prewarmSignal, type Pour } from './signal';
 import { fieldBeatAt } from '@/art/events';
 import { quarterTiles } from '@/art/veil';
+import { addStandIn, dropStandIn, scopeStandIn, standInTaken } from '@/features/timeline/stand-in';
 import { BORN, COLLAPSE, collapseEase, linearEasing, planSignal, shiftAt, shiftEase, type Box, type SignalPlan, type SignalSpec } from './signal-shape';
 
 /**
@@ -752,12 +753,23 @@ export function launchFlight(source: Source, opts: { dest: FlightDest; steer?: b
   // Whatever happens on the way, nothing outlives this: the real message always shows.
   window.setTimeout(() => abort(f), bubble ? HOLD_MS + 2000 : MAX_LIFE_MS);
   if (import.meta.env.DEV) devHook();
+  // The message stands in the conversation from now on (timeline/stand-in.ts): the card lands on
+  // that stand-in at once, in the timeline's own layout, however late the bridge adds the row.
+  const stand = bubble && !steer ? addStandIn(source.text, f.session, f.wall) : null;
   return {
-    settle: (ok) => settle(f, ok),
+    settle: (ok) => {
+      if (ok) standInTaken(stand);
+      else dropStandIn(stand);
+      return settle(f, ok);
+    },
     scope: (id) => {
       f.session = id;
+      if (stand) scopeStandIn(stand, id);
     },
-    release: () => abort(f),
+    release: () => {
+      dropStandIn(stand);
+      abort(f);
+    },
   };
 }
 
@@ -1358,6 +1370,22 @@ function drop(f: Flight) {
   if (i >= 0) pending.splice(i, 1);
 }
 
+/** A message in the air whose landing was a stand-in that has just left the page for its real row. */
+function fromStandIn(text: string, site: LandingSite): Flight | null {
+  return (
+    pending.find(
+      (f) =>
+        f.dest === 'timeline' &&
+        !f.ending &&
+        !!f.target &&
+        !f.target.isConnected &&
+        !!f.row?.closest('[data-standin]') &&
+        matches(f.key, text) &&
+        (!f.session || !site.session || f.session === site.session),
+    ) ?? null
+  );
+}
+
 function claim(dest: FlightDest, text: string, site: LandingSite): Flight | null {
   const i = pending.findIndex((f) => claimable(f, dest, text, site));
   return i >= 0 ? pending[i] : null;
@@ -1432,7 +1460,9 @@ function aim(f: Flight) {
  */
 export function landInTimeline(root: HTMLElement, text: string, opts: { steer?: boolean; late?: boolean } & LandingSite = {}): boolean {
   if (reducedMotion()) return false;
-  const f = claim('timeline', text, opts);
+  // A message that landed (or was landing) on its stand-in goes on to the real row that takes the
+  // stand-in's place in the same commit: the same place, so nothing moves (timeline/stand-in.ts).
+  const f = claim('timeline', text, opts) ?? fromStandIn(text, opts);
   if (!f) {
     if (!opts.late) {
       const now = performance.now();

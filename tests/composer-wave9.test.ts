@@ -262,3 +262,108 @@ describe('the working-tree menu (finding 26)', () => {
     expect(rule).toMatch(/max-width: 35%;/);
   });
 });
+
+describe('ownership of a queued draft', () => {
+  it('distinguishes a dropped reply from an explicit take', async () => {
+    vi.stubGlobal('window', { setTimeout: () => 0, clearTimeout() {} });
+    try {
+      const { takeQueued } = await import('../src/state/actions');
+      answer = () => new Error('reply lost after removal');
+      expect(await takeQueued('q', 'row')).toEqual({ kind: 'unknown' });
+      answer = () => ({ taken: true });
+      expect(await takeQueued('q', 'row')).toEqual({ kind: 'taken' });
+    } finally { answer = () => ({}); vi.unstubAllGlobals(); }
+  });
+
+  it('keeps the preview after a lost reply and keeps files attached during a take', async () => {
+    const { settleTake } = await import('../src/features/composer/restore');
+    const preview = { text: 'queued', attachments: [att('a')] };
+    expect(settleTake(preview, preview, { kind: 'unknown' })).toEqual(preview);
+    const now = { ...preview, attachments: [...preview.attachments, att('b')] };
+    expect(settleTake(now, preview, { kind: 'taken' })).toEqual(now);
+    expect(settleTake(preview, preview, { kind: 'taken' })).toEqual({ text: '', attachments: [] });
+    const message = { id: 'q', createdAt: 1, text: 'updated', attachments: [att('c')] };
+    expect(settleTake(now, preview, { kind: 'message', message })).toEqual({ text: 'updated', attachments: [att('c'), att('b')] });
+  });
+
+  it('Enter during a take waits and only submits once ownership is confirmed', async () => {
+    const { holdTake, waitForTake } = await import('../src/features/composer/pending');
+    let resolve!: (owned: boolean) => void;
+    const take = new Promise<boolean>(r => { resolve = r; });
+    holdTake('enter', take);
+    const send = vi.fn();
+    const enter = async () => { if (await waitForTake('enter')) send(); };
+    const first = enter(), second = enter();
+    expect(send).not.toHaveBeenCalled();
+    resolve(false);
+    await Promise.all([first, second]);
+    expect(send).not.toHaveBeenCalled();
+    holdTake('enter', Promise.resolve(true));
+    await Promise.all([enter(), enter()]);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps full retry content before rewind and restores it on send failure', async () => {
+    const { repeatMessage } = await import('../src/features/timeline/repeat-message');
+    const { withPending } = await import('../src/features/composer/pending');
+    const { useStore } = await import('../src/state/store');
+    const draft = { text: 'again', attachments: [att('whole')] };
+    const item = { ...draft, id: 'turn', type: 'user' as const, ts: 0 };
+    const sends: unknown[] = [];
+    answer = (method, params) => {
+      if (method === 'session.rewind') { expect(withPending('retry', undefined)).toMatchObject(draft); return { ok: true }; }
+      sends.push(params); return { ok: false };
+    };
+    try {
+      await Promise.all([repeatMessage('retry', item, draft.text, 'retry'), repeatMessage('retry', item, draft.text, 'retry')]);
+      expect(sends).toEqual([{ sessionId: 'retry', ...draft, submitId: expect.any(String) }]);
+      expect(useStore.getState().drafts.retry).toMatchObject(draft);
+    } finally { answer = () => ({}); }
+  });
+});
+
+it('two footer presses during whole attachment loading make one submission', async () => {
+  const { repeatMessage } = await import('../src/features/timeline/repeat-message');
+  const { applySnapshot } = await import('../src/state/store');
+  const cut = { id: 'p', type: 'user' as const, ts: 1, text: 'retry', more: true };
+  const session: import('@shared/protocol').SessionMeta = {
+    id: 'footer', provider: 'demo', title: '', titleSource: 'auto', cwd: '', status: 'idle', model: '', mode: 'default',
+    createdAt: 0, updatedAt: 0, usage: { inputTokens: 0, outputTokens: 0, turns: 0 },
+  };
+  applySnapshot({ session, items: [cut], todos: [], permissions: [], questions: [], queue: [] });
+  let resolve!: (answer: unknown) => void;
+  const whole = new Promise(r => { resolve = r; });
+  const sent: unknown[] = [];
+  answer = (method, params) => {
+    if (method === 'session.item') return whole;
+    sent.push(params);
+    return { ok: true };
+  };
+  try {
+    const first = repeatMessage('footer', cut, cut.text, 'footer');
+    const second = repeatMessage('footer', cut, cut.text, 'footer');
+    const sameTurn = repeatMessage('footer', { ...cut, id: 'steer' }, 'steered', 'retry', cut.id);
+    resolve({ item: { ...cut, more: false, attachments: [att('full')] } });
+    await Promise.all([first, second, sameTurn]);
+    expect(sent).toEqual([{ sessionId: 'footer', text: 'retry', attachments: [att('full')], submitId: expect.any(String) }]);
+  } finally { answer = () => ({}); }
+});
+
+it('rewind and edit recovers whole files beside typing and never sends on its own', async () => {
+  const { repeatMessage } = await import('../src/features/timeline/repeat-message');
+  const { withPending } = await import('../src/features/composer/pending');
+  const { useStore } = await import('../src/state/store');
+  const key = 'edit-again';
+  const item = { id: 'turn', type: 'user' as const, text: 'revise', ts: 0, attachments: [att('original')] };
+  useStore.getState().setDraft(key, { text: 'my draft', attachments: [att('new')] });
+  const before = bridgeCalls.length;
+  answer = () => {
+    expect(withPending(key, undefined).attachments).toEqual(item.attachments);
+    return { ok: true };
+  };
+  try {
+    expect(await repeatMessage(key, item, item.text, 'edit')).toBe(true);
+    expect(useStore.getState().drafts[key]).toMatchObject({ text: 'revise\nmy draft', attachments: [att('original'), att('new')] });
+    expect(bridgeCalls.slice(before).map(c => c.method)).toEqual(['session.rewind']);
+  } finally { answer = () => ({}); }
+});

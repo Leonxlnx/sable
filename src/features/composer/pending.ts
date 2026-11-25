@@ -1,3 +1,4 @@
+import type { QueuedMessage } from '@shared/protocol';
 import type { FieldDraft } from './restore';
 
 /**
@@ -48,13 +49,24 @@ export function onPending(fn: () => void): () => void {
  * The message `draft` left the field `key`: kept until the bridge answers. A message put back and
  * sent again unchanged keeps its id.
  */
-export function holdSend(key: string, draft: FieldDraft): PendingSend {
-  const r = retry.get(key);
-  const id = r && r.text === draft.text && r.files === filesKey(draft) ? r.id : newId();
-  retry.delete(key);
-  // The field's words left with this send: what was put back there is gone from it.
-  back.delete(key);
-  const p: PendingSend = { key, seq: ++seq, id, draft };
+const prepared = new WeakMap<FieldDraft, string>();
+
+export function submissionId(key: string, draft: FieldDraft): string {
+  const r = retry.get(key) ?? draft.recovery?.retry;
+  const id = prepared.get(draft) ?? (r && r.text === draft.text && r.files === filesKey(draft) ? r.id : newId());
+  prepared.set(draft, id);
+  return id;
+}
+
+export function holdSend(key: string, draft: FieldDraft, fromField = true): PendingSend {
+  const id = fromField ? submissionId(key, draft) : newId();
+  prepared.delete(draft);
+  if (fromField) {
+    retry.delete(key);
+    back.delete(key);
+  }
+  const kept = draft.recovery ? { ...draft, recovery: { ...draft.recovery, retry: { id, text: draft.text, files: filesKey(draft) } } } : draft;
+  const p: PendingSend = { key, seq: ++seq, id, draft: kept };
   out.set(key, [...(out.get(key) ?? []), p]);
   changed();
   return p;
@@ -96,7 +108,8 @@ function merged(parts: PendingSend[], now: FieldDraft | undefined, rest: string)
   const files = parts.flatMap((x) => x.draft.attachments);
   const seen = new Set<string>();
   const attachments = [...files, ...(now?.attachments ?? [])].filter((a) => (seen.has(a.id) ? false : (seen.add(a.id), true)));
-  return { text: join(head, rest), attachments };
+  const recovery = now?.recovery ?? parts.find(p => p.draft.recovery)?.draft.recovery;
+  return { text: join(head, rest), attachments, ...(recovery ? { recovery } : {}) };
 }
 
 /**
@@ -145,8 +158,38 @@ export function draftsWithPending<T extends FieldDraft>(drafts: Record<string, T
 
 /** Tests: forget everything. */
 export function resetPending() {
+  takes.clear();
   out.clear();
   back.clear();
   retry.clear();
   seq = 0;
+}
+
+/** The queue row shown in the field until the bridge confirms its ownership. */
+export function queueDraft(q: QueuedMessage): FieldDraft {
+  const attachments = q.attachments ?? [];
+  const preview = { text: q.text, files: attachments.map(a => a.id) };
+  return { text: q.text, attachments, recovery: { queueId: q.id, preview } };
+}
+
+// The bridge call has its own socket deadline. Only the first waiting press may resume.
+const takes = new Map<string, { answer: Promise<boolean>; waiting: boolean }>();
+
+export function holdTake(key: string, answer: Promise<boolean>, afterPaint?: () => Promise<void>) {
+  // A waiting Enter uses the composer rendered with the bridge's words and files.
+  const ready = afterPaint ? answer.then(async owned => { await afterPaint(); return owned; }) : answer;
+  const take = { answer: ready, waiting: false };
+  takes.set(key, take);
+  const release = () => { if (takes.get(key) === take) takes.delete(key); };
+  void ready.then(release, release);
+}
+
+export function takingDraft(key: string) { return takes.has(key); }
+
+export function waitForTake(key: string): Promise<boolean> | undefined {
+  const take = takes.get(key);
+  if (!take) return;
+  if (take.waiting) return Promise.resolve(false);
+  take.waiting = true;
+  return take.answer;
 }
