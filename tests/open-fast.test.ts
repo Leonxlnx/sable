@@ -371,3 +371,133 @@ it('opens an oversized snapshot once and trims a growing off-screen chat', async
     expect(useStore.getState().data.a.loaded).toBe(true);
   } finally { KEEP.items = budget; }
 });
+
+describe('a conversation read from the end', () => {
+  const row = (i: number, parentId?: string): TimelineItem => ({ id: 'i' + i, type: 'user', ts: i, text: 'Prompt ' + i, parentId });
+  const page = (kind: 'end' | 'older', before: number, rows: TimelineItem[]): SessionSnapshot => ({
+    ...snap('a'), items: rows, page: { kind, before, rootsBefore: before, recentAt: 0 },
+  });
+  it('prepends once per answer and reaches the same item indexes, groups, first build and marks as a whole read', async () => {
+    const { shapeIndex, groupTurns, turnsIndex } = await import('../src/features/timeline/turns');
+    const { marksOf } = await import('../src/features/timeline/nav-model');
+    const { tailStart } = await import('../src/features/timeline/build-window');
+    const rows = Array.from({ length: 50 }, (_, i) => row(i, i % 3 === 0 && i ? 'i' + (i - 1) : undefined));
+    const read = () => useStore.getState().data.a;
+    store.applySnapshot({ ...snap('a'), items: rows });
+    const whole = read();
+    const shapes = shapeIndex(), group = turnsIndex();
+    const expected = groupTurns(whole.roots, shapes(whole, whole.roots), false);
+    store.applySnapshot(page('end', 30, rows.slice(30)));
+    const end = read(), grouped = group(end.roots, shapes(end, end.roots), false);
+    const first = (groups: typeof grouped.groups) => groups.slice(tailStart(groups.map(() => 600), 2700));
+    expect(first(grouped.groups)).toEqual(first(expected.groups));
+    expect(end.loaded && end.incomplete).toBe(true);
+    const work = store.completeSession('a');
+    await flush();
+    expect(snapCalls()).toHaveLength(1);
+    actions.openSession('a');
+    await store.loadSession('a');
+    expect(snapCalls()).toHaveLength(1);
+    snapCalls()[0].resolve(page('older', 15, rows.slice(15, 30)));
+    await flush();
+    const mid = read();
+    expect(store.changedSince(mid, end.rev)).toEqual(rows.slice(15, 30).map(i => i.id));
+    const midLayout = group(mid.roots, shapes(mid, mid.roots), false);
+    expect(midLayout.groups.at(-1)).toBe(grouped.groups.at(-1));
+    snapCalls()[1].resolve(page('older', 0, rows.slice(0, 15)));
+    await work;
+    const done = read();
+    expect(done.incomplete).toBe(false);
+    expect(done.roots).toEqual(whole.roots);
+    expect(done.children).toEqual(whole.children);
+    expect(done.items).toEqual(whole.items);
+    const layout = group(done.roots, shapes(done, done.roots), false);
+    expect(layout).toEqual(expected);
+    expect(marksOf(layout.groups, done.items, new WeakMap())).toEqual(marksOf(expected.groups, whole.items, new WeakMap()));
+  });
+  it('applies a missing patch, removal and moved steer once and keeps live metadata across a page', async () => {
+    store.applySnapshot(page('end', 3, [row(3)]));
+    store.applyEvent({ type: 'item.patch', sessionId: 'a', id: 'i0', patch: { text: 'patched' } });
+    store.applyEvent({ type: 'item.removed', sessionId: 'a', id: 'i1' });
+    store.applyEvent({ type: 'item.removed', sessionId: 'a', id: 'i2', moving: true });
+    store.applyEvent({ type: 'item.added', sessionId: 'a', item: row(2), moved: true });
+    const queue = [{ id: 'q', text: 'next', createdAt: 1 }];
+    store.applyEvent({ type: 'queue.updated', sessionId: 'a', queue });
+    await flush();
+    snapCalls()[0].resolve(page('older', 0, [row(0), row(1), row(2)]));
+    await flush();
+    const d = useStore.getState().data.a;
+    expect(d.roots).toEqual(['i0', 'i3', 'i2']);
+    expect(d.items.i0).toMatchObject({ text: 'patched' });
+    expect(d.queue).toEqual(queue);
+  });
+  it('removes descendants whose missing parent arrives in a later page', async () => {
+    store.applySnapshot(page('end', 3, [row(3), row(4, 'i1')]));
+    store.applyEvent({ type: 'item.removed', sessionId: 'a', id: 'i0' });
+    await flush();
+    snapCalls()[0].resolve(page('older', 0, [row(0), row(1, 'i0'), row(2, 'i1')]));
+    await flush();
+    const d = useStore.getState().data.a;
+    expect(d.roots).toEqual(['i3']);
+    expect(d.children).toEqual({});
+    expect(Object.keys(d.items)).toEqual(['i3']);
+  });
+  it('drops an incomplete prefetch at its whole size and ignores its late page', async () => {
+    store.applySnapshot(page('end', KEEP.items + 1, [row(4)]));
+    const work = store.completeSession('a').catch(() => {});
+    await flush();
+    store.trimKept();
+    expect(useStore.getState().data.a.loaded).toBe(false);
+    snapCalls()[0]?.resolve(page('older', 0, [row(1)]));
+    await work;
+    expect(useStore.getState().data.a.items).toEqual({});
+  });
+  it('asks whole on reconnect and discards the page from the previous socket', async () => {
+    store.applySnapshot(page('end', 4, [row(4)]));
+    actions.openSession('a');
+    store.startBridge();
+    await flush();
+    statusListener?.('closed');
+    statusListener?.('open');
+    calls.find(c => c.method === 'app.hello')!.resolve({ version: '0', platform: 'win32', providers: [], projects: [], sessions: [meta('a')], settings: useStore.getState().settings, snapshotThreshold: 2 });
+    await flush();
+    expect(snapCalls().at(-1)!.params.page).toBeUndefined();
+    snapCalls().at(-1)!.resolve(snap('a', 6));
+    await flush();
+    snapCalls()[0].resolve(page('older', 0, [row(1)]));
+    await flush();
+    expect(useStore.getState().data.a.roots).toEqual(items('a', 6).map(i => i.id));
+  });
+  it.each(['rewind', 'fork'] as const)('waits for a complete chat before %s', async verb => {
+    store.applySnapshot(page('end', 2, [row(2)]));
+    const action = verb === 'rewind' ? actions.rewindTo('a', 'i0', false) : actions.forkAt('a', 'i0');
+    await flush();
+    expect(calls.map(c => c.method)).toEqual(['session.snapshot']);
+    snapCalls()[0].resolve(page('older', 0, [row(0), row(1)]));
+    await flush();
+    expect(calls[1].method).toBe('session.' + verb);
+    calls[1].resolve(verb === 'rewind' ? { ok: true } : snap('b'));
+    await action;
+  });
+});
+
+it('replaces a display-only tail after a restart, retaining identical rows and settling the running step by ID', async () => {
+  const kept: TimelineItem = { type: 'user', ts: 1, id: 'u', text: 'Continue' };
+  const step: TimelineItem = { type: 'tool', ts: 2, id: 'w', name: 'Bash', title: 'Work', kind: 'bash', status: 'running', detail: {} };
+  const view = snap('a', 0);
+  store.applySnapshot({ ...view, page: { kind: 'provisional', before: -1, rootsBefore: -1, recentAt: 0 }, items: [kept, step] });
+  // A click in the same task protects the displayed chat from the off-screen budget.
+  actions.openSession('a');
+  expect(useStore.getState().data.a).toMatchObject({ provisional: true, loaded: true, incomplete: true });
+  await flush();
+  expect(snapCalls()[0].params.page).toBe('real');
+  const stopped: TimelineItem = { ...step, status: 'cancelled' };
+  const notice: TimelineItem = { type: 'notice', id: 'n', ts: 3, variant: 'info', text: 'Ended early', early: 'restart' };
+  snapCalls()[0].resolve({ ...view, items: [{ ...kept }, stopped, notice] });
+  await flush();
+  const d = useStore.getState().data.a;
+  expect(d.provisional || d.incomplete).toBe(false);
+  expect(d.roots).toEqual(['u', 'w', 'n']);
+  expect(d.items.u).toBe(kept);
+  expect(d.items.w).toBe(stopped);
+});

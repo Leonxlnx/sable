@@ -1,5 +1,6 @@
 import { memo, useLayoutEffect, useRef, useState, type ReactElement, useSyncExternalStore } from 'react';
 import { Tip } from '@/ui';
+import { keyTipOffset } from './key-tip';
 
 const MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -80,6 +81,13 @@ export const SendKey = memo(function SendKey({ canSend, busy, showStop, steerabl
   // is something asked for by pointing at a key, not a hint left lying beside it after a press.
   const slot = useRef<HTMLDivElement>(null);
   const [quiet, setQuiet] = useState(false);
+  // The tip keeps off the rim's corner and the cove's horn (key-tip.ts): measured as the pointer or
+  // the keys reach the slot, before the tip's delay is over.
+  const [tipAt, setTipAt] = useState(() => keyTipOffset(90));
+  const measure = () => {
+    const card = slot.current?.closest<HTMLElement>('.cmp-card');
+    if (card) setTipAt(keyTipOffset(card.offsetHeight));
+  };
   const shown = useRef(showStop);
   useLayoutEffect(() => {
     if (shown.current === showStop) return;
@@ -90,7 +98,7 @@ export const SendKey = memo(function SendKey({ canSend, busy, showStop, steerabl
     quiet ? (
       el
     ) : (
-      <Tip label={label} keys={keys} side="top">
+      <Tip label={label} keys={keys} side="top" offset={tipAt}>
         {el}
       </Tip>
     );
@@ -102,7 +110,7 @@ export const SendKey = memo(function SendKey({ canSend, busy, showStop, steerabl
   const label = shell ? 'Run in terminal' : steer ? 'Steer into this turn' : queueing ? 'Queue message' : 'Send';
 
   return (
-    <div className="cmp-keys" ref={slot} onPointerLeave={() => quiet && setQuiet(false)}>
+    <div className="cmp-keys" ref={slot} onPointerEnter={measure} onFocus={measure} onPointerLeave={() => quiet && setQuiet(false)}>
       {tip(
         label,
         steer ? steerKeys : sendWithEnter ? 'enter' : 'mod+enter',

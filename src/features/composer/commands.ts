@@ -7,7 +7,7 @@ import type { FileHit } from '@/lib/workspace';
 import { fileIcon } from './file-icon';
 import { goHome, interrupt, openSettings, renameSession } from '@/state/actions';
 import { focusComposer } from '@/state/hooks';
-import { useStore } from '@/state/store';
+import { completeSession, useStore } from '@/state/store';
 import { untilCommand } from './until';
 import { spareCommand } from './spare';
 import { raceCommand } from '@/features/race/race';
@@ -46,7 +46,10 @@ export interface AppCommand {
 
 const ui = () => useStore.getState().setUi;
 
-function copyLastAnswer(sessionId: string) {
+async function copyLastAnswer(sessionId: string) {
+  if (useStore.getState().data[sessionId]?.incomplete) {
+    try { await completeSession(sessionId); } catch { return useStore.getState().toast('Could not read the conversation', 'error'); }
+  }
   const s = useStore.getState();
   const d = s.data[sessionId];
   if (!d) return;

@@ -1187,23 +1187,11 @@
   padding: 0;
 }
 
-/* Off, it reads as the control it is: the attach button's quiet disc (one fill step and the even
-   hairline), not a stray glyph. */
-.ux:not([data-on]) {
-  --chip-bg: var(--fill-2);
-  --chip-ring: var(--press-up);
-}
-
-.ux:not([data-on]):hover,
-.ux:not([data-on])[aria-expanded='true'] {
-  --chip-bg: var(--fill-3);
-}
-
-.ux:not([data-on]):active {
-  --chip-bg: var(--fill-4);
-  --chip-ring: var(--press-down);
-}
-
+/* Off, a bare chip as the phrase beside it is: no fill and no edge at rest, the mark in the
+   level word's tone, so it reads as one of the line's words and not as a stray glyph. The bar's
+   fills stay on its left (the attach disc, the mode chip): drawn as the attach button's disc, it
+   stood as a second attach button at the bar's other end. Pointed at, the hover fill; held, the
+   hairline (as every chip, .tb-chip above); on, a chip that is on. */
 .ux:not([data-on]) svg {
   color: var(--text-2);
 }
@@ -1948,11 +1936,12 @@
   font-weight: var(--w-regular);
 }
 
-/* A match, quietly: the bright tone and the medium weight, no line (the palette's `.hl`). */
+/* A match, quietly: the bright tone and the semibold weight, no line (the palette's `.hl`): the
+   weight keeps it in view on the highlighted row, whose words are all ivory. */
 .sg-hit {
   background: none;
   color: var(--text);
-  font-weight: var(--w-medium);
+  font-weight: var(--w-semi);
 }
 
 .sg-empty {
