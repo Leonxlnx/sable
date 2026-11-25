@@ -253,10 +253,9 @@ function ReviewBar({ sid, onOpen }: { sid: string; onOpen: () => void }) {
   const [busy, setBusy] = useState(false);
   return (
     <div className="composer-bar rp-bar">
-      <button type="button" className="setup-chip rp-count" aria-haspopup="dialog" onPointerDown={(e) => e.preventDefault()} onClick={() => (haptic('tap'), onOpen())}>
-        <Icon name="comment" size={16} className="setup-chip-mode" />
-        <span className="setup-chip-model num">{commentCount(n)}</span>
-        <Icon name="updown" size={12} weight="bold" className="setup-chip-caret" />
+      <button type="button" className="phrase rp-count" aria-haspopup="dialog" onPointerDown={(e) => e.preventDefault()} onClick={() => (haptic('tap'), onOpen())}>
+        <Icon name="comment" size={16} className="mode-chip-icon" />
+        <span className="phrase-model num">{commentCount(n)}</span>
       </button>
       <span className="bar-gap" />
       <button

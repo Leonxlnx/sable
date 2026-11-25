@@ -51,6 +51,18 @@ public class NotesPlugin extends Plugin {
         wv.evaluateJavascript(js, null);
     }
 
+    /**
+     * Stop now, confirmed on a live card: to the page as `window.__sableNoteStop({ sessionId })`
+     * (lib/note-answer.ts `stopFromNote`), which stops the chat only if it still runs.
+     */
+    static void deliverStop(String sessionId) {
+        NotesPlugin p = instance;
+        if (p == null || p.getBridge() == null || p.getBridge().getWebView() == null) return;
+        JSObject data = new JSObject();
+        data.put("sessionId", sessionId);
+        p.getBridge().getWebView().evaluateJavascript("window.__sableNoteStop&&window.__sableNoteStop(" + data.toString() + ")", null);
+    }
+
     @PluginMethod
     public void post(PluginCall call) {
         if (Notes.post(getContext(), call.getData())) call.resolve();

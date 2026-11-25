@@ -145,6 +145,13 @@
   --kb: 0px;
   --kb-ms: 280ms;
   --bar-h: 56px;
+  /* where a pane that floats at the foot (the prompt bars, the review pane) stands over the screen's
+     bottom edge, and how far the keyboard lifts it (lib/keyboard.ts, 2.18). The bottom edge the native
+     side reports is the gesture strip, which holds its own room: the pane stands on it, never a second
+     gap above it. Told the navigation bar's own height (`data-nav`), it stands one gap above the bar.
+     With the keyboard up it stands 8 px over the keyboard's top, wherever it stood at rest. */
+  --pane-foot: max(var(--sab), 12px);
+  --pane-lift: 0px;
 
   /* one base unit (4 px) and the page's one left and right edge: every screen's title, chips, rows and
      cards start at the gutter; what marks a row (an agent's mark, a status letter) stands at the gutter
@@ -160,6 +167,14 @@
   /* a row of a list: one line 52, two lines 64 */
   --row-1: 52px;
   --row-2: 64px;
+}
+
+:root[data-nav] {
+  --pane-foot: max(calc(var(--sab-nav) + 8px), 12px);
+}
+
+:root[data-kb] {
+  --pane-lift: calc(var(--kb) + var(--sab) + 8px - var(--pane-foot));
 }
 
 * {
@@ -297,7 +312,7 @@ p {
    For a few small controls only: the prompt bar's keys and chips, switches, segmented controls, the
    dial's knob and a chosen tile or tab. Raised a hair at rest (--press-up), set in when pressed or open
    (--press-down). The shadows swap in one frame with the press; nothing transitions them. Plain
-   buttons, fields, cards, rows and the timeline stay flat. Where: chat.css (.tool-key, .setup-chip,
+   buttons, fields, cards, rows and the timeline stay flat. Where: chat.css (.tool-key, .mode-chip, .phrase,
    .send), home.css (.where-chip, .dock-agent, the dock's key at rest), sheets.css (.seg, .dial,
    .mode-tile, .q-step), screens.css (.switch, .pair-go, .pair-retry). */
 
@@ -863,7 +878,8 @@ p {
 .filter,
 .tool-key,
 .send,
-.setup-chip,
+.mode-chip,
+.phrase,
 .where-chip,
 .search-clear,
 .dock-agent,
@@ -884,7 +900,8 @@ p {
 .filter::after,
 .tool-key::after,
 .send::after,
-.setup-chip::after,
+.mode-chip::after,
+.phrase::after,
 .where-chip::after,
 .search-clear::after,
 .dock-agent::after,
@@ -912,7 +929,8 @@ p {
   --hit: -7px 0;
 }
 
-.setup-chip,
+.mode-chip,
+.phrase,
 .where-chip {
   --hit: -2px 0;
 }

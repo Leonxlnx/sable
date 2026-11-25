@@ -13,7 +13,6 @@ import { Icon } from '@m/ui/icons';
 import { LogoMark, ProviderMark, Ring } from '@m/ui/marks';
 import { SNAP } from '@m/ui/motion';
 import { Sheet } from '@m/ui/Sheet';
-import { LimitsSheet } from './Limits';
 
 /** A Tailscale address (100.64.0.0/10): reached over the tailnet, from anywhere. */
 const tailnet = (ip?: string) => !!ip && /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip);
@@ -35,7 +34,6 @@ export function Settings() {
   const [haptics, setHapticsOn] = useState(hapticsEnabled);
   const [mine, setMine] = useState<string>();
   const [confirm, setConfirm] = useState(false);
-  const [limits, setLimits] = useState(false);
   const [archive, setArchive] = useState(false);
   const p = conn.pairing;
   const name = desktop ?? p?.desktop ?? 'Desktop';
@@ -131,7 +129,7 @@ export function Settings() {
 
         <h3 className="set-title">Chats</h3>
         <div className="group-card">
-          <button type="button" className="set-row" onClick={() => (haptic('tap'), setLimits(true))}>
+          <button type="button" className="set-row" onClick={() => (haptic('tap'), nav.push({ name: 'limits' }))}>
             <Icon name="gauge" size={20} />
             <span className="set-label">Limits</span>
             <Icon name="next" size={16} className="set-chev" />
@@ -189,7 +187,6 @@ export function Settings() {
           </button>
         </div>
       </Sheet>
-      <LimitsSheet open={limits} onClose={() => setLimits(false)} />
       <ArchiveSheet open={archive} onClose={() => setArchive(false)} />
     </div>
   );

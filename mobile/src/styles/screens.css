@@ -769,3 +769,259 @@ button.set-row:active {
   color: var(--text);
   background: rgb(0 0 0 / 0.45);
 }
+
+/* ── limits (2.18): the desktop's usage language, one gutter, no cards inside the page ──
+   Per agent a quiet heading; per account its name (the check: where new chats start) and each window
+   as an exact row: name and "62% used" on one line, one thin meter that fills as it is used (an ivory
+   fill whose head breaks into dither; amber near the cap, red at it), a hairline tick where an even pace
+   would stand, then when it resets and where the pace leads. Words keep their ink at every level. */
+.lm-scroll {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: touch;
+  /* the top's room is the pull body's own (home.css .pull-body) */
+  padding-bottom: calc(var(--sab) + 40px);
+}
+
+.lm-body {
+  padding: 0 var(--gutter);
+}
+
+.lm-away {
+  margin: var(--s-2) 0 0;
+  color: var(--text-3);
+  font-size: var(--t-small);
+  line-height: 1.5;
+}
+
+.lm-agent + .lm-agent {
+  margin-top: var(--s-4);
+}
+
+.lm-agent-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 48px;
+  margin: 0;
+  color: var(--text-3);
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+}
+
+.lm-acct {
+  padding: var(--s-1) 0 var(--s-6);
+}
+
+/* accounts of one agent part by a hairline, the page's own */
+.lm-acct + .lm-acct {
+  padding-top: var(--s-5);
+  box-shadow: inset 0 1px 0 var(--line);
+}
+
+.lm-acct-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 28px;
+  margin-bottom: var(--s-3);
+}
+
+.lm-acct-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-lead);
+  font-weight: var(--w-strong);
+  letter-spacing: -0.012em;
+}
+
+.lm-acct-plan {
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-size: var(--t-small);
+}
+
+.lm-acct-aside {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  color: var(--text-3);
+  font-size: var(--t-caption);
+  white-space: nowrap;
+}
+
+.lm-in-use {
+  display: grid;
+  place-items: center;
+  align-self: center;
+  color: var(--text);
+}
+
+.lm-none {
+  margin: 0;
+  color: var(--text-3);
+  font-size: var(--t-small);
+}
+
+.lm-empty,
+.lim-empty {
+  margin: 40px var(--gutter) 0;
+  color: var(--text-3);
+  font-size: var(--t-small);
+  line-height: 1.5;
+  animation: lm-empty-in 260ms var(--ease-out) 150ms backwards;
+}
+
+@keyframes lm-empty-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.lm-win {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lm-win + .lm-win {
+  margin-top: var(--s-5);
+}
+
+.lm-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lm-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+  font-size: var(--t-small);
+}
+
+.lm-used {
+  flex-shrink: 0;
+  color: var(--text);
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+}
+
+.lm-of {
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+.lm-credits {
+  margin-top: var(--s-5);
+}
+
+/* the meter: a 4 px track, an ivory fill that slides in (transform only) with a dithered head */
+.lm-meter {
+  position: relative;
+  display: block;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background-color: rgb(255 255 255 / 0.07);
+  overflow: hidden;
+}
+
+.lm-fill {
+  --meter: rgb(242 241 238 / 0.82);
+  position: absolute;
+  inset: 0;
+  padding-right: 8px;
+  border-radius: inherit;
+  background: var(--meter) content-box;
+  transform: translateX(calc((var(--p, 0) - 1) * 100%));
+  animation: lm-fill-in 700ms var(--ease-out) backwards;
+  animation-delay: calc(var(--d, 0ms) + 120ms);
+  transition: transform 600ms var(--ease-out);
+}
+
+.lm-fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  background-color: var(--meter);
+  -webkit-mask: var(--checker) 0 0 / 4px 4px;
+  mask: var(--checker) 0 0 / 4px 4px;
+}
+
+@keyframes lm-fill-in {
+  from {
+    transform: translateX(-100%);
+  }
+}
+
+.lm-meter[data-level] .lm-fill {
+  padding-right: 0;
+}
+
+.lm-meter[data-level] .lm-fill::after {
+  display: none;
+}
+
+.lm-meter[data-level='amber'] .lm-fill {
+  --meter: var(--amber);
+}
+
+.lm-meter[data-level='red'] .lm-fill {
+  --meter: var(--red);
+}
+
+/* where an even pace would stand now: a hairline across the track */
+.lm-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1.5px;
+  margin-left: -0.75px;
+  background: rgb(255 255 255 / 0.34);
+}
+
+.lm-note {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-3);
+  font-size: var(--t-caption);
+}
+
+.lm-pace {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.lm-pace[data-warn] {
+  color: var(--text-2);
+}
+
+.lm-pace-mark {
+  width: 5px;
+  height: 5px;
+  border-radius: var(--r-pill);
+  background-color: var(--amber);
+}
+
+.lm-skel .skel {
+  height: 11px;
+}
+
+.lm-skel .lm-meter {
+  background-color: var(--fill-1);
+}

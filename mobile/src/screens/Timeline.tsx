@@ -11,7 +11,8 @@ import { PLAIN_OFF } from '@m/lib/download-core';
 import { canonicalName, isPackageName } from '@shared/file-name';
 import { conn } from '@m/lib/conn';
 import { diffLines, renderMarkdown, settledCut } from '@m/lib/md';
-import { haptic, openExternal } from '@m/lib/native';
+import { haptic, openExternal, shareText } from '@m/lib/native';
+import { turnFiles, turnSummary } from '@m/lib/turn-summary';
 import { nav } from '@m/lib/nav';
 import { putDraft } from '@m/lib/put-draft';
 import { readReview, type PhoneReview } from '@m/lib/review';
@@ -189,7 +190,13 @@ export const TurnView = memo(function TurnView({ sid, turn, newest, reveal }: { 
       {turn.checks?.map((id) => (
         <CheckBlock key={id} sid={sid} id={id} />
       ))}
-      {newest && <CheckOffer sid={sid} turn={turn} />}
+      {newest && turn.state === 'done' && (
+        <div className="turn-acts">
+          <CheckOffer sid={sid} turn={turn} />
+          <ShareTurn sid={sid} turn={turn} />
+        </div>
+      )}
+      {newest && turn.state !== 'done' && <CheckOffer sid={sid} turn={turn} />}
     </section>
   );
 });
@@ -1756,6 +1763,48 @@ function OfferKey({ sid, turn, checker, online }: { sid: string; turn: TurnGroup
     >
       {busy ? <Ring size={13} /> : <ProviderMark provider={checker} size={14} />}
       <span>Check with {who}</span>
+    </button>
+  );
+}
+
+/**
+ * Under the newest finished turn: the turn as a message to send on (2.18): the chat's name, what was
+ * asked, what the work was and which files it changed, and the answer, through Android's share sheet.
+ */
+function ShareTurn({ sid, turn }: { sid: string; turn: TurnGroup }) {
+  const has = useStore((s) => {
+    const seg = turn.segments[turn.segments.length - 1];
+    const id = seg?.answer ?? seg?.reply;
+    return !!id && sessionData(s, sid).items[id]?.type === 'text';
+  });
+  if (!has) return null;
+  const share = () => {
+    haptic('tap');
+    const st = getState();
+    const meta = st.sessions[sid];
+    const d = sessionData(st, sid);
+    const lead = turn.segments[0]?.lead;
+    const leadItem = lead ? d.items[lead] : undefined;
+    const seg = turn.segments[turn.segments.length - 1];
+    const answerId = seg?.answer ?? seg?.reply;
+    const answer = answerId ? d.items[answerId] : undefined;
+    const span = turnSpan(d.items, turn);
+    const text = turnSummary({
+      title: meta?.title ?? 'Chat',
+      agent: meta ? PROVIDER_NAME[meta.provider] : 'Agent',
+      prompt: leadItem?.type === 'user' ? leadItem.text : undefined,
+      worked: span && span >= 1000 ? shortDuration(span) : undefined,
+      steps: turn.segments.reduce((n, x) => n + x.steps, 0),
+      files: turnFiles(d.items, d.children, turn.ids),
+      answer: answer?.type === 'text' ? answer.text : undefined,
+      cwd: meta?.cwd,
+    });
+    void shareText(text, meta?.title).then((ok) => !ok && setState({ toast: { text: 'Nothing here can share it', level: 'error', at: Date.now() } }));
+  };
+  return (
+    <button type="button" className="check-offer share-turn" aria-label="Share this turn" onClick={share}>
+      <Icon name="share" size={15} />
+      <span>Share</span>
     </button>
   );
 }

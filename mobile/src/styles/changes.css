@@ -546,8 +546,8 @@ button.chg-row:active {
   z-index: 3;
   display: flex;
   flex-direction: column;
-  padding: 0 10px calc(var(--sab) + 10px);
-  translate: 0 calc(-1 * var(--kb));
+  padding: 0 10px var(--pane-foot);
+  translate: 0 calc(-1 * var(--pane-lift));
   transition: translate var(--kb-ms) var(--ease-ime);
 }
 

@@ -120,8 +120,8 @@
 .home-hero {
   /* room under the title: the horizon's light is seen here, before the cards */
   /* the title and the line under it keep their room whether the line is there or not (the horizon is placed by this block) */
-  min-height: 116px;
-  padding: var(--s-2) var(--gutter) var(--s-8);
+  min-height: 92px;
+  padding: var(--s-2) var(--gutter) var(--s-6);
   transform-origin: 0 100%;
   animation: hero-out linear both;
   animation-timeline: --home;
@@ -787,9 +787,9 @@
 .attn {
   position: absolute;
   z-index: 5;
-  left: 12px;
-  width: calc(100% - 24px);
-  bottom: calc(var(--sab) + 12px + 58px + 10px);
+  left: 10px;
+  width: calc(100% - 20px);
+  bottom: calc(var(--pane-foot) + 58px + 10px);
   display: flex;
   align-items: center;
   gap: 10px;
@@ -812,11 +812,11 @@
   position: relative;
   z-index: 6;
   flex-shrink: 0;
-  margin: 6px 12px calc(var(--sab) + 12px);
+  margin: 6px 10px var(--pane-foot);
   padding: 6px 6px 6px 8px;
   border-radius: var(--r-pane);
   /* the main pane of glass, as the chat's prompt bar (base.css "the panes"); focused, it lifts */
-  translate: 0 calc(-1 * var(--kb));
+  translate: 0 calc(-1 * var(--pane-lift));
   transition: translate var(--kb-ms) var(--ease-ime);
   cursor: text;
 }
@@ -839,7 +839,8 @@
   transition: opacity 200ms var(--ease-out);
 }
 
-.home-dock[data-focus]::before {
+.home-dock[data-focus]::before,
+.home:not([data-clip]) .home-dock::before {
   opacity: 0;
 }
 
@@ -931,7 +932,7 @@
   height: 40px;
   padding: 0 12px 0 11px;
   border-radius: var(--r-pill);
-  /* tactile, as the setup chip beside it (chat.css) */
+  /* one fill step and its hairline (flat controls) */
   background-color: var(--fill-2);
   box-shadow: var(--press-up);
   font-size: var(--t-small);
@@ -962,8 +963,17 @@
   box-shadow: var(--press-down);
 }
 
-.dock-bar .setup-chip {
-  flex-shrink: 1;
+.dock-bar .phrase {
+  margin-left: auto;
+}
+
+/* three chips in the new chat's bar: the folder, the mode by its icon alone (its name is in its sheet), the model */
+.dock-bar .mode-chip {
+  padding: 0 10px;
+}
+
+.dock-bar .mode-chip-name {
+  display: none;
 }
 
 /* the key: pinned to the bar's lower right corner, so it never moves when the bar opens */
@@ -1087,7 +1097,7 @@
 
 /* the new-chat bar open (its chips over the words): the waiting line stays above it */
 .home:has(.home-dock[data-open]) .attn {
-  bottom: calc(var(--sab) + 12px + 106px + 10px);
+  bottom: calc(var(--pane-foot) + 106px + 10px);
 }
 
 /* ── the stage (sixteenth pass): the field is seen and breathes; what works now is at the top ── */

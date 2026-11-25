@@ -1641,8 +1641,8 @@
   z-index: 3;
   display: flex;
   flex-direction: column;
-  padding: 0 10px calc(var(--sab) + 10px);
-  translate: 0 calc(-1 * var(--kb));
+  padding: 0 10px var(--pane-foot);
+  translate: 0 calc(-1 * var(--pane-lift));
   transition: translate var(--kb-ms) var(--ease-ime);
 }
 
@@ -1763,54 +1763,91 @@
   transition-duration: 100ms, 100ms, 70ms;
 }
 
-.setup-chip {
+/* The mode chip and the model phrase (2.18, as the desktop's bar): bare until held or open, then one fill
+   step and the hairline. The mode is its icon and its word (Bypass keeps a red icon); the phrase is the
+   model and the level a step quieter, as wide as its words, by the send key. A narrow bar keeps the
+   mode's icon alone. */
+.composer-bar,
+.dock-bar {
+  container-type: inline-size;
+}
+
+.mode-chip,
+.phrase {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
   min-width: 0;
   height: 40px;
-  padding: 0 10px;
   border-radius: var(--r-pill);
   font-size: var(--t-small);
-  font-weight: var(--w-strong);
-  color: var(--text);
   white-space: nowrap;
   transition: background-color 100ms, scale 120ms var(--ease-out);
 }
 
-.setup-chip:active {
+.mode-chip {
+  flex-shrink: 0;
+  gap: 7px;
+  padding: 0 12px 0 10px;
+  font-weight: var(--w-strong);
+  color: var(--text);
+}
+
+.mode-chip-icon {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+
+.mode-chip[data-tone='danger'] .mode-chip-icon {
+  color: var(--red);
+}
+
+.phrase {
+  flex-shrink: 1;
+  gap: 6px;
+  padding: 0 10px;
+}
+
+.phrase-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: var(--w-strong);
+  color: var(--text);
+}
+
+.phrase-dot {
+  flex-shrink: 0;
+  color: var(--text-4);
+}
+
+.phrase-level {
+  flex-shrink: 0;
+  font-weight: var(--w-medium);
+  color: var(--text-3);
+}
+
+.mode-chip:active,
+.phrase:active {
   background-color: var(--fill-2);
   box-shadow: var(--press-down);
   scale: 0.97;
   transition-duration: 0ms, 70ms;
 }
 
-.setup-chip[aria-expanded='true'] {
+.mode-chip[aria-expanded='true'],
+.phrase[aria-expanded='true'] {
   background-color: var(--fill-2);
   box-shadow: var(--press-down);
 }
 
-.setup-chip-mode {
-  flex-shrink: 0;
-  color: var(--text-2);
-}
+@container (max-width: 340px) {
+  .mode-chip {
+    padding: 0 10px;
+  }
 
-.setup-chip-model {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.setup-chip-dim {
-  flex-shrink: 0;
-  font-weight: var(--w-medium);
-  color: var(--text-3);
-}
-
-.setup-chip-caret {
-  flex-shrink: 0;
-  margin-left: -1px;
-  color: var(--text-4);
+  .mode-chip-name {
+    display: none;
+  }
 }
 
 /* Send: the one ivory key, a flat face and a short soft drop (base.css --key-*). Held, it dims a touch,
@@ -2368,6 +2405,31 @@ button.queued-text[data-busy] {
 .check-offer:active {
   background: var(--fill-3);
   transform: scale(0.97);
+}
+
+/* under the newest answer, one row of one kind (the desktop's): bare chips of one height, no fill or
+   edge at rest, the press fill; the first one's mark on the answer's text edge (2.18) */
+.turn-acts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: -4px 0 0 -10px;
+}
+
+.turn-acts .check-offer {
+  height: 40px;
+  margin-top: 0;
+  padding: 0 12px 0 10px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.turn-acts .check-offer:active {
+  background: var(--fill-2);
+}
+
+.share-turn svg {
+  color: var(--text-3);
 }
 
 /* ── where the chat switched agents: the agent's mark, the words, one quiet action, between two rules ── */

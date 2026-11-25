@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NoticeItem, PermissionRequest, SessionMeta } from '@shared/protocol';
-import { limitAction, limitProvider } from '../mobile/src/lib/chat-rules';
+import { limitAction, limitProvider, worksNow } from '../mobile/src/lib/chat-rules';
+import { phoneEvent } from '../server/services/phone';
 import { liveOf, livePayload, noteAnswer, noteAsk, workEnded, type NoteAction } from '../mobile/src/lib/notes';
 
 const meta = (id: string, fields: Partial<SessionMeta> = {}) => ({ id, title: id, status: 'idle', ...fields }) as SessionMeta;
@@ -10,11 +11,24 @@ const payload = (sessions: SessionMeta[], overrides: Partial<typeof settings> = 
 
 describe('the payload for Notes.live', () => {
   it('sends the chat, clock and steps for its turn and counts agents and commands independently', () => {
-    expect(payload([meta('A', { status: 'running', activity: 'Editing' })])).toEqual({ chats: 1, waiting: 0, title: 'A', chat: 'A', text: 'Editing', since: 100, sub: '3 steps' });
-    expect(payload([meta('B', { background: 2, commands: 1 }), meta('C', { archived: true, commands: 4 })])).toEqual({ chats: 1, waiting: 0, title: 'B', chat: 'B', text: '2 sub-agents, 1 command', since: 100 });
-    expect(payload([meta('B', { status: 'awaiting', background: 1 }), meta('C', { status: 'starting' })])).toEqual({ chats: 2, waiting: 1, title: '2 chats working', text: 'B: 1 sub-agent working\nC: Starting', since: 100, sub: '1 waiting' });
+    // 2.18: each chat at work also gets a card of its own (lib/note-live.ts `liveCard`, tests/mobile-note-live.test.ts).
+    const card = (id: string, line: string, extra: object = {}) => expect.objectContaining({ id, title: id, line, since: 100, ...extra });
+    expect(payload([meta('A', { status: 'running', activity: 'Editing' })])).toEqual({ chats: 1, waiting: 0, title: 'A', chat: 'A', text: 'Editing', since: 100, sub: '3 steps', cards: [card('A', 'Editing', { steps: 3, meta: '3 steps', keys: ['open', 'stop'] })] });
+    expect(payload([meta('B', { background: 2, commands: 1 }), meta('C', { archived: true, commands: 4 })])).toEqual({ chats: 1, waiting: 0, title: 'B', chat: 'B', text: '2 sub-agents, 1 command', since: 100, cards: [card('B', '2 sub-agents, 1 command', { keys: ['open'] })] });
+    expect(payload([meta('B', { status: 'awaiting', background: 1 }), meta('C', { status: 'starting' })])).toEqual({ chats: 2, waiting: 1, title: '2 chats working', text: 'B: 1 sub-agent working\nC: Starting', since: 100, sub: '1 waiting', cards: [card('B', '1 sub-agent working', { others: '1 other chat working · 1 waiting' }), card('C', 'Starting')] });
     expect(payload([meta('B', { status: 'awaiting' })])).toEqual({ chats: 0, waiting: 1 });
     expect(payload([meta('C')])).toBeNull();
+  });
+
+  it('finishes work while a local server stays on and drops the ongoing notification', () => {
+    const serving = meta('A', { serving: 1 });
+    const mixed = { ...serving, commands: 1 };
+    expect(worksNow(serving)).toBe(false);
+    expect(worksNow(mixed)).toBe(true);
+    expect(workEnded(mixed, serving)).toBe(true);
+    expect(payload([serving])).toBeNull();
+    expect(payload([mixed])?.text).toBe('1 command running');
+    expect(phoneEvent({ type: 'session.updated', id: 'A', patch: { servingAddress: undefined, servingSince: undefined } })).toMatchObject({ patch: { servingSince: null, servingAddress: null } });
   });
 
   it('suppresses stale, disconnected and disabled work, including a reconnect awaiting its first list', () => {
@@ -92,6 +106,8 @@ it('replays insets delivered before JS loads and replaces all four edges and the
     style: { setProperty: (key: string, value: string) => css.set(key, value) },
     setAttribute: (name: string) => attrs.add(name), removeAttribute: (name: string) => attrs.delete(name),
   } });
+  // 2.18: the lift is believed only while a field has the focus (here the composer's field).
+  (document as unknown as { activeElement: unknown }).activeElement = { tagName: 'TEXTAREA' };
   vi.stubGlobal('window', { __sableInsetsState: [[24, 0, 16, 0], 200, 250] });
   const { keyboardLift } = await import('../mobile/src/lib/keyboard');
   expect(keyboardLift()).toBe(200);
@@ -100,4 +116,38 @@ it('replays insets delivered before JS loads and replaces all four edges and the
   window.__sableInsets!([0, 28, 10, 12], 0, 180);
   expect([...css.entries()]).toEqual([['--sat', '0px'], ['--sar', '28px'], ['--sab', '10px'], ['--sal', '12px'], ['--kb-ms', '180ms'], ['--kb', '0px']]);
   expect(attrs.has('data-kb')).toBe(false);
+});
+
+it('2.18: lifts nothing while no field has the focus, and passes the navigation bar on when the native side gives it', async () => {
+  vi.resetModules();
+  const css = new Map<string, string>();
+  const attrs = new Set<string>();
+  vi.stubGlobal('document', { activeElement: { tagName: 'BODY' }, documentElement: {
+    style: { setProperty: (key: string, value: string) => css.set(key, value), removeProperty: (key: string) => css.delete(key) },
+    setAttribute: (name: string) => attrs.add(name), removeAttribute: (name: string) => attrs.delete(name), hasAttribute: (name: string) => attrs.has(name),
+  } });
+  // A keyboard the native side never took back (it says 300) with nothing focused: no bar stands a keyboard high.
+  vi.stubGlobal('window', { __sableInsetsState: [[56, 0, 32, 0], 300, 250, 24] });
+  const { keyboardLift } = await import('../mobile/src/lib/keyboard');
+  expect(keyboardLift()).toBe(0);
+  expect(css.get('--sab')).toBe('32px');
+  expect(css.get('--sab-nav')).toBe('24px');
+  expect(attrs.has('data-nav')).toBe(true);
+  // An older native side (three arguments): the pane goes by --sab alone.
+  window.__sableInsets!([56, 0, 32, 0], 0, 0);
+  expect(css.has('--sab-nav')).toBe(false);
+  expect(attrs.has('data-nav')).toBe(false);
+});
+
+it('2.18: never lifts twice what the system already took off the page for the keyboard', async () => {
+  const { effectiveLift, editable } = await import('../mobile/src/lib/keyboard');
+  expect(effectiveLift({ raw: 300, focused: true, full: 987, height: 987, visual: 987 })).toBe(300);
+  expect(effectiveLift({ raw: 300, focused: false, full: 987, height: 987, visual: 987 })).toBe(0);
+  // The window resized by 300 for the keyboard (a system that still honours adjustResize): nothing left to lift.
+  expect(effectiveLift({ raw: 300, focused: true, full: 987, height: 687, visual: 687 })).toBe(0);
+  // The WebView shrank its visual viewport by 280: only the rest is lifted.
+  expect(effectiveLift({ raw: 300, focused: true, full: 987, height: 987, visual: 707 })).toBe(20);
+  expect(editable({ tagName: 'INPUT', type: 'search' } as unknown as Element)).toBe(true);
+  expect(editable({ tagName: 'INPUT', type: 'checkbox' } as unknown as Element)).toBe(false);
+  expect(editable({ tagName: 'BUTTON' } as unknown as Element)).toBe(false);
 });

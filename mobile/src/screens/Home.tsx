@@ -22,7 +22,7 @@ import { Pull } from '@m/ui/Pull';
 import { usePending } from '@m/lib/pending';
 import { onForget } from '@m/lib/forget';
 import { HomeDock } from './HomeDock';
-import { levelOf, LimitsSheet, scoped } from './Limits';
+import { levelOf, scoped } from './Limits';
 import { SearchResults } from './Search';
 
 // The deck (the prompt sheets and the markdown they render): its own chunk, fetched once something waits.
@@ -73,7 +73,8 @@ function workingKey(s: State): string {
  * down: the stage is the screen.
  */
 const horizon = (at: number, h: number, empty: boolean): Horizon =>
-  empty ? { x: 0.78, y: (at + 44) / h, up: 74 / h, down: 96 / h, spread: 0.95, amount: 0.64 } : { x: 0.8, y: (at + 4) / h, up: 50 / h, down: 56 / h, spread: 0.9, amount: 0.62 };
+  // 2.18: a quiet wash in the upper right, off the title (never light at full strength under words).
+  empty ? { x: 0.96, y: (at - 30) / h, up: 60 / h, down: 120 / h, spread: 0.62, amount: 0.34 } : { x: 0.98, y: (at - 40) / h, up: 46 / h, down: 90 / h, spread: 0.55, amount: 0.3 };
 
 /** The folder a chat belongs to on home: its own (a lane's chat: the folder it came from), or "Chats" for chats without one. */
 export const folderKey = (s: SessionMeta) => (s.chat ? '::chats' : norm(homeFolder(s)));
@@ -160,7 +161,6 @@ export function Home({ under }: { under: boolean }) {
   const [query, setQuery] = useState('');
   const [searching, setSearching] = useState(false);
   const q = useDeferredValue(searching ? query : '');
-  const [limits, setLimits] = useState(false);
   const [deck, setDeck] = useState(false);
   const [filter, setFilterState] = useState(readFilter);
   const [peek, setPeek] = useState<{ id: string; rect: DOMRect } | null>(null);
@@ -297,7 +297,19 @@ export function Home({ under }: { under: boolean }) {
     const sc = el?.querySelector('.home-scroll');
     if (!el || !sc) return;
     let t = 0;
+    // Rows under the bar's edge (more list below): only then the short fade above the bar (2.18; at
+    // rest over the field it stood as a dark seam across the light).
+    const clip = () => {
+      const more = sc.scrollHeight - sc.clientHeight - sc.scrollTop > 2;
+      if (more !== el.hasAttribute('data-clip')) el.toggleAttribute('data-clip', more);
+    };
+    clip();
+    const ro = new ResizeObserver(clip);
+    ro.observe(sc);
+    const body = sc.querySelector('.pull-body');
+    if (body) ro.observe(body);
     const on = () => {
+      clip();
       if (!t) el.setAttribute('data-moving', '');
       clearTimeout(t);
       t = window.setTimeout(() => {
@@ -307,6 +319,7 @@ export function Home({ under }: { under: boolean }) {
     };
     sc.addEventListener('scroll', on, { passive: true });
     return () => {
+      ro.disconnect();
       sc.removeEventListener('scroll', on);
       clearTimeout(t);
     };
@@ -334,10 +347,10 @@ export function Home({ under }: { under: boolean }) {
       <div className="screen home" ref={root} data-under={under || undefined} data-enter={entering || undefined} data-offline={connState === 'offline' || undefined}>
         <Field
           palette={paletteFor(defaultProvider)}
-          amount={0.84}
-          focusX={0.62}
-          focusY={1.12}
-          spread={0.82}
+          amount={0.5}
+          focusX={0.72}
+          focusY={1.08}
+          spread={1.12}
           stage={stage}
           floor={0}
           alert={waitingNow}
@@ -353,7 +366,7 @@ export function Home({ under }: { under: boolean }) {
             <button type="button" className="icon-btn" aria-label="Search" aria-pressed={searching} onClick={() => (haptic('tap'), searching ? closeSearch() : setSearching(true))}>
               <Icon name="search" size={22} />
             </button>
-            <button type="button" className="icon-btn" aria-label="Limits" onClick={() => (haptic('tap'), setLimits(true))}>
+            <button type="button" className="icon-btn" aria-label="Limits" onClick={() => (haptic('tap'), nav.push({ name: 'limits' }))}>
               <Icon name="gauge" size={22} />
             </button>
             <button type="button" className="icon-btn" aria-label="Settings" onClick={() => (haptic('tap'), nav.push({ name: 'settings' }))}>
@@ -390,7 +403,7 @@ export function Home({ under }: { under: boolean }) {
               <motion.div key="hero" className="home-hero" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={SNAP}>
                 <h1 className="home-title">{name}</h1>
                 {/* The connection when it is not there, else the account's limits at a glance. What works and what waits have their own cards below. */}
-                <HomeStatus conn={!loaded && connState === 'offline' ? 'away' : connState} fresh={fresh} onLimits={() => (haptic('tap'), setLimits(true))} />
+                <HomeStatus conn={!loaded && connState === 'offline' ? 'away' : connState} fresh={fresh} onLimits={() => (haptic('tap'), nav.push({ name: 'limits' }))} />
               </motion.div>
             )}
           </AnimatePresence>
@@ -459,7 +472,6 @@ export function Home({ under }: { under: boolean }) {
 
         <HomeDock covered={under} />
 
-        <LimitsSheet open={limits} onClose={() => setLimits(false)} />
         {(deckUsed || deck) && (
           <Suspense fallback={null}>
             <Deck open={deck} onClose={() => setDeck(false)} />

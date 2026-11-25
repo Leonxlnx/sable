@@ -2,6 +2,7 @@ import type { PermissionRequest, QuestionRequest, SessionMeta, TimelineItem } fr
 import { hasWork, workLabel } from '@shared/work-label';
 import { syntheticOf } from '@shared/synthetic';
 import { permissionKeys, scopeOf } from './asks';
+import { activityLine, doingLine, liveCard, type LiveCard, type TurnLive } from './note-live';
 
 /**
  * What the phone's notifications say, free of Android (lib/native.ts posts them through
@@ -154,12 +155,14 @@ export function noteAnswer(action: NoteAction, pending: { permissions: Permissio
 export interface LiveChat {
   id: string;
   title: string;
-  /** What it does now ("Editing session.ts"), else what still works ("2 sub-agents working"). */
+  /** What it does now, by kind of step ("Editing 3 files", lib/note-live.ts), else what still works ("2 sub-agents working"). */
   line: string;
   /** When the phone first saw it at work (ms). */
   since: number;
   /** Steps of its current turn, when the phone has the conversation. */
   steps?: number;
+  /** Its running turn as the phone reads it (checkpoints, files, what it does), when the phone has the conversation. */
+  turn?: TurnLive;
 }
 
 /** Chats currently at work, ordered by when the phone first observed their work. */
@@ -167,6 +170,8 @@ export interface Live {
   chats: LiveChat[];
   /** Chats waiting on the person (the connection stays for their answers). */
   waiting: number;
+  /** The chats' own lists' entries, for the cards (agent, whether the turn can be stopped). */
+  metas?: Readonly<Record<string, Pick<SessionMeta, 'status' | 'provider'>>>;
 }
 
 type StepPage = { roots: readonly string[]; items: Readonly<Record<string, TimelineItem>>; cursor?: string };
@@ -201,9 +206,10 @@ export function liveOf(
   sessions: readonly SessionMeta[],
   previous: readonly LiveChat[],
   now: number,
-  steps: (id: string) => number | undefined = () => undefined,
+  steps: (id: string) => number | TurnLive | undefined = () => undefined,
 ): Live {
   const chats: LiveChat[] = [];
+  const metas: Record<string, Pick<SessionMeta, 'status' | 'provider'>> = {};
   const seen = new Map(previous.map((chat) => [chat.id, chat.since]));
   let waiting = 0;
   for (const s of sessions) {
@@ -211,14 +217,20 @@ export function liveOf(
     if (s.status === 'awaiting') waiting++;
     const own = s.status === 'running' || s.status === 'starting';
     const between = seen.has(s.id) && betweenLoopTurns(s);
+    // A chat that only serves a local address is at rest (`serving` is no work: shared/work-label.ts).
     if (!own && !hasWork(s) && !between) continue;
     const work = workLabel(s);
-    const line = own ? (s.activity?.trim() ? cutClean(plainLine(s.activity), 80) : s.status === 'starting' ? 'Starting' : 'Working') : (work ?? 'Between turns');
-    const n = own ? steps(s.id) : undefined;
-    chats.push({ id: s.id, title: s.title?.trim() || 'Chat', line, since: seen.get(s.id) ?? now, ...(n ? { steps: n } : {}) });
+    const got = own ? steps(s.id) : undefined;
+    const turn = typeof got === 'object' ? got : undefined;
+    const n = typeof got === 'number' ? got : turn?.steps;
+    // What it does: the kind of step, never its content (a file name, a command or a search term).
+    const fromItems = turn && turn.doing.kind !== 'working' ? doingLine(turn.doing) : undefined;
+    const line = own ? (fromItems ?? activityLine(s.activity, s.status === 'starting' ? 'Starting' : 'Working')) : (work ?? 'Between turns');
+    chats.push({ id: s.id, title: s.title?.trim() || 'Chat', line, since: seen.get(s.id) ?? now, ...(n ? { steps: n } : {}), ...(turn ? { turn } : {}) });
+    metas[s.id] = { status: s.status, provider: s.provider };
   }
   chats.sort((a, b) => a.since - b.since);
-  return { chats, waiting };
+  return { chats, waiting, metas };
 }
 
 /** The live notification's words: title, line and the short sub-line, for one chat or several. */
@@ -243,6 +255,8 @@ export interface LiveSpec {
   sub?: string;
   since?: number;
   chat?: string;
+  /** One card per chat at work, oldest work first (lib/note-live.ts `liveCard`): Android draws each as a notification of its own. */
+  cards?: LiveCard[];
 }
 
 type LiveSettings = { notify?: boolean; fresh?: boolean; conn: string; listAt?: number };
@@ -257,8 +271,12 @@ export function livePayload(settings: LiveSettings, live: Live): LiveSpec | null
     chats, waiting: live.waiting,
     ...(words && { ...words, since: live.chats[0].since }),
     ...(chats === 1 && { chat: live.chats[0].id }),
+    ...(chats > 0 && { cards: live.chats.slice(0, CARDS_MAX).map((c) => liveCard(c, live.metas?.[c.id], chats, live.waiting)) }),
   };
 }
+
+/** At most this many chats get a card of their own (the summary names them all). */
+export const CARDS_MAX = 6;
 
 /** Done only when the turn and the work it left running have both ended. */
 export function workEnded(previous: SessionMeta, current: SessionMeta): boolean {

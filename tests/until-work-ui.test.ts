@@ -23,6 +23,22 @@ it('shows Running the check and its own elapsed time in the transcript until the
   state.sessions.chat = idle;
   expect(renderToStaticMarkup(createElement(Tail))).toBe('');
 });
+it('renders a quiet timed server button, then gives the working line to a concurrent command', () => {
+  const server = { ...idle, serving: 1, servingSince: 1000, servingAddress: 'localhost:3311' };
+  state.sessions.chat = server;
+  const quiet = renderToStaticMarkup(createElement(Tail));
+  expect(quiet).toContain('Serving localhost:3311. Open Agents');
+  expect(quiet).toContain('5s');
+  expect(quiet).not.toContain('work-ind');
+  state.sessions.chat = { ...server, commands: 1 };
+  const mixed = renderToStaticMarkup(createElement(Tail));
+  expect(mixed).toContain('Waiting for 1 background command');
+  expect(mixed).toContain('work-ind');
+  expect(mixed).not.toContain('5s');
+  state.sessions.chat = { ...server, serving: 2 };
+  expect(renderToStaticMarkup(createElement(Tail))).toContain('Serving 2 local servers');
+});
+
 it('keeps the phone working mark and live clock through the check', () => {
   expect(worksNow(check)).toBe(true);
   expect(hasWork(check)).toBe(true);

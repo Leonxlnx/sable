@@ -100,8 +100,9 @@ describe('the live notification', () => {
   it('lists every chat at work, sub-agents and commands too, with a clock from when it was first seen', () => {
     const list = [meta('a', { status: 'running', activity: 'Editing `session.ts`' }), meta('b', { status: 'idle', background: 2 }), meta('c', { status: 'idle' }), meta('d', { status: 'awaiting' })];
     const live = liveOf(list, [], 1000, (id) => (id === 'a' ? 12 : undefined));
+    // 2.18: the line names the kind of step only, never a file, a command or a search term (lib/note-live.ts).
     expect(live.chats.map((c) => [c.id, c.line, c.since, c.steps])).toEqual([
-      ['a', 'Editing session.ts', 1000, 12],
+      ['a', 'Editing', 1000, 12],
       ['b', '2 sub-agents working', 1000, undefined],
     ]);
     expect(live.waiting).toBe(1);

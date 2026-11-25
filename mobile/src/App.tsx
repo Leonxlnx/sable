@@ -22,6 +22,7 @@ import { MessageMenu } from './screens/MessageMenu';
 import { Home } from './screens/Home';
 import { Pair } from './screens/Pair';
 import { Settings } from './screens/Settings';
+import { LimitsScreen } from './screens/Limits';
 
 // The conversation (markdown, steps, composer) loads as its own chunk: home draws first, then it is fetched while idle.
 const loadChat = () => import('./screens/Chat');
@@ -322,6 +323,7 @@ export function App() {
 /** What a layer shows. */
 function Screen({ route: r }: { route: Route }) {
   if (r.name === 'settings') return <Settings />;
+  if (r.name === 'limits') return <LimitsScreen />;
   if (r.name === 'chat')
     return (
       <Suspense fallback={<div className="screen chat" />}>

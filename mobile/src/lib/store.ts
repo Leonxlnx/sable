@@ -24,7 +24,8 @@ import { partOfTurn, syntheticOf } from '@shared/synthetic';
 import { conn, type ConnState } from './conn';
 import { reshape, shapeString } from './turns';
 import { Intents, type Field } from './intents';
-import { liveEnabled, liveOf, livePayload, turnSteps, type LiveChat, type LiveSpec } from './notes';
+import { liveEnabled, liveOf, livePayload, type LiveChat, type LiveSpec } from './notes';
+import { turnLive } from './note-live';
 import { clearChatNotifications, clearShortcuts } from './native';
 import { reconciler, staleFetch } from './stale';
 import { onForget } from './forget';
@@ -178,12 +179,14 @@ export function watchLive(send: (spec: LiveSpec | null, stop: boolean) => void) 
   const sync = (before?: State) => {
     const { sessions, data, fresh, notify, conn } = state;
     if (before && before.sessions === sessions && before.fresh === fresh && before.notify === notify && before.conn === conn && before.listAt === state.listAt) {
-      if (before.data === data || !previous.some(({ id }) => before.data[id]?.roots !== data[id]?.roots || before.data[id]?.shape !== data[id]?.shape)) return;
+      // A step that settled its edits counts too (the live card's files, and the result it turns into).
+      if (before.data === data || !previous.some(({ id }) => before.data[id]?.roots !== data[id]?.roots || before.data[id]?.shape !== data[id]?.shape || before.data[id]?.fileSteps !== data[id]?.fileSteps)) return;
     }
     const enabled = liveEnabled(state);
     const live = liveOf(enabled ? Object.values(sessions) : [], previous, Date.now(), (id) => {
       const d = data[id];
-      return d && !d.cached && !d.next ? turnSteps(d) : undefined;
+      // The running turn as the live card reads it (checkpoints, files, the kind of step): lib/note-live.ts.
+      return d && !d.cached && !d.next ? turnLive(d) : undefined;
     });
     previous = live.chats;
     send(livePayload(state, live), !enabled);

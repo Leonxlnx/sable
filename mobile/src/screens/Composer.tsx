@@ -19,7 +19,7 @@ import { isUncertain } from '@m/lib/errors';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
-import { MODE_ICON, SetupSheet, type SetupState } from './Setup';
+import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
 
 /**
  * A message whose send was cut off by a lost connection may or may not have reached the desktop.
@@ -88,7 +88,7 @@ export function Composer({ sid }: { sid: string }) {
     return undefined;
   });
   const [files, setFiles] = useState<Attachment[]>([]);
-  const [sheet, setSheet] = useState(false);
+  const [sheet, setSheet] = useState<'model' | 'mode' | null>(null);
   const [focused, setFocused] = useState(false);
   const area = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -114,7 +114,7 @@ export function Composer({ sid }: { sid: string }) {
 
   // The setup sheet lists the other agents' models: asked for once per agent and folder as it opens.
   useEffect(() => {
-    if (!sheet || !s || !online) return;
+    if (sheet !== 'model' || !s || !online) return;
     const ps = getState().providers;
     for (const p of AGENTS) if (p !== s.provider && signedIn(ps[p])) ensureFolderCaps(p, s.cwd);
   }, [sheet, s?.provider, s?.cwd, online]);
@@ -213,7 +213,7 @@ export function Composer({ sid }: { sid: string }) {
     }),
     othersOff: running || !online,
     onOther: (provider, id) => {
-      setSheet(false);
+      setSheet(null);
       void conn.call('session.switchAgent', { sessionId: sid, provider, model: id }).catch((err) => {
         haptic('deny');
         toast((err as Error).message, 'error');
@@ -256,7 +256,7 @@ export function Composer({ sid }: { sid: string }) {
     if (!name) {
       haptic('tap');
       area.current?.blur();
-      setSheet(true);
+      setSheet('model');
       return;
     }
     haptic('select');
@@ -379,23 +379,9 @@ export function Composer({ sid }: { sid: string }) {
               <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => void pick(e.target.files).then(() => (e.target.value = ''))} />
             </>
           )}
-          {(model || s.model || mode) && (
-            <button
-              type="button"
-              className="setup-chip"
-              aria-expanded={sheet}
-              aria-haspopup="dialog"
-              aria-label={`${modelLabel}${effort && efforts.length ? `, ${effortName(effort)}` : ''}${mode ? `, ${mode.name}` : ''}`}
-              onPointerDown={(e) => e.preventDefault()}
-              onClick={() => (haptic('tap'), setSheet(true))}
-            >
-              {mode && <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={16} className="setup-chip-mode" />}
-              <span className="setup-chip-model">{modelLabel}</span>
-              {effort && efforts.length > 1 && <span className="setup-chip-dim">{effortName(effort)}</span>}
-              <Icon name="updown" size={12} weight="bold" className="setup-chip-caret" />
-            </button>
-          )}
+          <ModeChip mode={mode} open={sheet === 'mode'} onOpen={() => setSheet('mode')} />
           <span className="bar-gap" />
+          <ModelPhrase model={model || s.model ? modelLabel : undefined} effort={effort && efforts.length > 1 ? effortName(effort) : undefined} open={sheet === 'model'} onOpen={() => setSheet('model')} />
           {/* One key that stays where it is: send, or stop while a turn runs and the field is empty. Only its glyph changes. */}
           <button
             ref={sendKey}
@@ -420,7 +406,8 @@ export function Composer({ sid }: { sid: string }) {
         </div>
       </div>
 
-      <SetupSheet open={sheet} onClose={() => setSheet(false)} s={setup} />
+      <ModelSheet open={sheet === 'model'} onClose={() => setSheet(null)} s={setup} />
+      <ModeSheet open={sheet === 'mode'} onClose={() => setSheet(null)} s={setup} />
     </div>
   );
 }

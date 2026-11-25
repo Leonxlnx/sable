@@ -1,5 +1,6 @@
 package io.github.leonxlnx.sable.mobile;
 
+import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -18,9 +19,9 @@ import org.json.JSONObject;
  * mobile/src/lib/notes.ts; lib/native.ts posts them through NotesPlugin).
  *
  * Channels, each in its own tone: "Waiting on you" (high: it sounds and peeks), "Finished"
- * (default), "Working" (low and silent: the live notification while an agent works,
- * KeepAliveService) and "Connection" (min: the connection kept for a minute after work, or while
- * a chat waits). One notification per chat under a fixed id, so its newest state replaces the
+ * (default), "Working" (id "live" since 2.18: default importance so the lock screen shows it, but
+ * never a sound or a buzz: the live cards while agents work, KeepAliveService and LiveCards) and
+ * "Connection" (min: the connection kept for a minute after work, or while a chat waits). One notification per chat under a fixed id, so its newest state replaces the
  * last; two chats or more are held by one summary. Private on the lock screen: there it shows the
  * chat's name. A tap opens that chat
  * (`sable://chat/<id>?at=prompt|turn`, routed by App.tsx). Allow once and Deny ride on a
@@ -30,7 +31,7 @@ import org.json.JSONObject;
 final class Notes {
     static final String CH_WAITING = "waiting";
     static final String CH_DONE = "done";
-    static final String CH_WORKING = "working";
+    static final String CH_WORKING = "live";
     static final String CH_LINK = "link";
     static final String GROUP = "sable.chats";
     static final int SUMMARY_ID = 1;
@@ -49,9 +50,13 @@ final class Notes {
         waiting.enableVibration(true);
         NotificationChannel done = new NotificationChannel(CH_DONE, "Finished", NotificationManager.IMPORTANCE_DEFAULT);
         done.setLockscreenVisibility(NotificationCompat.VISIBILITY_PRIVATE);
-        NotificationChannel working = new NotificationChannel(CH_WORKING, "Working", NotificationManager.IMPORTANCE_LOW);
+        // Default, not low: a phone that hides silent notifications on the lock screen (the Pixel's
+        // own default) hid the live cards there, Live Updates included. It never sounds or buzzes: no
+        // sound, no vibration, and every card is posted silent and alerts once.
+        NotificationChannel working = new NotificationChannel(CH_WORKING, "Working", NotificationManager.IMPORTANCE_DEFAULT);
         working.setSound(null, null);
         working.enableVibration(false);
+        working.enableLights(false);
         working.setShowBadge(false);
         working.setLockscreenVisibility(NotificationCompat.VISIBILITY_PRIVATE);
         NotificationChannel link = new NotificationChannel(CH_LINK, "Connection", NotificationManager.IMPORTANCE_MIN);
@@ -62,6 +67,12 @@ final class Notes {
         nm.createNotificationChannel(link);
         // The single channel of earlier versions (LocalNotifications'): its notifications now each have their tone.
         if (nm.getNotificationChannel("turns") != null) nm.deleteNotificationChannel("turns");
+        // The live notification's channel before 2.18 (low: silent notifications, hidden on many lock screens).
+        try {
+            if (nm.getNotificationChannel("working") != null) nm.deleteNotificationChannel("working");
+        } catch (SecurityException ignored) {
+            // still held by a foreground service of the earlier version: it goes next time
+        }
     }
 
     /** Opens the app at `uri` (a chat, or home), in this activity. */
@@ -98,7 +109,10 @@ final class Notes {
             NotificationChannel target = nm.getNotificationChannel(channel);
             if (target == null || target.getImportance() == NotificationManager.IMPORTANCE_NONE) return false;
         }
-        String label = label(kind);
+        // A turn that ended under the live card says what it did ("Finished · 3 files changed": the
+        // card's own `result`, KeepAliveService), in the header where the card said its checkpoint.
+        String result = waiting ? null : KeepAliveService.resultOf(sid, kind);
+        String label = result != null ? result : label(kind);
         PendingIntent tap = open(c, chatUri(sid, waiting ? "prompt" : "turn"), id);
 
         // The redacted notification carries only the chat's name.
@@ -255,13 +269,59 @@ final class Notes {
         for (int i = 0; ids != null && i < ids.length(); i++) nm.cancel(ids.optInt(i));
     }
 
-    /** The ids of this app's notifications Android shows now (the live one left out). */
+    /** The ids of this app's notifications Android shows now (the live ones left out: the summary and the cards). */
     static JSONArray active(Context c) {
         JSONArray out = new JSONArray();
         NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return out;
-        for (StatusBarNotification n : nm.getActiveNotifications()) if (n.getId() != KeepAliveService.ID) out.put(n.getId());
+        for (StatusBarNotification n : nm.getActiveNotifications()) {
+            if (n.getId() != KeepAliveService.ID && !isLive(n)) out.put(n.getId());
+        }
         return out;
+    }
+
+    static boolean isLive(StatusBarNotification n) {
+        return n.getNotification().extras.getBoolean(LiveCards.EXTRA_LIVE, false);
+    }
+
+    /**
+     * Puts a chat's live card up at its own id, unless the chat's news is already there and newer than
+     * the work the card says (`since`: when the page sent it): a card drawn from an older word never
+     * covers "Done" or "Waiting for you". Held with `post`, so neither runs between the other's look and write.
+     */
+    static synchronized boolean postLive(Context c, int id, Notification card, long since) {
+        NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null || !NotificationManagerCompat.from(c).areNotificationsEnabled()) return false;
+        for (StatusBarNotification n : nm.getActiveNotifications()) {
+            if (n.getId() == id && !isLive(n) && n.getPostTime() > since) return false;
+        }
+        try {
+            nm.notify(id, card);
+            return true;
+        } catch (SecurityException e) {
+            return false;
+        }
+    }
+
+    /** Takes a live card away, only while it is still a live card (the chat's news at that id stays). */
+    static synchronized void cancelLive(Context c, int id) {
+        NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+        for (StatusBarNotification n : nm.getActiveNotifications()) {
+            if (n.getId() == id && isLive(n)) {
+                nm.cancel(id);
+                return;
+            }
+        }
+    }
+
+    /** Live cards no service draws any more (a process that ended while chats worked): they go. */
+    static synchronized void cancelStrayLive(Context c) {
+        NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return;
+        for (StatusBarNotification n : nm.getActiveNotifications()) {
+            if (n.getId() != KeepAliveService.ID && isLive(n)) nm.cancel(n.getId());
+        }
     }
 
     /** Every chat's notification goes (the live one goes with its service). */

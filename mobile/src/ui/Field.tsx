@@ -33,6 +33,45 @@ export const paletteRgb = (p: Palette) => PALETTES[p];
 
 const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16);
 
+/**
+ * The grain of the light (2.18): smooth value noise over a fixed lattice, the same on every start, so
+ * the bands of light break into the desktop field's slow currents instead of a perfect blob. Worked
+ * out once per size (shape), never per frame.
+ */
+const LATTICE = (() => {
+  let seed = 0x5ab1e;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  return Float32Array.from({ length: 64 * 64 }, rnd);
+})();
+const smooth = (t: number) => t * t * (3 - 2 * t);
+function noise2(x: number, y: number): number {
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  const fx = smooth(x - xi);
+  const fy = smooth(y - yi);
+  const at = (i: number, j: number) => LATTICE[((j & 63) << 6) | (i & 63)];
+  const a = at(xi, yi);
+  const b = at(xi + 1, yi);
+  const c = at(xi, yi + 1);
+  const d = at(xi + 1, yi + 1);
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+
+/**
+ * Battery first: on a phone running low and not charging (a stand-in for the battery saver, which a
+ * page cannot read) the field keeps its still frame: no drift, no breathing; beats still play once.
+ */
+let lowPower = false;
+void (navigator as unknown as { getBattery?: () => Promise<{ level: number; charging: boolean; addEventListener: (k: string, f: () => void) => void }> })
+  .getBattery?.()
+  .then((b) => {
+    const read = () => (lowPower = !b.charging && b.level <= 0.2);
+    read();
+    b.addEventListener('levelchange', read);
+    b.addEventListener('chargingchange', read);
+  })
+  .catch(() => {});
+
 export type BeatKind = 'send' | 'done' | 'pulse' | 'open';
 type Beat = { at: number; kind: BeatKind; x?: number; y?: number };
 const beats = new Set<(b: Beat) => void>();
@@ -129,6 +168,8 @@ export function Field({
     let cols = 0;
     let rows = 0;
     let base = new Float32Array(0);
+    // The grain under each cell (0..1), and the light it may take at the most (the reading column is spared).
+    let flow = new Float32Array(0);
     // The horizon's share of each cell (stage only).
     let high = new Float32Array(0);
     let img: ImageData | null = null;
@@ -145,13 +186,21 @@ export function Field({
     const shape = () => {
       const { focusX: fx, focusY: fy, spread: sp } = live.current;
       const aspect = rows / Math.max(1, cols);
+      // A phone on its side: the light stays a pool at the foot, as tall as in portrait, never a wash
+      // over the whole conversation (its distances were measured against the short height).
+      const wide = cols > rows ? (cols / rows) ** 1.5 : 1;
       for (let y = 0; y < rows; y++) {
         const ny = y / rows;
         for (let x = 0; x < cols; x++) {
           const dx = (x / cols - fx) * 1.1;
           const dy = (ny - fy) * aspect;
-          const d = Math.sqrt(dx * dx + dy * dy) / sp;
-          base[y * cols + x] = Math.max(0, 1 - d) ** 1.6;
+          const d = (Math.sqrt(dx * dx + dy * dy) / sp) * wide;
+          const i = y * cols + x;
+          base[i] = Math.max(0, 1 - d) ** 1.6;
+          // two octaves of the grain, in square units (the bands keep their shape on any screen)
+          const u = x / cols;
+          const v = ny * aspect;
+          flow[i] = 0.68 * noise2(u * 2.6 + 3.1, v * 2.6 + 7.7) + 0.32 * noise2(u * 6.3 + 11.4, v * 6.3 + 1.9);
         }
       }
       const st = live.current.stage;
@@ -209,6 +258,7 @@ export function Field({
       canvas.height = rows;
       img = ctx.createImageData(cols, rows);
       base = new Float32Array(cols * rows);
+      flow = new Float32Array(cols * rows);
       high = new Float32Array(live.current.stage ? cols * rows : 0);
       shape();
     };
@@ -282,14 +332,18 @@ export function Field({
           const bay = BAYER[(y & 3) * 4 + (x & 3)];
           // Too dark to light this cell whatever the streaks do: nothing to work out (most of the page).
           // (On the stage a wave only moves the light that is there, so this holds during a beat too.)
-          if ((!wave || stage) && (b * amt + h + floor) * (wave ? 7.5 : 4.4) + bay < 1) {
+          if ((!wave || stage) && (b * amt + h + floor) * (wave ? 7.5 : 4.8) + bay < 1) {
             data[i * 4 + 3] = 0;
             continue;
           }
           const nx = x / cols;
           const u = nx * ca + ny * sa;
           // (the stage's streaks are softer: it is looked at, not only glimpsed under a list)
-          const streak = stage ? 0.74 + 0.26 * Math.sin(u * 15 + t * 0.35) * Math.sin(u * 5.1 - t * 0.12 + ny * 2.1) : 0.62 + 0.38 * Math.sin(u * 22 + t * 0.35) * Math.sin(u * 7.3 - t * 0.12 + ny * 2.1);
+          // Slow currents, as the desktop's field: diagonal bands bent by the grain, thin where the grain is
+          // low (2.18; the old two crossed sines read as stripes on a blob).
+          const g = flow[i];
+          const band = 0.5 + 0.5 * Math.sin(u * (stage ? 9 : 12) + g * 5.4 - t * 0.3);
+          const streak = (0.1 + 0.9 * band * band * Math.sqrt(band)) * (0.4 + 1.15 * g);
           // The horizon leads here: its palette (amber while something waits on you).
           const top = h > b * amt;
           b = (b * amt + h) * streak * swell * breath + floor * (0.35 + streak);
@@ -337,7 +391,7 @@ export function Field({
         return;
       }
       const awake = onStage && performance.now() < awakeUntil;
-      if ((live.current.active || awake) && !live.current.waiting && !live.current.hidden && !reduced)
+      if ((live.current.active || awake) && !live.current.waiting && !live.current.hidden && !reduced && !lowPower)
         timer = window.setTimeout(
           () => {
             timer = 0;

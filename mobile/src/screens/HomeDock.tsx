@@ -19,7 +19,7 @@ import { PROVIDER_NAME, ProviderMark, SHORT_NAME } from '@m/ui/marks';
 import { SNAP } from '@m/ui/motion';
 import { effortName } from '@desk/lib/models';
 import { AgentSheet, createChat, FolderSheet, useNewChat } from './NewChat';
-import { MODE_ICON, SetupSheet, type SetupState } from './Setup';
+import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
 
 const DRAFT = 'sable.newdraft';
 // Forgetting the computer forgets the words written for a new chat on it.
@@ -47,7 +47,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
     }
   });
   const [focused, setFocused] = useState(false);
-  const [sheet, setSheet] = useState<'agent' | 'folder' | 'setup' | null>(null);
+  const [sheet, setSheet] = useState<'agent' | 'folder' | 'model' | 'mode' | null>(null);
   const [busy, setBusy] = useState(false);
   const c = useNewChat(focused || !!sheet || !!text);
   const dock = useRef<HTMLDivElement>(null);
@@ -90,7 +90,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
     if (cmd) {
       const name = (cmd[1] ?? '').trim();
       update('');
-      if (!name) return void (haptic('tap'), area.current?.blur(), setSheet('setup'));
+      if (!name) return void (haptic('tap'), area.current?.blur(), setSheet('model'));
       const m = matchModel(name, c.models as ModelInfo[]);
       if (m) {
         haptic('select');
@@ -222,21 +222,8 @@ export function HomeDock({ covered }: { covered: boolean }) {
                   <Icon name={c.folder === null ? 'chat' : 'folder'} size={16} />
                   <span>{folderLabel}</span>
                 </button>
-                {(modelLabel || mode) && (
-                  <button
-                    type="button"
-                    className="setup-chip"
-                    aria-expanded={sheet === 'setup'}
-                    aria-label={`${modelLabel ?? ''}${c.effort && c.efforts.length > 1 ? `, ${effortName(c.effort)}` : ''}${mode ? `, ${mode.name}` : ''}`}
-                    onPointerDown={(e) => e.preventDefault()}
-                    onClick={(e) => (e.stopPropagation(), haptic('tap'), setSheet('setup'))}
-                  >
-                    {mode && <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={16} className="setup-chip-mode" />}
-                    {modelLabel && <span className="setup-chip-model">{modelLabel}</span>}
-                    {c.effort && c.efforts.length > 1 && <span className="setup-chip-dim">{effortName(c.effort)}</span>}
-                    <Icon name="updown" size={12} weight="bold" className="setup-chip-caret" />
-                  </button>
-                )}
+                <ModeChip mode={mode} open={sheet === 'mode'} onOpen={() => setSheet('mode')} />
+                <ModelPhrase model={modelLabel} effort={c.effort && c.efforts.length > 1 ? effortName(c.effort) : undefined} open={sheet === 'model'} onOpen={() => setSheet('model')} />
               </div>
             </motion.div>
           )}
@@ -267,7 +254,8 @@ export function HomeDock({ covered }: { covered: boolean }) {
       </div>
       <AgentSheet open={sheet === 'agent'} onClose={() => setSheet(null)} c={c} />
       <FolderSheet open={sheet === 'folder'} onClose={() => setSheet(null)} c={c} />
-      <SetupSheet open={sheet === 'setup'} onClose={() => setSheet(null)} s={setup} />
+      <ModelSheet open={sheet === 'model'} onClose={() => setSheet(null)} s={setup} />
+      <ModeSheet open={sheet === 'mode'} onClose={() => setSheet(null)} s={setup} />
     </>
   );
 }

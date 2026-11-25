@@ -121,7 +121,7 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
     <div className="ask">
       <div className="ask-head">
         <span className="ask-glyph">
-          <Icon name={TOOL_ICON[req.kind] ?? 'tool'} size={20} />
+          <Icon name={TOOL_ICON[req.kind] ?? 'tool'} size={18} />
         </span>
         <div className="ask-titles">
           <h2 className="ask-title">{req.title}</h2>

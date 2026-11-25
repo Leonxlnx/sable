@@ -14,7 +14,8 @@ import { matchRanges, searchWords } from '@m/lib/find';
 import { canStop, followSent, newestSent, wholeForFind, worksNow } from '@m/lib/chat-rules';
 import { takeSentHere } from '@m/lib/follow';
 import { groupTurns, stabilize } from '@m/lib/turns';
-import { workLabel } from '@shared/work-label';
+import { useNow } from '@m/lib/useNow';
+import { servingLabel, waited, workLabel } from '@shared/work-label';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles } from '@m/ui/marks';
@@ -85,7 +86,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
 
   return (
     <div className="screen chat" data-live={live || undefined} data-waiting={waiting || undefined}>
-      <Field palette={paletteFor(s.provider)} amount={0.95} focusY={1.1} spread={0.56} active={live} waiting={waiting} />
+      <Field palette={paletteFor(s.provider)} amount={0.62} focusX={0.62} focusY={1.1} spread={0.8} active={live} waiting={waiting} />
       <ChatHead
         title={s.title}
         sub={connState === 'open' ? (s.chat ? undefined : baseName(homeFolder(s))) : undefined}
@@ -684,7 +685,9 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
 /** Under the conversation once the chat's own turn has ended while sub-agents or background commands it started still work. */
 function BackgroundLine({ id }: { id: string }) {
   const label = useStore((st) => (st.sessions[id] ? workLabel(st.sessions[id]) : null));
-  if (!label) return null;
+  const serving = useStore((st) => servingLabel(st.sessions[id] ?? {}));
+  const since = useStore((st) => st.sessions[id]?.servingSince);
+  if (!label) return serving ? <ServingLine label={serving} since={since} /> : null;
   return (
     <div className="bg-line" role="status">
       <span className="work-ind">
@@ -693,6 +696,11 @@ function BackgroundLine({ id }: { id: string }) {
       <span className="bg-line-text">{label}</span>
     </div>
   );
+}
+
+function ServingLine({ label, since }: { label: string; since?: number }) {
+  const now = useNow();
+  return <div className="bg-line" role="status">{label}{since && now - since >= 1000 ? ` · ${waited(now - since)}` : ''}</div>;
 }
 
 /** The first place in a message where a searched word stands (a range over it, in the text's own offsets: lib/find.ts), or null. */

@@ -2,7 +2,6 @@ package io.github.leonxlnx.sable.mobile;
 
 import android.app.Notification;
 import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
@@ -18,31 +17,41 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
- * The live notification while an agent works, and the connection to the computer kept meanwhile
- * while the app is in the background (Android cuts an app's network in the background: without it
- * the phone would hear nothing, no "Done", no "Waiting for you", until it is opened again).
+ * The live notifications while agents work, and the connection to the computer kept meanwhile while
+ * the app is in the background (Android cuts an app's network in the background: without it the phone
+ * would hear nothing, no "Done", no "Waiting for you", until it is opened again).
  *
- * The page says what works (`NotesPlugin.live`, from mobile/src/lib/notes.ts) on every change; this
- * service only draws it. Three states:
- * - Working: one ongoing notification on the "Working" channel (silent): the chat and what it does
- *   now, a chronometer since the work began, steps done where known, an indeterminate progress bar
- *   (Android draws its motion). On Android 16 it is a ProgressStyle notification that asks to be
- *   promoted as a Live Update (`android.requestPromotedOngoing`): a status bar chip, and where the
- *   system shows Live Updates there (HyperOS 3.1), its island. Xiaomi's own focus template is added
- *   only when HyperOS says it takes it from this app (`canShowFocus`, granted by Xiaomi's review).
- * - Waiting, or the minute after work ended: the quiet "Connection" notification (minimum
- *   importance: no icon in the status bar), so an answer from a notification and the next turn still
- *   reach the phone. A minute after the last work, with nothing waiting, the service stops.
- * - Nothing: no service.
+ * The page says what works (`NotesPlugin.live`, from mobile/src/lib/notes.ts `livePayload`) on every
+ * change; this service only draws it:
+ * - One card per chat at work (LiveCards, the page's `cards`), at the chat's own notification id, in
+ *   the group "sable.live": what it does now, the turn's clock, the checkpoint, a segment per checkpoint
+ *   closed, the other chats, Open and Stop. On Android 16 each card asks to be a Live Update (a status
+ *   bar chip with the turn's clock; HyperOS's island where it shows Live Updates). When a chat's turn
+ *   ends or it waits on the person, the page posts its news at the same id (Notes.post), which takes
+ *   the card's place: the result ("Finished · 3 files changed"), no longer ongoing; a card whose chat
+ *   left the live set with no news goes (only while it is still a live card: `Notes.cancelLive`).
+ * - The service's own notification is that group's summary: Android hides a summary with one card
+ *   under it, shows it as the header of two or more, and alone (no chat at work: a chat waiting, or the
+ *   minute after work) it is the quiet line that keeps the connection.
+ * - A card the person swiped away is not put up again until its chat's next turn (the platform's rule
+ *   for Live Updates). Stop asks once: the card turns into "Stop this turn?" with Stop now (unlocked
+ *   only) and Keep going, for eight seconds; Stop now goes to the page (NotesPlugin.deliverStop), which
+ *   checks the chat still runs and stops it as the chat's own Stop does.
  *
- * It holds no wake lock and polls nothing: the page's socket is the only connection, updates come
- * from the page's events (at most one redraw a second), and the chronometer is drawn by Android.
- * Leaving the activity tries to start the service with the latest work. A later socket update
- * also tries while hidden. If Android denies that start, an ordinary notification can still
- * reflect updates delivered to the page. Returning to the activity stops the service, as does
+ * It holds no wake lock and polls nothing: the page's socket is the only connection, updates come from
+ * the page's events (at most one redraw a second), the clocks are drawn by Android, and a card is put
+ * up again every two minutes only so that one left by a process that died goes by itself (TTL).
+ * Leaving the activity tries to start the service with the latest work; a later socket update also
+ * tries while hidden; if Android denies that start, ordinary notifications still follow the updates
+ * the page receives. Returning to the activity stops the service and takes the cards away, as does
  * three hours without a state update.
  */
 public class KeepAliveService extends Service {
@@ -50,20 +59,40 @@ public class KeepAliveService extends Service {
     private static final long LINGER_MS = 60_000L;
     private static final long MAX_MS = 3 * 60 * 60 * 1000L;
     private static final long REDRAW_MS = 1000L;
+    private static final long REFRESH_MS = 2 * 60_000L;
+    private static final long ASK_MS = 8_000L;
+    private static final long RESULT_KEEP_MS = 10 * 60_000L;
 
-    /** What the page said last (null: nothing yet). */
+    /** What the page said last (null: nothing yet), and when it said it. */
     private static JSONObject live;
+    private static long liveAt;
     /** When work and waiting last ended (elapsed realtime), or 0 while something works or waits. */
     private static long idleSince;
-    // Plugin updates, Activity callbacks and the service all run on the main looper.
+    // Plugin updates, Activity callbacks, receivers and the service all run on the main looper.
     private static boolean hidden, startPending, startDenied;
     private static KeepAliveService self;
     private boolean stopping;
     private static final Handler fallbackHandler = new Handler(Looper.getMainLooper());
 
+    /** The note ids of the cards up now, by chat. */
+    private static final Map<String, Integer> drawn = new HashMap<>();
+    /** Chats whose card the person swiped away during this turn. */
+    private static final Set<String> dismissed = new HashSet<>();
+    /** Chats whose Stop waits for its confirmation, until when (elapsed realtime). */
+    private static final Map<String, Long> asking = new HashMap<>();
+    /** Chats whose Stop went to the page. */
+    private static final Set<String> stoppingChats = new HashSet<>();
+    /** Each chat's last card and when it left the live set (for its result: Notes.post). Guarded by Notes.class. */
+    private static final Map<String, JSONObject> lastCards = new HashMap<>();
+    private static final Map<String, Long> leftAt = new HashMap<>();
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable redraw = this::draw;
     private final Runnable check = this::checkStop;
+    private final Runnable refresh = () -> {
+        drawnAt = 0;
+        draw();
+    };
     private final Runnable cap = () -> {
         live = null;
         idleSince = 0;
@@ -81,6 +110,11 @@ public class KeepAliveService extends Service {
         return l == null ? 0 : l.optInt("waiting", 0);
     }
 
+    private static JSONArray cards(JSONObject l) {
+        JSONArray a = l == null ? null : l.optJSONArray("cards");
+        return a == null ? new JSONArray() : a;
+    }
+
     /** Something to keep the connection for: work, a chat waiting, or the minute after. */
     private static boolean wanted() {
         JSONObject l = live;
@@ -88,14 +122,68 @@ public class KeepAliveService extends Service {
         return idleSince > 0 && SystemClock.elapsedRealtime() - idleSince < LINGER_MS;
     }
 
+    /** The notification id of a chat's own notification (lib/native.ts `idFor`, the same reckoning). */
+    static int noteId(String sessionId) {
+        int h = 7;
+        for (int i = 0; i < sessionId.length(); i++) h = h * 31 + sessionId.charAt(i);
+        long id = (Math.abs((long) h) % 2_000_000_000L) + 2;
+        return id == ID ? 2_000_000_002 : (int) id;
+    }
+
     static void setLive(Context context, JSONObject next) {
         boolean busy = chats(next) > 0 || waiting(next) > 0;
         boolean was = chats(live) > 0 || waiting(live) > 0;
+        remember(next);
         live = next;
+        liveAt = System.currentTimeMillis();
         if (busy || next.optBoolean("stop")) idleSince = 0;
         else if (was) idleSince = SystemClock.elapsedRealtime();
+        // A chat that left the live set may come back with its next turn: its swipe and its Stop are spent.
+        Set<String> now = new HashSet<>();
+        JSONArray cs = cards(next);
+        for (int i = 0; i < cs.length(); i++) {
+            JSONObject c = cs.optJSONObject(i);
+            if (c != null) now.add(c.optString("id"));
+        }
+        dismissed.retainAll(now);
+        asking.keySet().retainAll(now);
+        stoppingChats.retainAll(now);
         if (self != null) self.changed();
         else if (hidden) startIfWanted(context);
+        else if (!drawn.isEmpty()) clearCards(context);
+    }
+
+    /** Each chat's newest card, kept a while after it left the live set, so its result can say what it did. */
+    private static void remember(JSONObject next) {
+        synchronized (Notes.class) {
+            long t = System.currentTimeMillis();
+            Set<String> now = new HashSet<>();
+            JSONArray cs = cards(next);
+            for (int i = 0; i < cs.length(); i++) {
+                JSONObject c = cs.optJSONObject(i);
+                if (c == null) continue;
+                String id = c.optString("id");
+                now.add(id);
+                lastCards.put(id, c);
+                leftAt.remove(id);
+            }
+            for (String id : lastCards.keySet()) if (!now.contains(id) && !leftAt.containsKey(id)) leftAt.put(id, t);
+            leftAt.entrySet().removeIf((e) -> {
+                if (t - e.getValue() < RESULT_KEEP_MS) return false;
+                lastCards.remove(e.getKey());
+                return true;
+            });
+        }
+    }
+
+    /** What a chat's result says in its header ("Finished · 3 files changed"), or null when its work was not seen. Called with Notes.class held. */
+    static String resultOf(String sessionId, String kind) {
+        JSONObject c = lastCards.get(sessionId);
+        if (c == null) return null;
+        JSONObject r = c.optJSONObject("result");
+        if (r == null) return null;
+        String s = r.optString("failed".equals(kind) ? "failed" : "done", "");
+        return s.isEmpty() ? null : s;
     }
 
     static void onAppHidden(Context context) {
@@ -120,29 +208,69 @@ public class KeepAliveService extends Service {
         }
     }
 
+    /** Without the service: the cards alone, as ordinary notifications that follow the open socket. */
     private static void fallback(Context context) {
-        NotificationManager nm = context.getSystemService(NotificationManager.class);
-        if (nm == null) return;
         if (!hidden || chats(live) == 0) {
             fallbackHandler.removeCallbacksAndMessages(null);
-            nm.cancel(ID);
+            clearCards(context);
         } else if (!fallbackHandler.hasMessages(0)) {
-            // An ordinary notification can still follow the open socket. It expires if the process dies.
             fallbackHandler.postDelayed(() -> {
                 if (!hidden || chats(live) == 0) return;
-                try {
-                    nm.notify(ID, working(context, live, MAX_MS));
-                } catch (SecurityException ignored) { /* Notifications disabled. */ }
+                drawCards(context);
             }, REDRAW_MS);
         }
     }
 
     static void onAppVisible(Context context) {
         hidden = false;
-        // Also clears a fallback left by a previous WebView process.
+        // Also clears cards left by a previous WebView process (fallback clears them when nothing works).
         if (self == null && !startPending) fallback(context);
         startDenied = false;
         if (self != null) self.finish();
+        else clearCards(context);
+    }
+
+    /** Stop was pressed on a chat's card: it asks once (Stop now, Keep going) for a few seconds. */
+    static void askStop(Context context, String sessionId) {
+        if (sessionId == null || !drawn.containsKey(sessionId)) return;
+        asking.put(sessionId, SystemClock.elapsedRealtime() + ASK_MS);
+        fallbackHandler.postDelayed(() -> {
+            Long until = asking.get(sessionId);
+            if (until != null && SystemClock.elapsedRealtime() >= until) {
+                asking.remove(sessionId);
+                redrawNow(context);
+            }
+        }, ASK_MS + 50);
+        redrawNow(context);
+    }
+
+    static void keepGoing(Context context, String sessionId) {
+        if (asking.remove(sessionId) != null) redrawNow(context);
+    }
+
+    /** Stop now: confirmed (and unlocked). The page stops the chat if it still runs. */
+    static void confirmStop(Context context, String sessionId, Intent intent) {
+        if (sessionId == null || asking.remove(sessionId) == null) return;
+        stoppingChats.add(sessionId);
+        redrawNow(context);
+        NotesPlugin.deliverStop(sessionId);
+    }
+
+    /** The person swiped a card away: it stays away until its chat's next turn. */
+    static void cardDismissed(Context context, String sessionId) {
+        if (sessionId == null) return;
+        dismissed.add(sessionId);
+        drawn.remove(sessionId);
+    }
+
+    private static void redrawNow(Context context) {
+        if (self != null) {
+            self.drawnAt = 0;
+            self.handler.removeCallbacks(self.redraw);
+            self.draw();
+        } else if (hidden) {
+            drawCards(context);
+        }
     }
 
     @Override
@@ -150,9 +278,9 @@ public class KeepAliveService extends Service {
         startPending = false;
         self = this;
         try {
-            if (Build.VERSION.SDK_INT >= 34) startForeground(ID, build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-            else startForeground(ID, build());
-            drawnAt = SystemClock.elapsedRealtime();
+            if (Build.VERSION.SDK_INT >= 34) startForeground(ID, summary(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            else startForeground(ID, summary());
+            // The cards follow at once (drawnAt stays 0): a summary never stands alone over work.
         } catch (Exception e) {
             startDenied = true;
             finish();
@@ -192,6 +320,7 @@ public class KeepAliveService extends Service {
     private void finish() {
         stopping = true;
         handler.removeCallbacksAndMessages(null);
+        clearCards(getApplicationContext());
         stopSelf();
     }
 
@@ -202,104 +331,109 @@ public class KeepAliveService extends Service {
         NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return;
         try {
-            Notification n = build();
+            // The cards first, then their summary, so the group never shows the summary alone for a frame.
+            drawCards(this);
+            Notification n = summary();
             if (chats(live) > 0) focus(n, chats(live) == 1 ? live.optString("title", "Sable") : "Sable");
             nm.notify(ID, n);
         } catch (SecurityException ignored) {
             // notifications off: the service still keeps the connection
         }
+        handler.removeCallbacks(refresh);
+        if (!drawn.isEmpty()) handler.postDelayed(refresh, REFRESH_MS);
     }
 
-    private Notification build() {
+    /** Every chat at work gets its card; a chat that left the live set loses its own (unless its news took its place). */
+    private static void drawCards(Context c) {
         JSONObject l = live;
-        if (chats(l) > 0) return working(this, l, 0);
-        return quiet(l);
+        JSONArray cs = cards(l);
+        Set<String> keep = new HashSet<>();
+        long now = SystemClock.elapsedRealtime();
+        for (int i = 0; i < cs.length(); i++) {
+            JSONObject card = cs.optJSONObject(i);
+            if (card == null) continue;
+            String sid = card.optString("id", "");
+            if (sid.isEmpty() || dismissed.contains(sid)) continue;
+            int id = noteId(sid);
+            Long until = asking.get(sid);
+            boolean ask = until != null && now < until;
+            try {
+                if (Notes.postLive(c, id, LiveCards.build(c, card, id, ask, stoppingChats.contains(sid)), liveAt)) {
+                    drawn.put(sid, id);
+                    keep.add(sid);
+                }
+            } catch (RuntimeException ignored) {
+                // a card that cannot be drawn (a bad icon on an odd system): the summary still says it
+            }
+        }
+        for (Map.Entry<String, Integer> e : new HashMap<>(drawn).entrySet()) {
+            if (keep.contains(e.getKey())) continue;
+            Notes.cancelLive(c, e.getValue());
+            drawn.remove(e.getKey());
+        }
     }
 
-    /** Waiting on you, or the minute after work: kept quiet, at the bottom of the shade. */
-    private Notification quiet(JSONObject l) {
+    /** Every card goes (the app is on screen, or the service stops). A chat's news at the same id stays. */
+    private static void clearCards(Context c) {
+        for (Integer id : drawn.values()) Notes.cancelLive(c, id);
+        drawn.clear();
+        Notes.cancelStrayLive(c);
+    }
+
+    /** The service's own notification: the summary of the cards, or alone the quiet line that keeps the connection. */
+    private Notification summary() {
+        JSONObject l = live;
+        int n = chats(l);
         int w = waiting(l);
-        String line = w > 1 ? w + " chats waiting for you" : w == 1 ? "A chat is waiting for you" : "Connected to your computer";
-        return new NotificationCompat.Builder(this, Notes.CH_LINK)
-            .setSmallIcon(R.drawable.ic_stat_sable)
-            .setColor(Notes.IVORY)
-            .setContentTitle("Sable")
-            .setContentText(line)
-            .setOngoing(true)
-            .setSilent(true)
-            .setShowWhen(false)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            .setPublicVersion(Notes.base(this, Notes.CH_LINK, "Sable", null).setShowWhen(false).build())
-            .setContentIntent(Notes.open(this, "sable://home", ID))
-            .build();
-    }
-
-    /** At work: the live notification. */
-    private static Notification working(Context c, JSONObject l, long timeout) {
-        String title = Notes.cut(l.optString("title", "Working"), 80);
-        String text = Notes.cut(l.optString("text", "Working"), 400);
-        String first = text.contains("\n") ? text.substring(0, text.indexOf('\n')) : text;
-        String sub = l.optString("sub", "");
-        long since = l.optLong("since", System.currentTimeMillis());
-        boolean several = chats(l) > 1;
-        String chat = l.optString("chat", "");
-        PendingIntent tap = Notes.open(c, chat.isEmpty() ? "sable://home" : Notes.chatUri(chat, "turn"), ID);
-        if (Build.VERSION.SDK_INT >= 36) return promoted(c, title, text, first, sub, since, several, tap, timeout);
-        NotificationCompat.Builder b = new NotificationCompat.Builder(c, Notes.CH_WORKING)
+        if (n == 0) {
+            String line = w > 1 ? w + " chats waiting for you" : w == 1 ? "A chat is waiting for you" : "Connected to your computer";
+            return new NotificationCompat.Builder(this, Notes.CH_LINK)
+                .setSmallIcon(R.drawable.ic_stat_sable)
+                .setColor(Notes.IVORY)
+                .setContentTitle("Sable")
+                .setContentText(line)
+                .setOngoing(true)
+                .setSilent(true)
+                .setShowWhen(false)
+                .setGroup(LiveCards.GROUP)
+                .setGroupSummary(true)
+                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setPublicVersion(Notes.base(this, Notes.CH_LINK, "Sable", null).setShowWhen(false).build())
+                .setContentIntent(Notes.open(this, "sable://home", ID))
+                .build();
+        }
+        String title = n == 1 ? Notes.cut(l.optString("title", "Working"), 80) : n + " chats working";
+        String text = n == 1 ? Notes.cut(l.optString("text", "Working"), 120) : (w > 0 ? w + " waiting for you" : "");
+        NotificationCompat.InboxStyle inbox = new NotificationCompat.InboxStyle();
+        JSONArray cs = cards(l);
+        for (int i = 0; i < cs.length() && i < 6; i++) {
+            JSONObject c = cs.optJSONObject(i);
+            if (c != null) inbox.addLine(Notes.cut(c.optString("title", "Chat"), 40) + " · " + Notes.cut(c.optString("line", ""), 60));
+        }
+        inbox.setSummaryText(n + (n == 1 ? " chat working" : " chats working"));
+        NotificationCompat.Builder b = new NotificationCompat.Builder(this, Notes.CH_WORKING)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setSmallIcon(R.drawable.ic_stat_sable)
             .setColor(Notes.IVORY)
             .setContentTitle(title)
-            .setContentText(first)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setTimeoutAfter(timeout)
             .setSilent(true)
-            .setWhen(since)
+            .setWhen(l.optLong("since", System.currentTimeMillis()))
             .setUsesChronometer(true)
             .setShowWhen(true)
-            .setProgress(0, 0, true)
+            .setStyle(inbox)
+            .setGroup(LiveCards.GROUP)
+            .setGroupSummary(true)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            .setPublicVersion(
-                Notes.base(c, Notes.CH_WORKING, several ? "Sable" : title, null).setShowWhen(false).build()
-            )
-            .setContentIntent(tap);
-        if (!sub.isEmpty()) b.setSubText(sub);
-        if (several) b.setStyle(new NotificationCompat.BigTextStyle().bigText(text));
-        return b.build();
-    }
-
-    /** Android 16: a ProgressStyle notification asking to be a Live Update (a status bar chip, the island where the system shows them). */
-    private static Notification promoted(Context c, String title, String text, String first, String sub, long since, boolean several, PendingIntent tap, long timeout) {
-        Notification.Builder b = new Notification.Builder(c, Notes.CH_WORKING)
-            .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
-            .setSmallIcon(R.drawable.ic_stat_sable)
-            .setColor(Notes.IVORY)
-            .setContentTitle(title)
-            .setContentText(first)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setTimeoutAfter(timeout)
-            .setWhen(since)
-            .setUsesChronometer(true)
-            .setShowWhen(true)
-            .setCategory(Notification.CATEGORY_PROGRESS)
-            .setVisibility(Notification.VISIBILITY_PRIVATE)
-            .setPublicVersion(
-                Notes.base(c, Notes.CH_WORKING, several ? "Sable" : title, null).setShowWhen(false).build()
-            )
-            .setContentIntent(tap);
-        if (!sub.isEmpty()) b.setSubText(sub);
-        if (several) b.setStyle(new Notification.BigTextStyle().bigText(text));
-        else b.setStyle(new Notification.ProgressStyle().setProgressIndeterminate(true));
-        Bundle ex = new Bundle();
-        // Notification.EXTRA_REQUEST_PROMOTED_ONGOING (public from Android 16 QPR2; read by 16 as well).
-        ex.putBoolean("android.requestPromotedOngoing", true);
-        b.addExtras(ex);
+            .setPublicVersion(Notes.base(this, Notes.CH_WORKING, "Sable", n == 1 ? "A chat is working" : n + " chats working").setShowWhen(false).build())
+            .setContentIntent(Notes.open(this, n == 1 && !l.optString("chat").isEmpty() ? Notes.chatUri(l.optString("chat"), "turn") : "sable://home", ID));
+        if (!text.isEmpty()) b.setContentText(text);
         return b.build();
     }
 

@@ -1,17 +1,15 @@
-import { AnimatePresence, motion } from 'motion/react';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { STANDARD_SPEED, type Effort, type ModeInfo, type ModeTone, type ProviderId } from '@shared/protocol';
 import { effortName } from '@desk/lib/models';
 import { haptic } from '@m/lib/native';
 import { Icon, type IconName } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark } from '@m/ui/marks';
-import { AutoHeight } from '@m/ui/AutoHeight';
 import { Sheet } from '@m/ui/Sheet';
 
 export const MODE_ICON: Record<ModeTone, IconName> = { ask: 'hand', edit: 'edit', plan: 'plan', auto: 'bolt', danger: 'shield' };
 
 export interface SetupState {
-  /** The chat's agent (its mark heads the models). */
+  /** The chat's agent (its mark leads its models). */
   agent?: ProviderId;
   models: { id: string; name: string }[];
   model?: string;
@@ -35,112 +33,168 @@ export interface SetupState {
 }
 
 /**
- * How the agent works, in one sheet: the model, how hard it thinks (a dial with a stop per level,
- * each named under it), how fast it runs, and what it may do without asking. Every choice applies at
- * once; nothing here explains itself (people know their models).
+ * The mode on the prompt bar (2.18, its own chip again, as on the desktop): its icon and its word, bare
+ * until held or its sheet is open; Bypass keeps its red icon. A narrow bar keeps the icon alone.
  */
-export function SetupSheet({ open, onClose, s }: { open: boolean; onClose: () => void; s: SetupState }) {
+export function ModeChip({ mode, open, onOpen }: { mode?: ModeInfo; open: boolean; onOpen: () => void }) {
+  if (!mode) return null;
   return (
-    <Sheet open={open} onClose={onClose} label="Model and permissions">
-      <div className="setup">
-        <section className="setup-sec">
-          <h3 className="setup-head">
-            {s.agent && <ProviderMark provider={s.agent} size={13} />}
-            <span>{s.agent ? PROVIDER_NAME[s.agent] : 'Model'}</span>
-          </h3>
+    <button
+      type="button"
+      className="mode-chip"
+      data-tone={mode.tone}
+      aria-expanded={open}
+      aria-haspopup="dialog"
+      aria-label={`Permissions: ${mode.name}`}
+      onPointerDown={(e) => e.preventDefault()}
+      onClick={(e) => (e.stopPropagation(), haptic('tap'), onOpen())}
+    >
+      <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={17} className="mode-chip-icon" />
+      <span className="mode-chip-name">{mode.name}</span>
+    </button>
+  );
+}
+
+/** Model and effort as one phrase on the bar (the desktop's): "Demo Large · High", the level a step quieter. */
+export function ModelPhrase({ model, effort, open, onOpen }: { model?: string; effort?: string; open: boolean; onOpen: () => void }) {
+  if (!model) return null;
+  return (
+    <button
+      type="button"
+      className="phrase"
+      aria-expanded={open}
+      aria-haspopup="dialog"
+      aria-label={`${model}${effort ? `, ${effort}` : ''}`}
+      onPointerDown={(e) => e.preventDefault()}
+      onClick={(e) => (e.stopPropagation(), haptic('tap'), onOpen())}
+    >
+      <span className="phrase-model">{model}</span>
+      {effort && (
+        <>
+          <span className="phrase-dot" aria-hidden>
+            ·
+          </span>
+          <span className="phrase-level">{effort}</span>
+        </>
+      )}
+    </button>
+  );
+}
+
+/**
+ * The model panel, as the desktop's (2.18; the sheet of radio cards it replaces read as cheap): the
+ * models first, each led by its agent's mark with the check at the end of the one in use, the other
+ * agents' models under their agent's name; then the speeds as one row of choices; and at the foot,
+ * where the thumb rests, effort as ONE slider of the model's levels, its name over it. The sheet keeps
+ * its height while it is open: a model without speeds keeps the row (Standard alone), so nothing under
+ * the finger moves when a model is picked.
+ */
+export function ModelSheet({ open, onClose, s }: { open: boolean; onClose: () => void; s: SetupState }) {
+  const shown = useRef({ speed: false, effort: false });
+  if (!open) shown.current = { speed: false, effort: false };
+  const hasSpeed = s.speeds.length > 1;
+  const hasEffort = s.efforts.length > 1;
+  if (open) {
+    shown.current.speed ||= hasSpeed;
+    shown.current.effort ||= hasEffort;
+  }
+  const speedRow = hasSpeed || shown.current.speed;
+  const effortRow = hasEffort || shown.current.effort;
+  return (
+    <Sheet open={open} onClose={onClose} label="Model">
+      <div className="mp">
+        <div className="mp-models" role="radiogroup" aria-label="Model">
           {s.models.length ? (
-            <div className="setup-list" role="radiogroup" aria-label="Model">
-              {s.models.map((m) => (
-                <Row key={m.id} on={m.id === s.model} onPick={() => s.onModel(m.id)}>
-                  {m.name}
-                </Row>
-              ))}
-            </div>
+            s.models.map((m) => (
+              <PanelRow key={m.id} mark={s.agent} on={m.id === s.model} onPick={() => s.onModel(m.id)}>
+                {m.name}
+              </PanelRow>
+            ))
           ) : (
-            <div className="setup-list setup-skel" aria-hidden>
-              <span className="skel" style={{ width: '46%' }} />
-              <span className="skel" style={{ width: '38%' }} />
-              <span className="skel" style={{ width: '52%' }} />
+            <div className="mp-skel" aria-hidden>
+              {[46, 38, 52].map((w) => (
+                <span key={w} className="mp-row">
+                  <span className="skel" style={{ width: 16, height: 16, borderRadius: 4 }} />
+                  <span className="skel" style={{ width: `${w}%` }} />
+                </span>
+              ))}
             </div>
           )}
           {s.others?.map((o) => (
-            <div key={o.provider} className="setup-away">
-              <h4 className="setup-head setup-away-head">
-                <ProviderMark provider={o.provider} size={13} />
-                <span>{PROVIDER_NAME[o.provider]}</span>
-              </h4>
-              <AutoHeight className="setup-list">
-                <AnimatePresence initial={false} mode="popLayout">
-                  {o.models ? (
-                    <motion.div key="rows" className="setup-away-rows" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.16 }}>
-                      {o.models.map((m) => (
-                        <button
-                          key={m.id}
-                          type="button"
-                          className="setup-row setup-row-away"
-                          aria-label={`Switch to ${PROVIDER_NAME[o.provider]} with ${m.name}`}
-                          aria-disabled={s.othersOff || undefined}
-                          onClick={() => {
-                            if (s.othersOff) return void haptic('deny');
-                            haptic('select');
-                            s.onOther?.(o.provider, m.id);
-                          }}
-                        >
-                          <span className="setup-row-name">{m.name}</span>
-                          <Icon name="arrowRight" size={16} className="setup-away-go" />
-                        </button>
-                      ))}
-                    </motion.div>
-                  ) : (
-                    <motion.div key="skel" className="setup-away-rows setup-away-skel" aria-hidden exit={{ opacity: 0 }} transition={{ duration: 0.12 }}>
-                      <span className="setup-row">
-                        <span className="skel" style={{ width: '34%' }} />
-                      </span>
-                      <span className="setup-row">
-                        <span className="skel" style={{ width: '46%' }} />
-                      </span>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </AutoHeight>
+            <div key={o.provider} className="mp-away">
+              <h4 className="mp-away-head">{PROVIDER_NAME[o.provider]}</h4>
+              {o.models ? (
+                o.models.map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className="mp-row"
+                    aria-label={`Switch to ${PROVIDER_NAME[o.provider]} with ${m.name}`}
+                    aria-disabled={s.othersOff || undefined}
+                    onClick={() => {
+                      if (s.othersOff) return void haptic('deny');
+                      haptic('select');
+                      s.onOther?.(o.provider, m.id);
+                    }}
+                  >
+                    <ProviderMark provider={o.provider} size={16} />
+                    <span className="mp-name">{m.name}</span>
+                  </button>
+                ))
+              ) : (
+                <span className="mp-row" aria-hidden>
+                  <span className="skel" style={{ width: 16, height: 16, borderRadius: 4 }} />
+                  <span className="skel" style={{ width: '40%' }} />
+                </span>
+              )}
             </div>
           ))}
-        </section>
-
-        {s.efforts.length > 1 && <EffortSection efforts={s.efforts} value={s.effort} onPick={s.onEffort} />}
-
-        {s.speeds.length > 1 && (
-          <section className="setup-sec">
-            <h3 className="setup-head">Speed</h3>
-            <Segmented label="Speed" options={s.speeds} value={s.speed ?? STANDARD_SPEED} onPick={s.onSpeed} />
-          </section>
-        )}
-
-        {s.modes.length > 0 && (
-          <section className="setup-sec">
-            <h3 className="setup-head">Permissions</h3>
-            <div className="setup-list" role="radiogroup" aria-label="Permissions">
-              {s.modes.map((m) => (
-                <Row key={m.id} on={m.id === s.mode} onPick={() => s.onMode(m.id)} icon={MODE_ICON[m.tone] ?? 'hand'} tone={m.tone}>
-                  {m.name}
-                </Row>
-              ))}
-            </div>
-          </section>
+        </div>
+        {(speedRow || effortRow) && (
+          <div className="mp-foot">
+            {speedRow && <Segmented label="Speed" options={hasSpeed ? s.speeds : [{ id: STANDARD_SPEED, name: 'Standard' }]} value={hasSpeed ? (s.speed ?? STANDARD_SPEED) : STANDARD_SPEED} onPick={s.onSpeed} />}
+            {effortRow && (hasEffort ? <EffortSlider efforts={s.efforts} value={s.effort} onPick={s.onEffort} /> : <p className="mp-fixed">This model has one effort level.</p>)}
+          </div>
         )}
       </div>
     </Sheet>
   );
 }
 
-/** One choice of a few: a 52 px row, the chosen one bright with a filled mark. */
-function Row({ on, onPick, icon, tone, children }: { on: boolean; onPick: () => void; icon?: IconName; tone?: ModeTone; children: React.ReactNode }) {
+/** What the agent may do without asking: a row per mode, its icon, its name, the check at the end of the one in use. */
+export function ModeSheet({ open, onClose, s }: { open: boolean; onClose: () => void; s: SetupState }) {
+  return (
+    <Sheet open={open} onClose={onClose} label="Permissions">
+      <div className="mp">
+        <div className="mp-models" role="radiogroup" aria-label="Permissions">
+          {s.modes.map((m) => (
+            <PanelRow
+              key={m.id}
+              icon={MODE_ICON[m.tone] ?? 'hand'}
+              tone={m.tone}
+              on={m.id === s.mode}
+              onPick={() => {
+                s.onMode(m.id);
+                window.setTimeout(onClose, 160);
+              }}
+            >
+              {m.name}
+            </PanelRow>
+          ))}
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+
+/** One choice of a list: 48 px, its mark or icon, its name, the check at its end when it is the one in use. */
+function PanelRow({ on, onPick, mark, icon, tone, children }: { on: boolean; onPick: () => void; mark?: ProviderId; icon?: IconName; tone?: ModeTone; children: ReactNode }) {
   return (
     <button
       type="button"
       role="radio"
       aria-checked={on}
-      className="setup-row"
+      className="mp-row"
       data-on={on || undefined}
       data-tone={tone}
       onClick={() => {
@@ -149,23 +203,23 @@ function Row({ on, onPick, icon, tone, children }: { on: boolean; onPick: () => 
         onPick();
       }}
     >
-      {icon && <Icon name={icon} size={20} className="setup-row-icon" />}
-      <span className="setup-row-name">{children}</span>
-      <span className="setup-radio" aria-hidden>
-        <i />
-      </span>
+      {mark && <ProviderMark provider={mark} size={16} />}
+      {icon && <Icon name={icon} size={18} className="mp-icon" />}
+      <span className="mp-name">{children}</span>
+      {on && <Icon name="check" size={16} weight="bold" className="mp-check" />}
     </button>
   );
 }
 
 /**
- * Effort: the dial and the name of the level, which follows the finger. A level let go of shows at
- * once and stays until the chat confirms it (or for a few seconds), so the knob never goes back to the
- * old level while the desktop answers.
+ * Effort: one slider of the model's levels, the level's name over it. The thumb follows the finger
+ * 1:1 and the level under it is named and felt (a tick per stop) as it passes; letting go settles on
+ * the nearest stop. A level let go of shows at once and stays until the chat confirms it (or a few
+ * seconds), so the thumb never goes back to the old level while the desktop answers.
  */
-function EffortSection({ efforts, value, onPick }: { efforts: Effort[]; value?: Effort; onPick: (e: Effort) => void }) {
-  const [preview, setPreview] = useState<string | null>(null);
+function EffortSlider({ efforts, value, onPick }: { efforts: Effort[]; value?: Effort; onPick: (e: Effort) => void }) {
   const [held, setHeld] = useState<{ id: string; at: number } | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
   useEffect(() => {
     if (!held) return;
     if (held.id === value) return setHeld(null);
@@ -175,56 +229,37 @@ function EffortSection({ efforts, value, onPick }: { efforts: Effort[]; value?: 
   const shown = (held?.id ?? value) as Effort | undefined;
   const live = (preview ?? shown) as Effort | undefined;
   const stops = efforts.map((e) => ({ id: e, name: effortName(e) }));
-  const named = stops.length <= 5;
   return (
-    <section className="setup-sec">
-      <h3 className="setup-head">
-        <span>Effort</span>
-        {!named && <span className="setup-value">{live ? effortName(live) : ''}</span>}
-      </h3>
-      <Dial
+    <div className="mp-effort">
+      <div className="mp-level" aria-hidden>
+        {live ? effortName(live) : 'Effort'}
+      </div>
+      <Slider
         label="Effort"
         stops={stops}
         value={shown}
-        named={named}
         onPreview={setPreview}
         onPick={(id) => {
           setHeld({ id, at: Date.now() });
           onPick(id as Effort);
         }}
       />
-    </section>
+    </div>
   );
 }
 
 /**
- * A level among a few in order (effort): a track with a stop per level, filled up to the chosen
- * one, its knob following the finger and settling on the nearest stop with a tick per stop passed.
- * The level under the finger is reported as it moves (`onPreview`); letting go (or the system taking
- * the touch) picks the nearest stop, never the old one.
+ * A level among a few in order: a thin track with a dot per stop, filled to the thumb with a dithered
+ * head; the thumb follows the finger 1:1 (no easing while dragged) and settles on the nearest stop.
  */
-export function Dial({
-  label,
-  stops,
-  value,
-  named = false,
-  onPick,
-  onPreview,
-}: {
-  label: string;
-  stops: { id: string; name: string }[];
-  value?: string;
-  named?: boolean;
-  onPick: (id: string) => void;
-  onPreview?: (id: string | null) => void;
-}) {
+export function Slider({ label, stops, value, onPick, onPreview }: { label: string; stops: { id: string; name: string }[]; value?: string; onPick: (id: string) => void; onPreview?: (id: string | null) => void }) {
   const at = Math.max(0, stops.findIndex((o) => o.id === value));
   const [drag, setDrag] = useState<number | null>(null);
   const track = useRef<HTMLDivElement>(null);
   const last = useRef(at);
   const dragging = useRef<number | null>(null);
   const n = stops.length;
-  const pos = drag ?? at / (n - 1);
+  const pos = drag ?? at / Math.max(1, n - 1);
   useLayoutEffect(() => {
     last.current = at;
   }, [at]);
@@ -254,7 +289,7 @@ export function Dial({
   const shownAt = drag !== null ? near(drag) : at;
   return (
     <div
-      className="dial no-drag"
+      className="slider no-drag"
       role="slider"
       aria-label={label}
       aria-valuemin={0}
@@ -263,8 +298,7 @@ export function Dial({
       aria-valuetext={stops[at]?.name}
       tabIndex={0}
       data-drag={drag !== null || undefined}
-      data-named={named || undefined}
-      style={{ '--u': pos, '--n': n } as React.CSSProperties}
+      style={{ '--u': pos } as CSSProperties}
       onKeyDown={(e) => {
         const d = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -1 : 0;
         if (!d) return;
@@ -282,36 +316,22 @@ export function Dial({
       onPointerCancel={() => dragging.current !== null && end(dragging.current)}
       onLostPointerCapture={() => dragging.current !== null && end(dragging.current)}
     >
-      <div className="dial-track" ref={track}>
-        <span className="dial-fill" />
+      <div className="slider-track" ref={track}>
+        <span className="slider-fill" />
         {stops.map((o, i) => (
-          <i key={o.id} className="dial-stop" data-on={i <= shownAt || undefined} style={{ left: `${(i / (n - 1)) * 100}%` }} />
+          <i key={o.id} className="slider-stop" data-on={i <= shownAt || undefined} style={{ left: `${(i / Math.max(1, n - 1)) * 100}%` }} />
         ))}
-        <span className="dial-knob" />
+        <span className="slider-thumb" />
       </div>
-      {named ? (
-        <div className="dial-names" aria-hidden>
-          {stops.map((o, i) => (
-            <span key={o.id} data-on={i === shownAt || undefined} style={{ left: `${(i / (n - 1)) * 100}%` }} data-end={i === 0 ? 'start' : i === n - 1 ? 'end' : undefined}>
-              {o.name}
-            </span>
-          ))}
-        </div>
-      ) : (
-        <div className="dial-ends" aria-hidden>
-          <span>{stops[0]?.name}</span>
-          <span>{stops[n - 1]?.name}</span>
-        </div>
-      )}
     </div>
   );
 }
 
-/** A few named options with one chosen: the choice is a solid pill that slides to the one you pick. */
+/** A few named options with one chosen: the choice is a flat pill that slides to the one you pick. */
 export function Segmented({ label, options, value, onPick }: { label: string; options: { id: string; name: string }[]; value?: string; onPick: (id: string) => void }) {
   const i = Math.max(0, options.findIndex((o) => o.id === value));
   return (
-    <div className="seg no-drag" role="radiogroup" aria-label={label} style={{ '--n': options.length, '--i': i } as React.CSSProperties}>
+    <div className="seg no-drag" role="radiogroup" aria-label={label} style={{ '--n': options.length, '--i': i } as CSSProperties}>
       {value !== undefined && <span className="seg-thumb" aria-hidden />}
       {options.map((o) => (
         <button

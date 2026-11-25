@@ -178,29 +178,29 @@ export async function createChat(c: NewChoice, text: string) {
 
 export function AgentSheet({ open, onClose, c }: { open: boolean; onClose: () => void; c: NewChoice }) {
   return (
-    <Sheet open={open} onClose={onClose} title="Agent">
-      <div className="setup-list" role="radiogroup" aria-label="Agent">
-        {c.agents.map((id) => (
-          <button
-            key={id}
-            type="button"
-            role="radio"
-            aria-checked={c.agent === id}
-            className="setup-row setup-row-mark"
-            data-on={c.agent === id || undefined}
-            onClick={() => {
-              haptic('select');
-              c.setAgent(id);
-              onClose();
-            }}
-          >
-            <ProviderMark provider={id} size={20} />
-            <span className="setup-row-name">{PROVIDER_NAME[id]}</span>
-            <span className="setup-radio" aria-hidden>
-              <i />
-            </span>
-          </button>
-        ))}
+    <Sheet open={open} onClose={onClose} label="Agent">
+      <div className="mp">
+        <div className="mp-models" role="radiogroup" aria-label="Agent">
+          {c.agents.map((id) => (
+            <button
+              key={id}
+              type="button"
+              role="radio"
+              aria-checked={c.agent === id}
+              className="mp-row"
+              data-on={c.agent === id || undefined}
+              onClick={() => {
+                haptic('select');
+                c.setAgent(id);
+                onClose();
+              }}
+            >
+              <ProviderMark provider={id} size={16} />
+              <span className="mp-name">{PROVIDER_NAME[id]}</span>
+              {c.agent === id && <Icon name="check" size={16} weight="bold" className="mp-check" />}
+            </button>
+          ))}
+        </div>
       </div>
     </Sheet>
   );

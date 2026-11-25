@@ -346,106 +346,54 @@
   color: var(--text);
 }
 
-/* ── the setup sheet: model, effort, speed, permissions ── */
-.setup {
+/* ── the model panel and the permissions sheet (2.18): the desktop's panel at hand size ──
+   Rows of 48 px on the sheet's ink (no wells, no radio discs): the agent's mark or the mode's icon,
+   the name, the check at the end of the one in use; the other agents' models under their agent's
+   name; a hairline, the speeds as one row, and effort as one slider at the foot, its level named
+   over it. Held, a row takes one fill step in the frame. */
+.mp {
   display: flex;
   flex-direction: column;
-  gap: 26px;
-  padding: 10px 4px 4px;
+  padding: 0 0 2px;
 }
 
-.setup-sec {
+.mp-models {
   display: flex;
   flex-direction: column;
-  gap: 11px;
 }
 
-.setup-head {
+.mp-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin: 0 6px;
-  min-height: 18px;
-  font-size: var(--t-small);
-  font-weight: var(--w-medium);
-  color: var(--text-3);
-}
-
-.setup-head > span:first-of-type {
-  flex: 1;
-}
-
-.setup-value {
-  font-size: var(--t-small);
-  font-weight: var(--w-strong);
-  color: var(--text);
-}
-
-.setup-list {
-  display: flex;
-  flex-direction: column;
-  border-radius: var(--r-lg);
-  background: rgb(255 255 255 / 0.03);
-  box-shadow: inset 0 0 0 1px var(--line);
-  overflow: hidden;
-}
-
-.setup-skel {
-  gap: 22px;
-  padding: 19px 18px;
-}
-
-.setup-row {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 13px;
-  min-height: 52px;
-  padding: 0 16px 0 18px;
+  gap: 14px;
+  height: 48px;
+  padding: 0 12px;
+  border-radius: calc(var(--r-sheet) - 12px);
   font-size: var(--t-body);
   font-weight: var(--w-medium);
   color: var(--text-2);
   text-align: left;
-  transition: background-color 100ms, color 160ms;
+  transition: background-color 100ms, color 140ms;
 }
 
-.setup-row + .setup-row::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 18px;
-  right: 18px;
-  height: 1px;
-  background: var(--line);
+.mp-row:active {
+  background-color: var(--fill-2);
+  transition-duration: 0ms, 140ms;
 }
 
-.setup-row:active {
-  background: var(--fill-2);
-}
-
-.setup-row[data-on] {
-  color: var(--text);
-  font-weight: var(--w-strong);
-}
-
-/* a permission's glyph: quiet, bright when chosen; Bypass keeps a hint of its weight when chosen */
-.setup-row-icon {
-  flex-shrink: 0;
-  margin-left: -2px;
-  color: var(--text-3);
-  transition: color 160ms;
-}
-
-.setup-row[data-on] .setup-row-icon {
+.mp-row[data-on] {
   color: var(--text);
 }
 
-/* rows with a glyph: the hairline starts at the words, as in every list with a glyph column */
-.setup-row:has(.setup-row-icon) + .setup-row::before {
-  left: 50px;
+.mp-row[aria-disabled='true'] {
+  color: var(--text-4);
 }
 
-.setup-row-name {
+.mp-row[aria-disabled='true']:active {
+  background-color: transparent;
+}
+
+.mp-name {
   flex: 1;
   min-width: 0;
   white-space: nowrap;
@@ -453,193 +401,160 @@
   text-overflow: ellipsis;
 }
 
-.setup-radio {
-  display: grid;
-  place-items: center;
+.mp-icon {
   flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  box-shadow: inset 0 0 0 1.5px var(--line-3);
-  transition: background-color 160ms var(--ease-out);
-}
-
-.setup-radio i {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--ink);
-  transform: scale(0);
-  transition: transform 260ms var(--ease-spring);
-}
-
-.setup-row[data-on] .setup-radio {
-  background: var(--text);
-  box-shadow: none;
-}
-
-.setup-row[data-on] .setup-radio i {
-  transform: scale(1);
-}
-
-/* the other agents' models: picking one switches the chat to that agent */
-.setup-away {
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-  margin-top: 8px;
-}
-
-.setup-away-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 6px;
-  font-size: var(--t-small);
-  font-weight: var(--w-strong);
   color: var(--text-3);
 }
 
-.setup-away-rows {
+.mp-row[data-on] .mp-icon {
+  color: var(--text);
+}
+
+.mp-row[data-tone='danger'] .mp-icon {
+  color: var(--red);
+}
+
+.mp-check {
+  flex-shrink: 0;
+  color: var(--text);
+}
+
+.mp-skel .skel {
+  height: 12px;
+}
+
+.mp-away {
   display: flex;
   flex-direction: column;
 }
 
-.setup-row-away .setup-away-go {
-  color: var(--text-4);
-  flex-shrink: 0;
-  transition: transform 160ms var(--ease-out), color 120ms;
+.mp-away-head {
+  display: flex;
+  align-items: center;
+  height: 36px;
+  margin: 6px 12px 0;
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+  color: var(--text-3);
 }
 
-.setup-row-away:active .setup-away-go {
+.mp-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin: 10px 0 0;
+  padding: 16px 0 0;
+  box-shadow: inset 0 1px 0 var(--line);
+}
+
+/* the speeds' well and its pill take the sheet's corner less their inset (12 px, then 4) */
+.mp-foot .seg {
+  border-radius: calc(var(--r-sheet) - 12px);
+}
+
+.mp-foot .seg-thumb {
+  border-radius: calc(var(--r-sheet) - 16px);
+}
+
+.mp-fixed {
+  margin: 0;
+  height: 72px;
+  display: grid;
+  place-items: center;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.mp-level {
+  height: 22px;
+  text-align: center;
+  font-size: var(--t-body);
+  font-weight: var(--w-strong);
   color: var(--text);
-  transform: translateX(3px);
 }
 
-.setup-row-away[aria-disabled='true'] {
-  color: var(--text-4);
-}
-
-.setup-row-away[aria-disabled='true']:active {
-  background: transparent;
-}
-
-.setup-away-skel .setup-row {
-  pointer-events: none;
-}
-
-.setup-away-skel .skel {
-  height: 11px;
-}
-
-/* effort: a track with a stop per level, filled to the chosen one; the knob follows the finger */
-.dial {
+/* the slider: a thin track, an ivory fill to the thumb whose head breaks into dither, a dot per stop */
+.slider {
   position: relative;
-  padding: 19px 13px 0;
+  display: flex;
+  align-items: center;
+  height: 48px;
+  padding: 0 14px;
   outline: none;
   touch-action: none;
 }
 
-/* the track is a shallow well the knob travels in */
-.dial-track {
+.slider-track {
   position: relative;
-  height: 6px;
-  border-radius: 3px;
-  background: rgb(255 255 255 / 0.06);
-  box-shadow: var(--press-well);
+  flex: 1;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background-color: rgb(255 255 255 / 0.08);
 }
 
-.dial-fill {
+.slider-fill {
   position: absolute;
   top: 0;
   bottom: 0;
   left: 0;
-  width: calc(var(--u) * 100%);
+  /* the dithered head stands just before the thumb, not under it */
+  width: max(0px, calc(var(--u) * 100% - 10px));
+  padding-right: 8px;
   border-radius: inherit;
-  background: var(--text);
+  background: rgb(242 241 238 / 0.82) content-box;
   transition: width 300ms var(--ease-spring);
 }
 
-.dial-stop {
+.slider-fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  background-color: rgb(242 241 238 / 0.82);
+  -webkit-mask: var(--checker) 0 0 / 4px 4px;
+  mask: var(--checker) 0 0 / 4px 4px;
+}
+
+.slider-stop {
   position: absolute;
   top: 50%;
   width: 4px;
   height: 4px;
   margin: -2px 0 0 -2px;
   border-radius: 50%;
-  background: rgb(255 255 255 / 0.28);
+  background: rgb(255 255 255 / 0.3);
 }
 
-.dial-stop[data-on] {
-  background: rgb(10 10 11 / 0.55);
+.slider-stop[data-on] {
+  background: rgb(10 10 11 / 0.5);
 }
 
-.dial-knob {
+.slider-thumb {
   position: absolute;
   top: 50%;
   left: calc(var(--u) * 100%);
-  width: 26px;
-  height: 26px;
-  margin: -13px 0 0 -13px;
+  width: 24px;
+  height: 24px;
+  margin: -12px 0 0 -12px;
   border-radius: 50%;
-  /* a small ivory key: a lit top lip, a shaded lower lip, a short drop; a ring of the sheet's ink parts it from the track */
   background-color: var(--text);
-  box-shadow: var(--thumb-up), 0 0 0 4px var(--sheet-ink), 0 4px 10px -3px rgb(0 0 0 / 0.6);
-  transition: left 300ms var(--ease-spring), transform 160ms var(--ease-out);
+  box-shadow: var(--thumb-up);
+  transition: left 300ms var(--ease-spring), scale 160ms var(--ease-out);
 }
 
-.dial[data-drag] .dial-fill {
+.slider[data-drag] .slider-fill {
   transition: none;
 }
 
-.dial[data-drag] .dial-knob {
-  transition: transform 160ms var(--ease-out);
-  transform: scale(1.1);
+.slider[data-drag] .slider-thumb {
+  transition: scale 160ms var(--ease-out);
+  scale: 1.12;
 }
 
-.dial:focus-visible .dial-knob {
-  box-shadow: var(--thumb-up), 0 0 0 4px var(--sheet-ink), 0 0 0 6px rgb(242 241 238 / 0.5);
-}
-
-.dial-ends {
-  display: flex;
-  justify-content: space-between;
-  margin: 15px -13px 0;
-  padding: 0 2px;
-  font-size: var(--t-caption);
-  color: var(--text-4);
-}
-
-/* each level named under its stop; the one under the finger (or chosen) bright */
-.dial-names {
-  position: relative;
-  height: 18px;
-  margin-top: 16px;
-  font-size: var(--t-caption);
-  font-weight: var(--w-medium);
-  color: var(--text-4);
-}
-
-.dial-names span {
-  position: absolute;
-  top: 0;
-  translate: -50% 0;
-  white-space: nowrap;
-  transition: color 140ms;
-}
-
-/* the ends sit on the track's ends (a centred name would hang past it, into the sheet's margin) */
-.dial-names span:first-child {
-  translate: 0 0;
-}
-
-.dial-names span:last-child {
-  translate: -100% 0;
-}
-
-.dial-names span[data-on] {
-  color: var(--text);
-  font-weight: var(--w-strong);
+.slider:focus-visible .slider-thumb {
+  box-shadow: var(--thumb-up), 0 0 0 3px rgb(242 241 238 / 0.45);
 }
 
 .form-error {
@@ -671,213 +586,6 @@
   width: 100%;
 }
 
-/* ── limits: a card per account, a window per row ── */
-.lim-wrap {
-  margin: 0 -2px;
-}
-
-.lim {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 2px 2px 8px;
-}
-
-.lim-card {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  padding: 16px 18px 20px;
-  border-radius: var(--r-xl);
-  background: rgb(255 255 255 / 0.03);
-  box-shadow: inset 0 0 0 1px var(--line);
-}
-
-.lim-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 24px;
-}
-
-.lim-name {
-  font-size: var(--t-body);
-  font-weight: var(--w-strong);
-  letter-spacing: -0.01em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.lim-plan {
-  font-size: var(--t-small);
-  color: var(--text-3);
-  white-space: nowrap;
-}
-
-.lim-aside {
-  margin-left: auto;
-  font-size: var(--t-caption);
-  color: var(--text-3);
-  white-space: nowrap;
-}
-
-.lim-none {
-  margin-top: -6px;
-  font-size: var(--t-small);
-  color: var(--text-3);
-}
-
-.lim-empty {
-  padding: 26px 22px 34px;
-  text-align: center;
-  font-size: var(--t-small);
-  line-height: 1.5;
-  color: var(--text-3);
-}
-
-.lim-win {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.lim-line {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 20px;
-}
-
-.lim-label {
-  font-size: var(--t-small);
-  font-weight: var(--w-medium);
-  color: var(--text-2);
-}
-
-.lim-pct {
-  font-size: var(--t-lead);
-  font-weight: var(--w-strong);
-  letter-spacing: -0.015em;
-  color: var(--text);
-}
-
-.lim-pct small,
-.lim-money small {
-  margin-left: 1px;
-  font-size: var(--t-caption);
-  font-weight: var(--w-medium);
-  letter-spacing: 0;
-  color: var(--text-3);
-}
-
-.lim-money {
-  font-size: var(--t-body);
-  font-weight: var(--w-strong);
-}
-
-/* a meter of ink with an ivory fill whose edge breaks into dither, and a hairline where an even pace would be */
-.lim-meter {
-  position: relative;
-  height: 6px;
-  border-radius: 3px;
-  background: var(--fill-2);
-  overflow: hidden;
-}
-
-.lim-fill {
-  position: absolute;
-  inset: 0;
-  border-radius: 3px 0 0 3px;
-  background: var(--text-2);
-  transform: translateX(calc((var(--p) - 1) * 100%));
-  /* in from empty once; a newer reading then glides to its value */
-  animation: meter-in 900ms var(--ease-out) backwards;
-  animation-delay: calc(var(--d) + 140ms);
-  transition: transform 600ms var(--ease-out);
-}
-
-.lim-fill::before,
-.lim-fill::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 100%;
-  width: 6px;
-  background: inherit;
-  -webkit-mask: var(--checker) 0 0 / 4px 4px;
-  mask: var(--checker) 0 0 / 4px 4px;
-}
-
-.lim-fill::after {
-  left: calc(100% + 6px);
-  -webkit-mask-image: var(--sparse);
-  mask-image: var(--sparse);
-}
-
-@keyframes meter-in {
-  from {
-    transform: translateX(-100%);
-  }
-}
-
-.lim-tick {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  margin-left: -1px;
-  background: var(--bg);
-  opacity: 0.9;
-}
-
-.lim-win[data-level='amber'] .lim-fill {
-  background: var(--amber);
-}
-
-.lim-win[data-level='red'] .lim-fill {
-  background: var(--red);
-}
-
-.lim-win[data-level='amber'] .lim-pct {
-  color: var(--amber);
-}
-
-.lim-win[data-level='red'] .lim-pct {
-  color: var(--red);
-}
-
-.lim-note {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 16px;
-  font-size: var(--t-caption);
-  color: var(--text-3);
-}
-
-.lim-note [data-warn] {
-  color: var(--amber);
-}
-
-.lim-credits {
-  display: flex;
-  justify-content: space-between;
-  font-size: var(--t-small);
-}
-
-.lim-skel .skel {
-  height: 10px;
-}
-
-.lim-skel .lim-skel-mark {
-  width: 16px;
-  height: 16px;
-  border-radius: 5px;
-}
-
 /* ── what the agent asks: a permission or questions ── */
 .ask {
   display: flex;
@@ -889,20 +597,16 @@
 .ask-head {
   display: flex;
   align-items: flex-start;
-  gap: 14px;
+  gap: 12px;
 }
 
-/* the tool's glyph in a quiet ink well, level with the title's first line */
+/* the tool's mark: an amber icon leading the title's first line (the desktop's card that asks, 2.18; was
+   a glyph in an ink well) */
 .ask-glyph {
   display: grid;
   place-items: center;
-  width: 40px;
-  height: 40px;
-  margin-top: -6px;
-  border-radius: var(--r-md);
-  background: var(--fill-2);
-  box-shadow: inset 0 0 0 1px var(--line);
-  color: var(--text);
+  height: 24px;
+  color: var(--amber);
   flex-shrink: 0;
 }
 
@@ -1289,12 +993,31 @@
 }
 
 .q-title {
-  padding: 0 2px;
+  padding: 0 16px;
 }
 
-/* the answers' card and the key under it are one width: one column, edges on one line */
+/* the answers as plain rows (2.18, the desktop's card that asks): nothing at rest, no well around them,
+   the press fill, the chosen one a flat pill; their marks on the question's text edge */
 .q-choices {
   margin: 0;
+  gap: 2px;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.q-choices .choice {
+  border-radius: calc(var(--r-sheet) - 12px);
+}
+
+.q-choices .choice + .choice::before {
+  display: none;
+}
+
+.q-choices .choice-mark[data-selected] {
+  background: var(--fill-2);
+  box-shadow: var(--press-up);
 }
 
 .q-other {
