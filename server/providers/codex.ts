@@ -264,6 +264,15 @@ export class CodexProvider implements Provider {
   readonly sessions = new Map<string, CodexSession>();
   /** Includes sessions still waiting for thread/resume on this process. */
   readonly attached = new Map<CodexSession, CodexRpc>();
+  // A timed-out resume or unsubscribe can outlive its handle, including a close at a limit.
+  readonly threadWriters = new Map<string, CodexRpc>();
+  conversationReleased(id: string) {
+    return !this.threadWriters.has(id);
+  }
+  async unsubscribe(rpc: CodexRpc, id: string, reloading = false) {
+    await rpc.request('thread/unsubscribe', { threadId: id }, 10_000);
+    if (!reloading && this.threadWriters.get(id) === rpc) this.threadWriters.delete(id);
+  }
   /** Codex's own sub-agents by their thread, to the chat whose spawn step shows them (news of their threads goes there). */
   readonly receivers = new Map<string, CodexSession>();
   /** Turns of threads no spawn registered yet (thread id → turn id): taken when the spawn registers them. */
@@ -410,6 +419,7 @@ export class CodexProvider implements Provider {
   }
 
   private onExit(rpc: CodexRpc, info: ExitInfo) {
+    for (const [id, owner] of this.threadWriters) if (owner === rpc) this.threadWriters.delete(id);
     if (this.rpc === rpc) this.rpc = null;
     this.remoteOn = false;
     if (this.stopping === rpc) {
@@ -1392,6 +1402,7 @@ class CodexSession implements ProviderSession {
     let resumed = false;
     if (threadId) {
       try {
+        this.provider.threadWriters.set(threadId, rpc);
         resp = await rpc.request<ThreadStartResponse>('thread/resume', { ...params, threadId, excludeTurns: true }, THREAD_TIMEOUT);
         resumed = true;
       } catch (err) {
@@ -1402,6 +1413,7 @@ class CodexSession implements ProviderSession {
     // Dynamic tools exist only on thread/start (a resumed thread keeps what it was started with).
     const dynamicTools = this.provider.dynamicTools(rt.meta);
     resp ??= await rpc.request<ThreadStartResponse>('thread/start', dynamicTools ? { ...params, dynamicTools } : params, THREAD_TIMEOUT);
+    this.provider.threadWriters.set(resp.thread.id, rpc);
     // Still wanted? Only then is anything of it committed.
     if (epoch !== undefined && (this.closed || epoch !== this.loadEpoch)) {
       // A thread it opened that this session does not go on with: let go (one a newer reload resumes again stays).
@@ -1492,7 +1504,7 @@ class CodexSession implements ProviderSession {
           return false;
         }));
         if (this.provider.delegateOwner && released.includes(false)) await this.provider.dispose(true);
-      } else await rpc.request('thread/unsubscribe', { threadId: this.threadId }, 10_000).catch(() => {});
+      } else await this.provider.unsubscribe(rpc, this.threadId, !!this.reloading).catch(() => {});
     }
     this.dropReceivers();
     this.provider.attached.delete(this);
@@ -1602,7 +1614,7 @@ class CodexSession implements ProviderSession {
     if (!this.optionsDirty || !this.loaded || this.rt.delegates.size) return;
     this.optionsDirty = false;
     const rpc = await this.provider.client().catch(() => null);
-    await rpc?.request('thread/unsubscribe', { threadId: this.threadId }, 10_000).catch(() => {});
+    if (rpc) await this.provider.unsubscribe(rpc, this.threadId, !!this.reloading).catch(() => {});
     this.loaded = false;
     this.loadEpoch++;
   }

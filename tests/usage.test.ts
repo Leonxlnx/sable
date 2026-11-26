@@ -2,7 +2,7 @@
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BridgeEvent, RateLimit } from '@shared/protocol';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
@@ -45,6 +45,25 @@ function write(file: string, lines: string[]) {
 const sum = (rows: { input: number; output: number; cacheRead: number; cacheWrite: number }[], k: 'input' | 'output' | 'cacheRead' | 'cacheWrite') => rows.reduce((n, r) => n + r[k], 0);
 
 describe('transcript scanner', () => {
+  it('counts each path, then persists a deletion-only scan with the surviving account and totals', async () => {
+    const root = tmp();
+    const sources = ['first', 'second'].map(accountId => ({ provider: 'claude', format: 'claude', accountId, dir: path.join(root, accountId) }) as const);
+    for (const src of sources) write(path.join(src.dir, 'k', 's.jsonl'), [assistant({ id: 'reply', session: 's', t: NOW })]);
+    const opts = { cacheFile: path.join(root, 'cache.json') };
+    const scanner = new UsageScanner(opts);
+    await scanner.scan(sources);
+    expect(scanner.report().rows[0].input).toBe(20);
+    await scanner.flush();
+    rmSync(path.join(sources[0].dir, 'k', 's.jsonl'));
+    expect((await scanner.scan(sources)).read).toBe(0);
+    await vi.waitFor(async () => {
+      const reopened = new UsageScanner(opts);
+      await reopened.ready();
+      expect(reopened.report().rows[0].input).toBe(10);
+      expect(reopened.report().sessions['claude:s'].accountId).toBe('second');
+    }, { timeout: 5000, interval: 100 });
+  });
+
   it('reads Claude Code transcripts: one count per reply, malformed lines skipped, titles, cost, two accounts', async () => {
     const root = tmp();
     const a = path.join(root, 'a', 'projects');

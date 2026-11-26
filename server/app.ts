@@ -64,6 +64,7 @@ import type { DelegateReceipts, Provider, ProviderContext, ProviderSession } fro
 import { atCap, findAccountFolders, folderLabel, labelFromAuth, pickNextAccount } from './accounts/folders';
 import { bigContext, changedFiles, COMPACT_OPENER, COMPACT_TIMEOUT_MS, contextClause, isSlashCommand, lostClause, moveNote, type MoveOutcome } from './core/move-context';
 import { handoverText } from './accounts/handover';
+import { ConversationCopies } from './accounts/dedupe';
 import { itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
 import { runsTask, worksInBackground } from '../shared/background';
 import { runSubAgent } from './core/sub-agent';
@@ -274,6 +275,7 @@ export class App {
   /** Counts `limits.updated` events from each account's provider (so `provider.limits` does not repeat one). */
   private limitsSeq = new Map<string, number>();
   readonly sessions = new Map<string, SessionRuntime>();
+  private readonly conversationCopies: ConversationCopies;
   /** Updates of the desktop app (`services/update.ts`), when the shell can install them. */
   updates?: { readonly installing?: boolean; state: UpdateState; dispose(): void };
   private listeners = new Set<(e: BridgeEvent) => void>();
@@ -543,6 +545,14 @@ export class App {
     }
     this.registerCore();
     this.restoreRegistry(opts.returnAtStartMs);
+    this.conversationCopies = new ConversationCopies(this, () => this.disposed || !!this.updates?.installing, id => {
+      const rt = this.sessions.get(id);
+      if (!rt) return false; // An unavailable agent's chat can still own a saved leg.
+      const w = this.workOf(rt);
+      return !!(w.turn || w.agents || w.commands || rt.meta.moving || this.moveAttempts.has(rt) || this.switching.has(id) ||
+        this.opening.has(id) || this.delivering.has(id) || this.dispatching.has(id) || this.sending.has(id) || this.writers.get(rt)?.size ||
+        rt.meta.status === 'starting' || rt.meta.status === 'running' || rt.meta.status === 'awaiting');
+    });
   }
 
   private restoreRegistry(pacing?: AppOptions['returnAtStartMs']) {
@@ -1578,11 +1588,11 @@ export class App {
     return run;
   }
 
-  private steerReads = new WeakMap<SessionRuntime, Map<string, Promise<void>>>();
+  private steerReads = new WeakMap<SessionRuntime, Map<string, { latest: string; pending: Set<string> }>>();
 
   /** A deadline bounds the caller's wait. A later positive still owns its exact UUID. */
   private async restoreSteerReceipts(rt: SessionRuntime, only?: string) {
-    const reads = this.steerReads.get(rt) ?? new Map<string, Promise<void>>();
+    const reads = this.steerReads.get(rt) ?? new Map<string, { latest: string; pending: Set<string> }>();
     this.steerReads.set(rt, reads);
     const groups = new Map<string, { to: NonNullable<UserItem['issuedTo']>; ids: Set<string> }>();
     const pending = new Set<Promise<void>>();
@@ -1591,25 +1601,34 @@ export class App {
       if (!uuid || only && uuid !== only) continue;
       if (row.issuedTo?.stillQueued && !rt.handle?.stillQueued?.(uuid)) rt.forgetLiveQueue(uuid);
       const to = row.issuedTo;
-      const elsewhere = !to?.session || rt.meta.provider !== to.provider || (rt.meta.accountId ?? DEFAULT_ACCOUNT) !== (to.accountId ?? DEFAULT_ACCOUNT) || rt.meta.providerSessionId !== to.session;
+      const leg = rt.meta.provider === to?.provider ? rt.meta : rt.meta.agents?.find(l => l.provider === to?.provider);
+      const carried = !!to?.session && leg?.providerSessionId === to.session;
+      const accountId = carried ? leg.accountId : to?.accountId;
+      const elsewhere = !carried || rt.meta.provider !== to.provider;
       rt.queueReason(row.id, elsewhere ? (to?.stillQueued ? 'Claude reported this input still queued. This chat cannot receive its original receipt.' : 'This chat cannot receive the original Claude receipt. Check the original conversation before sending again.')
         : to.stillQueued ? 'Claude still has this input queued.' : 'Issued to Claude. Receipt unknown.');
       if (!to?.session) continue;
       const existing = reads.get(uuid);
-      if (existing) continue; // One observer owns this UUID. A concurrent retry sees the registered read.
-      const key = JSON.stringify([to.accountId, to.session, to.cwd]);
+      if (existing) {
+        existing.latest = accountId ?? DEFAULT_ACCOUNT;
+        if (existing.pending.has(existing.latest)) continue;
+      }
+      const key = JSON.stringify([accountId, to.session, to.cwd]);
       let group = groups.get(key);
-      if (!group) groups.set(key, group = { to, ids: new Set() });
+      if (!group) groups.set(key, group = { to: { ...to, accountId }, ids: new Set() });
       group.ids.add(uuid);
     }
     for (const { to, ids } of groups.values()) {
+      // A read started before a carry can still confirm the UUID. Its failure must not
+      // hide a receipt from the new account. Explicit resend waits for both observers.
+      const account = to.accountId ?? DEFAULT_ACCOUNT;
       const read = Promise.resolve().then(() => {
         const provider = this.provider(to.provider, to.accountId);
         if (!provider.steerReceipts) throw Error('Original Claude history is unavailable.');
         return provider.steerReceipts(to.session!, to.cwd, ids);
       }).catch(err => {
         if (!this.disposed && this.sessions.get(rt.id) === rt) {
-          for (const row of rt.queue) if (row.issuedUuid && ids.has(row.issuedUuid))
+          for (const row of rt.queue) if (row.issuedUuid && ids.has(row.issuedUuid) && reads.get(row.issuedUuid)?.latest === account)
             rt.queueReason(row.id, row.issuedTo?.stillQueued ? 'Claude reported this input still queued. Its original receipt is unavailable.' : 'The original Claude receipt is unavailable. Check that conversation before sending again.');
         }
         this.log('Could not check the original Claude receipt', String(err));
@@ -1620,8 +1639,18 @@ export class App {
           for (const uuid of receipts ?? []) if (ids.has(uuid) && rt.confirmSteerReceipt(uuid)) changed = true;
           if (changed) await rt.persistInput?.();
         }).catch(err => this.log('Could not save the original Claude receipt', String(err)))
-        .finally(() => { for (const uuid of ids) reads.delete(uuid); });
-      for (const uuid of ids) reads.set(uuid, read);
+        .finally(() => {
+          for (const uuid of ids) {
+            const observer = reads.get(uuid)!;
+            observer.pending.delete(account);
+            if (!observer.pending.size) reads.delete(uuid);
+          }
+        });
+      for (const uuid of ids) {
+        const observer = reads.get(uuid) ?? { latest: account, pending: new Set<string>() };
+        observer.pending.add(account);
+        reads.set(uuid, observer);
+      }
       pending.add(read);
     }
     if (pending.size) await boundedBy(Promise.all(pending), 3000, undefined);
@@ -4674,6 +4703,7 @@ export class App {
       void this.emitProvider(provider).catch(() => {});
       this.scheduleResetAlert();
     }
+    if (carried === 'conversation' && id) await this.conversationCopies.moved(rt.meta, id, accountId, fromId);
     return { ok: true, carried };
   }
 
@@ -6654,6 +6684,8 @@ export class App {
       void this.store.flush().catch(err => this.log('delegate quit checkpoint failed', err));
       await boundedBy(Promise.allSettled(children), Math.max(1, deadline - Date.now() - 2000), undefined);
     }
+    const registryReads = this.conversationCopies.finishRegistryReads();
+    if (registryReads) await boundedBy(registryReads, Math.max(1, deadline - Date.now() - 2000), undefined);
     const durable = await boundedBy(this.store.seal().then(() => true, (err: Error) => err), Math.max(1, deadline - Date.now()), false);
     const drainAgents = this.journal.active;
     if (durable === true && !childSaveError && !drainAgents) saved?.();

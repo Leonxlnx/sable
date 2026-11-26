@@ -251,7 +251,11 @@ export class UsageScanner {
         await slicer.tick();
       }
     }
-    for (const file of Object.keys(this.index.files)) if (!seen.has(file)) delete this.index.files[file];
+    let removed = false;
+    for (const file of Object.keys(this.index.files)) if (!seen.has(file)) {
+      delete this.index.files[file];
+      removed = true;
+    }
     todo.sort((a, b) => b.mtime - a.mtime);
     let read = 0;
     let bytes = 0;
@@ -279,7 +283,7 @@ export class UsageScanner {
       }
     }
     this.scannedAt = this.now();
-    if (read) this.save();
+    if (read || removed) this.save();
     return { files: seen.size, read, bytes, ms: Math.round(performance.now() - t0), slowest: slowest.sort((a, b) => b[1] - a[1]) };
   }
 
