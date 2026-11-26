@@ -1,24 +1,25 @@
 import { createServer as https } from 'node:https';
-import { createServer as http, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { Socket } from 'node:net';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { pipeline } from 'node:stream/promises';
+import type { Duplex } from 'node:stream';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { webNetworks } from './web-networks';
 import { realpath } from 'node:fs/promises';
 import { WebSocketServer } from 'ws';
-import { WEB_SHIPS, type WebState } from '../../shared/protocol';
+import { WEB_SHIPS, type WebNetwork, type WebState } from '../../shared/protocol';
 import { openContained, within } from '../core/contain';
 import type { App } from '../app';
 import type { PhoneService } from './phone';
-import { webAddresses, webCertificates, privateIPv4, webHostname } from './web-cert';
+import { webCertificates, privateIPv4, webHostname } from './web-cert';
 
-/** Before release, verify the installed root's name constraints on the target iPad and its fingerprint
- * during bootstrap. Only the shipped bundle under resources/web is executable on this origin. */
+/** The owner transfers ca.cer over an authenticated channel before opening the web client. */
 export interface WebOptions {
   assets?: string;
-  addresses?: () => string[];
+  networks?: () => WebNetwork[] | Promise<WebNetwork[]>;
   /** Bind fixtures to loopback while exercising the production Host and TLS checks. */
   loopback?: boolean;
   port?: number;
-  caPort?: number;
 }
 export interface WebChannel {
   active(): boolean;
@@ -50,173 +51,177 @@ async function staticFile(root: string, target: string, res: ServerResponse) {
   if (!mime || !within(root, file) || path.relative(file, await realpath(file)) !== '') throw Error();
   const { fh, inside } = await openContained(file, root, true);
   try {
-    if (!inside || res.destroyed) throw Error();
-    const bytes = await fh.readFile();
-    res.writeHead(200, { 'Content-Type': mime }).end(bytes);
+    if (!inside || res.destroyed || (await fh.stat()).size > 8 * 1024 * 1024) throw Error();
+    res.writeHead(200, { 'Content-Type': mime });
+    await pipeline(fh.createReadStream(), res);
   } finally { await fh.close(); }
 }
 
 export function registerWeb(app: App, makeChannel: (channel: WebChannel) => PhoneService, opts: WebOptions = {}) {
-  const enabled = () => WEB_SHIPS && app.store.state.settings.webRemote === true && !disposed;
-  const servers = new Set<Server>();
-  const sockets = new Set<Socket>();
+  const servers = new Set<Server>(), sockets = new Set<Duplex>();
   const since = new Map<string, number>();
-  let disposed = false;
-  let epoch = 0;
-  let channel: PhoneService | undefined;
-  let wss: WebSocketServer | undefined;
-  let certs: Certificates | undefined;
-  let ports: { port: number; caPort: number } | undefined;
-  let error: string | undefined;
-  let startup: Promise<void> | undefined;
-  let timer: NodeJS.Timeout | undefined;
-  let expiry: NodeJS.Timeout | undefined;
-  const active = () => enabled() && !!ports;
-  const state = (): WebState => {
-    if (!enabled()) return { listening: false, addresses: [], clients: [], devices: [] };
-    const status = channel?.status();
-    const devices = status?.devices ?? [];
-    const clients = devices.filter(d => d.online).map(d => ({ id: d.id, label: d.name, since: since.get(d.id)! }));
-    for (const id of since.keys()) if (!clients.some(c => c.id === id)) since.delete(id);
-    return { listening: active(), addresses: certs?.addresses ?? [], ...ports, devices, clients,
-      hostname: certs?.host, caFingerprint: certs?.ca.fingerprint256, pairing: status?.pairing,
-      request: status?.request, error: error ?? status?.saveError ?? status?.error };
-  };
-  const changed = () => { if (!disposed) app.emit({ type: 'web.updated', state: state() }); };
+  const enabled = () => WEB_SHIPS && app.store.state.settings.webRemote === true && !disposed;
+  const selection = () => app.store.state.settings.webNetwork;
+  let requestedNetwork: string | undefined;
+  let disposed = false, epoch = 0, reads = 0;
+  let channel: PhoneService | undefined, hub: WebSocketServer | undefined;
+  let certs: Certificates | undefined, port: number | undefined, networkId: string | undefined;
+  let networks: WebNetwork[] = [], error: string | undefined;
+  let startup: Promise<void> | undefined, inventory: Promise<WebNetwork[]> | undefined;
+  let timer: NodeJS.Timeout | undefined, expiry: NodeJS.Timeout | undefined;
+  const active = () => enabled() && !!port && networkId === selection();
   const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
   const root = opts.assets ?? (resources && path.join(resources, 'web'));
-  function stop(disable = false) {
+  function manage() {
+    if (!WEB_SHIPS || disposed) throw Error('Web access is off.');
+    return channel ??= makeChannel({ active, changed, connected: (id, at) => { if (!since.has(id)) since.set(id, at); },
+      link: (key, fp) => 'https://' + certs!.addresses[0] + ':' + port + '/#p=' + key + '&f=' + fp });
+  }
+  function state(): WebState {
+    const status = channel?.status(), devices = status?.devices ?? [];
+    const clients = devices.filter(d => d.online).map(d => ({ id: d.id, label: d.name, since: since.get(d.id)! }));
+    for (const id of since.keys()) if (!clients.some(c => c.id === id)) since.delete(id);
+    return { listening: active(), addresses: certs?.addresses ?? [], port, devices, clients, networks,
+      hostname: certs?.host, caFingerprint: certs?.ca.fingerprint256, caReplacement: certs?.replacement, pairing: status?.pairing,
+      request: status?.request, revocationDurable: !status?.saveError, error: error ?? status?.saveError ?? status?.error };
+  }
+  function changed() { if (!disposed) app.emit({ type: 'web.updated', state: state() }); }
+  function stop() {
     epoch++;
     clearTimeout(expiry);
-    clearInterval(timer);
-    expiry = timer = undefined;
-    ports = certs = undefined;
-    for (const server of servers) server.close();
-    for (const socket of sockets) socket.destroy();
+    port = certs = networkId = undefined;
+    for (const s of servers) s.close();
+    for (const s of sockets) s.destroy();
     servers.clear();
-    if (wss) {
-      for (const ws of wss.clients) ws.terminate();
-      wss.close();
-      wss = undefined;
-    }
-    if (channel) {
-      if (disable) void channel.setEnabled(false);
-      else void channel.stop();
-    }
+    hub?.clients.forEach(ws => ws.terminate());
+    hub?.close();
+    hub = undefined;
+    if (channel) void channel.setEnabled(false);
     since.clear();
     startup = undefined;
-    error = undefined;
   }
-
+  function currentNetworks() {
+    return inventory ??= Promise.resolve().then(opts.networks ?? webNetworks).then(rows =>
+      rows.filter((n, i) => privateIPv4(n.address) && rows.findIndex(r => r.id === n.id) === i &&
+        !rows.some(r => r.address === n.address && r.id !== n.id))).finally(() => { inventory = undefined; });
+  }
   async function start(generation: number) {
+    const available = await currentNetworks();
+    if (epoch !== generation || !enabled()) return;
+    const inventoryChanged = JSON.stringify(networks) !== JSON.stringify(available);
+    networks = available;
+    const selected = networks.find(n => n.id === selection() && privateIPv4(n.address));
+    if (!selected) throw Error('Select an available home network and address on the desktop.');
+    if (active() && certs?.host === webHostname() && certs.addresses[0] === selected.address &&
+        Date.parse(certs.cert.validTo) - Date.now() >= 30 * 86_400_000 && Date.parse(certs.intermediate.validTo) > Date.now()) {
+      if (inventoryChanged) changed();
+      return;
+    }
+    if (port) { stop(); sync(); return; }
     if (!root) throw Error('Packaged web assets are unavailable.');
     const assets = root;
-    const ips = (opts.addresses ?? webAddresses)();
-    if (!ips.length) throw Error('No private LAN address is available.');
-    const tls = webCertificates(app.store.dir, ips);
-    const binds = opts.loopback ? ['127.0.0.1'] : tls.addresses;
-    const hub = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
-    wss = hub;
-    hub.on('headers', headers => headers.push(...rawHeaders()));
-    hub.on('wsClientError', (_err, socket) => refuse(socket));
-    const names = [tls.host, ...tls.addresses];
-    function accepts(req: IncomingMessage, bootstrap: boolean) {
-      const port = bootstrap ? ports?.caPort : ports?.port;
+    const tls = webCertificates(app.store.dir, [selected.address]);
+    const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
+    hub = wss;
+    wss.on('headers', headers => headers.push(...rawHeaders()));
+    wss.on('wsClientError', (_err, socket) => refuse(socket));
+    async function accepts(req: IncomingMessage) {
       const peer = req.socket.remoteAddress;
-      return generation === epoch && active() && req.method === 'GET' && req.socket.localPort === port &&
-        req.headersDistinct.host?.length === 1 && !!peer &&
-        (privateIPv4(peer) || opts.loopback && peer === '127.0.0.1') &&
-        names.some(n => req.headers.host === n + ':' + port);
+      if (generation !== epoch || !active() || req.method !== 'GET' || req.socket.localPort !== port ||
+          req.headersDistinct.host?.length !== 1 || !peer || !(privateIPv4(peer) || opts.loopback && peer === '127.0.0.1') ||
+          ![tls.host, selected!.address].some(n => req.headers.host === n + ':' + port)) return false;
+      const current = await currentNetworks();
+      if (generation !== epoch || !active()) return false;
+      if (current.some(n => n.id === selected!.id && n.address === selected!.address)) return true;
+      stop();
+      networks = current;
+      error = 'The selected home network changed. Select an available network on the desktop.';
+      changed();
+      return false;
     }
-    const listen = async (bootstrap: boolean, base: number) => {
-      for (let offset = 0; offset <= 10; offset++) {
-        const attempt: Server[] = [];
-        let port = base + offset;
-        try {
-          for (const host of binds) {
-            if (!enabled() || generation !== epoch) throw Error('Web access stopped.');
-            const handle = (req: IncomingMessage, res: ServerResponse) => {
-              for (const [k, v] of Object.entries(HEADERS)) res.setHeader(k, v);
-              if (!accepts(req, bootstrap)) return void res.writeHead(403).end();
-              if (req.url === '/ca.cer') return void res.writeHead(200, { 'Content-Type': 'application/pkix-cert' }).end(tls.ca.raw);
-              if (bootstrap) return void res.writeHead(404).end();
-              void staticFile(assets, req.url ?? '', res).catch(() => res.writeHead(404).end());
-            };
-            const server = bootstrap ? http(handle) : https({ key: tls.key, cert: tls.cert.toString(), minVersion: 'TLSv1.2' }, handle);
-            attempt.push(server);
-            servers.add(server);
-            server.headersTimeout = server.requestTimeout = 10_000;
-            server.on('connection', socket => {
-              sockets.add(socket);
-              socket.once('close', () => sockets.delete(socket));
-            });
-            server.on('clientError', (_err, socket) => refuse(socket));
-            server.on('checkContinue', (req, res) => handle(req, res));
-            server.on('checkExpectation', (req, res) => handle(req, res));
-            server.on('upgrade', (req, socket, head) => {
-              if (bootstrap || !accepts(req, false) || req.url !== '/sable-web' ||
-                  req.headersDistinct.origin?.length !== 1 || req.headers.origin !== 'https://' + req.headers.host || hub.clients.size >= 12) return refuse(socket);
-              hub.handleUpgrade(req, socket, head, ws => channel!.acceptWeb(ws, req));
-            });
-            await new Promise<void>((resolve, reject) => {
-              const closed = () => reject(Error('Web access stopped.'));
-              server.once('close', closed);
-              server.once('error', reject);
-              server.listen(port, host, () => {
-                server.removeListener('error', reject);
-                server.removeListener('close', closed);
-                if (!enabled() || epoch !== generation) {
-                  server.close();
-                  reject(Error('Web access stopped.'));
-                } else resolve();
-              });
-            });
-            port = (server.address() as { port: number }).port;
-          }
-          return port;
-        } catch (err) {
-          for (const s of attempt) { s.close(); servers.delete(s); }
-          if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE' || offset === 10) throw err;
-        }
-      }
-      throw Error('No free web port.');
+    const handle = async (req: IncomingMessage, res: ServerResponse) => {
+      for (const [k, v] of Object.entries(HEADERS)) res.setHeader(k, v);
+      if (!await accepts(req).catch(() => false)) return void res.writeHead(403).end();
+      if (req.url === '/ca.cer') return void res.writeHead(200, { 'Content-Type': 'application/pkix-cert' }).end(tls.ca.raw);
+      if (reads >= 4) return void res.writeHead(503).end();
+      reads++;
+      try { await staticFile(assets, req.url ?? '', res); }
+      catch { if (!res.destroyed) res.writeHead(404).end(); }
+      finally { reads--; }
     };
-    const caPort = await listen(true, opts.caPort ?? 47831);
-    const port = await listen(false, opts.port ?? 47830);
-    if (!enabled() || generation !== epoch) return;
-    channel ??= makeChannel({ active, changed, connected: (id, at) => { if (!since.has(id)) since.set(id, at); },
-      link: (key, fp) => `https://${certs!.addresses[0]}:${ports!.port}/#p=${key}&f=${fp}` });
+    const server = https({ key: tls.key, cert: tls.cert.toString() + tls.intermediate.toString(), minVersion: 'TLSv1.2',
+      handshakeTimeout: 5000 }, handle);
+    servers.add(server);
+    server.maxConnections = 24;
+    server.maxRequestsPerSocket = 32;
+    server.headersTimeout = server.requestTimeout = 10_000;
+    server.on('connection', socket => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+    });
+    server.on('clientError', (_err, socket) => refuse(socket));
+    server.on('checkContinue', handle);
+    server.on('checkExpectation', handle);
+    server.on('upgrade', async (req, socket, head) => {
+      if (req.url !== '/sable-web' || req.headersDistinct.origin?.length !== 1 || req.headers.origin !== 'https://' + req.headers.host ||
+          !await accepts(req).catch(() => false) || socket.destroyed || wss.clients.size >= 12) return refuse(socket);
+      wss.handleUpgrade(req, socket, head, ws => manage().acceptWeb(ws, req));
+    });
+    for (let offset = 0; offset <= 10; offset++) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const closed = () => finish(Error('Web access stopped.'));
+          const finish = (err?: Error) => {
+            server.off('close', closed).off('error', finish).off('listening', listening);
+            if (err) reject(err); else resolve();
+          };
+          const listening = () => finish();
+          server.once('close', closed).once('error', finish).once('listening', listening);
+          server.listen((opts.port ?? 47830) + offset, opts.loopback ? '127.0.0.1' : selected.address);
+        });
+        break;
+      } catch (err) {
+        if (generation !== epoch || (err as NodeJS.ErrnoException).code !== 'EADDRINUSE' || offset === 10) throw err;
+      }
+    }
+    if (!enabled() || generation !== epoch || selected.id !== selection()) { server.close(); return; }
+    channel = manage();
+    networkId = selected.id;
     certs = tls;
-    ports = { port, caPort };
+    port = (server.address() as { port: number }).port;
+    error = undefined;
     await channel.setEnabled(true);
     changed();
   }
   function sync() {
     if (!enabled()) {
-      if (timer || startup || ports) { stop(true); changed(); }
+      clearInterval(timer); timer = undefined;
+      if (startup || port) { stop(); changed(); }
       return;
     }
+    if (requestedNetwork !== selection()) {
+      stop();
+      requestedNetwork = selection();
+    }
     if (startup) return;
-    if (certs && certs.host === webHostname() && certs.addresses.join() === (opts.addresses ?? webAddresses)().sort().join() &&
-        Date.parse(certs.cert.validTo) - Date.now() >= 30 * 86_400_000) return;
-    if (ports) stop();
-    timer ??= setInterval(sync, 30_000).unref();
-    const generation = ++epoch;
-    startup = start(generation).catch(err => {
+    timer ??= setInterval(sync, 5000).unref();
+    const generation = epoch;
+    const pending = start(generation).catch(err => {
       if (generation !== epoch) return;
       stop();
       error = (err as Error).message;
-      if (enabled()) timer = setInterval(sync, 30_000).unref();
       changed();
-    }).finally(() => { if (epoch === generation) startup = undefined; });
+    }).finally(() => { if (startup === pending) startup = undefined; });
+    startup = pending;
   }
   function ready() {
-    if (!active() || !channel) throw new Error('Web access is off.');
+    if (!active() || !channel) throw Error('Web access is off.');
     return channel;
   }
   app.register('web.state', async () => {
+    if (!WEB_SHIPS) throw Error('Web access is off.');
     await startup;
-    if (!enabled()) throw Error('Web access is off.');
+    if (existsSync(path.join(app.store.dir, 'web', 'pairings.json.closed'))) manage();
     return state();
   });
   app.register('web.offer', ({ cancel }) => {
@@ -227,9 +232,9 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     return state();
   });
   app.register('web.approve', ({ requestId, allow }) => { ready().approve(requestId, allow === true); return state(); });
-  app.register('web.revoke', ({ deviceId }) => { ready().revoke(deviceId); return state(); });
+  app.register('web.revoke', ({ deviceId }) => { manage().revoke(deviceId); return state(); });
   const off = app.subscribe(e => { if (e.type === 'settings.updated') sync(); });
-  app.onDispose(async () => { disposed = true; off(); stop(); await channel?.dispose(); });
+  app.closeWebIngress = () => { disposed = true; off(); clearInterval(timer); stop(); };
+  app.onDispose(async () => { await channel?.dispose(); });
   sync();
 }
-

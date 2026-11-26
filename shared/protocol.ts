@@ -1658,6 +1658,7 @@ export interface BackdropImage {
 
 export interface AppSettings {
   webRemote?: boolean;
+  webNetwork?: string;
   webSteerDanger?: boolean;
   accent: 'spectrum' | 'ember' | 'iris' | 'mint';
   ambience: 'full' | 'calm' | 'off';
@@ -2093,12 +2094,16 @@ export interface PhoneDevice {
 }
 
 export const WEB_SHIPS = false;
+export interface WebNetwork { id: string; name: string; address: string }
 export interface WebState {
+  networks?: WebNetwork[];
+  caReplacement?: string;
+  revocationDurable?: boolean;
   listening: boolean;
   addresses: string[];
   port?: number;
-  caPort?: number;
   hostname?: string;
+  /** Compare to ca.cer transferred over an authenticated channel. */
   caFingerprint?: string;
   clients: { id: string; label: string; since: number }[];
   devices: PhoneDevice[];
@@ -2228,7 +2233,7 @@ export const PHONE_METHODS = [
 /** A new phone or desktop method starts denied to the browser. */
 export const WEB_METHODS = [
   'app.hello', 'session.snapshot', 'session.send', 'session.submission', 'session.interrupt',
-  'permission.respond', 'question.respond', 'provider.limits', 'usage.limits',
+  'permission.respond', 'question.respond',
   'phone.tail', 'phone.item', 'phone.queue', 'phone.changes', 'phone.diff', 'phone.search',
   'phone.image', 'phone.answer', 'phone.steerNow', 'phone.sessions', 'phone.prompts',
 ] as const satisfies readonly (typeof PHONE_METHODS[number] | keyof PhoneMethods)[];

@@ -1,7 +1,8 @@
+import { webEvent, webItem, webQueue, webSession, webTail } from './web-view';
 import { registerWeb, type WebChannel, type WebOptions } from './web-remote';
-import { webSteerRefusal } from './web-policy';
+import { requireWebMessage, webSteerRefusal } from './web-policy';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -1117,7 +1118,34 @@ function narrow(method: string, params: Record<string, unknown>, queued?: (sessi
 }
 
 const WEB_ALLOWED = new Set<string>(WEB_METHODS);
-const WEB_INPUT = new Set(['session.send', 'permission.respond', 'question.respond', 'phone.answer', 'phone.steerNow']);
+const WEB_INPUT = new Set(['session.interrupt', 'session.send', 'permission.respond', 'question.respond', 'phone.answer', 'phone.steerNow']);
+
+function webPermissionOption(app: App, prompt: PermissionRequest, optionId: unknown) {
+  const provider = app.sessions.get(prompt.sessionId)?.meta.provider;
+  if (!provider || provider === 'opencode' || prompt.delegateId !== undefined ||
+      prompt.kind === 'share' || prompt.toolName === 'ExitPlanMode') return false;
+  const option = prompt.options.find(o => o.id === optionId);
+  if (option?.tone === 'deny') return ['deny', 'decline', 'denied'].includes(option.id);
+  const scope = prompt.scope;
+  if (scope?.roots?.length || scope?.read?.length || scope?.write?.length || scope?.hosts?.length) return false;
+  return option?.tone === 'allow' && ['allow', 'accept', 'approved'].includes(option.id);
+}
+
+function webPromptRefusal(app: App, method: string, raw: Record<string, unknown>, displayed: Map<string, string>) {
+  if (['phone.answer', 'question.respond', 'permission.respond'].includes(method)) {
+    const prompts = app.sessions.get(String(raw.sessionId))?.prompts();
+    const prompt = [...prompts?.questions ?? [], ...prompts?.permissions ?? []].find(p => p.id === raw.requestId);
+    if (!prompt || prompt.delegateId !== undefined) return 'Answer delegated or unavailable prompts on the desktop.';
+    if (method === 'permission.respond') {
+      if (!('toolName' in prompt)) return 'Choose a current permission request.';
+      const revision = phonePermission(prompt).revision;
+      if (!revision || revision !== raw.revision || displayed.get(prompt.id) !== revision)
+        return 'Open the current permission request on this device first.';
+      if (!webPermissionOption(app, prompt, raw.optionId))
+        return 'Only one-time permission decisions are available in the browser.';
+    }
+  }
+}
 
 export class PhoneService {
   private server?: Server;
@@ -1169,7 +1197,13 @@ export class PhoneService {
     this.identityFile = opts.identity ?? path.join(path.dirname(this.file), 'phone-identity.pem');
     this.port = opts.port ?? PHONE_PORT;
     this.host = opts.host ?? process.env.SABLE_PHONE_HOST ?? '0.0.0.0';
-    this.data = this.read();
+    // Only a clean close publishes a restart checkpoint. Consume it before loading
+    // any web token. A crash or failed registry write can never replay an older grant.
+    const checkpoint = this.file + '.closed';
+    if (web && existsSync(checkpoint)) {
+      renameSync(checkpoint, this.file);
+      this.data = this.read();
+    } else this.data = web ? { enabled: false, devices: [] } : this.read();
     const paired = (sender: { deviceId: string; generation: number }) => this.enabled && sender.generation === (this.data.generation ?? 0) && this.data.devices.some(d => d.id === sender.deviceId);
     if (web) app.webSenderRefusal = (sender, sessionId) => paired(sender) ? webSteerRefusal(app, sessionId) : 'Web access was removed or turned off.';
     else app.phoneStillPaired = paired;
@@ -1219,7 +1253,7 @@ export class PhoneService {
       } catch (err) {
         this.app.log('phone: could not save', (err as Error).message);
         const was = this.saveError;
-        this.saveError = 'Could not save the paired phones. Sable tries again; until then, a restart would undo this change.';
+        this.saveError = this.web ? 'Registry write failed. Web pairings will be discarded on an unclean restart.' : 'Could not save the paired phones. Sable tries again; until then, a restart would undo this change.';
         if (!was) this.changed();
         this.saveTimer = setTimeout(() => this.save(true), SAVE_RETRY_MS);
         this.saveTimer.unref?.();
@@ -1336,6 +1370,7 @@ export class PhoneService {
   }
 
   pair(cancel?: boolean) {
+    if (this.web) this.endRequest('The desktop closed this pairing offer.');
     if (cancel) this.pairing = undefined;
     else {
       try {
@@ -1727,7 +1762,7 @@ export class PhoneService {
     let replaced = false;
     if (f.event && overBytes(json, FRAME_MAX.event)) {
       replaced = true;
-      const page = this.pageFor(f.event);
+      const page = this.web ? null : this.pageFor(f.event);
       json = page ? JSON.stringify({ event: page }) : '';
       if (!json || overBytes(json, FRAME_MAX.event)) {
         this.app.log(`phone: a ${f.event.type} event too big for the phone went as phone.stale`);
@@ -2069,6 +2104,12 @@ export class PhoneService {
     };
     const unsubscribe = this.app.subscribe((event) => {
       if (!PHONE_EVENTS.has(event.type) || this.web && !this.enabled) return;
+      if (this.web) {
+        if (event.type === 'permission.removed') displayed.delete(event.id);
+        const projected = webEvent(event, watching);
+        if (projected) this.sendFrame(link, { event: projected as BridgeEvent });
+        return;
+      }
       if (ITEM_EVENTS.has(event.type) && !watching.includes((event as { sessionId: string }).sessionId)) return;
       const e = phoneEvent(event, this.kindOf);
       if (e?.type === 'permission.removed') displayed.delete(e.id);
@@ -2111,7 +2152,7 @@ export class PhoneService {
         const own = req.method as string;
         // Never the person's stylesheet through a chat: no chat in Sable's own folder, the Customize chat read-only.
         const guarded = this.web && WEB_INPUT.has(own);
-        const reason = () => guarded ? webSteerRefusal(this.app, raw.sessionId) : undefined;
+        const reason = () => guarded ? webSteerRefusal(this.app, raw.sessionId) ?? webPromptRefusal(this.app, own, raw, displayed) : undefined;
         const allowed = () => connected() && !reason();
         const act = () => {
           if (!connected()) throw new Error('This phone was removed on the desktop');
@@ -2121,6 +2162,7 @@ export class PhoneService {
         act();
         const refused = phoneRefusal(this.app, own, raw);
         if (refused) throw new Error(refused);
+        if (this.web && own === 'session.send') requireWebMessage(raw.text);
         let result: unknown;
         if (own === 'phone.fileLink') {
           // Plain HTTP downloads only for a phone paired before the secure channel; a secure one gets its files over this connection.
@@ -2152,15 +2194,21 @@ export class PhoneService {
           await this.app.call('session.snapshot', { sessionId });
           const q = this.app.sessions.get(sessionId)?.queue ?? [];
           const from = typeof raw.from === 'number' && Number.isInteger(raw.from) && raw.from >= 0 ? raw.from : 0;
-          result = { queue: trimQueue(q.slice(from, from + QUEUE_PAGE)), from, total: q.length };
+          result = { queue: this.web ? webQueue(trimQueue(q.slice(from, from + QUEUE_PAGE))) : trimQueue(q.slice(from, from + QUEUE_PAGE)), from, total: q.length };
+        } else if (this.web && own === 'app.hello') {
+          const state = await this.app.call('app.hello', {});
+          const list = sessionsPage(state.sessions.map(webSession), 0, PHONE_BYTES.helloSessions);
+          result = { version: state.version, sessions: list.sessions, sessionsCursor: list.cursor, sessionsTotal: list.total,
+            settings: {}, projects: [], providers: [] };
         } else if (own === 'phone.sessions') {
           // The chats' list on from where `app.hello` (or the page before) stopped.
           const state = await this.app.call('app.hello', {});
-          result = sessionsPage(state.sessions, placeIn(state.sessions, raw.cursor), PHONE_BYTES.sessions);
+          result = sessionsPage(this.web ? state.sessions.map(webSession) : state.sessions, placeIn(state.sessions, raw.cursor), PHONE_BYTES.sessions);
         } else if (own === 'phone.prompts') {
           // What waits on from a cursor: in one chat (`sessionId`, after `phone.tail`) or across chats (after `app.hello`).
           const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : undefined;
           let all: { permissions: PermissionRequest[]; questions: QuestionRequest[] };
+          if (this.web && !sessionId) throw Error('Choose a chat to read its prompts.');
           if (sessionId) all = this.app.sessions.get(sessionId)?.prompts() ?? { permissions: [], questions: [] };
           else all = (await this.app.call('app.hello', {})).prompts ?? { permissions: [], questions: [] };
           result = promptsPage(all, raw.cursor, PHONE_BYTES.prompts);
@@ -2210,12 +2258,20 @@ export class PhoneService {
             const str = (k: string) => (typeof raw[k] === 'string' ? (raw[k] as string) : undefined);
             const limit = typeof raw.limit === 'number' ? raw.limit : undefined;
             result = phoneTail(snap, { before: str('before'), limit, to: str('to'), around: str('around'), after: str('after') });
-          } else result = phoneDetail(snap.items, String(raw.itemId ?? ''), item => this.app.store.wholeItem(sessionId, item));
+          } else {
+            const detail = phoneDetail(snap.items, String(raw.itemId ?? ''), item => this.app.store.wholeItem(sessionId, item));
+            result = this.web ? { item: webItem(detail.item), children: detail.children.map(webItem) } : detail;
+          }
         } else if (own === 'phone.steerNow') {
           const { sessionId, itemId } = raw;
           if (typeof sessionId !== 'string' || typeof itemId !== 'string') throw new Error('Select a message in its conversation.');
           const card = this.app.sessions.get(sessionId)?.get(itemId);
           if (card?.type !== 'user' || card.parentId || card.remote || syntheticOf(card)?.role === 'hidden') throw new Error('That message is unavailable.');
+          if (this.web) {
+            requireWebMessage(card.text);
+            if (card.phoneSender?.kind !== 'web' || card.phoneSender.deviceId !== device.id)
+              throw Error('Only steer a message sent by this browser.');
+          }
           act();
           result = await this.app.call('session.steerNow', { sessionId, itemId }, {
             phoneSender, ...(guarded && { refusal: reason }),
@@ -2285,8 +2341,17 @@ export class PhoneService {
             result = phoneTail(result);
           }
         }
+        if (this.web && (own === 'session.snapshot' || own === 'phone.tail')) result = webTail(result as PhoneTail);
+        if (!connected()) return;
         const page = result as { permissions?: PhonePermission[]; prompts?: { permissions?: PhonePermission[] } } | undefined;
         const prompts = page?.permissions ?? page?.prompts?.permissions;
+        if (this.web && prompts) {
+          for (const view of prompts) {
+            const current = this.app.sessions.get(view.sessionId)?.prompts().permissions.find(p => p.id === view.id);
+            view.options = current && view.revision ? view.options.filter(o => webPermissionOption(this.app, current, o.id)) : [];
+            if (!view.options.length) view.incomplete = true;
+          }
+        }
         this.sendFrame(link, { id: req.id, ok: true, result }, Array.isArray(prompts) ? err => { if (!err) prompts.forEach(remember); } : undefined);
       } catch (err) {
         this.sendFrame(link, { id: req.id, ok: false, error: (err as Error).message ?? String(err) });
@@ -2320,7 +2385,9 @@ export class PhoneService {
 
   async dispose() {
     clearTimeout(this.saveTimer);
-    this.save(true);
+    if (this.web) {
+      if (this.commitDevices(this.data.devices)) renameSync(this.file, this.file + '.closed');
+    } else this.save(true);
     this.disposed = true;
     clearTimeout(this.saveTimer);
     await this.stop();

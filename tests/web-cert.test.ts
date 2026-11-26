@@ -1,58 +1,127 @@
-import './web-acl-fixture';
+import { restoreWebAcl } from './web-acl-fixture';
 import * as childProcess from 'node:child_process';
-import { createPrivateKey, X509Certificate } from 'node:crypto';
+import { createPrivateKey, generateKeyPairSync, sign, X509Certificate, type KeyObject } from 'node:crypto';
 import { createServer, get } from 'node:https';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { issueWebLeaf, privateIPv4, webCertificates } from '../server/services/web-cert';
 
+const capture = vi.hoisted(() => ({ keys: undefined as KeyObject[] | undefined }));
+vi.mock('node:crypto', async original => {
+  const mod = await original<typeof import('node:crypto')>();
+  return { ...mod, generateKeyPairSync: (...args: Parameters<typeof generateKeyPairSync>) => {
+    const pair = mod.generateKeyPairSync(...args);
+    capture.keys?.push(pair.privateKey as KeyObject);
+    return pair;
+  } };
+});
 const homes: string[] = [];
 function fixture() { const home = mkdtempSync(path.join(process.env.TEMP!, 'web-cert-')); homes.push(home); return home; }
-afterEach(() => { for (const dir of homes.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  capture.keys = undefined;
+  for (const dir of homes.splice(0)) { restoreWebAcl(dir); rmSync(dir, { recursive: true, force: true }); }
+});
 
-it('parses and verifies the installation CA and server SANs, and renews only the leaf', () => {
-  const home = fixture();
-  const day = 86_400_000, now = Date.now();
+it('verifies root, constrained issuer and renewable server leaf with X509Certificate', () => {
+  const home = fixture(), day = 86_400_000, now = Date.now();
   const issue = (days: number, ips = ['10.0.0.2']) => webCertificates(home, ips, 'sable-test', now + days * day);
-  const first = issue(0), leaf = new X509Certificate(first.cert.raw);
-  expect(first.ca.ca).toBe(true);
-  expect(first.ca.verify(first.ca.publicKey)).toBe(true);
-  expect(leaf.ca).toBe(false);
-  expect(leaf.verify(first.ca.publicKey)).toBe(true);
-  expect(leaf.checkHost(first.host)).toBe(first.host);
-  expect(leaf.checkIP('10.0.0.2')).toBe('10.0.0.2');
-  expect(leaf.keyUsage).toEqual(['1.3.6.1.5.5.7.3.1']);
-  expect(Date.parse(leaf.validTo) - Date.parse(leaf.validFrom)).toBe(397 * day);
-  expect(issue(366).cert.raw).toEqual(leaf.raw);
-  const renewed = issue(368);
-  expect(renewed.cert.raw).not.toEqual(leaf.raw);
+  const { ca, intermediate, cert, host } = issue(0);
+  expect(ca.ca && intermediate.ca && !cert.ca).toBe(true);
+  expect(ca.verify(ca.publicKey)).toBe(true);
+  expect(intermediate.checkIssued(ca) && intermediate.verify(ca.publicKey)).toBe(true);
+  expect(cert.checkIssued(intermediate) && cert.verify(intermediate.publicKey)).toBe(true);
+  expect(cert.verify(ca.publicKey)).toBe(false);
+  expect(cert.checkHost(host)).toBe(host);
+  expect(cert.checkIP('10.0.0.2')).toBe('10.0.0.2');
+  expect(cert.keyUsage).toEqual(['1.3.6.1.5.5.7.3.1']);
+  expect(Date.parse(cert.validTo) - Date.parse(cert.validFrom)).toBe(397 * day);
+  expect(issue(366).cert.raw).toEqual(cert.raw);
+  expect(issue(368).cert.raw).not.toEqual(cert.raw);
   const moved = issue(368, ['172.17.0.4']);
-  expect(moved.cert.checkIP('10.0.0.2')).toBeUndefined();
   expect(moved.cert.checkIP('172.17.0.4')).toBeDefined();
-  expect(moved.ca.raw).toEqual(first.ca.raw);
+  expect(moved.intermediate.raw).toEqual(intermediate.raw);
+  expect(moved.ca.raw).toEqual(ca.raw);
 }, 30_000);
 
-it('TLS trusts the SAN, rejects a different hostname and rejects a matching public SAN signed by this CA', async () => {
+it('keeps the root private key out of every file and every returned field', () => {
   const home = fixture();
-  const { ca, cert, key, host } = webCertificates(home, ['192.168.1.5'], 'sable-test');
+  capture.keys = [];
+  const issued = webCertificates(home, ['192.168.1.5']);
+  const rootKey = capture.keys.find(k => issued.ca.checkPrivateKey(k))!;
+  expect(rootKey).toBeDefined();
+  const encodings: Buffer[] = [];
+  for (const type of ['pkcs8', 'sec1'] as const) {
+    const der = rootKey.export({ format: 'der', type });
+    const pem = rootKey.export({ format: 'pem', type }).toString();
+    encodings.push(der, Buffer.from(der.toString('base64')), Buffer.from(pem), Buffer.from(JSON.stringify(pem)));
+  }
+  const dir = path.join(home, 'web');
+  for (const file of readdirSync(dir, { recursive: true, withFileTypes: true })) if (file.isFile()) {
+    const bytes = readFileSync(path.join(file.parentPath, file.name));
+    for (const encoding of encodings) expect(bytes.includes(encoding), file.name).toBe(false);
+  }
+  const visited = new Set<object>();
+  const visit = (value: unknown) => {
+    expect(value === rootKey).toBe(false);
+    if (!value || typeof value !== 'object' || visited.has(value) || ArrayBuffer.isView(value)) return;
+    visited.add(value);
+    for (const name of Reflect.ownKeys(value)) visit(Object.getOwnPropertyDescriptor(value, name)?.value);
+  };
+  visit(issued);
+  expect(Object.keys(issued).sort()).toEqual(['ca','intermediate','cert','key','host','addresses','replacement'].sort());
+  expect(issued.ca.checkPrivateKey(createPrivateKey(issued.key))).toBe(false);
+  for (const c of [issued.ca, issued.intermediate, issued.cert]) expect(c.publicKey.type).toBe('public');
+});
+
+it('reports a replacement root after loss or expiry of the intermediate', () => {
+  const home = fixture(), now = Date.now();
+  const issue = (at = now) => webCertificates(home, ['10.0.0.2'], 'sable-test', at);
+  const first = issue();
+  unlinkSync(path.join(home, 'web/issuer.json'));
+  const second = issue();
+  expect(second.ca.raw).not.toEqual(first.ca.raw);
+  expect(issue().replacement).toMatch(/install the new root/i);
+  const third = issue(Date.parse(second.intermediate.validTo) + 1);
+  expect(third.ca.raw).not.toEqual(second.ca.raw);
+  expect(third.replacement).toMatch(/expired/i);
+});
+
+// Re-sign a test TBS with a same-length DNS substitution, independently of production's SAN validator.
+function publicNameFixture(cert: X509Certificate, issuer: KeyObject) {
+  const outer = cert.raw;
+  const header = (at: number) => outer[at+1] < 128 ? 2 : 2 + (outer[at+1] & 127);
+  const t = header(0), h = header(t), end = t + h + outer.readUIntBE(t+2, h-2);
+  const tbs = Buffer.from(outer.subarray(t, end));
+  const before = Buffer.from('sable-test.local'), after = Buffer.from('outsider.example');
+  for (let at = tbs.indexOf(before); at >= 0; at = tbs.indexOf(before)) after.copy(tbs, at);
+  const algorithm = outer.subarray(end, end + 2 + outer[end + 1]);
+  const signature = sign('sha256', tbs, issuer);
+  const body = Buffer.concat([tbs, algorithm, Buffer.from([3, signature.length+1, 0]), signature]);
+  return new X509Certificate(Buffer.concat([Buffer.from([48, 130, body.length >> 8, body.length & 255]), body]));
+}
+
+it('TLS trusts only the root and rejects a matching public SAN signed by its intermediate', async () => {
+  const home = fixture();
+  const { ca, intermediate, cert, key, host } = webCertificates(home, ['192.168.1.5'], 'sable-test');
   async function connect(leaf: X509Certificate, servername: string) {
-    const server = createServer({ key, cert: leaf.toString() }, (_, res) => res.end());
+    const server = createServer({ key, cert: leaf.toString() + intermediate.toString() }, (_, res) => res.end());
     await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
     try {
       await new Promise<void>((resolve, reject) => {
-        get({ host: '127.0.0.1', port: (server.address() as {port: number}).port, servername, ca: ca.toString(), agent: false },
+        get({ host: '127.0.0.1', port: (server.address() as { port: number }).port, servername, ca: ca.toString(), agent: false },
           res => { res.resume(); res.on('end', resolve); }).on('error', reject);
       });
     } finally { await new Promise<void>(r => server.close(() => r())); }
   }
   await connect(cert, host);
   await expect(connect(cert, 'other.local')).rejects.toMatchObject({ code: 'ERR_TLS_CERT_ALTNAME_INVALID' });
-  const caKey = createPrivateKey(readFileSync(path.join(home, 'web/ca-key.pem')));
-  const outside = issueWebLeaf(caKey, 'Sable on sable-test', createPrivateKey(key), 'outside.example', [], Date.now());
-  expect(outside.checkHost('outside.example')).toBeDefined();
-  expect(outside.verify(ca.publicKey)).toBe(true);
-  await expect(connect(outside, 'outside.example')).rejects.toThrow(/permitted subtree|name constraint/i);
+  const issuer = createPrivateKey(JSON.parse(readFileSync(path.join(home, 'web/issuer.json'), 'utf8')).key);
+  expect(() => issueWebLeaf(issuer, 'issuer', createPrivateKey(key), 'outsider.example', [], Date.now())).toThrow(/Invalid local/);
+  const outside = publicNameFixture(cert, issuer);
+  expect(outside.checkHost('outsider.example')).toBe('outsider.example');
+  expect(outside.verify(intermediate.publicKey)).toBe(true);
+  await expect(connect(outside, 'outsider.example')).rejects.toThrow(/permitted subtree|name constraint/i);
 });
 
 it.runIf(process.platform === 'win32')('writes no private key if Windows refuses to protect the key directory', () => {
@@ -60,7 +129,7 @@ it.runIf(process.platform === 'win32')('writes no private key if Windows refuses
   const denied = vi.spyOn(childProcess, 'execFileSync').mockImplementation(() => { throw Error('Access denied'); });
   try {
     expect(() => webCertificates(home, ['10.0.0.2'])).toThrow(/restrict the web key directory/);
-    expect(existsSync(path.join(home, 'web/ca-key.pem'))).toBe(false);
+    expect(existsSync(path.join(home, 'web/issuer.json'))).toBe(false);
     expect(existsSync(path.join(home, 'web/ca.cer'))).toBe(false);
   } finally { denied.mockRestore(); }
 });
@@ -70,3 +139,27 @@ it('only LAN and link-local IPv4 addresses can be bound', () => {
   for (const ip of ['127.0.0.1', '172.15.1.1', '172.32.1.1', '8.8.8.8', '0.0.0.0', '::', '10.0.0.256']) expect(privateIPv4(ip)).toBe(false);
 });
 
+
+it.runIf(process.platform === 'win32')('fails closed when reuse cannot verify a restored private file ACL', () => {
+  const home = fixture();
+  const first = webCertificates(home, ['10.0.0.2']);
+  const call = childProcess.execFileSync;
+  const spy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((...args: Parameters<typeof call>) => {
+    const options = args[2];
+    if (options && typeof options === 'object' && 'env' in options && options.env?.SABLE_WEB_PRIVATE_FILE?.endsWith('issuer.json'))
+      throw Error('Unexpected web key access rule');
+    return call(...args);
+  });
+  try {
+    expect(() => webCertificates(home, ['10.0.0.2'])).toThrow(/could not verify/);
+    expect(readFileSync(path.join(home, 'web/ca.cer'))).toEqual(first.ca.raw);
+  } finally { spy.mockRestore(); }
+});
+
+it.runIf(process.platform === 'win32' && process.env.SABLE_TEST_WEB_ACL_FIXTURE !== '1')('rejects an existing key with a protected permissive Windows DACL', () => {
+  const home = fixture();
+  webCertificates(home, ['10.0.0.2']);
+  const file = path.join(home, 'web/server-key.pem');
+  childProcess.execFileSync('icacls.exe', [file, '/inheritance:d', '/grant', '*S-1-5-32-545:R'], { windowsHide: true });
+  expect(() => webCertificates(home, ['10.0.0.2'])).toThrow(/Unsafe Windows web key owner or permissions/);
+});

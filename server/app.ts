@@ -1,3 +1,4 @@
+import { requireWebMessage } from './services/web-policy';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -1852,6 +1853,7 @@ export class App {
   }
 
   private async deliverNow(rt: SessionRuntime, text: string, attachments?: UserItem['attachments'], extra?: DeliveryFields, ctx?: CallContext, explicit = false) {
+    if (ctx?.phoneSender?.kind === 'web') requireWebMessage(text);
     // Past its account's cap, the session moves to the next account before the message goes out.
     // The first message names the session's lane, or moves it into one when its folder got busy.
     // A caller that may no longer act (a phone removed meanwhile) is asked again after every wait.
@@ -4286,6 +4288,7 @@ export class App {
 
   /** Messages a phone sent while its chat moved, queued: the guard of the pairing that sent each (by queue id). */
   phoneStillPaired?: (sender: NonNullable<UserItem['phoneSender']>) => boolean;
+  closeWebIngress?: () => void;
   webSenderRefusal?: (sender: NonNullable<UserItem['phoneSender']>, sessionId: string) => string | undefined;
   private modeChanges = new Map<string, number>();
   changingMode(sessionId: string) { return this.modeChanges.has(sessionId); }
@@ -5184,6 +5187,11 @@ export class App {
         if (!original || entry.text !== original.text || entry.attachments !== original.attachments) continue;
         const beforeSend = () => {
           check();
+          if (caller.phoneSender?.kind === 'web') {
+            if (original.phoneSender?.deviceId !== caller.phoneSender.deviceId || original.phoneSender.kind !== 'web')
+              throw new NotNow('Only steer a message sent by this browser.');
+            requireWebMessage(entry.text);
+          }
           still(this.senderGuard(original.phoneSender, rt.id) ?? this.steerSenders.get(original));
           if (!sent && rt.turnActive) throw new NotNow('Another turn has already started.');
         };
@@ -6791,6 +6799,7 @@ export class App {
 
   async dispose(saved?: () => void) {
     this.disposed = true;
+    this.closeWebIngress?.();
     clearTimeout(this.heldLimitsTimer);
     const deadline = Date.now() + 9800;
     for (const rt of this.sessions.values()) this.steerControls.get(rt)?.abort(new NotNow('The chat was closed.'));
