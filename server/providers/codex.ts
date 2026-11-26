@@ -50,6 +50,7 @@ import { withDeadline } from '../util/deadline';
 import { serviceTierFor } from './codex-map';
 import { AGENT_INPUT_SCHEMA, AGENT_TOOLS, agentOfTool, agentToolDescription, readAgentCall } from './agent-tool';
 import { PROFILE_DESCRIPTION, PROFILE_INPUT_SCHEMA, PROFILE_TOOL, isProfileTool, profileDynamicAnswer } from './profile-tool';
+import { TRACK_DESCRIPTION, TRACK_INPUT_SCHEMA, TRACK_TOOL, isTrackTool, trackDynamicAnswer } from './track-tool';
 import { toolReceipt, type WantedReceipts } from '../core/delegate-result';
 import { UNTIL_INPUT_END, readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
@@ -878,6 +879,11 @@ export class CodexProvider implements Provider {
     }
   }
 
+  /** track_work: a process the agent started outside its tools, watched by Sable from now on. */
+  trackWork(rt: SessionRuntime, args: unknown, stepId?: string): { ok: boolean; text: string } {
+    return this.ctx.trackWork?.(rt, args, stepId) ?? { ok: false, text: 'Sable cannot track work in this session.' };
+  }
+
   /** remember_about_user: one fact into the profile. */
   rememberAboutUser(args: unknown): { ok: boolean; text: string } {
     const profile = this.ctx.profile?.();
@@ -918,6 +924,8 @@ export class CodexProvider implements Provider {
     if (widgetsEnabled(this.ctx.settings?.())) tools.push({ type: 'function', name: WIDGET_TOOL, description: WIDGET_DESCRIPTION, inputSchema: WIDGET_INPUT_SCHEMA });
     // The user's profile: one short fact at a time, merged by Sable (never secrets).
     if (this.profileOn()) tools.push({ type: 'function', name: PROFILE_TOOL, description: PROFILE_DESCRIPTION, inputSchema: PROFILE_INPUT_SCHEMA });
+    // track_work: work the agent started outside its tools, watched by Sable (a chat's own agent only).
+    if (meta && !meta.id?.startsWith('sub-') && !meta.options?.readOnly && this.ctx.trackWork) tools.push({ type: 'function', name: TRACK_TOOL, description: TRACK_DESCRIPTION, inputSchema: TRACK_INPUT_SCHEMA });
     // Sub-agents from the other agent (Claude Code), while it is installed and signed in.
     if (meta && !meta.id?.startsWith('sub-') && !meta.options?.readOnly && this.ctx.runAgent)
       for (const agent of this.ctx.otherAgents?.() ?? []) {
@@ -2930,6 +2938,8 @@ class CodexSession implements ProviderSession {
           if (dop) return await deviceDynamicAnswer(this.rt, dop, p?.arguments, ac.signal);
           // A fact for the user's profile: Sable merges it (and refuses secrets).
           if (isProfileTool(typeof p?.tool === 'string' ? p.tool : undefined)) return profileDynamicAnswer(this.provider.rememberAboutUser(p?.arguments));
+          // Work the agent started outside its tools: Sable watches the process it names.
+          if (!p?.namespace && isTrackTool(typeof p?.tool === 'string' ? p.tool : undefined)) return trackDynamicAnswer(this.provider.trackWork(this.rt, p?.arguments, p.turnId && p.callId ? `${p.turnId}:${p.callId}` : undefined));
           // A sub-agent from the other agent (Claude Code): it runs nested under this call's step.
           const agent = agentOfTool(typeof p?.tool === 'string' ? p.tool : undefined);
           if (agent) return await this.runDelegate(agent, p?.arguments, ac.signal, p.turnId && p.callId ? `${p.turnId}:${p.callId}` : undefined);

@@ -117,6 +117,17 @@ export function setTriage(open: boolean) {
 export const toggleTriage = () => setTriage(!useStore.getState().ui.triageOpen);
 
 /** Opens the side panel on a tab (the turn's "2 files changed" opens Changes). */
+/**
+ * Stops the watching of a tracked job (`ToolItem.tracked`, the agent's `track_work`): the row reads
+ * "Not tracked" and the agent is told nothing. Sable never touches the process itself.
+ */
+export function stopTracking(sessionId: string, itemId: string): Promise<boolean> {
+  return bridge.call('track.stop', { sessionId, itemId }).then(
+    (r) => r.ok,
+    () => false,
+  );
+}
+
 export function showRailTab(tab: RailTab) {
   useStore.getState().setUi({ railOpen: true, railTab: tab });
 }

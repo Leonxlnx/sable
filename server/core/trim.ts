@@ -1,6 +1,6 @@
 import { DEFAULT_ACCOUNT, type BridgeEvent, type SessionMeta, type SessionSnapshot, type SnapshotCursor, type TimelineItem, type ToolItem, type ToolKind, type ToolResult, type ToolStatus } from '../../shared/protocol';
 import { syntheticOf } from '../../shared/synthetic';
-import { runsTask, worksInBackground } from '../../shared/background';
+import { runsTask, tracksWork, worksInBackground } from '../../shared/background';
 import { constants as bufferLimits } from 'node:buffer';
 
 // ── what a window gets of an existing conversation ──
@@ -266,7 +266,7 @@ export function snapshotEnd(items: TimelineItem[]) {
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i];
     if (!it.parentId) roots++;
-    if ((parents.size && parents.delete(it.id)) || it.type === 'tool' && (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting' || runsTask(it) || worksInBackground(it)) ||
+    if ((parents.size && parents.delete(it.id)) || it.type === 'tool' && (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting' || runsTask(it) || worksInBackground(it) || tracksWork(it)) ||
         (it.type === 'text' || it.type === 'thinking') && it.streaming || it.type === 'user' && it.state === 'queued' ||
         it.type === 'notice' && it.limit?.provider && !it.limit.continuedWith && !it.limit.atReset) {
       live = i;

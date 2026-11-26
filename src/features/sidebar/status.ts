@@ -3,7 +3,7 @@ import { hasWork, workLabel } from '@shared/work-label';
 import type { StatusTone } from '@/art/Logo';
 
 /** The fields a row shows. Anything else changing on a session (usage, model, options) must not re-render it. */
-const SHOWN = ['id', 'title', 'status', 'unread', 'pinned', 'archived', 'updatedAt', 'activity', 'lastError', 'provider', 'accountId', 'spare', 'background', 'commands', 'review', 'reviewMany', 'muted'] as const;
+const SHOWN = ['id', 'title', 'status', 'unread', 'pinned', 'archived', 'updatedAt', 'activity', 'lastError', 'provider', 'accountId', 'spare', 'background', 'commands', 'tracked', 'trackedTitle', 'review', 'reviewMany', 'muted'] as const;
 export const sameShown = (a: SessionMeta, b: SessionMeta) => SHOWN.every((k) => a[k] === b[k]) && a.until?.phase === b.until?.phase;
 
 /**

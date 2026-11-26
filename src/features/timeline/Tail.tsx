@@ -111,7 +111,8 @@ export function workSince() {
  * stop button and Esc stop it). It steps back while prose is streaming, since the words are the signal.
  * With the chat's own turn over but work it started still going (sub-agents, `SessionMeta.background`;
  * background commands, `SessionMeta.commands`), it says so, and opens the Agents tab: "Waiting for 1
- * background command · 4m" from the oldest command's start, "2 sub-agents working".
+ * background command · 4m" from the oldest command's start, "2 sub-agents working", and a tracked
+ * job by its own title ("Codex builds the sign-in fix · 12m").
  */
 export const Tail = memo(function Tail() {
   const { sessionId } = useTimeline();
@@ -124,13 +125,19 @@ export const Tail = memo(function Tail() {
   const info = useStore((s) => tailInfo(s.data[sessionId]));
   const agents = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).agents);
   const commands = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).commands);
+  // Work the agent started outside its tools and asked Sable to watch (track_work): the bridge's own count, title and start.
+  const jobs = useStore((s) => workCounts(s.sessions[sessionId] ?? {}).jobs);
+  const jobTitle = useStore((s) => s.sessions[sessionId]?.trackedTitle ?? undefined);
+  const jobsSince = useStore((s) => s.sessions[sessionId]?.trackedSince ?? 0);
   const serving = useStore((s) => servingLabel(s.sessions[sessionId] ?? {}));
   const servingSince = useStore((s) => s.sessions[sessionId]?.servingSince);
   const [read] = useState(workSince);
   const work = useStore((s) => (agents || commands ? read(s.data[sessionId]) : NO_WORK));
   const working = status === 'running' || status === 'starting' || !!check;
-  const background = !working && status !== 'awaiting' && (agents > 0 || commands > 0);
-  const since = background ? work.since : servingSince;
+  const background = !working && status !== 'awaiting' && (agents > 0 || commands > 0 || jobs > 0);
+  // The oldest of everything still at work, tracked jobs among it.
+  const oldest = jobs > 0 && jobsSince && (!work.since || jobsSince < work.since) ? jobsSince : work.since;
+  const since = background ? oldest : servingSince;
   const now = useTick(working || (status !== 'awaiting' && !!since));
   // Laid out with the chat (history): it simply stands. Only work that begins while the person
   // watches rises in.
@@ -138,7 +145,7 @@ export const Tail = memo(function Tail() {
   if (!working && status !== 'awaiting') {
     if (!background && !serving) return null;
     // The bridge's counts are the truth; the items only tell which commands are monitors.
-    const label = tailLabel({ agents, commands, monitors: Math.min(work.monitors, commands) }) ?? serving;
+    const label = tailLabel({ agents, commands, monitors: Math.min(work.monitors, commands), jobs, jobTitle }) ?? serving;
     const ran = since ? now - since : 0;
     return (
       <button type="button" className="tail tail-bg" data-enter={fresh || undefined} onClick={() => showRailTab('agents')} aria-label={`${label}. Open Agents`}>

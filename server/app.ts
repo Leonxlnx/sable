@@ -67,6 +67,7 @@ import { handoverText } from './accounts/handover';
 import { ConversationCopies } from './accounts/dedupe';
 import { itemsSince, lastSwitch, legOf, rootBefore, undoableSwitch, withLeg, workedIn } from './core/agent-switch';
 import { runsTask, worksInBackground } from '../shared/background';
+import { WorkTracker, type ProcessProbe } from './core/track';
 import { runSubAgent } from './core/sub-agent';
 import { readOnlyMode, TurnChecks, withoutChecks } from './core/check';
 import { cutAt, forkHistory } from './core/fork';
@@ -201,6 +202,8 @@ export interface AppOptions {
   backgroundLimitMs?: { settle: number; max: number };
   /** Tests: when the returns chats still owe are looked at after a start (`RETURN_AT_START_MS`). */
   returnAtStartMs?: { first: number; gap: number };
+  /** Tests: how tracked work's processes are looked at (`core/track.ts`; default: the system's own answers). */
+  trackProbe?: ProcessProbe;
 }
 
 export { VERSION };
@@ -502,6 +505,8 @@ export class App {
   private resets: ResetConsoles;
   /** False where Sable cannot open a console window: the person runs the reset command in a terminal. */
   private consoles: boolean;
+  /** Work agents started outside their tools and asked Sable to watch (`track_work`). */
+  private tracker: WorkTracker;
 
   constructor(opts: AppOptions) {
     this.consoles = !!opts.openConsole || process.platform === 'win32';
@@ -533,6 +538,7 @@ export class App {
     this.compactTimeoutMs = opts.compactTimeoutMs ?? COMPACT_TIMEOUT_MS;
     this.backgroundLimitMs = opts.backgroundLimitMs;
     this.store = new Store(opts.home, (session, id) => this.sessions.get(session)?.get(id));
+    this.tracker = new WorkTracker({ session: id => this.sessions.get(id), log: (...args) => this.log(...args) }, opts.trackProbe);
     this.delegateJournal = new DelegateJournal(this.store.dir);
     this.phoneReceipts = new PhoneReceipts(this.store.dir);
     this.onDispose(() => this.phoneReceipts.close());
@@ -589,7 +595,8 @@ export class App {
       if (plain !== meta.title && !existsSync(path.join(this.store.dir, 'sessions', meta.id + '.json'))) meta.title = plain || 'New session';
       const rt = this.makeRuntime(meta, true);
       this.sessions.set(meta.id, rt);
-      if (meta.delegateRecovery) recovery.push(rt);
+      // A chat with tracked work is read by itself too: its rows attach to their processes again, or say they ended.
+      if (meta.delegateRecovery || meta.tracked) recovery.push(rt);
     }
     const pending = recovery.values();
     const hydrate = async () => {
@@ -820,6 +827,11 @@ export class App {
       otherAgents: () => this.otherAgents(),
       profile: () => profileOf(this),
       customBrief: () => customOf(this).brief(),
+      trackWork: (session, args, itemId) => {
+        const rt = this.sessions.get(session.id);
+        if (this.disposed || !rt || rt.meta !== session.meta) return { ok: false, text: 'No session is attached yet.' };
+        return this.tracker.track(rt, args, itemId);
+      },
       runAgent: (session, call, itemId, signal) => {
         const rt = this.sessions.get(session.id);
         if (this.disposed || !rt || rt.meta !== session.meta) return Promise.resolve({ ok: false, text: 'No session is attached yet.' });
@@ -1859,6 +1871,7 @@ export class App {
     if (recovered?.length) void rt.persistDelegate?.().then(() => this.delegateJournal.forget(rt.id, recovered))
       .catch(err => this.log('delegate journal retained', err));
     if (rt.pendingDelegateReports.size) this.scheduleLossWake(rt);
+    this.tracker.restored(rt);
     if (rt.items.length > SNAPSHOT_THRESHOLD) this.snapshotEnds.set(rt.items, snapshotEnd(rt.items));
     this.store.scheduleMigration(rt.id, () => {
       const work = this.workOf(rt);
@@ -6189,6 +6202,11 @@ export class App {
       if (!item) throw new Error('That part of the conversation is no longer there');
       return { item: { ...this.store.wholeItem(sessionId, item) } };
     });
+    this.register('track.stop', async ({ sessionId, itemId }) => {
+      const rt = this.runtime(sessionId);
+      await this.hydrateAsync(rt);
+      return { ok: this.tracker.stop(rt, itemId) };
+    });
     this.register('session.itemPart', ({ sessionId, itemId, path, offset = 0, seq }) => {
       const rt = this.runtime(sessionId);
       const item = rt.get(itemId);
@@ -6812,6 +6830,8 @@ export class App {
 
   async dispose(saved?: () => void) {
     this.disposed = true;
+    // Tracked rows stay as they are on disk: the next start looks at their processes again.
+    this.tracker.dispose();
     clearTimeout(this.heldLimitsTimer);
     const deadline = Date.now() + 9800;
     for (const rt of this.sessions.values()) this.steerControls.get(rt)?.abort(new NotNow('The chat was closed.'));

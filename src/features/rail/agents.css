@@ -127,10 +127,14 @@
   color: var(--text);
 }
 
-/* What failed in it: the one red figure, there whether the group is open or folded. */
-.agx-wave-failed,
-.agx-bar-failed {
+/* What failed in it, said while the group is folded: a quiet word, red only while it is news (it
+   stands in the newest wave, or failed since the person last looked at the tab). */
+.agx-wave-failed {
   flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.agx-wave-failed[data-news] {
   color: var(--red-text);
 }
 
@@ -138,6 +142,11 @@
   flex-shrink: 0;
   min-width: 2ch;
   text-align: right;
+}
+
+/* Inside an opened day its waves and their rows stand one step in, so the day reads as their holder. */
+.agx-list > [data-nested] {
+  margin-left: 14px;
 }
 
 /* What an open group holds back: in the titles' column. */
@@ -162,6 +171,45 @@
 
 .agx-more-btn:active {
   background-color: var(--fill-3);
+}
+
+/* ── a row's actions ──
+   At the row's end, in the place of its time or figure, while the row is pointed at or holds the
+   focus: they swap in one frame once the pointer has rested (50 ms), nothing fades. An opened row
+   has the same actions in words, so its tools stay away. */
+
+:is(.agx-row, .agx-card) {
+  position: relative;
+}
+
+.agx-tools {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  display: flex;
+  gap: 2px;
+  visibility: hidden;
+}
+
+/* A card's first line stands 10 px down and is 20 px tall. */
+.agx-card > .agx-tools {
+  top: 9px;
+  right: 3px;
+}
+
+.agx-tool {
+  --ib: 22px;
+  border-radius: var(--r-ctl-xs);
+}
+
+:is(.agx-row:not(.agx-cmd), .agx-card):not([data-open]):is(:hover, :focus-within) > .agx-tools {
+  visibility: visible;
+  transition: visibility 0s 50ms;
+}
+
+:is(.agx-row:not(.agx-cmd), .agx-card):not([data-open]):is(:hover, :focus-within) > :is(.agx-row-btn, .agx-card-btn) :is(.agx-meta, .agx-time) {
+  visibility: hidden;
+  transition: visibility 0s 50ms;
 }
 
 /* ── shared pieces of a line ── */
@@ -297,8 +345,47 @@
   }
 }
 
+/* Waiting on you is amber once, in the row's mark: the words beside it keep a readable ink. */
 .agx-now-wait {
-  color: var(--amber);
+  color: var(--text-2);
+}
+
+/* The last line of a job's log or a command's output, where an agent says what it does: plain
+   text as it was written (never markup, never a link), one line, quiet. */
+.agx-out {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-3);
+}
+
+/* Who runs a job, or whose command it is, after the title: a word, quiet. */
+.agx-by {
+  flex: 0 1 auto;
+  max-width: 40%;
+  font-size: var(--t-small);
+  font-weight: var(--w-regular);
+  color: var(--text-3);
+}
+
+/* Nothing works: one calm sentence on the titles' edge, where the first card would stand. */
+.agx-idle {
+  margin: 0;
+  padding: 0 calc(var(--agx-inset) + 1px);
+  height: var(--rail-row-h);
+  display: flex;
+  align-items: center;
+  font-size: var(--t-ui);
+  color: var(--text-3);
+}
+
+/* Servers are no work: quiet rows after what works, in the rows' own columns. */
+.agx-serving {
+  display: flex;
+  flex-direction: column;
+}
+
+.agx-cards + .agx-serving {
+  margin-top: 6px;
 }
 
 .agx-phase {
@@ -405,12 +492,9 @@
   background-color: var(--fill-1);
 }
 
-.agx-row[data-outcome='failed'] .agx-mark {
-  color: var(--red);
-}
-
-/* Every row leads with its state (AgentsTab `StateMark`): failed is the one red. */
-.agx-mark[data-state='failed'] {
+/* Every row leads with its state (AgentsTab `StateMark`). A failure is red only while it is news;
+   an older one keeps its cross in the row's quiet ink, and its word says the rest. */
+.agx-row[data-news] .agx-mark[data-state='failed'] {
   color: var(--red);
 }
 
@@ -454,7 +538,7 @@
   color: var(--text-3);
 }
 
-.agx-row[data-outcome='failed'] .agx-outcome {
+.agx-row[data-news] .agx-outcome {
   color: var(--text-2);
 }
 
@@ -614,6 +698,53 @@
   height: 48px;
   background: linear-gradient(to bottom, rgb(18 18 20 / 0), var(--panel));
   pointer-events: none;
+}
+
+/* The end of a job's log, opened: a few plain lines as they were written, each on one line. */
+.agx-tail {
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+  gap: 2px;
+  padding-left: 10px;
+  border-left: 1.5px solid var(--line-3);
+  color: var(--text-3);
+}
+
+.agx-tail-line {
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.agx-tail-line:last-child {
+  color: var(--text-2);
+}
+
+/* A command as it was run: code, so the code face; wrapped, a few lines at most. */
+.agx-command {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  align-self: stretch;
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  color: var(--text-3);
+}
+
+/* A row's actions, opened: one line of quiet buttons on the title's edge. */
+.agx-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.agx-acts > .agx-goto[aria-disabled='true'] {
+  color: var(--text-4);
+  background-color: transparent;
+  cursor: default;
 }
 
 .agx-more,

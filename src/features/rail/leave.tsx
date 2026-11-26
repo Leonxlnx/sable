@@ -9,9 +9,13 @@ import { EASE_OUT, play, reducedMotion, spring, uiZoom } from '@/lib/motion';
  * the list) simply goes.
  *
  * Rows are the `[data-flip]` children (their key) directly inside the wrapper.
+ *
+ * `sized`: changes when a row that stays changed its height (a block that holds a list of its
+ * own grew or shrank): the rows under it then glide to their new places instead of stepping there.
  */
 interface Props {
   order: string;
+  sized?: string;
   className?: string;
   children: ReactNode;
 }
@@ -41,7 +45,7 @@ export class LeaveList extends Component<Props> {
   private changed = 0;
 
   getSnapshotBeforeUpdate(prev: Props): Snap {
-    if (prev.order === this.props.order || !this.el || reducedMotion()) return null;
+    if ((prev.order === this.props.order && prev.sized === this.props.sized) || !this.el || reducedMotion()) return null;
     // Changes a few times a second (many sub-agents starting and ending at once): each motion would be
     // cut by the next, and measuring the rows before and after each forced two layouts of the window
     // per change (perf1: over a second of the fleet's 10 s). The rows simply change until it calms.
@@ -63,7 +67,7 @@ export class LeaveList extends Component<Props> {
     return { rows, box: this.el.getBoundingClientRect() };
   }
 
-  componentDidUpdate(_prev: Props, _state: unknown, snap: Snap) {
+  componentDidUpdate(prev: Props, _state: unknown, snap: Snap) {
     const host = this.el;
     if (!snap?.rows.size || !host) return;
     const z = uiZoom();
@@ -72,7 +76,8 @@ export class LeaveList extends Component<Props> {
     const gone = [...snap.rows].filter(([key]) => !kept.has(key));
     const came = now.filter((el) => !snap.rows.has(el.dataset.flip!)).length;
     // Rows joined or left, a few at a time: the others make room or close the gap. A batch simply changes.
-    if ((!gone.length && !came) || gone.length > MOST || came > MOST) return;
+    const resized = prev.sized !== this.props.sized;
+    if ((!gone.length && !came && !resized) || gone.length > MOST || came > MOST) return;
 
     // All reads, then all writes: one layout for the whole list.
     const moves: [HTMLElement, number][] = [];

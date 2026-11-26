@@ -28,6 +28,7 @@ import { browserOp, cleanToolInput, describeBrowser, SABLE_BROWSER_NAMESPACE } f
 import { describeDevice, deviceOp } from './device-tool';
 import { agentOfTool, describeAgentCall } from './agent-tool';
 import { describeProfileCall, isProfileTool } from './profile-tool';
+import { describeTrackCall, isTrackTool } from './track-tool';
 import type {
   RateLimitResetCreditsSummary,
   AskForApproval,
@@ -691,6 +692,16 @@ export function draftItem(item: ThreadItem, opts: { streaming?: boolean } = {}):
         return tool({
           name: item.tool,
           ...describeProfileCall(item.arguments),
+          status,
+          input: item.arguments,
+          ...(status !== 'running' ? { result: { text, isError: status === 'error' || undefined }, endedAt: done(status) } : {}),
+        });
+      }
+      // Work the agent asked Sable to watch: one line with its title (the bridge puts `tracked` on the step).
+      if (!item.namespace && isTrackTool(item.tool)) {
+        return tool({
+          name: item.tool,
+          ...describeTrackCall(item.arguments),
           status,
           input: item.arguments,
           ...(status !== 'running' ? { result: { text, isError: status === 'error' || undefined }, endedAt: done(status) } : {}),

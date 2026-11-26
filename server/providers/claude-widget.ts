@@ -7,6 +7,7 @@ import { DEVICE_CORE, DEVICE_DESCRIPTIONS, DEVICE_OPS, DEVICE_PARAMS, DEVICE_TOO
 import { BROWSER_CORE, BROWSER_DESCRIPTIONS, BROWSER_OPS, BROWSER_PARAMS, BROWSER_TOOLS, runBrowserTool, type BrowserOp, type BrowserToolResult } from './browser-tool';
 import { WIDGET_CODE_DESCRIPTION, WIDGET_DESCRIPTION, WIDGET_SERVER, WIDGET_TITLE_DESCRIPTION, WIDGET_TOOL, widgetResult } from './widget-tool';
 import { PROFILE_DESCRIPTION, PROFILE_FACT_DESCRIPTION, PROFILE_TOOL } from './profile-tool';
+import { TRACK_DESCRIPTION, TRACK_PARAMS, TRACK_TOOL } from './track-tool';
 
 /**
  * The in-process MCP server that gives Claude Code Sable's own tools: `show_widget` while generative
@@ -26,6 +27,8 @@ export function widgetServer(
     delegate?: { agents: ProviderId[]; run: (call: AgentCall, signal?: AbortSignal, stepId?: string) => Promise<{ ok: boolean; text: string }> };
     /** remember_about_user (the user's profile is on): merges one fact into it. */
     profile?: (fact: unknown) => { ok: boolean; text: string };
+    /** track_work: a process the agent started outside its tools, watched by Sable (`stepId`: the call's own step). */
+    track?: (args: unknown, stepId?: string) => { ok: boolean; text: string };
   } = { widgets: true },
 ): McpSdkServerConfigWithInstance {
   const tools = [];
@@ -77,6 +80,23 @@ export function widgetServer(
           return { content: [{ type: 'text' as const, text: r.text }], isError: !r.ok };
         },
         { annotations: { title: 'Remember about the user', readOnlyHint: false, destructiveHint: false, openWorldHint: false }, alwaysLoad: true },
+      ),
+    );
+  }
+  const track = opts.track;
+  if (track) {
+    tools.push(
+      tool(
+        TRACK_TOOL,
+        TRACK_DESCRIPTION,
+        { title: z.string().describe(TRACK_PARAMS.title.description), pid: z.number().int().describe(TRACK_PARAMS.pid.description), log: z.string().optional().describe(TRACK_PARAMS.log.description), by: z.string().optional().describe(TRACK_PARAMS.by.description) },
+        async (args, extra: unknown) => {
+          const id = (extra as { _meta?: Record<string, unknown> } | undefined)?._meta?.['claudecode/toolUseId'];
+          const r = track(args, typeof id === 'string' ? id : undefined);
+          return { content: [{ type: 'text' as const, text: r.text }], isError: !r.ok };
+        },
+        // Sable only watches the process: nothing is started, signalled or read outside the chat's folder.
+        { annotations: { title: 'Track work', readOnlyHint: true, destructiveHint: false, openWorldHint: false }, alwaysLoad: true },
       ),
     );
   }

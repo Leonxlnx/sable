@@ -38,6 +38,7 @@ import {
   type SessionMeta,
   type SessionSnapshot,
   type TimelineItem,
+  type TrackedWork,
   type ToolDetail,
   type ToolItem,
   type ToolResult,
@@ -346,6 +347,7 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
         ...(it.result ? { result: trimResult(it.result, full) } : {}),
         ...(it.workflow ? { workflow: trimWorkflow(it.workflow) } : {}),
         ...(it.task ? { task: { ...it.task, id: cap(it.task.id, 200), ...(typeof it.task.serving === 'string' && { serving: cap(it.task.serving, 300) }) } } : {}),
+        ...(it.tracked ? { tracked: phoneTracked(it.tracked) } : {}),
         // A check of a turn by the other agent: which turn and who, and its findings (they are its answer).
         ...(it.check ? { check: it.check } : {}),
         ...(opts.kids ? { kids: opts.kids } : {}),
@@ -363,6 +365,21 @@ export function phoneItem(it: TimelineItem, opts: { role?: 'answer' | 'step' | '
       return out;
     }
   }
+}
+
+/**
+ * Tracked work as a phone gets it: the row's words (who runs it, the log's last line, where it stands
+ * and since when), never the log's place on this computer, the process id or its start.
+ */
+export function phoneTracked(t: TrackedWork): TrackedWork {
+  return {
+    pid: 0,
+    state: t.state,
+    since: t.since,
+    ...(t.endedAt ? { endedAt: t.endedAt } : {}),
+    ...(t.by ? { by: cap(t.by, 80) } : {}),
+    ...(t.line ? { line: cap(t.line, 300) } : {}),
+  };
 }
 
 /**
@@ -386,6 +403,7 @@ export function phonePatch(patch: Partial<TimelineItem>, kind?: string): Partial
   if (p.detail) p.detail = trimDetail(p.detail as ToolDetail, LIMITS.field);
   if (p.result) p.result = trimResult(p.result as ToolResult);
   if (p.workflow) p.workflow = trimWorkflow(p.workflow as WorkflowRun);
+  if (p.tracked) p.tracked = phoneTracked(p.tracked as TrackedWork);
   if (p.attachments) p.attachments = trimAttachments(p.attachments as Attachment[]);
   if (typeof p.text === 'string' && p.text.length > LIMITS.answer) {
     p.text = p.text.slice(0, LIMITS.answer);
@@ -899,7 +917,7 @@ const PHONE_CLEARABLE = new Set<string>([
   'live',
   'accountId', 'movedFrom', 'returnAt', 'activity', 'lastError', 'remote', 'capState', 'moving',
   'pendingRestart', 'providerSessionId', 'until', 'spare', 'race', 'lane', 'agentHandover', 'moveNote',
-  'background', 'commands', 'serving', 'servingSince', 'servingAddress', 'options', 'effort', 'speed', 'fast', 'ultracode', 'pinned', 'archived', 'unread', 'branch',
+  'background', 'commands', 'serving', 'servingSince', 'servingAddress', 'tracked', 'trackedSince', 'trackedTitle', 'options', 'effort', 'speed', 'fast', 'ultracode', 'pinned', 'archived', 'unread', 'branch',
   'chat', 'custom', 'titleAsked', 'agents', 'returnModels',
 ] satisfies (keyof SessionMeta)[]);
 

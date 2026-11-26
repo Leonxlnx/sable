@@ -47,6 +47,8 @@ export interface ProviderContext {
   customBrief?: () => string;
   /** Runs a sub-agent of another agent for `rt`, nested under the tool step `itemId` (see `agent-tool.ts`). */
   runAgent?: (rt: SessionRuntime, call: AgentCall, itemId: string | undefined, signal?: AbortSignal) => Promise<{ ok: boolean; text: string }>;
+  /** `track_work` for `rt`: a process the agent started outside its tools, watched from now on (see `track-tool.ts`, `core/track.ts`). `itemId`: the call's own step. */
+  trackWork?: (rt: SessionRuntime, args: unknown, itemId: string | undefined) => { ok: boolean; text: string };
 }
 
 /** How a message goes to the agent (`ProviderSession.send`). */

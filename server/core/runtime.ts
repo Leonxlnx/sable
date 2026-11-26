@@ -22,7 +22,7 @@ import type {
 import type { ProviderSession } from '../providers/types';
 import { agentOfTool } from '../providers/agent-tool';
 import { isCompactOutput, personalOrigin, userItemText } from '../../shared/synthetic';
-import { runsTask, worksInBackground } from '../../shared/background';
+import { runsTask, tracksWork, worksInBackground } from '../../shared/background';
 import { taskServing } from './task-serving';
 import { turnLive, TurnLiveIndex } from '../../shared/turn-live';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
@@ -501,6 +501,7 @@ export class SessionRuntime {
     this.working.clear();
     this.running.clear();
     this.serving.clear();
+    this.tracking.clear();
     this.lost.clear();
     this.taskSteps.clear();
     this.pendingDelegateReports.clear();
@@ -512,6 +513,7 @@ export class SessionRuntime {
       if (i.type === 'tool' && (i.delegateCaller !== undefined || i.delegateReport === 'pending' || i.delegateReport === 'working')) this.owedDelegateReports.add(i.id);
       if (i.type === 'tool' && i.delegateReport === 'pending' && !this.reservedDelegateReports.has(i.id)) this.pendingDelegateReports.add(i.id);
       if (worksInBackground(i)) this.working.add(i.id);
+      if (tracksWork(i)) this.tracking.add(i.id);
       this.trackTask(i);
       if (runsTask(i)) {
         const serving = taskServing(i);
@@ -533,6 +535,8 @@ export class SessionRuntime {
   /** All live command steps, including the subset that serves. */
   private running = new Set<string>();
   private serving = new Map<string, TaskMark>();
+  /** Steps whose tracked process Sable still sees running (`track_work`; `SessionMeta.tracked` is their count). */
+  private tracking = new Set<string>();
   /** The step of each task the chat has seen, by the agent's own task id. */
   private taskSteps = new Map<string, string>();
   /** Steps whose lost-task note has yet to reach the agent. */
@@ -557,6 +561,12 @@ export class SessionRuntime {
     const works = worksInBackground(item);
     const runs = runsTask(item);
     const serves = runs && item.task.serving ? item.task : undefined;
+    const tracks = tracksWork(item);
+    if (tracks !== this.tracking.has(item.id)) {
+      if (tracks) this.tracking.add(item.id);
+      else this.tracking.delete(item.id);
+      this.update(this.trackedCounts());
+    }
     if (works === this.working.has(item.id) && runs === this.running.has(item.id) && serves === this.serving.get(item.id)) return;
     if (serves) this.serving.set(item.id, serves);
     else this.serving.delete(item.id);
@@ -596,7 +606,30 @@ export class SessionRuntime {
       servingSince = Math.min(servingSince ?? task.since, task.since);
       if (serving === 1 && typeof task.serving === 'string') servingAddress = task.serving;
     }
-    return { background, commands, serving, servingSince, servingAddress };
+    return { background, commands, serving, servingSince, servingAddress, ...this.trackedCounts() };
+  }
+
+  /** Tracked work (`track_work`): how many processes Sable still sees, since when, and the only one's title. */
+  private trackedCounts() {
+    let trackedSince: number | undefined;
+    let trackedTitle: string | undefined;
+    for (const id of this.tracking) {
+      const row = this.index.get(id);
+      if (!tracksWork(row)) continue;
+      trackedSince = Math.min(trackedSince ?? row.tracked.since, row.tracked.since);
+      if (this.tracking.size === 1) trackedTitle = row.title;
+    }
+    return { tracked: this.tracking.size, trackedSince, trackedTitle };
+  }
+
+  /** When the youngest tracked process was tracked (keep awake reads it). */
+  get newestTrackedAt(): number | undefined {
+    let at: number | undefined;
+    for (const id of this.tracking) {
+      const row = this.index.get(id);
+      if (tracksWork(row)) at = Math.max(at ?? 0, row.tracked.since);
+    }
+    return at;
   }
 
   private publishTaskCounts() {
@@ -1340,6 +1373,7 @@ export class SessionRuntime {
       had = this.working.delete(g) || had;
       ran = this.running.delete(g) || ran;
       this.serving.delete(g);
+      had = this.tracking.delete(g) || had;
       this.lost.delete(g);
     }
     for (const [task, step] of [...this.taskSteps]) if (gone.has(step)) this.taskSteps.delete(task);
@@ -1351,7 +1385,7 @@ export class SessionRuntime {
     this.update({ live: undefined });
     const before = this.meta.background ?? 0;
     const commands = this.meta.commands ?? 0;
-    const { serving, servingSince, servingAddress } = this.meta;
+    const { serving, servingSince, servingAddress, tracked, trackedSince, trackedTitle } = this.meta;
     this.load(items, this.todos);
     for (const id of this.waitingSteers.keys()) {
       if (this.get<UserItem>(id)?.state !== 'queued') this.clearSteerWaits(id);
@@ -1368,7 +1402,7 @@ export class SessionRuntime {
     // Re-publish the effective counts after the silent load.
     this.meta.background = before;
     this.meta.commands = commands;
-    Object.assign(this.meta, { serving, servingSince, servingAddress });
+    Object.assign(this.meta, { serving, servingSince, servingAddress, tracked, trackedSince, trackedTitle });
     this.publishTaskCounts();
   }
 
