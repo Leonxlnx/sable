@@ -1219,6 +1219,8 @@
 
 .live-end {
   justify-content: flex-start;
+  align-items: flex-end;
+  gap: 7px;
   padding-top: 13px;
 }
 
@@ -1226,6 +1228,68 @@
   font-size: var(--t-small);
   line-height: 16px;
   color: var(--text-2);
+}
+
+/* 2.21: the working mark leads a live row, a step larger than a row's mark (the agent's mark stands by the title) */
+.live-mark {
+  width: 16px;
+  margin-top: 14px;
+  height: 16px;
+}
+
+.live-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.live-title > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-title .pmark {
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+/* the line under the title starts with the title's words (past the agent's mark) */
+.live-row .live-line {
+  padding-left: 20px;
+}
+
+.live-steps {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.live-steps::before {
+  content: '·';
+  margin-right: 9px;
+  color: var(--text-4);
+}
+
+/* how far the turn has come: a short bar per checkpoint closed, the open one dithered */
+.cps {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 6px;
+}
+
+.cps i {
+  width: 8px;
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--text-3);
+}
+
+.cps .cp-open {
+  background-color: var(--text);
+  -webkit-mask: var(--checker) 0 0 / 4px 4px;
+  mask: var(--checker) 0 0 / 4px 4px;
+  transition: width 240ms var(--ease-out);
 }
 
 /* no chats yet: the stage is the screen, one sentence on it */

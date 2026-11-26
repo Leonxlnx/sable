@@ -128,6 +128,11 @@ export function Settings() {
 
         <h3 className="set-title">Chats</h3>
         <div className="group-card">
+          <button type="button" className="set-row" onClick={() => (haptic('tap'), nav.push({ name: 'accounts' }))}>
+            <Icon name="user" size={20} />
+            <span className="set-label">Accounts</span>
+            <Icon name="next" size={16} className="set-chev" />
+          </button>
           <button type="button" className="set-row" onClick={() => (haptic('tap'), nav.push({ name: 'limits' }))}>
             <Icon name="gauge" size={20} />
             <span className="set-label">Limits</span>

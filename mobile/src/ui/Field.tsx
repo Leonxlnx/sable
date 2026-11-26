@@ -73,7 +73,7 @@ void (navigator as unknown as { getBattery?: () => Promise<{ level: number; char
   })
   .catch(() => {});
 
-export type BeatKind = 'send' | 'done' | 'pulse' | 'open';
+export type BeatKind = 'send' | 'done' | 'pulse' | 'open' | 'fail';
 type Beat = { at: number; kind: BeatKind; x?: number; y?: number };
 const beats = new Set<(b: Beat) => void>();
 
@@ -90,10 +90,10 @@ export function fieldBeat(kind: BeatKind, at?: { x: number; y: number } | Elemen
   for (const f of beats) f(b);
 }
 
-const LIFE: Record<BeatKind, number> = { send: 1.15, done: 1.3, pulse: 1.0, open: 0.9 };
+const LIFE: Record<BeatKind, number> = { send: 1.15, done: 1.3, pulse: 1.0, open: 0.9, fail: 1.1 };
 
 /** How long the stage drifts after it was woken, then it rests. */
-const AWAKE_MS = 20_000;
+const AWAKE_MS = 8_000;
 const wakes = new Set<() => void>();
 /** Input on home, or home coming forward: the stage drifts again for a while. */
 export function fieldWake() {
@@ -337,6 +337,9 @@ export function Field({
             swell = 1 + (k > 0.55 ? 0.35 * Math.sin(((k - 0.55) / 0.45) * Math.PI) : 0);
           } else if (kind === 'open') {
             swell = 0.35 + 0.65 * (1 - (1 - k) ** 3);
+          } else if (kind === 'fail') {
+            // The light dips at once and comes back slowly (the desktop's `fail`): no wave, no colour.
+            swell = k < 0.18 ? 1 - 0.75 * (k / 0.18) : 0.25 + 0.75 * (1 - (1 - (k - 0.18) / 0.82) ** 2);
           }
         }
       }

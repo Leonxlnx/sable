@@ -10,4 +10,7 @@ export const System = registerPlugin<{
   shortcuts(o: { chats: { id: string; title: string }[] }): Promise<void>;
   keep(o: { key: string; value?: string }): Promise<void>;
   screen(): Promise<{ shown: boolean }>;
+  /** 2.21: whether the phone has the system's dictation, and the system's own speech dialog (its words back, empty when cancelled). */
+  canDictate(): Promise<{ on: boolean }>;
+  dictate(): Promise<{ text: string }>;
 }>('System');

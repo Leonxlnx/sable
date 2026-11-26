@@ -56,7 +56,7 @@ const opensTurn = (it: TimelineItem) => {
   return !syn || syn.role === 'command' || !!it.until;
 };
 
-function doingOf({ doing, doingCount = 1 }: BridgeTurnLive): Doing {
+export function doingOf({ doing, doingCount = 1 }: BridgeTurnLive): Doing {
   switch (doing) {
     case 'write':
     case 'edit':

@@ -84,13 +84,28 @@
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  max-width: 100%;
   color: var(--text-2);
 }
 
 .chat-work-text {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  color: var(--text);
   animation: work-text-in 160ms var(--ease-out) both;
+}
+
+/* its steps and its clock, a step quieter, each after a dot */
+.chat-work-meta {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.chat-work-meta::before {
+  content: '·';
+  margin-right: 7px;
+  color: var(--text-4);
 }
 
 @keyframes work-text-in {
@@ -2028,6 +2043,20 @@
   box-shadow: var(--rim-ring);
   color: var(--text-4);
   scale: 1;
+}
+
+/* an empty bar on a phone with dictation: the same glass disc and rim, its mic a step brighter (it can be pressed) */
+.send[data-mic] {
+  background-color: rgb(255 255 255 / 0.025);
+  background-image: none;
+  box-shadow: var(--rim-ring);
+  color: var(--text-2);
+}
+
+.send[data-mic]:active {
+  background-color: var(--fill-2);
+  color: var(--text);
+  scale: 0.94;
 }
 
 .send-arrow {

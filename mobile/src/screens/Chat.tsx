@@ -22,6 +22,7 @@ import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles } from 
 import { IME_EASE, SNAP } from '@m/ui/motion';
 import { Sheet } from '@m/ui/Sheet';
 import { footRoom } from '@m/lib/foot-room';
+import { clockOf, liveWords, useSecond } from '@m/lib/live-words';
 import { Composer } from './Composer';
 import { Prompts } from './Prompts';
 import { ReviewLine } from './Review';
@@ -52,6 +53,12 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
   });
   const [error, setError] = useState<string>();
   const [remote, setRemote] = useState(false);
+  // The account it runs on, named under the title when its agent has more than one (2.21).
+  const accountWord = useStore((st) => {
+    const ss = st.sessions[id];
+    const list = ss ? st.providers[ss.provider]?.accounts : undefined;
+    return list && list.length > 1 ? list.find((a) => a.id === (ss!.accountId ?? 'default'))?.label : undefined;
+  });
   // The conversation mounts a frame after the screen: the tap answers at once and the screen's opening
   // (on the compositor) is under way while the turns are built (they took the tap's own task, 140 ms
   // on the emulator, before anything moved). The screen is still transparent then, so nothing flashes.
@@ -87,12 +94,12 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
 
   return (
     <div className="screen chat" data-live={live || undefined} data-waiting={waiting || undefined}>
-      <Field palette={paletteFor(s.provider)} amount={0.62} focusX={0.62} focusY={1.1} spread={0.8} active={live} waiting={waiting} under=".composer" />
+      <Field palette={paletteFor(s.provider)} amount={0.7} focusX={0.62} focusY={0.985} spread={0.6} active={live} waiting={waiting} under=".composer" />
       <ChatHead
         title={s.title}
-        sub={connState === 'open' ? (s.chat ? undefined : baseName(homeFolder(s))) : undefined}
+        sub={connState === 'open' ? [s.chat ? undefined : baseName(homeFolder(s)), accountWord].filter(Boolean).join(' · ') || undefined : undefined}
         status={connState === 'open' ? undefined : connState === 'denied' ? 'Not paired' : listed ? 'Reconnecting' : 'Connecting'}
-        work={connState === 'open' && worksNow(s) ? (s.status === 'running' || s.status === 'starting' ? (s.status === 'starting' ? 'Starting' : 'Working') : (workLabel(s) ?? 'Working')) : undefined}
+        work={connState === 'open' && worksNow(s) ? <WorkWords id={id} /> : undefined}
         mark={<ProviderMark provider={s.provider} size={16} />}
         onBack={() => nav.pop()}
         race={racing ? <RaceKey s={s} /> : undefined}
@@ -157,7 +164,29 @@ function ReadOnlyFoot({ id, status, desktop }: { id: string; status: SessionMeta
   );
 }
 
-function ChatHead({ title, sub, status, work, mark, onBack, race, right }: { title: string; sub?: string; status?: string; work?: string; mark?: React.ReactNode; onBack: () => void; race?: React.ReactNode; right?: React.ReactNode }) {
+/**
+ * Under the title while the chat works (2.21): what it does now by kind ("Editing 3 files"), its steps
+ * and its clock, from the bridge's reading of the turn (lib/live-words.ts); its own clock, so the chat
+ * under it never renders for a tick.
+ */
+function WorkWords({ id }: { id: string }) {
+  const s = useStore((st) => st.sessions[id]);
+  const now = useSecond(true);
+  const first = useRef(now);
+  if (!s) return null;
+  const w = liveWords(s);
+  return (
+    <>
+      <span key={w.line} className="chat-work-text">
+        {w.line}
+      </span>
+      {w.steps > 0 && <span className="chat-work-meta num">{w.steps} {w.steps === 1 ? 'step' : 'steps'}</span>}
+      <span className="chat-work-meta num">{clockOf(now - (w.since ?? first.current))}</span>
+    </>
+  );
+}
+
+function ChatHead({ title, sub, status, work, mark, onBack, race, right }: { title: string; sub?: string; status?: string; work?: React.ReactNode; mark?: React.ReactNode; onBack: () => void; race?: React.ReactNode; right?: React.ReactNode }) {
   return (
     <header className="chat-head">
       <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), onBack())}>
@@ -176,10 +205,8 @@ function ChatHead({ title, sub, status, work, mark, onBack, race, right }: { tit
           ) : work ? (
             // At work (its turn, or sub-agents and commands it left working): a living mark under the title, wherever the reader is.
             <motion.div key="work" className="chat-sub chat-work" role="status" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
-              <Tiles size={10} />
-              <span key={work} className="chat-work-text">
-                {work}
-              </span>
+              <Tiles size={12} />
+              {work}
             </motion.div>
           ) : sub ? (
             <motion.div key="sub" className="chat-sub" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>

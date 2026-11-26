@@ -1025,3 +1025,391 @@ button.set-row:active {
 .lm-skel .lm-meter {
   background-color: var(--fill-1);
 }
+
+/* ── accounts (2.21): every agent's accounts, where new chats start, the chats on each ──
+   The limits screen's page (one gutter, a quiet heading per agent, a hairline between accounts): per
+   account its name and plan, the check where new chats start (a radio of its own, 48 px to the
+   finger), the meter of the window it is nearest its limit in, and its chats as plain rows with Move. */
+.now .now-scroll {
+  padding-top: calc(var(--sat) + var(--bar-h));
+}
+
+.ac-acct {
+  padding: var(--s-2) 0 var(--s-5);
+}
+
+.ac-acct + .ac-acct {
+  padding-top: var(--s-4);
+  box-shadow: inset 0 1px 0 var(--line);
+}
+
+.ac-acct[data-out] .ac-name {
+  color: var(--text-3);
+}
+
+.ac-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+}
+
+.ac-names {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ac-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-lead);
+  font-weight: var(--w-strong);
+  letter-spacing: -0.012em;
+}
+
+.ac-plan {
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-size: var(--t-small);
+}
+
+/* where new chats start: a round mark at the row's end (the check on the one), its word beside it */
+.ac-start {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 44px;
+  margin-right: -10px;
+  padding: 0 10px;
+  border-radius: var(--r-pill);
+  color: var(--text-3);
+  font-size: var(--t-small);
+  transition: background-color 100ms;
+}
+
+.ac-start:active {
+  background-color: var(--fill-2);
+}
+
+.ac-start[data-on] {
+  color: var(--text-2);
+}
+
+.ac-dot {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--line-3);
+  color: var(--ink);
+  transition: background-color 160ms var(--ease-out);
+}
+
+.ac-start[data-on] .ac-dot {
+  background: var(--text);
+  box-shadow: none;
+}
+
+.ac-use {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: var(--s-1);
+}
+
+.ac-chats {
+  display: flex;
+  flex-direction: column;
+  margin: var(--s-3) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ac-chat {
+  display: flex;
+  align-items: center;
+  min-height: 48px;
+}
+
+.ac-chat + .ac-chat {
+  box-shadow: inset 0 1px 0 var(--line);
+}
+
+.ac-chat-open {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  height: 48px;
+  text-align: left;
+  font-size: var(--t-body);
+  color: var(--text);
+  transition: opacity 100ms;
+}
+
+.ac-chat-open:active {
+  opacity: 0.6;
+}
+
+.ac-chat-mark {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  flex-shrink: 0;
+}
+
+.ac-chat-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-4);
+}
+
+.ac-chat-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Move: a bare chip (no edge until held), the row's quiet word at its end */
+.ac-move {
+  flex-shrink: 0;
+  height: 40px;
+  margin-right: -12px;
+  padding: 0 12px;
+  border-radius: var(--r-pill);
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+  color: var(--text-2);
+  transition: background-color 100ms, scale 120ms var(--ease-out);
+}
+
+.ac-move:active {
+  background-color: var(--fill-2);
+  box-shadow: var(--press-down);
+  color: var(--text);
+  scale: 0.96;
+}
+
+.ac-more {
+  padding: 12px 0 0 26px;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.ac-pick-use {
+  flex-shrink: 0;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.ac-pick-use[data-level='amber'] {
+  color: var(--amber);
+}
+
+.ac-pick-use[data-level='red'] {
+  color: var(--red);
+}
+
+.ac-pick[aria-busy='true'] {
+  opacity: 0.6;
+}
+
+/* ── now (2.21): everything at work across chats, a card each ── */
+.now-scroll {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: calc(var(--sab) + 32px);
+}
+
+.now-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: var(--s-2) 0 0;
+  padding: 0 12px;
+  list-style: none;
+}
+
+.now-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-xl);
+  background: var(--card-solid, rgb(19 19 22));
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+.now-card[data-waiting] {
+  box-shadow: inset 0 0 0 1px rgb(224 168 56 / 0.28);
+}
+
+.now-open {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  padding: 16px 18px 16px;
+  text-align: left;
+  border-radius: inherit;
+  transition: background-color 100ms;
+}
+
+.now-open:active {
+  background-color: var(--fill-1, rgb(255 255 255 / 0.03));
+}
+
+.now-head,
+.now-line {
+  width: 100%;
+}
+
+.now-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.now-head .pmark {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.now-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-body);
+  font-weight: var(--w-strong);
+  color: var(--text);
+}
+
+.now-time {
+  flex-shrink: 0;
+  font-size: var(--t-small);
+  color: var(--text-2);
+}
+
+.now-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-size: var(--t-small);
+  color: var(--text);
+}
+
+.now-card[data-waiting] .now-line {
+  color: var(--amber);
+}
+
+.now-mark {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  flex-shrink: 0;
+}
+
+.now-words {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.now-steps {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.now-steps::before {
+  content: '·';
+  margin-right: 10px;
+  color: var(--text-4);
+}
+
+/* the step it is on, as the live line names it */
+.now-last {
+  padding-left: 24px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.now-cps {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 6px;
+  padding-left: 24px;
+}
+
+.now-cps i {
+  width: 12px;
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--text-3);
+}
+
+.now-cps .cp-open {
+  background-color: var(--text);
+  -webkit-mask: var(--checker) 0 0 / 4px 4px;
+  mask: var(--checker) 0 0 / 4px 4px;
+  transition: width 240ms var(--ease-out);
+}
+
+/* Stop: a quiet key at the card's top right corner; a first tap asks ("Stop now"), the second stops */
+.now-stop {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 14px 0 12px;
+  border-radius: var(--r-pill);
+  background-color: var(--fill-2);
+  box-shadow: var(--press-up);
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+  color: var(--text);
+  transition: background-color 100ms, scale 120ms var(--ease-out);
+}
+
+.now-stop .stop-square.sm {
+  background: var(--text);
+}
+
+.now-stop[data-ask] {
+  background-color: var(--text);
+  color: var(--ink);
+}
+
+.now-stop[data-ask] .stop-square.sm {
+  background: var(--ink);
+}
+
+.now-stop:active {
+  scale: 0.96;
+}
+
+.now-key .tiles {
+  --s: 17px;
+}
