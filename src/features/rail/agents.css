@@ -173,6 +173,45 @@
   background-color: var(--fill-3);
 }
 
+/* ── a row's actions ──
+   At the row's end, in the place of its time or figure, while the row is pointed at or holds the
+   focus: they swap in one frame once the pointer has rested (50 ms), nothing fades. An opened row
+   has the same actions in words, so its tools stay away. */
+
+:is(.agx-row, .agx-card) {
+  position: relative;
+}
+
+.agx-tools {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  display: flex;
+  gap: 2px;
+  visibility: hidden;
+}
+
+/* A card's first line stands 10 px down and is 20 px tall. */
+.agx-card > .agx-tools {
+  top: 9px;
+  right: 3px;
+}
+
+.agx-tool {
+  --ib: 22px;
+  border-radius: var(--r-ctl-xs);
+}
+
+:is(.agx-row:not(.agx-cmd), .agx-card):not([data-open]):is(:hover, :focus-within) > .agx-tools {
+  visibility: visible;
+  transition: visibility 0s 50ms;
+}
+
+:is(.agx-row:not(.agx-cmd), .agx-card):not([data-open]):is(:hover, :focus-within) > :is(.agx-row-btn, .agx-card-btn) :is(.agx-meta, .agx-time) {
+  visibility: hidden;
+  transition: visibility 0s 50ms;
+}
+
 /* ── shared pieces of a line ── */
 
 .agx-mark {

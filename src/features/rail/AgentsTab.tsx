@@ -16,6 +16,7 @@ import { clock } from '@/features/usage/format';
 import { Icon } from '@/icons';
 import { stopTracking } from '@/state/actions';
 import { useStore } from '@/state/store';
+import { IconButton } from '@/ui';
 import { AgentDetail } from './AgentDetail';
 import { ShownCtx, indexFor, useLooked, usePaneTick, useProgress, useShown } from './agents-hooks';
 import { OUTCOME_WORD, STATE_MARK, agentState, agentsHeader, commandRowState, commandState, commandsView, dayLabel, failureIsNews, figuresOf, historyDays, isJob, jobRan, jobRowState, jobTail, jobsView, lastLine, liveKey, nowRows, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress, type RowState } from './agents-model';
@@ -336,12 +337,28 @@ const LiveCard = memo(function LiveCard({ sessionId, id, fresh }: { sessionId: s
         </span>
         {item.workflow ? <WorkflowLive run={item.workflow} /> : <AgentLive item={item} progress={progress} awaiting={awaiting} />}
       </button>
+      <RowTools sessionId={sessionId} id={id} />
       <Collapse open={open}>
         <AgentDetail sessionId={sessionId} item={item} live />
       </Collapse>
     </div>
   );
 });
+
+/**
+ * A row's actions, at its end while the row is pointed at or holds the focus (they stand where its
+ * time or figure stood; Tab reaches them after the row): to its step in the conversation, and for a
+ * tracked job that runs, to stop the watching (never the process: that is not Sable's to stop).
+ * The opened row has the same actions in words.
+ */
+function RowTools({ sessionId, id, job }: { sessionId: string; id: string; job?: boolean }) {
+  return (
+    <span className="agx-tools">
+      {job && <IconButton className="agx-tool" icon="x" size={12} label="Stop tracking" onClick={() => void stopTracking(sessionId, id)} />}
+      <IconButton className="agx-tool" icon="chat" size={13} label="Show in conversation" onClick={() => revealItem(sessionId, id)} />
+    </span>
+  );
+}
 
 /** Its time so far, ticking once a second while the pane shows. */
 function Since({ ts }: { ts: number }) {
@@ -402,6 +419,7 @@ const JobCard = memo(function JobCard({ sessionId, id, fresh }: { sessionId: str
           </span>
         ) : null}
       </button>
+      <RowTools sessionId={sessionId} id={id} job />
       <Collapse open={open}>
         <JobDetail sessionId={sessionId} item={item} />
       </Collapse>
@@ -498,6 +516,7 @@ const CommandCard = memo(function CommandCard({ sessionId, id, fresh }: { sessio
           </span>
         )}
       </button>
+      <RowTools sessionId={sessionId} id={id} />
       <Collapse open={open}>
         <div className="agx-detail">
           {/* The card's own line shows the command until there is output: said once. */}
@@ -650,6 +669,7 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh, newest, seenAt, ne
           {!word && f.ms >= 1000 && <span className="agx-dur">{shortDuration(f.ms)}</span>}
         </span>
       </button>
+      <RowTools sessionId={sessionId} id={id} />
       {/* A report whose delivery is unknown: the person decides, on a line of its own under the row
           (the row itself is one button). */}
       {delegateRetry(item) && (
@@ -688,6 +708,7 @@ const JobRow = memo(function JobRow({ sessionId, id, fresh }: { sessionId: strin
           {!word && <span className="agx-dur">{shortDuration(ran)}</span>}
         </span>
       </button>
+      <RowTools sessionId={sessionId} id={id} />
       <Collapse open={open}>
         <JobDetail sessionId={sessionId} item={item} />
       </Collapse>
