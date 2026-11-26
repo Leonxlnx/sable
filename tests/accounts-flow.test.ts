@@ -320,7 +320,8 @@ describe('Claude sign-in through its CLI (fake CLI)', () => {
         ['url', 'https://claude.ai/oauth/authorize?code=fake'],
         ['done', ''],
       ]);
-      const after = (await app.call('app.hello', {})).providers[0].accounts!.find((a) => a.id === account.id)!;
+    await until(() => events.some(e => e.type === 'provider.updated' && e.provider.accounts?.some(a => a.id === account.id && a.auth.loggedIn)), 'account status');
+    const after = (await app.call('app.hello', {})).providers[0].accounts!.find((a) => a.id === account.id)!;
       expect(after.auth).toMatchObject({ loggedIn: true, email: 'grace@example.dev', plan: 'Max' });
       expect(after.label).toBe('Grace');
       expect(existsSync(path.join(account.dir!, 'signed-in'))).toBe(true);

@@ -262,6 +262,7 @@ export class App {
   private factories = new Map<ProviderId, (ctx: ProviderContext) => Provider>();
   /** Last known sign-in per extra account (the default account asks its provider every time, as before). */
   private infoCache = new Map<string, Promise<ProviderInfo>>();
+  private authRetryAt = new Map<string, number>();
   private limitsCache = new Map<string, RateLimit[]>();
   /** Accounts whose last limits event named only some windows (`LimitsMeta.partial`): their cache lays over what the usage service knows. */
   private limitsPartial = new Set<string>();
@@ -289,8 +290,7 @@ export class App {
   private handlers = new Map<string, Handler<RpcName>>();
   private quiet: boolean;
   private delays: NonNullable<AppOptions['refreshDelays']>;
-  /** Accounts whose sign-in the user cancelled; the rejection that follows is not an error. */
-  private loginCancelled = new Set<string>();
+  private logins = new Map<string, { cancel: (timeout: boolean) => Promise<void> }>();
   private disposers: (() => void | Promise<void>)[] = [];
   /** Sessions of an agent that is not available in this build (the Demo outside development): kept on disk, not shown. */
   private hidden: SessionMeta[] = [];
@@ -312,8 +312,6 @@ export class App {
   /** Returns due at the same moment go this far apart (`RETURN_AT_START_MS.gap`; tests shorten it). */
   private returnGapMs = RETURN_AT_START_MS.gap;
   private queuedWhileMoving = new Set<string>();
-  /** Sign-ins given up after `loginTimeoutMs`; the rejection that follows is not an error. */
-  private loginTimedOut = new Set<string>();
   /**
    * A summary of the conversation so far, sent ahead of the next message after a session moved to
    * an account that could not take the conversation itself (by session id).
@@ -925,13 +923,17 @@ export class App {
         return;
       }
       case 'provider.updated':
-        if (accountId !== DEFAULT_ACCOUNT) this.infoCache.set(accountKey(e.provider.id, accountId), Promise.resolve(e.provider));
+        if (accountId !== DEFAULT_ACCOUNT) {
+          const key = accountKey(e.provider.id, accountId);
+          if (e.provider.auth.checking || e.provider.problem) this.infoCache.delete(key);
+          else this.infoCache.set(key, Promise.resolve(e.provider));
+        }
         void this.emitProvider(e.provider.id).catch(() => {});
         return;
       case 'caps.updated': {
         const tagged = { ...e, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId };
         // Only news when it differs from what the UI was given.
-        if (this.cache.set(capsCacheKey(e.provider, accountId, e.cwd), e.caps)) this.emit(tagged);
+        if (this.storeCaps(e.provider, accountId, e.cwd, e.caps)) this.emit(tagged);
         return;
       }
       default:
@@ -1055,7 +1057,7 @@ export class App {
     if (fb && fb.from === accountId && fb.until && fb.until > now) {
       // New chats return only once no window that holds the agent's default model stays full: a
       // weekly window still full keeps them away until its own reset (review wave 8, #18).
-      const model = effectiveModel(undefined, this.cache.get<Capabilities>(capsCacheKey(provider, accountId))?.models, this.store.state.settings.defaultModels[provider]);
+      const model = effectiveModel(undefined, this.cachedCaps(provider, accountId)?.models, this.store.state.settings.defaultModels[provider]);
       const still = (this.limitsCache.get(accountKey(provider, accountId)) ?? []).filter(
         (l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now) && (!windowModel(l) || !model || windowForModel(l, model)),
       );
@@ -1097,18 +1099,31 @@ export class App {
     if (hit && !force) return hit;
     const p = this.provider(provider, accountId);
     // A first read of several accounts at once (start-up) is staggered a little per account (auth-gate.ts).
-    const lag = force || accountId === DEFAULT_ACCOUNT ? 0 : authGate.stagger(key, 600, 200);
-    const info = (lag ? new Promise<void>((r) => setTimeout(r, lag)) : Promise.resolve()).then(() => p.info(force)).catch(() => fallbackInfo(p));
+    const retry = this.authRetryAt.get(key);
+    const lag = force ? 0 : Math.max((retry ?? 0) - Date.now(), accountId === DEFAULT_ACCOUNT ? 0 : authGate.stagger(key, 600, 200));
+    const info: Promise<ProviderInfo> = (lag ? new Promise<void>((r) => setTimeout(r, lag)) : Promise.resolve()).then(() => {
+      const newer = this.infoCache.get(key);
+      if (newer && newer !== info) return newer;
+      return p.info(force);
+    }).catch(() => fallbackInfo(p)).then(answer => {
+      if (this.infoCache.get(key) === info) {
+        const inconclusive = answer.auth.checking || answer.problem;
+        if (inconclusive) this.authRetryAt.set(key, retry === undefined ? 0 : Date.now() + 10_000);
+        else this.authRetryAt.delete(key);
+        if (inconclusive || accountId === DEFAULT_ACCOUNT) this.infoCache.delete(key);
+      }
+      return answer;
+    });
     this.infoCache.set(key, info);
     return info;
   }
 
   /** The provider as the UI sees it: the default account's CLI state plus every account. `force` re-reads one account. */
-  async providerInfo(provider: ProviderId, force?: string): Promise<ProviderInfo> {
-    const p = this.provider(provider);
+  async providerInfo(provider: ProviderId, force?: string, nameFromLogin = false): Promise<ProviderInfo> {
     const previous = this.cache.get<ProviderInfo>(`info:${provider}`);
     const coldBase = force !== DEFAULT_ACCOUNT && previous?.installed && this.dormant(provider, DEFAULT_ACCOUNT);
-    const base = coldBase ? previous : await p.info(force === DEFAULT_ACCOUNT).catch(() => fallbackInfo(p));
+    const status = coldBase ? previous : await this.accountAuth(provider, DEFAULT_ACCOUNT, force === DEFAULT_ACCOUNT);
+    const base = status.auth.checking && previous?.installed ? { ...status, installed: true, version: status.version ?? previous.version } : status;
     const defaultId = this.defaultAccountId(provider);
     const signIns = await Promise.all(
       this.accountList(provider).map(async (a) => {
@@ -1117,15 +1132,29 @@ export class App {
         const cached = previous?.accounts?.find(row => row.id === a.id);
         const cold = own ? coldBase : force !== a.id && this.dormant(provider, a.id);
         const info = own ? base : cold ? cached : base.installed ? await this.accountAuth(provider, a.id, force === a.id) : undefined;
-        return { a, own, info, cold, auth: info?.auth ?? { loggedIn: false, ...(cold && { checking: true }) } };
+        const read = info?.auth ?? { loggedIn: false, ...(cold && { checking: true }) };
+        const known = cached?.auth ?? (own ? previous?.auth : undefined);
+        const auth = read.checking && known?.loggedIn ? known : read;
+        return { a, own, info, cold, auth };
       }),
     );
     // The sign-ins first: one that changed forgets the old person's limits before any snapshot copies
     // them (review wave 8, #26).
     this.noteSignIns(
       provider,
-      signIns.filter(s => !s.cold).map((s) => ({ id: s.a.id, auth: s.auth })),
+      signIns.filter(s => !s.cold && !s.info?.auth.checking && !s.info?.problem).map((s) => ({ id: s.a.id, auth: s.auth })),
     );
+    if (nameFromLogin) {
+      const row = signIns.find(s => s.a.id === force);
+      if (row?.a.autoLabel && row.info?.auth.loggedIn && !row.info.auth.checking && !row.info.problem) {
+        const name = labelFromAuth(row.info.auth, signIns.filter(s => s !== row).map(s => s.a.label));
+        if (name) {
+          row.a.label = name;
+          row.a.autoLabel = false;
+          this.store.saveState();
+        }
+      }
+    }
     const accounts = signIns.map(
       ({ a, own, info, auth }): AccountInfo => ({
         id: a.id,
@@ -1141,7 +1170,7 @@ export class App {
       }),
     );
     const limitReset = limitResetVia(this.consoles, this.provider(provider));
-    return { ...base, accounts, ...(limitReset ? { limitReset } : {}) };
+    return { ...base, auth: accounts.find(a => a.id === DEFAULT_ACCOUNT)?.auth ?? base.auth, accounts, ...(limitReset ? { limitReset } : {}) };
   }
 
   /**
@@ -1166,15 +1195,17 @@ export class App {
 
   private forgetLimits(provider: ProviderId, accountId: string) {
     const key = accountKey(provider, accountId);
+    const hadLimits = !!this.limitsCache.get(key)?.length;
     this.earlyResetRead.delete(key);
     limitsAfterTurn.delete(this.provider(provider, accountId));
     this.limitsCache.delete(key);
     this.limitsPartial.delete(key);
     this.limitsMeta.delete(key);
     // When: a reading older than this (a transcript's snapshot, a reset's "before") is the old person's.
-    this.cache.set(`limits-forgotten:${key}`, Date.now());
+    this.cache.set(`limits-forgotten:${key}`, Math.max(Date.now(), this.limitsForgottenAt(provider, accountId) + 1));
     this.signInGen.set(key, (this.signInGen.get(key) ?? 0) + 1);
     for (const fn of this.limitsForgetters) fn(provider, accountId);
+    if (hadLimits) this.emit({ type: 'limits.updated', provider, accountId, limits: [] });
   }
 
   /**
@@ -1244,8 +1275,8 @@ export class App {
     this.limitsForgetters.push(fn);
   }
 
-  private async emitProvider(provider: ProviderId, force?: string) {
-    const info = await this.providerInfo(provider, force);
+  private async emitProvider(provider: ProviderId, force?: string, nameFromLogin = false) {
+    const info = await this.providerInfo(provider, force, nameFromLogin);
     this.cache.set(`info:${provider}`, info);
     this.emit({ type: 'provider.updated', provider: info });
     return info;
@@ -1282,7 +1313,7 @@ export class App {
         provider,
         label: a.label,
         isDefault: a.id === defaultId,
-        auth: prev?.auth ?? { loggedIn: false },
+        auth: prev?.auth ?? (a.id === DEFAULT_ACCOUNT ? cached.auth : { loggedIn: false, checking: true }),
         limits: this.limitsCache.get(accountKey(provider, a.id)) ?? prev?.limits,
         dir: a.id === DEFAULT_ACCOUNT ? undefined : this.accountDir(provider, a.id),
         problem: prev?.problem,
@@ -1412,7 +1443,7 @@ export class App {
    */
   /** A model the session's agent lists, from the live caps or the last known ones. */
   private modelInfo(rt: SessionRuntime, model: string) {
-    const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd));
+    const caps = rt.caps ?? this.cachedCaps(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd);
     return caps?.models.find((m) => m.id === model);
   }
 
@@ -1424,7 +1455,7 @@ export class App {
   /** The speed a new session starts with: the one asked for when its model offers it (as far as is known). */
   private startSpeed(provider: ProviderId, accountId: string, cwd: string, model: string | undefined, speed: string | undefined): Partial<SessionMeta> {
     if (!speed || speed === STANDARD_SPEED) return {};
-    const caps = this.cache.get<Capabilities>(capsCacheKey(provider, accountId, path.resolve(cwd))) ?? this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd));
+    const caps = this.cachedCaps(provider, accountId, path.resolve(cwd)) ?? this.cachedCaps(provider, accountId, cwd);
     const info = caps?.models.find((m) => m.id === model) ?? caps?.models.find((m) => m.isDefault);
     // Unknown caps: keep the choice; the agent's adapter checks it against the model again. A paid
     // speed (Claude's fast mode) is never started from a default: the session turns it on itself.
@@ -1434,25 +1465,40 @@ export class App {
 
   private async capsFast(provider: ProviderId, cwd: string | undefined, accountId = DEFAULT_ACCOUNT, refresh = false): Promise<Capabilities> {
     const p = this.provider(provider, accountId);
-    const key = capsCacheKey(provider, accountId, cwd);
+    const generation = this.signInGen.get(accountKey(provider, accountId));
     const fresh = () =>
       p.caps(cwd).then((answer) => {
         // Codex reads its MCP inventory (and the plugin behind browser / computer use) in the
         // background, which takes long: until it arrives, keep the last known inventory.
-        const before = this.cache.get<Capabilities>(key);
+        if (generation !== this.signInGen.get(accountKey(provider, accountId))) return this.capsFast(provider, cwd, accountId, true);
+        const before = this.cachedCaps(provider, accountId, cwd);
         const caps =
           provider === 'codex' && !answer.mcpServers.length && before?.mcpServers.length
             ? { ...answer, mcpServers: before.mcpServers, features: { ...answer.features, browser: before.features.browser, computerUse: before.features.computerUse, linkedBrowserComputer: before.features.linkedBrowserComputer } }
             : answer;
-        if (this.cache.set(key, caps)) this.emit({ type: 'caps.updated', provider, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, cwd, caps });
+        if (this.storeCaps(provider, accountId, cwd, caps)) this.emit({ type: 'caps.updated', provider, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, cwd, caps });
         return caps;
       });
-    const cached = provider === 'demo' || refresh ? undefined : this.cache.get<Capabilities>(key);
+    const cached = provider === 'demo' || refresh ? undefined : this.cachedCaps(provider, accountId, cwd);
     if (!cached) return fresh();
     // Check it a moment later, off the start-up path (the probe starts a CLI process).
     const t = setTimeout(() => !this.disposed && void fresh().catch(() => {}), this.delays.caps ?? CAPS_REFRESH_DELAY_MS);
     t.unref?.();
     return cached;
+  }
+
+  // A change of sign-in expires every folder, including folders only the disk cache remembers.
+  private cachedCaps(provider: ProviderId, accountId: string, cwd?: string): Capabilities | undefined {
+    const entry = this.cache.get<Capabilities | { since: number; caps: Capabilities }>(capsCacheKey(provider, accountId, cwd));
+    if (!entry) return;
+    const since = this.limitsForgottenAt(provider, accountId);
+    if ('since' in entry) return entry.since === since ? entry.caps : undefined;
+    return since ? undefined : entry;
+  }
+
+  private storeCaps(provider: ProviderId, accountId: string, cwd: string | undefined, caps: Capabilities) {
+    const since = this.limitsForgottenAt(provider, accountId);
+    return this.cache.set(capsCacheKey(provider, accountId, cwd), since ? { since, caps } : caps);
   }
 
   // ── prewarm ──
@@ -2821,7 +2867,7 @@ export class App {
    */
   private async modelCommand(rt: SessionRuntime, query: string): Promise<RpcMethods['session.send']['result']> {
     if (!query) return { ok: false, error: 'Name a model after /model' };
-    const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd)) ?? (await this.capsFast(rt.meta.provider, rt.meta.cwd, rt.meta.accountId ?? DEFAULT_ACCOUNT).catch(() => undefined));
+    const caps = rt.caps ?? this.cachedCaps(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd) ?? (await this.capsFast(rt.meta.provider, rt.meta.cwd, rt.meta.accountId ?? DEFAULT_ACCOUNT).catch(() => undefined));
     const own = matchModel(query, caps?.models ?? []);
     if (own) {
       this.setSessionModel(rt, own.id);
@@ -2830,7 +2876,7 @@ export class App {
     for (const p of this.otherAgents()) {
       if (p === rt.meta.provider) continue;
       const accountId = rt.meta.agents?.find((l) => l.provider === p)?.accountId ?? this.defaultAccountId(p);
-      const theirs = this.cache.get<Capabilities>(capsCacheKey(p, accountId, rt.meta.cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(p, accountId));
+      const theirs = this.cachedCaps(p, accountId, rt.meta.cwd) ?? this.cachedCaps(p, accountId);
       const m = theirs && matchModel(query, theirs.models);
       if (!m) continue;
       await this.switchAgent(rt, p, { model: m.id });
@@ -2884,7 +2930,7 @@ export class App {
     const known = await this.knownLimits(provider);
     const accounts = info.accounts ?? [];
     const cwd = opts.rt?.meta.cwd ?? opts.cwd;
-    const capsOf = (accountId: string) => this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, accountId));
+    const capsOf = (accountId: string) => this.cachedCaps(provider, accountId, cwd) ?? this.cachedCaps(provider, accountId);
     const chosen = opts.model ?? opts.rt?.meta.model;
     const ownCaps = (opts.rt?.caps ?? capsOf(current))?.models;
     const model = effectiveModel(chosen || undefined, ownCaps, this.store.state.settings.defaultModels[provider]);
@@ -2928,7 +2974,7 @@ export class App {
    * one reading for ranking, moves, caps and reset notices (review wave 8, #27).
    */
   private chatModel(rt: SessionRuntime): string | undefined {
-    const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd));
+    const caps = rt.caps ?? this.cachedCaps(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd);
     return effectiveModel(rt.meta.model, caps?.models, this.store.state.settings.defaultModels[rt.meta.provider]);
   }
 
@@ -2953,7 +2999,7 @@ export class App {
     if (!cap) return undefined;
     const known = await this.knownLimits(provider);
     // The alias "default" resolved, as everywhere else that reads per-model windows (review wave 8, #27).
-    const caps = this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, accountId));
+    const caps = this.cachedCaps(provider, accountId, cwd) ?? this.cachedCaps(provider, accountId);
     const model = effectiveModel(chosen || undefined, caps?.models, this.store.state.settings.defaultModels[provider]);
     const reached = capReached(known.get(accountId)?.limits, cap, model);
     if (!reached) return undefined;
@@ -4529,7 +4575,7 @@ export class App {
     const tokens = rt.meta.usage.contextTokens;
     let outcome: MoveOutcome = { kind: 'plain' };
     if (rt.meta.providerSessionId && target.adoptConversation && bigContext(tokens, rt.meta.usage.contextWindow)) {
-      const caps = rt.caps ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId, rt.meta.cwd)) ?? this.cache.get<Capabilities>(capsCacheKey(provider, fromId));
+      const caps = rt.caps ?? this.cachedCaps(provider, fromId, rt.meta.cwd) ?? this.cachedCaps(provider, fromId);
       const can = opts.compact !== false && !opts.retry && caps?.features.compact !== false && (await this.canRunTurn(rt, fromId));
       await ready();
       if (can) {
@@ -4849,7 +4895,7 @@ export class App {
     const accountId = keeps ? (target!.accountId ?? DEFAULT_ACCOUNT) : (opts.accountId ?? this.defaultAccountId(provider));
     // Refuses an account that was removed before anything changes.
     this.provider(provider, accountId);
-    const cached = this.cache.get<Capabilities>(capsCacheKey(provider, accountId, cwd));
+    const cached = this.cachedCaps(provider, accountId, cwd);
     const defaultModel = (caps: Capabilities | undefined) => caps?.models.find((m) => m.isDefault)?.id ?? caps?.models[0]?.id;
     const model = opts.model || (keeps ? target!.model : '') || settings.defaultModels[provider] || defaultModel(cached) || '';
     const prev = legs.find((l) => l.provider === from);
@@ -5402,7 +5448,7 @@ export class App {
 
   /** Shows what the agent offers right away from the cache; the adapter's own answer replaces it. */
   private seedCaps(rt: SessionRuntime) {
-    const cached = this.cache.get<Capabilities>(capsCacheKey(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd));
+    const cached = this.cachedCaps(rt.meta.provider, rt.meta.accountId ?? DEFAULT_ACCOUNT, rt.meta.cwd);
     if (!cached) return;
     if (!rt.caps) return rt.setCaps(cached);
     // Codex's MCP inventory (and so its browser / computer-use plugin) arrives much later.
@@ -5773,52 +5819,48 @@ export class App {
     this.register('auth.login', async ({ provider, accountId = DEFAULT_ACCOUNT }) => {
       const p = this.provider(provider, accountId);
       const key = accountKey(provider, accountId);
-      this.loginCancelled.delete(key);
-      this.loginTimedOut.delete(key);
-      this.emit({ type: 'auth.progress', provider, accountId, state: 'started' });
+      if (this.logins.has(key)) return { started: true };
+      this.accountUse.set(key, Date.now());
+      let waiting = true;
+      const flow = { cancel: async (timeout: boolean) => {
+        if (!waiting) return;
+        waiting = false;
+        clearTimeout(timer);
+        this.emit({ type: 'auth.progress', provider, accountId, state: timeout ? 'timeout' : 'cancelled' });
+        try { await p.cancelLogin(); }
+        finally { if (this.logins.get(key) === flow) this.logins.delete(key); }
+      } };
+      this.logins.set(key, flow);
       // A sign-in nobody finishes in the browser is given up, so the flow never hangs on "waiting".
-      const timer = setTimeout(() => {
-        this.loginTimedOut.add(key);
-        this.loginCancelled.add(key);
-        void p.cancelLogin().catch(() => {});
-        this.emit({ type: 'auth.progress', provider, accountId, state: 'timeout' });
-      }, this.loginTimeoutMs);
+      const timer = setTimeout(() => void flow.cancel(true).catch(() => {}), this.loginTimeoutMs);
       timer.unref?.();
+      this.emit({ type: 'auth.progress', provider, accountId, state: 'started' });
       void p
         .login()
         .then(async () => {
-          if (this.loginTimedOut.has(key)) return;
-          const info = await this.emitProvider(provider, accountId);
-          const signedIn = info.accounts?.find((a) => a.id === accountId)?.auth;
-          if (signedIn?.loggedIn) {
-            // A new account takes its name from the sign-in ("Account 2" becomes "Ada").
-            const stored = this.store.state.accounts.find((a) => a.provider === provider && a.id === accountId);
-            const name = stored?.autoLabel ? labelFromAuth(signedIn, this.accountList(provider).filter((a) => a.id !== accountId).map((a) => a.label)) : undefined;
-            if (stored && name) {
-              stored.label = name;
-              stored.autoLabel = false;
-              this.store.saveState();
-              await this.emitProvider(provider);
-            }
-            this.journal.record({ agent: provider, accountId }, { event: 'signed-in' });
-            this.emit({ type: 'auth.progress', provider, accountId, state: 'done' });
-          } else if (!this.loginCancelled.has(key)) this.emit({ type: 'auth.progress', provider, accountId, state: 'cancelled' });
+          if (!waiting) return;
+          waiting = false;
+          clearTimeout(timer);
+          this.cache.set(`signin:${key}`, undefined);
+          this.infoCache.delete(key);
+          this.authRetryAt.delete(key);
+          this.forgetLimits(provider, accountId);
+          this.journal.record({ agent: provider, accountId }, { event: 'signed-in' });
+          this.logins.delete(key);
+          this.emit({ type: 'auth.progress', provider, accountId, state: 'done' });
+          await this.emitProvider(provider, accountId, true);
         })
         .catch((err: Error) => {
-          // Cancelling kills the CLI, which rejects the login: already reported as 'cancelled'.
-          if (!this.loginCancelled.has(key)) this.emit({ type: 'auth.progress', provider, accountId, state: 'error', message: err.message });
+          if (waiting) this.emit({ type: 'auth.progress', provider, accountId, state: 'error', message: err.message ?? String(err) });
         })
         .finally(() => {
           clearTimeout(timer);
-          this.loginCancelled.delete(key);
-          this.loginTimedOut.delete(key);
+          if (this.logins.get(key) === flow) this.logins.delete(key);
         });
       return { started: true };
     });
     this.register('auth.cancel', async ({ provider, accountId = DEFAULT_ACCOUNT }) => {
-      this.loginCancelled.add(accountKey(provider, accountId));
-      await this.provider(provider, accountId).cancelLogin();
-      this.emit({ type: 'auth.progress', provider, accountId, state: 'cancelled' });
+      await this.logins.get(accountKey(provider, accountId))?.cancel(false);
       return { ok: true };
     });
     this.register('auth.logout', async ({ provider, accountId = DEFAULT_ACCOUNT }) => {
@@ -5910,6 +5952,7 @@ export class App {
         this.removingAccounts.delete(key);
       }
       this.infoCache.delete(key);
+      this.authRetryAt.delete(key);
       this.limitsCache.delete(key);
       this.earlyResetRead.delete(key);
       this.limitsToastAt.delete(key);
@@ -6890,8 +6933,8 @@ function capsCacheKey(provider: ProviderId, accountId: string, cwd?: string) {
   return `caps:${provider}:${accountId}:${cwd ? path.resolve(cwd).toLowerCase() : ''}`;
 }
 
-function fallbackInfo(p: Provider) {
-  return { id: p.id, name: p.name, installed: false, auth: { loggedIn: false }, problem: 'Could not query the CLI' };
+function fallbackInfo(p: Provider): ProviderInfo {
+  return { id: p.id, name: p.name, installed: false, auth: { loggedIn: false, checking: true }, problem: 'Could not query the CLI' };
 }
 
 /** Who an account is signed in as, for telling a changed sign-in (another person, a key in place of a plan). */

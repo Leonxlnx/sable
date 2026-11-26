@@ -10,6 +10,15 @@ export const signedOut = (auth: AuthState | undefined): boolean => !!auth && !au
 /** Whether the sign-in of any of these agents is not known yet: until it is, nothing asks to sign in or to connect an agent. */
 export const anyChecking = (providers: Partial<Record<ProviderId, ProviderInfo>>, ids: ProviderId[]): boolean => ids.some((id) => !!providers[id]?.auth.checking);
 
+/** A definitive answer belongs to its own account, including when hello and an update cross. */
+export function keepKnownAuth(was: ProviderInfo | undefined, next: ProviderInfo): ProviderInfo {
+  if (!was) return next;
+  const keep = (read: AuthState, known?: AuthState) => read.checking && known && !known.checking ? known : read;
+  return { ...next, auth: keep(next.auth, was.auth), accounts: next.accounts?.map(a => ({
+    ...a, auth: keep(a.auth, was.accounts?.find(old => old.id === a.id)?.auth),
+  })) };
+}
+
 /**
  * The agent home starts on: the one the person chose (`current` when `chosen`), else the one set in
  * settings, each only while it is installed; else the first real agent that is, else the Demo.
@@ -31,5 +40,9 @@ export const correctsGuess = (was: ProviderInfo | undefined, now: ProviderInfo):
  * hello's own answer (a frame applies its events first): the answer it brought is kept.
  */
 export function helloProviders(current: Partial<Record<ProviderId, ProviderInfo>>, told: ProviderInfo[]): Partial<Record<ProviderId, ProviderInfo>> {
-  return Object.fromEntries(told.map((p) => [p.id, p.auth.checking && current[p.id] && !current[p.id]!.auth.checking ? current[p.id]! : p]));
+  return Object.fromEntries(told.map(p => {
+    const was = current[p.id];
+    if (was && !was.auth.checking && p.auth.checking && (!p.accounts || p.accounts.every(a => a.auth.checking))) return [p.id, was];
+    return [p.id, keepKnownAuth(was, p)];
+  }));
 }

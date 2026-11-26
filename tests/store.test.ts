@@ -73,6 +73,11 @@ beforeEach(() => {
 });
 
 describe('store event application', () => {
+  it('shows the bridge reason when a sign-in fails', () => {
+    feed({ type: 'auth.progress', provider: 'claude', accountId: 'studio', state: 'error', message: 'The browser denied this sign-in' });
+    expect(S.useStore.getState().toasts.at(-1)).toMatchObject({ level: 'error', text: 'The browser denied this sign-in' });
+  });
+
   it('builds a session from added items and coalesces deltas into one write per frame', () => {
     feed({ type: 'session.added', session: meta() });
     expect(data()).toMatchObject({ loaded: true, roots: [], permissions: [], questions: [], todos: [] });

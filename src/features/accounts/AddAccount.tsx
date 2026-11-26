@@ -248,7 +248,7 @@ function Ready({ provider, accountId, onSignIn, onDone }: { provider: ProviderId
     >
       <div className="aa-ready-line">
         {account.auth.loggedIn ? <Icon name="check-circle" size={16} className="aa-ready-icon" /> : <Icon name="circle-dashed" size={16} className="aa-ready-icon" />}
-        <span className="aa-ready-state">{account.auth.loggedIn ? 'Signed in' : 'Not signed in'}</span>
+        <span className="aa-ready-state">{account.auth.loggedIn ? 'Signed in' : account.auth.checking ? 'Checking sign-in' : 'Not signed in'}</span>
         {plan && account.auth.loggedIn && <span className="aa-ready-plan">{plan} plan</span>}
         {account.external && <PathLabel fit path={tildePath(account.dir ?? '', home)} className="aa-ready-dir" />}
       </div>
@@ -278,10 +278,10 @@ function Ready({ provider, accountId, onSignIn, onDone }: { provider: ProviderId
             <button type="button" className="btn btn-sm btn-ghost" onClick={finish}>
               Later
             </button>
-            <button type="button" className="btn btn-sm btn-primary" autoFocus onClick={onSignIn}>
+            {!account.auth.checking && <button type="button" className="btn btn-sm btn-primary" autoFocus onClick={onSignIn}>
               <Icon name="sign-in" size={14} />
               Sign in
-            </button>
+            </button>}
           </>
         )}
       </div>

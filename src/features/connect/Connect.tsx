@@ -14,7 +14,7 @@ import { cancelLogin, login, logout, moveAccount, openSettings, readLimitsNow, r
 import { useAccounts } from '@/state/hooks';
 import { accountKey, useStore, type AuthFlow } from '@/state/store';
 import { cx, IconButton, Menu, MenuContent, MenuItem, MenuSep, MenuTrigger, Spinner } from '@/ui';
-import { anyChecking } from '@/lib/sign-in';
+import { anyChecking, signedOut } from '@/lib/sign-in';
 import { INSTALL, connectableAgents, isSignedIn, planBeside, planLabel } from './plan';
 import './connect.css';
 
@@ -39,15 +39,15 @@ export function ConnectCard({ provider, primary = false, compact = false }: { pr
   // Older bridges send no account list: the provider's own sign-in is its one account.
   const accounts: AccountInfo[] = listed.length || !info ? listed : [{ id: DEFAULT_ACCOUNT, provider, label: 'Main', isDefault: true, auth: info.auth }];
   const multi = accounts.length > 1;
-  const firstOut = primary ? accounts.find((a) => !a.auth.loggedIn)?.id : undefined;
+  const firstOut = primary ? accounts.find((a) => signedOut(a.auth))?.id : undefined;
 
   const mark = <ProviderMark provider={provider} size={compact ? 22 : 24} className="cc-mark" />;
 
   return (
     <article className="cc" data-provider={provider} data-compact={compact || undefined} data-multi={multi || undefined} data-spot={compact ? undefined : ''} aria-label={name}>
 
-      {!info || !info.installed || info.auth.checking ? (
-        <AgentState provider={provider} mark={mark} phase={!info || info.auth.checking ? 'loading' : 'missing'} />
+      {!info || !info.installed ? (
+        <AgentState provider={provider} mark={mark} phase={!info ? 'loading' : 'missing'} />
       ) : multi ? (
         <>
           <header className="cc-head">
@@ -165,7 +165,6 @@ function AccountRow({
   const [busy, setBusy] = useState<'out' | 'remove' | 'refresh' | 'in' | null>(null);
   const [celebrate, setCelebrate] = useState(false);
   const [dismissed, setDismissed] = useState<AuthFlow | undefined>(undefined);
-  const cancelledAt = useRef(0);
   const seenFlow = useRef(flow);
 
   // React to flow transitions while the row is on screen; a flow that ended before it mounted is history.
@@ -181,8 +180,6 @@ function AccountRow({
       const t = window.setTimeout(() => setCelebrate(false), 1800);
       return () => window.clearTimeout(t);
     }
-    // Cancelling kills the CLI, which the bridge may also report as a failure: not an error to the user.
-    if (flow?.state === 'error' && Date.now() - cancelledAt.current < 8000) setDismissed(flow);
   }, [flow]);
 
   const signedIn = account.auth.loggedIn;
@@ -191,7 +188,7 @@ function AccountRow({
   if (live) phase = live.state === 'timeout' ? 'error' : (live.state as RowPhase);
   else if (celebrate) phase = 'success';
   else if (busy === 'in') phase = 'started';
-  else phase = signedIn ? 'in' : 'out';
+  else phase = signedIn ? 'in' : signedOut(account.auth) ? 'out' : 'loading';
 
   useEffect(() => {
     if (phase !== 'in' && phase !== 'out') setConfirm(null);
@@ -213,7 +210,6 @@ function AccountRow({
     void login(provider, accountId).finally(() => setBusy((b) => (b === 'in' ? null : b)));
   };
   const cancel = () => {
-    cancelledAt.current = Date.now();
     setBusy(null);
     void cancelLogin(provider, accountId);
   };
@@ -242,6 +238,7 @@ function AccountRow({
               ? { key: 'success', text: <><DrawnCheck />Signed in</> }
               : phase === 'in'
                 ? { key: `in-${email ?? ''}`, text: email ?? account.auth.org ?? 'Signed in', tone: 'quiet' }
+                : phase === 'loading' ? { key: 'loading', text: 'Checking sign-in', tone: 'quiet' }
                 : { key: 'out', text: account.problem ?? 'Not signed in' };
 
   const actionsKey = confirm ? `c-${confirm}` : phase === 'url' && live?.url ? 'url-link' : phase;
@@ -368,6 +365,9 @@ function AccountRow({
                 <MenuItem icon="refresh" onSelect={() => void run('refresh', () => Promise.all([refreshProvider(provider, accountId), readLimitsNow(provider, accountId)]))}>
                   Refresh
                 </MenuItem>
+              )}
+              {signedIn && (provider === 'claude' || provider === 'codex') && (
+                <MenuItem icon="sign-in" onSelect={signIn}>Sign in again</MenuItem>
               )}
               {provider !== 'opencode' && (
                 <MenuItem icon="pencil" onSelect={() => setRenaming(true)}>

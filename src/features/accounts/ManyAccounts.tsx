@@ -8,6 +8,7 @@ import { roomRow, type RoomInput, type RoomRow } from '@/features/usage/room';
 import { accountUsed, usedPercent, usedText } from '@/features/usage/words';
 import { Icon } from '@/icons';
 import { useNow } from '@/lib/useNow';
+import { signedOut } from '@/lib/sign-in';
 import { accountName } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { Tip } from '@/ui';
@@ -243,10 +244,10 @@ function ManyRow({ row, now, rank, inUse, single, onPeek, onSelect }: { row: Roo
       className="menu-item acs-row acs-row-in"
       data-current={mark === 'here' || undefined}
       data-in-use={inUse || undefined}
-      data-out={!account.auth.loggedIn || undefined}
+      data-out={signedOut(account.auth) || undefined}
       onFocus={onPeek}
       onSelect={onSelect}
-      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${usedText(used)}` : ''}${words ? `, ${words.toLowerCase()}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${markWords(mark)}`}
+      aria-label={`${PROVIDER_NAME[provider]}, ${row.input.name}${plan ? `, ${plan}` : ''}${used !== undefined ? `, ${usedText(used)}` : ''}${words ? `, ${words.toLowerCase()}` : ''}${signedOut(account.auth) ? ', not signed in' : ''}${markWords(mark)}`}
     >
       {single ? (
         <ProviderMark provider={provider} size={14} className="acs-mark" />
@@ -263,7 +264,7 @@ function ManyRow({ row, now, rank, inUse, single, onPeek, onSelect }: { row: Roo
           <EndsCell rank={rank} now={now} />
         </>
       ) : (
-        <SignIn />
+        <AccountStatus checking={account.auth.checking} />
       )}
     </RM.Item>
   );
@@ -283,8 +284,8 @@ export function MarkCell({ mark }: { mark: AccountMark }) {
  * A signed-out account has no plan, no figures and no week: its row ends in what picking it does,
  * on the right edge the figures of the other rows end on.
  */
-export function SignIn() {
-  return <span className="acs-signin">Sign in</span>;
+export function AccountStatus({ checking }: { checking?: boolean }) {
+  return checking ? <span className="acs-plan">Checking sign-in</span> : <span className="acs-signin">Sign in</span>;
 }
 
 /**

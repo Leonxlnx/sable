@@ -283,7 +283,10 @@ export class CodexProvider implements Provider {
   private disposed = false;
   private versionCache?: { installed: boolean; version?: string; problem?: string };
   private capsCache = new Map<string, { at: number; caps: Promise<Capabilities> }>();
-  private lastAuth?: string;
+  private lastAuth?: AuthState;
+  private loginInfoUntil = 0;
+  private signInGeneration = 0;
+  private loginGeneration = 0;
   private snapshots = new Map<string, RateLimitSnapshot>();
   private mcpCache?: McpServerInfo[];
   private mcpAt = 0;
@@ -302,7 +305,13 @@ export class CodexProvider implements Provider {
   private readonly rpcOwner: { account: symbol };
 
   forDelegate() {
-    return new CodexProvider(this.ctx, this);
+    // The delegate owns its server until its task and receivers finish. An old
+    // server's account readings no longer belong to the folder after a sign-in.
+    const generation = this.signInGeneration;
+    return new CodexProvider({ ...this.ctx, emit: event => {
+      if (generation !== this.signInGeneration && (event.type === 'provider.updated' || event.type === 'caps.updated' || event.type === 'limits.updated')) return;
+      this.ctx.emit(event);
+    } }, this);
   }
 
   terminateOpeningDelegate() { return this.delegateOwner ? this.dispose(true) : Promise.resolve(); }
@@ -462,14 +471,16 @@ export class CodexProvider implements Provider {
         if (!p?.threadId) return this.noteWarning(p?.message);
         if (typeof p.threadId === 'string') this.sessions.get(p.threadId)?.onNotification(method, p);
         return;
-      case 'account/updated':
+      case 'account/updated': {
+        const previous = this.lastAuth;
+        this.loginInfoUntil = 0;
         void this.info()
           .then((info) => {
-            const key = JSON.stringify(info.auth);
-            if (this.lastAuth !== undefined && key !== this.lastAuth) this.ctx.emit({ type: 'provider.updated', provider: info });
+            if (previous && JSON.stringify(previous) !== JSON.stringify(info.auth)) this.ctx.emit({ type: 'provider.updated', provider: info });
           })
           .catch(() => {});
         return;
+      }
       case 'account/rateLimits/updated': {
         const snap = p?.rateLimits as RateLimitSnapshot | undefined;
         if (!snap) return;
@@ -618,6 +629,7 @@ export class CodexProvider implements Provider {
     const key = gateKey(this.id, this.configHome());
     return authGate.run(key, () => new Promise<NonNullable<typeof this.versionCache>>((resolve) => {
       if (this.ctx.closing?.()) throw new Error('Sable is closing');
+      if (this.rpc?.alive || this.starting || this.delegateProcesses.size) return resolve({ installed: true, version: this.versionCache?.version });
       const child = execFile(cmd.file, cmd.args, { shell: cmd.shell, windowsHide: true, timeout: 15_000, env: cmd.env }, (err, stdout, stderr) => {
         const out = `${stdout ?? ''}`.trim();
         const m = out.match(/(\d+\.\d+\.\d+[\w.-]*)/);
@@ -634,39 +646,51 @@ export class CodexProvider implements Provider {
     }), scope);
   }
 
+  private async readAccount(rpc: CodexRpc, timeout: number): Promise<AuthState> {
+    const r = await rpc.request<GetAccountResponse>('account/read', { refreshToken: false }, timeout);
+    if (!r || typeof r.requiresOpenaiAuth !== 'boolean' && !r.account) throw new Error('Unknown Codex account status');
+    const a = r.account;
+    const plan = codexPlan(a, !a && !r.requiresOpenaiAuth);
+    if (a?.type === 'chatgpt') return { loggedIn: true, method: 'chatgpt', email: a.email ?? undefined, ...plan, org: a.workspaceName ?? undefined };
+    if (a) return { loggedIn: true, method: a.type, ...plan };
+    if (!r.requiresOpenaiAuth) return { loggedIn: true, method: 'custom provider', ...plan };
+    return { loggedIn: false };
+  }
+
   async info(force = false): Promise<ProviderInfo> {
-    await authGate.beforeRead();
+    const fresh = !!this.lastAuth && Date.now() < this.loginInfoUntil;
+    if (!fresh) await authGate.beforeRead();
     const scope = this.scope('status');
     let pid = this.rpc?.pid;
     record(scope, { event: 'status', pid });
-    const v = await this.version(force);
-    const base = { id: this.id, name: this.name, installed: v.installed, version: v.version };
-    if (!v.installed) { record(scope, { event: 'status-answer', answer: 'unknown' }); return { ...base, auth: { loggedIn: false }, problem: v.problem }; }
+    const v = fresh || this.rpc?.alive ? { installed: true, version: this.versionCache?.version } : await this.version(force);
+    const base = { id: this.id, name: this.name, installed: v.installed, version: v.version, ...(setupWarnings.length ? { warnings: setupWarnings.map(w => ({ ...w })) } : {}) };
+    const unknown: AuthState = { loggedIn: false, checking: true };
+    if (!v.installed) { record(scope, { event: 'status-answer', answer: 'unknown' }); return { ...base, auth: this.lastAuth ?? unknown, problem: v.problem }; }
+    const generation = this.signInGeneration;
     try {
-      const rpc = await this.client('status');
-      pid = rpc.pid;
-      await authGate.beforeRead();
-      const r = await rpc.request<GetAccountResponse>('account/read', { refreshToken: false }, 20_000);
-      if (!r || typeof r.requiresOpenaiAuth !== 'boolean' && !r.account) throw new Error('Unknown Codex account status');
-      const a = r.account;
-      let auth: AuthState = { loggedIn: false };
-      const plan = codexPlan(a, !a && !r.requiresOpenaiAuth);
-      if (a?.type === 'chatgpt') auth = { loggedIn: true, method: 'chatgpt', email: a.email ?? undefined, ...plan, org: a.workspaceName ?? undefined };
-      else if (a) auth = { loggedIn: true, method: a.type, ...plan };
-      else if (!r.requiresOpenaiAuth) auth = { loggedIn: true, method: 'custom provider', ...plan };
+      let auth = this.lastAuth;
+      if (!auth || Date.now() >= this.loginInfoUntil) {
+        if (!this.rpc?.alive && !this.starting && this.delegateProcesses.size) throw new Error('Could not confirm the sign-in');
+        const rpc = await this.client('status');
+        pid = rpc.pid;
+        await authGate.beforeRead();
+        auth = await this.readAccount(rpc, 20_000);
+        if (generation !== this.signInGeneration) return { ...base, auth: this.lastAuth ?? unknown };
+        this.lastAuth = auth;
+      }
       record(scope, { event: 'status-answer', answer: auth.loggedIn ? 'in' : 'out', pid });
-      this.lastAuth = JSON.stringify(auth);
       // The app-server is up and signed in: read the limits now (free, about half a second), so a
       // first launch has them when the app is ready instead of asking only once the UI is up and
       // waiting another round trip. A view that asks meanwhile shares this read.
-      if (auth.loggedIn && !this.limitsPrimed && !this.ctx.dormant?.(this.id)) {
+      if (auth.loggedIn && (!fresh || this.rpc?.alive) && !this.limitsPrimed && !this.ctx.dormant?.(this.id)) {
         this.limitsPrimed = true;
         void this.limits().catch(() => {});
       }
-      return { ...base, auth, ...(setupWarnings.length ? { warnings: setupWarnings.map((w) => ({ ...w })) } : {}) };
+      return { ...base, auth };
     } catch (err) {
       record(scope, { event: 'status-answer', answer: 'unknown', pid });
-      return { ...base, auth: { loggedIn: false, checking: true }, problem: errMsg(err) };
+      return { ...base, auth: this.lastAuth ?? unknown, problem: errMsg(err) };
     }
   }
 
@@ -684,10 +708,16 @@ export class CodexProvider implements Provider {
   }
 
   async login(): Promise<void> {
-    const rpc = await this.client('login');
     if (this.pendingLogin) await this.cancelLogin();
+    const generation = this.loginGeneration;
+    const rpc = await this.client('login');
+    if (generation !== this.loginGeneration) throw new Error('Sign-in cancelled');
     const r = await rpc.request<LoginAccountResponse>('account/login/start', { type: 'chatgpt' }, 30_000);
     if (r.type !== 'chatgpt' && r.type !== 'chatgptDeviceCode') return;
+    if (generation !== this.loginGeneration) {
+      await rpc.request('account/login/cancel', { loginId: r.loginId }, 10_000);
+      throw new Error('Sign-in cancelled');
+    }
     const url = r.type === 'chatgpt' ? r.authUrl : r.verificationUrl;
     const done = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -704,7 +734,17 @@ export class CodexProvider implements Provider {
       url,
       message: r.type === 'chatgptDeviceCode' ? `Enter code ${r.userCode}` : 'Sign in with ChatGPT in your browser',
     });
-    return done;
+    await done;
+    const auth = await this.readAccount(rpc, 6000).catch(() => undefined);
+    if (generation !== this.loginGeneration) throw new Error('Sign-in cancelled');
+    // All ordinary threads share this app-server, including its completed sign-in.
+    this.signInGeneration++;
+    this.lastAuth = auth ?? { loggedIn: true };
+    this.loginInfoUntil = auth ? Date.now() + 120_000 : 0;
+    this.capsCache.clear();
+    this.snapshots.clear();
+    this.limitsAt = 0;
+    this.limitsPrimed = false;
   }
 
   private finishLogin(err?: Error) {
@@ -712,8 +752,8 @@ export class CodexProvider implements Provider {
     if (!l) return;
     this.pendingLogin = undefined;
     clearTimeout(l.timer);
-    this.capsCache.clear();
-    if (err && !l.cancelled) l.reject(err);
+    if (l.cancelled) l.reject(new Error('Sign-in cancelled'));
+    else if (err) l.reject(err);
     else l.resolve();
   }
 
@@ -724,6 +764,7 @@ export class CodexProvider implements Provider {
   }
 
   async cancelLogin(): Promise<void> {
+    this.loginGeneration++;
     const l = this.pendingLogin;
     if (!l) return;
     l.cancelled = true;
@@ -732,12 +773,15 @@ export class CodexProvider implements Provider {
     } catch {
       /* already finished */
     }
-    this.finishLogin();
+    if (this.pendingLogin === l) this.finishLogin();
   }
 
   async logout(): Promise<void> {
     const rpc = await this.client('logout');
     await rpc.request('account/logout', undefined, 20_000);
+    this.signInGeneration++;
+    this.loginInfoUntil = 0;
+    this.lastAuth = { loggedIn: false };
     this.capsCache.clear();
   }
 
@@ -964,12 +1008,13 @@ export class CodexProvider implements Provider {
   /** What this setup adds: the Codex app's computer-use plugin (browser + desktop), remote control. */
   optionalFeatures(list = this.mcpCache) {
     const cua = !!this.computerUsePlugin(list);
-    return { browser: cua, computerUse: cua, linkedBrowserComputer: cua, remoteControl: !!this.lastAuth?.includes('"chatgpt"') };
+    return { browser: cua, computerUse: cua, linkedBrowserComputer: cua, remoteControl: this.lastAuth?.method === 'chatgpt' };
   }
 
   /** Background MCP refresh; pushes the result into cached caps and open sessions. */
   refreshMcp(threadId?: string): Promise<McpServerInfo[]> {
     if (this.mcpLoading) return this.mcpLoading;
+    const generation = this.signInGeneration;
     const run = (async () => {
       await authGate.beforeRead();
       const rpc = await this.client('caps');
@@ -987,7 +1032,9 @@ export class CodexProvider implements Provider {
         for (const [cwd, entry] of this.capsCache) {
           entry.caps = entry.caps.then((c) => ({ ...c, mcpServers: list, features: { ...c.features, ...features } }));
           // The home composer asked before this slow inventory finished: tell it.
-          void entry.caps.then((caps) => this.ctx.emit({ type: 'caps.updated', provider: 'codex', cwd: cwd || undefined, caps })).catch(() => {});
+          void entry.caps.then(caps => {
+            if (generation === this.signInGeneration) this.ctx.emit({ type: 'caps.updated', provider: 'codex', cwd: cwd || undefined, caps });
+          }).catch(() => {});
         }
         for (const s of this.sessions.values()) s.updateMcp(list);
         return list;
@@ -1023,11 +1070,13 @@ export class CodexProvider implements Provider {
     if (this.limitsRun) return force === 'fresh' || deferred ? this.limitsRun.then(() => this.limits(force, afterTurn)) : this.limitsRun;
     if (!deferred && force !== 'fresh' && Date.now() - this.limitsAt < 60_000) return Promise.resolve(cached());
     this.limitsAt = Date.now();
+    const generation = this.signInGeneration;
     const run = (async () => {
       const rpc = await this.client('limits');
       if (busy()) return cached();
       if (deferred) limitsAfterTurn.delete(this);
       const r = await rpc.request<GetAccountRateLimitsResponse>('account/rateLimits/read', { excludeResetCreditDetails: true }, 20_000);
+      if (generation !== this.signInGeneration) return cached();
       this.snapshots.clear();
       const byId = r.rateLimitsByLimitId ? Object.values(r.rateLimitsByLimitId).filter((x): x is RateLimitSnapshot => !!x) : [];
       for (const s of byId.length ? byId : r.rateLimits ? [r.rateLimits] : []) this.snapshots.set(s.limitId ?? 'codex', s);

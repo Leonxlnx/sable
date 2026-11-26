@@ -12,7 +12,7 @@ import { Icon } from '@/icons';
 import { openSettings, readStaleFullLimits, refreshLimits, setDefaultAccount } from '@/state/actions';
 import { accountName, useFocusAccount } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
-import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, MarkCell, planOf, SignIn, usePool } from './ManyAccounts';
+import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, MarkCell, planOf, AccountStatus, usePool } from './ManyAccounts';
 import { useAccountOrder } from './order';
 import type { UseFirstRank } from '@shared/use-first';
 import { poolUsedPercent } from '@/features/usage/plans';
@@ -243,10 +243,10 @@ function Row({ provider, account, single, inUse, ends, rank, now, onPeek, onSele
       className="menu-item acs-row"
       data-current={mark === 'here' || undefined}
       data-in-use={inUse || undefined}
-      data-out={!account.auth.loggedIn || undefined}
+      data-out={signedOut(account.auth) || undefined}
       onFocus={onPeek}
       onSelect={onSelect}
-      aria-label={`${PROVIDER_NAME[provider]}, ${label}${plan ? `, ${plan}` : ''}${account.auth.loggedIn ? '' : ', not signed in'}${markWords(mark)}`}
+      aria-label={`${PROVIDER_NAME[provider]}, ${label}${plan ? `, ${plan}` : ''}${signedOut(account.auth) ? ', not signed in' : ''}${markWords(mark)}`}
     >
       <ProviderMark provider={provider} size={14} className="acs-mark" />
       <span className="acs-name truncate">{label}</span>
@@ -257,7 +257,7 @@ function Row({ provider, account, single, inUse, ends, rank, now, onPeek, onSele
           {ends && <EndsCell rank={rank} now={now} />}
         </>
       ) : (
-        <SignIn />
+        <AccountStatus checking={account.auth.checking} />
       )}
       {/* The check's column exists only where there is a choice to check (some agent has several accounts). */}
       {ends && <span className="acs-end">{!single && <MarkCell mark={mark} />}</span>}
