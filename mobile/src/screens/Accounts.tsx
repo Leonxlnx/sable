@@ -68,6 +68,8 @@ export function AccountsScreen() {
   const connState = useStore((s) => s.conn);
   const desktop = useStore((s) => s.desktop);
   const [moving, setMoving] = useState<string | null>(null);
+  // Accounts whose chats are all listed (the "and N more" row opens them).
+  const [whole, setWhole] = useState<Set<string>>(() => new Set());
   const [, bump] = useState(0);
 
   useEffect(() => {
@@ -173,7 +175,7 @@ export function AccountsScreen() {
                       ) : null}
                       {chats.length > 0 && (
                         <ul className="ac-chats" aria-label={`Chats on ${a.label}`}>
-                          {chats.slice(0, SHOWN).map((s) => (
+                          {(whole.has(`${id}:${a.id}`) ? chats : chats.slice(0, SHOWN)).map((s) => (
                             <li key={s.id} className="ac-chat">
                               <button type="button" className="ac-chat-open" onClick={() => (haptic('tap'), nav.chat(s.id))}>
                                 <span className="ac-chat-mark">{s.status === 'running' || s.status === 'starting' ? <Tiles size={12} /> : s.status === 'awaiting' ? <StatusMark tone="awaiting" size={10} /> : <i className="ac-chat-dot" />}</span>
@@ -186,7 +188,13 @@ export function AccountsScreen() {
                               )}
                             </li>
                           ))}
-                          {chats.length > SHOWN && <li className="ac-more num">{`and ${chats.length - SHOWN} more`}</li>}
+                          {chats.length > SHOWN && !whole.has(`${id}:${a.id}`) && (
+                            <li className="ac-more-row">
+                              <button type="button" className="ac-more num" onClick={() => (haptic('tap'), setWhole((w) => new Set(w).add(`${id}:${a.id}`)))}>
+                                {`and ${chats.length - SHOWN} more`}
+                              </button>
+                            </li>
+                          )}
                         </ul>
                       )}
                     </article>

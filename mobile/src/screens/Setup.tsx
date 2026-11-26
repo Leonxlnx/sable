@@ -92,7 +92,7 @@ export function ModelPhrase({ model, effort, levels, open, onOpen }: { model?: s
  * glide by the difference on that clock; a new model's name fades in where it stands while the old one
  * fades out where it stood. Transform and opacity only (WAAPI, the compositor's).
  */
-export function PhraseWords({ model, effort, levels }: { model: string; effort?: string; levels?: string[] }) {
+export function PhraseWords({ model, effort, levels, anchor = 'right' }: { model: string; effort?: string; levels?: string[]; anchor?: 'left' | 'right' }) {
   const ref = useRef<HTMLSpanElement>(null);
   const prev = useRef<{ model: string; effort?: string; at: Map<string, number> } | null>(null);
   useLayoutEffect(() => {
@@ -103,7 +103,8 @@ export function PhraseWords({ model, effort, levels }: { model: string; effort?:
     for (const c of el.children) {
       const part = c as HTMLElement;
       const k = part.dataset.k;
-      if (k && part.dataset.ghost === undefined) at.set(k, w - part.offsetLeft - part.offsetWidth);
+      // each part's distance from the end that holds still (the bar's phrase holds its right end, the sheet's head its left)
+      if (k && part.dataset.ghost === undefined) at.set(k, anchor === 'right' ? w - part.offsetLeft - part.offsetWidth : part.offsetLeft);
     }
     const p = prev.current;
     prev.current = { model, effort, at };
@@ -114,7 +115,8 @@ export function PhraseWords({ model, effort, levels }: { model: string; effort?:
       g.className = `${cls} phrase-ghost`;
       g.dataset.ghost = '';
       g.textContent = text;
-      g.style.right = `${p.at.get(k) ?? 0}px`;
+      if (anchor === 'right') g.style.right = `${p.at.get(k) ?? 0}px`;
+      else g.style.left = `${p.at.get(k) ?? 0}px`;
       el.appendChild(g);
       return g;
     };
@@ -124,7 +126,7 @@ export function PhraseWords({ model, effort, levels }: { model: string; effort?:
       if (!k || part.dataset.ghost !== undefined) continue;
       const was = p.at.get(k);
       const now = at.get(k)!;
-      if (was !== undefined && Math.abs(was - now) > 0.5) part.animate([{ transform: `translateX(${now - was}px)` }, { transform: 'none' }], glide);
+      if (was !== undefined && Math.abs(was - now) > 0.5) part.animate([{ transform: `translateX(${anchor === 'right' ? now - was : was - now}px)` }, { transform: 'none' }], glide);
     }
     if (p.effort !== effort && effort && p.effort) {
       const a = levels?.indexOf(p.effort) ?? -1;
@@ -146,7 +148,7 @@ export function PhraseWords({ model, effort, levels }: { model: string; effort?:
         () => g.remove(),
       );
     }
-  }, [model, effort, levels]);
+  }, [model, effort, levels, anchor]);
   return (
     <span className="phrase-words" ref={ref}>
       <span className="phrase-model" data-k={`m:${model}`} key={`m:${model}`}>
@@ -232,7 +234,7 @@ export function ModelSheet({ open, onClose, s }: { open: boolean; onClose: () =>
       title={
         name ? (
           <span className="mp-title" data-preview={preview ? '' : undefined}>
-            <PhraseWords model={name} effort={level} levels={levels} />
+            <PhraseWords model={name} effort={level} levels={levels} anchor="left" />
           </span>
         ) : (
           <span className="mp-title">Model</span>

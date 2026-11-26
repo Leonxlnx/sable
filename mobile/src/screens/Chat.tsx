@@ -94,7 +94,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
 
   return (
     <div className="screen chat" data-live={live || undefined} data-waiting={waiting || undefined}>
-      <Field palette={paletteFor(s.provider)} amount={0.7} focusX={0.62} focusY={0.985} spread={0.6} active={live} waiting={waiting} under=".composer" />
+      <Field palette={paletteFor(s.provider)} amount={0.7} focusX={0.62} focusY={0.985} spread={0.6} active={live} waiting={waiting} under=".composer, .ro-foot" />
       <ChatHead
         title={s.title}
         sub={connState === 'open' ? [s.chat ? undefined : baseName(homeFolder(s)), accountWord].filter(Boolean).join(' · ') || undefined : undefined}
