@@ -5,8 +5,11 @@ import { haptic } from '@m/lib/native';
 import { Icon, type IconName } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark } from '@m/ui/marks';
 import { Sheet } from '@m/ui/Sheet';
+import { reduced } from '@m/ui/motion';
+import { reel, ROLL_EASE, ROLL_MS } from '@desk/features/composer/reel';
 
-export const MODE_ICON: Record<ModeTone, IconName> = { ask: 'hand', edit: 'edit', plan: 'plan', auto: 'bolt', danger: 'shield' };
+/** The desktop's mode icons (icons/index.tsx MODE_ICON): Bypass is the fire, in red wherever it shows. */
+export const MODE_ICON: Record<ModeTone, IconName> = { ask: 'hand', edit: 'edit', plan: 'compass', auto: 'ffwd', danger: 'fire' };
 
 export interface SetupState {
   /** The chat's agent (its mark leads its models). */
@@ -33,8 +36,9 @@ export interface SetupState {
 }
 
 /**
- * The mode on the prompt bar (2.18, its own chip again, as on the desktop): its icon and its word, bare
- * until held or its sheet is open; Bypass keeps its red icon. A narrow bar keeps the icon alone.
+ * The mode on the prompt bar (2.21, the owner: "lieber bypass in klein nur icon"): its icon alone on a
+ * disc of one fill step, the desktop's mode chip at hand size; Bypass keeps its red icon. Its name is
+ * the button's label and the sheet's. A new mode's icon comes in where the old one stood.
  */
 export function ModeChip({ mode, open, onOpen }: { mode?: ModeInfo; open: boolean; onOpen: () => void }) {
   if (!mode) return null;
@@ -49,17 +53,25 @@ export function ModeChip({ mode, open, onOpen }: { mode?: ModeInfo; open: boolea
       onPointerDown={(e) => e.preventDefault()}
       onClick={(e) => (e.stopPropagation(), haptic('tap'), onOpen())}
     >
-      <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={17} className="mode-chip-icon" />
-      <span className="mode-chip-name">{mode.name}</span>
+      <span key={mode.tone} className="mode-chip-glyph">
+        <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={19} className="mode-chip-icon" />
+      </span>
     </button>
   );
 }
 
-/** Model and effort as one phrase on the bar (the desktop's): "Demo Large · High", the level a step quieter. */
-export function ModelPhrase({ model, effort, open, onOpen }: { model?: string; effort?: string; open: boolean; onOpen: () => void }) {
+/**
+ * Model and effort as ONE phrase on the bar, the desktop's (2.21): "Opus 5.5 · Extra high", the level
+ * a step quieter, always whole. Where the bar has no room for all of it the model's name and the dot
+ * go and the level stays (the desktop's order of shedding); nothing is ever cut with an ellipsis.
+ */
+export function ModelPhrase({ model, effort, levels, open, onOpen }: { model?: string; effort?: string; levels?: string[]; open: boolean; onOpen: () => void }) {
+  const ref = useRef<HTMLButtonElement>(null);
+  useShed(ref, `${model}|${effort}`);
   if (!model) return null;
   return (
     <button
+      ref={ref}
       type="button"
       className="phrase"
       aria-expanded={open}
@@ -68,40 +80,165 @@ export function ModelPhrase({ model, effort, open, onOpen }: { model?: string; e
       onPointerDown={(e) => e.preventDefault()}
       onClick={(e) => (e.stopPropagation(), haptic('tap'), onOpen())}
     >
-      <span className="phrase-model">{model}</span>
-      {effort && (
-        <>
-          <span className="phrase-dot" aria-hidden>
-            ·
-          </span>
-          <span className="phrase-level">{effort}</span>
-        </>
-      )}
+      <PhraseWords model={model} effort={effort} levels={levels} />
     </button>
   );
 }
 
 /**
- * The model panel, as the desktop's (2.18; the sheet of radio cards it replaces read as cheap): the
- * models first, each led by its agent's mark with the check at the end of the one in use, the other
- * agents' models under their agent's name; then the speeds as one row of choices; and at the foot,
- * where the thumb rests, effort as ONE slider of the model's levels, its name over it. The sheet keeps
- * its height while it is open: a model without speeds keeps the row (Standard alone), so nothing under
- * the finger moves when a model is picked.
+ * The phrase's words, which change as the desktop's chip does (Chip.tsx, reel.ts): the layout takes the
+ * new width at once and the phrase holds its right end; a new level rolls in the way it went (up from
+ * below, down from above) while the old one rolls out, one line apart on one clock; the name and the dot
+ * glide by the difference on that clock; a new model's name fades in where it stands while the old one
+ * fades out where it stood. Transform and opacity only (WAAPI, the compositor's).
+ */
+export function PhraseWords({ model, effort, levels }: { model: string; effort?: string; levels?: string[] }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const prev = useRef<{ model: string; effort?: string; at: Map<string, number> } | null>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const at = new Map<string, number>();
+    const w = el.offsetWidth;
+    for (const c of el.children) {
+      const part = c as HTMLElement;
+      const k = part.dataset.k;
+      if (k && part.dataset.ghost === undefined) at.set(k, w - part.offsetLeft - part.offsetWidth);
+    }
+    const p = prev.current;
+    prev.current = { model, effort, at };
+    if (!p || reduced() || (p.model === model && p.effort === effort)) return;
+    const glide = { duration: ROLL_MS, easing: ROLL_EASE };
+    const ghost = (k: string, text: string, cls: string) => {
+      const g = document.createElement('span');
+      g.className = `${cls} phrase-ghost`;
+      g.dataset.ghost = '';
+      g.textContent = text;
+      g.style.right = `${p.at.get(k) ?? 0}px`;
+      el.appendChild(g);
+      return g;
+    };
+    for (const c of el.children) {
+      const part = c as HTMLElement;
+      const k = part.dataset.k;
+      if (!k || part.dataset.ghost !== undefined) continue;
+      const was = p.at.get(k);
+      const now = at.get(k)!;
+      if (was !== undefined && Math.abs(was - now) > 0.5) part.animate([{ transform: `translateX(${now - was}px)` }, { transform: 'none' }], glide);
+    }
+    if (p.effort !== effort && effort && p.effort) {
+      const a = levels?.indexOf(p.effort) ?? -1;
+      const b = levels?.indexOf(effort) ?? -1;
+      const way: 1 | -1 = b >= a ? -1 : 1;
+      const r = reel(way);
+      el.querySelector<HTMLElement>(`[data-k="l:${CSS.escape(effort)}"]`)?.animate(r.in, glide);
+      const g = ghost(`l:${p.effort}`, p.effort, 'phrase-level');
+      g.animate(r.out, { ...glide, fill: 'forwards' }).finished.then(
+        () => g.remove(),
+        () => g.remove(),
+      );
+    }
+    if (p.model !== model) {
+      el.querySelector<HTMLElement>(`[data-k="m:${CSS.escape(model)}"]`)?.animate([{ opacity: 0 }, { opacity: 0, offset: 0.25 }, { opacity: 1 }], { duration: 170, easing: 'ease-out' });
+      const g = ghost(`m:${p.model}`, p.model, 'phrase-model');
+      g.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 60, easing: 'linear', fill: 'forwards' }).finished.then(
+        () => g.remove(),
+        () => g.remove(),
+      );
+    }
+  }, [model, effort, levels]);
+  return (
+    <span className="phrase-words" ref={ref}>
+      <span className="phrase-model" data-k={`m:${model}`} key={`m:${model}`}>
+        {model}
+      </span>
+      {effort && (
+        <>
+          <span className="phrase-dot" data-k="dot" aria-hidden>
+            ·
+          </span>
+          <span className="phrase-level" data-k={`l:${effort}`} key={`l:${effort}`}>
+            {effort}
+          </span>
+        </>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Sheds the phrase's name (and the dot) when the bar it stands in has no room for all of it, and
+ * brings it back once there is: measured when its words change and when the bar's width does.
+ */
+function useShed(ref: React.RefObject<HTMLElement | null>, words: string) {
+  const full = useRef(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const bar = el?.parentElement;
+    if (!el || !bar) return;
+    const check = () => {
+      const cs = getComputedStyle(bar);
+      const gap = parseFloat(cs.columnGap) || 0;
+      const pad = (parseFloat(cs.paddingRight) || 0) + (parseFloat(cs.paddingLeft) || 0);
+      // what the others take (a spacer that only fills the rest takes nothing; the pinned key is outside)
+      let used = 0;
+      let n = 0;
+      for (const k of bar.children) {
+        const kid = k as HTMLElement;
+        if (kid.classList.contains('bar-gap') || getComputedStyle(kid).position === 'absolute') continue;
+        n++;
+        if (kid !== el) used += kid.offsetWidth;
+      }
+      const room = bar.clientWidth - pad - used - gap * Math.max(0, n - 1);
+      if (!el.hasAttribute('data-shed')) {
+        full.current = el.offsetWidth;
+        if (full.current > room + 0.5) el.setAttribute('data-shed', '');
+      } else if (full.current && full.current <= room + 0.5) el.removeAttribute('data-shed');
+    };
+    el.removeAttribute('data-shed');
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, [ref, words]);
+}
+
+/**
+ * The model panel (2.21), the desktop's panel at hand size, as one bottom sheet: at its head the phrase
+ * the bar will say ("Demo Large · High"), which rolls as the level under the thumb changes; the models,
+ * each led by its agent's mark with the check at the end of the one in use, the other agents' models
+ * under their agent's name; a hairline; the speeds as one row of choices; and at the foot, where the
+ * thumb rests, effort as ONE slider of the model's levels (dragged 1:1, a tick per stop, the level's
+ * word riding over the thumb). Its rows never move under the finger: the speed row and the slider's row
+ * are always there once shown (a model with one level keeps a quiet disabled track).
  */
 export function ModelSheet({ open, onClose, s }: { open: boolean; onClose: () => void; s: SetupState }) {
-  const shown = useRef({ speed: false, effort: false });
-  if (!open) shown.current = { speed: false, effort: false };
+  const shown = useRef({ speed: false });
+  if (!open) shown.current = { speed: false };
   const hasSpeed = s.speeds.length > 1;
   const hasEffort = s.efforts.length > 1;
-  if (open) {
-    shown.current.speed ||= hasSpeed;
-    shown.current.effort ||= hasEffort;
-  }
+  if (open) shown.current.speed ||= hasSpeed;
   const speedRow = hasSpeed || shown.current.speed;
-  const effortRow = hasEffort || shown.current.effort;
+  const [preview, setPreview] = useState<string | null>(null);
+  const name = s.models.find((m) => m.id === s.model)?.name;
+  const levels = s.efforts.map((e) => effortName(e));
+  const level = hasEffort ? (preview ?? (s.effort ? effortName(s.effort) : undefined)) : undefined;
   return (
-    <Sheet open={open} onClose={onClose} label="Model">
+    <Sheet
+      open={open}
+      onClose={onClose}
+      label="Model"
+      className="mp-sheet"
+      title={
+        name ? (
+          <span className="mp-title" data-preview={preview ? '' : undefined}>
+            <PhraseWords model={name} effort={level} levels={levels} />
+          </span>
+        ) : (
+          <span className="mp-title">Model</span>
+        )
+      }
+    >
       <div className="mp">
         <div className="mp-models" role="radiogroup" aria-label="Model">
           {s.models.length ? (
@@ -114,7 +251,7 @@ export function ModelSheet({ open, onClose, s }: { open: boolean; onClose: () =>
             <div className="mp-skel" aria-hidden>
               {[46, 38, 52].map((w) => (
                 <span key={w} className="mp-row">
-                  <span className="skel" style={{ width: 16, height: 16, borderRadius: 4 }} />
+                  <span className="skel" style={{ width: 18, height: 18, borderRadius: 5 }} />
                   <span className="skel" style={{ width: `${w}%` }} />
                 </span>
               ))}
@@ -137,34 +274,38 @@ export function ModelSheet({ open, onClose, s }: { open: boolean; onClose: () =>
                       s.onOther?.(o.provider, m.id);
                     }}
                   >
-                    <ProviderMark provider={o.provider} size={16} />
+                    <ProviderMark provider={o.provider} size={18} />
                     <span className="mp-name">{m.name}</span>
                   </button>
                 ))
               ) : (
                 <span className="mp-row" aria-hidden>
-                  <span className="skel" style={{ width: 16, height: 16, borderRadius: 4 }} />
+                  <span className="skel" style={{ width: 18, height: 18, borderRadius: 5 }} />
                   <span className="skel" style={{ width: '40%' }} />
                 </span>
               )}
             </div>
           ))}
         </div>
-        {(speedRow || effortRow) && (
-          <div className="mp-foot">
-            {speedRow && <Segmented label="Speed" options={hasSpeed ? s.speeds : [{ id: STANDARD_SPEED, name: 'Standard' }]} value={hasSpeed ? (s.speed ?? STANDARD_SPEED) : STANDARD_SPEED} onPick={s.onSpeed} />}
-            {effortRow && (hasEffort ? <EffortSlider efforts={s.efforts} value={s.effort} onPick={s.onEffort} /> : <p className="mp-fixed">This model has one effort level.</p>)}
-          </div>
-        )}
+        <div className="mp-foot">
+          {speedRow && <Segmented label="Speed" options={hasSpeed ? s.speeds : [{ id: STANDARD_SPEED, name: 'Standard' }]} value={hasSpeed ? (s.speed ?? STANDARD_SPEED) : STANDARD_SPEED} onPick={s.onSpeed} />}
+          {hasEffort ? <EffortSlider efforts={s.efforts} value={s.effort} onPick={s.onEffort} onPreview={setPreview} /> : <Slider label="Effort" stops={NO_STOPS} disabled onPick={() => {}} />}
+        </div>
       </div>
     </Sheet>
   );
 }
 
-/** What the agent may do without asking: a row per mode, its icon, its name, the check at the end of the one in use. */
+/** The quiet track of a model with one level or none: two stops with no names, nothing to drag. */
+const NO_STOPS = [
+  { id: 'a', name: '' },
+  { id: 'b', name: '' },
+];
+
+/** What the agent may do without asking: a row per mode, its icon (Bypass in red), its name, the check at the end of the one in use. */
 export function ModeSheet({ open, onClose, s }: { open: boolean; onClose: () => void; s: SetupState }) {
   return (
-    <Sheet open={open} onClose={onClose} label="Permissions">
+    <Sheet open={open} onClose={onClose} label="Permissions" title={<span className="mp-title">Permissions</span>}>
       <div className="mp">
         <div className="mp-models" role="radiogroup" aria-label="Permissions">
           {s.modes.map((m) => (
@@ -203,63 +344,62 @@ function PanelRow({ on, onPick, mark, icon, tone, children }: { on: boolean; onP
         onPick();
       }}
     >
-      {mark && <ProviderMark provider={mark} size={16} />}
-      {icon && <Icon name={icon} size={18} className="mp-icon" />}
+      {mark && <ProviderMark provider={mark} size={18} />}
+      {icon && <Icon name={icon} size={19} className="mp-icon" />}
       <span className="mp-name">{children}</span>
-      {on && <Icon name="check" size={16} weight="bold" className="mp-check" />}
+      {on && <Icon name="check" size={17} weight="bold" className="mp-check" />}
     </button>
   );
 }
 
 /**
- * Effort: one slider of the model's levels, the level's name over it. The thumb follows the finger
- * 1:1 and the level under it is named and felt (a tick per stop) as it passes; letting go settles on
- * the nearest stop. A level let go of shows at once and stays until the chat confirms it (or a few
- * seconds), so the thumb never goes back to the old level while the desktop answers.
+ * Effort: one slider of the model's levels. The thumb follows the finger 1:1 and the level under it is
+ * named over the thumb, felt (a tick per stop) and handed to the sheet's head as it passes; letting go
+ * settles on the nearest stop. A level let go of shows at once and stays until the chat confirms it (or
+ * a few seconds), so the thumb never goes back to the old level while the desktop answers.
  */
-function EffortSlider({ efforts, value, onPick }: { efforts: Effort[]; value?: Effort; onPick: (e: Effort) => void }) {
+function EffortSlider({ efforts, value, onPick, onPreview }: { efforts: Effort[]; value?: Effort; onPick: (e: Effort) => void; onPreview: (name: string | null) => void }) {
   const [held, setHeld] = useState<{ id: string; at: number } | null>(null);
-  const [preview, setPreview] = useState<string | null>(null);
   useEffect(() => {
     if (!held) return;
     if (held.id === value) return setHeld(null);
     const t = window.setTimeout(() => setHeld(null), 4000);
     return () => clearTimeout(t);
   }, [held, value]);
+  // The head names the level let go of until the chat has it (or the hold lapses): then it reads the chat's own.
+  useEffect(() => {
+    if (!held) onPreview(null);
+  }, [held, onPreview]);
   const shown = (held?.id ?? value) as Effort | undefined;
-  const live = (preview ?? shown) as Effort | undefined;
   const stops = efforts.map((e) => ({ id: e, name: effortName(e) }));
   return (
-    <div className="mp-effort">
-      <div className="mp-level" aria-hidden>
-        {live ? effortName(live) : 'Effort'}
-      </div>
-      <Slider
-        label="Effort"
-        stops={stops}
-        value={shown}
-        onPreview={setPreview}
-        onPick={(id) => {
-          setHeld({ id, at: Date.now() });
-          onPick(id as Effort);
-        }}
-      />
-    </div>
+    <Slider
+      label="Effort"
+      stops={stops}
+      value={shown}
+      onPreview={(id) => onPreview(id ? effortName(id as Effort) : null)}
+      onPick={(id) => {
+        setHeld({ id, at: Date.now() });
+        onPick(id as Effort);
+      }}
+    />
   );
 }
 
 /**
- * A level among a few in order: a thin track with a dot per stop, filled to the thumb with a dithered
- * head; the thumb follows the finger 1:1 (no easing while dragged) and settles on the nearest stop.
+ * A level among a few in order (the desktop's `Slider` with stops): a thin track with a tick per stop,
+ * filled to the thumb with a dithered head, the level's word riding over the thumb. Dragged 1:1 (no
+ * easing under the finger); let go, the thumb, the fill and the word settle on the nearest stop on one
+ * clock (one animated number, `--u`, 140 ms). `disabled`: the quiet track of a model with one level.
  */
-export function Slider({ label, stops, value, onPick, onPreview }: { label: string; stops: { id: string; name: string }[]; value?: string; onPick: (id: string) => void; onPreview?: (id: string | null) => void }) {
+export function Slider({ label, stops, value, onPick, onPreview, disabled }: { label: string; stops: { id: string; name: string }[]; value?: string; onPick: (id: string) => void; onPreview?: (id: string | null) => void; disabled?: boolean }) {
   const at = Math.max(0, stops.findIndex((o) => o.id === value));
   const [drag, setDrag] = useState<number | null>(null);
   const track = useRef<HTMLDivElement>(null);
   const last = useRef(at);
   const dragging = useRef<number | null>(null);
   const n = stops.length;
-  const pos = drag ?? at / Math.max(1, n - 1);
+  const pos = disabled ? 0 : (drag ?? at / Math.max(1, n - 1));
   useLayoutEffect(() => {
     last.current = at;
   }, [at]);
@@ -281,10 +421,11 @@ export function Slider({ label, stops, value, onPick, onPreview }: { label: stri
   const end = (u: number | null) => {
     dragging.current = null;
     setDrag(null);
-    onPreview?.(null);
-    if (u === null) return;
-    const i = near(u);
-    if (stops[i] && stops[i].id !== value) onPick(stops[i].id);
+    const i = u === null ? -1 : near(u);
+    const pick = stops[i] && stops[i].id !== value ? stops[i].id : null;
+    // A level let go of stays named (the sheet's head) until the chat has it; nothing picked, the preview ends.
+    onPreview?.(pick);
+    if (pick) onPick(pick);
   };
   const shownAt = drag !== null ? near(drag) : at;
   return (
@@ -292,14 +433,17 @@ export function Slider({ label, stops, value, onPick, onPreview }: { label: stri
       className="slider no-drag"
       role="slider"
       aria-label={label}
+      aria-disabled={disabled || undefined}
       aria-valuemin={0}
       aria-valuemax={n - 1}
       aria-valuenow={at}
       aria-valuetext={stops[at]?.name}
-      tabIndex={0}
+      tabIndex={disabled ? -1 : 0}
       data-drag={drag !== null || undefined}
+      data-off={disabled || undefined}
       style={{ '--u': pos } as CSSProperties}
       onKeyDown={(e) => {
+        if (disabled) return;
         const d = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -1 : 0;
         if (!d) return;
         e.preventDefault();
@@ -307,6 +451,7 @@ export function Slider({ label, stops, value, onPick, onPreview }: { label: stri
         if (i !== at) onPick(stops[i].id);
       }}
       onPointerDown={(e) => {
+        if (disabled) return;
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
         move(read(e.clientX));
       }}
@@ -317,11 +462,16 @@ export function Slider({ label, stops, value, onPick, onPreview }: { label: stri
       onLostPointerCapture={() => dragging.current !== null && end(dragging.current)}
     >
       <div className="slider-track" ref={track}>
+        {!disabled && (
+          <span className="slider-word" aria-hidden>
+            {stops[shownAt]?.name}
+          </span>
+        )}
         <span className="slider-fill" />
         {stops.map((o, i) => (
-          <i key={o.id} className="slider-stop" data-on={i <= shownAt || undefined} style={{ left: `${(i / Math.max(1, n - 1)) * 100}%` }} />
+          <i key={o.id} className="slider-stop" data-on={(!disabled && i <= shownAt) || undefined} style={{ left: `${(i / Math.max(1, n - 1)) * 100}%` }} />
         ))}
-        <span className="slider-thumb" />
+        {!disabled && <span className="slider-thumb" />}
       </div>
     </div>
   );

@@ -3,6 +3,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import type { PhoneChangedFile, PhoneChanges } from '@shared/protocol';
 import { clampToHunk, linesOf, locate, newCommentId, rangeLabel, type ReviewComment } from '@desk/features/review/model';
 import { plural } from '@desk/lib/format';
+import { footRoom } from '@m/lib/foot-room';
 import { fit } from '@m/lib/fit';
 import { pushBack } from '@m/lib/back';
 import { reloadChanges, reloadDiff, useChanges, useDiff, type ChangesScope } from '@m/lib/changes';
@@ -226,6 +227,9 @@ function Failed({ text, onRetry }: { text: string; onRetry: () => void }) {
   );
 }
 
+/** The review pane lies over the list or the diff (2.21): its height is the room the scroller keeps after its last line. */
+const reviewRoom = footRoom('--foot-h');
+
 /** The list's foot: the review pane, once comments wait. */
 function ListFoot({ sid }: { sid: string }) {
   const n = useComments(sid).length;
@@ -234,7 +238,7 @@ function ListFoot({ sid }: { sid: string }) {
     <>
       <AnimatePresence initial={false}>
         {n > 0 && (
-          <motion.div key="foot" className="rfoot" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 24 }} transition={SNAP}>
+          <motion.div key="foot" ref={reviewRoom} className="rfoot" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 24 }} transition={SNAP}>
             <div className="rpane">
               <ReviewBar sid={sid} onOpen={() => setSheet(true)} />
             </div>
@@ -361,6 +365,11 @@ export function DiffScreen({ id, path, items }: { id: string; path: string; item
   const scroller = useRef<HTMLDivElement>(null);
   const host = useRef<HTMLDivElement>(null);
   const foot = useRef<HTMLDivElement>(null);
+  // The pane lies over the diff (2.21): its height is the room after the last line.
+  const footRef = useCallback((el: HTMLDivElement | null) => {
+    foot.current = el;
+    return reviewRoom(el);
+  }, []);
   const field = useRef<HTMLTextAreaElement>(null);
   const live = useRef({ sel, editing, text });
   live.current = { sel, editing, text };
@@ -649,7 +658,7 @@ export function DiffScreen({ id, path, items }: { id: string; path: string; item
       </div>
       <AnimatePresence initial={false}>
         {mode && (
-          <motion.div key="foot" ref={foot} className="rfoot" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 24 }} transition={SNAP}>
+          <motion.div key="foot" ref={footRef} className="rfoot" initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 24 }} transition={SNAP}>
             <div className="rpane" data-focus={(mode === 'form' && focused) || undefined}>
               <AutoHeight>
                 <motion.div key={mode} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={SNAP}>

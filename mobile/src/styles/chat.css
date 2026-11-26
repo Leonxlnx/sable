@@ -1713,7 +1713,7 @@
 /* ── the jump to the newest ── */
 .jump {
   position: sticky;
-  bottom: 14px;
+  bottom: calc(var(--foot-h, 0px) + 14px);
   display: grid;
   place-items: center;
   width: 44px;
@@ -1725,24 +1725,44 @@
 
 /* ── the foot: what waits, the queue, the prompt bar ── */
 .chat-foot {
-  position: relative;
+  /* 2.21: the foot lies OVER the conversation, which scrolls on under the glass (the owner: the bar on
+     top of the rest, nothing in between): no fade above it, no band. The thread keeps the foot's
+     height as room after its last line (.thread-foot, --foot-h from lib/foot-room.ts). */
+  position: absolute;
   z-index: 3;
+  left: 0;
+  right: 0;
+  bottom: 0;
   display: flex;
   flex-direction: column;
   padding: 0 10px var(--pane-foot);
   translate: 0 calc(-1 * var(--pane-lift));
   transition: translate var(--kb-ms) var(--ease-ime);
+  pointer-events: none;
 }
 
-/* the newest lines leave under a short fade, not cut at the bar's edge */
-.chat-foot::before {
+.chat-foot > * {
+  pointer-events: auto;
+}
+
+/* lifted over the keyboard, the bar's foot down to the keys is the page's ink (no line of the
+   conversation between the bar and the keyboard) */
+.composer[data-focus]::before {
   content: '';
   position: absolute;
-  left: 0;
-  right: 0;
-  top: -34px;
-  height: 34px;
-  background: linear-gradient(rgb(7 7 8 / 0), rgb(7 7 8 / 0.92));
+  z-index: -2;
+  top: 100%;
+  left: -10px;
+  right: -10px;
+  height: calc(var(--pane-lift) + var(--pane-foot) + 2px);
+  background: var(--bg);
+  pointer-events: none;
+}
+
+/* the room the foot takes, after the last line (the content's own 28 px stay above the bar) */
+.thread-foot {
+  flex-shrink: 0;
+  height: var(--foot-h, 0px);
   pointer-events: none;
 }
 
@@ -1851,54 +1871,85 @@
   transition-duration: 100ms, 100ms, 70ms;
 }
 
-/* The mode chip and the model phrase (2.18, as the desktop's bar): bare until held or open, then one fill
-   step and the hairline. The mode is its icon and its word (Bypass keeps a red icon); the phrase is the
-   model and the level a step quieter, as wide as its words, by the send key. A narrow bar keeps the
-   mode's icon alone. */
+/* The mode and the model phrase (2.21, the desktop's bar at hand size). The mode is its icon alone on
+   a disc of one fill step and its hairline (the desktop's mode chip; Bypass keeps its red fire); held
+   or open, one step up. The phrase is the model and the level a step quieter, always whole (no
+   ellipsis): bare until held or open, as wide as its words, its right end held by the send key; where
+   the bar has no room the name and the dot go and the level stays (Setup.tsx `useShed`). */
 .composer-bar,
 .dock-bar {
   container-type: inline-size;
 }
 
-.mode-chip,
+.mode-chip {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-pill);
+  background-color: var(--fill-2);
+  box-shadow: var(--press-up);
+  color: var(--text-2);
+  transition: background-color 100ms, scale 120ms var(--ease-out);
+}
+
+.mode-chip-glyph {
+  display: grid;
+  place-items: center;
+  /* a new mode's icon comes in where the old one stood (keyed by the mode: a fresh element) */
+  animation: mode-in 180ms var(--ease-out) both;
+}
+
+@keyframes mode-in {
+  from {
+    opacity: 0;
+    transform: scale(0.6) rotate(-12deg);
+  }
+}
+
+.mode-chip[data-tone='danger'] {
+  color: var(--red);
+}
+
+.mode-chip:active {
+  background-color: var(--fill-3);
+  box-shadow: var(--press-down);
+  scale: 0.94;
+  transition-duration: 0ms, 70ms;
+}
+
+.mode-chip[aria-expanded='true'] {
+  background-color: var(--fill-3);
+  box-shadow: var(--press-down);
+}
+
 .phrase {
+  position: relative;
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
   min-width: 0;
   height: 40px;
+  padding: 0 12px;
   border-radius: var(--r-pill);
   font-size: var(--t-small);
   white-space: nowrap;
   transition: background-color 100ms, scale 120ms var(--ease-out);
 }
 
-.mode-chip {
-  flex-shrink: 0;
-  gap: 7px;
-  padding: 0 12px 0 10px;
-  font-weight: var(--w-strong);
-  color: var(--text);
-}
-
-.mode-chip-icon {
-  flex-shrink: 0;
-  color: var(--text-2);
-}
-
-.mode-chip[data-tone='danger'] .mode-chip-icon {
-  color: var(--red);
-}
-
-.phrase {
-  flex-shrink: 1;
-  gap: 6px;
-  padding: 0 10px;
+/* the rolled words are cut at the chip's top and bottom (the desktop's .ph) */
+.phrase-words {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 100%;
+  overflow: hidden;
 }
 
 .phrase-model {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex-shrink: 0;
   font-weight: var(--w-strong);
   color: var(--text);
 }
@@ -1914,7 +1965,21 @@
   color: var(--text-3);
 }
 
-.mode-chip:active,
+/* a word on its way out, where it stood (Setup.tsx PhraseWords) */
+.phrase-ghost {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  pointer-events: none;
+}
+
+.phrase[data-shed] .phrase-model,
+.phrase[data-shed] .phrase-dot {
+  display: none;
+}
+
 .phrase:active {
   background-color: var(--fill-2);
   box-shadow: var(--press-down);
@@ -1922,20 +1987,9 @@
   transition-duration: 0ms, 70ms;
 }
 
-.mode-chip[aria-expanded='true'],
 .phrase[aria-expanded='true'] {
   background-color: var(--fill-2);
   box-shadow: var(--press-down);
-}
-
-@container (max-width: 340px) {
-  .mode-chip {
-    padding: 0 10px;
-  }
-
-  .mode-chip-name {
-    display: none;
-  }
 }
 
 /* Send: the one ivory key, a flat face and a short soft drop (base.css --key-*). Held, it dims a touch,
@@ -1967,12 +2021,25 @@
   transition-duration: 120ms, 120ms, 70ms;
 }
 
+/* nothing to send: a disc of the pane's own glass with the pane's rim and a dim arrow (the desktop's) */
 .send:disabled {
-  background-color: var(--fill-2);
+  background-color: rgb(255 255 255 / 0.025);
   background-image: none;
-  box-shadow: var(--press-up);
+  box-shadow: var(--rim-ring);
   color: var(--text-4);
   scale: 1;
+}
+
+.send-arrow {
+  display: block;
+  overflow: visible;
+}
+
+.send-arrow path {
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .send[data-busy] {

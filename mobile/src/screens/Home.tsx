@@ -298,19 +298,7 @@ export function Home({ under }: { under: boolean }) {
     const sc = el?.querySelector('.home-scroll');
     if (!el || !sc) return;
     let t = 0;
-    // Rows under the bar's edge (more list below): only then the short fade above the bar (2.18; at
-    // rest over the field it stood as a dark seam across the light).
-    const clip = () => {
-      const more = sc.scrollHeight - sc.clientHeight - sc.scrollTop > 2;
-      if (more !== el.hasAttribute('data-clip')) el.toggleAttribute('data-clip', more);
-    };
-    clip();
-    const ro = new ResizeObserver(clip);
-    ro.observe(sc);
-    const body = sc.querySelector('.pull-body');
-    if (body) ro.observe(body);
     const on = () => {
-      clip();
       if (!t) el.setAttribute('data-moving', '');
       clearTimeout(t);
       t = window.setTimeout(() => {
@@ -320,7 +308,6 @@ export function Home({ under }: { under: boolean }) {
     };
     sc.addEventListener('scroll', on, { passive: true });
     return () => {
-      ro.disconnect();
       sc.removeEventListener('scroll', on);
       clearTimeout(t);
     };
@@ -354,6 +341,7 @@ export function Home({ under }: { under: boolean }) {
           spread={1.12}
           stage={stage}
           floor={0}
+          under=".home-dock"
           alert={waitingNow}
           active={working > 0 && !under}
           hidden={under}

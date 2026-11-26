@@ -19,7 +19,7 @@ import { isUncertain } from '@m/lib/errors';
 import { shownPermissions } from '@m/lib/shown';
 import { offers, pressFrom, type Submission } from '@m/lib/submit';
 import { discardPress, onOutgoing, outgoing, retryPress, sendPress } from '@m/lib/phone-send';
-import { Icon } from '@m/ui/icons';
+import { Icon, SendArrow } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
 import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
@@ -307,7 +307,7 @@ export function Composer({ sid }: { sid: string }) {
           )}
           <ModeChip mode={mode} open={sheet === 'mode'} onOpen={() => setSheet('mode')} />
           <span className="bar-gap" />
-          <ModelPhrase model={model || s.model ? modelLabel : undefined} effort={effort && efforts.length > 1 ? effortName(effort) : undefined} open={sheet === 'model'} onOpen={() => setSheet('model')} />
+          <ModelPhrase model={model || s.model ? modelLabel : undefined} effort={effort && efforts.length > 1 ? effortName(effort) : undefined} levels={efforts.map((e) => effortName(e))} open={sheet === 'model'} onOpen={() => setSheet('model')} />
           {/* One key that stays where it is: send, or stop while a turn runs and the field is empty. Only its glyph changes. */}
           <button
             ref={sendKey}
@@ -324,7 +324,7 @@ export function Composer({ sid }: { sid: string }) {
                 <motion.span key="stop" className="stop-square" initial={{ scale: 0.4, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.4, opacity: 0 }} transition={reduced() ? { duration: 0 } : GLYPH} />
               ) : (
                 <motion.span key="send" className="send-glyph" initial={{ scale: 0.4, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.4, opacity: 0 }} transition={reduced() ? { duration: 0 } : GLYPH}>
-                  <Icon name="up" size={18} weight="bold" />
+                  <SendArrow />
                 </motion.span>
               )}
             </AnimatePresence>

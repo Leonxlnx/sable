@@ -126,6 +126,7 @@ export function Field({
   stage,
   floor = 0,
   alert = false,
+  under,
   className,
 }: {
   palette: Palette;
@@ -144,11 +145,16 @@ export function Field({
   floor?: number;
   /** Something waits on you: the horizon is amber. */
   alert?: boolean;
+  /**
+   * The prompt bar (a selector in the field's screen): the foot's light lives only under the bar's
+   * top edge (2.21), so the bar lies over the list with nothing between them; the glass shows it frosted.
+   */
+  under?: string;
   className?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const live = useRef({ palette, amount, active, focusX, focusY, spread, hidden, waiting, stage, floor, alert });
-  live.current = { palette, amount, active, focusX, focusY, spread, hidden, waiting, stage, floor, alert };
+  const live = useRef({ palette, amount, active, focusX, focusY, spread, hidden, waiting, stage, floor, alert, under });
+  live.current = { palette, amount, active, focusX, focusY, spread, hidden, waiting, stage, floor, alert, under };
   const stageKey = stage ? `${stage.x}|${stage.y}|${stage.up}|${stage.down}|${stage.spread}|${stage.amount}` : '';
   const api = useRef<{ kick: () => void; reshape: () => void } | null>(null);
 
@@ -183,9 +189,22 @@ export function Field({
     let raf = 0;
     let box = { left: 0, top: 0, width: 1, height: 1 };
     const t0 = performance.now();
+    // The first row of the foot's light (the bar's top edge and a little): nothing of it above (2.21).
+    let cutRow = 0;
+    const barOf = () => (live.current.under ? (canvas.parentElement?.querySelector<HTMLElement>(live.current.under) ?? null) : null);
+    const cutOf = () => {
+      const bar = barOf();
+      const host = canvas.parentElement;
+      if (!bar || !host) return 0;
+      // Its place in the layout (a lift by the keyboard is a transform and does not count).
+      let top = 0;
+      for (let el: HTMLElement | null = bar; el && el !== host; el = el.offsetParent as HTMLElement | null) top += el.offsetTop;
+      return Math.max(0, Math.floor((top + 20) / CELL));
+    };
 
     const shape = () => {
       const { focusX: fx, focusY: fy, spread: sp } = live.current;
+      cutRow = cutOf();
       const aspect = rows / Math.max(1, cols);
       // A phone on its side: the light stays a pool at the foot, as tall as in portrait, never a wash
       // over the whole conversation (its distances were measured against the short height).
@@ -197,7 +216,7 @@ export function Field({
           const dy = (ny - fy) * aspect;
           const d = (Math.sqrt(dx * dx + dy * dy) / sp) * wide;
           const i = y * cols + x;
-          base[i] = Math.max(0, 1 - d) ** 1.6;
+          base[i] = y < cutRow ? 0 : Math.max(0, 1 - d) ** 1.6;
           // two octaves of the grain, in square units (the bands keep their shape on any screen)
           const u = x / cols;
           const v = ny * aspect;
@@ -326,6 +345,11 @@ export function Field({
       for (const [y0, y1] of all ? [[0, rows] as [number, number]] : lit)
       for (let y = y0; y < y1; y++) {
         const ny = y / rows;
+        // Above the bar a chat draws nothing, not even a beat (the bar lies over the conversation).
+        if (!stage && y < cutRow) {
+          for (let x = 0, i = y * cols; x < cols; x++, i++) data[i * 4 + 3] = 0;
+          continue;
+        }
         for (let x = 0; x < cols; x++) {
           const i = y * cols + x;
           let b = base[i];
@@ -428,6 +452,17 @@ export function Field({
       draw();
     });
     ro.observe(canvas);
+    // The bar grows (a second line, its chips) or shrinks: the light's top edge follows it.
+    const bar = barOf();
+    const barRo = bar
+      ? new ResizeObserver(() => {
+          if (cutOf() !== cutRow) {
+            shape();
+            kick();
+          }
+        })
+      : null;
+    if (bar) barRo!.observe(bar);
     const onBeat = (b: Beat) => {
       if (reduced || live.current.hidden) return;
       const r = canvas.getBoundingClientRect();
@@ -456,6 +491,7 @@ export function Field({
     const offScreen = onScreenChange((on) => on && kick());
     return () => {
       ro.disconnect();
+      barRo?.disconnect();
       beats.delete(onBeat);
       wakes.delete(onWake);
       host?.removeEventListener('pointerdown', onDown);

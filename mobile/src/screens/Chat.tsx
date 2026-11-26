@@ -21,6 +21,7 @@ import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles } from '@m/ui/marks';
 import { IME_EASE, SNAP } from '@m/ui/motion';
 import { Sheet } from '@m/ui/Sheet';
+import { footRoom } from '@m/lib/foot-room';
 import { Composer } from './Composer';
 import { Prompts } from './Prompts';
 import { ReviewLine } from './Review';
@@ -86,7 +87,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
 
   return (
     <div className="screen chat" data-live={live || undefined} data-waiting={waiting || undefined}>
-      <Field palette={paletteFor(s.provider)} amount={0.62} focusX={0.62} focusY={1.1} spread={0.8} active={live} waiting={waiting} />
+      <Field palette={paletteFor(s.provider)} amount={0.62} focusX={0.62} focusY={1.1} spread={0.8} active={live} waiting={waiting} under=".composer" />
       <ChatHead
         title={s.title}
         sub={connState === 'open' ? (s.chat ? undefined : baseName(homeFolder(s))) : undefined}
@@ -118,11 +119,11 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
       )}
       {s.custom ? (
         // The Customize chat can change the desktop's look: it is read here and answered on the computer (a running turn can still be stopped).
-        <div className="chat-foot">
+        <div className="chat-foot" ref={footRef}>
           <ReadOnlyFoot id={id} status={s.status} desktop={desktop} />
         </div>
       ) : (
-        <div className="chat-foot">
+        <div className="chat-foot" ref={footRef}>
           <Prompts sid={id} />
           <ReviewLine sid={id} />
           <Composer sid={id} />
@@ -134,6 +135,9 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
 }
 
 /** The foot of a chat answered on the computer: says so, with the stop key while its turn can be stopped. */
+/** The foot (what waits, the queue, the prompt bar) lies over the conversation: its height is the room the thread keeps after its last line. */
+const footRef = footRoom('--foot-h');
+
 function ReadOnlyFoot({ id, status, desktop }: { id: string; status: SessionMeta['status']; desktop?: string }) {
   const online = useStore((st) => st.conn === 'open');
   const stoppable = canStop(status);
@@ -650,6 +654,8 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
             </TurnGuard>
           ))}
         {!gapped && range.hi >= keys.length && !busy && <BackgroundLine id={id} />}
+        {/* The prompt bar lies over the conversation (2.21): this much room after the last line, so it can scroll out from under the glass. */}
+        <div className="thread-foot" aria-hidden />
       </div>
       <AnimatePresence>
         {showJump && (
