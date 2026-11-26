@@ -77,10 +77,11 @@ function alive(pid: number): boolean {
   }
 }
 
+/** What a helper printed, whatever it exited with (an id that is gone makes the listing fail for that one alone). */
 function run(file: string, args: string[]): Promise<string> {
   return new Promise((resolve) => {
     try {
-      execFile(file, args, { windowsHide: true, timeout: 8000, maxBuffer: 256 * 1024, cwd: path.dirname(file) }, (err, stdout) => resolve(err ? '' : String(stdout)));
+      execFile(file, args, { windowsHide: true, timeout: 8000, maxBuffer: 256 * 1024, cwd: path.dirname(file) }, (_err, stdout) => resolve(String(stdout ?? '')));
     } catch {
       resolve('');
     }
@@ -120,7 +121,7 @@ export function systemProbe(): ProcessProbe {
       alive,
       bornAll: async (pids) => {
         if (!pids.length) return new Map();
-        const script = `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { try { '{0} {1}' -f $_.Id, $_.StartTime.ToFileTimeUtc() } catch {} }`;
+        const script = `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { try { '{0} {1}' -f $_.Id, $_.StartTime.ToFileTimeUtc() } catch {} }; exit 0`;
         return bornLines(await run(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script]));
       },
     };

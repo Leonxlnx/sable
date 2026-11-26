@@ -917,7 +917,7 @@ const PHONE_CLEARABLE = new Set<string>([
   'live',
   'accountId', 'movedFrom', 'returnAt', 'activity', 'lastError', 'remote', 'capState', 'moving',
   'pendingRestart', 'providerSessionId', 'until', 'spare', 'race', 'lane', 'agentHandover', 'moveNote',
-  'background', 'commands', 'serving', 'servingSince', 'servingAddress', 'options', 'effort', 'speed', 'fast', 'ultracode', 'pinned', 'archived', 'unread', 'branch',
+  'background', 'commands', 'serving', 'servingSince', 'servingAddress', 'tracked', 'trackedSince', 'trackedTitle', 'options', 'effort', 'speed', 'fast', 'ultracode', 'pinned', 'archived', 'unread', 'branch',
   'chat', 'custom', 'titleAsked', 'agents', 'returnModels',
 ] satisfies (keyof SessionMeta)[]);
 

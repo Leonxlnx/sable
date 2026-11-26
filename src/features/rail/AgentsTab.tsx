@@ -197,7 +197,8 @@ function AgentsList({ sessionId }: { sessionId: string }) {
       </div>
       <div className="rail-scroll scroll agx-scroll">
         <TimelineCtx.Provider value={ctx}>
-          <LeaveList className="agx-list" order={keys.join('|')}>
+          {/* The block of what works now changes its height when a card joins or leaves: history glides after it. */}
+          <LeaveList className="agx-list" order={keys.join('|')} sized={`${now}#${servers}`}>
             {rows.map((r) => r.node(arrived.has(r.as)))}
           </LeaveList>
         </TimelineCtx.Provider>
@@ -394,11 +395,12 @@ const JobCard = memo(function JobCard({ sessionId, id, fresh }: { sessionId: str
             <Since ts={t.since} />
           </span>
         </span>
-        {t.line && (
+        {/* A job that named a log keeps its line from the start, so the card never grows when the first line arrives. */}
+        {t.log !== undefined || t.line ? (
           <span className="agx-sub">
-            <span className="agx-out truncate">{t.line}</span>
+            <span className="agx-out truncate">{t.line || 'No output yet'}</span>
           </span>
-        )}
+        ) : null}
       </button>
       <Collapse open={open}>
         <JobDetail sessionId={sessionId} item={item} />
@@ -473,7 +475,8 @@ const CommandCard = memo(function CommandCard({ sessionId, id, fresh }: { sessio
     const agent = it?.parentId && d ? ownerAgent(d.items, it) : undefined;
     return agent ? agentTask(agent) : '';
   });
-  const line = useHeld(out, 700);
+  // Its last line of output; before any, the command itself, so the card keeps one height.
+  const line = useHeld(out, 700) || item?.detail.command || '';
   const [open, setOpen] = useFold(foldKey(sessionId, id, SCOPE), false);
   if (!item) return null;
   const name = item.detail.description || item.title;
@@ -497,7 +500,8 @@ const CommandCard = memo(function CommandCard({ sessionId, id, fresh }: { sessio
       </button>
       <Collapse open={open}>
         <div className="agx-detail">
-          {item.detail.command && <code className="agx-command">{item.detail.command}</code>}
+          {/* The card's own line shows the command until there is output: said once. */}
+          {item.detail.command && out && <code className="agx-command">{item.detail.command}</code>}
           <button type="button" className="agx-goto" onClick={() => revealItem(sessionId, id)}>
             <Icon name="chat" size={13} />
             Show in conversation
