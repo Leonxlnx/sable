@@ -12,7 +12,7 @@ export function forkHistory(items: TimelineItem[], whole: (row: TimelineItem) =>
     const active = ['running', 'pending', 'awaiting'].includes(row.status);
     if (!active && !row.delegateReport && !row.delegateDeliveryId && row.result?.agent?.background !== 'running'
       && row.workflow?.status !== 'running' && row.task?.state !== 'running' && row.task?.state !== 'lost') return row;
-    const { delegateRetryId, delegateReceiptState, delegateReceiversPending, delegateCaller, delegateReport, delegateAttempt, delegateDeliveryId, delegateContinuations, delegateWait, ...copy } = whole(row) as typeof row;
+    const { delegateRetryId, delegateReceiptState, delegateRedelivered, delegateReceiversPending, delegateCaller, delegateReport, delegateAttempt, delegateDeliveryId, delegateContinuations, delegateWait, ...copy } = whole(row) as typeof row;
     if (active) copy.status = 'cancelled';
     if (copy.result?.agent?.background === 'running') copy.result = { ...copy.result, agent: { ...copy.result.agent, background: 'stopped' } };
     if (copy.workflow?.status === 'running') copy.workflow = { ...copy.workflow, status: 'stopped' };

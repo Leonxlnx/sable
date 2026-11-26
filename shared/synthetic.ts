@@ -80,12 +80,14 @@ export function readDelegateIds(text: string, into: Set<string>, wanted?: Readon
   const blocks = /<system-reminder>A background sub-agent reported\.\n[^<]*?\nDelivery ID: ([\da-f-]{36})\n[^<]*<\/system-reminder>/g;
   for (const match of text.matchAll(blocks)) if (!wanted || wanted.has(match[1])) into.add(match[1]);
 }
+/** After the Delivery ID: a report can reach the agent twice (a receipt Sable could not read sends it again once). */
+export const DELEGATE_REPORT_COPY = 'If you already have the report with this Delivery ID, ignore this copy.';
 export function delegateReport(title: string, outcome: string, report: string, deliveryId?: string) {
   // A report can quote markup, including the reminder's own closing tag.
   const escape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
   const body = escape(report.slice(0, 40_000));
   const bounded = report.length > 40_000 || body.length > 40_000 ? body.slice(0, 40_000) + '\n\n(cut off)' : body;
-  return `<system-reminder>${DELEGATE_REPORT}\n${escape(title.slice(0, 160))} (${outcome})\n${deliveryId ? 'Delivery ID: ' + deliveryId + '\n' : ''}${bounded}</system-reminder>`;
+  return `<system-reminder>${DELEGATE_REPORT}\n${escape(title.slice(0, 160))} (${outcome})\n${deliveryId ? 'Delivery ID: ' + deliveryId + '\n' + DELEGATE_REPORT_COPY + '\n' : ''}${bounded}</system-reminder>`;
 }
 
 export const STEER_NOW_BLOCK = '<system-reminder>Work was interrupted because the person asked for an answer now. Answer their message first, then continue the interrupted work if it still makes sense. Tell them what was lost, including any unfinished foreground sub-agent progress.</system-reminder>';

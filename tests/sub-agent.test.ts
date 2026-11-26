@@ -9,6 +9,7 @@ import { App } from '../server/app';
 import { GatedProcess } from '../server/core/auth-gate';
 import { runSubAgent, claimStep } from '../server/core/sub-agent';
 import { SessionRuntime } from '../server/core/runtime';
+import { withDeadline } from '../server/util/deadline';
 import type { Provider, ProviderSession } from '../server/providers/types';
 import { AGENT_INPUT_SCHEMA, agentToolDescription, agentOfTool, describeAgentCall, readAgentCall } from '../server/providers/agent-tool';
 import { DemoProvider } from '../server/providers/demo';
@@ -75,10 +76,81 @@ describe('sub-agent tool', () => {
       expect(result).toBeDefined();
       expect(rt.get<ToolItem>('step')?.status).not.toBe('running');
       expect(rt.delegates.size).toBe(0);
-      if (phase === 'save') expect(rt.items.some(i => i.type === 'notice' && i.text.includes('Could not save'))).toBe(true);
+      if (phase === 'save') expect(rt.items.some(i => i.type === 'notice')).toBe(false);
       if (phase === 'open') finishOpen();
       await vi.advanceTimersByTimeAsync(1510);
       if (phase === 'open' || phase === 'close') expect(hard).toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  // A long chat saves slower than the 5 s a delegate's result waits for: the row holds the result, nothing failed.
+  const slowSave = (save: () => Promise<void>) => {
+    const rt = new SessionRuntime({ id: 'parent', provider: 'codex', cwd: process.cwd(), title: 'test', titleSource: 'user',
+      model: 'm', mode: 'default', status: 'idle', createdAt: 1, updatedAt: 1, usage: { turns: 0, inputTokens: 0, outputTokens: 0 } }, () => {}, () => {});
+    let child!: SessionRuntime;
+    const handle = { send: async () => {
+      child.beginTurn();
+      child.add({ type: 'text', text: 'Findings', streaming: false });
+      // The caller's process is gone: the result is a report that waits to be announced.
+      rt.processGeneration++;
+      child.endTurn();
+    }, close: async () => {} } as unknown as ProviderSession;
+    const provider = { open: async (r: SessionRuntime) => { child = r; return handle; } } as unknown as Provider;
+    const staged = vi.fn();
+    const announced = vi.fn();
+    rt.persistDelegate = () => withDeadline(save(), 5000, 'Saving the delegate');
+    rt.stageDelegateReports = () => staged;
+    rt.onDelegateReport = announced;
+    rt.add<ToolItem>({ type: 'tool', id: 'step', name: 'delegate_to_codex', kind: 'agent', title: 'Review', status: 'running', detail: {} });
+    let result: { ok: boolean; text: string } | undefined;
+    void runSubAgent({ provider: () => provider, accountFor: () => undefined, defaultModel: () => 'm', modeFor: () => 'default', log() {} },
+      rt, { agent: 'codex', prompt: 'test', description: 'Review' }, 'step').then(r => { result = r; });
+    return { rt, staged, announced, result: () => result };
+  };
+
+  it('announces a report once when a save slower than its deadline settles, with no error card', async () => {
+    let finish!: () => void;
+    const saves = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+    vi.useFakeTimers();
+    try {
+      const h = slowSave(saves);
+      await vi.advanceTimersByTimeAsync(5010);
+      expect(h.result()).toMatchObject({ ok: true, text: 'Findings' });
+      expect(h.rt.get<ToolItem>('step')).toMatchObject({ status: 'done', delegateReport: 'pending', result: { text: 'Findings' } });
+      expect(h.rt.items.some(i => i.type === 'notice')).toBe(false);
+      expect(h.announced).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.announced).not.toHaveBeenCalled();
+      finish();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(h.staged).toHaveBeenCalledTimes(1);
+      expect(h.announced).toHaveBeenCalledTimes(1);
+      // The call's start saved its ownership, its end the result: no further save for the late announcement.
+      expect(saves).toHaveBeenCalledTimes(2);
+      expect(h.rt.items.some(i => i.type === 'notice')).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['at once', 'late'])('says once that a rejected save (%s) left the result unsaved, and carries on with the row', async when => {
+    let fail!: () => void;
+    const saves = vi.fn(() => when === 'late' ? new Promise<void>((_, reject) => { fail = () => reject(Error('disk full')); }) : Promise.reject(Error('disk full')));
+    vi.useFakeTimers();
+    try {
+      const h = slowSave(saves);
+      await vi.advanceTimersByTimeAsync(5010);
+      if (when === 'late') {
+        expect(h.rt.items.some(i => i.type === 'notice')).toBe(false);
+        fail();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      const notices = h.rt.items.filter(i => i.type === 'notice');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({ variant: 'error', level: 'warn', text: "The sub-agent's result is shown but not saved yet" });
+      expect(h.result()).toMatchObject({ ok: true, text: 'Findings' });
+      expect(h.rt.get<ToolItem>('step')).toMatchObject({ delegateReport: 'pending', result: { text: 'Findings' } });
+      expect(h.staged).not.toHaveBeenCalled();
+      expect(h.announced).toHaveBeenCalledTimes(1);
+      expect(saves).toHaveBeenCalledTimes(2);
     } finally { vi.useRealTimers(); }
   });
 

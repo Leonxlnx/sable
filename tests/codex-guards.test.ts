@@ -13,7 +13,7 @@ import { runSubAgent } from '../server/core/sub-agent';
 import { SessionRuntime } from '../server/core/runtime';
 import type { Provider } from '../server/providers/types';
 import type { TextItem, ToolItem } from '../shared/protocol';
-import { delegateReport, parseSynthetic } from '../shared/synthetic';
+import { DELEGATE_REPORT, delegateReport, parseSynthetic, readDelegateIds, syntheticOf, userItemText } from '../shared/synthetic';
 import { App } from '../server/app';
 import { REPLY_FIRST_PROMPT } from '../shared/protocol';
 import { CodexRpc } from '../server/providers/codex-rpc';
@@ -329,6 +329,8 @@ it('reconciles a Codex report by ID and waits for a personal retry decision for 
   h.rt.loadRestored([id, 'dfed6fdd-3fba-4c20-b5d6-25145a92a43f'].map((delivery, n) => ({
     type: 'tool', ts: n, id: 'call' + n, title: 'Review', name: 'delegate_to_claude', kind: 'agent', detail: {}, status: 'done',
     delegateReport: 'pending', delegateDeliveryId: delivery, delegateAttempt: { provider: 'codex', session: 'th1' }, result: { text: 'Findings' },
+    // Sent again by itself once already: the second lookup that does not complete is the person's to decide.
+    delegateRedelivered: 1,
   })));
   h.rt.onDelegateReport!();
   await until(() => h.rt.get<ToolItem>('call0')?.delegateReport === 'delivered', 'recorded report');
@@ -336,6 +338,9 @@ it('reconciles a Codex report by ID and waits for a personal retry decision for 
   expect(h.count('turn/start')).toBe(0);
   active = false;
   expect(h.rt.get<ToolItem>('call1')?.delegateReceiptState).toBe('unknown');
+  expect(h.rt.get<ToolItem>('call1')?.delegateRetryId).toMatch(/^[\da-f-]{36}$/);
+  // The row says it; nothing is written into the conversation.
+  expect(h.rt.items.some(i => i.type === 'notice')).toBe(false);
   await h.app.call('session.send', { sessionId: h.id, text: '/report-retry ' + h.rt.get<ToolItem>('call1')!.delegateRetryId });
   await until(() => h.count('turn/start') > 0, 'requested resend');
   const input = h.calls.find(c => c.method === 'turn/start')?.params.input as { text: string }[];
@@ -588,4 +593,39 @@ describe('#14: an error belongs to the turn it names', () => {
     expect(h.rt.turnActive).toBe(false);
     expect(lastTurn(h.rt)?.error).toBe('model overloaded');
   });
+});
+
+it('sends a Codex report again once, with no notice, when its receipt lookup does not complete', async () => {
+  const delivery = 'dfed6fdd-3fba-4c20-b5d6-25145a92a43f';
+  // A turn still in progress: the history cannot say whether the report arrived.
+  const h = await codexFake({ threadRead: () => ({ thread: { turns: [{ id: 'old', status: 'inProgress', items: [] }] } }) });
+  h.rt.loadRestored([{ type: 'tool', ts: 0, id: 'call1', title: 'Review', name: 'delegate_to_claude', kind: 'agent', detail: {}, status: 'done',
+    delegateReport: 'pending', delegateDeliveryId: delivery, delegateAttempt: { provider: 'codex', session: 'th1' }, result: { text: 'Findings' } }]);
+  h.rt.onDelegateReport!();
+  await until(() => h.count('turn/start') > 0, 'the report sent again');
+  const input = h.calls.find(c => c.method === 'turn/start')?.params.input as { text: string }[];
+  expect(input[0].text).toContain('Delivery ID: ' + delivery + '\nIf you already have the report with this Delivery ID, ignore this copy.\nFindings');
+  const row = h.rt.get<ToolItem>('call1')!;
+  expect(row.delegateRedelivered).toBe(1);
+  expect(row.delegateReceiptState).toBeFalsy();
+  expect(row.delegateRetryId).toBeFalsy();
+  expect(h.rt.items.some(i => i.type === 'notice')).toBe(false);
+  expect(h.count('turn/start')).toBe(1);
+  h.complete('turn1');
+});
+
+it('knows a report with and without the sentence about a copy', () => {
+  const id = 'fea5b259-ff81-4da5-9670-bf4f16ae95ce';
+  const now = delegateReport('Review', 'done', 'Findings', id);
+  const old = now.replace('If you already have the report with this Delivery ID, ignore this copy.\n', '');
+  expect(now).not.toBe(old);
+  expect(old).toContain('Delivery ID: ' + id + '\nFindings');
+  for (const block of [now, old]) {
+    const ids = new Set<string>();
+    readDelegateIds(block, ids);
+    expect([...ids]).toEqual([id]);
+    const item = { type: 'user' as const, id: 'u', ts: 1, state: 'sent' as const, text: DELEGATE_REPORT + '\n\n' + block };
+    expect(syntheticOf(item)).toBeTruthy();
+    expect(userItemText(item)).not.toMatch(/Findings|Delivery ID|ignore this copy/);
+  }
 });
