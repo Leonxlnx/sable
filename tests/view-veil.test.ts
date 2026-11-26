@@ -90,7 +90,8 @@ describe('a change of view: one veil, one clock, one direction', () => {
     expect(quartersOn(cover, 5000)).toEqual([true, true, true, false]);
     // Down a frame a step from the peak, the new view in its place (nothing rises).
     const reveal = veil.slice(veil.indexOf('export function veilReveal'));
-    expect(reveal).toContain('const rise = cover.peak < 4 ? 0 : sw.rise;');
+    // Nor does a view that takes the veil's waiting state over: its skeleton stands where the veil's stood.
+    expect(reveal).toContain('const rise = cover.peak < 4 || kept ? 0 : sw.rise;');
     // Chosen for a chat whose conversation is in the window, from another chat; no waiting state.
     const hook = app.slice(app.indexOf('function useShownView'), app.indexOf('export function App()'));
     expect(hook).toContain('quick: !!shown.sessionId && warmChat(live.sessionId)');
@@ -125,10 +126,13 @@ describe('a change of view: one veil, one clock, one direction', () => {
     expect(veil).not.toMatch(/delay: solidIn \+ VEIL_WAIT_AFTER/);
     expect(veil).toMatch(/waitTimer = window\.setTimeout\(\(\) => \{\s*if \(w\.isConnected\) waitIn\(w\);\s*\}, solidIn \+ VEIL_WAIT_AFTER\);/);
     expect(veil).toMatch(/const waitIn = \(w: HTMLElement\) => w\.animate\(\[\{ opacity: 0 \}, \{ opacity: 1 \}\], \{ duration: WAIT_IN,[^}]*\}\);/);
-    // The same waiting state where no veil stands (a conversation on screen before it is read,
-    // Timeline.tsx `Reading`): the same clock, brought by the page's timer too.
+    // The same waiting state in the new view (a conversation on screen before it is read, Timeline.tsx
+    // `Reading`): the open's clock (the cover's due time; without a cover, from its mount), brought by
+    // the page's timer too; where the veil keeps its own on top, taken over when the veil has gone.
     const alone = veil.slice(veil.indexOf('export function waitingIn'), veil.indexOf('const covers'));
-    expect(alone).toMatch(/window\.setTimeout\(\(\) => \{[^]*waitIn\(el\);[^]*\}, Math\.max\(0, after\)\);/);
+    expect(alone).toMatch(/const due = cover\?\.waitDue \?\? timeNow\(\) \+ after;[^]*if \(due <= timeNow\(\)\) show\(due\);\s*else t = window\.setTimeout\(\(\) => show\(\), due - timeNow\(\)\);/);
+    expect(alone).toContain('void cover.kept.then(() => live && show(start));');
+    expect(alone).toContain('const a = waitIn(el);');
     expect(alone).not.toMatch(/delay:/);
     const reveal = veil.slice(veil.indexOf('export function veilReveal'));
     expect(reveal.indexOf('window.clearTimeout(cover.waitTimer)')).toBeGreaterThan(-1);

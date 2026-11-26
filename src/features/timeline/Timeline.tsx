@@ -47,7 +47,9 @@ function heldLive(inner: HTMLElement, el: HTMLElement): boolean {
  */
 function Reading() {
   const el = useRef<HTMLDivElement>(null);
-  useEffect(() => waitingIn(el.current), []);
+  // On the clock of the open (the veil that began with the click, on the stage's body), else from here;
+  // decided in the commit that mounts it (a passive effect waited behind the page's next long task).
+  useLayoutEffect(() => waitingIn(el.current, el.current?.closest<HTMLElement>('.stage-body')), []);
   return (
     <div ref={el} className="tl-wait" style={{ opacity: 0 }} role="status" aria-label="Reading conversation">
       <i className="skel tl-skel-card" />
@@ -102,15 +104,24 @@ export function Timeline({ sessionId }: { sessionId: string }) {
   /** The follower's state; `wrote` is the scroll position it set last, to notice a move made by anyone else. */
   const glide = useRef({ raf: 0, pos: 0, v: 0, last: 0, wrote: 0 });
 
+  /**
+   * The end of the conversation's own layout, as a scroll position. Drawn lower by a glide (the dock's,
+   * a send's travel: a translate on the content), the content lengthens the scroller by as much, and
+   * keeping that end while it ran pinned the view to a place the glide then took away: the conversation
+   * jumped by what was left of the glide (+170 px, then clamped back frame by frame) whenever something
+   * grew meanwhile. Drawn higher, nothing is added (overflow above the start is not scrollable).
+   */
+  const endOf = useCallback((el: HTMLElement) => el.scrollHeight - el.clientHeight - Math.max(0, drawnY(content.current)), []);
+
   const pin = useCallback(() => {
     const el = scroller.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
+    el.scrollTop = endOf(el);
     lastTop.current = el.scrollTop;
     glide.current.pos = el.scrollTop;
     glide.current.wrote = el.scrollTop;
     glide.current.v = 0;
-  }, []);
+  }, [endOf]);
 
   const previousBefore = useRef(before);
   useLayoutEffect(() => {
@@ -127,7 +138,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     const el = scroller.current;
     if (!el) return;
     const g = glide.current;
-    const gap = el.scrollHeight - el.clientHeight - el.scrollTop;
+    const gap = endOf(el) - el.scrollTop;
     // History being laid out, reduced motion, or a jump too large to travel: go straight there.
     if (!live.current || reducedMotion() || gap > el.clientHeight * 1.5) {
       pin();
@@ -146,13 +157,13 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       const dt = Math.min(0.034, Math.max(0.001, (now - g.last) / 1000));
       g.last = now;
       // Exact for a long frame, and it goes on from a move anyone else made meanwhile (follow.ts).
-      const step = glideFrame(g, el.scrollTop, el.scrollHeight - el.clientHeight, FOLLOW_W, dt);
+      const step = glideFrame(g, el.scrollTop, endOf(el), FOLLOW_W, dt);
       el.scrollTop = step.top;
       lastTop.current = g.wrote = el.scrollTop;
       if (!step.done) g.raf = requestAnimationFrame(tick);
     };
     g.raf = requestAnimationFrame(tick);
-  }, [pin]);
+  }, [pin, endOf]);
 
   /**
    * The content grew or shrank while the view is at the end: the end is kept in the same frame (a
@@ -167,6 +178,30 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     if (glide.current.raf) return;
     pin();
   }, [pin]);
+
+  /**
+   * A message sent while the reader is up the conversation (a steer from further up): the scroll is at
+   * the end in this frame and the conversation is drawn where it stood, gliding there by translate on
+   * the dock's clock for the way (`glideMs`), on the compositor. The follower wrote that travel as
+   * scroll per animation frame on the main thread, which is busy right after a send: it moved 67 to
+   * 88 px between presented frames. Nothing else changes: content that grows meanwhile keeps the
+   * layout's end (`keepEnd`, `endOf`), a later change of the dock carries the glide on from where it
+   * stands (`glideY`), and the send's flight lands where the row will rest (composer/flight.ts
+   * `targetAt`: the scroller's extra length is the glide still to come). Further than the follower
+   * travels (1.5 views), or under reduced motion: false, as before.
+   */
+  const travelFromAway = useCallback(() => {
+    const el = scroller.current;
+    const inner = content.current;
+    if (!el || !inner || reducedMotion() || glide.current.raf) return false;
+    const gap = endOf(el) - el.scrollTop;
+    if (gap < 0.5 || gap > el.clientHeight * 1.5) return false;
+    const top = el.scrollTop;
+    pin();
+    const moved = el.scrollTop - top;
+    if (moved > 0.5) glideY(inner, moved, undefined, { ms: glideMs(moved) });
+    return true;
+  }, [pin, endOf]);
 
   useEffect(() => () => cancelAnimationFrame(glide.current.raf), []);
 
@@ -473,11 +508,14 @@ export function Timeline({ sessionId }: { sessionId: string }) {
     // A notification Claude Code writes into the chat is not a send: a reader scrolled up stays put.
     if (followsSend(lastId, item, item?.type === 'user' && !!syntheticOf(item)) && live.current) {
       // The view travels to the message: it rises from behind the composer as the scroll catches up.
+      // From the end that is the follower (the send's own lift hands over to it, composer/flight.ts);
+      // from a reader's place further up, the dock's glide (`travelFromAway`).
+      const away = !stuck.current;
       stuck.current = true;
       setAway(false);
-      follow();
+      if (!away || !travelFromAway()) follow();
     }
-  }, [lastId, sessionId, follow, followsSend]);
+  }, [lastId, sessionId, follow, travelFromAway, followsSend]);
 
   // Revealing an older item (TurnList builds and scrolls to it) lets go of the end first,
   // or the growth above would pin the view straight back down.

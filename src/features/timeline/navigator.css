@@ -212,6 +212,15 @@
   pointer-events: none;
 }
 
+/* Closed, the pane holds nothing and is out of the layout. An empty box over the whole conversation,
+   above its scroller, was squashed into one compositor layer with the rail while the rail was
+   composited (its arrival after a chat opened): 1392 x 828 device px, hit-testable only at the rail's
+   button, so the compositor could not hit test a wheel through it and the first scroll after an open
+   waited for the main thread (230 to 300 ms behind a busy page; CLAUDE.md, Performance). */
+.nav-pane:empty {
+  display: none;
+}
+
 .nav-index {
   display: flex;
   flex-direction: column;

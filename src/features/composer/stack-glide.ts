@@ -160,11 +160,26 @@ const runs = new WeakMap<Element, Run>();
 
 const alive = (r: Run | undefined): r is Run => !!r && (r.anim.playState === 'running' || r.anim.playState === 'paused');
 
+/**
+ * Where a run is drawn at `now`, from its own start: the animation's start time once it has one. A
+ * started animation is pending until the frame that first draws it and holds its first keyframe till
+ * then: on a busy page that frame came 130 ms after the glide was made, and a reading from the moment
+ * it was made said 74 px of it were gone while it was still drawn whole (Timeline.tsx keeps the
+ * layout's end by it: the view went 74 px too far and was clamped back frame by frame).
+ */
+function leftOf(r: Run, now: number): number {
+  if (r.held) return r.from;
+  const start = r.anim.startTime;
+  // Pending: still where it stood. (A stand-in without a timeline of its own, in tests: from when it was made.)
+  if (start === null) return r.from;
+  return glideLeft(r.from, now - (typeof start === 'number' ? start : r.t0), r.ms);
+}
+
 /** How far from its place a glide on `el` is drawn right now (0: none, or it is over). Worked out from its own start. */
 export function drawnY(el: Element | null | undefined, now = performance.now()): number {
   const r = el ? runs.get(el) : undefined;
   if (!alive(r)) return 0;
-  return r.held ? r.from : glideLeft(r.from, now - r.t0, r.ms);
+  return leftOf(r, now);
 }
 
 export interface GlideOpts {
@@ -189,7 +204,7 @@ export function glideY(el: Element | null | undefined, d: number, now = performa
   const prev = runs.get(el);
   let from = d;
   if (alive(prev)) {
-    from += prev.held ? prev.from : glideLeft(prev.from, now - prev.t0, prev.ms);
+    from += leftOf(prev, now);
     prev.anim.cancel();
     for (const a of prev.beside) a.cancel();
   }

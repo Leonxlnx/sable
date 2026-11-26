@@ -75,6 +75,23 @@ describe('the dock glide (composer/stack-glide.ts)', () => {
     expect(made[2].opts.duration).toBe(glideMs(473));
   });
 
+  it('a glide is read from its own start: pending (its first frame not drawn yet) it is still where it stood', () => {
+    const anim = { playState: 'running', startTime: null as number | null, pause() {}, play() {}, cancel() {} };
+    const el = { animate: () => anim } as unknown as Element;
+    glideY(el, 474, 0, { ms: glideMs(474) });
+    // The first frame came 130 ms late on a busy page: until then the whole way is still to go.
+    expect(drawnY(el, 130)).toBe(474);
+    // Drawn from 130 on: counted from there, not from when it was made.
+    anim.startTime = 130;
+    expect(drawnY(el, 130 + 60)).toBeCloseTo(glideLeft(474, 60, glideMs(474)));
+    expect(drawnY(el, 130 + 60)).toBeGreaterThan(glideLeft(474, 190, glideMs(474)) + 30);
+    // The next change carries on from there too.
+    const made: Keyframe[][] = [];
+    (el as unknown as { animate: (f: Keyframe[]) => unknown }).animate = (f: Keyframe[]) => (made.push(f), { ...anim, startTime: null });
+    glideY(el, 10, 130 + 60);
+    expect(made[0][0]).toEqual({ translate: `0 ${(10 + glideLeft(474, 60, glideMs(474))).toFixed(2)}px` });
+  });
+
   it('a tray adds its height less its tuck to the dock, nothing when it is gone', () => {
     expect(trayShare(0)).toBe(0);
     expect(trayShare(84)).toBe(84 - TUCK);

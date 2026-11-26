@@ -311,7 +311,10 @@ function useShownView(live: StageView, body: RefObject<HTMLElement | null>): { s
     const side = (v: HTMLElement) => v.dataset.view === 'dock' || v.dataset.view === 'light';
     const show = parts.filter((v) => (side(v) ? !chat(was) && chat(shown) : v.dataset.view === shown.key));
     const hide = parts.filter((v) => (side(v) ? chat(was) && !chat(shown) : v.dataset.view !== shown.key));
-    const run = veilReveal(el, { hide, show, rise: 8 });
+    // A chat still being read shows the veil's own waiting state in its conversation (Timeline.tsx `Reading`): one
+    // already in view on the veil is kept there and taken over, never faded out and in again.
+    const keep = !!shown.sessionId && !useStore.getState().data[shown.sessionId]?.loaded;
+    const run = veilReveal(el, { hide, show, rise: 8, keep });
     swapRun = run;
     void run.done.then(() => swapRun === run && settle(el));
   }, [shown, body]);
