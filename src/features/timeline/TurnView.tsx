@@ -551,7 +551,7 @@ export function mayContinue(s: Store, sessionId: string, line: string): boolean 
   const meta = s.sessions[sessionId];
   const roots = s.data[sessionId]?.roots;
   if (!meta || !roots) return false;
-  if (meta.status === 'running' || meta.status === 'awaiting' || meta.status === 'starting' || hasWork(meta)) return false;
+  if (meta.status === 'running' || meta.status === 'awaiting' || meta.status === 'starting' || hasWork({ ...meta, tracked: undefined })) return false;
   for (let i = roots.length - 1, n = 0; i >= 0 && n < 40; i--, n++) {
     if (roots[i] === line) return true;
     if (s.data[sessionId]!.items[roots[i]]?.type !== 'notice') return false;
