@@ -93,7 +93,7 @@ import { PhoneReceipts, Submissions, messagePrint } from './core/submissions';
 import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
-import { DeadlineExceeded, withDeadline } from './util/deadline';
+import { DeadlineExceeded, lateEnd, withDeadline } from './util/deadline';
 import { cliPresentSoon } from './util/cli-present';
 
 /**
@@ -1613,7 +1613,7 @@ export class App {
     };
     rt.offerToolResult = row => {
       const keys = this.offerDelegateReports(rt, [row]).map(record => record.key);
-      void rt.persistDelegate?.().then(() => this.delegateJournal.forget(rt.id, keys))
+      void rt.persistDelegate?.().catch(lateEnd).then(() => this.delegateJournal.forget(rt.id, keys))
         .catch(err => this.log('foreground receipt journal retained', err));
     };
     rt.saveQuitResult = row => {
@@ -1868,7 +1868,7 @@ export class App {
       }
     }
     const recovered = this.recoveredDelegateKeys.get(rt);
-    if (recovered?.length) void rt.persistDelegate?.().then(() => this.delegateJournal.forget(rt.id, recovered))
+    if (recovered?.length) void rt.persistDelegate?.().catch(lateEnd).then(() => this.delegateJournal.forget(rt.id, recovered))
       .catch(err => this.log('delegate journal retained', err));
     if (rt.pendingDelegateReports.size) this.scheduleLossWake(rt);
     this.tracker.restored(rt);
@@ -2460,7 +2460,8 @@ export class App {
 
   private preparePersonalReports(rt: SessionRuntime) {
     const saved = this.stagePersonalReports(rt);
-    if (saved) void rt.persistDelegate?.().then(saved).catch(err => this.log('delegate destination checkpoint failed', err));
+    // A save slower than its deadline still ends: the staged report is saved then, and can ride on a message.
+    if (saved) void rt.persistDelegate?.().catch(lateEnd).then(saved).catch(err => this.log('delegate destination checkpoint failed', err));
   }
 
   private stagePersonalReports(rt: SessionRuntime) {
@@ -2674,7 +2675,7 @@ export class App {
       if (!offered && charged && budget?.delegateContinuations && rt.get(budget.id) === budget) {
         rt.patch(budget.id, { delegateContinuations: budget.delegateContinuations - 1 });
       }
-      if (reports.length && this.sessions.get(rt.id) === rt) void rt.persistDelegate?.().then(() => this.delegateJournal.forget(rt.id, offers.map(record => record.key)))
+      if (reports.length && this.sessions.get(rt.id) === rt) void rt.persistDelegate?.().catch(lateEnd).then(() => this.delegateJournal.forget(rt.id, offers.map(record => record.key)))
         .catch(err => this.log('delegate receipt save failed', err));
     };
     if (blocks.length) out.item = { ...out.item, text: [out.item.text, ...blocks].join('\n\n') };
@@ -2703,7 +2704,8 @@ export class App {
     }
     try {
       if (blocks.length && !personal) {
-        await rt.persistDelegate?.();
+        // A slow save is waited for (the wake's own deadline bounds it): it is not the provider's failure.
+        await rt.persistDelegate?.().catch(lateEnd);
         maySend();
       }
       if ((wake || reportWake) && !rt.turnActive) {
@@ -6297,7 +6299,7 @@ export class App {
         this.refundDelegate(rt, row.delegateAttempt);
         rt.patch<ToolItem>(row.id, { delegateAttempt: undefined, delegateReceiptState: null, delegateRetryId: null, delegateWait: 'retry' });
         rt.stopRequested = false;
-        await rt.persistDelegate?.();
+        await rt.persistDelegate?.().catch(lateEnd);
         if (ctx.phoneSender && identity) this.phoneReceipts.record(rt.id, identity);
         this.scheduleLossWake(rt);
         return { ok: true };

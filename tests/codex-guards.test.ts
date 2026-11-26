@@ -18,6 +18,7 @@ import { App } from '../server/app';
 import { REPLY_FIRST_PROMPT } from '../shared/protocol';
 import { CodexRpc } from '../server/providers/codex-rpc';
 import { CodexProvider } from '../server/providers/codex';
+import { withDeadline } from '../server/util/deadline';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -628,4 +629,50 @@ it('knows a report with and without the sentence about a copy', () => {
     expect(syntheticOf(item)).toBeTruthy();
     expect(userItemText(item)).not.toMatch(/Findings|Delivery ID|ignore this copy/);
   }
+});
+
+it('waits for a slow save before a report wake and never blames the provider for it', async () => {
+  const delivery = 'dfed6fdd-3fba-4c20-b5d6-25145a92a43f';
+  const h = await codexFake();
+  h.rt.loadRestored([{ type: 'tool', ts: 0, id: 'call1', title: 'Review', name: 'delegate_to_claude', kind: 'agent', detail: {}, status: 'done',
+    delegateReport: 'pending', delegateDeliveryId: delivery, result: { text: 'Findings' } }]);
+  // The chat's save takes longer than the delegate's wait for it.
+  const g = gate();
+  h.rt.persistDelegate = () => withDeadline(g.wait(), 20, 'Saving the delegate');
+  h.rt.onDelegateReport!();
+  await tick(200);
+  expect(h.count('turn/start')).toBe(0);
+  expect(h.rt.items.some(i => i.type === 'notice')).toBe(false);
+  expect(h.rt.get<ToolItem>('call1')?.delegateWait).toBeFalsy();
+  g.open();
+  await until(() => h.count('turn/start') === 1, 'the report once its save ended');
+  const input = h.calls.find(c => c.method === 'turn/start')?.params.input as { text: string }[];
+  expect(input[0].text).toContain('Delivery ID: ' + delivery);
+  expect(h.rt.items.some(i => i.type === 'notice')).toBe(false);
+  h.complete('turn1');
+});
+
+it('lets a staged report ride on the next message once its slow save has ended', async () => {
+  const delivery = '0b0a7a66-6a4b-4f0c-9a3e-0d8f2f1f6b11';
+  const h = await codexFake();
+  await h.send('hello');
+  await until(() => h.count('turn/start') === 1, 'the first turn');
+  h.complete('turn1');
+  await until(() => !h.rt.turnActive, 'rest');
+  h.rt.add<ToolItem>({ type: 'tool', id: 'call1', title: 'Review', name: 'delegate_to_claude', kind: 'agent', detail: {}, status: 'done',
+    delegateReport: 'pending', delegateDeliveryId: delivery, result: { text: 'Findings' } });
+  h.rt.pendingDelegateReports.add('call1');
+  const g = gate();
+  h.rt.persistDelegate = () => withDeadline(g.wait(), 20, 'Saving the delegate');
+  (h.app as unknown as { preparePersonalReports(rt: SessionRuntime): void }).preparePersonalReports(h.rt);
+  expect(h.rt.get<ToolItem>('call1')?.delegateAttempt?.prepared).toBeTruthy();
+  await tick(120);
+  g.open();
+  await tick();
+  await h.send('and now');
+  await until(() => h.count('turn/start') === 2, 'the next message');
+  const input = h.calls.filter(c => c.method === 'turn/start')[1].params.input as { text: string }[];
+  expect(input.map(i => i.text).join(' ')).toContain('Delivery ID: ' + delivery);
+  await until(() => h.rt.get<ToolItem>('call1')?.delegateReport === 'delivered', 'the report delivered with it');
+  h.complete('turn2');
 });

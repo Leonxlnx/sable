@@ -28,6 +28,7 @@ import { turnLive, TurnLiveIndex } from '../../shared/turn-live';
 import { approvedShare, handOver, type ApprovedShare } from './handed';
 import { anonymousDelegateStep, resultDigest, restoreWorkingDelegate, savedDelegateEnds } from './delegate-result';
 import { backgroundAgentName } from './limit-policy';
+import { lateEnd } from '../util/deadline';
 
 export type Emit = (event: BridgeEvent) => void;
 
@@ -215,6 +216,14 @@ export class SessionRuntime {
     }
   }
 
+  /**
+   * Saves what the rows already say. A save that only misses its deadline is no failure (a long chat
+   * saves slower than the wait): it is followed to its real end, and only one that rejects is said.
+   */
+  private saveDelegate(what: string) {
+    void this.persistDelegate?.().catch(lateEnd).catch(err => this.notice('error', 'Could not save ' + what, String(err)));
+  }
+
   /** Tool start frames can precede the request that supplies the child. */
   readonly steeredDelegateSteps = new Set<string>();
   releaseDelegates() {
@@ -242,7 +251,7 @@ export class SessionRuntime {
       this.patch<ToolItem>(id, { delegateWait: why });
       changed = true;
     }
-    if (changed) void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the held delegate report', String(err)));
+    if (changed) this.saveDelegate('the held delegate report');
   }
 
   /** Messages sent while a turn was running; the app sends them as turns end. */
@@ -356,7 +365,7 @@ export class SessionRuntime {
     if (late) {
       if (!this.confirmLateDelegate(id, attempt)) return;
     } else this.patch<ToolItem>(id, { delegateCaller: undefined, delegateAttempt: undefined });
-    void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the delegate receipt', String(err)));
+    this.saveDelegate('the delegate receipt');
   }
 
   endDelegateGeneration() {
@@ -364,7 +373,7 @@ export class SessionRuntime {
     for (const owner of this.delegates.values()) owner.callerGone?.();
     const hadResults = this.foregroundResults.size > 0;
     for (const id of this.foregroundResults.keys()) this.releaseToolResult(id);
-    if (hadResults) void this.persistDelegate?.().catch(err => this.notice('error', 'Could not save the delegate report', String(err)));
+    if (hadResults) this.saveDelegate('the delegate report');
     if (this.pendingDelegateReports.size) this.onDelegateReport?.();
   }
 
