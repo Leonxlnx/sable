@@ -2522,10 +2522,17 @@ export class App {
             if (row !== rt.get(row.id) || row.delegateAttempt !== attempt || !rt.pendingDelegateReports.has(row.id)) continue;
             const delivered = receipts?.ids.has(attempt.tool ? 'tool:' + attempt.tool : row.delegateDeliveryId!);
             if (!delivered && !receipts?.settled) {
-              const decision = randomUUID();
-              rt.patch<ToolItem>(row.id, { delegateWait: null, delegateReceiptState: 'unknown', delegateRetryId: decision });
-              rt.notice('info', 'Delivery unconfirmed for ' + row.title,
-                'The answer is saved on the delegate step. The agent may already have it. To send it again, enter /report-retry ' + decision);
+              // The lookup did not complete (a long history is not read in 3 s). The first time for a row
+              // the report goes again by the pending path, as after a lookup that did not find it: its text
+              // tells the agent to ignore a copy it already has. The count is saved with the row and never
+              // cleared, so a row is sent again by itself at most once. After that the row says "Delivery
+              // unknown" and offers "Send report again"; nothing is written into the conversation.
+              if (!row.delegateRedelivered) {
+                this.refundDelegate(rt, attempt);
+                rt.patch<ToolItem>(row.id, { delegateAttempt: undefined, delegateReceiptState: null, delegateReport: 'pending', delegateRedelivered: 1 });
+                continue;
+              }
+              rt.patch<ToolItem>(row.id, { delegateWait: null, delegateReceiptState: 'unknown', delegateRetryId: randomUUID() });
               continue;
             }
             if (delivered) {

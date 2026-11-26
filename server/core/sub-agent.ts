@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { withDeadline } from '../util/deadline';
-import type { BridgeEvent, PermissionRequest, ProviderId, Question, SessionMeta, TimelineItem, ToolItem, UserItem } from '../../shared/protocol';
+import { DeadlineExceeded, lateEnd, withDeadline } from '../util/deadline';
+import type { BridgeEvent, NoticeItem, PermissionRequest, ProviderId, Question, SessionMeta, TimelineItem, ToolItem, UserItem } from '../../shared/protocol';
 import { agentToolId, AGENT_TOOLS, describeAgentCall, type AgentCall } from '../providers/agent-tool';
 import type { Provider } from '../providers/types';
 import { delegateAnswer, MAX_DELEGATE_RESULT } from './delegate-result';
@@ -359,20 +359,42 @@ export async function runSubAgent(
           result: { text: result.text, isError: !result.ok, ...(pending ? { agent: { background: outcome } } : {}) },
         });
         if (pending && !byPerson) parent.pendingDelegateReports.add(itemId);
-        const prepared = pending && !byPerson ? parent.stageDelegateReports?.() : undefined;
+        let prepared = pending && !byPerson ? parent.stageDelegateReports?.() : undefined;
         let folded: (() => void) | undefined;
         if (quitting && parent.saveQuitResult) {
           try { folded = parent.saveQuitResult(parent.get<ToolItem>(itemId)!); }
           catch (err) { deps.log('delegate quit journal failed', err); }
         }
+        // Once this call has ended the child owns nothing: a late save asks whether the row is still this task's.
+        const mine = (late?: boolean) => late ? !revoked && parent.get<ToolItem>(itemId)?.delegateDeliveryId === deliveryId : child.ownsRow();
+        const announce = (late?: boolean) => { if (pending && !byPerson && mine(late)) parent.onDelegateReport?.(); };
+        // The row holds the result from the patch on. Only a save that rejects says so, once, as a warning.
+        const unsaved = (err: unknown, late?: boolean) => {
+          if (mine(late)) parent.add<NoticeItem>({ type: 'notice', variant: 'error', level: 'warn',
+            text: "The sub-agent's result is shown but not saved yet", detail: String(err) });
+        };
+        let late: Promise<void> | undefined;
         try {
           if (parent.persistDelegate) {
             await withDeadline(parent.persistDelegate(), 5000, 'Saving the delegate result');
             folded?.();
           }
-        } catch (err) { if (!folded) throw err; }
-        prepared?.();
-        if (pending && !byPerson && child.ownsRow()) parent.onDelegateReport?.();
+        } catch (err) {
+          if (quitting) { if (!folded) throw err; }
+          // A slow save is no failure: the caller gets its result now, and what follows a save runs
+          // when that same save settles. No second save is started.
+          else if (err instanceof DeadlineExceeded) late = lateEnd(err);
+          else {
+            saveError = err instanceof Error ? err : Error(String(err));
+            unsaved(err);
+            prepared = undefined;
+          }
+        }
+        if (late) void late.then(() => { prepared?.(); announce(true); }, err => { unsaved(err, true); announce(true); });
+        else {
+          prepared?.();
+          announce();
+        }
       }
     } catch (err) {
       saveError = err instanceof Error ? err : Error(String(err));

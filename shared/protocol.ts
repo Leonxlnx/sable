@@ -1122,6 +1122,8 @@ export interface ToolItem extends BaseItem {
   delegateReceiptState?: 'checking' | 'unknown' | null;
   /** One decision token per uncertain attempt, consumed by the built-in /report-retry command. */
   delegateRetryId?: string | null;
+  /** A receipt lookup that did not complete sent this report again by itself. Once per row, never cleared. */
+  delegateRedelivered?: 1;
   /** The prepared ID moves to issued at the native offer. Older issued attempts have neither field. */
   delegateAttempt?: { provider: ProviderId; account?: string; session?: string; after?: string; tool?: string; budget?: string; prepared?: string; issued?: string };
   /** Budget anchor for an imported conversation with no personal card. */
