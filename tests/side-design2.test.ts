@@ -103,14 +103,13 @@ describe('the Agents tab leads every row with its state (design2 #12)', () => {
     expect(STATE_MARK[commandRowState('done')]).toBe('check');
   });
 
-  it('the header says what the tail says: what works now, and nothing once nothing does', () => {
-    expect(agentsHeader({ working: 0, running: 1 })).toBe('1 command running');
-    expect(agentsHeader({ working: 2, running: 1 })).toBe('2 sub-agents, 1 command');
-    expect(agentsHeader({ working: 2, running: 0 })).toBe('2 sub-agents working');
-    // A tracked job that is the only work reads by its own title; beside other work it is a part.
-    expect(agentsHeader({ working: 0, running: 0, jobs: 1, jobTitle: 'Codex builds the sign-in fix' })).toBe('Codex builds the sign-in fix');
-    expect(agentsHeader({ working: 1, running: 0, jobs: 2 })).toBe('1 sub-agent, 2 jobs');
+  it('the header says what is true now as one figure, and nothing once nothing works', () => {
+    expect(agentsHeader({ working: 0, running: 1 })).toBe('1 working');
+    expect(agentsHeader({ working: 2, running: 1 })).toBe('3 working');
+    // Tracked jobs are work like any other; the cards under the header say what each thing is.
+    expect(agentsHeader({ working: 1, running: 0, jobs: 2 })).toBe('3 working');
     expect(agentsHeader({ working: 0, running: 0, serving: 1 })).toBe('1 serving');
+    expect(agentsHeader({ working: 1, running: 0, serving: 1 })).toBe('1 working');
     // Once nothing works it says nothing: never a total of what ended or failed (26 Nov: "948 done · 27 failed").
     expect(agentsHeader({ working: 0, running: 0 })).toBe('');
   });

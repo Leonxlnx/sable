@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { TimelineItem, ToolItem, UserItem } from '@shared/protocol';
-import { agentIndex, commandIndex, commandsView, failureIsNews, isJob, jobIndex, jobRan, jobRowState, jobTail, jobsView, lastLine, liveKey, noteIndex, nowRows, overview, userIndex, type Timeline } from '../src/features/rail/agents-model';
+import { agentIndex, commandIndex, commandsView, dayLabel, failureIsNews, historyDays, isJob, jobIndex, jobRan, jobRowState, jobTail, jobsView, lastLine, liveKey, noteIndex, nowRows, overview, userIndex, type Timeline } from '../src/features/rail/agents-model';
 import { trackedEndReport } from '@shared/synthetic';
 
 const user = (id: string, ts: number): UserItem => ({ id, ts, type: 'user', text: `message ${id}`, state: 'sent' }) as UserItem;
@@ -135,6 +135,24 @@ describe('a failure is red only while it is news', () => {
     expect(overview(ids, liveKey(t.items, ids), t.items, userIndex()(t), t.roots).waves.map((w) => w.news)).toEqual([1, 0, 0]);
     expect(failureIsNews(t.items['old-bad'] as ToolItem, false, 4000)).toBe(false);
     expect(failureIsNews(t.items['old-bad'] as ToolItem, true, 4000)).toBe(true);
+  });
+
+  it('history folds by day: the newest wave\'s day stands as its waves, every earlier day is one line', () => {
+    const at = (y: number, m: number, d: number, h: number) => new Date(y, m, d, h).getTime();
+    const t = new Tl();
+    const days: [string, number][] = [['mon-a', at(2026, 10, 23, 9)], ['mon-b', at(2026, 10, 23, 22)], ['wed', at(2026, 10, 25, 12)], ['thu-a', at(2026, 10, 26, 8)], ['thu-b', at(2026, 10, 26, 21)]];
+    for (const [u, ts] of days) {
+      t.add(user(u, ts)).add(agent(`${u}-1`, { ts: ts + 10, endedAt: ts + 20, ...(u === 'mon-a' ? { status: 'error' as const } : {}) })).add(agent(`${u}-2`, { ts: ts + 30, endedAt: ts + 40 }));
+    }
+    const ids = agentIndex()(t);
+    const o = overview(ids, liveKey(t.items, ids), t.items, userIndex()(t), t.roots);
+    const h = historyDays(o.waves);
+    expect(h.recent.map((w) => w.user)).toEqual(['thu-b', 'thu-a']);
+    expect(h.days.map((d) => [d.waves.map((w) => w.user), d.count, d.failed, d.news])).toEqual([[['wed'], 2, 0, 0], [['mon-b', 'mon-a'], 4, 1, 0]]);
+    const now = at(2026, 10, 26, 23);
+    expect(h.days.map((d) => dayLabel(d.at, now))).toEqual(['Yesterday', 'Monday']);
+    expect(dayLabel(at(2026, 10, 2, 12), now)).toBe('2 Nov');
+    expect(historyDays([])).toEqual({ recent: [], days: [] });
   });
 
   it('the stylesheet keeps red for news: no rule colours a failure by its outcome alone', () => {

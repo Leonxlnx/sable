@@ -144,6 +144,11 @@
   text-align: right;
 }
 
+/* Inside an opened day its waves and their rows stand one step in, so the day reads as their holder. */
+.agx-list > [data-nested] {
+  margin-left: 14px;
+}
+
 /* What an open group holds back: in the titles' column. */
 .agx-more-btn {
   display: flex;

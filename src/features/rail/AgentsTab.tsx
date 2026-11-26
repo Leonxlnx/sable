@@ -18,7 +18,7 @@ import { stopTracking } from '@/state/actions';
 import { useStore } from '@/state/store';
 import { AgentDetail } from './AgentDetail';
 import { ShownCtx, indexFor, useLooked, usePaneTick, useProgress, useShown } from './agents-hooks';
-import { OUTCOME_WORD, STATE_MARK, agentState, agentsHeader, commandRowState, commandState, commandsView, failureIsNews, figuresOf, isJob, jobRan, jobRowState, jobTail, jobsView, lastLine, liveKey, nowRows, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress, type RowState } from './agents-model';
+import { OUTCOME_WORD, STATE_MARK, agentState, agentsHeader, commandRowState, commandState, commandsView, dayLabel, failureIsNews, figuresOf, historyDays, isJob, jobRan, jobRowState, jobTail, jobsView, lastLine, liveKey, nowRows, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress, type RowState } from './agents-model';
 import { LeaveList } from './leave';
 import './agents.css';
 
@@ -52,6 +52,7 @@ const MANY = 4;
 /** The folds of the finished commands and jobs, among the waves' own. */
 const COMMANDS = '\0commands';
 const JOBS = '\0jobs';
+const DAY = '\0day:';
 
 /**
  * Everything of the session that works beside its own turn, for a person who glances at it.
@@ -93,7 +94,6 @@ function AgentsList({ sessionId }: { sessionId: string }) {
   const cmds = useShown((s) => readCommands(s.data[sessionId]));
   const readJobs = useMemo(() => jobsView(jobs), [jobs]);
   const tracked = useShown((s) => readJobs(s.data[sessionId]));
-  const jobTitle = useShown((s) => s.sessions[sessionId]?.trackedTitle ?? undefined);
   const seenAt = useLooked(sessionId);
   const cwd = useStore((s) => s.sessions[sessionId]?.cwd ?? '');
   const home = useStore((s) => s.home);
@@ -128,25 +128,38 @@ function AgentsList({ sessionId }: { sessionId: string }) {
   rows.push({ key: 'now', as: 'now', node: () => <Now key="now" sessionId={sessionId} order={now} servers={servers} /> });
   // A wave gets its line when there is more than one, or other groups beside it: one wave alone is simply the list.
   const headed = view.waves.length > 1 || cmds.past.length > 0 || tracked.past.length > 0;
-  view.waves.forEach((w, i) => {
+  const wave = (w: (typeof view.waves)[number], i: number, nested: boolean) => {
     const open = !headed || waveOpen(i, view.done, chosen(w.user));
     if (headed) {
       const hk = `h:${w.user}`;
-      rows.push({ key: hk, as: hk, node: (fresh) => <WaveHead key={hk} sessionId={sessionId} user={w.user} count={w.ids.length} failed={w.failed} news={w.news} open={open} onFlip={flip} fresh={fresh} /> });
+      rows.push({ key: hk, as: hk, node: (fresh) => <WaveHead key={hk} sessionId={sessionId} user={w.user} count={w.ids.length} failed={w.failed} news={w.news} open={open} onFlip={flip} fresh={fresh} nested={nested} /> });
     }
     if (!open) return;
     const shown = waveRows(w, all(w.user));
-    for (const id of shown.ids) rows.push({ key: id, as: `D${id}`, node: (fresh) => <DoneRow key={id} sessionId={sessionId} id={id} fresh={fresh} newest={i === 0} seenAt={seenAt} /> });
+    for (const id of shown.ids) rows.push({ key: id, as: `D${id}`, node: (fresh) => <DoneRow key={id} sessionId={sessionId} id={id} fresh={fresh} newest={i === 0} seenAt={seenAt} nested={nested} /> });
     if (shown.more) {
       const mk = `m:${w.user}`;
-      rows.push({ key: mk, as: mk, node: () => <MoreRow key={mk} id={mk} group={w.user} count={shown.more} onFlip={flip} /> });
+      rows.push({ key: mk, as: mk, node: () => <MoreRow key={mk} id={mk} group={w.user} count={shown.more} onFlip={flip} nested={nested} /> });
     }
-  });
+  };
+  // The newest wave's own day stands as its waves; every earlier day is one line that holds its own.
+  const history = useMemo(() => historyDays(view.waves), [view.waves]);
+  history.recent.forEach((w, i) => wave(w, i, false));
+  let before = history.recent.length;
+  const today = Date.now();
+  for (const d of history.days) {
+    const dk = `${DAY}${d.key}`;
+    const open = chosen(dk) ?? false;
+    const from = before;
+    rows.push({ key: `h:${dk}`, as: `h:${dk}`, node: (fresh) => <GroupHead key={`h:${dk}`} id={`h:${dk}`} group={dk} label={dayLabel(d.at, today)} count={d.count} failed={d.failed} news={d.news} open={open} onFlip={flip} fresh={fresh} /> });
+    if (open) d.waves.forEach((w, k) => wave(w, from + k, true));
+    before += d.waves.length;
+  }
   if (tracked.past.length) {
     const open = chosen(JOBS) ?? tracked.past.length <= 4;
     rows.push({ key: 'h:job', as: 'h:job', node: (fresh) => <GroupHead key="h:job" id="h:job" group={JOBS} label="Jobs" count={tracked.past.length} failed={0} news={0} open={open} onFlip={flip} fresh={fresh} /> });
     if (open) {
-      const shown = waveRows({ user: JOBS, ids: tracked.past, failed: 0, news: 0 }, all(JOBS));
+      const shown = waveRows({ user: JOBS, ids: tracked.past, failed: 0, news: 0, at: 0 }, all(JOBS));
       for (const id of shown.ids) rows.push({ key: `j:${id}`, as: `j:${id}`, node: (fresh) => <JobRow key={`j:${id}`} sessionId={sessionId} id={id} fresh={fresh} /> });
       if (shown.more) rows.push({ key: 'm:job', as: 'm:job', node: () => <MoreRow key="m:job" id="m:job" group={JOBS} count={shown.more} onFlip={flip} /> });
     }
@@ -157,13 +170,13 @@ function AgentsList({ sessionId }: { sessionId: string }) {
     rows.push({ key: 'h:cmd', as: 'h:cmd', node: (fresh) => <GroupHead key="h:cmd" id="h:cmd" group={COMMANDS} label="Commands" count={cmds.past.length} failed={cmds.failed} news={0} open={open} onFlip={flip} fresh={fresh} /> });
     if (open) {
       // Every failure shows (`waveRows` lists those first).
-      const shown = waveRows({ user: COMMANDS, ids: cmds.past, failed: cmds.failed, news: 0 }, all(COMMANDS));
+      const shown = waveRows({ user: COMMANDS, ids: cmds.past, failed: cmds.failed, news: 0, at: 0 }, all(COMMANDS));
       for (const id of shown.ids) rows.push({ key: `c:${id}`, as: `c:${id}`, node: (fresh) => <CommandRow key={`c:${id}`} sessionId={sessionId} id={id} fresh={fresh} seenAt={seenAt} /> });
       if (shown.more) rows.push({ key: 'm:cmd', as: 'm:cmd', node: () => <MoreRow key="m:cmd" id="m:cmd" group={COMMANDS} count={shown.more} onFlip={flip} /> });
     }
   }
   // What is true now, in the words of the conversation's last line and the sidebar.
-  const head = agentsHeader({ serving: cmds.serving, working: view.working.length, running: cmds.running, jobs: tracked.running.length, jobTitle });
+  const head = agentsHeader({ serving: cmds.serving, working: view.working.length, running: cmds.live.length, jobs: tracked.running.length });
   const keys = rows.map((r) => r.key);
   const arrived = useEntrances(rows.map((r) => r.as));
 
@@ -224,9 +237,9 @@ function useEntrances(keys: readonly string[]): ReadonlySet<string> {
  * One line over a group of rows: when it began, what it is, how many, and while folded what failed
  * in it: in red only while that is news (`news`), else as a quiet word. It folds the group.
  */
-const GroupHead = memo(function GroupHead({ id, group, time, label, count, failed, news, open, onFlip, fresh, title }: { id: string; group: string; time?: string; label: string; count: number; failed: number; news: number; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; title?: string }) {
+const GroupHead = memo(function GroupHead({ id, group, time, label, count, failed, news, open, onFlip, fresh, title, nested }: { id: string; group: string; time?: string; label: string; count: number; failed: number; news: number; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; title?: string; nested?: boolean }) {
   return (
-    <div role="listitem" data-flip={id} className="agx-wave" data-open={open || undefined} data-new={fresh || undefined}>
+    <div role="listitem" data-flip={id} className="agx-wave" data-open={open || undefined} data-new={fresh || undefined} data-nested={nested || undefined}>
       <button type="button" className="agx-wave-btn" aria-expanded={open} onClick={() => onFlip(group, !open)} title={title}>
         <span className="agx-mark" aria-hidden>
           <Icon name="caret-right" size={10} weight="bold" className="agx-caret" />
@@ -242,16 +255,16 @@ const GroupHead = memo(function GroupHead({ id, group, time, label, count, faile
 });
 
 /** A wave's line: the first words of the message that set its agents going, under the time it was sent. */
-const WaveHead = memo(function WaveHead({ sessionId, user, count, failed, news, open, onFlip, fresh }: { sessionId: string; user: string; count: number; failed: number; news: number; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean }) {
+const WaveHead = memo(function WaveHead({ sessionId, user, count, failed, news, open, onFlip, fresh, nested }: { sessionId: string; user: string; count: number; failed: number; news: number; open: boolean; onFlip: (key: string, to: boolean) => void; fresh: boolean; nested?: boolean }) {
   const item = useShown((s) => (user ? s.data[sessionId]?.items[user] : undefined));
   const text = item?.type === 'user' ? promptLine(userItemText(item)) : 'Earlier';
-  return <GroupHead id={`h:${user}`} group={user} time={item ? clock(item.ts) : undefined} label={text} title={text} count={count} failed={failed} news={news} open={open} onFlip={onFlip} fresh={fresh} />;
+  return <GroupHead id={`h:${user}`} group={user} time={item ? clock(item.ts) : undefined} label={text} title={text} count={count} failed={failed} news={news} open={open} onFlip={onFlip} fresh={fresh} nested={nested} />;
 });
 
 /** What an open group holds back. */
-const MoreRow = memo(function MoreRow({ id, group, count, onFlip }: { id: string; group: string; count: number; onFlip: (key: string, to: boolean) => void }) {
+const MoreRow = memo(function MoreRow({ id, group, count, onFlip, nested }: { id: string; group: string; count: number; onFlip: (key: string, to: boolean) => void; nested?: boolean }) {
   return (
-    <div role="listitem" data-flip={id} className="agx-more-row">
+    <div role="listitem" data-flip={id} className="agx-more-row" data-nested={nested || undefined}>
       <button type="button" className="agx-more-btn num" onClick={() => onFlip(`${group}\0all`, true)}>
         Show {count} more
       </button>
@@ -603,7 +616,7 @@ function Who({ provider }: { provider: NonNullable<ReturnType<typeof agentProvid
  * An outcome other than done is said in words where the time would stand; its tokens and steps,
  * and when it finished, are in the opened row.
  */
-const DoneRow = memo(function DoneRow({ sessionId, id, fresh, newest, seenAt }: { sessionId: string; id: string; fresh: boolean; newest: boolean; seenAt: number }) {
+const DoneRow = memo(function DoneRow({ sessionId, id, fresh, newest, seenAt, nested }: { sessionId: string; id: string; fresh: boolean; newest: boolean; seenAt: number; nested?: boolean }) {
   const item = useShown((s) => s.data[sessionId]?.items[id]) as ToolItem | undefined;
   // A background agent's call returned at once: its notification says when it ended.
   const noted = useShown((s) => indexFor(sessionId).notes(s.data[sessionId]).get(id)?.ts ?? 0);
@@ -621,7 +634,7 @@ const DoneRow = memo(function DoneRow({ sessionId, id, fresh, newest, seenAt }: 
   const endedAt = noted || (launched ? 0 : (item.endedAt ?? 0));
   const news = outcome === 'failed' && failureIsNews(item, newest, seenAt);
   return (
-    <div role="listitem" data-flip={id} className="agx-row" data-outcome={outcome} data-news={news || undefined} data-open={open || undefined} data-new={fresh || undefined}>
+    <div role="listitem" data-flip={id} className="agx-row" data-outcome={outcome} data-news={news || undefined} data-open={open || undefined} data-new={fresh || undefined} data-nested={nested || undefined}>
       <button type="button" className="agx-row-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
         <StateMark state={agentState(outcome)} />
         <span className="agx-title truncate">{agentTask(item)}</span>

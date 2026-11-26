@@ -69,7 +69,7 @@ describe('what names a wave', () => {
       .add(user('u2', 300, 'Now the phone'))
       .add(agent('a4', { ts: 310 }));
     expect(userIndex()(t)).toEqual(['u1', 'u2']);
-    expect(see(t).waves).toEqual([
+    expect(see(t).waves).toMatchObject([
       { user: 'u2', ids: ['a4'], failed: 0, news: 0 },
       { user: 'u1', ids: ['a3', 'a2', 'a1'], failed: 0, news: 0 },
     ]);
@@ -90,7 +90,7 @@ describe('overview', () => {
     expect(o.done).toBe(3);
     expect(o.failed).toBe(1);
     // What failed stands first in its wave, then newest first.
-    expect(o.waves).toEqual([{ user: 'u1', ids: ['bad', 'late', 'ok'], failed: 1, news: 1 }]);
+    expect(o.waves).toMatchObject([{ user: 'u1', ids: ['bad', 'late', 'ok'], failed: 1, news: 1 }]);
   });
 
   it('moves an agent from working to its wave when it ends, and nothing else', () => {
@@ -99,7 +99,7 @@ describe('overview', () => {
     t.items = { ...t.items, a: { ...t.items.a, status: 'done', endedAt: 500 } as ToolItem };
     const o = see(t);
     expect(o.working).toEqual(['b']);
-    expect(o.waves).toEqual([{ user: 'u1', ids: ['a'], failed: 0, news: 0 }]);
+    expect(o.waves).toEqual([{ user: 'u1', ids: ['a'], failed: 0, news: 0, at: 100 }]);
   });
 
   it('is cheap for hundreds of agents', () => {
@@ -131,7 +131,7 @@ describe('overview', () => {
 });
 
 describe('folding', () => {
-  const wave = (n: number, failed = 0): Wave => ({ user: 'u', ids: Array.from({ length: n }, (_, i) => `a${i}`), failed, news: 0 });
+  const wave = (n: number, failed = 0): Wave => ({ user: 'u', ids: Array.from({ length: n }, (_, i) => `a${i}`), failed, news: 0, at: 0 });
 
   it('opens only the newest wave: history folds away, however short the list', () => {
     expect(waveOpen(0, 500, undefined)).toBe(true);

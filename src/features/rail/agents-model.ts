@@ -3,7 +3,6 @@ import type { TaskMark, TimelineItem, ToolItem, TrackedWork, WorkflowRun } from 
 import { syntheticOf, type TaskOutcome } from '@shared/synthetic';
 import { isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
 import { changedSince } from '@/state/revision';
-import { workLabel } from '@shared/work-label';
 
 /**
  * What the Agents tab reads from a session, worked out so that a streamed step costs next to
@@ -578,6 +577,8 @@ export interface Wave {
   /** What failed first, then newest first. */
   ids: string[];
   failed: number;
+  /** When its message was sent (0 before the first message). */
+  at: number;
   /**
    * How many of those failures are news: in the newest wave, or failed since the person last looked
    * at the tab (`seenAt`). Only news is red; an older failure is a quiet word.
@@ -615,9 +616,67 @@ export function overview(ids: readonly string[], live: string, items: Items, use
       } else rest.push(id);
     }
     failed += bad.length;
-    return { user: g.user, ids: bad.length ? [...bad, ...rest] : g.ids, failed: bad.length, news };
+    return { user: g.user, ids: bad.length ? [...bad, ...rest] : g.ids, failed: bad.length, at: items[g.user]?.ts ?? 0, news };
   });
   return { working, waves, done: done.length, failed };
+}
+
+/** The waves of one earlier day, as one line of history. */
+export interface Day {
+  /** The local day ("2026-10-25": year, month from 0, day). */
+  key: string;
+  /** When its newest wave began. */
+  at: number;
+  /** Newest first. */
+  waves: Wave[];
+  /** Its finished agents, and what failed among them. */
+  count: number;
+  failed: number;
+  news: number;
+}
+
+const dayKey = (ts: number) => {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+};
+
+/**
+ * History by day: the waves of the newest wave's own day stand as they are (`recent`); every
+ * earlier day folds to one line that holds its waves, so five days of work are a handful of
+ * lines. `waves` newest first, as `overview` gives them.
+ */
+export function historyDays(waves: readonly Wave[]): { recent: Wave[]; days: Day[] } {
+  if (!waves.length) return { recent: [], days: [] };
+  const first = dayKey(waves[0].at);
+  const recent: Wave[] = [];
+  const days: Day[] = [];
+  for (const w of waves) {
+    const key = dayKey(w.at);
+    if (key === first && !days.length) {
+      recent.push(w);
+      continue;
+    }
+    let day = days[days.length - 1];
+    if (!day || day.key !== key) days.push((day = { key, at: w.at, waves: [], count: 0, failed: 0, news: 0 }));
+    day.waves.push(w);
+    day.count += w.ids.length;
+    day.failed += w.failed;
+    day.news += w.news;
+  }
+  return { recent, days };
+}
+
+/** A day as a line of history says it: "Yesterday", the weekday within a week, else the date ("24 Nov"). */
+export function dayLabel(at: number, now: number): string {
+  const day = (ts: number) => {
+    const d = new Date(ts);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  };
+  const ago = Math.round((day(now) - day(at)) / 86_400_000);
+  if (ago <= 0) return 'Today';
+  if (ago === 1) return 'Yesterday';
+  if (ago < 7) return new Date(at).toLocaleDateString('en', { weekday: 'long' });
+  return new Date(at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 }
 
 /**
@@ -684,14 +743,14 @@ export const STATE_MARK: Record<RowState, 'ring' | 'wait' | 'check' | 'x' | 'min
 };
 
 /**
- * The tab's header says what is true now, in the words the conversation's last line and the
- * sidebar use (`workLabel`): "2 sub-agents working", "1 sub-agent, 1 command", a tracked job that is
- * the only work by its own title, "1 serving" when only servers run. Nothing when nothing works:
- * never a total of what ended or failed over the chat's whole life.
+ * The tab's header says what is true now, as one figure: "2 working" (everything that works, the
+ * cards right under it say what each is), "1 serving" when only servers run. Nothing when nothing
+ * works: never a total of what ended or failed over the chat's whole life. The sidebar and the
+ * conversation's last line name the work (`workLabel`); here the list itself does.
  */
-export function agentsHeader(n: { serving?: number; working: number; running: number; jobs?: number; jobTitle?: string }): string {
-  const now = workLabel({ background: n.working, commands: n.running, tracked: n.jobs, trackedTitle: n.jobTitle });
-  if (now) return now;
+export function agentsHeader(n: { serving?: number; working: number; running: number; jobs?: number }): string {
+  const now = n.working + n.running + (n.jobs ?? 0);
+  if (now > 0) return `${now} working`;
   return n.serving ? `${n.serving} serving` : '';
 }
 
