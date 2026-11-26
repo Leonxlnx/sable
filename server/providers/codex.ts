@@ -38,6 +38,7 @@ import { lostLine, type SessionRuntime } from '../core/runtime';
 import type { TitlePrompt } from '../core/titles';
 import { codexForkTurn, cutAt } from '../core/fork';
 import type { Provider, ProviderContext, ProviderSession, SendOptions } from './types';
+import { limitsAfterTurn } from '../core/limit-refresh';
 import { codexPlan } from './plans';
 import { windowForModel } from '../../shared/limit-windows';
 import { chatReplyInstruction, CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
@@ -1009,16 +1010,23 @@ export class CodexProvider implements Provider {
   /** The first sign-in seen in this run started a limits read. */
   private limitsPrimed = false;
 
-  limits(force: boolean | 'fresh' = false): Promise<RateLimit[]> {
+  limits(force: boolean | 'fresh' = false, afterTurn = false): Promise<RateLimit[]> {
     const cached = () => mapLimits([...this.snapshots.values()]);
-    const busy = () => this.disposed || this.ctx.closing?.() || authGate.readsPaused() || this.rpc?.hasTurn || [...this.attached.keys()].some(s => s.turnActive);
+    const busy = () => {
+      if (this.disposed || this.ctx.closing?.() || authGate.readsPaused()) return true;
+      const working = this.rpc?.hasTurn || [...this.attached.keys()].some(s => s.turnActive);
+      if (force === true && working) limitsAfterTurn.add(this);
+      return working;
+    };
     if (busy()) return Promise.resolve(cached());
-    if (this.limitsRun) return force === 'fresh' ? this.limitsRun.then(() => this.limits('fresh')) : this.limitsRun;
-    if (force !== 'fresh' && Date.now() - this.limitsAt < 60_000) return Promise.resolve(cached());
+    const deferred = afterTurn && limitsAfterTurn.has(this);
+    if (this.limitsRun) return force === 'fresh' || deferred ? this.limitsRun.then(() => this.limits(force, afterTurn)) : this.limitsRun;
+    if (!deferred && force !== 'fresh' && Date.now() - this.limitsAt < 60_000) return Promise.resolve(cached());
     this.limitsAt = Date.now();
     const run = (async () => {
       const rpc = await this.client('limits');
       if (busy()) return cached();
+      if (deferred) limitsAfterTurn.delete(this);
       const r = await rpc.request<GetAccountRateLimitsResponse>('account/rateLimits/read', { excludeResetCreditDetails: true }, 20_000);
       this.snapshots.clear();
       const byId = r.rateLimitsByLimitId ? Object.values(r.rateLimitsByLimitId).filter((x): x is RateLimitSnapshot => !!x) : [];
@@ -1052,11 +1060,13 @@ export class CodexProvider implements Provider {
 
   /** One limits read after a turn ends, at most once a minute. */
   private refreshLimitsSoon() {
-    if (this.limitsTimer || this.disposed || this.ctx.dormant?.(this.id)) return;
-    const wait = Math.max(1500, 60_000 - (Date.now() - this.limitsAt));
+    const deferred = limitsAfterTurn.has(this);
+    if (this.disposed || (!deferred && (this.limitsTimer || this.ctx.dormant?.(this.id)))) return;
+    clearTimeout(this.limitsTimer);
+    const wait = deferred ? 1500 : Math.max(1500, 60_000 - (Date.now() - this.limitsAt));
     this.limitsTimer = setTimeout(() => {
       this.limitsTimer = undefined;
-      if (!this.disposed && this.rpc) void this.limits().catch(() => {});
+      if (!this.disposed && this.rpc) void this.limits(false, true).catch(() => {});
     }, wait);
     this.limitsTimer.unref?.();
   }
@@ -1126,6 +1136,7 @@ export class CodexProvider implements Provider {
 
   private async closeProcesses(hard: boolean) {
     this.disposed = true;
+    clearTimeout(this.limitsTimer);
     clearTimeout(this.idleTimer);
     if (this.pendingLogin) this.finishLogin(new Error('Codex provider is shut down'));
     for (const s of this.sessions.values()) s.abortPrompts();

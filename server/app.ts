@@ -85,7 +85,9 @@ import { matchesWindowModel, windowForModel, windowModel } from '../shared/limit
 import { mergeWindows } from './services/limits';
 import { workOf, WAKE_DELIVERY_GRACE_MS, type ChatWork } from './core/work';
 import { effectiveModel, planWeight, SPARE_STALE_RETRY_MS, SpareWaits, type SpareAccount, type SpareRun } from './core/spare';
-import { ResetConsoles } from './core/reset-console';
+import { clearedWindows, ResetConsoles } from './core/reset-console';
+import { heldForLimits, isApiKeyAuth, limitsAfterTurn } from './core/limit-refresh';
+export { isApiKeyAuth } from './core/limit-refresh';
 import { PhoneReceipts, Submissions, messagePrint } from './core/submissions';
 import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
@@ -244,6 +246,7 @@ const LOSS_WAKE_WINDOW_MS = 10 * 60_000;
 const LOSS_WAKE_CRASH_MS = 2 * 60_000;
 const recentLossWakes = (rt: SessionRuntime, now = Date.now()) => (rt.meta.lossWake?.attempts ?? []).filter(at => now - at < LOSS_WAKE_WINDOW_MS);
 const accountKey = (provider: ProviderId, accountId: string) => `${provider}:${accountId}`;
+type KnownLimits = Map<string, { limits?: RateLimit[]; planLimits?: boolean }>;
 
 /** The bridge application: owns providers, sessions and persistence. Transport-agnostic. */
 export class App {
@@ -269,6 +272,10 @@ export class App {
   /** Per agent: the limit handover moved sessions off the preferred account; new sessions use `to` until `until`. */
   private fallbacks = new Map<ProviderId, { from: string; to: string; until?: number }>();
   private resetTimer?: NodeJS.Timeout;
+  private heldLimitsTimer?: NodeJS.Timeout;
+  private limitsToastAt = new Map<string, number>();
+  /** The confirmed reset reading can serve several chats returning to this dormant account. */
+  private earlyResetRead = new Map<string, { at: number; seq: number; limits: RateLimit[] }>();
   private resetCheckedAt = Date.now();
   /** Sessions told once that they run on credits Sable was not allowed to use (per account and window). */
   private creditsWarned = new Set<string>();
@@ -396,11 +403,8 @@ export class App {
     accounts: (provider) => this.spareAccounts(provider),
     refresh: async (provider, accountId) => {
       if (this.dormant(provider, accountId)) return false;
-      const key = accountKey(provider, accountId);
-      const seq = this.limitsSeq.get(key) ?? 0;
-      await this.call('provider.limits', { provider, accountId, force: true });
       // Only the agent's own reading counts: a failed read hands back the last known rows.
-      return (this.limitsSeq.get(key) ?? 0) > seq;
+      return (await this.readLimits(provider, accountId, true)).fresh;
     },
     refused: (rt) => this.refusedMessage(rt)?.id,
     start: (rt, accountId, wait) => this.startSpare(rt, accountId, wait),
@@ -544,6 +548,7 @@ export class App {
       this.factories.set(p.id, make);
     }
     this.registerCore();
+    this.scheduleHeldLimits();
     this.restoreRegistry(opts.returnAtStartMs);
     this.conversationCopies = new ConversationCopies(this, () => this.disposed || !!this.updates?.installing, id => {
       const rt = this.sessions.get(id);
@@ -810,7 +815,7 @@ export class App {
       log: this.log,
       emit: (e) => this.fromProvider(accountId, e),
       journal: this.journal,
-      closing: () => this.disposed,
+      closing: () => this.disposed || !!this.updates?.installing,
       dormant: provider => this.dormant(provider, accountId),
       account: accountId === DEFAULT_ACCOUNT ? undefined : { id: accountId, dir },
       settings: () => this.store.state.settings,
@@ -898,7 +903,9 @@ export class App {
         return this.emit({ ...e, accountId });
       case 'limits.updated': {
         const key = accountKey(e.provider, accountId);
-        this.limitsCache.set(key, e.limits);
+        const before = this.limitsCache.get(key) ?? [];
+        const rows = e.meta?.partial ? mergeWindows(before, e.limits) : e.limits;
+        this.limitsCache.set(key, rows);
         if (e.meta?.partial) this.limitsPartial.add(key);
         else this.limitsPartial.delete(key);
         if (e.meta) this.limitsMeta.set(key, { ...this.limitsMeta.get(key), ...e.meta });
@@ -910,6 +917,11 @@ export class App {
         const now = Date.now();
         const past = e.limits.some((l) => l.percent >= 100 && !(l.resetsAt && l.resetsAt <= now));
         this.spare.limitsChanged(e.provider, accountId, past && runningOnCredits(this.limitsMeta.get(key)));
+        // The dialog compares its own before and after, including its second read.
+        if ((e.provider === 'claude' || e.provider === 'codex') && !this.disposed && !this.updates?.installing && !this.resets.current(e.provider, accountId)) {
+          const cleared = clearedWindows(before, e.limits, now);
+          if (cleared.length) this.limitsCleared(e.provider, accountId, cleared, e.limits);
+        }
         return;
       }
       case 'provider.updated':
@@ -961,6 +973,41 @@ export class App {
 
   // ── limit resets ──
 
+  /** Only cached sign-ins and readings are inspected. Leave a gap after each actual attempt. */
+  private scheduleHeldLimits(pending?: { provider: ProviderId; accountId: string }[]) {
+    if (this.disposed || (!this.providers.has('claude') && !this.providers.has('codex'))) return;
+    const delay = pending?.length ? 4000 : (29 + 2 * Math.random()) * 60_000;
+    this.heldLimitsTimer = setTimeout(() => {
+      const accounts = pending?.length ? pending : [...this.providers.keys()]
+        .filter(p => p === 'claude' || p === 'codex')
+        .flatMap(provider => this.accountList(provider).map(a => ({ provider, accountId: a.id })));
+      void this.readNextHeld(accounts).catch(err => this.log('Held limits read failed', err))
+        .finally(() => this.scheduleHeldLimits(accounts));
+    }, delay);
+    this.heldLimitsTimer.unref?.();
+  }
+
+  private async readNextHeld(accounts: { provider: ProviderId; accountId: string }[]) {
+    const readings = new Map<ProviderId, KnownLimits>();
+    while (accounts.length && !this.disposed) {
+      const { provider, accountId } = accounts.shift()!;
+      if (this.updates?.installing || authGate.readsPaused()) continue;
+      if (!readings.has(provider)) readings.set(provider, await this.knownLimits(provider));
+      const info = this.cache.get<ProviderInfo>(`info:${provider}`);
+      const account = info?.accounts?.find(a => a.id === accountId);
+      const auth = account?.auth ?? (accountId === DEFAULT_ACCOUNT ? info?.auth : undefined);
+      if (!info?.installed || !auth?.loggedIn || isApiKeyAuth(auth) || !this.findAccount(provider, accountId)) continue;
+      const key = accountKey(provider, accountId);
+      const known = readings.get(provider)?.get(accountId);
+      if ((this.limitsMeta.get(key)?.planLimits ?? known?.planLimits) === false) continue;
+      const limits = known?.limits ?? account?.limits ?? [];
+      if (!heldForLimits(limits, this.capOf(provider, accountId), Date.now())) continue;
+      if (!this.limitsCache.get(key)?.length) this.limitsCache.set(key, limits);
+      await this.readLimits(provider, accountId, true);
+      break;
+    }
+  }
+
   private capped() {
     return [...this.limitsCache.entries()].map(([key, limits]) => {
       const [provider, ...rest] = key.split(':');
@@ -985,16 +1032,26 @@ export class App {
   }
 
   /**
-   * An account's full windows cleared before their time (a reset used in the agent's own dialog, as
-   * a fresh read showed): what waits for its reset goes on as at a reset by time: chats waiting to
-   * continue there, and new chats return to it when it is the preferred one.
+   * A fresh reading confirmed an early reset. Release the same waits whether the reset was
+   * discovered by a limits read or confirmed after the agent's reset dialog.
    */
-  private limitsCleared(provider: ProviderId, accountId: string, windows: RateLimit[]) {
+  private limitsCleared(provider: ProviderId, accountId: string, windows: RateLimit[], read = this.limitsCache.get(accountKey(provider, accountId))) {
     // Chats that waited go on only where every window holding their model has room now (the planner
     // checks the fresh reading); the windows that cleared say whose wait this was.
     void this.spare.resetCleared(provider, accountId, windows).catch(err => this.log('Could not resume reset wait', err));
     const fb = this.fallbacks.get(provider);
     const now = Date.now();
+    const key = accountKey(provider, accountId);
+    if (read) this.earlyResetRead.set(key, { at: now, seq: this.limitsSeq.get(key) ?? 0, limits: read });
+    for (const w of windows) this.notifyReset(provider, accountId, w.label, now);
+    for (const rt of this.sessions.values()) {
+      if (rt.meta.provider !== provider || rt.meta.movedFrom !== accountId) continue;
+      const models = [this.chatModel(rt), ...(rt.meta.returnModels ?? [])];
+      if (!windows.some(w => models.some(m => windowForModel(w, m)))) continue;
+      rt.update({ returnAt: now });
+      this.returnChecked.delete(rt.id);
+      this.armReturn(rt);
+    }
     if (fb && fb.from === accountId && fb.until && fb.until > now) {
       // New chats return only once no window that holds the agent's default model stays full: a
       // weekly window still full keeps them away until its own reset (review wave 8, #18).
@@ -1009,12 +1066,16 @@ export class App {
     this.scheduleResetAlert();
   }
 
+  private notifyReset(provider: ProviderId, accountId: string, window: string, at: number) {
+    if (this.store.state.settings.notifyLimitReset)
+      this.emit({ type: 'limit.reset', provider, accountId: accountId === DEFAULT_ACCOUNT ? undefined : accountId, window, at });
+  }
+
   private onResetDue() {
     const now = Date.now();
     const due = dueResets(this.capped(), this.resetCheckedAt, now);
     this.resetCheckedAt = now;
-    if (this.store.state.settings.notifyLimitReset)
-      for (const r of due) this.emit({ type: 'limit.reset', provider: r.provider, accountId: r.accountId === DEFAULT_ACCOUNT ? undefined : r.accountId, window: r.window, at: r.at });
+    for (const r of due) this.notifyReset(r.provider, r.accountId, r.window, r.at);
     for (const [provider, fb] of this.fallbacks) if (fb.until && fb.until <= now) void this.emitProvider(provider).catch(() => {});
     this.scheduleResetAlert();
   }
@@ -1105,6 +1166,8 @@ export class App {
 
   private forgetLimits(provider: ProviderId, accountId: string) {
     const key = accountKey(provider, accountId);
+    this.earlyResetRead.delete(key);
+    limitsAfterTurn.delete(this.provider(provider, accountId));
     this.limitsCache.delete(key);
     this.limitsPartial.delete(key);
     this.limitsMeta.delete(key);
@@ -1119,24 +1182,52 @@ export class App {
    * this one ran (a throttled or refused read hands back the last known rows and says nothing).
    * `force: 'fresh'` goes past the agent's own throttles (a reset's reading after its dialog).
    */
-  private async readLimits(provider: ProviderId, accountId: string, force: boolean | 'fresh', requested = !!force): Promise<{ limits: RateLimit[]; fresh: boolean; signIn: number }> {
+  private async readLimits(provider: ProviderId, accountId: string, force: boolean | 'fresh', { requested = !!force, feedback = false } = {}): Promise<{ limits: RateLimit[]; fresh: boolean; signIn: number }> {
     const key = accountKey(provider, accountId);
-    const seq = this.limitsSeq.get(key) ?? 0;
     const signIn = this.signInGen.get(key) ?? 0;
-    if (provider === 'claude' || provider === 'codex') {
-      const chats = [...this.sessions.values()].filter(s => s.meta.provider === provider && (s.meta.accountId ?? DEFAULT_ACCOUNT) === accountId);
-      const dormant = this.dormant(provider, accountId);
-      if (authGate.readsPaused() || chats.some(s => s.turnActive) || (!requested && dormant)) {
-        return { limits: this.limitsCache.get(key) ?? [], fresh: false, signIn };
-      }
+    const cached = () => ({ limits: this.limitsCache.get(key) ?? [], fresh: false, signIn });
+    const p = this.provider(provider, accountId);
+    const plan = provider === 'claude' || provider === 'codex';
+    if (feedback && plan && !this.limitsCache.get(key)?.length && this.handlers.has('usage.limits')) {
+      // First click after a restart: the old full window may exist only in the limits book.
+      const known = (await this.knownLimits(provider)).get(accountId)?.limits;
+      if (signIn !== (this.signInGen.get(key) ?? 0) || !this.findAccount(provider, accountId)) return cached();
+      if (known?.length && !this.limitsCache.get(key)?.length) this.limitsCache.set(key, known);
     }
-    const limits = await this.provider(provider, accountId).limits(force);
+    if (this.disposed || this.updates?.installing) return cached();
+    const busy = () => [...this.sessions.values()].some(s => s.meta.provider === provider && (s.meta.accountId ?? DEFAULT_ACCOUNT) === accountId && s.turnActive);
+    const skipped = () => {
+      if (force !== true || this.disposed || this.updates?.installing) return;
+      const working = plan && (busy() || limitsAfterTurn.has(p));
+      if (working) limitsAfterTurn.add(p);
+      if (!feedback) return;
+      const now = Date.now();
+      if (now - (this.limitsToastAt.get(key) ?? -Infinity) < 60_000) return;
+      this.limitsToastAt.set(key, now);
+      const label = this.accountLabel(provider, accountId);
+      this.emit({ type: 'toast', level: 'info', text: working ? `${label} is working. Its limits are read when the turn ends.` : `Limits for ${label} could not be read just now.` });
+    };
+    if (plan && (authGate.readsPaused() || busy() || (!requested && this.dormant(provider, accountId)))) {
+      skipped();
+      return cached();
+    }
+    let limits: RateLimit[];
+    const seq = this.limitsSeq.get(key) ?? 0;
+    try { limits = await p.limits(force); }
+    catch (err) {
+      skipped();
+      if (!feedback) throw err;
+      return cached();
+    }
     const fresh = (this.limitsSeq.get(key) ?? 0) > seq;
     // A sign-in that changed meanwhile: this reading may be the previous person's; it is not kept.
     if ((this.signInGen.get(key) ?? 0) !== signIn) return { limits: this.limitsCache.get(key) ?? [], fresh: false, signIn: this.signInGen.get(key) ?? 0 };
-    this.limitsCache.set(key, limits);
     // A provider that read them announced it already (with what it knows about the read).
-    if (!fresh) this.emit({ type: 'limits.updated', provider, accountId, limits });
+    if (!fresh) {
+      skipped();
+      limits = this.limitsCache.get(key) ?? limits;
+      this.emit({ type: 'limits.updated', provider, accountId, limits });
+    }
     return { limits, fresh, signIn };
   }
 
@@ -2757,11 +2848,11 @@ export class App {
   // ── accounts at a limit ──
 
   /** Limits known per account of `provider`: what the usage service remembers, then what came in this run. */
-  private async knownLimits(provider: ProviderId): Promise<Map<string, { limits?: RateLimit[]; planLimits?: boolean }>> {
+  private async knownLimits(provider: ProviderId): Promise<KnownLimits> {
     // An agent's first word names who is signed in: limits kept from another person's sign-in are
     // forgotten with it (noteSignIns), so no decision is made on them a moment before.
     await this.firstWord(provider);
-    const out = new Map<string, { limits?: RateLimit[]; planLimits?: boolean }>();
+    const out: KnownLimits = new Map();
     if (this.handlers.has('usage.limits')) {
       const reports = await this.call('usage.limits', {}).catch(() => []);
       for (const r of reports) if (r.provider === provider) out.set(r.accountId, { limits: r.limits, planLimits: r.planLimits });
@@ -3473,7 +3564,7 @@ export class App {
 
   private async tryReturn(rt: SessionRuntime, opts: { retry?: boolean }): Promise<void> {
     const from = rt.meta.movedFrom;
-    if (!from) return;
+    if (!from || this.disposed || this.updates?.installing) return;
     const provider = rt.meta.provider;
     const current = rt.meta.accountId ?? DEFAULT_ACCOUNT;
     const forget = () => {
@@ -3492,7 +3583,7 @@ export class App {
     if (this.returned.has(key) || (!opts.retry && checked && Date.now() - checked < RETURN_RECHECK_MS)) return;
     const closes = this.closesOf(rt);
     // Still the same chat, open, owing this return, on the account it went to.
-    const still = () => this.sessions.get(rt.id) === rt && this.closesOf(rt) === closes && rt.meta.movedFrom === from && (rt.meta.accountId ?? DEFAULT_ACCOUNT) === current;
+    const still = () => !this.disposed && !this.updates?.installing && this.sessions.get(rt.id) === rt && this.closesOf(rt) === closes && rt.meta.movedFrom === from && (rt.meta.accountId ?? DEFAULT_ACCOUNT) === current;
     // A reading that could not tell (failed, not fresh, no room shown): one more try, later each time.
     const inconclusive = () => {
       this.returnChecked.set(rt.id, Date.now());
@@ -3501,8 +3592,14 @@ export class App {
       this.armReturn(rt, returnRetryMs(tries));
     };
     let reading: { limits: RateLimit[]; fresh: boolean };
+    const account = accountKey(provider, from);
+    const early = this.earlyResetRead.get(account);
     try {
-      reading = await this.readLimits(provider, from, 'fresh', false);
+      if (early && at === early.at) {
+        // Work could have held the chat past this reading. Confirm again even if the account is dormant.
+        reading = Date.now() - early.at < 60_000 && early.seq === this.limitsSeq.get(account)
+          ? { limits: early.limits, fresh: true } : await this.readLimits(provider, from, true);
+      } else reading = await this.readLimits(provider, from, 'fresh', { requested: false });
     } catch {
       if (still()) inconclusive();
       return;
@@ -3511,14 +3608,16 @@ export class App {
     const model = this.chatModel(rt);
     const now = Date.now();
     const cap = this.capOf(provider, from);
-    const rank = rankAccount({ id: from, signedIn: true, limits: reading.limits, cap }, now, model);
+    // A partial answer can prove room only for the windows it named. Other known holds still count.
+    const limits = this.limitsPartial.has(account) ? mergeWindows(this.limitsCache.get(account) ?? [], reading.limits) : reading.limits;
+    const rank = rankAccount({ id: from, signedIn: true, limits, cap }, now, model);
     const refused = rt.meta.returnModels ?? [];
-    const full = [model, ...refused].some(m => atCap(reading.limits, now, m) || capReached(reading.limits, cap, m, now)) || rank.state === 'held' || rank.state === 'spent';
+    const full = [model, ...refused].some(m => atCap(limits, now, m) || capReached(limits, cap, m, now)) || rank.state === 'held' || rank.state === 'spent';
     if (reading.fresh && full) {
       // Still held, as a fresh reading says: looked at again when the window that holds it resets.
       this.returnChecked.set(rt.id, now);
       this.returnTries.delete(rt.id);
-      const held = reading.limits.filter(l => l.percent >= 100 && l.resetsAt && l.resetsAt > now && [model, ...refused].some(m => windowForModel(l, m)));
+      const held = limits.filter(l => l.percent >= 100 && l.resetsAt && l.resetsAt > now && [model, ...refused].some(m => windowForModel(l, m)));
       const until = Math.max(rank.until ?? 0, rank.state === 'spent' ? rank.expiresAt ?? 0 : 0, ...held.map(l => l.resetsAt!));
       if (until && until > now) {
         rt.update({ returnAt: until });
@@ -5724,6 +5823,8 @@ export class App {
     });
     this.register('auth.logout', async ({ provider, accountId = DEFAULT_ACCOUNT }) => {
       await this.provider(provider, accountId).logout();
+      this.earlyResetRead.delete(accountKey(provider, accountId));
+      limitsAfterTurn.delete(this.provider(provider, accountId));
       this.limitsCache.delete(accountKey(provider, accountId));
       return this.emitProvider(provider, accountId);
     });
@@ -5810,6 +5911,8 @@ export class App {
       }
       this.infoCache.delete(key);
       this.limitsCache.delete(key);
+      this.earlyResetRead.delete(key);
+      this.limitsToastAt.delete(key);
       this.store.state.accounts = this.store.state.accounts.filter((a) => !(a.provider === provider && a.id === accountId));
       const defaults = this.store.state.settings.defaultAccounts;
       if (defaults?.[provider] === accountId) {
@@ -5831,7 +5934,7 @@ export class App {
         this.provider(provider, accountId);
         this.accountUse.set(accountKey(provider, accountId), Date.now());
       }
-      return (await this.readLimits(provider, accountId, !!force)).limits;
+      return (await this.readLimits(provider, accountId, !!force, { feedback: !!force })).limits;
     });
     // Spends a reset credit: only the confirmed click in the UI calls this, never anything automatic.
     this.register('provider.useReset', async ({ provider, accountId = DEFAULT_ACCOUNT, key }) => {
@@ -6666,6 +6769,7 @@ export class App {
 
   async dispose(saved?: () => void) {
     this.disposed = true;
+    clearTimeout(this.heldLimitsTimer);
     const deadline = Date.now() + 9800;
     for (const rt of this.sessions.values()) this.steerControls.get(rt)?.abort(new NotNow('The chat was closed.'));
     for (const timer of this.lossWakeTimers.values()) clearTimeout(timer);
@@ -6788,11 +6892,6 @@ function capsCacheKey(provider: ProviderId, accountId: string, cwd?: string) {
 
 function fallbackInfo(p: Provider) {
   return { id: p.id, name: p.name, installed: false, auth: { loggedIn: false }, problem: 'Could not query the CLI' };
-}
-
-/** A sign-in that bills per token (an API key, the Console): never a plan with a week to use up. */
-export function isApiKeyAuth(auth: AuthState): boolean {
-  return /api/i.test(auth.method ?? '') || /^(api key|console)$/i.test(auth.plan ?? '');
 }
 
 /** Who an account is signed in as, for telling a changed sign-in (another person, a key in place of a plan). */

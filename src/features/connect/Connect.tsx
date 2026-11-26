@@ -10,7 +10,7 @@ import { openAddAccount } from '@/features/accounts/model';
 import { windowLevel } from '@/features/usage/format';
 import { resetsText, usedPercent, usedText } from '@/features/usage/words';
 import { LoginCode } from './LoginCode';
-import { cancelLogin, login, logout, moveAccount, openSettings, refreshLimits, refreshProvider, removeAccount, renameAccount, setDefaultAccount } from '@/state/actions';
+import { cancelLogin, login, logout, moveAccount, openSettings, readLimitsNow, refreshProvider, removeAccount, renameAccount, setDefaultAccount } from '@/state/actions';
 import { useAccounts } from '@/state/hooks';
 import { accountKey, useStore, type AuthFlow } from '@/state/store';
 import { cx, IconButton, Menu, MenuContent, MenuItem, MenuSep, MenuTrigger, Spinner } from '@/ui';
@@ -365,7 +365,7 @@ function AccountRow({
             </MenuTrigger>
             <MenuContent align="end" width={200}>
               {signedIn && (
-                <MenuItem icon="refresh" onSelect={() => void run('refresh', () => Promise.all([refreshProvider(provider, accountId), refreshLimits(provider, accountId)]))}>
+                <MenuItem icon="refresh" onSelect={() => void run('refresh', () => Promise.all([refreshProvider(provider, accountId), readLimitsNow(provider, accountId)]))}>
                   Refresh
                 </MenuItem>
               )}

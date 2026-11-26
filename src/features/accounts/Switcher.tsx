@@ -9,7 +9,7 @@ import { useAccountWindows } from '@/features/usage/Limits';
 import { useNow } from '@/lib/useNow';
 import { Tip } from '@/ui';
 import { Icon } from '@/icons';
-import { openSettings, refreshLimits, setDefaultAccount } from '@/state/actions';
+import { openSettings, readStaleFullLimits, refreshLimits, setDefaultAccount } from '@/state/actions';
 import { accountName, useFocusAccount } from '@/state/hooks';
 import { accountKey, useStore } from '@/state/store';
 import { AccountUsed, EndsCell, ManyAccounts, MANY_ACCOUNTS, MarkCell, planOf, SignIn, usePool } from './ManyAccounts';
@@ -115,7 +115,10 @@ export function AccountSwitcher() {
     <RM.Root
       open={open}
       onOpenChange={(o) => {
-        if (o) openedAt.current = performance.now();
+        if (o) {
+          openedAt.current = performance.now();
+          void readStaleFullLimits();
+        }
         setOpen(o);
         if (!o) setPeek(null);
       }}
@@ -264,6 +267,7 @@ function Row({ provider, account, single, inUse, ends, rank, now, onPeek, onSele
 
 /** The pointed-at account's limits, beside the menu. Kept mounted per account so it reads once. */
 function Peek({ provider, accountId, onOpenUsage }: { provider: ProviderId; accountId: string; onOpenUsage: () => void }) {
+  useEffect(() => { void readStaleFullLimits({ provider, accountId }); }, [provider, accountId]);
   return (
     <div className="acs-peek-in">
       <LimitsGlance provider={provider} accountId={accountId} onOpenUsage={onOpenUsage} />

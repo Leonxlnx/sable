@@ -57,6 +57,7 @@ import { claudeForkPoint, cutAt } from '../core/fork';
 import { killTree, retireReader, runCli, spawnCli } from '../util/proc';
 import { agentLimitOf, appPictures, backgroundTaskOf, baseName, describeTool, flattenContent, mapResult, mergeWorkflow, normalizeTodos, peekPartialInput, plainWords, previewDiff, taskKindOf, wakeOf, workflowStart, type TaskKind } from './claude-tools';
 import type { Provider, ProviderContext, ProviderSession, SendOptions, WarmChoice } from './types';
+import { limitsAfterTurn } from '../core/limit-refresh';
 import { claudePlan } from './plans';
 import { carryClaudeConversation } from '../accounts/handover';
 import { chatReplyInstruction, CONCISE_REPLIES_PROMPT, STEER_FIRST_BLOCK } from '../../shared/protocol';
@@ -907,18 +908,26 @@ export class ClaudeProvider implements Provider {
    * Reads plan limits through a live agent process (the SDK's usage request; no tokens). Reads
    * closer together than `minGapMs` share the last answer.
    */
-  readLimits(q: Query, minGapMs = 60_000, standalone = false): Promise<RateLimit[]> {
+  readLimits(q: Query, minGapMs = 60_000, standalone = false, afterTurn = false): Promise<RateLimit[]> {
     const busy = () => authGate.readsPaused() || this.ctx.closing?.() || [...this.sessions].some(s => s.runtime().turnActive);
     if (busy()) return Promise.resolve(this.limitsCache);
-    if (this.limitsRun) return this.limitsRun;
-    if (Date.now() - this.limitsAt < minGapMs) return Promise.resolve(this.limitsCache);
+    const deferred = afterTurn && limitsAfterTurn.has(this);
+    if (this.limitsRun) return deferred ? this.limitsRun.then(() => this.readLimits(q, minGapMs, standalone, true)) : this.limitsRun;
+    if (!deferred && Date.now() - this.limitsAt < minGapMs) return Promise.resolve(this.limitsCache);
     // The usage endpoint refused lately (the CLI remembers that for up to an hour): asking again
     // only adds load. Turns keep the windows current through rate_limit_event meanwhile.
-    if (minGapMs > 0 && Date.now() < this.limitsRefusedUntil) return Promise.resolve(this.limitsCache);
+    if (minGapMs > 0 && Date.now() < this.limitsRefusedUntil) {
+      if (deferred) limitsAfterTurn.delete(this);
+      return Promise.resolve(this.limitsCache);
+    }
     // An auxiliary request: never beside another one of this account, nor beside a start of it (auth-gate.ts).
     const scope = this.scope('limits');
     scope.pid = [...this.sessions].find(s => s.liveQuery() === q)?.processPid() ?? (this.warm?.q === q ? this.warm.owner.child?.pid : undefined);
-    const read = () => busy() ? Promise.resolve(this.limitsCache) : this.readLimitsNow(q);
+    const read = () => {
+      if (busy()) return Promise.resolve(this.limitsCache);
+      if (deferred) limitsAfterTurn.delete(this);
+      return this.readLimitsNow(q);
+    };
     // A cold probe already holds the auxiliary lease at its physical spawn.
     const run = (standalone ? read() : authGate.run(gateKey('claude', this.configHome()), read, scope)).finally(() => {
       if (this.limitsRun === run) this.limitsRun = undefined;
@@ -1060,7 +1069,11 @@ export class ClaudeProvider implements Provider {
       await this.probeRun;
       return this.limits(force);
     }
-    if (authGate.readsPaused() || this.ctx.closing?.() || [...this.sessions].some(s => s.runtime().turnActive)) return this.limitsCache;
+    if (authGate.readsPaused() || this.ctx.closing?.()) return this.limitsCache;
+    if ([...this.sessions].some(s => s.runtime().turnActive)) {
+      if (force === true) limitsAfterTurn.add(this);
+      return this.limitsCache;
+    }
     const fresh = force === 'fresh';
     // A read already under way began before this call: a fresh one waits for it and asks again.
     const read = async (q: Query) => {
@@ -4381,7 +4394,7 @@ class ClaudeSession implements ProviderSession {
       rt.limitInBackground(wakeLimit);
     }
     this.scheduleIdleClose();
-    if (this.q && !error) void this.provider.readLimits(this.q, 60_000);
+    if (this.q && (!error || limitsAfterTurn.has(this.provider))) void this.provider.readLimits(this.q, 60_000, false, true);
     // A changed option restarts the process once nothing holds it any more (`restartWhenFree`).
     if (this.restartPending) this.freeLater();
     else if (this.q && rt.meta.options?.browser) void this.checkBrowser(this.q);

@@ -1,8 +1,10 @@
 import { DEFAULT_ACCOUNT, type AccountCap, type AccountInfo, type Attachment, type FolderGroup, type Project, type BackdropConfig, type BackdropImage, type BrowserAnswer, type Effort, type ProviderId, type QueuedMessage, type SessionMeta, type SessionOptions } from '@shared/protocol';
 import { DEFAULT_BACKDROP, normalizeBackdrop } from '@shared/backdrop';
 import { bridge } from '@/lib/bridge';
+import { accountsOf } from '@/features/accounts/model';
+import { heldForLimits, isApiKeyAuth } from '../../server/core/limit-refresh';
 import { addComment, clearReview, editComment, removeComment, reviewMessage, type ReviewComment } from '@/features/review/model';
-import { accountLiveCaps, applySnapshot, applyWholeItem, capsKey, completeSession, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
+import { accountKey, accountLiveCaps, applySnapshot, applyWholeItem, capsKey, completeSession, loadSession, navigationCount, touchKept, trimKept, useStore, type RailTab, type SettingsSection, type Store } from './store';
 import { seenCaps } from '@/features/composer/caps-seen';
 import { ultraOffered } from '@/features/composer/effort-track';
 import type { PullFailures, PullStatus, UserItem } from '@shared/protocol';
@@ -784,6 +786,43 @@ export const refreshProvider = (provider: ProviderId, accountId?: string) => bri
 export const refreshLimits = (provider: ProviderId, accountId?: string) => bridge.call('provider.limits', { provider, accountId }).catch(() => []);
 /** Plan limits read now, even when no agent process runs (it may start a short one; no tokens). For a refresh the user asked for. */
 export const readLimitsNow = (provider: ProviderId, accountId?: string) => bridge.call('provider.limits', { provider, accountId, force: true }).catch(() => []);
+
+const switcherReadsAt = new Map<string, number>();
+const switcherQueued = new Set<string>();
+let switcherReads = Promise.resolve();
+let nextSwitcherRead = 0;
+
+/** An open menu checks all its rows. Its side pane joins the same spaced queue for just its row. */
+export function readStaleFullLimits(only?: { provider: ProviderId; accountId: string }) {
+  for (const provider of ['claude', 'codex'] as const) {
+    if (only && only.provider !== provider) continue;
+    for (const { id } of accountsOf(useStore.getState().providers[provider])) {
+      if (only && only.accountId !== id) continue;
+      const key = accountKey(provider, id);
+      const due = () => {
+        const state = useStore.getState();
+        const info = state.providers[provider];
+        const account = accountsOf(info).find(a => a.id === id);
+        const report = state.limitReports[key];
+        if (!info?.installed || !account?.auth.loggedIn || isApiKeyAuth(account.auth) || report?.planLimits === false || report?.readAt === undefined) return false;
+        const now = Date.now();
+        return now - report.readAt > 600_000 && now - (switcherReadsAt.get(key) ?? -Infinity) >= 600_000 &&
+          heldForLimits(report.limits.length ? report.limits : state.limits[key] ?? [], state.settings.accountCaps?.[`${provider}:${id}`], now);
+      };
+      if (switcherQueued.has(key) || !due()) continue;
+      switcherQueued.add(key);
+      switcherReads = switcherReads.then(async () => {
+        const wait = nextSwitcherRead - Date.now();
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+        if (!due()) return;
+        switcherReadsAt.set(key, Date.now());
+        await readLimitsNow(provider, id);
+        nextSwitcherRead = Date.now() + 4000;
+      }).finally(() => switcherQueued.delete(key));
+    }
+  }
+  return switcherReads;
+}
 /** Spends one reset credit of the account. Call only from the user's confirmed click; reuse `key` on a retry. */
 /** Opens the account's own agent in its reset dialog (a console window); the person confirms there. Progress comes as `limit.resetRun`. */
 export const resetInAgent = (provider: ProviderId, accountId: string | undefined) => bridge.call('limit.resetInAgent', { provider, accountId });
