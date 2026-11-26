@@ -197,7 +197,7 @@ function ChatHead({ title, sub, status, work, mark, onBack, race, right }: { tit
           {mark}
           <span>{title}</span>
         </div>
-        <AnimatePresence mode="popLayout" initial={false}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
           {status ? (
             <motion.div key="status" className="chat-sub chat-status" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
               <Ring size={11} /> {status}

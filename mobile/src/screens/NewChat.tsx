@@ -219,7 +219,7 @@ export function FolderSheet({ open, onClose, c }: { open: boolean; onClose: () =
   };
   return (
     <Sheet open={open} onClose={onClose} title={browse ? 'Choose a folder' : 'Folder'} tall={browse}>
-      <AnimatePresence mode="popLayout" initial={false}>
+      <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
         {browse ? (
           <motion.div key="browse" initial={{ opacity: 0, x: 40 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 40 }} transition={SPRING}>
             <FolderBrowser start={c.folder} onPick={pick} onCancel={() => setBrowse(false)} />
@@ -313,7 +313,7 @@ function FolderBrowser({ start, onPick, onCancel }: { start: string | null; onPi
         </button>
       </div>
       {error && <p className="form-error">{error}</p>}
-      <AnimatePresence mode="popLayout" initial={false} custom={dir}>
+      <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false} custom={dir}>
         <motion.div
           key={here?.path ?? 'roots'}
           className="choices browser-list"

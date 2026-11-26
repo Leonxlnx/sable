@@ -127,7 +127,7 @@ export interface PairResult {
 /** What `pair` shows in place of the pairing it would replace while the kept one cannot be read. */
 const UNREAD_PAIRING: Pairing = { hosts: [], port: 0, token: '', deviceId: '', desktop: '' };
 
-const url = (host: string, port: number) => `ws://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}${PHONE_PATH}`;
+const url = (host: string, port: number) => import.meta.env.SABLE_WEB ? `wss://${location.host}/sable-web` : `ws://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}${PHONE_PATH}`;
 
 /** A refusal this phone may act on for good: signed by the pinned desktop (or, plain, from a pairing before the secure channel). */
 const refusal = (text: string) => Object.assign(new Error(text), { denied: true as const });

@@ -227,7 +227,7 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
       {desktopOnly && <p className="ask-desk">Answer this one on the desktop. The phone shows only part of it.</p>}
 
       <AutoHeight className="ask-actions-wrap">
-        <AnimatePresence mode="popLayout" initial={false}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
           {note ? (
             <motion.div key="note" className="ask-actions" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }} transition={SNAP}>
               <form
@@ -372,7 +372,7 @@ export function QuestionBody({ sid, req, onLater, laterLabel = 'Later' }: { sid:
         </div>
       )}
       <AutoHeight className="q-pane">
-        <AnimatePresence mode="popLayout" initial={false} custom={dir}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false} custom={dir}>
           <motion.div
             key={at}
             className="question"

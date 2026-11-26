@@ -215,7 +215,7 @@ function Computer({ name, state, palette }: { name: string; state: string; palet
         <span className="computer-glyph">
           <Icon name="desktop" size={22} />
         </span>
-        <AnimatePresence mode="popLayout" initial={false}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
           <motion.span key={word} className="computer-state" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
             {state === 'connecting' ? <Ring size={11} /> : <i className="conn-dot" />}
             {word}
@@ -224,7 +224,7 @@ function Computer({ name, state, palette }: { name: string; state: string; palet
       </div>
       <div className="computer-name">{name}</div>
       <div className="computer-line">
-        <AnimatePresence mode="popLayout" initial={false}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
           <motion.div key={lineKey} className="computer-line-in" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={SNAP}>
             {lineKey === 'addr' ? (
               <span className="computer-addr num">

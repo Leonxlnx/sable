@@ -102,6 +102,7 @@ import { cliPresentSoon } from './util/cli-present';
 export interface CallContext {
   phoneSender?: UserItem['phoneSender'];
   allowed?: () => boolean;
+  refusal?: () => string | undefined;
   /**
    * The caller knows a sign-in only as in or out and keeps what it read (a phone): `app.hello`
    * waits for an agent's own answer where it would say `checking`.
@@ -111,14 +112,14 @@ export interface CallContext {
 
 /** The caller of a call may no longer act (a phone removed while its request waited). */
 export class CallerGone extends Error {
-  constructor() {
-    super('This phone was removed on the desktop');
+  constructor(reason = 'This phone was removed on the desktop') {
+    super(reason);
   }
 }
 
 /** Throws `CallerGone` when the caller may no longer act. */
 const still = (ctx?: CallContext) => {
-  if (ctx?.allowed && !ctx.allowed()) throw new CallerGone();
+  if (ctx?.allowed && !ctx.allowed()) throw new CallerGone(ctx?.refusal?.());
 };
 
 /**
@@ -653,7 +654,7 @@ export class App {
   private partVersions = new WeakMap<TimelineItem[], Map<string, number>>();
   private enqueueSubmission?: { rt: SessionRuntime; id: string };
   emit = (event: BridgeEvent) => {
-    if (event.type === 'phone.updated' || event.type === 'update.state' || event.type === 'limits.updated' || event.type === 'limits.report' || event.type === 'settings.updated') {
+    if (event.type === 'web.updated' || event.type === 'phone.updated' || event.type === 'update.state' || event.type === 'limits.updated' || event.type === 'limits.report' || event.type === 'settings.updated') {
       for (const rt of this.sessions.values()) {
         this.scheduleLossWake(rt);
         if (event.type === 'update.state' && !this.updates?.installing && this.updateDrains.delete(rt)) rt.onQueueRunnable?.();
@@ -1579,7 +1580,7 @@ export class App {
     rt.onUnreadSteer = (id, fresh) => {
       const card = rt.get<UserItem>(id);
       if (!card) return;
-      const caller = this.senderGuard(card.phoneSender) ?? this.steerSenders.get(card);
+      const caller = this.senderGuard(card.phoneSender, rt.id) ?? this.steerSenders.get(card);
       const delay = this.store.state.settings.steerAfterMs ?? 30_000;
       const exhausted = (card.steerAttempts ?? 0) >= 2;
       const arm = (retry: boolean, reason?: string) => rt.waitForSteer(id, exhausted ? 0 : retry ? Math.max(delay * 2, 5000) : delay, () => {
@@ -1978,9 +1979,9 @@ export class App {
       if (early) {
         rt.remove(early.id);
         if (!rt.turnActive && rt.meta.status === 'starting') rt.update({ status: 'idle' });
-        rt.notice('info', 'A message from a removed phone was not sent');
+        rt.notice('info', ctx.refusal?.() ?? 'A message from a removed phone was not sent');
       }
-      throw new CallerGone();
+      throw new CallerGone(ctx?.refusal?.());
     };
     gone();
     // A model chosen since the agent started takes effect now, with this message (never inside a running turn).
@@ -2050,7 +2051,7 @@ export class App {
         extra?.steerNow?.();
       }, true, accepted, undefined, !!extra?.steerNow || !!extra?.steerAttempts);
       // A held input outlives the RPC. Its eventual provider write checks the pairing again.
-      if (ctx?.phoneSender) sender = this.senderGuard(ctx.phoneSender);
+      if (ctx?.phoneSender) sender = this.senderGuard(ctx.phoneSender, rt.id);
     } catch (err) {
       unhand();
       if (extra?.steerNow || extra?.steerAttempts) {
@@ -3372,8 +3373,8 @@ export class App {
   /** The sender's guard of a message refused at a limit, kept until it is really dispatched (review wave 17, #3). */
   private refusedGuards = new WeakMap<UserItem, CallContext>();
 
-  private refusedGuard(item: UserItem) {
-    return this.senderGuard(item.phoneSender) ?? this.refusedGuards.get(item);
+  private refusedGuard(rt: SessionRuntime, item: UserItem) {
+    return this.senderGuard(item.phoneSender, rt.id) ?? this.refusedGuards.get(item);
   }
 
   /** Sends to the chat queue behind `p` until it settles (with any other hold). */
@@ -3413,9 +3414,9 @@ export class App {
 
   /** The refused message's sender may still act (a phone not removed meanwhile); said once when not. */
   private refusedAllowed(rt: SessionRuntime, item: UserItem): boolean {
-    const guard = this.refusedGuard(item);
+    const guard = this.refusedGuard(rt, item);
     if (!guard?.allowed || guard.allowed()) return true;
-    rt.notice('info', 'A message from a removed phone was not sent');
+    rt.notice('info', guard.refusal?.() ?? 'A message from a removed phone was not sent');
     return false;
   }
 
@@ -3850,7 +3851,7 @@ export class App {
     try {
       const check = () => {
         if (!valid()) throw new NotNow('The chat no longer waits for this reset.');
-        if (refused) still(this.refusedGuard(refused));
+        if (refused) still(this.refusedGuard(rt, refused));
       };
       if (rt.meta.provider === 'claude') await this.sendFirstInput(rt, handle, item, check, () => {});
       else await this.sendWithHandover(rt, handle, item, check);
@@ -3993,7 +3994,7 @@ export class App {
     const unhand = this.handOver(rt, refused.id);
     try {
       await this.sendWithHandover(rt, handle, item, () => {
-        still(this.refusedGuard(refused));
+        still(this.refusedGuard(rt, refused));
         if (this.stopsOf(rt) !== mark.stops || this.closesOf(rt) !== mark.closes || this.moving.has(rt.id) || this.limitPending(rt)) throw new NotNow('The sign-in retry was interrupted.');
       });
       this.journal.record({ agent: mark.provider, accountId: mark.accountId }, { event: 'retry' });
@@ -4285,7 +4286,14 @@ export class App {
 
   /** Messages a phone sent while its chat moved, queued: the guard of the pairing that sent each (by queue id). */
   phoneStillPaired?: (sender: NonNullable<UserItem['phoneSender']>) => boolean;
-  private senderGuard(phoneSender?: UserItem['phoneSender']): CallContext | undefined {
+  webSenderRefusal?: (sender: NonNullable<UserItem['phoneSender']>, sessionId: string) => string | undefined;
+  private modeChanges = new Map<string, number>();
+  changingMode(sessionId: string) { return this.modeChanges.has(sessionId); }
+  private senderGuard(phoneSender: UserItem['phoneSender'], sessionId: string): CallContext | undefined {
+    if (phoneSender?.kind === 'web') {
+      const refusal = () => this.webSenderRefusal ? this.webSenderRefusal(phoneSender, sessionId) : 'Web access is off.';
+      return { phoneSender, allowed: () => !refusal(), refusal };
+    }
     return phoneSender && { phoneSender, allowed: () => !!this.phoneStillPaired?.(phoneSender) };
   }
   /** `session.send` by submission id: a retry of a send that went out is answered, not sent again. */
@@ -4770,7 +4778,7 @@ export class App {
         const checkDelivery = () => {
           live();
           if (this.stopsOf(rt) !== stops) throw stopped;
-          still(this.refusedGuard(refused));
+          still(this.refusedGuard(rt, refused));
         };
         if (provider === 'claude') await this.sendFirstInput(rt, handle, retry, checkDelivery, rollback);
         else await this.sendWithHandover(rt, handle, retry, checkDelivery);
@@ -5075,8 +5083,16 @@ export class App {
 
   private nextAutomaticMessage(rt: SessionRuntime, includeRevokedTransient = false) {
     const held = this.spare.held(rt);
-    return rt.queue.find(q => !held.has(q.id) && this.senderGuard(q.phoneSender)?.allowed?.() !== false &&
-      (includeRevokedTransient || !!q.phoneSender || rt.transientQueueGuards.get(q.id)?.() !== false));
+    return rt.queue.find(q => {
+      if (held.has(q.id)) return false;
+      const sender = this.senderGuard(q.phoneSender, rt.id);
+      if (sender?.allowed?.() === false) {
+        const reason = includeRevokedTransient && sender.refusal?.();
+        if (reason) rt.queueReason(q.id, reason);
+        return false;
+      }
+      return includeRevokedTransient || !!q.phoneSender || rt.transientQueueGuards.get(q.id)?.() !== false;
+    });
   }
 
   /** After a turn: the next queued message goes out, or (nothing waits) an until loop runs its check. */
@@ -5126,7 +5142,7 @@ export class App {
     if (!handle?.recallSteers || !handle.interruptSteer) return { ok: false };
     const card = rt.get<UserItem>(itemId);
     if (!rt.turnActive || card?.type !== 'user' || card.parentId || !card.steered || card.state !== 'queued' || this.steerEnds.has(rt)) return { ok: false };
-    still(this.senderGuard(card.phoneSender) ?? this.steerSenders.get(card));
+    still(this.senderGuard(card.phoneSender, rt.id) ?? this.steerSenders.get(card));
     // A returned phone message keeps the guard of the pairing that originally sent it.
     const originals = new Map(rt.items.filter((it): it is UserItem => it.type === 'user' && !it.parentId && !!it.steered && it.state === 'queued').map(it => [it.id, it]));
     let ended = false, drainOnRelease = true;
@@ -5168,7 +5184,7 @@ export class App {
         if (!original || entry.text !== original.text || entry.attachments !== original.attachments) continue;
         const beforeSend = () => {
           check();
-          still(this.senderGuard(original.phoneSender) ?? this.steerSenders.get(original));
+          still(this.senderGuard(original.phoneSender, rt.id) ?? this.steerSenders.get(original));
           if (!sent && rt.turnActive) throw new NotNow('Another turn has already started.');
         };
         beforeSend();
@@ -5177,7 +5193,7 @@ export class App {
         sent = true;
         if (id === itemId) selectedSent = true;
       }
-      if (sent && !rt.queue.some(q => originals.has(q.id) && !q.byHand && this.senderGuard(q.phoneSender)?.allowed?.() !== false)) rt.unreadQueueHeld = false;
+      if (sent && !rt.queue.some(q => originals.has(q.id) && !q.byHand && this.senderGuard(q.phoneSender, rt.id)?.allowed?.() !== false)) rt.unreadQueueHeld = false;
       return { ok: selectedSent };
     } catch (error) {
       const reason = (error as Error).message;
@@ -5244,7 +5260,7 @@ export class App {
       rt.queueReason(id, 'Claude still has this input queued.');
       return false;
     }
-    const sender = entry.phoneSender && caller && !caller.allowed && !steerNow ? undefined : this.senderGuard(entry.phoneSender) ?? (rt.transientQueueGuards.has(id) ? { allowed: rt.transientQueueGuards.get(id) } : undefined);
+    const sender = entry.phoneSender && entry.phoneSender.kind !== 'web' && caller && !caller.allowed && !steerNow ? undefined : this.senderGuard(entry.phoneSender, rt.id) ?? (rt.transientQueueGuards.has(id) ? { allowed: rt.transientQueueGuards.get(id) } : undefined);
     const guard = sender?.allowed && caller?.allowed ? { ...sender, allowed: () => sender.allowed!() && caller.allowed!() } : sender ?? caller;
     try {
       still(guard);
@@ -5286,7 +5302,7 @@ export class App {
     if (wait) {
       if (this.stopsOf(rt) === stops && !this.steerEnds.has(rt)) rt.unreadQueueHeld = false;
     } else if (stops === this.stopsOf(rt)) {
-      const sender = this.senderGuard(ctx.phoneSender);
+      const sender = this.senderGuard(ctx.phoneSender, rt.id);
       try {
         if (await this.deliverQueued(rt, id, sender) && rt.queue.includes(entry)) {
           // The live dispatch deferred to a move or hold before reaching the agent.
@@ -6420,7 +6436,13 @@ export class App {
         this.scheduleLossWake(rt);
         rt.heldMode = undefined;
         this.modeDue.delete(rt.id);
-        await rt.handle?.setMode(mode);
+        this.modeChanges.set(rt.id, (this.modeChanges.get(rt.id) ?? 0) + 1);
+        try { await rt.handle?.setMode(mode); }
+        finally {
+          const remaining = this.modeChanges.get(rt.id)! - 1;
+          if (remaining) this.modeChanges.set(rt.id, remaining);
+          else this.modeChanges.delete(rt.id);
+        }
       }
       rt.update({ mode });
       // The mode that never asks (Bypass, Full access) answers what already waits too; questions stay.

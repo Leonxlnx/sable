@@ -20,5 +20,5 @@
       "@m/*": ["src/*"]
     }
   },
-  "include": ["src", "vite.config.ts", "capacitor.config.ts", "../shared/protocol.ts", "../shared/speed.ts", "../src/lib/models.ts", "../src/lib/format.ts"]
+  "include": ["src", "vite.config.ts", "vite.web.config.ts", "capacitor.config.ts", "../shared/protocol.ts", "../shared/speed.ts", "../src/lib/models.ts", "../src/lib/format.ts"]
 }

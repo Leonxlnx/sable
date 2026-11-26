@@ -132,6 +132,7 @@ export const mimeOf = (name: string) => (isPackageName(canonicalName(name)) ? un
 
 /** Starts a download of one file of a share step. */
 export function startDownload(key: string, p: { sid: string; itemId: string; index: number; name: string; size?: number; from?: string }) {
+  if (import.meta.env.SABLE_WEB) return Promise.reject(new Error('File transfers are available on the desktop.'));
   const name = canonicalName(p.name);
   // Over a plain pairing nothing is fetched (neither the bytes nor their digest could be trusted on the way).
   if (!conn.pairedSecurely) return Promise.reject(new Error(PLAIN_OFF));
@@ -146,6 +147,7 @@ export const cancelDownload = (key: string) => core.cancel(key);
  * verified private copy (FilesPlugin decides that itself, by the final MIME type and the record).
  */
 export async function openDownload(key: string) {
+  if (import.meta.env.SABLE_WEB) return;
   const d = core.get(key);
   if (d.state !== 'done') return;
   if (!isNative) {

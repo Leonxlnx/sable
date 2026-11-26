@@ -1,0 +1,3 @@
+html,body { background: #070708; margin: 0; }
+html[data-away] *,html[data-away] *::before,html[data-away] *::after { animation-play-state: paused !important; }
+

@@ -43,6 +43,7 @@ export interface VeilOptions {
 }
 
 export function veil(host: HTMLElement, mode: 'cover' | 'reveal', o: VeilOptions): { done: Promise<void>; remove: () => void } {
+  if (import.meta.env.SABLE_WEB) return { done: Promise.resolve(), remove: () => {} };
   const el = document.createElement('div');
   el.className = 'veil';
   el.setAttribute('aria-hidden', 'true');

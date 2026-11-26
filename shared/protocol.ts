@@ -839,7 +839,7 @@ interface BaseItem {
 }
 
 /** Non-secret identity of an accepted phone submission. */
-export interface PhoneSender { deviceId: string; generation: number }
+export interface PhoneSender { kind?: 'web'; deviceId: string; generation: number }
 
 /** Where to check an issued Claude input, even after the chat moves. */
 export interface SteerDestination {
@@ -1657,6 +1657,8 @@ export interface BackdropImage {
 }
 
 export interface AppSettings {
+  webRemote?: boolean;
+  webSteerDanger?: boolean;
   accent: 'spectrum' | 'ember' | 'iris' | 'mint';
   ambience: 'full' | 'calm' | 'off';
   fontScale: number;
@@ -1982,6 +1984,7 @@ export type BridgeEvent =
   /** Devices changed in a way the bridge saw (an emulator started, booted, stopped or failed). */
   | { type: 'device.updated'; status: DeviceStatus }
   /** Settings › Phone changed (on or off, a pairing offer, a phone asking to pair, a phone seen). Never sent to phones. */
+  | { type: 'web.updated'; state: WebState }
   | { type: 'phone.updated'; status: PhoneStatus }
   /** The user's profile changed (an agent added a fact, or it was edited). */
   | { type: 'profile.updated'; profile: UserProfile }
@@ -2075,6 +2078,7 @@ export const PHONE_PATH = '/sable-phone';
 
 /** A phone allowed to connect. Its token is kept only as a hash. */
 export interface PhoneDevice {
+  kind?: 'web';
   id: string;
   name: string;
   pairedAt: number;
@@ -2086,6 +2090,21 @@ export interface PhoneDevice {
    * paired before it, still on plain frames until it pairs again.
    */
   secure?: boolean;
+}
+
+export const WEB_SHIPS = false;
+export interface WebState {
+  listening: boolean;
+  addresses: string[];
+  port?: number;
+  caPort?: number;
+  hostname?: string;
+  caFingerprint?: string;
+  clients: { id: string; label: string; since: number }[];
+  devices: PhoneDevice[];
+  request?: PhoneStatus['request'];
+  pairing?: PhoneStatus['pairing'];
+  error?: string;
 }
 
 export interface PhoneStatus {
@@ -2205,6 +2224,14 @@ export const PHONE_METHODS = [
   'turn.check',
   'turn.checkStop',
 ] as const satisfies readonly RpcName[];
+
+/** A new phone or desktop method starts denied to the browser. */
+export const WEB_METHODS = [
+  'app.hello', 'session.snapshot', 'session.send', 'session.submission', 'session.interrupt',
+  'permission.respond', 'question.respond', 'provider.limits', 'usage.limits',
+  'phone.tail', 'phone.item', 'phone.queue', 'phone.changes', 'phone.diff', 'phone.search',
+  'phone.image', 'phone.answer', 'phone.steerNow', 'phone.sessions', 'phone.prompts',
+] as const satisfies readonly (typeof PHONE_METHODS[number] | keyof PhoneMethods)[];
 
 /**
  * A timeline item as a phone gets it: what the phone shows, big fields cut (no tool input or
@@ -2919,6 +2946,10 @@ export interface RpcMethods {
   'config.read': { params: { provider: ProviderId; cwd?: string }; result: AgentConfigFile[] };
 
   /** Settings › Phone (`server/services/phone.ts`). None of these can be called by a phone. */
+  'web.state': { params: Record<string, never>; result: WebState };
+  'web.offer': { params: { cancel?: boolean }; result: WebState };
+  'web.approve': { params: { requestId: string; allow: boolean }; result: WebState };
+  'web.revoke': { params: { deviceId: string }; result: WebState };
   'phone.status': { params: Record<string, never>; result: PhoneStatus };
   /** Starts or stops the LAN endpoint (remembered across restarts). Turning it off ends every phone connection. */
   'phone.setEnabled': { params: { on: boolean }; result: PhoneStatus };

@@ -82,7 +82,7 @@ export function launchFlight(text: string, field: HTMLTextAreaElement, bar: HTML
   if (!key) return;
   const b = bar.getBoundingClientRect();
   const from = { x: b.right - 34, y: b.top };
-  const calm = reduced();
+  const calm = import.meta.env.SABLE_WEB || reduced();
   const f: Flight = {
     key,
     t0: performance.now(),

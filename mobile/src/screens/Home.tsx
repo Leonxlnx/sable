@@ -379,7 +379,7 @@ export function Home({ under }: { under: boolean }) {
             await refresh([]);
           }}
         >
-          <AnimatePresence mode="popLayout" initial={false}>
+          <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
             {searching ? (
               <motion.div key="search" className="home-hero home-search" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={SNAP}>
                 <label className="search">
@@ -530,7 +530,7 @@ function HomeStatus({ conn: state, fresh, onLimits }: { conn: string; fresh: boo
         </button>
       ));
   return (
-    <AnimatePresence mode="popLayout" initial={false}>
+    <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
       {body && (
         <motion.div key={key} className="home-status" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={SNAP}>
           {body}

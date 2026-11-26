@@ -56,7 +56,7 @@ export function setScreen(on: boolean) {
 export const AWAY_CSS = 'html[data-away] *,html[data-away] *::before,html[data-away] *::after{animation-play-state:paused!important}';
 
 if (typeof document !== 'undefined') {
-  if (typeof document.createElement === 'function' && document.head) {
+  if (!import.meta.env.SABLE_WEB && typeof document.createElement === 'function' && document.head) {
     const style = document.createElement('style');
     style.textContent = AWAY_CSS;
     document.head.appendChild(style);
