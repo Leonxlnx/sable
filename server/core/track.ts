@@ -122,7 +122,7 @@ export function systemProbe(): ProcessProbe {
       bornAll: async (pids) => {
         if (!pids.length) return new Map();
         const script = `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { try { '{0} {1}' -f $_.Id, $_.StartTime.ToFileTimeUtc() } catch {} }; exit 0`;
-        return bornLines(await run(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script]));
+        return bornLines(await run(windowsPowerShell(), ['-NoProfile', '-NonInteractive', '-Command', script]));
       },
     };
   }
