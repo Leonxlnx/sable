@@ -408,13 +408,14 @@ const JobCard = memo(function JobCard({ sessionId, id, fresh }: { sessionId: str
 });
 
 /**
- * An opened job, in place: when it was tracked and ended, the end of its log (the last line while
- * it runs; the lines its report carried once it is over), and its actions: to its step in the
+ * An opened job, in place: when it was tracked and ended, the end of its log once it is over (the
+ * lines its report carried; while it runs the card shows the last line), and its actions: to its step in the
  * conversation, and while it runs to stop the watching (never the process).
  */
 function JobDetail({ sessionId, item }: { sessionId: string; item: ToolItem & { tracked: NonNullable<ToolItem['tracked']> } }) {
   const t = item.tracked;
-  const lines = t.state === 'running' ? (t.line ? [t.line] : []) : jobTail(item.result?.text, t.line);
+  // While it runs the card's own line shows the log's last line: said once. Over, the end of the log.
+  const lines = t.state === 'running' ? [] : jobTail(item.result?.text, t.line);
   const [stopping, setStopping] = useState(false);
   const from = clock(t.since);
   const facts = t.state === 'ended' && t.endedAt ? `${from} to ${clock(t.endedAt)}` : `Tracked ${from}`;
