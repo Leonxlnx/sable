@@ -7,7 +7,7 @@ import { dissolve, ghostOf } from '@/lib/dissolve';
 import { play, reducedMotion } from '@/lib/motion';
 import { acknowledgedOrder, bindRow, keyOf, rowActs, rowDelivery, withExpected, type ExpectedRow } from './queue-rows';
 import { landInTray, launchFromTray } from './flight';
-import { STACK_EASE, STACK_MS, aboveTray, clearFor, glideY, rowMoves, trayShare } from './stack-glide';
+import { STACK_EASE, aboveTray, clearFor, glideMs, glideY, rowMoves, trayShare } from './stack-glide';
 import { removeQueued, reorderQueue, sendQueuedNow } from '@/state/actions';
 import { useStore } from '@/state/store';
 
@@ -152,23 +152,25 @@ function glideTray(clip: HTMLElement, was: { height: number; rows: Map<string, n
   const share = trayShare(now.height) - trayShare(was.height);
   if (Math.abs(m.tray) < 0.5 && !m.rows.size) return;
   const t = performance.now();
+  // One clock for the whole change, from what it does to the dock's height (the conversation's end follows by the same).
+  const ms = glideMs(share);
   const list = cq.querySelector<HTMLElement>('.cq-list');
   const open = list && list.scrollHeight <= list.clientHeight + 1;
   if (open) list.style.overflow = 'visible';
-  const edge = glideY(cq, m.tray, t);
+  const edge = glideY(cq, m.tray, t, { ms });
   for (const r of rowsOf(clip)) {
     const own = m.rows.get(r.getAttribute('data-qid') ?? '');
-    if (own) glideY(r, own, t);
+    if (own) glideY(r, own, t, { ms });
   }
   // A removed row's copy stands still where the row was: against the tray's glide.
   for (const g of clip.querySelectorAll<HTMLElement>('[data-qghost]')) {
     g.removeAttribute('data-qghost');
-    glideY(g, -m.tray, t);
+    glideY(g, -m.tray, t, { ms });
     // Its words are gone before the row coming down into its place reaches them (the rows have no
     // fill of their own: the two lines read over each other for a few frames).
     play(g.firstElementChild, [{ opacity: 1 }, { opacity: 0 }], { duration: WORDS_GONE, easing: 'ease-out', fill: 'forwards' });
   }
-  if (Math.abs(share) > 0.5) for (const el of aboveTray(clip)) glideY(el, share, t);
+  if (Math.abs(share) > 0.5) for (const el of aboveTray(clip)) glideY(el, share, t, { ms });
   if (edge && open && list) {
     const done = () => {
       if (!cq.getAnimations().some((a) => a !== edge && a.playState === 'running')) list.style.overflow = '';
@@ -191,10 +193,11 @@ function foldTray(clip: HTMLElement, height: number, fade: boolean) {
   if (!ghost) return;
   const copy = ghost.firstElementChild as HTMLElement | null;
   const t = performance.now();
+  const ms = glideMs(share);
   // (Words that already flew out of the row are hidden in it, and stay so in the copy.)
   if (fade) for (const w of ghost.querySelectorAll<HTMLElement>('.cq-text')) if (w.style.opacity !== '0') play(w, [{ opacity: 1 }, { opacity: 0 }], { duration: WORDS_OUT, easing: 'ease-out', fill: 'forwards' });
-  const slide = copy ? play(copy, [{ translate: '0 0' }, { translate: `0 ${share}px` }], { duration: STACK_MS, easing: STACK_EASE, fill: 'forwards' }) : null;
-  for (const el of aboveTray(clip)) glideY(el, -share, t);
+  const slide = copy ? play(copy, [{ translate: '0 0' }, { translate: `0 ${share}px` }], { duration: ms, easing: STACK_EASE, fill: 'forwards' }) : null;
+  for (const el of aboveTray(clip)) glideY(el, -share, t, { ms });
   const off = () => ghost.remove();
   if (slide) slide.finished.then(off, off);
   else off();

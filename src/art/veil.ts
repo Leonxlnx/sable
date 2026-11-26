@@ -197,6 +197,27 @@ export const VEIL_WAIT_AFTER = 180;
 const WAIT_IN = 360;
 const WAIT_OUT = 70;
 
+/** The waiting state comes in: unseen until now, then slowly (ease in and out over `WAIT_IN`). */
+const waitIn = (w: HTMLElement) => w.animate([{ opacity: 0 }, { opacity: 1 }], { duration: WAIT_IN, easing: 'cubic-bezier(0.5, 0, 0.5, 1)', fill: 'forwards' });
+
+/**
+ * The same waiting state where no veil stands: a conversation shown before it is in the window (the
+ * launch gave up waiting for it, a cold chat opened after `OPEN_HOLD_MS`) holds its skeleton, which
+ * comes on the waiting state's own clock (`VEIL_WAIT_AFTER` after it is in the page, then `WAIT_IN`),
+ * brought by the page's timer for the same reason (see `VEIL_WAIT_AFTER`): a conversation that
+ * arrives and is laid out meanwhile shows nothing of it. `el` stands unseen (`opacity: 0`) until
+ * then. Returns its cancel.
+ */
+export function waitingIn(el: HTMLElement | null, after = VEIL_WAIT_AFTER): () => void {
+  if (!el) return () => {};
+  const t = window.setTimeout(() => {
+    if (!el.isConnected) return;
+    if (typeof el.animate === 'function') waitIn(el);
+    else el.style.opacity = '1';
+  }, Math.max(0, after));
+  return () => window.clearTimeout(t);
+}
+
 const covers = new WeakMap<HTMLElement, Cover>();
 
 /**
@@ -317,7 +338,7 @@ export function veilCover(host: HTMLElement | null, opts: { color?: string; cell
       w.style.opacity = '0';
       el.appendChild(w);
       waitTimer = window.setTimeout(() => {
-        if (w.isConnected) w.animate([{ opacity: 0 }, { opacity: 1 }], { duration: WAIT_IN, easing: 'cubic-bezier(0.5, 0, 0.5, 1)', fill: 'forwards' });
+        if (w.isConnected) waitIn(w);
       }, solidIn + VEIL_WAIT_AFTER);
       wait = w;
     }

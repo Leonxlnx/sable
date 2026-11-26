@@ -125,6 +125,15 @@
   height: 9px;
 }
 
+/* A conversation not in the window yet (Timeline.tsx `Reading`): the veil's waiting state in flow,
+   at the column's top where `.stage-wait` stands (the content's own 30px above it). Opacity only. */
+.tl-wait {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  padding: 0 var(--gutter);
+}
+
 .tl-empty {
   color: var(--text-3);
   font-size: var(--t-ui);
@@ -2325,9 +2334,28 @@ button:hover > .row-caret {
   color: var(--text-2);
 }
 
-/* The answer after the opened checkpoints: a little more air, so the last word reads as the last word. */
-.tl-fold.nest + .fold-text:not(.nest) > .collapse-inner > .tl-item[data-answer] {
+/* The answer after the opened checkpoints: a little more air, so the last word reads as the last word.
+   The air comes and goes with the opening, on the fold's own clock (`.tl-fold` above): it follows the
+   turn's open state (TurnView `data-open`), never which pieces stand before the answer. Those are in
+   the page, closed, from the click that opens and until the close has ended, so the air stepped 12 px
+   in one frame at the start of every opening and at the end of every closing. */
+.tg .tl-item[data-answer] {
+  transition: padding-top 300ms cubic-bezier(0.3, 0, 0.15, 1);
+}
+
+.tg[data-open] .tl-item[data-answer] {
+  transition: padding-top 220ms var(--ease-out);
+}
+
+.tg[data-open] > .tl-fold.nest + .fold-text:not(.nest) > .collapse-inner > .tl-item[data-answer] {
   padding-top: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tg .tl-item[data-answer],
+  .tg[data-open] .tl-item[data-answer] {
+    transition: none;
+  }
 }
 
 /* A run's line and its opened steps: the box the live line sticks inside. */

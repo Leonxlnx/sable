@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { clearFor, glideLeft, rowMoves, trayShare, STACK_MS, TUCK } from '../src/features/composer/stack-glide';
+import { clearFor, drawnY, glideLeft, glideMs, glideY, rowMoves, trayShare, GLIDE_MAX_MS, GLIDE_NEAR, STACK_MS, TUCK } from '../src/features/composer/stack-glide';
+
 
 const map = (o: Record<string, number>) => new Map(Object.entries(o));
 
@@ -18,6 +19,60 @@ describe('the dock glide (composer/stack-glide.ts)', () => {
   it('takes no more than a fifth of the way in its first frame (no step before the glide)', () => {
     expect(28 - glideLeft(28, 16.7)).toBeLessThan(28 / 5);
     expect(64 - glideLeft(64, 16.7)).toBeLessThan(64 / 5);
+  });
+
+  /** The largest move between two frames 16.7 ms apart of a glide of `d` px on `ms` (the curve worked out). */
+  const worstFrame = (d: number, ms: number) => {
+    let worst = 0;
+    for (let t = 0; t < ms; t += 0.5) worst = Math.max(worst, glideLeft(d, t, ms) - glideLeft(d, t + 16.7, ms));
+    return worst;
+  };
+
+  it('keeps its own time over a short way (a queue row, a strip, a 68 px card)', () => {
+    for (const d of [0, 1, 13, 28, 68, GLIDE_NEAR, -28, -68]) expect(glideMs(d)).toBe(STACK_MS);
+    // Measured before the change: 16.1 px in the largest step of a 68 px card. Unchanged.
+    expect(worstFrame(68, glideMs(68))).toBeLessThan(18);
+  });
+
+  it('takes longer over a long way, so its fastest frame stays comfortable (a 473 px card: 123 px a frame before)', () => {
+    expect(worstFrame(473, STACK_MS)).toBeGreaterThan(110);
+    expect(glideMs(473)).toBeGreaterThan(600);
+    expect(glideMs(473)).toBeLessThanOrEqual(GLIDE_MAX_MS);
+    expect(worstFrame(473, glideMs(473))).toBeLessThan(52);
+    // Grows with the root of the way: never slower than needed, the same either way.
+    let prev = 0;
+    for (let d = 0; d <= 1200; d += 8) {
+      const ms = glideMs(d);
+      expect(ms).toBeGreaterThanOrEqual(prev);
+      expect(glideMs(-d)).toBe(ms);
+      prev = ms;
+    }
+    expect(glideMs(240)).toBeLessThan(500);
+    expect(glideMs(5000)).toBe(GLIDE_MAX_MS);
+    expect(glideMs(Number.NaN)).toBe(STACK_MS);
+  });
+
+  it('a glide carries on from where it stands on its own clock, and drawnY reads that clock', () => {
+    const made: { frames: Keyframe[]; opts: KeyframeAnimationOptions }[] = [];
+    const el = {
+      animate(frames: Keyframe[], opts: KeyframeAnimationOptions) {
+        made.push({ frames, opts });
+        return { playState: 'running', pause() {}, play() {}, cancel() { this.playState = 'idle'; } };
+      },
+    } as unknown as Element;
+    const ms = glideMs(473);
+    glideY(el, -473, 0, { ms });
+    expect(made[0].opts.duration).toBe(ms);
+    expect(drawnY(el, 100)).toBeCloseTo(glideLeft(-473, 100, ms));
+    expect(drawnY(el, STACK_MS)).not.toBe(0);
+    // The next change (a card arriving at once) starts from there, on the clock it is given.
+    glideY(el, 300, 100, { ms: STACK_MS });
+    expect(made[1].frames[0]).toEqual({ translate: `0 ${(300 + glideLeft(-473, 100, ms)).toFixed(2)}px` });
+    expect(made[1].opts.duration).toBe(STACK_MS);
+    // Left out, its own way decides.
+    const el2 = { animate: el.animate.bind(el) } as unknown as Element;
+    glideY(el2, 473, 0);
+    expect(made[2].opts.duration).toBe(glideMs(473));
   });
 
   it('a tray adds its height less its tuck to the dock, nothing when it is gone', () => {

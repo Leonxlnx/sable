@@ -123,7 +123,13 @@ describe('a change of view: one veil, one clock, one direction', () => {
     // a compositor delay a long chat in memory showed the skeleton while it was laid out and then cut
     // it off in one frame. The reveal clears the timer.
     expect(veil).not.toMatch(/delay: solidIn \+ VEIL_WAIT_AFTER/);
-    expect(veil).toMatch(/waitTimer = window\.setTimeout\(\(\) => \{\s*if \(w\.isConnected\) w\.animate\(\[\{ opacity: 0 \}, \{ opacity: 1 \}\], \{ duration: WAIT_IN,[^}]*\}\);\s*\}, solidIn \+ VEIL_WAIT_AFTER\);/);
+    expect(veil).toMatch(/waitTimer = window\.setTimeout\(\(\) => \{\s*if \(w\.isConnected\) waitIn\(w\);\s*\}, solidIn \+ VEIL_WAIT_AFTER\);/);
+    expect(veil).toMatch(/const waitIn = \(w: HTMLElement\) => w\.animate\(\[\{ opacity: 0 \}, \{ opacity: 1 \}\], \{ duration: WAIT_IN,[^}]*\}\);/);
+    // The same waiting state where no veil stands (a conversation on screen before it is read,
+    // Timeline.tsx `Reading`): the same clock, brought by the page's timer too.
+    const alone = veil.slice(veil.indexOf('export function waitingIn'), veil.indexOf('const covers'));
+    expect(alone).toMatch(/window\.setTimeout\(\(\) => \{[^]*waitIn\(el\);[^]*\}, Math\.max\(0, after\)\);/);
+    expect(alone).not.toMatch(/delay:/);
     const reveal = veil.slice(veil.indexOf('export function veilReveal'));
     expect(reveal.indexOf('window.clearTimeout(cover.waitTimer)')).toBeGreaterThan(-1);
     expect(reveal.indexOf('window.clearTimeout(cover.waitTimer)')).toBeLessThan(reveal.indexOf('const seen ='));

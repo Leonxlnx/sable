@@ -14,10 +14,11 @@ import { TurnList } from './TurnView';
 import { StandInCards } from './StandIn';
 import { useStandIns } from './stand-in';
 import { keptAt } from './build-window';
-import { DOCK_GLIDE_EASE, DOCK_GLIDE_MS, takeCardLeft } from '@/features/session/dock-glide';
-import { drawnY, glideY } from '@/features/composer/stack-glide';
+import { DOCK_GLIDE_EASE, takeCardLeft } from '@/features/session/dock-glide';
+import { drawnY, glideMs, glideY } from '@/features/composer/stack-glide';
 import { endSnap, glideFrame, sendFollower, tailGlide, tailPlace } from './follow';
 import { useStaged } from '@/features/session/staged';
+import { waitingIn } from '@/art/veil';
 import './timeline.css';
 
 /** Within this distance of the end, new content keeps the view pinned to it. */
@@ -35,6 +36,34 @@ function heldLive(inner: HTMLElement, el: HTMLElement): boolean {
   if (!head) return false;
   const held = el.getBoundingClientRect().top + (parseFloat(getComputedStyle(head).top) || 0);
   return Math.abs(head.getBoundingClientRect().top - held) < 1;
+}
+
+/**
+ * A conversation on screen before it is in the window (the launch gave up waiting for a long chat
+ * the bridge still reads, a cold chat opened after `OPEN_HOLD_MS`): the quiet skeleton a slow change
+ * of view shows on its veil (App.tsx `waitingChat`, app.css `.stage-wait`), in the column's measures,
+ * on the veil's waiting clock (`waitingIn`). Never an empty stage. The conversation takes its place
+ * in one commit, laid out at its end (the layout effect on `loaded`), with the dock where it stays.
+ */
+function Reading() {
+  const el = useRef<HTMLDivElement>(null);
+  useEffect(() => waitingIn(el.current), []);
+  return (
+    <div ref={el} className="tl-wait" style={{ opacity: 0 }} role="status" aria-label="Reading conversation">
+      <i className="skel tl-skel-card" />
+      <div className="tl-skel-text">
+        {[92, 86, 64].map((w, i) => (
+          <i key={i} className="skel" style={{ width: `${w}%` }} />
+        ))}
+      </div>
+      <i className="skel tl-skel-card" data-short />
+      <div className="tl-skel-text">
+        {[88, 94, 79, 46].map((w, i) => (
+          <i key={i} className="skel" style={{ width: `${w}%` }} />
+        ))}
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -266,12 +295,17 @@ export function Timeline({ sessionId }: { sessionId: string }) {
           const held = head ? el.getBoundingClientRect().top + (parseFloat(getComputedStyle(head).top) || 0) : 0;
           // A glide of the dock still under way (a card came and was answered at once) carries on from where it stands.
           const fresh = Math.abs(drawnY(inner)) < 0.5;
+          // The dock's clock for the way the conversation comes down (a short one that does not fill the view
+          // comes less than the dock lost, on its own short clock); where it fills the view that is the dock's
+          // change, so the queue tray's copy folding by the same keeps the same time (QueueTray `foldTray`).
+          const ms = glideMs(d);
           glideY(inner, -d, undefined, {
             hold: byCard,
+            ms,
             beside: () => {
               if (!head || !fresh || headTop - d >= held - 0.5) return [];
               const reach = Math.min(1, Math.max(0, 1 - (headTop - held) / d));
-              const hold = play(head, [{ translate: `0 ${held - headTop + d}px`, offset: 0 }, { translate: '0 0', offset: reach }, { translate: '0 0', offset: 1 }], { duration: DOCK_GLIDE_MS, easing: DOCK_GLIDE_EASE });
+              const hold = play(head, [{ translate: `0 ${held - headTop + d}px`, offset: 0 }, { translate: '0 0', offset: reach }, { translate: '0 0', offset: 1 }], { duration: ms, easing: DOCK_GLIDE_EASE });
               // Held by a transform, not by the layout: it keeps the ground it has while stuck, so the
               // lines coming down pass under it.
               if (hold) {
@@ -314,7 +348,7 @@ export function Timeline({ sessionId }: { sessionId: string }) {
           const moved = el.scrollTop - top;
           // From where the conversation is drawn: a glide that still waits or runs (the card before was
           // just answered) is taken into this one, never played over it.
-          if (moved > 0.5) glideY(inner, moved);
+          if (moved > 0.5) glideY(inner, moved, undefined, { ms: glideMs(moved) });
         } else if (taller) follow();
         else keepEnd();
       } else setAway(el.scrollHeight - el.scrollTop - el.clientHeight > AWAY);
@@ -476,13 +510,15 @@ export function Timeline({ sessionId }: { sessionId: string }) {
   // A message on its way stands at the end already (stand-in.ts): the chat is not empty.
   const standing = useStandIns().some((x) => x.session === sessionId);
   const empty = loaded && count === 0 && !waiting && !standing;
+  // Not in the window yet and still being read: its skeleton (a read that failed says so above it, SessionView).
+  const reading = useStore((s) => !s.data[sessionId]?.loaded && !s.data[sessionId]?.historyFailed);
 
   return (
     <TimelineCtx.Provider value={ctx}>
       <div className="tl">
         <div className="tl-scroll scroll" ref={scroller} tabIndex={-1}>
           <div className="tl-content" ref={content} data-empty={empty || undefined}>
-            {empty ? <p className="tl-empty">Send a message to start.</p> : loaded && <TurnList ids={roots} />}
+            {empty ? <p className="tl-empty">Send a message to start.</p> : loaded ? <TurnList ids={roots} /> : reading && <Reading />}
             {loaded && <StandInCards sessionId={sessionId} />}
           </div>
         </div>

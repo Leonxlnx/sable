@@ -212,15 +212,17 @@ describe('a queued message removed leaves in the frame of the click', () => {
     // A queue is used while a turn streams: the height animated by script got five frames a second.
     const glide = tray.slice(tray.indexOf('function glideTray'), tray.indexOf('export interface QueueTrayProps'));
     expect(glide).not.toMatch(/style\.height|height: 0|requestAnimationFrame/);
-    // The tray, the rows that stay, a removed row's copy and what stands above: one clock (stack-glide.ts).
-    expect(glide).toContain('const edge = glideY(cq, m.tray, t);');
-    expect(glide).toContain('glideY(g, -m.tray, t);');
-    expect(glide).toContain('for (const el of aboveTray(clip)) glideY(el, share, t);');
+    // The tray, the rows that stay, a removed row's copy and what stands above: one clock (stack-glide.ts),
+    // from the dock's change of height (`glideMs`: longer for a longer way, the same for all of them).
+    expect(glide).toContain('const ms = glideMs(share);');
+    expect(glide).toContain('const edge = glideY(cq, m.tray, t, { ms });');
+    expect(glide).toContain('glideY(g, -m.tray, t, { ms });');
+    expect(glide).toContain('for (const el of aboveTray(clip)) glideY(el, share, t, { ms });');
     // The last row: the tray goes into the pane as one dead copy, the strips come down with it.
     expect(glide).toContain("const ghost = reducedMotion() ? null : ghostOf(clip, { anchor: 'bottom' });");
     expect(glide).toContain("clip.style.display = 'none';");
     const sg = readFileSync('src/features/composer/stack-glide.ts', 'utf8');
-    expect(sg).toContain("play(el, [{ translate: `0 ${from.toFixed(2)}px` }, { translate: '0 0' }], { duration: STACK_MS, easing: STACK_EASE })");
+    expect(sg).toContain("play(el, [{ translate: `0 ${from.toFixed(2)}px` }, { translate: '0 0' }], { duration: ms, easing: STACK_EASE })");
     const css = readFileSync('src/features/composer/composer.css', 'utf8').replace(/\r\n/g, '\n');
     expect(css).toMatch(/\.cq-clip \{[^}]*margin-bottom: -20px;/);
     // Only its lower edge cuts, and the tray's body goes on below its box: a tray drawn higher never shows a gap.

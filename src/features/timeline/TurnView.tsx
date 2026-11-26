@@ -525,7 +525,7 @@ const TurnView = memo(function TurnView({ turn }: { turn: TurnGroup }) {
     return () => rememberTurnSize(sizeKey, el?.offsetHeight ?? 0);
   }, [sizeKey]);
   return (
-    <section ref={box} className="tg" data-state={turn.state} data-turn={turn.key} style={standIn ? { containIntrinsicSize: `auto ${standIn}px` } : undefined}>
+    <section ref={box} className="tg" data-state={turn.state} data-turn={turn.key} data-open={open || undefined} style={standIn ? { containIntrinsicSize: `auto ${standIn}px` } : undefined}>
       {rows}
       {turn.early && <EndedEarly turn={turn} />}
       <TurnFoot turn={turn} />

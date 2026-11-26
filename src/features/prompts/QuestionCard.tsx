@@ -6,7 +6,8 @@ import { respondQuestion } from '@/state/actions';
 import { leaveCard } from './leave';
 import { focusComposer } from '@/state/hooks';
 import { play } from '@/lib/motion';
-import { DOCK_GLIDE_EASE, DOCK_GLIDE_MS } from '@/features/session/dock-glide';
+import { DOCK_GLIDE_EASE } from '@/features/session/dock-glide';
+import { glideMs } from '@/features/composer/stack-glide';
 import { usePromptKeys } from './keys';
 
 interface Answer {
@@ -273,8 +274,8 @@ export function QuestionCard({ sessionId, req, more }: { sessionId: string; req:
     const d = tall - was.tall;
     if (was.step === step || !was.tall || d < 8) return;
     const round = getComputedStyle(el).borderTopLeftRadius || '0px';
-    // The dock's own curve: the card grows on the clock the conversation above it glides on.
-    const timing = { duration: DOCK_GLIDE_MS, easing: DOCK_GLIDE_EASE };
+    // The dock's own curve: the card grows on the clock the conversation above it glides on (the dock grows by d).
+    const timing = { duration: glideMs(d), easing: DOCK_GLIDE_EASE };
     play(el, [{ clipPath: `inset(${d}px 0 0 0 round ${round} ${round} 0 0)` }, { clipPath: `inset(0 0 0 0 round ${round} ${round} 0 0)` }], timing);
     play(el.querySelector('.qc-head'), [{ translate: `0 ${d}px` }, { translate: '0 0' }], timing);
   });

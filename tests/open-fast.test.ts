@@ -90,6 +90,31 @@ describe('opening a chat', () => {
     expect(useStore.getState().data.a.loaded).toBe(true);
   });
 
+  it('a first read that fails is marked (the conversation says so instead of a skeleton for ever), and a read again clears it', async () => {
+    void store.loadSession('a').catch(() => {});
+    expect(useStore.getState().data.a?.historyFailed).toBeFalsy();
+    const c = snapCalls()[0] as Call & { done?: boolean };
+    c.done = true;
+    c.reject(new Error('The chat could not be read'));
+    await flush();
+    await flush();
+    expect(useStore.getState().data.a?.loaded).toBeFalsy();
+    expect(useStore.getState().data.a?.historyFailed).toBe(true);
+    void store.retryHistory('a').catch(() => {});
+    expect(useStore.getState().data.a?.historyFailed).toBe(false);
+    await answer('a');
+    expect(useStore.getState().data.a.loaded).toBe(true);
+    expect(useStore.getState().data.a.historyFailed).toBeFalsy();
+  });
+
+  it('a read that fails for a chat removed meanwhile marks nothing', async () => {
+    actions.prefetchSession('a');
+    useStore.setState((s) => ({ sessions: { b: s.sessions.b, c: s.sessions.c } }));
+    snapCalls()[0].reject(new Error('gone'));
+    await flush();
+    expect(useStore.getState().data.a).toBeUndefined();
+  });
+
   it('a chat already here opens at once, without asking', () => {
     store.applySnapshot(snap('a'));
     calls.length = 0;

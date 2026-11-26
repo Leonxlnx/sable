@@ -6,7 +6,8 @@ import { bezier } from './signal-shape';
  * The dock's one clock. The composer's stack (the prompt cards, the strips, the queue tray) stands
  * on the pane's top edge and grows upward: when the tray gets a row, loses one, comes or goes, the
  * layout takes its final shape in that frame and everything that moved is drawn where it stood and
- * glides to its place on this timing, by translate only (on the compositor). The conversation's end
+ * glides to its place on this timing (a longer time for a longer way, `glideMs`, the same for all
+ * that move together), by translate only (on the compositor). The conversation's end
  * follows on the same timing (Timeline.tsx, the dock's taller and shorter branches), so the tray,
  * the strips and the last line of the conversation travel as one.
  */
@@ -14,6 +15,27 @@ export const STACK_MS = DOCK_GLIDE_MS;
 export const STACK_EASE = DOCK_GLIDE_EASE;
 /** The same curve, worked out (for a glide that carries on from where it stands). */
 const curve = bezier(0.32, 0.72, 0, 1);
+
+/** Up to this travel (px) the dock keeps its own `STACK_MS`: a queue row, a strip, a short card. */
+export const GLIDE_NEAR = 72;
+/** The longest the dock's clock gets, whatever the way (ms). */
+export const GLIDE_MAX_MS = 700;
+
+/**
+ * The dock's clock for a glide of `travel` px: one rule for everything that glides, and whatever moves
+ * as one is given the same time: the queue tray, its rows and the strips above by the dock's change of
+ * height, the conversation's end by its own way (which is that change wherever the conversation fills
+ * the view; a short one comes less and keeps its short clock). Up to `GLIDE_NEAR` it is the dock's own
+ * 260 ms; further, the time grows with the square root of the way, so the fastest frame grows only
+ * with its root. The curve's steepest stretch (16 % in) runs at 4.2 times its mean speed: a 473 px
+ * card leaving took 112 px in one frame in 260 ms (68 px: 16 px), and takes about 50 in 665 ms.
+ * Never past `GLIDE_MAX_MS`.
+ */
+export function glideMs(travel: number): number {
+  const a = Math.abs(travel);
+  if (!(a > GLIDE_NEAR)) return STACK_MS;
+  return Math.min(GLIDE_MAX_MS, Math.round(STACK_MS * Math.sqrt(a / GLIDE_NEAR)));
+}
 
 /** How far a glide that started `from` px away still has to go `elapsed` ms after it started. */
 export function glideLeft(from: number, elapsed: number, ms = STACK_MS): number {
@@ -125,6 +147,8 @@ export function whenFlowing(go: () => void, cap = 400): void {
 interface Run {
   from: number;
   t0: number;
+  /** Its clock (`glideMs`). */
+  ms: number;
   anim: Animation;
   /** Drawn where it stood and not started yet (it waits for the page, `whenFlowing`). */
   held: boolean;
@@ -140,10 +164,15 @@ const alive = (r: Run | undefined): r is Run => !!r && (r.anim.playState === 'ru
 export function drawnY(el: Element | null | undefined, now = performance.now()): number {
   const r = el ? runs.get(el) : undefined;
   if (!alive(r)) return 0;
-  return r.held ? r.from : glideLeft(r.from, now - r.t0);
+  return r.held ? r.from : glideLeft(r.from, now - r.t0, r.ms);
 }
 
 export interface GlideOpts {
+  /**
+   * Its clock (ms). What glides together is given the same, from the dock's change of height
+   * (`glideMs(change)`); left out, the glide's own way decides (`glideMs(from)`).
+   */
+  ms?: number;
   /** Wait, drawn where it stood, until frames flow again (`whenFlowing`): for a glide that follows a prompt card leaving. */
   hold?: boolean;
   /** Animations that share the glide's start: held with it, let go with it, cancelled with it. */
@@ -152,23 +181,24 @@ export interface GlideOpts {
 
 /**
  * Draws `el` `d` px lower than its place (negative: higher) and glides it home on the dock's
- * clock. A glide still under way on it (or one that still waits) carries on from where it stands,
- * worked out from its own start (never read from a computed style).
+ * clock (`opts.ms`). A glide still under way on it (or one that still waits) carries on from where
+ * it stands, worked out from its own start and its own clock (never read from a computed style).
  */
 export function glideY(el: Element | null | undefined, d: number, now = performance.now(), opts: GlideOpts = {}): Animation | null {
   if (!el || reducedMotion()) return null;
   const prev = runs.get(el);
   let from = d;
   if (alive(prev)) {
-    from += prev.held ? prev.from : glideLeft(prev.from, now - prev.t0);
+    from += prev.held ? prev.from : glideLeft(prev.from, now - prev.t0, prev.ms);
     prev.anim.cancel();
     for (const a of prev.beside) a.cancel();
   }
   runs.delete(el);
   if (Math.abs(from) < 0.5) return null;
-  const anim = play(el, [{ translate: `0 ${from.toFixed(2)}px` }, { translate: '0 0' }], { duration: STACK_MS, easing: STACK_EASE });
+  const ms = opts.ms ?? glideMs(from);
+  const anim = play(el, [{ translate: `0 ${from.toFixed(2)}px` }, { translate: '0 0' }], { duration: ms, easing: STACK_EASE });
   if (!anim) return null;
-  const run: Run = { from, t0: now, anim, held: !!opts.hold, beside: (opts.beside?.() ?? []).filter((a): a is Animation => !!a) };
+  const run: Run = { from, t0: now, ms, anim, held: !!opts.hold, beside: (opts.beside?.() ?? []).filter((a): a is Animation => !!a) };
   runs.set(el, run);
   if (run.held) {
     // Paused at its first frame: the thing is drawn where it stood, on its own layer already.

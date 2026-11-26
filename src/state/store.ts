@@ -1186,6 +1186,8 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
   if (inFlight && !opts.fresh) return inFlight;
   if (pages.has(sessionId) && !opts.fresh) return Promise.resolve();
   if (opts.fresh) pages.delete(sessionId);
+  // Read again after a first read failed: its skeleton stands again meanwhile (Timeline.tsx `Reading`).
+  if (useStore.getState().data[sessionId]?.historyFailed && !useStore.getState().data[sessionId]?.loaded) markUnreadable(sessionId, false);
   const end = !opts.fresh && !useStore.getState().data[sessionId]?.incomplete && (snapshotThreshold !== undefined || !useStore.getState().ready);
   const p: Promise<void> = bridge
     .call('session.snapshot', { sessionId, ...(opts.peek && { peek: true }), ...(end && { page: 'end' as const }) })
@@ -1205,6 +1207,8 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
         patchData(sessionId, () => ({ historyFailed: true }));
         throw Error(historyError);
       }
+      // A first read that failed: the conversation says so, with Try again, instead of a skeleton for ever.
+      if (fetching.get(sessionId) === p && !useStore.getState().data[sessionId]?.loaded) markUnreadable(sessionId, true);
       throw err;
     })
     .finally(() => {
@@ -1212,6 +1216,15 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
     });
   fetching.set(sessionId, p);
   return p;
+}
+
+/** A chat not in the window whose read failed (`on`), or is read again: `patchData` leaves a chat that is not loaded alone. */
+function markUnreadable(sessionId: string, on: boolean) {
+  useStore.setState((s) => {
+    const d = s.data[sessionId];
+    if (!s.sessions[sessionId] || d?.loaded || !!d?.historyFailed === on) return s;
+    return { data: { ...s.data, [sessionId]: { ...(d ?? emptyData()), historyFailed: on } } };
+  });
 }
 
 // Whichever way a chat came on screen (a notification's click, anything that sets it directly): a
