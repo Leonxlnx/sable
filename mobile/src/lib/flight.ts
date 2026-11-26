@@ -276,7 +276,8 @@ function frame(f: Flight) {
   // The break: one light tick, and a wave through the field from where the drop left.
   if (!f.ticked && t >= SNAP) {
     f.ticked = true;
-    haptic('tap');
+    // 2.21: the send is felt as a send (a firmer tick than a tap), where the drop leaves.
+    haptic('send');
     fieldBeat('send', { x: f.from.x, y: f.from.y - 16 });
   }
 

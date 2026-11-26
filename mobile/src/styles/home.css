@@ -609,12 +609,13 @@
   color: var(--text);
 }
 
+/* the room after the last row: the bar's own height and its foot, and a gap (the bar lies over the list) */
 .home-pad {
-  height: 22px;
+  height: calc(var(--dock-h, 58px) + var(--pane-foot) + 18px);
 }
 
 .home:has(.attn) .home-pad {
-  height: 84px;
+  height: calc(var(--dock-h, 58px) + var(--pane-foot) + 18px + 72px);
 }
 
 .home-skel {
@@ -789,7 +790,7 @@
   z-index: 5;
   left: 10px;
   width: calc(100% - 20px);
-  bottom: calc(var(--pane-foot) + 58px + 10px);
+  bottom: calc(var(--pane-foot) + var(--dock-h, 58px) + 10px);
   display: flex;
   align-items: center;
   gap: 10px;
@@ -805,14 +806,17 @@
 }
 
 /* ── new chat: the prompt bar at the foot of home ── */
-/* In the column, under the list (not over it): the list ends above the bar under a short fade into
-   the page, and nothing scrolls beneath it or in the gap under it (rows used to show through the
-   glass and under its foot). The keyboard lifts it by a transform; the list never moves. */
+/* 2.21: one pane of glass that lies OVER the list (the owner: "die prompt bar über dem rest drauf, nicht
+   mit so einer layer dither dazwischen"): the rows scroll on under the frosted glass, nothing stands
+   between them and the bar (no fade, no band of the field above it), and the list keeps the bar's
+   height as room after its last row (.home-pad, --dock-h from lib/foot-room.ts). The keyboard lifts
+   it by a transform; the list never moves. */
 .home-dock {
-  position: relative;
+  position: absolute;
   z-index: 6;
-  flex-shrink: 0;
-  margin: 6px 10px var(--pane-foot);
+  left: 10px;
+  right: 10px;
+  bottom: var(--pane-foot);
   padding: 6px 6px 6px 8px;
   border-radius: var(--r-pane);
   /* the main pane of glass, as the chat's prompt bar (base.css "the panes"); focused, it lifts */
@@ -825,30 +829,25 @@
   visibility: hidden;
 }
 
-/* the list's last rows leave under a short fade into the page, above the bar */
-.home-dock::before {
+/* lifted over the keyboard, the bar's foot down to the keyboard is the page's ink: no row shows between
+   the bar and the keys (at rest the list may pass under the bar's foot) */
+.home-dock[data-focus]::before {
   content: '';
   position: absolute;
   z-index: -2;
-  left: -12px;
-  right: -12px;
-  bottom: calc(100% + 6px);
-  height: 30px;
-  background: linear-gradient(rgb(7 7 8 / 0), rgb(7 7 8 / 0.9));
+  top: 100%;
+  left: -10px;
+  right: -10px;
+  height: calc(var(--pane-lift) + var(--pane-foot) + 2px);
+  background: var(--bg);
   pointer-events: none;
-  transition: opacity 200ms var(--ease-out);
 }
 
-.home-dock[data-focus]::before,
-.home:not([data-clip]) .home-dock::before {
-  opacity: 0;
-}
-
+/* focused, a tap anywhere else lets the field go: it catches the tap and darkens nothing (2.21) */
 .dock-scrim {
   position: absolute;
   z-index: 5;
   inset: 0;
-  background: rgb(0 0 0 / 0.55);
 }
 
 /* the words: the agent's mark and the field, the same in both states (the key keeps its corner) */
@@ -967,14 +966,6 @@
   margin-left: auto;
 }
 
-/* three chips in the new chat's bar: the folder, the mode by its icon alone (its name is in its sheet), the model */
-.dock-bar .mode-chip {
-  padding: 0 10px;
-}
-
-.dock-bar .mode-chip-name {
-  display: none;
-}
 
 /* the key: pinned to the bar's lower right corner, so it never moves when the bar opens */
 .home-dock .dock-send {
@@ -1095,10 +1086,6 @@
   --pane-fill: var(--glass-solid);
 }
 
-/* the new-chat bar open (its chips over the words): the waiting line stays above it */
-.home:has(.home-dock[data-open]) .attn {
-  bottom: calc(var(--pane-foot) + 106px + 10px);
-}
 
 /* ── the stage (sixteenth pass): the field is seen and breathes; what works now is at the top ── */
 
@@ -1232,6 +1219,8 @@
 
 .live-end {
   justify-content: flex-start;
+  align-items: flex-end;
+  gap: 7px;
   padding-top: 13px;
 }
 
@@ -1239,6 +1228,68 @@
   font-size: var(--t-small);
   line-height: 16px;
   color: var(--text-2);
+}
+
+/* 2.21: the working mark leads a live row, a step larger than a row's mark (the agent's mark stands by the title) */
+.live-mark {
+  width: 16px;
+  margin-top: 14px;
+  height: 16px;
+}
+
+.live-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.live-title > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-title .pmark {
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+/* the line under the title starts with the title's words (past the agent's mark) */
+.live-row .live-line {
+  padding-left: 20px;
+}
+
+.live-steps {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.live-steps::before {
+  content: '·';
+  margin-right: 9px;
+  color: var(--text-4);
+}
+
+/* how far the turn has come: a short bar per checkpoint closed, the open one dithered */
+.cps {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 6px;
+}
+
+.cps i {
+  width: 8px;
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--text-3);
+}
+
+.cps .cp-open {
+  background-color: var(--text);
+  -webkit-mask: var(--checker) 0 0 / 4px 4px;
+  mask: var(--checker) 0 0 / 4px 4px;
+  transition: width 240ms var(--ease-out);
 }
 
 /* no chats yet: the stage is the screen, one sentence on it */
@@ -1315,4 +1366,15 @@
 /* the computer cannot be reached: the stage's light is low until it is back */
 .home[data-offline] > .field {
   opacity: 0.38;
+}
+
+/* 2.21: the pieces the list's own scroll drives (the bar's ink and title, the hero, the shade) are never
+   paused off screen (lib/screen.ts AWAY_CSS): they ask for no frame by themselves, and a scroll-driven
+   animation paused and resumed stayed where it was paused (back on home the bar's ink and title were
+   gone over a scrolled list until the screen was opened again). */
+html[data-away] .home-bar::before,
+html[data-away] .home-bar-title,
+html[data-away] .home-hero,
+html[data-away] .home-shade {
+  animation-play-state: running !important;
 }

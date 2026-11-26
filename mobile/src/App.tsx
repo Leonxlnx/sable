@@ -23,6 +23,8 @@ import { Home } from './screens/Home';
 import { Pair } from './screens/Pair';
 import { Settings } from './screens/Settings';
 import { LimitsScreen } from './screens/Limits';
+import { AccountsScreen } from './screens/Accounts';
+import { NowScreen } from './screens/Now';
 
 // The conversation (markdown, steps, composer) loads as its own chunk: home draws first, then it is fetched while idle.
 const loadChat = () => import('./screens/Chat');
@@ -86,14 +88,18 @@ function watchTurns() {
         // Felt while the app is open: clearly for the chat on screen, a tick for one elsewhere.
         haptic(chatOf(nav.stack[nav.stack.length - 1]) === s.id ? 'success' : 'select');
       }
+      if (ended && s.status === 'error' && inForeground()) {
+        // A turn that failed: the light dips and comes back where it ended, and it is felt.
+        fieldBeat('fail', [...document.querySelectorAll('.layer')].pop()?.querySelector('.composer') ?? document.querySelector(`.home [data-live="${CSS.escape(s.id)}"]`) ?? document.querySelector('.home-dock'));
+        if (chatOf(nav.stack[nav.stack.length - 1]) === s.id) haptic('deny');
+      }
       if (!waits && !ended) continue;
       if (waits && inForeground()) {
         // Waiting on you somewhere else than on screen: felt once, and said at the top when home is covered.
         const top = nav.stack[nav.stack.length - 1];
-        if (chatOf(top) !== s.id) {
-          haptic('warning');
-          if (top) setState({ attention: { id: s.id, at: Date.now() } });
-        }
+        // 2.21: felt on the chat itself too (its card rises in the foot), once.
+        haptic('warning');
+        if (chatOf(top) !== s.id && top) setState({ attention: { id: s.id, at: Date.now() } });
       }
       if (!canNotify()) continue;
       const id = s.id;
@@ -335,6 +341,8 @@ export function App() {
 function Screen({ route: r }: { route: Route }) {
   if (r.name === 'settings') return <Settings />;
   if (r.name === 'limits') return <LimitsScreen />;
+  if (r.name === 'accounts') return <AccountsScreen />;
+  if (r.name === 'now') return <NowScreen />;
   if (r.name === 'chat')
     return (
       <Suspense fallback={<div className="screen chat" />}>

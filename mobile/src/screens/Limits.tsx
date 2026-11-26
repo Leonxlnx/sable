@@ -55,7 +55,7 @@ function useAgents(now: number): { provider: ProviderId; accounts: Account[] }[]
 }
 
 /** The desktop reads every signed-in account's limits again (all of them, or those read long ago); its answers arrive as reports. */
-async function readAll(force: boolean, onReading?: (keys: Set<string>) => void) {
+export async function readAll(force: boolean, onReading?: (keys: Set<string>) => void) {
   await refreshLimits();
   const st = getState();
   const due: { provider: ProviderId; accountId: string }[] = [];
@@ -106,7 +106,9 @@ export function LimitsScreen() {
           <Icon name="back" size={22} />
         </button>
         <span className="sub-head-title">Limits</span>
-        <span className="icon-btn-spacer" />
+        <button type="button" className="icon-btn" aria-label="Accounts" onClick={() => (haptic('tap'), nav.push({ name: 'accounts' }))}>
+          <Icon name="user" size={21} />
+        </button>
       </header>
       <Pull
         className="lm-scroll"

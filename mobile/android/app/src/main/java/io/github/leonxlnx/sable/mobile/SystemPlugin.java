@@ -5,6 +5,9 @@ import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import androidx.activity.result.ActivityResult;
 import androidx.core.content.pm.ShortcutInfoCompat;
 import androidx.core.content.pm.ShortcutManagerCompat;
 import androidx.core.graphics.drawable.IconCompat;
@@ -12,6 +15,7 @@ import com.getcapacitor.JSArray;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.util.ArrayList;
 import java.util.List;
@@ -114,5 +118,53 @@ public class SystemPlugin extends Plugin {
         } catch (Exception e) {
             call.reject("The shortcuts could not be set.");
         }
+    }
+
+    /**
+     * Whether the phone has the system's own dictation (a speech recognizer an app may start), for the
+     * composer's mic (2.21). Android 11 and later see it through the manifest's queries.
+     */
+    @PluginMethod
+    public void canDictate(PluginCall call) {
+        com.getcapacitor.JSObject r = new com.getcapacitor.JSObject();
+        boolean on;
+        try {
+            Intent ask = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            on = SpeechRecognizer.isRecognitionAvailable(getContext()) || !getContext().getPackageManager().queryIntentActivities(ask, 0).isEmpty();
+        } catch (Exception e) {
+            on = false;
+        }
+        r.put("on", on);
+        call.resolve(r);
+    }
+
+    /**
+     * The system's dictation (2.21): Android's own speech dialog, in the phone's language; what it heard
+     * comes back as `text` (empty when the person cancelled). Nothing is recorded by the app itself.
+     */
+    @PluginMethod
+    public void dictate(PluginCall call) {
+        Intent ask = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        ask.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        ask.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        try {
+            startActivityForResult(call, ask, "dictated");
+        } catch (ActivityNotFoundException e) {
+            call.reject("This phone has no dictation.");
+        }
+    }
+
+    @ActivityCallback
+    private void dictated(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        com.getcapacitor.JSObject r = new com.getcapacitor.JSObject();
+        String text = "";
+        Intent data = result.getData();
+        if (result.getResultCode() == Activity.RESULT_OK && data != null) {
+            ArrayList<String> heard = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if (heard != null && !heard.isEmpty() && heard.get(0) != null) text = heard.get(0);
+        }
+        r.put("text", text);
+        call.resolve(r);
     }
 }

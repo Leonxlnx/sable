@@ -13,13 +13,14 @@ import { notSentHere, sentHere } from '@m/lib/follow';
 import { composition, onDraft, pendingTakes, setDraft, settleTaken, stageTaken, takeReceipt } from '@m/lib/drafts';
 import { epoch, still } from '@m/lib/epoch';
 import { confirmTake, STILL_QUEUED, stillQueued, takeBack, type TakeDeps } from '@m/lib/take';
-import { haptic } from '@m/lib/native';
+import { haptic, isNative } from '@m/lib/native';
+import { System } from '@m/lib/system-plugin';
 import { acceptIntent, closeGap, ensureFolderCaps, getState, intend, sessionData, setState, undoIntent, unsureIntent, useStore } from '@m/lib/store';
 import { isUncertain } from '@m/lib/errors';
 import { shownPermissions } from '@m/lib/shown';
 import { offers, pressFrom, type Submission } from '@m/lib/submit';
 import { discardPress, onOutgoing, outgoing, retryPress, sendPress } from '@m/lib/phone-send';
-import { Icon } from '@m/ui/icons';
+import { Icon, SendArrow } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
 import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
@@ -49,6 +50,10 @@ const confirmPending = () => {
 };
 conn.onOpen(confirmPending);
 if (conn.state === 'open') confirmPending();
+
+/** Whether the phone has the system's dictation: asked once (the mic on an empty bar, 2.21). */
+let dictation: Promise<boolean> | null = null;
+const canDictate = () => (dictation ??= isNative ? System.canDictate().then((r) => !!r.on, () => false) : Promise.resolve(false));
 
 /** The agents a chat can switch to, in the desktop's order. */
 const AGENTS: ProviderId[] = ['claude', 'codex', 'opencode'];
@@ -87,6 +92,14 @@ export function Composer({ sid }: { sid: string }) {
   const online = useStore((st) => st.conn === 'open');
   const [sheet, setSheet] = useState<'model' | 'mode' | null>(null);
   const [focused, setFocused] = useState(false);
+  const [dictates, setDictates] = useState(false);
+  useEffect(() => {
+    let live = true;
+    void canDictate().then((on) => live && setDictates(on));
+    return () => {
+      live = false;
+    };
+  }, []);
   const area = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const sendKey = useRef<HTMLButtonElement>(null);
@@ -241,6 +254,23 @@ export function Composer({ sid }: { sid: string }) {
     void conn.call('session.interrupt', { sessionId: sid }).catch(() => {});
   };
 
+  // An empty bar's key is the system's dictation where the phone has it (2.21): what it heard goes
+  // into the field, never sent by itself.
+  const mic = dictates && empty && !stopping && !field && online;
+  const dictate = () => {
+    haptic('tap');
+    void System.dictate().then(
+      ({ text: heard }) => {
+        const words = heard?.trim();
+        if (!words) return;
+        const had = area.current?.value ?? '';
+        edit(had.trim() ? `${had.trimEnd()} ${words}` : words);
+        area.current?.focus();
+      },
+      (err: Error) => toast(err.message, 'error'),
+    );
+  };
+
   const pick = async (list: FileList | null) => {
     if (!list) return;
     const e = epoch();
@@ -307,24 +337,29 @@ export function Composer({ sid }: { sid: string }) {
           )}
           <ModeChip mode={mode} open={sheet === 'mode'} onOpen={() => setSheet('mode')} />
           <span className="bar-gap" />
-          <ModelPhrase model={model || s.model ? modelLabel : undefined} effort={effort && efforts.length > 1 ? effortName(effort) : undefined} open={sheet === 'model'} onOpen={() => setSheet('model')} />
+          <ModelPhrase model={model || s.model ? modelLabel : undefined} effort={effort && efforts.length > 1 ? effortName(effort) : undefined} levels={efforts.map((e) => effortName(e))} open={sheet === 'model'} onOpen={() => setSheet('model')} />
           {/* One key that stays where it is: send, or stop while a turn runs and the field is empty. Only its glyph changes. */}
           <button
             ref={sendKey}
             type="button"
             className="send"
             data-stop={stopping || undefined}
-            aria-label={stopping ? 'Stop' : field ? 'Send again' : running ? 'Queue' : 'Send'}
-            disabled={!stopping && (empty || !online)}
-            onPointerDown={(e) => !stopping && e.preventDefault()}
-            onClick={stopping ? stop : () => void send()}
+            data-mic={mic || undefined}
+            aria-label={stopping ? 'Stop' : mic ? 'Dictate' : field ? 'Send again' : running ? 'Queue' : 'Send'}
+            disabled={!stopping && !mic && (empty || !online)}
+            onPointerDown={(e) => !stopping && !mic && e.preventDefault()}
+            onClick={stopping ? stop : mic ? dictate : () => void send()}
           >
             <AnimatePresence initial={false}>
-              {stopping ? (
+              {mic ? (
+                <motion.span key="mic" className="send-glyph" initial={{ scale: 0.4, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.4, opacity: 0 }} transition={reduced() ? { duration: 0 } : GLYPH}>
+                  <Icon name="mic" size={19} />
+                </motion.span>
+              ) : stopping ? (
                 <motion.span key="stop" className="stop-square" initial={{ scale: 0.4, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.4, opacity: 0 }} transition={reduced() ? { duration: 0 } : GLYPH} />
               ) : (
                 <motion.span key="send" className="send-glyph" initial={{ scale: 0.4, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.4, opacity: 0 }} transition={reduced() ? { duration: 0 } : GLYPH}>
-                  <Icon name="up" size={18} weight="bold" />
+                  <SendArrow />
                 </motion.span>
               )}
             </AnimatePresence>
