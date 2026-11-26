@@ -15,7 +15,7 @@
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: calc(var(--sat) + var(--bar-h) + var(--s-2)) 0 28px;
+  padding: calc(var(--sat) + var(--bar-h) + var(--s-2)) 0 calc(var(--foot-h, 0px) + 28px);
 }
 
 .chg-meta {
@@ -286,7 +286,7 @@ button.chg-row:active {
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: calc(var(--sat) + var(--bar-h) + 6px) 0 20px;
+  padding: calc(var(--sat) + var(--bar-h) + 6px) 0 calc(var(--foot-h, 0px) + 20px);
 }
 
 .dl {
@@ -542,7 +542,11 @@ button.chg-row:active {
 
 /* ── the review pane at the foot (a glass pane, base.css "the panes") ── */
 .rfoot {
-  position: relative;
+  /* 2.21: the pane lies over the list or the diff (they scroll on under the glass; no fade above it) */
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
   z-index: 3;
   display: flex;
   flex-direction: column;
@@ -552,16 +556,6 @@ button.chg-row:active {
 }
 
 /* the last lines leave under a short fade, not cut at the pane's edge */
-.rfoot::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: -30px;
-  height: 30px;
-  background: linear-gradient(rgb(7 7 8 / 0), rgb(7 7 8 / 0.9));
-  pointer-events: none;
-}
 
 .rpane {
   position: relative;

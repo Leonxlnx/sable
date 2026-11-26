@@ -609,21 +609,31 @@ p {
 
 .tiles i {
   background: var(--text);
-  opacity: 0.18;
-  animation: tile 1.6s steps(1, end) infinite;
-  animation-delay: calc(var(--d) * 100ms);
+  opacity: 0.16;
+  /* 2.21: the mark builds itself cell by cell in dither order, stands whole a moment, and lets go in
+     the same order (the launch's build at hand size); the only loop of the app's own marks */
+  animation: tile 2.2s linear infinite;
+  animation-delay: calc(var(--d) * 64ms);
 }
 
 @keyframes tile {
-  0%,
-  100% {
-    opacity: 0.18;
+  0% {
+    opacity: 0.16;
   }
-  12% {
+  3%,
+  52% {
     opacity: 1;
   }
-  40% {
-    opacity: 0.5;
+  58%,
+  100% {
+    opacity: 0.16;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiles i {
+    animation: none;
+    opacity: 0.7;
   }
 }
 

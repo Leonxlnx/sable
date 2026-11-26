@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { matchModel, type ModelInfo } from '@shared/protocol';
 import { baseName } from '@desk/lib/format';
 import { pushBack } from '@m/lib/back';
@@ -9,18 +9,21 @@ import { pressFrom } from '@m/lib/submit';
 import { dropFlight, launchFlight } from '@m/lib/flight';
 import { onKeyboard } from '@m/lib/keyboard';
 import { fit } from '@m/lib/fit';
+import { footRoom } from '@m/lib/foot-room';
 import { haptic, isNative } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
 import { notSentHere, sentHere } from '@m/lib/follow';
 import { epoch, still } from '@m/lib/epoch';
 import { openFrom } from '@m/lib/open';
 import { applySnapshot, setState, useStore } from '@m/lib/store';
-import { Icon } from '@m/ui/icons';
+import { Icon, SendArrow } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, SHORT_NAME } from '@m/ui/marks';
 import { SNAP } from '@m/ui/motion';
 import { effortName } from '@desk/lib/models';
 import { AgentSheet, createChat, FolderSheet, useNewChat } from './NewChat';
 import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
+
+const dockRoom = footRoom('--dock-h');
 
 /**
  * New chat, as on the desktop's home: the prompt bar itself. At rest one line of frosted glass over
@@ -37,6 +40,11 @@ export function HomeDock({ covered }: { covered: boolean }) {
   const [busy, setBusy] = useState(false);
   const c = useNewChat(focused || !!sheet || !!text);
   const dock = useRef<HTMLDivElement>(null);
+  // The bar lies over the list (2.21): its height is the room the list keeps after its last row.
+  const dockRef = useCallback((el: HTMLDivElement | null) => {
+    dock.current = el;
+    return dockRoom(el);
+  }, []);
   const area = useRef<HTMLTextAreaElement>(null);
   const sendKey = useRef<HTMLButtonElement>(null);
   const open = focused || !!text.trim() || !!sheet;
@@ -154,7 +162,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
         )}
       </AnimatePresence>
       {/* The words keep their place whether the bar is open or not, and the key stays in its corner: opening only grows the row of choices under the words. */}
-      <div className="home-dock" ref={dock} data-open={open || undefined} data-focus={focused || undefined} data-covered={covered || undefined} onClick={() => area.current?.focus()}>
+      <div className="home-dock" ref={dockRef} data-open={open || undefined} data-focus={focused || undefined} data-covered={covered || undefined} onClick={() => area.current?.focus()}>
         <div className="dock-line">
           {c.agent && (
             <button
@@ -204,7 +212,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
                   <span>{folderLabel}</span>
                 </button>
                 <ModeChip mode={mode} open={sheet === 'mode'} onOpen={() => setSheet('mode')} />
-                <ModelPhrase model={modelLabel} effort={c.effort && c.efforts.length > 1 ? effortName(c.effort) : undefined} open={sheet === 'model'} onOpen={() => setSheet('model')} />
+                <ModelPhrase model={modelLabel} effort={c.effort && c.efforts.length > 1 ? effortName(c.effort) : undefined} levels={c.efforts.map((e) => effortName(e))} open={sheet === 'model'} onOpen={() => setSheet('model')} />
               </div>
             </motion.div>
           )}
@@ -228,7 +236,7 @@ export function HomeDock({ covered }: { covered: boolean }) {
             <span className="send-wait" />
           ) : (
             <motion.span className="send-glyph" animate={{ rotate: open ? 0 : 90 }} transition={SNAP}>
-              <Icon name={open ? 'up' : 'plus'} size={18} weight="bold" />
+              {open ? <SendArrow /> : <Icon name="plus" size={20} />}
             </motion.span>
           )}
         </button>

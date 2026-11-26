@@ -11,11 +11,15 @@ export type Route =
   | { name: 'settings' }
   /** Every signed-in account's plan windows (2.18: a screen of its own, was a sheet over home). */
   | { name: 'limits' }
+  /** Every agent's accounts, where new chats start, the chats on each (2.21). */
+  | { name: 'accounts' }
+  /** Everything at work across chats, each with its last line and a Stop (2.21). */
+  | { name: 'now' }
   | { name: 'changes'; id: string; items?: string[]; lead?: string }
   | { name: 'diff'; id: string; path: string; items?: string[] };
 
 /** The chat a screen belongs to (a chat, its changes, a diff of it). */
-export const chatOf = (r: Route | undefined): string | undefined => (r && r.name !== 'settings' && r.name !== 'limits' ? r.id : undefined);
+export const chatOf = (r: Route | undefined): string | undefined => (r && 'id' in r ? r.id : undefined);
 
 /** A key that tells screens apart (a layer per screen). */
 export const routeKey = (r: Route): string =>
@@ -24,7 +28,7 @@ export const routeKey = (r: Route): string =>
 const strings = (v: unknown) => v === undefined || (Array.isArray(v) && v.every((x) => typeof x === 'string'));
 const valid = (r: Route | null | undefined): r is Route => {
   if (!r || typeof r !== 'object') return false;
-  if (r.name === 'settings' || r.name === 'limits') return true;
+  if (r.name === 'settings' || r.name === 'limits' || r.name === 'accounts' || r.name === 'now') return true;
   if (typeof r.id !== 'string') return false;
   if (r.name === 'chat') return true;
   if (r.name === 'changes') return strings(r.items) && (r.lead === undefined || typeof r.lead === 'string');

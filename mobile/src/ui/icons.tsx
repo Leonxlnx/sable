@@ -82,6 +82,13 @@ export const ICON_NAMES = {
   branch: 'GitBranch',
   wrap: 'ArrowUDownLeft',
   select: 'CursorText',
+  fire: 'Fire',
+  compass: 'Compass',
+  ffwd: 'FastForward',
+  user: 'UserCircle',
+  swap: 'ArrowsLeftRight',
+  mic: 'Microphone',
+  pulse: 'Pulse',
 } as const;
 
 
@@ -100,6 +107,16 @@ export function Icon({ name, size = 18, weight = 'regular', className }: { name:
       aria-hidden
       dangerouslySetInnerHTML={{ __html: weight === 'bold' ? d[1] : d[0] }}
     />
+  );
+}
+
+/** The send key's arrow, the desktop's (SendKey.tsx `SendGlyphSvg`): one thin arrow, 21 px, a 1.6 stroke. */
+export function SendArrow() {
+  return (
+    <svg className="send-arrow" width="21" height="21" viewBox="0 0 16 16" fill="none" aria-hidden>
+      <path d="M8 12.75V3.75" />
+      <path d="M4.25 7.5 8 3.75l3.75 3.75" />
+    </svg>
   );
 }
 

@@ -8,6 +8,7 @@ import { pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
 import { haptic } from '@m/lib/native';
 import { onScreen } from '@m/lib/screen';
+import { clockOf, liveWords, useSecond } from '@m/lib/live-words';
 import { nav } from '@m/lib/nav';
 import { openFrom } from '@m/lib/open';
 import { homeFolder, openRace } from '@m/lib/race';
@@ -75,7 +76,7 @@ function workingKey(s: State): string {
  */
 const horizon = (at: number, h: number, empty: boolean): Horizon =>
   // 2.18: a quiet wash in the upper right, off the title (never light at full strength under words).
-  empty ? { x: 0.96, y: (at - 30) / h, up: 60 / h, down: 120 / h, spread: 0.62, amount: 0.34 } : { x: 0.98, y: (at - 40) / h, up: 46 / h, down: 90 / h, spread: 0.55, amount: 0.3 };
+  empty ? { x: 0.96, y: (at - 30) / h, up: 60 / h, down: 120 / h, spread: 0.62, amount: 0.34 } : { x: 0.98, y: (at - 40) / h, up: 46 / h, down: 58 / h, spread: 0.55, amount: 0.3 };
 
 /** The folder a chat belongs to on home: its own (a lane's chat: the folder it came from), or "Chats" for chats without one. */
 export const folderKey = (s: SessionMeta) => (s.chat ? '::chats' : norm(homeFolder(s)));
@@ -298,19 +299,7 @@ export function Home({ under }: { under: boolean }) {
     const sc = el?.querySelector('.home-scroll');
     if (!el || !sc) return;
     let t = 0;
-    // Rows under the bar's edge (more list below): only then the short fade above the bar (2.18; at
-    // rest over the field it stood as a dark seam across the light).
-    const clip = () => {
-      const more = sc.scrollHeight - sc.clientHeight - sc.scrollTop > 2;
-      if (more !== el.hasAttribute('data-clip')) el.toggleAttribute('data-clip', more);
-    };
-    clip();
-    const ro = new ResizeObserver(clip);
-    ro.observe(sc);
-    const body = sc.querySelector('.pull-body');
-    if (body) ro.observe(body);
     const on = () => {
-      clip();
       if (!t) el.setAttribute('data-moving', '');
       clearTimeout(t);
       t = window.setTimeout(() => {
@@ -320,7 +309,6 @@ export function Home({ under }: { under: boolean }) {
     };
     sc.addEventListener('scroll', on, { passive: true });
     return () => {
-      ro.disconnect();
       sc.removeEventListener('scroll', on);
       clearTimeout(t);
     };
@@ -354,6 +342,7 @@ export function Home({ under }: { under: boolean }) {
           spread={1.12}
           stage={stage}
           floor={0}
+          under=".home-dock"
           alert={waitingNow}
           active={working > 0 && !under}
           hidden={under}
@@ -364,6 +353,12 @@ export function Home({ under }: { under: boolean }) {
           <LogoMark size={20} cells className="home-mark" />
           <span className="home-bar-title">{name}</span>
           <div className="home-tools">
+            {/* Something at work or waiting: Now, everything running on one screen (2.21) */}
+            {(working > 0 || pending.length > 0) && (
+              <button type="button" className="icon-btn now-key" aria-label="Now" onClick={() => (haptic('tap'), nav.push({ name: 'now' }))}>
+                <Tiles size={17} />
+              </button>
+            )}
             <button type="button" className="icon-btn" aria-label="Search" aria-pressed={searching} onClick={() => (haptic('tap'), searching ? closeSearch() : setSearching(true))}>
               <Icon name="search" size={22} />
             </button>
@@ -545,28 +540,6 @@ function HomeStatus({ conn: state, fresh, onLimits }: { conn: string; fresh: boo
   );
 }
 
-/** A turn's time so far: 0:42, 12:05, 1:02:10. */
-function clockOf(ms: number): string {
-  const t = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t % 3600) / 60);
-  const sec = String(t % 60).padStart(2, '0');
-  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
-}
-
-/** One clock for the live rows, a tick a second while any is mounted and home is in view. */
-function useSecond(on: boolean): number {
-  const [t, setT] = useState(() => Date.now());
-  useEffect(() => {
-    if (!on) return;
-    setT(Date.now());
-    // Off screen (lib/screen.ts: the page may be held visible there) nothing draws.
-    const id = window.setInterval(() => onScreen() && setT(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [on]);
-  return t;
-}
-
 /**
  * What works now: the chats with a turn running, each with what it does this moment and its time so
  * far, a tap away. A chat that finishes while you look stays a moment ("Done", the ring closing on
@@ -598,13 +571,13 @@ const LiveRow = memo(function LiveRow({ id, done, now }: { id: string; done: boo
   const end = useRef(0);
   if (!done) end.current = 0;
   else if (!end.current) end.current = s?.updatedAt ?? now;
-  const began = useRef(s?.updatedAt ?? now);
-  if (s && !done) began.current = s.updatedAt;
+  // When the phone first saw it at work: the turn's own start when the desktop says it (`live`).
+  const began = useRef(now);
   if (!s) return null;
   const failed = done && s.status === 'error';
-  // Its own turn over, sub-agents or background commands it started still at work: they are what it does now.
-  const background = s.status !== 'running' && s.status !== 'starting' ? workLabel(s) : null;
-  const line = done ? (failed ? (s.lastError ?? 'Stopped with an error') : 'Done') : s.status === 'starting' ? 'Starting' : background || s.activity || 'Working';
+  const w = liveWords(s);
+  const since = w.since ?? began.current;
+  const line = done ? (failed ? (s.lastError ?? 'Stopped with an error') : 'Done') : w.line;
   return (
     <motion.li layout="position" className="rrow" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0, transition: { duration: 0.22 } }} transition={SNAP}>
       <button
@@ -614,32 +587,53 @@ const LiveRow = memo(function LiveRow({ id, done, now }: { id: string; done: boo
         data-live={id}
         data-radius="17"
         data-done={done ? (failed ? 'error' : 'ok') : undefined}
+        aria-label={`${s.title}. ${line}${!done && w.steps ? `, ${w.steps} steps` : ''}`}
         onClick={(e) => {
           haptic('tap');
           openFrom(id, e.currentTarget, 17);
           nav.chat(id);
         }}
       >
-        <span className="row-mark">
-          <ProviderMark provider={s.provider} size={15} />
-        </span>
+        {/* 2.21: the working mark itself leads the row (the mark's cells building and letting go), the agent's mark beside the title */}
+        <span className="row-mark live-mark">{done ? failed ? <StatusMark tone="error" size={12} /> : <Icon name="check" size={15} weight="bold" className="live-check" /> : <Tiles size={16} />}</span>
         <span className="row-main">
-          <span className="row-title">{s.title}</span>
+          <span className="row-title live-title">
+            <ProviderMark provider={s.provider} size={13} />
+            <span>{s.title}</span>
+          </span>
           <span className="row-sub live-line">
-            <span className="live-state">{done ? failed ? <StatusMark tone="error" size={10} /> : <Icon name="check" size={12} weight="bold" className="live-check" /> : <Tiles size={11} />}</span>
-            {/* The words change in place: the new line rises in (CSS, once per line). No shimmer here: it paints on every frame, and the tiles beside it already say it works. */}
+            {/* The words change in place: the new line rises in (CSS, once per line). */}
             <span key={line} className="live-text">
               {line}
             </span>
+            {!done && w.steps > 0 && <span className="live-steps num">{w.steps} {w.steps === 1 ? 'step' : 'steps'}</span>}
           </span>
         </span>
         <span className="row-end live-end">
-          <span className="live-time num">{clockOf((done ? end.current : now) - began.current)}</span>
+          <span className="live-time num">{clockOf((done ? end.current : now) - since)}</span>
+          {!done && w.steps > 0 && <Checkpoints done={w.done} open={w.open} />}
         </span>
       </button>
     </motion.li>
   );
 });
+
+/**
+ * How far a turn has come, as the conversation reads it: a short bar per checkpoint closed and the
+ * open one dithered, its length by its steps (at most eight bars: older ones merge into the first).
+ * Static paint; it changes only when a checkpoint closes or a step is added.
+ */
+function Checkpoints({ done, open }: { done: number; open: number }) {
+  const n = Math.min(done, 7);
+  return (
+    <span className="cps" aria-hidden>
+      {Array.from({ length: n }, (_, i) => (
+        <i key={i} />
+      ))}
+      <i className="cp-open" style={{ width: `${Math.min(18, 6 + open * 2)}px` }} />
+    </span>
+  );
+}
 
 /**
  * What waits on you across chats: one calm card at the top of home. The oldest prompt names itself

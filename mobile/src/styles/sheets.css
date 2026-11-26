@@ -37,12 +37,30 @@
   padding-bottom: calc(var(--sab) + 14px);
   /* the pane: the ink; the rim, the inner edge and the depth are shadows (base.css) */
   background: var(--sheet-ink);
-  /* the inner edge, the contact line and the depth; and the same ink below the sheet when it is
-     pulled up past its foot (an outer shadow is drawn only outside the sheet, so only that part shows) */
-  box-shadow: var(--rim-ring), var(--rim-inner), var(--shadow-glass), 0 72px 0 0 var(--sheet-ink);
+  /* the rim and the depth; no inner glow (its lower edge read as a seam once the body runs on below) */
+  box-shadow: var(--rim-ring), var(--shadow-glass);
   isolation: isolate;
   will-change: transform;
   transition: translate var(--kb-ms) var(--ease-ime);
+}
+
+/* 2.21: the sheet's body goes on below the screen's edge, so a sheet pulled up past its top never
+   shows its lower end or the page under it (the owner: "zeigt sich sogar unten das ende"). The same
+   ink, a screen tall, its rim's two sides running on; it starts a pixel inside the sheet, over the
+   rim's lower line. Below the screen at rest; static paint, moved with the sheet by its transform. */
+.sheet::after {
+  content: '';
+  position: absolute;
+  z-index: 4;
+  left: 0;
+  right: 0;
+  top: calc(100% - 2px);
+  height: 100lvh;
+  background: var(--sheet-ink);
+  box-shadow:
+    inset 1px 0 0 rgb(255 255 255 / 0.095),
+    inset -1px 0 0 rgb(255 255 255 / 0.095);
+  pointer-events: none;
 }
 
 /* the keyboard lifts a sheet only for a field of its own (a sheet opened from a focused prompt bar
@@ -346,11 +364,34 @@
   color: var(--text);
 }
 
-/* ── the model panel and the permissions sheet (2.18): the desktop's panel at hand size ──
-   Rows of 48 px on the sheet's ink (no wells, no radio discs): the agent's mark or the mode's icon,
-   the name, the check at the end of the one in use; the other agents' models under their agent's
-   name; a hairline, the speeds as one row, and effort as one slider at the foot, its level named
-   over it. Held, a row takes one fill step in the frame. */
+/* ── the model panel and the permissions sheet (2.21): the desktop's panel at hand size ──
+   Its head is the phrase the bar will say (rolling with the slider); rows of 48 px on the sheet's ink
+   (no wells, no radio discs): the agent's mark or the mode's icon, the name, the check at the end of
+   the one in use, the row in use in ivory and the rest a step quieter; the other agents' models under
+   their agent's name; a hairline, the speeds as one row, and effort as one slider at the foot with its
+   level riding over the thumb. Held, a row takes one fill step in the frame. */
+.mp-title {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  font-size: var(--t-lead);
+  font-weight: var(--w-strong);
+  letter-spacing: -0.01em;
+}
+
+.mp-title .phrase-words {
+  gap: 7px;
+}
+
+.mp-title .phrase-level {
+  color: var(--text-3);
+}
+
+/* while the thumb is held the level under it is named a step dimmer, as the desktop's bar does */
+.mp-title[data-preview] .phrase-level {
+  color: var(--text-4);
+}
+
 .mp {
   display: flex;
   flex-direction: column;
@@ -430,9 +471,9 @@
 
 .mp-away-head {
   display: flex;
-  align-items: center;
-  height: 36px;
-  margin: 6px 12px 0;
+  align-items: flex-end;
+  height: 34px;
+  margin: 4px 12px 4px;
   font-size: var(--t-small);
   font-weight: var(--w-medium);
   color: var(--text-3);
@@ -441,13 +482,13 @@
 .mp-foot {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 6px;
   margin: 10px 0 0;
-  padding: 16px 0 0;
+  padding: 14px 0 0;
   box-shadow: inset 0 1px 0 var(--line);
 }
 
-/* the speeds' well and its pill take the sheet's corner less their inset (12 px, then 4) */
+/* the speeds: one row of choices, a darker track and a flat pill (the sheet's corner less their insets) */
 .mp-foot .seg {
   border-radius: calc(var(--r-sheet) - 12px);
 }
@@ -456,32 +497,29 @@
   border-radius: calc(var(--r-sheet) - 16px);
 }
 
-.mp-fixed {
-  margin: 0;
-  height: 72px;
-  display: grid;
-  place-items: center;
-  font-size: var(--t-small);
-  color: var(--text-3);
+/* the slider (the desktop's with stops): a thin track, an ivory fill to the thumb whose head breaks
+   into dither, a tick per stop, the level's word riding over the thumb (pinned inside the track's ends).
+   One number, --u, places the thumb, the fill and the word: under the finger it is written per move;
+   let go, it settles on its stop in 140 ms on one clock for all three. */
+@property --u {
+  syntax: '<number>';
+  inherits: true;
+  initial-value: 0;
 }
 
-.mp-level {
-  height: 22px;
-  text-align: center;
-  font-size: var(--t-body);
-  font-weight: var(--w-strong);
-  color: var(--text);
-}
-
-/* the slider: a thin track, an ivory fill to the thumb whose head breaks into dither, a dot per stop */
 .slider {
   position: relative;
   display: flex;
-  align-items: center;
-  height: 48px;
-  padding: 0 14px;
+  align-items: flex-end;
+  height: 70px;
+  padding: 0 14px 18px;
   outline: none;
   touch-action: none;
+  transition: --u 140ms var(--ease-out);
+}
+
+.slider[data-drag] {
+  transition: none;
 }
 
 .slider-track {
@@ -502,7 +540,6 @@
   padding-right: 8px;
   border-radius: inherit;
   background: rgb(242 241 238 / 0.82) content-box;
-  transition: width 300ms var(--ease-spring);
 }
 
 .slider-fill::after {
@@ -535,26 +572,43 @@
   position: absolute;
   top: 50%;
   left: calc(var(--u) * 100%);
-  width: 24px;
-  height: 24px;
-  margin: -12px 0 0 -12px;
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
   border-radius: 50%;
   background-color: var(--text);
   box-shadow: var(--thumb-up);
-  transition: left 300ms var(--ease-spring), scale 160ms var(--ease-out);
+  transition: scale 160ms var(--ease-out);
 }
 
-.slider[data-drag] .slider-fill {
-  transition: none;
+/* the level's word over the thumb: centred on it, and held inside the track's ends */
+.slider-word {
+  position: absolute;
+  bottom: 22px;
+  left: calc(var(--u) * 100%);
+  transform: translateX(calc(var(--u) * -100%));
+  font-size: var(--t-small);
+  font-weight: var(--w-strong);
+  white-space: nowrap;
+  color: var(--text);
+  pointer-events: none;
 }
 
 .slider[data-drag] .slider-thumb {
-  transition: scale 160ms var(--ease-out);
-  scale: 1.12;
+  scale: 1.1;
 }
 
 .slider:focus-visible .slider-thumb {
   box-shadow: var(--thumb-up), 0 0 0 3px rgb(242 241 238 / 0.45);
+}
+
+/* a model with one level or none: the quiet track, nothing to drag */
+.slider[data-off] .slider-track {
+  background-color: rgb(255 255 255 / 0.05);
+}
+
+.slider[data-off] .slider-stop {
+  background: rgb(255 255 255 / 0.14);
 }
 
 .form-error {
@@ -1376,4 +1430,9 @@
   background-color: var(--fill-2);
   box-shadow: var(--press-up);
   color: var(--text);
+}
+
+/* a scroll-driven fade is never paused off screen (lib/screen.ts AWAY_CSS; it asks for no frame) */
+html[data-away] .sheet-body::before {
+  animation-play-state: running !important;
 }

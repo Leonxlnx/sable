@@ -71,4 +71,14 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- An APK the agent handed over opens in the installer (Android asks once to allow installs from Sable). -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- 2.21: the composer's mic starts the system's own dictation; Android 11 and later show the app only what it names here. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
 </manifest>
