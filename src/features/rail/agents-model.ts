@@ -1,5 +1,5 @@
 import { emptyIndex } from '@/state/revision';
-import type { TaskMark, TimelineItem, ToolItem, WorkflowRun } from '@shared/protocol';
+import type { TaskMark, TimelineItem, ToolItem, TrackedWork, WorkflowRun } from '@shared/protocol';
 import { syntheticOf, type TaskOutcome } from '@shared/synthetic';
 import { isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
 import { changedSince } from '@/state/revision';
@@ -266,10 +266,17 @@ export interface Commands {
   serving: number;
   running: number;
   failed: number;
+  /** The same, apart: what works now, what serves, and what is over (failed first, then newest first). */
+  live: string[];
+  servers: string[];
+  past: string[];
 }
 
 export function commandRows(ids: readonly string[], items: Items, notes: ReadonlyMap<string, EndNote>): Commands {
   const live: string[] = [];
+  // A command whose step still runs (it may yet go to the background): it works, and stands with what
+  // works now, but the bridge counts it with the turn, not among the commands.
+  const starting: string[] = [];
   const serving: string[] = [];
   const bad: string[] = [];
   const rest: string[] = [];
@@ -277,11 +284,11 @@ export function commandRows(ids: readonly string[], items: Items, notes: Readonl
     const it = items[ids[i]];
     if (!isBackgroundCommand(it)) continue;
     const state = commandState(it, notes.get(it.id));
-    (state === 'running' ? live : state === 'serving' ? serving : state === 'failed' ? bad : rest).push(it.id);
+    (state === 'running' ? live : state === 'starting' ? starting : state === 'serving' ? serving : state === 'failed' ? bad : rest).push(it.id);
   }
   // The oldest running first, as the working agents stand.
   if (live.length > 1) live.sort((a, b) => ((items[a] as ToolItem).task?.since ?? 0) - ((items[b] as ToolItem).task?.since ?? 0));
-  return { ids: [...live, ...serving, ...bad, ...rest], serving: serving.length, running: live.length, failed: bad.length };
+  return { ids: [...live, ...starting, ...serving, ...bad, ...rest], serving: serving.length, running: live.length, failed: bad.length, live: [...live, ...starting], servers: serving, past: [...bad, ...rest] };
 }
 
 /**
@@ -308,7 +315,7 @@ export function commandsView(commands: (t: Timeline | undefined) => readonly str
   let ids: readonly string[] | null = null;
   let ended: ReadonlyMap<string, EndNote> | null = null;
   let key = '';
-  let out: Commands = { ids: [], serving: 0, running: 0, failed: 0 };
+  let out: Commands = { ids: [], serving: 0, running: 0, failed: 0, live: [], servers: [], past: [] };
   return (t) => {
     const started = commands(t);
     const seen = notes(t);
@@ -571,6 +578,11 @@ export interface Wave {
   /** What failed first, then newest first. */
   ids: string[];
   failed: number;
+  /**
+   * How many of those failures are news: in the newest wave, or failed since the person last looked
+   * at the tab (`seenAt`). Only news is red; an older failure is a quiet word.
+   */
+  news: number;
 }
 
 export interface Overview {
@@ -586,22 +598,35 @@ export interface Overview {
  * The tab's list at a glance: who works now, then what finished, by the message that set it going.
  * `ids`, `users` oldest first (`agentIndex`, `userIndex`); `live` from `liveKey`.
  */
-export function overview(ids: readonly string[], live: string, items: Items, users: readonly string[], roots?: readonly string[]): Overview {
+export function overview(ids: readonly string[], live: string, items: Items, users: readonly string[], roots?: readonly string[], seenAt = Infinity): Overview {
   const working: string[] = [];
   const done: string[] = [];
   ids.forEach((id, i) => (live[i] === '1' ? working : done).push(id));
   let failed = 0;
-  const waves = groupDone(done, items, users, roots).map((g): Wave => {
+  const waves = groupDone(done, items, users, roots).map((g, index): Wave => {
     const bad: string[] = [];
     const rest: string[] = [];
+    let news = 0;
     for (const id of g.ids) {
       const it = items[id];
-      (it?.type === 'tool' && outcomeOf(it) === 'failed' ? bad : rest).push(id);
+      if (it?.type === 'tool' && outcomeOf(it) === 'failed') {
+        bad.push(id);
+        if (failureIsNews(it, index === 0, seenAt)) news++;
+      } else rest.push(id);
     }
     failed += bad.length;
-    return { user: g.user, ids: bad.length ? [...bad, ...rest] : g.ids, failed: bad.length };
+    return { user: g.user, ids: bad.length ? [...bad, ...rest] : g.ids, failed: bad.length, news };
   });
   return { working, waves, done: done.length, failed };
+}
+
+/**
+ * Whether a failure is news: it stands in the newest wave, or it failed after the person last
+ * looked at the tab (`seenAt`: when the pane last left the screen, or first came on it). Anything
+ * else is history: said in a quiet word, never in red.
+ */
+export function failureIsNews(item: ToolItem, newest: boolean, seenAt: number): boolean {
+  return newest || (item.endedAt ?? item.ts) > seenAt;
 }
 
 /** A wave shows this many rows until asked for all; a tab with no more finished agents than `OPEN_ALL` opens every wave. */
@@ -610,9 +635,9 @@ export const OPEN_ALL = 12;
 /** However many failed, a wave that holds rows back lists at most this many. */
 const WAVE_MOST = 24;
 
-/** Whether a wave stands open: as the person left it, else the newest one, or all of them while the list is short. */
-export function waveOpen(index: number, done: number, chosen: boolean | undefined): boolean {
-  return chosen ?? (index === 0 || done <= OPEN_ALL);
+/** Whether a wave stands open: as the person left it, else only the newest one. History folds away. */
+export function waveOpen(index: number, _done: number, chosen: boolean | undefined): boolean {
+  return chosen ?? index === 0;
 }
 
 /**
@@ -659,17 +684,156 @@ export const STATE_MARK: Record<RowState, 'ring' | 'wait' | 'check' | 'x' | 'min
 };
 
 /**
- * The tab's header, in the units the conversation's tail line and the sidebar use (sub-agents and
- * commands, `workLabel`): what works now ("1 sub-agent, 1 command", "2 sub-agents working", "1
- * command running"); once nothing works, how many ended well ("4 done", agents and commands
- * together); what failed is said apart (`failed`, every failure of both).
+ * The tab's header says what is true now, in the words the conversation's last line and the
+ * sidebar use (`workLabel`): "2 sub-agents working", "1 sub-agent, 1 command", a tracked job that is
+ * the only work by its own title, "1 serving" when only servers run. Nothing when nothing works:
+ * never a total of what ended or failed over the chat's whole life.
  */
-export function agentsHeader(n: { serving?: number; working: number; running: number; agentsDone: number; agentsFailed: number; commands: number; commandsFailed: number }): { label: string; failed: number } {
-  const failed = n.agentsFailed + n.commandsFailed;
-  const now = workLabel({ background: n.working, commands: n.running });
-  if (now) return { label: now, failed };
-  if (n.serving) return { label: `${n.serving} serving`, failed };
-  const ended = n.agentsDone + Math.max(0, n.commands - n.running);
-  const ok = Math.max(0, ended - failed);
-  return { label: ok ? `${ok} done` : '', failed };
+export function agentsHeader(n: { serving?: number; working: number; running: number; jobs?: number; jobTitle?: string }): string {
+  const now = workLabel({ background: n.working, commands: n.running, tracked: n.jobs, trackedTitle: n.jobTitle });
+  if (now) return now;
+  return n.serving ? `${n.serving} serving` : '';
+}
+
+// ── tracked jobs (`track_work`) ──
+
+/** A step that carries tracked work: a process the agent started outside its tools and asked Sable to watch. */
+export function isJob(it: TimelineItem | undefined): it is ToolItem & { tracked: TrackedWork } {
+  return it?.type === 'tool' && !!it.tracked;
+}
+
+/**
+ * The chat's tracked jobs (the `track_work` call's own step, always the chat's own), oldest first:
+ * the same array until one is tracked. The bridge marks the step after it joined its list, which
+ * changes no list: the write that marked it says (as `commandIndex` reads a task's mark).
+ */
+export function jobIndex(): (t: Timeline | undefined) => readonly string[] {
+  let scan: Scan<string> | undefined;
+  let rev = -1;
+  let known = new Set<string>();
+  let out: readonly string[] = NONE;
+  return (t) => {
+    if (!t) return NONE;
+    let turned = false;
+    if (t.rev !== undefined && t.rev !== rev) {
+      const changed = changedSince({ items: t.items, rev: t.rev, changed: t.changed }, rev);
+      if (!changed) turned = rev >= 0;
+      else for (const id of changed) if (!known.has(id) && isJob(t.items[id])) turned = true;
+      rev = t.rev;
+    }
+    if (!turned && scan?.arr === t.roots) return out;
+    if (turned) scan = undefined;
+    scan = grow(scan, t.roots, (id) => (isJob(t.items[id]) ? id : undefined));
+    if (scan.found.length === out.length && scan.found.every((id, i) => id === out[i])) return out;
+    known = new Set(scan.found);
+    out = scan.found.length ? scan.found : NONE;
+    return out;
+  };
+}
+
+export interface Jobs {
+  /** Processes Sable still sees running, the longest runner first. */
+  running: string[];
+  /** Ended or no longer tracked, newest first. */
+  past: string[];
+}
+
+const NO_JOBS: Jobs = { running: [], past: [] };
+
+/** The tab's jobs, worked out again when one is tracked or one's state changes; the same object otherwise. */
+export function jobsView(jobs: (t: Timeline | undefined) => readonly string[]): (t: Timeline | undefined) => Jobs {
+  let ids: readonly string[] | null = null;
+  let key = '';
+  let out = NO_JOBS;
+  return (t) => {
+    const all = jobs(t);
+    if (!all.length) return NO_JOBS;
+    let k = '';
+    for (const id of all) k += `${(t?.items[id] as ToolItem | undefined)?.tracked?.state ?? ''},`;
+    if (all === ids && k === key) return out;
+    ids = all;
+    key = k;
+    const running: string[] = [];
+    const past: string[] = [];
+    for (const id of all) {
+      const it = t?.items[id];
+      if (!isJob(it)) continue;
+      if (it.tracked.state === 'running') running.push(id);
+      else past.unshift(id);
+    }
+    out = { running, past };
+    return out;
+  };
+}
+
+/**
+ * The end of a job's log as its report carried it (the bridge's `trackedEndReport`), at most twelve
+ * lines; else its last line. A report that came cut to the window reads as its last line alone.
+ */
+export function jobTail(report: string | undefined, line: string | undefined): string[] {
+  const head = 'The last lines of its log:\n';
+  const at = report ? report.indexOf(head) : -1;
+  if (report && at >= 0) {
+    const rest = report.slice(at + head.length);
+    const end = rest.lastIndexOf('\nCheck what it left');
+    if (end >= 0) {
+      const lines = rest.slice(0, end).split('\n').filter((l) => l.trim());
+      if (lines.length) return lines.slice(-12);
+    }
+  }
+  return line ? [line] : [];
+}
+
+/** Where a tracked job stands as a row's state: gone is done (Sable knows no exit code), let go is a dash. */
+export function jobRowState(t: TrackedWork): RowState {
+  return t.state === 'running' ? 'running' : t.state === 'ended' ? 'done' : 'stopped';
+}
+
+/** How long a job ran, as far as Sable saw it: 0 while it runs or when its end's time is not known. */
+export function jobRan(t: TrackedWork): number {
+  return t.state === 'ended' && t.endedAt ? Math.max(0, t.endedAt - t.since) : 0;
+}
+
+// ── what works now, as one list ──
+
+export interface NowRow {
+  id: string;
+  kind: 'agent' | 'job' | 'command';
+}
+
+/** When a thing that works began: a job when it was tracked, a command when its task started, an agent at its step. */
+function began(it: TimelineItem | undefined): number {
+  if (it?.type !== 'tool') return 0;
+  return it.tracked?.since ?? it.task?.since ?? it.ts;
+}
+
+/**
+ * Everything that works now as one list in one grammar (sub-agents and workflows, tracked jobs,
+ * running commands and monitors), the longest runner first: what the top of the tab shows. Servers
+ * are not work: they stand apart, after it.
+ */
+export function nowRows(agents: readonly string[], jobs: readonly string[], commands: readonly string[], items: Items): NowRow[] {
+  const rows: NowRow[] = [
+    ...agents.map((id): NowRow => ({ id, kind: 'agent' })),
+    ...jobs.map((id): NowRow => ({ id, kind: 'job' })),
+    ...commands.map((id): NowRow => ({ id, kind: 'command' })),
+  ];
+  // A stable order: by start, then as given.
+  return rows
+    .map((row, at) => ({ row, at, ts: began(items[row.id]) }))
+    .sort((a, b) => a.ts - b.ts || a.at - b.at)
+    .map((r) => r.row);
+}
+
+/** The last line a step's live output shows, as one plain line, cut: what a running command does now. */
+export function lastLine(output: string | undefined, max = 160): string {
+  if (!output) return '';
+  const end = output.length > 4096 ? output.slice(-4096) : output;
+  const rows = end.split('\n');
+  for (let i = rows.length - 1; i >= 0; i--) {
+    // eslint-disable-next-line no-control-regex
+    const row = rows[i].slice(rows[i].lastIndexOf('\r') + 1).replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (row) return row.length > max ? `${row.slice(0, max - 1).trimEnd()}…` : row;
+  }
+  return '';
 }

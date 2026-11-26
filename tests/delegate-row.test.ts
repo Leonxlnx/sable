@@ -82,7 +82,7 @@ describe('who counts as working', () => {
     const rest = ids.slice(1);
     const after = overview(rest, liveKey(items, rest), items, []);
     expect(after.working).toEqual([]);
-    expect(agentsHeader({ working: after.working.length, running: 0, agentsDone: after.done, agentsFailed: after.failed, commands: 0, commandsFailed: 0 })).toEqual({ label: '2 done', failed: 1 });
+    expect(agentsHeader({ working: after.working.length, running: 0 })).toBe('');
     expect(outcomeOf(failed)).toBe('failed');
     expect(outcomeOf(pending)).toBe('done');
   });

@@ -70,8 +70,8 @@ describe('what names a wave', () => {
       .add(agent('a4', { ts: 310 }));
     expect(userIndex()(t)).toEqual(['u1', 'u2']);
     expect(see(t).waves).toEqual([
-      { user: 'u2', ids: ['a4'], failed: 0 },
-      { user: 'u1', ids: ['a3', 'a2', 'a1'], failed: 0 },
+      { user: 'u2', ids: ['a4'], failed: 0, news: 0 },
+      { user: 'u1', ids: ['a3', 'a2', 'a1'], failed: 0, news: 0 },
     ]);
   });
 });
@@ -90,7 +90,7 @@ describe('overview', () => {
     expect(o.done).toBe(3);
     expect(o.failed).toBe(1);
     // What failed stands first in its wave, then newest first.
-    expect(o.waves).toEqual([{ user: 'u1', ids: ['bad', 'late', 'ok'], failed: 1 }]);
+    expect(o.waves).toEqual([{ user: 'u1', ids: ['bad', 'late', 'ok'], failed: 1, news: 1 }]);
   });
 
   it('moves an agent from working to its wave when it ends, and nothing else', () => {
@@ -99,7 +99,7 @@ describe('overview', () => {
     t.items = { ...t.items, a: { ...t.items.a, status: 'done', endedAt: 500 } as ToolItem };
     const o = see(t);
     expect(o.working).toEqual(['b']);
-    expect(o.waves).toEqual([{ user: 'u1', ids: ['a'], failed: 0 }]);
+    expect(o.waves).toEqual([{ user: 'u1', ids: ['a'], failed: 0, news: 0 }]);
   });
 
   it('is cheap for hundreds of agents', () => {
@@ -131,13 +131,13 @@ describe('overview', () => {
 });
 
 describe('folding', () => {
-  const wave = (n: number, failed = 0): Wave => ({ user: 'u', ids: Array.from({ length: n }, (_, i) => `a${i}`), failed });
+  const wave = (n: number, failed = 0): Wave => ({ user: 'u', ids: Array.from({ length: n }, (_, i) => `a${i}`), failed, news: 0 });
 
-  it('opens the newest wave, and every wave while the list is short', () => {
+  it('opens only the newest wave: history folds away, however short the list', () => {
     expect(waveOpen(0, 500, undefined)).toBe(true);
     expect(waveOpen(1, 500, undefined)).toBe(false);
-    expect(waveOpen(3, OPEN_ALL, undefined)).toBe(true);
-    expect(waveOpen(3, OPEN_ALL + 1, undefined)).toBe(false);
+    expect(waveOpen(3, OPEN_ALL, undefined)).toBe(false);
+    expect(waveOpen(1, 2, undefined)).toBe(false);
   });
 
   it('keeps what the person chose', () => {
@@ -207,7 +207,7 @@ describe('background commands', () => {
     expect(commandState(bash('x', { status: 'running' }), undefined)).toBe('starting');
     expect(commandState(bash('x', { status: 'error' }), undefined)).toBe('failed');
     // What failed first, then newest first (nothing here says one runs).
-    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'serve', 'build'], serving: 0, running: 0, failed: 1 });
+    expect(commandRows(commandIndex()(t), t.items, notes)).toMatchObject({ ids: ['tests', 'serve', 'build'], serving: 0, running: 0, failed: 1 });
   });
 
   it("read the bridge's own word first: running first with its time, then what failed, then the newest", () => {
@@ -227,7 +227,8 @@ describe('background commands', () => {
     expect(commandState(t.items.build as ToolItem, { ts: 9, outcome: 'failed' })).toBe('done');
     // A chat saved before the bridge kept it: started, never running.
     expect(commandState(t.items.old as ToolItem, undefined)).toBe('unknown');
-    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'server', 'lint', 'build', 'gone', 'old'], serving: 1, running: 1, failed: 1 });
+    // The same, apart, as the tab shows it: what works now, what serves, and what is over.
+    expect(commandRows(commandIndex()(t), t.items, notes)).toEqual({ ids: ['tests', 'server', 'lint', 'build', 'gone', 'old'], serving: 1, running: 1, failed: 1, live: ['tests'], servers: ['server'], past: ['lint', 'build', 'gone', 'old'] });
   });
 
   it('lists a command the bridge marked on a step that was not sent to the background, and one a sub-agent started', () => {
