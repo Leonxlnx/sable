@@ -68,6 +68,7 @@ import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
 import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from './widget-tool';
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
+import { TRACK_TOOL_ID } from './track-tool';
 import { toolReceipt, type WantedReceipts } from '../core/delegate-result';
 import { readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
@@ -651,8 +652,16 @@ export class ClaudeProvider implements Provider {
     const device = deviceEnabled(meta);
     // The user's profile: remember_about_user merges one fact into it (never secrets).
     const profile = this.profileOn() ? (fact: unknown) => this.ctx.profile!().remember(fact) : undefined;
-    const own = this.widgets() || browser || device || delegates.length > 0 || !!profile;
-    const allowed = [...(this.widgets() ? [WIDGET_TOOL_ID] : []), ...(browser ? BROWSER_TOOL_IDS : []), ...(device ? DEVICE_TOOL_IDS : []), ...delegates.map(agentToolId), ...(profile ? [PROFILE_TOOL_ID] : [])];
+    // track_work: work the agent started outside its tools, watched by Sable (a chat's own agent only).
+    const trackWork = this.ctx.trackWork;
+    const track = trackWork && !meta.id?.startsWith('sub-') && !meta.options?.readOnly
+      ? (args: unknown, stepId?: string) => {
+          const rt = owner.session?.runtime();
+          return rt ? trackWork(rt, args, stepId) : { ok: false, text: 'No session is attached yet.' };
+        }
+      : undefined;
+    const own = this.widgets() || browser || device || delegates.length > 0 || !!profile || !!track;
+    const allowed = [...(this.widgets() ? [WIDGET_TOOL_ID] : []), ...(browser ? BROWSER_TOOL_IDS : []), ...(device ? DEVICE_TOOL_IDS : []), ...delegates.map(agentToolId), ...(profile ? [PROFILE_TOOL_ID] : []), ...(track ? [TRACK_TOOL_ID] : [])];
     const runAgent = this.ctx.runAgent;
     const delegate =
       delegates.length && runAgent
@@ -693,7 +702,7 @@ export class ClaudeProvider implements Provider {
       // Generative UI: an in-process server with the show_widget tool, allowed without asking.
       // The user's own MCP servers still load from their settings.
       ...(own
-        ? { mcpServers: { [WIDGET_SERVER]: widgetServer({ widgets: this.widgets(), session: browser ? () => owner.session?.runtime() : undefined, device: device ? () => owner.session?.runtime() : undefined, delegate, profile }) }, allowedTools: allowed }
+        ? { mcpServers: { [WIDGET_SERVER]: widgetServer({ widgets: this.widgets(), session: browser ? () => owner.session?.runtime() : undefined, device: device ? () => owner.session?.runtime() : undefined, delegate, profile, track }) }, allowedTools: allowed }
         : {}),
       canUseTool: (name, toolInput, o) =>
         owner.session ? owner.session.canUseTool(name, toolInput, o) : Promise.resolve({ behavior: 'deny', message: 'No session is attached yet.' } as PermissionResult),
@@ -3107,6 +3116,8 @@ class ClaudeSession implements ProviderSession {
     if (agentOfTool(name)) return { behavior: 'allow', updatedInput: input };
     // A fact for the user's profile: Sable checks it (never secrets) and the user can remove it.
     if (name === PROFILE_TOOL_ID) return { behavior: 'allow', updatedInput: input };
+    // track_work only tells Sable which process to watch: nothing is started or changed.
+    if (name === TRACK_TOOL_ID) return { behavior: 'allow', updatedInput: input };
 
     if (name === 'AskUserQuestion') {
       const questions = describeTool(name, input).detail.questions ?? [];

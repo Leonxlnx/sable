@@ -11,13 +11,15 @@ export function forkHistory(items: TimelineItem[], whole: (row: TimelineItem) =>
     if (row.type !== 'tool') return row;
     const active = ['running', 'pending', 'awaiting'].includes(row.status);
     if (!active && !row.delegateReport && !row.delegateDeliveryId && row.result?.agent?.background !== 'running'
-      && row.workflow?.status !== 'running' && row.task?.state !== 'running' && row.task?.state !== 'lost') return row;
+      && row.workflow?.status !== 'running' && row.task?.state !== 'running' && row.task?.state !== 'lost' && row.tracked?.state !== 'running') return row;
     const { delegateRetryId, delegateReceiptState, delegateReceiversPending, delegateCaller, delegateReport, delegateAttempt, delegateDeliveryId, delegateContinuations, delegateWait, ...copy } = whole(row) as typeof row;
     if (active) copy.status = 'cancelled';
     if (copy.result?.agent?.background === 'running') copy.result = { ...copy.result, agent: { ...copy.result.agent, background: 'stopped' } };
     if (copy.workflow?.status === 'running') copy.workflow = { ...copy.workflow, status: 'stopped' };
     if (copy.task?.state === 'running') copy.task = { ...copy.task, state: 'stopped', lossTold: true };
     else if (copy.task?.state === 'lost') copy.task = { ...copy.task, lossTold: true };
+    // A tracked process is watched by the chat that tracked it: the fork's copy is history.
+    if (copy.tracked?.state === 'running') copy.tracked = { ...copy.tracked, state: 'left' };
     return copy;
   });
 }

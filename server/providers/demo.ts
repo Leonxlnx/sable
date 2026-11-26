@@ -415,7 +415,8 @@ class DemoSession implements ProviderSession {
     try {
       await s.sleep(250 + Math.random() * 350);
       if (id !== 'command') s.step();
-      const result = await SCENARIOS[id]({ s, prompt: item.text, item, model });
+      const trackWork = this.ctx.trackWork;
+      const result = await SCENARIOS[id]({ s, prompt: item.text, item, model, ...(trackWork ? { track: (args: unknown, stepId?: string) => trackWork(this.rt, args, stepId) } : {}) });
       if (result && 'error' in result) error = result.error;
     } catch (err) {
       if (this.current !== ctrl || err instanceof Aborted) {
