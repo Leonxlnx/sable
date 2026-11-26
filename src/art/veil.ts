@@ -156,6 +156,8 @@ export const VEIL_QUICK = { peak: 3, step: 16 };
 const FRAME = 16;
 /** The rise of what arrives, as it resolves (ms). */
 const RISE_MS = 320;
+/** The id of the animation that hides a view going away (`veilReveal`), so a view that comes back can drop it. */
+const HIDE = 'veil-hide';
 
 interface Cover {
   el: HTMLElement;
@@ -179,11 +181,8 @@ interface Cover {
   /** What stands on the solid veil when the new view takes long (unseen until then), and the timer that brings it. */
   wait?: HTMLElement;
   waitTimer?: number;
-  /** When the waiting state is due (`performance.now()`: the cover's start, solid, `VEIL_WAIT_AFTER`), and when its fade began (kept at the reveal). */
+  /** When the waiting state is due (`performance.now()`: the cover's start, solid, `VEIL_WAIT_AFTER`). */
   waitDue?: number;
-  waitStart?: number | null;
-  /** Set when the reveal keeps the waiting state on top for the new view to take over: settles when the veil has gone. */
-  kept?: Promise<void>;
 }
 
 /**
@@ -217,10 +216,8 @@ const waitIn = (w: HTMLElement) => w.animate([{ opacity: 0 }, { opacity: 1 }], {
  * solid, `VEIL_WAIT_AFTER`), so the view that switches after `OPEN_HOLD_MS` is not followed by an empty
  * stage; one already due when its view comes starts in that commit, at the point of its fade the open's
  * clock says (the page's timer would wait out whatever long task follows the view's mount: the veil went
- * and the stage stood empty until it fired). Where the veil's own waiting state is already in view, the veil keeps it on top while it goes
- * (`veilReveal` with `keep`) and this one takes over in the frame the veil has gone, at the same point
- * of the same fade: the same skeleton in the same place, never out and in again. Without a veil (the
- * launch, reduced motion) the clock starts here, `after` ms on.
+ * and the stage stood empty until it fired). The veil's own waiting state goes with the veil as ever.
+ * Without a veil (the launch, reduced motion) the clock starts here, `after` ms on.
  */
 export function waitingIn(el: HTMLElement | null, host?: HTMLElement | null, after = VEIL_WAIT_AFTER): () => void {
   if (!el) return () => {};
@@ -241,11 +238,6 @@ export function waitingIn(el: HTMLElement | null, host?: HTMLElement | null, aft
   queueMicrotask(() => {
     if (!live) return;
     const cover = host ? covers.get(host) : undefined;
-    if (cover?.kept) {
-      const start = cover.waitStart ?? null;
-      void cover.kept.then(() => live && show(start));
-      return;
-    }
     const due = cover?.waitDue ?? timeNow() + after;
     // Due already (the view came after the open's clock had run out): at the point of its fade the
     // open's clock says, from this frame. Not yet: the page's timer brings it.
@@ -395,12 +387,6 @@ export interface VeilSwitch {
   /** What comes: unseen until the veil is solid, then there, rising `rise` px as it resolves. */
   show?: HTMLElement[];
   rise?: number;
-  /**
-   * The new view shows the same waiting state in the same place (a chat still being read, Timeline.tsx
-   * `Reading`): one already in view stays on top while the veil goes, nothing rises, and the view's own
-   * takes over in the frame the veil has gone, at the same point of its fade (`waitingIn`).
-   */
-  keep?: boolean;
 }
 
 export interface VeilRun {
@@ -445,30 +431,27 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
   const waiting = cover.wait;
   cover.wait = undefined;
   const seen = !!waiting && getComputedStyle(waiting).opacity !== '0';
-  // Taken over by the new view (`keep`): it stays as it is, on top, and goes with the veil.
-  const kept = seen && !!sw.keep;
   if (waiting && !seen) waiting.remove();
-  if (waiting && seen && !kept) {
+  if (waiting && seen) {
     const from = getComputedStyle(waiting).opacity;
     for (const a of waiting.getAnimations()) a.cancel();
     waiting.animate([{ opacity: from }, { opacity: 0 }], { duration: WAIT_OUT, easing: 'linear', fill: 'forwards' });
   }
-  let release = () => {};
-  if (kept && waiting) {
-    cover.waitStart = (waiting.getAnimations()[0]?.startTime as number | null | undefined) ?? null;
-    cover.kept = new Promise<void>((r) => (release = r));
-  }
-  const hold = wait + FRAME + (seen && !kept ? WAIT_OUT : 0);
+  const hold = wait + FRAME + (seen ? WAIT_OUT : 0);
   const at = (ms: number, total: number) => Math.min(1, Math.max(0, ms / total));
   for (const el of sw.hide ?? []) {
     const cur = getComputedStyle(el).opacity;
-    pin(el.animate(wait > 0 ? [{ opacity: cur, offset: 0 }, { opacity: cur, offset: at(wait, hold) }, { opacity: 0, offset: 1 }] : [{ opacity: 0 }, { opacity: 0 }], { duration: hold, easing: 'linear', fill: 'both' }));
+    const a = pin(el.animate(wait > 0 ? [{ opacity: cur, offset: 0 }, { opacity: cur, offset: at(wait, hold) }, { opacity: 0, offset: 1 }] : [{ opacity: 0 }, { opacity: 0 }], { duration: hold, easing: 'linear', fill: 'both' }));
+    a.id = HIDE;
   }
-  // The quick change shows the new view in its place from its first frame: nothing rises. Nor does a
-  // view that takes the waiting state over: its skeleton stands where the veil's stood.
-  const rise = cover.peak < 4 || kept ? 0 : sw.rise;
+  // The quick change shows the new view in its place from its first frame: nothing rises.
+  const rise = cover.peak < 4 ? 0 : sw.rise;
   const from = rise ? `translateY(${rise}px)` : 'none';
   for (const el of sw.show ?? []) {
+    // A view that comes back while it was still on its way out (there and straight back, before the
+    // last change had let it go) is the same element: the hide of that change, which holds it at
+    // nothing for good, goes, or the view stood invisible once this reveal was over.
+    for (const old of el.getAnimations()) if (old.id === HIDE) old.cancel();
     const total = hold + (rise ? RISE_MS : FRAME);
     pin(el.animate(
       [
@@ -513,11 +496,9 @@ export function veilReveal(host: HTMLElement | null, sw: VeilSwitch = {}): VeilR
   const end = () => {
     window.clearTimeout(cap);
     // A new cover took the element over meanwhile: it is that one's now.
-    if (covers.get(host) !== cover) return release();
+    if (covers.get(host) !== cover) return;
     covers.delete(host);
     cover.el.remove();
-    // In the same task as the removal: a view that took the waiting state over shows its own in this frame.
-    release();
   };
   // A hidden window finishes no animation: the veil never outlives its run by long.
   const cap = window.setTimeout(end, out + 1500);

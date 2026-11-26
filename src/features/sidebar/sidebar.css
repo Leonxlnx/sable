@@ -591,6 +591,10 @@
   position: absolute;
   inset: 0;
   z-index: -1;
+  /* Paint only. Sliding from the row it left, it lies over the rows on its way, above them when its
+     own row is lower in the list (each row is a stacking context of its own): a press there landed on
+     the pill and the click on no row at all (desk2, `reentry.mjs`: there and straight back). */
+  pointer-events: none;
   border-radius: inherit;
   background-color: var(--fill-3);
   /* Flat controls (ui.css): one fill step and one even hairline. */

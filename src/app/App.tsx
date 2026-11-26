@@ -215,6 +215,8 @@ interface StageView {
 
 /** The veil's run for the change of view under way: what leaves stays in the page until it is solid. */
 let swapRun: VeilRun | null = null;
+/** The longest a view on its way out waits for the veil to be solid (ms): a cover is solid in about 80. */
+const HOLD_CAP_MS = 1500;
 
 /**
  * What stands on the solid veil when a chat takes long to be there (a long one read from disk, a
@@ -259,9 +261,14 @@ function HoldForVeil() {
   useEffect(() => {
     if (present) return;
     let live = true;
-    void (swapRun?.solid ?? Promise.resolve()).then(() => live && safeToRemove?.());
+    const go = () => live && safeToRemove?.();
+    void (swapRun?.solid ?? Promise.resolve()).then(go);
+    // Never held for good: AnimatePresence lets every view on its way out go only once all of them may,
+    // so one that waited for ever would keep each view after it in the page (each a whole conversation).
+    const cap = window.setTimeout(go, HOLD_CAP_MS);
     return () => {
       live = false;
+      window.clearTimeout(cap);
     };
   }, [present, safeToRemove]);
   return null;
@@ -311,10 +318,10 @@ function useShownView(live: StageView, body: RefObject<HTMLElement | null>): { s
     const side = (v: HTMLElement) => v.dataset.view === 'dock' || v.dataset.view === 'light';
     const show = parts.filter((v) => (side(v) ? !chat(was) && chat(shown) : v.dataset.view === shown.key));
     const hide = parts.filter((v) => (side(v) ? chat(was) && !chat(shown) : v.dataset.view !== shown.key));
-    // A chat still being read shows the veil's own waiting state in its conversation (Timeline.tsx `Reading`): one
-    // already in view on the veil is kept there and taken over, never faded out and in again.
-    const keep = !!shown.sessionId && !useStore.getState().data[shown.sessionId]?.loaded;
-    const run = veilReveal(el, { hide, show, rise: 8, keep });
+    // A chat still being read shows its own skeleton (Timeline.tsx `Reading`): the veil's waiting state goes
+    // with the veil as ever. (0.2.38 kept the veil's on top for the view's to take over; never proven in a
+    // film, it is out again: a plain skeleton that comes and is replaced by the conversation is enough.)
+    const run = veilReveal(el, { hide, show, rise: 8 });
     swapRun = run;
     void run.done.then(() => swapRun === run && settle(el));
   }, [shown, body]);

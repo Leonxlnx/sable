@@ -4,10 +4,11 @@ import { AnimatePresence, motion, useIsPresent } from 'motion/react';
 import { Icon } from '@/icons';
 import { EASE_OUT, play, reducedMotion, uiZoom } from '@/lib/motion';
 import { interrupt } from '@/state/actions';
-import { useStore } from '@/state/store';
+import { readStalled, STALL_MS, useStore } from '@/state/store';
 import { EMPTY, TimelineCtx, type TimelineCtxValue } from './ctx';
 import { navFeed } from './nav-bus';
 import { Navigator } from './Navigator';
+import { navReady } from './nav-model';
 import { readerScrolls } from '@/features/genui/frames';
 import { REVEAL_EVENT, type RevealDetail } from './reveal';
 import { TurnList } from './TurnView';
@@ -45,11 +46,17 @@ function heldLive(inner: HTMLElement, el: HTMLElement): boolean {
  * on the veil's waiting clock (`waitingIn`). Never an empty stage. The conversation takes its place
  * in one commit, laid out at its end (the layout effect on `loaded`), with the dock where it stays.
  */
-function Reading() {
+function Reading({ sessionId }: { sessionId: string }) {
   const el = useRef<HTMLDivElement>(null);
   // On the clock of the open (the veil that began with the click, on the stage's body), else from here;
   // decided in the commit that mounts it (a passive effect waited behind the page's next long task).
   useLayoutEffect(() => waitingIn(el.current, el.current?.closest<HTMLElement>('.stage-body')), []);
+  // Never a skeleton for ever: still reading after `STALL_MS`, the chat is asked again, and then the
+  // view says it could not be read, with Try again (store.ts `readStalled`, SessionView).
+  useEffect(() => {
+    const t = window.setTimeout(() => readStalled(sessionId), STALL_MS);
+    return () => window.clearTimeout(t);
+  }, [sessionId]);
   return (
     <div ref={el} className="tl-wait" style={{ opacity: 0 }} role="status" aria-label="Reading conversation">
       <i className="skel tl-skel-card" />
@@ -96,6 +103,11 @@ export function Timeline({ sessionId }: { sessionId: string }) {
   const [away, setAway] = useState(false);
   // The conversation's map is not part of a first message's frames: it mounts after the landing.
   const mapped = useStaged('landed');
+  // Nor is it drawn while older pages of the chat still come (store.ts `readOlder`, nav-model.ts
+  // `navReady`): the rail was laid out again with every page (8, 21, 34, 23, 36 lines and the lit mark
+  // between 328 and 428 px within 1.5 s of opening a long chat, desk2 `j3.mjs`). It comes once, when
+  // the whole conversation is here, as for a chat already in the window.
+  const whole = useStore((s) => navReady(s.data[sessionId]));
 
   // The turn list hands its layout to the conversation's map through this.
   const feed = useMemo(() => navFeed(), [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -556,11 +568,11 @@ export function Timeline({ sessionId }: { sessionId: string }) {
       <div className="tl">
         <div className="tl-scroll scroll" ref={scroller} tabIndex={-1}>
           <div className="tl-content" ref={content} data-empty={empty || undefined}>
-            {empty ? <p className="tl-empty">Send a message to start.</p> : loaded ? <TurnList ids={roots} /> : reading && <Reading />}
+            {empty ? <p className="tl-empty">Send a message to start.</p> : loaded ? <TurnList ids={roots} /> : reading && <Reading sessionId={sessionId} />}
             {loaded && <StandInCards sessionId={sessionId} />}
           </div>
         </div>
-        {!NO_NAV && mapped && <Navigator key={sessionId} sessionId={sessionId} feed={feed} scroller={scroller} content={content} hold={hold} />}
+        {!NO_NAV && mapped && whole && <Navigator key={sessionId} sessionId={sessionId} feed={feed} scroller={scroller} content={content} hold={hold} />}
         <AnimatePresence>
           {away && (
             <motion.button

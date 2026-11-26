@@ -10,6 +10,7 @@ import {
   groupHeight,
   isBuilt,
   markAt,
+  navReady,
   marksOf,
   markY,
   matchPrompt,
@@ -194,6 +195,21 @@ describe('runs', () => {
     const long = sizes(times(new Array(999).fill(1)));
     expect(long.length).toBeLessThanOrEqual(16);
     expect(long.reduce((a, b) => a + b, 0)).toBe(1000);
+  });
+
+  it('is made only for a conversation held whole: pages put in front of it cut every run anew', () => {
+    // A long chat opened at its end: its newest 13 messages, then older pages in front of them.
+    const sitting = (n: number) => times(new Array(n - 1).fill(2));
+    const end = runsOf(sitting(40).slice(-13));
+    const whole = runsOf(sitting(40));
+    // The run that held the newest messages is no longer where it was, nor is any mark's index.
+    expect(end).toEqual([{ from: 0, to: 13 }]);
+    expect(whole).toEqual([{ from: 0, to: 24 }, { from: 24, to: 40 }]);
+    expect(navReady(undefined)).toBe(false);
+    expect(navReady({ loaded: false })).toBe(false);
+    expect(navReady({ loaded: true, incomplete: true })).toBe(false);
+    expect(navReady({ loaded: true, incomplete: false })).toBe(true);
+    expect(navReady({ loaded: true })).toBe(true);
   });
 
   it('finds the run of a message', () => {

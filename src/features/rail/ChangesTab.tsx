@@ -495,20 +495,27 @@ function needs(d: DiffEntry | undefined) {
  * so opening the panel or the tab never waits on rows below the fold.
  */
 const FIRST_ROWS = 36;
+/**
+ * The rows added per idle moment after the first. All of them at once was one task of two to four
+ * seconds for a long chat's edits outside a repository (about 2,000 files): on every switch to that
+ * chat with the tab open the window took no click until it was over (desk2, `railcost.mjs`).
+ */
+const MORE_ROWS = 120;
 
 function useRowLimit(total: number): number {
   const [limit, setLimit] = useState(FIRST_ROWS);
   const more = total > limit;
   useEffect(() => {
     if (!more) return;
+    const grow = () => setLimit((l) => l + MORE_ROWS);
     const w = window as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number; cancelIdleCallback?: (id: number) => void };
     if (w.requestIdleCallback) {
-      const id = w.requestIdleCallback(() => setLimit(Infinity), { timeout: 700 });
+      const id = w.requestIdleCallback(grow, { timeout: 700 });
       return () => w.cancelIdleCallback?.(id);
     }
-    const t = window.setTimeout(() => setLimit(Infinity), 300);
+    const t = window.setTimeout(grow, 300);
     return () => window.clearTimeout(t);
-  }, [more]);
+  }, [more, limit]);
   return limit;
 }
 
@@ -760,6 +767,8 @@ function SessionEdits({ sessionId, cwd }: { sessionId: string; cwd: string }) {
   const dels = files.reduce((n, f) => n + f.deletions, 0);
   const allOpen = files.length > 0 && files.every((f) => open.has(f.path));
   const arrived = useArrivals(files.map((f) => f.path));
+  // A long chat edits thousands of files: the first rows at once, the rest a share at a time when idle.
+  const limit = useRowLimit(files.length);
   const toggle = (p: string) =>
     setOpen((o) => {
       const n = new Set(o);
@@ -798,7 +807,7 @@ function SessionEdits({ sessionId, cwd }: { sessionId: string; cwd: string }) {
         ) : (
           <>
             <ul className="ch-list">
-              {files.map((f) => {
+              {files.slice(0, limit).map((f) => {
                 const [dir, base] = splitPath(f.path);
                 const isOpen = open.has(f.path);
                 return (

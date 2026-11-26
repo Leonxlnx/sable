@@ -40,6 +40,7 @@ import { SpareStrip } from './SpareStrip';
 import { CustomStrip } from '@/features/customize/CustomStrip';
 import { ReviewBar } from '@/features/review/ReviewBar';
 import { SendKey } from './SendKey';
+import { enterAction } from './enter-keys';
 import { SuggestMenu } from './SuggestMenu';
 import { modelCommand } from './model-command';
 import { UltraChip, UltraEdge } from './Ultracode';
@@ -286,6 +287,10 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
   const searchSeq = useRef(0);
 
   const busy = status === 'running' || status === 'awaiting' || status === 'starting';
+  // A turn in progress: only then does a message wait behind it (the queue) or go into it (a steer).
+  // While the agent only starts (`starting`: a message sent to it, a chat just made) a message is sent
+  // as any other, and the bridge hands it over once the agent is there.
+  const turnRuns = status === 'running' || status === 'awaiting';
   // A chat with nothing said yet asks for the first task, as home does; later the field is a reply.
   // While its conversation still loads, the session itself says which: a chat that has had a turn
   // (or runs one) is a reply. So the field never stands blank and then names itself a moment later.
@@ -628,6 +633,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     if (!out) return;
     field.appendChild(layer);
     let last: Animation = out;
+    let follow: MutationObserver | null = null;
     if (next) {
       const ph = document.createElement('div');
       ph.className = 'cmp-roll-ph';
@@ -635,8 +641,18 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       layer.appendChild(ph);
       card.current?.setAttribute('data-rolling', '');
       last = play(ph, [{ transform: 'translateY(8px)', opacity: 0 }, { transform: 'translateY(0px)', opacity: 1 }], { duration: flew ? 160 : 100, delay: flew ? (queued ? 300 : 150) : 33, easing: EASE_OUT, fill: 'both' }) ?? out;
+      // The word that rises is the one the field will show: the chat's state may change under the roll
+      // (the bridge's answer to the send: a turn that runs, or an agent that is still starting).
+      const ta = ref.current;
+      if (ta && typeof MutationObserver === 'function') {
+        follow = new MutationObserver(() => {
+          if (ta.placeholder) ph.textContent = ta.placeholder;
+        });
+        follow.observe(ta, { attributes: true, attributeFilter: ['placeholder'] });
+      }
     }
     const done = () => {
+      follow?.disconnect();
       layer.remove();
       card.current?.removeAttribute('data-rolling');
     };
@@ -718,18 +734,20 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     const out = draft.recovery?.retry?.id === id && draft.recovery.payload ? draft.recovery.payload : parcel(body, attachments);
     // The words leave the field for where they land: the conversation, or the queue tray while a
     // turn runs (a steer goes into the turn). Measured once here, before the field empties.
-    const steering = steer && busy && steerable;
+    const steering = steer && turnRuns && steerable;
     const ta = ref.current;
     const flew = !!ta && !!body && !reducedMotion();
     const live = sessionId ? useStore.getState().data[sessionId] : undefined;
     const represented = live?.items[id]?.type === 'user' || live?.queue.some(q => q.submitId === id || q.id === id);
-    const flight = flew ? launchFlight({ el: ta, text: body }, { submitId: id, represented, dest: sessionId && busy && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId, session: sessionId }) : null;
+    const flight = flew ? launchFlight({ el: ta, text: body }, { submitId: id, represented, dest: sessionId && turnRuns && !steering ? 'tray' : 'timeline', steer: steering, first: !sessionId, session: sessionId }) : null;
     // Queued: its row is in the tray in this frame, the words fly into it (QueueTray `expectQueued`).
-    const expect = sessionId && busy && !steering && body ? expectQueued(sessionId, body, id) : null;
+    const expect = sessionId && turnRuns && !steering && body ? expectQueued(sessionId, body, id) : null;
     if (variant === 'session') launchKey(card.current);
-    // In a session the next placeholder is always the queueing one: the turn is running (or about to).
+    // The next placeholder rises in: behind a running turn the queueing one; else the field's own as the
+    // send leaves it (a chat whose agent answers at once runs a turn before it shows, one whose agent
+    // starts slowly is a reply: `rollOut` follows the field's own word while it rises).
     // A queued message's words rise through the field into the tray: the placeholder waits for them.
-    rollOut(text, variant === 'session' ? 'Queue a follow-up' : null, flew, !!sessionId && busy && !steering);
+    rollOut(text, variant === 'session' ? (turnRuns ? 'Queue a follow-up' : 'Reply') : null, flew, !!sessionId && turnRuns && !steering);
     // From home: the composer starts its glide to the dock at once, before the session exists.
     if (choice) beginHandoff(card.current);
     // The press itself only touches the page: the field empties on screen now, and the store, React
@@ -949,20 +967,12 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
       return;
     }
     if (e.key === 'Enter') {
-      if (variant === 'session' && busy && !shell) {
-        // While a turn runs: the send keys queue, the same keys with the modifier steer.
-        const steerKeys = sendWithEnter ? mod && !e.shiftKey : mod && e.shiftKey;
-        const queueKeys = sendWithEnter ? !mod && !e.shiftKey : mod && !e.shiftKey;
-        if (steerKeys || queueKeys) {
-          e.preventDefault();
-          void submit(steerKeys && steerable);
-        }
-        return;
-      }
-      const send = sendWithEnter ? !e.shiftKey || mod : mod;
-      if (send) {
+      // Ctrl+Enter sends now: a plain send at rest or while the agent starts, the steer while a turn
+      // runs, never the queue (but with an agent that takes nothing mid-turn). enter-keys.ts.
+      const act = enterAction({ mod, shift: e.shiftKey }, { turnRuns: variant === 'session' && turnRuns && !shell, steerable, sendWithEnter });
+      if (act !== 'newline') {
         e.preventDefault();
-        void submit();
+        void submit(act === 'steer');
       }
       return;
     }
@@ -1006,7 +1016,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
     if (recall !== null) setRecall(null);
   };
 
-  const queueing = variant === 'session' && busy && !shell;
+  const queueing = variant === 'session' && turnRuns && !shell;
   // The bar stands complete in the first frame of a chat that opens: its placeholder from the
   // session itself (above), its mode, model and effort from the session and the agent's last
   // known answer (choice.ts, caps-seen.ts). Nothing waits for the conversation to load.
@@ -1148,7 +1158,7 @@ export const Composer = memo(function Composer({ sessionId, variant, autoFocus }
         {/* The key is no part of the pane: it rests in the cove the pane's corner makes for it. */}
         <SendKey
           canSend={canSend}
-          busy={busy}
+          busy={variant === 'session' && turnRuns}
           showStop={showStop}
           steerable={steerable}
           sendWithEnter={sendWithEnter}

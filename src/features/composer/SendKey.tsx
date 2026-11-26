@@ -1,6 +1,7 @@
 import { memo, useLayoutEffect, useRef, useState, type ReactElement, useSyncExternalStore } from 'react';
 import { Tip } from '@/ui';
 import { keyTipOffset } from './key-tip';
+import { sendKeys } from './enter-keys';
 
 const MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -56,7 +57,7 @@ export function SendGlyphSvg({ glyph }: { glyph: SendGlyph }) {
 
 export interface SendKeyProps {
   canSend: boolean;
-  /** A turn is running: Enter queues, the modifier steers. */
+  /** A turn is running (not an agent that only starts): Enter queues, Ctrl+Enter steers. */
   busy: boolean;
   /** Show the stop key in the slot (busy with nothing typed). */
   showStop: boolean;
@@ -106,14 +107,16 @@ export const SendKey = memo(function SendKey({ canSend, busy, showStop, steerabl
   const held = useModHeld(queueing && steerable);
   const steer = queueing && steerable && held;
   const glyph: SendGlyph = steer ? 'steer' : 'send';
-  const steerKeys = sendWithEnter ? 'mod+enter' : 'mod+shift+enter';
   const label = shell ? 'Run in terminal' : steer ? 'Steer into this turn' : queueing ? 'Queue message' : 'Send';
+  // Ctrl+Enter sends now (a steer while a turn runs); a queue is the plain send key, or Ctrl+Shift+Enter
+  // where Enter makes a new line. An agent that takes nothing mid-turn queues on Ctrl+Enter too (OpenCode).
+  const keys = sendKeys(steer ? 'steer' : queueing ? 'queue' : 'send', { steerable, sendWithEnter });
 
   return (
     <div className="cmp-keys" ref={slot} onPointerEnter={measure} onFocus={measure} onPointerLeave={() => quiet && setQuiet(false)}>
       {tip(
         label,
-        steer ? steerKeys : sendWithEnter ? 'enter' : 'mod+enter',
+        keys,
         <button
           type="button"
           className="cmp-send"

@@ -308,6 +308,22 @@ export const useStore = create<Store>((set, get) => ({
   },
 }));
 
+// A listener that throws never keeps the ones after it from hearing a write: zustand calls them in a
+// row, and the window's own (React's, which put the change on the stage) come last, after every
+// module that listens. One failing listener would otherwise leave a change made in the store but not
+// on screen (a click on a chat that changes nothing).
+{
+  const subscribe = useStore.subscribe;
+  useStore.subscribe = (listener) =>
+    subscribe((state, prev) => {
+      try {
+        listener(state, prev);
+      } catch (err) {
+        console.error('A store listener failed', err);
+      }
+    });
+}
+
 // ───────────────────────── event application ─────────────────────────
 
 type DeltaKey = string; // `${sessionId}\u0000${itemId}\u0000${field}`
@@ -593,6 +609,13 @@ export async function completeSession(id: string) {
 }
 
 export function retryHistory(id: string): Promise<void> {
+  // A first read that failed or never answered: asked again from its end, never handed the request
+  // that stalled (sharing it, Try again did nothing at all).
+  if (!useStore.getState().data[id]?.loaded) {
+    fetching.delete(id);
+    pages.delete(id);
+    return loadSession(id);
+  }
   const running = fetching.get(id);
   if (running) return running;
   patchData(id, () => ({ historyFailed: false }));
@@ -1216,6 +1239,32 @@ export function loadSession(sessionId: string, opts: { peek?: boolean; fresh?: b
     });
   fetching.set(sessionId, p);
   return p;
+}
+
+/**
+ * How long a chat on screen may stand as "reading" while the bridge answers before it is asked
+ * again, and as long again before the view says it could not be read (with Try again). A long chat
+ * the bridge reads for the first time answers well within it (6 to 7 s for a 1.45 GB base); a
+ * request that is never answered (lost on its way, a window state nobody foresaw) must not leave a
+ * skeleton on the stage for ever.
+ */
+export const STALL_MS = 8000;
+
+/** The conversation of a chat on screen has not come after `STALL_MS`: asked again, then said. */
+export function readStalled(sessionId: string) {
+  const d = useStore.getState().data[sessionId];
+  if (!useStore.getState().sessions[sessionId] || d?.loaded || d?.historyFailed) return;
+  // No connection: the window says so already, and the open chat is read again when it is back (`hello`).
+  if (bridge.status !== 'open') return;
+  fetching.delete(sessionId);
+  pages.delete(sessionId);
+  const p = loadSession(sessionId);
+  p.catch(() => {});
+  setTimeout(() => {
+    // Still that request, still nothing: the conversation says it could not be read. Its answer, should
+    // it come after all, is applied as ever and puts the conversation in place of the line.
+    if (fetching.get(sessionId) === p && !useStore.getState().data[sessionId]?.loaded && bridge.status === 'open') markUnreadable(sessionId, true);
+  }, STALL_MS);
 }
 
 /** A chat not in the window whose read failed (`on`), or is read again: `patchData` leaves a chat that is not loaded alone. */

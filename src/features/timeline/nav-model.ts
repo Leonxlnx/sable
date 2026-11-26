@@ -373,6 +373,14 @@ export const RAIL_HIDE = 1.8;
  */
 export const RAIL_MARKS = 3;
 
+/**
+ * Whether the navigator is made at all: only for a conversation the window holds whole. While older
+ * pages still come (a long chat opened at its end), every page puts messages in front of the marks
+ * there are: the runs are cut again from the first message and every mark's index moves, so a rail
+ * drawn meanwhile was laid out anew with each page and its lit mark named another message.
+ */
+export const navReady = (d: { loaded?: boolean; incomplete?: boolean } | undefined) => !!d?.loaded && !d.incomplete;
+
 /** Whether the rail shows: a conversation long enough to need it (`shown`: it shows now, so it hides only a little lower). */
 export function railShown(scrollHeight: number, viewHeight: number, marks: number, shown: boolean): boolean {
   if (viewHeight <= 0 || marks < RAIL_MARKS) return false;

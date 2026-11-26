@@ -1069,7 +1069,10 @@ button:hover > .row-caret {
   display: none;
 }
 
-.tl-item[data-standin] .user-card::after {
+/* The same sign on the real row while its agent is still starting (User.tsx `late`): the message is
+   sent, the bridge holds it until the agent is there to read it. */
+.tl-item[data-standin] .user-card::after,
+.user[data-late] .user-card::after {
   content: '';
   position: absolute;
   left: 16px;
@@ -1093,7 +1096,8 @@ button:hover > .row-caret {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tl-item[data-standin] .user-card::after {
+  .tl-item[data-standin] .user-card::after,
+  .user[data-late] .user-card::after {
     animation: none;
   }
 }

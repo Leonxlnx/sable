@@ -158,6 +158,11 @@ export const UserMessage = memo(function UserMessage({ item, landingId = item.id
   useEffect(() => (actions ? undefined : afterSend(() => setActions(true))), [actions]);
 
   const queued = item.state === 'queued';
+  // Sent, and only waiting for its own agent to start (or to read it): for the person it is sent, so it
+  // reads as sent, with the send's one sign while it is late (the stand-in's hairline). "Queued" is a
+  // message waiting in a running turn (steered) or one the bridge holds at a limit.
+  const late = queued && !item.steered && !item.heldAtLimit;
+  const waits = queued && !late;
   const images = item.attachments?.filter((a) => hasThumbnail(a, item.more)) ?? [];
   const files = item.attachments?.filter((a) => !hasThumbnail(a, item.more)) ?? [];
   // A review sent from the review bar: what was typed, then the comments as a short list. Wrappers
@@ -258,7 +263,7 @@ export const UserMessage = memo(function UserMessage({ item, landingId = item.id
   };
 
   return (
-    <div className="user" ref={root} data-queued={queued || undefined} data-open={open || undefined} data-steered={item.steered || undefined}>
+    <div className="user" ref={root} data-queued={waits || undefined} data-late={late || undefined} data-open={open || undefined} data-steered={item.steered || undefined}>
       {actions && (
         <div className="user-actions">
           {!queued && <Stamp ts={item.ts} prefix={item.steered ? 'Steered' : undefined} className="user-stamp" />}
@@ -303,7 +308,7 @@ export const UserMessage = memo(function UserMessage({ item, landingId = item.id
             From the Claude app
           </span>
         ) : (
-          queued && (
+          waits && (
             <span className="user-mark" data-waiting>
               <Icon name="queue" size={11} />
               Queued

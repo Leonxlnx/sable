@@ -241,6 +241,10 @@ export class DemoProvider implements Provider {
   }
 
   async open(rt: SessionRuntime, opts: { loadTranscript?: boolean }): Promise<ProviderSession> {
+    // A real agent's process takes seconds to start (Codex's thread start most of a minute): checks
+    // of what the window shows meanwhile set SABLE_DEMO_OPEN_MS (ms) for the same wait.
+    const openMs = Number(process.env.SABLE_DEMO_OPEN_MS);
+    if (openMs > 0) await new Promise((r) => setTimeout(r, openMs));
     rt.setCaps(capabilities());
     const patch: Parameters<SessionRuntime['update']>[0] = {};
     if (!rt.meta.model) patch.model = DEFAULT_MODEL;
