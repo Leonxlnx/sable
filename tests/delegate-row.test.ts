@@ -155,8 +155,8 @@ describe('a report whose delivery is not known', () => {
     expect(at).toBeGreaterThan(block.indexOf('<span>{line.report}</span>'));
     expect(at).toBeLessThan(block.indexOf('{line.parts.map((p) => ('));
     const tab = read('src/features/rail/AgentsTab.tsx');
-    // The row is one button: the action is its sibling, never inside it.
-    expect(tab).toMatch(/<\/button>\s*\{\/\*[^*]*\*\/\}\s*\{delegateRetry\(item\) && \(\s*<div className="agx-again">\s*<ReportAgain sessionId=\{sessionId\} item=\{item\} className="agx-goto" \/>\s*<\/div>\s*\)\}\s*<Collapse open=\{open\}>/);
+    // The row is one button: the action is its sibling, never inside it (after the row's own hover tools).
+    expect(tab).toMatch(/<\/button>\s*<RowTools sessionId=\{sessionId\} id=\{id\} \/>\s*\{\/\*[^*]*\*\/\}\s*\{delegateRetry\(item\) && \(\s*<div className="agx-again">\s*<ReportAgain sessionId=\{sessionId\} item=\{item\} className="agx-goto" \/>\s*<\/div>\s*\)\}\s*<Collapse open=\{open\}>/);
     const css = read('src/features/timeline/timeline.css');
     expect(css).toMatch(/\n\.agent-again \{[^}]*height: 22px;[^}]*font-size: 12px;[^}]*color: var\(--text-2\);/);
     expect(css).toMatch(/\n\.agent-again:focus-visible \{\s*outline: var\(--focus-w\) solid var\(--focus\);/);
