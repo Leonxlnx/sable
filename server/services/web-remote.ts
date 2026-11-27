@@ -93,6 +93,20 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   let startup: Promise<void> | undefined, inventory: Promise<WebNetwork[]> | undefined;
   let timer: NodeJS.Timeout | undefined, expiry: NodeJS.Timeout | undefined;
   const active = () => enabled() && !!port && networkId === selection();
+  // At most four files are read at once. A page asks for more together (script, styles, fonts on up to six
+  // connections): those wait for a free read, sixteen at most and 5 s each, then 503 (a refusal at once
+  // left a fresh page without its fonts or a lazy chunk).
+  const waiting: (() => void)[] = [];
+  const readSlot = () => {
+    if (reads < 4) return (reads++, Promise.resolve(true));
+    if (waiting.length >= 16) return Promise.resolve(false);
+    return new Promise<boolean>(resolve => {
+      const go = () => { clearTimeout(late); reads++; resolve(true); };
+      const late = setTimeout(() => { waiting.splice(waiting.indexOf(go) >>> 0, 1); resolve(false); }, 5000);
+      waiting.push(go);
+    });
+  };
+  const freeSlot = () => { reads--; waiting.shift()?.(); };
   const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
   // The packaged client (`resources/web`, scripts/build-electron.mjs), or a checkout's own web build when
   // the bridge runs from source (the dev server has no resources folder). Missing: web access cannot start.
@@ -178,11 +192,10 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       for (const [k, v] of Object.entries(HEADERS)) res.setHeader(k, v);
       if (!await accepts(req).catch(() => false)) return void res.writeHead(403).end();
       if (req.url === '/ca.cer') return void res.writeHead(200, { 'Content-Type': 'application/pkix-cert' }).end(tls.ca.raw);
-      if (reads >= 4) return void res.writeHead(503).end();
-      reads++;
+      if (!await readSlot()) return void (res.destroyed || res.writeHead(503).end());
       try { await staticFile(assets, req.url ?? '', res); }
       catch { if (!res.destroyed) res.writeHead(404).end(); }
-      finally { reads--; }
+      finally { freeSlot(); }
     };
     const server = https({ key: tls.key, cert: tls.cert.toString() + tls.intermediate.toString(), minVersion: 'TLSv1.2',
       handshakeTimeout: 5000 }, handle);

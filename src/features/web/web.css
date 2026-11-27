@@ -56,10 +56,11 @@
   user-select: all;
 }
 
-.web-link .copy-btn,
-.web-link .icon-btn {
+/* The glyph sits a word space after the address: the button's own inset taken back. */
+.web-link .copy-btn {
   flex-shrink: 0;
   margin-block: -4px;
+  margin-left: -4px;
 }
 
 /* The root's SHA-256 as the tablet's certificate details show it: four lines of eight pairs. */

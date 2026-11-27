@@ -410,6 +410,8 @@ it('exposes chat fields only on hello, pages, snapshots and live updates', async
   rt.enqueue('unopened-queue');
   const hello = (await c.call('app.hello')).result;
   expect(hello).toMatchObject({ settings: {}, providers: [], projects: [], sessions: [{ id: rt.id, cwd: '' }] });
+  // Exactly the empty maps the client indexes by agent (it crashed on a bare {}), nothing of the desktop's.
+  expect(hello.settings).toEqual({ defaultModels: {}, defaultEfforts: {}, defaultModes: {} });
   expect(JSON.stringify(c.frames)).not.toContain('unopened-queue');
   for (const method of ['phone.sessions','session.snapshot','phone.tail']) expect((await c.call(method, { sessionId: rt.id })).ok).toBe(true);
   rt.update({ remote: { ...remote, status: 'connected' } });
@@ -557,11 +559,18 @@ it('bounds simultaneous static asset reads before pairing', async () => {
       res => { res.resume(); res.once('end', () => resolve(res.statusCode)); }).on('error', reject);
   });
   const inFlight = Promise.allSettled(Array.from({ length: 4 }, get));
+  let waited: Promise<PromiseSettledResult<number | undefined>[]>;
   try {
     await vi.waitFor(() => expect(pending).toHaveBeenCalledTimes(4));
+    // More wait for a free read (a page loads its script, styles and fonts at once), never read beside the four.
+    waited = Promise.allSettled(Array.from({ length: 16 }, get));
+    await new Promise(r => setTimeout(r, 1500));
+    expect(pending).toHaveBeenCalledTimes(4);
+    // Past sixteen waiting: refused at once.
     expect(await get()).toBe(503);
   } finally { release(); pending.mockRestore(); }
   expect(await inFlight).toEqual(Array(4).fill({ status: 'fulfilled', value: 200 }));
+  expect(await waited!).toEqual(Array(16).fill({ status: 'fulfilled', value: 200 }));
 });
 
 it('drops queued authority on restart when disabling could not save its generation', async () => {
