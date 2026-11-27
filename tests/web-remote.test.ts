@@ -31,7 +31,7 @@ afterEach(async () => {
   clearance.ships = true;
   vi.restoreAllMocks();
 });
-function fixture(ports: { port?: number } = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
+function fixture(ports: { port?: number; showSave?: (defaultPath: string) => Promise<string | undefined> } = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
   const home = existingHome ?? mkdtempSync(path.join(process.env.TEMP!, 'web-test-'));
   if (!existingHome) homes.push(home);
   let release!: () => void;
@@ -141,6 +141,36 @@ it('chooses a free HTTPS port and releases it on dispose', async () => {
       await new Promise<void>((resolve, reject) => replacement.once('error', reject).listen(state.port, '127.0.0.1', resolve));
     } finally { await new Promise<void>(r => replacement.close(() => r())); }
   } finally { await new Promise<void>(r => busy.close(() => r())); }
+});
+
+it('saves the public root where the person picks, gives the address as a QR code and says when the client is missing', async () => {
+  // Before web access ever started there is no root to save.
+  expect(await fixture().app.call('web.saveCa', {})).toEqual({ ok: false, missing: true });
+  let offered: string | undefined;
+  const picked: { file?: string } = {};
+  const h = await setup(fixture({ showSave: async (p) => { offered = p; return picked.file; } }));
+  picked.file = path.join(h.home, 'saved.cer');
+  expect(await h.app.call('web.saveCa', {})).toEqual({ ok: true, path: picked.file });
+  expect(readFileSync(picked.file)).toEqual(h.ca.raw);
+  expect(path.basename(offered!)).toBe('Sable certificate.cer');
+  picked.file = undefined;
+  expect(await h.app.call('web.saveCa', {})).toEqual({ ok: false, canceled: true });
+  const s = await h.app.call('web.state', {});
+  expect(s.assets).toBe(true);
+  expect(s.addressQr).toMatchObject({ link: 'https://10.0.0.7:' + s.port + '/', size: expect.any(Number) });
+  expect(s.addressQr!.qr).toMatch(/^M/);
+  // No desktop shell (a test runs in plain Node): the window downloads the bytes itself.
+  expect(process.versions.electron).toBeUndefined();
+  const bare = await setup();
+  expect(await bare.app.call('web.saveCa', {})).toEqual({ ok: false, unsupported: true, der: bare.ca.raw.toString('base64') });
+  // A build without the web client: web.state says so, and turning web access on starts nothing.
+  rmSync(path.join(bare.assets, 'index.html'));
+  expect((await bare.app.call('web.state', {})).assets).toBe(false);
+  const missing = fixture();
+  rmSync(path.join(missing.assets, 'index.html'));
+  await missing.app.call('app.setSettings', { patch: { webRemote: true } });
+  const off = await missing.app.call('web.state', {});
+  expect(off).toMatchObject({ listening: false, assets: false, error: 'Packaged web assets are unavailable.' });
 });
 
 it('serves only contained assets and the public CA, requires the exact Host, GET, upgrade route and Origin', async () => {

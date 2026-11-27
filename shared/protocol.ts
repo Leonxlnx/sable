@@ -2150,6 +2150,10 @@ export interface WebState {
   request?: PhoneStatus['request'];
   pairing?: PhoneStatus['pairing'];
   error?: string;
+  /** False: this build carries no web client (`resources/web`), so web access cannot start. */
+  assets?: boolean;
+  /** While it listens: the address to open on a tablet (`https://<address>:<port>/`) as a QR code (SVG path data on a `size` grid). */
+  addressQr?: { link: string; qr: string; size: number };
 }
 
 export interface PhoneStatus {
@@ -2997,6 +3001,12 @@ export interface RpcMethods {
   'web.offer': { params: { cancel?: boolean }; result: WebState };
   'web.approve': { params: { requestId: string; allow: boolean }; result: WebState };
   'web.revoke': { params: { deviceId: string }; result: WebState };
+  /**
+   * Writes the public root (`<home>/web/ca.cer`) where the person picks in the desktop's save dialog,
+   * for sending it to a tablet another way. Without a desktop shell: `unsupported` with the DER bytes
+   * (base64) for the window to download. `missing`: no root exists yet (web access never started).
+   */
+  'web.saveCa': { params: Record<string, never>; result: { ok: boolean; path?: string; canceled?: boolean; unsupported?: boolean; missing?: boolean; der?: string } };
   'phone.status': { params: Record<string, never>; result: PhoneStatus };
   /** Starts or stops the LAN endpoint (remembered across restarts). Turning it off ends every phone connection. */
   'phone.setEnabled': { params: { on: boolean }; result: PhoneStatus };

@@ -1,0 +1,175 @@
+/* Settings › Phone › Web access (WebAccess.tsx). The phone page's own parts (rows, cards, the ask card,
+   the link well) where they fit; only what the web section adds is here. */
+
+.web-access {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+  /* The top bar's mark scrolls the section to the top of the pane: not under the pane's fade. */
+  scroll-margin-top: 12px;
+}
+
+/* One hairline between the card's blocks, as between its rows. */
+.web-net,
+.web-net + .set-row,
+.web-pair,
+.web-dev + .web-dev {
+  border-top: 1px solid var(--line);
+}
+
+/* "Network" heads its list: the list follows the label on the card's text edge. (Two classes more than
+   settings.css's row rules, which load after this file.) */
+.web-access .web-net > .set-row {
+  min-height: 0;
+  padding-bottom: 4px;
+}
+
+.web-net-list {
+  padding-top: 0;
+}
+
+.web-net-addr {
+  flex-shrink: 0;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.web-net-list .pick[aria-checked='true'] .web-net-addr {
+  color: var(--text-2);
+}
+
+/* An address in a help line: the words in the line's tone, the address a step clearer, its copy button beside it. */
+.web-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.web-link-text {
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: all;
+}
+
+.web-link .copy-btn,
+.web-link .icon-btn {
+  flex-shrink: 0;
+  margin-block: -4px;
+}
+
+/* The root's SHA-256 as the tablet's certificate details show it: four lines of eight pairs. */
+.web-fp {
+  display: grid;
+  gap: 1px;
+  margin-top: 8px;
+}
+
+.web-fp-head {
+  margin-bottom: 3px;
+}
+
+.web-fp-line {
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+  line-height: 1.55;
+  color: var(--text-2);
+  white-space: pre;
+}
+
+.web-step {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.web-step-n {
+  color: var(--text-3);
+}
+
+/* The QR codes: a light well with the same quiet corner as the phone's. */
+.web-qr,
+.web-qr-small {
+  flex-shrink: 0;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: #f2f1ee;
+}
+
+.web-qr {
+  width: 176px;
+}
+
+.web-qr-small {
+  width: 88px;
+}
+
+.web-qr svg,
+.web-qr-small svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.web-pair {
+  display: flex;
+  gap: 20px;
+  padding: 16px;
+  align-items: flex-start;
+}
+
+.web-pair-side {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.web-pair-how {
+  margin: -6px 0 4px;
+  font-size: var(--t-small);
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* A notice from the bridge: a replaced root (amber, it needs the person) or a change not saved (red). */
+.web-note {
+  padding: 12px 16px;
+  border-radius: var(--r-lg);
+  font-size: var(--t-small);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.web-note::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 8px;
+  border-radius: 50%;
+  vertical-align: 1px;
+  background: var(--amber);
+}
+
+.web-note[data-tone='error']::before {
+  background: var(--red);
+}
+
+/* A narrow dialog: the pairing code stands above its words, the address's code under the address. */
+@container (max-width: 520px) {
+  .web-pair {
+    flex-direction: column;
+  }
+
+  .web-access .set-row:has(> .set-row-control > .web-qr-small) {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+}

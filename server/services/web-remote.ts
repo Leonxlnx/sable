@@ -3,7 +3,8 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { pipeline } from 'node:stream/promises';
 import type { Duplex } from 'node:stream';
 import path from 'node:path';
-import { existsSync } from 'node:fs';
+import { X509Certificate } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { webNetworks } from './web-networks';
 import { realpath } from 'node:fs/promises';
 import { WebSocketServer } from 'ws';
@@ -12,6 +13,7 @@ import { openContained, within } from '../core/contain';
 import type { App } from '../app';
 import type { PhoneService } from './phone';
 import { webCertificates, privateIPv4, webHostname } from './web-cert';
+import { qrSvgPath } from './qr';
 
 /** The owner transfers ca.cer over an authenticated channel before opening the web client. */
 export interface WebOptions {
@@ -20,6 +22,27 @@ export interface WebOptions {
   /** Bind fixtures to loopback while exercising the production Host and TLS checks. */
   loopback?: boolean;
   port?: number;
+  /** Where "Save certificate" writes (tests); by default the desktop shell's save dialog. */
+  showSave?: (defaultPath: string) => Promise<string | undefined>;
+}
+
+/** The desktop shell's save dialog for the public root, or undefined without a shell (the dev server). */
+async function electronSave(): Promise<((defaultPath: string) => Promise<string | undefined>) | undefined> {
+  if (!process.versions.electron) return undefined;
+  const { BrowserWindow, dialog } = await import('electron');
+  return async (defaultPath) => {
+    const owner = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows().find(w => !w.isDestroyed());
+    const opts = { title: 'Save certificate', defaultPath, buttonLabel: 'Save', filters: [{ name: 'Certificate', extensions: ['cer'] }],
+      properties: ['createDirectory', 'showOverwriteConfirmation'] as ('createDirectory' | 'showOverwriteConfirmation')[] };
+    const r = owner ? await dialog.showSaveDialog(owner, opts) : await dialog.showSaveDialog(opts);
+    return r.canceled || !r.filePath ? undefined : r.filePath;
+  };
+}
+
+/** Where the save dialog starts: the Downloads folder. */
+async function downloads() {
+  try { return (await import('electron')).app.getPath('downloads'); }
+  catch { return path.join(process.env.USERPROFILE ?? process.env.HOME ?? '.', 'Downloads'); }
 }
 export interface WebChannel {
   active(): boolean;
@@ -71,11 +94,22 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   let timer: NodeJS.Timeout | undefined, expiry: NodeJS.Timeout | undefined;
   const active = () => enabled() && !!port && networkId === selection();
   const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
-  const root = opts.assets ?? (resources && path.join(resources, 'web'));
+  // The packaged client (`resources/web`, scripts/build-electron.mjs), or a checkout's own web build when
+  // the bridge runs from source (the dev server has no resources folder). Missing: web access cannot start.
+  // A folder named in the options is the only one looked at.
+  const assetsRoot = () => (opts.assets !== undefined ? [opts.assets] : [resources && path.join(resources, 'web'), !resources ? path.resolve('mobile/dist-web') : undefined])
+    .find((dir): dir is string => !!dir && existsSync(path.join(dir, 'index.html')));
   function manage() {
     if (!WEB_SHIPS || disposed) throw Error('Web access is off.');
     return channel ??= makeChannel({ active, changed, connected: (id, at) => { if (!since.has(id)) since.set(id, at); },
       link: (key, fp) => 'https://' + certs!.addresses[0] + ':' + port + '/#p=' + key + '&f=' + fp });
+  }
+  let shownQr: WebState['addressQr'];
+  function addressQr() {
+    const link = active() && certs ? 'https://' + certs.addresses[0] + ':' + port + '/' : undefined;
+    if (!link) return undefined;
+    if (shownQr?.link !== link) { const { path: qr, size } = qrSvgPath(link); shownQr = { link, qr, size }; }
+    return shownQr;
   }
   function state(): WebState {
     const status = channel?.status(), devices = status?.devices ?? [];
@@ -83,7 +117,8 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     for (const id of since.keys()) if (!clients.some(c => c.id === id)) since.delete(id);
     return { listening: active(), addresses: certs?.addresses ?? [], port, devices, clients, networks,
       hostname: certs?.host, caFingerprint: certs?.ca.fingerprint256, caReplacement: certs?.replacement, pairing: status?.pairing,
-      request: status?.request, revocationDurable: !status?.saveError, error: error ?? status?.saveError ?? status?.error };
+      request: status?.request, revocationDurable: !status?.saveError, error: error ?? status?.saveError ?? status?.error,
+      assets: !!assetsRoot(), addressQr: addressQr() };
   }
   function changed() { if (!disposed) app.emit({ type: 'web.updated', state: state() }); }
   function stop() {
@@ -118,8 +153,8 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       return;
     }
     if (port) { stop(); sync(); return; }
-    if (!root) throw Error('Packaged web assets are unavailable.');
-    const assets = root;
+    const assets = assetsRoot();
+    if (!assets) throw Error('Packaged web assets are unavailable.');
     const tls = webCertificates(app.store.dir, [selected.address]);
     const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
     hub = wss;
@@ -233,6 +268,20 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   });
   app.register('web.approve', ({ requestId, allow }) => { ready().approve(requestId, allow === true); return state(); });
   app.register('web.revoke', ({ deviceId }) => { manage().revoke(deviceId); return state(); });
+  // The public root only (what `/ca.cer` serves), checked to be a CA certificate before it is written.
+  app.register('web.saveCa', async () => {
+    if (!WEB_SHIPS) throw Error('Web access is off.');
+    const file = path.join(app.store.dir, 'web', 'ca.cer');
+    let ca = certs?.ca;
+    if (!ca && existsSync(file)) { try { ca = new X509Certificate(readFileSync(file)); } catch { ca = undefined; } }
+    if (!ca?.ca) return { ok: false, missing: true };
+    const show = opts.showSave ?? await electronSave();
+    if (!show) return { ok: false, unsupported: true, der: ca.raw.toString('base64') };
+    const target = await show(path.join(await downloads(), 'Sable certificate.cer'));
+    if (!target) return { ok: false, canceled: true };
+    writeFileSync(target, ca.raw);
+    return { ok: true, path: target };
+  });
   const off = app.subscribe(e => { if (e.type === 'settings.updated') sync(); });
   app.closeWebIngress = () => { disposed = true; off(); clearInterval(timer); stop(); };
   app.onDispose(async () => { await channel?.dispose(); });

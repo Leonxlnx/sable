@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import type { PhoneStatus } from '@shared/protocol';
+import { WEB_SHIPS, type PhoneStatus } from '@shared/protocol';
+import { WebAccess } from '@/features/web/WebAccess';
 import { Icon } from '@/icons';
 import { bridge } from '@/lib/bridge';
 import { setSettings } from '@/state/actions';
@@ -164,6 +165,9 @@ export function Phone() {
           ))}
         </Card>
       )}
+
+      {/* Sable in a browser on a tablet (switched off until it ships: shared/protocol.ts WEB_SHIPS). */}
+      {WEB_SHIPS && <WebAccess />}
     </div>
   );
 }
