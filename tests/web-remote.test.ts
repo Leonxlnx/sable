@@ -16,6 +16,7 @@ import { App, type AppOptions } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
 import { registerPhone } from '../server/services/phone';
 import { WEB_METHODS, type WebState } from '../shared/protocol';
+import type { WebOptions } from '../server/services/web-remote';
 import { pskOfKey, pskOfToken, startHandshake } from '../mobile/src/lib/secure';
 import { beside, fingerprintIn, handshake, keyOf, pairSecure, wireClient } from './phone-wire';
 
@@ -31,7 +32,7 @@ afterEach(async () => {
   clearance.ships = true;
   vi.restoreAllMocks();
 });
-function fixture(ports: { port?: number; showSave?: (defaultPath: string) => Promise<string | undefined>; networks?: () => { id: string; name: string; address: string }[] } = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
+function fixture(ports: Pick<WebOptions, 'port' | 'showSave' | 'networks' | 'lookTimes'> = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
   const home = existingHome ?? mkdtempSync(path.join(process.env.TEMP!, 'web-test-'));
   if (!existingHome) homes.push(home);
   let release!: () => void;
@@ -173,26 +174,94 @@ it('saves the public root where the person picks, gives the address as a QR code
   expect(off).toMatchObject({ listening: false, assets: false, error: 'Packaged web assets are unavailable.' });
 });
 
-it('keeps listening and keeps its browsers through a network inventory that fails, but admits nothing on it', async () => {
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+/** The page's own GET, as a tablet asks it: its status. */
+function page(h: Awaited<ReturnType<typeof setup>>, route = '/') {
+  return new Promise<number | undefined>((resolve, reject) => {
+    https.get({ host: '127.0.0.1', path: route, servername: h.s.hostname, port: h.s.port, ca: h.ca.toString(), agent: false, headers: { Host: h.host } },
+      res => { res.resume(); res.once('end', () => resolve(res.statusCode)); }).on('error', reject);
+  });
+}
+/** A socket of the page's own: open, or the refusal's status. */
+function upgrade(ws: WebSocket) {
+  return new Promise<string>((resolve) => {
+    ws.once('open', () => { resolve('open'); ws.close(); });
+    ws.once('unexpected-response', (_q, r) => resolve(String(r.statusCode)));
+    ws.once('error', () => resolve('error'));
+  });
+}
+
+// Found by the first end-to-end run in the packaged app: every request and every upgrade waited for a fresh
+// PowerShell look at the networks (5 to 17 s under load, failing 5 times in 12, and a failure refused it).
+it('answers requests on the kept look at once, keeps its browsers through failing looks while the last good one holds, then stops and says why', async () => {
   const nets = [{ id: 'home/adapter/10.0.0.7', name: 'Home', address: '10.0.0.7' }];
-  const inventory = { fail: false };
-  const h = await setup(fixture({ networks: () => { if (inventory.fail) throw Error('Command failed: powershell.exe (timed out)'); return nets; } }));
+  const inventory = { fail: false, slow: 0, runs: 0, ended: 0 };
+  const h = await setup(fixture({ lookTimes: { fresh: 300, idle: 900, hold: 4000 }, networks: async () => {
+    inventory.runs++;
+    try {
+      if (inventory.slow) await sleep(inventory.slow);
+      if (inventory.fail) throw Error('Command failed: powershell.exe (timed out)');
+      return nets;
+    } finally { inventory.ended++; }
+  } }));
   const p = await h.pair();
   let closed = false;
   void p.c.closed.then(() => { closed = true; });
+  // A look that takes a second holds no request: the kept look answers, the new look runs behind it.
+  inventory.slow = 1000;
+  await sleep(350);
+  const asked = performance.now();
+  expect(await page(h)).toBe(200);
+  expect(await upgrade(h.ws())).toBe('open');
+  expect(performance.now() - asked).toBeLessThan(700);
+  await vi.waitFor(() => expect(inventory.ended).toBe(inventory.runs), { timeout: 5000 });
+  inventory.slow = 0;
+  // Looks fail from now on: nothing changes while the last good look holds (two minutes; 4 s here).
   inventory.fail = true;
-  // Any settings change runs the same check the 5 s timer runs.
-  await h.app.call('app.setSettings', { patch: { webSteerDanger: false } });
-  const s = await h.app.call('web.state', {});
-  expect(s).toMatchObject({ listening: true, port: h.s.port, error: undefined });
-  expect(s.clients.map(c => c.id)).toEqual([p.deviceId]);
-  await new Promise(r => setTimeout(r, 300));
+  const failing = inventory.runs;
+  await sleep(700);
+  expect(inventory.runs).toBeGreaterThan(failing);
+  const held = await h.app.call('web.state', {});
+  expect(held).toMatchObject({ listening: true, port: h.s.port, error: undefined });
+  expect(held.clients.map(c => c.id)).toEqual([p.deviceId]);
   expect(closed).toBe(false);
-  // Admission still needs an inventory that succeeds: a new socket is refused meanwhile.
-  const fresh = h.ws();
-  await expect(new Promise((resolve, reject) => { fresh.once('open', resolve); fresh.once('error', reject); fresh.once('unexpected-response', (_q, r) => reject(Error(String(r.statusCode)))); })).rejects.toThrow(/403/);
+  expect(await page(h)).toBe(200);
+  // Then the listener stops, its browsers go, and web.state says why.
+  await vi.waitFor(async () => expect((await h.app.call('web.state', {})).listening).toBe(false), { timeout: 8000, interval: 100 });
+  expect((await h.app.call('web.state', {})).error).toMatch(/Could not read this computer’s networks for two minutes/);
+  await p.c.closed;
+  // A look that succeeds again starts it again.
   inventory.fail = false;
-  expect((await p.c.call('app.hello')).ok).toBe(true);
+  await vi.waitFor(async () => expect((await h.app.call('web.state', {})).listening).toBe(true), { timeout: 8000, interval: 100 });
+  expect((await h.app.call('web.state', {})).error).toBeUndefined();
+});
+
+it('runs nothing while off, a look at most once per idle period at rest, and one per fresh period while a browser is connected', async () => {
+  let runs = 0;
+  const nets = [{ id: 'home/adapter/10.0.0.7', name: 'Home', address: '10.0.0.7' }];
+  const f = fixture({ lookTimes: { fresh: 100, idle: 1000, hold: 60_000 }, networks: () => { runs++; return nets; } });
+  await sleep(1200);
+  expect(runs).toBe(0);
+  const h = await setup(f);
+  // The start's look, and the one Settings' first read asks for when the start took longer than `fresh`.
+  await sleep(200);
+  const on = runs;
+  expect(on).toBeGreaterThanOrEqual(1);
+  expect(on).toBeLessThanOrEqual(3);
+  // At rest: once per idle period (it would be thirty times at the connected pace).
+  await sleep(3000);
+  expect(runs - on).toBeGreaterThanOrEqual(2);
+  expect(runs - on).toBeLessThanOrEqual(4);
+  const p = await h.pair();
+  const paired = runs;
+  await sleep(1000);
+  expect(runs - paired).toBeGreaterThanOrEqual(4);
+  expect(runs - paired).toBeLessThanOrEqual(11);
+  await h.app.call('app.setSettings', { patch: { webRemote: false } });
+  await p.c.closed;
+  const off = runs;
+  await sleep(1500);
+  expect(runs).toBe(off);
 });
 
 it('serves only contained assets and the public CA, requires the exact Host, GET, upgrade route and Origin', async () => {
@@ -498,8 +567,9 @@ it.each([true, false])('keeps offline revoke effective across restart with regis
   expect((await handshake(restarted.wire(), 'hello', p.fp, await pskOfToken(p.token), p.deviceId)).denied).toBeTruthy();
 });
 
-it('requires a selected network and rejects a different network on the same adapter and IP', async () => {
-  const f = fixture();
+it('requires a selected network, and stops within one fresh period when it changes, also to another network on the same adapter and IP', async () => {
+  // Looks every 500 ms while a browser is connected (30 s in the app: web-look.test.ts), every 5 s at rest.
+  const f = fixture({ lookTimes: { fresh: 500, idle: 5000, hold: 10_000 } });
   delete f.app.store.state.settings.webNetwork;
   await f.app.call('app.setSettings', { patch: { webRemote: true } });
   const initial = await f.app.call('web.state', {});
@@ -509,11 +579,27 @@ it('requires a selected network and rejects a different network on the same adap
   await f.app.call('app.setSettings', { patch: { webNetwork: f.networks[0].id } });
   const h = await setup(f), p = await h.pair();
   expect(h.s.addresses).toEqual(['10.0.0.7']);
+  const changed = performance.now();
   f.networks[0] = { ...f.networks[0], id: 'hotel/adapter/10.0.0.7' };
-  await expect(h.wire().open).rejects.toThrow();
-  await f.app.call('app.setSettings', { patch: {} });
-  expect((await f.app.call('web.state', {})).listening).toBe(false);
   await p.c.closed;
+  // Seen by the next look while connected (500 ms), not the one at rest (5 s).
+  expect(performance.now() - changed).toBeLessThan(2500);
+  const s = await f.app.call('web.state', {});
+  expect(s.listening).toBe(false);
+  expect(s.error).toMatch(/selected home network changed/);
+  await expect(h.wire().open).rejects.toThrow();
+});
+
+it('notices the change at the first request after a rest, before the next look at rest is due', async () => {
+  const f = fixture({ lookTimes: { fresh: 300, idle: 60_000, hold: 120_000 } });
+  const h = await setup(f);
+  await sleep(400);
+  f.networks[0] = { ...f.networks[0], id: 'hotel/adapter/10.0.0.7' };
+  // Admitted on the kept look, which is older than 300 ms: a look runs behind it at once and stops the
+  // listener (which may cut this very request off).
+  await page(h).catch(() => undefined);
+  await vi.waitFor(async () => expect((await f.app.call('web.state', {})).listening).toBe(false), { timeout: 3000, interval: 50 });
+  await expect(page(h)).rejects.toThrow();
 });
 
 it.each([true, false])('invalidates pending desktop approval when an offer is cancelled or replaced (%s)', async cancel => {

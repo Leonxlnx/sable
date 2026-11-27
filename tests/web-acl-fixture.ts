@@ -17,19 +17,18 @@ export function restoreWebAcl(home: string) {
     { windowsHide: true, env: { ...process.env, SABLE_TEST_RESTORE: dir } });
 }
 
-vi.mock('node:child_process', async original => {
-  const actual = await original<typeof import('node:child_process')>();
-  return { ...actual, execFileSync: (...args: Parameters<typeof actual.execFileSync>) => {
-    const [file, , options] = args;
-    const env = options && typeof options === 'object' && 'env' in options && options.env;
-    if (env && process.env.SABLE_TEST_WEB_ACL_FIXTURE === '1' && process.platform === 'win32' &&
-        path.basename(file).toLowerCase() === 'powershell.exe') {
+// web-cert.ts runs its PowerShell through web-run.ts (from a worker thread). With SABLE_TEST_WEB_ACL_FIXTURE=1
+// (a sandbox where Windows ACLs cannot be set) the folder's DACL and the key reads are stood in for.
+vi.mock('../server/services/web-run', async original => {
+  const actual = await original<typeof import('../server/services/web-run')>();
+  return { ...actual, runOff: (file: string, args: string[], env: NodeJS.ProcessEnv, opts?: { timeout?: number; maxBuffer?: number }) => {
+    if (process.env.SABLE_TEST_WEB_ACL_FIXTURE === '1' && process.platform === 'win32' && path.basename(file).toLowerCase() === 'powershell.exe') {
       if (env.SABLE_WEB_KEY_DIR && fixtureDir(env.SABLE_WEB_KEY_DIR)) {
         mkdirSync(env.SABLE_WEB_KEY_DIR, { recursive: true });
-        return Buffer.alloc(0);
+        return Promise.resolve(Buffer.alloc(0));
       }
-      if (env.SABLE_WEB_PRIVATE_FILE && fixtureDir(path.dirname(env.SABLE_WEB_PRIVATE_FILE))) return readFileSync(env.SABLE_WEB_PRIVATE_FILE);
+      if (env.SABLE_WEB_PRIVATE_FILE && fixtureDir(path.dirname(env.SABLE_WEB_PRIVATE_FILE))) return Promise.resolve(readFileSync(env.SABLE_WEB_PRIVATE_FILE));
     }
-    return actual.execFileSync(...args);
+    return actual.runOff(file, args, env, opts);
   } };
 });

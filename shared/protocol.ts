@@ -2134,9 +2134,12 @@ export interface PhoneDevice {
 }
 
 export const WEB_SHIPS = false;
-export interface WebNetwork { id: string; name: string; address: string }
+/** A network web access can serve on: a Wi-Fi by its name, an Ethernet by its adapter's (server/services/web-networks.ts). */
+export interface WebNetwork { id: string; name: string; address: string; kind?: 'wifi' | 'ethernet' }
 export interface WebState {
   networks?: WebNetwork[];
+  /** Connected Wi-Fi or Ethernet networks Windows calls public: never served on (Settings says to make one private). */
+  publicNetworks?: string[];
   caReplacement?: string;
   revocationDurable?: boolean;
   listening: boolean;

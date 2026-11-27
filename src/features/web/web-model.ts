@@ -38,6 +38,11 @@ export function sinceWords(ts: number, now: number): string {
   return at.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 }
 
+/** "Home", "Home and Office", "Home, Office and Lab". */
+function listWords(names: string[]): string {
+  return names.length < 2 ? (names[0] ?? '') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
 /** "now", "5m ago", "on 3 Nov" (as Settings › Phone says it). */
 function ago(ts: number, now: number) {
   const s = Math.max(0, Math.round((now - ts) / 1000));
@@ -94,8 +99,13 @@ export function webSection(s: WebState, settings: WebSettings, now: number): Web
 
   let networkHelp: string | undefined;
   if (on && assets) {
-    if (!networks.length) networkHelp = 'No home network is connected';
-    else if (chosenId && !chosen) networkHelp = 'The chosen network is not connected';
+    // Only private networks are served on; a connected public one (often a home Wi-Fi) is named, so the person knows what to change.
+    const open = s.publicNetworks ?? [];
+    if (chosenId && !chosen && networks.length) networkHelp = 'The chosen network is not connected';
+    else if (open.length) networkHelp = open.length > 1
+      ? `${listWords(open)} are public networks in Windows. Make one private to use it here.`
+      : `${open[0]} is a public network in Windows. Make it private to use it here.`;
+    else if (!networks.length) networkHelp = 'No home network is connected';
   }
 
   // The bridge's own words, unless a line above already says it: no network chosen or connected, or no client in this build.

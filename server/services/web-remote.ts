@@ -5,7 +5,8 @@ import type { Duplex } from 'node:stream';
 import path from 'node:path';
 import { X509Certificate } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { webNetworks } from './web-networks';
+import { servable, webNetworks, type ReadNetwork } from './web-networks';
+import { LOOK_MS, NetworkLook, nextLookIn, type LookTimes } from './web-look';
 import { realpath } from 'node:fs/promises';
 import { WebSocketServer } from 'ws';
 import { WEB_SHIPS, type WebNetwork, type WebState } from '../../shared/protocol';
@@ -18,7 +19,9 @@ import { qrSvgPath } from './qr';
 /** The owner transfers ca.cer over an authenticated channel before opening the web client. */
 export interface WebOptions {
   assets?: string;
-  networks?: () => WebNetwork[] | Promise<WebNetwork[]>;
+  networks?: () => ReadNetwork[] | Promise<ReadNetwork[]>;
+  /** How long a look at the networks is kept and how often one runs by itself (tests shorten them). */
+  lookTimes?: Partial<LookTimes>;
   /** Bind fixtures to loopback while exercising the production Host and TLS checks. */
   loopback?: boolean;
   port?: number;
@@ -58,8 +61,10 @@ const HEADERS = {
   'Cache-Control': 'no-store',
 };
 const types: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.woff': 'font/woff', '.svg': 'image/svg+xml', '.png': 'image/png' };
-type Certificates = ReturnType<typeof webCertificates>;
+type Certificates = Awaited<ReturnType<typeof webCertificates>>;
 function rawHeaders() { return Object.entries(HEADERS).map(([key, value]) => key + ': ' + value); }
+/** web.state's error once no look at the networks has succeeded for `hold` (two minutes). */
+const LOST = 'Could not read this computer’s networks for two minutes, so web access stopped. Sable tries again every minute.';
 function refuse(socket: NodeJS.WritableStream) {
   socket.end(['HTTP/1.1 403 Forbidden', ...rawHeaders(), 'Connection: close', 'Content-Length: 0', '', ''].join('\r\n'));
 }
@@ -89,10 +94,20 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   let disposed = false, epoch = 0, reads = 0;
   let channel: PhoneService | undefined, hub: WebSocketServer | undefined;
   let certs: Certificates | undefined, port: number | undefined, networkId: string | undefined;
-  let networks: WebNetwork[] = [], error: string | undefined;
-  let startup: Promise<void> | undefined, inventory: Promise<WebNetwork[]> | undefined;
+  let networks: WebNetwork[] = [], publicNames: string[] = [], error: string | undefined;
+  /** The network and address the listener serves on. */
+  let servingOn: WebNetwork | undefined;
+  let startup: Promise<void> | undefined;
   let timer: NodeJS.Timeout | undefined, expiry: NodeJS.Timeout | undefined;
   const active = () => enabled() && !!port && networkId === selection();
+  // One look at the networks, kept (web-look.ts): nothing waits for a PowerShell run but the first start.
+  // Off-screen checks of the packaged app (loopback: nothing listens on the LAN) may serve on a network
+  // Windows calls public, as a home Wi-Fi often is.
+  const look = new NetworkLook<ReadNetwork>(async () => {
+    const rows = await (opts.networks ?? webNetworks)();
+    return opts.loopback ? rows.map(({ private: _, ...r }) => r) : rows;
+  }, { ...LOOK_MS, ...opts.lookTimes });
+  const connected = () => (hub?.clients.size ?? 0) > 0 || sockets.size > 0;
   // At most four files are read at once. A page asks for more together (script, styles, fonts on up to six
   // connections): those wait for a free read, sixteen at most and 5 s each, then 503 (a refusal at once
   // left a fresh page without its fonts or a lazy chunk).
@@ -130,6 +145,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     const clients = devices.filter(d => d.online).map(d => ({ id: d.id, label: d.name, since: since.get(d.id)! }));
     for (const id of since.keys()) if (!clients.some(c => c.id === id)) since.delete(id);
     return { listening: active(), addresses: certs?.addresses ?? [], port, devices, clients, networks,
+      ...(publicNames.length ? { publicNetworks: publicNames } : {}),
       hostname: certs?.host, caFingerprint: certs?.ca.fingerprint256, caReplacement: certs?.replacement, pairing: status?.pairing,
       request: status?.request, revocationDurable: !status?.saveError, error: error ?? status?.saveError ?? status?.error,
       assets: !!assetsRoot(), addressQr: addressQr() };
@@ -138,7 +154,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   function stop() {
     epoch++;
     clearTimeout(expiry);
-    port = certs = networkId = undefined;
+    port = certs = networkId = servingOn = undefined;
     for (const s of servers) s.close();
     for (const s of sockets) s.destroy();
     servers.clear();
@@ -149,57 +165,88 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     since.clear();
     startup = undefined;
   }
-  function currentNetworks() {
-    return inventory ??= Promise.resolve().then(opts.networks ?? webNetworks).then(rows =>
-      rows.filter((n, i) => privateIPv4(n.address) && rows.findIndex(r => r.id === n.id) === i &&
-        !rows.some(r => r.address === n.address && r.id !== n.id))).finally(() => { inventory = undefined; });
+  /** Takes a look's rows: the list Settings shows, and a listener whose network is gone stops. */
+  function takeRows(rows: ReadNetwork[]) {
+    const next = servable(rows);
+    const listChanged = JSON.stringify([networks, publicNames]) !== JSON.stringify([next.networks, next.publicNames]);
+    networks = next.networks;
+    publicNames = next.publicNames;
+    if (active() && servingOn && !networks.some(n => n.id === servingOn!.id && n.address === servingOn!.address)) {
+      stop();
+      error = 'The selected home network changed. Select an available network on the desktop.';
+      changed();
+      return;
+    }
+    if (listChanged) changed();
+  }
+  /**
+   * A look now (shared with one under way). A look that fails changes nothing while the last good one
+   * holds (two minutes); after that the listener stops and says why, and the next look that succeeds
+   * starts it again.
+   */
+  function lookNow(): Promise<void> {
+    return look.ask().then(takeRows, () => {
+      if (look.rows() || !active()) return;
+      stop();
+      error = LOST;
+      changed();
+    });
+  }
+  /** The next look by itself: every 30 s while a browser is connected, every minute while nothing is, never while off. */
+  function schedule() {
+    clearTimeout(timer);
+    timer = undefined;
+    if (!enabled()) return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      if (!enabled()) return;
+      void lookNow().finally(() => { sync(); schedule(); });
+    }, nextLookIn(look.startedAt, connected(), look.times, Date.now())).unref();
   }
   async function start(generation: number) {
-    let available: WebNetwork[];
-    try { available = await currentNetworks(); }
-    catch (err) {
-      // An inventory that failed (PowerShell slow or timed out under load: 5 to 17 s, every other run, in the
-      // end-to-end check) says nothing about the network. While listening, keep listening and ask again on the
-      // next tick: stopping cut every browser off and brought the listener back 5 s later. Admission is
-      // unchanged: every request still needs an inventory that succeeds and names the chosen network.
-      if (active() && epoch === generation) return;
-      throw err;
+    let rows = look.rows();
+    const unread = look.at === undefined ? 'Could not read this computer’s networks. Sable tries again in a minute.' : LOST;
+    if (!rows) {
+      // The timer's own look just failed: its retry is the next tick, not a second run now.
+      if (look.failure !== undefined && look.triedAt !== undefined && Date.now() - look.triedAt < 1000) throw Error(unread);
+      try { rows = await look.ask(); }
+      catch { throw Error(unread); }
     }
     if (epoch !== generation || !enabled()) return;
-    const inventoryChanged = JSON.stringify(networks) !== JSON.stringify(available);
-    networks = available;
+    const next = servable(rows);
+    const listChanged = JSON.stringify([networks, publicNames]) !== JSON.stringify([next.networks, next.publicNames]);
+    networks = next.networks;
+    publicNames = next.publicNames;
     const selected = networks.find(n => n.id === selection() && privateIPv4(n.address));
-    if (!selected) throw Error('Select an available home network and address on the desktop.');
-    if (active() && certs?.host === webHostname() && certs.addresses[0] === selected.address &&
+    if (!selected) throw Error(/network changed/.test(error ?? '') ? error : 'Select an available home network and address on the desktop.');
+    if (active() && servingOn?.id === selected.id && certs?.host === webHostname() && certs.addresses[0] === selected.address &&
         Date.parse(certs.cert.validTo) - Date.now() >= 30 * 86_400_000 && Date.parse(certs.intermediate.validTo) > Date.now()) {
-      if (inventoryChanged) changed();
+      if (listChanged) changed();
       return;
     }
     if (port) { stop(); sync(); return; }
     const assets = assetsRoot();
     if (!assets) throw Error('Packaged web assets are unavailable.');
-    const tls = webCertificates(app.store.dir, [selected.address]);
+    const tls = await webCertificates(app.store.dir, [selected.address]);
+    if (epoch !== generation || !enabled() || selected.id !== selection()) return;
     const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
     hub = wss;
     wss.on('headers', headers => headers.push(...rawHeaders()));
     wss.on('wsClientError', (_err, socket) => refuse(socket));
-    async function accepts(req: IncomingMessage) {
+    // Answered on the kept look at once (a request never waits for PowerShell); a look older than 30 s is
+    // asked again behind it, and one that finds the network gone stops the listener (takeRows).
+    function accepts(req: IncomingMessage) {
       const peer = req.socket.remoteAddress;
       if (generation !== epoch || !active() || req.method !== 'GET' || req.socket.localPort !== port ||
           req.headersDistinct.host?.length !== 1 || !peer || !(privateIPv4(peer) || opts.loopback && peer === '127.0.0.1') ||
           ![tls.host, selected!.address].some(n => req.headers.host === n + ':' + port)) return false;
-      const current = await currentNetworks();
-      if (generation !== epoch || !active()) return false;
-      if (current.some(n => n.id === selected!.id && n.address === selected!.address)) return true;
-      stop();
-      networks = current;
-      error = 'The selected home network changed. Select an available network on the desktop.';
-      changed();
-      return false;
+      if (!look.rows() || !networks.some(n => n.id === selected!.id && n.address === selected!.address)) return false;
+      if (look.stale() && !look.looking) void lookNow();
+      return true;
     }
     const handle = async (req: IncomingMessage, res: ServerResponse) => {
       for (const [k, v] of Object.entries(HEADERS)) res.setHeader(k, v);
-      if (!await accepts(req).catch(() => false)) return void res.writeHead(403).end();
+      if (!accepts(req)) return void res.writeHead(403).end();
       if (req.url === '/ca.cer') return void res.writeHead(200, { 'Content-Type': 'application/pkix-cert' }).end(tls.ca.raw);
       if (!await readSlot()) return void (res.destroyed || res.writeHead(503).end());
       try { await staticFile(assets, req.url ?? '', res); }
@@ -213,7 +260,10 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     server.maxRequestsPerSocket = 32;
     server.headersTimeout = server.requestTimeout = 10_000;
     server.on('connection', socket => {
+      // Something connects: looks run every 30 s from now on (once a minute again when the next look finds nothing connected).
+      const first = !sockets.size;
       sockets.add(socket);
+      if (first) schedule();
       socket.once('close', () => sockets.delete(socket));
     });
     server.on('clientError', (_err, socket) => refuse(socket));
@@ -221,7 +271,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     server.on('checkExpectation', handle);
     server.on('upgrade', async (req, socket, head) => {
       if (req.url !== '/sable-web' || req.headersDistinct.origin?.length !== 1 || req.headers.origin !== 'https://' + req.headers.host ||
-          !await accepts(req).catch(() => false) || socket.destroyed || wss.clients.size >= 12) return refuse(socket);
+          !accepts(req) || socket.destroyed || wss.clients.size >= 12) return refuse(socket);
       wss.handleUpgrade(req, socket, head, ws => manage().acceptWeb(ws, req));
     });
     for (let offset = 0; offset <= 10; offset++) {
@@ -244,6 +294,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     if (!enabled() || generation !== epoch || selected.id !== selection()) { server.close(); return; }
     channel = manage();
     networkId = selected.id;
+    servingOn = selected;
     certs = tls;
     port = (server.address() as { port: number }).port;
     error = undefined;
@@ -252,7 +303,9 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   }
   function sync() {
     if (!enabled()) {
-      clearInterval(timer); timer = undefined;
+      // Off: nothing runs at all (no timer, no look), and nothing is kept for the next time.
+      clearTimeout(timer); timer = undefined;
+      look.forget();
       if (startup || port) { stop(); changed(); }
       return;
     }
@@ -260,8 +313,8 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       stop();
       requestedNetwork = selection();
     }
+    if (!timer) schedule();
     if (startup) return;
-    timer ??= setInterval(sync, 5000).unref();
     const generation = epoch;
     const pending = start(generation).catch(err => {
       if (generation !== epoch) return;
@@ -279,6 +332,8 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     if (!WEB_SHIPS) throw Error('Web access is off.');
     await startup;
     if (existsSync(path.join(app.store.dir, 'web', 'pairings.json.closed'))) manage();
+    // Settings opened on a list older than 30 s: it is looked at again behind this answer (web.updated brings it).
+    if (enabled() && look.at !== undefined && look.stale() && !look.looking) void lookNow();
     return state();
   });
   app.register('web.offer', ({ cancel }) => {
@@ -305,7 +360,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     return { ok: true, path: target };
   });
   const off = app.subscribe(e => { if (e.type === 'settings.updated') sync(); });
-  app.closeWebIngress = () => { disposed = true; off(); clearInterval(timer); stop(); };
+  app.closeWebIngress = () => { disposed = true; off(); clearTimeout(timer); timer = undefined; stop(); };
   app.onDispose(async () => { await channel?.dispose(); });
   sync();
 }

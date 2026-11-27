@@ -1,11 +1,13 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, X509Certificate, type KeyObject } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, chmodSync, existsSync, lstatSync, linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
+import { runOff } from './web-run';
 import { isIPv4 } from 'node:net';
 import path from 'node:path';
 
 const DAY = 86_400_000;
+/** Lets the bridge's other work run between the pieces of an issue (keys, files, a process start). */
+const breath = () => new Promise<void>(r => setImmediate(r));
 // The only DER types and OIDs these v3 certificates use.
 function der(tag: number, ...parts: Buffer[]) {
   const body = Buffer.concat(parts);
@@ -55,16 +57,15 @@ export function privateIPv4(ip: string) {
   return a === 10 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 169 && b === 254;
 }
 
-function privateDirectory(dir: string) {
+async function privateDirectory(dir: string) {
   if (existsSync(dir) && !lstatSync(dir).isDirectory()) throw new Error('The web key directory must be a private folder.');
   if (process.platform !== 'win32') {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     return chmodSync(dir, 0o700);
   }
   // chmod on Windows cannot restrict read access. Replace the DACL before creating any secrets.
-  const shell = keyShell();
   try {
-    execFileSync(shell, ['-NoProfile', '-NonInteractive', '-Command', `
+    await powershell(['-NoProfile', '-NonInteractive', '-Command', `
     $ErrorActionPreference = 'Stop'
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $acl = [Security.AccessControl.DirectorySecurity]::new()
@@ -76,8 +77,18 @@ function privateDirectory(dir: string) {
       $dir.SetAccessControl($acl)
     }
     if (!$dir.GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Equals($sid)) { throw 'Unexpected web key directory owner' }`],
-    { windowsHide: true, stdio: ['ignore', 'ignore', 'inherit'], env: { ...process.env, SABLE_WEB_KEY_DIR: dir } });
+    { ...process.env, SABLE_WEB_KEY_DIR: dir });
   } catch (cause) { throw new Error('Could not restrict the web key directory to this Windows user.', { cause }); }
+}
+
+/**
+ * One Windows PowerShell run, off the bridge's thread (each takes 0.5 to 2 s, far more under load: run
+ * synchronously, three of them held every chat for about 2 s while a certificate was issued; and even
+ * the start of a process holds the thread it starts from, so it starts from a worker: web-run.ts). Its
+ * standard output as bytes; a failure carries the exit code as `status`.
+ */
+function powershell(args: string[], env: NodeJS.ProcessEnv): Promise<Buffer> {
+  return runOff(keyShell(), args, env, { timeout: 60_000, maxBuffer: 1 << 20 });
 }
 
 // Publish only a complete file. The provisioning lock covers the whole chain.
@@ -129,14 +140,13 @@ catch {
 }
 [Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length)`;
 
-function readPrivate(file: string) {
+async function readPrivate(file: string) {
   const st = lstatSync(file);
   if (!st.isFile() || st.nlink !== 1) throw Error('Invalid web key file.');
   if (process.platform === 'win32') {
     try {
-      return execFileSync(keyShell(), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(readWindowsKey, 'utf16le').toString('base64')], {
-        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, SABLE_WEB_PRIVATE_FILE: file },
-      });
+      return await powershell(['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(readWindowsKey, 'utf16le').toString('base64')],
+        { ...process.env, SABLE_WEB_PRIVATE_FILE: file });
     } catch (cause) {
       if ((cause as { status?: number }).status === 65) throw Error('Unsafe Windows web key owner or permissions.');
       throw new Error('Windows could not verify the web private key.', { cause });
@@ -176,12 +186,37 @@ function checkNames(host: string, addresses: string[]) {
     throw Error('Invalid local certificate name or address.');
 }
 
+/** A lock older than this was left by a process that ended while it issued (each step is bounded at 60 s). */
+const STALE_LOCK_MS = 5 * 60_000;
+
+/** Issues under way in this process, per key folder: the next waits for the last (the lock file serializes processes). */
+const issuing = new Map<string, Promise<unknown>>();
+
+/**
+ * The chain for these addresses, issued or renewed as needed. Asynchronous: the three PowerShell runs on
+ * Windows (the folder's DACL, the two key reads) go off the bridge's thread; what stays on it (keys,
+ * signatures, small files) takes a few milliseconds. Two calls in one process take turns (a listener
+ * restarted for another network while the first issue still ran found the lock file taken).
+ */
 export function webCertificates(home: string, addresses: string[], computer = hostname(), now = Date.now()) {
+  const dir = path.join(home, 'web');
+  const run = (issuing.get(dir) ?? Promise.resolve()).catch(() => {}).then(() => issue(home, addresses, computer, now));
+  issuing.set(dir, run);
+  const done = () => { if (issuing.get(dir) === run) issuing.delete(dir); };
+  run.then(done, done);
+  return run;
+}
+
+async function issue(home: string, addresses: string[], computer: string, now: number) {
   const dir = path.join(home, 'web'), host = webHostname(computer);
   checkNames(host, addresses);
-  privateDirectory(dir);
-  // Serialize migration and rotation as well as leaf renewal across bridge processes.
+  await privateDirectory(dir);
+  // Serialize migration and rotation as well as leaf renewal across bridge processes. A lock a process
+  // left when it ended mid-issue (older than any issue can take) no longer blocks issuing for good.
   const lock = path.join(dir, 'issuing.lock');
+  try {
+    if (Date.now() - lstatSync(lock).mtimeMs > STALE_LOCK_MS) unlinkSync(lock);
+  } catch { /* none */ }
   const fd = openSync(lock, 'wx', 0o600);
   try {
     const caFile = path.join(dir, 'ca.cer'), issuerFile = path.join(dir, 'issuer.json');
@@ -193,7 +228,7 @@ export function webCertificates(home: string, addresses: string[], computer = ho
     }
     let bundle: ReturnType<typeof newAuthority> | undefined;
     if (existsSync(issuerFile)) {
-      const bytes = readPrivate(issuerFile);
+      const bytes = await readPrivate(issuerFile);
       try {
         bundle = JSON.parse(bytes.toString());
         const issuer = new X509Certificate(bundle!.intermediate), root = new X509Certificate(bundle!.root);
@@ -203,19 +238,23 @@ export function webCertificates(home: string, addresses: string[], computer = ho
       } catch { reason = 'The issuing key or certificate was lost or expired. Remove the old root and install the new root.'; }
     } else if (existsSync(caFile)) reason ??= 'The issuing key was lost. Remove the old root and install the new root.';
     if (!bundle || reason) {
+      await breath();
       bundle = newAuthority(computer, now, reason);
       publish(issuerFile, JSON.stringify(bundle), true);
     }
     const ca = new X509Certificate(bundle.root), intermediate = new X509Certificate(bundle.intermediate);
+    await breath();
     if (!existsSync(caFile) || !ca.raw.equals(readFileSync(caFile))) publish(caFile, ca.raw, true);
     const serverFile = path.join(dir, 'server-key.pem');
+    await breath();
     if (!existsSync(serverFile)) publish(serverFile, pem(newKey()));
-    const key = createPrivateKey(readPrivate(serverFile));
+    const key = createPrivateKey(await readPrivate(serverFile));
     const file = path.join(dir, 'server.cer');
     let leaf = existsSync(file) ? new X509Certificate(readFileSync(file)) : undefined;
     const ips = [...new Set(addresses)].sort();
     const sans = ['DNS:' + host, ...ips.map(ip => 'IP Address:' + ip)].join(', ');
     if (!leaf || !leaf.checkPrivateKey(key) || !leaf.verify(intermediate.publicKey) || leaf.subjectAltName !== sans || Date.parse(leaf.validTo) - now < 30 * DAY) {
+      await breath();
       leaf = issueWebLeaf(createPrivateKey(bundle.key), String(intermediate.toLegacyObject().subject.CN), key, host, ips, now);
       publish(file, leaf.raw, true);
     }
