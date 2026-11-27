@@ -637,6 +637,18 @@ p {
   }
 }
 
+/* the battery saver (lib/saver.ts): the working mark stands whole and still, as under reduced motion */
+html[data-saver] .tiles i {
+  animation: none;
+  opacity: 0.7;
+}
+
+html[data-saver] .shimmer {
+  animation: none;
+  background: none;
+  color: var(--text-2);
+}
+
 .shimmer {
   background: linear-gradient(90deg, var(--text-3) 0%, var(--text) 45%, var(--text-3) 70%) 0 0 / 220% 100%;
   -webkit-background-clip: text;

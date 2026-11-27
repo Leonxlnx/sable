@@ -98,7 +98,9 @@ export async function readAll(force: boolean, onReading?: (keys: Set<string>) =>
 
 /**
  * Limits, in the desktop's usage language (2.18; the sheet of cards it replaces read as cheap): per
- * agent its accounts, nearest their limit first, the one new chats start on with the check; per
+ * agent (its head says how many of its accounts have room) its accounts in the order to use them
+ * (2.22, the desktop's switcher order), the one in use with the switcher's check, those signed out
+ * as quiet rows after them; per
  * account each window as one exact row: its name and the share used ("62% used"), one thin meter that
  * fills as it is used (the dithered head; amber near the cap, red at it, the only colours), an even
  * pace's place as a tick on the meter, and under it when it resets and where the pace leads. One

@@ -1568,3 +1568,30 @@ html[data-away] .sheet-body::before {
   font-size: var(--t-small);
   color: var(--text-3);
 }
+/* ── Share into Sable (screens/ShareSheet.tsx): what was shared, as it will go into the draft, then where ── */
+.share-preview {
+  margin: 0 12px 16px;
+  font-size: var(--t-small);
+  line-height: 1.5;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.share-title {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.share-sheet .choice-aside {
+  max-width: 36%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
