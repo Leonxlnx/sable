@@ -9,18 +9,33 @@ import { reduced } from './motion';
  */
 
 const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-const cache = new Map<string, string>();
 
-function pattern(q: number, color: string, cell: number) {
-  const key = `${q}|${color}|${cell}`;
-  let url = cache.get(key);
-  if (url) return url;
-  let rects = '';
-  for (let i = 0; i < 16; i++) if (BAYER[i] >> 2 === q) rects += `<rect x='${(i & 3) * cell}' y='${(i >> 2) * cell}' width='${cell}' height='${cell}'/>`;
-  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='${4 * cell}' height='${4 * cell}' shape-rendering='crispEdges' fill='${color}'>${rects}</svg>`;
-  url = `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
-  cache.set(key, url);
-  return url;
+/**
+ * One quarter of the 4x4 dither as a canvas of one pixel per cell (2.22), drawn up to the cell size by
+ * the compositor (`image-rendering: pixelated`): a texture of a few thousand pixels where a background
+ * pattern was rastered at the screen's full size four times at the start of every veil (13 MB each on
+ * a 1220 x 2712 phone, and the raster on the first frame of the cover).
+ */
+function quarter(q: number, color: string, cols: number, rows: number, row0: number): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = cols;
+  c.height = rows;
+  const ctx = c.getContext('2d');
+  if (!ctx) return c;
+  // The quarter's four cells of a 4x4 tile, laid over the whole canvas as a pattern (one fill).
+  const t = document.createElement('canvas');
+  t.width = 4;
+  t.height = 4;
+  const tc = t.getContext('2d');
+  if (!tc) return c;
+  tc.fillStyle = color;
+  for (let i = 0; i < 16; i++) if (BAYER[i] >> 2 === q) tc.fillRect(i & 3, i >> 2, 1, 1);
+  const p = ctx.createPattern(t, 'repeat');
+  if (!p) return c;
+  ctx.translate(0, -(row0 & 3));
+  ctx.fillStyle = p;
+  ctx.fillRect(0, 0, cols, rows + 4);
+  return c;
 }
 
 /** A cell that lands on whole device pixels (no seams between cells). */
@@ -59,6 +74,8 @@ export function veil(host: HTMLElement, mode: 'cover' | 'reveal', o: VeilOptions
   const cell = crispCell(o.cell ?? 4);
   const tile = cell * 4;
   const h = host.clientHeight || window.innerHeight;
+  const w = host.clientWidth || window.innerWidth;
+  const cols = Math.ceil(w / cell);
   const bands = Math.max(1, o.bands ?? 1);
   const bandH = Math.ceil(h / bands / tile) * tile;
   const dur = o.duration ?? 260;
@@ -67,11 +84,14 @@ export function veil(host: HTMLElement, mode: 'cover' | 'reveal', o: VeilOptions
   for (let b = 0; b < bands; b++) {
     const band = document.createElement('div');
     const top = b * bandH;
-    band.style.cssText = `position:absolute;left:0;right:0;top:${top}px;height:${b === bands - 1 ? Math.max(bandH, h - top) : bandH}px`;
+    const height = b === bands - 1 ? Math.max(bandH, h - top) : bandH;
+    const rows = Math.ceil(height / cell);
+    band.style.cssText = `position:absolute;left:0;right:0;top:${top}px;height:${height}px;overflow:hidden`;
     const order = o.from === 'bottom' ? bands - 1 - b : b;
     for (let q = 0; q < 4; q++) {
-      const i = document.createElement('i');
-      i.style.cssText = `position:absolute;inset:0;background-image:${pattern(q, o.color, cell)};background-size:${tile}px ${tile}px;background-position:0 ${-top}px;will-change:opacity`;
+      // Each band starts on a whole tile, so its rows continue the dither of the band above.
+      const i = quarter(q, o.color, cols, rows, Math.round(top / cell));
+      i.style.cssText = `position:absolute;left:0;top:0;width:${cols * cell}px;height:${rows * cell}px;image-rendering:pixelated;will-change:opacity`;
       // cover: sparse first; reveal: the last quarter in goes first (solid, checker, sparse, clear).
       const step = mode === 'cover' ? q : 3 - q;
       const at = (o.delay ?? 0) + (order * 0.9 + step) * slot;
