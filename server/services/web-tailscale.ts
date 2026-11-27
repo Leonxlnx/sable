@@ -338,7 +338,8 @@ export class TailscaleServe {
         this.deciding = true;
         let restarted = false;
         try { restarted = await this.restarted(held.daemon); } finally { this.deciding = false; }
-        this.onLost?.(held.target, restarted);
+        // Withdrawn or replaced meanwhile (switched off and on again, the same loopback port): nothing to tell.
+        if (this.held === held) this.onLost?.(held.target, restarted);
       });
       const until = Date.now() + this.times.settle;
       let seen: 'free' | 'ours' | 'taken' = 'free';
