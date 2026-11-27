@@ -117,7 +117,9 @@ function open(rows: TimelineItem[]) {
   const onDisk = () => {
     const fresh = new Store(home);
     const read = fresh.loadSession('c');
-    void fresh.seal().catch(() => {});
+    // Sealed with the others at the test's end, one after another: two stores of one process share the
+    // state file's temp name, and a seal left running here raced the next store's rename (ENOENT, once, under load).
+    stores.push(fresh);
     expect(read.unreadable).toBeFalsy();
     return read.items;
   };
