@@ -102,10 +102,13 @@ button.update-row:active {
   scale: 0.99;
 }
 
-button.update-row:focus-visible,
-.update-cancel:focus-visible {
+button.update-row:focus-visible {
   outline: var(--focus-w) solid var(--focus);
   outline-offset: var(--focus-inset);
+}
+
+button.update-row[data-state='open'] {
+  background-color: var(--fill-2);
 }
 
 .update-icon {
@@ -125,43 +128,21 @@ button.update-row:focus-visible,
   font-weight: var(--w-regular);
 }
 
-.update-cancel {
+/* The waiting row opens its menu: what it waits for, the restart now, the way back. */
+.update-caret {
   flex-shrink: 0;
-  height: 24px;
-  padding: 0 8px;
-  border-radius: var(--r-ctl-xs);
-  color: var(--text-2);
-  transition:
-    background-color var(--d-1) var(--ease),
-    color var(--d-1) var(--ease);
+  color: var(--text-3);
 }
 
-.update-cancel:hover {
-  color: var(--text);
-  background-color: var(--fill-2);
+/* As wide as its row, so both stand on the sidebar's inset; a narrow sidebar's menu keeps room for a name and its word. */
+.update-menu {
+  width: max(var(--radix-dropdown-menu-trigger-width), 232px);
 }
 
-/* A narrow sidebar keeps the labels whole: the version gives way (Settings › About has it) and
-   Cancel becomes its icon. */
-.update-short {
-  display: none;
-}
-
+/* A narrow sidebar keeps the label whole: the version gives way (Settings › About has it). */
 @container side-foot (max-width: 214px) {
-  .update-ver,
-  .update-long {
+  .update-ver {
     display: none;
-  }
-
-  .update-cancel {
-    display: inline-grid;
-    place-items: center;
-    width: 24px;
-    padding: 0;
-  }
-
-  .update-cancel .update-short {
-    display: block;
   }
 }
 

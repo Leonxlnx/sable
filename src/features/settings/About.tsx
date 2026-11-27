@@ -2,7 +2,8 @@ import type { ProviderId } from '@shared/protocol';
 import { DitherField } from '@/art/DitherField';
 import { LogoMark, ProviderMark, PROVIDER_NAME, Wordmark } from '@/art/Logo';
 import { connectableAgents, planLabel, signedInAccount } from '@/features/connect/plan';
-import { checkForUpdate, installUpdate, setSettings } from '@/state/actions';
+import { checkForUpdate, installUpdate, restartNow, setSettings } from '@/state/actions';
+import { waitChats, waitLabel } from '@/features/sidebar/update-wait';
 import { useStore } from '@/state/store';
 import { Spinner } from '@/ui';
 import { tildePath } from '@/lib/format';
@@ -98,6 +99,8 @@ export function About() {
 /** Updates of the desktop app: where it stands, and the one thing to do next. Hidden where Sable cannot update itself. */
 function Updates() {
   const u = useStore((s) => s.update);
+  const one = u?.pending ? waitChats(u.waits) : [];
+  const name = useStore((s) => (one.length === 1 ? s.sessions[one[0].sessionId!]?.title : undefined));
   if (!u || u.status === 'unsupported') return null;
   const value =
     u.status === 'checking' ? (
@@ -114,7 +117,12 @@ function Updates() {
       </span>
     ) : u.status === 'ready' ? (
       u.pending ? (
-        <span className="about-val">Restarts when the agents finish</span>
+        <span className="about-val about-upd">
+          {waitLabel(u.waits, () => name)}
+          <button type="button" className="btn btn-sm" onClick={() => void restartNow()}>
+            Restart now
+          </button>
+        </span>
       ) : (
         <button type="button" className="btn btn-sm btn-primary" onClick={() => void installUpdate()}>
           Restart to update to {u.latest}

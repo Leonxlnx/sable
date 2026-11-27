@@ -791,6 +791,8 @@ export const checkForUpdate = () =>
   }).catch(fail);
 /** Installs the downloaded release and restarts Sable (while agents work: once they are done). */
 export const installUpdate = () => bridge.call('update.install', {}).then(setUpdate).catch(fail);
+/** Restarts into the update now, whatever still works: the person read what that ends. */
+export const restartNow = () => bridge.call('update.install', { force: true }).then(setUpdate).catch(fail);
 /** A restart waiting for the agents to finish: not after all. */
 export const cancelUpdate = () => bridge.call('update.install', { cancel: true }).then(setUpdate).catch(fail);
 export const refreshProvider = (provider: ProviderId, accountId?: string) => bridge.call('auth.refresh', { provider, accountId }).catch(fail);
