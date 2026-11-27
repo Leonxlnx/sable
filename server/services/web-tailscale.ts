@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { findProgram } from '../util/which';
 import { runOff } from './web-run';
 import type { WebTailscale } from '../../shared/protocol';
 
@@ -12,15 +12,26 @@ import type { WebTailscale } from '../../shared/protocol';
  * tailnet reaches it. Every call to the CLI goes through this module (`TailscaleCli`; tests put a fake in
  * its place, and no test calls the real CLI with a command that changes anything).
  *
+ * The publication is a FOREGROUND serve (`serve --yes --https=<port> <target>`, never `--bg`): Tailscale
+ * keeps what a foreground serve publishes under that CLI process's own session (`Foreground` by session
+ * in `serve status --json`) and drops it the moment the process ends. Sable holds that process as its
+ * child, so the publication lives exactly as long as Sable holds it:
+ *
+ * - Nothing is ever left behind. A lasting (`--bg`) entry outlived a crash, a quit whose withdrawal was
+ *   slow, and a restart of the computer, and went on sending the tablet to a loopback port Sable no longer
+ *   held: any program on this computer could take that port and answer under Sable's address, with script
+ *   that reads the tablet's stored pairing. On Windows every child of the process is in a job that ends
+ *   with it (libuv's), so even a killed Sable takes its serve with it. Elsewhere a killed parent leaves
+ *   its children running, so this mode is offered on Windows only (`tailscalePath`).
+ * - Sable never removes or changes an entry. It starts its own serve only on a port 443 nothing uses and
+ *   ends only its own process; an entry that merely looks like Sable's is the owner's. No record on disk
+ *   says what is Sable's (one could be stale or written by someone else): the process it holds does.
+ * - The loopback port is let go only after Tailscale no longer lists the publication (`withdraw` resolves
+ *   then; web-remote.ts keeps the listener bound and refusing until it does).
+ *
  * The CLI of Tailscale 1.104 (read from its `serve --help` here): `serve status --json` reads the serve
  * configuration (`{}` when there is none; else `TCP` by port, `Web` by `<name>:<port>` with `Handlers` by
- * mount path, `AllowFunnel`, `Foreground` by session), `serve --bg --yes --https=<port> <target>` adds a
- * handler at `/` that proxies to the target and keeps it after the command ends, and
- * `serve --https=<port> off` removes the handler at `/` of that port (and the port once it has none).
- * Sable publishes on port 443 only when nothing is configured on it, records what it published
- * (`<home>/web/tailscale.json`, before the command runs), and withdraws exactly that: only when the port
- * still holds nothing but Sable's own handler with Sable's own target. A port that holds anything else
- * is the owner's: Sable says so and touches nothing.
+ * mount path, `AllowFunnel`, `Foreground` by session, each a configuration of the same shape).
  */
 
 /** The port the tablet opens on the tailnet: `https://<name>/`. */
@@ -28,19 +39,29 @@ export const TS_PORT = 443;
 /** The loopback listener's first port (up to ten above when taken). */
 export const TS_LOCAL_PORT = 47841;
 
+/** A CLI process Sable keeps running (the foreground serve). */
+export interface TailscaleHeld {
+  /** Resolves once the process has gone, by itself or by `stop`, with the end of what it printed. Never rejects. */
+  gone: Promise<string>;
+  /** Ends the process; resolves once it has gone. */
+  stop(): Promise<void>;
+}
+
 export interface TailscaleCli {
   /** The installed CLI's absolute path, or undefined when Tailscale is not installed (looked up at each call). */
   file(): string | undefined;
   /** Its standard output; rejects on a non-zero exit, after 10 s, or past 1 MB of output. */
   run(args: string[]): Promise<string>;
+  /** Starts the CLI and keeps it running until `stop` (or its own end). */
+  hold(args: string[]): TailscaleHeld;
 }
 
 const exists = (file: string) => { try { return existsSync(file); } catch { return false; } };
 
 /**
- * Where the CLI is installed: Tailscale's own install folders first, then the absolute PATH entries
- * outside the folder Sable was started from (`findProgram`, never a bare name and never the current
- * folder: a project could otherwise put its own `tailscale.exe` in the way).
+ * Where the CLI is installed: Tailscale's own install folder under Program Files, and nowhere else. PATH
+ * is never searched: an entry of it can lie inside a project (a repository's own `bin` folder holding a
+ * `tailscale.exe`), and whatever is found here is started as the person. Windows only: see the header.
  */
 export function tailscalePath(o: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; isProgram?: (f: string) => boolean } = {}): string | undefined {
   const platform = o.platform ?? process.platform;
@@ -50,16 +71,32 @@ export function tailscalePath(o: { platform?: NodeJS.Platform; env?: NodeJS.Proc
   // Checks of the packaged app off-screen only (with SABLE_WEB_LOOPBACK=1, as the chain mode's): a fake
   // CLI by its absolute path, so no check ever reaches the machine's real Tailscale.
   if (env.SABLE_WEB_LOOPBACK === '1' && env.SABLE_TAILSCALE_CLI !== undefined) return p.isAbsolute(env.SABLE_TAILSCALE_CLI) && isProgram(env.SABLE_TAILSCALE_CLI) ? env.SABLE_TAILSCALE_CLI : undefined;
-  const roots = platform === 'win32' ? [env.ProgramW6432, env.ProgramFiles, env['ProgramFiles(x86)']].filter((r): r is string => !!r && p.isAbsolute(r)) : [];
-  const known = platform === 'win32' ? roots.map(r => p.join(r, 'Tailscale', 'tailscale.exe'))
-    : platform === 'darwin' ? ['/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale', '/opt/homebrew/bin/tailscale']
-    : ['/usr/bin/tailscale', '/usr/sbin/tailscale', '/usr/local/bin/tailscale'];
-  const found = known.find(isProgram);
-  if (found) return found;
-  return findProgram('tailscale', { platform, env, outside: [process.cwd()], ...(o.isProgram ? { isProgram: o.isProgram, real: (f: string) => f } : {}) }) ?? undefined;
+  if (platform !== 'win32') return undefined;
+  const roots = [env.ProgramW6432, env.ProgramFiles, env['ProgramFiles(x86)']].filter((r): r is string => !!r && p.isAbsolute(r));
+  return roots.map(r => p.join(r, 'Tailscale', 'tailscale.exe')).find(isProgram);
 }
 
-/** The real CLI, started from a worker thread (a process start holds the thread it starts from: web-run.ts). */
+/** The process itself: no shell, no window, its output read (the end of it kept for the log) so a pipe never fills. */
+function holdProcess(file: string, args: string[]): TailscaleHeld {
+  let said = '', ended = false, end!: (said: string) => void;
+  const gone = new Promise<string>(resolve => { end = resolve; });
+  const done = () => { if (!ended) { ended = true; end(said.trim()); } };
+  const keep = (b: Buffer) => { said = (said + b.toString('utf8')).slice(-600); };
+  try {
+    const child = spawn(file, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+    child.stdout?.on('data', keep);
+    child.stderr?.on('data', keep);
+    child.once('error', err => { said += String(err.message); done(); });
+    child.once('exit', done);
+    return { gone, stop: () => { if (!ended) { try { child.kill(); } catch { /* gone already */ } } return gone.then(() => {}); } };
+  } catch (err) {
+    said = String((err as Error).message);
+    done();
+    return { gone, stop: () => Promise.resolve() };
+  }
+}
+
+/** The real CLI: short commands from a worker thread (a process start holds the thread it starts from: web-run.ts). */
 export function realCli(find: () => string | undefined = tailscalePath): TailscaleCli {
   return {
     file: find,
@@ -67,6 +104,11 @@ export function realCli(find: () => string | undefined = tailscalePath): Tailsca
       const file = find();
       if (!file) throw Error('Tailscale is not installed.');
       return (await runOff(file, args, process.env, { timeout: 10_000, maxBuffer: 1 << 20 })).toString('utf8');
+    },
+    hold(args) {
+      const file = find();
+      if (!file) return { gone: Promise.resolve('Tailscale is not installed.'), stop: () => Promise.resolve() };
+      return holdProcess(file, args);
     },
   };
 }
@@ -83,15 +125,20 @@ const TS_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.ne
 
 export const TS_WORDS = {
   missing: 'Tailscale is not installed on this computer. Install it from tailscale.com and sign in.',
+  platform: 'Web access over Tailscale works on Windows only for now.',
   stopped: 'Tailscale is not running on this computer. Start it and sign in.',
   login: 'Tailscale is not signed in on this computer. Sign in to your tailnet.',
   noName: 'This computer has no Tailscale name. Turn on MagicDNS in the Tailscale admin console (DNS).',
   https: 'HTTPS is off for your tailnet. In the Tailscale admin console, open DNS and enable HTTPS Certificates.',
   taken: 'Port 443 of this computer’s Tailscale name is already used by your own Tailscale Serve setup. Sable leaves it alone.',
   gone: 'Tailscale Serve no longer points at Sable (its setup was changed outside Sable). Turn web access off and on to publish it again.',
+  lost: 'Tailscale stopped publishing Sable. Sable publishes it again within a minute.',
   unreadable: 'Could not read Tailscale’s state. Sable tries again in a minute.',
   failed: 'Tailscale did not publish Sable. Sable tries again in a minute.',
 } as const;
+
+/** Why there is no CLI to use: not installed, or a system this mode is not offered on. */
+export const missingWords = (platform: NodeJS.Platform = process.platform) => (platform === 'win32' ? TS_WORDS.missing : TS_WORDS.platform);
 
 export function readTailscale(raw: string): TailscaleLook {
   let j: Record<string, unknown>;
@@ -112,59 +159,101 @@ export function readTailscale(raw: string): TailscaleLook {
   return { kind: 'ready', name, ...(typeof login === 'string' && login && login !== 'tagged-devices' ? { login } : {}) };
 }
 
+interface ServeShape {
+  TCP?: Record<string, Record<string, unknown> | undefined>;
+  Web?: Record<string, { Handlers?: Record<string, Record<string, unknown> | undefined> } | undefined>;
+  AllowFunnel?: Record<string, unknown>;
+  Foreground?: Record<string, unknown>;
+}
+const plain = (s: unknown) => (typeof s === 'string' ? s.replace(/\/+$/, '') : undefined);
+function serveConfig(raw: string): ServeShape | undefined {
+  let j: unknown;
+  try { j = JSON.parse(raw); } catch { return undefined; }
+  // No configuration at all prints `{}` (1.104 here); `null` is the same answer from a CLI that prints it so.
+  if (j === null) return {};
+  return typeof j === 'object' && !Array.isArray(j) ? j as ServeShape : undefined;
+}
+
 /**
- * Who holds `port` on this computer in the serve configuration `raw`: nobody, Sable (exactly one handler
- * at `/` that proxies to `target`, an HTTPS port, never funnelled, nothing in the foreground), or the
- * owner (anything else, also an answer that cannot be read: then nothing is touched).
+ * Who holds `port` on this computer in the serve configuration `raw`: nobody; a serve of the shape Sable
+ * starts (`ours`: nothing lasting on the port, and exactly one foreground session on it whose one handler
+ * at `/` proxies to `target`, an HTTPS port, never funnelled); or the owner (anything else, also an answer
+ * that cannot be read: then nothing is done). `ours` says the shape only: whether it is this run's own is
+ * known by the process this run holds (`TailscaleServe`).
  */
 export function serveHolds(raw: string, name: string, port: number, target: string): 'free' | 'ours' | 'taken' {
-  let j: Record<string, unknown>;
-  try { j = JSON.parse(raw); } catch { return 'taken'; }
-  if (!j || typeof j !== 'object' || Array.isArray(j)) return 'taken';
+  const j = serveConfig(raw);
+  if (!j) return 'taken';
   const key = String(port), suffix = ':' + key;
   const used = (c: unknown) => {
-    const cfg = (c ?? {}) as { TCP?: Record<string, unknown>; Web?: Record<string, unknown>; AllowFunnel?: Record<string, unknown> };
+    const cfg = (c ?? {}) as ServeShape;
     return !!cfg.TCP?.[key] || Object.keys(cfg.Web ?? {}).some(k => k.endsWith(suffix)) || Object.keys(cfg.AllowFunnel ?? {}).some(k => k.endsWith(suffix));
   };
-  const foreground = Object.values((j.Foreground ?? {}) as Record<string, unknown>);
-  if (!used(j) && !foreground.some(used)) return 'free';
-  if (foreground.some(used)) return 'taken';
-  const tcp = (j.TCP as Record<string, Record<string, unknown>> | undefined)?.[key];
-  const webKeys = Object.keys((j.Web ?? {}) as object).filter(k => k.endsWith(suffix));
-  const handlers = (j.Web as Record<string, { Handlers?: Record<string, Record<string, unknown>> }>)?.[name + suffix]?.Handlers ?? {};
+  const sessions = Object.values(j.Foreground ?? {}).filter(used) as ServeShape[];
+  // A lasting entry on the port is never Sable's: Sable makes none.
+  if (used(j)) return 'taken';
+  if (!sessions.length) return 'free';
+  if (sessions.length !== 1) return 'taken';
+  const s = sessions[0];
+  const tcp = s.TCP?.[key];
+  const webKeys = Object.keys(s.Web ?? {}).filter(k => k.endsWith(suffix));
+  const handlers = s.Web?.[name + suffix]?.Handlers ?? {};
   const mounts = Object.keys(handlers);
-  const funnel = Object.entries((j.AllowFunnel ?? {}) as Record<string, unknown>).some(([k, v]) => k.endsWith(suffix) && v);
-  const plain = (s: unknown) => typeof s === 'string' ? s.replace(/\/+$/, '') : undefined;
+  const at = handlers['/'] ?? {};
+  const funnel = Object.entries(s.AllowFunnel ?? {}).some(([k, v]) => k.endsWith(suffix) && v);
   const ours = !!tcp && tcp.HTTPS === true && !tcp.TCPForward && !tcp.TerminateTLS && webKeys.length === 1 && webKeys[0] === name + suffix &&
-    mounts.length === 1 && mounts[0] === '/' && plain(handlers['/'].Proxy) === plain(target) && Object.keys(handlers['/']).length === 1 && !funnel;
+    mounts.length === 1 && mounts[0] === '/' && plain(at.Proxy) === plain(target) && Object.keys(at).length === 1 && !funnel;
   return ours ? 'ours' : 'taken';
 }
 
-/** What Sable published (written before the command runs, removed once it is withdrawn). */
-interface Published { name: string; port: number; target: string }
-
-function readRecord(file: string): Published | undefined {
-  try {
-    const r = JSON.parse(readFileSync(file, 'utf8'));
-    return r && typeof r.name === 'string' && typeof r.target === 'string' && r.port === TS_PORT ? { name: r.name, port: r.port, target: r.target } : undefined;
-  } catch { return undefined; }
+/**
+ * Some foreground session in `raw` still sends requests to `target` (on any port, under any name): what a
+ * withdrawal waits out before the loopback port is let go. An answer that cannot be read throws: not known.
+ */
+export function sessionProxies(raw: string, target: string): boolean {
+  const j = serveConfig(raw);
+  if (!j) throw Error('Tailscale’s serve status could not be read.');
+  const want = plain(target);
+  return Object.values(j.Foreground ?? {}).some(s => Object.values((s as ServeShape | null)?.Web ?? {}).some(w =>
+    Object.values(w?.Handlers ?? {}).some(h => plain(h?.Proxy) === want)));
 }
+
+/**
+ * How long a new serve may take to show in the status, the pause between two looks, the looks a withdrawal
+ * takes; and for web-remote.ts: how long until a withdrawal that was not seen through is tried again, and
+ * until a serve that ended by itself is published again.
+ */
+export const TS_TIMES = { settle: 8000, step: 250, confirm: 8, retry: 30_000, republish: 5000 };
+export type TailscaleTimes = typeof TS_TIMES;
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+/** The serve this run holds. */
+interface Holding { name: string; target: string; proc: TailscaleHeld; ended: boolean; live: boolean }
 
 /** Publishing and withdrawing, one command at a time. */
 export class TailscaleServe {
   private queue: Promise<unknown> = Promise.resolve();
+  private held?: Holding;
+  readonly times: TailscaleTimes;
   /** Commands run (tests and the cost at rest). */
   runs: string[][] = [];
+  /** The serve this run published ended by itself (Tailscale restarted, its process was ended): told once. */
+  onLost?: (target: string) => void;
 
-  constructor(readonly cli: TailscaleCli, private record: string) {}
+  constructor(readonly cli: TailscaleCli, times: Partial<TailscaleTimes> = {}) {
+    this.times = { ...TS_TIMES, ...times };
+  }
 
-  /** Installed at all (no process: a look at the install folders). */
+  /** Installed at all (no process: a look at the install folder). */
   installed(): boolean { return !!this.cli.file(); }
 
   private run(args: string[]) {
     this.runs.push(args);
     return this.cli.run(args);
   }
+
+  private status() { return this.run(['serve', 'status', '--json']); }
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const next = this.queue.then(fn, fn);
@@ -174,74 +263,104 @@ export class TailscaleServe {
 
   /** One look at this computer's Tailscale (`status --json`). */
   async look(): Promise<TailscaleLook | { kind: 'missing'; text: string }> {
-    if (!this.installed()) return { kind: 'missing', text: TS_WORDS.missing };
+    if (!this.installed()) return { kind: 'missing', text: missingWords() };
     try { return readTailscale(await this.run(['status', '--json'])); }
     catch { return { kind: 'unreadable', text: TS_WORDS.unreadable }; }
   }
 
-  /** Who holds port 443 now for `target` (one `serve status --json`). */
+  /**
+   * Whether port 443 is this run's now for `target` (one `serve status --json`): `ours` only while the
+   * process this run started for exactly that still lives.
+   */
   async holds(name: string, target: string) {
-    return serveHolds(await this.run(['serve', 'status', '--json']), name, TS_PORT, target);
+    const seen = serveHolds(await this.status(), name, TS_PORT, target);
+    const mine = !!this.held && !this.held.ended && this.held.name === name && this.held.target === target;
+    return seen === 'ours' && !mine ? 'taken' : seen;
   }
 
   /**
-   * Publishes `target` (the loopback listener) at `https://<name>/`: refused (`taken`) when port 443 holds
-   * anything that is not exactly this; nothing run when it already is. Checked again after the command.
+   * Publishes `target` (the loopback listener) at `https://<name>/` for as long as this run holds the
+   * serve: refused (`taken`) unless port 443 holds nothing at all; nothing run when this run publishes
+   * exactly that already. The entry is looked for until it shows; a serve that ends, shows something else
+   * or does not show in time is ended and this throws.
    */
   publish(name: string, target: string): Promise<'published' | 'taken'> {
     return this.serial(async () => {
-      let raw = await this.run(['serve', 'status', '--json']);
-      // Sable's own entry from a run that ended without withdrawing it (another loopback port): replaced.
-      const rec = readRecord(this.record);
-      if (rec && rec.target !== target && serveHolds(raw, rec.name, rec.port, rec.target) === 'ours') {
-        await this.run(['serve', `--https=${rec.port}`, 'off']);
-        this.forget();
-        raw = await this.run(['serve', 'status', '--json']);
+      const old = this.held;
+      if (old && !old.ended && old.name === name && old.target === target && serveHolds(await this.status(), name, TS_PORT, target) === 'ours') return 'published';
+      // This run's earlier serve (another loopback port, another name) goes first; not confirmed gone: throws.
+      await this.end();
+      if (serveHolds(await this.status(), name, TS_PORT, target) !== 'free') return 'taken';
+      const args = ['serve', '--yes', `--https=${TS_PORT}`, target];
+      this.runs.push(args);
+      const held: Holding = { name, target, proc: this.cli.hold(args), ended: false, live: false };
+      this.held = held;
+      let said = '';
+      void held.proc.gone.then(s => {
+        held.ended = true;
+        said = s;
+        if (held.live) { held.live = false; this.onLost?.(held.target); }
+      });
+      const until = Date.now() + this.times.settle;
+      let seen: 'free' | 'ours' | 'taken' = 'free';
+      while (!held.ended) {
+        await Promise.race([held.proc.gone, sleep(this.times.step)]);
+        if (held.ended) break;
+        // A status that cannot be run is looked at again until the time is up.
+        try { seen = serveHolds(await this.status(), name, TS_PORT, target); } catch { seen = 'free'; }
+        if (seen !== 'free' || Date.now() >= until) break;
       }
-      const before = serveHolds(raw, name, TS_PORT, target);
-      if (before === 'taken') return 'taken';
-      this.save({ name, port: TS_PORT, target });
-      if (before === 'free') await this.run(['serve', '--bg', '--yes', `--https=${TS_PORT}`, target]);
-      const after = await this.holds(name, target);
-      // What is there now is not exactly Sable's: never withdrawn by Sable (it may be the owner's).
-      if (after !== 'ours') { if (after === 'free') this.forget(); throw Error(TS_WORDS.failed); }
-      return 'published';
+      if (seen === 'ours' && !held.ended) { held.live = true; return 'published'; }
+      const why = held.ended ? 'the serve ended' : seen === 'taken' ? 'port 443 shows something else' : 'the serve did not show in time';
+      await this.end().catch(() => {});
+      throw Error(why + (said ? ': ' + said.slice(-300) : ''));
     });
   }
 
   /**
-   * Withdraws what Sable published (in this run or a run that ended without withdrawing it): only while
-   * the port still holds exactly Sable's handler. Anything else there is left as it is, and the record
-   * goes; a command that fails keeps the record for the next try. `target`: only that publication (a
-   * newer one that replaced it in the meantime is left alone); absent, whatever the record names.
+   * Ends this run's serve and looks until no session of Tailscale's sends requests to its target. Throws
+   * while that is not known (Tailscale's status cannot be read, or still lists it): the serve's process is
+   * gone all the same, and the next call looks again.
    */
-  withdraw(target?: string): Promise<void> {
-    return this.serial(async () => {
-      const rec = readRecord(this.record);
-      if (!rec || (target !== undefined && rec.target !== target)) return;
-      if (!this.installed()) return;
-      const holds = serveHolds(await this.run(['serve', 'status', '--json']), rec.name, rec.port, rec.target);
-      if (holds === 'ours') await this.run(['serve', `--https=${rec.port}`, 'off']);
-      this.forget();
-    });
+  private async end() {
+    const held = this.held;
+    if (!held) return;
+    held.live = false;
+    await held.proc.stop();
+    let last: unknown;
+    for (let i = 0; i < this.times.confirm; i++) {
+      if (i) await sleep(this.times.step);
+      try {
+        if (!sessionProxies(await this.status(), held.target)) {
+          if (this.held === held) this.held = undefined;
+          return;
+        }
+        last = Error('Tailscale still lists the serve.');
+      } catch (err) { last = err; }
+    }
+    throw last;
   }
 
-  /** Something Sable published is recorded (no process). */
-  owes(): boolean { return !!readRecord(this.record); }
-
-  private save(rec: Published) {
-    mkdirSync(path.dirname(this.record), { recursive: true });
-    const tmp = this.record + '.tmp';
-    writeFileSync(tmp, JSON.stringify(rec));
-    renameSync(tmp, this.record);
+  /** Withdraws what this run published; resolves once Tailscale no longer lists it (see `end`). */
+  withdraw(): Promise<void> {
+    return this.serial(() => this.end());
   }
 
-  private forget() { rmSync(this.record, { force: true }); }
+  /** The loopback target of a serve this run started and has not seen gone (no process). */
+  owes(): string | undefined { return this.held?.target; }
+
+  /** Quitting: the serve's process is ended without waiting (what it published goes with it). */
+  drop() {
+    const held = this.held;
+    if (!held) return;
+    held.live = false;
+    void held.proc.stop();
+  }
 }
 
 /** Settings' view of a look (`WebState.tailscale`). */
 export function tailscaleView(look: Awaited<ReturnType<TailscaleServe['look']>> | undefined, installed: boolean): WebTailscale {
-  if (!installed) return { state: 'missing', text: TS_WORDS.missing };
+  if (!installed) return { state: 'missing', text: missingWords() };
   if (!look) return { state: 'unknown' };
   switch (look.kind) {
     case 'missing': return { state: 'missing', text: look.text };

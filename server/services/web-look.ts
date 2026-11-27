@@ -21,7 +21,7 @@ export function nextLookIn(lastStart: number | undefined, connected: boolean, ti
 }
 
 export class NetworkLook<T> {
-  private good?: { rows: T[]; at: number };
+  private good?: { rows: T[]; at: number; run: number };
   private pending?: Promise<T[]>;
   /** Looks started (for tests and the cost at rest). */
   runs = 0;
@@ -36,6 +36,14 @@ export class NetworkLook<T> {
   /** When the last good look was taken, if any. */
   get at(): number | undefined {
     return this.good?.at;
+  }
+
+  /**
+   * Which look the kept one is, counted as `runs` counts them (0: none). A caller that noted `runs` when
+   * something arrived knows a later number is a look that began after it, whatever the clocks say.
+   */
+  get goodRun(): number {
+    return this.good?.run ?? 0;
   }
 
   /** The kept rows while they may be used (up to `hold` after the last good look); undefined after. */
@@ -54,14 +62,14 @@ export class NetworkLook<T> {
     if (this.pending && this.pendingEra === this.era) return this.pending;
     this.pendingEra = this.era;
     return (this.pending = (async () => {
-      this.runs++;
+      const run = ++this.runs;
       const era = this.era, began = this.startedAt = this.now();
       try {
         // Starting a process holds the thread for 10 to 25 ms: never in the turn of the request that asked.
         await new Promise<void>(r => setImmediate(r));
         const rows = await this.read();
         // The rows are as old as the look's beginning (what it read may have changed while it ran).
-        if (era === this.era) { this.good = { rows, at: began }; this.failure = undefined; }
+        if (era === this.era) { this.good = { rows, at: began, run }; this.failure = undefined; }
         return rows;
       } catch (err) {
         if (era === this.era) this.failure = (err as Error)?.message ?? String(err);

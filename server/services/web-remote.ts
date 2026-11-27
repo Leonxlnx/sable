@@ -11,7 +11,8 @@ import { realpath } from 'node:fs/promises';
 import { WebSocketServer } from 'ws';
 import { WEB_TAILSCALE, type WebNetwork, type WebState } from '../../shared/protocol';
 import { webOn } from './web-on';
-import { realCli, tailnetPeer, tailscaleView, TailscaleServe, TS_LOCAL_PORT, TS_PORT, TS_WORDS, type TailscaleCli } from './web-tailscale';
+import { networkInterfaces } from 'node:os';
+import { realCli, tailnetPeer, tailscaleView, TailscaleServe, TS_LOCAL_PORT, TS_PORT, TS_WORDS, type TailscaleCli, type TailscaleTimes } from './web-tailscale';
 import { openContained, within } from '../core/contain';
 import type { App } from '../app';
 import type { PhoneService } from './phone';
@@ -33,6 +34,26 @@ export interface WebOptions {
   tailscale?: TailscaleCli;
   /** The first loopback port in Tailscale mode (tests: 0 for any free one). */
   tailscalePort?: number;
+  /** How long a serve may take to show and to go (tests shorten them). */
+  tailscaleTimes?: Partial<TailscaleTimes>;
+  /** This computer's addresses as the system lists them now (tests); by default `os.networkInterfaces()`. */
+  interfaces?: () => string;
+  /** How often open connections are checked against the networks (tests shorten it). */
+  watchMs?: number;
+}
+
+/** While a browser is connected over the home network: how often the addresses and the look's age are checked. */
+const WATCH_MS = 5000;
+
+/**
+ * This computer's IPv4 addresses as the system lists them now: one system call, no process. A change (a
+ * Wi-Fi left or joined, a cable, a VPN) means a kept look at the networks is of another moment. IPv6 is
+ * left out: its temporary addresses change by themselves.
+ */
+function addressesNow(): string {
+  const all = networkInterfaces();
+  return Object.keys(all).sort().map(name => name + '=' + (all[name] ?? []).filter(a => a.family === 'IPv4')
+    .map(a => a.address + '/' + a.netmask + '/' + a.mac).sort().join(',')).join(';');
 }
 
 /** The desktop shell's save dialog for the public root, or undefined without a shell (the dev server). */
@@ -104,34 +125,69 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   /** The network and address the listener serves on. */
   let servingOn: WebNetwork | undefined;
   let startup: Promise<void> | undefined;
-  let timer: NodeJS.Timeout | undefined, expiry: NodeJS.Timeout | undefined;
+  let timer: NodeJS.Timeout | undefined, expiry: NodeJS.Timeout | undefined, watch: NodeJS.Timeout | undefined;
   const active = () => enabled() && !!port && networkId === selection();
   // Tailscale as the network (web-tailscale.ts): one look at its state, the name Sable is published
-  // under, and whether this run published it (then a stop withdraws it). `tsHeld`: port 443 is the
-  // owner's; `tsGone`: Sable's entry was removed outside Sable (not published again until the switch or
+  // under, and the loopback listener the publication points at. `tsHeld`: port 443 is the owner's;
+  // `tsGone`: what Sable published was changed outside Sable (not published again until the switch or
   // the network changes).
-  const ts = new TailscaleServe(opts.tailscale ?? realCli(), path.join(app.store.dir, 'web', 'tailscale.json'));
+  const ts = new TailscaleServe(opts.tailscale ?? realCli(), opts.tailscaleTimes);
   const tailscaleMode = () => selection() === WEB_TAILSCALE;
   let tsLook: Awaited<ReturnType<TailscaleServe['look']>> | undefined, tsLookAt = 0;
   let tsName: string | undefined, tsLogin: string | undefined, tsTarget: string | undefined;
-  let tsPublished: string | undefined, tsHeld = false, tsGone = false;
+  let tsHeld = false, tsGone = false;
+  /** This mode's loopback listener, from its bind on. */
+  let tsServer: Server | undefined;
+  /** Loopback listeners that serve nothing any more and wait for Tailscale to let go of them. */
+  const parked = new Set<Server>();
   let withdrawing: Promise<void> | undefined;
+  let again: NodeJS.Timeout | undefined, soon: NodeJS.Timeout | undefined;
   const servingTs = () => active() && networkId === WEB_TAILSCALE && !!tsName;
   /** What a browser opens: `https://<name>` over Tailscale, else `https://<address>:<port>`. */
   const origin = () => (servingTs() ? 'https://' + tsName : certs && port ? 'https://' + certs.addresses[0] + ':' + port : undefined);
+  /**
+   * What this run published on Tailscale goes, and only then the loopback port it pointed at. Until
+   * Tailscale no longer lists the publication the listener stays bound and refuses everything (its start
+   * is over: `accepts` is false), so no other program on this computer can take the port and answer the
+   * tablet under Sable's address. Not known gone (Tailscale's status cannot be read): the port is kept
+   * and it is looked at again every 30 s, and by the next start.
+   */
   function withdraw() {
-    if (!tsPublished) return;
-    const target = tsPublished === '*' ? undefined : tsPublished;
-    tsPublished = undefined;
-    const w: Promise<void> = ts.withdraw(target).catch(err => app.log('web: could not withdraw from Tailscale Serve', (err as Error).message))
-      .finally(() => { if (withdrawing === w) withdrawing = undefined; });
+    if (tsServer) { parked.add(tsServer); tsServer = undefined; }
+    if (!parked.size && !ts.owes()) return;
+    clearTimeout(again);
+    again = undefined;
+    const w: Promise<void> = ts.withdraw().then(() => {
+      for (const s of parked) s.close();
+      parked.clear();
+    }, err => {
+      app.log('web: Tailscale still lists Sable, its port is kept', (err as Error).message);
+      if (!disposed) again = setTimeout(withdraw, ts.times.retry).unref();
+    }).finally(() => { if (withdrawing === w) withdrawing = undefined; });
     withdrawing = w;
   }
-  // One look at the networks, kept (web-look.ts): nothing waits for a PowerShell run but the first start.
-  // Off-screen checks of the packaged app (loopback: nothing listens on the LAN) may serve on a network
-  // Windows calls public, as a home Wi-Fi often is.
+  // The serve ended by itself (Tailscale restarted or updated, its process was ended): the listener stops,
+  // and Sable publishes again by itself, first after a few seconds and then with the minute's look.
+  ts.onLost = target => {
+    if (disposed || tsTarget !== target) return;
+    stop();
+    error = TS_WORDS.lost;
+    changed();
+    clearTimeout(soon);
+    soon = setTimeout(() => { soon = undefined; if (enabled() && tailscaleMode() && !port) sync(); }, ts.times.republish).unref();
+  };
+  // One look at the networks, kept (web-look.ts): nothing waits for a PowerShell run but the first start
+  // and a new connection (below). Off-screen checks of the packaged app (loopback: nothing listens on the
+  // LAN) may serve on a network Windows calls public, as a home Wi-Fi often is.
+  const addresses = opts.interfaces ?? addressesNow;
+  /** The addresses the system listed when the kept look began. */
+  let lookAddresses: string | undefined;
   const look = new NetworkLook<ReadNetwork>(async () => {
+    const before = addresses();
     const rows = await (opts.networks ?? webNetworks)();
+    // The addresses changed while it ran: what it read belongs to neither moment.
+    if (addresses() !== before) throw Error('The networks changed during the look.');
+    lookAddresses = before;
     return opts.loopback ? rows.map(({ private: _, ...r }) => r) : rows;
   }, { ...LOOK_MS, ...opts.lookTimes });
   const connected = () => (hub?.clients.size ?? 0) > 0 || sockets.size > 0;
@@ -190,7 +246,9 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   function stop() {
     epoch++;
     clearTimeout(expiry);
-    // What this run published on Tailscale goes with the listener (exactly that: web-tailscale.ts).
+    clearTimeout(watch);
+    watch = undefined;
+    // What this run published on Tailscale goes first; its listener's port only after (withdraw).
     withdraw();
     port = certs = networkId = servingOn = tsName = tsLogin = tsTarget = undefined;
     for (const s of servers) s.close();
@@ -231,6 +289,41 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       changed();
     });
   }
+  /**
+   * The system lists other addresses than when the kept look began (the home network's listener only): the
+   * look is void, every open connection ends, and nothing is admitted until a new look has read the networks.
+   */
+  function networkMoved(): boolean {
+    if (lookAddresses === undefined || addresses() === lookAddresses) return false;
+    lookAddresses = undefined;
+    look.forget();
+    for (const s of sockets) s.destroy();
+    hub?.clients.forEach(ws => ws.terminate());
+    void lookNow();
+    return true;
+  }
+  /**
+   * While a browser is connected over the home network, every few seconds and whatever a look is doing:
+   * the addresses are compared, and a kept look past its hold ends the listener (so no connection outlives
+   * the last good look by more than the hold and one tick).
+   */
+  function watchNetworks() {
+    if (watch || !active() || networkId === WEB_TAILSCALE) return;
+    watch = setTimeout(() => {
+      watch = undefined;
+      // Nothing connected: the next connection starts the watch again.
+      if (!active() || networkId === WEB_TAILSCALE || !connected()) return;
+      if (!networkMoved() && !look.rows() && !(look.at === undefined && look.looking)) {
+        // The kept look is past its hold. (Forgotten a moment ago with its new look still running: nothing
+        // is admitted meanwhile, and that look's own end decides.)
+        stop();
+        error = LOST;
+        changed();
+        return;
+      }
+      watchNetworks();
+    }, opts.watchMs ?? WATCH_MS).unref();
+  }
   /** The next look by itself: every 30 s while a browser is connected, every minute while nothing is, never while off. */
   function schedule() {
     clearTimeout(timer);
@@ -268,8 +361,8 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     let holds: 'free' | 'ours' | 'taken';
     try { holds = await ts.holds(name, target); } catch { return; }
     if (generation !== epoch || !servingTs() || holds === 'ours') return;
-    // Not Sable's any more: nothing of it is withdrawn (it may be the owner's now).
-    tsPublished = undefined;
+    // Changed outside Sable: this run's own serve ends with the listener (nothing else is touched), and
+    // it is not published again by itself.
     stop();
     tsGone = true;
     error = TS_WORDS.gone;
@@ -307,16 +400,28 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     hub = wss;
     wss.on('headers', headers => headers.push(...rawHeaders()));
     wss.on('wsClientError', (_err, socket) => refuse(socket));
-    // Answered on the kept look at once (a request never waits for PowerShell); a look older than 30 s is
-    // asked again behind it, and one that finds the network gone stops the listener (takeRows).
+    // A request for the public client is answered on the kept look at once (it never waits for PowerShell),
+    // unless the system's addresses changed since that look; a look older than 30 s is asked again behind
+    // it, and one that finds the network gone stops the listener (takeRows).
     function accepts(req: IncomingMessage) {
       const peer = req.socket.remoteAddress;
       if (generation !== epoch || !active() || req.method !== 'GET' || req.socket.localPort !== port ||
           req.headersDistinct.host?.length !== 1 || !peer || !(privateIPv4(peer) || opts.loopback && peer === '127.0.0.1') ||
           ![tls.host, selected!.address].some(n => req.headers.host === n + ':' + port)) return false;
+      if (networkMoved()) return false;
       if (!look.rows() || !networks.some(n => n.id === selected!.id && n.address === selected!.address)) return false;
       if (look.stale() && !look.looking) void lookNow();
       return true;
+    }
+    /**
+     * A new connection to the chats never rides on a kept look: a look that began after it arrived must say
+     * the selected network is still this one (the same address on another network is not), or it is refused.
+     * A look under way is shared; one that began earlier is followed by a new one.
+     */
+    async function verified(arrived: number) {
+      for (let i = 0; i < 2 && generation === epoch && active() && look.goodRun <= arrived; i++) await lookNow();
+      return generation === epoch && active() && look.goodRun > arrived && !!look.rows() &&
+        networks.some(n => n.id === selected!.id && n.address === selected!.address);
     }
     const handle = async (req: IncomingMessage, res: ServerResponse) => {
       for (const [k, v] of Object.entries(HEADERS)) res.setHeader(k, v);
@@ -338,14 +443,18 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       const first = !sockets.size;
       sockets.add(socket);
       if (first) schedule();
+      watchNetworks();
       socket.once('close', () => sockets.delete(socket));
     });
     server.on('clientError', (_err, socket) => refuse(socket));
     server.on('checkContinue', handle);
     server.on('checkExpectation', handle);
     server.on('upgrade', async (req, socket, head) => {
-      if (req.url !== '/sable-web' || req.headersDistinct.origin?.length !== 1 || req.headers.origin !== 'https://' + req.headers.host ||
-          !accepts(req) || socket.destroyed || wss.clients.size >= 12) return refuse(socket);
+      // The looks begun so far: only a later one counts for this connection (no clock is compared).
+      const arrived = look.runs;
+      const fits = () => accepts(req) && !socket.destroyed && wss.clients.size < 12;
+      if (req.url !== '/sable-web' || req.headersDistinct.origin?.length !== 1 || req.headers.origin !== 'https://' + req.headers.host || !fits()) return refuse(socket);
+      if (!await verified(arrived).catch(() => false) || !fits()) return socket.destroyed ? undefined : refuse(socket);
       wss.handleUpgrade(req, socket, head, ws => manage().acceptWeb(ws, req));
     });
     await bind(server, opts.port ?? 47830, opts.loopback ? '127.0.0.1' : selected.address, generation);
@@ -397,6 +506,13 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     if (epoch !== generation || !enabled() || !tailscaleMode()) return;
     // Published already: the timer's own look (tsCheck) watches it; nothing is run again here.
     if (servingTs()) return;
+    // A port still kept from before (Tailscale's status could not be read then): looked at again first.
+    if (parked.size || ts.owes()) {
+      withdraw();
+      await withdrawing;
+      if (parked.size || ts.owes()) throw Error(TS_WORDS.failed);
+      if (epoch !== generation || !enabled() || !tailscaleMode()) return;
+    }
     if (tsGone) throw Error(TS_WORDS.gone);
     const seen = tsLook = await ts.look();
     tsLookAt = Date.now();
@@ -431,8 +547,9 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       catch { if (!res.destroyed) res.writeHead(404).end(); }
       finally { freeSlot(); }
     };
+    // Not among `servers`: stop() never closes this listener itself. From its bind on its port is let go
+    // only by withdraw(), after Tailscale no longer lists what points at it.
     const server = http({}, handle);
-    servers.add(server);
     server.maxConnections = 24;
     server.maxRequestsPerSocket = 32;
     server.headersTimeout = server.requestTimeout = 10_000;
@@ -451,22 +568,21 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     });
     await bind(server, opts.tailscalePort ?? TS_LOCAL_PORT, '127.0.0.1', generation);
     local = (server.address() as { port: number }).port;
-    if (!enabled() || generation !== epoch || !tailscaleMode()) { server.close(); return; }
+    tsServer = server;
+    if (!enabled() || generation !== epoch || !tailscaleMode()) { withdraw(); return; }
     const target = 'http://127.0.0.1:' + local;
     let published: 'published' | 'taken';
     try { published = await ts.publish(name, target); }
     catch (err) {
-      server.close();
-      servers.delete(server);
+      withdraw();
       // The CLI's own words stay in the log (a path, a version): Settings says it in one plain sentence.
       app.log('web: tailscale serve failed', (err as Error).message);
       throw Error(TS_WORDS.failed);
     }
-    if (published === 'taken') { server.close(); servers.delete(server); tsHeld = true; throw Error(TS_WORDS.taken); }
-    tsPublished = target;
+    if (published === 'taken') { withdraw(); tsHeld = true; throw Error(TS_WORDS.taken); }
     tsHeld = false;
     // Switched off or elsewhere while it published: withdrawn at once.
-    if (!enabled() || generation !== epoch || !tailscaleMode()) { server.close(); withdraw(); return; }
+    if (!enabled() || generation !== epoch || !tailscaleMode()) { withdraw(); return; }
     channel = manage();
     networkId = WEB_TAILSCALE;
     servingOn = { id: WEB_TAILSCALE, name: 'Tailscale', address: name };
@@ -482,7 +598,9 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     if (!enabled()) {
       // Off: nothing runs at all (no timer, no look), and nothing is kept for the next time.
       clearTimeout(timer); timer = undefined;
+      clearTimeout(soon); soon = undefined;
       look.forget();
+      lookAddresses = undefined;
       tsLook = undefined;
       tsHeld = tsGone = false;
       if (startup || port) { stop(); changed(); }
@@ -520,15 +638,17 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     if (enabled() && !look.looking && (look.at === undefined ? tailscaleMode() : look.stale())) void lookNow().catch(() => {});
     return state();
   });
-  app.register('web.offer', ({ cancel }) => {
+  // Off is said before anything of the request is read (parameters that are no object included).
+  app.register('web.offer', params => {
+    const web = ready();
     clearTimeout(expiry);
-    ready().pair(cancel);
+    web.pair(params?.cancel);
     const until = channel?.status().pairing?.expiresAt;
     if (until) expiry = setTimeout(() => channel?.pair(true), Math.max(0, until - Date.now())).unref();
     return state();
   });
-  app.register('web.approve', ({ requestId, allow }) => { ready().approve(requestId, allow === true); return state(); });
-  app.register('web.revoke', ({ deviceId }) => { manage().revoke(deviceId); return state(); });
+  app.register('web.approve', params => { ready().approve(params?.requestId, params?.allow === true); return state(); });
+  app.register('web.revoke', params => { manage().revoke(params?.deviceId); return state(); });
   // The public root only (what `/ca.cer` serves), checked to be a CA certificate before it is written.
   app.register('web.saveCa', async () => {
     if (!webOn()) throw Error('Web access is off.');
@@ -544,18 +664,27 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     return { ok: true, path: target };
   });
   const off = app.subscribe(e => { if (e.type === 'settings.updated') sync(); });
-  app.closeWebIngress = () => { disposed = true; off(); clearTimeout(timer); timer = undefined; stop(); };
-  // Quitting: what was published on Tailscale is withdrawn (stop() began it), for 6 s at most; left
-  // behind, the next start with web access withdraws it (below).
+  app.closeWebIngress = () => {
+    disposed = true;
+    off();
+    clearTimeout(timer); clearTimeout(soon); clearTimeout(again);
+    timer = soon = again = undefined;
+    stop();
+  };
+  // Quitting: what was published on Tailscale is withdrawn (stop() began it) and seen gone, for 6 s at
+  // most and only when there is something to withdraw (no timer otherwise). Past that the serve's process
+  // is ended without waiting; it could not outlive Sable in any case (web-tailscale.ts).
   app.onDispose(async () => {
-    await Promise.race([withdrawing, new Promise(r => setTimeout(r, 6000).unref())]);
+    const w = withdrawing;
+    if (w) {
+      let late: NodeJS.Timeout | undefined;
+      await Promise.race([w, new Promise<void>(r => { late = setTimeout(r, 6000); late.unref(); })]);
+      clearTimeout(late);
+    }
+    ts.drop();
+    for (const s of parked) s.close();
+    parked.clear();
     await channel?.dispose();
   });
-  // A run that ended without withdrawing what it published (a crash): withdrawn now, unless Tailscale is
-  // chosen and on (its start replaces it). Only when a record says so: no process otherwise.
-  if (webOn() && !(enabled() && tailscaleMode()) && ts.owes()) {
-    tsPublished = '*';
-    withdraw();
-  }
   sync();
 }
