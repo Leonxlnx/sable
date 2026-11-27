@@ -7,6 +7,9 @@ import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { issueWebLeaf, privateIPv4, webCertificates } from '../server/services/web-cert';
 
+// Outside the ACL fixture every key read is a PowerShell run that compiles its C# reader (about
+// 0.7 s each, 2 s per provisioning on an idle machine, far more beside a build): 5 s is too short.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 const capture = vi.hoisted(() => ({ keys: undefined as KeyObject[] | undefined }));
 vi.mock('node:crypto', async original => {
   const mod = await original<typeof import('node:crypto')>();

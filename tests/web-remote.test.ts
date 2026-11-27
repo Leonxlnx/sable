@@ -19,6 +19,9 @@ import { WEB_METHODS, type WebState } from '../shared/protocol';
 import { pskOfKey, pskOfToken, startHandshake } from '../mobile/src/lib/secure';
 import { beside, fingerprintIn, handshake, keyOf, pairSecure, wireClient } from './phone-wire';
 
+// The real Windows key checks (PowerShell per key read, see web-cert.test.ts) make each listener start
+// take seconds outside the ACL fixture.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 const clearance = vi.hoisted(() => ({ ships: true }));
 vi.mock('../shared/protocol', async original => ({ ...await original<typeof import('../shared/protocol')>(), get WEB_SHIPS() { return clearance.ships; } }));
 const homes: string[] = [], apps: App[] = [];
