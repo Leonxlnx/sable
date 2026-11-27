@@ -155,7 +155,16 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
         !rows.some(r => r.address === n.address && r.id !== n.id))).finally(() => { inventory = undefined; });
   }
   async function start(generation: number) {
-    const available = await currentNetworks();
+    let available: WebNetwork[];
+    try { available = await currentNetworks(); }
+    catch (err) {
+      // An inventory that failed (PowerShell slow or timed out under load: 5 to 17 s, every other run, in the
+      // end-to-end check) says nothing about the network. While listening, keep listening and ask again on the
+      // next tick: stopping cut every browser off and brought the listener back 5 s later. Admission is
+      // unchanged: every request still needs an inventory that succeeds and names the chosen network.
+      if (active() && epoch === generation) return;
+      throw err;
+    }
     if (epoch !== generation || !enabled()) return;
     const inventoryChanged = JSON.stringify(networks) !== JSON.stringify(available);
     networks = available;

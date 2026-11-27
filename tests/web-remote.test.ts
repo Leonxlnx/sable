@@ -31,7 +31,7 @@ afterEach(async () => {
   clearance.ships = true;
   vi.restoreAllMocks();
 });
-function fixture(ports: { port?: number; showSave?: (defaultPath: string) => Promise<string | undefined> } = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
+function fixture(ports: { port?: number; showSave?: (defaultPath: string) => Promise<string | undefined>; networks?: () => { id: string; name: string; address: string }[] } = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
   const home = existingHome ?? mkdtempSync(path.join(process.env.TEMP!, 'web-test-'));
   if (!existingHome) homes.push(home);
   let release!: () => void;
@@ -55,7 +55,7 @@ function fixture(ports: { port?: number; showSave?: (defaultPath: string) => Pro
   writeFileSync(path.join(assets, 'index.html'), 'Sable web fixture');
   const networks = [{ id: 'home/adapter/10.0.0.7', name: 'Home', address: '10.0.0.7' }];
   app.store.state.settings.webNetwork = networks[0].id;
-  registerPhone(app, { port: 0, host: '127.0.0.1', web: { assets, loopback: true, port: 0, ...ports, networks: () => networks } });
+  registerPhone(app, { port: 0, host: '127.0.0.1', web: { assets, loopback: true, port: 0, networks: () => networks, ...ports } });
   return { app, home, assets, delay, sent, release, networks };
 }
 async function setup(f = fixture()) {
@@ -171,6 +171,28 @@ it('saves the public root where the person picks, gives the address as a QR code
   await missing.app.call('app.setSettings', { patch: { webRemote: true } });
   const off = await missing.app.call('web.state', {});
   expect(off).toMatchObject({ listening: false, assets: false, error: 'Packaged web assets are unavailable.' });
+});
+
+it('keeps listening and keeps its browsers through a network inventory that fails, but admits nothing on it', async () => {
+  const nets = [{ id: 'home/adapter/10.0.0.7', name: 'Home', address: '10.0.0.7' }];
+  const inventory = { fail: false };
+  const h = await setup(fixture({ networks: () => { if (inventory.fail) throw Error('Command failed: powershell.exe (timed out)'); return nets; } }));
+  const p = await h.pair();
+  let closed = false;
+  void p.c.closed.then(() => { closed = true; });
+  inventory.fail = true;
+  // Any settings change runs the same check the 5 s timer runs.
+  await h.app.call('app.setSettings', { patch: { webSteerDanger: false } });
+  const s = await h.app.call('web.state', {});
+  expect(s).toMatchObject({ listening: true, port: h.s.port, error: undefined });
+  expect(s.clients.map(c => c.id)).toEqual([p.deviceId]);
+  await new Promise(r => setTimeout(r, 300));
+  expect(closed).toBe(false);
+  // Admission still needs an inventory that succeeds: a new socket is refused meanwhile.
+  const fresh = h.ws();
+  await expect(new Promise((resolve, reject) => { fresh.once('open', resolve); fresh.once('error', reject); fresh.once('unexpected-response', (_q, r) => reject(Error(String(r.statusCode)))); })).rejects.toThrow(/403/);
+  inventory.fail = false;
+  expect((await p.c.call('app.hello')).ok).toBe(true);
 });
 
 it('serves only contained assets and the public CA, requires the exact Host, GET, upgrade route and Origin', async () => {
