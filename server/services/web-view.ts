@@ -1,10 +1,14 @@
 import type { BridgeEvent, PhoneItem, PhoneTail, SessionMeta } from '../../shared/protocol';
 
-// Both session lists and incremental patches use these same scalar fields.
+// Both session lists and incremental patches use these same scalar fields. What works besides the turn
+// (commands, tracked jobs: 0.2.41's `tracked`, `trackedTitle`, `trackedSince`) and the running turn's
+// reading (`live`: counts and kinds only, never a name or a word) are given as the phone is given them
+// (phone.ts sends SessionMeta whole), so a chat with a tracked job reads as working in a browser too.
 function sessionFields(s: Partial<SessionMeta>) {
   return { id: s.id, provider: s.provider, title: s.title, titleSource: s.titleSource, model: s.model,
     mode: s.mode, status: s.status, createdAt: s.createdAt, updatedAt: s.updatedAt, pinned: s.pinned,
-    archived: s.archived, unread: s.unread, background: s.background, custom: s.custom };
+    archived: s.archived, unread: s.unread, background: s.background, custom: s.custom,
+    commands: s.commands, tracked: s.tracked, trackedTitle: s.trackedTitle, trackedSince: s.trackedSince, live: s.live };
 }
 export function webSession(s: SessionMeta): SessionMeta {
   return { ...sessionFields(s), id: s.id, provider: s.provider, title: s.title, titleSource: s.titleSource,
@@ -22,7 +26,8 @@ export function webItem(i: PhoneItem) {
     case 'turn': return { ...row, durationMs: i.durationMs, stopReason: i.stopReason, error: i.error };
     case 'tool': return { ...row, name: i.name, kind: i.kind, status: i.status, title: i.title, detail: i.detail,
       result: i.result && { text: i.result.text, stderr: i.result.stderr, diff: i.result.diff, isError: i.result.isError },
-      output: i.output, pics: i.pics };
+      // A tracked job's row as the phone has it (phone.ts phoneTracked: no process id, its log's line cut).
+      output: i.output, pics: i.pics, tracked: i.tracked };
   }
 }
 export function webTail(t: PhoneTail) {
@@ -38,7 +43,13 @@ export function webQueue(rows: PhoneTail['queue']) {
 export function webEvent(e: BridgeEvent, watched: readonly string[]) {
   switch (e.type) {
     case 'session.added': return { type: e.type, session: webSession(e.session) };
-    case 'session.updated': return { type: e.type, id: e.id, patch: sessionFields(e.patch) };
+    case 'session.updated': {
+      // A field the patch clears (there, undefined) travels as null: JSON drops undefined, and a browser
+      // kept the old value (a chat read unread, or working, after it no longer was).
+      const patch: Record<string, unknown> = sessionFields(e.patch);
+      for (const [k, v] of Object.entries(e.patch)) if (v === undefined && k in patch) patch[k] = null;
+      return { type: e.type, id: e.id, patch };
+    }
     case 'session.removed': return { type: e.type, id: e.id };
     case 'item.delta': return watched.includes(e.sessionId) && e.field === 'text'
       ? { type: e.type, sessionId: e.sessionId, id: e.id, seq: e.seq, field: e.field, delta: e.delta } : null;

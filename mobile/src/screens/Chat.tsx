@@ -27,6 +27,7 @@ import { Composer } from './Composer';
 import { Prompts } from './Prompts';
 import { ReviewLine } from './Review';
 import { ItemRow, TurnGuard, TurnView } from './Timeline';
+import { mayCall } from '../web/allow';
 
 const PAGE = 24;
 const FIRST = 5;
@@ -106,7 +107,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         right={
           <>
             <ChangesKey id={id} />
-            {(s.provider === 'claude' || s.provider === 'demo' || remoteOn) && (
+            {(s.provider === 'claude' || s.provider === 'demo' || remoteOn) && mayCall('session.setOptions') && (
               <button type="button" className="icon-btn remote-btn" data-tone={s.remote?.tone ?? (remoteOn ? 'waiting' : 'off')} aria-label="Remote control" onClick={() => (haptic('tap'), setRemote(true))}>
                 <Icon name="link" size={20} />
                 {remoteOn && <i className="remote-dot" />}

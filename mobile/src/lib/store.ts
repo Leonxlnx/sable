@@ -31,6 +31,7 @@ import { reconciler, staleFetch } from './stale';
 import { onForget } from './forget';
 import { epoch, still } from './epoch';
 import { onScreen } from './screen';
+import { mayCall } from '../web/allow';
 
 /**
  * The phone's view of the desktop: sessions, folders, accounts and the open conversations, kept
@@ -738,6 +739,8 @@ export async function refresh(openIds: string[]): Promise<{ complete: boolean }>
 
 /** Every account's limits as the desktop last read them (it reads them itself; this only asks what it knows). */
 export async function refreshLimits() {
+  // A browser is not told limits (web access's allowlist): nothing to ask.
+  if (!mayCall('usage.limits')) return;
   try {
     const reports = await conn.call('usage.limits', {});
     const limits: State['limits'] = {};

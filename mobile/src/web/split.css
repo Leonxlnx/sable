@@ -1,0 +1,909 @@
+/*
+ * The tablet layout (web/Split.tsx): the desktop's window at hand. Its measures are the desktop's
+ * (src/styles/tokens.css, src/app/app.css, src/features/sidebar/sidebar.css): the window's body
+ * (--shell) holds the list of chats, and the stage, a sheet one clear step darker, is cut into it 8 px
+ * from its edges with the desktop's corner and hairline; the conversation reads in the desktop's
+ * column and its composer is docked at the stage's foot. Every phone screen shown on the stage takes
+ * the desktop's type scale, corners and tones from the tokens set here; what the phone draws at hand
+ * size (its 40 px keys, 44 px rows) steps down to the desktop's controls, a touch larger where a
+ * finger must hit them. Hover answers only where there is a pointer that hovers.
+ */
+
+:root[data-split] {
+  /* the desktop's tones (tokens.css) */
+  --shell: #141417;
+  --sheet: #0c0c0e;
+  --bg: var(--sheet);
+  --text-2: #aeada9;
+  --text-3: #7a7975;
+  --text-4: #54534f;
+  --text-4-shell: #5a5955;
+  --fill-4: rgb(255 255 255 / 0.125);
+  --line-3: rgb(255 255 255 / 0.15);
+  --focus: rgb(242 241 238 / 0.5);
+  /* the desktop's type: 13 px for the interface, 14 px for what is read */
+  --t-caption: 12px;
+  --t-small: 13px;
+  --t-body: 14px;
+  --t-lead: 15.5px;
+  --t-title: 19px;
+  --t-display: 24px;
+  --w-medium: 500;
+  --w-strong: 580;
+  /* the desktop's corners */
+  --r-sm: 8px;
+  --r-md: 10px;
+  --r-lg: 12px;
+  --r-xl: 14px;
+  --r-pane: 20px;
+  --r-sheet: 16px;
+  /* the stage's top bar, the reading column and the list */
+  --bar-h: 44px;
+  --column: 760px;
+  --wside-w: 268px;
+  --wgap: 8px;
+  --wrow-h: 32px;
+  font-size: var(--t-body);
+}
+
+/* a finger rather than a pointer: rows a little taller */
+@media (pointer: coarse) {
+  :root[data-split] {
+    --wrow-h: 36px;
+  }
+}
+
+/* One scroller, one thin bar (the desktop's base.css): no arrows, the thumb on hover. */
+:root[data-split] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+:root[data-split] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:root[data-split] ::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.08) padding-box;
+}
+
+:root[data-split] ::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(255 255 255 / 0.16);
+}
+
+:root[data-split] ::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* ── the window ── */
+
+.wsplit {
+  position: fixed;
+  /* exactly the visible part of the page (web/viewport.ts): an on-screen keyboard shortens the stage, and
+     the composer stays on its foot above the keys; never vh */
+  top: var(--vvt, 0px);
+  left: 0;
+  right: 0;
+  height: var(--vvh, 100dvh);
+  display: grid;
+  grid-template-columns: var(--wside-w) minmax(0, 1fr);
+  padding: var(--sat) var(--sar) 0 var(--sal);
+  background: var(--shell);
+  transition: grid-template-columns 220ms var(--ease-out);
+}
+
+.wsplit[data-folded] {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wsplit {
+    transition: none;
+  }
+}
+
+.wside-slot {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.wsplit[data-folded] .wside-slot {
+  visibility: hidden;
+}
+
+/* The stage: a sheet cut into the body, the desktop's corner and hairline. It clips as a rectangle
+   (a round clip over a scroller costs every wheel step a trip to the main thread in Chromium); the
+   four corners are drawn over it by .wcorner. */
+.wstage {
+  position: relative;
+  min-width: 0;
+  margin: var(--wgap) var(--wgap) calc(var(--wgap) + var(--sab)) var(--wgap);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  background: var(--sheet);
+}
+
+.wsplit:not([data-folded]) .wstage {
+  margin-left: 0;
+}
+
+.wstage-body {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.wcorner {
+  position: absolute;
+  z-index: 60;
+  width: var(--r-xl);
+  height: var(--r-xl);
+  box-sizing: border-box;
+  pointer-events: none;
+  border: 0 solid color-mix(in srgb, var(--sheet) 94%, white 6%);
+  box-shadow: 0 0 0 var(--r-xl) var(--shell);
+  clip-path: inset(0);
+}
+
+.wcorner[data-at='tl'] {
+  top: -1px;
+  left: -1px;
+  border-width: 1px 0 0 1px;
+  border-top-left-radius: var(--r-xl);
+}
+
+.wcorner[data-at='tr'] {
+  top: -1px;
+  right: -1px;
+  border-width: 1px 1px 0 0;
+  border-top-right-radius: var(--r-xl);
+}
+
+.wcorner[data-at='bl'] {
+  bottom: -1px;
+  left: -1px;
+  border-width: 0 0 1px 1px;
+  border-bottom-left-radius: var(--r-xl);
+}
+
+.wcorner[data-at='br'] {
+  bottom: -1px;
+  right: -1px;
+  border-width: 0 1px 1px 0;
+  border-bottom-right-radius: var(--r-xl);
+}
+
+/* The toggle stands where the desktop's does, at the start of the stage's top bar, in both states. */
+.wtoggle {
+  position: absolute;
+  z-index: 40;
+  top: 7px;
+  left: 8px;
+}
+
+/* ── icon buttons, the desktop's 30 px ones ── */
+
+.wicon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  transition:
+    background-color 100ms,
+    color 100ms,
+    scale 120ms var(--ease-out);
+}
+
+.wicon:active {
+  background-color: var(--fill-3);
+  color: var(--text);
+  scale: 0.94;
+  transition-duration: 0ms, 0ms, 70ms;
+}
+
+@media (hover: hover) {
+  .wicon:hover {
+    background-color: var(--fill-2);
+    color: var(--text);
+  }
+}
+
+/* ── the list (web/Side.tsx; the desktop's sidebar.css) ── */
+
+.wside {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: var(--wside-w);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.wside-top {
+  flex-shrink: 0;
+  padding: 0 6px 8px;
+}
+
+/* the brand on the stage's top bar's centre line (45 px, the desktop's) */
+.wside-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: calc(var(--bar-h) + var(--wgap) + 1px);
+  padding: var(--wgap) 4px 0 8px;
+}
+
+.wside-mark {
+  flex-shrink: 0;
+  color: var(--text);
+}
+
+.wside-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* the search: a field of the desktop's, a darker well whose hairline lights on focus */
+.wsearch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  margin-top: 4px;
+  padding: 0 6px 0 10px;
+  border-radius: var(--r-sm);
+  background: rgb(0 0 0 / 0.22);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--text-3);
+  transition: box-shadow 0s;
+}
+
+.wsearch:focus-within {
+  box-shadow: inset 0 0 0 1px rgb(242 241 238 / 0.28);
+}
+
+.wsearch input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
+  font-size: var(--t-small);
+}
+
+.wsearch input::placeholder {
+  color: var(--text-3);
+}
+
+.wsearch-clear {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  color: var(--text-3);
+}
+
+@media (hover: hover) {
+  .wsearch-clear:hover {
+    background: var(--fill-2);
+    color: var(--text);
+  }
+}
+
+.wkbd {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  font-family: var(--font);
+  font-size: 11.5px;
+  color: var(--text-4-shell);
+}
+
+@media (pointer: coarse) and (hover: none) {
+  .wkbd {
+    display: none;
+  }
+}
+
+.wside-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 6px 12px;
+}
+
+.wgroup + .wgroup {
+  margin-top: 10px;
+}
+
+.wgroup-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: var(--w-medium);
+  color: var(--text-3);
+}
+
+.wrows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* A chat: the agent's mark in the icon column, the title, the time or the state at the end. Under the
+   pointer one fill step; the chat on screen a flat pill with its hairline (the desktop's .srow-pill). */
+.wrow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: var(--wrow-h);
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  color: var(--text-2);
+  font-size: var(--t-small);
+}
+
+.wrow:active {
+  background-color: var(--fill-2);
+}
+
+@media (hover: hover) {
+  .wrow:hover {
+    background-color: var(--fill-2);
+    color: var(--text);
+  }
+
+  .wrow:hover .wrow-agent {
+    opacity: 1;
+  }
+}
+
+.wrow[data-active] {
+  background-color: var(--fill-3);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  color: var(--text);
+}
+
+.wrow[data-tone='unread'],
+.wrow[data-tone='awaiting'] {
+  color: var(--text);
+}
+
+.wrow:focus-visible {
+  outline: 1.5px solid var(--focus);
+  outline-offset: -1.5px;
+}
+
+.wrow-mark {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 16px;
+}
+
+.wrow-agent {
+  opacity: 0.72;
+}
+
+.wrow[data-active] .wrow-agent {
+  opacity: 1;
+}
+
+.wrow-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.wrow-end {
+  display: grid;
+  place-items: center end;
+  flex-shrink: 0;
+  min-width: 16px;
+}
+
+.wrow-time {
+  font-size: 11.5px;
+  color: var(--text-4-shell);
+}
+
+.wrow[data-active] .wrow-time {
+  color: var(--text-3);
+}
+
+/* a message that matched: its chat, then its words */
+.whit {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 7px 8px 8px;
+  border-radius: var(--r-sm);
+  text-align: left;
+}
+
+@media (hover: hover) {
+  .whit:hover {
+    background-color: var(--fill-2);
+  }
+}
+
+.whit:focus-visible {
+  outline: 1.5px solid var(--focus);
+  outline-offset: -1.5px;
+}
+
+.whit-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.whit-chat {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.whit-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  padding-left: 20px;
+  font-size: var(--t-small);
+  line-height: 1.45;
+  color: var(--text-2);
+}
+
+.whit-text mark {
+  background: none;
+  color: var(--text);
+  font-weight: var(--w-strong);
+}
+
+.whit-you {
+  color: var(--text-3);
+}
+
+.wmore {
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-small);
+  color: var(--text-2);
+}
+
+@media (hover: hover) {
+  .wmore:hover {
+    background-color: var(--fill-2);
+    color: var(--text);
+  }
+}
+
+.wside-empty {
+  padding: 10px 8px;
+  font-size: var(--t-small);
+  line-height: 1.5;
+  color: var(--text-3);
+  animation: wempty-in 220ms ease-out 150ms both;
+}
+
+@keyframes wempty-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.wside-skel {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-top: 30px;
+}
+
+.wside-skel-row {
+  display: flex;
+  align-items: center;
+  height: var(--wrow-h);
+  padding: 0 40px 0 34px;
+}
+
+.wside-skel-row .skel {
+  height: 8px;
+}
+
+.wside-foot {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  height: calc(44px + var(--wgap));
+  padding: 0 6px calc(var(--wgap) + var(--sab)) 14px;
+}
+
+.wside-conn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+/* ── the stage's screens: the phone's, in the desktop's measures ── */
+
+.wstage .layer {
+  box-shadow: none;
+}
+
+.wstage .screen {
+  background: var(--sheet);
+}
+
+/* the field under the composer, as restrained as the desktop's in a chat (its pane is wider than a phone's) */
+.wstage .chat > .field {
+  opacity: 0.55;
+}
+
+.wstage .chat:has(.composer[data-focus]) > .field {
+  opacity: 0.3;
+}
+
+/* a sheet's keys at the desktop's size: the first one ivory, the rest one fill step, Later a quiet word */
+:root[data-split] .ask-btn {
+  height: 36px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-small);
+}
+
+:root[data-split] .ask-later {
+  height: 32px;
+}
+
+/* nothing chosen: the field low and quiet, and one sentence */
+.wstage .wempty {
+  display: grid;
+  place-items: center;
+}
+
+.wempty-text {
+  position: relative;
+  z-index: 1;
+  font-size: 13px;
+  color: var(--text-3);
+  animation: wempty-in 220ms ease-out 150ms both;
+}
+
+/* The top bar (44 px, the desktop's): the toggle's room at its start, the title at the desktop's
+   size, no fade band (a hairline-free ink bar over the conversation, as the stage's own bar). */
+.wstage .chat-head,
+.wstage .sub-head {
+  height: var(--bar-h);
+  padding: 0 8px 0 46px;
+  gap: 4px;
+}
+
+.wstage .chat-head::before,
+.wstage .sub-head::before {
+  inset: 0 0 -18px;
+  background: linear-gradient(var(--sheet) 0, var(--sheet) calc(100% - 18px), rgb(12 12 14 / 0));
+}
+
+/* the chat is chosen in the list: no way back from it */
+.wstage .layer[data-route='chat'] .chat-head .back-btn {
+  display: none;
+}
+
+.wstage .chat-titles {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding-left: 0;
+}
+
+.wstage .chat-title {
+  flex-shrink: 1;
+  min-width: 0;
+  gap: 8px;
+  font-size: var(--t-small);
+  font-weight: var(--w-strong);
+  letter-spacing: 0;
+}
+
+.wstage .chat-title .pmark {
+  width: 14px;
+  height: 14px;
+}
+
+.wstage .chat-sub {
+  flex-shrink: 1;
+  min-width: 0;
+  padding-left: 0;
+  font-size: var(--t-small);
+}
+
+.wstage .icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+}
+
+.wstage .icon-btn svg {
+  width: 17px;
+  height: 17px;
+}
+
+@media (hover: hover) {
+  .wstage .icon-btn:hover {
+    background-color: var(--fill-2);
+    color: var(--text);
+  }
+}
+
+/* Settings and a chat's changes: the column's measure, not the stage's width */
+.wstage .settings-scroll > * {
+  max-width: 600px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.wstage .settings-scroll > .set-title {
+  padding-inline: 10px;
+}
+
+.wstage .settings-scroll {
+  padding-top: calc(var(--bar-h) + 12px);
+}
+
+/* the conversation in the desktop's column */
+.wstage .thread-content {
+  width: 100%;
+  max-width: calc(var(--column) + 48px);
+  margin: 0 auto;
+  padding: calc(var(--bar-h) + 20px) 24px 28px;
+}
+
+.wstage .thread-skel {
+  padding-top: calc(var(--bar-h) + 20px);
+}
+
+.wstage .thread-skel-body {
+  max-width: calc(var(--column) + 48px);
+  margin: 0 auto;
+  padding: 8px 24px;
+}
+
+.wstage .thread-empty {
+  margin-top: 30dvh;
+}
+
+/* the foot, docked in the column: what waits, the queue, the composer. The stage itself is the visible
+   part of the page (above an on-screen keyboard), so nothing lifts it again. */
+.wstage .chat-foot {
+  align-items: center;
+  padding: 0 24px max(var(--sab), 16px);
+  translate: none;
+}
+
+.wstage .composer[data-focus]::before {
+  display: none;
+}
+
+/* a pointer that hovers: the conversation's rows answer it as the desktop's do */
+@media (hover: hover) {
+  .wstage :is(.work-line, .step-line, .block-head):not(:disabled):hover {
+    background-color: var(--fill-1);
+  }
+
+  .wstage .turn-acts button:hover,
+  .wstage .icon-btn.sm:hover {
+    background-color: var(--fill-2);
+    color: var(--text);
+  }
+}
+
+.wstage .chat-foot > * {
+  width: 100%;
+  max-width: var(--column);
+}
+
+/* The composer's bar: the desktop's 28 px chips and 40 px key, a touch larger for a finger. */
+.wstage .composer {
+  padding: 2px 6px 6px;
+}
+
+.wstage .composer-input {
+  min-height: 46px;
+  padding: 13px 10px 6px;
+  font-size: var(--t-body);
+}
+
+.wstage .composer-bar {
+  height: 40px;
+}
+
+.wstage .tool-key,
+.wstage .mode-chip {
+  width: 32px;
+  height: 32px;
+}
+
+.wstage .tool-key svg,
+.wstage .mode-chip svg {
+  width: 17px;
+  height: 17px;
+}
+
+.wstage .phrase {
+  height: 32px;
+  padding: 0 10px;
+  font-size: var(--t-small);
+}
+
+/* The mode with its name, as the desktop's chip ("Ask first"); a phone's bar keeps the icon alone. */
+.mode-chip-name {
+  display: none;
+}
+
+.wstage .mode-chip[aria-disabled='true'] {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+  padding: 0 11px 0 8px;
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+}
+
+.wstage .mode-chip[aria-disabled='true'] .mode-chip-name {
+  display: inline;
+  color: var(--text);
+}
+
+.wstage .mode-chip[data-tone='danger'] .mode-chip-name {
+  color: var(--text);
+}
+
+/* a chip that only shows (a browser may not change it): no press, no hand */
+.wstage .phrase[aria-disabled='true'],
+.wstage .mode-chip[aria-disabled='true'] {
+  cursor: default;
+}
+
+.wstage .phrase[aria-disabled='true']:active,
+.wstage .mode-chip[aria-disabled='true']:active {
+  background-color: transparent;
+  box-shadow: none;
+  scale: 1;
+}
+
+.wstage .mode-chip[aria-disabled='true']:active {
+  background-color: var(--fill-2);
+  box-shadow: var(--press-up);
+}
+
+@media (hover: hover) {
+  .wstage .tool-key:hover,
+  .wstage .mode-chip:not([aria-disabled='true']):hover {
+    background-color: var(--fill-3);
+    color: var(--text);
+  }
+
+  .wstage .phrase:not([aria-disabled='true']):hover {
+    background-color: var(--fill-2);
+  }
+
+  .wstage .send:not(:disabled):hover {
+    background-color: #fff;
+  }
+}
+
+.wstage .user-row {
+  padding-left: 96px;
+}
+
+.wstage .user-bubble {
+  padding: 9px 14px 10px;
+  border-radius: var(--r-lg);
+  background: rgb(0 0 0 / 0.34);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+}
+
+/* A sheet (a question, a permission, the model) floats over the stage as the desktop's dialogs do: one
+   pane of the column's width at the stage's foot, every corner round, no grip; the list stays where it is
+   under the dimmed page. */
+:root[data-split] .sheet-layer {
+  align-items: center;
+  padding: var(--sat) calc(var(--sar) + var(--wgap)) calc(var(--sab) + var(--wgap) + 16px) calc(var(--sal) + var(--wside-w) + var(--wgap));
+}
+
+:root[data-split][data-folded] .sheet-layer {
+  padding-left: calc(var(--sal) + var(--wgap));
+}
+
+:root[data-split] .sheet {
+  width: min(620px, 100%);
+  max-height: calc(100% - 40px);
+  margin: 0;
+  padding-bottom: 12px;
+  border-radius: 16px;
+}
+
+/* no tail under it (a phone's sheet runs on below the screen for the finger's overpull) */
+:root[data-split] .sheet::after {
+  display: none;
+}
+
+:root[data-split] .sheet-grip {
+  height: 16px;
+}
+
+/* buttons at the desktop's size: 30 px, 36 for the large ones a sheet ends with */
+:root[data-split] .btn {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-small);
+  font-weight: var(--w-medium);
+}
+
+:root[data-split] .btn-lg {
+  height: 38px;
+}
+
+@media (hover: hover) {
+  :root[data-split] .btn:not(:disabled):hover {
+    background-color: var(--fill-4);
+  }
+
+  :root[data-split] .btn-primary:not(:disabled):hover {
+    background-color: #fff;
+  }
+}
+
+/* the phone's vh (a screen's height) is the stage's here: the dynamic viewport's, never the large one */
+:root[data-split] .ask-patch {
+  max-height: min(34dvh, 320px);
+}
+
+:root[data-split] .ask-files {
+  max-height: 34dvh;
+}
+
+:root[data-split] .sheet-grip span {
+  display: none;
+}
+
+/* what floats over the stage takes the stage's width, not the window's */
+.wstage .jump {
+  width: 36px;
+  height: 36px;
+  margin-top: -50px;
+}

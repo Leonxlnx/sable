@@ -40,8 +40,19 @@ export interface SetupState {
  * disc of one fill step, the desktop's mode chip at hand size; Bypass keeps its red icon. Its name is
  * the button's label and the sheet's. A new mode's icon comes in where the old one stood.
  */
-export function ModeChip({ mode, open, onOpen }: { mode?: ModeInfo; open: boolean; onOpen: () => void }) {
+export function ModeChip({ mode, open, onOpen }: { mode?: ModeInfo; open: boolean; onOpen?: () => void }) {
   if (!mode) return null;
+  // Shown, not offered (a browser may not change a chat's mode: web/allow.ts): the same chip, still.
+  if (!onOpen)
+    return (
+      <span className="mode-chip" data-tone={mode.tone} role="img" aria-disabled="true" aria-label={`Permissions: ${mode.name}`} title={mode.name}>
+        <span key={mode.tone} className="mode-chip-glyph">
+          <Icon name={MODE_ICON[mode.tone] ?? 'hand'} size={19} className="mode-chip-icon" />
+        </span>
+        {/* Its name beside it where the bar has the desktop's room (web/split.css). */}
+        <span className="mode-chip-name">{mode.name}</span>
+      </span>
+    );
   return (
     <button
       type="button"
@@ -65,10 +76,17 @@ export function ModeChip({ mode, open, onOpen }: { mode?: ModeInfo; open: boolea
  * a step quieter, always whole. Where the bar has no room for all of it the model's name and the dot
  * go and the level stays (the desktop's order of shedding); nothing is ever cut with an ellipsis.
  */
-export function ModelPhrase({ model, effort, levels, open, onOpen }: { model?: string; effort?: string; levels?: string[]; open: boolean; onOpen: () => void }) {
+export function ModelPhrase({ model, effort, levels, open, onOpen }: { model?: string; effort?: string; levels?: string[]; open: boolean; onOpen?: () => void }) {
   const ref = useRef<HTMLButtonElement>(null);
   useShed(ref, `${model}|${effort}`);
   if (!model) return null;
+  // Shown, not offered (a browser may not change a chat's model or effort: web/allow.ts): the same words, still.
+  if (!onOpen)
+    return (
+      <span ref={ref as unknown as React.Ref<HTMLSpanElement>} className="phrase" role="img" aria-disabled="true" aria-label={`${model}${effort ? `, ${effort}` : ''}`}>
+        <PhraseWords model={model} effort={effort} levels={levels} />
+      </span>
+    );
   return (
     <button
       ref={ref}

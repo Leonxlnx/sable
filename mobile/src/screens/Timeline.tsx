@@ -36,6 +36,7 @@ import { useThumb } from '@m/lib/thumbs';
 import { openViewer, viewerLoaded } from '@m/ui/Viewer';
 import { holdMessage } from './MessageMenu';
 import { SynLine } from './Synthetic';
+import { mayCall } from '../web/allow';
 
 const useItem = <T extends TimelineItem>(sid: string, id: string | null | undefined) => useStore((s) => (id ? (sessionData(s, sid).items[id] as T | undefined) : undefined));
 
@@ -1387,7 +1388,7 @@ function AgentSwitchLine({ sid, it }: { sid: string; it: NoticeItem }) {
         <ProviderMark provider={mark.to} size={14} />
         <span className="switch-text">{it.text}</span>
       </span>
-      {!mark.past && (
+      {!mark.past && mayCall('session.switchAgent') && (
         <button type="button" className="switch-back" aria-disabled={off || undefined} data-going={going || undefined} onClick={back}>
           Switch back
         </button>
@@ -1472,7 +1473,7 @@ function LimitCard({ sid, it, next, went }: { sid: string; it: NoticeItem; next?
         {l.resetsAt && <span className="limit-card-reset num">{resetIn(l.resetsAt, now)}</span>}
       </div>
       {it.detail && <div className="limit-card-detail">{it.detail}</div>}
-      {action && (
+      {action && mayCall(action.method) && (
         <button
           type="button"
           className="btn btn-primary btn-block limit-card-go"
@@ -1763,7 +1764,7 @@ const CheckBlock = memo(function CheckBlock({ sid, id }: { sid: string; id: stri
           {took >= 1000 && <span className="work-meta num">{shortDuration(took)}</span>}
           {steps > 0 && <Icon name="caretDown" size={12} weight="bold" className="work-caret" />}
         </button>
-        {live && (
+        {live && mayCall('turn.checkStop') && (
           <button type="button" className="icon-btn sm check-stop" aria-label="Stop the check" onClick={() => (haptic('warning'), void conn.call('turn.checkStop', { sessionId: sid, itemId: id }).catch(() => {}))}>
             <span className="stop-square sm" />
           </button>
@@ -1824,7 +1825,7 @@ function CheckOffer({ sid, turn }: { sid: string; turn: TurnGroup }) {
       return t?.type === 'tool' && (t.status === 'running' || t.status === 'pending' || t.status === 'done');
     }),
   );
-  if (!checker || !ready || !opener || checked) return null;
+  if (!checker || !ready || !opener || checked || !mayCall('turn.check')) return null;
   // A sub-agent whose steps are not here may have made the change: the desktop says (only when nothing here did).
   if (!changes.files && changes.unknown.length) return <AskedOffer sid={sid} turn={turn} ids={changes.unknown} checker={checker} online={online} />;
   if (!changes.files) return null;

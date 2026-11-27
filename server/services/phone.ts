@@ -2216,10 +2216,12 @@ export class PhoneService {
         } else if (this.web && own === 'app.hello') {
           const state = await this.app.call('app.hello', {});
           const list = sessionsPage(state.sessions.map(webSession), 0, PHONE_BYTES.helloSessions);
-          // No desktop setting goes to a browser; the maps the client indexes by agent go empty (with none
-          // the page crashed right after pairing: mobile NewChat reads `settings.defaultModels[agent]`).
+          // No desktop setting goes to a browser but how Enter sends (the composer keeps the desktop's own
+          // "Send with Enter"); the maps the client indexes by agent go empty (with none the page crashed
+          // right after pairing: mobile NewChat reads `settings.defaultModels[agent]`).
+          const enter = state.settings.sendWithEnter;
           result = { version: state.version, sessions: list.sessions, sessionsCursor: list.cursor, sessionsTotal: list.total,
-            settings: { defaultModels: {}, defaultEfforts: {}, defaultModes: {} }, projects: [], providers: [] };
+            settings: { defaultModels: {}, defaultEfforts: {}, defaultModes: {}, ...(typeof enter === 'boolean' ? { sendWithEnter: enter } : {}) }, projects: [], providers: [] };
         } else if (own === 'phone.sessions') {
           // The chats' list on from where `app.hello` (or the page before) stopped.
           const state = await this.app.call('app.hello', {});

@@ -26,6 +26,7 @@ import { onForget } from '@m/lib/forget';
 import { HomeDock } from './HomeDock';
 import { levelOf, scoped } from './Limits';
 import { SearchResults } from './Search';
+import { mayCall } from '../web/allow';
 
 // The deck (the prompt sheets and the markdown they render): its own chunk, fetched once something waits.
 const loadDeck = () => import('./Deck');
@@ -362,9 +363,11 @@ export function Home({ under }: { under: boolean }) {
             <button type="button" className="icon-btn" aria-label="Search" aria-pressed={searching} onClick={() => (haptic('tap'), searching ? closeSearch() : setSearching(true))}>
               <Icon name="search" size={22} />
             </button>
-            <button type="button" className="icon-btn" aria-label="Limits" onClick={() => (haptic('tap'), nav.push({ name: 'limits' }))}>
-              <Icon name="gauge" size={22} />
-            </button>
+            {mayCall('provider.limits') && (
+              <button type="button" className="icon-btn" aria-label="Limits" onClick={() => (haptic('tap'), nav.push({ name: 'limits' }))}>
+                <Icon name="gauge" size={22} />
+              </button>
+            )}
             <button type="button" className="icon-btn" aria-label="Settings" onClick={() => (haptic('tap'), nav.push({ name: 'settings' }))}>
               <Icon name="gear" size={22} />
             </button>
@@ -466,7 +469,8 @@ export function Home({ under }: { under: boolean }) {
           )}
         </AnimatePresence>
 
-        <HomeDock covered={under} />
+        {/* A new chat is the desktop's to start (a browser may not create one: web/allow.ts). */}
+        {mayCall('session.create') && <HomeDock covered={under} />}
 
         {(deckUsed || deck) && (
           <Suspense fallback={null}>
@@ -812,14 +816,17 @@ const SWIPE_MAX = 132;
  * right (the working tiles, amber while it waits on you, a dot when unread). Swiped left it archives,
  * swiped right it pins (or unpins); held, its actions.
  */
-export const Row = memo(function Row({ id, onMenu, swipe = true, search }: { id: string; onMenu: (id: string, rect: DOMRect) => void; swipe?: boolean; search?: boolean }) {
+export const Row = memo(function Row({ id, onMenu, swipe: swipeAsked = true, search }: { id: string; onMenu: (id: string, rect: DOMRect) => void; swipe?: boolean; search?: boolean }) {
+  // Pin, archive and rename are the desktop's own in a browser (web/allow.ts): no swipe, no menu there.
+  const actions = mayCall('session.update');
+  const swipe = swipeAsked && actions;
   const s = useHome((st) => st.sessions[id]);
   const projects = useHome((st) => st.projects);
   const now = useNow();
   const li = useRef<HTMLLIElement>(null);
   const face = useRef<HTMLButtonElement>(null);
   const swiped = useRef(false);
-  const lp = useLongPress((el) => onMenu(id, el.getBoundingClientRect()));
+  const lp = useLongPress((el) => actions && onMenu(id, el.getBoundingClientRect()));
   const lpCancel = useRef(lp.cancel);
   lpCancel.current = lp.cancel;
   const [gone, setGone] = useState(false);

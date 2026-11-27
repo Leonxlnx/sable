@@ -4,7 +4,7 @@ import { PAIR_LINK_PREFIX, PHONE_PATH, type BridgeEvent, type PhoneFrame, type P
 type Methods = RpcMethods & PhoneMethods;
 import { eraseNative, loadMark, loadPairing, removePairing, saveMark, savePairing, type EraseMark } from './native';
 import { mergeHosts, sameHosts } from './hosts';
-import { busyError, transportError } from './errors';
+import { busyError, isTransport, transportError } from './errors';
 import { eraseAll, pageStorage } from './erase';
 import { FORGET_FAILED } from './credential';
 import { IdentityError, pskOfKey, pskOfToken, startHandshake, type Channel } from './secure';
@@ -632,8 +632,10 @@ class Conn {
   check(timeoutMs = 10_000) {
     if (this.state !== 'open' || !this.live()) return;
     const w = this.wire;
-    void this.call('usage.limits', {}, timeoutMs).catch(() => {
-      if (this.wire !== w) return;
+    void this.call('usage.limits', {}, timeoutMs).catch((err) => {
+      // The desktop answered, if only with a no (a browser may not read limits: web access's allowlist):
+      // the connection is alive. Only a call the connection lost or never answered says otherwise.
+      if (this.wire !== w || !isTransport(err)) return;
       // It is let go now and a fresh connection starts, not after its close event.
       this.dropWire();
       if (this.state === 'denied' || this.holdOld) return;

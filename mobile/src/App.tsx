@@ -25,6 +25,9 @@ import { Settings } from './screens/Settings';
 import { LimitsScreen } from './screens/Limits';
 import { AccountsScreen } from './screens/Accounts';
 import { NowScreen } from './screens/Now';
+import { useSplit, WEB } from './web/allow';
+import { Split } from './web/Split';
+import { WebPair } from './web/WebPair';
 
 // The conversation (markdown, steps, composer) loads as its own chunk: home draws first, then it is fetched while idle.
 const loadChat = () => import('./screens/Chat');
@@ -158,6 +161,8 @@ export function App() {
   const state = useStore((s) => s.conn);
   const error = useStore((s) => s.connError);
   const stack = useNav();
+  // A browser 820 px wide or more: the tablet layout, the list beside the chat (web/Split.tsx). Never in the phone app.
+  const split = useSplit();
   const [link, setLink] = useState<string | null>(null);
   // The list from the last run draws in the first frame (read synchronously); without one, nothing is drawn
   // until the saved pairing is read (a few ms), so no pairing screen flashes at a cold start.
@@ -266,7 +271,8 @@ export function App() {
   }, [stack]);
 
   const repairing = useStore((s) => !!s.repairing);
-  const unpaired = state === 'unpaired' || (state === 'denied' && !getState().loaded);
+  // In a browser a removal shows the pairing screen at once: nothing of the conversations stays on screen.
+  const unpaired = state === 'unpaired' || (state === 'denied' && (WEB || !getState().loaded));
   const pairing = unpaired || !!link || repairing;
   // Leaving the pairing screen for home: the launch plays from the pairing mark.
   useEffect(() => {
@@ -279,6 +285,24 @@ export function App() {
 
   if (!ready) return <div className="app" />;
   const top = stack[stack.length - 1];
+
+  if (pairing && WEB) {
+    // A browser's own pairing screen (web/WebPair.tsx): the link it was opened with shows from its first frame (nothing is asked before Pair).
+    return (
+      <>
+        <WebPair
+          link={link}
+          removed={state === 'denied'}
+          onLinkUsed={() => {
+            setLink(null);
+            setState({ repairing: false });
+          }}
+          onLinkDone={() => setLink(null)}
+        />
+        <Toast />
+      </>
+    );
+  }
 
   if (pairing) {
     return (
@@ -308,6 +332,36 @@ export function App() {
     );
   }
 
+  const banner = state === 'denied' && (
+    <div className="banner glass" role="alert">
+      <span>{error ?? 'This phone is no longer allowed'}</span>
+      <button type="button" className="btn btn-sm" onClick={() => void conn.forget().catch((err: Error) => setState({ toast: { text: err.message, level: 'error', at: Date.now() } }))}>
+        Pair again
+      </button>
+    </div>
+  );
+
+  if (split) {
+    return (
+      <>
+        <Split stack={stack}>
+          <AnimatePresence>
+            {stack.map((r, i) => (
+              <Layer key={routeKey(r)} route={r} index={i} covered={i < stack.length - 1} split>
+                <Screen route={r} />
+              </Layer>
+            ))}
+          </AnimatePresence>
+          {banner}
+        </Split>
+        {launch === 'on' && <Launch onDone={() => setLaunch('done')} />}
+        <MessageMenu />
+        <Viewer />
+        <Toast />
+      </>
+    );
+  }
+
   return (
     <>
       <div className="app">
@@ -320,14 +374,7 @@ export function App() {
           ))}
         </AnimatePresence>
         <Attention top={top} />
-        {state === 'denied' && (
-          <div className="banner glass" role="alert">
-            <span>{error ?? 'This phone is no longer allowed'}</span>
-            <button type="button" className="btn btn-sm" onClick={() => void conn.forget().catch((err: Error) => setState({ toast: { text: err.message, level: 'error', at: Date.now() } }))}>
-              Pair again
-            </button>
-          </div>
-        )}
+        {banner}
       </div>
       {launch === 'on' && <Launch onDone={() => setLaunch('done')} />}
       <MessageMenu />
@@ -366,7 +413,10 @@ const H = () => window.innerHeight;
  * opened as a clip-path was drawn by the main thread, which was busy mounting it: the opening and the
  * way back lost most of their frames on a phone).
  */
-function Layer({ route, index, covered, children }: { route: Route; index: number; covered: boolean; children: ReactNode }) {
+function Layer({ route, index, covered, split = false, children }: { route: Route; index: number; covered: boolean; split?: boolean; children: ReactNode }) {
+  // The tablet layout's stage: one chat replaces another in place by a short cross-fade (the desktop's
+  // view change, without its veil); what opens over a chat still slides in from the stage's edge.
+  const swaps = split && route.name === 'chat';
   const ref = useRef<HTMLDivElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const [present, safeToRemove] = usePresence();
@@ -382,8 +432,8 @@ function Layer({ route, index, covered, children }: { route: Route; index: numbe
     const b = body.current;
     if (!el || !b) return;
     const o = origin.current;
-    if (reduced()) {
-      animate(el, { opacity: [0, 1] }, { duration: 0.14 });
+    if (reduced() || swaps) {
+      animate(el, { opacity: [0, 1] }, { duration: 0.14, ease: 'easeOut' });
       return;
     }
     if (o) {
@@ -430,8 +480,8 @@ function Layer({ route, index, covered, children }: { route: Route; index: numbe
     leaving.current = list;
     const done = () => leaving.current === list && safeToRemove();
     const go = <T extends { stop: () => void }>(a: T) => (list.push(a), a);
-    if (reduced()) {
-      void go(animate(el, { opacity: 0 }, { duration: 0.12 })).finished.then(done);
+    if (reduced() || swaps) {
+      void go(animate(el, { opacity: 0 }, { duration: swaps ? 0.1 : 0.12 })).finished.then(done);
       return;
     }
     // Replaced by its race rival: it leaves toward its own side while the rival comes in from the other.
@@ -454,7 +504,7 @@ function Layer({ route, index, covered, children }: { route: Route; index: numbe
   }, [present]);
 
   return (
-    <div ref={ref} className="layer" style={{ zIndex: 10 + index }} data-route={route.name}>
+    <div ref={ref} className="layer" style={{ zIndex: 10 + index }} data-route={route.name} data-swaps={swaps || undefined}>
       <div ref={body} className="layer-body">
         {children}
       </div>

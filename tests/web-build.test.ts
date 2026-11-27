@@ -51,6 +51,9 @@ it('builds an external-script, external-style index and confines persistent stor
       expect(src).toMatch(/^\.\/assets\/[\w.-]+$/);
       expect(existsSync(path.join(outDir, src))).toBe(true);
     }
+    // The icon, the Home Screen icon and the manifest (drawn from the mark at build time, mobile/web-icons.ts).
+    for (const rel of ['icon', 'apple-touch-icon', 'manifest']) expect(html).toContain(`rel="${rel}"`);
+    for (const file of ['favicon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'manifest.webmanifest']) expect(existsSync(path.join(outDir, 'assets', file)), file).toBe(true);
     const js = readdirSync(path.join(outDir, 'assets')).filter(n => n.endsWith('.js')).map(n => readFileSync(path.join(outDir, 'assets', n), 'utf8')).join('\n');
     expect(js.match(/\blocalStorage\b/g)).toHaveLength(1);
     expect(js).toMatch(/window\.localStorage/);

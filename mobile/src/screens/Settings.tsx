@@ -14,6 +14,7 @@ import { Icon } from '@m/ui/icons';
 import { LogoMark, ProviderMark, Ring } from '@m/ui/marks';
 import { SNAP } from '@m/ui/motion';
 import { Sheet } from '@m/ui/Sheet';
+import { mayCall, WEB } from '../web/allow';
 
 /** A Tailscale address (100.64.0.0/10): reached over the tailnet, from anywhere. */
 const tailnet = (ip?: string) => !!ip && /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip);
@@ -126,18 +127,26 @@ export function Settings() {
           </>
         )}
 
+        {/* Accounts, limits and the archive's Restore never reach a browser (web/allow.ts): the section is the phone's. */}
+        {!WEB && (
+        <>
         <h3 className="set-title">Chats</h3>
         <div className="group-card">
-          <button type="button" className="set-row" onClick={() => (haptic('tap'), nav.push({ name: 'accounts' }))}>
-            <Icon name="user" size={20} />
-            <span className="set-label">Accounts</span>
-            <Icon name="next" size={16} className="set-chev" />
-          </button>
-          <button type="button" className="set-row" onClick={() => (haptic('tap'), nav.push({ name: 'limits' }))}>
-            <Icon name="gauge" size={20} />
-            <span className="set-label">Limits</span>
-            <Icon name="next" size={16} className="set-chev" />
-          </button>
+          {/* A browser is told no accounts and may not read limits (web/allow.ts): those stay on the desktop. */}
+          {mayCall('session.switchAccount') && (
+            <button type="button" className="set-row" onClick={() => (haptic('tap'), nav.push({ name: 'accounts' }))}>
+              <Icon name="user" size={20} />
+              <span className="set-label">Accounts</span>
+              <Icon name="next" size={16} className="set-chev" />
+            </button>
+          )}
+          {mayCall('provider.limits') && (
+            <button type="button" className="set-row" onClick={() => (haptic('tap'), nav.push({ name: 'limits' }))}>
+              <Icon name="gauge" size={20} />
+              <span className="set-label">Limits</span>
+              <Icon name="next" size={16} className="set-chev" />
+            </button>
+          )}
           <button type="button" className="set-row" onClick={() => (haptic('tap'), setArchive(true))}>
             <Icon name="archive" size={20} />
             <span className="set-label">Archived</span>
@@ -145,6 +154,8 @@ export function Settings() {
             <Icon name="next" size={16} className="set-chev" />
           </button>
         </div>
+        </>
+        )}
 
         <h3 className="set-title">About</h3>
         <div className="group-card">
@@ -173,7 +184,11 @@ export function Settings() {
       <Sheet open={confirm} onClose={() => setConfirm(false)} label="Forget this computer">
         <div className="confirm">
           <h2 className="confirm-title">Forget {name}?</h2>
-          <p className="confirm-sub">Its chats, drafts and the files downloaded from it go from this phone. To use it again, scan its code in Settings › Phone.</p>
+          <p className="confirm-sub">
+            {WEB
+              ? 'Its chats go from this browser. To use it again, pair it from Settings › Phone › Web access on the computer.'
+              : 'Its chats, drafts and the files downloaded from it go from this phone. To use it again, scan its code in Settings › Phone.'}
+          </p>
           <button
             type="button"
             className="btn btn-primary btn-lg btn-block"

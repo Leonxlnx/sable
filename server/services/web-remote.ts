@@ -61,7 +61,7 @@ const HEADERS = {
   'Strict-Transport-Security': 'max-age=31536000',
   'Cache-Control': 'no-store',
 };
-const types: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.woff': 'font/woff', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const types: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.woff': 'font/woff', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 type Certificates = Awaited<ReturnType<typeof webCertificates>>;
 function rawHeaders() { return Object.entries(HEADERS).map(([key, value]) => key + ': ' + value); }
 /** web.state's error once no look at the networks has succeeded for `hold` (two minutes). */

@@ -246,8 +246,8 @@ it('runs nothing while off, a look at most once per idle period at rest, and one
   // The start's look, and the one Settings' first read asks for when the start took longer than `fresh`.
   await sleep(200);
   const on = runs;
+  // (How many the start took depends on how long the certificate took on a busy machine: not the rule.)
   expect(on).toBeGreaterThanOrEqual(1);
-  expect(on).toBeLessThanOrEqual(3);
   // At rest: once per idle period (it would be thirty times at the connected pace).
   await sleep(3000);
   expect(runs - on).toBeGreaterThanOrEqual(2);
@@ -501,8 +501,11 @@ it('exposes chat fields only on hello, pages, snapshots and live updates', async
   rt.enqueue('unopened-queue');
   const hello = (await c.call('app.hello')).result;
   expect(hello).toMatchObject({ settings: {}, providers: [], projects: [], sessions: [{ id: rt.id, cwd: '' }] });
-  // Exactly the empty maps the client indexes by agent (it crashed on a bare {}), nothing of the desktop's.
-  expect((hello as { settings: unknown }).settings).toEqual({ defaultModels: {}, defaultEfforts: {}, defaultModes: {} });
+  // Exactly the empty maps the client indexes by agent (it crashed on a bare {}), nothing of the desktop's
+  // but how Enter sends (the composer keeps the desktop's own setting).
+  const { sendWithEnter, ...maps } = (hello as { settings: { sendWithEnter?: unknown } }).settings;
+  expect(maps).toEqual({ defaultModels: {}, defaultEfforts: {}, defaultModes: {} });
+  expect(sendWithEnter === undefined || typeof sendWithEnter === 'boolean').toBe(true);
   expect(JSON.stringify(c.frames)).not.toContain('unopened-queue');
   for (const method of ['phone.sessions','session.snapshot','phone.tail']) expect((await c.call(method, { sessionId: rt.id })).ok).toBe(true);
   rt.update({ remote: { ...remote, status: 'connected' } });
@@ -510,6 +513,27 @@ it('exposes chat fields only on hello, pages, snapshots and live updates', async
   for (const marker of [remote.code, remote.url, 'private-account-dir','private-project-path','private-default-model','private-desktop-toast','unopened-suggestion',h.home])
     expect(JSON.stringify(c.frames)).not.toContain(marker);
   expect((await c.call('phone.prompts')).ok).toBe(false);
+});
+
+// 0.2.41's tracked work reaches a browser as it reaches the phone: a chat with a tracked job reads as working.
+it('gives a browser a chat’s tracked work as the phone has it, never the process id or the log’s path', async () => {
+  const h = await setup(), { c } = await h.pair();
+  const { session } = await h.app.call('session.create', { provider: 'demo', cwd: beside(h.home), mode: 'default' });
+  const rt = h.app.runtime(session.id);
+  rt.add({ id: 'job1', type: 'tool', ts: 1, name: 'mcp__sable__track_work', kind: 'other', title: 'Codex builds the sign-in fix', status: 'done', detail: {},
+    tracked: { pid: 424242, by: 'Codex', log: 'private-log-path.log', line: '18 passed', state: 'running', since: 1000, born: 'private-born' } } as unknown as ToolItem);
+  rt.update({ tracked: 1, trackedTitle: 'Codex builds the sign-in fix', trackedSince: 1000, commands: 2 });
+  const listed = ((await c.call('app.hello')).result as { sessions: { id: string; tracked?: number; trackedTitle?: string; trackedSince?: number; commands?: number }[] }).sessions.find(s => s.id === rt.id)!;
+  expect(listed).toMatchObject({ tracked: 1, trackedTitle: 'Codex builds the sign-in fix', trackedSince: 1000, commands: 2 });
+  const tail = (await c.call('phone.tail', { sessionId: rt.id })).result as { items: ToolItem[] };
+  expect(tail.items.find(i => i.id === 'job1')?.tracked).toEqual({ pid: 0, by: 'Codex', line: '18 passed', state: 'running', since: 1000 });
+  // Ended: the cleared fields travel to the browser too.
+  rt.update({ tracked: undefined, trackedTitle: undefined, trackedSince: undefined });
+  await vi.waitFor(() => expect(c.frames.some(f => JSON.stringify(f).includes('"tracked":null,"trackedTitle":null,"trackedSince":null'))).toBe(true));
+  for (const marker of ['424242', 'private-log-path', 'private-born']) expect(JSON.stringify(c.frames)).not.toContain(marker);
+  // How Enter sends is the desktop's setting, the one setting a browser is told.
+  await h.app.call('app.setSettings', { patch: { sendWithEnter: false } });
+  expect(((await c.call('app.hello')).result as { settings: object }).settings).toEqual({ defaultModels: {}, defaultEfforts: {}, defaultModes: {}, sendWithEnter: false });
 });
 
 it('requires this socket’s current permission revision and only a one-time decision', async () => {

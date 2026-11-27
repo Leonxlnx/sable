@@ -1,0 +1,175 @@
+/*
+ * Pairing in a browser (web/WebPair.tsx): the phone's pairing ground (screens.css .pair, the field and its
+ * veil, the mark) with one column of the desktop's measures: the mark, the name, one status block of a line
+ * or two that keeps its height, and one row under it (the name and Pair, a pasted link and Continue, Cancel).
+ * A new status fades in where the old one stood; two are never on screen together.
+ */
+
+.wpair .wp-main {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-width: 440px;
+  margin: 0 auto;
+  padding-bottom: 6dvh;
+  text-align: center;
+}
+
+.wp-title {
+  margin-top: 4px;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.wp-status {
+  width: 100%;
+  min-height: 76px;
+  margin-top: 18px;
+}
+
+.wp-status-in {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  animation: wp-in 200ms var(--ease-out) both;
+}
+
+@keyframes wp-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wp-status-in {
+    animation-duration: 1ms;
+  }
+}
+
+.wp-line {
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+
+.wp-strong {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text);
+  font-weight: var(--w-medium);
+}
+
+.wp-sub {
+  max-width: 380px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.wp-dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--text-2);
+}
+
+.wp-status[data-tone='waiting'] .wp-dot {
+  background: var(--amber);
+}
+
+.wp-status[data-tone='error'] .wp-dot {
+  background: var(--red);
+}
+
+.wp-form {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 14px;
+}
+
+.wp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.wp-row-end {
+  justify-content: center;
+}
+
+/* a field of the desktop's: a darker well whose hairline lights on focus */
+.wp-field {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: 10px;
+  background: rgb(0 0 0 / 0.32);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  color: var(--text-3);
+  text-align: left;
+}
+
+.wp-field:focus-within {
+  box-shadow: inset 0 0 0 1px rgb(242 241 238 / 0.28);
+}
+
+.wp-label {
+  flex-shrink: 0;
+  font-size: 13px;
+  color: var(--text-3);
+}
+
+.wp-field input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.wp-field input::placeholder {
+  color: var(--text-3);
+}
+
+.wpair .wp-go,
+.wpair .wp-alt {
+  height: 44px;
+  padding: 0 20px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+@media (hover: hover) {
+  .wpair .wp-alt:hover,
+  .wpair .wp-go:not(.btn-primary):not(:disabled):hover {
+    background-color: var(--fill-4);
+  }
+
+  .wpair .btn-primary.wp-go:not(:disabled):hover {
+    background-color: #fff;
+  }
+}
+
+.wpair .wp-go:disabled {
+  opacity: 0.45;
+}
