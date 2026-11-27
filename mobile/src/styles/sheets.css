@@ -1436,3 +1436,135 @@
 html[data-away] .sheet-body::before {
   animation-play-state: running !important;
 }
+
+/* ── "Working now" (screens/WorkSheet.tsx): the desktop Agents tab's cards at hand size, flat rows on the sheet ── */
+.wn-list {
+  display: flex;
+  flex-direction: column;
+  padding: 0 4px 4px;
+}
+
+.wn-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-height: 60px;
+  padding: 12px 8px;
+}
+
+.wn-row + .wn-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 36px;
+  right: 8px;
+  height: 1px;
+  background: var(--line);
+}
+
+.wn-mark {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 22px;
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.wn-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.wn-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+}
+
+.wn-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--t-body);
+  font-weight: var(--w-medium);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wn-by {
+  max-width: 34%;
+  font-size: var(--t-small);
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wn-time {
+  flex-shrink: 0;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.wn-sub {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 20px;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}
+
+.wn-now {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wn-steps::before {
+  content: '·';
+  margin: 0 7px;
+  color: var(--text-4);
+}
+
+/* the chat's own Stop: the Now screen's key, in the row's flow */
+.wn-stop {
+  position: static;
+  flex-shrink: 0;
+  margin: 4px 0 -2px;
+}
+
+.wn-row[data-quiet] .wn-title {
+  font-weight: 400;
+  color: var(--text-2);
+}
+
+.wn-dash {
+  width: 9px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+.wn-wait {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+
+.wn-more,
+.wn-empty {
+  margin: 14px 8px 10px;
+  font-size: var(--t-small);
+  color: var(--text-3);
+}

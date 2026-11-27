@@ -188,11 +188,14 @@ describe('where the word is drawn', () => {
 
   it('on the phone: the same model, the word leading the row’s figures', () => {
     const screen = read('mobile/src/screens/Timeline.tsx');
-    expect(screen).toMatch(/import \{ delegateWord \} from '@desk\/features\/timeline\/delegate-word';/);
+    // 2.22: the same module also gives the row its one decision ("Send report again", `delegateRetry`).
+    expect(screen).toMatch(/import \{ DELEGATE_RETRY_LABEL, delegateRetry, delegateWord \} from '@desk\/features\/timeline\/delegate-word';/);
     expect(screen).toMatch(/const report = delegateWord\(it\);/);
     expect(screen).toMatch(/\{report === 'Stopping' \? 'Stopping' : it\.status === 'error' \? 'Failed' :/);
     expect(screen).toMatch(/\{\[report !== 'Stopping' && report, stats\?\.steps \?/);
     // The model the phone imports brings nothing of the window with it.
     expect(read('src/features/timeline/delegate-word.ts')).not.toMatch(/from '@\//);
+    // Nor does the pure part of the Agents tab's model the phone reads what works from (2.22).
+    expect(read('src/features/rail/now-model.ts')).not.toMatch(/from '@\//);
   });
 });

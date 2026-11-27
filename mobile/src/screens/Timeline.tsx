@@ -6,7 +6,8 @@ import { syntheticOf, userItemText } from '@shared/synthetic';
 import { formatDuration, formatTokens, plural, resetIn } from '@desk/lib/format';
 import { leadTitle } from '@desk/features/timeline/lead-in';
 import { firstAutoAt, steerWaitLine, steerWaitSpoken, waitingOn, waitsAsSteer } from '@desk/features/timeline/steer-wait';
-import { delegateWord } from '@desk/features/timeline/delegate-word';
+import { DELEGATE_RETRY_LABEL, delegateRetry, delegateWord } from '@desk/features/timeline/delegate-word';
+import { STATE_MARK, isAgentLive, isJob, jobAgent, jobEndWord, jobRan, jobRowState } from '@desk/features/rail/now-model';
 import { epoch, still } from '@m/lib/epoch';
 import { useNow } from '@m/lib/useNow';
 import { onScreen } from '@m/lib/screen';
@@ -26,7 +27,7 @@ import { checkOpener, foldTarget, limitAction, limitProvider, showKind, turnChan
 import { foldKey, keepDetail, keepOpen, keptDetail, stepKey, wasOpen } from '@m/lib/folds';
 import { useChanges } from '@m/lib/changes';
 import { checkpointStart, runSpan, turnSpan, type Segment, type StepsChunk, type TurnGroup } from '@m/lib/turns';
-import { hasWork } from '@shared/work-label';
+import { hasWork, waited } from '@shared/work-label';
 import { Icon, TOOL_ICON, type IconName } from '@m/ui/icons';
 import { FileGlyph, kindName } from '@m/ui/FileGlyph';
 import { PROVIDER_NAME, ProviderMark, Ring, StatusMark, Tiles } from '@m/ui/marks';
@@ -1057,6 +1058,8 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
   if (it.type === 'thinking') return <ThinkingStep sid={sid} it={it} quiet={quiet} />;
   if (it.type === 'text') return <div className="step-text" data-id={id}>{inlineCode(it.text.length > 280 ? `${it.text.slice(0, 280)}…` : it.text)}</div>;
   if (it.type !== 'tool') return null;
+  // Work the agent started outside its tools and asked Sable to watch (track_work): drawn as what it is.
+  if (isJob(it)) return <JobStep id={id} it={it} />;
   const more = !!(it as PhoneItem).more;
   const detail = toolDetail(full ?? it);
   const status = it.status;
@@ -1084,6 +1087,50 @@ const Step = memo(function Step({ sid, id, quiet }: { sid: string; id: string; q
           </motion.div>
         )}
       </AnimatePresence>
+    </div>
+  );
+});
+
+/**
+ * A job the agent started outside its tools and asked Sable to track (`ToolItem.tracked`), in the
+ * desktop Agents tab's grammar at hand size: its state's mark (the ring while it runs, the quiet check
+ * once it is gone, a dash when nobody tracks it any more), its title, who runs it (an agent's mark, else
+ * the word), how long it has run or ran ("Ended" when Sable does not know when it ended), and under it
+ * the last line of its log as one plain line (the agent's process wrote it: never markup).
+ */
+const JobStep = memo(function JobStep({ id, it }: { id: string; it: ToolItem & { tracked: NonNullable<ToolItem['tracked']> } }) {
+  const t = it.tracked;
+  const running = t.state === 'running';
+  // Minutes are what a job is read in: the clock moves once a second only while it runs and is in view.
+  const now = useSecond(running);
+  const state = jobRowState(t);
+  const report = delegateWord(it);
+  const end = jobEndWord(t);
+  const when = running ? waited(Math.max(0, now - t.since)) : report || end || shortDuration(jobRan(t));
+  const by = t.by ?? it.detail?.description;
+  const agent = jobAgent(by);
+  const spoken = `${it.title}${by ? `, ${by}` : ''}. ${running ? `Running, ${when}` : state === 'done' ? (end ? 'Ended' : `Ended after ${when}`) : 'Not tracked'}${report ? `. ${report}` : ''}`;
+  return (
+    <div className="step job" data-id={id} data-state={state} role="group" aria-label={spoken}>
+      <div className="step-line job-line" aria-hidden>
+        <span className="step-icon job-mark" data-state={state}>
+          {running ? <Ring size={13} /> : STATE_MARK[state] === 'check' ? <Icon name="check" size={13} weight="bold" /> : <i className="job-dash" />}
+        </span>
+        <span className="step-title job-title">{it.title}</span>
+        {agent ? (
+          <span className="job-who">
+            <ProviderMark provider={agent} size={13} />
+          </span>
+        ) : by ? (
+          <span className="job-by">{by}</span>
+        ) : null}
+        <span className="job-time num">{when}</span>
+      </div>
+      {t.line && (
+        <span className="job-log" aria-hidden>
+          {t.line}
+        </span>
+      )}
     </div>
   );
 });
@@ -1273,7 +1320,9 @@ const Block = memo(function Block({ sid, id }: { sid: string; id: string }) {
   }
   const stats = it.result?.agent;
   const bg = stats?.background;
-  const runningNow = it.status === 'running' || it.status === 'pending' || bg === 'running';
+  // Working now by the desktop's rule (now-model.ts `isAgentLive`): a handed-over task whose child has
+  // ended and whose report waits is no running child, whatever its launch result still says.
+  const runningNow = isAgentLive(it);
   const name = it.detail?.subagent || it.title;
   return <AgentBlock sid={sid} id={id} it={it} name={name} running={runningNow} background={!!bg} kids={kids} />;
 });
@@ -1309,6 +1358,7 @@ function AgentBlock({ sid, id, it, name, running, background, kids }: { sid: str
           {kids > 0 && <Icon name="caretDown" size={12} weight="bold" className="block-caret" />}
         </span>
       </button>
+      <ReportAgain sid={sid} it={it} />
       <AnimatePresence initial={false}>
         {open && steps.length > 0 && (
           <motion.div className="block-steps" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={REVEAL}>
@@ -1319,6 +1369,39 @@ function AgentBlock({ sid, id, it, name, running, background, kids }: { sid: str
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+/**
+ * "Send report again", the desktop's one action of a handed-over task whose report went out and whose
+ * delivery the bridge could not confirm (`delegateReceiptState: 'unknown'`, since 0.2.41 only the
+ * second time for a row; no notice is written): the press sends the bridge's own `/report-retry <id>`
+ * once, with one submission id, which the bridge takes as the decision and never as a message to the
+ * agent. The row's word changes with its answer; a refusal is a toast in the bridge's words.
+ */
+function ReportAgain({ sid, it }: { sid: string; it: ToolItem }) {
+  const command = delegateRetry(it);
+  const submitId = useRef<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const online = useStore((s) => s.conn === 'open');
+  if (!command) return null;
+  return (
+    <button
+      type="button"
+      className="btn btn-sm block-again"
+      disabled={sending || !online}
+      onClick={() => {
+        haptic('tap');
+        setSending(true);
+        submitId.current ??= crypto.randomUUID();
+        void conn
+          .call('session.send', { sessionId: sid, text: command, submitId: submitId.current })
+          .catch((err: Error) => setState({ toast: { text: err.message, level: 'error', at: Date.now() } }))
+          .finally(() => setSending(false));
+      }}
+    >
+      {DELEGATE_RETRY_LABEL}
+    </button>
   );
 }
 

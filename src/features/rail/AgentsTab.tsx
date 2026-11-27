@@ -19,6 +19,7 @@ import { useStore } from '@/state/store';
 import { IconButton } from '@/ui';
 import { AgentDetail } from './AgentDetail';
 import { ShownCtx, indexFor, useLooked, usePaneTick, useProgress, useShown } from './agents-hooks';
+import { jobAgent } from './now-model';
 import { OUTCOME_WORD, STATE_MARK, agentState, agentsHeader, commandRowState, commandState, commandsView, dayLabel, failureIsNews, figuresOf, historyDays, isJob, jobRan, jobRowState, jobTail, jobsView, lastLine, liveKey, nowRows, outcomeOf, overview, ownerAgent, promptLine, readProgress, waveOpen, waveRows, workflowNow, type CommandState, type Progress, type RowState } from './agents-model';
 import { LeaveList } from './leave';
 import './agents.css';
@@ -367,14 +368,8 @@ function Since({ ts }: { ts: number }) {
   return ms >= 1000 ? shortDuration(ms) : null;
 }
 
-/** The agent a job's "who" names, when it names one: its mark stands for the word. */
-function byProvider(by: string | undefined): ProviderId | null {
-  if (!by) return null;
-  if (/\bcodex\b/i.test(by)) return 'codex';
-  if (/\bclaude\b/i.test(by)) return 'claude';
-  if (/\bopencode\b/i.test(by)) return 'opencode';
-  return null;
-}
+/** The agent a job's "who" names, when it names one: its mark stands for the word (now-model.ts, which the phone reads too). */
+const byProvider = (by: string | undefined): ProviderId | null => jobAgent(by);
 
 /** Who runs a job or started a command, after its title: an agent's mark, else the word, quiet. */
 function By({ by }: { by: string | undefined }) {

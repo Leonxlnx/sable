@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { SessionMeta } from '@shared/protocol';
-import { workLabel } from '@shared/work-label';
+import { workCounts, workLabel } from '@shared/work-label';
 import { activityLine, doingLine, doingOf } from './note-live';
 import { onScreen } from './screen';
 
@@ -23,9 +23,16 @@ export interface LiveWords {
   open: number;
 }
 
-export function liveWords(s: Pick<SessionMeta, 'status' | 'activity' | 'live' | 'background' | 'commands' | 'serving'>): LiveWords {
+export function liveWords(s: Pick<SessionMeta, 'status' | 'activity' | 'live' | 'background' | 'commands' | 'serving' | 'until' | 'tracked' | 'trackedSince' | 'trackedTitle'>): LiveWords {
   const own = s.status === 'running' || s.status === 'starting';
-  if (!own) return { line: workLabel(s as SessionMeta) ?? 'Working', steps: 0, done: 0, open: 0 };
+  if (!own) {
+    // The shared words (a single tracked job by its own title, "2 jobs running"), and since when the
+    // work runs where the bridge says it: tracked jobs carry their start (`trackedSince`); sub-agents
+    // and commands have none in the list, so a clock beside them would be the phone's own guess.
+    const c = workCounts(s);
+    const since = c.jobs > 0 && !c.agents && !c.commands && s.until?.phase !== 'checking' ? s.trackedSince : undefined;
+    return { line: workLabel(s) ?? 'Working', ...(since ? { since } : {}), steps: 0, done: 0, open: 0 };
+  }
   if (s.status === 'starting') return { line: 'Starting', steps: 0, done: 0, open: 0 };
   const l = s.live;
   if (!l) return { line: activityLine(s.activity), steps: 0, done: 0, open: 0 };

@@ -84,7 +84,8 @@ function NowCard({ id, now }: { id: string; now: number }) {
         <span className="now-head">
           <ProviderMark provider={s.provider} size={14} />
           <span className="now-title">{s.title}</span>
-          {!waiting && own && <span className="now-time num">{clockOf(now - (w.since ?? first))}</span>}
+          {/* Its turn's clock; with the turn over, the tracked job's own (lib/live-words.ts: only where the bridge says when it began). */}
+          {!waiting && (own || w.since) && <span className="now-time num">{clockOf(now - (w.since ?? first))}</span>}
         </span>
         <span className="now-line">
           <span className="now-mark">{waiting ? <StatusMark tone="awaiting" size={12} /> : <Tiles size={14} />}</span>
