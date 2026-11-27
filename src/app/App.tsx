@@ -30,6 +30,7 @@ import { isNarrow } from '@/lib/narrow';
 import { useStore } from '@/state/store';
 import { IconButton, Tip, TipProvider, Toasts } from '@/ui';
 import { CapabilitiesButton } from './Capabilities';
+import { WebMark } from '@/features/web/WebMark';
 import { onOpenCue } from './open-cue';
 import { loadSessionView, sessionViewNow } from './views';
 import { WindowControls } from './WindowControls';
@@ -1027,6 +1028,8 @@ function Topbar({ panelShown }: { panelShown: boolean }) {
       <div className="topbar-actions">
         <WaitingCount />
         {session && <ContextMeter sessionId={session.id} />}
+        {/* A browser attached through web access (nothing while none is, or while it is not built in). */}
+        <WebMark />
         {session && <CapabilitiesButton sessionId={session.id} />}
         {session && <ChatMenu sessionId={session.id} />}
         {/* The sidebar's top row has the search; the bar shows it only while the sidebar is away. */}
