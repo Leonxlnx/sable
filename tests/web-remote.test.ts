@@ -32,7 +32,7 @@ afterEach(async () => {
   clearance.ships = true;
   vi.restoreAllMocks();
 });
-function fixture(ports: Pick<WebOptions, 'port' | 'showSave' | 'networks' | 'lookTimes' | 'watchMs' | 'interfaces'> = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
+function fixture(ports: Pick<WebOptions, 'port' | 'showSave' | 'networks' | 'lookTimes' | 'watchMs' | 'interfaces' | 'connectGapMs'> = {}, existingHome?: string, extra: AppOptions['providers'] = []) {
   const home = existingHome ?? mkdtempSync(path.join(process.env.TEMP!, 'web-test-'));
   if (!existingHome) homes.push(home);
   let release!: () => void;
@@ -56,7 +56,9 @@ function fixture(ports: Pick<WebOptions, 'port' | 'showSave' | 'networks' | 'loo
   writeFileSync(path.join(assets, 'index.html'), 'Sable web fixture');
   const networks = [{ id: 'home/adapter/10.0.0.7', name: 'Home', address: '10.0.0.7' }];
   app.store.state.settings.webNetwork = networks[0].id;
-  registerPhone(app, { port: 0, host: '127.0.0.1', web: { assets, loopback: true, port: 0, networks: () => networks, ...ports } });
+  // (No pause between the looks new connections ask for: these tests connect one after another. Its own test
+  // sets one. And the system's addresses are a fixed word: this laptop's own Wi-Fi must not decide a test.)
+  registerPhone(app, { port: 0, host: '127.0.0.1', web: { assets, loopback: true, port: 0, connectGapMs: 0, interfaces: () => 'wifi=10.0.0.7', networks: () => networks, ...ports } });
   return { app, home, assets, delay, sent, release, networks };
 }
 async function setup(f = fixture()) {
@@ -202,7 +204,7 @@ function upgrade(ws: WebSocket) {
 it('answers requests on the kept look at once, keeps its browsers through failing looks while the last good one holds, then stops and says why', async () => {
   const nets = [{ id: 'home/adapter/10.0.0.7', name: 'Home', address: '10.0.0.7' }];
   const inventory = { fail: false, slow: 0, runs: 0, ended: 0 };
-  const h = await setup(fixture({ lookTimes: { fresh: 300, idle: 900, hold: 4000 }, networks: async () => {
+  const h = await setup(fixture({ lookTimes: { fresh: 300, idle: 900, hold: 8000 }, networks: async () => {
     inventory.runs++;
     try {
       if (inventory.slow) await sleep(inventory.slow);
@@ -227,7 +229,7 @@ it('answers requests on the kept look at once, keeps its browsers through failin
   await vi.waitFor(() => expect(inventory.ended).toBe(inventory.runs), { timeout: 5000 });
   inventory.slow = 0;
   // Looks fail from now on: nothing changes for who is connected while the last good look holds (two
-  // minutes; 4 s here), and the page's own requests are answered; a new connection is refused.
+  // minutes; 8 s here), and the page's own requests are answered; a new connection is refused.
   inventory.fail = true;
   const failing = inventory.runs;
   await sleep(700);
@@ -240,7 +242,7 @@ it('answers requests on the kept look at once, keeps its browsers through failin
   expect(await upgrade(h.ws())).toBe('403');
   expect(closed).toBe(false);
   // Then the listener stops, its browsers go, and web.state says why.
-  await vi.waitFor(async () => expect((await h.app.call('web.state', {})).listening).toBe(false), { timeout: 8000, interval: 100 });
+  await vi.waitFor(async () => expect((await h.app.call('web.state', {})).listening).toBe(false), { timeout: 16_000, interval: 100 });
   expect((await h.app.call('web.state', {})).error).toMatch(/Could not read this computer’s networks for two minutes/);
   await p.c.closed;
   // A look that succeeds again starts it again.
@@ -658,6 +660,27 @@ it('never opens a connection to the chats on a kept look: the same address on an
   const s = await f.app.call('web.state', {});
   expect(s.listening).toBe(false);
   expect(s.error).toMatch(/selected home network changed/);
+});
+
+// The second review: every connection asked for a look of its own, so any device on the network could have
+// Sable run PowerShell with each request, before anything only a paired device could pass.
+it('looks at the networks for new connections once per gap at most, and never for what is no WebSocket handshake', async () => {
+  let runs = 0;
+  const f = fixture({ connectGapMs: 700, lookTimes: { fresh: 60_000, idle: 60_000, hold: 120_000 }, networks: () => { runs++; return f.networks; } });
+  const h = await setup(f);
+  const kept = runs;
+  const odd = (extra: WebSocket.ClientOptions) => new WebSocket('wss://127.0.0.1:' + h.s.port + '/sable-web', { servername: h.s.hostname, ca: h.ca.toString(), headers: { Host: h.host, Origin: 'https://' + h.host }, ...extra } as WebSocket.ClientOptions);
+  expect(await upgrade(odd({ protocolVersion: 8 }))).toBe('403');
+  expect(runs).toBe(kept);
+  // Six at once: all are let in, on two looks at most (the first, and one for those that arrived while it ran).
+  const began = performance.now();
+  expect(await Promise.all(Array.from({ length: 6 }, () => upgrade(h.ws())))).toEqual(Array(6).fill('open'));
+  expect(runs - kept).toBeLessThanOrEqual(2);
+  // One after another: each waits for the next look, which the gap paces.
+  for (let i = 0; i < 3; i++) expect(await upgrade(h.ws())).toBe('open');
+  const elapsed = performance.now() - began;
+  expect(runs - kept).toBeLessThanOrEqual(1 + Math.ceil(elapsed / 700));
+  expect(elapsed).toBeGreaterThan(1400);
 });
 
 it('ends every connection when the system’s addresses change and admits nothing until a new look has read the networks', async () => {

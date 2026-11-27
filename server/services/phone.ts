@@ -2406,10 +2406,14 @@ export class PhoneService {
     link.onClose(done);
   }
 
-  async dispose() {
+  /**
+   * `clean` false (web pairings only; web-remote.ts): this close publishes no restart checkpoint, so the
+   * next run starts without the browsers paired so far, as after a crash.
+   */
+  async dispose(clean = true) {
     clearTimeout(this.saveTimer);
     if (this.web) {
-      if (this.commitDevices(this.data.devices)) renameSync(this.file, this.file + '.closed');
+      if (clean && this.commitDevices(this.data.devices)) renameSync(this.file, this.file + '.closed');
     } else this.save(true);
     this.disposed = true;
     clearTimeout(this.saveTimer);

@@ -7,7 +7,7 @@ import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { App } from '../server/app';
 import { DemoProvider } from '../server/providers/demo';
 import { registerPhone } from '../server/services/phone';
-import { readTailscale, serveHolds, sessionProxies, tailnetPeer, tailscalePath, TailscaleServe, TS_WORDS, type TailscaleCli, type TailscaleHeld } from '../server/services/web-tailscale';
+import { daemonOf, readTailscale, serveHolds, sessionProxies, tailnetPeer, tailscalePath, TailscaleServe, TS_WORDS, type TailscaleCli, type TailscaleHeld, type TailscaleTimes } from '../server/services/web-tailscale';
 import { webSection } from '../src/features/web/web-model';
 import { WEB_TAILSCALE, type WebState } from '../shared/protocol';
 import { pskOfKey } from '../mobile/src/lib/secure';
@@ -51,8 +51,14 @@ interface FakeTs {
   refuse?: string;
   /** Tailscale goes on listing a serve whose process has gone (it has not noticed yet). */
   sticky: boolean;
-  /** Every running serve ends by itself, as when Tailscale restarts. */
+  /** Which run of Tailscale's service this is (what Windows says about it). */
+  daemon: string | undefined;
+  /** Every running serve's process ends, Tailscale itself running on (a process ended by hand). */
   kill(): void;
+  /** Tailscale's service restarts (an update of it): another run of it, and every serve has gone. */
+  restart(): void;
+  /** The owner's `tailscale serve reset`: the configuration is empty, and Tailscale ends the serves it removed. */
+  reset(): void;
   target(): string | undefined;
 }
 function fakeCli(o: { status?: Record<string, unknown>; config?: Record<string, any>; installed?: boolean } = {}): FakeTs {
@@ -66,9 +72,13 @@ function fakeCli(o: { status?: Record<string, unknown>; config?: Record<string, 
     live: new Set(),
     showAfter: 5,
     sticky: false,
+    daemon: 'pid 4100',
     kill() { for (const p of [...t.live]) p.die('the serve was ended'); },
+    restart() { t.daemon = 'pid ' + (4200 + ++sessions); t.kill(); },
+    reset() { t.kill(); t.config = {}; },
     cli: {
       file: () => (t.installed ? 'C:\\Program Files\\Tailscale\\tailscale.exe' : undefined),
+      daemon: async () => t.daemon,
       async run(args: string[]) {
         calls.push(args);
         const a = args.join(' ');
@@ -115,7 +125,7 @@ function statusOf(o: { backend?: string; certs?: string[] | null; name?: string;
     User: { 7: { LoginName: o.user ?? LOGIN } } };
 }
 /** Short waits for the module's own looks. */
-const FAST = { settle: 600, step: 10, confirm: 4, retry: 150, republish: 150 };
+const FAST = { settle: 600, step: 10, confirm: 4, recheck: 40, retry: 150, republish: 150 };
 const changing = (calls: string[][]) => calls.filter(c => !(c.join(' ') === 'status --json' || c.join(' ') === 'serve status --json'));
 // Never a lasting entry, never a command that removes or changes one, never Funnel.
 const forbidden = (calls: string[][]) => calls.flat().filter(a => /funnel|reset|^up$|^set$|logout|clear|^--bg|^off$/.test(a));
@@ -310,21 +320,56 @@ it('a withdrawal is done only once Tailscale no longer lists the serve', async (
   expect(serve.owes()).toBeUndefined();
 });
 
-it('tells once when its serve ended by itself, never for its own withdrawal', async () => {
+it('tells once when its serve ended by itself, and whether Tailscale restarted; never for its own withdrawal', async () => {
   const f = fakeCli();
   const serve = new TailscaleServe(f.cli, FAST);
-  const lost: string[] = [];
-  serve.onLost = target => lost.push(target);
+  const lost: [string, boolean][] = [];
+  serve.onLost = (target, restarted) => lost.push([target, restarted]);
   expect(await serve.publish(NAME, T)).toBe('published');
   await serve.withdraw();
   expect(await serve.publish(NAME, T)).toBe('published');
   expect(lost).toEqual([]);
-  f.kill();
-  await vi.waitFor(() => expect(lost).toEqual([T]));
-  // No longer this run's: the status may still name it for a moment, `holds` does not say `ours`.
+  // Removed while Tailscale kept running (the owner's reset, the process ended by hand): no restart.
+  f.reset();
+  await vi.waitFor(() => expect(lost).toEqual([[T, false]]));
+  // No longer this run's: `holds` does not say `ours`.
   expect(await serve.holds(NAME, T)).not.toBe('ours');
   await serve.withdraw();
-  expect(lost).toEqual([T]);
+  expect(lost).toHaveLength(1);
+  // Tailscale's service restarted: another run of it.
+  expect(await serve.publish(NAME, T)).toBe('published');
+  f.restart();
+  await vi.waitFor(() => expect(lost).toEqual([[T, false], [T, true]]));
+  await serve.withdraw();
+  // A service on its way down that still answers as before is asked once more a moment later.
+  expect(await serve.publish(NAME, T)).toBe('published');
+  const was = f.daemon;
+  f.kill();
+  setTimeout(() => { f.daemon = 'down'; }, 15);
+  await vi.waitFor(() => expect(lost).toHaveLength(3));
+  expect(lost[2]).toEqual([T, true]);
+  expect(was).not.toBe('down');
+  await serve.withdraw();
+  // What the service is cannot be read: never taken for a restart.
+  f.daemon = undefined;
+  expect(await serve.publish(NAME, T)).toBe('published');
+  f.restart();
+  f.daemon = undefined;
+  await vi.waitFor(() => expect(lost).toHaveLength(4));
+  expect(lost[3]).toEqual([T, false]);
+});
+
+it('reads which run of Tailscale’s service this is from Windows’ own answer', () => {
+  const answer = (state: string, pid: string) => ['', 'SERVICE_NAME: Tailscale ', '        TYPE               : 10  WIN32_OWN_PROCESS  ', `        STATE              : ${state} `,
+    '                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)', '        WIN32_EXIT_CODE    : 0  (0x0)', '        SERVICE_EXIT_CODE  : 0  (0x0)',
+    '        CHECKPOINT         : 0x0', '        WAIT_HINT          : 0x0', `        PID                : ${pid}`, '        FLAGS              : ', ''].join('\r\n');
+  expect(daemonOf(answer('4  RUNNING', '5120'))).toBe('pid 5120');
+  expect(daemonOf(answer('4  RUNNING', '6044'))).toBe('pid 6044');
+  expect(daemonOf(answer('3  STOP_PENDING', '5120'))).toBe('down');
+  expect(daemonOf(answer('1  STOPPED', '0'))).toBe('down');
+  expect(daemonOf(answer('2  START_PENDING', '6044'))).toBe('down');
+  expect(daemonOf('[SC] EnumQueryServicesStatus:OpenService FAILED 1060:')).toBeUndefined();
+  expect(daemonOf('')).toBeUndefined();
 });
 
 it('takes the tailnet address of the browser from the proxy, and nothing else', () => {
@@ -354,7 +399,7 @@ it('keeps serving through a look it cannot read, stops and withdraws when Tailsc
 
 // ── the listener in this mode ──
 
-function fixture(f = fakeCli(), home = mkdtempSync(path.join(process.env.TEMP!, 'web-test-ts-')), lookTimes?: { fresh: number; idle: number; hold: number }) {
+function fixture(f = fakeCli(), home = mkdtempSync(path.join(process.env.TEMP!, 'web-test-ts-')), lookTimes?: { fresh: number; idle: number; hold: number }, times: Partial<TailscaleTimes> = {}) {
   homes.push(home);
   const app = new App({ home, userHome: home, quiet: true, providers: [ctx => new DemoProvider(ctx, { speed: 0 })] });
   apps.push(app);
@@ -363,7 +408,7 @@ function fixture(f = fakeCli(), home = mkdtempSync(path.join(process.env.TEMP!, 
   writeFileSync(path.join(assets, 'index.html'), 'Sable web fixture');
   app.store.state.settings.webNetwork = WEB_TAILSCALE;
   const networks = [{ id: 'home/adapter/10.0.0.7', name: 'Home', address: '10.0.0.7' }];
-  registerPhone(app, { port: 0, host: '127.0.0.1', web: { assets, loopback: true, port: 0, tailscalePort: 0, networks: () => networks, tailscale: f.cli, tailscaleTimes: FAST, ...(lookTimes ? { lookTimes } : {}) } });
+  registerPhone(app, { port: 0, host: '127.0.0.1', web: { assets, loopback: true, port: 0, tailscalePort: 0, networks: () => networks, tailscale: f.cli, tailscaleTimes: { ...FAST, ...times }, ...(lookTimes ? { lookTimes } : {}) } });
   return { app, home, f, networks };
 }
 const local = (f: ReturnType<typeof fakeCli>) => Number(/:(\d+)$/.exec(f.target()!)![1]);
@@ -451,10 +496,8 @@ it('serves only what came through Tailscale’s proxy for this computer’s name
   expect(await upgrade({ Host: NAME, Origin: `https://${NAME}` })).toBe('403');
 });
 
-it('pairs a browser over Tailscale with the desktop’s Allow, at https://<name>/, and shows its tailnet address', async () => {
-  const { app, f } = fixture();
-  await app.call('app.setSettings', { patch: { webRemote: true } });
-  await app.call('web.state', {});
+/** A browser pairs through the proxy's headers and the desktop allows it. */
+async function pairBrowser(app: App, f: FakeTs) {
   const link = new URL((await app.call('web.offer', {})).pairing!.link);
   expect(link.origin + link.pathname).toBe(`https://${NAME}/`);
   const q = new URLSearchParams(link.hash.slice(1));
@@ -469,8 +512,66 @@ it('pairs a browser over Tailscale with the desktop’s Allow, at https://<name>
   await app.call('web.approve', { requestId: s.request!.id, allow: true });
   await c.next(fr => !!fr.paired);
   await c.next(fr => !!fr.welcome);
+  return ws;
+}
+
+it('pairs a browser over Tailscale with the desktop’s Allow, at https://<name>/, and shows its tailnet address', async () => {
+  const { app, f } = fixture();
+  await app.call('app.setSettings', { patch: { webRemote: true } });
+  await app.call('web.state', {});
+  const ws = await pairBrowser(app, f);
   expect((await app.call('web.state', {})).devices.map(d => d.name)).toEqual(['iPad · Safari']);
   ws.close();
+});
+
+// The second review: at quit the port was closed whether or not Tailscale had let go of the serve.
+it.each([false, true])('at quit a paired browser is kept only when Tailscale was seen to let go (still listed: %s)', async sticky => {
+  const f = fakeCli();
+  const { app, home } = fixture(f);
+  await app.call('app.setSettings', { patch: { webRemote: true } });
+  await app.call('web.state', {});
+  (await pairBrowser(app, f)).close();
+  const port = local(f);
+  f.sticky = sticky;
+  const quit = performance.now();
+  await app.dispose();
+  apps.splice(apps.indexOf(app), 1);
+  // Never the six seconds a withdrawal may take at most: this one answered at once, either way.
+  expect(performance.now() - quit).toBeLessThan(4000);
+  expect(f.live.size).toBe(0);
+  // Still listed: Sable does not close the listener itself (it refuses on, for as long as the process
+  // lives), and no checkpoint of the pairings is published.
+  expect(await knock(port)).toBe(sticky ? '403' : 'closed');
+  expect(existsSync(path.join(home, 'web', 'pairings.json.closed'))).toBe(!sticky);
+  // The next run: a browser that could have been answered by another program in between pairs again.
+  const g = fakeCli();
+  const next = fixture(g, home);
+  expect((await next.app.call('web.state', {})).devices.map(d => d.name)).toEqual(sticky ? [] : ['iPad · Safari']);
+});
+
+// The second review: two failed withdrawals each left a timer, and the forgotten one later ended a newer serve.
+it('a late try of an old withdrawal never ends a newer serve', async () => {
+  const f = fakeCli();
+  // A serve that shows together with something else on the port, and stays listed after its process ended.
+  const run = f.cli.run;
+  let spoil = true;
+  f.cli.run = async (args: string[]) => { if (spoil && f.live.size && args[0] === 'serve') Object.assign(f.config, entryTo('http://127.0.0.1:3000')); return run(args); };
+  f.sticky = true;
+  const { app } = fixture(f, undefined, { fresh: 200, idle: 200, hold: 120_000 }, { retry: 900 });
+  await app.call('app.setSettings', { patch: { webRemote: true } });
+  expect((await app.call('web.state', {})).error).toBe(TS_WORDS.failed);
+  await new Promise(r => setTimeout(r, 60));
+  // Tailscale lets go and the port is free again: the next start publishes.
+  spoil = false;
+  f.sticky = false;
+  f.config = {};
+  await vi.waitFor(async () => expect((await app.call('web.state', {})).listening).toBe(true), { timeout: 5000 });
+  const port = local(f);
+  // Past every retry of the failed withdrawals: the new serve and its listener are untouched.
+  await new Promise(r => setTimeout(r, 1300));
+  expect(f.live.size).toBe(1);
+  expect(await knock(port)).toBe('200');
+  expect((await app.call('web.state', {})).listening).toBe(true);
 });
 
 it('withdraws what it published when switched off, when the network changes and when Sable quits; nothing runs while off', async () => {
@@ -546,7 +647,7 @@ it('keeps the loopback port, refusing everything, until Tailscale no longer list
   expect(forbidden(f.calls)).toEqual([]);
 });
 
-it('publishes again by itself when its serve ended, and stays off when the setup was changed outside Sable', async () => {
+it('publishes again by itself after a restart of Tailscale, and never after its serve was removed outside Sable', async () => {
   const f = fakeCli();
   const first = fixture(f, undefined, { fresh: 300, idle: 300, hold: 120_000 });
   await first.app.call('app.setSettings', { patch: { webRemote: true } });
@@ -554,7 +655,7 @@ it('publishes again by itself when its serve ended, and stays off when the setup
   // Tailscale restarts (an update): the serve's process ends. The listener stops and says so, then Sable
   // publishes again without the person.
   const stopped = new Promise<WebState>(resolve => { const off = first.app.subscribe(e => { if (e.type === 'web.updated' && !e.state.listening) { off(); resolve(e.state); } }); });
-  f.kill();
+  f.restart();
   expect((await stopped).error).toBe(TS_WORDS.lost);
   await vi.waitFor(async () => expect((await first.app.call('web.state', {})).listening).toBe(true), { timeout: 5000 });
   expect((await first.app.call('web.state', {})).error).toBeUndefined();
@@ -565,14 +666,15 @@ it('publishes again by itself when its serve ended, and stays off when the setup
   const second = fixture(g, undefined, { fresh: 300, idle: 300, hold: 120_000 });
   await second.app.call('app.setSettings', { patch: { webRemote: true } });
   expect((await second.app.call('web.state', {})).listening).toBe(true);
-  // The owner clears the serve setup with Tailscale's own commands while Sable's process still runs: the
-  // next look stops the listener, ends Sable's serve and says so.
-  g.config = {};
+  // The owner clears the serve setup with Tailscale's own command (which ends the serves it removed) while
+  // Tailscale runs on: the listener stops and says so, and Sable does not put back what the owner removed.
   const state = new Promise<WebState>(resolve => { const off = second.app.subscribe(e => { if (e.type === 'web.updated' && !e.state.listening) { off(); resolve(e.state); } }); });
+  g.reset();
   const s = await state;
   expect(s.error).toBe(TS_WORDS.gone);
-  // Not published again by itself.
+  // Not published again by itself: not after the few seconds, not with the looks that follow.
   await new Promise(r => setTimeout(r, 1200));
+  expect((await second.app.call('web.state', {})).error).toBe(TS_WORDS.gone);
   expect(g.target()).toBeUndefined();
   expect(g.live.size).toBe(0);
   expect(changing(g.calls)).toHaveLength(1);

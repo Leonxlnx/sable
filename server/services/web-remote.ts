@@ -40,10 +40,19 @@ export interface WebOptions {
   interfaces?: () => string;
   /** How often open connections are checked against the networks (tests shorten it). */
   watchMs?: number;
+  /** The least time between two looks that new connections ask for (tests shorten it). */
+  connectGapMs?: number;
 }
 
 /** While a browser is connected over the home network: how often the addresses and the look's age are checked. */
 const WATCH_MS = 5000;
+/**
+ * A new connection over the home network asks for a look at the networks (a PowerShell run of a second or
+ * two) before anything of it is checked that only a paired device could pass. So that any device on the
+ * network cannot ask for one with every request: one look for all that arrive before it begins, and the
+ * next no sooner than this after the last began.
+ */
+const CONNECT_GAP_MS = 10_000;
 
 /**
  * This computer's IPv4 addresses as the system lists them now: one system call, no process. A change (a
@@ -154,27 +163,45 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
    */
   function withdraw() {
     if (tsServer) { parked.add(tsServer); tsServer = undefined; }
-    if (!parked.size && !ts.owes()) return;
+    release();
+  }
+  /**
+   * The kept ports' part of it, one at a time: asked again while one runs, it runs once more after. It
+   * never touches a listener that serves: only the one timer it keeps for itself tries again, and a new
+   * start comes only after everything kept is gone (startTailscale), so a late try cannot end a newer serve.
+   */
+  let more = false;
+  function release() {
+    if (tsServer) return;
+    if (withdrawing) { more = true; return; }
     clearTimeout(again);
     again = undefined;
+    if (!parked.size && !ts.owes()) return;
     const w: Promise<void> = ts.withdraw().then(() => {
       for (const s of parked) s.close();
       parked.clear();
     }, err => {
       app.log('web: Tailscale still lists Sable, its port is kept', (err as Error).message);
-      if (!disposed) again = setTimeout(withdraw, ts.times.retry).unref();
-    }).finally(() => { if (withdrawing === w) withdrawing = undefined; });
+      clearTimeout(again);
+      again = disposed ? undefined : setTimeout(release, ts.times.retry).unref();
+    }).finally(() => {
+      if (withdrawing === w) withdrawing = undefined;
+      if (more) { more = false; release(); }
+    });
     withdrawing = w;
   }
-  // The serve ended by itself (Tailscale restarted or updated, its process was ended): the listener stops,
-  // and Sable publishes again by itself, first after a few seconds and then with the minute's look.
-  ts.onLost = target => {
+  // The serve ended by itself. With a restart of Tailscale (an update of it) the listener stops and Sable
+  // publishes again by itself, first after a few seconds and then with the minute's look. Without one it
+  // was removed while Tailscale kept running (the owner's `serve reset`): never undone by Sable, the
+  // listener stays off until the switch or the network changes.
+  ts.onLost = (target, restarted) => {
     if (disposed || tsTarget !== target) return;
     stop();
-    error = TS_WORDS.lost;
+    tsGone = !restarted;
+    error = restarted ? TS_WORDS.lost : TS_WORDS.gone;
     changed();
     clearTimeout(soon);
-    soon = setTimeout(() => { soon = undefined; if (enabled() && tailscaleMode() && !port) sync(); }, ts.times.republish).unref();
+    soon = restarted ? setTimeout(() => { soon = undefined; if (enabled() && tailscaleMode() && !port) sync(); }, ts.times.republish).unref() : undefined;
   };
   // One look at the networks, kept (web-look.ts): nothing waits for a PowerShell run but the first start
   // and a new connection (below). Off-screen checks of the packaged app (loopback: nothing listens on the
@@ -290,6 +317,27 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     });
   }
   /**
+   * The look new connections wait for (CONNECT_GAP_MS): whoever arrives before it begins shares it, and it
+   * begins after every one of them arrived. A look under way then began before some of them: it is waited
+   * out first.
+   */
+  let batch: Promise<void> | undefined, batchAt = -Infinity;
+  function lookForConnections(): Promise<void> {
+    if (batch) return batch;
+    const mine: { run?: Promise<void> } = {};
+    mine.run = (async () => {
+      const wait = batchAt + (opts.connectGapMs ?? CONNECT_GAP_MS) - performance.now();
+      // Always a later turn, also with nothing to wait for: `batch` is set by then.
+      await new Promise<void>(r => setTimeout(r, Math.max(0, wait)).unref());
+      // From here on an arrival needs the next look.
+      if (batch === mine.run) batch = undefined;
+      batchAt = performance.now();
+      if (look.looking) await lookNow();
+      await lookNow();
+    })();
+    return batch = mine.run;
+  }
+  /**
    * The system lists other addresses than when the kept look began (the home network's listener only): the
    * look is void, every open connection ends, and nothing is admitted until a new look has read the networks.
    */
@@ -360,7 +408,8 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     }
     let holds: 'free' | 'ours' | 'taken';
     try { holds = await ts.holds(name, target); } catch { return; }
-    if (generation !== epoch || !servingTs() || holds === 'ours') return;
+    // (A serve that just ended by itself is being looked at: `onLost` decides.)
+    if (generation !== epoch || !servingTs() || holds === 'ours' || ts.deciding) return;
     // Changed outside Sable: this run's own serve ends with the listener (nothing else is touched), and
     // it is not published again by itself.
     stop();
@@ -416,13 +465,21 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     /**
      * A new connection to the chats never rides on a kept look: a look that began after it arrived must say
      * the selected network is still this one (the same address on another network is not), or it is refused.
-     * A look under way is shared; one that began earlier is followed by a new one.
+     * That look is shared and paced (lookForConnections), and at most twelve connections wait for one.
      */
+    let knocking = 0;
     async function verified(arrived: number) {
-      for (let i = 0; i < 2 && generation === epoch && active() && look.goodRun <= arrived; i++) await lookNow();
+      if (knocking >= 12) return false;
+      knocking++;
+      try {
+        if (generation === epoch && active() && look.goodRun <= arrived) await lookForConnections();
+      } finally { knocking--; }
       return generation === epoch && active() && look.goodRun > arrived && !!look.rows() &&
         networks.some(n => n.id === selected!.id && n.address === selected!.address);
     }
+    /** What every WebSocket opening handshake has: checked before a look is asked for. */
+    const opening = (req: IncomingMessage) => req.headers.upgrade?.toLowerCase() === 'websocket' && req.headers['sec-websocket-version'] === '13' &&
+      /^[+/0-9A-Za-z]{22}==$/.test(String(req.headers['sec-websocket-key'] ?? ''));
     const handle = async (req: IncomingMessage, res: ServerResponse) => {
       for (const [k, v] of Object.entries(HEADERS)) res.setHeader(k, v);
       if (!accepts(req)) return void res.writeHead(403).end();
@@ -453,7 +510,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       // The looks begun so far: only a later one counts for this connection (no clock is compared).
       const arrived = look.runs;
       const fits = () => accepts(req) && !socket.destroyed && wss.clients.size < 12;
-      if (req.url !== '/sable-web' || req.headersDistinct.origin?.length !== 1 || req.headers.origin !== 'https://' + req.headers.host || !fits()) return refuse(socket);
+      if (req.url !== '/sable-web' || req.headersDistinct.origin?.length !== 1 || req.headers.origin !== 'https://' + req.headers.host || !opening(req) || !fits()) return refuse(socket);
       if (!await verified(arrived).catch(() => false) || !fits()) return socket.destroyed ? undefined : refuse(socket);
       wss.handleUpgrade(req, socket, head, ws => manage().acceptWeb(ws, req));
     });
@@ -681,10 +738,14 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       await Promise.race([w, new Promise<void>(r => { late = setTimeout(r, 6000); late.unref(); })]);
       clearTimeout(late);
     }
+    // Not seen gone in time. Sable never closes such a listener itself: it goes on refusing for as long as
+    // this process lives (and no longer keeps the process alive). And since Tailscale may send the tablet
+    // to this port for a moment after the process has gone, where another program could answer it and
+    // read its pairing, the browsers paired so far are not carried into the next run: they pair again.
+    const unseen = parked.size > 0 || !!ts.owes();
     ts.drop();
-    for (const s of parked) s.close();
-    parked.clear();
-    await channel?.dispose();
+    for (const s of parked) s.unref();
+    await channel?.dispose(!unseen);
   });
   sync();
 }

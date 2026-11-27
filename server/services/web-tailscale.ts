@@ -54,6 +54,24 @@ export interface TailscaleCli {
   run(args: string[]): Promise<string>;
   /** Starts the CLI and keeps it running until `stop` (or its own end). */
   hold(args: string[]): TailscaleHeld;
+  /**
+   * Which run of Tailscale's own service this is (its process id while it runs, `down` while it does not),
+   * or undefined when that cannot be read. Never the CLI: Windows is asked about the service.
+   */
+  daemon(): Promise<string | undefined>;
+}
+
+/**
+ * `sc queryex Tailscale` read: the service's process id while it runs. A serve that ended while this stayed
+ * the same was removed by someone (the owner's `serve reset`); one that ended because this changed went
+ * with a restart of Tailscale (an update of it), and only that one is published again without the person.
+ */
+export function daemonOf(out: string): string | undefined {
+  const state = /^\s*\S+\s*:\s*(\d)\s+[A-Z_]+\s*$/m.exec(out)?.[1];
+  if (!state) return undefined;
+  const pid = /^\s*PID\s*:\s*(\d+)\s*$/m.exec(out)?.[1];
+  if (state !== '4') return 'down';
+  return pid && pid !== '0' ? 'pid ' + pid : undefined;
 }
 
 const exists = (file: string) => { try { return existsSync(file); } catch { return false; } };
@@ -110,6 +128,14 @@ export function realCli(find: () => string | undefined = tailscalePath): Tailsca
       if (!file) return { gone: Promise.resolve('Tailscale is not installed.'), stop: () => Promise.resolve() };
       return holdProcess(file, args);
     },
+    async daemon() {
+      // Windows' own service control program by its absolute path (never PATH), read-only.
+      const root = process.env.SystemRoot ?? process.env.windir;
+      if (process.platform !== 'win32' || !root || !path.win32.isAbsolute(root)) return undefined;
+      try {
+        return daemonOf((await runOff(path.win32.join(root, 'System32', 'sc.exe'), ['queryex', 'Tailscale'], process.env, { timeout: 5000, maxBuffer: 1 << 16 })).toString('latin1'));
+      } catch { return undefined; }
+    },
   };
 }
 
@@ -132,7 +158,7 @@ export const TS_WORDS = {
   https: 'HTTPS is off for your tailnet. In the Tailscale admin console, open DNS and enable HTTPS Certificates.',
   taken: 'Port 443 of this computer’s Tailscale name is already used by your own Tailscale Serve setup. Sable leaves it alone.',
   gone: 'Tailscale Serve no longer points at Sable (its setup was changed outside Sable). Turn web access off and on to publish it again.',
-  lost: 'Tailscale stopped publishing Sable. Sable publishes it again within a minute.',
+  lost: 'Tailscale restarted and stopped publishing Sable. Sable publishes it again within a minute.',
   unreadable: 'Could not read Tailscale’s state. Sable tries again in a minute.',
   failed: 'Tailscale did not publish Sable. Sable tries again in a minute.',
 } as const;
@@ -220,16 +246,17 @@ export function sessionProxies(raw: string, target: string): boolean {
 
 /**
  * How long a new serve may take to show in the status, the pause between two looks, the looks a withdrawal
- * takes; and for web-remote.ts: how long until a withdrawal that was not seen through is tried again, and
- * until a serve that ended by itself is published again.
+ * takes; after a serve ended by itself, how long until Tailscale's service is asked a second time whether
+ * it restarted; and for web-remote.ts: how long until a withdrawal that was not seen through is tried
+ * again, and until a serve that went with a restart of Tailscale is published again.
  */
-export const TS_TIMES = { settle: 8000, step: 250, confirm: 8, retry: 30_000, republish: 5000 };
+export const TS_TIMES = { settle: 8000, step: 250, confirm: 8, recheck: 3000, retry: 30_000, republish: 5000 };
 export type TailscaleTimes = typeof TS_TIMES;
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-/** The serve this run holds. */
-interface Holding { name: string; target: string; proc: TailscaleHeld; ended: boolean; live: boolean }
+/** The serve this run holds, and which run of Tailscale's service it was started under. */
+interface Holding { name: string; target: string; proc: TailscaleHeld; ended: boolean; live: boolean; daemon?: string }
 
 /** Publishing and withdrawing, one command at a time. */
 export class TailscaleServe {
@@ -238,8 +265,14 @@ export class TailscaleServe {
   readonly times: TailscaleTimes;
   /** Commands run (tests and the cost at rest). */
   runs: string[][] = [];
-  /** The serve this run published ended by itself (Tailscale restarted, its process was ended): told once. */
-  onLost?: (target: string) => void;
+  /**
+   * The serve this run published ended by itself: told once, with whether Tailscale's own service
+   * restarted meanwhile (`restarted`). Without that it was removed while Tailscale kept running (the
+   * owner's `serve reset`, its process ended by hand), which Sable never undoes by itself.
+   */
+  onLost?: (target: string, restarted: boolean) => void;
+  /** A serve ended by itself and why is still being looked at (`onLost` follows). */
+  deciding = false;
 
   constructor(readonly cli: TailscaleCli, times: Partial<TailscaleTimes> = {}) {
     this.times = { ...TS_TIMES, ...times };
@@ -291,15 +324,21 @@ export class TailscaleServe {
       // This run's earlier serve (another loopback port, another name) goes first; not confirmed gone: throws.
       await this.end();
       if (serveHolds(await this.status(), name, TS_PORT, target) !== 'free') return 'taken';
+      const daemon = await this.cli.daemon().catch(() => undefined);
       const args = ['serve', '--yes', `--https=${TS_PORT}`, target];
       this.runs.push(args);
-      const held: Holding = { name, target, proc: this.cli.hold(args), ended: false, live: false };
+      const held: Holding = { name, target, proc: this.cli.hold(args), ended: false, live: false, daemon };
       this.held = held;
       let said = '';
-      void held.proc.gone.then(s => {
+      void held.proc.gone.then(async s => {
         held.ended = true;
         said = s;
-        if (held.live) { held.live = false; this.onLost?.(held.target); }
+        if (!held.live) return;
+        held.live = false;
+        this.deciding = true;
+        let restarted = false;
+        try { restarted = await this.restarted(held.daemon); } finally { this.deciding = false; }
+        this.onLost?.(held.target, restarted);
       });
       const until = Date.now() + this.times.settle;
       let seen: 'free' | 'ours' | 'taken' = 'free';
@@ -315,6 +354,20 @@ export class TailscaleServe {
       await this.end().catch(() => {});
       throw Error(why + (said ? ': ' + said.slice(-300) : ''));
     });
+  }
+
+  /**
+   * Whether Tailscale's service is another run than `was` (or down): asked at once and once more a moment
+   * later, since a service on its way down may still answer as before. Not known then or now: no.
+   */
+  private async restarted(was: string | undefined): Promise<boolean> {
+    if (was === undefined) return false;
+    for (const wait of [0, this.times.recheck]) {
+      if (wait) await sleep(wait);
+      const now = await this.cli.daemon().catch(() => undefined);
+      if (now !== undefined && now !== was) return true;
+    }
+    return false;
   }
 
   /**
