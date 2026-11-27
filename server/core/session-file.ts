@@ -571,7 +571,11 @@ interface Base {
   old?: boolean;
   /** Settled items changed since the base was written: every tail carries them (`over`) until the base is written again. */
   over: Set<string>;
-  /** Where each of those stands (its place cannot change while this base holds: the order before `settled` is checked at every save). */
+  /**
+   * Where each of those stands: its place before `settled`, which cannot change while this base holds (the
+   * order there is checked at every save), or -1 for a row that stands at or after `settled` (it is in the
+   * tail anyway; only a quit, which may save a longer prefix, has to look for it).
+   */
   overAt?: Map<string, number>;
 }
 
@@ -1657,16 +1661,30 @@ export class SessionFiles {
       over = new Set(base.over);
       if (save.dirty !== 'all') for (const d of save.dirty) if (base.idSet.has(d)) over.add(d);
       if (final && (save.dirty === 'all' || this.force.has(id))) over = new Set(base.ids.slice(0, from));
-      // The changed settled rows by their places, where every one is known (kept with the base, or said by
-      // the caller for the rows it named) and holds that very row; else the walk, which ends with the last of them.
+      // The changed rows of the saved prefix by their places, where every one is known: kept with the base, or
+      // said by the caller for the rows it named and holding that very row. A row at or after `settled` is none
+      // of them (the rows before it are the base's own, in its order) and is only remembered as such. Where one
+      // is not known, the walk, which ends with the last of them.
       const known = base.overAt;
       const at: number[] = [];
+      let placed = over.size <= OVER_MAX.items * 2;
       overAt = new Map();
-      for (const oid of over) {
-        const i = known?.get(oid) ?? save.places?.get(oid);
-        if (i === undefined || i >= from || (rowIds ? rowIds[i] : items[i]?.id) !== oid) break;
-        at.push(i);
+      if (placed) for (const oid of over) {
+        let i = known?.get(oid);
+        if (i === undefined) {
+          const hint = save.places?.get(oid);
+          if (hint !== undefined && (rowIds ? rowIds[hint] : items[hint]?.id) === oid) {
+            if (hint < base.settled && base.ids[hint] === oid) i = hint;
+            else if (hint >= base.settled && hint >= from) i = -1;
+          }
+        }
+        // A quit can save a longer prefix than `settled`: a row behind it has to be looked for.
+        if (i === undefined || (i < 0 && final) || (i >= 0 && i < from && (rowIds ? rowIds[i] : items[i]?.id) !== oid)) {
+          placed = false;
+          break;
+        }
         overAt.set(oid, i);
+        if (i >= 0 && i < from) at.push(i);
       }
       const keep = (item: TimelineItem) => {
         if (isLight(item) && isDeepStrictEqual(item, baseline(base.index?.get(item.id)))) {
@@ -1674,7 +1692,7 @@ export class SessionFiles {
           overAt!.delete(item.id);
         } else overItems.push(item);
       };
-      if (at.length === over.size) for (const i of at.sort((a, b) => a - b)) keep(items[i]);
+      if (placed) for (const i of at.sort((a, b) => a - b)) keep(items[i]);
       else {
         overAt = new Map();
         let left = over.size;
@@ -1685,6 +1703,8 @@ export class SessionFiles {
           overAt.set(item.id, i);
           keep(item);
         }
+        // What the walk did not meet stands behind the prefix: remembered, so the next save does not walk for it.
+        if (left > 0 && !final && from === base.settled) for (const oid of over) if (!overAt.has(oid)) overAt.set(oid, -1);
       }
       if (!final && overItems.length > OVER_MAX.items) whole = true;
     }
@@ -1786,8 +1806,6 @@ export class SessionFiles {
     // Windows cannot replace an open destination. Its old index stays live until the rename.
     if (migration) await source.endCopy();
     source.close();
-    const readers = this.reading.get(id);
-    if (readers?.size) await Promise.allSettled(readers);
     const ids = 'ids' in save ? save.ids : rowIds ? rowIds.slice() : save.items.map(i => i.id);
     let idSet: Set<string>;
     if ('ids' in save) idSet = save.idSet;
@@ -1803,6 +1821,10 @@ export class SessionFiles {
         }
       }
     }
+    // Last before the rename, with nothing that yields after it: a reader that opened the old base
+    // meanwhile (a fork copying it) would make Windows refuse the rename.
+    const readers = this.reading.get(id);
+    if (readers?.size) await Promise.allSettled(readers);
     const base: Base = { gen, count: items.length, roots, orphans, ids, settled: 'ids' in save ? save.settled : settledEnd(save.items),
       idSet, size: written.size,
       index: written.index, over: new Set(), notices: { file, prefix: head, rows: written.notices } };

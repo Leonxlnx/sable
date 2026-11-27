@@ -102,6 +102,8 @@ interface SavedRows {
 
 /** A slice of the copies made ahead (ms). */
 const WARM_SLICE_MS = 6;
+/** Up to this many named rows are each looked for by their place; more are met in one walk over all places. */
+const PLACES_MAX = 64;
 
 /** JSON persistence under ~/.sable. Writes are debounced and atomic. */
 export class Store {
@@ -122,7 +124,10 @@ export class Store {
   private savedRows = new Map<string, SavedRows>();
   /** Rows whose saved copy was made again outside a save since the chat's last one (`replaceView`). */
   private recopied = new Map<string, Set<string>>();
-  private warming = new Map<string, symbol>();
+  /** The copies being made ahead of a chat's first save (`warmSave`): `done` settles when that work ends, however it ends. */
+  private warming = new Map<string, { done: Promise<void> }>();
+  /** How the saves found their rows, for tests and for reading a slow save: by place, or by asking about every place. */
+  private rowSaves = { byPlace: 0, asked: 0 };
   private activeSaves = new Map<string, SessionSave>();
   private migrations = new Map<string, { after: number; atRest: () => boolean }>();
   private migrationTimer?: NodeJS.Timeout;
@@ -550,8 +555,10 @@ export class Store {
       return item ? src.lastIndexOf(item) : -1;
     };
     // Only where the runtime asked is the one these rows are of (it gives the last row back as itself): a save
-    // for rows nobody answers for asks about every place, as before.
-    if (was && named && ask && n > 0 && ask(id, src[n - 1].id) === src[n - 1]) {
+    // for rows nobody answers for asks about every place, as before. And only for a few rows: each is looked
+    // for by a walk over the places, so thousands of them (every row a base write slimmed) are one walk instead.
+    if (was && named && ask && n > 0 && named.size + (again?.size ?? 0) <= PLACES_MAX && ask(id, src[n - 1].id) === src[n - 1]) {
+      this.rowSaves.byPlace++;
       // Places that hold another row than at the last save (added, put in, taken out before, moved).
       const other: number[] = [];
       for (let i = n - 1; i >= 0; i--) if (was[i] !== src[i]) other.push(i);
@@ -575,7 +582,9 @@ export class Store {
       source = was;
     } else {
       // Nothing to take over, or no way to ask for a row: every place is asked about, the named ones first met from the end.
+      this.rowSaves.asked++;
       let left = (named?.size ?? 0) + (again?.size ?? 0);
+      const met = again && new Set<string>();
       for (let i = n - 1; i >= 0; i--) {
         const item = src[i];
         const same = was !== undefined && was[i] === item;
@@ -584,14 +593,20 @@ export class Store {
         if (left > 0) {
           // A row that stands where it stood is known by the id kept beside it.
           const rid = same ? ids[i] : item.id;
+          // Each name counts once, also where two rows carry it: the asking must not stop before the others are met.
           if (named?.has(rid)) {
             changed = true;
-            left--;
-            places.set(rid, i);
+            if (!places.has(rid)) {
+              left--;
+              places.set(rid, i);
+            }
           }
           if (again?.has(rid)) {
             copied = true;
-            left--;
+            if (!met!.has(rid)) {
+              left--;
+              met!.add(rid);
+            }
           }
         }
         if (same && !changed && !copied) continue;
@@ -610,7 +625,8 @@ export class Store {
    */
   warmSave(id: string, live: TimelineItem[]) {
     if (this.sealed || this.savedRows.has(id) || this.warming.has(id) || live.length < 2048) return;
-    const run = Symbol();
+    let finish!: () => void;
+    const run = { done: new Promise<void>((resolve) => { finish = resolve; }) };
     this.warming.set(id, run);
     const src = live.slice();
     const n = src.length;
@@ -619,7 +635,8 @@ export class Store {
     const facts = new Uint8Array(n);
     let i = n - 1;
     const step = () => {
-      if (this.sealed || this.warming.get(id) !== run) return;
+      // Given up (a save came first, the chat went, a quit): whoever waits for it goes on.
+      if (this.sealed || this.warming.get(id) !== run) return finish();
       const until = performance.now() + WARM_SLICE_MS;
       for (; i >= 0; i--) {
         if ((i & 31) === 0 && performance.now() >= until) break;
@@ -634,12 +651,24 @@ export class Store {
       this.warming.delete(id);
       // The places too, unless a save took them or a row was copied again meanwhile: the first save then asks about no row it need not.
       if (!this.savedRows.has(id) && !this.recopied.has(id)) this.savedRows.set(id, { source: src, copies, ids, facts });
+      finish();
     };
     setImmediate(step);
   }
 
+  /**
+   * A save that must happen now (an input to commit, a restart notice to confirm) waits for the copies
+   * being made ahead, which is a second at most: flushed at once, it made the rest of them in its own
+   * task, the very freeze the copies made ahead are there to prevent. A quit waits for nothing.
+   */
+  private async warmed(id: string) {
+    const warm = this.warming.get(id);
+    if (warm && !this.sealed) await warm.done;
+  }
+
   /** Commit input ownership before the corresponding SDK write or RPC acknowledgement. */
   async persistInput(id: string, requireOpen = false) {
+    await this.warmed(id);
     if (this.sealed) {
       if (requireOpen) throw new Error('The conversation store is closing.');
       return this.sealed;
@@ -650,6 +679,7 @@ export class Store {
 
   /** SessionFiles retries failed writes on the next save. Only acknowledge a restart notice seen on disk. */
   async savedRestartNotice(id: string, notice: string): Promise<boolean> {
+    await this.warmed(id);
     await this.flushSession(id);
     return this.sessionFiles.savedRestartNotice(id, notice);
   }

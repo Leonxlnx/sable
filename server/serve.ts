@@ -7,7 +7,6 @@ import { customOf, customOptions, type Customizer } from './services/custom';
 import { watchAwake, watchPhoneAwake } from './core/awake';
 import { setThumbHost, type ThumbHost } from './services/thumbs';
 import { registerUpdates, type UpdateHost } from './services/update';
-import { stalls } from './util/stalls';
 import { bootMark } from './util/boot';
 
 /**
@@ -213,8 +212,6 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const bridge = attachBridge(server);
   custom = customOf(bridge.app);
   registerUpdates(bridge.app, opts.updates);
-  // How late the loop runs, kept in memory for `diag.stalls`.
-  stalls.start();
   setThumbHost(bridge.app, opts.thumbs);
   bootMark('server:bridge');
 

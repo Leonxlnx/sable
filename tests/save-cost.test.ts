@@ -98,11 +98,19 @@ function open(rows: TimelineItem[]) {
   const store = new Store(home, (_s, id) => byId.get(id));
   stores.push(store);
   const live = rows;
-  for (const row of live) byId.set(row.id, row);
+  /** The runtime's index of its rows by id, as the bridge keeps it: brought up to the rows as they stand. */
+  const sync = () => {
+    byId.clear();
+    for (const row of live) byId.set(row.id, row);
+  };
+  sync();
   const save = async (dirty: Set<string> | 'all') => {
+    sync();
     store.saveSession('c', () => ({ items: live, todos: [], queue: [], dirty }));
     await store.persistInput('c');
   };
+  /** How the saves found their rows so far: by place, or by asking about every place. */
+  const found = () => ({ ...(store as unknown as { rowSaves: { byPlace: number; asked: number } }).rowSaves });
   /** The base is past the size written whole each time (so the saves under test go through the tail). */
   const long = () => statSync(path.join(home, 'sessions', 'c.json')).size > SMALL_BASE;
   /** What a store that never saw this chat reads from its files. */
@@ -113,7 +121,7 @@ function open(rows: TimelineItem[]) {
     expect(read.unreadable).toBeFalsy();
     return read.items;
   };
-  return { home, store, live, byId, save, onDisk, long };
+  return { home, store, live, byId, save, onDisk, long, sync, found };
 }
 
 /** Turns enough for a file past the size that is written whole at every save: only then a save writes the tail. */
@@ -136,12 +144,15 @@ describe('a save that takes rows over by their place', () => {
       h.live.push(step('live' + i));
       added.add('live' + i);
     }
+    const before = h.found();
     await h.save(added);
     expect(h.onDisk()).toEqual(h.live);
 
     // Nothing changed: the same again.
     await h.save(new Set());
     expect(h.onDisk()).toEqual(h.live);
+    // Both took the rows over by their place: nobody asked about every row.
+    expect(h.found()).toEqual({ byPlace: before.byPlace + 2, asked: before.asked });
 
     // A row of the running turn changed in place, and one far up.
     (h.live[h.live.length - 3] as { title: string }).title = 'Read another file';
@@ -180,8 +191,67 @@ describe('a save that takes rows over by their place', () => {
 
     // Everything named changed.
     (h.live[10] as { title: string }).title = 'All of it';
+    const all = h.found();
     await h.save('all');
     expect(h.onDisk()).toEqual(h.live);
+    // Only that one asked about every row (as the very first save did); each of the nine changes before it went by place.
+    expect(all).toEqual({ byPlace: 9, asked: 1 });
+    expect(h.found()).toEqual({ byPlace: 9, asked: 2 });
+  });
+
+  it('writes a base in the middle of a turn, then the turn\'s last rows as they change, and all of it at a quit', async () => {
+    const rows = chat(LONG);
+    // A turn under way: rows after the last finished turn.
+    rows.push({ type: 'user', id: 'live-u', ts: 9e6, text: 'More', state: 'sent' } as TimelineItem);
+    for (let i = 0; i < 30; i++) rows.push(step('live' + i));
+    const h = open(rows);
+    await h.save('all');
+    expect(h.long()).toBe(true);
+    // The base holds the turn's rows too, behind its settled part: one of them changes, then another.
+    (h.live[h.live.length - 10] as { title: string }).title = 'Changed after the base';
+    await h.save(new Set([h.live[h.live.length - 10].id]));
+    expect(h.onDisk()).toEqual(h.live);
+    (h.live[h.live.length - 20] as { title: string }).title = 'Changed later';
+    h.live.push(step('more'));
+    await h.save(new Set([h.live[h.live.length - 21].id, 'more']));
+    expect(h.onDisk()).toEqual(h.live);
+    // A settled row far up too, and a save with nothing named after it.
+    (h.live[900] as { title: string }).title = 'An old step';
+    await h.save(new Set([h.live[900].id]));
+    await h.save(new Set());
+    expect(h.onDisk()).toEqual(h.live);
+    // The quit's save may keep a longer prefix of the base: every changed row is still written.
+    (h.live[h.live.length - 5] as { title: string }).title = 'Changed at the end';
+    h.sync();
+    h.store.saveSession('c', () => ({ items: h.live, todos: [], queue: [], dirty: new Set([h.live[h.live.length - 5].id]) }));
+    await h.store.seal();
+    expect(h.onDisk()).toEqual(h.live);
+  });
+
+  it('meets many rows copied again in one walk, and writes them', async () => {
+    const h = open(chat(LONG));
+    await h.save('all');
+    const added = new Set<string>(['live-u']);
+    h.live.push({ type: 'user', id: 'live-u', ts: 9e6, text: 'More', state: 'sent' } as TimelineItem);
+    for (let i = 0; i < 150; i++) {
+      h.live.push(step('live' + i));
+      added.add('live' + i);
+    }
+    await h.save(added);
+    const replace = (h.store as unknown as { replaceView(id: string, item: TimelineItem, view: TimelineItem): void }).replaceView.bind(h.store);
+    for (let i = 0; i < 100; i++) {
+      const row = h.live[h.live.length - 1 - i];
+      replace('c', row, { ...row, title: 'In another form ' + i } as TimelineItem);
+    }
+    const before = h.found();
+    await h.save(new Set());
+    expect(h.onDisk()).toEqual(h.live);
+    // More names than are looked for one by one: one walk over the places.
+    expect(h.found()).toEqual({ byPlace: before.byPlace, asked: before.asked + 1 });
+    h.live.push(step('later'));
+    await h.save(new Set(['later']));
+    expect(h.onDisk()).toEqual(h.live);
+    expect(h.found().byPlace).toBe(before.byPlace + 1);
   });
 
   it('keeps a row\'s copy while nobody names it, as a save always did', async () => {
@@ -231,12 +301,14 @@ describe('a save that takes rows over by their place', () => {
     const h = open(chat(LONG));
     await h.save('all');
     h.live.push(step('one'));
+    h.sync();
     h.store.saveSession('c', () => ({ items: h.live, todos: [], queue: [], dirty: new Set(['one']) }));
     const first = h.store.persistInput('c');
     // The first write is under way with its own rows: these changes belong to the next.
     h.live.splice(200, 1);
     h.live.push(step('two'));
     (h.live[100] as { title: string }).title = 'Changed meanwhile';
+    h.sync();
     h.store.saveSession('c', () => ({ items: h.live, todos: [], queue: [], dirty: new Set(['two', h.live[100].id]) }));
     await Promise.all([first, h.store.persistInput('c')]);
     expect(h.onDisk()).toEqual(h.live);
@@ -269,12 +341,28 @@ describe('the copies of a chat just read', () => {
     expect(h.onDisk()).toEqual(h.live);
   });
 
+  it('are waited for by a save that must happen now, which then asks about no row', async () => {
+    const h = open(chat(600, false));
+    h.store.warmSave('c', h.live);
+    h.live.push(step('now'));
+    h.sync();
+    h.store.saveSession('c', () => ({ items: h.live, todos: [], queue: [], dirty: new Set(['now']) }));
+    // As the bridge commits an input right after a chat was read: at once, yet not as one task over every row.
+    await h.store.persistInput('c');
+    expect(h.found()).toEqual({ byPlace: 1, asked: 0 });
+    expect(h.onDisk()).toEqual(h.live);
+  });
+
   it('give way to a save that comes first', async () => {
     const h = open(chat(600, false));
     h.store.warmSave('c', h.live);
     h.live.push(step('early'));
-    await h.save(new Set(['early']));
+    // A quit waits for nothing: its save makes the copies that are left itself.
+    h.sync();
+    h.store.saveSession('c', () => ({ items: h.live, todos: [], queue: [], dirty: new Set(['early']) }));
+    await h.store.flush();
     expect((h.store as unknown as { warming: Map<string, unknown> }).warming.size).toBe(0);
+    expect(h.found().asked).toBe(1);
     expect(h.onDisk()).toEqual(h.live);
     h.live.splice(3, 1);
     await h.save(new Set());
@@ -299,9 +387,12 @@ describe('what a steady save costs', () => {
     };
     const one = Math.min(walk(), walk(), walk());
     let best = Infinity;
+    const before = h.found();
     for (let r = 0; r < 6; r++) {
       const id = 'tick' + r;
-      h.live.push(step(id));
+      const row = step(id);
+      h.live.push(row);
+      h.byId.set(id, row);
       h.store.saveSession('c', () => ({ items: h.live, todos: [], queue: [], dirty: new Set([id]) }));
       // The longest stretch in which no timer could run while the save went on.
       let last = performance.now();
@@ -316,6 +407,8 @@ describe('what a steady save costs', () => {
       clearInterval(tick);
       best = Math.min(best, block);
     }
+    // Each of them took the rows over by their place.
+    expect(h.found()).toEqual({ byPlace: before.byPlace + 6, asked: before.asked });
     // Asking about every row cost some ten walks; taking rows over by their place costs about one.
     expect(best).toBeLessThan(one * 4 + 25);
     expect(h.onDisk().length).toBe(h.live.length);

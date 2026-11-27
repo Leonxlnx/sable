@@ -8,6 +8,9 @@
  *   took in one go, so a late timer has a name beside it.
  *
  * Kept in memory (the last `KEEP` of each) and read through `diag.stalls`; nothing is written anywhere.
+ * The timer runs only while somebody reads: a first reading starts it, and it stops by itself `IDLE_MS`
+ * after the last one (the bridge costs nothing at rest). Named work is noted always: that costs a
+ * clock reading where the work is.
  */
 
 const EVERY_MS = 50;
@@ -16,6 +19,8 @@ export const STALL_MS = 100;
 /** A named part of the bridge this long in one go is kept (ms). */
 export const MARK_MS = 40;
 const KEEP = 120;
+/** The timer stops this long after the last reading (ms). */
+const IDLE_MS = 30 * 60_000;
 
 export interface StallReading {
   /** How long the readings cover (ms). */
@@ -33,6 +38,7 @@ export interface StallReading {
 class Stalls {
   private began = performance.now();
   private timer?: NodeJS.Timeout;
+  private idle?: NodeJS.Timeout;
   private due = 0;
   private late = { over100: 0, over250: 0, over500: 0, over1000: 0, worst: 0 };
   private stalls: { at: number; ms: number }[] = [];
@@ -61,7 +67,9 @@ class Stalls {
 
   stop() {
     clearInterval(this.timer);
+    clearTimeout(this.idle);
     this.timer = undefined;
+    this.idle = undefined;
   }
 
   note(what: string, ms: number) {
@@ -76,6 +84,11 @@ class Stalls {
   }
 
   read(): StallReading {
+    // Somebody looks: the lateness is measured from now on, until nobody has looked for a while.
+    this.start();
+    clearTimeout(this.idle);
+    this.idle = setTimeout(() => this.stop(), IDLE_MS);
+    this.idle.unref?.();
     const now = performance.now();
     return {
       forMs: Math.round(now - this.began),
