@@ -4,6 +4,7 @@ import { planLabel } from '@desk/features/connect/plan';
 import { conn } from '@m/lib/conn';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
+import { veilFirst } from '@m/ui/screen-veil';
 import { getState, refreshLimits, setState, useStore } from '@m/lib/store';
 import { useNow } from '@m/lib/useNow';
 import { resetsText, tightestUse, usedPercent, usedWords, windowLevel } from '@m/lib/usage-words';
@@ -92,7 +93,7 @@ export function AccountsScreen() {
   return (
     <div className="screen accounts">
       <header className="sub-head">
-        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), nav.pop())}>
+        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), veilFirst(() => nav.pop()))}>
           <Icon name="back" size={22} />
         </button>
         <span className="sub-head-title">Accounts</span>

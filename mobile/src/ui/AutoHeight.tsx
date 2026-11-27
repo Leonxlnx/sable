@@ -5,9 +5,9 @@ import { reduced, REVEAL } from './motion';
 /**
  * A box whose height follows its content on a spring: what arrives (models, limits, an error)
  * grows the box instead of pushing everything under it in one frame. The first height is taken
- * as it is (nothing animates in on mount). The box's own padding and border count (a padded box, as
- * a sheet's keys are, lost that much of its content at the bottom: the web build's shorter keys
- * showed "Later" cut in half).
+ * as it is (nothing animates in on mount). In the web build the box's own padding and border count
+ * (a padded box, as a sheet's keys are, lost that much of its content at the bottom: the web build's
+ * shorter keys showed "Later" cut in half); the phone app keeps the height it ships with.
  */
 export function AutoHeight({ children, className, role, label }: { children: ReactNode; className?: string; role?: string; label?: string }) {
   const outer = useRef<HTMLDivElement>(null);
@@ -18,7 +18,7 @@ export function AutoHeight({ children, className, role, label }: { children: Rea
     if (!el) return;
     const edges = () => {
       const o = outer.current;
-      if (!o) return 0;
+      if (!import.meta.env.SABLE_WEB || !o) return 0;
       const cs = getComputedStyle(o);
       return (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0) + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
     };

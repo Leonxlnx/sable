@@ -1,8 +1,12 @@
 import { emptyIndex } from '@/state/revision';
-import type { TaskMark, TimelineItem, ToolItem, TrackedWork, WorkflowRun } from '@shared/protocol';
+import type { TaskMark, TimelineItem, ToolItem, WorkflowRun } from '@shared/protocol';
 import { syntheticOf, type TaskOutcome } from '@shared/synthetic';
-import { isAgentLive, workflowGlance } from '@/features/timeline/agent-line';
+import { workflowGlance } from '@/features/timeline/agent-line';
 import { changedSince } from '@/state/revision';
+import { isAgentItem, isAgentLive, isBackgroundCommand, isJob, type RowState } from './now-model';
+
+// The pure part (what works now, a row's state, jobs), which the phone reads too: now-model.ts.
+export { STATE_MARK, isBackgroundCommand, isJob, jobRan, jobRowState, lastLine, nowRows, progressIndex, readProgress, type NowRow, type Progress, type RowState } from './now-model';
 
 /**
  * What the Agents tab reads from a session, worked out so that a streamed step costs next to
@@ -50,8 +54,6 @@ export function grow<T>(prev: Scan<T> | undefined, arr: readonly string[], pick:
   }
   return { arr, found };
 }
-
-const isAgentItem = (it: TimelineItem | undefined): it is ToolItem => it?.type === 'tool' && it.kind === 'agent';
 
 /**
  * Every sub-agent and workflow of a session (top level and nested under another agent), oldest
@@ -152,18 +154,6 @@ export function noteIndex(): (t: Timeline | undefined) => ReadonlyMap<string, En
 }
 
 // ── background commands ──
-
-/**
- * A command the agent left running after its step returned (a build, a test run, a dev server, a
- * monitor): the bridge marks it (`ToolItem.task`), and a chat saved before it did says so on the
- * shell step alone (`run_in_background`).
- */
-export function isBackgroundCommand(it: TimelineItem | undefined): it is ToolItem {
-  if (it?.type !== 'tool' || it.check) return false;
-  if (it.task) return true;
-  if (it.kind !== 'bash') return false;
-  return !!it.detail.background || (it.input as { run_in_background?: unknown } | undefined)?.run_in_background === true;
-}
 
 /** A shell step still being written or running: it may yet turn out to be sent to the background. */
 const isOpenCommand = (it: TimelineItem | undefined) => it?.type === 'tool' && it.kind === 'bash' && (it.status === 'pending' || it.status === 'running' || it.status === 'awaiting');
@@ -345,70 +335,7 @@ export function liveKey(items: Items | undefined, ids: readonly string[]): strin
   return k;
 }
 
-// ── a working sub-agent ──
-
-interface Kids {
-  arr: readonly string[];
-  tools: number;
-  /** The latest task-list step (TodoWrite) under it, if any. */
-  todo: string;
-}
-
-function scanKids(prev: Kids | undefined, arr: readonly string[], items: Items): Kids {
-  if (prev?.arr === arr) return prev;
-  const n = prev?.arr.length ?? 0;
-  const appended = !!prev && n > 0 && arr.length >= n && arr[0] === prev.arr[0] && arr[n - 1] === prev.arr[n - 1];
-  let tools = appended ? prev.tools : 0;
-  let todo = appended ? prev.todo : '';
-  for (let i = appended ? n : 0; i < arr.length; i++) {
-    const it = items[arr[i]];
-    if (it?.type !== 'tool') continue;
-    tools++;
-    if (it.kind === 'todo') todo = arr[i];
-  }
-  return { arr, tools, todo };
-}
-
-export interface Progress {
-  steps: number;
-  /** What it does now: the latest step's title, "Thinking", or "Writing the report". */
-  now: string;
-  /** Its own task list, when it keeps one: the only honest measure of how far it is. */
-  todo?: { done: number; total: number };
-  /** Its latest step waits for the person's approval. */
-  waiting?: boolean;
-}
-
-const SEP = '\u0001';
-
-/**
- * How far one working sub-agent is, as one string (`steps`, `now`, `done/total`): its card renders
- * when that string changes, never on a streamed word. Counting is incremental.
- */
-export function progressIndex(): (items: Items | undefined, kids: readonly string[] | undefined) => string {
-  let scan: Kids | undefined;
-  return (items, kids) => {
-    if (!items || !kids?.length) return `0${SEP}${SEP}${SEP}`;
-    scan = scanKids(scan, kids, items);
-    const last = items[kids[kids.length - 1]];
-    const now = !last ? '' : last.type === 'tool' ? last.title : last.type === 'thinking' ? 'Thinking' : last.type === 'text' ? 'Writing the report' : '';
-    const todos = scan.todo ? (items[scan.todo] as ToolItem | undefined)?.detail.todos : undefined;
-    const todo = todos?.length ? `${todos.filter((t) => t.status === 'completed').length}/${todos.length}` : '';
-    const waiting = last?.type === 'tool' && last.status === 'awaiting' ? 'w' : '';
-    return `${scan.tools}${SEP}${now}${SEP}${todo}${SEP}${waiting}`;
-  };
-}
-
-export function readProgress(key: string): Progress {
-  const [steps, now, todo, waiting] = key.split(SEP);
-  const out: Progress = { steps: Number(steps) || 0, now: now ?? '' };
-  if (todo) {
-    const [done, total] = todo.split('/').map(Number);
-    out.todo = { done, total };
-  }
-  if (waiting) out.waiting = true;
-  return out;
-}
+// ── a working sub-agent (how far it is: `progressIndex`, `readProgress` in now-model.ts) ──
 
 /** The ids of its latest `n` steps, oldest first, as one string. */
 export function latestSteps(items: Items | undefined, kids: readonly string[] | undefined, n: number): string {
@@ -709,10 +636,7 @@ export function waveRows(wave: Wave, all: boolean): { ids: readonly string[]; mo
   return { ids: wave.ids.slice(0, n), more: wave.ids.length - n };
 }
 
-// ── every row's state, first ──
-
-/** Where a row of the tab stands, whatever it is (a sub-agent, a workflow, a background command). */
-export type RowState = 'running' | 'serving' | 'waiting' | 'done' | 'failed' | 'stopped' | 'denied' | 'lost' | 'unknown';
+// ── every row's state, first (`RowState`, `STATE_MARK`: now-model.ts) ──
 
 /** An agent's outcome as a row's state. */
 export function agentState(outcome: Outcome): RowState {
@@ -723,24 +647,6 @@ export function agentState(outcome: Outcome): RowState {
 export function commandRowState(state: CommandState): RowState {
   return state === 'starting' ? 'running' : state;
 }
-
-/**
- * The mark every row leads with: its state, never its kind (no terminal or tree glyph in that
- * column). Running is the ring, waiting on the person the amber dot, done the quiet check, failed
- * the red cross, stopped a dash, denied the prohibit sign, lost the dashed circle (its process went),
- * unknown a question mark (it gave no word of its end). Each row's words say the same beside it.
- */
-export const STATE_MARK: Record<RowState, 'ring' | 'wait' | 'check' | 'x' | 'minus' | 'prohibit' | 'circle-dashed' | 'question'> = {
-  running: 'ring',
-  serving: 'minus',
-  waiting: 'wait',
-  done: 'check',
-  failed: 'x',
-  stopped: 'minus',
-  denied: 'prohibit',
-  lost: 'circle-dashed',
-  unknown: 'question',
-};
 
 /**
  * The tab's header says what is true now, as one figure: "2 working" (everything that works, the
@@ -755,11 +661,6 @@ export function agentsHeader(n: { serving?: number; working: number; running: nu
 }
 
 // ── tracked jobs (`track_work`) ──
-
-/** A step that carries tracked work: a process the agent started outside its tools and asked Sable to watch. */
-export function isJob(it: TimelineItem | undefined): it is ToolItem & { tracked: TrackedWork } {
-  return it?.type === 'tool' && !!it.tracked;
-}
 
 /**
  * The chat's tracked jobs (the `track_work` call's own step, always the chat's own), oldest first:
@@ -843,56 +744,4 @@ export function jobTail(report: string | undefined, line: string | undefined): s
   return line ? [line] : [];
 }
 
-/** Where a tracked job stands as a row's state: gone is done (Sable knows no exit code), let go is a dash. */
-export function jobRowState(t: TrackedWork): RowState {
-  return t.state === 'running' ? 'running' : t.state === 'ended' ? 'done' : 'stopped';
-}
-
-/** How long a job ran, as far as Sable saw it: 0 while it runs or when its end's time is not known. */
-export function jobRan(t: TrackedWork): number {
-  return t.state === 'ended' && t.endedAt ? Math.max(0, t.endedAt - t.since) : 0;
-}
-
-// ── what works now, as one list ──
-
-export interface NowRow {
-  id: string;
-  kind: 'agent' | 'job' | 'command';
-}
-
-/** When a thing that works began: a job when it was tracked, a command when its task started, an agent at its step. */
-function began(it: TimelineItem | undefined): number {
-  if (it?.type !== 'tool') return 0;
-  return it.tracked?.since ?? it.task?.since ?? it.ts;
-}
-
-/**
- * Everything that works now as one list in one grammar (sub-agents and workflows, tracked jobs,
- * running commands and monitors), the longest runner first: what the top of the tab shows. Servers
- * are not work: they stand apart, after it.
- */
-export function nowRows(agents: readonly string[], jobs: readonly string[], commands: readonly string[], items: Items): NowRow[] {
-  const rows: NowRow[] = [
-    ...agents.map((id): NowRow => ({ id, kind: 'agent' })),
-    ...jobs.map((id): NowRow => ({ id, kind: 'job' })),
-    ...commands.map((id): NowRow => ({ id, kind: 'command' })),
-  ];
-  // A stable order: by start, then as given.
-  return rows
-    .map((row, at) => ({ row, at, ts: began(items[row.id]) }))
-    .sort((a, b) => a.ts - b.ts || a.at - b.at)
-    .map((r) => r.row);
-}
-
-/** The last line a step's live output shows, as one plain line, cut: what a running command does now. */
-export function lastLine(output: string | undefined, max = 160): string {
-  if (!output) return '';
-  const end = output.length > 4096 ? output.slice(-4096) : output;
-  const rows = end.split('\n');
-  for (let i = rows.length - 1; i >= 0; i--) {
-    // eslint-disable-next-line no-control-regex
-    const row = rows[i].slice(rows[i].lastIndexOf('\r') + 1).replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
-    if (row) return row.length > max ? `${row.slice(0, max - 1).trimEnd()}…` : row;
-  }
-  return '';
-}
+// isJob, jobRowState, jobRan, nowRows (what works now, as one list) and lastLine: now-model.ts.

@@ -1959,6 +1959,20 @@ export interface AppState {
  * on "Restart to update" (the installer starts Sable again). `unsupported`: a dev or standalone
  * bridge. `pending`: asked to restart while agents work; it restarts once they are done.
  */
+/**
+ * What keeps a restart for an update waiting: a chat and the kind of work it holds, or Sable's own
+ * step in flight (`sable`, no chat). `agent`: the agent's process says it still works though the chat
+ * shows nothing (its own word, a call it waits on).
+ */
+export interface UpdateWait {
+  sessionId?: string;
+  kind: 'turn' | 'starting' | 'asks' | 'moving' | 'agents' | 'command' | 'wake' | 'agent' | 'sable';
+  /** How many (sub-agents, commands), when more than one. */
+  count?: number;
+  /** A hold that ends by its age alone (a young background command, a wake-up due soon): when (ms). */
+  until?: number;
+}
+
 export interface UpdateState {
   status: 'unsupported' | 'idle' | 'checking' | 'downloading' | 'ready' | 'error';
   /** The running version. */
@@ -1967,7 +1981,10 @@ export interface UpdateState {
   latest?: string;
   /** Downloaded share, 0 to 1. */
   progress?: number;
+  /** The person asked for the restart and it waits for work to end. */
   pending?: boolean;
+  /** While `pending`: what it waits for. */
+  waits?: UpdateWait[];
   error?: string;
   /** When the releases were last asked (ms). */
   checkedAt?: number;
@@ -2662,6 +2679,20 @@ export interface RpcMethods {
   'app.setSettings': { params: { patch: Partial<AppSettings> }; result: AppSettings };
 
   'auth.journal': { params: { limit?: number }; result: string[] };
+  /**
+   * How long the bridge kept its event loop to itself lately (`server/util/stalls.ts`): late timers and
+   * named whole-chat work, in numbers and fixed words only. For finding what makes the window sluggish.
+   */
+  'diag.stalls': {
+    params: Record<string, never>;
+    result: {
+      forMs: number;
+      late: { over100: number; over250: number; over500: number; over1000: number; worst: number };
+      stalls: { agoMs: number; ms: number }[];
+      marks: Record<string, { count: number; totalMs: number; worstMs: number }>;
+      marked: { agoMs: number; what: string; ms: number }[];
+    };
+  };
   'auth.refresh': { params: { provider: ProviderId; accountId?: string }; result: ProviderInfo };
   'auth.login': { params: { provider: ProviderId; accountId?: string }; result: { started: boolean } };
   /** The code the browser showed instead of returning to Sable ("code#state"): finishes the sign-in in progress. */
@@ -3038,7 +3069,8 @@ export interface RpcMethods {
   /** Asks GitHub for a newer release now (a found one downloads in the background). */
   'update.check': { params: Record<string, never>; result: UpdateState };
   /** Installs the downloaded release and restarts Sable; while agents work, once they are done (`cancel`: not after all). */
-  'update.install': { params: { cancel?: boolean }; result: UpdateState };
+  /** `force`: restart now, whatever still works (the person read what it ends). */
+  'update.install': { params: { cancel?: boolean; force?: boolean }; result: UpdateState };
   'memory.write': { params: { path: string; content: string }; result: { ok: boolean } };
 
   /** Stores an image for the backdrop (base64; PNG, JPEG, WebP or GIF, at most 8 MB). The bridge picks the id. */

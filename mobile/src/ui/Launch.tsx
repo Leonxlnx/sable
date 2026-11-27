@@ -3,6 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { LogoMark } from './marks';
 import { reduced, SPRING } from './motion';
 import { veil } from './veil';
+import { saver } from '@m/lib/saver';
 
 /**
  * The launch, as on the desktop but at hand speed: the mark builds from its own cells where
@@ -44,7 +45,7 @@ export function Launch({ onDone }: { onDone: () => void }) {
       stops.forEach((s) => s.stop());
       done.current();
     };
-    if (reduced()) {
+    if (reduced() || saver()) {
       const t = setTimeout(finish, 60);
       return () => clearTimeout(t);
     }

@@ -319,8 +319,8 @@ export function Composer({ sid }: { sid: string }) {
           onChange={(e) => edit(e.target.value)}
           onKeyDown={(e) => {
             // Enter sends (the keyboard shows a send key); Shift+Enter, or Enter with "Send with Enter" off on the desktop, is a new line.
-            // Ctrl or Cmd with Enter sends whatever the setting says (the desktop's), from a hardware keyboard.
-            if (e.key === 'Enter' && !e.shiftKey && (sendWithEnter || e.metaKey || e.ctrlKey) && !e.nativeEvent.isComposing) {
+            // In a browser Ctrl or Cmd with Enter sends whatever the setting says (the desktop's), from a hardware keyboard.
+            if (e.key === 'Enter' && !e.shiftKey && (sendWithEnter || (WEB && (e.metaKey || e.ctrlKey))) && !e.nativeEvent.isComposing) {
               e.preventDefault();
               void send();
             }

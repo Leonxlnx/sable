@@ -5,11 +5,12 @@ import { AccountSwitcher, AddAccountDialog } from '@/features/accounts';
 import { connectableAgents, isSignedIn } from '@/features/connect/plan';
 import { Icon } from '@/icons';
 import { anyChecking } from '@/lib/sign-in';
-import { cancelUpdate, installUpdate, openSettings, refreshLimits } from '@/state/actions';
+import { cancelUpdate, installUpdate, openSession, openSettings, refreshLimits, restartNow } from '@/state/actions';
 import { useFocusAccount } from '@/state/hooks';
 import { useStore } from '@/state/store';
-import { IconButton } from '@/ui';
+import { IconButton, Menu, MenuContent, MenuItem, MenuSep, MenuTrigger } from '@/ui';
 import { useLimitsTicker } from '@/features/usage/ticker';
+import { waitChats, waitLabel, waitWord } from './update-wait';
 import './footer.css';
 
 /**
@@ -46,22 +47,49 @@ function useLimitRefresh() {
 
 /**
  * A downloaded update: one quiet row above the account that restarts into it. Asked while agents
- * work, it says it waits for them, with a way back.
+ * work, it names the chat it waits for; its menu lists every chat with what it holds, and offers the
+ * restart now and the way back.
  */
 function UpdateRow() {
   const u = useStore((s) => s.update);
+  // The names only (one string): the row never renders for another change of a chat.
+  const names = useStore((s) => (u?.pending ? waitChats(u.waits).map((w) => s.sessions[w.sessionId!]?.title ?? '').join('\n') : ''));
   if (!u || u.status !== 'ready' || !u.latest) return null;
   if (u.pending) {
+    const chats = waitChats(u.waits);
+    const titles = names.split('\n');
+    const title = (id: string) => titles[chats.findIndex((w) => w.sessionId === id)] || undefined;
+    const now = Date.now();
+    const own = (u.waits ?? []).find((w) => !w.sessionId);
     return (
-      <div className="update-row" data-pending="">
-        <Icon name="reload" size={15} className="update-icon" />
-        <span className="update-label grow truncate">Waits for agents</span>
-        <button type="button" className="update-cancel" aria-label="Cancel the restart" onClick={() => void cancelUpdate()}>
-          {/* A narrow sidebar keeps the label whole: Cancel becomes its icon (footer.css). */}
-          <span className="update-long">Cancel</span>
-          <Icon name="x" size={13} className="update-short" />
-        </button>
-      </div>
+      <Menu>
+        <MenuTrigger asChild>
+          <button type="button" className="update-row" data-pending="">
+            <Icon name="reload" size={15} className="update-icon" />
+            <span className="update-label grow truncate">{waitLabel(u.waits, title)}</span>
+            <Icon name="caret-up" size={11} className="update-caret" />
+          </button>
+        </MenuTrigger>
+        <MenuContent side="top" align="start" className="update-menu">
+          {chats.map((w) => (
+            <MenuItem key={w.sessionId} hint={waitWord(w, now)} onSelect={() => openSession(w.sessionId!)}>
+              {title(w.sessionId!) ?? 'Chat'}
+            </MenuItem>
+          ))}
+          {own && (
+            <MenuItem disabled hint={waitWord(own, now)}>
+              Sable
+            </MenuItem>
+          )}
+          {(chats.length > 0 || own) && <MenuSep />}
+          <MenuItem icon="reload" onSelect={() => void restartNow()}>
+            Restart now
+          </MenuItem>
+          <MenuItem icon="x" onSelect={() => void cancelUpdate()}>
+            Cancel
+          </MenuItem>
+        </MenuContent>
+      </Menu>
     );
   }
   return (

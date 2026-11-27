@@ -257,22 +257,35 @@ export function turnBoundary(item: TimelineItem) {
   return !syn || syn.role === 'command';
 }
 
+/** A row that is not settled: a step, a text or a task still going, a message still queued, a limit not decided. */
+function rowLive(it: TimelineItem): boolean {
+  return !!(it.type === 'tool' && (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting' || runsTask(it) || worksInBackground(it) || tracksWork(it)) ||
+    (it.type === 'text' || it.type === 'thinking') && it.streaming || it.type === 'user' && it.state === 'queued' ||
+    it.type === 'notice' && it.limit?.provider && !it.limit.continuedWith && !it.limit.atReset);
+}
+
+/** What `snapshotEnd` asks of a row, as bits: whoever keeps them per row spares the scan every row's fields. */
+export const ROW_ROOT = 1, ROW_LIVE = 2, ROW_TURN = 4;
+export function rowFacts(it: TimelineItem): number {
+  return (it.parentId ? 0 : ROW_ROOT) | (rowLive(it) ? ROW_LIVE : 0) | (turnBoundary(it) ? ROW_TURN : 0);
+}
+
 /** Eight ordinary prompt boundaries cover the largest tailStart can build.
- * A queued steer, streaming row or background task takes its entire turn too. */
-export function snapshotEnd(items: TimelineItem[]) {
+ * A queued steer, streaming row or background task takes its entire turn too.
+ * `facts`: each row's bits (`rowFacts`), one per item in the same order; the rule is the same with and without. */
+export function snapshotEnd(items: TimelineItem[], facts?: ArrayLike<number>) {
   let start = 0, prompts = 0, live = items.length;
   let roots = 0, shownRoots = 0;
   const parents = new Set<string>();
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i];
-    if (!it.parentId) roots++;
-    if ((parents.size && parents.delete(it.id)) || it.type === 'tool' && (it.status === 'running' || it.status === 'pending' || it.status === 'awaiting' || runsTask(it) || worksInBackground(it) || tracksWork(it)) ||
-        (it.type === 'text' || it.type === 'thinking') && it.streaming || it.type === 'user' && it.state === 'queued' ||
-        it.type === 'notice' && it.limit?.provider && !it.limit.continuedWith && !it.limit.atReset) {
+    const f = facts ? facts[i] : -1;
+    if (f < 0 ? !it.parentId : f & ROW_ROOT) roots++;
+    if ((parents.size && parents.delete(it.id)) || (f < 0 ? rowLive(it) : f & ROW_LIVE)) {
       live = i;
       if (it.parentId) parents.add(it.parentId);
     }
-    if (prompts >= 8 && live >= start || !turnBoundary(it)) continue;
+    if (prompts >= 8 && live >= start || !(f < 0 ? turnBoundary(it) : f & ROW_TURN)) continue;
     if (++prompts === 8 || i <= live && live < start) {
       start = i;
       shownRoots = roots;

@@ -1,12 +1,16 @@
-import { useEffect, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import type { AccountInfo, LimitsReport, ProviderId, RateLimit } from '@shared/protocol';
+import type { UseFirstRank } from '@shared/use-first';
 import { planLabel } from '@desk/features/connect/plan';
+import { accountInUse, accountMark } from '@desk/features/accounts/model';
+import { accountOrder, roomWords } from '@m/lib/account-order';
 import { conn } from '@m/lib/conn';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
+import { veilFirst } from '@m/ui/screen-veil';
 import { getState, refreshLimits, useStore } from '@m/lib/store';
 import { useNow } from '@m/lib/useNow';
-import { clock, evenPace, paceText, resetsText, tightestUse, usedPercent, usedWords, windowLevel } from '@m/lib/usage-words';
+import { clock, evenPace, paceText, resetsText, usedPercent, usedWords, windowLevel } from '@m/lib/usage-words';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark } from '@m/ui/marks';
 import { Pull } from '@m/ui/Pull';
@@ -32,26 +36,49 @@ interface Account {
   account: AccountInfo;
   report?: LimitsReport;
   windows: RateLimit[];
-  top: number;
+  rank?: UseFirstRank;
 }
 
-/** Every signed-in account that has limits to read: its own agent's, nearest its limit first. */
-function useAgents(now: number): { provider: ProviderId; accounts: Account[] }[] {
+interface Agent {
+  provider: ProviderId;
+  /** Signed in, in the desktop's order (use first, or the person's own). */
+  accounts: Account[];
+  /** Signed out: a quiet row each, after the others. */
+  out: AccountInfo[];
+  /** "2 of 3 with room" (several accounts with a plan only). */
+  room: string;
+}
+
+/**
+ * Every agent with accounts, as the desktop's switcher and Settings › Usage list them: its signed-in
+ * accounts in the order to use them (lib/account-order.ts, the desktop's pure rule), then those signed
+ * out. OpenCode signs in to model providers, not as accounts: listed only while it has plan limits.
+ */
+function useAgents(now: number): Agent[] {
   const providers = useStore((s) => s.providers);
   const limits = useStore((s) => s.limits);
-  const out: { provider: ProviderId; accounts: Account[] }[] = [];
-  for (const id of AGENTS) {
-    const accounts = (providers[id]?.accounts ?? [])
-      .filter((a) => a.auth.loggedIn)
-      .map((account) => {
+  const settings = useStore((s) => s.settings);
+  // The order moves with time only as weeks end: read again once a minute, not on every tick of the clock.
+  const minute = Math.floor(now / 60_000);
+  return useMemo(() => {
+    const out: Agent[] = [];
+    for (const id of AGENTS) {
+      const info = providers[id];
+      if (!info?.installed) continue;
+      const all = info?.accounts?.length ? info.accounts : info?.installed && info.auth ? [{ id: 'default', provider: id, label: 'Main', isDefault: true, auth: info.auth } as AccountInfo] : [];
+      if (!all.length) continue;
+      if (id === 'opencode' && !all.some((a) => limits[`${id}:${a.id}`]?.limits?.length)) continue;
+      const signedIn = all.filter((a) => a.auth.loggedIn);
+      const { list, rank } = accountOrder(id, signedIn, limits, settings, minute * 60_000);
+      const accounts = list.map((account) => {
         const report = limits[`${id}:${account.id}`];
         const windows = ordered((report?.limits ?? account.limits ?? []).filter((w) => w.percent >= 0));
-        return { account, report, windows, top: report?.planLimits === false ? -2 : tightestUse(windows, now) };
-      })
-      .sort((a, b) => b.top - a.top);
-    if (accounts.length) out.push({ provider: id, accounts });
-  }
-  return out;
+        return { account, report, windows, rank: rank.get(account.id) };
+      });
+      out.push({ provider: id, accounts, out: all.filter((a) => !a.auth.loggedIn), room: roomWords([...rank.values()]) });
+    }
+    return out;
+  }, [providers, limits, settings, minute]);
 }
 
 /** The desktop reads every signed-in account's limits again (all of them, or those read long ago); its answers arrive as reports. */
@@ -72,7 +99,9 @@ export async function readAll(force: boolean, onReading?: (keys: Set<string>) =>
 
 /**
  * Limits, in the desktop's usage language (2.18; the sheet of cards it replaces read as cheap): per
- * agent its accounts, nearest their limit first, the one new chats start on with the check; per
+ * agent (its head says how many of its accounts have room) its accounts in the order to use them
+ * (2.22, the desktop's switcher order), the one in use with the switcher's check, those signed out
+ * as quiet rows after them; per
  * account each window as one exact row: its name and the share used ("62% used"), one thin meter that
  * fills as it is used (the dithered head; amber near the cap, red at it, the only colours), an even
  * pace's place as a tick on the meter, and under it when it resets and where the pace leads. One
@@ -102,7 +131,7 @@ export function LimitsScreen() {
   return (
     <div className="screen limits">
       <header className="sub-head">
-        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), nav.pop())}>
+        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), veilFirst(() => nav.pop()))}>
           <Icon name="back" size={22} />
         </button>
         <span className="sub-head-title">Limits</span>
@@ -126,27 +155,34 @@ export function LimitsScreen() {
         ) : (
           <div className="lm-body">
             {connState !== 'open' && <p className="lm-away">{`${desktop ?? 'The computer'} is away. These are the limits it last read.`}</p>}
-            {agents.map(({ provider, accounts }) => (
+            {agents.map(({ provider, accounts, out, room }) => (
               <section key={provider} className="lm-agent" aria-label={PROVIDER_NAME[provider]}>
                 <h2 className="lm-agent-head">
-                  <ProviderMark provider={provider} size={15} />
-                  <span>{PROVIDER_NAME[provider]}</span>
+                  <ProviderMark provider={provider} size={16} />
+                  <span className="lm-agent-name">{PROVIDER_NAME[provider]}</span>
+                  {room && <span className="lm-agent-room num">{room}</span>}
                 </h2>
                 {accounts.map(({ account, report, windows }) => {
                   const readAt = report?.readAt;
-                  const stale = readAt && now - readAt > STALE_MS ? `As of ${clock(readAt, now)}` : undefined;
+                  const busy = reading.has(`${provider}:${account.id}`);
+                  const aside = busy && windows.length ? 'Reading' : readAt && now - readAt > STALE_MS ? `As of ${clock(readAt, now)}` : undefined;
                   const named = planLabel(account.auth) ?? (account.auth.method === 'local' ? account.auth.plan : undefined);
                   const plan = named && named !== PROVIDER_NAME[provider] && named !== account.label ? named : undefined;
                   const extra = report?.extra?.enabled && report.extra.limit ? report.extra : undefined;
-                  const inUse = account.isDefault && accounts.length > 1;
+                  // The desktop switcher's one check (accounts/model.ts `accountMark`): with no chat open, the
+                  // account in use is the one the next chat starts on. One account needs no mark.
+                  const several = accounts.length + out.length > 1;
+                  const here = several && accountMark(account, accountInUse([...accounts.map((a) => a.account), ...out], undefined)?.id) === 'here';
                   return (
-                    <article key={account.id} className="lm-acct">
+                    <article key={account.id} className="lm-acct" data-here={here || undefined}>
                       <div className="lm-acct-head">
-                        <span className="lm-acct-name">{accounts.length > 1 ? account.label : (plan ?? account.label)}</span>
-                        {accounts.length > 1 && plan && <span className="lm-acct-plan">{plan}</span>}
-                        <span className="lm-acct-aside num">{stale}</span>
-                        {inUse && (
-                          <span className="lm-in-use" role="img" aria-label="New chats start here">
+                        <span className="lm-acct-name">{several ? account.label : (plan ?? account.label)}</span>
+                        {several && plan && <span className="lm-acct-plan">{plan}</span>}
+                        <span className="lm-acct-aside num" data-busy={aside === 'Reading' || undefined}>
+                          {aside}
+                        </span>
+                        {here && (
+                          <span className="lm-in-use" role="img" aria-label="In use">
                             <Icon name="check" size={16} weight="bold" />
                           </span>
                         )}
@@ -211,6 +247,12 @@ export function LimitsScreen() {
                     </article>
                   );
                 })}
+                {out.map((account) => (
+                  <div key={account.id} className="lm-out">
+                    <span className="lm-acct-name">{account.label}</span>
+                    <span className="lm-out-word">Not signed in</span>
+                  </div>
+                ))}
               </section>
             ))}
           </div>

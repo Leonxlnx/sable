@@ -88,6 +88,20 @@
   color: var(--text-2);
 }
 
+/* the line is the key to "Working now" (WorkSheet.tsx): a press lights its words, nothing moves */
+button.chat-work {
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button.chat-work:active .chat-work-text {
+  color: var(--text-2);
+}
+
+.chat-work-words {
+  display: contents;
+}
+
 .chat-work-text {
   min-width: 0;
   overflow: hidden;
@@ -616,6 +630,28 @@
   font-weight: var(--w-medium);
 }
 
+/* the desktop's last line: how long the oldest of it has run, a step quieter after a dot; a tap raises "Working now" */
+button.bg-line {
+  width: 100%;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button.bg-line:active .bg-line-text {
+  color: var(--text);
+}
+
+.bg-line-time {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.bg-line-time::before {
+  content: '·';
+  margin-right: 7px;
+  color: var(--text-4);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .tp[data-nest],
   .tp-in[data-nest],
@@ -853,6 +889,63 @@
   font-size: var(--t-caption);
   color: var(--red);
   flex-shrink: 0;
+}
+
+/* a tracked job (track_work): the step's own row in the Agents tab's grammar; its log's last line under the title */
+.job-line {
+  cursor: default;
+}
+
+.job-mark[data-state='done'] {
+  color: var(--text-3);
+}
+
+.job-dash {
+  width: 9px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+.step.job[data-state='running'] .job-title {
+  color: var(--text);
+}
+
+.job-who {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.job-by {
+  max-width: 30%;
+  flex-shrink: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-3);
+}
+
+.job-time {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+
+.job-log {
+  display: block;
+  margin: -10px 10px 6px 37px;
+  font-size: var(--t-caption);
+  line-height: 1.45;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* a handed-over task's one action where its report's delivery is unknown */
+.block-again {
+  align-self: flex-start;
+  margin: 4px 0 0 29px;
 }
 
 .step-detail-wrap {

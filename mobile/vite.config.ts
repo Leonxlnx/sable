@@ -13,6 +13,9 @@ export default defineConfig({
       '@shared': r('../shared'),
       '@desk': r('../src'),
       '@m': r('./src'),
+      // The desktop's own name for its folder, inside the pure modules the phone reads (usage/plans.ts,
+      // usage/format.ts): `@/…` only (a bare '@' alias matches '@' and '@/…', never '@capacitor/…').
+      '@': r('../src'),
     },
     // The shared files import nothing from node_modules but these; resolve them here, not at the root.
     dedupe: ['react', 'react-dom'],

@@ -8,7 +8,7 @@ import { lastNote, liveEnabled, waitingNote, workEnded } from '@m/lib/notes';
 import { answerFromNote } from '@m/lib/note-answer';
 import { epoch, still } from '@m/lib/epoch';
 import { chatOf, nav, routeKey, useNav, type Route } from '@m/lib/nav';
-import { rowOf, takeOrigin, type Origin } from '@m/lib/open';
+import { takeOrigin } from '@m/lib/open';
 import { pruneComments } from '@m/lib/comments';
 import { takeSwap } from '@m/lib/race';
 import { closeSessionData, getState, hasCachedHome, loadCachedHome, openSession, refresh, setState, subscribeStore, useStore, watchLive } from '@m/lib/store';
@@ -16,7 +16,10 @@ import '@m/lib/keyboard';
 import { fieldBeat } from '@m/ui/Field';
 import { Launch } from '@m/ui/Launch';
 import { ProviderMark, StatusMark } from '@m/ui/marks';
-import { nowOf, reduced, SNAP, SPRING } from '@m/ui/motion';
+import { reduced, SNAP, SPRING } from '@m/ui/motion';
+import { veilChange, veilFirst } from '@m/ui/screen-veil';
+import { ShareSheet } from './screens/ShareSheet';
+import { watchWidget } from '@m/lib/widget';
 import { Viewer } from '@m/ui/Viewer';
 import { MessageMenu } from './screens/MessageMenu';
 import { Home } from './screens/Home';
@@ -210,7 +213,8 @@ export function App() {
         }
       }),
       onBackButton(goBack),
-      pushBack(() => nav.pop()),
+      // Android's back: through the veil (ui/screen-veil.ts), the cover in the frame of the press.
+      pushBack(() => (nav.stack.length ? (veilFirst(() => nav.pop()), true) : false)),
       onPairLink((url) => {
         // The app icon's shortcuts (a new chat, home's bar focused; one of the last chats) and the
         // notifications: a chat where it matters (`at=prompt`: the prompt waiting, its sheet opens by
@@ -235,6 +239,8 @@ export function App() {
       if (getState().notify === undefined) setState({ notify });
     });
     const stopShortcuts = subscribeStore(watchShortcuts());
+    // 2.22: the home-screen widget's figures (lib/widget.ts).
+    const stopWidget = subscribeStore(watchWidget(getState));
     const idle = window.setTimeout(() => void loadChat().then(() => window.setTimeout(() => void loadChanges(), 800)), 400);
     // Back where it was: Android may have closed the app in the background.
     void conn.init().then(() => {
@@ -250,6 +256,7 @@ export function App() {
       stopWatch();
       stopLive?.();
       stopShortcuts();
+      stopWidget();
       clearTimeout(idle);
     };
   }, []);
@@ -377,6 +384,7 @@ export function App() {
         {banner}
       </div>
       {launch === 'on' && <Launch onDone={() => setLaunch('done')} />}
+      <ShareSheet />
       <MessageMenu />
       <Viewer />
       <Toast />
@@ -403,15 +411,13 @@ function Screen({ route: r }: { route: Route }) {
   );
 }
 
-const H = () => window.innerHeight;
-
 /**
- * A screen over home. A chat grows out of the row (or card, or field) it was opened from: it scales
- * up from that row's place while it fades in, and home steps back. Going back it shrinks into its row
- * again when that row is on screen; otherwise screens slide. Transform and opacity only, as WAAPI
- * animations: the compositor runs them while the page mounts the conversation (the window that
- * opened as a clip-path was drawn by the main thread, which was busy mounting it: the opening and the
- * way back lost most of their frames on a phone).
+ * A screen over home. 2.22: it comes and goes through the dither veil, as the desktop changes its
+ * view (ui/screen-veil.ts): the veil steps in over what is there (about 80 ms), the screen is shown
+ * (or let go) under it, and it steps out (about 130 ms). Opacity on the veil's four small layers
+ * only: nothing slides, nothing scales, nothing fights the veil. (2.21 grew a chat out of its row and
+ * slid other screens: the page moved under its own content on every frame.) A race's rival still
+ * comes in beside it, as columns.
  */
 function Layer({ route, index, covered, split = false, children }: { route: Route; index: number; covered: boolean; split?: boolean; children: ReactNode }) {
   // The tablet layout's stage: one chat replaces another in place by a short cross-fade (the desktop's
@@ -420,9 +426,12 @@ function Layer({ route, index, covered, split = false, children }: { route: Rout
   const ref = useRef<HTMLDivElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const [present, safeToRemove] = usePresence();
-  // Taken once (a development double run of the effect must not lose it).
-  const origin = useRef<Origin | null | undefined>(undefined);
-  if (origin.current === undefined) origin.current = route.name === 'chat' ? takeOrigin(route.id) : null;
+  // Where a chat was opened from is no longer drawn: taken once so it is not left for a later opening.
+  const origin = useRef<boolean>(false);
+  if (!origin.current) {
+    origin.current = true;
+    if (route.name === 'chat') takeOrigin(route.id);
+  }
   // A race's rival taking this chat's place: the two slide together, as columns side by side.
   const swapIn = useRef<1 | -1 | null | undefined>(undefined);
   if (swapIn.current === undefined) swapIn.current = route.name === 'chat' ? takeSwap(route.id, 'in') : null;
@@ -431,32 +440,38 @@ function Layer({ route, index, covered, split = false, children }: { route: Rout
     const el = ref.current;
     const b = body.current;
     if (!el || !b) return;
-    const o = origin.current;
+    // The tablet layout's chat-for-chat swap (`swaps`, never in the phone app) is the same short fade.
     if (reduced() || swaps) {
-      animate(el, { opacity: [0, 1] }, { duration: 0.14, ease: 'easeOut' });
+      animate(el, { opacity: [0, 1] }, swaps ? { duration: 0.14, ease: 'easeOut' } : { duration: 0.14 });
       return;
     }
-    if (o) {
-      // Out of what was tapped: the screen grows from that row's place as it comes in.
-      b.style.transformOrigin = `50% ${(o.rect.top + o.rect.height / 2).toFixed(0)}px`;
-      animate(b, { transform: ['scale(0.9)', 'scale(1)'] }, SPRING);
-      animate(b, { opacity: [0, 1] }, { duration: 0.2, ease: 'easeOut' });
+    // A race's rival: the two slide together, as columns side by side (the one lateral move kept).
+    if (swapIn.current) {
+      animate(el, { transform: [`translateX(${swapIn.current * 100}%)`, 'translateX(0%)'] }, SPRING);
       return;
     }
-    const dir = swapIn.current ?? 1;
-    animate(el, { transform: [`translateX(${dir * 100}%)`, 'translateX(0%)'] }, SPRING);
+    // 2.22: through the dither (ui/screen-veil.ts): the screen is there once the veil is solid over
+    // the one it covers, and the veil opens onto it. Nothing slides or scales.
+    el.style.opacity = '0';
+    veilChange(() => {
+      el.style.opacity = '';
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Covered by a newer screen: it steps back, as home does.
+  // Covered by a newer screen: under the veil it is simply hidden; shown again under the veil going back.
   const wasCovered = useRef(covered);
   useEffect(() => {
     const b = body.current;
     if (!b || !present || wasCovered.current === covered) return;
     wasCovered.current = covered;
-    const n = nowOf(b);
-    b.style.transformOrigin = '';
-    animate(b, { transform: [`scale(${n.scale})`, `scale(${covered ? 0.94 : 1})`], opacity: [n.opacity, covered ? 0.4 : 1] }, SPRING);
+    const set = () => {
+      b.style.transformOrigin = '';
+      b.style.transform = '';
+      b.style.opacity = '';
+      b.style.visibility = wasCovered.current ? 'hidden' : '';
+    };
+    veilChange(set);
   }, [covered, present]);
 
   // The animations of a layer on its way out: the same screen opened again at once brings it back from where it is.
@@ -470,8 +485,8 @@ function Layer({ route, index, covered, split = false, children }: { route: Rout
       leaving.current = null;
       going.forEach((a) => a.stop());
       el.style.pointerEvents = '';
+      el.style.opacity = '';
       animate(el, { transform: 'translateX(0%)', opacity: 1 }, SPRING);
-      animate(b, { transform: 'scale(1)', opacity: 1 }, SPRING);
       return;
     }
     if (!el || !b) return void safeToRemove();
@@ -490,16 +505,9 @@ function Layer({ route, index, covered, split = false, children }: { route: Rout
       void go(animate(el, { transform: ['translateX(0%)', `translateX(${-swapOut * 100}%)`] }, SPRING)).finished.then(done);
       return;
     }
-    const row = route.name === 'chat' ? rowOf(route.id) : null;
-    if (row) {
-      // Back into its row: the screen shrinks toward the row's place and fades as home comes forward.
-      b.style.transformOrigin = `50% ${Math.min(H(), Math.max(0, row.rect.top + row.rect.height / 2)).toFixed(0)}px`;
-      const n = nowOf(b);
-      go(animate(b, { transform: [`scale(${n.scale})`, 'scale(0.9)'] }, { ...SPRING, stiffness: 470 }));
-      void go(animate(b, { opacity: [n.opacity, 0] }, { duration: 0.2, ease: 'easeIn' })).finished.then(done);
-      return;
-    }
-    void go(animate(el, { transform: ['translateX(0%)', 'translateX(100%)'] }, { type: 'spring', stiffness: 520, damping: 50, restDelta: 1 })).finished.then(done);
+    // 2.22: through the dither (ui/screen-veil.ts): it goes once the veil is solid over it, and the
+    // veil opens onto the screen under it.
+    veilChange(done);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [present]);
 

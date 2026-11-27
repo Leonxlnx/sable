@@ -1,3 +1,4 @@
+import { stallMark } from './util/stalls';
 import type { IncomingMessage, Server } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { BRIDGE_PATH, type RpcMethods, type RpcRequest, type ServerFrame } from '../shared/protocol';
@@ -85,14 +86,18 @@ export function attachBridge(http: Server, opts: Partial<AppOptions> = {}) {
           }
         }
         const result = await app.call(req.method, (pageRequest ?? req.params) as never);
+        const cut = stallMark('socket.cut');
         let view = resultForWindow(result, wholeItem, !!(pageRequest?.page || pageRequest?.peek));
+        cut();
         // A byte cut must never silently remove an unresolved decision from a
         // provisional end. In that case the first answer comes from restore.
         if (pageRequest && isSnapshot(result) && result.page?.kind === 'provisional' && isSnapshot(view) && result.items.length !== view.items.length) {
           const real = await app.call('session.snapshot', { ...pageRequest, page: 'real', keepFrom: result.items[0]?.id });
           view = resultForWindow(real, wholeItem, true);
         }
+        const written = stallMark('socket.answer');
         const frame = JSON.stringify({ id: req.id, ok: true, result: view });
+        written();
         // Measuring runs (SABLE_BOOT_TRACE=1): each call, when it came, how long it took, how big its answer was.
         if (trace) console.log(`[rpc] ${req.method} ${(performance.timeOrigin + t).toFixed(1)} ${(performance.now() - t).toFixed(1)}ms ${frame.length}B`);
         if (ws.readyState === ws.OPEN) ws.send(frame);

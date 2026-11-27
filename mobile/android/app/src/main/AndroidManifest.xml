@@ -31,6 +31,13 @@
                 <data android:scheme="sable" android:host="pair" />
             </intent-filter>
 
+            <!-- 2.22: Sable in Android's share sheet for text and links; the page asks which chat's draft it goes in (MainActivity.takeShare). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+
             <!-- The app icon's shortcuts: "New chat" here, the last chats from the app (SystemPlugin). -->
             <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
 
@@ -56,6 +63,13 @@
         </service>
         <!-- Allow once and Deny on a chat's notification (Notes.java): handed to the page, which answers. -->
         <receiver android:name=".NoteActionReceiver" android:exported="false" />
+        <!-- 2.22: the home-screen widget, chats working and waiting (NowWidget). -->
+        <receiver android:name=".NowWidget" android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_now_info" />
+        </receiver>
     </application>
 
     <!-- Permissions -->

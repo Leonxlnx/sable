@@ -1,7 +1,7 @@
 import type { ProviderSession } from '../providers/types';
 
 export type WorkSession = {
-  meta: { status: string; background?: number; commands?: number; serving?: number; moving?: boolean };
+  meta: { id?: string; status: string; background?: number; commands?: number; serving?: number; moving?: boolean };
   turnActive: boolean;
   readonly newestCommandAt?: number;
   readonly newestProcessCommandAt?: number;

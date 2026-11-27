@@ -2,9 +2,13 @@ package io.github.leonxlnx.sable.mobile;
 
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.net.Uri;
+import android.os.PowerManager;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import androidx.activity.result.ActivityResult;
@@ -118,6 +122,80 @@ public class SystemPlugin extends Plugin {
         } catch (Exception e) {
             call.reject("The shortcuts could not be set.");
         }
+    }
+
+    /** The home-screen widget's figures (2.22, NowWidget): chats working and waiting, and the computer's name. */
+    @PluginMethod
+    public void widget(PluginCall call) {
+        NowWidget.put(getContext(), call.getInt("working", 0), call.getInt("waiting", 0), call.getString("desktop"));
+        call.resolve();
+    }
+
+    /** A share's words at most (characters): what another app hands over goes into a draft, never sent by itself. */
+    private static final int SHARED_MAX = 20_000;
+
+    /**
+     * Text another app shared to Sable (2.22: Android's share sheet, `ACTION_SEND` of text, MainActivity):
+     * the page asks which chat it goes to and puts it in that chat's draft (lib/share-in.ts). Kept for the
+     * page until it listens (a share that started the app arrives before the page does).
+     */
+    void shared(String text, String subject) {
+        if (text == null) return;
+        String t = text.length() > SHARED_MAX ? text.substring(0, SHARED_MAX) : text;
+        if (t.trim().isEmpty()) return;
+        com.getcapacitor.JSObject r = new com.getcapacitor.JSObject();
+        r.put("text", t);
+        if (subject != null && !subject.trim().isEmpty()) r.put("subject", cut(subject.trim(), 200));
+        notifyListeners("share", r, true);
+    }
+
+    /**
+     * Battery saver (2.22): whether Android's own switch is on, for the page's motion (lib/saver.ts:
+     * the field's still frame, no beats, changes of screen at once); later changes come as the
+     * `powerSave` event, from the system's broadcast while the plugin is loaded.
+     */
+    private BroadcastReceiver powerSaveReceiver;
+
+    @Override
+    public void load() {
+        powerSaveReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                com.getcapacitor.JSObject r = new com.getcapacitor.JSObject();
+                r.put("on", powerSaveOn());
+                notifyListeners("powerSave", r);
+            }
+        };
+        try {
+            // The system's broadcast only (not exported: nothing else may send it to the app).
+            androidx.core.content.ContextCompat.registerReceiver(getContext(), powerSaveReceiver, new IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED), androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+        } catch (Exception e) {
+            powerSaveReceiver = null;
+        }
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        if (powerSaveReceiver != null) {
+            try {
+                getContext().unregisterReceiver(powerSaveReceiver);
+            } catch (Exception e) {
+                // already gone
+            }
+            powerSaveReceiver = null;
+        }
+    }
+
+    private boolean powerSaveOn() {
+        PowerManager pm = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+        return pm != null && pm.isPowerSaveMode();
+    }
+
+    @PluginMethod
+    public void powerSave(PluginCall call) {
+        com.getcapacitor.JSObject r = new com.getcapacitor.JSObject();
+        r.put("on", powerSaveOn());
+        call.resolve(r);
     }
 
     /**

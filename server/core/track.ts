@@ -11,6 +11,7 @@ import { openOwnFile } from '../services/git';
 import { windowsPowerShell } from '../services/term';
 import { folderNow, within } from './contain';
 import type { SessionRuntime } from './runtime';
+import { lateEnd } from '../util/deadline';
 
 /**
  * Tracked work (`track_work`, `ToolItem.tracked`): a process the agent started outside its own tools
@@ -430,6 +431,8 @@ export class WorkTracker {
       await rt.persistDelegate?.();
       prepared?.();
     } catch (err) {
+      // A slow save still ends: the staged report counts as saved then.
+      if (prepared) void lateEnd(err).then(prepared, () => {});
       this.host.log('tracked work: the end could not be saved', (err as Error).message);
     }
     if (!held && this.host.session(rt.id) === rt) rt.onDelegateReport?.();

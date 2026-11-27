@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { App } from '../app';
 import { workOf, type WorkSession } from '../core/work';
-import type { UpdateState } from '../../shared/protocol';
+import type { UpdateState, UpdateWait } from '../../shared/protocol';
 import { VERSION } from '../version';
 import { installMac } from './update-mac';
 
@@ -21,6 +21,10 @@ import { installMac } from './update-mac';
 
 export const RELEASES_URL = 'https://api.github.com/repos/Leonxlnx/sable/releases/latest';
 const FIRST_CHECK_MS = 30_000;
+/** While a restart waits, it looks again at least this often. */
+const RECHECK_MS = 15_000;
+/** Sable's own step in flight (a send, a start, a decision) holds a restart this long at most: longer is a stuck entry, not work. */
+export const STEP_HOLDS_MS = 3 * 60_000;
 /** Also while a downloaded version waits for the restart: a newer release then takes its place (see `supersede`). */
 const EVERY_MS = 2 * 3600_000;
 
@@ -89,6 +93,8 @@ interface UpdaterOptions {
    * again by itself, as nothing the bridge says changes when that while is over.
    */
   recheckAt?: () => number | undefined;
+  /** What the restart waits for, for the person to read (asked only while it waits). */
+  waits?: () => UpdateWait[];
   /** No timers (tests call check() themselves). */
   manual?: boolean;
 }
@@ -254,37 +260,70 @@ export class Updater {
     return hash.digest('hex') === rel.sha256;
   }
 
-  /** Installs the downloaded release and quits; while agents work, once they are done. */
-  install(cancel = false): UpdateState {
+  /**
+   * Installs the downloaded release and quits; while agents work, once they are done, and the state
+   * says what it waits for (`waits`). `force`: now, whatever still works: the person read what that ends.
+   */
+  install(cancel = false, force = false): UpdateState {
     if (cancel) {
       this.busyCheck = undefined;
       this.armRecheck();
-      this.set({ pending: undefined });
+      this.set({ pending: undefined, waits: undefined });
       return this.state;
     }
     if (this.state.status !== 'ready' || !this.file || !this.opts.host) throw new Error('No update is ready to install.');
     if (this.left) return this.state;
+    if (force) {
+      this.busyCheck = undefined;
+      this.armRecheck();
+      this.go(true);
+      return this.state;
+    }
     if (this.opts.busy?.() || !this.go()) {
       this.busyCheck = () => {
         try {
-          if (!this.go()) return this.armRecheck();
+          if (!this.go()) {
+            this.tellWaits();
+            return this.armRecheck();
+          }
         } catch (err) {
-          this.set({ pending: undefined, error: (err as Error).message });
+          this.set({ pending: undefined, waits: undefined, error: (err as Error).message });
         }
         this.busyCheck = undefined;
         this.armRecheck();
       };
-      this.set({ pending: true });
+      this.set({ pending: true, waits: this.readWaits() });
       this.armRecheck();
     }
     return this.state;
   }
 
-  /** While a restart waits: a look again when the work that holds it stops holding it by its age alone. */
+  private readWaits(): UpdateWait[] | undefined {
+    let waits: UpdateWait[] | undefined;
+    try {
+      waits = this.opts.waits?.();
+    } catch {
+      waits = undefined;
+    }
+    return waits?.length ? waits : undefined;
+  }
+
+  /** What it waits for changed: said once per change, never per look. */
+  private tellWaits() {
+    const waits = this.readWaits();
+    if (JSON.stringify(waits) !== JSON.stringify(this.state.waits)) this.set({ waits });
+  }
+
+  /**
+   * While a restart waits: a look again when the work that holds it stops holding it by its age alone,
+   * and every `RECHECK_MS` whatever holds it: work that ends without a word from its chat (a command
+   * the agent stopped, its process's own state) must not keep a restart waiting for the rest of a
+   * command's half hour.
+   */
   private armRecheck() {
     clearTimeout(this.recheck);
     this.recheck = undefined;
-    const at = this.busyCheck ? this.opts.recheckAt?.() ?? Date.now() + 3000 : undefined;
+    const at = this.busyCheck ? Math.min(this.opts.recheckAt?.() ?? Date.now() + 3000, Date.now() + RECHECK_MS) : undefined;
     if (at === undefined) return;
     this.recheck = setTimeout(() => this.workChanged(), Math.max(1000, at - Date.now() + 50));
     this.recheck.unref?.();
@@ -310,13 +349,13 @@ export class Updater {
     });
   }
 
-  private go() {
+  private go(force = false) {
     if (this.left) return true;
-    if (this.opts.busy?.()) return false;
+    if (!force && this.opts.busy?.()) return false;
     const file = this.file!;
     this.left = true;
     const quit = () => {
-      this.set({ pending: undefined });
+      this.set({ pending: undefined, waits: undefined });
       this.opts.host?.quit();
     };
     try {
@@ -324,7 +363,7 @@ export class Updater {
       if (!started) quit();
       else void started.then(quit, (err: Error) => {
         this.left = false;
-        this.set({ pending: undefined, error: err.message });
+        this.set({ pending: undefined, waits: undefined, error: err.message });
       });
     } catch (err) {
       this.left = false;
@@ -350,31 +389,66 @@ export type UpdateSession = WorkSession;
  * commands do.
  */
 export function updateWaits(sessions: Iterable<UpdateSession>, now = Date.now()): { busy: boolean; recheckAt?: number } {
-  let busy = false;
-  let recheckAt: number | undefined;
+  const holds = updateHolds(sessions, now);
+  if (!holds.length) return { busy: false };
+  if (holds.some((h) => h.until === undefined)) return { busy: true };
+  return { busy: true, recheckAt: Math.max(...holds.map((h) => h.until!)) };
+}
+
+/**
+ * The same rule, said per chat for the person: which chats hold the restart and by what. A chat is
+ * named once, by the strongest thing it holds; one with `until` holds by its age alone.
+ */
+export function updateHolds(sessions: Iterable<UpdateSession>, now = Date.now()): UpdateWait[] {
+  const out: UpdateWait[] = [];
   for (const rt of sessions) {
     const work = workOf(rt, true, now, 'update');
-    if (rt.meta.moving || work.turn || work.agents || rt.meta.status === 'running' || rt.meta.status === 'starting' || rt.meta.status === 'awaiting') return { busy: true };
-    if (work.holds !== undefined) {
-      busy = true;
-      recheckAt = Math.max(recheckAt ?? 0, work.holds);
+    const s = rt.meta.status;
+    const of = rt.meta.id ? { sessionId: rt.meta.id } : {};
+    const kind: UpdateWait['kind'] | undefined = rt.meta.moving ? 'moving' : s === 'starting' ? 'starting' : s === 'awaiting' ? 'asks'
+      : rt.turnActive || s === 'running' ? 'turn' : work.agents ? 'agents' : work.turn ? 'agent' : undefined;
+    if (kind) out.push({ ...of, kind, ...(kind === 'agents' && work.agents > 1 ? { count: work.agents } : {}) });
+    else if (work.holds !== undefined) {
+      out.push({ ...of, kind: work.commands ? 'command' : work.wakeAt !== undefined ? 'wake' : 'agent',
+        ...(work.commands > 1 ? { count: work.commands } : {}), until: work.holds });
     }
   }
-  return busy ? { busy, recheckAt } : { busy };
+  return out;
+}
+
+/**
+ * A reading that holds only for `ms` at a stretch: `read` true for longer is taken as stuck. The
+ * stretch starts over when nobody looked for `gap` (the count belongs to one wait, not to an old one).
+ */
+export function boundedHold(read: () => boolean, ms: number, gap = 10_000): (now?: number) => boolean {
+  let since: number | undefined;
+  let seen = 0;
+  return (now = Date.now()) => {
+    if (!read()) {
+      since = undefined;
+      return false;
+    }
+    if (since === undefined || now - seen > gap) since = now;
+    seen = now;
+    return now - since < ms;
+  };
 }
 
 /** Updates through the desktop shell: `update.check`, `update.install`, and the state in `app.hello`. */
 export function registerUpdates(app: App, host?: UpdateHost) {
+  // A step of Sable's own in flight is seconds of work; an entry that stays is a leak, and no restart waits on a leak.
+  const step = boundedHold(() => app.preparingWork, STEP_HOLDS_MS);
   const updater = new Updater((state) => app.emit({ type: 'update.state', state }), {
     host: process.platform === 'win32' || process.platform === 'darwin' ? host : undefined,
-    busy: () => app.preparingWork || updateWaits(app.sessions.values()).busy,
+    busy: () => step() || updateWaits(app.sessions.values()).busy,
     recheckAt: () => updateWaits(app.sessions.values()).recheckAt,
+    waits: () => [...updateHolds(app.sessions.values()), ...(step() ? [{ kind: 'sable' as const }] : [])],
   });
   app.updates = updater;
   app.subscribe((e) => {
     if (e.type === 'session.updated' || e.type === 'session.removed' || e.type === 'session.added') updater.workChanged();
   });
   app.register('update.check', () => updater.check(true));
-  app.register('update.install', ({ cancel }) => updater.install(cancel === true));
+  app.register('update.install', ({ cancel, force }) => updater.install(cancel === true, force === true));
   return updater;
 }

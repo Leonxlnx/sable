@@ -4,4 +4,7 @@
     <string name="title_activity_main">Sable</string>
     <string name="package_name">io.github.leonxlnx.sable.mobile</string>
     <string name="custom_url_scheme">io.github.leonxlnx.sable.mobile</string>
+    <string name="widget_working">working</string>
+    <string name="widget_waiting">waiting</string>
+    <string name="widget_description">Chats working and waiting for you</string>
 </resources>

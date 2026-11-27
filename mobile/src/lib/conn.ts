@@ -633,9 +633,9 @@ class Conn {
     if (this.state !== 'open' || !this.live()) return;
     const w = this.wire;
     void this.call('usage.limits', {}, timeoutMs).catch((err) => {
-      // The desktop answered, if only with a no (a browser may not read limits: web access's allowlist):
-      // the connection is alive. Only a call the connection lost or never answered says otherwise.
-      if (this.wire !== w || !isTransport(err)) return;
+      // In a browser the desktop answers this with a no (web access's allowlist): the connection is alive
+      // then, and only a call the connection lost or never answered says otherwise. The app as before.
+      if (this.wire !== w || (import.meta.env.SABLE_WEB && !isTransport(err))) return;
       // It is let go now and a fresh connection starts, not after its close event.
       this.dropWire();
       if (this.state === 'denied' || this.holdOld) return;
