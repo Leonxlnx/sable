@@ -7,6 +7,8 @@ import { Icon } from '@m/ui/icons';
 import { ProviderMark } from '@m/ui/marks';
 import { Choice, Sheet } from '@m/ui/Sheet';
 
+const NONE: Record<string, never> = {};
+
 /**
  * Share into Sable (2.22): text or a link shared from another app asks which chat it goes to: the new
  * chat first, then the Recent list (pinned first, the newest after). A tap puts the words in that
@@ -14,7 +16,8 @@ import { Choice, Sheet } from '@m/ui/Sheet';
  */
 export function ShareSheet() {
   const shared = useShared();
-  const sessions = useStore((s) => s.sessions);
+  // The chats' list is read only while a share waits (closed, the sheet did not render on every change of it).
+  const sessions = useStore((s) => (shared ? s.sessions : NONE));
   const paired = useStore((s) => s.conn !== 'unpaired');
   useEffect(() => listenForShares(), []);
   const open = !!shared && paired;

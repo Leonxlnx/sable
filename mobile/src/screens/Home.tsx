@@ -274,8 +274,8 @@ export function Home({ under }: { under: boolean }) {
   // 2.22: no stepping back: the change of screen is the dither veil's (ui/screen-veil.ts), and home is
   // hidden or shown again under it, in the frame it is solid.
   const wasUnder = useRef(under);
-  // The bar goes with the rest of home, under the solid veil, never a frame before it.
-  const [dockCovered, setDockCovered] = useState(under);
+  // The bar goes with the rest of home (it is inside the root this hides), under the solid veil, never a
+  // frame before it. (A state of its own here rendered home once more on every change of screen.)
   useLayoutEffect(() => {
     const el = root.current;
     if (!el || wasUnder.current === under) return;
@@ -284,7 +284,6 @@ export function Home({ under }: { under: boolean }) {
       el.style.transform = '';
       el.style.opacity = '';
       el.style.visibility = wasUnder.current ? 'hidden' : '';
-      setDockCovered(wasUnder.current);
     });
   }, [under]);
 
@@ -473,7 +472,7 @@ export function Home({ under }: { under: boolean }) {
           )}
         </AnimatePresence>
 
-        <HomeDock covered={dockCovered} />
+        <HomeDock covered={false} />
 
         {(deckUsed || deck) && (
           <Suspense fallback={null}>
