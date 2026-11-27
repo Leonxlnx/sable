@@ -8,7 +8,8 @@
 // dist-resources/claude/ (a hard link, so no copy of its ~370 MB) and shipped by electron-builder as
 // an extra resource. electron/main.ts points SABLE_CLAUDE_BIN at it.
 import { build } from 'esbuild';
-import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, cpSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -140,6 +141,33 @@ const stageCss = (rel) => {
 };
 stageCss('');
 
+/*
+ * The web client of web access (server/services/web-remote.ts serves it from resources/web): the phone
+ * app's web build (mobile/vite.web.config.ts -> mobile/dist-web), built here with the root's own Vite from
+ * the mobile folder (what mobile's `build:web` does, without its type-check: the root's tsc covers the
+ * shared code), staged in dist-resources/web/ and shipped as an extra resource (resources/web/index.html,
+ * resources/web/assets/). It needs mobile/'s packages: without them (a fresh clone, the Mac workflow) or
+ * when the build fails the folder stays empty, the app works and web access says it is not included
+ * (`web.state` `assets: false`). Once WEB_SHIPS is true a build without the client is an error.
+ */
+const webOut = path.join(root, 'dist-resources/web');
+rmSync(webOut, { recursive: true, force: true });
+mkdirSync(webOut, { recursive: true });
+const mobile = path.join(root, 'mobile');
+const webShips = /^export const WEB_SHIPS = true;/m.test(readFileSync(path.join(root, 'shared/protocol.ts'), 'utf8'));
+let noWeb;
+if (!existsSync(path.join(mobile, 'node_modules/react/package.json'))) noWeb = "mobile/'s packages are not installed";
+else {
+  const web = spawnSync(process.execPath, [path.join(root, 'node_modules/vite/bin/vite.js'), 'build', '--config', 'vite.web.config.ts', '--configLoader', 'runner', '--logLevel', 'warn'], {
+    cwd: mobile,
+    stdio: 'inherit',
+  });
+  if (web.status !== 0 || !existsSync(path.join(mobile, 'dist-web/index.html'))) noWeb = 'its build failed';
+  else cpSync(path.join(mobile, 'dist-web'), webOut, { recursive: true });
+}
+if (noWeb && webShips) throw new Error(`Web access ships (WEB_SHIPS) but its web client was not built: ${noWeb}.`);
+if (noWeb) console.warn(`No web client in this build (${noWeb}): web access will say it is not included.`);
+
 /* ── the Claude Code binary ── */
 
 const exe = process.platform === 'win32' ? 'claude.exe' : 'claude';
@@ -165,4 +193,4 @@ if (!same(source, staged)) {
   }
 }
 
-console.log('Built dist-electron/main.cjs (app.cjs) and dist-electron/preload.cjs; staged dist-resources/claude/' + exe + ' and dist-resources/reference/');
+console.log('Built dist-electron/main.cjs (app.cjs) and dist-electron/preload.cjs; staged dist-resources/claude/' + exe + ', dist-resources/reference/' + (noWeb ? '' : ' and dist-resources/web/'));

@@ -89,6 +89,7 @@ export const ICON_NAMES = {
   swap: 'ArrowsLeftRight',
   mic: 'Microphone',
   pulse: 'Pulse',
+  sidebar: 'SidebarSimple',
 } as const;
 
 

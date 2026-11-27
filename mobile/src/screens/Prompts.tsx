@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from 'motion/react';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
-import type { PermissionOption, PermissionRequest, Question, QuestionRequest } from '@shared/protocol';
+import type { PermissionOption, PhonePermission, Question, QuestionRequest } from '@shared/protocol';
 import { fit } from '@m/lib/fit';
 import { pushBack } from '@m/lib/back';
 import { conn } from '@m/lib/conn';
@@ -79,7 +79,7 @@ function PathLabel({ path }: { path: string }) {
   );
 }
 
-export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }: { sid: string; req: PermissionRequest; more: number; onLater: () => void; laterLabel?: string }) {
+export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }: { sid: string; req: PhonePermission; more: number; onLater: () => void; laterLabel?: string }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   // Deny with a note, as on the desktop: when the agent takes one, Deny turns the keys into a field
@@ -94,7 +94,7 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
     setBusy(o.id);
     haptic(o.tone === 'deny' ? 'deny' : 'success');
     try {
-      await conn.call('permission.respond', { sessionId: sid, requestId: req.id, optionId: o.id, ...(msg ? { message: msg } : {}) });
+      await conn.call('permission.respond', { sessionId: sid, requestId: req.id, optionId: o.id, ...(import.meta.env.SABLE_WEB && { revision: req.revision }), ...(msg ? { message: msg } : {}) });
     } catch (err) {
       setBusy(null);
       fail(err);
@@ -227,7 +227,7 @@ export function PermissionBody({ sid, req, more, onLater, laterLabel = 'Later' }
       {desktopOnly && <p className="ask-desk">Answer this one on the desktop. The phone shows only part of it.</p>}
 
       <AutoHeight className="ask-actions-wrap">
-        <AnimatePresence mode="popLayout" initial={false}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
           {note ? (
             <motion.div key="note" className="ask-actions" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }} transition={SNAP}>
               <form
@@ -372,7 +372,7 @@ export function QuestionBody({ sid, req, onLater, laterLabel = 'Later' }: { sid:
         </div>
       )}
       <AutoHeight className="q-pane">
-        <AnimatePresence mode="popLayout" initial={false} custom={dir}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false} custom={dir}>
           <motion.div
             key={at}
             className="question"

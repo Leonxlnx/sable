@@ -4,7 +4,7 @@ import { PAIR_LINK_PREFIX, PHONE_PATH, type BridgeEvent, type PhoneFrame, type P
 type Methods = RpcMethods & PhoneMethods;
 import { eraseNative, loadMark, loadPairing, removePairing, saveMark, savePairing, type EraseMark } from './native';
 import { mergeHosts, sameHosts } from './hosts';
-import { busyError, transportError } from './errors';
+import { busyError, isTransport, transportError } from './errors';
 import { eraseAll, pageStorage } from './erase';
 import { FORGET_FAILED } from './credential';
 import { IdentityError, pskOfKey, pskOfToken, startHandshake, type Channel } from './secure';
@@ -127,7 +127,7 @@ export interface PairResult {
 /** What `pair` shows in place of the pairing it would replace while the kept one cannot be read. */
 const UNREAD_PAIRING: Pairing = { hosts: [], port: 0, token: '', deviceId: '', desktop: '' };
 
-const url = (host: string, port: number) => `ws://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}${PHONE_PATH}`;
+const url = (host: string, port: number) => import.meta.env.SABLE_WEB ? `wss://${location.host}/sable-web` : `ws://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}${PHONE_PATH}`;
 
 /** A refusal this phone may act on for good: signed by the pinned desktop (or, plain, from a pairing before the secure channel). */
 const refusal = (text: string) => Object.assign(new Error(text), { denied: true as const });
@@ -632,8 +632,10 @@ class Conn {
   check(timeoutMs = 10_000) {
     if (this.state !== 'open' || !this.live()) return;
     const w = this.wire;
-    void this.call('usage.limits', {}, timeoutMs).catch(() => {
-      if (this.wire !== w) return;
+    void this.call('usage.limits', {}, timeoutMs).catch((err) => {
+      // In a browser the desktop answers this with a no (web access's allowlist): the connection is alive
+      // then, and only a call the connection lost or never answered says otherwise. The app as before.
+      if (this.wire !== w || (import.meta.env.SABLE_WEB && !isTransport(err))) return;
       // It is let go now and a fresh connection starts, not after its close event.
       this.dropWire();
       if (this.state === 'denied' || this.holdOld) return;

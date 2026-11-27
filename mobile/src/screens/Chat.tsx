@@ -30,6 +30,7 @@ import { Composer } from './Composer';
 import { Prompts } from './Prompts';
 import { ReviewLine } from './Review';
 import { ItemRow, TurnGuard, TurnView } from './Timeline';
+import { mayCall } from '../web/allow';
 
 const PAGE = 24;
 const FIRST = 5;
@@ -110,7 +111,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         right={
           <>
             <ChangesKey id={id} />
-            {(s.provider === 'claude' || s.provider === 'demo' || remoteOn) && (
+            {(s.provider === 'claude' || s.provider === 'demo' || remoteOn) && mayCall('session.setOptions') && (
               <button type="button" className="icon-btn remote-btn" data-tone={s.remote?.tone ?? (remoteOn ? 'waiting' : 'off')} aria-label="Remote control" onClick={() => (haptic('tap'), setRemote(true))}>
                 <Icon name="link" size={20} />
                 {remoteOn && <i className="remote-dot" />}
@@ -206,7 +207,7 @@ function ChatHead({ title, sub, status, work, onWork, mark, onBack, race, right 
           {mark}
           <span>{title}</span>
         </div>
-        <AnimatePresence mode="popLayout" initial={false}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
           {status ? (
             <motion.div key="status" className="chat-sub chat-status" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
               <Ring size={11} /> {status}

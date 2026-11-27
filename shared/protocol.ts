@@ -849,7 +849,7 @@ interface BaseItem {
 }
 
 /** Non-secret identity of an accepted phone submission. */
-export interface PhoneSender { deviceId: string; generation: number }
+export interface PhoneSender { kind?: 'web'; deviceId: string; generation: number }
 
 /** Where to check an issued Claude input, even after the chat moves. */
 export interface SteerDestination {
@@ -1697,6 +1697,9 @@ export interface BackdropImage {
 }
 
 export interface AppSettings {
+  webRemote?: boolean;
+  webNetwork?: string;
+  webSteerDanger?: boolean;
   accent: 'spectrum' | 'ember' | 'iris' | 'mint';
   ambience: 'full' | 'calm' | 'off';
   fontScale: number;
@@ -1926,6 +1929,8 @@ export interface PullFailures {
 export interface AppState {
   /** The desktop bridge pages conversations above this item count. */
   snapshotThreshold?: number;
+  /** Web access is in this run (`WEB_SHIPS`, or the owner's `--web` / `SABLE_WEB=1`: server/services/web-on.ts); absent otherwise. */
+  webAccess?: true;
   version: string;
   platform: string;
   home: string;
@@ -2039,6 +2044,7 @@ export type BridgeEvent =
   /** Devices changed in a way the bridge saw (an emulator started, booted, stopped or failed). */
   | { type: 'device.updated'; status: DeviceStatus }
   /** Settings › Phone changed (on or off, a pairing offer, a phone asking to pair, a phone seen). Never sent to phones. */
+  | { type: 'web.updated'; state: WebState }
   | { type: 'phone.updated'; status: PhoneStatus }
   /** The user's profile changed (an agent added a fact, or it was edited). */
   | { type: 'profile.updated'; profile: UserProfile }
@@ -2132,6 +2138,7 @@ export const PHONE_PATH = '/sable-phone';
 
 /** A phone allowed to connect. Its token is kept only as a hash. */
 export interface PhoneDevice {
+  kind?: 'web';
   id: string;
   name: string;
   pairedAt: number;
@@ -2143,6 +2150,48 @@ export interface PhoneDevice {
    * paired before it, still on plain frames until it pairs again.
    */
   secure?: boolean;
+}
+
+export const WEB_SHIPS = false;
+/** A network web access can serve on: a Wi-Fi by its name, an Ethernet by its adapter's (server/services/web-networks.ts). */
+export interface WebNetwork { id: string; name: string; address: string; kind?: 'wifi' | 'ethernet' }
+/** `AppSettings.webNetwork` for Tailscale: published inside the tailnet by `tailscale serve` (server/services/web-tailscale.ts). */
+export const WEB_TAILSCALE = 'tailscale';
+/**
+ * Tailscale as web access's network: `missing` not installed, `stopped` not running or not signed in,
+ * `https` HTTPS certificates are off for the tailnet, `taken` port 443 is the owner's own Serve entry,
+ * `ready` it can publish, `published` Sable is published at `https://<name>/`, `unknown` not looked at yet.
+ */
+export interface WebTailscale {
+  state: 'missing' | 'stopped' | 'https' | 'taken' | 'ready' | 'published' | 'unknown';
+  /** This computer's MagicDNS name (`<machine>.<tailnet>.ts.net`). */
+  name?: string;
+  /** The plain sentence Settings shows under the network for this state. */
+  text?: string;
+}
+export interface WebState {
+  networks?: WebNetwork[];
+  /** Tailscale, the first choice of network (always there, its state read only while it is chosen). */
+  tailscale?: WebTailscale;
+  /** Connected Wi-Fi or Ethernet networks Windows calls public: never served on (Settings says to make one private). */
+  publicNetworks?: string[];
+  caReplacement?: string;
+  revocationDurable?: boolean;
+  listening: boolean;
+  addresses: string[];
+  port?: number;
+  hostname?: string;
+  /** Compare to ca.cer transferred over an authenticated channel. */
+  caFingerprint?: string;
+  clients: { id: string; label: string; since: number }[];
+  devices: PhoneDevice[];
+  request?: PhoneStatus['request'];
+  pairing?: PhoneStatus['pairing'];
+  error?: string;
+  /** False: this build carries no web client (`resources/web`), so web access cannot start. */
+  assets?: boolean;
+  /** While it listens: the address to open on a tablet (`https://<address>:<port>/`) as a QR code (SVG path data on a `size` grid). */
+  addressQr?: { link: string; qr: string; size: number };
 }
 
 export interface PhoneStatus {
@@ -2262,6 +2311,14 @@ export const PHONE_METHODS = [
   'turn.check',
   'turn.checkStop',
 ] as const satisfies readonly RpcName[];
+
+/** A new phone or desktop method starts denied to the browser. */
+export const WEB_METHODS = [
+  'app.hello', 'session.snapshot', 'session.send', 'session.submission', 'session.interrupt',
+  'permission.respond', 'question.respond',
+  'phone.tail', 'phone.item', 'phone.queue', 'phone.changes', 'phone.diff', 'phone.search',
+  'phone.image', 'phone.answer', 'phone.steerNow', 'phone.sessions', 'phone.prompts',
+] as const satisfies readonly (typeof PHONE_METHODS[number] | keyof PhoneMethods)[];
 
 /**
  * A timeline item as a phone gets it: what the phone shows, big fields cut (no tool input or
@@ -2992,6 +3049,16 @@ export interface RpcMethods {
   'config.read': { params: { provider: ProviderId; cwd?: string }; result: AgentConfigFile[] };
 
   /** Settings › Phone (`server/services/phone.ts`). None of these can be called by a phone. */
+  'web.state': { params: Record<string, never>; result: WebState };
+  'web.offer': { params: { cancel?: boolean }; result: WebState };
+  'web.approve': { params: { requestId: string; allow: boolean }; result: WebState };
+  'web.revoke': { params: { deviceId: string }; result: WebState };
+  /**
+   * Writes the public root (`<home>/web/ca.cer`) where the person picks in the desktop's save dialog,
+   * for sending it to a tablet another way. Without a desktop shell: `unsupported` with the DER bytes
+   * (base64) for the window to download. `missing`: no root exists yet (web access never started).
+   */
+  'web.saveCa': { params: Record<string, never>; result: { ok: boolean; path?: string; canceled?: boolean; unsupported?: boolean; missing?: boolean; der?: string } };
   'phone.status': { params: Record<string, never>; result: PhoneStatus };
   /** Starts or stops the LAN endpoint (remembered across restarts). Turning it off ends every phone connection. */
   'phone.setEnabled': { params: { on: boolean }; result: PhoneStatus };

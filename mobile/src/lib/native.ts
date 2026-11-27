@@ -1,3 +1,4 @@
+import { readWebFragment } from './web-link';
 import { App } from '@capacitor/app';
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import { Device } from '@capacitor/device';
@@ -14,6 +15,7 @@ import { System } from './system-plugin';
 
 /** Thin wrappers over the Capacitor plugins, quiet when a plugin is missing (the web preview). */
 
+let webPairLink = import.meta.env.SABLE_WEB ? readWebFragment(location, history) : undefined;
 export const isNative = Capacitor.isNativePlatform();
 
 /**
@@ -43,6 +45,7 @@ export async function loadPairing(): Promise<Pairing | null> {
     throw damaged();
   }
   if (!p || typeof p !== 'object' || typeof p.token !== 'string' || !p.token || !Array.isArray(p.hosts)) throw damaged();
+  if (import.meta.env.SABLE_WEB && !/^[\w-]{43}$/.test(p.fp ?? '')) throw damaged();
   return p;
 }
 
@@ -452,6 +455,12 @@ export function onBackButton(fn: () => boolean) {
  * `sable://new`, `sable://chat/<id>`), the launch one included.
  */
 export function onPairLink(fn: (url: string) => void) {
+  if (import.meta.env.SABLE_WEB) {
+    const t = setTimeout(() => { if (webPairLink) fn(webPairLink); webPairLink = undefined; }, 0);
+    const opened = () => { const link = readWebFragment(location, history); if (link) fn(link); };
+    window.addEventListener('hashchange', opened);
+    return () => { clearTimeout(t); window.removeEventListener('hashchange', opened); };
+  }
   if (!isNative) {
     const q = new URLSearchParams(location.search).get('pair');
     if (q) setTimeout(() => fn(q), 0);

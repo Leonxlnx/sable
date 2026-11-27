@@ -86,6 +86,10 @@
       {
         "from": "dist-resources/reference",
         "to": "reference"
+      },
+      {
+        "from": "dist-resources/web",
+        "to": "web"
       }
     ],
     "asar": true,

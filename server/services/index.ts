@@ -37,7 +37,9 @@ export function registerServices(app: App, opts: ServiceOptions = {}) {
   registerBackdrop(app);
   registerUsage(app, { home: opts.userHome });
   registerDevice(app);
-  registerPhone(app);
+  // SABLE_WEB_LOOPBACK=1 (checks of the packaged app off-screen): web access listens on 127.0.0.1 only and
+  // admits a browser told that the LAN address points there, so Windows never asks about its firewall.
+  registerPhone(app, process.env.SABLE_WEB_LOOPBACK === '1' ? { web: { loopback: true } } : {});
   registerProfile(app);
   registerCapture(app);
   registerSearch(app);

@@ -1,5 +1,8 @@
+import { webEvent, webItem, webQueue, webSession, webTail } from './web-view';
+import { registerWeb, type WebChannel, type WebOptions } from './web-remote';
+import { requireWebMessage, webSteerRefusal } from './web-policy';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +11,8 @@ import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { answerHello, loadIdentity, PlainLink, readSecHello, SealedLink, type Identity, type Link, type SecHello } from './phone-secure';
 import {
   PHONE_METHODS,
+  WEB_METHODS,
+  PHONE_SECURE_VERSION,
   PHONE_OWN_METHODS,
   PHONE_PATH,
   PHONE_PORT,
@@ -90,6 +95,7 @@ export { SEARCH } from './search';
  */
 
 interface StoredPhone {
+  kind?: 'web';
   id: string;
   name: string;
   /** SHA-256 of the token, hex. */
@@ -1129,6 +1135,36 @@ function narrow(method: string, params: Record<string, unknown>, queued?: (sessi
   return p;
 }
 
+const WEB_ALLOWED = new Set<string>(WEB_METHODS);
+const WEB_INPUT = new Set(['session.interrupt', 'session.send', 'permission.respond', 'question.respond', 'phone.answer', 'phone.steerNow']);
+
+function webPermissionOption(app: App, prompt: PermissionRequest, optionId: unknown) {
+  const provider = app.sessions.get(prompt.sessionId)?.meta.provider;
+  if (!provider || provider === 'opencode' || prompt.delegateId !== undefined ||
+      prompt.kind === 'share' || prompt.toolName === 'ExitPlanMode') return false;
+  const option = prompt.options.find(o => o.id === optionId);
+  if (option?.tone === 'deny') return ['deny', 'decline', 'denied'].includes(option.id);
+  const scope = prompt.scope;
+  if (scope?.roots?.length || scope?.read?.length || scope?.write?.length || scope?.hosts?.length) return false;
+  return option?.tone === 'allow' && ['allow', 'accept', 'approved'].includes(option.id);
+}
+
+function webPromptRefusal(app: App, method: string, raw: Record<string, unknown>, displayed: Map<string, string>) {
+  if (['phone.answer', 'question.respond', 'permission.respond'].includes(method)) {
+    const prompts = app.sessions.get(String(raw.sessionId))?.prompts();
+    const prompt = [...prompts?.questions ?? [], ...prompts?.permissions ?? []].find(p => p.id === raw.requestId);
+    if (!prompt || prompt.delegateId !== undefined) return 'Answer delegated or unavailable prompts on the desktop.';
+    if (method === 'permission.respond') {
+      if (!('toolName' in prompt)) return 'Choose a current permission request.';
+      const revision = phonePermission(prompt).revision;
+      if (!revision || revision !== raw.revision || displayed.get(prompt.id) !== revision)
+        return 'Open the current permission request on this device first.';
+      if (!webPermissionOption(app, prompt, raw.optionId))
+        return 'Only one-time permission decisions are available in the browser.';
+    }
+  }
+}
+
 export class PhoneService {
   private server?: Server;
   private wss?: WebSocketServer;
@@ -1156,6 +1192,7 @@ export class PhoneService {
   /** Authenticated connections per device id. */
   private live = new Map<string, Set<Link>>();
   private saveTimer?: NodeJS.Timeout;
+  private disposed = false;
   /** The paired phones could not be written (the change holds in memory; tried again). */
   private saveError?: string;
   private starting?: Promise<void>;
@@ -1170,6 +1207,7 @@ export class PhoneService {
   constructor(
     private app: App,
     opts: PhoneOptions = {},
+    private web?: WebChannel,
   ) {
     this.changes = new PhoneChangesReader((sessionId) => this.app.call('session.snapshot', { sessionId }));
     this.finder = searchOf(app);
@@ -1177,12 +1215,20 @@ export class PhoneService {
     this.identityFile = opts.identity ?? path.join(path.dirname(this.file), 'phone-identity.pem');
     this.port = opts.port ?? PHONE_PORT;
     this.host = opts.host ?? process.env.SABLE_PHONE_HOST ?? '0.0.0.0';
-    this.data = this.read();
-    app.phoneStillPaired = sender => this.data.enabled && sender.generation === (this.data.generation ?? 0) && this.data.devices.some(d => d.id === sender.deviceId);
+    // Only a clean close publishes a restart checkpoint. Consume it before loading
+    // any web token. A crash or failed registry write can never replay an older grant.
+    const checkpoint = this.file + '.closed';
+    if (web && existsSync(checkpoint)) {
+      renameSync(checkpoint, this.file);
+      this.data = this.read();
+    } else this.data = web ? { enabled: false, devices: [] } : this.read();
+    const paired = (sender: { deviceId: string; generation: number }) => this.enabled && sender.generation === (this.data.generation ?? 0) && this.data.devices.some(d => d.id === sender.deviceId);
+    if (web) app.webSenderRefusal = (sender, sessionId) => paired(sender) ? webSteerRefusal(app, sessionId) : 'Web access was removed or turned off.';
+    else app.phoneStillPaired = paired;
   }
 
   get enabled() {
-    return this.data.enabled;
+    return !this.disposed && (this.web ? this.web.active() : this.data.enabled);
   }
 
   /** The identity key, read (or made) once; throws when its file is there but cannot be read. */
@@ -1195,8 +1241,8 @@ export class PhoneService {
       const raw = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<PhoneFile>;
       const devices = Array.isArray(raw.devices)
         ? raw.devices
-            .filter((d) => d && typeof d.id === 'string' && typeof d.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(d.tokenHash))
-            .map((d) => ({ id: d.id, name: String(d.name ?? 'Phone'), tokenHash: d.tokenHash, pairedAt: Number(d.pairedAt) || 0, ...(typeof d.lastSeen === 'number' ? { lastSeen: d.lastSeen } : {}), ...(d.secure === true ? { secure: true as const } : {}) }))
+            .filter((d) => d && (this.web ? d.kind === 'web' && d.secure === true : d.kind === undefined) && typeof d.id === 'string' && typeof d.tokenHash === 'string' && /^[0-9a-f]{64}$/.test(d.tokenHash))
+            .map((d) => ({ ...(this.web && { kind: 'web' as const }), id: d.id, name: String(d.name ?? 'Phone'), tokenHash: d.tokenHash, pairedAt: Number(d.pairedAt) || 0, ...(typeof d.lastSeen === 'number' ? { lastSeen: d.lastSeen } : {}), ...(d.secure === true ? { secure: true as const } : {}) }))
         : [];
       return { enabled: !!raw.enabled, generation: raw.generation ?? 0, devices };
     } catch {
@@ -1225,7 +1271,7 @@ export class PhoneService {
       } catch (err) {
         this.app.log('phone: could not save', (err as Error).message);
         const was = this.saveError;
-        this.saveError = 'Could not save the paired phones. Sable tries again; until then, a restart would undo this change.';
+        this.saveError = this.web ? 'Registry write failed. Web pairings will be discarded on an unclean restart.' : 'Could not save the paired phones. Sable tries again; until then, a restart would undo this change.';
         if (!was) this.changed();
         this.saveTimer = setTimeout(() => this.save(true), SAVE_RETRY_MS);
         this.saveTimer.unref?.();
@@ -1240,7 +1286,7 @@ export class PhoneService {
   status(): PhoneStatus {
     if (this.pairing && this.pairing.expiresAt < Date.now()) this.pairing = undefined;
     const devices: PhoneDevice[] = this.data.devices
-      .map((d) => ({ id: d.id, name: d.name, pairedAt: d.pairedAt, lastSeen: d.lastSeen, ...(this.live.get(d.id)?.size ? { online: true } : {}), ...(d.secure ? { secure: true } : {}) }))
+      .map((d) => ({ ...(d.kind && { kind: d.kind }), id: d.id, name: d.name, pairedAt: d.pairedAt, lastSeen: d.lastSeen, ...(this.live.get(d.id)?.size ? { online: true } : {}), ...(d.secure ? { secure: true } : {}) }))
       .sort((a, b) => (b.lastSeen ?? b.pairedAt) - (a.lastSeen ?? a.pairedAt));
     return {
       enabled: this.data.enabled,
@@ -1257,6 +1303,8 @@ export class PhoneService {
   }
 
   private changed() {
+    if (this.disposed) return;
+    if (this.web) return this.web.changed();
     this.app.emit({ type: 'phone.updated', status: this.status() });
   }
 
@@ -1264,13 +1312,14 @@ export class PhoneService {
     if (this.data.enabled && !on) this.data.generation = (this.data.generation ?? 0) + 1;
     this.data.enabled = on;
     this.save(true);
-    if (on) await this.start();
-    else await this.stop();
+    if (!on) await this.stop();
+    else if (!this.web) await this.start();
     this.changed();
     return this.status();
   }
 
   start(): Promise<void> {
+    if (this.web) throw new Error('Web access requires HTTPS.');
     if (this.server) return this.starting ?? Promise.resolve();
     this.error = undefined;
     const server = createServer((req, res) => {
@@ -1339,12 +1388,13 @@ export class PhoneService {
   }
 
   pair(cancel?: boolean) {
+    if (this.web) this.endRequest('The desktop closed this pairing offer.');
     if (cancel) this.pairing = undefined;
     else {
       try {
         const key = randomBytes(16).toString('base64url');
         // The link carries the desktop's identity (its key's fingerprint): the phone trusts no other.
-        const link = pairLink(lanAddresses(), this.port, key, this.identity().fingerprint, os.hostname());
+        const link = this.web ? this.web.link(key, this.identity().fingerprint) : pairLink(lanAddresses(), this.port, key, this.identity().fingerprint, os.hostname());
         const { path: qr, size } = qrSvgPath(link);
         this.pairing = { key, expiresAt: Date.now() + PAIR_TTL_MS, link, qr, size };
         if (this.error === IDENTITY_ERROR) this.error = undefined;
@@ -1378,7 +1428,7 @@ export class PhoneService {
       }
       const token = randomBytes(32).toString('base64url');
       // Pairing happens only over the secure channel now: this phone connects only that way.
-      const device: StoredPhone = { id: randomUUID(), name: r.name, tokenHash: sha256(token), pairedAt: Date.now(), lastSeen: Date.now(), secure: true };
+      const device: StoredPhone = { ...(this.web && { kind: 'web' }), id: randomUUID(), name: r.name, tokenHash: sha256(token), pairedAt: Date.now(), lastSeen: Date.now(), secure: true };
       // The new entry and the removal of the plain one it replaces are written together, and in effect only once written.
       if (!this.commitDevices([...this.data.devices.filter((d) => d.id !== old?.id), device])) {
         this.sendFrame(r.link, { denied: 'This computer could not save the pairing. Try again.' });
@@ -1730,7 +1780,7 @@ export class PhoneService {
     let replaced = false;
     if (f.event && overBytes(json, FRAME_MAX.event)) {
       replaced = true;
-      const page = this.pageFor(f.event);
+      const page = this.web ? null : this.pageFor(f.event);
       json = page ? JSON.stringify({ event: page }) : '';
       if (!json || overBytes(json, FRAME_MAX.event)) {
         this.app.log(`phone: a ${f.event.type} event too big for the phone went as phone.stale`);
@@ -1867,8 +1917,14 @@ export class PhoneService {
     return rt ? phoneEvent({ type: 'timeline.reset', sessionId: rt.id, items: rt.items }) : null;
   }
 
-  private onSocket(ws: WebSocket, req: IncomingMessage) {
-    const ip = req.socket.remoteAddress ?? '?';
+  /** `peer`: the browser's address when a proxy on this computer carries it (Tailscale Serve: its tailnet address), for the limits and the Allow card. */
+  acceptWeb(ws: WebSocket, req: IncomingMessage, peer?: string) {
+    if (!this.web || !this.enabled || this.blocked(peer ?? req.socket.remoteAddress ?? '?')) return ws.terminate();
+    this.onSocket(ws, req, peer);
+  }
+
+  private onSocket(ws: WebSocket, req: IncomingMessage, peer?: string) {
+    const ip = peer ?? req.socket.remoteAddress ?? '?';
     // Until the phone is in (or waits for "Allow"), a few seconds; then the socket closes.
     const gate = { admitted: false };
     const helloTimer = setTimeout(() => {
@@ -1880,6 +1936,7 @@ export class PhoneService {
       if (text.length > MAX_HELLO_BYTES) return ws.close(1009, 'too big');
       // Its shape first: the secure channel's hello, or (a phone paired before it) a token or a key; anything else closes this socket and nothing more.
       const sec = readSecHello(text);
+      if (this.web && sec?.v !== PHONE_SECURE_VERSION) return ws.close(4003, 'Current sealed protocol required');
       if (sec) return this.secureStart(ws, ip, sec, gate, helloTimer);
       const msg: PhoneHello | null = readHello(text);
       if (!msg) return ws.close(4000, 'bad hello');
@@ -2043,12 +2100,13 @@ export class PhoneService {
   /** From here on the link is a narrowed bridge connection for `device`. */
   private authenticated(link: Link, device: StoredPhone) {
     device.lastSeen = Date.now();
+    this.web?.connected(device.id, device.lastSeen);
     this.save();
     let set = this.live.get(device.id);
     if (!set) this.live.set(device.id, (set = new Set()));
     set.add(link);
     // Its addresses now: a phone keeps new ones (Tailscale, a new network) and reaches it there later.
-    this.sendFrame(link, { welcome: { deviceId: device.id, desktop: os.hostname(), version: VERSION, hosts: lanAddresses() } });
+    this.sendFrame(link, { welcome: { deviceId: device.id, desktop: os.hostname(), version: VERSION, ...(this.web ? {} : { hosts: lanAddresses() }) } });
     this.changed();
 
     // The conversations this socket has open (opened last at the end): their items' events reach it.
@@ -2064,7 +2122,13 @@ export class PhoneService {
       if (!p.incomplete && p.revision) displayed.set(p.id, p.revision);
     };
     const unsubscribe = this.app.subscribe((event) => {
-      if (!PHONE_EVENTS.has(event.type)) return;
+      if (!PHONE_EVENTS.has(event.type) || this.web && !this.enabled) return;
+      if (this.web) {
+        if (event.type === 'permission.removed') displayed.delete(event.id);
+        const projected = webEvent(event, watching);
+        if (projected) this.sendFrame(link, { event: projected as BridgeEvent });
+        return;
+      }
       if (ITEM_EVENTS.has(event.type) && !watching.includes((event as { sessionId: string }).sessionId)) return;
       const e = phoneEvent(event, this.kindOf);
       if (e?.type === 'permission.removed') displayed.delete(e.id);
@@ -2085,14 +2149,12 @@ export class PhoneService {
     // phone still paired with this token. Asked before every request and again before anything a
     // request does after a wait.
     let attached = true;
-    const phoneSender = { deviceId: device.id, generation: this.data.generation ?? 0 };
-    const allowed = () => attached && this.data.enabled && this.data.devices.some((d) => d.id === device.id && d.tokenHash === device.tokenHash);
-    const act = () => {
-      if (!allowed()) throw new Error('This phone was removed on the desktop');
-    };
+    const phoneSender = { deviceId: device.id, generation: this.data.generation ?? 0, ...(this.web && { kind: 'web' as const }) };
+    const connected = () => attached && this.enabled && this.data.devices.some((d) => d.id === device.id && d.tokenHash === device.tokenHash);
+
 
     const offMessage = link.onMessage(async (text) => {
-      if (!allowed()) return;
+      if (!connected()) return;
       let req: RpcRequest;
       try {
         req = JSON.parse(text);
@@ -2100,16 +2162,26 @@ export class PhoneService {
         return;
       }
       if (typeof req?.id !== 'number' || typeof req.method !== 'string') return;
-      if (!ALLOWED.has(req.method) && !OWN.has(req.method)) {
-        this.sendFrame(link, { id: req.id, ok: false, error: `Not available from the phone: ${req.method}` });
+      if (this.web ? !WEB_ALLOWED.has(req.method) : !ALLOWED.has(req.method) && !OWN.has(req.method)) {
+        this.sendFrame(link, { id: req.id, ok: false, error: `Not available from the ${this.web ? 'browser' : 'phone'}: ${req.method}` });
         return;
       }
       try {
         const raw = req.params && typeof req.params === 'object' ? (req.params as Record<string, unknown>) : {};
         const own = req.method as string;
         // Never the person's stylesheet through a chat: no chat in Sable's own folder, the Customize chat read-only.
+        const guarded = this.web && WEB_INPUT.has(own);
+        const reason = () => guarded ? webSteerRefusal(this.app, raw.sessionId) ?? webPromptRefusal(this.app, own, raw, displayed) : undefined;
+        const allowed = () => connected() && !reason();
+        const act = () => {
+          if (!connected()) throw new Error('This phone was removed on the desktop');
+          const refusal = reason();
+          if (refusal) throw new Error(refusal);
+        };
+        act();
         const refused = phoneRefusal(this.app, own, raw);
         if (refused) throw new Error(refused);
+        if (this.web && own === 'session.send') requireWebMessage(raw.text);
         let result: unknown;
         if (own === 'phone.fileLink') {
           // Plain HTTP downloads only for a phone paired before the secure channel; a secure one gets its files over this connection.
@@ -2141,15 +2213,25 @@ export class PhoneService {
           await this.app.call('session.snapshot', { sessionId });
           const q = this.app.sessions.get(sessionId)?.queue ?? [];
           const from = typeof raw.from === 'number' && Number.isInteger(raw.from) && raw.from >= 0 ? raw.from : 0;
-          result = { queue: trimQueue(q.slice(from, from + QUEUE_PAGE)), from, total: q.length };
+          result = { queue: this.web ? webQueue(trimQueue(q.slice(from, from + QUEUE_PAGE))) : trimQueue(q.slice(from, from + QUEUE_PAGE)), from, total: q.length };
+        } else if (this.web && own === 'app.hello') {
+          const state = await this.app.call('app.hello', {});
+          const list = sessionsPage(state.sessions.map(webSession), 0, PHONE_BYTES.helloSessions);
+          // No desktop setting goes to a browser but how Enter sends (the composer keeps the desktop's own
+          // "Send with Enter"); the maps the client indexes by agent go empty (with none the page crashed
+          // right after pairing: mobile NewChat reads `settings.defaultModels[agent]`).
+          const enter = state.settings.sendWithEnter;
+          result = { version: state.version, sessions: list.sessions, sessionsCursor: list.cursor, sessionsTotal: list.total,
+            settings: { defaultModels: {}, defaultEfforts: {}, defaultModes: {}, ...(typeof enter === 'boolean' ? { sendWithEnter: enter } : {}) }, projects: [], providers: [] };
         } else if (own === 'phone.sessions') {
           // The chats' list on from where `app.hello` (or the page before) stopped.
           const state = await this.app.call('app.hello', {});
-          result = sessionsPage(state.sessions, placeIn(state.sessions, raw.cursor), PHONE_BYTES.sessions);
+          result = sessionsPage(this.web ? state.sessions.map(webSession) : state.sessions, placeIn(state.sessions, raw.cursor), PHONE_BYTES.sessions);
         } else if (own === 'phone.prompts') {
           // What waits on from a cursor: in one chat (`sessionId`, after `phone.tail`) or across chats (after `app.hello`).
           const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : undefined;
           let all: { permissions: PermissionRequest[]; questions: QuestionRequest[] };
+          if (this.web && !sessionId) throw Error('Choose a chat to read its prompts.');
           if (sessionId) all = this.app.sessions.get(sessionId)?.prompts() ?? { permissions: [], questions: [] };
           else all = (await this.app.call('app.hello', {})).prompts ?? { permissions: [], questions: [] };
           result = promptsPage(all, raw.cursor, PHONE_BYTES.prompts);
@@ -2199,15 +2281,24 @@ export class PhoneService {
             const str = (k: string) => (typeof raw[k] === 'string' ? (raw[k] as string) : undefined);
             const limit = typeof raw.limit === 'number' ? raw.limit : undefined;
             result = phoneTail(snap, { before: str('before'), limit, to: str('to'), around: str('around'), after: str('after') });
-          } else result = phoneDetail(snap.items, String(raw.itemId ?? ''), item => this.app.store.wholeItem(sessionId, item));
+          } else {
+            const detail = phoneDetail(snap.items, String(raw.itemId ?? ''), item => this.app.store.wholeItem(sessionId, item));
+            result = this.web ? { item: webItem(detail.item), children: detail.children.map(webItem) } : detail;
+          }
         } else if (own === 'phone.steerNow') {
           const { sessionId, itemId } = raw;
           if (typeof sessionId !== 'string' || typeof itemId !== 'string') throw new Error('Select a message in its conversation.');
           const card = this.app.sessions.get(sessionId)?.get(itemId);
           if (card?.type !== 'user' || card.parentId || card.remote || syntheticOf(card)?.role === 'hidden') throw new Error('That message is unavailable.');
+          if (this.web) {
+            requireWebMessage(card.text);
+            if (card.phoneSender?.kind !== 'web' || card.phoneSender.deviceId !== device.id)
+              throw Error('Only steer a message sent by this browser.');
+          }
           act();
           result = await this.app.call('session.steerNow', { sessionId, itemId }, {
-            phoneSender, allowed: () => !!this.app.phoneStillPaired?.(phoneSender) && !phoneRefusal(this.app, own, { sessionId }),
+            phoneSender, ...(guarded && { refusal: reason }),
+            allowed: () => (this.web ? !this.app.webSenderRefusal!(phoneSender, sessionId) : !!this.app.phoneStillPaired?.(phoneSender)) && !phoneRefusal(this.app, own, { sessionId }),
           });
         } else if (own === 'phone.answer') {
           // By the ids the phone got, into the agent's own keys (the original question and option words).
@@ -2217,7 +2308,7 @@ export class PhoneService {
           if (!asked) throw new Error('Those questions were already answered.');
           const answers = phonePicks(asked, raw.picks);
           act();
-          result = await this.app.call('question.respond', { sessionId, requestId, answers }, { allowed });
+          result = await this.app.call('question.respond', { sessionId, requestId, answers }, { allowed, ...(guarded && { refusal: reason }) });
         } else if (own === 'queue.take') {
           return void (await this.takeQueued(link, req.id, raw, allowed, device.id));
         } else if (own === 'phone.takeDone') {
@@ -2259,7 +2350,7 @@ export class PhoneService {
           act();
           // The guard goes along: a handler that waits (a send for the agent to start, a model change to apply) asks it again before it acts.
           // (`settled`: a phone knows a sign-in only as in or out, so its hello never says "not known yet".)
-          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed, settled: true, ...((submission || own === 'queue.sendNow') && { phoneSender }) }));
+          result = phoneResult(req.method, await this.app.call(req.method as RpcName, params as never, { allowed, ...(guarded && { refusal: reason }), settled: true, ...((submission || own === 'queue.sendNow') && { phoneSender }) }));
           if (submission && params.submitId && (result as { ok?: boolean })?.ok)
             result = { ...result as object, submitId: raw.submitId };
           // Folder browsing for a new chat: folders only, never file names.
@@ -2273,8 +2364,17 @@ export class PhoneService {
             result = phoneTail(result);
           }
         }
+        if (this.web && (own === 'session.snapshot' || own === 'phone.tail')) result = webTail(result as PhoneTail);
+        if (!connected()) return;
         const page = result as { permissions?: PhonePermission[]; prompts?: { permissions?: PhonePermission[] } } | undefined;
         const prompts = page?.permissions ?? page?.prompts?.permissions;
+        if (this.web && prompts) {
+          for (const view of prompts) {
+            const current = this.app.sessions.get(view.sessionId)?.prompts().permissions.find(p => p.id === view.id);
+            view.options = current && view.revision ? view.options.filter(o => webPermissionOption(this.app, current, o.id)) : [];
+            if (!view.options.length) view.incomplete = true;
+          }
+        }
         this.sendFrame(link, { id: req.id, ok: true, result }, Array.isArray(prompts) ? err => { if (!err) prompts.forEach(remember); } : undefined);
       } catch (err) {
         this.sendFrame(link, { id: req.id, ok: false, error: (err as Error).message ?? String(err) });
@@ -2297,7 +2397,7 @@ export class PhoneService {
       // Its files under way end with its last connection (the phone starts them again when it is back).
       if (!this.live.get(device.id)?.size) this.sending.drop(device.id);
       const d = this.data.devices.find((x) => x.id === device.id);
-      if (d) {
+      if (d && !this.disposed) {
         d.lastSeen = Date.now();
         this.save();
       }
@@ -2308,12 +2408,16 @@ export class PhoneService {
 
   async dispose() {
     clearTimeout(this.saveTimer);
-    this.save(true);
+    if (this.web) {
+      if (this.commitDevices(this.data.devices)) renameSync(this.file, this.file + '.closed');
+    } else this.save(true);
+    this.disposed = true;
+    clearTimeout(this.saveTimer);
     await this.stop();
   }
 }
 
-export function registerPhone(app: App, opts: PhoneOptions = {}) {
+export function registerPhone(app: App, opts: PhoneOptions & { web?: WebOptions } = {}) {
   const phone = new PhoneService(app, opts);
   app.register('phone.status', () => phone.status());
   app.register('phone.setEnabled', ({ on }) => phone.setEnabled(!!on));
@@ -2321,6 +2425,10 @@ export function registerPhone(app: App, opts: PhoneOptions = {}) {
   app.register('phone.approve', ({ requestId, allow }) => phone.approve(String(requestId), !!allow));
   app.register('phone.revoke', ({ deviceId }) => phone.revoke(String(deviceId)));
   app.onDispose(() => phone.dispose());
+  registerWeb(app, channel => new PhoneService(app, {
+    file: path.join(app.store.dir, 'web', 'pairings.json'),
+    identity: opts.identity ?? path.join(path.dirname(opts.file ?? path.join(app.store.dir, 'phone.json')), 'phone-identity.pem'),
+  }, channel), opts.web);
   if (phone.enabled) void phone.start();
   return phone;
 }

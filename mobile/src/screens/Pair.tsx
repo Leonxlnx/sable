@@ -177,7 +177,7 @@ export function Pair({
   let status: ReactNode;
   let tone: string | undefined;
   if (step.kind === 'idle')
-    status = again ? (
+    status = import.meta.env.SABLE_WEB ? <p className="pair-line">Open the pairing link shown on your desktop.</p> : again ? (
       <>
         <p className="pair-line pair-strong">Pair again for a secure connection</p>
         <p className="pair-sub">On your computer, open {WHERE} and scan the code.</p>
@@ -257,7 +257,7 @@ export function Pair({
           Sable
         </motion.h1>
         <div className="pair-status" data-tone={tone}>
-          <AnimatePresence mode="popLayout" initial={false}>
+          <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
             <motion.div key={step.kind === 'error' ? `e:${step.text}` : step.kind} className="pair-status-in" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.2 }}>
               {status}
             </motion.div>
@@ -300,7 +300,7 @@ export function Pair({
             </motion.form>
           )}
         </AnimatePresence>
-        <AnimatePresence mode="popLayout" initial={false}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false}>
           {step.kind === 'separate' ? (
             <motion.div key="separate" className="pair-buttons" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }} transition={SNAP}>
               <button type="button" className="btn btn-primary btn-lg" onClick={() => (haptic('tap'), void go(step.offer, step.token, step.separate))}>
@@ -327,7 +327,7 @@ export function Pair({
               </button>
             </motion.div>
           ) : (
-            <motion.div key="go" className="pair-buttons" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 12 }} transition={SNAP}>
+            import.meta.env.SABLE_WEB ? null : <motion.div key="go" className="pair-buttons" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 12 }} transition={SNAP}>
               <button type="button" className="btn btn-primary btn-lg" onClick={() => (haptic('tap'), setScan(true))}>
                 <Icon name="scan" size={20} /> Scan code
               </button>
@@ -345,7 +345,7 @@ export function Pair({
       </div>
 
       <AnimatePresence>
-        {scan && (
+        {!import.meta.env.SABLE_WEB && scan && (
           <Scanner
             onCode={(c) => void start(c)}
             onClose={() => setScan(false)}

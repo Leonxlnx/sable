@@ -6,6 +6,7 @@
   "description": "Sable on Android: your desktop's sessions over the home network.",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5190 --strictPort",
+    "build:web": "tsc --noEmit -p tsconfig.json && node ../node_modules/vite/bin/vite.js build --config vite.web.config.ts --configLoader runner",
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "sync": "vite build && cap sync android",

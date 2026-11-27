@@ -48,8 +48,8 @@ export interface WireClient {
 }
 
 /** A socket to the endpoint; plain until `handshake` makes it secure. */
-export function wireClient(port: number, origin: string | null = 'http://localhost'): WireClient {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${PHONE_PATH}`, origin ? { headers: { origin } } : undefined);
+export function wireClient(port: number, origin: string | null = 'http://localhost', socket?: WebSocket): WireClient {
+  const ws = socket ?? new WebSocket(`ws://127.0.0.1:${port}${PHONE_PATH}`, origin ? { headers: { origin } } : undefined);
   const frames: Frame[] = [];
   let waiters: ((f: Frame) => void)[] = [];
   const c = {} as WireClient;

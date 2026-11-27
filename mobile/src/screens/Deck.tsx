@@ -70,7 +70,7 @@ export function Deck({ open, onClose }: { open: boolean; onClose: () => void }) 
             </button>
           </div>
         )}
-        <AnimatePresence mode="popLayout" initial={false} custom={dir}>
+        <AnimatePresence mode={import.meta.env.SABLE_WEB ? "sync" : "popLayout"} initial={false} custom={dir}>
           {front ? (
             <motion.div
               key={front.key}

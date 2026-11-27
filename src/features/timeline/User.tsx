@@ -16,6 +16,7 @@ import { parseReview } from '@/features/review/model';
 import { ReviewComments } from '@/features/review/ReviewMessage';
 import { afterSend, sendInAir } from '@/features/composer/settle';
 import { EASE_OUT, play, uiZoom } from '@/lib/motion';
+import { WebOrigin } from '@/features/web/WebOrigin';
 import { MessageAgain } from './Again';
 import { useTimeline } from './ctx';
 import { Stamp } from './Stamp';
@@ -301,7 +302,10 @@ export const UserMessage = memo(function UserMessage({ item, landingId = item.id
         </div>
       )}
       <div className="user-card">
-        {item.steered ? null : item.remote ? (
+        {item.phoneSender?.kind === 'web' ? (
+          // Sent from a browser through web access: always said, steered or not (who acted on this computer).
+          <WebOrigin deviceId={item.phoneSender.deviceId} />
+        ) : item.steered ? null : item.remote ? (
           // Sent from elsewhere (Remote Control in the Claude app or on claude.ai).
           <span className="user-mark">
             <Icon name="phone" size={11} />

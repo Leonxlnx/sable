@@ -24,6 +24,8 @@ import { Icon, SendArrow } from '@m/ui/icons';
 import { PROVIDER_NAME } from '@m/ui/marks';
 import { reduced, SNAP } from '@m/ui/motion';
 import { ModeChip, ModeSheet, ModelPhrase, ModelSheet, type SetupState } from './Setup';
+import { mayCall, WEB } from '../web/allow';
+import { knownMode } from '../web/modes';
 
 /** Words taken back from the queue: kept on the phone before the desktop lets the message go (lib/take.ts). */
 const takes: TakeDeps = {
@@ -150,7 +152,8 @@ export function Composer({ sid }: { sid: string }) {
   const stopping = running && empty;
   const model = caps?.models.find((m) => m.id === s.model);
   const models = caps ? visibleModels(s.provider, caps.models, visibility, s.model) : [];
-  const mode = caps?.modes.find((m) => m.id === s.mode);
+  // A browser is told no capabilities: the mode by its id, shown only (web/modes.ts).
+  const mode = caps?.modes.find((m) => m.id === s.mode) ?? (WEB ? knownMode(s.provider, s.mode) : undefined);
   const efforts = model?.efforts ?? [];
   const effort = s.effort ?? model?.defaultEffort;
   const speeds = offeredSpeeds(model, false);
@@ -214,7 +217,7 @@ export function Composer({ sid }: { sid: string }) {
     const e = epoch();
     if (!online || (!retry && !text.trim() && !files.length)) return;
     const cmd = !files.length && MODEL_CMD.exec(text.trim());
-    if (!retry && cmd && !cmd[1]?.trim()) {
+    if (!retry && cmd && !cmd[1]?.trim() && mayCall('session.setModel')) {
       edit('', []);
       haptic('tap');
       area.current?.blur();
@@ -316,7 +319,8 @@ export function Composer({ sid }: { sid: string }) {
           onChange={(e) => edit(e.target.value)}
           onKeyDown={(e) => {
             // Enter sends (the keyboard shows a send key); Shift+Enter, or Enter with "Send with Enter" off on the desktop, is a new line.
-            if (e.key === 'Enter' && !e.shiftKey && sendWithEnter && !e.nativeEvent.isComposing) {
+            // In a browser Ctrl or Cmd with Enter sends whatever the setting says (the desktop's), from a hardware keyboard.
+            if (e.key === 'Enter' && !e.shiftKey && (sendWithEnter || (WEB && (e.metaKey || e.ctrlKey))) && !e.nativeEvent.isComposing) {
               e.preventDefault();
               void send();
             }
@@ -335,9 +339,10 @@ export function Composer({ sid }: { sid: string }) {
               <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => void pick(e.target.files).then(() => (e.target.value = ''))} />
             </>
           )}
-          <ModeChip mode={mode} open={sheet === 'mode'} onOpen={() => setSheet('mode')} />
+          {/* In a browser the mode and the model only show (web/allow.ts: they are changed on the desktop). */}
+          <ModeChip mode={mode} open={sheet === 'mode'} onOpen={mayCall('session.setMode') ? () => setSheet('mode') : undefined} />
           <span className="bar-gap" />
-          <ModelPhrase model={model || s.model ? modelLabel : undefined} effort={effort && efforts.length > 1 ? effortName(effort) : undefined} levels={efforts.map((e) => effortName(e))} open={sheet === 'model'} onOpen={() => setSheet('model')} />
+          <ModelPhrase model={model || s.model ? modelLabel : undefined} effort={effort && efforts.length > 1 ? effortName(effort) : undefined} levels={efforts.map((e) => effortName(e))} open={sheet === 'model'} onOpen={mayCall('session.setModel') ? () => setSheet('model') : undefined} />
           {/* One key that stays where it is: send, or stop while a turn runs and the field is empty. Only its glyph changes. */}
           <button
             ref={sendKey}
@@ -408,7 +413,9 @@ function QueueRow(props: { sid: string } & ({ q: QueuedMessage } | { entry: Subm
     if (liquid && ref.current) claimFlight(text, ref.current, 'row');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const editable = !!q && !q.attachments?.length && !!q.text;
+  // A browser may not take a queued message back, send it now or remove it (web/allow.ts): its row only shows it.
+  const editable = !!q && !q.attachments?.length && !!q.text && mayCall('queue.take');
+  const mayAct = !q || (mayCall('queue.sendNow') && mayCall('queue.remove'));
   const delivery = q ? rowDelivery(q) : { reason: 'Not sent', again: true };
   const acts = rowActs(delivery, false);
   const words = delivery.reason ? (
@@ -455,7 +462,7 @@ function QueueRow(props: { sid: string } & ({ q: QueuedMessage } | { entry: Subm
             ) : (
               <span className="queued-text" data-why={delivery.reason ? '' : undefined}>{words}</span>
             )}
-            <button
+            {mayAct && <button
               type="button"
               className="icon-btn sm"
               aria-label={acts.send}
@@ -474,8 +481,8 @@ function QueueRow(props: { sid: string } & ({ q: QueuedMessage } | { entry: Subm
               }}
             >
               <Icon name="steer" size={18} />
-            </button>
-            <button
+            </button>}
+            {mayAct && <button
               type="button"
               className="icon-btn sm"
               aria-label={acts.remove}
@@ -491,7 +498,7 @@ function QueueRow(props: { sid: string } & ({ q: QueuedMessage } | { entry: Subm
               }}
             >
               <Icon name="x" size={16} />
-            </button>
+            </button>}
           </motion.div>
   );
 }

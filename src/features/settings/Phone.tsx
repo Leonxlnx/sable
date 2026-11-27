@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { PhoneStatus } from '@shared/protocol';
+import { WebAccess } from '@/features/web/WebAccess';
 import { Icon } from '@/icons';
 import { bridge } from '@/lib/bridge';
 import { setSettings } from '@/state/actions';
@@ -26,6 +27,8 @@ export function Phone() {
   const [status, setStatus] = useState<PhoneStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const awake = useStore((s) => s.settings.phoneAwake !== false);
+  // Web access is in this run (WEB_SHIPS, or the owner's --web: the bridge's hello says so).
+  const web = useStore((s) => s.webAccess);
   const now = useNow();
 
   useEffect(() => {
@@ -164,6 +167,9 @@ export function Phone() {
           ))}
         </Card>
       )}
+
+      {/* Sable in a browser on a tablet (switched off until it ships, WEB_SHIPS; on for one run with --web). */}
+      {web && <WebAccess />}
     </div>
   );
 }

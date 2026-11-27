@@ -137,6 +137,8 @@ export interface Store {
   home: string;
   /** Where the bridge keeps its data (Settings › About); empty until hello, or from an older bridge. */
   dataDir: string;
+  /** Web access is in this run (hello's `webAccess`: `WEB_SHIPS` or the owner's `--web`); false shows nothing of it. */
+  webAccess: boolean;
   providers: Partial<Record<ProviderId, ProviderInfo>>;
   projects: Project[];
   /** Projects grouping folders in the sidebar. */
@@ -234,6 +236,7 @@ export const useStore = create<Store>((set, get) => ({
   platform: '',
   home: '',
   dataDir: '',
+  webAccess: false,
   providers: {},
   projects: [],
   groups: [],
@@ -952,6 +955,7 @@ async function hello() {
       platform: app.platform,
       home: app.home,
       dataDir: app.dataDir ?? '',
+      webAccess: app.webAccess === true,
       providers,
       limits: withAccountLimits(s.limits, app.providers),
       projects: app.projects,
