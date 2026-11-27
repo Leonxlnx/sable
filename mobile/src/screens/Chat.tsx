@@ -15,7 +15,10 @@ import { canStop, followSent, newestSent, wholeForFind, worksNow } from '@m/lib/
 import { takeSentHere } from '@m/lib/follow';
 import { groupTurns, stabilize } from '@m/lib/turns';
 import { useNow } from '@m/lib/useNow';
-import { servingLabel, waited, workLabel } from '@shared/work-label';
+import { servingLabel, tailLabel, waited, workCounts } from '@shared/work-label';
+import { backgroundSince, runningMonitors } from '@m/lib/work-now';
+import { openWorkSheet, WorkSheet } from './WorkSheet';
+import { veilFirst } from '@m/ui/screen-veil';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles } from '@m/ui/marks';
@@ -83,7 +86,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
   if (!s) {
     return (
       <div className="screen chat">
-        <ChatHead title="" onBack={() => nav.pop()} />
+        <ChatHead title="" onBack={() => veilFirst(() => nav.pop())} />
         {listed ? <p className="empty">This chat is no longer on the desktop.</p> : <div className="thread-skel"><ThreadSkeleton /></div>}
       </div>
     );
@@ -100,8 +103,9 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         sub={connState === 'open' ? [s.chat ? undefined : baseName(homeFolder(s)), accountWord].filter(Boolean).join(' · ') || undefined : undefined}
         status={connState === 'open' ? undefined : connState === 'denied' ? 'Not paired' : listed ? 'Reconnecting' : 'Connecting'}
         work={connState === 'open' && worksNow(s) ? <WorkWords id={id} /> : undefined}
+        onWork={() => (haptic('tap'), openWorkSheet(id))}
         mark={<ProviderMark provider={s.provider} size={16} />}
-        onBack={() => nav.pop()}
+        onBack={() => veilFirst(() => nav.pop())}
         race={racing ? <RaceKey s={s} /> : undefined}
         right={
           <>
@@ -137,6 +141,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         </div>
       )}
       <RemoteSheet id={id} open={remote} onClose={() => setRemote(false)} />
+      <WorkSheet id={id} />
     </div>
   );
 }
@@ -171,10 +176,14 @@ function ReadOnlyFoot({ id, status, desktop }: { id: string; status: SessionMeta
  */
 function WorkWords({ id }: { id: string }) {
   const s = useStore((st) => st.sessions[id]);
+  // With its own turn over, the oldest of what still works (the last line's own reading), not when the phone first saw it.
+  const bg = useBackground(id);
+  const bgSince = s && s.status !== 'running' && s.status !== 'starting' ? bg.since : undefined;
   const now = useSecond(true);
   const first = useRef(now);
   if (!s) return null;
   const w = liveWords(s);
+  if (!w.since && bgSince) w.since = bgSince;
   return (
     <>
       <span key={w.line} className="chat-work-text">
@@ -186,7 +195,7 @@ function WorkWords({ id }: { id: string }) {
   );
 }
 
-function ChatHead({ title, sub, status, work, mark, onBack, race, right }: { title: string; sub?: string; status?: string; work?: React.ReactNode; mark?: React.ReactNode; onBack: () => void; race?: React.ReactNode; right?: React.ReactNode }) {
+function ChatHead({ title, sub, status, work, onWork, mark, onBack, race, right }: { title: string; sub?: string; status?: string; work?: React.ReactNode; onWork?: () => void; mark?: React.ReactNode; onBack: () => void; race?: React.ReactNode; right?: React.ReactNode }) {
   return (
     <header className="chat-head">
       <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), onBack())}>
@@ -203,11 +212,14 @@ function ChatHead({ title, sub, status, work, mark, onBack, race, right }: { tit
               <Ring size={11} /> {status}
             </motion.div>
           ) : work ? (
-            // At work (its turn, or sub-agents and commands it left working): a living mark under the title, wherever the reader is.
-            <motion.div key="work" className="chat-sub chat-work" role="status" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
+            // At work (its turn, or sub-agents and commands it left working): a living mark under the title, wherever the reader is;
+            // a tap raises "Working now" (WorkSheet.tsx), everything of the chat at work with what each does.
+            <motion.button key="work" type="button" className="chat-sub chat-work" aria-label="Working now" onClick={onWork} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
               <Tiles size={12} />
-              {work}
-            </motion.div>
+              <span className="chat-work-words" role="status">
+                {work}
+              </span>
+            </motion.button>
           ) : sub ? (
             <motion.div key="sub" className="chat-sub" initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={SNAP}>
               {sub}
@@ -715,19 +727,59 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   );
 }
 
+/**
+ * Since when a chat's background work runs, and how many of its running commands are monitors: read
+ * from the loaded steps when the chat's own counts change, and again every few seconds (the steps of
+ * an older page load later). Never in a store selector: a selector runs on every write to the store,
+ * and both readings walk every loaded step. As selectors they made three such walks per streamed
+ * event while a chat with background work was open (2.22's first build: about twice 2.21's script
+ * time on opening such a chat, in the profiles of 27 Nov).
+ */
+function useBackground(id: string): { since?: number; monitors: number } {
+  // The chat's own counts as one short string: what the readings below depend on, at no cost per write.
+  const key = useStore((st) => {
+    const s = st.sessions[id];
+    return s ? `${s.status}|${s.background ?? 0}|${s.commands ?? 0}|${s.tracked ?? 0}|${s.trackedSince ?? 0}` : '';
+  });
+  const tick = Math.floor(useNow() / BACKGROUND_EVERY_MS);
+  return useMemo(() => {
+    const st = getState();
+    const s = st.sessions[id];
+    if (!key || !s) return { monitors: 0 };
+    const items = sessionData(st, id).items;
+    return { since: backgroundSince(s, items), monitors: s.commands ? runningMonitors(items) : 0 };
+    // `key` and `tick` say when to read again; the store is read as it stands then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, key, tick]);
+}
+/** How often the loaded steps are read again for `useBackground` with nothing else changed (ms). */
+const BACKGROUND_EVERY_MS = 5000;
+
 /** Under the conversation once the chat's own turn has ended while sub-agents or background commands it started still work. */
 function BackgroundLine({ id }: { id: string }) {
-  const label = useStore((st) => (st.sessions[id] ? workLabel(st.sessions[id]) : null));
-  const serving = useStore((st) => servingLabel(st.sessions[id] ?? {}));
-  const since = useStore((st) => st.sessions[id]?.servingSince);
-  if (!label) return serving ? <ServingLine label={serving} since={since} /> : null;
+  // The desktop's last line (timeline/Tail.tsx), in the shared words (`tailLabel`): "2 sub-agents
+  // working", "Waiting for 1 background command", a single tracked job by its own title, with how long
+  // the oldest of it has run where that is known (a job's start is the bridge's; the phone has the
+  // commands' and sub-agents' own steps only when they are loaded).
+  const s = useStore((st) => st.sessions[id]);
+  const { since, monitors } = useBackground(id);
+  // The header's own clock (`WorkWords`) and a job's row tick by the second: on a slower tick this line
+  // stood a minute behind them ("18m" under a row that said "19m").
+  const now = useSecond(true);
+  const serving = servingLabel(s ?? {});
+  if (!s) return null;
+  const c = workCounts(s);
+  const label = s.until?.phase === 'checking' ? 'Running the check' : tailLabel({ agents: c.agents, commands: c.commands, monitors, jobs: c.jobs, jobTitle: s.trackedTitle });
+  if (!label) return serving ? <ServingLine label={serving} since={s.servingSince} /> : null;
+  const ran = since && now - since >= 1000 ? waited(now - since) : '';
   return (
-    <div className="bg-line" role="status">
+    <button type="button" className="bg-line" aria-label={`${label}${ran ? `, ${ran}` : ''}. What works now`} onClick={() => (haptic('tap'), openWorkSheet(id))}>
       <span className="work-ind">
         <Tiles size={13} />
       </span>
       <span className="bg-line-text">{label}</span>
-    </div>
+      {ran && <span className="bg-line-time num">{ran}</span>}
+    </button>
   );
 }
 

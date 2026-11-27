@@ -1,9 +1,9 @@
 import type { ProviderId, ToolItem, WorkflowRun } from '@shared/protocol';
-import { worksInBackground } from '@shared/background';
+import { isAgentLive } from '@/features/rail/now-model';
 import { clock } from '@/features/usage/format';
 import { limitTitle } from '@/features/usage/scope';
 import { formatTokens, plural } from '@/lib/format';
-import { DELEGATE_RETRY_LABEL, delegateEnded, delegateRetry, delegateWord, type DelegateWord } from './delegate-word';
+import { DELEGATE_RETRY_LABEL, delegateRetry, delegateWord, type DelegateWord } from './delegate-word';
 import { shortDuration } from './util';
 
 /**
@@ -38,15 +38,8 @@ export const agentTask = (item: ToolItem): string => item.detail.description || 
 // Where a handed-over task's report stands (delegate-word.ts, which the phone reads too).
 export { DELEGATE_RETRY_LABEL, delegateRetry, delegateWord, type DelegateWord };
 
-/** Working now: its call runs, or it works on in the background (a background agent, a workflow). */
-export const isAgentLive = (item: ToolItem | undefined): boolean => {
-  if (!item) return false;
-  // A report that waits is no running child: it never counts where the window counts who works.
-  if (delegateEnded(item)) return false;
-  // The same rule as the bridge's count of background work (shared/background.ts).
-  if (!item.workflow && (item.status === 'running' || item.status === 'pending' || item.status === 'awaiting')) return true;
-  return worksInBackground(item);
-};
+/** Working now: its call runs, or it works on in the background (a background agent, a workflow). The rule lives in the pure now-model.ts, which the phone reads too. */
+export { isAgentLive };
 
 /** "Fable weekly limit reached · resets Sat 00:00": a sub-agent the plan stopped. */
 export function agentLimitText(item: ToolItem, now = Date.now()): string | undefined {

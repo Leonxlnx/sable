@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { ProviderId } from '@shared/protocol';
 import { onScreen, onScreenChange } from '@m/lib/screen';
+import { onSaver, saver } from '@m/lib/saver';
 
 /**
  * The dither field behind home and chats, as on the desktop: light that gathers at the lower edge,
@@ -59,19 +60,10 @@ function noise2(x: number, y: number): number {
 }
 
 /**
- * Battery first: on a phone running low and not charging (a stand-in for the battery saver, which a
- * page cannot read) the field keeps its still frame: no drift, no breathing; beats still play once.
+ * Battery first (2.22): under the system's battery saver (lib/saver.ts: Android's own switch, or a
+ * phone running low and not charging where it cannot be asked) the field keeps its still frame: no
+ * drift, no breathing, no beat.
  */
-let lowPower = false;
-void (navigator as unknown as { getBattery?: () => Promise<{ level: number; charging: boolean; addEventListener: (k: string, f: () => void) => void }> })
-  .getBattery?.()
-  .then((b) => {
-    const read = () => (lowPower = !b.charging && b.level <= 0.2);
-    read();
-    b.addEventListener('levelchange', read);
-    b.addEventListener('chargingchange', read);
-  })
-  .catch(() => {});
 
 export type BeatKind = 'send' | 'done' | 'pulse' | 'open' | 'fail';
 type Beat = { at: number; kind: BeatKind; x?: number; y?: number };
@@ -348,9 +340,31 @@ export function Field({
       for (const [y0, y1] of all ? [[0, rows] as [number, number]] : lit)
       for (let y = y0; y < y1; y++) {
         const ny = y / rows;
-        // Above the bar a chat draws nothing, not even a beat (the bar lies over the conversation).
+        // Above the bar a chat's light never shows (the bar lies over the conversation, 2.21). A beat
+        // passes there once (2.22: under the glass alone it read as a glow nobody saw at hand size): the
+        // crest from the send key rising behind the conversation, the ring closing in on the bar, a pulse;
+        // its own cells only, sparse, in the palette's deepest step, thinning as it rises, gone with it.
         if (!stage && y < cutRow) {
-          for (let x = 0, i = y * cols; x < cols; x++, i++) data[i * 4 + 3] = 0;
+          if (!wave) {
+            for (let x = 0, i = y * cols; x < cols; x++, i++) data[i * 4 + 3] = 0;
+            continue;
+          }
+          const low = kind === 'pulse' ? 1 - ny * 0.6 : Math.max(0, (ny - 0.35) / 0.65);
+          const dy = (ny - by) * aspect;
+          for (let x = 0, i = y * cols; x < cols; x++, i++) {
+            const dx = x / cols - bx;
+            const crest = Math.exp(-(((Math.sqrt(dx * dx + dy * dy) - waveR) / 0.05) ** 2));
+            const level = crest * wave * 0.46 * low * low * 3 + BAYER[(y & 3) * 4 + (x & 3)] - 0.5;
+            if (level < 0.5) {
+              data[i * 4 + 3] = 0;
+              continue;
+            }
+            const c = stops[Math.min(1, Math.floor(level - 0.5))];
+            data[i * 4] = c[0];
+            data[i * 4 + 1] = c[1];
+            data[i * 4 + 2] = c[2];
+            data[i * 4 + 3] = 255;
+          }
           continue;
         }
         for (let x = 0; x < cols; x++) {
@@ -420,7 +434,7 @@ export function Field({
         return;
       }
       const awake = onStage && performance.now() < awakeUntil;
-      if ((live.current.active || awake) && !live.current.waiting && !live.current.hidden && !reduced && !lowPower)
+      if ((live.current.active || awake) && !live.current.waiting && !live.current.hidden && !reduced && !saver())
         timer = window.setTimeout(
           () => {
             timer = 0;
@@ -467,7 +481,7 @@ export function Field({
       : null;
     if (bar) barRo!.observe(bar);
     const onBeat = (b: Beat) => {
-      if (reduced || live.current.hidden) return;
+      if (reduced || live.current.hidden || saver()) return;
       const r = canvas.getBoundingClientRect();
       box = { left: r.left, top: r.top, width: Math.max(1, r.width), height: Math.max(1, r.height) };
       const nx = b.x === undefined ? 0.5 : (b.x - box.left) / box.width;
@@ -492,7 +506,17 @@ export function Field({
     host?.addEventListener('pointercancel', onUp, { passive: true });
     if (live.current.stage) awakeUntil = performance.now() + AWAKE_MS;
     const offScreen = onScreenChange((on) => on && kick());
+    // The saver switched on: a beat under way ends on the still frame; switched off: the drift resumes.
+    const offSaver = onSaver((on) => {
+      if (on && beat) {
+        beat = null;
+        img?.data.fill(0);
+        whole = true;
+      }
+      kick();
+    });
     return () => {
+      offSaver();
       ro.disconnect();
       barRo?.disconnect();
       beats.delete(onBeat);

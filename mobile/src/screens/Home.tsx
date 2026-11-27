@@ -20,6 +20,7 @@ import { Field, fieldBeat, fieldWake, paletteFor, type Horizon } from '@m/ui/Fie
 import { Icon } from '@m/ui/icons';
 import { LogoMark, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles, type Tone } from '@m/ui/marks';
 import { nowOf, REVEAL, SNAP, SPRING } from '@m/ui/motion';
+import { veilChange, veilFirst } from '@m/ui/screen-veil';
 import { Pull } from '@m/ui/Pull';
 import { usePending } from '@m/lib/pending';
 import { onForget } from '@m/lib/forget';
@@ -270,15 +271,20 @@ export function Home({ under }: { under: boolean }) {
 
   // Under a chat or settings, home steps back (smaller, dimmer) on the same spring as the screen over it.
   // Once a screen covers it whole, home is not drawn at all (it was drawn under every frame of the chat's scrolling).
+  // 2.22: no stepping back: the change of screen is the dither veil's (ui/screen-veil.ts), and home is
+  // hidden or shown again under it, in the frame it is solid.
   const wasUnder = useRef(under);
+  // The bar goes with the rest of home (it is inside the root this hides), under the solid veil, never a
+  // frame before it. (A state of its own here rendered home once more on every change of screen.)
   useLayoutEffect(() => {
     const el = root.current;
     if (!el || wasUnder.current === under) return;
     wasUnder.current = under;
-    el.style.visibility = '';
-    const n = nowOf(el);
-    const a = animate(el, { transform: [`scale(${n.scale})`, `scale(${under ? 0.94 : 1})`], opacity: [n.opacity, under ? 0.45 : 1] }, SPRING);
-    if (under) void a.finished.then(() => wasUnder.current && (el.style.visibility = 'hidden'));
+    veilChange(() => {
+      el.style.transform = '';
+      el.style.opacity = '';
+      el.style.visibility = wasUnder.current ? 'hidden' : '';
+    });
   }, [under]);
 
   useEffect(() => (searching ? pushBack(() => (closeSearch(), true)) : undefined), [searching]);
@@ -466,7 +472,7 @@ export function Home({ under }: { under: boolean }) {
           )}
         </AnimatePresence>
 
-        <HomeDock covered={under} />
+        <HomeDock covered={false} />
 
         {(deckUsed || deck) && (
           <Suspense fallback={null}>
@@ -591,7 +597,7 @@ const LiveRow = memo(function LiveRow({ id, done, now }: { id: string; done: boo
         onClick={(e) => {
           haptic('tap');
           openFrom(id, e.currentTarget, 17);
-          nav.chat(id);
+          veilFirst(() => nav.chat(id));
         }}
       >
         {/* 2.21: the working mark itself leads the row (the mark's cells building and letting go), the agent's mark beside the title */}
@@ -993,7 +999,7 @@ export const Row = memo(function Row({ id, onMenu, swipe = true, search }: { id:
           if (lp.fired() || swiped.current || gone) return;
           haptic('tap');
           openFrom(id, e.currentTarget, 17);
-          nav.chat(id);
+          veilFirst(() => nav.chat(id));
         }}
       >
         <span className="row-mark">

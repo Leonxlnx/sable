@@ -12,6 +12,7 @@ import { diffRows, hunkIndex, rowNumber, type DiffRow, type LineRow } from '@m/l
 import { onKeyboard } from '@m/lib/keyboard';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
+import { veilFirst } from '@m/ui/screen-veil';
 import { changesHeading } from '@m/lib/review';
 import { useStore } from '@m/lib/store';
 import { AutoHeight } from '@m/ui/AutoHeight';
@@ -47,7 +48,7 @@ function connWord(state: string, listed: boolean) {
 
 function Back() {
   return (
-    <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), nav.pop())}>
+    <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), veilFirst(() => nav.pop()))}>
       <Icon name="back" size={22} />
     </button>
   );

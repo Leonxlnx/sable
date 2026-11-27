@@ -6,6 +6,7 @@ import { conn } from '@m/lib/conn';
 import { appVersion, askNotifications, haptic, hapticsEnabled, isNative, noteStatus, notificationsAllowed, openNoteSettings, savePref, setHaptics, type NoteStatus } from '@m/lib/native';
 import { homeFolder } from '@m/lib/race';
 import { nav } from '@m/lib/nav';
+import { veilFirst } from '@m/ui/screen-veil';
 import { onScreenChange } from '@m/lib/screen';
 import { setState, useStore } from '@m/lib/store';
 import { AutoHeight } from '@m/ui/AutoHeight';
@@ -75,7 +76,7 @@ export function Settings() {
   return (
     <div className="screen settings">
       <header className="sub-head">
-        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), nav.pop())}>
+        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), veilFirst(() => nav.pop()))}>
           <Icon name="back" size={22} />
         </button>
         <span className="sub-head-title">Settings</span>
