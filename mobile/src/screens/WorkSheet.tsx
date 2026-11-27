@@ -221,5 +221,7 @@ function ServerRow({ sid, id }: { sid: string; id: string }) {
   const it = useStore((st) => sessionData(st, sid).items[id]) as ToolItem | undefined;
   if (!it) return null;
   const at = typeof it.task?.serving === 'string' ? it.task.serving : undefined;
-  return <Row quiet mark={<i className="wn-dash" />} title={it.detail?.description || it.title} now={servingLabel({ serving: 1, servingAddress: at }) ?? 'Serving'} />;
+  // The row's own word, as the desktop's Agents tab says it: "Serving", with the address when one is known
+  // (the chat-level line "Serving 1 local server" counts servers; under one row it read oddly).
+  return <Row quiet mark={<i className="wn-dash" />} title={it.detail?.description || it.title} now={at ? (servingLabel({ serving: 1, servingAddress: at }) ?? 'Serving') : 'Serving'} />;
 }

@@ -177,7 +177,8 @@ function ReadOnlyFoot({ id, status, desktop }: { id: string; status: SessionMeta
 function WorkWords({ id }: { id: string }) {
   const s = useStore((st) => st.sessions[id]);
   // With its own turn over, the oldest of what still works (the last line's own reading), not when the phone first saw it.
-  const bgSince = useStore((st) => (st.sessions[id] && st.sessions[id].status !== 'running' && st.sessions[id].status !== 'starting' ? backgroundSince(st.sessions[id], sessionData(st, id).items) : undefined));
+  const bg = useBackground(id);
+  const bgSince = s && s.status !== 'running' && s.status !== 'starting' ? bg.since : undefined;
   const now = useSecond(true);
   const first = useRef(now);
   if (!s) return null;
@@ -726,6 +727,34 @@ function Thread({ id, at, seq, find }: { id: string; at?: string; seq?: number; 
   );
 }
 
+/**
+ * Since when a chat's background work runs, and how many of its running commands are monitors: read
+ * from the loaded steps when the chat's own counts change, and again every few seconds (the steps of
+ * an older page load later). Never in a store selector: a selector runs on every write to the store,
+ * and both readings walk every loaded step. As selectors they made three such walks per streamed
+ * event while a chat with background work was open (2.22's first build: about twice 2.21's script
+ * time on opening such a chat, in the profiles of 27 Nov).
+ */
+function useBackground(id: string): { since?: number; monitors: number } {
+  // The chat's own counts as one short string: what the readings below depend on, at no cost per write.
+  const key = useStore((st) => {
+    const s = st.sessions[id];
+    return s ? `${s.status}|${s.background ?? 0}|${s.commands ?? 0}|${s.tracked ?? 0}|${s.trackedSince ?? 0}` : '';
+  });
+  const tick = Math.floor(useNow() / BACKGROUND_EVERY_MS);
+  return useMemo(() => {
+    const st = getState();
+    const s = st.sessions[id];
+    if (!key || !s) return { monitors: 0 };
+    const items = sessionData(st, id).items;
+    return { since: backgroundSince(s, items), monitors: s.commands ? runningMonitors(items) : 0 };
+    // `key` and `tick` say when to read again; the store is read as it stands then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, key, tick]);
+}
+/** How often the loaded steps are read again for `useBackground` with nothing else changed (ms). */
+const BACKGROUND_EVERY_MS = 5000;
+
 /** Under the conversation once the chat's own turn has ended while sub-agents or background commands it started still work. */
 function BackgroundLine({ id }: { id: string }) {
   // The desktop's last line (timeline/Tail.tsx), in the shared words (`tailLabel`): "2 sub-agents
@@ -733,9 +762,10 @@ function BackgroundLine({ id }: { id: string }) {
   // the oldest of it has run where that is known (a job's start is the bridge's; the phone has the
   // commands' and sub-agents' own steps only when they are loaded).
   const s = useStore((st) => st.sessions[id]);
-  const monitors = useStore((st) => (st.sessions[id]?.commands ? runningMonitors(sessionData(st, id).items) : 0));
-  const since = useStore((st) => backgroundSince(st.sessions[id], sessionData(st, id).items));
-  const now = useNow();
+  const { since, monitors } = useBackground(id);
+  // The header's own clock (`WorkWords`) and a job's row tick by the second: on a slower tick this line
+  // stood a minute behind them ("18m" under a row that said "19m").
+  const now = useSecond(true);
   const serving = servingLabel(s ?? {});
   if (!s) return null;
   const c = workCounts(s);
