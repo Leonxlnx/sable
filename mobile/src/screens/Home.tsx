@@ -20,7 +20,7 @@ import { Field, fieldBeat, fieldWake, paletteFor, type Horizon } from '@m/ui/Fie
 import { Icon } from '@m/ui/icons';
 import { LogoMark, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles, type Tone } from '@m/ui/marks';
 import { nowOf, REVEAL, SNAP, SPRING } from '@m/ui/motion';
-import { veilChange } from '@m/ui/screen-veil';
+import { veilChange, veilFirst } from '@m/ui/screen-veil';
 import { Pull } from '@m/ui/Pull';
 import { usePending } from '@m/lib/pending';
 import { onForget } from '@m/lib/forget';
@@ -274,6 +274,8 @@ export function Home({ under }: { under: boolean }) {
   // 2.22: no stepping back: the change of screen is the dither veil's (ui/screen-veil.ts), and home is
   // hidden or shown again under it, in the frame it is solid.
   const wasUnder = useRef(under);
+  // The bar goes with the rest of home, under the solid veil, never a frame before it.
+  const [dockCovered, setDockCovered] = useState(under);
   useLayoutEffect(() => {
     const el = root.current;
     if (!el || wasUnder.current === under) return;
@@ -282,6 +284,7 @@ export function Home({ under }: { under: boolean }) {
       el.style.transform = '';
       el.style.opacity = '';
       el.style.visibility = wasUnder.current ? 'hidden' : '';
+      setDockCovered(wasUnder.current);
     });
   }, [under]);
 
@@ -470,7 +473,7 @@ export function Home({ under }: { under: boolean }) {
           )}
         </AnimatePresence>
 
-        <HomeDock covered={under} />
+        <HomeDock covered={dockCovered} />
 
         {(deckUsed || deck) && (
           <Suspense fallback={null}>
@@ -595,7 +598,7 @@ const LiveRow = memo(function LiveRow({ id, done, now }: { id: string; done: boo
         onClick={(e) => {
           haptic('tap');
           openFrom(id, e.currentTarget, 17);
-          nav.chat(id);
+          veilFirst(() => nav.chat(id));
         }}
       >
         {/* 2.21: the working mark itself leads the row (the mark's cells building and letting go), the agent's mark beside the title */}
@@ -997,7 +1000,7 @@ export const Row = memo(function Row({ id, onMenu, swipe = true, search }: { id:
           if (lp.fired() || swiped.current || gone) return;
           haptic('tap');
           openFrom(id, e.currentTarget, 17);
-          nav.chat(id);
+          veilFirst(() => nav.chat(id));
         }}
       >
         <span className="row-mark">

@@ -7,6 +7,7 @@ import { accountOrder, roomWords } from '@m/lib/account-order';
 import { conn } from '@m/lib/conn';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
+import { veilFirst } from '@m/ui/screen-veil';
 import { getState, refreshLimits, useStore } from '@m/lib/store';
 import { useNow } from '@m/lib/useNow';
 import { clock, evenPace, paceText, resetsText, usedPercent, usedWords, windowLevel } from '@m/lib/usage-words';
@@ -130,7 +131,7 @@ export function LimitsScreen() {
   return (
     <div className="screen limits">
       <header className="sub-head">
-        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), nav.pop())}>
+        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), veilFirst(() => nav.pop()))}>
           <Icon name="back" size={22} />
         </button>
         <span className="sub-head-title">Limits</span>

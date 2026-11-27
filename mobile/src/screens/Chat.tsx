@@ -18,6 +18,7 @@ import { useNow } from '@m/lib/useNow';
 import { servingLabel, tailLabel, waited, workCounts } from '@shared/work-label';
 import { backgroundSince, runningMonitors } from '@m/lib/work-now';
 import { openWorkSheet, WorkSheet } from './WorkSheet';
+import { veilFirst } from '@m/ui/screen-veil';
 import { Field, paletteFor } from '@m/ui/Field';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, RaceGlyph, Ring, StatusMark, Tiles } from '@m/ui/marks';
@@ -85,7 +86,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
   if (!s) {
     return (
       <div className="screen chat">
-        <ChatHead title="" onBack={() => nav.pop()} />
+        <ChatHead title="" onBack={() => veilFirst(() => nav.pop())} />
         {listed ? <p className="empty">This chat is no longer on the desktop.</p> : <div className="thread-skel"><ThreadSkeleton /></div>}
       </div>
     );
@@ -104,7 +105,7 @@ export function Chat({ id, at, seq, find }: { id: string; at?: string; seq?: num
         work={connState === 'open' && worksNow(s) ? <WorkWords id={id} /> : undefined}
         onWork={() => (haptic('tap'), openWorkSheet(id))}
         mark={<ProviderMark provider={s.provider} size={16} />}
-        onBack={() => nav.pop()}
+        onBack={() => veilFirst(() => nav.pop())}
         race={racing ? <RaceKey s={s} /> : undefined}
         right={
           <>

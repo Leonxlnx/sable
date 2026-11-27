@@ -5,6 +5,7 @@ import { canStop, worksNow } from '@m/lib/chat-rules';
 import { clockOf, liveWords, useSecond } from '@m/lib/live-words';
 import { haptic } from '@m/lib/native';
 import { nav } from '@m/lib/nav';
+import { veilFirst } from '@m/ui/screen-veil';
 import { getState, setState, useStore } from '@m/lib/store';
 import { Icon } from '@m/ui/icons';
 import { PROVIDER_NAME, ProviderMark, StatusMark, Tiles } from '@m/ui/marks';
@@ -37,7 +38,7 @@ export function NowScreen() {
   return (
     <div className="screen now">
       <header className="sub-head">
-        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), nav.pop())}>
+        <button type="button" className="icon-btn back-btn" aria-label="Back" onClick={() => (haptic('tap'), veilFirst(() => nav.pop()))}>
           <Icon name="back" size={22} />
         </button>
         <span className="sub-head-title">Now</span>
@@ -80,7 +81,7 @@ function NowCard({ id, now }: { id: string; now: number }) {
   };
   return (
     <li className="now-card" data-waiting={waiting || undefined}>
-      <button type="button" className="now-open" onClick={() => (haptic('tap'), nav.chat(id))} aria-label={`${s.title}, ${PROVIDER_NAME[s.provider]}. ${waiting ? 'Waiting for you' : w.line}`}>
+      <button type="button" className="now-open" onClick={() => (haptic('tap'), veilFirst(() => nav.chat(id)))} aria-label={`${s.title}, ${PROVIDER_NAME[s.provider]}. ${waiting ? 'Waiting for you' : w.line}`}>
         <span className="now-head">
           <ProviderMark provider={s.provider} size={14} />
           <span className="now-title">{s.title}</span>

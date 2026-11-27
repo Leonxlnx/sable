@@ -17,7 +17,7 @@ import { fieldBeat } from '@m/ui/Field';
 import { Launch } from '@m/ui/Launch';
 import { ProviderMark, StatusMark } from '@m/ui/marks';
 import { reduced, SNAP, SPRING } from '@m/ui/motion';
-import { veilChange } from '@m/ui/screen-veil';
+import { veilChange, veilFirst } from '@m/ui/screen-veil';
 import { ShareSheet } from './screens/ShareSheet';
 import { watchWidget } from '@m/lib/widget';
 import { Viewer } from '@m/ui/Viewer';
@@ -208,7 +208,8 @@ export function App() {
         }
       }),
       onBackButton(goBack),
-      pushBack(() => nav.pop()),
+      // Android's back: through the veil (ui/screen-veil.ts), the cover in the frame of the press.
+      pushBack(() => (nav.stack.length ? (veilFirst(() => nav.pop()), true) : false)),
       onPairLink((url) => {
         // The app icon's shortcuts (a new chat, home's bar focused; one of the last chats) and the
         // notifications: a chat where it matters (`at=prompt`: the prompt waiting, its sheet opens by
