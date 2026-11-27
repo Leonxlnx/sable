@@ -407,7 +407,7 @@ function EndedEarly({ sid, turn }: { sid: string; turn: TurnGroup }) {
   const why = note?.type === 'notice' && note.early ? EARLY_WHY[note.early] : '';
   const canContinue = useStore((s) => {
     const meta = s.sessions[sid];
-    if (!meta || meta.status === 'running' || meta.status === 'awaiting' || meta.status === 'starting' || hasWork(meta)) return false;
+    if (!meta || meta.status === 'running' || meta.status === 'awaiting' || meta.status === 'starting' || hasWork({ ...meta, tracked: undefined })) return false;
     const d = sessionData(s, sid);
     for (let i = d.roots.length - 1, n = 0; i >= 0 && n < 40; i--, n++) {
       if (d.roots[i] === line) return true;

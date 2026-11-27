@@ -40,7 +40,7 @@ describe('the work label', () => {
   });
 
   it('reads only whole positive counts', () => {
-    expect(workCounts({ background: -1, commands: Number.NaN })).toEqual({ agents: 0, commands: 0 });
+    expect(workCounts({ background: -1, commands: Number.NaN })).toEqual({ agents: 0, commands: 0, jobs: 0 });
     // Whatever says nothing in words is no work either: the mark and the label always agree.
     expect(hasWork({ commands: 0.5 })).toBe(false);
     expect(workLabel({ commands: 0.5 })).toBeNull();

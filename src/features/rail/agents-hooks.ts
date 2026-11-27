@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useTick } from '@/features/timeline/util';
 import { useStore } from '@/state/store';
-import { agentIndex, commandIndex, noteIndex, progressIndex, userIndex } from './agents-model';
+import { agentIndex, commandIndex, jobIndex, noteIndex, progressIndex, userIndex } from './agents-model';
 
 type Store = ReturnType<typeof useStore.getState>;
 
@@ -39,6 +39,7 @@ interface Indexes {
   users: ReturnType<typeof userIndex>;
   notes: ReturnType<typeof noteIndex>;
   commands: ReturnType<typeof commandIndex>;
+  jobs: ReturnType<typeof jobIndex>;
 }
 
 /** Per session, shared by the tab's count and the list: the second reader of a state pays nothing. */
@@ -47,11 +48,35 @@ const indexes = new Map<string, Indexes>();
 export function indexFor(sessionId: string): Indexes {
   let x = indexes.get(sessionId);
   if (!x) {
-    x = { agents: agentIndex(), users: userIndex(), notes: noteIndex(), commands: commandIndex() };
+    x = { agents: agentIndex(), users: userIndex(), notes: noteIndex(), commands: commandIndex(), jobs: jobIndex() };
     indexes.set(sessionId, x);
     if (indexes.size > 12) indexes.delete(indexes.keys().next().value as string);
   }
   return x;
+}
+
+/** When the person last looked at each chat's Agents tab (while the app is open). */
+const looked = new Map<string, number>();
+
+/**
+ * When the person last looked at this chat's Agents tab: when its pane last left the screen, else
+ * when it first came on it. A failure after that is news (red); one before it is history. Read as
+ * the pane comes on screen and held while it shows, so what fails in view stays news until the
+ * person has looked away and back.
+ */
+export function useLooked(sessionId: string): number {
+  const shown = useContext(ShownCtx);
+  const held = useRef<{ id: string; shown: boolean; at: number } | null>(null);
+  if (!held.current || held.current.id !== sessionId || (shown && !held.current.shown)) held.current = { id: sessionId, shown, at: looked.get(sessionId) ?? Date.now() };
+  else held.current.shown = shown;
+  useEffect(() => {
+    if (!shown) return;
+    return () => {
+      looked.set(sessionId, Date.now());
+      if (looked.size > 64) looked.delete(looked.keys().next().value as string);
+    };
+  }, [shown, sessionId]);
+  return held.current.at;
 }
 
 /** How often a working agent's line may change: a burst of steps reads as a few calm updates. */

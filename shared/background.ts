@@ -25,6 +25,15 @@ export function runsTask(i: TimelineItem | undefined): i is ToolItem & { task: N
   return !!i && i.type === 'tool' && i.task?.state === 'running';
 }
 
+/**
+ * A step whose tracked process Sable still sees running (`ToolItem.tracked`, the `track_work` tool:
+ * work the agent started outside its own tools; counted in `SessionMeta.tracked`). The bridge owns
+ * the state, from its own look at the process, so it outranks the step's status.
+ */
+export function tracksWork(i: TimelineItem | undefined): i is ToolItem & { tracked: NonNullable<ToolItem['tracked']> } {
+  return !!i && i.type === 'tool' && i.tracked?.state === 'running';
+}
+
 /** The evidence carried by the task for its lifetime, including after its output is trimmed. */
 export function taskServing(item: ToolItem, output = item.output, result = item.result): string | true | undefined {
   if (item.task?.kind !== 'command' || item.name === 'Monitor') return undefined;

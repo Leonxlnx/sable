@@ -68,6 +68,7 @@ import { DEVICE_HINT, DEVICE_TOOL_IDS, deviceEnabled } from './device-tool';
 import { WIDGET_FENCE_HINT, WIDGET_SERVER, WIDGET_TOOL_ID, widgetsEnabled } from './widget-tool';
 import { AGENT_TOOLS, agentOfTool, agentToolId, type AgentCall } from './agent-tool';
 import { PROFILE_TOOL_ID } from './profile-tool';
+import { TRACK_TOOL_ID } from './track-tool';
 import { toolReceipt, type WantedReceipts } from '../core/delegate-result';
 import { readDelegateIds } from '../../shared/synthetic';
 import { claimStep } from '../core/sub-agent';
@@ -263,7 +264,9 @@ const READ_ONLY_BLOCKED = ['Bash', 'BashOutput', 'KillShell', 'Edit', 'MultiEdit
 export class ClaudeProvider implements Provider {
   readonly id = 'claude' as const;
   readonly name = 'Claude Code';
-  private infoCache?: { at: number; info: ProviderInfo };
+  private infoCache?: { at: number; info: ProviderInfo; fromLogin?: boolean };
+  private signInGeneration = 0;
+  private oldQueries = new WeakSet<Query>();
   private capsCache = new Map<string, { at: number; caps: Capabilities }>();
   private capsInflight = new Map<string, Promise<Capabilities>>();
   private loginProc?: ChildProcess;
@@ -384,6 +387,8 @@ export class ClaudeProvider implements Provider {
 
   private infoRun?: { force: boolean; result: Promise<ProviderInfo> };
   info(force = false): Promise<ProviderInfo> {
+    const cached = this.infoCache;
+    if (cached?.fromLogin && Date.now() - cached.at < 120_000) return Promise.resolve(cached.info);
     if (this.infoRun) {
       if (force && !this.infoRun.force) return this.infoRun.result.then(() => this.info(true));
       return this.infoRun.result;
@@ -394,13 +399,35 @@ export class ClaudeProvider implements Provider {
   }
 
   private async readInfo(force: boolean): Promise<ProviderInfo> {
-    if (!force && this.infoCache && Date.now() - this.infoCache.at < 30_000) return this.infoCache.info;
+    if (!force && this.infoCache && !this.infoCache.info.auth.checking && Date.now() - this.infoCache.at < 30_000) return this.infoCache.info;
+    const generation = this.signInGeneration;
+    const info = await this.readStatus(force);
+    // A status that began before a sign-in cannot replace the login process's answer.
+    const known = this.infoCache?.info;
+    if (known && generation !== this.signInGeneration) return known;
+    // A refusal check needs to distinguish a confirmed status from the row we keep showing.
+    // (Only a signed-in row is marked: a known signed-out account stays plainly "Not signed in".)
+    if (known && info.auth.checking && !known.auth.checking) return known.auth.loggedIn ? { ...known, problem: 'Could not confirm the sign-in' } : known;
+    this.infoCache = { at: Date.now(), info };
+    return info;
+  }
+
+  private sdkAccount(a?: Awaited<ReturnType<Query['accountInfo']>>): ProviderInfo | undefined {
+    const apiKey = !!a?.apiKeySource && a.apiKeySource !== 'none';
+    if (!a || !(a.email || a.subscriptionType || apiKey || (a.apiProvider && a.apiProvider !== 'firstParty'))) return;
+    const method = apiKey ? 'apiKey' : a.tokenSource;
+    return { id: this.id, name: this.name, installed: true, version: this.infoCache?.info.version,
+      auth: { loggedIn: true, email: a.email, org: a.organization, method, ...claudePlan({ ...a, authMethod: method }) } };
+  }
+
+  private async readStatus(force: boolean): Promise<ProviderInfo> {
     // The same binary the SDK runs (SABLE_CLAUDE_BIN, set by the desktop shell), so the check does
     // not depend on what PATH the app was started with.
     await authGate.beforeRead();
     const scope = this.scope('status');
     const sessions = [...this.sessions].filter(s => s.liveQuery());
-    const session = sessions.find(s => !s.holdsWork()) ?? (this.warm ? undefined : sessions[0]);
+    const current = sessions.filter(s => !this.oldQueries.has(s.liveQuery()!));
+    const session = current.find(s => !s.holdsWork()) ?? (this.warm ? undefined : current[0] ?? sessions[0]);
     const live = session?.liveQuery() ?? this.warm?.q;
     let pid = session ? session.processPid() : this.warm?.owner.child?.pid;
     scope.pid = pid;
@@ -409,16 +436,14 @@ export class ClaudeProvider implements Provider {
       // The SDK account info describes initialization. A refusal needs a fresh CLI answer.
       const a = await authGate.run(gateKey(this.id, this.configHome()), async () => {
         if (this.ctx.closing?.() || (session ? session.liveQuery() : this.warm?.q) !== live) return;
-        if (!force && live.accountInfo) return withTimeout(live.accountInfo(), 6000, 'account info');
         // Reinitializing can cancel hook callbacks. Only ask an idle process.
-        if (!session?.holdsWork() && live.reinitialize) return (await withTimeout(live.reinitialize(), 6000, 'account status')).account;
+        if (force && !session?.holdsWork() && live.reinitialize) return (await withTimeout(live.reinitialize(), 6000, 'account status')).account;
+        return withTimeout(live.accountInfo(), 6000, 'account info');
       }, scope).catch(() => undefined);
-      const apiKey = !!a?.apiKeySource && a.apiKeySource !== 'none';
-      if (a && (a.email || a.subscriptionType || apiKey || (a.apiProvider && a.apiProvider !== 'firstParty'))) {
+      const info = this.oldQueries.has(live) ? undefined : this.sdkAccount(a);
+      if (info) {
         record(scope, { event: 'status-answer', answer: 'in', pid });
-        const method = apiKey ? 'apiKey' : a.tokenSource;
-        return { id: this.id, name: this.name, installed: true, version: this.infoCache?.info.version,
-          auth: { loggedIn: true, email: a.email, org: a.organization, method, ...claudePlan({ ...a, authMethod: method }) } };
+        return info;
       }
       record(scope, { event: 'status-answer', answer: 'unknown', pid });
       return { id: this.id, name: this.name, installed: true, auth: { loggedIn: false, checking: true } };
@@ -452,7 +477,6 @@ export class ClaudeProvider implements Provider {
       info.auth.checking = true;
     }
     record(scope, { event: 'status-answer', answer: info.auth.checking ? 'unknown' : info.auth.loggedIn ? 'in' : 'out', pid });
-    this.infoCache = { at: Date.now(), info };
     return info;
   }
 
@@ -468,27 +492,61 @@ export class ClaudeProvider implements Provider {
     const release = await authGate.claimDialog(gateKey(this.id, this.configHome()), this.scope('login'), cancelled);
     try {
       if (cancelled()) throw new Error('Sign-in cancelled');
-      await this.loginDialog();
+      const info = await this.loginDialog();
+      if (cancelled()) throw new Error('Sign-in cancelled');
+      this.signInGeneration++;
+      // Completion itself confirms sign-in even if the optional identity read timed out.
+      this.infoCache = { at: info ? Date.now() : 0, fromLogin: !!info,
+        info: info ?? { id: this.id, name: this.name, installed: true, version: this.infoCache?.info.version, auth: { loggedIn: true } } };
+      this.capsCache.clear();
+      this.capsInflight.clear();
+      this.limitsCache = [];
+      this.extraCache = undefined;
+      this.limitsAt = this.limitsProbeAt = this.limitsRefusedUntil = 0;
+      this.limitsRefusedLogged = false;
+      await this.discardWarm();
+      for (const session of this.sessions) {
+        const q = session.liveQuery();
+        if (q) {
+          this.oldQueries.add(q);
+          session.restartForSignIn();
+        }
+      }
     } finally { release(); }
   }
 
-  private async loginDialog(): Promise<void> {
+  private async loginDialog(): Promise<ProviderInfo | undefined> {
     // SABLE_LOGIN=cli: the CLI's own `claude auth login` (the tests drive a fake CLI that way).
-    if (process.env.SABLE_LOGIN === 'cli') return this.loginWithCli();
+    if (process.env.SABLE_LOGIN === 'cli') { await this.loginWithCli(); return; }
     const input = new PushQueue<SDKUserMessage>();
-    const q = query({ prompt: input, options: { ...this.baseOptions(homedir(), 'login'), settingSources: [], strictMcpConfig: true, persistSession: false } }) as AuthQuery;
+    const scope = this.scope('login');
+    const q = query({ prompt: input, options: { ...this.baseOptions(homedir(), scope), settingSources: [], strictMcpConfig: true, persistSession: false } }) as AuthQuery;
     if (typeof q.claudeAuthenticate !== 'function') {
       input.end();
       q.close();
-      return this.loginWithCli();
+      await this.loginWithCli();
+      return;
     }
     const auth = { q, input };
     this.auth = auth;
     try {
       const urls = await withTimeout(q.claudeAuthenticate(true), 30_000, 'Claude Code sign-in');
+      if (this.auth !== auth) throw new Error('Sign-in cancelled');
       this.ctx.emit({ type: 'auth.progress', provider: 'claude', state: 'url', url: urls.automaticUrl, codeUrl: urls.manualUrl });
       openInBrowser(urls.automaticUrl);
       await q.claudeOAuthWaitForCompletion();
+      // accountInfo() describes initialization, before the browser sign-in.
+      record(scope, { event: 'status' });
+      let info: ProviderInfo | undefined;
+      try {
+        const read = authGate.run(gateKey(this.id, this.configHome()), async () => {
+          // A lease granted after the deadline must not touch the closed dialog.
+          if (this.auth === auth) return this.sdkAccount((await q.reinitialize()).account);
+        }, { ...scope, reason: 'status' });
+        info = await withTimeout(read, 6000, 'account status');
+      } catch { /* The CLI already confirmed completion. */ }
+      record(scope, { event: 'status-answer', answer: info ? 'in' : 'unknown' });
+      return info;
     } finally {
       if (this.auth === auth) this.auth = undefined;
       input.end();
@@ -497,7 +555,6 @@ export class ClaudeProvider implements Provider {
       } catch {
         /* already gone */
       }
-      this.infoCache = undefined;
     }
   }
 
@@ -541,7 +598,6 @@ export class ClaudeProvider implements Provider {
         untrack();
         if (end) end(generation !== this.loginGeneration ? 'abort' : code === 0 ? 'exit' : 'error', generation !== this.loginGeneration);
         if (this.loginProc === child) this.loginProc = undefined;
-        this.infoCache = undefined;
         if (code === 0) resolve();
         else reject(new Error(out.trim().split('\n').pop() || 'Sign-in was not completed'));
       });
@@ -571,14 +627,22 @@ export class ClaudeProvider implements Provider {
   async logout() {
     const release = await authGate.claimDialog(gateKey(this.id, this.configHome()), this.scope('logout'), () => !!this.ctx.closing?.());
     try {
-      await this.cli('logout', ['auth', 'logout'], 15_000);
-      this.infoCache = undefined;
+      const result = await this.cli('logout', ['auth', 'logout'], 15_000);
+      if (result?.code === 0) {
+        this.signInGeneration++;
+        this.infoCache = { at: Date.now(), info: { id: this.id, name: this.name, installed: true, version: this.infoCache?.info.version, auth: { loggedIn: false } } };
+        for (const session of this.sessions) {
+          const q = session.liveQuery();
+          if (q) this.oldQueries.add(q);
+        }
+        await this.discardWarm();
+      }
     } finally { release(); }
   }
 
-  baseOptions(cwd: string, reason: StartReason = 'chat'): Options {
+  baseOptions(cwd: string, scope = this.scope('chat')): Options {
     return {
-      spawnClaudeCodeProcess: authGate.spawner(undefined, undefined, this.scope(reason)),
+      spawnClaudeCodeProcess: authGate.spawner(undefined, undefined, scope),
       cwd,
       settingSources: ['user', 'project', 'local'],
       systemPrompt: { type: 'preset', preset: 'claude_code' },
@@ -651,8 +715,16 @@ export class ClaudeProvider implements Provider {
     const device = deviceEnabled(meta);
     // The user's profile: remember_about_user merges one fact into it (never secrets).
     const profile = this.profileOn() ? (fact: unknown) => this.ctx.profile!().remember(fact) : undefined;
-    const own = this.widgets() || browser || device || delegates.length > 0 || !!profile;
-    const allowed = [...(this.widgets() ? [WIDGET_TOOL_ID] : []), ...(browser ? BROWSER_TOOL_IDS : []), ...(device ? DEVICE_TOOL_IDS : []), ...delegates.map(agentToolId), ...(profile ? [PROFILE_TOOL_ID] : [])];
+    // track_work: work the agent started outside its tools, watched by Sable (a chat's own agent only).
+    const trackWork = this.ctx.trackWork;
+    const track = trackWork && !meta.id?.startsWith('sub-') && !meta.options?.readOnly
+      ? (args: unknown, stepId?: string) => {
+          const rt = owner.session?.runtime();
+          return rt ? trackWork(rt, args, stepId) : { ok: false, text: 'No session is attached yet.' };
+        }
+      : undefined;
+    const own = this.widgets() || browser || device || delegates.length > 0 || !!profile || !!track;
+    const allowed = [...(this.widgets() ? [WIDGET_TOOL_ID] : []), ...(browser ? BROWSER_TOOL_IDS : []), ...(device ? DEVICE_TOOL_IDS : []), ...delegates.map(agentToolId), ...(profile ? [PROFILE_TOOL_ID] : []), ...(track ? [TRACK_TOOL_ID] : [])];
     const runAgent = this.ctx.runAgent;
     const delegate =
       delegates.length && runAgent
@@ -693,7 +765,7 @@ export class ClaudeProvider implements Provider {
       // Generative UI: an in-process server with the show_widget tool, allowed without asking.
       // The user's own MCP servers still load from their settings.
       ...(own
-        ? { mcpServers: { [WIDGET_SERVER]: widgetServer({ widgets: this.widgets(), session: browser ? () => owner.session?.runtime() : undefined, device: device ? () => owner.session?.runtime() : undefined, delegate, profile }) }, allowedTools: allowed }
+        ? { mcpServers: { [WIDGET_SERVER]: widgetServer({ widgets: this.widgets(), session: browser ? () => owner.session?.runtime() : undefined, device: device ? () => owner.session?.runtime() : undefined, delegate, profile, track }) }, allowedTools: allowed }
         : {}),
       canUseTool: (name, toolInput, o) =>
         owner.session ? owner.session.canUseTool(name, toolInput, o) : Promise.resolve({ behavior: 'deny', message: 'No session is attached yet.' } as PermissionResult),
@@ -792,25 +864,26 @@ export class ClaudeProvider implements Provider {
   }
 
   caps(cwd = process.cwd()): Promise<Capabilities> {
+    const generation = this.signInGeneration;
     const hit = this.capsCache.get(cwd);
     if (hit && Date.now() - hit.at < 5 * 60_000) return Promise.resolve(hit.caps);
     const running = this.capsInflight.get(cwd);
     if (running) return running;
     const session = [...this.sessions].find(s => s.liveQuery() && s.runtime().meta.cwd === cwd);
-    const current = session?.runtime().caps;
+    const current = session && !this.oldQueries.has(session.liveQuery()!) ? session.runtime().caps : undefined;
     const probe = async () => {
       if (!session) {
         if ([...this.sessions].some(s => s.runtime().turnActive)) return hit?.caps ?? this.buildCaps(undefined, []);
-        return this.probe(cwd);
+        return this.probe(cwd, generation);
       }
       const q = session.liveQuery();
-      if (!q || !q.reinitialize || session.holdsWork()) return current ?? this.buildCaps(undefined, []);
+      if (!q || this.oldQueries.has(q) || !q.reinitialize || session.holdsWork()) return current ?? this.buildCaps(undefined, []);
       return authGate.run(gateKey(this.id, this.configHome()), async () => {
         if (session.liveQuery() !== q || session.holdsWork() || this.ctx.closing?.()) return current ?? this.buildCaps(undefined, []);
         const init = await withTimeout(q.reinitialize(), 8000, 'model list');
         const mcp = await withTimeout(q.mcpServerStatus(), 8000, 'MCP status');
         const caps = this.buildCaps(init, mcp, current?.skills.map(s => s.name));
-        this.capsCache.set(cwd, { at: Date.now(), caps });
+        if (generation === this.signInGeneration) this.capsCache.set(cwd, { at: Date.now(), caps });
         return caps;
       }, this.scope('caps'));
     };
@@ -819,17 +892,17 @@ export class ClaudeProvider implements Provider {
         this.ctx.log('claude caps probe failed:', (err as Error).message);
         return current ?? this.buildCaps(undefined, []);
       })
-      .finally(() => this.capsInflight.delete(cwd));
+      .finally(() => { if (this.capsInflight.get(cwd) === p) this.capsInflight.delete(cwd); });
     this.capsInflight.set(cwd, p);
     return p;
   }
 
   /** Starts a throwaway CLI process just to read what this project offers. Costs no tokens. */
-  private async probe(cwd: string): Promise<Capabilities> {
+  private async probe(cwd: string, generation: number): Promise<Capabilities> {
     await authGate.beforeRead();
     if (this.ctx.closing?.()) return this.buildCaps(undefined, []);
     const input = new PushQueue<SDKUserMessage>();
-    const q = query({ prompt: input, options: { ...this.baseOptions(cwd, 'caps'), persistSession: false } });
+    const q = query({ prompt: input, options: { ...this.baseOptions(cwd, this.scope('caps')), persistSession: false } });
     const read = async () => {
       const init = await q.initializationResult();
       const mcp = await withTimeout(q.mcpServerStatus(), 8_000, 'MCP status').catch(() => []);
@@ -838,12 +911,12 @@ export class ClaudeProvider implements Provider {
         .then((r) => r.skills.map((s) => s.name))
         .catch(() => undefined);
       // Read plan limits while this process is alive: there is no other cheap moment to ask.
-      if (!this.ctx.dormant?.(this.id)) await this.readLimits(q, 60_000, true);
+      if (generation === this.signInGeneration && !this.ctx.dormant?.(this.id)) await this.readLimits(q, 60_000, true);
       return this.buildCaps(init, mcp, skills);
     };
     try {
       const caps = await withTimeout(read(), GATE.auxLeaseMs, 'capabilities probe');
-      this.capsCache.set(cwd, { at: Date.now(), caps });
+      if (generation === this.signInGeneration) this.capsCache.set(cwd, { at: Date.now(), caps });
       return caps;
     } finally {
       input.end();
@@ -909,7 +982,8 @@ export class ClaudeProvider implements Provider {
    * closer together than `minGapMs` share the last answer.
    */
   readLimits(q: Query, minGapMs = 60_000, standalone = false, afterTurn = false): Promise<RateLimit[]> {
-    const busy = () => authGate.readsPaused() || this.ctx.closing?.() || [...this.sessions].some(s => s.runtime().turnActive);
+    const generation = this.signInGeneration;
+    const busy = () => generation !== this.signInGeneration || this.oldQueries.has(q) || authGate.readsPaused() || this.ctx.closing?.() || [...this.sessions].some(s => s.runtime().turnActive);
     if (busy()) return Promise.resolve(this.limitsCache);
     const deferred = afterTurn && limitsAfterTurn.has(this);
     if (this.limitsRun) return deferred ? this.limitsRun.then(() => this.readLimits(q, minGapMs, standalone, true)) : this.limitsRun;
@@ -937,9 +1011,11 @@ export class ClaudeProvider implements Provider {
   }
 
   private async readLimitsNow(q: Query): Promise<RateLimit[]> {
+    const generation = this.signInGeneration;
     this.limitsAt = Date.now(); // A failed request also consumes this polling interval.
     try {
       const u = (await withTimeout(q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }), 10_000, 'usage')) as Obj;
+      if (generation !== this.signInGeneration) return this.limitsCache;
       const rl = u?.rate_limits as Obj | null;
       // Available but empty: the usage endpoint refused (HTTP 429, remembered by the CLI per
       // sign-in for up to an hour) and the process has no reply headers to fall back on yet. A
@@ -998,7 +1074,8 @@ export class ClaudeProvider implements Provider {
    * the reply's headers, so it costs nothing and works when the usage endpoint refuses). A refusal
    * marks its window full. Returns the window that refused the turn, if it did.
    */
-  onRateLimit(info: Obj | undefined): { resetsAt?: number; window?: string } | undefined {
+  onRateLimit(info: Obj | undefined, q?: Query): { resetsAt?: number; window?: string } | undefined {
+    if (q && this.oldQueries.has(q)) return;
     if (!info) return undefined;
     // A remembered window whose reset has passed has rolled over: it is empty until the next
     // message starts it again. Kept as such (not dropped), since the CLI may not report that
@@ -1086,7 +1163,7 @@ export class ClaudeProvider implements Provider {
     };
     for (const s of this.sessions) {
       const q = s.liveQuery();
-      if (q) return read(q);
+      if (q && !this.oldQueries.has(q)) return read(q);
     }
     if (this.warm) return read(this.warm.q);
     // The probe's once-a-minute throttle holds for clicks, not for a reset's reading after its
@@ -1099,7 +1176,7 @@ export class ClaudeProvider implements Provider {
 
   private async probeLimits() {
     const input = new PushQueue<SDKUserMessage>();
-    const q = query({ prompt: input, options: { ...this.baseOptions(homedir(), 'limits'), settingSources: [], strictMcpConfig: true, persistSession: false } });
+    const q = query({ prompt: input, options: { ...this.baseOptions(homedir(), this.scope('limits')), settingSources: [], strictMcpConfig: true, persistSession: false } });
     try {
       const read = q.initializationResult().then(() => this.readLimits(q, 0, true));
       return await withTimeout(read, GATE.auxLeaseMs, 'limits probe');
@@ -1654,7 +1731,7 @@ class ClaudeSession implements ProviderSession {
    * (`restartWhenFree`). What the notice says starts or stops ("Browser control starts"), and whether
    * it has said that it waits for background work.
    */
-  private restartPending?: string;
+  private restartPending?: string | true; // true for a sign-in, which resumes on the next message
   private restartTold = false;
   /** The running process has reported its own capabilities (better than the probe's). */
   liveCaps = false;
@@ -2091,14 +2168,20 @@ class ClaudeSession implements ProviderSession {
     }
   }
 
+  restartForSignIn() {
+    this.restartPending = true;
+    this.restartWhenFree();
+  }
+
   /** The restart a changed option waits for, once the turn is over and nothing else holds the process; said once when background work still does. */
   private restartWhenFree() {
     if (!this.restartPending || this.retired || this.rt.turnActive) return;
     if (Date.now() < this.taskEndUntil) return;
     if (this.holdsWork()) {
       if (this.owner?.child?.pending) this.freeLater(1000);
+      else if (this.cliBusy()) this.freeLater(this.heardAt + CLI_TRUST_MS - Date.now());
       else if (!this.worksNow() && this.wakeDue()) this.freeLater(this.wakeAt()! + WAKE_GRACE_MS + 1 - Date.now());
-      if (!this.restartTold && (this.liveIds().size || this.promptsOpen() || this.wakeDue())) {
+      if (typeof this.restartPending === 'string' && !this.restartTold && (this.liveIds().size || this.promptsOpen() || this.wakeDue())) {
         this.restartTold = true;
         this.rt.notice('info', `${this.restartPending} ${this.whenFree()}`);
       }
@@ -2152,10 +2235,11 @@ class ClaudeSession implements ProviderSession {
 
   /** Replaces the idle agent process so new start-up options take effect (the conversation resumes). */
   private restart() {
+    const signIn = this.restartPending === true;
+    const keepRunning = !!this.rt.meta.options?.remoteControl && !signIn;
     this.restartPending = undefined;
     this.restartTold = false;
-    const keepRunning = !!this.rt.meta.options?.remoteControl;
-    this.tellLost(this.shutdown('process', 'capability'), 'process');
+    this.tellLost(this.shutdown('process', signIn ? undefined : 'capability'), 'process');
     this.rt.update({ remote: undefined, capState: undefined });
     if (keepRunning) this.ensure();
   }
@@ -3107,6 +3191,8 @@ class ClaudeSession implements ProviderSession {
     if (agentOfTool(name)) return { behavior: 'allow', updatedInput: input };
     // A fact for the user's profile: Sable checks it (never secrets) and the user can remove it.
     if (name === PROFILE_TOOL_ID) return { behavior: 'allow', updatedInput: input };
+    // track_work only tells Sable which process to watch: nothing is started or changed.
+    if (name === TRACK_TOOL_ID) return { behavior: 'allow', updatedInput: input };
 
     if (name === 'AskUserQuestion') {
       const questions = describeTool(name, input).detail.questions ?? [];
@@ -3342,7 +3428,7 @@ class ClaudeSession implements ProviderSession {
       }
       case 'rate_limit_event': {
         // The windows come with the event itself: no usage read needed.
-        const hit = this.provider.onRateLimit(any.rate_limit_info);
+        const hit = this.provider.onRateLimit(any.rate_limit_info, this.q);
         if (hit) {
           this.limitHit = hit;
           for (const [uuid, id] of this.turnLimits) {
@@ -3488,7 +3574,7 @@ class ClaudeSession implements ProviderSession {
     // working on after the turn ended): no notice of its own; the step stops at the limit and the
     // bridge says it once for the chat (`SessionRuntime.limitInBackground`).
     const refusedAtLimit = m.error === 'rate_limit';
-    if (refusedAtLimit && m.rate_limit_info) this.limitHit = this.provider.onRateLimit(m.rate_limit_info) ?? this.limitHit;
+    if (refusedAtLimit && m.rate_limit_info) this.limitHit = this.provider.onRateLimit(m.rate_limit_info, this.q) ?? this.limitHit;
     const atLimit = refusedAtLimit && !parentId && rt.turnActive && !this.autonomousTurn();
     // Claude Code's own words for a request that failed (an API error, a refusal at a limit): said by
     // the notice below, never as the agent's answer. Its stand-in "No response requested." (written

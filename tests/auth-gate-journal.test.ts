@@ -556,7 +556,7 @@ it('asks the CLI once for JSON status, preserves unknown and omits all CLI outpu
   await vi.waitFor(() => expect(children).toHaveLength(3));
   children[2].stdout.write('temporary failure with private output');
   children[2].exit();
-  expect((await check).auth).toEqual({ loggedIn: false, checking: true });
+  expect((await check).auth).toEqual((await first).auth);
   const lines = await journal.lines();
   expect(lines.join('')).not.toMatch(/private|example|9\.9\.9/);
   expect(lines.map(line => JSON.parse(line)).filter(row => row.event === 'status-answer').map(row => row.answer)).toEqual(['in', 'unknown']);

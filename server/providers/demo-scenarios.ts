@@ -2,6 +2,7 @@
  * Scripted sessions for the demo provider. Every scenario works on the fictional
  * relay-api project (demo-codebase.ts) so paths, code, diffs and test output agree.
  */
+import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +18,7 @@ import { signInShips } from '../services/sign-ins';
 import { demoSite, LOOKS, siteCss, siteHtml } from './demo-site';
 import { AUTH_FIXED, AUTH_JS, SESSION_FIXED, SESSION_JS, seedUntilFixture, untilFixture } from './demo-until';
 import { briefFiles, CHECK_LEAD, NO_PROBLEMS } from '../core/check';
+import { TRACK_TOOL_ID } from './track-tool';
 import path from 'node:path';
 
 // ───────────────────────────────── content file ─────────────────────────────────
@@ -43,6 +45,8 @@ export interface ScenarioContext {
   prompt: string;
   item: UserItem;
   model: string;
+  /** `track_work` as the bridge answers it for this chat (absent in bare tests). */
+  track?: (args: unknown, stepId?: string) => { ok: boolean; text: string };
 }
 
 export type ScenarioResult = void | { error: string };
@@ -2080,11 +2084,59 @@ const outlive: Scenario = async ({ s }) => {
   at(60_000, () => end(server, 'stopped'));
 };
 
+/**
+ * Work started outside the agent's own tools (26 Nov: "i dont see you working at all"): the agent
+ * starts a detached job from a shell and tells Sable with `track_work`. The Demo starts a real,
+ * harmless process for the bridge to watch (this Node, asleep, writing a line to a log now and
+ * then; the log only where the chat's folder is Sable's own or a temporary one), ends its turn, and
+ * is woken by the job's end (`reported`). "quick": a job of a few seconds; "long": half an hour.
+ */
+const tracked: Scenario = async ({ s, prompt, track }) => {
+  const k = Math.max(0.05, Number(process.env.SABLE_DEMO_SPEED) || 1);
+  const seconds = /\bquick\b/i.test(prompt) ? 6 : /\blong\b/i.test(prompt) ? 1800 : Math.round(45 / k);
+  const own = !!s.rt.meta.chat || path.resolve(s.cwd).toLowerCase().startsWith(path.resolve(tmpdir()).toLowerCase());
+  const log = own ? path.join(s.cwd, 'codex-fix.log') : undefined;
+  await s.say('I will hand the sign-in fix to a Codex job that runs on its own, so a limit on this chat cannot stop it, and tell Sable to watch it.');
+  const cmd = 'nohup codex exec "Fix the sign-in refresh" > codex-fix.log 2>&1 &';
+  const start = await s.tool({ name: 'Bash', kind: 'bash', title: 'Start the Codex job', detail: { command: cmd, description: 'Start the Codex job', cwd: s.cwd }, input: { command: cmd, description: 'Start the Codex job' } });
+  s.start(start);
+  const lines = ['Reading server/core/auth-gate.ts', 'Editing server/core/auth-gate.ts', 'Running tests/auth-gate.test.ts', '18 passed, 1 failed: a refresh refused mid-start', 'Editing server/providers/claude.ts', 'Running tests/auth-gate.test.ts', '19 passed'];
+  const every = Math.max(700, Math.round((seconds * 1000) / (lines.length + 1)));
+  const job = `const fs=require('fs');const f=process.argv[1];const L=${JSON.stringify(lines)};let i=0;const w=()=>{if(f&&i<L.length)try{fs.appendFileSync(f,L[i]+String.fromCharCode(10))}catch{}i++};w();setInterval(w,${every});setTimeout(()=>process.exit(0),${seconds * 1000});`;
+  let pid = 0;
+  try {
+    const child = spawn(process.execPath, ['-e', job, log ?? ''], { detached: true, stdio: 'ignore', windowsHide: true, cwd: tmpdir(), env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
+    child.on('error', () => {});
+    child.unref();
+    pid = child.pid ?? 0;
+  } catch {
+    pid = 0;
+  }
+  await s.pause(300, 500);
+  s.complete(start, { text: `[1] ${pid}` });
+  const input = { title: 'Codex builds the sign-in fix', pid, ...(log ? { log: 'codex-fix.log' } : {}), by: 'Codex' };
+  const row = await s.tool({ name: TRACK_TOOL_ID, kind: 'other', title: input.title, detail: { description: input.by }, input });
+  s.start(row);
+  const answer = track?.(input, row) ?? { ok: false, text: 'Sable cannot track work in this session.' };
+  await s.pause(120, 200);
+  s.complete(row, { text: answer.text, ...(answer.ok ? {} : { isError: true }) }, answer.ok ? 'done' : 'error');
+  await s.say(answer.ok ? 'The Codex job is running on its own. I will carry on when it is done.' : `I could not have the job tracked: ${answer.text}`);
+  s.finish();
+};
+
+/** The hidden message that brings a report (a delegated child's, or tracked work's end): a short turn of the agent's own. */
+const reported: Scenario = async ({ s }) => {
+  await s.say('The job is done: the sign-in fix is in and its tests pass. I will review the diff next.');
+  s.finish();
+};
+
 // ─────────────────────────────────── selection ──────────────────────────────────
 
 export const SCENARIOS = {
   flagship,
   outlive,
+  tracked,
+  reported,
   plan,
   questions,
   agents,
@@ -2135,6 +2187,9 @@ const KEYWORDS: [RegExp, ScenarioId][] = [
   [/\bnotifications?\b/i, 'notifications'],
   // Work that goes on after its turn: background commands, a monitor, a workflow (day 7).
   [/\b(outlive|lingering)\b/i, 'outlive'],
+  // Work started outside the agent's tools and tracked (`track_work`), and the report that follows its end.
+  [/^A background sub-agent reported\./, 'reported'],
+  [/\b(track(ed|ing)?|detached)\b/i, 'tracked'],
   // Before / after captures of a local page (demo-site.ts).
   [/\bbefore\s*\/?\s*after\b|\bbeforeafter\b/i, 'beforeafter'],
   // Signing in on a page in the Browser tab, watched (demo-portal.ts): before the plain browser tools.

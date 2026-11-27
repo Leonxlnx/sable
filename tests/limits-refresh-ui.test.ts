@@ -2,7 +2,7 @@ import { createElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { AccountInfo, LimitsReport, ProviderInfo } from '@shared/protocol';
-import { accountKey, useStore, type Store } from '../src/state/store';
+import { accountKey, applyEvent, useStore, type Store } from '../src/state/store';
 import { ConnectCard } from '../src/features/connect/Connect';
 import { AccountSwitcher } from '../src/features/accounts/Switcher';
 import { readStaleFullLimits } from '../src/state/actions';
@@ -49,6 +49,20 @@ it('the account-card Refresh sends force to the bridge for that account', () => 
   expect(menu.call).not.toHaveBeenCalled();
   menu.select!();
   expect(menu.call).toHaveBeenCalledWith('provider.limits', { provider: 'claude', accountId: 'studio', force: true });
+});
+
+it('shows the last signed-in row during a read and offers Sign in on a confirmed sign-out', () => {
+  setAccounts([account('studio', { loggedIn: true, plan: 'Max', email: 'studio@example.invalid' })]);
+  const provider = useStore.getState().providers.claude!;
+  const card = () => renderToStaticMarkup(createElement(ConnectCard, { provider: 'claude' }));
+  applyEvent({ type: 'provider.updated', provider: { ...provider, accounts: [account('studio', { loggedIn: false, checking: true })] } });
+  expect(card()).toContain('studio@example.invalid');
+  expect(card()).not.toContain('>Sign in<');
+  setAccounts([account('studio', { loggedIn: false, checking: true })]);
+  expect(card()).toContain('Checking sign-in');
+  expect(card()).not.toContain('>Sign in<');
+  applyEvent({ type: 'provider.updated', provider: { ...provider, accounts: [account('studio', { loggedIn: false })] } });
+  expect(card()).toContain('>Sign in</button>');
 });
 
 it('opening the switcher and its pane spaces stale full accounts and checks each at most once in ten minutes', async () => {

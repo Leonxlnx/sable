@@ -21,7 +21,7 @@ describe('a sign-in not read yet', () => {
   it('is read so by the home composer\'s Sign in chip, the sidebar footer\'s name and the sign-in cards', () => {
     expect(src('features/composer/Controls.tsx')).toMatch(/return signedOut\(acct \? acct\.auth : p\.auth\);/);
     expect(src('features/accounts/Switcher.tsx')).toMatch(/if \(signedOut\(account\.auth\)\) return 'Sign in';/);
-    expect(src('features/connect/Connect.tsx')).toMatch(/info\.auth\.checking \? 'loading'/);
+    expect(src('features/connect/Connect.tsx')).toContain("signedOut(account.auth) ? 'out' : 'loading'");
   });
 
   it('asks nobody to sign in or to connect an agent while an answer is on its way', () => {

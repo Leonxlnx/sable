@@ -11,7 +11,7 @@ import type { AppSettings, BridgeEvent, PhoneStatus, SessionMeta } from '../../s
  */
 
 /** A session as keep awake reads it: `newestCommandAt`, when its youngest working command (including monitors) began. */
-export type AwakeSession = { meta: SessionMeta; turnActive: boolean; readonly newestCommandAt?: number };
+export type AwakeSession = { meta: SessionMeta; turnActive: boolean; readonly newestCommandAt?: number; readonly newestTrackedAt?: number };
 
 export interface AwakeSource {
   sessions: Iterable<AwakeSession>;
@@ -23,6 +23,12 @@ export interface AwakeSource {
  * does, up to this bound. Serving tasks have their own count and clock.
  */
 export const COMMAND_AWAKE_MS = 2 * 60 * 60_000;
+
+/**
+ * How long tracked work (`track_work`: a process the agent started outside its tools and asked Sable
+ * to watch) keeps the computer awake: a night's job does, a process that never ends does not for ever.
+ */
+export const TRACKED_AWAKE_MS = 12 * 60 * 60_000;
 
 /** Whether this session's agent is at work now. */
 export function working(s: { meta: SessionMeta; turnActive: boolean }): boolean {
@@ -45,7 +51,10 @@ export function watchAwake(src: AwakeSource, onChange: (busy: boolean) => void, 
   /** A command younger than `COMMAND_AWAKE_MS` runs in the session: until when it keeps it awake, else 0. */
   const commandUntil = (s: AwakeSession, now: number) => {
     const at = (s.meta.commands ?? 0) > 0 ? s.newestCommandAt : undefined;
-    return at !== undefined && now - at < COMMAND_AWAKE_MS ? at + COMMAND_AWAKE_MS : 0;
+    const command = at !== undefined && now - at < COMMAND_AWAKE_MS ? at + COMMAND_AWAKE_MS : 0;
+    // Tracked work likewise, on its own longer bound.
+    const job = (s.meta.tracked ?? 0) > 0 ? s.newestTrackedAt : undefined;
+    return Math.max(command, job !== undefined && now - job < TRACKED_AWAKE_MS ? job + TRACKED_AWAKE_MS : 0);
   };
   // Sub-agents still working after their chat's own turn ended keep the computer awake too, and so
   // does a background command that is not old.
@@ -82,7 +91,7 @@ export function watchAwake(src: AwakeSource, onChange: (busy: boolean) => void, 
     }
   };
   const off = src.subscribe((e) => {
-    if (e.type === 'session.updated' && ('status' in e.patch || 'until' in e.patch || 'background' in e.patch || 'commands' in e.patch)) check();
+    if (e.type === 'session.updated' && ('status' in e.patch || 'until' in e.patch || 'background' in e.patch || 'commands' in e.patch || 'tracked' in e.patch)) check();
     else if (e.type === 'session.removed' || e.type === 'session.added') check();
   });
   check();

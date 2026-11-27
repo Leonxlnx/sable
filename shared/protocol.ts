@@ -525,6 +525,16 @@ export interface SessionMeta {
   /** The oldest serving task and the sole server’s address, also available when its step is paged out. */
   servingSince?: number;
   servingAddress?: string;
+  /**
+   * Work the agent started outside its own tools and asked Sable to watch (`track_work`, `ToolItem.tracked`
+   * with state `running`): how many processes Sable still sees running. Work like any other wherever a
+   * chat's work is read (`shared/work-label.ts`), but it holds no account move and no update: the
+   * process is not Sable's and outlives both.
+   */
+  tracked?: number;
+  /** When the oldest of them was tracked, and the title of the only one, for the lists and the last line. */
+  trackedSince?: number;
+  trackedTitle?: string;
   /** The chat is moving to another account right now (set and cleared by `session.switchAccount`). */
   moving?: boolean;
   /** The account the session runs under; absent means `default`. */
@@ -1112,6 +1122,8 @@ export interface ToolItem extends BaseItem {
   delegateReceiptState?: 'checking' | 'unknown' | null;
   /** One decision token per uncertain attempt, consumed by the built-in /report-retry command. */
   delegateRetryId?: string | null;
+  /** A receipt lookup that did not complete sent this report again by itself. Once per row, never cleared. */
+  delegateRedelivered?: 1;
   /** The prepared ID moves to issued at the native offer. Older issued attempts have neither field. */
   delegateAttempt?: { provider: ProviderId; account?: string; session?: string; after?: string; tool?: string; budget?: string; prepared?: string; issued?: string };
   /** Budget anchor for an imported conversation with no personal card. */
@@ -1152,6 +1164,8 @@ export interface ToolItem extends BaseItem {
    * monitor in the agent's process. The bridge owns its state, from the agent's own task events.
    */
   task?: TaskMark;
+  /** A `track_work` call: the process the agent asked Sable to watch, and where it stands (the bridge owns it). */
+  tracked?: TrackedWork;
   /**
    * Set by the bridge only, on a finished step in a whole timeline sent to a window (a snapshot,
    * `timeline.reset`): its long output or result was cut (the start and end of long texts kept,
@@ -1232,6 +1246,32 @@ export interface TaskMark {
   why?: 'process' | 'restart' | 'move' | 'limit' | 'you';
   /** The agent accepted a message carrying the note about this lost task. */
   lossTold?: true;
+}
+
+/**
+ * Work the agent started outside its own tools (a detached process) and told Sable about with
+ * `track_work` (`ToolItem.tracked`, `server/core/track.ts`). Sable only watches: it never starts,
+ * signals or ends the process. The row is the tool call's own step.
+ */
+export interface TrackedWork {
+  /** The process id the agent named. */
+  pid: number;
+  /** Who runs it, in a word or two as the agent said it ("Codex", "build"). */
+  by?: string;
+  /** The log file the agent named, inside the chat's folder. Never sent to a phone. */
+  log?: string;
+  /** The last line of that log as plain text, cut. Untrusted: one plain line, never Markdown, never a link. */
+  line?: string;
+  /**
+   * `running` while Sable sees the process; `ended` once it is gone (`endedAt` when Sable saw it go,
+   * absent when it went while Sable was closed or its id was reused: the time is not known); `left`
+   * when Sable no longer watches it (the person stopped tracking it, a fork's copy).
+   */
+  state: 'running' | 'ended' | 'left';
+  since: number;
+  endedAt?: number;
+  /** The process's own start as the system tells it: tells a reused id apart. Never shown. */
+  born?: string;
 }
 
 /** Closes a turn: duration, cost, token counts. */
@@ -2714,6 +2754,8 @@ export interface RpcMethods {
   'session.snapshot': { params: { sessionId: string; peek?: boolean; page?: 'end' | 'real' | SnapshotCursor; keepFrom?: string }; result: SessionSnapshot };
   /** One item whole, as the bridge holds it (a step a window got cut, `ToolItem.more`). */
   'session.item': { params: { sessionId: string; itemId: string }; result: { item: TimelineItem } };
+  /** Stops watching a tracked process (`ToolItem.tracked`): the row reads "Not tracked", the agent is told nothing. Never touches the process. */
+  'track.stop': { params: { sessionId: string; itemId: string }; result: { ok: boolean } };
   /** Read a member of an item too large for one JSON message. Strings and object keys are paged. */
   'session.itemPart': {
     params: { sessionId: string; itemId: string; path: (string | number)[]; offset?: number; seq?: number };

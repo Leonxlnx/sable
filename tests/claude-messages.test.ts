@@ -1900,16 +1900,16 @@ describe('Sable delegates in a Claude turn', () => {
       await vi.waitFor(() => expect(wire).toBeDefined());
       if (issued) sdk.history.mockResolvedValueOnce([]);
       await vi.advanceTimersByTimeAsync(90_010);
-      expect(h.rt.reservedDelegateReports.has('no-ack')).toBe(false);
       expect(c.row().delegateReport).toBe('pending');
       if (issued) {
-        expect(c.row().delegateReceiptState).toBe('unknown');
-        const retry = c.row().delegateRetryId!;
-        wire.taken?.();
-        expect(h.rt.items.some(i => i.type === 'notice' && i.detail?.endsWith('/report-retry ' + retry))).toBe(false);
-        expect(c.row().delegateReport).toBe('delivered');
+        // The receipt lookup did not complete: the report goes again by itself, once, and nothing is written.
+        expect(c.row().delegateRedelivered).toBe(1);
+        expect(c.row().delegateReceiptState).toBeFalsy();
         expect(c.row().delegateRetryId).toBeFalsy();
+        expect(h.rt.reservedDelegateReports.has('no-ack') || h.rt.pendingDelegateReports.has('no-ack')).toBe(true);
+        expect(h.rt.items.some(i => i.type === 'notice' && /Delivery unconfirmed|report-retry/.test(i.text + (i.detail ?? '')))).toBe(false);
       } else {
+        expect(h.rt.reservedDelegateReports.has('no-ack')).toBe(false);
         expect(c.row().delegateReceiptState).toBeFalsy();
         expect(users(h.rt)[0].delegateContinuations ?? 0).toBe(0);
         expect(() => wire.issueReport?.()).toThrow();
@@ -1952,7 +1952,7 @@ describe('Sable delegates in a Claude turn', () => {
     } finally { close(); await c.result; }
   });
 
-  it('gives a foreground tool result with no echo a visible receipt decision', async () => {
+  it('sends a foreground tool result with no echo again once, with no notice', async () => {
     const h = await setup();
     const c = h.start('codex', 'silent-caller');
     await tick();
@@ -1962,10 +1962,10 @@ describe('Sable delegates in a Claude turn', () => {
       await vi.waitFor(() => expect(c.row().delegateAttempt?.tool).toBe('silent-caller'));
       sdk.history.mockResolvedValueOnce([]);
       await vi.advanceTimersByTimeAsync(90_010);
-      expect(c.row()).toMatchObject({ delegateReport: 'pending', delegateReceiptState: 'unknown', result: { text: 'Report for silent-caller' } });
-      c.receipt('Report for silent-caller');
-      expect(c.row().delegateReport).toBe('delivered');
+      expect(c.row()).toMatchObject({ delegateReport: 'pending', delegateRedelivered: 1, result: { text: 'Report for silent-caller' } });
+      expect(c.row().delegateReceiptState).toBeFalsy();
       expect(c.row().delegateRetryId).toBeFalsy();
+      expect(h.rt.items.some(i => i.type === 'notice' && /Delivery unconfirmed|report-retry/.test(i.text + (i.detail ?? '')))).toBe(false);
     } finally { vi.useRealTimers(); await c.result; }
   });
 
@@ -2187,12 +2187,13 @@ describe('Sable delegates in a Claude turn', () => {
     sdk.history.mockResolvedValueOnce([{ type: 'user', uuid: h.first, message: { content: 'delegate the review' } },
       ...(recorded ? [{ type: 'user', uuid: m.uuid, message: m.message }] : [])]);
     const restarted = await claudeApp(h);
-    await until(() => recorded ? restarted.rt.get<ToolItem>('durable')?.delegateReport === 'delivered' : restarted.rt.get<ToolItem>('durable')?.delegateReceiptState === 'unknown', 'restart reconciliation');
+    // A lookup that did not complete sends the report again by itself, once, with no notice.
+    await until(() => recorded ? restarted.rt.get<ToolItem>('durable')?.delegateReport === 'delivered' : restarted.pushed.length === 1, 'restart reconciliation');
     if (!recorded) {
-      expect(restarted.pushed).toHaveLength(0);
-      expect(phoneItem(restarted.rt.get<ToolItem>('durable')!)).toMatchObject({ delegateReceiptState: 'unknown' });
-      await restarted.app.call('session.send', { sessionId: h.id, text: '/report-retry ' + restarted.rt.get<ToolItem>('durable')!.delegateRetryId });
-      await until(() => restarted.pushed.length === 1, 'manual resend');
+      expect(restarted.rt.get<ToolItem>('durable')).toMatchObject({ delegateRedelivered: 1 });
+      expect(restarted.rt.get<ToolItem>('durable')?.delegateReceiptState).toBeFalsy();
+      expect(restarted.rt.items.some(i => i.type === 'notice' && /Delivery unconfirmed|report-retry/.test(i.text + (i.detail ?? '')))).toBe(false);
+      expect(restarted.pushed[0].message.content).toContain('If you already have the report with this Delivery ID, ignore this copy.');
     }
     expect(restarted.pushed).toHaveLength(recorded ? 0 : 1);
     if (!recorded) expect(restarted.pushed[0].message.content).toEqual(m.message.content);

@@ -25,7 +25,7 @@ import type {
 import { DEFAULT_ACCOUNT, DEFAULT_SETTINGS } from '@shared/protocol';
 import { bridge, type ConnStatus } from '@/lib/bridge';
 import { bootMark } from '@/lib/boot';
-import { correctsGuess, helloProviders, homeAgent } from '@/lib/sign-in';
+import { correctsGuess, helloProviders, homeAgent, keepKnownAuth } from '@/lib/sign-in';
 import { attention, heard, startNotify } from '@/lib/notify';
 import type { Reviews } from '@/features/review/model';
 
@@ -839,7 +839,7 @@ export function applyEvent(e: BridgeEvent) {
       return;
     case 'provider.updated':
       useStore.setState((s) => {
-        const providers = { ...s.providers, [e.provider.id]: e.provider };
+        const providers = { ...s.providers, [e.provider.id]: keepKnownAuth(s.providers[e.provider.id], e.provider) };
         // Hello picked home's agent, at a first start from a guess (lib/sign-in.ts): the agent's own answer corrects the pick.
         const homeProvider = correctsGuess(s.providers[e.provider.id], e.provider) ? homeAgent(Object.values(providers), { current: s.ui.homeProvider, chosen: homeChosen, preferred: s.settings.defaultProvider }) : s.ui.homeProvider;
         return { providers, limits: withAccountLimits(s.limits, [e.provider]), ...(homeProvider !== s.ui.homeProvider ? { ui: { ...s.ui, homeProvider } } : {}) };
@@ -851,7 +851,12 @@ export function applyEvent(e: BridgeEvent) {
       const url = e.url ?? (e.state === 'started' ? undefined : useStore.getState().auth[key]?.url);
       const codeUrl = e.codeUrl ?? (e.state === 'started' ? undefined : useStore.getState().auth[key]?.codeUrl);
       const flow: AuthFlow = { state: e.state, url, codeUrl, message: e.message };
-      useStore.setState((s) => ({ auth: { ...s.auth, [key]: flow } }));
+      useStore.setState((s) => ({
+        auth: { ...s.auth, [key]: flow },
+        ...(e.state === 'done' && { providerCaps: Object.fromEntries(Object.entries(s.providerCaps)
+          .filter(([k]) => !capsForAccount(k, e.provider, e.accountId))) }),
+      }));
+      if (e.state === 'error') useStore.getState().toast(e.message || 'Sign-in failed', 'error');
       // A finished sign-in is history after a moment, so its success state does not linger.
       if (e.state === 'done') {
         window.setTimeout(() => {
@@ -1314,10 +1319,13 @@ export const capsKey = (provider: ProviderId, cwd: string | null, accountId?: st
   `${provider}:${(cwd ?? '').replaceAll('%', '%25').replaceAll('@', '%40')}${accountId && accountId !== DEFAULT_ACCOUNT ? `@${accountId}` : ''}`;
 
 /** A live answer for the same account from another folder. A literal @ in a folder is escaped by capsKey. */
+function capsForAccount(key: string, provider: ProviderId, accountId?: string) {
+  return key.startsWith(`${provider}:`) && (accountId && accountId !== DEFAULT_ACCOUNT ? key.endsWith(`@${accountId}`) : !key.includes('@'));
+}
+
 export function capsFromAnywhere(all: Record<string, Capabilities>, provider: ProviderId, accountId?: string): Capabilities | undefined {
-  const suffix = accountId && accountId !== DEFAULT_ACCOUNT ? `@${accountId}` : '';
   for (const key in all) {
-    if (key.startsWith(`${provider}:`) && (suffix ? key.endsWith(suffix) : !key.includes('@'))) return all[key];
+    if (capsForAccount(key, provider, accountId)) return all[key];
   }
 }
 

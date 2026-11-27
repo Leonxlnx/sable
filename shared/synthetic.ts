@@ -80,15 +80,32 @@ export function readDelegateIds(text: string, into: Set<string>, wanted?: Readon
   const blocks = /<system-reminder>A background sub-agent reported\.\n[^<]*?\nDelivery ID: ([\da-f-]{36})\n[^<]*<\/system-reminder>/g;
   for (const match of text.matchAll(blocks)) if (!wanted || wanted.has(match[1])) into.add(match[1]);
 }
+/** After the Delivery ID: a report can reach the agent twice (a receipt Sable could not read sends it again once). */
+export const DELEGATE_REPORT_COPY = 'If you already have the report with this Delivery ID, ignore this copy.';
 export function delegateReport(title: string, outcome: string, report: string, deliveryId?: string) {
   // A report can quote markup, including the reminder's own closing tag.
   const escape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
   const body = escape(report.slice(0, 40_000));
   const bounded = report.length > 40_000 || body.length > 40_000 ? body.slice(0, 40_000) + '\n\n(cut off)' : body;
-  return `<system-reminder>${DELEGATE_REPORT}\n${escape(title.slice(0, 160))} (${outcome})\n${deliveryId ? 'Delivery ID: ' + deliveryId + '\n' : ''}${bounded}</system-reminder>`;
+  return `<system-reminder>${DELEGATE_REPORT}\n${escape(title.slice(0, 160))} (${outcome})\n${deliveryId ? 'Delivery ID: ' + deliveryId + '\n' + DELEGATE_REPORT_COPY + '\n' : ''}${bounded}</system-reminder>`;
 }
 
-export const STEER_NOW_BLOCK = '<system-reminder>Work was interrupted because the person asked for an answer now. Answer their message first, then continue the interrupted work if it still makes sense. Tell them what was lost, including any unfinished foreground sub-agent progress.</system-reminder>';
+/**
+ * The end of work the agent asked Sable to watch (`track_work`, server/core/track.ts): the body of
+ * a `delegateReport`, the one wrapper a report travels in, so every reader already knows the whole
+ * as Sable's. `ran`: how long Sable saw it run, in words ("41m"); absent when the end's time is
+ * not known (`closed`: it went while Sable was closed; `reused`: its id belongs to another process
+ * now). `lines`: the end of its log, untrusted (the wrapper escapes markup).
+ */
+export function trackedEndReport(o: { pid: number; ran?: string; why?: 'closed' | 'reused'; lines?: string[]; log?: boolean }): string {
+  const end = o.why === 'closed' ? 'Its process ended while Sable was closed; when is not known.'
+    : o.why === 'reused' ? 'Its process ended (the id now belongs to another process); when is not known.'
+    : `Its process is gone${o.ran ? ` after ${o.ran}` : ''}.`;
+  const log = o.lines?.length ? `The last lines of its log:\n${o.lines.join('\n')}` : o.log ? 'Its log could not be read.' : 'It named no log.';
+  return `This is no sub-agent: it is the work you asked Sable to track (process ${o.pid}). ${end} Sable only watched it and does not know its exit code.\n${log}\nCheck what it left, then carry on with the task.`;
+}
+
+export const STEER_NOW_BLOCK ='<system-reminder>Work was interrupted because the person asked for an answer now. Answer their message first, then continue the interrupted work if it still makes sense. Tell them what was lost, including any unfinished foreground sub-agent progress.</system-reminder>';
 
 const COMMAND_TAGS = new Set(['command-name', 'command-message', 'command-args', 'command-contents']);
 const OUTPUT_TAGS = new Set(['local-command-stdout', 'local-command-stderr', 'bash-stdout', 'bash-stderr']);
