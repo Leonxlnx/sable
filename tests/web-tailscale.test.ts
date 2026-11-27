@@ -288,6 +288,8 @@ it('says each state in Settings: not installed, not running, HTTPS off, the port
   expect(published.v.address).toMatchObject({ link: `https://${NAME}/`, shown: `https://${NAME}` });
   expect(published.v.setup?.caUrl).toBeUndefined();
   expect(published.v.networkHelp).toBeUndefined();
+  // Over Tailscale the home networks are still listed to choose from (looked at when Settings asks).
+  await vi.waitFor(async () => expect((await apps[apps.length - 1].call('web.state', {})).networks?.map(n => n.name)).toEqual(['Home']));
   expect(forbidden([...taken.calls, ...ok.calls])).toEqual([]);
   // Nothing of Sable's certificate chain was made in this mode.
   for (const h of homes) expect(existsSync(path.join(h, 'web', 'ca.cer'))).toBe(false);

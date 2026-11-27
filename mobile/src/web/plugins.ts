@@ -11,6 +11,13 @@ export const Preferences = {
 export const Capacitor = { isNativePlatform: () => false };
 // What this browser is ("iPad · Safari"): the name the pairing screen offers, which the person may change.
 export const Device = { getInfo: async () => ({ name: deviceLabel(navigator.userAgent, navigator.maxTouchPoints) }) };
-export const registerPlugin = () => ({});
+// A plugin of the app's own (SystemPlugin.java and the like) does not exist in a browser: every method
+// fails as a call that is not available (each caller already handles that), and a listener is accepted
+// and never called. (A bare `{}` threw at once on `addListener`: the phone flow's share sheet, 2.22,
+// took the whole page down at 390 px.)
+const absent = () => Promise.reject(new Error('Not available in a browser.'));
+export const registerPlugin = () => new Proxy({}, {
+  get: (_t, key) => key === 'then' ? undefined : key === 'addListener' ? async () => ({ remove: async () => {} }) : absent,
+});
 export const App = {}, Haptics = {}, ImpactStyle = {}, NotificationType = {}, LocalNotifications = {}, Keyboard = {};
 

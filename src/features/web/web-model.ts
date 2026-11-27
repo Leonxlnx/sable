@@ -120,7 +120,8 @@ export function webSection(s: WebState, settings: WebSettings, now: number): Web
     else if (open.length) networkHelp = open.length > 1
       ? `${listWords(open)} are public networks in Windows. Make one private to use it here.`
       : `${open[0]} is a public network in Windows. Make it private to use it here.`;
-    else if (!networks.length) networkHelp = 'No home network is connected';
+    // Not looked at yet (no `networks` from the bridge): nothing rather than "none".
+    else if (s.networks && !s.networks.length) networkHelp = 'No home network is connected';
   }
 
   // The bridge's own words, unless a line above already says it: no network chosen or connected, or no client in this build.

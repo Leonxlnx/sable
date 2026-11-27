@@ -56,6 +56,8 @@ describe('webSection', () => {
     expect(webSection({ ...off, networks: [networks[1]], error: 'The selected home network changed. Select an available network on the desktop.' }, on, now))
       .toMatchObject({ networkHelp: 'The chosen network is not connected', error: undefined });
     expect(webSection({ ...off, networks: [] }, on, now).networkHelp).toBe('No home network is connected');
+    // The first look still under way (the bridge sends no list yet): no sentence, not "none".
+    expect(webSection({ ...off, networks: undefined }, on, now).networkHelp).toBeUndefined();
     // A home Wi-Fi Windows calls public is never served on: it is named, with what to change.
     expect(webSection({ ...off, networks: [], publicNetworks: ['Home'] }, on, now).networkHelp).toBe('Home is a public network in Windows. Make it private to use it here.');
     expect(webSection({ ...off, networks, publicNetworks: ['Home', 'Cafe'] }, { webRemote: true }, now).networkHelp).toBe('Home and Cafe are public networks in Windows. Make one private to use it here.');

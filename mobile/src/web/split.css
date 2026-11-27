@@ -649,6 +649,12 @@
   font-size: var(--t-small);
 }
 
+/* What works now, beside the title: its words change in place. The phone's fade-in restarts with every
+   new line, so a turn that moves on every few hundred ms left only "· 38 steps · 0:01" on screen. */
+.wstage .chat-work-text {
+  animation: none;
+}
+
 .wstage .icon-btn {
   width: 30px;
   height: 30px;

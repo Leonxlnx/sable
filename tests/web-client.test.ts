@@ -5,6 +5,7 @@ import { crc32, faviconSvg, iconPng, manifest, MARK } from '../mobile/web-icons'
 import { cleanDeviceName, deviceLabel } from '../mobile/src/web/device';
 import { mayCall } from '../mobile/src/web/allow';
 import { knownMode } from '../mobile/src/web/modes';
+import { registerPlugin } from '../mobile/src/web/plugins';
 
 // The web client's small things (web2 job 3): its name, its icons, and the one rule for what it offers.
 
@@ -89,4 +90,15 @@ it('gives the favicon as SVG and a standalone manifest', () => {
   const m = JSON.parse(manifest());
   expect(m).toMatchObject({ name: 'Sable', display: 'standalone', start_url: '/', scope: '/' });
   expect(m.icons.map((i: { src: string }) => i.src)).toEqual(['icon-192.png', 'icon-512.png']);
+});
+
+it('stands in for the app’s own plugins without throwing: calls fail as unavailable, listeners are taken', async () => {
+  // The phone flow's share sheet (2.22) listens on SystemPlugin at once; a bare `{}` threw and took the page down at 390 px.
+  const System = registerPlugin() as unknown as { addListener(e: string, f: () => void): Promise<{ remove(): Promise<void> }>; powerSave(): Promise<unknown>; widget(o: object): Promise<void> };
+  const h = await System.addListener('share', () => {});
+  await expect(h.remove()).resolves.toBeUndefined();
+  await expect(System.powerSave()).rejects.toThrow(/Not available in a browser/);
+  await expect(System.widget({ working: 1 })).rejects.toThrow(/Not available/);
+  // Not mistaken for a promise when awaited.
+  expect(await Promise.resolve(System)).toBe(System);
 });

@@ -178,7 +178,9 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       : tsHeld && tailscaleMode() ? { state: 'taken' as const, name: tsName, text: TS_WORDS.taken }
       : tsGone && tailscaleMode() ? { state: 'unknown' as const, text: TS_WORDS.gone }
       : tailscaleView(tailscaleMode() ? tsLook : undefined, ts.installed());
-    return { listening: active(), addresses: overTs ? [tsName!] : certs?.addresses ?? [], port: overTs ? TS_PORT : port, devices, clients, networks,
+    // No list before the first look at the home networks ends (Settings then says nothing rather than "none").
+    const listed = look.at !== undefined || look.failure !== undefined || networks.length > 0;
+    return { listening: active(), addresses: overTs ? [tsName!] : certs?.addresses ?? [], port: overTs ? TS_PORT : port, devices, clients, ...(listed ? { networks } : {}),
       ...(publicNames.length ? { publicNetworks: publicNames } : {}), tailscale,
       hostname: overTs ? tsName : certs?.host, caFingerprint: overTs ? undefined : certs?.ca.fingerprint256, caReplacement: overTs ? undefined : certs?.replacement, pairing: status?.pairing,
       request: status?.request, revocationDurable: !status?.saveError, error: error ?? status?.saveError ?? status?.error,
@@ -283,11 +285,12 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
       try { rows = await look.ask(); }
       catch { throw Error(unread); }
     }
-    if (epoch !== generation || !enabled()) return;
+    // The list for Settings is taken also when this start was overtaken (another network chosen meanwhile).
     const next = servable(rows);
     const listChanged = JSON.stringify([networks, publicNames]) !== JSON.stringify([next.networks, next.publicNames]);
     networks = next.networks;
     publicNames = next.publicNames;
+    if (epoch !== generation || !enabled()) { if (listChanged) changed(); return; }
     const selected = networks.find(n => n.id === selection() && privateIPv4(n.address));
     if (!selected) throw Error(/network changed/.test(error ?? '') ? error : 'Select an available home network and address on the desktop.');
     if (active() && servingOn?.id === selected.id && certs?.host === webHostname() && certs.addresses[0] === selected.address &&
