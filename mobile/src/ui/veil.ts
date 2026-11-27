@@ -20,13 +20,16 @@ function quarter(q: number, color: string, cols: number, rows: number, row0: num
   const c = document.createElement('canvas');
   c.width = cols;
   c.height = rows;
-  const ctx = c.getContext('2d');
+  // A software canvas (`willReadFrequently`): a few thousand pixels, drawn once. An accelerated one
+  // set up a GPU surface on its first fill, for each quarter of every veil: on the emulator 130 ms a
+  // fill, 4 s of the main thread over two opens of a chat (phone7's profile, 27 Nov).
+  const ctx = c.getContext('2d', { willReadFrequently: true });
   if (!ctx) return c;
   // The quarter's four cells of a 4x4 tile, laid over the whole canvas as a pattern (one fill).
   const t = document.createElement('canvas');
   t.width = 4;
   t.height = 4;
-  const tc = t.getContext('2d');
+  const tc = t.getContext('2d', { willReadFrequently: true });
   if (!tc) return c;
   tc.fillStyle = color;
   for (let i = 0; i < 16; i++) if (BAYER[i] >> 2 === q) tc.fillRect(i & 3, i >> 2, 1, 1);
@@ -36,6 +39,22 @@ function quarter(q: number, color: string, cols: number, rows: number, row0: num
   ctx.fillStyle = p;
   ctx.fillRect(0, 0, cols, rows + 4);
   return c;
+}
+
+/**
+ * Quarters already drawn, kept for the next veil of the same size and colour (a change of screen is a
+ * cover and a reveal: two sets in use at once at most), so a veil after the first draws nothing.
+ */
+const pool = new Map<string, HTMLCanvasElement[][]>();
+const KEEP = 2;
+const setKey = (color: string, cols: number, rows: number, row0: number) => `${color}|${cols}|${rows}|${row0 & 3}`;
+function takeSet(color: string, cols: number, rows: number, row0: number): HTMLCanvasElement[] {
+  return pool.get(setKey(color, cols, rows, row0))?.pop() ?? [0, 1, 2, 3].map((q) => quarter(q, color, cols, rows, row0));
+}
+function giveSet(key: string, set: HTMLCanvasElement[]) {
+  const free = pool.get(key) ?? [];
+  if (free.length < KEEP) free.push(set);
+  pool.set(key, free);
 }
 
 /** A cell that lands on whole device pixels (no seams between cells). */
@@ -62,7 +81,20 @@ export function veil(host: HTMLElement, mode: 'cover' | 'reveal', o: VeilOptions
   el.className = 'veil';
   el.setAttribute('aria-hidden', 'true');
   el.style.cssText = `position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:${o.z ?? 60};contain:strict`;
-  const remove = () => el.remove();
+  const anims: Animation[] = [];
+  const sets: [string, HTMLCanvasElement[]][] = [];
+  let gone = false;
+  const remove = () => {
+    el.remove();
+    if (gone) return;
+    gone = true;
+    // The quarters go back to the pool without their steps (a kept `fill: forwards` would hold them).
+    for (const a of anims) a.cancel();
+    for (const [key, set] of sets) {
+      for (const c of set) c.remove();
+      giveSet(key, set);
+    }
+  };
   if (reduced()) {
     // No dither steps: a plain fade (a reveal is simply gone).
     if (mode === 'reveal') return { done: Promise.resolve(), remove };
@@ -80,7 +112,6 @@ export function veil(host: HTMLElement, mode: 'cover' | 'reveal', o: VeilOptions
   const bandH = Math.ceil(h / bands / tile) * tile;
   const dur = o.duration ?? 260;
   const slot = dur / (4 + (bands - 1) * 0.9);
-  const anims: Animation[] = [];
   for (let b = 0; b < bands; b++) {
     const band = document.createElement('div');
     const top = b * bandH;
@@ -88,9 +119,12 @@ export function veil(host: HTMLElement, mode: 'cover' | 'reveal', o: VeilOptions
     const rows = Math.ceil(height / cell);
     band.style.cssText = `position:absolute;left:0;right:0;top:${top}px;height:${height}px;overflow:hidden`;
     const order = o.from === 'bottom' ? bands - 1 - b : b;
+    // Each band starts on a whole tile, so its rows continue the dither of the band above.
+    const row0 = Math.round(top / cell);
+    const set = takeSet(o.color, cols, rows, row0);
+    sets.push([setKey(o.color, cols, rows, row0), set]);
     for (let q = 0; q < 4; q++) {
-      // Each band starts on a whole tile, so its rows continue the dither of the band above.
-      const i = quarter(q, o.color, cols, rows, Math.round(top / cell));
+      const i = set[q];
       i.style.cssText = `position:absolute;left:0;top:0;width:${cols * cell}px;height:${rows * cell}px;image-rendering:pixelated;will-change:opacity`;
       // cover: sparse first; reveal: the last quarter in goes first (solid, checker, sparse, clear).
       const step = mode === 'cover' ? q : 3 - q;

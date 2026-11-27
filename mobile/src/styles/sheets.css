@@ -1595,3 +1595,8 @@ html[data-away] .sheet-body::before {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* Nothing here is ever the current one: no empty check slot, so the folder word ends on the rows' own inset. */
+.share-sheet .choice-check {
+  display: none;
+}
