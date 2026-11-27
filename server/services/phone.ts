@@ -1917,13 +1917,14 @@ export class PhoneService {
     return rt ? phoneEvent({ type: 'timeline.reset', sessionId: rt.id, items: rt.items }) : null;
   }
 
-  acceptWeb(ws: WebSocket, req: IncomingMessage) {
-    if (!this.web || !this.enabled || this.blocked(req.socket.remoteAddress ?? '?')) return ws.terminate();
-    this.onSocket(ws, req);
+  /** `peer`: the browser's address when a proxy on this computer carries it (Tailscale Serve: its tailnet address), for the limits and the Allow card. */
+  acceptWeb(ws: WebSocket, req: IncomingMessage, peer?: string) {
+    if (!this.web || !this.enabled || this.blocked(peer ?? req.socket.remoteAddress ?? '?')) return ws.terminate();
+    this.onSocket(ws, req, peer);
   }
 
-  private onSocket(ws: WebSocket, req: IncomingMessage) {
-    const ip = req.socket.remoteAddress ?? '?';
+  private onSocket(ws: WebSocket, req: IncomingMessage, peer?: string) {
+    const ip = peer ?? req.socket.remoteAddress ?? '?';
     // Until the phone is in (or waits for "Allow"), a few seconds; then the socket closes.
     const gate = { admitted: false };
     const helloTimer = setTimeout(() => {

@@ -100,6 +100,7 @@ export function WebAccess() {
 
       {v.setup && (
         <Card title="Set up a device">
+          {v.setup.caUrl && (
           <Row
             label={<Step n={1}>Install the certificate</Step>}
             align="start"
@@ -108,7 +109,7 @@ export function WebAccess() {
                 <span className="web-link">
                   <span>Open</span>
                   <span className="web-link-text num">{v.setup.caUrl}</span>
-                  <CopyButton text={v.setup.caUrl} label="Copy the certificate's address" size={13} />
+                  <CopyButton text={v.setup.caUrl!} label="Copy the certificate's address" size={13} />
                 </span>
                 {v.setup.fingerprint.length > 0 && (
                   <span className="web-fp" aria-label="SHA-256 fingerprint">
@@ -128,12 +129,13 @@ export function WebAccess() {
               Save certificate
             </button>
           </Row>
+          )}
           {v.setup.pairing ? (
             <div className="web-pair">
               <Qr qr={v.setup.pairing.qr} size={v.setup.pairing.size} label="Pairing code for a browser" className="web-qr" />
               <div className="web-pair-side">
                 <div className="set-row-label">
-                  <Step n={2}>Pair</Step>
+                  {v.setup.caUrl ? <Step n={2}>Pair</Step> : 'Pair'}
                 </div>
                 <p className="web-pair-how">Scan the code with the tablet’s camera, then allow it here.</p>
                 <div className="phone-link">
@@ -151,7 +153,7 @@ export function WebAccess() {
               </div>
             </div>
           ) : (
-            <Row label={<Step n={2}>Pair</Step>}>
+            <Row label={v.setup.caUrl ? <Step n={2}>Pair</Step> : 'Pair'}>
               <button
                 type="button"
                 className="btn btn-sm"

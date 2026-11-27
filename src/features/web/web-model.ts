@@ -1,4 +1,4 @@
-import type { AppSettings, WebState } from '@shared/protocol';
+import { WEB_TAILSCALE, type AppSettings, type WebState, type WebTailscale } from '@shared/protocol';
 
 /**
  * What Settings › Phone › Web access shows for a state (pure; `WebAccess.tsx` draws it). In order and
@@ -62,14 +62,14 @@ export interface WebSection {
   switchable: boolean;
   /** The switch row's one line. */
   status?: string;
-  /** The networks to choose from (only while on). */
+  /** The networks to choose from (only while on): Tailscale first, then the home networks. */
   networks?: { id: string; name: string; address: string; chosen: boolean }[];
   /** Under "Network": why nothing is served on the chosen one. */
   networkHelp?: string;
   /** While it listens: the address to open on the tablet and its QR. */
   address?: { link: string; shown: string; qr?: { qr: string; size: number } };
-  /** While it listens: setting up a device. */
-  setup?: { caUrl: string; fingerprint: string[]; pairing?: { link: string; qr: string; size: number; left: string } };
+  /** While it listens: setting up a device (no certificate over Tailscale: its own is valid). */
+  setup?: { caUrl?: string; fingerprint: string[]; pairing?: { link: string; qr: string; size: number; left: string } };
   request?: { id: string; name: string; address: string };
   devices: { id: string; name: string; line: string; online: boolean }[];
   /** The steer switch (only while on). */
@@ -83,17 +83,31 @@ export interface WebSection {
 
 type WebSettings = Pick<AppSettings, 'webRemote' | 'webNetwork' | 'webSteerDanger'>;
 
+/** Tailscale's row in the list: a word for a state that keeps it from serving, else nothing. */
+export function tailscaleWord(t: WebTailscale | undefined): string {
+  switch (t?.state) {
+    case 'missing': return 'Not installed';
+    case 'stopped': return 'Not running';
+    case 'https': return 'HTTPS off';
+    case 'taken': return 'Port in use';
+    default: return '';
+  }
+}
+
 export function webSection(s: WebState, settings: WebSettings, now: number): WebSection {
   const on = settings.webRemote === true;
   const assets = s.assets !== false;
   const networks = s.networks ?? [];
   const chosenId = settings.webNetwork;
-  const chosen = networks.find((n) => n.id === chosenId);
+  // Over Tailscale (web-tailscale.ts): its own state says why nothing is served; no certificate step.
+  const overTs = chosenId === WEB_TAILSCALE;
+  const ts = s.tailscale;
+  const chosen = overTs ? { id: WEB_TAILSCALE } : networks.find((n) => n.id === chosenId);
   const listening = on && s.listening && !!s.port && !!s.addresses[0];
 
   let status: string | undefined;
   if (!assets && !on) status = 'Not included in this version';
-  else if (!on) status = 'Paired browsers connect over your home network';
+  else if (!on) status = 'Paired browsers connect over your home network or Tailscale';
   else if (!assets) status = 'Not included in this version';
   else if (chosen && !listening && !s.error) status = 'Starting';
 
@@ -101,7 +115,8 @@ export function webSection(s: WebState, settings: WebSettings, now: number): Web
   if (on && assets) {
     // Only private networks are served on; a connected public one (often a home Wi-Fi) is named, so the person knows what to change.
     const open = s.publicNetworks ?? [];
-    if (chosenId && !chosen && networks.length) networkHelp = 'The chosen network is not connected';
+    if (overTs) networkHelp = listening ? undefined : ts?.text;
+    else if (chosenId && !chosen && networks.length) networkHelp = 'The chosen network is not connected';
     else if (open.length) networkHelp = open.length > 1
       ? `${listWords(open)} are public networks in Windows. Make one private to use it here.`
       : `${open[0]} is a public network in Windows. Make it private to use it here.`;
@@ -109,11 +124,11 @@ export function webSection(s: WebState, settings: WebSettings, now: number): Web
   }
 
   // The bridge's own words, unless a line above already says it: no network chosen or connected, or no client in this build.
-  const said = !assets || !chosen || /Select an available|home network changed|assets are unavailable/i.test(s.error ?? '');
+  const said = !assets || !chosen || /Select an available|home network changed|assets are unavailable/i.test(s.error ?? '') || (overTs && !!s.error && s.error === ts?.text);
   const unsaved = s.revocationDurable === false;
   const error = on && !said && !unsaved ? s.error : undefined;
 
-  const origin = listening ? `https://${s.addresses[0]}:${s.port}` : undefined;
+  const origin = listening ? (s.port === 443 ? `https://${s.addresses[0]}` : `https://${s.addresses[0]}:${s.port}`) : undefined;
   const pairing = listening && s.pairing && s.pairing.expiresAt > now ? s.pairing : undefined;
   const since = new Map(s.clients.map((c) => [c.id, c.since]));
 
@@ -121,13 +136,13 @@ export function webSection(s: WebState, settings: WebSettings, now: number): Web
     on,
     switchable: assets || on,
     status,
-    networks: on && assets ? networks.map((n) => ({ ...n, chosen: n.id === chosenId })) : undefined,
+    networks: on && assets ? [{ id: WEB_TAILSCALE, name: 'Tailscale', address: tailscaleWord(ts), chosen: overTs }, ...networks.map((n) => ({ ...n, chosen: n.id === chosenId }))] : undefined,
     networkHelp,
     // While a pairing code is open it is the only code on the page (the address's own would open the page unpaired).
     address: origin ? { link: `${origin}/`, shown: origin, qr: !pairing && s.addressQr?.link === `${origin}/` ? s.addressQr : undefined } : undefined,
     setup: origin
       ? {
-          caUrl: `${origin}/ca.cer`,
+          caUrl: overTs ? undefined : `${origin}/ca.cer`,
           fingerprint: fingerprintLines(s.caFingerprint),
           pairing: pairing ? { link: pairing.link, qr: pairing.qr, size: pairing.size, left: countdown(pairing.expiresAt - now) } : undefined,
         }

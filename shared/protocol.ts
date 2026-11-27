@@ -2155,8 +2155,24 @@ export interface PhoneDevice {
 export const WEB_SHIPS = false;
 /** A network web access can serve on: a Wi-Fi by its name, an Ethernet by its adapter's (server/services/web-networks.ts). */
 export interface WebNetwork { id: string; name: string; address: string; kind?: 'wifi' | 'ethernet' }
+/** `AppSettings.webNetwork` for Tailscale: published inside the tailnet by `tailscale serve` (server/services/web-tailscale.ts). */
+export const WEB_TAILSCALE = 'tailscale';
+/**
+ * Tailscale as web access's network: `missing` not installed, `stopped` not running or not signed in,
+ * `https` HTTPS certificates are off for the tailnet, `taken` port 443 is the owner's own Serve entry,
+ * `ready` it can publish, `published` Sable is published at `https://<name>/`, `unknown` not looked at yet.
+ */
+export interface WebTailscale {
+  state: 'missing' | 'stopped' | 'https' | 'taken' | 'ready' | 'published' | 'unknown';
+  /** This computer's MagicDNS name (`<machine>.<tailnet>.ts.net`). */
+  name?: string;
+  /** The plain sentence Settings shows under the network for this state. */
+  text?: string;
+}
 export interface WebState {
   networks?: WebNetwork[];
+  /** Tailscale, the first choice of network (always there, its state read only while it is chosen). */
+  tailscale?: WebTailscale;
   /** Connected Wi-Fi or Ethernet networks Windows calls public: never served on (Settings says to make one private). */
   publicNetworks?: string[];
   caReplacement?: string;

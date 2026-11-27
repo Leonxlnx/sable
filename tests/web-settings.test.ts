@@ -35,7 +35,7 @@ it('counts an offer down in minutes and seconds', () => {
 describe('webSection', () => {
   it('off: the switch with its line, and nothing else', () => {
     const v = webSection(off, {}, now);
-    expect(v).toMatchObject({ on: false, switchable: true, status: 'Paired browsers connect over your home network', devices: [], unsaved: false });
+    expect(v).toMatchObject({ on: false, switchable: true, status: 'Paired browsers connect over your home network or Tailscale', devices: [], unsaved: false });
     expect(v.networks ?? v.address ?? v.setup ?? v.request ?? v.steer).toBeUndefined();
   });
 
@@ -46,7 +46,8 @@ describe('webSection', () => {
 
   it('on with no network chosen: the networks to choose from, no address, and not the bridge\'s own words about it', () => {
     const v = webSection({ ...off, networks, error: 'Select an available home network and address on the desktop.' }, { webRemote: true }, now);
-    expect(v.networks?.map((n) => [n.id, n.chosen])).toEqual([['n1', false], ['n2', false]]);
+    // Tailscale is always the first choice (web-tailscale.ts), then the home networks.
+    expect(v.networks?.map((n) => [n.id, n.chosen])).toEqual([['tailscale', false], ['n1', false], ['n2', false]]);
     expect(v.address ?? v.setup ?? v.error ?? v.status).toBeUndefined();
     expect(v.steer).toBe(false);
   });
