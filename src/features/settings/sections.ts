@@ -1,6 +1,5 @@
-import { WEB_SHIPS } from '@shared/protocol';
 import type { IconName } from '@/icons';
-import type { SettingsSection } from '@/state/store';
+import { useStore, type SettingsSection } from '@/state/store';
 
 export interface SectionMeta {
   id: SettingsSection;
@@ -43,7 +42,10 @@ export const SECTIONS: SectionMeta[] = [
     id: 'phone',
     label: 'Phone',
     icon: 'phone',
-    keywords: `phone mobile android app pair pairing qr code remote network lan devices${WEB_SHIPS ? ' web access browser tablet ipad certificate' : ''}`,
+    // Web access's words only in a run that has it (WEB_SHIPS, or the owner's --web).
+    get keywords() {
+      return `phone mobile android app pair pairing qr code remote network lan devices${useStore.getState().webAccess ? ' web access browser tablet ipad certificate' : ''}`;
+    },
   },
   { id: 'customize', label: 'Customize', icon: 'wand', keywords: 'customize customise redesign restyle theme css stylesheet styles your own look agent change sable sidebar layout original' },
   {

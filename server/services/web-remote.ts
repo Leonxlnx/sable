@@ -9,7 +9,8 @@ import { servable, webNetworks, type ReadNetwork } from './web-networks';
 import { LOOK_MS, NetworkLook, nextLookIn, type LookTimes } from './web-look';
 import { realpath } from 'node:fs/promises';
 import { WebSocketServer } from 'ws';
-import { WEB_SHIPS, type WebNetwork, type WebState } from '../../shared/protocol';
+import type { WebNetwork, WebState } from '../../shared/protocol';
+import { webOn } from './web-on';
 import { openContained, within } from '../core/contain';
 import type { App } from '../app';
 import type { PhoneService } from './phone';
@@ -88,7 +89,7 @@ async function staticFile(root: string, target: string, res: ServerResponse) {
 export function registerWeb(app: App, makeChannel: (channel: WebChannel) => PhoneService, opts: WebOptions = {}) {
   const servers = new Set<Server>(), sockets = new Set<Duplex>();
   const since = new Map<string, number>();
-  const enabled = () => WEB_SHIPS && app.store.state.settings.webRemote === true && !disposed;
+  const enabled = () => webOn() && app.store.state.settings.webRemote === true && !disposed;
   const selection = () => app.store.state.settings.webNetwork;
   let requestedNetwork: string | undefined;
   let disposed = false, epoch = 0, reads = 0;
@@ -129,7 +130,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   const assetsRoot = () => (opts.assets !== undefined ? [opts.assets] : [resources && path.join(resources, 'web'), !resources ? path.resolve('mobile/dist-web') : undefined])
     .find((dir): dir is string => !!dir && existsSync(path.join(dir, 'index.html')));
   function manage() {
-    if (!WEB_SHIPS || disposed) throw Error('Web access is off.');
+    if (!webOn() || disposed) throw Error('Web access is off.');
     return channel ??= makeChannel({ active, changed, connected: (id, at) => { if (!since.has(id)) since.set(id, at); },
       link: (key, fp) => 'https://' + certs!.addresses[0] + ':' + port + '/#p=' + key + '&f=' + fp });
   }
@@ -329,7 +330,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
     return channel;
   }
   app.register('web.state', async () => {
-    if (!WEB_SHIPS) throw Error('Web access is off.');
+    if (!webOn()) throw Error('Web access is off.');
     await startup;
     if (existsSync(path.join(app.store.dir, 'web', 'pairings.json.closed'))) manage();
     // Settings opened on a list older than 30 s: it is looked at again behind this answer (web.updated brings it).
@@ -347,7 +348,7 @@ export function registerWeb(app: App, makeChannel: (channel: WebChannel) => Phon
   app.register('web.revoke', ({ deviceId }) => { manage().revoke(deviceId); return state(); });
   // The public root only (what `/ca.cer` serves), checked to be a CA certificate before it is written.
   app.register('web.saveCa', async () => {
-    if (!WEB_SHIPS) throw Error('Web access is off.');
+    if (!webOn()) throw Error('Web access is off.');
     const file = path.join(app.store.dir, 'web', 'ca.cer');
     let ca = certs?.ca;
     if (!ca && existsSync(file)) { try { ca = new X509Certificate(readFileSync(file)); } catch { ca = undefined; } }

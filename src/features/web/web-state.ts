@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { WEB_SHIPS, type WebState } from '@shared/protocol';
+import type { WebState } from '@shared/protocol';
 import { bridge } from '@/lib/bridge';
 import { openSettings } from '@/state/actions';
 import { useStore } from '@/state/store';
@@ -7,7 +7,8 @@ import { useStore } from '@/state/store';
 /**
  * Web access as the desktop window knows it (server/services/web-remote.ts): `web.state` once, then
  * every `web.updated`. Read by Settings › Phone, the top bar's mark and a message's origin. Nothing at
- * all runs while `WEB_SHIPS` is false: the hooks answer null and nothing is asked or subscribed.
+ * all runs while web access is not in this run (`webShown`: the bridge's hello says so, for `WEB_SHIPS`
+ * or the owner's `--web`): the hooks answer null and nothing is asked or subscribed.
  */
 let state: WebState | null = null;
 const listeners = new Set<() => void>();
@@ -23,12 +24,12 @@ function set(next: WebState | null, made = false) {
 
 /** Asks the bridge again (after an answer that changed it, or a reconnect). */
 export function refreshWeb(): Promise<void> {
-  if (!WEB_SHIPS) return Promise.resolve();
+  if (!webShown()) return Promise.resolve();
   return bridge.call('web.state', {}).then(set, () => {});
 }
 
 function start() {
-  if (started || !WEB_SHIPS) return;
+  if (started || !webShown()) return;
   started = true;
   bridge.on((e) => {
     if (e.type === 'web.updated') set(e.state);
@@ -47,10 +48,16 @@ const subscribe = (l: () => void) => {
   };
 };
 
-/** The whole state; null while web access is not built in or not read yet. */
+/** Web access is in this run: the bridge's hello said so (`WEB_SHIPS`, or `Sable.exe --web` / `SABLE_WEB=1`: server/services/web-on.ts). */
+export const webShown = () => useStore.getState().webAccess;
+
+/** The whole state; null while web access is not in this run or not read yet. */
 export function useWebState(): WebState | null {
-  start();
-  return useSyncExternalStore(subscribe, () => state);
+  // Hello may answer after the first render (the top bar's mark): the hook runs again when it does.
+  const on = useStore((s) => s.webAccess);
+  if (on) start();
+  const s = useSyncExternalStore(subscribe, () => state);
+  return on ? s : null;
 }
 
 /** A `web.*` call whose answer is the new state: applied at once (the event follows with the same); a refusal is a toast. */

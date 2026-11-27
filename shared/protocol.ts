@@ -1929,6 +1929,8 @@ export interface PullFailures {
 export interface AppState {
   /** The desktop bridge pages conversations above this item count. */
   snapshotThreshold?: number;
+  /** Web access is in this run (`WEB_SHIPS`, or the owner's `--web` / `SABLE_WEB=1`: server/services/web-on.ts); absent otherwise. */
+  webAccess?: true;
   version: string;
   platform: string;
   home: string;

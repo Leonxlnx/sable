@@ -1,4 +1,5 @@
 import { requireWebMessage } from './services/web-policy';
+import { webOn } from './services/web-on';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -5608,6 +5609,8 @@ export class App {
     const providers = await Promise.all([...this.providers.values()].map((p) => (settled ? this.providerInfoSettled(p.id) : this.providerInfoFast(p.id)).catch(() => fallbackInfo(p))));
     return {
       snapshotThreshold: SNAPSHOT_THRESHOLD,
+      // Web access is in this run (services/web-on.ts): the window shows its parts only then.
+      ...(webOn() ? { webAccess: true as const } : {}),
       version: VERSION,
       platform: process.platform,
       home: homedir(),
