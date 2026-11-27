@@ -8,7 +8,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { open, rename, stat, statfs, unlink } from 'node:fs/promises';
 import { Worker } from 'node:worker_threads';
 import type { QueuedMessage, TimelineItem, Todo } from '../../shared/protocol';
-import { cutItem, isLight, LIGHT, recentStart, workerCut, SNAPSHOT_THRESHOLD, snapshotEnd, turnBoundary } from './trim';
+import { cutItem, isLight, LIGHT, recentStart, workerCut, ROW_ROOT, SNAPSHOT_THRESHOLD, snapshotEnd, turnBoundary } from './trim';
+import { stallMark } from '../util/stalls';
 
 /**
  * A session's timeline on disk, as a base file and a small tail. For a large base the reader
@@ -58,6 +59,14 @@ export interface SessionData {
 export interface SessionSave extends SessionData {
   /** Ids of items changed or added since the last save; 'all' when unknown (a reload, a reset). */
   dirty: Set<string> | 'all';
+  /** Each item's bits for the end of the chat (`rowFacts`), in the items' order, when the caller keeps them: the writer then reads no settled row to find where the end begins. */
+  facts?: Uint8Array;
+  /** Each item's id, in the items' order, when the caller keeps them (never changed once handed over): the order is checked against the base without reading a row. */
+  rowIds?: string[];
+  /** Where the items named in `dirty` stand in `items`, for those the caller knows: a changed settled row is found by its place. */
+  places?: Map<string, number>;
+  /** `items` is an array made for this save that nobody changes any more: the writer works on it as it is. */
+  own?: boolean;
 }
 
 /** The tail is folded into the base once it is bigger than this. */
@@ -526,6 +535,8 @@ function readInWorker(file: string, tail: string, guard?: { check(): void; signa
 }
 /** Bytes batched per asynchronous write. */
 const CHUNK = 1 << 20;
+/** The longest a write works before it lets the bridge's other work run (ms). */
+const SLICE_MS = 8;
 
 /** Everything the counted writer needs for an unchanged indexed base with an empty footer.
  * Its IDs and offsets belong to the reader. No mutable runtime row is retained by the idle job. */
@@ -560,6 +571,8 @@ interface Base {
   old?: boolean;
   /** Settled items changed since the base was written: every tail carries them (`over`) until the base is written again. */
   over: Set<string>;
+  /** Where each of those stands (its place cannot change while this base holds: the order before `settled` is checked at every save). */
+  overAt?: Map<string, number>;
 }
 
 type Read<T> = { ok: true; value: T | null } | { ok: false };
@@ -1134,7 +1147,12 @@ export class SessionFiles {
       return this.finish(id, (err as NodeJS.ErrnoException).code === 'ENOENT' ? { ok: true, value: null } : { ok: false });
     }
     const tail = staged?.tail ? statSync(suffix) : this.tailStat(id);
-    if (!this.large(stat.size, tail?.size ?? 0)) return this.load(id);
+    if (!this.large(stat.size, tail?.size ?? 0)) {
+      // Read and parsed in this task: a chat of some megabytes holds the bridge while it is.
+      const read = stallMark('chat.read');
+      try { return this.load(id); }
+      finally { read(); }
+    }
     const previous = this.bases.get(id);
     const read = await this.trackRead(id, readInWorker(file, suffix)).catch(() => ({ ok: false as const }));
     // A synchronous hydrate that won the race owns the installed index.
@@ -1589,9 +1607,12 @@ export class SessionFiles {
   }
 
   private async write(id: string, save: SessionSave, final: boolean) {
+    const checked = stallMark('save.check');
     const base = this.bases.get(id);
     // The order as of now: an item moved during a long base write must not appear twice or not at all.
-    const items = save.items.slice();
+    const items = save.own ? save.items : save.items.slice();
+    // The ids beside the rows, when the caller keeps them: the order is checked without a trip to each row.
+    const rowIds = save.rowIds?.length === items.length ? save.rowIds : undefined;
     // Prefer the existing generation at quit when the suffix fits. A rewind can shorten the matching prefix.
     let from = base?.settled ?? 0;
     let whole = !base || base.old || this.force.has(id) || save.dirty === 'all' || base.size < SMALL_BASE || items.length < from;
@@ -1600,10 +1621,23 @@ export class SessionFiles {
       from = 0;
       while (from < base.ids.length && items[from]?.id === base.ids[from]) from++;
     } else if (!whole && base) {
-      for (let i = 0; i < from; i++) {
-        if (items[i].id !== base.ids[i]) {
-          whole = true;
-          break;
+      const ids = base.ids;
+      if (rowIds) {
+        for (let i = 0; i < from; i++) {
+          const rid = rowIds[i];
+          if (rid !== ids[i]) {
+            whole = true;
+            break;
+          }
+          // The row's own string from now on: two equal strings that are one object compare without being read.
+          ids[i] = rid;
+        }
+      } else {
+        for (let i = 0; i < from; i++) {
+          if (items[i].id !== ids[i]) {
+            whole = true;
+            break;
+          }
         }
       }
     }
@@ -1618,21 +1652,47 @@ export class SessionFiles {
       if (conflict >= 0) from = Math.min(from, conflict);
     }
     const overItems: TimelineItem[] = [];
+    let overAt: Map<string, number> | undefined;
     if (!whole && base) {
       over = new Set(base.over);
       if (save.dirty !== 'all') for (const d of save.dirty) if (base.idSet.has(d)) over.add(d);
       if (final && (save.dirty === 'all' || this.force.has(id))) over = new Set(base.ids.slice(0, from));
-      if (over.size) for (let i = 0; i < from; i++) {
-        const item = items[i];
-        if (over.has(item.id) && isLight(item) && isDeepStrictEqual(item, baseline(base.index?.get(item.id)))) over.delete(item.id);
-        if (over.has(item.id)) overItems.push(item);
+      // The changed settled rows by their places, where every one is known (kept with the base, or said by
+      // the caller for the rows it named) and holds that very row; else the walk, which ends with the last of them.
+      const known = base.overAt;
+      const at: number[] = [];
+      overAt = new Map();
+      for (const oid of over) {
+        const i = known?.get(oid) ?? save.places?.get(oid);
+        if (i === undefined || i >= from || (rowIds ? rowIds[i] : items[i]?.id) !== oid) break;
+        at.push(i);
+        overAt.set(oid, i);
+      }
+      const keep = (item: TimelineItem) => {
+        if (isLight(item) && isDeepStrictEqual(item, baseline(base.index?.get(item.id)))) {
+          over!.delete(item.id);
+          overAt!.delete(item.id);
+        } else overItems.push(item);
+      };
+      if (at.length === over.size) for (const i of at.sort((a, b) => a - b)) keep(items[i]);
+      else {
+        overAt = new Map();
+        let left = over.size;
+        for (let i = 0; left > 0 && i < from; i++) {
+          const item = items[i];
+          if (!over.has(item.id)) continue;
+          left--;
+          overAt.set(item.id, i);
+          keep(item);
+        }
       }
       if (!final && overItems.length > OVER_MAX.items) whole = true;
     }
+    checked();
     if (!whole && base && over) {
       const tmp = this.writerTemp(id, this.tailOf(id));
       const head = `{"baseGen":${base.gen},"from":${from},"items":[\n`;
-      const endId = items.length > SNAPSHOT_THRESHOLD ? items[snapshotEnd(items).start].id : undefined;
+      const endId = items.length > SNAPSHOT_THRESHOLD ? items[snapshotEnd(items, save.facts?.length === items.length ? save.facts : undefined).start].id : undefined;
       const end = `\n],"baseCount":${base.count},"baseRoots":${base.roots}${endId ? ',"endId":' + JSON.stringify(endId) : ''},"todos":${JSON.stringify(save.todos ?? [])}${save.queue ? `,"queue":${JSON.stringify(save.queue)}` : ''}${save.receiptRepair?.length ? ',"receiptRepair":' + JSON.stringify(save.receiptRepair) : ''}}`;
       const source = new BaseReader(this.pathOf(id), base);
       let written;
@@ -1651,6 +1711,7 @@ export class SessionFiles {
           delete base.deferredTail;
           base.notices = { file: this.tailOf(id), prefix: head, rows: written.notices };
           base.over = over!;
+          base.overAt = overAt;
         });
         this.force.delete(id);
         return;
@@ -1698,8 +1759,15 @@ export class SessionFiles {
     const file = this.pathOf(id), tmp = migration?.tmp ?? this.writerTemp(id, file);
     const head = `{"gen":${gen},"items":[\n`;
     const items = 'ids' in save ? save.ids : save.items;
-    const roots = 'ids' in save ? save.roots : save.items.reduce((n, i) => n + Number(!i.parentId), 0);
-    const endId = 'ids' in save ? save.endId : save.items.length > SNAPSHOT_THRESHOLD ? save.items[snapshotEnd(save.items).start].id : undefined;
+    // What the caller keeps per row (its bits, its id) spares three walks over every row of the chat.
+    const kept = 'ids' in save ? undefined : save as Partial<SessionSave>;
+    const facts = kept?.facts?.length === items.length ? kept.facts : undefined;
+    const rowIds = kept?.rowIds?.length === items.length ? kept.rowIds : undefined;
+    let roots = 0;
+    if ('ids' in save) roots = save.roots;
+    else if (facts) for (let i = 0; i < facts.length; i++) roots += facts[i] & ROW_ROOT;
+    else roots = save.items.reduce((n, i) => n + Number(!i.parentId), 0);
+    const endId = 'ids' in save ? save.endId : save.items.length > SNAPSHOT_THRESHOLD ? save.items[snapshotEnd(save.items, facts).start].id : undefined;
     const counts = endId ? `,"endId":${JSON.stringify(endId)}${orphans?.length ? ',"hasOver":true' : ''},"itemCount":${items.length},"rootCount":${roots}` : '';
     const receipts = 'receiptRepair' in save && save.receiptRepair?.length ? ',"receiptRepair":' + JSON.stringify(save.receiptRepair) : '';
     const claims = this.bases.get(id)?.claims;
@@ -1720,9 +1788,23 @@ export class SessionFiles {
     source.close();
     const readers = this.reading.get(id);
     if (readers?.size) await Promise.allSettled(readers);
-    const ids = 'ids' in save ? save.ids : save.items.map(i => i.id);
+    const ids = 'ids' in save ? save.ids : rowIds ? rowIds.slice() : save.items.map(i => i.id);
+    let idSet: Set<string>;
+    if ('ids' in save) idSet = save.idSet;
+    else {
+      // Built in slices: as one `new Set(ids)`, a chat of 126,000 rows held the bridge for 80 ms at the end of every base write.
+      idSet = new Set();
+      let since = performance.now();
+      for (let i = 0; i < ids.length; i++) {
+        idSet.add(ids[i]);
+        if ((i & 1023) === 1023 && performance.now() - since >= SLICE_MS) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          since = performance.now();
+        }
+      }
+    }
     const base: Base = { gen, count: items.length, roots, orphans, ids, settled: 'ids' in save ? save.settled : settledEnd(save.items),
-      idSet: 'ids' in save ? save.idSet : new Set(ids), size: written.size,
+      idSet, size: written.size,
       index: written.index, over: new Set(), notices: { file, prefix: head, rows: written.notices } };
     // Replacing a GB-sized file on Windows can take hundreds of milliseconds.
     // Make both indexes available during that single atomic filesystem operation.
@@ -1756,7 +1838,11 @@ async function renameRetry(from: string, to: string, commit: () => void, migrati
     if (migration) { await migration.unchanged(); migration.check(); }
     try {
       if (migration) { migration.renaming(); await rename(from, to); }
-      else fs.renameSync(from, to);
+      else {
+        const renamed = stallMark('save.rename');
+        try { fs.renameSync(from, to); }
+        finally { renamed(); }
+      }
       commit();
       return;
     } catch (err) {
@@ -1958,9 +2044,11 @@ async function writeLines(file: string, sections: WriteSection[], foot: string, 
     pending = 0;
   };
   let since = performance.now();
+  // A slice of this work ends after `SLICE_MS`, whatever it wrote: bounded by bytes alone, a megabyte of
+  // small rows (each read, compared and copied) held the bridge for a hundred milliseconds and more.
   const yieldCopy = async () => {
     await new Promise<void>(resolve => setImmediate(resolve));
-    check!();
+    check?.();
     since = performance.now();
   };
   try {
@@ -1975,7 +2063,7 @@ async function writeLines(file: string, sections: WriteSection[], foot: string, 
         const first = source.retainedLine(ids[0], 0)!.offset;
         let length = 0;
         for (const [i, id] of ids.entries()) {
-          if (performance.now() - since >= 8) await yieldCopy();
+          if (performance.now() - since >= SLICE_MS) await yieldCopy();
           const line = source.retainedLine(id, i);
           if (!line || line.offset !== first + length) throw Error('Session row offsets changed');
           index.set(id, { ...line, offset: size + length });
@@ -1995,7 +2083,7 @@ async function writeLines(file: string, sections: WriteSection[], foot: string, 
         continue;
       }
       for (let i = 0; i < section.items.length; i++) {
-        if (check && performance.now() - since >= 8) await yieldCopy();
+        if (performance.now() - since >= SLICE_MS) await yieldCopy();
         if (i) {
           append(Buffer.from(',\n'));
           chars += 2;

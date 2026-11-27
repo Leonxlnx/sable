@@ -94,6 +94,7 @@ import { openConsole as realConsole, type OpenConsole } from './util/console';
 import { VERSION } from './version';
 import { bootMark } from './util/boot';
 import { DeadlineExceeded, lateEnd, withDeadline } from './util/deadline';
+import { stallMark, stalls } from './util/stalls';
 import { cliPresentSoon } from './util/cli-present';
 
 /**
@@ -1709,7 +1710,9 @@ export class App {
           if (file.unreadable) throw Error('Unreadable session file');
           meta = { ...rt.meta };
           this.installingTimeline.set(rt, changes);
-          restartNotice = this.loadInto(rt, file);
+          const installed = stallMark('chat.install');
+          try { restartNotice = this.loadInto(rt, file); }
+          finally { installed(); }
         } catch (err) {
           if (this.sessions.get(rt.id) !== rt || this.disposed) return;
           this.log('This chat could not be read from disk', rt.id, String(err));
@@ -1726,6 +1729,8 @@ export class App {
         try { this.phoneReceipts.remember(rt.id, file.receiptRepair, file.queue); }
         catch (err) { this.log('Could not stage phone receipt repairs', rt.id, String(err)); }
         if (changes.meta) this.store.saveState();
+        // A long chat's first save copies every row: made ahead, a slice at a time, never in that save's one task.
+        this.store.warmSave(rt.id, rt.items);
         if (changes.items) this.saveTimeline(rt);
         try { this.afterRestore(rt, file, restartNotice); }
         catch (err) { this.log('Session maintenance failed', rt.id, String(err)); }
@@ -5822,6 +5827,7 @@ export class App {
 
     // ── auth ──
     this.register('auth.journal', ({ limit }) => this.journal.lines(limit));
+    this.register('diag.stalls', () => stalls.read());
     this.register('auth.refresh', ({ provider, accountId = DEFAULT_ACCOUNT }) => {
       this.provider(provider, accountId);
       this.accountUse.set(accountKey(provider, accountId), Date.now());
@@ -6180,27 +6186,30 @@ export class App {
       if (this.unreadable.has(sessionId)) return rt.snapshot();
       // Fetched ahead of an open (`peek`): not read yet.
       if (rt.meta.unread && !peek) rt.update({ unread: false });
-      const snap = rt.snapshot();
-      if (!page || snap.items.length <= SNAPSHOT_THRESHOLD && typeof page === 'string') return snap;
-      if (typeof page !== 'string') {
-        const older = snapshotPage(snap, page);
-        if (!older.page) return older;
-        // Runtime patches and deltas mutate the row in place. Freeze its fields at the sequence
-        // boundary, before the socket's async caller resumes and projects the bounded page.
-        return { ...older, items: older.items.map(item => ({ ...item })), seq: this.itemSequence };
-      }
-      let end = this.snapshotEnds.get(rt.items);
-      if (!end) this.snapshotEnds.set(rt.items, end = snapshotEnd(rt.items));
-      // Restore can settle an old running turn. Keep its displayed rows in the
-      // replacement even if the ordinary idle tail starts further down now.
-      if (page === 'real' && keepFrom && end.start && rt.items[end.start]?.id !== keepFrom) {
-        let roots = end.roots;
-        for (let i = end.start - 1; i >= 0; i--) {
-          if (!rt.items[i].parentId) roots--;
-          if (rt.items[i].id === keepFrom) { end = { start: i, roots }; break; }
+      const paged = stallMark('chat.page');
+      try {
+        const snap = rt.snapshot();
+        if (!page || snap.items.length <= SNAPSHOT_THRESHOLD && typeof page === 'string') return snap;
+        if (typeof page !== 'string') {
+          const older = snapshotPage(snap, page);
+          if (!older.page) return older;
+          // Runtime patches and deltas mutate the row in place. Freeze its fields at the sequence
+          // boundary, before the socket's async caller resumes and projects the bounded page.
+          return { ...older, items: older.items.map(item => ({ ...item })), seq: this.itemSequence };
         }
-      }
-      return snapshotPage(snap, 'end', end);
+        let end = this.snapshotEnds.get(rt.items);
+        if (!end) this.snapshotEnds.set(rt.items, end = snapshotEnd(rt.items));
+        // Restore can settle an old running turn. Keep its displayed rows in the
+        // replacement even if the ordinary idle tail starts further down now.
+        if (page === 'real' && keepFrom && end.start && rt.items[end.start]?.id !== keepFrom) {
+          let roots = end.roots;
+          for (let i = end.start - 1; i >= 0; i--) {
+            if (!rt.items[i].parentId) roots--;
+            if (rt.items[i].id === keepFrom) { end = { start: i, roots }; break; }
+          }
+        }
+        return snapshotPage(snap, 'end', end);
+      } finally { paged(); }
     });
     // A window gets finished steps cut (core/trim.ts): one whole, when it opens. A chat not read yet
     // (a picture of a file asked after a restart) is read off the main thread, one read for all, as a snapshot is.

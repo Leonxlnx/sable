@@ -2638,6 +2638,20 @@ export interface RpcMethods {
   'app.setSettings': { params: { patch: Partial<AppSettings> }; result: AppSettings };
 
   'auth.journal': { params: { limit?: number }; result: string[] };
+  /**
+   * How long the bridge kept its event loop to itself lately (`server/util/stalls.ts`): late timers and
+   * named whole-chat work, in numbers and fixed words only. For finding what makes the window sluggish.
+   */
+  'diag.stalls': {
+    params: Record<string, never>;
+    result: {
+      forMs: number;
+      late: { over100: number; over250: number; over500: number; over1000: number; worst: number };
+      stalls: { agoMs: number; ms: number }[];
+      marks: Record<string, { count: number; totalMs: number; worstMs: number }>;
+      marked: { agoMs: number; what: string; ms: number }[];
+    };
+  };
   'auth.refresh': { params: { provider: ProviderId; accountId?: string }; result: ProviderInfo };
   'auth.login': { params: { provider: ProviderId; accountId?: string }; result: { started: boolean } };
   /** The code the browser showed instead of returning to Sable ("code#state"): finishes the sign-in in progress. */

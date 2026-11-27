@@ -5,7 +5,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { isBackdropImageId, migrateBackdrop, migrateQuietDefault, normalizeBackdrop } from '../../shared/backdrop';
-import { isLight, LIGHT } from './trim';
+import { isLight, LIGHT, rowFacts } from './trim';
+import { stallMark } from '../util/stalls';
 import { SessionFiles, type SessionData, type SessionSave } from './session-file';
 import { DEFAULT_SETTINGS, type AppSettings, type FolderGroup, type Project, type ProviderId, type QueuedMessage, type SessionMeta, type TimelineItem, type Todo, type ToolItem } from '../../shared/protocol';
 
@@ -58,14 +59,49 @@ export function fillMissing<T>(defaults: T, saved: unknown): T {
 /** Freeze just the fields resident in memory. Immutable strings can be shared even inside a
  * result or attachment. The index and original line bytes have a separate lifetime. */
 function snapshotItem(item: TimelineItem): TimelineItem {
-  const clone = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(clone);
-    if (!v || typeof v !== 'object') return v;
-    if (Object.getPrototypeOf(v) !== Object.prototype) return structuredClone(v);
-    return Object.fromEntries(Object.entries(v).map(([k, value]) => [k, clone(value)]));
-  };
-  return clone(item) as TimelineItem;
+  return cloneField(item) as TimelineItem;
 }
+
+/** Own enumerable fields in their order, as `Object.entries` gives them, without the arrays in between (a long chat's first save copies every row). */
+function cloneField(v: unknown): unknown {
+  if (Array.isArray(v)) {
+    const out = new Array(v.length);
+    for (let i = 0; i < v.length; i++) out[i] = cloneField(v[i]);
+    return out;
+  }
+  if (!v || typeof v !== 'object') return v;
+  if (Object.getPrototypeOf(v) !== Object.prototype) return structuredClone(v);
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(v)) {
+    const value = cloneField((v as Record<string, unknown>)[k]);
+    // A plain assignment to this name would set the copy's prototype.
+    if (k === '__proto__') Object.defineProperty(out, k, { value, enumerable: true, writable: true, configurable: true });
+    else out[k] = value;
+  }
+  return out;
+}
+
+/** The longest a debounced save waits for the copies of a chat just read (ms). */
+const WARM_WAIT_MS = 6000;
+
+/**
+ * What the last save of a chat saw, row by row: the runtime's own row at each place, the copy it was saved
+ * as, and the row's bits for the end of the chat. The next save takes a row over by its place when the
+ * same object still stands there and nothing named it changed, so a save costs the rows that changed and
+ * one comparison per row of the rest. (Asked of a map row by row, a chat of 126,000 rows held the bridge,
+ * which is the window's main process, for 150 to 600 ms on every save: every second and a half while it
+ * streamed.)
+ */
+interface SavedRows {
+  source: TimelineItem[];
+  copies: TimelineItem[];
+  /** Each copy's id, beside it: asked for a row's id, nobody reads the row (a row read is a trip through memory, 126,000 of them some 20 ms). */
+  ids: string[];
+  facts: Uint8Array;
+}
+
+/** A slice of the copies made ahead (ms). */
+const WARM_SLICE_MS = 6;
 
 /** JSON persistence under ~/.sable. Writes are debounced and atomic. */
 export class Store {
@@ -83,6 +119,10 @@ export class Store {
   private writingState: Promise<void> = Promise.resolve();
   /** Frozen item versions shared by concurrent saves until the runtime marks the item dirty. */
   private savedItems = new WeakMap<TimelineItem, TimelineItem>();
+  private savedRows = new Map<string, SavedRows>();
+  /** Rows whose saved copy was made again outside a save since the chat's last one (`replaceView`). */
+  private recopied = new Map<string, Set<string>>();
+  private warming = new Map<string, symbol>();
   private activeSaves = new Map<string, SessionSave>();
   private migrations = new Map<string, { after: number; atRest: () => boolean }>();
   private migrationTimer?: NodeJS.Timeout;
@@ -95,7 +135,11 @@ export class Store {
   private recoveryOwed = false;
   private startupBusy = false;
 
+  /** The runtime's own row for an id, when the bridge gave the way to ask (a bare store has none). */
+  private runtimeRow?: (session: string, id: string) => TimelineItem | undefined;
+
   constructor(dir?: string, runtimeItem?: (session: string, id: string) => TimelineItem | undefined) {
+    this.runtimeRow = runtimeItem;
     this.sessionFiles = new SessionFiles(id => this.sessionPath(id), runtimeItem && ((id, saved, preview) => {
       const current = runtimeItem(id, saved.id);
       if (current && isDeepStrictEqual(current, saved)) this.replaceView(id, current, preview);
@@ -290,7 +334,9 @@ export class Store {
     const data = this.pending.get(file);
     if (!data) return;
     this.pending.delete(file);
+    const written = stallMark('state.write');
     const contents = JSON.stringify(data());
+    written();
     this.writingState = this.writingState.catch(() => {}).then(async () => {
       const tmp = `${file}.${process.pid}.tmp`;
       await writeFile(tmp, contents, 'utf8');
@@ -385,10 +431,15 @@ export class Store {
   }
 
   private replaceView(id: string, item: TimelineItem, view: TimelineItem) {
-    this.savedItems.delete(item);
     for (const key of Object.getOwnPropertyNames(item)) Reflect.deleteProperty(item, key);
     Object.assign(item, view);
     this.bindProviderInputs(id, [item]);
+    // Its saved copy is made here, in the slices this is called in. Left to the next save, every row a
+    // base write had slimmed was copied in that save's one task: a second and more for a long chat.
+    this.savedItems.set(item, snapshotItem(item));
+    let named = this.recopied.get(id);
+    if (!named) this.recopied.set(id, named = new Set());
+    named.add(item.id);
   }
 
   /** Keep runtime references valid when a rewind or a late event makes an old step live again. */
@@ -417,12 +468,22 @@ export class Store {
     this.migrations.delete(id);
     this.sessionPending.set(id, data);
     if (this.sessionTimers.has(id)) return;
+    this.armSave(id, 1500, 0);
+  }
+
+  /**
+   * The debounced save. While the copies of a chat just read are still being made (`warmSave`), it waits
+   * for them a little longer, a few seconds at most: a save that came first would make the rest in one task.
+   * Whoever needs the save now (`persistInput`, a quit) flushes at once as ever.
+   */
+  private armSave(id: string, delay: number, waited: number) {
     this.sessionTimers.set(
       id,
       setTimeout(() => {
         this.sessionTimers.delete(id);
-        this.flushSession(id);
-      }, 1500),
+        if (this.warming.has(id) && !this.sealed && waited < WARM_WAIT_MS && this.sessionPending.has(id)) return this.armSave(id, 250, waited + 250);
+        void this.flushSession(id);
+      }, delay),
     );
   }
 
@@ -431,20 +492,150 @@ export class Store {
     if (!data) return Promise.resolve();
     this.sessionPending.delete(id);
     const save = data();
-    const items = save.items.map(item => {
-      let copy = this.savedItems.get(item);
-      if (!copy || save.dirty === 'all' || save.dirty.has(item.id)) {
-        copy = snapshotItem(item);
-        this.savedItems.set(item, copy);
-      }
-      return copy;
-    });
-    const snapshot = { items, dirty: save.dirty === 'all' ? 'all' as const : new Set(save.dirty), todos: structuredClone(save.todos),
+    const copied = stallMark('save.rows');
+    const { items, ids, facts, places } = this.copyRows(id, save.items, save.dirty);
+    copied();
+    const snapshot = { items, facts, rowIds: ids, places, own: true, dirty: save.dirty === 'all' ? 'all' as const : new Set(save.dirty), todos: structuredClone(save.todos),
       queue: structuredClone(save.queue), receiptRepair: save.receiptRepair?.slice() };
     this.activeSaves.set(id, snapshot);
     return this.sessionFiles.save(id, () => snapshot, !!this.sealed).finally(() => {
       if (this.activeSaves.get(id) === snapshot && !this.sessionFiles.needsRetry(id)) this.activeSaves.delete(id);
     });
+  }
+
+  /**
+   * The rows of a save as copies nothing changes any more, with each row's bits (`SavedRows`). A row keeps
+   * its copy while the same object stands at the same place, is not named changed (`dirty`) and was not
+   * copied again meanwhile (`recopied`); every other row is looked up as before, and copied when it has no
+   * copy or is named.
+   */
+  private copyRows(id: string, src: TimelineItem[], dirty: Set<string> | 'all') {
+    const n = src.length;
+    const prev = this.savedRows.get(id);
+    const again = this.recopied.get(id);
+    this.recopied.delete(id);
+    // A save came before the warm-up was through: it is this save's work now.
+    this.warming.delete(id);
+    const all = dirty === 'all';
+    const named = all ? undefined : dirty;
+    const keep = prev && !all ? prev : undefined;
+    // What the last save saw is taken over whole (arrays copied as blocks); only the places that differ are made again.
+    const items: TimelineItem[] = keep ? keep.copies.slice(0, n) : [];
+    const ids: string[] = keep ? keep.ids.slice(0, n) : [];
+    items.length = n;
+    ids.length = n;
+    const facts = new Uint8Array(n);
+    if (keep) facts.set(keep.facts.length > n ? keep.facts.subarray(0, n) : keep.facts);
+    const was = keep?.source;
+    // The runtime's rows as this save saw them, for the next one to compare with. Kept from save to save and
+    // set right where it differs (it is this store's alone); copied only where there is nothing to keep.
+    let source: TimelineItem[] | undefined;
+    const places = new Map<string, number>();
+    const make = (i: number, changed: boolean) => {
+      const item = src[i];
+      let copy = changed ? undefined : this.savedItems.get(item);
+      if (!copy) {
+        copy = snapshotItem(item);
+        this.savedItems.set(item, copy);
+      }
+      items[i] = copy;
+      ids[i] = copy.id;
+      facts[i] = rowFacts(copy);
+    };
+    // Where a named row stands: the runtime's own row for the id, looked for among the rows by what it is
+    // (a walk over places, no row is read). -1: not among them (taken out since).
+    const ask = this.runtimeRow;
+    const placeOf = (rid: string) => {
+      const item = ask!(id, rid);
+      return item ? src.lastIndexOf(item) : -1;
+    };
+    // Only where the runtime asked is the one these rows are of (it gives the last row back as itself): a save
+    // for rows nobody answers for asks about every place, as before.
+    if (was && named && ask && n > 0 && ask(id, src[n - 1].id) === src[n - 1]) {
+      // Places that hold another row than at the last save (added, put in, taken out before, moved).
+      const other: number[] = [];
+      for (let i = n - 1; i >= 0; i--) if (was[i] !== src[i]) other.push(i);
+      const changed = new Set<number>();
+      for (const rid of named) {
+        const i = placeOf(rid);
+        if (i < 0) continue;
+        changed.add(i);
+        places.set(rid, i);
+      }
+      for (const i of other) make(i, changed.delete(i));
+      for (const i of changed) make(i, true);
+      if (again) for (const rid of again) {
+        const i = placeOf(rid);
+        // Copied again outside a save: its new copy is the one kept for it.
+        if (i >= 0 && !places.has(rid) && was[i] === src[i]) make(i, false);
+      }
+      // From the lowest place up, so rows added at the end are appended in order.
+      for (let k = other.length - 1; k >= 0; k--) was[other[k]] = src[other[k]];
+      was.length = n;
+      source = was;
+    } else {
+      // Nothing to take over, or no way to ask for a row: every place is asked about, the named ones first met from the end.
+      let left = (named?.size ?? 0) + (again?.size ?? 0);
+      for (let i = n - 1; i >= 0; i--) {
+        const item = src[i];
+        const same = was !== undefined && was[i] === item;
+        let changed = all;
+        let copied = false;
+        if (left > 0) {
+          // A row that stands where it stood is known by the id kept beside it.
+          const rid = same ? ids[i] : item.id;
+          if (named?.has(rid)) {
+            changed = true;
+            left--;
+            places.set(rid, i);
+          }
+          if (again?.has(rid)) {
+            copied = true;
+            left--;
+          }
+        }
+        if (same && !changed && !copied) continue;
+        make(i, changed);
+      }
+    }
+    this.savedRows.set(id, { source: source ?? src.slice(), copies: items, ids, facts });
+    return { items, ids, facts, places };
+  }
+
+  /**
+   * Makes the copies of a chat just read ahead of its first save, a slice at a time. The first save of a
+   * chat copies every row; for one of 126,000 rows that was one task of three seconds in which the window
+   * answered nothing. Only copies are made here: the save decides as ever which of them still hold (a row
+   * changed after its copy is named changed, and copied again). A save that comes first does what is left.
+   */
+  warmSave(id: string, live: TimelineItem[]) {
+    if (this.sealed || this.savedRows.has(id) || this.warming.has(id) || live.length < 2048) return;
+    const run = Symbol();
+    this.warming.set(id, run);
+    const src = live.slice();
+    const n = src.length;
+    const copies = new Array<TimelineItem>(n);
+    const ids = new Array<string>(n);
+    const facts = new Uint8Array(n);
+    let i = n - 1;
+    const step = () => {
+      if (this.sealed || this.warming.get(id) !== run) return;
+      const until = performance.now() + WARM_SLICE_MS;
+      for (; i >= 0; i--) {
+        if ((i & 31) === 0 && performance.now() >= until) break;
+        const item = src[i];
+        let copy = this.savedItems.get(item);
+        if (!copy) this.savedItems.set(item, copy = snapshotItem(item));
+        copies[i] = copy;
+        ids[i] = copy.id;
+        facts[i] = rowFacts(copy);
+      }
+      if (i >= 0) return void setImmediate(step);
+      this.warming.delete(id);
+      // The places too, unless a save took them or a row was copied again meanwhile: the first save then asks about no row it need not.
+      if (!this.savedRows.has(id) && !this.recopied.has(id)) this.savedRows.set(id, { source: src, copies, ids, facts });
+    };
+    setImmediate(step);
   }
 
   /** Commit input ownership before the corresponding SDK write or RPC acknowledgement. */
@@ -471,6 +662,9 @@ export class Store {
     this.sessionTimers.delete(id);
     this.sessionPending.delete(id);
     this.activeSaves.delete(id);
+    this.savedRows.delete(id);
+    this.recopied.delete(id);
+    this.warming.delete(id);
     this.sessionFiles.remove(id);
   }
 
